@@ -152,7 +152,7 @@ mid-flight. There's an action audit. There's no embedded LLM — bring your own.
 - One adjustable divider, no saved layouts, no docking, no theme editor yet.
   Text starts at 16px; scaling and accessibility need real work.
 - No reverse execution, no replay, no decompiler, no syscall/GPU tracing yet.
-- **License: still undecided.** System dependencies and their observed licenses
+- **License: GPLv3** System dependencies and their observed licenses
   are catalogued in [docs/DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
 Longer, more depressing, more precise lists live in [DAY1.md](DAY1.md) and the
