@@ -19,6 +19,8 @@ KEY = dict(esc=1, equal=13, tab=15, q=16, w=17, e=18, ctrl=29, a=30, d=32, g=34,
 results = []
 M1 = ["--source", "tests/fixtures/m1.c", "--break", "change_value", "--", "./zig-out/bin/xodb-m1-fixture", "w"]
 TARGET = ["--source", "tests/fixtures/target.c", "--", "./zig-out/bin/xodb-fixture"]
+THREADS_PANE = "210x170+8+590"
+SIDE_PANE = "250x450+1020+95"
 
 def check(name, ok, detail=""):
     results.append({"check": name, "ok": bool(ok), "detail": str(detail)})
@@ -295,6 +297,8 @@ def layouts(tree):
         d.stopped()
         d.keys("layout", "fr", "tap", KEY["q"])
         check("French layout: the key labelled A (QWERTY Q position) does not quit", d.alive() and d.trace()[-1]["shortcut"] in ("a", ""), d.trace()[-2:])
+        # A opens the allocation inspector, which owns keys until dismissed.
+        d.keys("tap", KEY["esc"])
         d.keys("layout", "fr", "tap", KEY["a"])
         check("French layout: the key labelled Q quits", d.app.wait(timeout=5) == 0)
     finally:
@@ -306,6 +310,7 @@ def layouts(tree):
         texts = [e["text"] for e in d.trace() if e["kind"] == "press"]
         # A plain letter: E opens the expression field (T19), which then owns typed keys.
         check("German layout: text is o-umlaut, and dead acute plus a composes", texts[-3:] == ["ö", "", "á"], texts[-3:])
+        d.keys("tap", KEY["esc"]) # Close the inspector opened by the A shortcut.
         d.keys("down", KEY["ctrl"], "tap", KEY["q"], "up", KEY["ctrl"])
         press = [e for e in d.trace() if e["kind"] == "press" and e["code"] == KEY["q"]][-1]
         check("Ctrl+Q is not the Q shortcut and carries no text", d.alive() and "C" in press["mods"] and press["text"] == "", press)

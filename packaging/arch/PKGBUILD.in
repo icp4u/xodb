@@ -1,0 +1,31 @@
+# Generated with a pinned source checksum by scripts/package-source.
+pkgname=xodb
+pkgver=0.0.0
+pkgrel=1
+pkgdesc='Native Linux debugger and profiler with a Wayland/Vulkan interface'
+arch=('x86_64')
+license=('GPL-3.0-only' 'MIT')
+depends=('glibc' 'capstone' 'libelf' 'wayland' 'libxkbcommon'
+         'vulkan-icd-loader' 'freetype2' 'harfbuzz' 'ttf-dejavu')
+makedepends=('zig>=0.16.0' 'zig<0.16.1' 'pkgconf' 'wayland-protocols>=1.36'
+             'vulkan-headers' 'shaderc')
+optdepends=('vulkan-driver: Vulkan implementation for your GPU'
+            'openssh: remote debugging over SSH'
+            'sudo: explicit allocation-helper workflow')
+source=("$pkgname-$pkgver.tar.gz")
+sha256sums=('@SHA256@')
+
+build() {
+    cd "$srcdir/$pkgname-$pkgver"
+    ./packaging/build /usr/share/fonts/TTF/DejaVuSansMono.ttf
+}
+
+check() {
+    cd "$srcdir/$pkgname-$pkgver"
+    .work/package/bin/xodb --help >/dev/null 2>&1
+}
+
+package() {
+    cd "$srcdir/$pkgname-$pkgver"
+    ./packaging/install "$pkgdir" /usr/lib/xodb
+}

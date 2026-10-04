@@ -4,7 +4,8 @@ xodb uses installed system libraries and generates Wayland bindings at build tim
 The UI adapts RAD Debugger rectangle shading and visual conventions; its MIT
 notice is retained in [licenses/RAD-Debugger-MIT.txt](licenses/RAD-Debugger-MIT.txt).
 No LLVM implementation code is included.
-The project license has not yet been selected.
+The project license is GPLv3; see [LICENSE](../LICENSE). The RAD Debugger
+adaptations retain their MIT notice.
 
 Preserve applicable notices if dependencies or
 protocol-generated files are bundled for distribution.

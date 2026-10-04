@@ -1,0 +1,74 @@
+#!/usr/bin/env python3
+"""Export a local working-tree snapshot and a checksum-pinned Arch recipe."""
+import argparse
+import gzip
+import hashlib
+import os
+from pathlib import Path
+import re
+import subprocess
+import tarfile
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('destination', type=Path, help='new directory outside the checkout')
+    args = parser.parse_args()
+    destination = args.destination.resolve()
+    if destination == ROOT or ROOT in destination.parents:
+        parser.error('keep package outputs outside the source checkout')
+    version = re.match(r'xodb \(([0-9][0-9.]*)-\d+\)', (ROOT / 'packaging/debian/changelog').read_text())
+    if version is None:
+        parser.error('expected a numeric package version in packaging/debian/changelog')
+    version = version[1]
+    recipe = (ROOT / 'packaging/arch/PKGBUILD.in').read_text()
+    spec = (ROOT / 'packaging/rpm/xodb.spec').read_text()
+    if f'pkgver={version}\n' not in recipe or not re.search(r'^Version:\s+' + re.escape(version) + r'$', spec, re.M):
+        parser.error('Debian, RPM and Arch recipe versions must agree')
+    names = subprocess.check_output(['git', 'ls-files', '--cached', '--others',
+        '--exclude-standard', '-z'], cwd=ROOT).decode().split('\0')
+    directories = {'src', 'tests', 'scripts', 'docs', 'config', 'packaging'}
+    top = {'build.zig', 'LICENSE', 'README.md', 'SETUP.md', 'ruby_flow.png'}
+    selected = []
+    for name in sorted(set(filter(None, names))):
+        path = Path(name)
+        if path.parts[0] not in directories and name not in top:
+            continue
+        if any(part.startswith('.') for part in path.parts):
+            continue
+        if path.name == 'AGENTS.md' or path.name.endswith(('~', '.bak', '.orig', '.rej', '.swp', '.pyc')):
+            continue
+        source = ROOT / path
+        if source.is_symlink() or not source.is_file():
+            parser.error(f'expected a regular source file: {name}')
+        selected.append((name, name))
+        # Debian tools need a source-root copy; keep the repository layout too.
+        if name.startswith('packaging/debian/'):
+            selected.append((name, name.removeprefix('packaging/')))
+    epoch = int(os.environ.get('SOURCE_DATE_EPOCH') or subprocess.check_output(
+        ['git', 'show', '-s', '--format=%ct', 'HEAD'], cwd=ROOT, text=True).strip())
+    destination.mkdir(parents=True, exist_ok=False)
+    archive = destination / f'xodb-{version}.tar.gz'
+    # Drop account names, local paths and varying filesystem timestamps.
+    with archive.open('xb') as raw, gzip.GzipFile(filename='', fileobj=raw, mode='wb', mtime=epoch) as compressed:
+        with tarfile.open(fileobj=compressed, mode='w', format=tarfile.PAX_FORMAT) as tar:
+            for name, archive_name in selected:
+                source = ROOT / name
+                info = tar.gettarinfo(str(source), arcname=f'xodb-{version}/{archive_name}')
+                info.uid = info.gid = 0
+                info.uname = info.gname = ''
+                info.mtime = epoch
+                info.mode = 0o755 if source.stat().st_mode & 0o111 else 0o644
+                with source.open('rb') as stream:
+                    tar.addfile(info, stream)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    (destination / (archive.name + '.sha256')).write_text(f'{digest}  {archive.name}\n')
+    (destination / 'PKGBUILD').write_text(recipe.replace('@SHA256@', digest))
+    print(f'{archive}: {len(selected)} source files; sha256 {digest}')
+    print(f'Arch recipe: {destination / "PKGBUILD"}')
+
+
+if __name__ == '__main__':
+    main()

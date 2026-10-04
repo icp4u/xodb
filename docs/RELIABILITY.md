@@ -111,14 +111,12 @@ tests report their existing architecture skips on x86-64.
 of deliberately orphaned or signal-resistant owned children, including a child
 that escapes its original process group/session.
 
-## CI and hardware sign-off
+## Automation and hardware sign-off
 
-[The workflow](../.github/workflows/reliability.yml) builds GUI ReleaseSafe and
-headless Debug in an Arch Linux container on a hosted GitHub runner. It pins
-Zig and verifies its upstream checksum, runs portable tests, and retains logs
-and summaries even on failure. It does not enable perf, attach to processes,
-run a GPU, or use a privileged/self-hosted runner. Arch dependency versions
-remain rolling and are recorded in the report.
+This checkout has no checked-in GitHub Actions workflow. The local
+`scripts/release-check` runner is the available automation; its reports are
+local evidence, not a claim of hosted CI coverage. Dependency versions are
+recorded in each report. #TODO: set up CI
 
 Before tagging, record these additional results for the candidate build:
 

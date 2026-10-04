@@ -22,6 +22,7 @@ pub const api = @cImport({
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
     @cInclude("sys/sysmacros.h");
+    @cInclude("../binary/mapped_file.h");
     if (gui) {
         @cInclude("wayland-client.h");
         @cInclude("xdg-shell-client-protocol.h");

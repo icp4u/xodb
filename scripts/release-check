@@ -23,8 +23,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe'):
     live = tier in ('host', 'all')
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
+    steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
+    steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     if live:
-        for name in ('mcp', 'm1-control', 'm1-source', 'm1-stepping',
+        for name in ('mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
@@ -34,6 +36,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe'):
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
     if tier in ('gui', 'all'):
         for name, args in (
+            ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),

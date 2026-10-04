@@ -184,6 +184,7 @@ test "shared syscall ring wrap copies exactly" {
 }
 
 test "syscall partial-open failure closes all prepared descriptors" {
+    try @import("../test_support.zig").requireLive();
     if (builtin.cpu.arch != .x86_64) return error.SkipZigTest;
     const result = try start(std.testing.allocator, c.getpid(), &.{ c.getpid(), std.math.maxInt(i32) });
     switch (result) {
@@ -195,5 +196,25 @@ test "syscall partial-open failure closes all prepared descriptors" {
             try std.testing.expectEqual(c.ESRCH, failure.errno);
             try std.testing.expectEqual(@as(u16, 2), failure.opened_then_closed);
         },
+    }
+}
+
+test "syscall failure cleanup closes prepared descriptors without perf permissions" {
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(0, c.pipe2(&fds, c.O_CLOEXEC));
+    const self = std.testing.allocator.create(Collector) catch |err| {
+        _ = c.close(fds[0]);
+        _ = c.close(fds[1]);
+        return err;
+    };
+    self.* = .{ .allocator = std.testing.allocator, .pid = 1, .enter_type = 1, .exit_type = 2, .count = 2 };
+    self.slots[0] = .{ .tid = 1, .enter = fds[0], .exit = fds[1] };
+    self.slots[1] = .{ .tid = 2 }; // failed before the second pair opened
+    const result = self.fail(failed("injected.open", c.EMFILE, 2, "descriptor exhaustion"));
+    try std.testing.expectEqual(c.EMFILE, result.failed.errno);
+    try std.testing.expectEqual(2, result.failed.opened_then_closed);
+    for (fds) |fd| {
+        try std.testing.expectEqual(-1, c.fcntl(fd, c.F_GETFD));
+        try std.testing.expectEqual(c.EBADF, errno());
     }
 }

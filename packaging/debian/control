@@ -1,0 +1,21 @@
+Source: xodb
+Section: devel
+Priority: optional
+Maintainer: xodb contributors <packaging@xodb.invalid>
+Build-Depends: debhelper-compat (= 13),
+ zig (>= 0.16.0) <!pkg.xodb.external-zig>,
+ zig (<< 0.16.1) <!pkg.xodb.external-zig>,
+ pkg-config, libcapstone-dev, libdw-dev, libelf-dev,
+ libwayland-dev, libwayland-bin, wayland-protocols (>= 1.36),
+ libxkbcommon-dev, libvulkan-dev, glslc, libfreetype-dev, libharfbuzz-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+
+Package: xodb
+Architecture: amd64
+Depends: ${shlibs:Depends}, ${misc:Depends}, fonts-dejavu-core
+Suggests: openssh-client, sudo
+Description: native Linux debugger and profiler
+ A debugger, disassembler and profiler with a Wayland/Vulkan interface and
+ an MCP server. Includes an optional allocation helper without granting
+ privileges or changing host tracing policy.

@@ -45,28 +45,9 @@ pub const Prepared = struct {
 fn cancelled(cancel: ?*const std.atomic.Value(bool)) !void {
     if (cancel) |flag| if (flag.load(.acquire)) return error.AllocationPreparationCancelled;
 }
-fn matching(path: [:0]const u8, region: modules.Region) c_int {
-    const fd = c.open(path, c.O_RDONLY | c.O_NONBLOCK | c.O_CLOEXEC);
-    if (fd < 0) return -1;
-    var s: c.struct_stat = undefined;
-    if (c.fstat(fd, &s) == 0 and s.st_mode & c.S_IFMT == c.S_IFREG and s.st_ino == region.inode and
-        c.major(s.st_dev) == region.device_major and c.minor(s.st_dev) == region.device_minor) return fd;
-    _ = c.close(fd);
-    return -1;
-}
 fn open(pid: i32, region: modules.Region) !c_int {
-    if (pid <= 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/' or std.mem.indexOfScalar(u8, region.path, 0) != null) return error.AllocationMappingIdentity;
-    var path: [8192]u8 = undefined;
-    var fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/map_files/{x}-{x}", .{ pid, region.start, region.end }), region);
-    if (fd >= 0) return fd;
-    fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/exe", .{pid}), region);
-    if (fd >= 0) return fd;
-    // Target mount namespace before local path; both still require dev/inode.
-    fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/root{s}", .{ pid, region.path }), region);
-    if (fd >= 0) return fd;
-    fd = matching(try std.fmt.bufPrintZ(&path, "{s}", .{region.path}), region);
-    if (fd >= 0) return fd;
-    return error.AllocationMappingIdentity;
+    if (pid <= 0) return error.AllocationMappingIdentity;
+    return @import("../binary/mapped_file.zig").open(pid, region) catch error.AllocationMappingIdentity;
 }
 /// Exact defined function names only. Duplicate table entries at one address
 /// are fine; different definitions, IFUNC resolvers and data labels are not.

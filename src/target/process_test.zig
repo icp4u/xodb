@@ -144,6 +144,12 @@ test "fork during breakpoint stepping repairs the child's inherited unpatched in
 test "owned shutdown reaps an unadopted fork or vfork child" {
     try @import("../test_support.zig").requireLive();
     if (linux.architecture != .x86_64) return error.SkipZigTest;
+    // Keep the natural-parent exit notification here after the owned parent
+    // dies, rather than leaving its orphaned child to the outer test runner.
+    var previous: c_int = 0;
+    try std.testing.expectEqual(@as(c_int, 0), c.prctl(c.PR_GET_CHILD_SUBREAPER, &previous, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)));
+    try std.testing.expectEqual(@as(c_int, 0), c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)));
+    defer _ = c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, @intCast(previous)), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
     for ([_][:0]const u8{ "fork", "vfork" }) |mode| {
         const parent = try create();
         defer destroy(parent);

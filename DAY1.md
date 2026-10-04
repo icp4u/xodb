@@ -1,5 +1,8 @@
 # xodb — Day 1 features
 
+Historical snapshot; later additions and current limits are documented in
+[README.md](README.md) and the linked feature guides.
+
 Implemented as of 2026-10-01. Local GUI and profiling features below describe
 the Linux x86-64 build; ARM64 and remote support have separate limits.
 
@@ -158,4 +161,3 @@ the Linux x86-64 build; ARM64 and remote support have separate limits.
 - Syscall, allocation, wakeup, blocking-stack, and GPU tracing are not integrated.
 - GUI expression watches, Lua scripting, Android, serial transport, and multi-client sessions remain pending.
 - No saved/dockable layouts or general shortcut/theme editor.
-

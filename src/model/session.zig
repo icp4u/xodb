@@ -34,6 +34,31 @@ pub const Frame = struct {
 };
 const value_view = @import("value_view.zig");
 pub const ValueSummary = struct { type: []const u8, kind: eval.Kind, size: u64, address: ?u64, bits: ?u64, display: []const u8, availability: eval.Availability, diagnostic: ?[]const u8 = null, language: eval.Language = .unknown, enumerator: ?[]const u8 = null, visualization: ?value_view.Preview = null, composite: bool = false, partial: bool = false };
+/// Inspection borrows module strings. Evidence must own the entire value,
+/// including optional preview metadata and inline/source names, across exec.
+fn retainEvidence(a: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!@TypeOf(value) {
+    const T = @TypeOf(value);
+    switch (@typeInfo(T)) {
+        .optional => return if (value) |v| try retainEvidence(a, v) else null,
+        .pointer => |p| {
+            if (p.size != .slice) @compileError("evidence must contain values and slices, not borrowed object pointers");
+            const copy = try a.alloc(p.child, value.len);
+            for (value, copy) |v, *out| out.* = try retainEvidence(a, v);
+            return copy;
+        },
+        .@"struct" => |s| {
+            var copy = value;
+            inline for (s.fields) |f| @field(copy, f.name) = try retainEvidence(a, @field(value, f.name));
+            return copy;
+        },
+        .array => {
+            var copy = value;
+            for (value, &copy) |v, *out| out.* = try retainEvidence(a, v);
+            return copy;
+        },
+        else => return value,
+    }
+}
 pub const InstructionEvidence = struct { address: u64, mnemonic: []const u8, operands: []const u8, source: ?info.Site, basis: []const u8 = "linear_decode_from_symbol_start" };
 pub const LocalEvidence = struct { name: []const u8, value: ValueSummary, diagnostic: ?[]const u8 };
 pub const Observation = struct { locals: []LocalEvidence, locals_truncated: bool, event: linux.Event, captured_generation: u64, value: ValueSummary, frames: []Frame, preceding_instruction: ?InstructionEvidence, access_instruction: ?InstructionEvidence = null };
@@ -636,9 +661,8 @@ pub const Session = struct {
         const value = try self.evaluateExpression(a, tid, frame_index, expression);
         const address = value.address orelse return error.NotAddressable;
         if (value.type.size > 8 or value.type.size == 0) return error.InvalidWatchRange;
-        var summary = try self.summarize(a, value);
+        const summary = try retainEvidence(a, try self.summarize(a, value));
         if (summary.availability != .available) return error.ValueUnavailable;
-        summary.type = try a.dupe(u8, summary.type);
         const question_copy = try a.dupe(u8, question);
         const expression_copy = try a.dupe(u8, expression);
         try self.investigations.ensureUnusedCapacity(a, 1);
@@ -692,9 +716,6 @@ pub const Session = struct {
                     continue;
                 }
                 const frames: []Frame = self.stack(a, event.tid, 16) catch try a.alloc(Frame, 0);
-                for (frames) |*frame| if (frame.symbol) |symbol| {
-                    frame.symbol = try a.dupe(u8, symbol);
-                };
                 var value = record_.initial;
                 // Keep the watched identity even if the expression goes out of
                 // scope or a pointer variable changes at this stop.
@@ -711,11 +732,10 @@ pub const Session = struct {
                 const variables = self.locals(a, event.tid, 0) catch &.{};
                 var saved_locals: std.ArrayList(LocalEvidence) = .empty;
                 for (variables[0..@min(64, variables.len)]) |variable| {
-                    var summary = try self.summarize(a, variable.value);
-                    summary.type = try a.dupe(u8, summary.type);
-                    try saved_locals.append(a, .{ .name = try a.dupe(u8, variable.name), .value = summary, .diagnostic = variable.diagnostic });
+                    try saved_locals.append(a, .{ .name = variable.name, .value = try self.summarize(a, variable.value), .diagnostic = variable.diagnostic });
                 }
-                try record_.observations.append(a, .{ .locals = try saved_locals.toOwnedSlice(a), .locals_truncated = variables.len > 64, .event = event, .captured_generation = self.target.generation, .value = value, .frames = frames, .preceding_instruction = if (event.trap_pc == null) self.precedingInstruction(a, event.pc) catch null else null, .access_instruction = if (event.trap_pc) |pc| self.armAccessInstruction(a, pc) catch null else null });
+                const observation = Observation{ .locals = try saved_locals.toOwnedSlice(a), .locals_truncated = variables.len > 64, .event = event, .captured_generation = self.target.generation, .value = value, .frames = frames, .preceding_instruction = if (event.trap_pc == null) self.precedingInstruction(a, event.pc) catch null else null, .access_instruction = if (event.trap_pc) |pc| self.armAccessInstruction(a, pc) catch null else null };
+                try record_.observations.append(a, try retainEvidence(a, observation));
             }
         }
         self.evidence_sequence = self.target.sequence;
@@ -1331,4 +1351,34 @@ test "agent capabilities and generation protect shared execution state" {
     try session.authorize(.agent, .mutation, session.target.generation);
     session.setAgentScope(.observe);
     try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .execution, session.target.generation));
+}
+
+test "retained evidence owns enum and nested preview and frame strings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var borrowed = "FIRST".*;
+    const value = ValueSummary{
+        .type = &borrowed,
+        .kind = .signed,
+        .size = 4,
+        .address = 1,
+        .bits = 1,
+        .display = &borrowed,
+        .availability = .available,
+        .enumerator = &borrowed,
+        .diagnostic = &borrowed,
+        .visualization = .{ .presentation = .slice, .data_address = 1, .count = 1, .element_type = &borrowed, .text = &borrowed, .hex = &borrowed, .diagnostic = &borrowed, .basis = &borrowed },
+    };
+    var inlined = [_]info.Inline{.{ .name = &borrowed, .depth = 1, .die_offset = 0, .call_path = &borrowed, .decl_path = &borrowed }};
+    const frame = Frame{ .index = 0, .pc = 1, .lookup_pc = 1, .registers = @splat(null), .symbol = &borrowed, .inline_frames = &inlined, .source = .{ .path = &borrowed, .original_path = &borrowed, .line = 1, .column = 0, .address = 1, .is_statement = true, .prologue_end = false, .discriminator = 0 } };
+    const saved_value = try retainEvidence(arena.allocator(), value);
+    const saved_frame = try retainEvidence(arena.allocator(), frame);
+    @memset(&borrowed, '?');
+    const expected_value = try std.json.Stringify.valueAlloc(arena.allocator(), saved_value, .{});
+    const expected_frame = try std.json.Stringify.valueAlloc(arena.allocator(), saved_frame, .{});
+    try std.testing.expect(std.mem.indexOf(u8, expected_value, "?????") == null);
+    try std.testing.expect(std.mem.indexOf(u8, expected_frame, "?????") == null);
+    try std.testing.expectEqualStrings("FIRST", saved_value.enumerator.?);
+    try std.testing.expectEqualStrings("FIRST", saved_value.visualization.?.element_type);
+    try std.testing.expectEqualStrings("FIRST", saved_frame.inline_frames[0].name);
 }

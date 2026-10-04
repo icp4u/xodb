@@ -22,6 +22,39 @@ fn check(result: c.VkResult) !void {
     }
 }
 
+/// Vulkan enumeration counts belong to the driver. Query, allocate and retry
+/// VK_INCOMPLETE; a fixed array can make initialization fail on another GPU.
+fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime label: []const u8) !std.ArrayList(T) {
+    const a = std.heap.page_allocator;
+    for (0..4) |_| {
+        var count: u32 = 0;
+        const counted = @call(.auto, query, args ++ .{ &count, null });
+        if (counted != c.VK_SUCCESS and counted != c.VK_INCOMPLETE) {
+            std.debug.print("xodb: {s} count failed: {d}\n", .{ label, counted });
+            return error.VulkanFailed;
+        }
+        if (count > 4096) {
+            std.debug.print("xodb: {s} count {d} exceeds enumeration limit 4096\n", .{ label, count });
+            return error.VulkanEnumerationLimit;
+        }
+        if (count == 0) return .empty;
+        const values = try a.alloc(T, count);
+        const result = @call(.auto, query, args ++ .{ &count, values.ptr });
+        if (result == c.VK_INCOMPLETE) {
+            a.free(values);
+            continue;
+        }
+        if (result != c.VK_SUCCESS or count > values.len) {
+            a.free(values);
+            std.debug.print("xodb: {s} enumeration failed: {d} (count {d})\n", .{ label, result, count });
+            return error.VulkanFailed;
+        }
+        return .{ .items = values[0..count], .capacity = values.len };
+    }
+    std.debug.print("xodb: {s} enumeration still incomplete after four attempts\n", .{label});
+    return error.VulkanEnumerationUnstable;
+}
+
 pub const Renderer = struct {
     window: ?*Window = null,
     compositor_wait: Wait = .{},
@@ -37,10 +70,10 @@ pub const Renderer = struct {
     format: c.VkFormat = c.VK_FORMAT_B8G8R8A8_UNORM,
     extent: c.VkExtent2D = .{ .width = 0, .height = 0 },
     count: u32 = 0,
-    images: [16]c.VkImage = @splat(null),
-    views: [16]c.VkImageView = @splat(null),
-    framebuffers: [16]c.VkFramebuffer = @splat(null),
-    finished: [16]c.VkSemaphore = @splat(null),
+    images: std.ArrayList(c.VkImage) = .empty,
+    views: []c.VkImageView = &.{},
+    framebuffers: []c.VkFramebuffer = &.{},
+    finished: []c.VkSemaphore = &.{},
     pass: c.VkRenderPass = null,
     pass_format: c.VkFormat = c.VK_FORMAT_UNDEFINED,
     pipeline: c.VkPipeline = null,
@@ -80,16 +113,19 @@ pub const Renderer = struct {
         surface_info.display = window.display;
         surface_info.surface = window.surface;
         try check(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface));
-        var devices: [16]c.VkPhysicalDevice = undefined;
-        var count: u32 = devices.len;
-        try check(c.vkEnumeratePhysicalDevices(self.instance, &count, &devices));
+        var devices = try enumerate(c.VkPhysicalDevice, c.vkEnumeratePhysicalDevices, .{self.instance}, "vkEnumeratePhysicalDevices");
+        defer devices.deinit(std.heap.page_allocator);
         var best: i32 = -1;
-        for (devices[0..count]) |physical| {
+        for (devices.items) |physical| {
             var props: c.VkPhysicalDeviceProperties = undefined;
             c.vkGetPhysicalDeviceProperties(physical, &props);
-            var families: [32]c.VkQueueFamilyProperties = undefined;
-            var n: u32 = families.len;
-            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, &families);
+            var n: u32 = 0;
+            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, null);
+            if (n > 4096) return error.VulkanEnumerationLimit;
+            const families = try std.heap.page_allocator.alloc(c.VkQueueFamilyProperties, n);
+            defer std.heap.page_allocator.free(families);
+            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, families.ptr);
+            if (n > families.len) return error.VulkanEnumerationUnstable;
             for (families[0..n], 0..) |family, i| {
                 var present: c.VkBool32 = 0;
                 try check(c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present));
@@ -228,12 +264,11 @@ pub const Renderer = struct {
     fn createSwap(self: *Renderer, width: u32, height: u32) !void {
         var caps: c.VkSurfaceCapabilitiesKHR = undefined;
         try check(c.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.physical, self.surface, &caps));
-        var formats: [64]c.VkSurfaceFormatKHR = undefined;
-        var n: u32 = formats.len;
-        try check(c.vkGetPhysicalDeviceSurfaceFormatsKHR(self.physical, self.surface, &n, &formats));
-        if (n == 0) return error.NoSurfaceFormat;
-        var chosen = formats[0];
-        for (formats[0..n]) |f| if (f.format == c.VK_FORMAT_B8G8R8A8_UNORM) {
+        var formats = try enumerate(c.VkSurfaceFormatKHR, c.vkGetPhysicalDeviceSurfaceFormatsKHR, .{ self.physical, self.surface }, "vkGetPhysicalDeviceSurfaceFormatsKHR");
+        defer formats.deinit(std.heap.page_allocator);
+        if (formats.items.len == 0) return error.NoSurfaceFormat;
+        var chosen = formats.items[0];
+        for (formats.items) |f| if (f.format == c.VK_FORMAT_B8G8R8A8_UNORM) {
             chosen = f;
             break;
         };
@@ -263,8 +298,15 @@ pub const Renderer = struct {
         try check(c.vkCreateSwapchainKHR(self.device, &create, null, &replacement));
         self.swap = replacement;
         if (old != null) c.vkDestroySwapchainKHR(self.device, old, null);
-        self.count = self.images.len;
-        try check(c.vkGetSwapchainImagesKHR(self.device, self.swap, &self.count, &self.images));
+        self.images = try enumerate(c.VkImage, c.vkGetSwapchainImagesKHR, .{ self.device, self.swap }, "vkGetSwapchainImagesKHR");
+        self.count = @intCast(self.images.items.len);
+        if (self.count == 0) return error.NoSwapchainImages;
+        self.views = try std.heap.page_allocator.alloc(c.VkImageView, self.count);
+        @memset(self.views, null);
+        self.framebuffers = try std.heap.page_allocator.alloc(c.VkFramebuffer, self.count);
+        @memset(self.framebuffers, null);
+        self.finished = try std.heap.page_allocator.alloc(c.VkSemaphore, self.count);
+        @memset(self.finished, null);
         if (self.pass != null and self.pass_format != self.format) {
             c.vkDestroyPipeline(self.device, self.pipeline, null);
             c.vkDestroyRenderPass(self.device, self.pass, null);
@@ -273,7 +315,7 @@ pub const Renderer = struct {
         }
         if (self.pass == null) try self.createPass();
         for (0..self.count) |i| {
-            try self.createView(self.images[i], self.format, &self.views[i]);
+            try self.createView(self.images.items[i], self.format, &self.views[i]);
             var framebuffer = info(c.VkFramebufferCreateInfo, c.VK_STRUCTURE_TYPE_FRAMEBUFFER_CREATE_INFO);
             framebuffer.renderPass = self.pass;
             framebuffer.attachmentCount = 1;
@@ -393,15 +435,18 @@ pub const Renderer = struct {
     }
     /// Releases what depends on the extent. The swapchain handle survives to seed its replacement.
     fn destroySwap(self: *Renderer) void {
-        for (0..self.count) |i| {
-            if (self.framebuffers[i] != null) c.vkDestroyFramebuffer(self.device, self.framebuffers[i], null);
-            if (self.views[i] != null) c.vkDestroyImageView(self.device, self.views[i], null);
-            if (self.finished[i] != null) c.vkDestroySemaphore(self.device, self.finished[i], null);
-        }
+        for (self.framebuffers) |framebuffer| if (framebuffer != null) c.vkDestroyFramebuffer(self.device, framebuffer, null);
+        for (self.views) |view| if (view != null) c.vkDestroyImageView(self.device, view, null);
+        for (self.finished) |semaphore| if (semaphore != null) c.vkDestroySemaphore(self.device, semaphore, null);
+        std.heap.page_allocator.free(self.framebuffers);
+        std.heap.page_allocator.free(self.views);
+        std.heap.page_allocator.free(self.finished);
+        self.images.deinit(std.heap.page_allocator);
+        self.images = .empty;
         self.count = 0;
-        self.framebuffers = @splat(null);
-        self.views = @splat(null);
-        self.finished = @splat(null);
+        self.framebuffers = &.{};
+        self.views = &.{};
+        self.finished = &.{};
     }
     pub fn deinit(self: *Renderer) void {
         if (self.window) |window| window.cancelFrame();

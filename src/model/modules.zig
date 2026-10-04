@@ -40,6 +40,7 @@ pub const Module = struct {
 };
 pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0 };
 pub const Modules = struct {
+    pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
     core_source: ?*const @import("../binary/core.zig").Core = null,
     core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
     core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
@@ -51,10 +52,13 @@ pub const Modules = struct {
     immutable: bool = false,
     snapshot_bytes: usize = 0,
     debug_files: ?*@import("../binary/debug_files.zig").Files = null,
+    load_failures: std.ArrayList(LoadFailure) = .empty,
     pub fn init(a: std.mem.Allocator) Modules {
         return .{ .allocator = a };
     }
     pub fn deinit(self: *Modules) void {
+        self.clearFailures();
+        self.load_failures.deinit(self.allocator);
         var ids = self.core_ids.valueIterator();
         while (ids.next()) |value| switch (value.*) {
             .id => |id| self.allocator.free(id),
@@ -173,13 +177,32 @@ pub const Modules = struct {
             try new_regions.append(self.allocator, .{ .start = start, .end = end, .offset = offset, .inode = inode, .device_major = device_major, .device_minor = device_minor, .permissions = perms[0..4].*, .path = try self.allocator.dupe(u8, name) });
         }
         if (c.ferror(file) != 0) return error.ProcessMapsUnavailable;
+        self.clearFailures();
         for (self.regions.items) |r| self.allocator.free(r.path);
         self.regions.deinit(self.allocator);
         self.regions = new_regions;
     }
     pub fn load(self: *Modules, region: Region) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, false);
+        return self.loadRange(region, false) catch |err| {
+            self.noteFailure(region, err);
+            return err;
+        };
+    }
+    fn clearFailures(self: *Modules) void {
+        for (self.load_failures.items) |failure| self.allocator.free(failure.path);
+        self.load_failures.clearRetainingCapacity();
+    }
+    fn noteFailure(self: *Modules, region: Region, err: anyerror) void {
+        if (err == error.NotElf or err == error.NoBinaryImage) return;
+        for (self.load_failures.items) |failure| if (std.mem.eql(u8, failure.path, region.path) and std.mem.eql(u8, failure.diagnostic, @errorName(err))) return;
+        if (self.load_failures.items.len >= 64) return;
+        const path = self.allocator.dupe(u8, region.path) catch return;
+        self.load_failures.append(self.allocator, .{ .start = region.start, .end = region.end, .path = path, .diagnostic = @errorName(err) }) catch {
+            self.allocator.free(path);
+            return;
+        };
+        std.debug.print("xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
     }
     /// A perf record describes one range at one file offset, not the current
     /// collection of VMAs. Do not combine it with the opening/live map snapshot.
@@ -201,15 +224,6 @@ pub const Modules = struct {
         var relative = region;
         relative.offset -= file_offset;
         if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
-        if (file_offset == 0) {
-            var first = region;
-            var end = region.end;
-            for (self.regions.items) |r| if (sameFile(r, region)) {
-                if (r.start < first.start) first = r;
-                end = @max(end, r.end);
-            };
-            return .{ .first = first, .end = end, .bias = try image.loadBias(first.start, first.offset) };
-        }
         const page = try pageSize();
         var first_segment: ?elf.Segment = null;
         for (0..image.header.segment_count) |i| {
@@ -267,14 +281,7 @@ pub const Modules = struct {
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
-        var proc_buf: [128]u8 = undefined;
-        const map_path = try std.fmt.bufPrintZ(&proc_buf, "/proc/{d}/map_files/{x}-{x}", .{ self.pid, region.start, region.end });
-        var fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else openMatching(map_path, region);
-        if (fd < 0 and self.core_source == null) {
-            const exe_path = try std.fmt.bufPrintZ(&proc_buf, "/proc/{d}/exe", .{self.pid});
-            fd = openMatching(exe_path, region);
-        }
-        if (fd < 0 and self.core_source == null) fd = openMatching(path, region);
+        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else try @import("../binary/mapped_file.zig").open(self.pid, region);
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
         var stat: c.struct_stat = undefined;
@@ -283,13 +290,9 @@ pub const Modules = struct {
         if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
         const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = @intCast(stat.st_size) } else try apk.find(self.allocator, fd, @intCast(stat.st_size), region.offset);
         if (entry.offset % try pageSize() != 0) return error.ApkEntryNotPageAligned;
-        const mapped: snapshot.Bytes = if (self.immutable or entry.offset != 0)
-            try snapshot.readRange(fd, entry.offset, entry.size, @min(snapshot.per_image_limit, snapshot.total_limit - self.snapshot_bytes), null)
-        else blk: {
-            const ptr = c.mmap(null, entry.size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
-            if (ptr == std.c.MAP_FAILED) return error.BinaryUnavailable;
-            break :blk @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr.?)))[0..entry.size];
-        };
+        // MAP_PRIVATE still faults against the file after truncation. Parsed
+        // ELF/libdw slices must only reference owned, bounded snapshots.
+        const mapped = try snapshot.readRange(fd, entry.offset, entry.size, @min(snapshot.per_image_limit, snapshot.total_limit - self.snapshot_bytes), null);
         errdefer _ = c.munmap(mapped.ptr, mapped.len);
         if (entry.offset != 0) {
             var after: c.struct_stat = undefined;
@@ -313,7 +316,7 @@ pub const Modules = struct {
         }
         self.next_id += 1;
         try self.loaded.append(self.allocator, module);
-        if (self.immutable or entry.offset != 0) self.snapshot_bytes += mapped.len;
+        self.snapshot_bytes += mapped.len;
         return module;
     }
     /// A later executable mapping need not be the ELF's first PT_LOAD. Accept
@@ -343,14 +346,6 @@ pub const Modules = struct {
         }
         return found orelse error.BadMapping;
     }
-    fn openMatching(path: [:0]const u8, region: Region) c_int {
-        const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
-        if (fd < 0) return -1;
-        var stat: c.struct_stat = undefined;
-        if (c.fstat(fd, &stat) == 0 and stat.st_mode & c.S_IFMT == c.S_IFREG and stat.st_ino == region.inode and c.major(stat.st_dev) == region.device_major and c.minor(stat.st_dev) == region.device_minor) return fd;
-        _ = c.close(fd);
-        return -1;
-    }
     pub fn at(self: *Modules, address: u64) !*Module {
         for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r);
         return error.UnmappedAddress;
@@ -358,14 +353,18 @@ pub const Modules = struct {
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
         // APKs have no offset-zero ELF mapping. Executable VMAs identify their
         // embedded libraries; Modules.load deduplicates the other mappings.
+        var failure: ?anyerror = null;
         for (self.regions.items) |r| {
             if ((r.offset != 0 and r.permissions[2] != 'x') or r.path.len == 0 or r.path[0] != '/') continue;
-            const module = self.load(r) catch continue;
+            const module = self.load(r) catch |err| {
+                if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
+                continue;
+            };
             const symbol = module.symbols().findSymbol(name) orelse continue;
             if (!symbol.hasAddress()) continue;
             return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
         }
-        return error.SymbolNotFound;
+        return failure orelse error.SymbolNotFound;
     }
     pub fn symbolAt(self: *Modules, address: u64) !Symbol {
         const module = try self.at(address);

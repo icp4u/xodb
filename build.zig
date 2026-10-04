@@ -4,12 +4,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const gui = b.option(bool, "gui", "Build the Wayland/Vulkan interface (disable for headless MCP)") orelse true;
+    const font_path = b.option([]const u8, "font-path", "Default GUI font (runtime --font overrides this)") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", gui);
+    options.addOption([]const u8, "font_path", font_path);
     module.addOptions("build_options", options);
     module.addIncludePath(b.path("src/profile"));
     module.addCSourceFile(.{ .file = b.path("src/profile/allocation_broker.c"), .flags = &.{"-std=c11"} });
+    module.addCSourceFile(.{ .file = b.path("src/binary/mapped_file.c"), .flags = &.{"-std=c11"} });
     if (target.result.cpu.arch == .x86_64) module.addCSourceFile(.{ .file = b.path("src/target/xstate_layout.c"), .flags = &.{"-std=c11"} });
     for ([_][]const u8{ "capstone", "libdw" }) |lib| module.linkSystemLibrary(lib, .{});
     if (gui) {
@@ -44,6 +47,7 @@ pub fn build(b: *std.Build) void {
     if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux) {
         const helper = b.addExecutable(.{ .name = "xodb-allocation-helper", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         helper.root_module.addCSourceFile(.{ .file = b.path("src/profile/allocation_broker.c"), .flags = &.{ "-std=c11", "-DXODB_ALLOCATION_HELPER" } });
+        helper.root_module.addCSourceFile(.{ .file = b.path("src/binary/mapped_file.c"), .flags = &.{"-std=c11"} });
         const installed_helper = b.addInstallArtifact(helper, .{});
         b.getInstallStep().dependOn(&installed_helper.step);
         app_step.dependOn(&installed_helper.step);

@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=xodb
+Comment=Native Linux debugger and profiler
+Exec=xodb
+TryExec=xodb
+Icon=applications-development
+Terminal=false
+Categories=Development;Debugger;

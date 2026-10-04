@@ -35,6 +35,7 @@ pub const Server = struct {
     queued: usize = 0,
     sent: usize = 0,
     closed: bool = false,
+    input_eof: bool = false,
     negotiated: bool = false,
     initialized: bool = false,
     stdout_flags: c_int = 0,
@@ -62,7 +63,12 @@ pub const Server = struct {
         self.queued += 1;
     }
     fn reply(self: *Server, a: Allocator, id: Value, result: anytype) !void {
-        try self.queue(try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = id, .result = result }, .{}));
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = id, .result = result }, .{});
+        if (bytes.len >= self.output.len) {
+            try self.failure(a, id, -32000, "McpResponseTooLarge: request a smaller page or range");
+            return;
+        }
+        try self.queue(bytes);
     }
     fn failure(self: *Server, a: Allocator, id: Value, code: i32, message: []const u8) !void {
         try self.queue(try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = code, .message = message } }, .{}));
@@ -164,7 +170,7 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, name, "list_modules")) {
             try session.refreshMaps();
-            return asValue(a, .{ .regions = session.modules.regions.items });
+            return asValue(a, .{ .regions = session.modules.regions.items, .load_failures = session.modules.load_failures.items });
         }
         if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpoints[0..session.target.breakpoint_count], .watchpoints = session.target.watchpoints, .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = @import("../target/linux.zig").architecture == .x86_64 });
         if (std.mem.eql(u8, name, "get_investigation")) return asValue(a, (try session.investigation(number(member(args, "id")) orelse return error.InvalidArguments)).*);
@@ -231,7 +237,11 @@ pub const Server = struct {
                 if (hex.len == 0 or hex.len > 8192 or hex.len % 2 != 0) return error.InvalidArguments;
                 var bytes: [4096]u8 = undefined;
                 for (0..hex.len / 2) |i| bytes[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return error.InvalidArguments;
-                try session.target.writeMemory(try address(args), bytes[0 .. hex.len / 2]);
+                const before = session.target.generation;
+                session.target.writeMemory(try address(args), bytes[0 .. hex.len / 2]) catch |err| {
+                    if (session.target.generation != before) session.record(.agent, "write_memory_partial");
+                    return err;
+                };
             } else if (std.mem.eql(u8, name, "write_register")) {
                 const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
                 if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
@@ -426,25 +436,44 @@ pub const Server = struct {
         } else try self.failure(a, id, -32601, "Method not found");
     }
     pub fn pump(self: *Server, session: *Session) !void {
+        // A request executes exactly once, only when its full reply has room.
+        // Leave both buffered requests and unread pipe bytes pending while the
+        // client drains output. A burst is backpressure, not a client failure.
+        try self.flush();
+        if (self.queued != 0) return;
         if (self.initialized and self.reported_scope != null and self.reported_scope.? != session.agent_scope) {
             try self.queue("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/tools/list_changed\"}");
+            self.reported_scope = session.agent_scope;
+            try self.flush();
+            if (self.queued != 0) return;
         }
         self.reported_scope = session.agent_scope;
-        var fds = [_]c.pollfd{ .{ .fd = self.input_fd, .events = c.POLLIN, .revents = 0 }, .{ .fd = self.output_fd, .events = if (self.sent < self.queued) c.POLLOUT else 0, .revents = 0 } };
-        if (c.poll(&fds, 2, 0) < 0) return;
-        if (!self.closed and fds[0].revents & (c.POLLIN | c.POLLHUP) != 0) {
-            if (self.used == self.input.len) return error.McpRequestTooLarge;
-            const n = c.read(self.input_fd, self.input[self.used..].ptr, self.input.len - self.used);
-            if (n < 0 and std.c._errno().* != c.EAGAIN and std.c._errno().* != c.EINTR) return error.McpInputClosed;
-            if (n == 0) self.closed = true;
-            if (n > 0) self.used += @intCast(n);
-            while (std.mem.indexOfScalar(u8, self.input[0..self.used], '\n')) |end| {
-                try self.handle(session, self.input[0..end]);
-                const consumed = end + 1;
-                std.mem.copyForwards(u8, &self.input, self.input[consumed..self.used]);
-                self.used -= consumed;
+        if (!self.input_eof and self.used < self.input.len) {
+            var fd = c.pollfd{ .fd = self.input_fd, .events = c.POLLIN, .revents = 0 };
+            if (c.poll(&fd, 1, 0) > 0 and fd.revents & (c.POLLIN | c.POLLHUP) != 0) {
+                const n = c.read(self.input_fd, self.input[self.used..].ptr, self.input.len - self.used);
+                if (n < 0 and std.c._errno().* != c.EAGAIN and std.c._errno().* != c.EINTR) return error.McpInputClosed;
+                if (n == 0) self.input_eof = true;
+                if (n > 0) self.used += @intCast(n);
             }
         }
+        // Keep target polling and the GUI responsive even for notification or
+        // tiny-response floods. Buffered lines are processed without new input.
+        for (0..8) |_| {
+            const end = std.mem.indexOfScalar(u8, self.input[0..self.used], '\n') orelse {
+                if (self.used == self.input.len) return error.McpRequestTooLarge;
+                if (self.input_eof) self.closed = true;
+                return;
+            };
+            try self.handle(session, self.input[0..end]);
+            const consumed = end + 1;
+            std.mem.copyForwards(u8, &self.input, self.input[consumed..self.used]);
+            self.used -= consumed;
+            try self.flush();
+            if (self.queued != 0) return;
+        }
+    }
+    fn flush(self: *Server) !void {
         if (self.sent < self.queued) {
             const n = c.write(self.output_fd, self.output[self.sent..].ptr, self.queued - self.sent);
             if (n > 0) self.sent += @intCast(n) else if (n < 0 and std.c._errno().* != c.EAGAIN and std.c._errno().* != c.EINTR) return error.McpOutputClosed;
@@ -473,4 +502,22 @@ test "every advertised tool has a unique name and explicit access classification
         try std.testing.expect(readonly == .bool);
         for (parsed.value.array.items[0..i]) |previous| try std.testing.expect(!std.mem.eql(u8, name, string(member(previous, "name")).?));
     }
+}
+
+test "one oversized reply returns a protocol error and preserves the server" {
+    const a = std.testing.allocator;
+    const server = try a.create(Server);
+    defer a.destroy(server);
+    server.* = .{};
+    const huge = try a.alloc(u8, server.output.len);
+    defer a.free(huge);
+    @memset(huge, 'x');
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    try server.reply(arena.allocator(), .{ .integer = 7 }, huge);
+    const reply = try std.json.parseFromSlice(Value, a, server.output[0 .. server.queued - 1], .{});
+    defer reply.deinit();
+    try std.testing.expectEqual(7, member(reply.value, "id").?.integer);
+    try std.testing.expectEqual(-32000, member(member(reply.value, "error").?, "code").?.integer);
+    try std.testing.expect(!server.closed);
 }

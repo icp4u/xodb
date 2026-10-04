@@ -10,6 +10,10 @@ comptime {
     std.debug.assert(@alignOf(SignalInfo) == @alignOf(c.siginfo_t));
 }
 pub const architecture = @import("arch.zig").native;
+// Save before installing debugger handlers. Ignored dispositions survive exec;
+// restarted inferiors must receive the launcher's original configuration too.
+pub const launch_signal_numbers = [_]std.posix.SIG{ .INT, .TERM, .HUP, .PIPE };
+pub var launch_signals: ?[launch_signal_numbers.len]std.posix.Sigaction = null;
 
 pub const StopInfo = struct {
     tid: i32,
@@ -461,6 +465,7 @@ pub const Target = struct {
             return error.ForkFailed;
         }
         if (pid == 0) {
+            if (launch_signals) |*actions| for (launch_signal_numbers, actions) |number, *action| std.posix.sigaction(number, action, null);
             _ = c.close(gate[1]);
             var token: u8 = 0;
             if (c.read(gate[0], &token, 1) != 1) c._exit(126);
@@ -1128,20 +1133,27 @@ pub const Target = struct {
         if (self.core != null) return error.ReadOnlyCore;
         if (self.state != .stopped) return error.NotStopped;
         if (bytes.len > 4096 or address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+        var written: usize = 0;
+        defer if (written > 0) {
+            // Even a failed request invalidates snapshots if a prefix changed.
+            self.event(.memory_written, self.pid, @intCast(written));
+            self.events[self.event_count - 1].address = address;
+        };
         for (bytes, 0..) |byte, offset| {
             const addr = address + offset;
-            var covered = false;
+            var overlay: ?*bp.Breakpoint = null;
             for (self.breakpoints[0..self.breakpoint_count]) |*b| {
                 if (addr >= b.address and addr - b.address < architecture.trap().len) {
-                    b.original[@intCast(addr - b.address)] = byte;
-                    covered = b.patched;
+                    overlay = b;
                     break;
                 }
             }
-            if (!covered) try self.patchByte(addr, byte);
+            if (overlay == null or !overlay.?.patched) self.patchByte(addr, byte) catch |err| {
+                return if (written > 0) error.PartialMemoryWrite else err;
+            };
+            if (overlay) |b| b.original[@intCast(addr - b.address)] = byte;
+            written += 1;
         }
-        self.event(.memory_written, self.pid, @intCast(bytes.len));
-        self.events[self.event_count - 1].address = address;
     }
     fn recomputeState(self: *Target) void {
         if (self.pid == 0) return;

@@ -1,0 +1,18 @@
+#!/usr/bin/make -f
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+
+override_dh_auto_build:
+	./packaging/build /usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf
+
+override_dh_auto_test:
+	.work/package/bin/xodb --help >/dev/null 2>&1
+
+override_dh_auto_install:
+	./packaging/install "$(CURDIR)/debian/xodb" /usr/libexec
+
+override_dh_auto_clean:
+	rm -rf .work/package .zig-cache .cache/zig-global

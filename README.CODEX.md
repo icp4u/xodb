@@ -1,5 +1,9 @@
 # xodb
 
+Historical development notes. Capability statements below may be
+outdated; use [README.md](README.md) and its per-feature documentation for the
+current release.
+
 A native Linux debugging workstation. M0 provides a Wayland/Vulkan workspace,
 real process control, and a shared model for the GUI and external MCP clients.
 M1 adds source debugging and recorded watchpoint investigations.
@@ -279,8 +283,6 @@ replaced. Event and watchpoint fields document sampling and attribution limits.
   failures retry while preserving the target; a real GPU reset is not tested.
 - MCP request lines are limited to 64 KiB; a client that stops reading can exhaust
   its bounded output queue and end the session.
-- The project license is still to be selected. System dependency origins and
-  observed licenses are listed in [DEPENDENCIES.md](docs/DEPENDENCIES.md).
 
 ## Development
 

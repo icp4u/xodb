@@ -32,7 +32,7 @@ pub fn main(init: std.process.Init) !void {
     var scope_explicit = false;
     var agent_scope: @import("model/session.zig").AgentScope = .observe;
     var source: ?[:0]const u8 = null;
-    var font_path: [:0]const u8 = "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
+    var font_path: [:0]const u8 = build_options.font_path ++ "";
     var frames: u64 = 0;
     var record_path: ?[:0]const u8 = null;
     var profile_out: ?[:0]const u8 = null;
@@ -143,6 +143,9 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
     } else @import("preferences.zig").Preferences{};
+    var launch_signals: [@import("target/linux.zig").launch_signal_numbers.len]std.posix.Sigaction = undefined;
+    for (@import("target/linux.zig").launch_signal_numbers, &launch_signals) |number, *action| std.posix.sigaction(number, null, action);
+    @import("target/linux.zig").launch_signals = launch_signals;
     _ = c.signal(c.SIGINT, onSignal);
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);

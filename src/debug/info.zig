@@ -117,7 +117,9 @@ pub const Image = struct {
     split_bytes: usize = 0,
     units_error: ?anyerror = null,
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
+    pending_aliases: std.AutoHashMapUnmanaged(*const eval.Type, Alias) = .empty,
     address_table: []const u8,
+    const Alias = struct { target: *const eval.Type, name: []const u8 };
     pub fn init(binary: elf.Image, bytes: []u8) !Image {
         return initWithAllocator(binary, bytes, std.heap.page_allocator);
     }
@@ -459,6 +461,14 @@ pub const Image = struct {
         return .{ .cfa = cfa, .caller = caller, .method = method, .outermost = outermost };
     }
     fn typeOf(self: *Image, die_: c.Dwarf_Die, depth: usize) anyerror!*const eval.Type {
+        // Recursive aliases can observe a structure before its fields exist.
+        // Finish their copies only after the complete outer graph is built.
+        defer if (depth == 0) self.finishAliases();
+        errdefer if (depth == 0) {
+            // No unfinished type may survive a failed graph construction.
+            self.types.clearRetainingCapacity();
+            self.pending_aliases.clearRetainingCapacity();
+        };
         if (depth > 64) return &unknown;
         var die = die_;
         const key = @intFromPtr(die.addr);
@@ -512,9 +522,11 @@ pub const Image = struct {
             },
             std.dwarf.TAG.typedef, std.dwarf.TAG.const_type, std.dwarf.TAG.volatile_type, std.dwarf.TAG.restrict_type, std.dwarf.TAG.atomic_type => {
                 if (reference(&die, std.dwarf.AT.type)) |child| {
-                    t.* = (try self.typeOf(child, depth + 1)).*;
+                    const target = try self.typeOf(child, depth + 1);
+                    t.* = target.*;
                     const alias = name(&die);
                     if (alias.len > 0) t.name = alias;
+                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias });
                 }
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
@@ -574,6 +586,26 @@ pub const Image = struct {
             else => {},
         }
         return t;
+    }
+    fn finishAliases(self: *Image) void {
+        var it = self.pending_aliases.iterator();
+        while (it.next()) |entry| {
+            var target = entry.value_ptr.target;
+            var alias_name = entry.value_ptr.name;
+            var hops: usize = 0;
+            while (self.pending_aliases.get(target)) |alias| : (hops += 1) {
+                if (hops == 64) {
+                    target = &unknown;
+                    break;
+                }
+                if (alias_name.len == 0) alias_name = alias.name;
+                target = alias.target;
+            }
+            const out = @constCast(entry.key_ptr.*);
+            out.* = target.*;
+            if (alias_name.len > 0) out.name = alias_name;
+        }
+        self.pending_aliases.clearRetainingCapacity();
     }
     fn place(self: *Image, a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64, ctx: loc.Context, before_prologue: bool) !loc.Place {
         var attr: c.Dwarf_Attribute = undefined;

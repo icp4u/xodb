@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "allocation_broker.h"
+#include "../binary/mapped_file.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -194,7 +195,8 @@ static int mapped_offset(int pid, int fd, uint64_t offset) {
     for (unsigned i = 0; i < 65536 && fgets(line, sizeof line, f); ++i) {
         unsigned long long start, end, from, inode; unsigned ma, mi; char perms[5];
         if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &start, &end, perms, &from, &ma, &mi, &inode) != 7) continue;
-        if (end > start && perms[2] == 'x' && inode == s.st_ino && ma == major(s.st_dev) && mi == minor(s.st_dev) && offset >= from && offset - from < end - start) { found = true; break; }
+        if (end > start && perms[2] == 'x' && inode == s.st_ino && offset >= from && offset - from < end - start &&
+            xodb_mapped_file_matches(fd, pid, start, end, ma, mi, inode, 1)) { found = true; break; }
     }
     fclose(f);
     if (!found) { errno = EPERM; return -1; }

@@ -1,0 +1,10 @@
+xodb is licensed under version 3 of the GNU General Public License.
+The full license is included in the source LICENSE file and installed at
+/usr/share/licenses/xodb/LICENSE. On Debian systems it is also available at
+/usr/share/common-licenses/GPL-3.
+
+The rectangle shading and visual conventions adapted from RAD Debugger retain
+their MIT copyright and permission notice, installed at
+/usr/share/licenses/xodb/RAD-Debugger-MIT.txt.
+
+System libraries and fonts are dependencies and are not bundled in this package.

@@ -101,7 +101,16 @@ for name, mode, count, options, expected in cases:
                     c.action('continue')
             assert state['state'] != 'exited' and time.monotonic() < deadline, state
             time.sleep(.002)
-        if cap['status'] == 'collecting': cap = c.action('stop_profile', capture_id=cap['id'])['capture']
+        # get_session may drain the automatic stop after the earlier profile
+        # snapshot. Do not race that stop with a manual stop request.
+        cap = c.inspect('get_profile')['capture']
+        if expected == 'manual':
+            if cap['status'] == 'collecting': cap = c.action('stop_profile', capture_id=cap['id'])['capture']
+        else:
+            while cap['status'] == 'collecting':
+                assert time.monotonic() < deadline, cap
+                time.sleep(.002)
+                cap = c.inspect('get_profile')['capture']
         assert cap['status'] == expected and not perf_fds(c), cap
         assert cap['lost_samples'] == cap['unknown_records'] == 0, cap
         assert cap['scheduling']['invalid_events'] == 0, cap

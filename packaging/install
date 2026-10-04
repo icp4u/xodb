@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+cd "$(dirname "$0")/.."
+if [ "$#" -ne 2 ]; then
+    echo 'usage: packaging/install ABSOLUTE_DESTDIR HELPER_DIRECTORY' >&2
+    exit 2
+fi
+case "$1" in /) exit 2 ;; /*) ;; *) echo 'DESTDIR must be an absolute staging directory' >&2; exit 2 ;; esac
+case "$2" in /usr/*) ;; *) echo 'helper directory must be under /usr' >&2; exit 2 ;; esac
+install -Dm755 .work/package/bin/xodb "$1/usr/bin/xodb"
+install -Dm755 .work/package/bin/xodb-allocation-helper "$1$2/xodb-allocation-helper"
+install -Dm644 packaging/xodb.desktop "$1/usr/share/applications/xodb.desktop"
+install -Dm644 LICENSE "$1/usr/share/licenses/xodb/LICENSE"
+install -Dm644 docs/licenses/RAD-Debugger-MIT.txt "$1/usr/share/licenses/xodb/RAD-Debugger-MIT.txt"
+install -dm755 "$1/usr/share/doc/xodb"
+cp -R README.md SETUP.md docs config "$1/usr/share/doc/xodb/"
