@@ -8,7 +8,7 @@ const Font = @import("../render/font.zig").Font;
 const keys = @import("../platform/input.zig");
 const style = @import("style.zig");
 const theme = style.theme;
-pub const Mode = enum { calls, lifetimes, outstanding, events };
+pub const Mode = enum { calls, lifetimes, outstanding, events, heap };
 pub const Row = union(enum) { call: model.SpanRow, lifetime: model.LifetimeRow, event: model.RecordRow };
 const a = std.heap.page_allocator;
 const max_rows = 64;
@@ -34,7 +34,13 @@ pub const Panel = struct {
     message: []const u8 = "",
     bounds: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     list: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
-    tabs: [4]gpu.Rect = undefined,
+    tabs: [5]gpu.Rect = undefined,
+    metric: @import("../profile/allocation_heap.zig").Metric = .allocated_bytes,
+    zoom: u32 = 0,
+    heap_scroll: u16 = 0,
+    heap_hits: [512]struct { rect: gpu.Rect, node: u32 } = undefined,
+    heap_count: usize = 0,
+    heap_pending: bool = false,
     controls: [3]gpu.Rect = undefined,
     ready_hits: bool = false,
     pub fn deinit(self: *Panel) void {
@@ -46,6 +52,9 @@ pub const Panel = struct {
     }
     fn resetPage(self: *Panel) void {
         self.start = 0;
+        self.zoom = 0;
+        self.heap_scroll = 0;
+        self.heap_count = 0;
         self.next = null;
         self.selected = 0;
         self.history.clearRetainingCapacity();
@@ -85,12 +94,21 @@ pub const Panel = struct {
         self.dirty = true;
     }
     pub fn back(self: *Panel) void {
+        if (self.mode == .heap) {
+            self.zoom = 0;
+            self.heap_scroll = 0;
+            return;
+        }
         if (self.history.items.len == 0) return;
         self.start = self.history.pop().?;
         self.selected = 0;
         self.dirty = true;
     }
     pub fn wheel(self: *Panel, delta: i32) void {
+        if (self.mode == .heap) {
+            self.heap_scroll = @intCast(std.math.clamp(@as(i32, self.heap_scroll) + delta, 0, 32));
+            return;
+        }
         if (delta > 0) {
             if (self.selected + @as(usize, @intCast(delta)) < self.count) self.selected += @intCast(delta) else self.forward();
         } else if (delta < 0) {
@@ -113,7 +131,12 @@ pub const Panel = struct {
                 'l' => self.setMode(.lifetimes),
                 'o' => self.setMode(.outstanding),
                 'e' => self.setMode(.events),
-                0xff09 => self.setMode(@enumFromInt((@as(u32, @intFromEnum(self.mode)) + 1) % 4)),
+                'f' => self.setMode(.heap),
+                'm' => if (self.mode == .heap) {
+                    self.metric = @enumFromInt((@as(u32, @intFromEnum(self.metric)) + 1) % 3);
+                    self.resetPage();
+                },
+                0xff09 => self.setMode(@enumFromInt((@as(u32, @intFromEnum(self.mode)) + 1) % 5)),
                 't' => if (capture) |current| self.cycleThread(current),
                 'r' => if (capture) |current| {
                     current.requestAnalysis(true) catch |err| {
@@ -141,11 +164,22 @@ pub const Panel = struct {
             switch (i) {
                 0 => if (capture) |current| self.cycleThread(current),
                 1 => self.back(),
-                2 => self.forward(),
+                2 => if (self.mode == .heap) {
+                    self.metric = @enumFromInt((@as(u32, @intFromEnum(self.metric)) + 1) % 3);
+                    self.resetPage();
+                } else self.forward(),
                 else => unreachable,
             }
             return;
         };
+        if (self.mode == .heap) {
+            for (self.heap_hits[0..self.heap_count]) |hit| if (inside(hit.rect, x, y)) {
+                self.zoom = hit.node;
+                self.heap_scroll = 0;
+                return;
+            };
+            return;
+        }
         if (inside(self.list, x, y)) {
             const row: usize = @intFromFloat((y - self.list.y) / 22);
             if (row < self.count) self.selected = row;
@@ -175,6 +209,7 @@ pub const Panel = struct {
         var filter = self.filter;
         filter.outstanding_only = self.mode == .outstanding;
         switch (self.mode) {
+            .heap => {},
             .calls => {
                 const page = capture.spanPage(a, current, filter, self.start, limit) catch |err| {
                     self.message = @errorName(err);
@@ -251,14 +286,68 @@ pub const Panel = struct {
     pub fn liveHit(width: f32, x: f32, y: f32) bool {
         return inside(liveButton(width), x, y);
     }
+    fn drawHeap(self: *Panel, r: *gpu.Renderer, font: *Font, b: gpu.Rect, capture: *model.Capture) !void {
+        self.heap_count = 0;
+        self.heap_pending = false;
+        const maybe = capture.heapView(self.filter, self.metric, .gui) catch |err| {
+            try r.textFit(font, b.x + 12, b.y + 160, b.w - 24, @errorName(err), theme.warm);
+            return;
+        };
+        const view = maybe orelse {
+            self.heap_pending = true;
+            try r.textFit(font, b.x + 12, b.y + 160, b.w - 24, "Building allocation call tree", theme.weak);
+            return;
+        };
+        const graph = &view.graph;
+        if (self.zoom >= graph.nodes.items.len) self.zoom = 0;
+        const root = graph.nodes.items[self.zoom];
+        var buffer: [512]u8 = undefined;
+        try r.textFit(font, b.x + 12, b.y + 157, b.w - 24, try std.fmt.bufPrint(&buffer, "M metric: {s} / {d} total / {d} excluded / {d} allocations missing caller stacks", .{ switch (self.metric) {
+            .allocated_bytes => "Allocated bytes",
+            .outstanding_bytes => "Outstanding bytes",
+            .allocations => "Allocation count",
+        }, graph.nodes.items[0].inclusive, view.excluded_weight, view.missing_stacks }), theme.text);
+        const bounds = gpu.Rect{ .x = b.x + 12, .y = b.y + 184, .w = b.w - 24, .h = @max(0, b.h - 228) };
+        if (root.inclusive == 0) {
+            try r.textFit(font, bounds.x, bounds.y, bounds.w, "No positive weight for this metric and filter", theme.weak);
+            return;
+        }
+        const scale = bounds.w / @as(f32, @floatFromInt(root.inclusive));
+        for (graph.nodes.items) |node| {
+            if (node.depth < root.depth or node.inclusive == 0 or node.x < root.x or node.x - root.x >= root.inclusive) continue;
+            var ancestor: ?u32 = node.id;
+            while (ancestor != null and ancestor.? != self.zoom) ancestor = graph.nodes.items[ancestor.?].parent;
+            if (ancestor == null) continue;
+            const depth = node.depth - root.depth;
+            if (depth < self.heap_scroll) continue;
+            const y = bounds.y + @as(f32, @floatFromInt(depth - self.heap_scroll)) * 24;
+            if (y + 23 > bounds.y + bounds.h) continue;
+            const rect = gpu.Rect{ .x = bounds.x + @as(f32, @floatFromInt(node.x - root.x)) * scale, .y = y, .w = @max(0, @as(f32, @floatFromInt(node.inclusive)) * scale - 1), .h = 23 };
+            if (rect.w < 1) continue;
+            const fill = switch (node.frame.kind) {
+                .root, .thread => theme.flame_root,
+                .incomplete, .unknown, .unverified => theme.flame_unknown,
+                .code => style.mix(theme.flame_low, theme.flame_high, @as(f32, @floatFromInt(std.hash.Wyhash.hash(0, node.frame.name) % 100)) / 100),
+            };
+            try r.rect(rect, fill);
+            if (rect.w > 20) try r.textFit(font, rect.x + 4, rect.y + 2, rect.w - 8, node.frame.name, theme.flame_text);
+            if (self.heap_count < self.heap_hits.len) {
+                self.heap_hits[self.heap_count] = .{ .rect = rect, .node = node.id };
+                self.heap_count += 1;
+            }
+        }
+        try r.textFit(font, b.x + 12, b.y + b.h - 30, b.w - 24, try std.fmt.bufPrint(&buffer, "Click to zoom; Back resets. {s}: {d}. Outstanding is not proof of a leak.", .{ root.frame.name, root.inclusive }), theme.weak);
+    }
     pub fn drawLive(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, live: *@import("../profile/allocation_live.zig").Live, tid: i32) !void {
         if (!self.open) return;
         try self.draw(r, font, width, height, live.capture);
         const b = gpu.Rect{ .x = 20, .y = 60, .w = @max(0, width - 40), .h = 36 };
         try style.box(r, b, theme.surface, theme.focus, @splat(6));
         var buffer: [256]u8 = undefined;
-        const message = if (live.failure != null and live.failure.?.kind == .permission) "Permission denied; see docs/ALLOCATIONS.md" else if (live.err) |err| @errorName(err) else if (live.preparing()) "Preparing probes; keep target paused" else if (live.collecting() and live.reason != null) "Stopping capture; releasing probes" else if (live.collecting()) "Tracing selected threads; Space continues/pauses" else if (live.reason) |reason| try std.fmt.bufPrint(&buffer, "Capture stopped: {s}; next start selects TID {d}", .{ @tagName(reason), tid }) else try std.fmt.bufPrint(&buffer, "Start on stopped TID {d}: malloc/calloc/realloc/free", .{tid});
+        const archived = if (live.capture) |capture| capture.archived else false;
+        const message = if (archived) "Offline allocation evidence; S saves a copy" else if (live.failure != null and live.failure.?.kind == .permission) "Permission denied; see docs/ALLOCATIONS.md" else if (live.err) |err| @errorName(err) else if (live.preparing()) "Preparing probes; keep target paused" else if (live.collecting() and live.reason != null) "Stopping capture; releasing probes" else if (live.collecting()) "Tracing selected threads; Space continues/pauses" else if (live.reason) |reason| try std.fmt.bufPrint(&buffer, "Capture stopped: {s}; next start selects TID {d}", .{ @tagName(reason), tid }) else try std.fmt.bufPrint(&buffer, "Start on stopped TID {d}: malloc/calloc/realloc/free", .{tid});
         try r.textFit(font, b.x + 10, b.y + 9, b.w - 190, message, if (live.err != null) theme.warm else theme.text);
+        if (archived) return;
         try style.button(r, font, liveButton(width), if (live.preparing()) "Cancel" else if (live.collecting()) "Stop capture" else "Start capture", "P", theme.focus, 0, 0);
     }
     pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, current: ?*model.Capture) !void {
@@ -274,10 +363,10 @@ pub const Panel = struct {
             try r.textFit(font, b.x + 10, b.y + 10, b.w - 20, "Allocation panel needs a larger window", theme.weak);
             return;
         }
-        try r.textFit(font, b.x + 12, b.y + 10, b.w - 24, "ALLOCATIONS   Esc close   C/L/O/E views   T thread   R retry analysis", theme.text);
-        const tab_width = @min(180, (b.w - 42) / 4);
-        const labels = [_][]const u8{ "Calls", "Lifetimes", "Outstanding", "Events" };
-        const shortcuts = [_][]const u8{ "C", "L", "O", "E" };
+        try r.textFit(font, b.x + 12, b.y + 10, b.w - 24, "ALLOCATIONS   Esc close   C/L/O/E/F views   T thread   S save   R retry analysis", theme.text);
+        const tab_width = @min(180, (b.w - 48) / 5);
+        const labels = [_][]const u8{ "Calls", "Lifetimes", "Outstanding", "Events", "Flames" };
+        const shortcuts = [_][]const u8{ "C", "L", "O", "E", "F" };
         for (labels, 0..) |label, i| {
             const rect = gpu.Rect{ .x = b.x + 12 + @as(f32, @floatFromInt(i)) * (tab_width + 6), .y = b.y + 36, .w = tab_width, .h = 28 };
             self.tabs[i] = rect;
@@ -305,11 +394,15 @@ pub const Panel = struct {
         };
         const thread_label = if (self.filter.thread_id) |id| try std.fmt.bufPrint(&buffer, "Thread #{d}", .{id}) else "All threads";
         try style.button(r, font, self.controls[0], thread_label, "T", theme.text, 0, 0);
-        try style.button(r, font, self.controls[1], "Back", "PgUp", if (self.history.items.len > 0) theme.text else theme.weak, 0, 0);
-        try style.button(r, font, self.controls[2], "Next", "PgDn", if (self.next != null) theme.text else theme.weak, 0, 0);
-        try r.textFit(font, b.x + 458, b.y + 127, b.w - 470, try std.fmt.bufPrint(&buffer, "{d} rows / {d} retained / start #{d}", .{ self.count, self.total, self.start }), theme.weak);
+        try style.button(r, font, self.controls[1], "Back", "PgUp", if (self.history.items.len > 0 or self.mode == .heap) theme.text else theme.weak, 0, 0);
+        try style.button(r, font, self.controls[2], if (self.mode == .heap) "Metric" else "Next", if (self.mode == .heap) "M" else "PgDn", if (self.next != null or self.mode == .heap) theme.text else theme.weak, 0, 0);
+        if (self.mode != .heap) try r.textFit(font, b.x + 458, b.y + 127, b.w - 470, try std.fmt.bufPrint(&buffer, "{d} rows / {d} retained / start #{d}", .{ self.count, self.total, self.start }), theme.weak);
         self.list = .{ .x = b.x + 8, .y = b.y + 160, .w = b.w - 16, .h = @as(f32, @floatFromInt(wanted)) * 22 };
         self.ready_hits = true;
+        if (self.mode == .heap) {
+            try self.drawHeap(r, font, b, capture);
+            return;
+        }
         for (self.rows[0..self.count], 0..) |row, i| {
             const y = self.list.y + @as(f32, @floatFromInt(i)) * 22;
             if (i == self.selected) try style.focus(r, .{ .x = self.list.x, .y = y - 1, .w = self.list.w, .h = 22 }, 3, 1);

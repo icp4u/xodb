@@ -476,13 +476,13 @@ pub const FlameView = struct {
             const hash = std.hash.Wyhash.hash(0, node.frame.name);
             const tone: f32 = @as(f32, @floatFromInt(hash % 101)) / 100;
             const color: gpu.Color = switch (node.frame.kind) {
-                .code => .{ 0.63 + tone * 0.23, 0.25 + tone * 0.24, 0.16 + tone * 0.07, 1 },
-                .root, .thread => .{ 0.22, 0.34, 0.46, 1 },
-                else => .{ 0.32, 0.33, 0.37, 1 },
+                .code => style.mix(theme.flame_low, theme.flame_high, tone),
+                .root, .thread => theme.flame_root,
+                else => theme.flame_unknown,
             };
             try r.rect(.{ .x = x + 0.5, .y = y, .w = @max(0, width - 1), .h = 23 }, color);
             if (node.id == self.selected) try style.focus(r, .{ .x = x, .y = y, .w = width, .h = 23 }, 2, 1);
-            if (width > 35) try r.textFit(font, x + 5, y + 2, width - 10, node.frame.name, .{ 1, 0.95, 0.88, 1 });
+            if (width > 35) try r.textFit(font, x + 5, y + 2, width - 10, node.frame.name, theme.flame_text);
         }
         r.clip = bounds;
         const y = view.y + view.h + 8;

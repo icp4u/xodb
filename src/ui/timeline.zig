@@ -930,7 +930,7 @@ fn label(r: *gpu.Renderer, font: *Font, x: f32, y: f32, width: f32, color: gpu.C
 }
 /// A mouse-only header button in the toolbar-button style, without a key chip.
 fn pill(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, text: []const u8, color: gpu.Color) !void {
-    try style.box(r, rect, style.mix(theme.header, .{ 1, 1, 1, 1 }, 0.035), style.mix(theme.border, color, 0.3), @splat(rect.h / 2));
+    try style.box(r, rect, style.mix(theme.header, theme.highlight, 0.035), style.mix(theme.border, color, 0.3), @splat(rect.h / 2));
     try r.textFit(font, rect.x + 12, rect.y + 3, rect.w - 20, text, color);
 }
 

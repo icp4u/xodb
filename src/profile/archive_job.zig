@@ -8,12 +8,14 @@ pub const Job = struct {
     pub const DerivedOwner = enum { gui, mcp };
     derived_owner: DerivedOwner = .mcp,
     id: u64,
-    kind: enum { open, save, view, stack, derived },
+    kind: enum { open, save, view, stack, derived, allocation_save },
     path: [:0]u8,
     symbols: ?[:0]u8 = null,
     local_id: u64 = 0,
     reanalyze: bool = false,
     capture: ?*Capture = null,
+    allocation: ?*@import("allocation_capture.zig").Capture = null,
+    allocation_opened: ?*@import("allocation_capture.zig").Capture = null,
     original_bytes: ?[]const u8 = null,
     sample_ordinal: usize = 0,
     capture_id: u64 = 0,
@@ -78,7 +80,17 @@ pub const Job = struct {
             .open => {
                 const bytes = try archive.readFile(a, self.path, archive.max_file_bytes, &self.progress);
                 defer a.free(bytes);
+                if (std.mem.startsWith(u8, bytes, @import("allocation_archive.zig").magic)) {
+                    if (self.symbols != null or self.reanalyze) return error.AllocationArchiveUsesRecordedLabels;
+                    self.allocation_opened = try @import("allocation_archive.zig").decode(a, bytes, &self.progress);
+                    return;
+                }
                 self.opened = try archive.decode(a, bytes, .{ .local_id = self.local_id, .resolver = .{ .enabled = self.symbols != null or self.reanalyze, .root = self.symbols }, .reanalyze = self.reanalyze, .progress = &self.progress });
+            },
+            .allocation_save => {
+                const bytes = try @import("allocation_archive.zig").encode(a, self.allocation.?, &self.progress);
+                defer a.free(bytes);
+                self.publication = archive.publish(self.path, bytes, &self.progress);
             },
             .save => {
                 var encoded: ?[]u8 = null;
@@ -101,6 +113,8 @@ pub const Job = struct {
         self.progress.cancel.store(true, .release);
         self.join();
         if (self.capture) |capture| capture.archive_busy = false;
+        if (self.allocation) |capture| capture.archive_busy = false;
+        if (self.allocation_opened) |capture| capture.deinit();
         if (self.opened) |*opened| opened.deinit();
         if (self.view) |*view| view.deinit();
         if (self.view_budget) |budget| a.destroy(budget);

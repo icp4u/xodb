@@ -5,23 +5,27 @@
 const std = @import("std");
 const Kind = @import("allocation_lifetimes.zig").Kind;
 const events = @import("allocation_events.zig");
+const stacks = @import("allocation_stacks.zig");
+pub const max_record_size = 4096;
+pub const entry_sample_type = sample_type | (1 << 5) | (1 << 13); // CALLCHAIN, STACK_USER
 pub const max_hooks = 16;
 pub const sample_type: u64 = (1 << 1) | (1 << 2) | (1 << 6) | (1 << 12); // TID,TIME,ID,REGS_USER
 pub const register_mask: u64 = (1 << 0) | (1 << 4) | (1 << 5) | (1 << 7) | (1 << 8); // AX,SI,DI,SP,IP
 pub const Hook = struct { id: u16, kind: Kind, entry_id: u64, return_id: u64 };
-pub const Identity = struct { pid: u32, tid: u32, hooks: []const Hook };
+pub const Identity = struct { pid: u32, tid: u32, hooks: []const Hook, callstacks: bool = false };
 pub const Phase = enum { enter, leave };
 pub const Registers = struct { ax: u64, si: u64, di: u64, sp: u64, ip: u64 };
 pub const Record = struct {
     time_ns: u64,
     data: union(enum) {
-        sample: struct { hook: u16, kind: Kind, phase: Phase, registers: Registers },
+        sample: struct { hook: u16, kind: Kind, phase: Phase, registers: Registers, stack: stacks.Stack = .{} },
         lost: u64,
         throttle,
         unthrottle,
         thread_exit,
         exec,
         rename,
+        mapping_change,
         fork: struct { pid: u32, tid: u32 },
     },
 };
@@ -50,7 +54,8 @@ fn task(bytes: []const u8, at: usize, who: Identity) !void {
     if (try number(u32, bytes, at) != who.pid or try number(u32, bytes, at + 4) != who.tid) return error.AllocationTaskIdentity;
 }
 /// TID|TIME|ID|REGS_USER samples, TID|TIME|ID trailers on metadata.
-/// No arbitrary stack-memory or allocated-object contents are read.
+/// Entry stacks optionally include a frame-pointer chain and one return-address
+/// word at SP. Allocated-object contents are never sampled.
 pub fn decode(bytes: []const u8, who: Identity) !Record {
     try validateIdentity(who);
     if (bytes.len < 8 or bytes.len != try number(u16, bytes, 6) or bytes.len % 8 != 0) return error.AllocationRecordSize;
@@ -60,13 +65,46 @@ pub fn decode(bytes: []const u8, who: Identity) !Record {
         if (misc & 7 != 2) return error.AllocationSampleMode;
         try task(bytes, 8, who);
         const selected = try select(who, try number(u64, bytes, 24));
-        if (try number(u64, bytes, 32) != 2) return error.AllocationRegisterAbi;
-        if (bytes.len != 80) return error.AllocationRegisterSize;
+        const with_stack = who.callstacks and selected.phase == .enter;
+        var at: usize = 32;
+        var chain: [stacks.max_frames + 2]u64 = undefined;
+        var chain_count: usize = 0;
+        if (with_stack) {
+            const count = try number(u64, bytes, at);
+            if (count > chain.len) return error.AllocationCallchainSize;
+            at += 8;
+            for (chain[0..@intCast(count)]) |*pc| {
+                pc.* = try number(u64, bytes, at);
+                at += 8;
+            }
+            chain_count = @intCast(count);
+        }
+        if (try number(u64, bytes, at) != 2) return error.AllocationRegisterAbi;
+        at += 8;
+        const regs = Registers{ .ax = try number(u64, bytes, at), .si = try number(u64, bytes, at + 8), .di = try number(u64, bytes, at + 16), .sp = try number(u64, bytes, at + 24), .ip = try number(u64, bytes, at + 32) };
+        at += 40;
+        var stack = stacks.Stack{};
+        if (with_stack) {
+            const size = try number(u64, bytes, at);
+            at += 8;
+            if (size != 0 and size != 8) return error.AllocationEntryStackSize;
+            var caller: u64 = 0;
+            if (size != 0) {
+                const word = try number(u64, bytes, at);
+                const dynamic = try number(u64, bytes, at + 8);
+                if (dynamic > size) return error.AllocationEntryStackSize;
+                if (dynamic == 8) caller = word;
+                at += 16;
+            }
+            stack = entryStack(regs.ip, caller, chain[0..chain_count]);
+        }
+        if (at != bytes.len) return error.AllocationRegisterSize;
         return .{ .time_ns = try number(u64, bytes, 16), .data = .{ .sample = .{
             .hook = selected.hook.id,
             .kind = selected.hook.kind,
             .phase = selected.phase,
-            .registers = .{ .ax = try number(u64, bytes, 40), .si = try number(u64, bytes, 48), .di = try number(u64, bytes, 56), .sp = try number(u64, bytes, 64), .ip = try number(u64, bytes, 72) },
+            .registers = regs,
+            .stack = stack,
         } } };
     }
     if (bytes.len < 32) return error.AllocationRecordTruncated;
@@ -99,6 +137,12 @@ pub fn decode(bytes: []const u8, who: Identity) !Record {
             if (pid == 0 or tid == 0) return error.AllocationTaskIdentity;
             break :blk .{ .fork = .{ .pid = pid, .tid = tid } };
         },
+        1, 10 => blk: {
+            try task(bytes, 8, who);
+            const filename: usize = if (typ == 1) 40 else 72;
+            if (tail <= filename or std.mem.indexOfScalar(u8, bytes[filename..tail], 0) == null) return error.AllocationRecordSize;
+            break :blk .mapping_change;
+        },
         3 => blk: {
             try task(bytes, 8, who);
             if (tail < 24 or std.mem.indexOfScalar(u8, bytes[16..tail], 0) == null) return error.AllocationRecordSize;
@@ -107,6 +151,46 @@ pub fn decode(bytes: []const u8, who: Identity) !Record {
         else => return error.AllocationUnknownRecord,
     };
     return .{ .time_ns = time, .data = data };
+}
+// Kernel frame-pointer chains may omit the immediate caller at a function
+// entry before its prologue. Preserve the return address independently from the
+// captured entry SP, adding it only when the kernel did not include it already.
+fn entryStack(ip: u64, caller: u64, chain: []const u64) stacks.Stack {
+    var out = stacks.Stack{ .status = if (caller == 0 or caller >= 0x8000000000000000) .caller_missing else .prefix };
+    if (ip != 0 and ip < 0x8000000000000000) {
+        out.pcs[0] = ip;
+        out.count = 1;
+    }
+    const has_caller = out.status == .prefix;
+    if (has_caller) {
+        out.pcs[out.count] = caller;
+        out.count += 1;
+    }
+    var seen_ip = false;
+    var first_caller = true;
+    var chain_frames: usize = 0;
+    for (chain) |pc| {
+        if (pc >= 0x8000000000000000) continue; // perf context markers, never PCs
+        if (pc == 0) break;
+        chain_frames += 1;
+        if (!seen_ip) {
+            seen_ip = true;
+            if (pc == ip) continue;
+        }
+        if (first_caller) {
+            first_caller = false;
+            if (has_caller and pc == caller) continue;
+        }
+        if (out.count == stacks.max_frames) {
+            out.status = .depth_limit;
+            break;
+        }
+        out.pcs[out.count] = pc;
+        out.count += 1;
+    }
+    if (chain_frames >= stacks.max_frames) out.status = .depth_limit;
+    if (out.count == 0) out.status = .missing;
+    return out;
 }
 /// For native x86-64 System V allocator functions probed at their entry.
 /// The verified return probe has SP after popping the eight-byte return
@@ -324,4 +408,43 @@ test "normalization rejects absent stacks and retains mismatches for evidence ga
     try store.feed(a, 0, try normalizedSample(ret));
     store.finish(false);
     try std.testing.expectError(error.AllocationEvidenceGap, store.project(a));
+}
+
+test "allocation entry stacks own callchain and caller evidence and reject malformed payloads" {
+    var bytes: [144]u8 = @splat(0);
+    const base = testSample(100);
+    @memcpy(bytes[0..32], base[0..32]);
+    put(u16, &bytes, 6, bytes.len);
+    put(u64, &bytes, 32, 4);
+    put(u64, &bytes, 40, @bitCast(@as(i64, -512))); // PERF_CONTEXT_USER
+    put(u64, &bytes, 48, 0x5555);
+    put(u64, &bytes, 56, 0x1234);
+    put(u64, &bytes, 64, 0x2222);
+    @memcpy(bytes[72..120], base[32..80]);
+    put(u64, &bytes, 120, 8);
+    put(u64, &bytes, 128, 0x1234);
+    put(u64, &bytes, 136, 8);
+    var who = identity;
+    who.callstacks = true;
+    const stack = (try decode(&bytes, who)).data.sample.stack;
+    try std.testing.expectEqualSlices(u64, &.{ 0x5555, 0x1234, 0x2222 }, stack.addresses());
+    try std.testing.expectEqual(stacks.Status.prefix, stack.status);
+    // A kernel chain that skipped the entry caller gets the saved SP word.
+    put(u64, &bytes, 56, 0x3333);
+    const added = (try decode(&bytes, who)).data.sample.stack;
+    try std.testing.expectEqualSlices(u64, &.{ 0x5555, 0x1234, 0x3333, 0x2222 }, added.addresses());
+    put(u64, &bytes, 136, 0);
+    try std.testing.expectEqual(stacks.Status.caller_missing, (try decode(&bytes, who)).data.sample.stack.status);
+    put(u64, &bytes, 136, 9);
+    try std.testing.expectError(error.AllocationEntryStackSize, decode(&bytes, who));
+    put(u64, &bytes, 136, 8);
+    for (0..bytes.len) |n| {
+        if (n >= 8) put(u16, &bytes, 6, @intCast(n));
+        if (decode(bytes[0..n], who)) |_| return error.TruncatedStackAccepted else |_| {}
+    }
+    put(u16, &bytes, 6, bytes.len);
+    put(u64, &bytes, 32, std.math.maxInt(u64));
+    try std.testing.expectError(error.AllocationCallchainSize, decode(&bytes, who));
+    // Return probes deliberately keep the small original payload.
+    try std.testing.expectEqual(stacks.Status.disabled, (try decode(&testSample(101), who)).data.sample.stack.status);
 }

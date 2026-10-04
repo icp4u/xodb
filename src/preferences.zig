@@ -19,7 +19,40 @@ pub const Profile = struct {
     }
 };
 pub const Symbols = struct { automatic: bool = true, auto_file_bytes: u32 = 64 * 1024 * 1024, auto_total_bytes: u32 = 128 * 1024 * 1024 };
-pub const Preferences = struct { profile: Profile = .{}, allocations: @import("profile/allocation_live.zig").Config = .{}, symbols: Symbols = .{} };
+/// Inline storage keeps a parsed preference independent of the JSON arena.
+pub const ThemePath = struct {
+    bytes: [4096]u8 = @splat(0),
+    len: usize = 0,
+    pub fn slice(self: *const ThemePath) []const u8 {
+        return self.bytes[0..self.len];
+    }
+    pub fn jsonParse(a: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !ThemePath {
+        const value = try std.json.innerParse([]const u8, a, source, options);
+        if (value.len >= 4096) return error.ValueTooLong;
+        if (value.len == 0 or std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidCharacter;
+        var result = ThemePath{};
+        @memcpy(result.bytes[0..value.len], value);
+        result.len = value.len;
+        return result;
+    }
+};
+pub const Preferences = struct {
+    profile: Profile = .{},
+    allocations: @import("profile/allocation_live.zig").Config = .{},
+    symbols: Symbols = .{},
+    appearance: struct { theme: ThemePath = .{} } = .{},
+};
+
+/// CLI wins. File references in preferences are relative to that config file.
+pub fn themeSelection(a: std.mem.Allocator, prefs: *const Preferences, config: ?[:0]const u8, cli: ?[:0]const u8) !?[:0]const u8 {
+    if (cli) |path| return path;
+    const path = prefs.appearance.theme.slice();
+    if (path.len == 0) return null;
+    if (std.mem.startsWith(u8, path, "builtin:") or std.fs.path.isAbsolute(path)) return try a.dupeZ(u8, path);
+    const joined = try std.fs.path.join(a, &.{ if (config) |file| std.fs.path.dirname(file) orelse "." else ".", path });
+    defer a.free(joined);
+    return try a.dupeZ(u8, joined);
+}
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     if (bytes.len > max_bytes) return error.PreferencesTooLarge;
     const parsed = try std.json.parseFromSlice(Preferences, a, bytes, .{});
@@ -103,4 +136,22 @@ test "allocation preferences bound evidence memory and record retention independ
     const custom = try parse(a, "{\"allocations\":{\"duration_ms\":0,\"record_limit\":131072,\"memory_limit\":134217728}}");
     try std.testing.expectEqual(@as(u32, 0), custom.allocations.duration_ms);
     for ([_][]const u8{ "{\"allocations\":{\"record_limit\":1}}", "{\"allocations\":{\"record_limit\":131073}}", "{\"allocations\":{\"memory_limit\":134217729}}" }) |invalid| try std.testing.expectError(error.InvalidAllocationConfig, parse(a, invalid));
+}
+
+test "theme preferences own their path and resolve against config with CLI precedence" {
+    const a = std.testing.allocator;
+    const prefs = try parse(a, "{\"profile\":{\"frequency_hz\":77},\"appearance\":{\"theme\":\"themes/ember.json\"}}");
+    try std.testing.expectEqual(@as(u32, 77), prefs.profile.frequency_hz);
+    try std.testing.expectEqualStrings("themes/ember.json", prefs.appearance.theme.slice());
+    const selected = (try themeSelection(a, &prefs, "/example/config/settings.json", null)).?;
+    defer a.free(selected);
+    try std.testing.expectEqualStrings("/example/config/themes/ember.json", selected);
+    try std.testing.expectEqualStrings("builtin:contrast", (try themeSelection(a, &prefs, "/example/config/settings.json", "builtin:contrast")).?);
+    const built = try parse(a, "{\"appearance\":{\"theme\":\"builtin:light\"}}");
+    const name = (try themeSelection(a, &built, "/example/config/settings.json", null)).?;
+    defer a.free(name);
+    try std.testing.expectEqualStrings("builtin:light", name);
+    try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"\"}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"appearance\":{\"thme\":\"x\"}}"));
+    try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"a\\u0000b\"}}"));
 }

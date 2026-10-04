@@ -10,11 +10,12 @@ fn number(args: Value, key: []const u8) !u64 {
     return @intCast(v.integer);
 }
 pub fn handles(name: []const u8) bool {
-    return std.mem.eql(u8, name, "save_capture_archive") or std.mem.eql(u8, name, "get_archive_status") or std.mem.eql(u8, name, "cancel_archive_job");
+    return std.mem.eql(u8, name, "save_allocation_archive") or std.mem.eql(u8, name, "save_capture_archive") or std.mem.eql(u8, name, "get_archive_status") or std.mem.eql(u8, name, "cancel_archive_job");
 }
 pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Value) !Value {
     if (args != .object) return error.InvalidArguments;
-    const save = std.mem.eql(u8, name, "save_capture_archive");
+    const allocation = std.mem.eql(u8, name, "save_allocation_archive");
+    const save = allocation or std.mem.eql(u8, name, "save_capture_archive");
     const cancel = std.mem.eql(u8, name, "cancel_archive_job");
     const allowed: []const []const u8 = if (save) &.{ "generation", "capture_id", "revision", "path" } else if (cancel) &.{ "generation", "job_id" } else &.{};
     var keys = args.object.iterator();
@@ -25,13 +26,18 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Val
     }
     if (save) {
         try session.authorize(.agent, .execution, try number(args, "generation"));
-        const capture = session.profile orelse return error.NoProfile;
-        if (try number(args, "capture_id") != capture.id) return error.StaleCapture;
-        if (try number(args, "revision") != capture.revision) return error.StaleProfile;
+        if (allocation) {
+            const capture = session.allocations.capture orelse return error.NoAllocationCapture;
+            if (try number(args, "capture_id") != capture.identity.capture_id or try number(args, "revision") != capture.revision) return error.StaleAllocationCapture;
+        } else {
+            const capture = session.profile orelse return error.NoProfile;
+            if (try number(args, "capture_id") != capture.id) return error.StaleCapture;
+            if (try number(args, "revision") != capture.revision) return error.StaleProfile;
+        }
         const path = args.object.get("path") orelse return error.InvalidArguments;
         if (path != .string or path.string.len == 0 or path.string.len > 4096 or std.mem.indexOfScalar(u8, path.string, 0) != null) return error.InvalidArguments;
-        const id = try session.saveArchive(path.string);
-        session.record(.agent, "save_capture_archive");
+        const id = if (allocation) try session.saveAllocationArchive(path.string) else try session.saveArchive(path.string);
+        session.record(.agent, if (allocation) "save_allocation_archive" else "save_capture_archive");
         return asValue(a, .{ .job_id = id, .generation = session.target.generation, .completion = "poll get_archive_status for publication; accepting a job does not mean the file was saved" });
     }
     if (cancel) {

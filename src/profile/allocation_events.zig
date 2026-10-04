@@ -22,6 +22,8 @@ pub const Sample = struct {
     arg0: u64 = 0,
     arg1: u64 = 0,
     result: u64 = 0,
+    /// Allocation-entry stack citation, independent of the pairing stack key.
+    stack: ?u32 = null,
 };
 pub const Event = struct {
     time_ns: u64,

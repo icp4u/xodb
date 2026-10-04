@@ -2409,3 +2409,27 @@ last-thread TRACEEXIT must skip software-trap restoration into its disappearing
 address space. A dedicated native test injects both cases; all four ARM backend
 tests and the 26 MCP scenarios pass, followed by the x86 regression gate.
 
+
+## 2026-10-04 — Startup themes across native GUI views
+
+Added a data-only theme loader with built-in dark, light and contrast palettes,
+strict versioned JSON and owned palette values. `--theme` overrides
+`appearance.theme`; relative preference paths resolve beside the selected
+configuration. Themes load once before the GUI starts. Successful loading is
+silent; invalid files report on stderr and fall back to dark. Local debugger,
+core/archive, imported-profile and remote GUI drawing use the same colors.
+Headless services accept preferences without opening appearance assets.
+
+The user selected passive, startup-only behavior: no theme hotkeys, popups,
+reload worker or file polling. Restarting applies edited theme files. Fonts,
+zoom, density, saved layouts and docking remain separate work. Custom colors can
+reduce contrast; built-in light and contrast text have deterministic contrast
+checks, while the original dark palette is retained. The [workflow and schema](THEMES.md)
+document these boundaries.
+
+Validation covers parser ownership and errors, preference paths/precedence,
+built-in contrast and private-Sway startup in local/imported/remote views.
+The GUI test verifies quiet success, unchanged palette and stop generation after
+file edits or the former hotkey, next-startup adoption, small windows, invalid-file
+fallback and headless operation. No target permissions, packages or system
+settings changed.

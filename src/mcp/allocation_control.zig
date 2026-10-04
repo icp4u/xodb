@@ -6,7 +6,7 @@ const evidence = @import("allocations.zig");
 const hooks = @import("../profile/allocation_hooks.zig");
 const V = std.json.Value;
 pub fn handles(name: []const u8) bool {
-    for ([_][]const u8{ "start_allocations", "stop_allocations", "get_allocation_capture", "get_allocation_events", "get_allocation_calls", "get_allocation_lifetimes" }) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    for ([_][]const u8{ "start_allocations", "stop_allocations", "get_allocation_capture", "get_allocation_events", "get_allocation_calls", "get_allocation_lifetimes", "get_allocation_stack", "get_allocation_flamegraph" }) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
     return false;
 }
 fn number32(args: V, key: []const u8, default: u32) !u32 {
@@ -34,7 +34,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         return status(a, session);
     }
     if (std.mem.eql(u8, name, "start_allocations")) {
-        try wire.fields(args, &.{ "generation", "tids", "mapping_address", "hooks", "duration_ms", "record_limit", "memory_limit" });
+        try wire.fields(args, &.{ "generation", "tids", "mapping_address", "hooks", "duration_ms", "record_limit", "memory_limit", "callstacks" });
         try session.authorize(.agent, .execution, try wire.number(args, "generation", null));
         const list = args.object.get("tids") orelse return error.InvalidArguments;
         if (list != .array or list.array.items.len == 0 or list.array.items.len > 32) return error.InvalidAllocationThreads;
@@ -61,7 +61,13 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
             }
             requests = custom[0..items.array.items.len];
         }
+        var callstacks = session.allocation_defaults.callstacks;
+        if (args.object.get("callstacks")) |value| {
+            if (value != .bool) return error.InvalidArguments;
+            callstacks = value.bool;
+        }
         try session.startAllocations(.agent, tids[0..list.array.items.len], .{
+            .callstacks = callstacks,
             .duration_ms = try number32(args, "duration_ms", session.allocation_defaults.duration_ms),
             .record_limit = try number32(args, "record_limit", session.allocation_defaults.record_limit),
             .memory_limit = try number32(args, "memory_limit", session.allocation_defaults.memory_limit),

@@ -37,6 +37,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe'):
     if tier in ('gui', 'all'):
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
+            ('gui-themes', ['tests/themes.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),

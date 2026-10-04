@@ -1,0 +1,19 @@
+{
+  "version": 1,
+  "id": "user.ember",
+  "base": "builtin:dark",
+  "colors": {
+    "background": "#121316",
+    "surface": "#1A1C21",
+    "header": "#252830",
+    "text": "#E2E4E9",
+    "weak": "#A0A6B2",
+    "focus": "#E9AA68",
+    "breakpoint": "#F07878",
+    "warm": "#EDC477",
+    "good": "#8ECCAA"
+  },
+  "palettes": {
+    "threads": ["#E9AA68", "#70C8D0", "#BCA0E8", "#E992BA"]
+  }
+}

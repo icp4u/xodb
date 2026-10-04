@@ -24,7 +24,8 @@ Load it explicitly:
 ./zig-out/bin/xodb --config config/preferences.example.json --attach PID
 ~~~
 
-There is currently no implicit config search, automatic save or live file reload.
+There is currently no implicit config search, automatic save or preferences-file reload.
+The selected [theme file](THEMES.md) is loaded at startup; restart to apply edits.
 xodb does not create a file in your home directory. Edit a file where you want it
 and pass its path. This keeps location, merging and persistence choices open.
 
@@ -32,6 +33,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 
 | Setting | Initial default | Meaning |
 | --- | --- | --- |
+| appearance.theme | builtin:dark | GUI theme preset or file relative to these preferences; CLI --theme wins |
 | profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |
 | profile.sample_limit | 16384 | Maximum retained samples, 1–65536; the independent 32 MiB sample store may fill earlier |
@@ -44,6 +46,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | allocations.duration_ms | 60000 | Allocation wall-clock deadline; 0 removes the time limit |
 | allocations.record_limit | 32768 | Entry/return evidence ceiling, 2–131072 records |
 | allocations.memory_limit | 33554432 | Retained allocation evidence/metadata/analysis, 1–128 MiB |
+| allocations.callstacks | true | Capture bounded frame-pointer caller prefixes at allocator entry |
 | profile.user_stack_budget_bytes | 33554432 | Total retained stack bytes, 0–67108864; registers/CPU samples continue after exhaustion |
 
 Duration accepts an unsigned 32-bit value (up to 4,294,967,295 ms, about 49 days).

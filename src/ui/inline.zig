@@ -107,7 +107,7 @@ pub const Panel = struct {
         }
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
-        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, .{ 0, 0, 0, 0.65 });
+        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         var buffer: [1024]u8 = undefined;
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, try std.fmt.bufPrint(&buffer, "INLINE SCOPES   physical frame {d} / tid {d}   I / Esc close", .{ frame_index, tid }), theme.text);

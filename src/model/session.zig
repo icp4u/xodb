@@ -216,7 +216,7 @@ pub const Session = struct {
         self.offline = true;
     }
     pub fn openArchive(self: *Session, path: []const u8, symbols: ?[]const u8, reanalyze: bool) !void {
-        if (self.target.pid != 0 or self.profile != null or self.imported != null) return error.ConflictingTargets;
+        if (self.target.pid != 0 or self.profile != null or self.imported != null or self.allocations.capture != null or self.allocations.preparing()) return error.ConflictingTargets;
         try self.clearArchiveJob();
         const job = try ArchiveJob.create(self.next_archive_job, .open, path);
         errdefer job.deinit();
@@ -354,6 +354,20 @@ pub const Session = struct {
         self.next_archive_job += 1;
         return job.id;
     }
+    pub fn saveAllocationArchive(self: *Session, path: []const u8) !u64 {
+        try self.clearArchiveJob();
+        const capture = self.allocations.capture orelse return error.NoAllocationCapture;
+        capture.poll();
+        if (capture.ended_ns == null or capture.worker != null) return error.AllocationCaptureNotFinalized;
+        const job = try ArchiveJob.create(self.next_archive_job, .allocation_save, path);
+        errdefer job.deinit();
+        job.allocation = capture;
+        capture.archive_busy = true;
+        try job.start();
+        self.archive_job = job;
+        self.next_archive_job += 1;
+        return job.id;
+    }
     pub fn pollArchive(self: *Session) void {
         const job = self.archive_job orelse return;
         if (job.reaped or !job.done.load(.acquire)) return;
@@ -396,6 +410,19 @@ pub const Session = struct {
         }
         // Clear the borrowed pointer before a later capture can replace it.
         job.capture = null;
+        if (job.allocation) |capture| capture.archive_busy = false;
+        job.allocation = null;
+        if (job.allocation_opened) |capture| {
+            if (job.progress.cancel.load(.acquire)) {
+                capture.deinit();
+                job.failure = error.ArchiveCancelled;
+            } else {
+                self.allocations.capture = capture;
+                capture.requestAnalysis(false) catch {};
+                std.debug.print("xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
+            }
+            job.allocation_opened = null;
+        }
         if (job.opened) |opened| {
             self.artifact = opened;
             self.dropDerived();
@@ -1312,6 +1339,10 @@ pub const Session = struct {
         return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.generation, .image_epoch = self.target.image_epoch, .pid = self.target.pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(linux.architecture), .state = self.target.state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        if (self.archive_job) |job| {
+            job.deinit();
+            self.archive_job = null;
+        }
         self.allocations.deinit();
         self.memory.deinit();
         self.persistent.deinit();

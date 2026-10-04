@@ -180,7 +180,7 @@ pub const Panel = struct {
         if (!self.open) return;
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
-        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, .{ 0, 0, 0, 0.65 });
+        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.text(font, b.x + 14, b.y + 10, "BREAKPOINTS   B / Esc close", theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, "N new  Space toggle  Del  C if  L log  O stop  H ignore  T thread", theme.weak);

@@ -13,8 +13,8 @@ and debugger behavior tests should carry forward.
 2. Small Lua inspection slice: explicitly loaded named commands, `dbg.eval`,
    stack/locals/memory inspection, bounded jobs and MCP results. Put the Lua
    runtime/error boundary in C so that component can survive the rewrite.
-3. Data-only themes: semantic palette loading and safe reload, preserving the
-   current default and the current control geometry.
+3. Data-only themes: passive startup palette loading, preserving the
+   current default and the current control geometry. Implemented; [workflow](THEMES.md).
 4. Fix and integrate demonstrable architecture candidates with the existing
    compiler where worthwhile; do not make missing compiler backends a release
    dependency. Review corrections against ARCHITECTURE_HANDOFF_REVIEW.md.

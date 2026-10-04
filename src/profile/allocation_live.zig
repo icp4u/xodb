@@ -14,9 +14,10 @@ const broker = @cImport({
     @cInclude("allocation_broker.h");
 });
 
-pub const Stop = enum { manual, duration, record_limit, memory_limit, evidence_gap, target_ended, thread_ended, image_changed, scope_changed, collector_error, shutdown };
+pub const Stop = enum { manual, duration, record_limit, memory_limit, evidence_gap, target_ended, thread_ended, image_changed, mapping_changed, scope_changed, collector_error, shutdown };
 pub const Config = struct {
     duration_ms: u32 = 60000,
+    callstacks: bool = true,
     record_limit: u32 = events.default_records,
     memory_limit: u32 = model.default_memory_limit,
     pub fn validate(self: Config) !void {
@@ -45,9 +46,9 @@ const Job = struct {
     err: ?anyerror = null,
     broker_fd: c_int = -1,
     broker_pid: c_int = -1,
-    fn open(ptr: *anyopaque, tid: i32, group: c_int, file: c_int, offset: u64, returning: bool, leader: bool) c_int {
+    fn open(ptr: *anyopaque, tid: i32, group: c_int, file: c_int, offset: u64, returning: bool, leader: bool, callstacks: bool) c_int {
         const self: *Job = @ptrCast(@alignCast(ptr));
-        return broker.xodb_allocation_broker_open(self.broker_fd, self.context.identity.pid, tid, file, group, offset, @intFromBool(returning), @intFromBool(leader), cancelled, self);
+        return broker.xodb_allocation_broker_open(self.broker_fd, self.context.identity.pid, tid, file, group, offset, @intFromBool(returning), @intFromBool(leader), @intFromBool(callstacks), cancelled, self);
     }
     fn cancelled(ptr: ?*anyopaque) callconv(.c) c_int {
         const self: *Job = @ptrCast(@alignCast(ptr.?));
@@ -95,6 +96,7 @@ const Job = struct {
             .tids = tids[0..self.context.thread_count],
             .sources = prepared.sources[0..prepared.count],
             .enable = false,
+            .callstacks = self.config.callstacks,
             .cancel = &self.cancel,
             .opener = if (self.helper != null) .{ .user = self, .call = open } else null,
         });
@@ -109,7 +111,19 @@ const Job = struct {
         for (prepared.sources[0..prepared.count], prepared.locations[0..prepared.count], self.requests[0..prepared.count], 0..) |source, location, request, i| {
             described[i] = .{ .id = source.id, .kind = source.kind, .name = request.name, .path = self.region.path, .device = source.identity.device, .inode = source.identity.inode, .file_offset = source.offset, .link_address = location.link_address, .runtime_address = location.runtime_address };
         }
-        self.capture = try model.Capture.create(a, self.context.identity, .{ .record_limit = self.config.record_limit, .memory_limit = self.config.memory_limit }, self.context.threads[0..self.context.thread_count], described[0..prepared.count], 0);
+        self.capture = try model.Capture.create(a, self.context.identity, .{ .record_limit = self.config.record_limit, .memory_limit = self.config.memory_limit, .callstacks = self.config.callstacks }, self.context.threads[0..self.context.thread_count], described[0..prepared.count], 0);
+        if (self.config.callstacks) {
+            const symbols = try a.create(modules.Modules);
+            symbols.* = modules.Modules.init(a);
+            self.capture.?.symbols = symbols;
+            symbols.immutable = true;
+            try symbols.refresh(self.context.identity.pid);
+            if (symbols.regions.items.len > 16384) return error.AllocationMapLimit;
+            for (symbols.regions.items) |region| {
+                if (self.cancel.load(.acquire)) return error.AllocationPreparationCancelled;
+                if (region.permissions[2] == 'x') _ = symbols.load(region) catch continue;
+            }
+        }
     }
     fn deinit(self: *Job) void {
         self.cancel.store(true, .release);
@@ -172,6 +186,11 @@ pub const Live = struct {
         if (self.capture) |capture| {
             capture.poll();
             if (capture.worker != null) return error.AllocationAnalysisBusy;
+            if (capture.archive_busy) return error.ArchiveBusy;
+            for (capture.heap_jobs) |job_| if (job_) |job| if (!job.done.load(.acquire)) {
+                job.cancel.store(true, .release);
+                return error.AllocationHeapBusy;
+            };
         }
         var context = context_;
         context.identity.capture_id = self.next_id;
@@ -198,7 +217,7 @@ pub const Live = struct {
             self.unread = true;
         }
         self.stopped_ns = linux.now();
-        if (reason == .image_changed or reason == .scope_changed or reason == .collector_error) self.capture.?.abort(.identity);
+        if (reason == .image_changed or reason == .mapping_changed or reason == .scope_changed or reason == .collector_error) self.capture.?.abort(.identity);
         std.debug.print("xodb: allocation capture {d} stop={s}\n", .{ self.capture.?.identity.capture_id, @tagName(reason) });
     }
     fn complete(self: *Live) void {
@@ -296,12 +315,26 @@ pub const Live = struct {
                     self.stop(.scope_changed);
                     break :blk null;
                 },
+                .mapping_change => blk: {
+                    capture.abort(.identity);
+                    self.stop(.mapping_changed);
+                    break :blk null;
+                },
                 .rename => null,
             };
-            if (event) |value| capture.feed(item.lane, value) catch |err| {
-                self.err = err;
-                self.unread = true;
-            };
+            if (event) |value| {
+                var owned = value;
+                if (raw.data == .sample and raw.data.sample.phase == .enter) {
+                    owned.data.sample.stack = capture.stacks.intern(capture.budget.allocator(), raw.data.sample.stack) catch blk: {
+                        capture.stacks.omitted +|= 1;
+                        break :blk null;
+                    };
+                }
+                capture.feed(item.lane, owned) catch |err| {
+                    self.err = err;
+                    self.unread = true;
+                };
+            }
             if (raw.data == .exec) self.stop(.image_changed);
             if (raw.data == .thread_exit) self.stop(.thread_ended);
         }

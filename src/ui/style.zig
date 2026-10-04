@@ -10,9 +10,7 @@ const std = @import("std");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 
-pub fn rgb(hex: u24) gpu.Color {
-    return .{ @as(f32, @floatFromInt(hex >> 16)) / 255, @as(f32, @floatFromInt((hex >> 8) & 0xff)) / 255, @as(f32, @floatFromInt(hex & 0xff)) / 255, 1 };
-}
+pub const rgb = @import("../appearance.zig").rgb;
 pub fn fade(color: gpu.Color, alpha: f32) gpu.Color {
     return .{ color[0], color[1], color[2], color[3] * alpha };
 }
@@ -22,35 +20,12 @@ pub fn mix(a: gpu.Color, b: gpu.Color, t: f32) gpu.Color {
     return out;
 }
 
-pub const theme = struct {
-    // xodb's own base palette.
-    pub const background = rgb(0x0a0d12);
-    pub const surface = rgb(0x0f131a);
-    pub const header = rgb(0x151b25);
-    pub const border = rgb(0x232d3b);
-    pub const text = rgb(0xc9d4e3);
-    pub const weak = rgb(0x6e829c);
-    pub const good = rgb(0x7ad4a3);
-    pub const neutral = rgb(0x7ab0f0);
-    pub const warm = rgb(0xf5b36e);
-    // Semantic slots after RAD Debugger's default dark theme (raddbg.mdesk:1616-1685).
-    pub const focus = rgb(0x2392eb);
-    pub const thread_main = rgb(0xebb624);
-    pub const thread_other = rgb(0x26d0d2);
-    pub const breakpoint = rgb(0xe0452c);
-    pub const shadow: gpu.Color = .{ 0, 0, 0, 0.5 };
-    pub const pop = rgb(0x675331);
-    pub const good_pop = rgb(0x2c5b36);
-    pub const bad_pop = rgb(0x803425);
-    pub const fresh = rgb(0x3d3631);
-    pub const stripe: gpu.Color = .{ 1, 1, 1, 0.022 };
-};
+const appearance = @import("../appearance.zig");
+pub const theme = &appearance.active.colors;
 
-/// One color per thread, stable for the session. The first thread is gold and the
-/// second cyan, as in RAD Debugger; later threads take further hues.
+/// Thread identities keep the same palette index in every view.
 pub fn threadColor(id: u64) gpu.Color {
-    const more = [_]gpu.Color{ theme.thread_other, rgb(0xb48ef0), rgb(0xf078b4), rgb(0xa4d65e), rgb(0xf59a52), rgb(0x5eb5f7), rgb(0x5ee0b0) };
-    return if (id <= 1) theme.thread_main else more[(id - 2) % more.len];
+    return appearance.active.threads[(id -| 1) % appearance.active.thread_count];
 }
 
 /// Moves `value` toward `target` by a fraction that depends only on elapsed time.
@@ -84,7 +59,7 @@ pub fn focus(r: *gpu.Renderer, rect: gpu.Rect, radius: f32, t: f32) !void {
 /// Small rounded label for a key binding; returns its width.
 pub fn chip(r: *gpu.Renderer, font: *Font, x: f32, y: f32, label: []const u8, color: gpu.Color) !f32 {
     const w = r.measure(font, label) + 12;
-    try box(r, .{ .x = x, .y = y, .w = w, .h = 21 }, .{ 1, 1, 1, 0.04 }, .{ 1, 1, 1, 0.10 }, @splat(8));
+    try box(r, .{ .x = x, .y = y, .w = w, .h = 21 }, theme.chip_fill, theme.chip_border, @splat(8));
     try r.text(font, x + 6, y + 1, label, color);
     return w;
 }
@@ -95,12 +70,12 @@ pub fn chip(r: *gpu.Renderer, font: *Font, x: f32, y: f32, label: []const u8, co
 pub fn button(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, label: []const u8, key: []const u8, color: gpu.Color, hot: f32, active: f32) !void {
     const radii: [4]f32 = @splat(rect.h / 2);
     if (hot > 0.01) try shadow(r, rect, rect.h / 2, 0.7 * hot * (1 - active));
-    try box(r, rect, mix(theme.header, .{ 1, 1, 1, 1 }, 0.035 + 0.05 * hot), mix(theme.border, color, 0.25 + 0.45 * hot), radii);
+    try box(r, rect, mix(theme.header, theme.highlight, 0.035 + 0.05 * hot), mix(theme.border, color, 0.25 + 0.45 * hot), radii);
     if (active > 0.01) {
         const depth = @min(rect.h * 0.6 * active, 16);
         const dark = fade(theme.shadow, active);
         try r.shape(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = depth + rect.h / 2 }, dark, .{ .radii = radii, .colors = .{ dark, dark, fade(dark, 0), fade(dark, 0) } });
-        const light: gpu.Color = .{ 1, 1, 1, 0.08 * active };
+        const light = fade(theme.highlight, 0.08 * active);
         try r.shape(.{ .x = rect.x, .y = rect.y + rect.h - depth, .w = rect.w, .h = depth }, light, .{ .radii = radii, .colors = .{ fade(light, 0), fade(light, 0), light, light } });
     }
     const key_width = r.measure(font, key) + 12;

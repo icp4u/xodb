@@ -31,9 +31,9 @@ pub const data_pages = 16;
 pub const Source = hooks.Source;
 pub const Opener = struct {
     user: *anyopaque,
-    call: *const fn (*anyopaque, i32, c_int, c_int, u64, bool, bool) c_int,
+    call: *const fn (*anyopaque, i32, c_int, c_int, u64, bool, bool, bool) c_int,
 };
-pub const Config = struct { pid: i32, tids: []const i32, sources: []const Source, opener: ?Opener = null, enable: bool = true, cancel: ?*const std.atomic.Value(bool) = null };
+pub const Config = struct { pid: i32, tids: []const i32, sources: []const Source, opener: ?Opener = null, enable: bool = true, callstacks: bool = true, cancel: ?*const std.atomic.Value(bool) = null };
 pub const Opened = union(enum) { collector: *Collector, failed: perf.Failure };
 pub const Item = struct { lane: u16, record: wire.Record };
 pub const Drain = struct { count: usize = 0, more: bool = false, failure: ?perf.Failure = null };
@@ -55,6 +55,7 @@ pub const Collector = struct {
     source_count: usize = 0,
     cursor: usize = 0,
     running: bool = false,
+    callstacks: bool = false,
     failed: bool = false,
     /// Retain one bounded malformed record for diagnostics.
     fault_bytes: [256]u8 = @splat(0),
@@ -128,15 +129,15 @@ pub const Collector = struct {
             var records_read: usize = 0;
             while (slot.tail < head and records_read < 128 and result.count < out.len) : (records_read += 1) {
                 if (head - slot.tail < 8) return self.fault(result.count, slot.tid, "incomplete perf header");
-                var bytes: [256]u8 = undefined;
+                var bytes: [wire.max_record_size]u8 = undefined;
                 copy(ring, slot.tail, bytes[0..8]);
                 const size_ = std.mem.readInt(u16, bytes[6..8], .little);
                 if (size_ < 8 or size_ > bytes.len or size_ > head - slot.tail or size_ % 8 != 0)
                     return self.fault(result.count, slot.tid, "invalid perf record size");
                 copy(ring, slot.tail, bytes[0..size_]);
-                const record = wire.decode(bytes[0..size_], .{ .pid = @intCast(self.pid), .tid = @intCast(slot.tid), .hooks = slot.ids[0..self.source_count] }) catch |err| {
-                    @memcpy(self.fault_bytes[0..size_], bytes[0..size_]);
-                    self.fault_len = size_;
+                const record = wire.decode(bytes[0..size_], .{ .pid = @intCast(self.pid), .tid = @intCast(slot.tid), .hooks = slot.ids[0..self.source_count], .callstacks = self.callstacks }) catch |err| {
+                    self.fault_len = @min(size_, self.fault_bytes.len);
+                    @memcpy(self.fault_bytes[0..self.fault_len], bytes[0..self.fault_len]);
                     return self.fault(result.count, slot.tid, @errorName(err));
                 };
                 slot.tail += size_;
@@ -144,7 +145,7 @@ pub const Collector = struct {
                 @atomicStore(u64, field(slot.map, 1032), slot.tail, .seq_cst);
                 out[result.count] = .{ .lane = @intCast(index), .record = record };
                 result.count += 1;
-                if (record.data == .exec or record.data == .fork) {
+                if (record.data == .exec or record.data == .fork or record.data == .mapping_change) {
                     // Existing heap scope/identity has ended. The owner must
                     // retain this record and mark an incomplete ending.
                     _ = self.stop();
@@ -239,20 +240,23 @@ fn executableOffset(fd: c_int, offset: u64, stat: c.struct_stat) !void {
     }
     return error.AllocationOffsetNotExecutable;
 }
-fn openEvent(tid: i32, group: c_int, pmu: u32, ret: u64, file: File, leader: bool) c_int {
+fn openEvent(tid: i32, group: c_int, pmu: u32, ret: u64, file: File, leader: bool, callstacks: bool) c_int {
     var path: [64]u8 = undefined;
     const pinned = std.fmt.bufPrintZ(&path, "/proc/self/fd/{d}", .{file.fd}) catch unreachable;
     var attr = std.mem.zeroes(perf.Attr);
-    attr.size = 96;
+    attr.size = 112;
     attr.typ = pmu;
     attr.config = ret;
     attr.config1 = @intFromPtr(pinned.ptr);
     attr.config2 = file.source.offset;
     attr.sample_period = 1;
-    attr.sample_type = wire.sample_type;
+    attr.sample_type = if (callstacks and ret == 0) wire.entry_sample_type else wire.sample_type;
+    attr.sample_max_stack = if (callstacks and ret == 0) @import("allocation_stacks.zig").max_frames else 0;
+    attr.sample_stack_user = if (callstacks and ret == 0) 8 else 0;
     attr.sample_regs_user = wire.register_mask;
-    attr.flags = 1 | (1 << 5) | (1 << 6) | (1 << 18) | (1 << 25);
+    attr.flags = 1 | (1 << 5) | (1 << 6) | (1 << 18) | (1 << 21) | (1 << 25);
     if (leader) attr.flags |= (1 << 9) | (1 << 13) | (1 << 24);
+    if (leader and callstacks) attr.flags |= (1 << 8) | (1 << 23);
     attr.clockid = c.CLOCK_MONOTONIC;
     return @intCast(c.syscall(@as(c_long, c.SYS_perf_event_open), &attr, @as(c.pid_t, tid), @as(c_int, -1), group, @as(c_ulong, c.PERF_FLAG_FD_CLOEXEC)));
 }
@@ -269,7 +273,7 @@ pub fn start(a: std.mem.Allocator, config: Config) !Opened {
     const format = read("/sys/bus/event_source/devices/uprobe/format/retprobe", &text) catch |err| return .{ .failed = fail("allocations.pmu", errno(), -1, @errorName(err)) };
     const mask = wire.retprobeMask(format) catch |err| return .{ .failed = fail("allocations.pmu", 0, -1, @errorName(err)) };
     const self = try a.create(Collector);
-    self.* = .{ .allocator = a, .pid = config.pid };
+    self.* = .{ .allocator = a, .pid = config.pid, .callstacks = config.callstacks };
     for (config.sources) |source| {
         const file = &self.files[self.source_count];
         self.source_count += 1;
@@ -292,7 +296,7 @@ pub fn start(a: std.mem.Allocator, config: Config) !Opened {
             for (0..2) |phase| {
                 const leader = slot.opened == 0;
                 if (config.cancel) |cancel| if (cancel.load(.acquire)) return self.rollback(fail("allocations.cancel", c.ECANCELED, tid, "allocation preparation cancelled"));
-                const fd = if (config.opener) |opener| opener.call(opener.user, tid, slot.fds[0], file.fd, file.source.offset, phase == 1, leader) else openEvent(tid, slot.fds[0], pmu, if (phase == 1) mask else 0, file, leader);
+                const fd = if (config.opener) |opener| opener.call(opener.user, tid, slot.fds[0], file.fd, file.source.offset, phase == 1, leader, config.callstacks) else openEvent(tid, slot.fds[0], pmu, if (phase == 1) mask else 0, file, leader, config.callstacks);
                 if (fd < 0) return self.rollback(fail("allocations.perf_event_open", errno(), tid, "task-local uprobe open failed; current kernels require CAP_SYS_ADMIN for creation"));
                 slot.fds[slot.opened] = fd;
                 slot.opened += 1;

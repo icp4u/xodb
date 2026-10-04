@@ -88,7 +88,7 @@ pub const Panel = struct {
         if (!self.open) return;
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
-        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 112 }, .{ 0, 0, 0, 0.65 });
+        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 112 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "SYSCALLS   X / Esc close   Wheel / PgUp / PgDown   Click a row", theme.text);
         try r.textFit(font, b.x + 14, b.y + 35, b.w - 28, "Elapsed includes off-CPU time and debugger pauses. Names assume the x86-64 syscall ABI.", theme.weak);

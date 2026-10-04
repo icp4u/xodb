@@ -24,11 +24,11 @@ def run(payload,descriptors=()):
         except subprocess.TimeoutExpired:p.kill();p.wait();raise
 fd=os.open('/proc/self/exe',os.O_RDONLY|os.O_CLOEXEC)
 try:
-    packet=lambda flags:struct.pack('=IiiIQ',0x58414c31,os.getpid(),os.getpid(),flags,0)
+    packet=lambda flags:struct.pack('=IiiIQ',0x58414c32,os.getpid(),os.getpid(),flags,0)
     assert run(b'x')==b''
-    for descriptors,flags,expected in [((),2,errno.EINVAL),((fd,),4,errno.EINVAL),((fd,),2,errno.EPERM)]:
+    for descriptors,flags,expected in [((),2,errno.EINVAL),((fd,),8,errno.EINVAL),((fd,),2,errno.EPERM)]:
         reply=run(packet(flags),descriptors)
-        assert struct.unpack('=Ii',reply)==(0x58414c31,expected),reply
+        assert struct.unpack('=Ii',reply)==(0x58414c32,expected),reply
     assert run(packet(2),(fd,fd,fd))==b''
 finally:os.close(fd)
 p=subprocess.run([helper,'--stdio'],input=b'',capture_output=True)
@@ -50,11 +50,11 @@ try:
     fd=os.open(f'/proc/{child}/exe',os.O_RDONLY|os.O_CLOEXEC)
     try:
         for offset in (0,os.fstat(fd).st_size,2**64-1):
-            packet=struct.pack('=IiiIQ',0x58414c31,child,child,2,offset)
-            assert struct.unpack('=Ii',run(packet,(fd,)))==(0x58414c31,errno.EINVAL)
-        packet=struct.pack('=IiiIQ',0x58414c31,child,child,2,int(mapped[2],16))
+            packet=struct.pack('=IiiIQ',0x58414c32,child,child,2,offset)
+            assert struct.unpack('=Ii',run(packet,(fd,)))==(0x58414c32,errno.EINVAL)
+        packet=struct.pack('=IiiIQ',0x58414c32,child,child,2,int(mapped[2],16))
         reply=struct.unpack('=Ii',run(packet,(fd,)))
-        assert reply[0]==0x58414c31 and reply[1] in (errno.EACCES,errno.EPERM),reply
+        assert reply[0]==0x58414c32 and reply[1] in (errno.EACCES,errno.EPERM),reply
     finally:os.close(fd)
 finally:
     try:os.kill(child,signal.SIGKILL)

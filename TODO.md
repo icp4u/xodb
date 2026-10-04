@@ -15,7 +15,8 @@ see linux-ai-debugger-agents.md for an ai summary of a discussion fleshing out t
 
 ## Future tasks
 
-- [ ] Skinnable, flexible display: themes, fonts/scaling, pane arrangement and saved layouts.
+- [x] Initial startup themes: semantic colors, presets and explicit loading ([workflow](docs/THEMES.md)).
+- [ ] Skinnable, flexible display: fonts/scaling, control treatments, pane arrangement and saved layouts.
 - [x] Initial AArch64 hardware data watchpoints, write investigations and remote GUI controls ([evidence/limits](docs/research/arm64-watchpoints/integration.md)).
 - [ ] AArch64 feature coverage: precise multi-watch attribution, modern ARM validation, profiling, native GUI and remaining debugger gaps.
 - [ ] Investigate debugging additional architectures and the hardware/emulation needed to validate them.

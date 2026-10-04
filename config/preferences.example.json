@@ -1,4 +1,7 @@
 {
+  "appearance": {
+    "theme": "builtin:dark"
+  },
   "profile": {
     "duration_ms": 60000,
     "frequency_hz": 99,

@@ -2,11 +2,12 @@
 """Allocation inspector component on a private compositor, using labeled fixture data.
 
 Builds a scratch app with fixture-only injection; production Session/tool routing
-is unchanged. This does not test perf collection or the pending privilege model.
+is unchanged. This does not test perf collection or collection permissions.
 """
 import importlib.util,json,os,shutil,subprocess,sys,time
 from pathlib import Path
 from datetime import datetime
+from PIL import Image
 root=Path(__file__).resolve().parents[1];os.chdir(root)
 spec=importlib.util.spec_from_file_location('input_repro',root/'tests/helpers/input.py')
 h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
@@ -70,6 +71,32 @@ try:
     ok('complete fixture has 80 lifetimes',page['total_unfiltered']==80)
     ok('same common summary shown to MCP',page['summary']['outstanding_count']==53)
     d.shot('02-lifetimes-wide')
+    # Same capture, three metrics, exact stack citations and archive publication.
+    totals = {'allocated_bytes': sum(24+i*8 for i in range(80)),
+              'outstanding_bytes': sum(24+i*8 for i in range(80) if i%3),
+              'allocations':80}
+    for metric, expected in totals.items():
+        deadline=time.monotonic()+8
+        while True:
+            graph=d.tool('get_allocation_flamegraph',**args,metric=metric,limit=256)
+            if not graph.get('pending'):break
+            assert time.monotonic()<deadline,graph
+            time.sleep(.02)
+        ok(metric+' counts known fixture evidence',graph['total_weight']==expected)
+        ok(metric+' contains caller attribution',any(n['name']=='retain_block' for n in graph['nodes']))
+    stack=d.tool('get_allocation_stack',**args,allocation_span=0)
+    ok('entry stack retains its exact caller',stack['frames'][1]['pc']=='0x402004' and not stack['complete'])
+    archive=work/'allocation.xoa'
+    saved=d.tool('allocation_preview_save',path=str(archive))
+    ok('fixture archive published',saved['state']=='published')
+    d.keys('tap',33) # F
+    until(lambda v:v['mode']=='heap' and v['heap_hits']>0)
+    d.shot('02b-heap-bytes')
+    d.keys('tap',50) # M
+    until(lambda v:v['metric']=='outstanding_bytes' and v['heap_hits']>0)
+    d.shot('02c-heap-outstanding')
+    d.keys('tap',38) # L
+    s=until(lambda v:v['mode']=='lifetimes' and v['count']>0)
     d.keys('tap',111) # Delete is deliberately not a panel action.
     ok('unknown key leaves selection intact',status()['selected']==s['selected'])
     d.keys('tap',109) # PgDn
@@ -128,7 +155,38 @@ try:
     time.sleep(.15);d.shot('08-empty-small')
     ok('empty capture clears stale rows',status()['count']==0)
     d.app.stdin.close();ok('fixture shuts down cleanly',d.app.wait(timeout=5)==0)
-    print('Private allocation GUI component checks:',work.relative_to(root),flush=True)
+    d.close();d=None
+    # Production executable: no fixture injection, target, or host symbol files.
+    d=h.Display(str(root),['--open-capture',str(archive),'--agent-scope','control'])
+    deadline=time.monotonic()+8
+    while True:
+        info=d.tool('get_allocation_capture')
+        if info.get('state')=='ready':break
+        assert time.monotonic()<deadline,info
+        time.sleep(.02)
+    ok('production reopen restores lifetime totals',info['archived'] and info['summary']['outstanding_count']==53)
+    key=info['key'];args=dict(session_id=key['identity']['session_id'],capture_id=key['identity']['capture_id'],revision=key['revision'])
+    deadline=time.monotonic()+8
+    while True:
+        graph=d.tool('get_allocation_flamegraph',**args,metric='outstanding_bytes',limit=256)
+        if not graph.get('pending'):break
+        assert time.monotonic()<deadline,graph
+        time.sleep(.02)
+    ok('production archive flames retain byte weights and labels',graph['total_weight']==totals['outstanding_bytes'] and any(n['name']=='retain_block' for n in graph['nodes']))
+    time.sleep(1.1)
+    shot=d.shot('09-production-reopened-heap')
+    with Image.open(shot) as pixels:
+        ok('GUI renders its own heap metric while MCP queries another',max(abs(a-b) for a,b in zip(pixels.convert('RGB').getpixel((40,290)),(56,87,117)))<=2)
+    copy=work/'allocation-copy.xoa'
+    saved=d.tool('save_allocation_archive',generation=d.session()['generation'],capture_id=key['identity']['capture_id'],revision=key['revision'],path=str(copy))
+    deadline=time.monotonic()+8
+    while True:
+        job=d.tool('get_archive_status')['job']
+        if job['done']:break
+        assert time.monotonic()<deadline,job
+        time.sleep(.02)
+    ok('production save publishes asynchronously',job['publication']['state']=='published' and copy.exists())
+    print('Private allocation GUI component and production archive checks:',work.relative_to(root),flush=True)
 finally:
     (work/'checks.json').write_text(json.dumps({'fixture_only':True,'live_collection_tested':False,'checks':checks},indent=2)+'\n')
     if d:d.close()

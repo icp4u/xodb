@@ -23,7 +23,7 @@ fn expected(capture: *const model.Capture, args: Value) !model.Key {
 fn record(a: Allocator, row: model.RecordRow) !Value {
     const event = row.event;
     const data = switch (event.data) {
-        .sample => |sample| try wire.value(a, .{ .kind = "sample", .phase = sample.phase, .hook_id = sample.hook, .allocation_kind = sample.kind, .stack_key = try hex(a, sample.stack_key), .ip = try hex(a, sample.ip), .arg0 = try hex(a, sample.arg0), .arg1 = try hex(a, sample.arg1), .result = try hex(a, sample.result) }),
+        .sample => |sample| try wire.value(a, .{ .kind = "sample", .phase = sample.phase, .hook_id = sample.hook, .allocation_kind = sample.kind, .stack_key = try hex(a, sample.stack_key), .ip = try hex(a, sample.ip), .arg0 = try hex(a, sample.arg0), .arg1 = try hex(a, sample.arg1), .result = try hex(a, sample.result), .stack_id = sample.stack }),
         .lost => |n| try wire.value(a, .{ .kind = "lost", .count = n }),
         else => try wire.value(a, .{ .kind = @tagName(event.data) }),
     };
@@ -44,6 +44,8 @@ pub fn status(a: Allocator, capture: *model.Capture) !Value {
     }));
     return wire.value(a, .{
         .key = capture.key(),
+        .archived = capture.archived,
+        .origin = capture.origin,
         .state = capture.state,
         .started_ns = capture.started_ns,
         .ended_ns = capture.ended_ns,
@@ -53,6 +55,11 @@ pub fn status(a: Allocator, capture: *model.Capture) !Value {
         .memory = capture.memory(),
         .record_count = capture.store.records.items.len,
         .span_count = capture.store.spans.items.len,
+        .stack_count = capture.stacks.entries.items.len,
+        .stacks_omitted = capture.stacks.omitted,
+        .stack_method = "perf_frame_pointers_and_entry_return_address",
+        .stack_completeness = "prefix_only",
+        .symbol_basis = if (capture.archived) "recorded_archive_annotations" else "opening_immutable_elf_snapshots",
         .lost = capture.store.lost,
         .throttles = capture.store.throttles,
         .rejected = capture.store.rejected,
@@ -74,8 +81,27 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
     const records = std.mem.eql(u8, name, "get_allocation_events");
     const spans = std.mem.eql(u8, name, "get_allocation_calls");
     const lifetimes = std.mem.eql(u8, name, "get_allocation_lifetimes");
-    if (!is_status and !records and !spans and !lifetimes) return error.UnknownTool;
-    try wire.fields(args, if (is_status) &.{} else if (lifetimes)
+    const stack_query = std.mem.eql(u8, name, "get_allocation_stack");
+    const heap = std.mem.eql(u8, name, "get_allocation_flamegraph");
+    if (!is_status and !records and !spans and !lifetimes and !stack_query and !heap) return error.UnknownTool;
+    if (stack_query) {
+        try wire.fields(args, &.{ "session_id", "capture_id", "revision", "allocation_span" });
+        const capture = current orelse return error.NoAllocationCapture;
+        capture.poll();
+        const key = try expected(capture, args);
+        const ordinal = try wire.number(args, "allocation_span", null);
+        if (ordinal >= capture.store.spans.items.len) return error.InvalidArguments;
+        const span = capture.store.spans.items[@intCast(ordinal)];
+        const id = if (span.entry_record) |entry| capture.store.records.items[entry].event.data.sample.stack else null;
+        const stack = if (id) |n| capture.stacks.entries.items[n] else @import("../profile/allocation_stacks.zig").Stack{};
+        var frames: std.ArrayList(Value) = .empty;
+        for (stack.addresses(), 0..) |pc, depth| {
+            const frame = capture.stackFrame(pc, depth);
+            try frames.append(a, try wire.value(a, .{ .pc = try hex(a, pc), .lookup_address = try hex(a, frame.lookup_address), .symbol_address = try hex(a, frame.address), .name = frame.name, .module = frame.module, .kind = frame.kind }));
+        }
+        return wire.value(a, .{ .key = key, .allocation_span = ordinal, .stack_id = id, .status = if (id != null) @tagName(stack.status) else if (capture.config.callstacks) "not_retained" else "disabled", .method = "perf_frame_pointers_and_entry_return_address", .complete = false, .frames = frames.items });
+    }
+    try wire.fields(args, if (is_status) &.{} else if (heap) &.{ "session_id", "capture_id", "revision", "start", "limit", "thread_id", "from_ns", "to_ns", "metric" } else if (lifetimes)
         &.{ "session_id", "capture_id", "revision", "start", "limit", "thread_id", "from_ns", "to_ns", "outstanding_only", "retry" }
     else
         &.{ "session_id", "capture_id", "revision", "start", "limit", "thread_id", "from_ns", "to_ns" });
@@ -97,6 +123,27 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
             if (thread.id == id) break true;
         } else false;
         if (!found) return error.InvalidAllocationThread;
+    }
+    if (heap) {
+        const value = args.object.get("metric") orelse Value{ .string = "allocated_bytes" };
+        if (value != .string or start > @import("../profile/flame.zig").max_nodes) return error.InvalidArguments;
+        const metric = std.meta.stringToEnum(@import("../profile/allocation_heap.zig").Metric, value.string) orelse return error.InvalidArguments;
+        const view = (try capture.heapView(filter, metric, .mcp)) orelse return wire.value(a, .{ .key = key, .pending = true, .metric = metric, .filter = filter });
+        if (start > view.graph.nodes.items.len) return error.InvalidArguments;
+        const end = @min(view.graph.nodes.items.len, start + limit);
+        var nodes: std.ArrayList(Value) = .empty;
+        for (view.graph.nodes.items[@intCast(start)..@intCast(end)]) |node| try nodes.append(a, try wire.value(a, .{
+            .id = node.id,
+            .parent = node.parent,
+            .kind = node.frame.kind,
+            .name = node.frame.name,
+            .module = node.frame.module,
+            .address = try hex(a, node.frame.address),
+            .inclusive = node.inclusive,
+            .self = node.self,
+            .depth = node.depth,
+        }));
+        return wire.value(a, .{ .key = key, .pending = false, .metric = metric, .unit = if (metric == .allocations) "allocations" else "requested_bytes", .filter = filter, .filter_basis = "allocation_entry", .nodes = nodes.items, .next = if (end < view.graph.nodes.items.len) @as(?u64, end) else null, .total_weight = view.graph.nodes.items[0].inclusive, .excluded_weight = view.excluded_weight, .allocations = view.allocations, .caller_stacks = view.caller_stacks, .missing_stacks = view.missing_stacks, .zero_weight = view.zero_weight, .outstanding_is_leak_proof = false });
     }
     if (records) {
         const page = try capture.recordPage(a, key, filter, @intCast(start), @intCast(limit));

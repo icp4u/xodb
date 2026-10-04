@@ -653,7 +653,7 @@ pub const Renderer = struct {
             font.dirty = false;
             self.atlas_ready = true;
         }
-        const clear = c.VkClearValue{ .color = .{ .float32 = .{ 0.035, 0.043, 0.06, 1 } } };
+        const clear = c.VkClearValue{ .color = .{ .float32 = @import("../appearance.zig").active.colors.background } };
         var pass = info(c.VkRenderPassBeginInfo, c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
         pass.renderPass = self.pass;
         pass.framebuffer = self.framebuffers[image_index];

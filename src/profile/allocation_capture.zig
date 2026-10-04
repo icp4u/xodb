@@ -25,7 +25,7 @@ pub const Hook = struct {
     link_address: u64,
     runtime_address: u64,
 };
-pub const Config = struct { record_limit: usize = events.default_records, memory_limit: usize = default_memory_limit };
+pub const Config = struct { record_limit: usize = events.default_records, memory_limit: usize = default_memory_limit, callstacks: bool = false };
 pub const State = enum { collecting, stopping, finalized, analyzing, ready, unavailable };
 pub const Filter = struct { thread_id: ?u64 = null, from_ns: u64 = 0, to_ns: u64 = std.math.maxInt(u64), outstanding_only: bool = false };
 pub const RecordRow = struct { ordinal: u32, thread: Thread, event: events.Event };
@@ -63,6 +63,9 @@ pub const Capture = struct {
     backing: Allocator,
     budget: Budget,
     identity: Identity,
+    origin: ?Identity = null,
+    archived: bool = false,
+    archive_busy: bool = false,
     revision: u64 = 1,
     started_ns: u64,
     ended_ns: ?u64 = null,
@@ -73,6 +76,12 @@ pub const Capture = struct {
     hooks: [16]Hook = undefined,
     hook_count: usize = 0,
     store: events.Store,
+    stacks: @import("allocation_stacks.zig").Store = .{},
+    /// Immutable opening ELF snapshots. Symbolization never opens the old PID.
+    symbols: ?*@import("../model/modules.zig").Modules = null,
+    labels: std.AutoHashMapUnmanaged(u64, @import("flame.zig").Frame) = .empty,
+    labels_omitted: usize = 0,
+    heap_jobs: [2]?*@import("allocation_heap.zig").Job = @splat(null),
     state: State = .collecting,
     failure: ?anyerror = null,
     analysis: ?Analysis = null,
@@ -113,12 +122,24 @@ pub const Capture = struct {
     /// Shutdown may join; normal event-loop replacement must cancel, poll and
     /// wait for worker==null before destroying the old capture.
     pub fn deinit(self: *Capture) void {
+        for (self.heap_jobs) |job_| if (job_) |job| job.deinit();
         self.cancel.store(true, .release);
         if (self.worker) |thread| thread.join();
         const a = self.budget.allocator();
         if (self.worker_result) |*result| result.deinit(a);
         if (self.analysis) |*result| result.deinit(a);
         self.store.deinit(a);
+        self.stacks.deinit(a);
+        var labels = self.labels.valueIterator();
+        while (labels.next()) |frame| {
+            a.free(frame.name);
+            a.free(frame.module);
+        }
+        self.labels.deinit(a);
+        if (self.symbols) |symbols| {
+            symbols.deinit();
+            self.backing.destroy(symbols);
+        }
         for (self.hooks[0..self.hook_count]) |hook| {
             a.free(hook.name);
             a.free(hook.path);
@@ -150,6 +171,10 @@ pub const Capture = struct {
         }
         if (event.data == .sample) {
             const sample = event.data.sample;
+            if (sample.stack) |id| if (sample.phase != .enter or id >= self.stacks.entries.items.len) {
+                self.badSource(.identity);
+                return error.InvalidAllocationStack;
+            };
             const known = for (self.hooks[0..self.hook_count]) |hook| {
                 if (hook.id == sample.hook and hook.kind == sample.kind) break true;
             } else false;
@@ -207,6 +232,7 @@ pub const Capture = struct {
         self.state = .analyzing;
     }
     fn execute(self: *Capture) !Analysis {
+        try self.annotate();
         const a = self.budget.allocator();
         const projection = try self.store.projectWithCancel(a, &self.cancel);
         errdefer projection.deinit(a);
@@ -215,12 +241,78 @@ pub const Capture = struct {
         if (self.cancel.load(.acquire)) return error.AllocationAnalysisCancelled;
         return .{ .projection = projection, .view = view };
     }
+    fn annotate(self: *Capture) !void {
+        const a = self.budget.allocator();
+        for (self.stacks.entries.items) |stack| {
+            if (self.cancel.load(.acquire)) return error.AllocationAnalysisCancelled;
+            for (stack.addresses(), 0..) |pc, depth| {
+                const lookup = if (depth == 0) pc else pc -| 1;
+                if (self.labels.contains(lookup)) continue;
+                if (self.labels.count() >= 65536) {
+                    self.labels_omitted += 1;
+                    continue;
+                }
+                var frame = @import("flame.zig").Frame{ .kind = .unknown, .address = lookup, .lookup_address = lookup, .name = "unresolved address" };
+                if (self.symbols) |symbols| {
+                    // Consult only ELF snapshots successfully opened before collection.
+                    // Loaded module extents alone include non-executable gaps.
+                    for (symbols.regions.items) |region| {
+                        if (region.permissions[2] != 'x' or lookup < region.start or lookup >= region.end) continue;
+                        for (symbols.loaded.items) |module| {
+                            if (lookup < module.start or lookup >= module.end or module.inode != region.inode or module.device_major != region.device_major or module.device_minor != region.device_minor) continue;
+                            const link = module.linkAddress(lookup) catch continue;
+                            frame.module_id = module.id;
+                            frame.module = module.path;
+                            if (module.symbols().symbolAt(link)) |found| {
+                                frame.kind = .code;
+                                frame.name = found.symbol.name;
+                                frame.address = module.runtimeAddress(found.symbol.value) catch lookup;
+                            }
+                            break;
+                        }
+                        break;
+                    }
+                }
+                frame.name = try a.dupe(u8, frame.name);
+                errdefer a.free(frame.name);
+                frame.module = try a.dupe(u8, frame.module);
+                errdefer a.free(frame.module);
+                try self.labels.put(a, lookup, frame);
+            }
+        }
+    }
+    pub fn stackFrame(self: *const Capture, pc: u64, depth: usize) @import("flame.zig").Frame {
+        const lookup = if (depth == 0) pc else pc -| 1;
+        // Annotation is published only after the analysis worker is joined.
+        return if (self.worker == null) self.labels.get(lookup) orelse .{ .kind = .unknown, .address = lookup, .lookup_address = lookup, .name = "unresolved address" } else .{ .kind = .unknown, .address = lookup, .lookup_address = lookup, .name = "symbols pending" };
+    }
     fn run(self: *Capture) void {
         self.worker_result = self.execute() catch |err| blk: {
             self.worker_failure = if (self.budget.denied) error.AllocationMemoryLimit else err;
             break :blk null;
         };
         self.done.store(true, .release);
+    }
+    pub fn heapView(self: *Capture, filter: Filter, metric: @import("allocation_heap.zig").Metric, owner: @import("allocation_heap.zig").Owner) !?*const @import("allocation_heap.zig").View {
+        try self.requestAnalysis(false);
+        if (self.worker != null) return null;
+        if (self.state != .ready) return self.failure orelse error.AllocationAnalysisPending;
+        const key_ = @import("allocation_heap.zig").Key{ .capture = self.key(), .filter = filter, .metric = metric };
+        const slot = &self.heap_jobs[@intFromEnum(owner)];
+        if (slot.*) |job| {
+            if (!std.meta.eql(job.key, key_)) {
+                job.cancel.store(true, .release);
+                if (!job.done.load(.acquire)) return null;
+                job.deinit();
+                slot.* = null;
+            } else {
+                if (!job.done.load(.acquire)) return null;
+                if (job.failure) |err| return err;
+                return &job.result.?;
+            }
+        }
+        slot.* = try @import("allocation_heap.zig").Job.create(self, filter, metric);
+        return null;
     }
     pub fn cancelAnalysis(self: *Capture) void {
         self.cancel.store(true, .release);
@@ -510,4 +602,77 @@ fn createFailureCase(a: Allocator) !void {
 }
 test "allocation capture creation and evidence failure release every partial allocation" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, createFailureCase, .{});
+}
+
+test "heap metrics and allocation archives preserve caller citations and cross-thread frees" {
+    const a = std.testing.allocator;
+    const capture = try Capture.create(a, test_id, .{ .callstacks = true }, &test_threads, &test_hooks, 100);
+    defer capture.deinit();
+    var stack = @import("allocation_stacks.zig").Stack{ .status = .prefix, .count = 3 };
+    stack.pcs[0..3].* = .{ 0x401000, 0x402004, 0x403004 };
+    const id = (try capture.stacks.intern(capture.budget.allocator(), stack)).?;
+    var entry = testSample(110, .enter, .malloc, 0x8000, 40, 0);
+    entry.data.sample.stack = id;
+    try capture.feed(0, entry);
+    try capture.feed(0, testSample(120, .leave, .malloc, 0x8000, 0, 0xfffffffffffff123));
+    entry.time_ns = 130;
+    entry.data.sample.arg0 = 60;
+    try capture.feed(0, entry);
+    try capture.feed(0, testSample(140, .leave, .malloc, 0x8000, 0, 0x2000));
+    try capture.feed(1, testSample(150, .enter, .free, 0x7000, 0xfffffffffffff123, 0));
+    try capture.feed(1, testSample(160, .leave, .free, 0x7000, 0, 0));
+    try capture.finish(170, false);
+    try capture.requestAnalysis(false);
+    try waitAnalysis(capture);
+    var cancel = std.atomic.Value(bool).init(false);
+    const heap = @import("allocation_heap.zig");
+    for ([_]heap.Metric{ .allocated_bytes, .outstanding_bytes, .allocations }, [_]u64{ 100, 60, 2 }) |metric, expected| {
+        var view = try heap.build(a, capture, .{}, metric, &cancel);
+        defer view.deinit();
+        try std.testing.expectEqual(expected, view.graph.nodes.items[0].inclusive);
+        try std.testing.expectEqual(@as(u64, 0), view.missing_stacks);
+    }
+    var other = try heap.build(a, capture, .{ .thread_id = 23 }, .allocated_bytes, &cancel);
+    defer other.deinit();
+    try std.testing.expectEqual(@as(u64, 0), other.graph.nodes.items[0].inclusive);
+    var range = try heap.build(a, capture, .{ .from_ns = 125 }, .allocated_bytes, &cancel);
+    defer range.deinit();
+    try std.testing.expectEqual(@as(u64, 60), range.graph.nodes.items[0].inclusive);
+    const archive = @import("allocation_archive.zig");
+    const bytes = try archive.encode(a, capture, null);
+    defer a.free(bytes);
+    const reopened = try archive.decode(a, bytes, null);
+    defer reopened.deinit();
+    try std.testing.expect(reopened.archived);
+    try std.testing.expectEqual(test_id, reopened.origin.?);
+    try std.testing.expectEqualSlices(u64, stack.addresses(), reopened.stacks.entries.items[id].addresses());
+    try reopened.requestAnalysis(false);
+    try waitAnalysis(reopened);
+    try std.testing.expectEqual(capture.summary().?, reopened.summary().?);
+    var again = try heap.build(a, reopened, .{}, .outstanding_bytes, &cancel);
+    defer again.deinit();
+    try std.testing.expectEqual(@as(u64, 60), again.graph.nodes.items[0].inclusive);
+    bytes[bytes.len - 1] ^= 1;
+    try std.testing.expectError(error.AllocationArchiveChecksum, archive.decode(a, bytes, null));
+    cancel.store(true, .release);
+    try std.testing.expectError(error.AllocationAnalysisCancelled, heap.build(a, capture, .{}, .allocated_bytes, &cancel));
+}
+
+test "allocation archive retains missing returns and loss without manufacturing totals" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |loss| {
+        const capture = try Capture.create(a, test_id, .{}, &test_threads, &test_hooks, 100);
+        defer capture.deinit();
+        try capture.feed(0, testSample(110, .enter, .malloc, 0x8000, 40, 0));
+        if (loss) try capture.feed(0, .{ .time_ns = 120, .data = .{ .lost = 7 } });
+        try capture.finish(130, false);
+        const bytes = try @import("allocation_archive.zig").encode(a, capture, null);
+        defer a.free(bytes);
+        const opened = try @import("allocation_archive.zig").decode(a, bytes, null);
+        defer opened.deinit();
+        try std.testing.expectEqual(capture.store.first_gap, opened.store.first_gap);
+        try std.testing.expectEqual(capture.store.lost, opened.store.lost);
+        try std.testing.expectError(error.AllocationEvidenceGap, opened.requestAnalysis(false));
+        try std.testing.expect(opened.summary() == null);
+    }
 }

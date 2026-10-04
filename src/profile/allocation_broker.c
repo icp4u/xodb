@@ -96,11 +96,11 @@ done:
 }
 int xodb_allocation_broker_open(int socket_fd, int pid, int tid, int file_fd,
                                int group_fd, uint64_t offset, int return_probe,
-                               int leader, xodb_allocation_cancel cancelled, void *context) {
+                               int leader, int callstacks, xodb_allocation_cancel cancelled, void *context) {
     if (cancelled && cancelled(context)) { errno = ECANCELED; return -1; }
     const struct xodb_allocation_open request = {
         .magic = XODB_ALLOCATION_MAGIC, .pid = pid, .tid = tid,
-        .flags = (return_probe ? 1u : 0u) | (leader ? 2u : 0u), .offset = offset,
+        .flags = (return_probe ? 1u : 0u) | (leader ? 2u : 0u) | (callstacks ? 4u : 0u), .offset = offset,
     };
     int fds[2] = { file_fd, group_fd };
     if (send_packet(socket_fd, &request, sizeof request, fds, group_fd < 0 ? 1 : 2)) return -1;
@@ -204,15 +204,18 @@ static int mapped_offset(int pid, int fd, uint64_t offset) {
 }
 static int open_probe(struct xodb_allocation_open request, int fds[2], size_t count, struct ucred peer, unsigned pmu, uint64_t retmask) {
     const bool leader = !!(request.flags & 2);
-    if (request.magic != XODB_ALLOCATION_MAGIC || request.pid <= 0 || request.tid <= 0 || request.flags > 3 ||
+    const bool stacks = (request.flags & 4) && !(request.flags & 1);
+    if (request.magic != XODB_ALLOCATION_MAGIC || request.pid <= 0 || request.tid <= 0 || request.flags > 7 ||
         count != (leader ? 1u : 2u)) { errno = EINVAL; return -1; }
     if (held_task(request.pid, request.tid, peer) || executable_offset(fds[0], request.offset) || mapped_offset(request.pid, fds[0], request.offset)) return -1;
     char path[64]; snprintf(path, sizeof path, "/proc/self/fd/%d", fds[0]);
     struct perf_event_attr attr = {
-        .type = pmu, .size = 96, .config = request.flags & 1 ? retmask : 0,
+        .type = pmu, .size = 112, .config = request.flags & 1 ? retmask : 0,
         .config1 = (uint64_t)(uintptr_t)path, .config2 = request.offset,
-        .sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID | PERF_SAMPLE_REGS_USER,
+        .sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID | PERF_SAMPLE_REGS_USER | (stacks ? PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER : 0),
+        .sample_max_stack = stacks ? 32 : 0, .sample_stack_user = stacks ? 8 : 0,
         .sample_regs_user = (1ull << 0) | (1ull << 4) | (1ull << 5) | (1ull << 7) | (1ull << 8),
+        .exclude_callchain_kernel = 1, .mmap = leader && (request.flags & 4), .mmap2 = leader && (request.flags & 4),
         .disabled = 1, .exclude_kernel = 1, .exclude_hv = 1, .sample_id_all = 1,
         .use_clockid = 1, .clockid = CLOCK_MONOTONIC,
         .comm = leader, .task = leader, .comm_exec = leader,

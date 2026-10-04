@@ -84,6 +84,9 @@ nothing executes.
 **Allocations.** Native allocator calls, reallocs, frees, lifetime and
 outstanding views — with MCP evidence. See [docs/ALLOCATIONS.md](docs/ALLOCATIONS.md).
 
+**Themes.** Built-in dark, light and contrast palettes and custom JSON colors,
+selected at startup for local, remote and offline views. See [themes](docs/THEMES.md).
+
 **Remote + ARM64.** The x86-64 workstation GUI drives a headless xodb on an
 AArch64 Jetson over SSH or LAN TCP. ARM64 hardware data watchpoints work through
 MCP. Android: native executables *and* JNI libraries inside a debug APK, over USB.
@@ -209,7 +212,7 @@ mid-flight. There's an action audit. There's no embedded LLM — bring your own.
   needs to get faster.
 - Fixed 1,024-thread / 4,096-event capacities per process; old events expire.
   Source files are capped at 1 MiB.
-- One adjustable divider, no saved layouts, no docking, no theme editor yet.
+- [Startup colors and presets](docs/THEMES.md); one adjustable divider, no saved layouts, docking or theme editor yet.
   Text starts at 16px; scaling and accessibility need real work.
 - No reverse execution, replay, decompiler, or GPU tracing.
   [Syscall timing](docs/SYSCALL_TIMING.md) is opt-in for selected x86-64 threads;
@@ -222,7 +225,7 @@ initial feature snapshot.
 
 ## What's next
 
-- Skinnable, flexible display: themes, fonts/scaling, pane layouts you can save.
+- Skinnable, flexible display: font scaling, skin controls and pane layouts you can save; startup themes are available.
 - AArch64 feature coverage: precise multi-watch attribution, modern ARM
   validation, profiling, native ARM GUI.
 - More architectures, and the hardware or emulation to actually validate them.

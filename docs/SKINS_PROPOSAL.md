@@ -1,5 +1,10 @@
 # Skins and look and feel sketch
 
+Startup semantic colors and presets are now implemented; see
+[the theme workflow](THEMES.md). Theme files load only at startup; the reload
+interfaces in this older sketch are not adopted. The remaining skin, typography,
+layout and plugin interfaces below remain proposals.
+
 2026-10-02. Discussion proposal for review, alongside the
 [Lua plugin sketch](LUA_PLUGIN_PROPOSAL.md). The configuration keys and interfaces
 below are illustrative and **not implemented or adopted**. Current binaries

@@ -195,7 +195,7 @@ pub const Panel = struct {
         self.update(session, tid);
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
-        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, .{ 0, 0, 0, 0.65 });
+        try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         var buffer: [1024]u8 = undefined;
         const title = try std.fmt.bufPrint(&buffer, "{s}   {s} / Esc close   tid {d}   stop {d}{s}", .{ if (self.kind == .memory) "MEMORY" else "FP / SIMD", if (self.kind == .memory) "M" else "R", tid, self.generation, if (session.target.state != .stopped) " (historical: target running)" else "" });

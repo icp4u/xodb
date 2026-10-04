@@ -30,14 +30,6 @@ const buttons = [_]ToolButton{
     .{ .label = "Watch", .key = "W", .code = 17, .x = 940, .w = 110 },
     .{ .label = "Flow", .key = "G", .code = 34, .x = 1068, .w = 138 },
 };
-const bg: gpu.Color = .{ 0.048, 0.061, 0.084, 1 };
-const panel: gpu.Color = .{ 0.065, 0.080, 0.108, 1 };
-const line: gpu.Color = .{ 0.14, 0.18, 0.23, 1 };
-const text_color: gpu.Color = .{ 0.79, 0.83, 0.89, 1 };
-const muted: gpu.Color = .{ 0.43, 0.51, 0.61, 1 };
-const green: gpu.Color = .{ 0.48, 0.83, 0.64, 1 };
-const blue: gpu.Color = .{ 0.48, 0.69, 0.94, 1 };
-const orange: gpu.Color = .{ 0.96, 0.70, 0.43, 1 };
 const tab_width = 4;
 /// In the profile view, flames take the body above this fraction of the height
 /// and the timeline the row below it.
@@ -140,6 +132,8 @@ pub const Workspace = struct {
     stop_panel: @import("stop.zig").Panel = .{},
     process_panel: @import("processes.zig").Panel = .{},
     allocation_panel: @import("allocations.zig").Panel = .{},
+    allocation_save_editor: watch_ui.Editor = .{},
+    allocation_archive_seen: bool = false,
     syscall_panel: @import("syscalls.zig").Panel = .{},
     inline_panel: @import("inline.zig").Panel = .{},
     inspection_panel: @import("inspection.zig").Panel = .{},
@@ -197,7 +191,7 @@ pub const Workspace = struct {
     hover_line: ?u32 = null,
     divider_hot: bool = false,
     alive: f32 = 1, // thread-line entrance, restarted at each stop
-    bar: gpu.Color = theme.header,
+    bar: gpu.Color = (@import("../appearance.zig").Colors{}).header,
     stale_regs: ?linux.Registers = null, // the same thread's registers at its previous stop
     last_draw: u64 = 0,
     animating: bool = false,
@@ -364,6 +358,27 @@ pub const Workspace = struct {
                         if (tree.active() != session) return;
                         continue;
                     };
+                    if (self.allocation_save_editor.open) {
+                        if (self.allocation_save_editor.key(event)) |action| switch (action) {
+                            .submit => |path| {
+                                _ = session.saveAllocationArchive(path) catch |err| {
+                                    self.allocation_save_editor.message = @errorName(err);
+                                    w.dirty = true;
+                                    continue;
+                                };
+                                session.record(.human, "save_allocation_archive");
+                                self.allocation_save_editor.open = false;
+                            },
+                            else => {},
+                        };
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.allocation_panel.open and event.plain() and event.kind == .press and event.shortcut == 's') {
+                        self.allocation_save_editor.start();
+                        w.dirty = true;
+                        continue;
+                    }
                     const inspect_tid = if (session.target.thread_count > 0) session.target.threads[@min(self.selected, session.target.thread_count - 1)].tid else 0;
                     if (self.allocation_panel.open and event.plain() and event.kind == .press and event.shortcut == 'p') {
                         self.toggleAllocations(session);
@@ -1278,6 +1293,12 @@ pub const Workspace = struct {
     }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
         if (session.imported) |*state| return self.imported.draw(r, font, w, state);
+        if (session.allocations.capture) |capture| if (capture.archived and !self.allocation_archive_seen) {
+            self.allocation_archive_seen = true;
+            self.show_profile = false;
+            self.allocation_panel.show();
+            self.allocation_panel.setMode(.heap);
+        };
         self.refresh(session);
         self.animate(session);
         const state = session.target.state;
@@ -1448,7 +1469,7 @@ pub const Workspace = struct {
         } else try self.drawBottom(r, font, session, width, height, left, bottom, thread_color);
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
-        try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, .{ 1, 1, 1, 0.06 });
+        try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
         try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.generation });
         if (width >= 900) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
@@ -1459,6 +1480,14 @@ pub const Workspace = struct {
         try self.stop_panel.draw(r, font, width, height, session, inspect_tid);
         if (self.show_profile) try self.syscall_panel.draw(r, font, width, height, session.profile, self.flame.selection.filter);
         try self.allocation_panel.drawLive(r, font, width, height, &session.allocations, inspect_tid);
+        if (self.allocation_panel.open and self.allocation_panel.mode == .heap and self.allocation_panel.heap_pending) self.animating = true;
+        if (self.allocation_save_editor.open) {
+            const b = gpu.Rect{ .x = 32, .y = 102, .w = @max(0, width - 64), .h = 92 };
+            try style.box(r, b, theme.background, theme.focus, @splat(6));
+            try r.textFit(font, b.x + 10, b.y + 8, b.w - 20, "Save allocation archive: enter a new file path; Enter saves, Esc cancels", theme.text);
+            try r.textFit(font, b.x + 10, b.y + 34, b.w - 20, self.allocation_save_editor.text.slice(), theme.text);
+            try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.allocation_save_editor.message, theme.warm);
+        }
         if (session.process_tree) |tree| try self.process_panel.draw(tree, r, font, width, height);
     }
     /// Threads, stack and events, below the source view.

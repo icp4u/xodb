@@ -232,7 +232,9 @@ concrete API review remain open.
 Requested 2026-10-01. These are future tasks; implementation milestones and
 owners remain open.
 
-- [ ] **Skinnable, flexible display (near-term priority):** customizable colors, fonts, scaling and
+- [x] **Startup themes:** semantic colors, built-in presets and explicit JSON loading
+  across local, remote and offline GUI views. [Workflow and limits](THEMES.md).
+- [ ] **Skinnable, flexible display (near-term priority):** fonts, scaling and
   density; flexible pane arrangement, resizing, visibility and saved layouts.
   Review concrete interactions and preference keys before adopting them.
 - [x] **Initial AArch64 data watches:** native thread lifecycle, internal access

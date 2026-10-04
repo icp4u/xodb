@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     const args = try init.minimal.args.toSlice(a);
     var allocation_helper: ?[:0]const u8 = null;
     var config_path: ?[:0]const u8 = null;
+    var theme_path: ?[:0]const u8 = null;
     var headless = !build_options.gui;
     var mcp = false;
     var follow_forks = false;
@@ -67,6 +68,7 @@ pub fn main(init: std.process.Init) !void {
                 \\With --mcp, --source FILE explicitly shares that source file with remote viewers.
                 \\--allocation-helper PATH explicitly permits sudo -n to open allocation probes (see docs/ALLOCATIONS.md).
                 \\A opens allocations; P in that panel starts/stops capture on the selected thread.
+                \\--theme FILE|builtin:dark|builtin:light|builtin:contrast selects GUI colors at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
                 \\T cycles the next capture duration in the profile view; 0 in config/MCP means until stopped.
                 \\--debug-dir DIR replaces default /usr/lib/debug roots (repeatable); local companions are verified.
@@ -92,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--allocation-helper")) allocation_helper = args[i];
@@ -118,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--agent-scope")) agent_scope = std.meta.stringToEnum(@import("model/session.zig").AgentScope, args[i]) orelse return error.InvalidAgentScope;
             if (std.mem.eql(u8, arg, "--source")) source = args[i];
             if (std.mem.eql(u8, arg, "--font")) font_path = args[i];
+            if (std.mem.eql(u8, arg, "--theme")) theme_path = args[i];
             if (std.mem.eql(u8, arg, "--attach")) attach = try std.fmt.parseInt(i32, args[i], 10);
             if (std.mem.eql(u8, arg, "--frames")) frames = try std.fmt.parseInt(u64, args[i], 10);
         } else return error.UnknownArgument;
@@ -143,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
     } else @import("preferences.zig").Preferences{};
+    if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
     var launch_signals: [@import("target/linux.zig").launch_signal_numbers.len]std.posix.Sigaction = undefined;
     for (@import("target/linux.zig").launch_signal_numbers, &launch_signals) |number, *action| std.posix.sigaction(number, null, action);
     @import("target/linux.zig").launch_signals = launch_signals;
@@ -389,7 +393,21 @@ fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
         if (session.profile) |capture| {
             if (capture.collector != null) try session.stopProfile();
         }
-        _ = session.saveArchive(destination) catch |err| {
+        if (session.profile == null) {
+            session.allocations.stop(.manual);
+            const deadline = @import("target/linux.zig").now() + 10_000_000_000;
+            while (session.allocations.preparing() or session.allocations.collecting()) {
+                session.allocations.poll(false, null);
+                if (@import("target/linux.zig").now() > deadline) return error.AllocationArchiveShutdownDeadline;
+                _ = @import("c.zig").api.usleep(1000);
+            }
+            if (session.allocations.capture) |capture| while (capture.worker != null) {
+                capture.poll();
+                if (@import("target/linux.zig").now() > deadline) return error.AllocationArchiveShutdownDeadline;
+                _ = @import("c.zig").api.usleep(1000);
+            };
+        }
+        _ = (if (session.profile == null and session.allocations.capture != null) session.saveAllocationArchive(destination) else session.saveArchive(destination)) catch |err| {
             std.debug.print("xodb: requested archive save failed: {s}; {s}\n", .{ @errorName(err), destination });
             return err;
         };
@@ -419,6 +437,7 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
 }
 
 test {
+    std.testing.refAllDecls(@import("appearance.zig"));
     std.testing.refAllDecls(@import("remote/transport.zig"));
     std.testing.refAllDecls(@import("remote/client.zig"));
     std.testing.refAllDecls(@import("mcp/remote.zig"));
