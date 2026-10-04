@@ -212,7 +212,7 @@ pub const Workspace = struct {
     pub fn loadSource(self: *Workspace, path: []const u8) !void {
         if (std.mem.eql(u8, path, self.source_path) and self.source.len > 0) return;
         const a = std.heap.page_allocator;
-        const name = try a.dupeZ(u8, path);
+        const name = try a.dupeSentinel(u8, path, 0);
         errdefer a.free(name);
         const file = c.fopen(name, "rb") orelse return error.SourceFileUnavailable;
         defer _ = c.fclose(file);
@@ -507,13 +507,13 @@ pub const Workspace = struct {
         if (self.show_profile and self.timeline.motion(w.pointer_x, w.pointer_y)) w.dirty = true;
         self.step(w, session, false, 0);
         if (w.input.dropped != self.reported_dropped) {
-            std.debug.print("Input queue dropped {d} events ({d} total)\n", .{ w.input.dropped - self.reported_dropped, w.input.dropped });
+            @import("../m68k_log.zig").print("Input queue dropped {d} events ({d} total)\n", .{ w.input.dropped - self.reported_dropped, w.input.dropped });
             self.reported_dropped = w.input.dropped;
             self.status = "Some input was dropped; try again";
             w.dirty = true;
         }
         if (w.input.keymap_errors != self.reported_keymap_errors) {
-            std.debug.print("Input keymap errors: {d}\n", .{w.input.keymap_errors});
+            @import("../m68k_log.zig").print("Input keymap errors: {d}\n", .{w.input.keymap_errors});
             self.reported_keymap_errors = w.input.keymap_errors;
             self.status = "Keyboard layout unavailable; mouse controls still work";
             w.dirty = true;
@@ -1456,7 +1456,7 @@ pub const Workspace = struct {
             } else {
                 try pane(r, font, side, "REGISTERS", "changed since last stop");
                 if (self.regs) |regs| {
-                    inline for (std.meta.fields(linux.Registers), 0..) |field, i| {
+                    inline for (@typeInfo(linux.Registers).@"struct".field_names, 0..) |field, i| {
                         const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
                         const value = @field(regs, field.name);
                         const changed = if (self.stale_regs) |old| @field(old, field.name) != value else false;
@@ -1601,7 +1601,7 @@ const ThreadRows = struct {
         for (self.names[0..self.name_count]) |*entry| if (entry.id == id) return entry.bytes[0..entry.len];
         if (self.name_count == self.names.len) return "";
         var path: [64]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&path, "/proc/{d}/task/{d}/comm", .{ pid, tid }) catch return "";
+        const z = std.fmt.bufPrintSentinel(&path, "/proc/{d}/task/{d}/comm", .{ pid, tid }, 0) catch return "";
         const entry = &self.names[self.name_count];
         entry.* = .{ .id = id, .len = 0, .bytes = undefined };
         const fd = c.open(z.ptr, c.O_RDONLY | c.O_CLOEXEC);
@@ -1831,7 +1831,7 @@ test "timeline drag and lane click commit a flame filter; motion does not" {
     session.profile = capture;
     for (0..2) |i| {
         capture.threads[i] = .{ .debugger_id = i + 1, .perf = .{ .tid = @intCast(i + 41), .event_id = i + 1, .start_time_ticks = 1, .start_time_known = true } };
-        _ = try std.fmt.bufPrintZ(&capture.thread_names[i], "Thread {d}", .{i + 41});
+        _ = try std.fmt.bufPrintSentinel(&capture.thread_names[i], "Thread {d}", .{i + 41}, 0);
     }
     for (0..100) |i| try capture.samples.append(a, .{ .tid = @intCast(41 + i % 2), .tid_present = true, .time_ns = 1000 + i * 10_000, .time_present = true });
     // Invalid samples are excluded exactly as flames exclude them.
@@ -1924,7 +1924,7 @@ test "timeline adapter bounds maximum scheduling and debugger overlay history" {
     var samples: usize = 0;
     for (data.lanes) |lane| samples += lane.samples.len;
     try std.testing.expectEqual(profile.max_samples, samples);
-    std.debug.print("timeline adapter maximum history: {d} us; {d} switch events, {d} total overlays\n", .{ (linux.now() - begin) / 1000, capture.switches.retained, data.marks.len });
+    @import("../m68k_log.zig").print("timeline adapter maximum history: {d} us; {d} switch events, {d} total overlays\n", .{ (linux.now() - begin) / 1000, capture.switches.retained, data.marks.len });
 }
 
 test "duration shortcut works in a narrow profile view without changing target state" {

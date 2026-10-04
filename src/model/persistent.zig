@@ -200,9 +200,9 @@ pub const Manager = struct {
             if (thread.reason == .breakpoint and probe(session, id) != null and thread.breakpoint_address == probe(session, id).?.address) loader_hit = true;
         };
         if (loader_hit) {
-            var bytes: [32]u8 = undefined;
+            var bytes: [20]u8 = undefined;
             if (try session.target.readMemory(self.debug_address.?, &bytes) != bytes.len) return error.LoaderRendezvousUnreadable;
-            const state = std.mem.readInt(u32, bytes[24..28], .little);
+            const state = std.mem.readInt(u32, bytes[12..16], .big);
             if (state == 2) {
                 try self.remember(session);
                 for (self.entries.items) |item| if (probe(session, item.id)) |current| {

@@ -51,7 +51,7 @@ pub const Memory = struct {
     }
     pub fn capture(self: *Memory, session: anytype, address: u64, length: usize) !u64 {
         if (session.target.state != .stopped) return error.NotStopped;
-        if (length == 0 or length > max_snapshot or address == 0 or address > std.math.maxInt(u64) - length) return error.InvalidMemoryRange;
+        if (length == 0 or length > max_snapshot or address == 0 or address > @as(u64, std.math.maxInt(u64)) - length) return error.InvalidMemoryRange;
         const bytes = try A.alloc(u8, length);
         errdefer A.free(bytes);
         @memset(bytes, 0);
@@ -90,7 +90,7 @@ pub const Memory = struct {
     }
     pub fn startSearch(self: *Memory, session: anytype, address: u64, length: usize, pattern: []const u8) !u64 {
         if (session.target.state != .stopped) return error.NotStopped;
-        if (length == 0 or length > max_search or address == 0 or address > std.math.maxInt(u64) - length) return error.InvalidMemoryRange;
+        if (length == 0 or length > max_search or address == 0 or address > @as(u64, std.math.maxInt(u64)) - length) return error.InvalidMemoryRange;
         if (pattern.len == 0 or pattern.len > 256) return error.InvalidMemoryPattern;
         if (self.search) |search| if (search.state == .running) return error.MemorySearchBusy;
         var search = Search{ .id = self.next_id, .generation = session.target.generation, .image_epoch = session.target.image_epoch, .address = address, .length = length, .pattern_len = pattern.len };

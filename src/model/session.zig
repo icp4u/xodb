@@ -48,7 +48,7 @@ fn retainEvidence(a: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!
         },
         .@"struct" => |s| {
             var copy = value;
-            inline for (s.fields) |f| @field(copy, f.name) = try retainEvidence(a, @field(value, f.name));
+            inline for (s.field_names) |f| @field(copy, f) = try retainEvidence(a, @field(value, f));
             return copy;
         },
         .array => {
@@ -186,6 +186,7 @@ pub const Session = struct {
         return true;
     }
     fn pollAllocations(self: *Session) void {
+        if (linux.architecture == .m68k) return;
         var pending_valid = false;
         if (self.allocations.pendingContext()) |context| pending_valid =
             self.target.state == .stopped and self.target.pid == context.identity.pid and
@@ -225,7 +226,7 @@ pub const Session = struct {
         errdefer job.deinit();
         job.local_id = self.next_profile_id;
         job.reanalyze = reanalyze;
-        if (symbols) |root| job.symbols = try std.heap.page_allocator.dupeZ(u8, root);
+        if (symbols) |root| job.symbols = try std.heap.page_allocator.dupeSentinel(u8, root, 0);
         try job.start();
         self.offline = true;
         self.archive_job = job;
@@ -372,6 +373,7 @@ pub const Session = struct {
         return job.id;
     }
     pub fn pollArchive(self: *Session) void {
+        if (linux.architecture == .m68k) return;
         const job = self.archive_job orelse return;
         if (job.reaped or !job.done.load(.acquire)) return;
         job.join();
@@ -422,7 +424,7 @@ pub const Session = struct {
             } else {
                 self.allocations.capture = capture;
                 capture.requestAnalysis(false) catch {};
-                std.debug.print("xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
+                @import("../m68k_log.zig").print("xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
             }
             job.allocation_opened = null;
         }
@@ -431,10 +433,10 @@ pub const Session = struct {
             self.dropDerived();
             self.profile = self.artifact.?.capture;
             job.opened = null;
-            std.debug.print("xodb: opened archive: {d} samples, {d} annotations, {d} decoded allocation peak bytes; {s}\n", .{ self.profile.?.samples.len(), opened.source.annotation_count, opened.budget.peak, job.path });
+            @import("../m68k_log.zig").print("xodb: opened archive: {d} samples, {d} annotations, {d} decoded allocation peak bytes; {s}\n", .{ self.profile.?.samples.len(), opened.source.annotation_count, opened.budget.peak, job.path });
         }
-        if (job.failure) |err| std.debug.print("xodb: archive {s} failed: {s}; {s}\n", .{ @tagName(job.kind), @errorName(err), job.path });
-        if (job.publication) |result| std.debug.print("xodb: archive {s}: {d} bytes; error={s} cleanup_error={}; {s}\n", .{ @tagName(result.state), result.bytes, result.error_name orelse "none", result.cleanup_error, job.path });
+        if (job.failure) |err| @import("../m68k_log.zig").print("xodb: archive {s} failed: {s}; {s}\n", .{ @tagName(job.kind), @errorName(err), job.path });
+        if (job.publication) |result| @import("../m68k_log.zig").print("xodb: archive {s}: {d} bytes; error={s} cleanup_error={}; {s}\n", .{ @tagName(result.state), result.bytes, result.error_name orelse "none", result.cleanup_error, job.path });
     }
     pub fn finishArchive(self: *Session) !void {
         const job = self.archive_job orelse return;
@@ -454,8 +456,8 @@ pub const Session = struct {
         };
         return self.openProfile(request) catch |err| {
             self.profile_error = @errorName(err);
-            std.debug.print("xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.pid, self.profile_requested_threads });
-            if (self.profile_failure) |failure| std.debug.print("xodb: perf open: {s} syscall={s} errno={d} tid={d} opened_then_closed={d}; {s}\n", .{ @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.opened_then_closed, failure.detail });
+            @import("../m68k_log.zig").print("xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.pid, self.profile_requested_threads });
+            if (self.profile_failure) |failure| @import("../m68k_log.zig").print("xodb: perf open: {s} syscall={s} errno={d} tid={d} opened_then_closed={d}; {s}\n", .{ @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.opened_then_closed, failure.detail });
             return err;
         };
     }
@@ -547,6 +549,7 @@ pub const Session = struct {
         capture.enroll(thread.tid, thread.id, now);
     }
     fn pollProfile(self: *Session) void {
+        if (linux.architecture == .m68k) return;
         const capture = self.profile orelse return;
         if (capture.collector == null) return;
         self.profileMarkers(capture);
@@ -608,7 +611,7 @@ pub const Session = struct {
         var count: usize = 0;
         errdefer for (saved[0..count]) |arg| a.free(arg);
         for (argv, saved) |arg, *copy| {
-            copy.* = try a.dupeZ(u8, arg);
+            copy.* = try a.dupeSentinel(u8, arg, 0);
             count += 1;
         }
         try self.target.launch(saved);
@@ -712,8 +715,9 @@ pub const Session = struct {
         var bytes: [4096]u8 = undefined;
         const count: usize = @intCast(pc - symbol.address);
         if (try self.target.readMemory(symbol.address, bytes[0..count]) != count) return null;
-        var instructions: [1024]@import("disassembly.zig").Instruction = undefined;
-        const n = try @import("disassembly.zig").decode(bytes[0..count], symbol.address, &instructions);
+        const instructions = try a.alloc(@import("disassembly.zig").Instruction, 1024);
+        defer a.free(instructions);
+        const n = try @import("disassembly.zig").decode(bytes[0..count], symbol.address, instructions);
         if (n == 0) return null;
         const last = instructions[n - 1];
         if (last.address + last.size != pc) return null;
@@ -964,7 +968,7 @@ pub const Session = struct {
         self.persistent.poll(self) catch |err| {
             self.suppress_probe_resume = true;
             self.step_diagnostic = @errorName(err);
-            std.debug.print("xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
+            @import("../m68k_log.zig").print("xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
         };
         self.memory.poll(self);
         self.pollProfile();
@@ -1378,6 +1382,9 @@ pub const Session = struct {
         self.agent_scope = scope;
         self.target.generation += 1;
         self.record(.human, "set_agent_scope");
+    }
+    pub noinline fn initInto(self: *Session) void {
+        self.* = .{ .id = linux.now() };
     }
     pub fn init() Session {
         return .{ .id = linux.now() };

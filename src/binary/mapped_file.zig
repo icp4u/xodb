@@ -13,14 +13,14 @@ pub fn open(pid: i32, region: anytype) !c_int {
     if (region.inode == 0 or region.path.len == 0 or region.path[0] != '/' or std.mem.indexOfScalar(u8, region.path, 0) != null) return error.BinaryIdentityUnavailable;
     var path: [8192]u8 = undefined;
     if (pid > 0) {
-        var fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/map_files/{x}-{x}", .{ pid, region.start, region.end }), pid, region);
+        var fd = matching(try std.fmt.bufPrintSentinel(&path, "/proc/{d}/map_files/{x}-{x}", .{ pid, region.start, region.end }, 0), pid, region);
         if (fd >= 0) return fd;
-        fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/exe", .{pid}), pid, region);
+        fd = matching(try std.fmt.bufPrintSentinel(&path, "/proc/{d}/exe", .{pid}, 0), pid, region);
         if (fd >= 0) return fd;
-        fd = matching(try std.fmt.bufPrintZ(&path, "/proc/{d}/root{s}", .{ pid, region.path }), pid, region);
+        fd = matching(try std.fmt.bufPrintSentinel(&path, "/proc/{d}/root{s}", .{ pid, region.path }, 0), pid, region);
         if (fd >= 0) return fd;
     }
-    const fd = matching(try std.fmt.bufPrintZ(&path, "{s}", .{region.path}), pid, region);
+    const fd = matching(try std.fmt.bufPrintSentinel(&path, "{s}", .{region.path}, 0), pid, region);
     if (fd >= 0) return fd;
     return error.BinaryIdentityUnavailable;
 }

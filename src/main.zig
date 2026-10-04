@@ -1,4 +1,5 @@
 const std = @import("std");
+pub const std_options: std.Options = .{ .enable_segfault_handler = false, .allow_stack_tracing = false };
 const build_options = @import("build_options");
 const c = @import("c.zig").api;
 const ProcessTree = @import("model/process_tree.zig").Tree;
@@ -14,10 +15,18 @@ fn onSignal(signal: c_int) callconv(.c) void {
     quitting = signal;
 }
 
-pub fn main(init: std.process.Init) !void {
+pub fn main(init: std.process.Init.Minimal) void {
+    run(init) catch |err| {
+        @import("m68k_log.zig").print("xodb: {s}\n", .{@errorName(err)});
+        c._exit(1);
+    };
+}
+fn run(init: std.process.Init.Minimal) !void {
     const startup_started = linux.now();
-    const a = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(a);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const args = try init.args.toSlice(a);
     var allocation_helper: ?[:0]const u8 = null;
     var config_path: ?[:0]const u8 = null;
     var theme_path: ?[:0]const u8 = null;
@@ -54,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--help")) {
-            std.debug.print(
+            @import("m68k_log.zig").print(
                 \\xodb — native Linux debugger (M1 workstation baseline)
                 \\Usage: xodb [--source FILE] [--mcp] [--headless] [--attach PID | -- PROGRAM ARGS...]
                 \\       xodb [--font FILE] [--frames N]
@@ -147,7 +156,7 @@ pub fn main(init: std.process.Init) !void {
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint != null or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
-        std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
+        @import("m68k_log.zig").print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
     } else @import("preferences.zig").Preferences{};
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
@@ -162,12 +171,12 @@ pub fn main(init: std.process.Init) !void {
         if (comptime build_options.gui) {
             var remote_args: std.ArrayList([:0]const u8) = .empty;
             const endpoint: @import("remote/client.zig").Endpoint = if (connect) |address| .{ .tcp = address } else blk: {
-                try remote_args.appendSlice(a, &.{ remote_xodb, "--headless", "--mcp", "--agent-scope", if (scope_explicit) try a.dupeZ(u8, @tagName(agent_scope)) else "control" });
+                try remote_args.appendSlice(a, &.{ remote_xodb, "--headless", "--mcp", "--agent-scope", if (scope_explicit) try a.dupeSentinel(u8, @tagName(agent_scope), 0) else "control" });
                 if (source) |path| try remote_args.appendSlice(a, &.{ "--source", path });
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
                 for (debug_files.items) |path| try remote_args.appendSlice(a, &.{ "--debug-file", path });
-                if (initial_breakpoint) |name| try remote_args.appendSlice(a, &.{ "--break", try a.dupeZ(u8, name) });
+                if (initial_breakpoint) |name| try remote_args.appendSlice(a, &.{ "--break", try a.dupeSentinel(u8, name, 0) });
                 if (attach) |pid| {
                     try remote_args.appendSlice(a, &.{ "--attach", try std.fmt.allocPrintSentinel(a, "{d}", .{pid}, 0) });
                 } else {
@@ -185,13 +194,14 @@ pub fn main(init: std.process.Init) !void {
     defer connection.close();
     if (listen) |endpoint| connection = try @import("remote/transport.zig").acceptOne(endpoint, &quitting);
     const session = try a.create(Session);
-    session.* = Session.init();
+    session.initInto();
     session.agent_scope = agent_scope;
     session.profile_defaults = preferences.profile.config();
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
     defer session.deinit();
-    var tree = ProcessTree{ .limit = process_limit };
+    const tree = try a.create(ProcessTree);
+    tree.* = .{ .limit = process_limit };
     tree.init(session);
     defer tree.deinit();
     session.debug_files.automatic = preferences.symbols.automatic;
@@ -200,30 +210,30 @@ pub fn main(init: std.process.Init) !void {
     for (debug_dirs.items) |path| try session.debug_files.addRoot(path);
     for (source_maps.items) |spec| try session.source_maps.add(spec);
     for (debug_files.items) |path| session.debug_files.add(path) catch |err| {
-        std.debug.print("xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
+        @import("m68k_log.zig").print("xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
     };
     defer if (profile_out) |path| {
         if (session.profile) |capture| {
             if (capture.collector != null) capture.stop(.manual, linux.now());
             if (@import("profile/export.zig").save(capture, path, .{})) |result| {
-                std.debug.print("xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
-            } else |err| std.debug.print("xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
-        } else std.debug.print("xodb: profile export skipped: no capture; {s}\n", .{path});
+                @import("m68k_log.zig").print("xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
+            } else |err| @import("m68k_log.zig").print("xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
+        } else @import("m68k_log.zig").print("xodb: profile export skipped: no capture; {s}\n", .{path});
     };
-    defer if (record_path) |path| session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
+    defer if (record_path) |path| session.saveInvestigations(path) catch |err| @import("m68k_log.zig").print("Evidence export failed: {s}\n", .{@errorName(err)});
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
     if (open_profile) |path| try session.openImported(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
     if (attach) |pid| {
         const started = linux.now();
-        std.debug.print("xodb: attaching to pid={d}\n", .{pid});
+        @import("m68k_log.zig").print("xodb: attaching to pid={d}\n", .{pid});
         session.target.attach(pid) catch |err| {
-            std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
+            @import("m68k_log.zig").print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
             return err;
         };
-        std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.thread_count, @tagName(session.target.state), (linux.now() -| started) / 1_000_000 });
+        @import("m68k_log.zig").print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.thread_count, @tagName(session.target.state), (linux.now() -| started) / 1_000_000 });
     }
     if (launch.len > 0) try session.launch(launch);
     if (follow_forks) try session.target.setFollowProcesses(true);
@@ -344,7 +354,7 @@ pub fn main(init: std.process.Init) !void {
                     phase_started = linux.now();
                     renderer.init(&window) catch |err| {
                         workspace.status = @errorName(err);
-                        std.debug.print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
+                        @import("m68k_log.zig").print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
                         render_retry = current + 1_000_000_000;
                         continue;
                     };
@@ -354,7 +364,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const presented = renderFrame(&renderer, font, workspace, &window, active) catch |err| {
                     workspace.status = @errorName(err);
-                    std.debug.print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
+                    @import("m68k_log.zig").print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
                     // A failed submit may leave the frame fence unsignalled. Recreate
                     // the renderer instead of waiting on that fence next frame.
                     renderer.deinit();
@@ -386,7 +396,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (mcp and server.closed) "mcp_eof" else if (frames > 0 and rendered >= frames) "frame_limit" else "loop_exit";
         try finishRequestedArchive(session, capture_out);
-        std.debug.print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
+        @import("m68k_log.zig").print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
     }
 }
 fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
@@ -414,7 +424,7 @@ fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
             };
         }
         _ = (if (session.profile == null and session.allocations.capture != null) session.saveAllocationArchive(destination) else session.saveArchive(destination)) catch |err| {
-            std.debug.print("xodb: requested archive save failed: {s}; {s}\n", .{ @errorName(err), destination });
+            @import("m68k_log.zig").print("xodb: requested archive save failed: {s}; {s}\n", .{ @errorName(err), destination });
             return err;
         };
         try session.finishArchive();
@@ -422,7 +432,7 @@ fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
 }
 fn reportSlow(phase: []const u8, started: u64) void {
     const elapsed = linux.now() -| started;
-    if (elapsed >= 250_000_000) std.debug.print("xodb: slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
+    if (elapsed >= 250_000_000) @import("m68k_log.zig").print("xodb: slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
 }
 fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, session: *Session) !bool {
     var started = linux.now();
@@ -433,7 +443,7 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
         // Geometry exhaustion or allocation failure can leave a partial frame;
         // presenting it is safe and the next frame reports the error.
         workspace.status = @errorName(err);
-        std.debug.print("Workspace draw failed: {s}; target retained\n", .{@errorName(err)});
+        @import("m68k_log.zig").print("Workspace draw failed: {s}; target retained\n", .{@errorName(err)});
     };
     reportSlow("workspace draw/inspection", started);
     started = linux.now();
@@ -493,3 +503,5 @@ test {
 test {
     _ = @import("profile/imported_test.zig");
 }
+
+pub const panic = std.debug.FullPanic(@import("m68k_log.zig").panicMessage);

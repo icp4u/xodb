@@ -19,21 +19,7 @@
 const std = @import("std");
 const records = @import("records.zig");
 
-pub const c = @cImport({
-    @cUndef("_FORTIFY_SOURCE"); // glibc fortified fcntl wrappers cannot be translated in ReleaseSafe
-    @cDefine("_GNU_SOURCE", "1");
-    @cDefine("BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD", "1"); // translate-c needs one ioctl declaration
-    @cInclude("errno.h");
-    @cInclude("fcntl.h");
-    @cInclude("stdio.h");
-    @cInclude("unistd.h");
-    @cInclude("string.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/mman.h");
-    @cInclude("sys/syscall.h");
-    @cInclude("linux/perf_event.h");
-    @cInclude("time.h");
-});
+pub const c = @import("../generated/linux_perf.zig");
 
 pub const max_threads: u16 = 1024;
 pub const max_data_pages: u8 = 64;
@@ -218,7 +204,7 @@ const Slot = struct {
 
 pub const Collector = struct {
     allocator: std.mem.Allocator,
-    slots: [max_threads]Slot = [_]Slot{.{}} ** max_threads,
+    slots: [max_threads]Slot = @as([max_threads]Slot, @splat(.{})),
     slot_count: u16 = 0,
     next_slot: usize = 0,
     samples: []records.Sample,
@@ -387,6 +373,7 @@ pub const Collector = struct {
     }
 
     pub fn drain(self: *Collector) Drain {
+        if (@import("builtin").cpu.arch == .m68k) return .{ .samples = &.{}, .sides = &.{}, .user_states = &.{}, .user_stack = &.{}, .status = .closed, .skipped_unknown = 0, .reason = "m68k perf unsupported" };
         if (self.closed) return .{ .samples = &.{}, .sides = &.{}, .user_states = &.{}, .user_stack = &.{}, .status = .closed, .skipped_unknown = 0, .reason = "collector is closed" };
         var used_samples: usize = 0;
         var used_sides: usize = 0;
@@ -683,6 +670,7 @@ fn mapRing(fd: c_int, data_pages: u8, page: usize) ?[]u8 {
 const View = struct { data: []u8, head: u64 };
 
 fn slotView(slot: *Slot, page: usize) ?View {
+    if (@import("builtin").cpu.arch == .m68k) return null;
     if (!slot.mapped or slot.map.len < off_data_size + 8) return null;
     const head = @atomicLoad(u64, field(slot.map, off_data_head), .acquire);
     var data_off = readNum(u64, slot.map[off_data_offset..][0..8]);
@@ -891,7 +879,7 @@ test "enroll held newborn transactionally, reject budget and reuse, retire drain
     const collector = switch (opened) {
         .collector => |value| value,
         .failed => |failure| {
-            std.debug.print("perf enrollment test: {s} errno={d} {s}\n", .{ failure.syscall, failure.errno, failure.detail });
+            @import("../m68k_log.zig").print("perf enrollment test: {s} errno={d} {s}\n", .{ failure.syscall, failure.errno, failure.detail });
             return error.TestUnexpectedResult;
         },
     };

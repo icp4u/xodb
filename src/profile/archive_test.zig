@@ -187,7 +187,7 @@ test "archive largest evidence counts and long paths fit measured independent bu
     try std.testing.expectEqual(@as(usize, 1023), opened.capture.history.entries.items[0].path.len);
     var view = try opened.capture.graphDirect(a, .{ .tid = 4100 });
     defer view.deinit();
-    std.debug.print("archive budget: bytes={d} encoded_peak={d} decoded_peak={d} encode_ms={d} decode_and_graph_ms={d} filter_ms={d} nodes={d} excluded_samples={d}\n", .{ bytes.len, encoding.peak, opened.budget.peak, (encoded - started) / 1_000_000, (decoded - encoded) / 1_000_000, (now() - decoded) / 1_000_000, opened.capture.offline_graph.?.nodes.items.len, opened.capture.offline_graph.?.rejected });
+    @import("../m68k_log.zig").print("archive budget: bytes={d} encoded_peak={d} decoded_peak={d} encode_ms={d} decode_and_graph_ms={d} filter_ms={d} nodes={d} excluded_samples={d}\n", .{ bytes.len, encoding.peak, opened.budget.peak, (encoded - started) / 1_000_000, (decoded - encoded) / 1_000_000, (now() - decoded) / 1_000_000, opened.capture.offline_graph.?.nodes.items.len, opened.capture.offline_graph.?.rejected });
     if (c.getenv("XODB_ARCHIVE_BUDGET_PATH")) |destination| {
         const result = archive.publish(std.mem.span(destination), bytes, null);
         try std.testing.expectEqual(.published, result.state);

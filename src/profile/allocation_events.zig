@@ -442,7 +442,7 @@ test "maximum record store and projection have a measured memory bound" {
     calls.deinit(a);
     store.deinit(a);
     try std.testing.expectEqual(@as(usize, 0), budget.used);
-    std.debug.print("allocation events/projection/analysis peak: {d} bytes / {d} records\n", .{ budget.peak, max_records });
+    @import("../m68k_log.zig").print("allocation events/projection/analysis peak: {d} bytes / {d} records\n", .{ budget.peak, max_records });
 }
 
 test "throttle and decode boundaries mark open calls; finished evidence is immutable" {

@@ -111,7 +111,7 @@ pub const Capture = struct {
     status: Stop = .collecting,
     // Unique exceptional conditions, in observation order (rings are not
     // globally time ordered). The first remains the primary stop reason.
-    stop_reasons: [@typeInfo(Stop).@"enum".fields.len]Stop = undefined,
+    stop_reasons: [@typeInfo(Stop).@"enum".field_names.len]Stop = undefined,
     stop_reason_count: usize = 0,
     failure: ?perf.Failure = null,
     diagnostic: []const u8 = "",
@@ -184,7 +184,7 @@ pub const Capture = struct {
                 for (debugger_ids, 0..) |debugger_id, i| {
                     self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).? };
                     self.cpu_before[i] = activity.read(pid, config.tids[i]);
-                    _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{config.tids[i]}) catch unreachable;
+                    _ = std.fmt.bufPrintSentinel(&self.thread_names[i], "Thread {d}", .{config.tids[i]}, 0) catch unreachable;
                 }
                 return .{ .capture = self };
             },
@@ -208,7 +208,7 @@ pub const Capture = struct {
         const i = self.thread_count;
         self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).?, .enrolled_ns = now };
         self.cpu_before[i] = activity.read(self.pid, tid);
-        _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{tid}) catch unreachable;
+        _ = std.fmt.bufPrintSentinel(&self.thread_names[i], "Thread {d}", .{tid}, 0) catch unreachable;
         self.thread_count += 1;
         self.accepted.threads = @intCast(self.thread_count);
         self.revision += 1;
@@ -359,16 +359,16 @@ pub const Capture = struct {
             .collecting, .manual => return,
             else => {},
         }
-        std.debug.print("xodb: profile #{d} stopped: {s}; pid={d} elapsed_ms={d} duration_limit_ms={d} samples={d} sample_limit={d} threads={d} mappings={d} lost={d} unknown={d} ring_bytes={d}; {s}\n", .{ self.id, @tagName(self.status), self.pid, (self.ended_ns.? -| self.started_ns) / 1_000_000, self.config.duration_ms, self.samples.len(), self.config.sample_limit, self.thread_count, self.mapping_events, self.lost_samples, self.unknown_records, self.accepted.ring_data_bytes, self.diagnostic });
+        @import("../m68k_log.zig").print("xodb: profile #{d} stopped: {s}; pid={d} elapsed_ms={d} duration_limit_ms={d} samples={d} sample_limit={d} threads={d} mappings={d} lost={d} unknown={d} ring_bytes={d}; {s}\n", .{ self.id, @tagName(self.status), self.pid, (self.ended_ns.? -| self.started_ns) / 1_000_000, self.config.duration_ms, self.samples.len(), self.config.sample_limit, self.thread_count, self.mapping_events, self.lost_samples, self.unknown_records, self.accepted.ring_data_bytes, self.diagnostic });
         if (self.stop_reason_count > 1) {
-            std.debug.print("xodb: profile #{d} additional stop conditions:", .{self.id});
-            for (self.stop_reasons[1..self.stop_reason_count]) |reason| std.debug.print(" {s}", .{@tagName(reason)});
-            std.debug.print("\n", .{});
+            @import("../m68k_log.zig").print("xodb: profile #{d} additional stop conditions:", .{self.id});
+            for (self.stop_reasons[1..self.stop_reason_count]) |reason| @import("../m68k_log.zig").print(" {s}", .{@tagName(reason)});
+            @import("../m68k_log.zig").print("\n", .{});
         }
-        if (self.syscalls.enabled) std.debug.print("xodb: profile #{d} syscalls: retained={d} lost={d} throttles={d} discarded={d} invalid={d}\n", .{ self.id, self.syscalls.items.items.len, self.syscalls.lost, self.syscalls.throttles, self.syscalls.discarded, self.syscalls.invalid });
-        if (self.config.context_switch) std.debug.print("xodb: profile #{d} scheduling: retained={d} discarded={d} invalid={d} storage_bytes={d}\n", .{ self.id, self.switches.retained, self.switches.discarded, self.switches.invalid, self.switches.storageBytes() });
-        if (self.scope_change) |change| std.debug.print("xodb: profile #{d} task creation: pid={d} tid={d} parent_pid={d} parent_tid={d} same_process={}\n", .{ self.id, change.pid, change.tid, change.parent_pid, change.parent_tid, change.pid == self.pid });
-        if (self.failure) |failure| std.debug.print("xodb: profile #{d} collector failure: {s} syscall={s} errno={d} tid={d}; {s}\n", .{ self.id, @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.detail });
+        if (self.syscalls.enabled) @import("../m68k_log.zig").print("xodb: profile #{d} syscalls: retained={d} lost={d} throttles={d} discarded={d} invalid={d}\n", .{ self.id, self.syscalls.items.items.len, self.syscalls.lost, self.syscalls.throttles, self.syscalls.discarded, self.syscalls.invalid });
+        if (self.config.context_switch) @import("../m68k_log.zig").print("xodb: profile #{d} scheduling: retained={d} discarded={d} invalid={d} storage_bytes={d}\n", .{ self.id, self.switches.retained, self.switches.discarded, self.switches.invalid, self.switches.storageBytes() });
+        if (self.scope_change) |change| @import("../m68k_log.zig").print("xodb: profile #{d} task creation: pid={d} tid={d} parent_pid={d} parent_tid={d} same_process={}\n", .{ self.id, change.pid, change.tid, change.parent_pid, change.parent_tid, change.pid == self.pid });
+        if (self.failure) |failure| @import("../m68k_log.zig").print("xodb: profile #{d} collector failure: {s} syscall={s} errno={d} tid={d}; {s}\n", .{ self.id, @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.detail });
     }
     /// Publish the compact sample first, then attach its owned raw state. A
     /// refused sample must not leave an orphan in the separately bounded store.
@@ -401,7 +401,7 @@ pub const Capture = struct {
                 self.noteStop(.decode_error, "sample user-state bounds are invalid");
                 continue;
             };
-            if (!was_exhausted and self.user_state.exhausted) std.debug.print("xodb: profile #{d} stack retention budget reached: used={d} budget={d} first_missing_sample={d}; CPU sampling continues, later stack dumps are not retained; collection overhead continues\n", .{ self.id, self.user_state.used, self.config.user_stack_budget_bytes, self.firstSkippedSample().? });
+            if (!was_exhausted and self.user_state.exhausted) @import("../m68k_log.zig").print("xodb: profile #{d} stack retention budget reached: used={d} budget={d} first_missing_sample={d}; CPU sampling continues, later stack dumps are not retained; collection overhead continues\n", .{ self.id, self.user_state.used, self.config.user_stack_budget_bytes, self.firstSkippedSample().? });
         }
         if (self.samples.len() == self.samples.max_samples) self.noteStop(.capacity, "sample storage limit reached");
     }
@@ -725,7 +725,7 @@ pub const Capture = struct {
         const bytes = @min(image.mapping.len - offset, frame_.lookup_address - frame_.address + 128);
         const disasm = @import("../model/disassembly.zig");
         const decoded = try a.alloc(disasm.Instruction, 4096);
-        const count = try disasm.decode(image.mapping[offset..][0..bytes], frame_.address, decoded);
+        const count = try disasm.decode(image.mapping[@intCast(offset)..][0..@intCast(bytes)], frame_.address, decoded);
         var first: usize = 0;
         for (decoded[0..count], 0..) |instruction, i| {
             if (instruction.address <= frame_.lookup_address) first = i;
@@ -988,7 +988,7 @@ test "maximum capture and mapping budgets preserve counts and bound identity sto
     capture.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = 1, .session_id = 1, .generation = 0, .image_epoch = 0, .pid = 1, .started_ns = 1, .config = .{}, .accepted = undefined, .thread_count = 1, .collector = null, .images = modules.Modules.init(a) };
     defer capture.deinit();
     capture.threads[0] = .{ .debugger_id = 1, .perf = .{ .tid = 1, .event_id = 1, .start_time_ticks = 1, .start_time_known = true } };
-    _ = try std.fmt.bufPrintZ(&capture.thread_names[0], "Thread 1", .{});
+    _ = try std.fmt.bufPrintSentinel(&capture.thread_names[0], "Thread 1", .{}, 0);
     for (0..mappings.max_opening) |i| {
         const start = 4096 + i * 64;
         try capture.history.opening(a, .{ .start = start, .end = start + 48 });
@@ -1010,7 +1010,7 @@ test "maximum capture and mapping budgets preserve counts and bound identity sto
     try std.testing.expectEqual(@as(u64, max_samples), graph_.nodes.items[0].inclusive + graph_.rejected);
     try std.testing.expect(graph_.nodes.items.len <= flame.max_nodes and graph_.rejected > 0);
     try std.testing.expect(capture.cache.count() <= max_frames_cached);
-    std.debug.print("mapping graph bound ({s}): {d} ms / {d} nodes / {d} accepted / {d} excluded\n", .{ @tagName(@import("builtin").mode), elapsed / 1_000_000, graph_.nodes.items.len, graph_.nodes.items[0].inclusive, graph_.rejected });
+    @import("../m68k_log.zig").print("mapping graph bound ({s}): {d} ms / {d} nodes / {d} accepted / {d} excluded\n", .{ @tagName(@import("builtin").mode), elapsed / 1_000_000, graph_.nodes.items.len, graph_.nodes.items[0].inclusive, graph_.rejected });
 }
 
 test "ring sizing preserves the total budget for every supported thread count" {
@@ -1031,7 +1031,7 @@ test "CPU timeline and flames share filters, invalid sample handling, and final-
     defer capture.deinit();
     for (0..2) |i| {
         capture.threads[i] = .{ .debugger_id = i + 10, .perf = .{ .tid = @intCast(i + 1), .event_id = i + 1, .start_time_ticks = 1, .start_time_known = true } };
-        _ = try std.fmt.bufPrintZ(&capture.thread_names[i], "Thread {d}", .{i + 1});
+        _ = try std.fmt.bufPrintSentinel(&capture.thread_names[i], "Thread {d}", .{i + 1}, 0);
     }
     for ([_]u64{ 100, 109, 110, 150, 199, 200 }, 0..) |time, i| {
         try capture.samples.append(a, .{ .ip = 4096, .ip_present = true, .tid = @intCast(1 + i % 2), .tid_present = true, .time_ns = time, .time_present = true, .cpu_mode = .user });

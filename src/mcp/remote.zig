@@ -100,8 +100,8 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     }
     view.watch_hits = hits.items;
     const regs = try session.target.registers(view.tid);
-    const register_rows = try a.alloc(wire.Register, std.meta.fields(@TypeOf(regs)).len);
-    inline for (std.meta.fields(@TypeOf(regs)), 0..) |field, i| register_rows[i] = .{ .name = field.name, .value = @field(regs, field.name) };
+    const register_rows = try a.alloc(wire.Register, @typeInfo(@TypeOf(regs)).@"struct".field_names.len);
+    inline for (@typeInfo(@TypeOf(regs)).@"struct".field_names, 0..) |field, i| register_rows[i] = .{ .name = field, .value = @field(regs, field) };
     view.registers = register_rows;
     const frames = session.stack(a, view.tid, 64) catch |err| blk: {
         try diagnostics.append(a, .{ .component = "stack", .message = @errorName(err) });

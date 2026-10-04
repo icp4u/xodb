@@ -7,25 +7,7 @@ const builtin = @import("builtin");
 const wire = @import("allocation_perf.zig");
 const perf = @import("linux_perf.zig");
 const hooks = @import("allocation_hooks.zig");
-const c = @cImport({
-    @cUndef("_FORTIFY_SOURCE");
-    @cDefine("_GNU_SOURCE", "1");
-    @cDefine("BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD", "1");
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("errno.h");
-    @cInclude("stdio.h");
-    @cInclude("sys/stat.h");
-    @cInclude("sys/ioctl.h");
-    @cInclude("sys/mman.h");
-    @cInclude("sys/syscall.h");
-    @cInclude("linux/perf_event.h");
-    @cInclude("time.h");
-    @cInclude("signal.h");
-    @cInclude("sys/wait.h");
-    @cInclude("dirent.h");
-    @cInclude("dlfcn.h");
-});
+const c = @import("../generated/linux_allocations.zig");
 pub const max_threads = 32;
 pub const data_pages = 16;
 pub const Source = hooks.Source;
@@ -111,6 +93,7 @@ pub const Collector = struct {
     /// output items are still returned: publish them before marking the gap.
     /// Disable all groups, then drain to more=false before claiming complete.
     pub fn drain(self: *Collector, out: []Item) Drain {
+        if (@import("builtin").cpu.arch == .m68k) return .{ .failure = fail("allocations", 0, -1, "m68k allocations unsupported") };
         if (self.failed) return .{ .failure = fail("allocations.drain", 0, -1, "collector has a latched decode/ring failure") };
         if (out.len == 0) return .{ .failure = fail("allocations.drain", 0, -1, "empty output buffer") };
         var result = Drain{};
@@ -204,7 +187,7 @@ fn read(path: [:0]const u8, bytes: []u8) ![]const u8 {
 fn heldThread(pid: i32, tid: i32) !void {
     var path: [80]u8 = undefined;
     var bytes: [8192]u8 = undefined;
-    const data = try read(try std.fmt.bufPrintZ(&path, "/proc/{d}/task/{d}/status", .{ pid, tid }), &bytes);
+    const data = try read(try std.fmt.bufPrintSentinel(&path, "/proc/{d}/task/{d}/status", .{ pid, tid }, 0), &bytes);
     var tgid = false;
     var stopped = false;
     var lines = std.mem.splitScalar(u8, data, '\n');
@@ -242,7 +225,7 @@ fn executableOffset(fd: c_int, offset: u64, stat: c.struct_stat) !void {
 }
 fn openEvent(tid: i32, group: c_int, pmu: u32, ret: u64, file: File, leader: bool, callstacks: bool) c_int {
     var path: [64]u8 = undefined;
-    const pinned = std.fmt.bufPrintZ(&path, "/proc/self/fd/{d}", .{file.fd}) catch unreachable;
+    const pinned = std.fmt.bufPrintSentinel(&path, "/proc/self/fd/{d}", .{file.fd}, 0) catch unreachable;
     var attr = std.mem.zeroes(perf.Attr);
     attr.size = 112;
     attr.typ = pmu;
@@ -499,13 +482,13 @@ test "ordinary-user owned setup leaves descriptor counts unchanged on the observ
             try std.testing.expectEqual(.permission, failure.kind);
             try std.testing.expectEqualStrings("allocations.perf_event_open", failure.syscall);
             try std.testing.expect(failure.errno == c.EACCES or failure.errno == c.EPERM);
-            std.debug.print("allocation setup: permission denied (errno={d}); live register semantics NOT tested\n", .{failure.errno});
+            @import("../m68k_log.zig").print("allocation setup: permission denied (errno={d}); live register semantics NOT tested\n", .{failure.errno});
         },
         .collector => |collector| {
             const stopped = collector.stop();
             collector.close();
             try std.testing.expect(stopped == null);
-            std.debug.print("allocation setup: ordinary-user open/close succeeded; child remained stopped, register semantics NOT tested\n", .{});
+            @import("../m68k_log.zig").print("allocation setup: ordinary-user open/close succeeded; child remained stopped, register semantics NOT tested\n", .{});
         },
     }
     try std.testing.expectEqual(before, try fdCount());

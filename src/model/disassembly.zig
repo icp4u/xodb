@@ -11,9 +11,9 @@ pub fn decodeFlow(bytes: []const u8, address: u64, out: []Instruction) !usize {
 }
 fn decodeImpl(bytes: []const u8, address: u64, out: []Instruction, detail: bool) !usize {
     if (out.len == 0 or bytes.len == 0) return 0;
-    if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+    if (address > @as(u64, std.math.maxInt(u64)) - bytes.len) return error.InvalidAddress;
     var handle: c.csh = 0;
-    if (c.cs_open(if (architecture == .aarch64) c.CS_ARCH_ARM64 else c.CS_ARCH_X86, if (architecture == .aarch64) c.CS_MODE_ARM else c.CS_MODE_64, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
+    if (c.cs_open(if (architecture == .m68k) c.CS_ARCH_M68K else if (architecture == .aarch64) c.CS_ARCH_ARM64 else c.CS_ARCH_X86, if (architecture == .m68k) @as(c_uint, c.CS_MODE_BIG_ENDIAN) | c.CS_MODE_M68K_040 else if (architecture == .aarch64) c.CS_MODE_ARM else c.CS_MODE_64, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
     defer _ = c.cs_close(&handle);
     if (detail and c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_ON) != c.CS_ERR_OK) return error.DisassemblerDetailUnavailable;
     var instructions: [*c]c.cs_insn = null;
@@ -25,7 +25,14 @@ fn decodeImpl(bytes: []const u8, address: u64, out: []Instruction, detail: bool)
         if (!detail) continue;
         if (raw.detail == null) return error.DisassemblerDetailUnavailable;
         const groups = raw.detail.*.groups[0..raw.detail.*.groups_count];
-        if (architecture == .aarch64) {
+        if (architecture == .m68k) {
+            out[i].flow = if (raw.id == c.M68K_INS_RTS or raw.id == c.M68K_INS_RTE or raw.id == c.M68K_INS_RTR) .ret
+                else if (raw.id == c.M68K_INS_JSR or raw.id == c.M68K_INS_BSR) .call
+                else if (raw.id == c.M68K_INS_JMP or raw.id == c.M68K_INS_BRA) .jump
+                else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_JUMP) != null) .conditional
+                else if (raw.id == c.M68K_INS_TRAP or raw.id == c.M68K_INS_ILLEGAL) .trap
+                else .ordinary;
+        } else if (architecture == .aarch64) {
             const arm = raw.detail.*.unnamed_0.arm64;
             out[i].flow = if (raw.id == c.ARM64_INS_BRK or raw.id == c.ARM64_INS_HLT)
                 .trap

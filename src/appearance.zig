@@ -42,7 +42,7 @@ pub const Colors = struct {
 };
 pub const Theme = struct {
     colors: Colors = .{},
-    threads: [16]Color = .{ rgb(0xebb624), rgb(0x26d0d2), rgb(0xb48ef0), rgb(0xf078b4), rgb(0xa4d65e), rgb(0xf59a52), rgb(0x5eb5f7), rgb(0x5ee0b0) } ++ .{rgb(0x26d0d2)} ** 8,
+    threads: [16]Color = .{ rgb(0xebb624), rgb(0x26d0d2), rgb(0xb48ef0), rgb(0xf078b4), rgb(0xa4d65e), rgb(0xf59a52), rgb(0x5eb5f7), rgb(0x5ee0b0) } ++ @as([8]Color, @splat(rgb(0x26d0d2))),
     thread_count: usize = 8,
     id: [65]u8 = @splat(0),
     pub fn name(self: *const Theme) []const u8 {
@@ -94,7 +94,7 @@ pub fn builtin(name: []const u8) !Theme {
             .flame_import_unknown = rgb(0xc8cdd5),
             .flame_text = rgb(0x272015),
         };
-        theme.threads = .{ rgb(0x835b00), rgb(0x006973), rgb(0x7149a3), rgb(0xa6386d), rgb(0x4c7019), rgb(0x9b4e16), rgb(0x226da6), rgb(0x217353) } ++ .{rgb(0x006973)} ** 8;
+        theme.threads = .{ rgb(0x835b00), rgb(0x006973), rgb(0x7149a3), rgb(0xa6386d), rgb(0x4c7019), rgb(0x9b4e16), rgb(0x226da6), rgb(0x217353) } ++ @as([8]Color, @splat(rgb(0x006973)));
     } else if (std.mem.eql(u8, name, "builtin:contrast")) {
         theme.colors = .{
             .background = rgb(0x000000),
@@ -177,9 +177,9 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8, diagnostic: *Diagnostic) !
         while (it.next()) |entry| {
             diagnostic.field("colors", entry.key_ptr.*);
             var found = false;
-            inline for (std.meta.fields(Colors)) |field| {
-                if (std.mem.eql(u8, field.name, entry.key_ptr.*)) {
-                    @field(theme.colors, field.name) = try color(entry.value_ptr.*);
+            inline for (@typeInfo(Colors).@"struct".field_names) |field| {
+                if (std.mem.eql(u8, field, entry.key_ptr.*)) {
+                    @field(theme.colors, field) = try color(entry.value_ptr.*);
                     found = true;
                 }
             }
@@ -233,7 +233,7 @@ pub fn init(selection: ?[:0]const u8) void {
     const selected = selection orelse return;
     var diagnostic = Diagnostic{};
     active = load(std.heap.page_allocator, selected, &diagnostic) catch |err| {
-        std.debug.print("xodb: Theme failed: {s} / {s}; using built-in dark; {s}\n", .{ @errorName(err), diagnostic.text(), selected });
+        @import("m68k_log.zig").print("xodb: Theme failed: {s} / {s}; using built-in dark; {s}\n", .{ @errorName(err), diagnostic.text(), selected });
         return;
     };
 }
@@ -285,7 +285,7 @@ test "theme input caps and duplicate fields are enforced" {
     try std.testing.expectError(error.ThemeTooLarge, parse(std.testing.allocator, huge, &d));
     try std.testing.expectError(error.DuplicateField, parse(std.testing.allocator, "{\"version\":1,\"version\":1}", &d));
     try std.testing.expectError(error.DuplicateField, parse(std.testing.allocator, "{\"version\":1,\"colors\":{\"text\":\"#ffffff\",\"text\":\"#000000\"}}", &d));
-    const many = "{\"version\":1,\"palettes\":{\"threads\":[" ++ "\"#112233\"," ** 16 ++ "\"#112233\"]}}";
+    const many = "{\"version\":1,\"palettes\":{\"threads\":[" ++ "\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\",\"#112233\"," ++ "\"#112233\"]}}";
     try std.testing.expectError(error.InvalidThemePalette, parse(std.testing.allocator, many, &d));
 }
 

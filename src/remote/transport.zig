@@ -1,21 +1,6 @@
 //! A single MCP byte stream. TCP never binds implicitly; SSH owns one child.
 const std = @import("std");
-pub const c = @cImport({
-    @cUndef("_FORTIFY_SOURCE");
-    @cDefine("_GNU_SOURCE", "1");
-    @cDefine("BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD", "1"); // translate-c needs one ioctl declaration
-    @cInclude("unistd.h");
-    @cInclude("fcntl.h");
-    @cInclude("errno.h");
-    @cInclude("poll.h");
-    @cInclude("signal.h");
-    @cInclude("spawn.h");
-    @cInclude("sys/socket.h");
-    @cInclude("sys/wait.h");
-    @cInclude("arpa/inet.h");
-    @cInclude("netinet/tcp.h");
-    @cInclude("time.h");
-});
+pub const c = @import("../generated/transport.zig");
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn bind(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn accept4(c_int, ?*c.sockaddr, ?*c.socklen_t, c_int) c_int;
@@ -40,7 +25,7 @@ const Address = struct {
         var host = text[0..colon];
         const ipv6 = host.len > 2 and host[0] == '[' and host[host.len - 1] == ']';
         if (ipv6) host = host[1 .. host.len - 1];
-        const z = try a.dupeZ(u8, host);
+        const z = try a.dupeSentinel(u8, host, 0);
         defer a.free(z);
         var result = Address{ .len = if (ipv6) @sizeOf(c.sockaddr_in6) else @sizeOf(c.sockaddr_in), .family = if (ipv6) c.AF_INET6 else c.AF_INET };
         if (ipv6) {
@@ -108,7 +93,7 @@ pub const Stream = struct {
         if (host.len == 0 or host[0] == '-' or std.mem.indexOfScalar(u8, host, 0) != null) return error.InvalidSshHost;
         const command = try shellCommand(a, arguments);
         defer a.free(command);
-        const host_z = try a.dupeZ(u8, host);
+        const host_z = try a.dupeSentinel(u8, host, 0);
         defer a.free(host_z);
         const argv = [_:null]?[*:0]const u8{ "ssh", "-T", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", host_z.ptr, command.ptr };
         var fds: [2]c_int = undefined;
@@ -136,7 +121,7 @@ pub fn shellCommand(allocator: std.mem.Allocator, args: []const [:0]const u8) ![
         } else try bytes.append(allocator, ch);
         try bytes.append(allocator, '\'');
     }
-    return allocator.dupeZ(u8, bytes.items);
+    return allocator.dupeSentinel(u8, bytes.items, 0);
 }
 /// Accept exactly one connection before touching the target. No daemon/reconnect.
 pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stream {
@@ -148,7 +133,7 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
     if (bind(fd, @ptrCast(&address.storage), address.len) < 0) return error.RemoteBindFailed;
     if (c.listen(fd, 1) < 0) return error.RemoteListenFailed;
-    std.debug.print("xodb: listening on {s}; one client, plaintext TCP without authentication\n", .{endpoint});
+    @import("../m68k_log.zig").print("xodb: listening on {s}; one client, plaintext TCP without authentication\n", .{endpoint});
     while (quitting.* == 0) {
         var p = c.pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(&p, 1, 50) <= 0) continue;
@@ -158,7 +143,7 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
             return error.RemoteAcceptFailed;
         }
         tuneTcp(client);
-        std.debug.print("xodb: remote client connected; listener closed\n", .{});
+        @import("../m68k_log.zig").print("xodb: remote client connected; listener closed\n", .{});
         return .{ .fd = client };
     }
     return error.Cancelled;

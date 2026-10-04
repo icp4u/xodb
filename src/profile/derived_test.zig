@@ -41,11 +41,11 @@ fn build(n: usize, budget: u32) !*model.Capture {
     capture.user_state = try model.sample_state.Store.init(a, n, budget);
     capture.thread_count = 2;
     capture.threads[1] = .{ .debugger_id = 2, .perf = .{ .tid = 4101, .event_id = 2, .start_time_ticks = 1, .start_time_known = true } };
-    _ = try std.fmt.bufPrintZ(&capture.thread_names[1], "Thread 4101", .{});
+    _ = try std.fmt.bufPrintSentinel(&capture.thread_names[1], "Thread 4101", .{}, 0);
     var bytes: [16]u8 = @splat(0);
     std.mem.writeInt(u64, bytes[0..8], parent + 2, .little);
     for (0..n) |i| {
-        const case: Case = @enumFromInt(i % @typeInfo(Case).@"enum".fields.len);
+        const case: Case = @enumFromInt(i % @typeInfo(Case).@"enum".field_names.len);
         const pc = switch (case) {
             .signal => sym.at(image, "saved_signal"),
             .cycle => sym.at(image, "saved_cycle"),

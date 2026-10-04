@@ -19,15 +19,7 @@
 //! and the wl_keyboard interface in wayland.xml. No code was copied.
 
 const std = @import("std");
-const c = @cImport({
-    @cDefine("_GNU_SOURCE", "1");
-    @cInclude("unistd.h");
-    @cInclude("sys/mman.h");
-    @cInclude("xkbcommon/xkbcommon.h");
-    @cInclude("xkbcommon/xkbcommon-compose.h");
-    @cInclude("malloc.h"); // mallinfo2 and stdio are used only by the leak test
-    @cInclude("stdio.h");
-});
+const c = @import("../generated/input.zig");
 
 pub const capacity = 64;
 pub const Mods = packed struct(u8) { shift: bool = false, ctrl: bool = false, alt: bool = false, logo: bool = false, caps: bool = false, num: bool = false, _: u2 = 0 };
@@ -254,7 +246,7 @@ pub const Keyboard = struct {
         if (self.trace) {
             var name: [64]u8 = @splat(0);
             _ = c.xkb_keysym_get_name(event.shortcut, &name, name.len);
-            std.debug.print("input {s} code={d} sym=0x{x} shortcut={s} text=\"{s}\" mods={s}{s}{s}{s} t={d}\n", .{ @tagName(event.kind), event.code, event.sym, std.mem.sliceTo(&name, 0), event.text(), if (event.mods.shift) "S" else "", if (event.mods.ctrl) "C" else "", if (event.mods.alt) "A" else "", if (event.mods.logo) "L" else "", event.time_ms });
+            @import("../m68k_log.zig").print("input {s} code={d} sym=0x{x} shortcut={s} text=\"{s}\" mods={s}{s}{s}{s} t={d}\n", .{ @tagName(event.kind), event.code, event.sym, std.mem.sliceTo(&name, 0), event.text(), if (event.mods.shift) "S" else "", if (event.mods.ctrl) "C" else "", if (event.mods.alt) "A" else "", if (event.mods.logo) "L" else "", event.time_ms });
         }
         if (self.count == capacity) {
             self.dropped += 1;

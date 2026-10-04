@@ -5,3 +5,4 @@ zig-out/
 .work/
 *.un~
 __pycache__/
+/src/generated/*.zig

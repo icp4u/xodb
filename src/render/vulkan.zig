@@ -17,7 +17,7 @@ fn info(comptime T: type, kind: c.VkStructureType) T {
 }
 fn check(result: c.VkResult) !void {
     if (result != c.VK_SUCCESS) {
-        std.debug.print("Vulkan result: {d}\n", .{result});
+        @import("../m68k_log.zig").print("Vulkan result: {d}\n", .{result});
         return error.VulkanFailed;
     }
 }
@@ -30,11 +30,11 @@ fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime 
         var count: u32 = 0;
         const counted = @call(.auto, query, args ++ .{ &count, null });
         if (counted != c.VK_SUCCESS and counted != c.VK_INCOMPLETE) {
-            std.debug.print("xodb: {s} count failed: {d}\n", .{ label, counted });
+            @import("../m68k_log.zig").print("xodb: {s} count failed: {d}\n", .{ label, counted });
             return error.VulkanFailed;
         }
         if (count > 4096) {
-            std.debug.print("xodb: {s} count {d} exceeds enumeration limit 4096\n", .{ label, count });
+            @import("../m68k_log.zig").print("xodb: {s} count {d} exceeds enumeration limit 4096\n", .{ label, count });
             return error.VulkanEnumerationLimit;
         }
         if (count == 0) return .empty;
@@ -46,12 +46,12 @@ fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime 
         }
         if (result != c.VK_SUCCESS or count > values.len) {
             a.free(values);
-            std.debug.print("xodb: {s} enumeration failed: {d} (count {d})\n", .{ label, result, count });
+            @import("../m68k_log.zig").print("xodb: {s} enumeration failed: {d} (count {d})\n", .{ label, result, count });
             return error.VulkanFailed;
         }
         return .{ .items = values[0..count], .capacity = values.len };
     }
-    std.debug.print("xodb: {s} enumeration still incomplete after four attempts\n", .{label});
+    @import("../m68k_log.zig").print("xodb: {s} enumeration still incomplete after four attempts\n", .{label});
     return error.VulkanEnumerationUnstable;
 }
 
@@ -140,7 +140,7 @@ pub const Renderer = struct {
             }
         }
         if (self.physical == null) return error.NoPresentDevice;
-        std.debug.print("Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
+        @import("../m68k_log.zig").print("Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
         const priority: f32 = 1;
         var queue_info = info(c.VkDeviceQueueCreateInfo, c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
         queue_info.queueFamilyIndex = self.family;
@@ -565,7 +565,7 @@ pub const Renderer = struct {
         const next = pen + @as(f32, @floatFromInt(pos.x_advance)) / 64;
         // Report degradation once and use the reserved missing-glyph box.
         const g = font.glyph(id) catch |err| fallback: {
-            if (!font.degraded) std.debug.print("Text rendering degraded: {s}; using missing-glyph boxes\n", .{@errorName(err)});
+            if (!font.degraded) @import("../m68k_log.zig").print("Text rendering degraded: {s}; using missing-glyph boxes\n", .{@errorName(err)});
             font.degraded = true;
             break :fallback font.glyph(0) catch return next;
         };
@@ -721,17 +721,17 @@ const Wait = struct {
         const current = now();
         if (self.since == null) self.since = current;
         if (!self.reported and current -| self.since.? >= 1_000_000_000) {
-            std.debug.print("xodb: render {s} not ready for {d} ms; frame deferred, event loop remains active\n", .{ label, (current -| self.since.?) / 1_000_000 });
+            @import("../m68k_log.zig").print("xodb: render {s} not ready for {d} ms; frame deferred, event loop remains active\n", .{ label, (current -| self.since.?) / 1_000_000 });
             self.reported = true;
         }
     }
     fn complete(self: *Wait, label: []const u8) void {
-        if (self.reported) std.debug.print("xodb: render {s} ready after {d} ms\n", .{ label, (now() -| self.since.?) / 1_000_000 });
+        if (self.reported) @import("../m68k_log.zig").print("xodb: render {s} ready after {d} ms\n", .{ label, (now() -| self.since.?) / 1_000_000 });
         self.* = .{};
     }
 };
 
 fn reportSlowCall(name: []const u8, started: u64) void {
     const elapsed = Wait.now() -| started;
-    if (elapsed >= 250_000_000) std.debug.print("xodb: slow Vulkan {s}: {d} ms\n", .{ name, elapsed / 1_000_000 });
+    if (elapsed >= 250_000_000) @import("../m68k_log.zig").print("xodb: slow Vulkan {s}: {d} ms\n", .{ name, elapsed / 1_000_000 });
 }

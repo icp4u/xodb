@@ -103,7 +103,7 @@ pub const Tree = struct {
                 entry.session.cancelStep();
                 entry.session.step_diagnostic = @errorName(err);
                 if (entry.last_generation != entry.session.target.generation)
-                    std.debug.print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.pid, @errorName(err) });
+                    @import("../m68k_log.zig").print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.pid, @errorName(err) });
             };
             if (entry.last_generation != entry.session.target.generation) {
                 self.revision += 1;
@@ -121,7 +121,7 @@ pub const Tree = struct {
             self.adopt(parent, birth) catch |err| {
                 entry.failed_generation = parent.target.generation;
                 entry.admission_error = @errorName(err);
-                std.debug.print("xodb: process #{d} child pid={d} held: {s}\n", .{ parent.process_id, birth.pid, @errorName(err) });
+                @import("../m68k_log.zig").print("xodb: process #{d} child pid={d} held: {s}\n", .{ parent.process_id, birth.pid, @errorName(err) });
                 self.revision += 1;
                 return;
             };
@@ -134,7 +134,7 @@ pub const Tree = struct {
         if (!parent.target.follow_processes) return error.ProcessFollowingDisabled;
         if (self.count == self.limit) return error.ProcessLimit;
         const child = try A.create(model.Session);
-        child.* = model.Session.init();
+        child.initInto();
         errdefer {
             child.deinit();
             A.destroy(child);
@@ -148,7 +148,7 @@ pub const Tree = struct {
         // Clone logical policies before the kernel child is transferred: any
         // allocation failure leaves that birth safely owned by its parent.
         try parent.persistent.copyForFork(&child.persistent);
-        for (parent.probes.rules, &child.probes.rules) |rule, *copy| {
+        for (&parent.probes.rules, &child.probes.rules) |rule, *copy| {
             copy.* = rule;
             copy.matched_hits = 0;
             copy.last_error = null;
@@ -177,7 +177,7 @@ pub const Tree = struct {
         self.entries[self.count] = .{ .id = child.process_id, .parent = parent.process_id, .session = child, .kind = event.kind };
         self.count += 1;
         self.revision += 1;
-        std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.pid, @tagName(event.kind), parent.process_id });
+        @import("../m68k_log.zig").print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.pid, @tagName(event.kind), parent.process_id });
     }
     pub fn deinit(self: *Tree) void {
         // Release all target links before freeing any session. A failed detach
@@ -196,7 +196,7 @@ pub const Tree = struct {
                 // Main is shutting down. Keep storage alive for the root's
                 // final cleanup retry; a leaked shutdown allocation is safer
                 // than destroying a still-linked target.
-                std.debug.print("xodb: process #{d} cleanup incomplete; retaining target storage for final shutdown retry\\n", .{child.process_id});
+                @import("../m68k_log.zig").print("xodb: process #{d} cleanup incomplete; retaining target storage for final shutdown retry\\n", .{child.process_id});
                 continue;
             }
             child.deinit();

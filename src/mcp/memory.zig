@@ -43,8 +43,8 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         try wire.fields(args, &.{ "id", "baseline", "start", "limit" });
         const snapshot = try session.memory.find(try wire.number(args, "id", null));
         const baseline = if (args.object.get("baseline") != null) try session.memory.find(try wire.number(args, "baseline", null)) else null;
-        const start = try wire.number(args, "start", 0);
-        const limit = try wire.number(args, "limit", 256);
+        const start = std.math.cast(usize, try wire.number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try wire.number(args, "limit", 256)) orelse return error.InvalidArguments;
         if (limit == 0 or limit > 4096 or start > snapshot.bytes.len) return error.InvalidArguments;
         const end = @min(snapshot.bytes.len, start + limit);
         const hex = try a.alloc(u8, (end - start) * 2);
@@ -63,8 +63,8 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
     const search = if (session.memory.search) |*v| v else return error.NoMemorySearch;
     if (search.id != id) return error.StaleMemorySearch;
     if (cancel and search.state == .running) search.state = .cancelled;
-    const start = try wire.number(args, "start", 0);
-    const limit = try wire.number(args, "limit", 64);
+    const start = std.math.cast(usize, try wire.number(args, "start", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try wire.number(args, "limit", 64)) orelse return error.InvalidArguments;
     if (start > search.count or limit == 0 or limit > 128) return error.InvalidArguments;
     const end = @min(search.count, start + limit);
     const hits = try a.alloc([]const u8, end - start);

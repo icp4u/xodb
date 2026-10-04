@@ -25,7 +25,7 @@ pub const Core = struct {
         var self = Core{ .arena = std.heap.ArenaAllocator.init(a) };
         errdefer self.deinit();
         const alloc = self.arena.allocator();
-        const z = try alloc.dupeZ(u8, path);
+        const z = try alloc.dupeSentinel(u8, path, 0);
         self.path = z;
         self.fd = c.open(z, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
         if (self.fd < 0) return error.CoreFileUnavailable;

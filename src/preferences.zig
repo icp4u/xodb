@@ -48,10 +48,10 @@ pub fn themeSelection(a: std.mem.Allocator, prefs: *const Preferences, config: ?
     if (cli) |path| return path;
     const path = prefs.appearance.theme.slice();
     if (path.len == 0) return null;
-    if (std.mem.startsWith(u8, path, "builtin:") or std.fs.path.isAbsolute(path)) return try a.dupeZ(u8, path);
+    if (std.mem.startsWith(u8, path, "builtin:") or std.fs.path.isAbsolute(path)) return try a.dupeSentinel(u8, path, 0);
     const joined = try std.fs.path.join(a, &.{ if (config) |file| std.fs.path.dirname(file) orelse "." else ".", path });
     defer a.free(joined);
-    return try a.dupeZ(u8, joined);
+    return try a.dupeSentinel(u8, joined, 0);
 }
 pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     if (bytes.len > max_bytes) return error.PreferencesTooLarge;

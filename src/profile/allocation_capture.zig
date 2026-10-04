@@ -224,7 +224,7 @@ pub const Capture = struct {
         self.worker_failure = null;
         self.failure = null;
         self.budget.denied = false;
-        self.worker = std.Thread.spawn(.{}, run, .{self}) catch |err| {
+        self.worker = unsupportedThread(.{}, run, .{self}) catch |err| {
             self.state = .unavailable;
             self.failure = err;
             return err;
@@ -592,7 +592,7 @@ test "maximum allocation capture worker stays inside the configured total budget
     try std.testing.expectEqual(@as(u64, lifetime.max_calls), capture.summary().?.outstanding_count);
     const memory = capture.memory().?;
     try std.testing.expect(memory.peak <= default_memory_limit);
-    std.debug.print("allocation capture worker peak: {d} bytes / {d} records; evidence, metadata and analysis included\n", .{ memory.peak, events.max_records });
+    @import("../m68k_log.zig").print("allocation capture worker peak: {d} bytes / {d} records; evidence, metadata and analysis included\n", .{ memory.peak, events.max_records });
 }
 fn createFailureCase(a: Allocator) !void {
     const capture = try Capture.create(a, test_id, .{}, &test_threads, &test_hooks, 100);
@@ -676,3 +676,5 @@ test "allocation archive retains missing returns and loss without manufacturing 
         try std.testing.expect(opened.summary() == null);
     }
 }
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

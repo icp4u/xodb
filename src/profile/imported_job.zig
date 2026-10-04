@@ -14,7 +14,7 @@ pub const Job = struct {
     thread: ?std.Thread = null,
     failure: ?anyerror = null,
     fn start(self: *Job) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
     }
     fn run(self: *Job) void {
         self.execute() catch |err| {
@@ -109,7 +109,7 @@ pub const State = struct {
         const job = try a.create(Job);
         job.* = .{};
         errdefer job.deinit();
-        job.path = try a.dupeZ(u8, path);
+        job.path = try a.dupeSentinel(u8, path, 0);
         try job.start();
         return .{ .load_job = job };
     }
@@ -124,7 +124,7 @@ pub const State = struct {
                 job.profile = null;
                 job.view = null;
             }
-            if (self.failure) |err| std.debug.print("xodb: profile import failed: {s}\n", .{@errorName(err)}) else std.debug.print("xodb: imported {s}: {d} samples, {d} {s}, labels=simpleperf\n", .{ self.profile.?.wire.architecture, self.full.?.samples, self.full.?.total_period, self.profile.?.wire.unit });
+            if (self.failure) |err| @import("../m68k_log.zig").print("xodb: profile import failed: {s}\n", .{@errorName(err)}) else @import("../m68k_log.zig").print("xodb: imported {s}: {d} samples, {d} {s}, labels=simpleperf\n", .{ self.profile.?.wire.architecture, self.full.?.samples, self.full.?.total_period, self.profile.?.wire.unit });
             job.deinit();
             self.load_job = null;
             self.serial += 1;
@@ -160,3 +160,5 @@ pub const State = struct {
         self.* = .{};
     }
 };
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

@@ -12,8 +12,8 @@ pub fn call(a: std.mem.Allocator, session: *model.Session, name: []const u8, arg
     const tree = session.process_tree orelse return error.NoProcessTree;
     if (std.mem.eql(u8, name, "get_processes")) {
         try wire.fields(args, &.{ "start", "limit" });
-        const start = try wire.number(args, "start", 0);
-        const limit = try wire.number(args, "limit", 32);
+        const start = std.math.cast(usize, try wire.number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try wire.number(args, "limit", 32)) orelse return error.InvalidArguments;
         if (start > tree.count or limit == 0 or limit > 128) return error.InvalidArguments;
         const end = start + @min(limit, tree.count - start);
         var rows: std.ArrayList(Value) = .empty;

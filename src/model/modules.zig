@@ -83,7 +83,7 @@ pub const Modules = struct {
         self.core_source = core;
         self.immutable = true;
         if (executable) |name| {
-            const z = try self.allocator.dupeZ(u8, name);
+            const z = try self.allocator.dupeSentinel(u8, name, 0);
             defer self.allocator.free(z);
             const real = c.realpath(z, null) orelse return error.CoreExecutableUnavailable;
             defer c.free(real);
@@ -96,7 +96,7 @@ pub const Modules = struct {
             defer _ = c.munmap(data.ptr, data.len);
             const image = try elf.Image.parse(data);
             const id = image.buildId() orelse return error.CoreExecutableBuildIdMissing;
-            const path = try self.allocator.dupeZ(u8, std.mem.span(real));
+            const path = try self.allocator.dupeSentinel(u8, std.mem.span(real), 0);
             errdefer self.allocator.free(path);
             self.core_executable = .{ .path = path, .id = try self.allocator.dupe(u8, id) };
         }
@@ -146,7 +146,7 @@ pub const Modules = struct {
         if (pid <= 0) return;
         self.pid = pid;
         var path_buf: [80]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buf, "/proc/{d}/maps", .{pid});
+        const path = try std.fmt.bufPrintSentinel(&path_buf, "/proc/{d}/maps", .{pid}, 0);
         const file = c.fopen(path, "r") orelse return error.ProcessMapsUnavailable;
         defer _ = c.fclose(file);
         var new_regions: std.ArrayList(Region) = .empty;
@@ -202,7 +202,7 @@ pub const Modules = struct {
             self.allocator.free(path);
             return;
         };
-        std.debug.print("xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
+        @import("../m68k_log.zig").print("xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
     }
     /// A perf record describes one range at one file offset, not the current
     /// collection of VMAs. Do not combine it with the opening/live map snapshot.
@@ -277,7 +277,7 @@ pub const Modules = struct {
         }
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
-        const path = try self.allocator.dupeZ(u8, selected_path);
+        const path = try self.allocator.dupeSentinel(u8, selected_path, 0);
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
@@ -309,10 +309,10 @@ pub const Modules = struct {
         module.* = .{ .id = self.next_id, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable };
         if (self.debug_files) |files| {
             module.debug_file = (if (entry.offset == 0) files.discover(&image, path) else files.matching(&image)) catch |err| blk: {
-                std.debug.print("xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
+                @import("../m68k_log.zig").print("xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
                 break :blk null;
             };
-            if (module.debug_file) |file| std.debug.print("xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
+            if (module.debug_file) |file| @import("../m68k_log.zig").print("xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
         }
         self.next_id += 1;
         try self.loaded.append(self.allocator, module);

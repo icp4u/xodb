@@ -49,7 +49,7 @@ pub fn read(pid: i32, tid: i32) ?Ticks {
     // /proc/PID/stat aggregates a thread group. This path gives only the selected
     // task, including when TID == PID, avoiding double-counting the leader.
     var buffer: [96]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buffer, "/proc/{d}/task/{d}/stat", .{ pid, tid }) catch return null;
+    const path = std.fmt.bufPrintSentinel(&buffer, "/proc/{d}/task/{d}/stat", .{ pid, tid }, 0) catch return null;
     const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) return null;
     defer _ = c.close(fd);

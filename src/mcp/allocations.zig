@@ -89,7 +89,7 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
         const capture = current orelse return error.NoAllocationCapture;
         capture.poll();
         const key = try expected(capture, args);
-        const ordinal = try wire.number(args, "allocation_span", null);
+        const ordinal = std.math.cast(usize, try wire.number(args, "allocation_span", null)) orelse return error.InvalidArguments;
         if (ordinal >= capture.store.spans.items.len) return error.InvalidArguments;
         const span = capture.store.spans.items[@intCast(ordinal)];
         const id = if (span.entry_record) |entry| capture.store.records.items[entry].event.data.sample.stack else null;
@@ -109,8 +109,8 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
     capture.poll();
     if (is_status) return status(a, capture);
     const key = try expected(capture, args);
-    const start = try wire.number(args, "start", 0);
-    const limit = try wire.number(args, "limit", 64);
+    const start = std.math.cast(usize, try wire.number(args, "start", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try wire.number(args, "limit", 64)) orelse return error.InvalidArguments;
     const filter = model.Filter{
         .thread_id = if (args.object.contains("thread_id")) try wire.number(args, "thread_id", null) else null,
         .from_ns = try wire.number(args, "from_ns", 0),

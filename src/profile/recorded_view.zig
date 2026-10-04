@@ -80,7 +80,7 @@ pub const Job = struct {
         return self;
     }
     pub fn start(self: *Job) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
     }
     fn run(self: *Job) void {
         const started = now();
@@ -160,7 +160,7 @@ pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture 
     try copy.images.loaded.ensureTotalCapacity(allocator, source.images.loaded.items.len);
     for (source.images.loaded.items) |image| {
         if (!image.immutable) return error.ProfileViewMutableImage;
-        const path = try allocator.dupeZ(u8, image.path);
+        const path = try allocator.dupeSentinel(u8, image.path, 0);
         errdefer allocator.free(path);
         const private = try allocator.create(modules.Module);
         // Deliberately read only immutable fields; archive/source workers may
@@ -206,7 +206,7 @@ pub const State = struct {
     fn failed(self: *State, key: Key, err: anyerror) void {
         self.failure = .{ .key = key, .err = err };
         self.serial += 1;
-        std.debug.print("xodb: recorded flame view failed: {s}; capture={d} revision={d}; change filter or explicitly retry\n", .{ @errorName(err), key.capture_id, key.revision });
+        @import("../m68k_log.zig").print("xodb: recorded flame view failed: {s}; capture={d} revision={d}; change filter or explicitly retry\n", .{ @errorName(err), key.capture_id, key.revision });
     }
     pub fn retained(self: *const State, key: Key) bool {
         if (self.failure) |failure| if (failure.key.eql(key)) return true;
@@ -264,3 +264,5 @@ pub const State = struct {
         capture.deinit();
     }
 };
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

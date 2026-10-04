@@ -145,7 +145,7 @@ pub const Sample = struct {
     cpu_mode: CpuMode = .unknown,
     callchain: Callchain = .absent,
     frame_count: u16 = 0,
-    frames: [max_frames]ChainItem = [_]ChainItem{.{}} ** max_frames,
+    frames: [max_frames]ChainItem = @as([max_frames]ChainItem, @splat(.{})),
     /// Index into the drain's user-state table, plus one. Zero means this
     /// sample has no user registers or stack. The kernel callchain above is
     /// a separate record and is never filled from the user stack.
@@ -160,7 +160,7 @@ pub const Sample = struct {
 pub const UserState = struct {
     abi: u64 = 0,
     regs_mask: u64 = 0,
-    regs: [max_user_regs]u64 = [_]u64{0} ** max_user_regs,
+    regs: [max_user_regs]u64 = @as([max_user_regs]u64, @splat(0)),
     regs_present: bool = false,
     stack_size: u64 = 0,
     stack_dyn: u64 = 0,
@@ -199,7 +199,7 @@ pub const Side = struct {
     event_id: u64 = 0,
     stream_id: u64 = 0,
     exec: bool = false,
-    name: [name_cap]u8 = [_]u8{0} ** name_cap,
+    name: [name_cap]u8 = @as([name_cap]u8, @splat(0)),
     name_len: u8 = 0,
     name_truncated: bool = false,
     address: u64 = 0,
@@ -213,7 +213,7 @@ pub const Side = struct {
     flags: u32 = 0,
     build_id: bool = false,
     maps_parse_timeout: bool = false,
-    path: [path_cap]u8 = [_]u8{0} ** path_cap,
+    path: [path_cap]u8 = @as([path_cap]u8, @splat(0)),
     path_len: u8 = 0,
     path_truncated: bool = false,
     raw_type: u32 = 0,

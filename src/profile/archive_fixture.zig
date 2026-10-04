@@ -21,7 +21,7 @@ fn blank(a: std.mem.Allocator, threads: usize) !*Capture {
     capture.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = 7, .session_id = 3, .generation = 42, .image_epoch = 2, .pid = 4100, .started_ns = base_ns, .ended_ns = base_ns + 2_000_000_000, .observed_until_ns = base_ns + 1_999_000_000, .config = .{ .frequency_hz = 997, .duration_ms = 10000, .context_switch = true }, .accepted = .{ .event = .task_clock, .requested_frequency_hz = 997, .kernel_max_sample_rate = 100000, .kernel_max_stack = 127, .exclude_kernel = true, .mmap_data = true, .callchain = true, .include_weight = false, .sample_type = 0x1a7, .sample_max_stack = 64, .clockid = 1, .ring_data_bytes = 262144, .data_offset = 4096, .mmap_version = 0, .threads = @intCast(threads), .context_switch = true }, .thread_count = threads, .collector = null, .images = modules.Modules.init(a), .status = .manual, .revision = 99, .debugger_sequence = 77 };
     for (0..threads) |i| {
         capture.threads[i] = .{ .debugger_id = i + 1, .perf = .{ .tid = @intCast(4100 + i), .event_id = 900 + i, .start_time_ticks = 123456 + i, .start_time_known = i % 3 != 2 } };
-        _ = std.fmt.bufPrintZ(&capture.thread_names[i], "Thread {d}", .{4100 + i}) catch unreachable;
+        _ = std.fmt.bufPrintSentinel(&capture.thread_names[i], "Thread {d}", .{4100 + i}, 0) catch unreachable;
         if (i % 2 == 0) capture.cpu_before[i] = .{ .start_time = 123456 + i, .user = 10 * i, .kernel = i };
     }
     return capture;
@@ -30,7 +30,7 @@ fn blank(a: std.mem.Allocator, threads: usize) !*Capture {
 /// Maps an ELF file as a capture-time image, the way capture opening does.
 pub fn addElf(capture: *Capture, path: []const u8, start: u64, end: u64) !*modules.Module {
     const a = capture.images.allocator;
-    const name = try a.dupeZ(u8, path);
+    const name = try a.dupeSentinel(u8, path, 0);
     errdefer a.free(name);
     const fd = c.open(name.ptr, c.O_RDONLY | c.O_CLOEXEC);
     if (fd < 0) return error.FixtureElfMissing;

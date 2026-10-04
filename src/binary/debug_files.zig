@@ -34,7 +34,7 @@ pub const Files = struct {
     pub fn addRoot(self: *Files, path: []const u8) !void {
         if (self.roots.items.len >= 16) return error.DebugDirectoryLimit;
         if (path.len == 0 or path.len > 4096 or path[0] != '/' or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidDebugDirectory;
-        const copy = try self.allocator.dupeZ(u8, path);
+        const copy = try self.allocator.dupeSentinel(u8, path, 0);
         errdefer self.allocator.free(copy);
         try self.roots.append(self.allocator, copy);
     }
@@ -47,7 +47,7 @@ pub const Files = struct {
         errdefer _ = c.munmap(bytes.ptr, bytes.len);
         const image = try elf.Image.parse(bytes);
         if (image.sectionByName(".debug_info") == null and image.sectionByName(".zdebug_info") == null) return error.DebugFileMissingDwarf;
-        const name = try self.allocator.dupeZ(u8, path);
+        const name = try self.allocator.dupeSentinel(u8, path, 0);
         errdefer self.allocator.free(name);
         const file = try self.allocator.create(File);
         file.* = .{ .path = name, .image = image, .bytes = bytes, .build_id = image.buildId() orelse &.{} };
@@ -79,7 +79,7 @@ pub const Files = struct {
             if (!std.mem.eql(u8, id, file.build_id)) return error.DebugFileBuildIdMismatch;
         } else if (crc == null) return error.DebugFileMissingBuildId;
         if (crc) |expected| {
-            if (file.crc == null) file.crc = std.hash.crc.Crc32.hash(file.bytes);
+            if (file.crc == null) file.crc = std.hash.crc.@"CRC-32/ISO-HDLC".hash(file.bytes);
             if (file.crc.? != expected) return error.DebugFileCrcMismatch;
         }
     }
@@ -102,7 +102,7 @@ pub const Files = struct {
     }
     fn attempt(self: *Files, runtime: *const elf.Image, path: [:0]const u8, crc: ?u32) ?*const File {
         return self.candidate(runtime, path, crc) catch |err| {
-            std.debug.print("xodb: automatic debug companion rejected: {s}; {s}\n", .{ @errorName(err), path });
+            @import("../m68k_log.zig").print("xodb: automatic debug companion rejected: {s}; {s}\n", .{ @errorName(err), path });
             return null;
         };
     }
@@ -131,7 +131,7 @@ pub const Files = struct {
         if (std.mem.indexOfScalar(u8, name, '/') != null or std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return error.InvalidDebugLink;
         const crc_at = (end + 1 + 3) & ~@as(usize, 3);
         if (crc_at > bytes.len or bytes.len - crc_at != 4) return error.InvalidDebugLink;
-        const crc = std.mem.readInt(u32, bytes[crc_at..][0..4], .little);
+        const crc = std.mem.readInt(u32, bytes[crc_at..][0..4], .big);
         const dir = std.fs.path.dirname(path) orelse return null;
         for ([_][]const u8{ "", ".debug/" }) |middle| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}/{s}{s}", .{ dir, middle, name }, 0), crc)) |file| return file;
         if (dir.len > 0 and dir[0] == '/') for (roots) |root| if (self.attempt(image, try std.fmt.allocPrintSentinel(a, "{s}{s}/{s}", .{ root, dir, name }, 0), crc)) |file| return file;

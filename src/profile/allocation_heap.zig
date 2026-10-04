@@ -91,7 +91,7 @@ pub const Job = struct {
         const self = try allocator.create(Job);
         errdefer allocator.destroy(self);
         self.* = .{ .key = .{ .capture = capture.key(), .filter = filter, .metric = metric }, .capture = capture, .budget = .{ .backing = allocator, .limit = 64 * 1024 * 1024 } };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
         return self;
     }
     fn run(self: *Job) void {
@@ -109,3 +109,5 @@ pub const Job = struct {
         allocator.destroy(self);
     }
 };
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

@@ -4,8 +4,8 @@ const wire = @import("profile.zig");
 const model = @import("../profile/comparison.zig");
 pub fn call(a: std.mem.Allocator, session: *@import("../model/session.zig").Session, args: std.json.Value) !std.json.Value {
     try wire.fields(args, &.{ "start", "limit", "view" });
-    const start = try wire.number(args, "start", 0);
-    const limit = try wire.number(args, "limit", 64);
+    const start = std.math.cast(usize, try wire.number(args, "start", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try wire.number(args, "limit", 64)) orelse return error.InvalidArguments;
     if (start > model.max_nodes or limit == 0 or limit > 256) return error.InvalidArguments;
     const mode = args.object.get("view") orelse std.json.Value{ .string = "functions" };
     if (mode != .string or (!std.mem.eql(u8, mode.string, "functions") and !std.mem.eql(u8, mode.string, "flames"))) return error.InvalidArguments;

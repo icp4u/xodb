@@ -100,7 +100,7 @@ pub const Server = struct {
             const core = if (session.target.core) |*core| core else return error.NotCoreSession;
             const m = try wire.number(args, "mapping_start", 0);
             const p = try wire.number(args, "segment_start", 0);
-            const limit = try wire.number(args, "limit", 16);
+            const limit = std.math.cast(usize, try wire.number(args, "limit", 16)) orelse return error.InvalidArguments;
             if (m > core.mappings.items.len or p > core.segments.items.len or limit == 0 or limit > 32) return error.InvalidArguments;
             const me = m + @min(limit, core.mappings.items.len - m);
             const pe = p + @min(limit, core.segments.items.len - p);
@@ -173,7 +173,7 @@ pub const Server = struct {
             try session.refreshMaps();
             return asValue(a, .{ .regions = session.modules.regions.items, .load_failures = session.modules.load_failures.items });
         }
-        if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpoints[0..session.target.breakpoint_count], .watchpoints = session.target.watchpoints, .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = @import("../target/linux.zig").architecture == .x86_64 });
+        if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpoints[0..session.target.breakpoint_count], .watchpoints = session.target.watchpoints, .policies = session.probes.rules[0..], .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = @import("../target/linux.zig").architecture == .x86_64 });
         if (std.mem.eql(u8, name, "get_investigation")) return asValue(a, (try session.investigation(number(member(args, "id")) orelse return error.InvalidArguments)).*);
         if (std.mem.eql(u8, name, "get_audit")) return asValue(a, .{ .actions = session.audit[0..session.audit_count] });
         const execution_names = [_][]const u8{ "continue", "interrupt", "step_instruction", "step_over_instruction", "step_source", "step_over", "investigate_write", "set_breakpoint", "remove_breakpoint", "set_watchpoint", "remove_watchpoint" };
@@ -297,7 +297,7 @@ pub const Server = struct {
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
             const regs = try session.target.registers(@intCast(tid));
             var values: std.json.ObjectMap = .{};
-            inline for (std.meta.fields(@TypeOf(regs))) |field| try values.put(a, field.name, .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{@field(regs, field.name)}) });
+            inline for (@typeInfo(@TypeOf(regs)).@"struct".field_names) |field| try values.put(a, field, .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{@field(regs, field)}) });
             return asValue(a, .{ .generation = session.target.generation, .tid = tid, .registers = Value{ .object = values } });
         }
         if (std.mem.eql(u8, name, "read_memory")) {

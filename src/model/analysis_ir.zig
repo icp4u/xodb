@@ -162,7 +162,7 @@ fn lift(a: std.mem.Allocator, handle: c.csh, raw: *const c.cs_insn) !Instruction
 pub fn decode(a: std.mem.Allocator, bytes: []const u8, address: u64, limit: usize) ![]Instruction {
     if (@import("../target/arch.zig").native != .x86_64) return error.InstructionAnalysisUnsupportedArchitecture;
     if (bytes.len == 0 or bytes.len > max_bytes or limit == 0 or limit > max_instructions) return error.InvalidAnalysisLimit;
-    if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+    if (address > @as(u64, std.math.maxInt(u64)) - bytes.len) return error.InvalidAddress;
     var handle: c.csh = 0;
     if (c.cs_open(c.CS_ARCH_X86, c.CS_MODE_64, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
     defer _ = c.cs_close(&handle);

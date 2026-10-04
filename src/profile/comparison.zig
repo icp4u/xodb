@@ -217,12 +217,12 @@ pub const Job = struct {
         for ([_][]const u8{ before, after }) |path| if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.ArchivePathInvalid;
         const self = try a.create(Job);
         errdefer a.destroy(self);
-        const first = try a.dupeZ(u8, before);
+        const first = try a.dupeSentinel(u8, before, 0);
         errdefer a.free(first);
-        const second = try a.dupeZ(u8, after);
+        const second = try a.dupeSentinel(u8, after, 0);
         errdefer a.free(second);
         self.* = .{ .paths = .{ first, second } };
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
         return self;
     }
     fn read(self: *Job, side: usize) !flame.Graph {
@@ -349,3 +349,5 @@ test "identical evidence matches unresolved leaf PCs without invented share chan
     defer different.deinit();
     try std.testing.expectEqual(@as(usize, 2), different.rows.len);
 }
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

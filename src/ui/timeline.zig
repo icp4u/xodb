@@ -1237,7 +1237,7 @@ test "geometry stays within budget for 1024 pathological lanes" {
         quads = r.vertices / 6;
     }
     try testing.expectEqual(@as(u64, 2), view.rebuilds);
-    std.debug.print("\ntimeline budget: 64 of 1024 lanes, 4,000 intervals/lane, 3840x2160: rebuild {d} us, draw {d} us, {d} quads ({d} KiB vertices)\n", .{ rebuild_ns / 1000, draw_ns / 1000, quads, quads * 6 * 60 / 1024 });
+    @import("../m68k_log.zig").print("\ntimeline budget: 64 of 1024 lanes, 4,000 intervals/lane, 3840x2160: rebuild {d} us, draw {d} us, {d} quads ({d} KiB vertices)\n", .{ rebuild_ns / 1000, draw_ns / 1000, quads, quads * 6 * 60 / 1024 });
     try testing.expect(quads < 12_000);
 }
 

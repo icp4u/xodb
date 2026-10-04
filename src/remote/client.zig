@@ -25,7 +25,7 @@ pub const Client = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn start(self: *Client) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
     }
     pub fn deinit(self: *Client) void {
         self.stop.store(true, .release);
@@ -74,7 +74,7 @@ pub const Client = struct {
         self.work() catch |err| {
             if (err != error.Cancelled) {
                 self.message(@errorName(err));
-                std.debug.print("xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
+                @import("../m68k_log.zig").print("xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
             }
         };
         self.lock();
@@ -126,7 +126,7 @@ pub const Client = struct {
                 _ = rpc.call(mem, "tools/call", args.value) catch |err| blk: {
                     if (err != error.RemoteToolFailed) return err;
                     self.message(std.mem.sliceTo(&rpc.diagnostic, 0));
-                    std.debug.print("xodb: remote action {s} rejected: {s}\n", .{ string(field(args.value, "name")), std.mem.sliceTo(&rpc.diagnostic, 0) });
+                    @import("../m68k_log.zig").print("xodb: remote action {s} rejected: {s}\n", .{ string(field(args.value, "name")), std.mem.sliceTo(&rpc.diagnostic, 0) });
                     break :blk Value.null;
                 };
                 generation = std.math.maxInt(u64);
@@ -146,7 +146,7 @@ pub const Client = struct {
                     snapshot.deinit();
                     return error.InvalidRemoteView;
                 }
-                std.debug.print("xodb: remote {s} pid={d} state={s} generation={d} tid={d} frame={d} symbol={s} line={d}\n", .{
+                @import("../m68k_log.zig").print("xodb: remote {s} pid={d} state={s} generation={d} tid={d} frame={d} symbol={s} line={d}\n", .{
                     snapshot.value.architecture,                                                                                                  snapshot.value.pid,                                                                                                                             snapshot.value.state, snapshot.value.generation, snapshot.value.tid, snapshot.value.frame,
                     if (snapshot.value.frame < snapshot.value.frames.len) snapshot.value.frames[snapshot.value.frame].symbol orelse "?" else "?", if (snapshot.value.frame < snapshot.value.frames.len) (if (snapshot.value.frames[snapshot.value.frame].source) |site| site.line else 0) else 0,
                 });
@@ -290,7 +290,7 @@ fn mockRpc(mem: std.mem.Allocator, bytes: []const u8, fragment: usize) !Value {
     var fds: [2]c_int = undefined;
     if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &fds) < 0) return error.SocketFailed;
     defer _ = c.close(fds[1]);
-    const thread = try std.Thread.spawn(.{}, MockReply.run, .{MockReply{ .fd = fds[1], .bytes = bytes, .fragment = fragment }});
+    const thread = try unsupportedThread(.{}, MockReply.run, .{MockReply{ .fd = fds[1], .bytes = bytes, .fragment = fragment }});
     defer thread.join();
     defer {
         _ = c.shutdown(fds[0], c.SHUT_RDWR);
@@ -342,3 +342,5 @@ test "remote RPC accepts MCP text mirrors larger than 64 KiB within the frame ca
     try std.testing.expectEqual(@as(usize, 80 * 1024), field(field(result, "content").array.items[0], "text").string.len);
     try std.testing.expectEqual(@as(u64, 1), try integer(field(field(result, "structuredContent"), "schema")));
 }
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

@@ -10,9 +10,7 @@ const wire = @import("allocation_perf.zig");
 const perf = @import("linux_perf.zig");
 const native = @import("linux_allocations.zig");
 const a = std.heap.page_allocator;
-const broker = @cImport({
-    @cInclude("allocation_broker.h");
-});
+const broker = @import("../generated/allocation_live.zig");
 
 pub const Stop = enum { manual, duration, record_limit, memory_limit, evidence_gap, target_ended, thread_ended, image_changed, mapping_changed, scope_changed, collector_error, shutdown };
 pub const Config = struct {
@@ -68,8 +66,8 @@ const Job = struct {
             self.requests[self.request_count].name = try a.dupe(u8, request.name);
             self.request_count += 1;
         }
-        if (helper) |path| self.helper = try a.dupeZ(u8, path);
-        self.worker = try std.Thread.spawn(.{}, run, .{self});
+        if (helper) |path| self.helper = try a.dupeSentinel(u8, path, 0);
+        self.worker = try unsupportedThread(.{}, run, .{self});
         return self;
     }
     fn run(self: *Job) void {
@@ -151,7 +149,7 @@ const Cleanup = struct {
         const self = try a.create(Cleanup);
         errdefer a.destroy(self);
         self.* = .{ .collector = collector };
-        self.worker = try std.Thread.spawn(.{}, run, .{self});
+        self.worker = try unsupportedThread(.{}, run, .{self});
         return self;
     }
     fn deinit(self: *Cleanup) void {
@@ -218,7 +216,7 @@ pub const Live = struct {
         }
         self.stopped_ns = linux.now();
         if (reason == .image_changed or reason == .mapping_changed or reason == .scope_changed or reason == .collector_error) self.capture.?.abort(.identity);
-        std.debug.print("xodb: allocation capture {d} stop={s}\n", .{ self.capture.?.identity.capture_id, @tagName(reason) });
+        @import("../m68k_log.zig").print("xodb: allocation capture {d} stop={s}\n", .{ self.capture.?.identity.capture_id, @tagName(reason) });
     }
     fn complete(self: *Live) void {
         self.serial += 1;
@@ -226,7 +224,7 @@ pub const Live = struct {
             self.cleanup = Cleanup.create(collector) catch |err| blk: {
                 // Resource exhaustion still needs deterministic descriptor
                 // cleanup; report the exceptional synchronous fallback.
-                std.debug.print("xodb: allocation cleanup worker failed: {s}; closing synchronously\n", .{@errorName(err)});
+                @import("../m68k_log.zig").print("xodb: allocation cleanup worker failed: {s}; closing synchronously\n", .{@errorName(err)});
                 collector.close();
                 break :blk null;
             };
@@ -246,6 +244,7 @@ pub const Live = struct {
     /// `pending_valid` is computed on the session owner from stop/image/thread
     /// identities. Preparation may never publish a capture against a new stop.
     pub fn poll(self: *Live, pending_valid: bool, boundary: ?Stop) void {
+        if (linux.architecture == .m68k) return;
         if (self.capture) |capture| capture.poll();
         if (self.cleanup) |cleanup| if (cleanup.done.load(.acquire)) {
             cleanup.deinit();
@@ -279,12 +278,12 @@ pub const Live = struct {
                     self.reason = null;
                     self.stopped_ns = null;
                     self.unread = false;
-                    std.debug.print("xodb: allocation capture {d} started: {d} threads, {d} hooks\n", .{ candidate.identity.capture_id, candidate.thread_count, candidate.hook_count });
+                    @import("../m68k_log.zig").print("xodb: allocation capture {d} started: {d} threads, {d} hooks\n", .{ candidate.identity.capture_id, candidate.thread_count, candidate.hook_count });
                 }
             }
             if (self.err) |err| {
-                std.debug.print("xodb: allocation preparation failed: {s}\n", .{@errorName(err)});
-                if (self.failure) |failure| std.debug.print("xodb: allocations: syscall={s} errno={d} tid={d}; {s}\n", .{ failure.syscall, failure.errno, failure.tid, failure.detail });
+                @import("../m68k_log.zig").print("xodb: allocation preparation failed: {s}\n", .{@errorName(err)});
+                if (self.failure) |failure| @import("../m68k_log.zig").print("xodb: allocations: syscall={s} errno={d} tid={d}; {s}\n", .{ failure.syscall, failure.errno, failure.tid, failure.detail });
             }
         };
         const collector = self.collector orelse return;
@@ -316,7 +315,7 @@ pub const Live = struct {
                     break :blk null;
                 },
                 .mapping_change => |change| blk: {
-                    std.debug.print("xodb: allocation executable mapping changed: {s} prot={d} device={d} inode={d}\n", .{ std.mem.sliceTo(&change.name, 0), change.prot, change.device, change.inode });
+                    @import("../m68k_log.zig").print("xodb: allocation executable mapping changed: {s} prot={d} device={d} inode={d}\n", .{ std.mem.sliceTo(&change.name, 0), change.prot, change.device, change.inode });
                     capture.abort(.identity);
                     self.stop(.mapping_changed);
                     break :blk null;
@@ -329,7 +328,7 @@ pub const Live = struct {
                             break :blk null;
                         }
                     };
-                    std.debug.print("xodb: allocation probe trampoline [uprobes] at 0x{x}..0x{x}\n", .{ mapping.start, mapping.end });
+                    @import("../m68k_log.zig").print("xodb: allocation probe trampoline [uprobes] at 0x{x}..0x{x}\n", .{ mapping.start, mapping.end });
                     break :blk null;
                 },
                 .rename => null,
@@ -403,3 +402,5 @@ test "allocation preparation cancellation and stale completion preserve retained
         try std.testing.expectEqual(if (cancel) error.AllocationPreparationCancelled else error.StaleAllocationPreparation, live.err.?);
     }
 }
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

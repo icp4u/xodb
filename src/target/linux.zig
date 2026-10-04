@@ -113,12 +113,32 @@ pub const ArmRegisters = extern struct {
     pc: u64,
     pstate: u64,
 };
-pub const Registers = if (architecture == .aarch64) ArmRegisters else X86Registers;
+pub const M68kRegisters = struct {
+    d0: u32,
+    d1: u32,
+    d2: u32,
+    d3: u32,
+    d4: u32,
+    d5: u32,
+    d6: u32,
+    d7: u32,
+    a0: u32,
+    a1: u32,
+    a2: u32,
+    a3: u32,
+    a4: u32,
+    a5: u32,
+    a6: u32,
+    usp: u32,
+    pc: u32,
+    sr: u32,
+};
+pub const Registers = if (architecture == .m68k) M68kRegisters else if (architecture == .aarch64) ArmRegisters else X86Registers;
 pub fn programCounter(regs: Registers) u64 {
-    return if (architecture == .aarch64) regs.pc else regs.rip;
+    return if (architecture == .aarch64 or architecture == .m68k) regs.pc else regs.rip;
 }
 pub fn stackPointer(regs: Registers) u64 {
-    return if (architecture == .aarch64) regs.sp else regs.rsp;
+    return if (architecture == .m68k) regs.usp else if (architecture == .aarch64) regs.sp else regs.rsp;
 }
 const RawRegisters = if (architecture == .aarch64) ArmRegisters else c.struct_user_regs_struct;
 fn getRegisters(tid: i32) !RawRegisters {
@@ -139,7 +159,7 @@ fn setRegisters(tid: i32, raw: *const RawRegisters) !void {
 }
 fn setPc(tid: i32, pc: u64) !void {
     var raw = try getRegisters(tid);
-    if (architecture == .aarch64) raw.pc = pc else raw.rip = pc;
+    if (architecture == .m68k) raw.pc = @bitCast(@as(u32, @intCast(pc))) else if (architecture == .aarch64) raw.pc = pc else raw.rip = pc;
     try setRegisters(tid, &raw);
 }
 pub const Event = struct {
@@ -278,7 +298,7 @@ pub const Target = struct {
         // On x86, even disabled following must hold a newborn before it can
         // execute inherited software traps. The coordinator chooses adoption
         // or explicit family release; no untraced child runs patched code.
-        return c.PTRACE_O_TRACECLONE | c.PTRACE_O_TRACEEXEC | c.PTRACE_O_TRACEEXIT | (if (architecture == .x86_64 or follow) @as(usize, c.PTRACE_O_TRACEFORK | c.PTRACE_O_TRACEVFORK | c.PTRACE_O_TRACEVFORKDONE) else 0) | (if (owned) @as(usize, c.PTRACE_O_EXITKILL) else 0);
+        return @as(usize, c.PTRACE_O_TRACECLONE | c.PTRACE_O_TRACEEXEC | c.PTRACE_O_TRACEEXIT) | (if (architecture == .x86_64 or follow) @as(usize, c.PTRACE_O_TRACEFORK | c.PTRACE_O_TRACEVFORK | c.PTRACE_O_TRACEVFORKDONE) else 0) | (if (owned) @as(usize, c.PTRACE_O_EXITKILL) else 0);
     }
     pub fn setFollowProcesses(self: *Target, enabled: bool) !void {
         if (architecture != .x86_64) return error.UnsupportedProcessFollowing;
@@ -508,7 +528,7 @@ pub const Target = struct {
         // A running, not-yet-seized parent can clone behind readdir's cursor.
         while (now() < deadline) {
             var buf: [128]u8 = undefined;
-            const path = try std.fmt.bufPrintZ(&buf, "/proc/{d}/task", .{pid});
+            const path = try std.fmt.bufPrintSentinel(&buf, "/proc/{d}/task", .{pid}, 0);
             const dir = c.opendir(path) orelse return error.ProcessGone;
             defer _ = c.closedir(dir);
             var added = false;
@@ -561,17 +581,17 @@ pub const Target = struct {
     }
     fn validateNativeAbi(self: *const Target) !void {
         var buf: [64]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&buf, "/proc/{d}/exe", .{try self.stoppedTid()});
+        const path = try std.fmt.bufPrintSentinel(&buf, "/proc/{d}/exe", .{try self.stoppedTid()}, 0);
         const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC);
         if (fd < 0) return error.TargetImageUnavailable;
         defer _ = c.close(fd);
         var header: [20]u8 = undefined;
         if (c.pread(fd, &header, header.len, 0) != header.len) return error.TargetImageUnavailable;
-        if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 2 or header[5] != 1 or std.mem.readInt(u16, header[18..20], .little) != @intFromEnum(architecture)) return error.UnsupportedTargetArchitecture;
+        if (!std.mem.eql(u8, header[0..4], "\x7fELF") or header[4] != 1 or header[5] != 2 or std.mem.readInt(u16, header[18..20], .big) != @intFromEnum(architecture)) return error.UnsupportedTargetArchitecture;
     }
     fn tracedMember(tid: c.pid_t, pid: c.pid_t) bool {
         var path: [64]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&path, "/proc/{d}/status", .{tid}) catch return false;
+        const name = std.fmt.bufPrintSentinel(&path, "/proc/{d}/status", .{tid}, 0) catch return false;
         const fd = c.open(name, c.O_RDONLY);
         if (fd < 0) return false;
         defer _ = c.close(fd);
@@ -589,7 +609,7 @@ pub const Target = struct {
     }
     fn taskGone(tid: c.pid_t) bool {
         var path: [64]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{tid}) catch return false;
+        const name = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{tid}, 0) catch return false;
         const fd = c.open(name, c.O_RDONLY);
         if (fd < 0) return std.c._errno().* == c.ENOENT or std.c._errno().* == c.ESRCH;
         defer _ = c.close(fd);
@@ -603,7 +623,7 @@ pub const Target = struct {
     }
     fn isZombie(tid: c.pid_t) bool {
         var path: [64]u8 = undefined;
-        const name = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{tid}) catch return false;
+        const name = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{tid}, 0) catch return false;
         const fd = c.open(name, c.O_RDONLY);
         if (fd < 0) return false;
         defer _ = c.close(fd);
@@ -688,22 +708,24 @@ pub const Target = struct {
     }
     fn patchByte(self: *Target, address: u64, byte: u8) !void {
         const tid = try self.stoppedTid();
-        const aligned = address & ~@as(u64, 7);
-        const shift: u6 = @intCast((address & 7) * 8);
-        const old = try peek(tid, c.PTRACE_PEEKTEXT, aligned);
-        _ = try trace(c.PTRACE_POKETEXT, tid, aligned, (old & ~(@as(u64, 255) << shift)) | (@as(u64, byte) << shift));
+        const aligned = std.math.cast(usize, address & ~@as(u64, 3)) orelse return error.InvalidAddress;
+        const offset: usize = @intCast(address & 3);
+        var bytes: [4]u8 = undefined;
+        std.mem.writeInt(u32, &bytes, try peek(tid, c.PTRACE_PEEKTEXT, aligned), .big);
+        bytes[offset] = byte;
+        _ = try trace(c.PTRACE_POKETEXT, tid, aligned, std.mem.readInt(u32, &bytes, .big));
     }
     fn patchInstruction(self: *Target, address: u64, bytes: []const u8) !void {
         try patchInstructionTid(try self.stoppedTid(), address, bytes);
     }
     fn patchInstructionTid(tid: i32, address: u64, bytes: []const u8) !void {
-        if (bytes.len != architecture.trap().len or (architecture == .aarch64 and address % 4 != 0)) return error.InvalidBreakpointAddress;
-        const aligned = address & ~@as(u64, 7);
-        const offset: usize = @intCast(address & 7);
-        var word: [8]u8 = undefined;
-        std.mem.writeInt(u64, &word, try peek(tid, c.PTRACE_PEEKTEXT, aligned), .little);
+        if (bytes.len != 2 or address % 2 != 0) return error.InvalidBreakpointAddress;
+        const aligned = std.math.cast(usize, address & ~@as(u64, 3)) orelse return error.InvalidAddress;
+        const offset: usize = @intCast(address & 3);
+        var word: [4]u8 = undefined;
+        std.mem.writeInt(u32, &word, try peek(tid, c.PTRACE_PEEKTEXT, aligned), .big);
         @memcpy(word[offset..][0..bytes.len], bytes);
-        _ = try trace(c.PTRACE_POKETEXT, tid, aligned, std.mem.readInt(u64, &word, .little));
+        _ = try trace(c.PTRACE_POKETEXT, tid, aligned, std.mem.readInt(u32, &word, .big));
     }
     pub fn setBreakpoint(self: *Target, address: u64, temporary: bool) !u64 {
         try self.memoryMutationAllowed();
@@ -711,7 +733,7 @@ pub const Target = struct {
         if (self.state != .stopped) return error.NotStopped;
         if (self.breakpointAt(address)) |i| return self.breakpoints[i].id;
         if (self.breakpoint_count == self.breakpoints.len) return error.BreakpointLimit;
-        if (architecture == .aarch64 and address % 4 != 0) return error.InvalidBreakpointAddress;
+        if (address % 2 != 0) return error.InvalidBreakpointAddress;
         var original: [4]u8 = @splat(0);
         const bytes = original[0..architecture.trap().len];
         if (try self.readMemory(address, bytes) != bytes.len) return error.MemoryUnreadable;
@@ -744,7 +766,7 @@ pub const Target = struct {
         const i = self.breakpointId(id) orelse return error.UnknownBreakpoint;
         if (!self.breakpoints[i].pending) return error.BreakpointAlreadyResolved;
         if (self.breakpointAt(address) != null) return error.BreakpointLocationAlreadyUsed;
-        if (address == 0 or (architecture == .aarch64 and address % 4 != 0)) return error.InvalidBreakpointAddress;
+        if (address == 0 or (address % 2 != 0)) return error.InvalidBreakpointAddress;
         var original: [4]u8 = @splat(0);
         const bytes = original[0..architecture.trap().len];
         if (try self.readMemory(address, bytes) != bytes.len) return error.MemoryUnreadable;
@@ -862,6 +884,7 @@ pub const Target = struct {
         _ = try trace(c.PTRACE_POKEUSER, tid, debugOffset(index_), value);
     }
     fn configureWatchpoints(self: *Target, tid: i32) !void {
+        if (architecture == .m68k) return;
         if (architecture == .aarch64) return self.configureArmWatchpoints(tid, true);
         const i = self.index(tid) orelse return error.UnknownThread;
         if (self.threads[i].state == .exited) return;
@@ -959,6 +982,7 @@ pub const Target = struct {
         return state;
     }
     pub fn watchpointCapacity(self: *const Target) !u8 {
+        if (architecture == .m68k) return error.HardwareWatchpointsUnsupported;
         if (self.core != null) return error.ReadOnlyCore;
         if (self.state != .stopped) return error.NotStopped;
         if (architecture == .x86_64) return 4;
@@ -1010,7 +1034,7 @@ pub const Target = struct {
     fn watchValue(tid: i32, watch: bp.Watchpoint) ?u64 {
         var bytes: [8]u8 = @splat(0);
         var local = c.iovec{ .iov_base = &bytes, .iov_len = watch.length };
-        var remote = c.iovec{ .iov_base = @ptrFromInt(watch.address), .iov_len = watch.length };
+        var remote = c.iovec{ .iov_base = @ptrFromInt(@as(usize, @intCast(watch.address))), .iov_len = watch.length };
         if (c.process_vm_readv(tid, &local, 1, &remote, 1, 0) != watch.length) return null;
         return std.mem.readInt(u64, &bytes, .little);
     }
@@ -1057,7 +1081,7 @@ pub const Target = struct {
             e.other_threads_running = hit.other_threads_running;
             if (after) |value| watch.previous = value;
         };
-        if (!completed) std.debug.print("xodb: ARM64 watch access interrupted tid={d} trap_pc=0x{x}; completion unconfirmed\n", .{ tid, hit.pc });
+        if (!completed) @import("../m68k_log.zig").print("xodb: ARM64 watch access interrupted tid={d} trap_pc=0x{x}; completion unconfirmed\n", .{ tid, hit.pc });
     }
     fn startArmWatchCompletion(self: *Target) !bool {
         for (self.threads[0..self.thread_count]) |*thread| {
@@ -1120,8 +1144,11 @@ pub const Target = struct {
         if (self.state != .stopped) return error.NotStopped;
         _ = self.index(tid) orelse return error.UnknownThread;
         var regs = try getRegisters(tid);
-        inline for (std.meta.fields(Registers)) |field| if (std.mem.eql(u8, name, field.name)) {
-            @field(regs, field.name) = value;
+        inline for (@typeInfo(Registers).@"struct".field_names) |field| if (std.mem.eql(u8, name, field)) {
+            if (architecture == .m68k) {
+                if (value > std.math.maxInt(@Int(.unsigned, @bitSizeOf(@TypeOf(@field(regs, field)))))) return error.InvalidRegisterValue;
+                @field(regs, field) = @bitCast(@as(@Int(.unsigned, @bitSizeOf(@TypeOf(@field(regs, field)))) , @intCast(value)));
+            } else @field(regs, field) = value;
             try setRegisters(tid, &regs);
             self.event(.register_written, tid, 0);
             return;
@@ -1132,7 +1159,7 @@ pub const Target = struct {
         try self.memoryMutationAllowed();
         if (self.core != null) return error.ReadOnlyCore;
         if (self.state != .stopped) return error.NotStopped;
-        if (bytes.len > 4096 or address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+        if (bytes.len > 4096 or address > @as(u64, std.math.maxInt(u64)) - bytes.len) return error.InvalidAddress;
         var written: usize = 0;
         defer if (written > 0) {
             // Even a failed request invalidates snapshots if a prefix changed.
@@ -1432,7 +1459,7 @@ pub const Target = struct {
                 }
             }
             if (self.stepping != null and self.stepping.?.tid == tid) {
-                if (self.threads[i].reason == .signal) std.debug.print("xodb: single step interrupted by signal {d}; tid={d}\n", .{ sig, tid });
+                if (self.threads[i].reason == .signal) @import("../m68k_log.zig").print("xodb: single step interrupted by signal {d}; tid={d}\n", .{ sig, tid });
                 try self.finishStep(false);
             }
             self.event(.stop, tid, sig);
@@ -1509,7 +1536,7 @@ pub const Target = struct {
         if (self.threads[i].state != .stopped) return error.NotStopped;
         const regs = try getRegisters(tid);
         var out: Registers = undefined;
-        inline for (std.meta.fields(Registers)) |field| @field(out, field.name) = @field(regs, field.name);
+        inline for (@typeInfo(Registers).@"struct".field_names) |field| @field(out, field) = if (architecture == .m68k) @as(@Int(.unsigned, @bitSizeOf(@TypeOf(@field(regs, field)))), @bitCast(@field(regs, field))) else @field(regs, field);
         return out;
     }
     pub fn extendedRegisters(self: *const Target, tid: i32) !@import("xstate.zig").State {
@@ -1531,7 +1558,7 @@ pub const Target = struct {
         if (dest.len == 0) return 0;
         if (address == 0 or address > std.math.maxInt(usize) - dest.len) return error.InvalidAddress;
         var local = c.iovec{ .iov_base = dest.ptr, .iov_len = dest.len };
-        var remote = c.iovec{ .iov_base = @ptrFromInt(address), .iov_len = dest.len };
+        var remote = c.iovec{ .iov_base = @ptrFromInt(@as(usize, @intCast(address))), .iov_len = dest.len };
         const n = c.process_vm_readv(try self.stoppedTid(), &local, 1, &remote, 1, 0);
         if (n < 0) return error.MemoryUnreadable;
         const count: usize = @intCast(n);
@@ -1672,13 +1699,13 @@ pub const Target = struct {
         if (self.pid == 0) return;
         if (self.owned) for (self.vfork_children) |child| if (child) |target| target.deinit();
         if (self.birth_count == 0 and (self.state == .exited or (!self.owned and self.thread_count == 0))) {
-            self.separateVfork() catch |err| std.debug.print("vfork cleanup failed: {s}\n", .{@errorName(err)});
+            self.separateVfork() catch |err| @import("../m68k_log.zig").print("vfork cleanup failed: {s}\n", .{@errorName(err)});
             self.pid = 0;
             self.state = .idle;
             return;
         }
         if (!self.owned) {
-            (if (self.birth_count != 0 or self.sharedVm()) self.detachProcessFamily() else self.detach()) catch |err| std.debug.print("detach failed: {s}\n", .{@errorName(err)});
+            (if (self.birth_count != 0 or self.sharedVm()) self.detachProcessFamily() else self.detach()) catch |err| @import("../m68k_log.zig").print("detach failed: {s}\n", .{@errorName(err)});
             return;
         }
         for (self.births[0..self.birth_count]) |birth| if (!birth.exited) {
@@ -1735,7 +1762,7 @@ pub const Target = struct {
             }
         };
         self.birth_count = 0;
-        self.separateVfork() catch |err| std.debug.print("vfork cleanup failed: {s}\n", .{@errorName(err)});
+        self.separateVfork() catch |err| @import("../m68k_log.zig").print("vfork cleanup failed: {s}\n", .{@errorName(err)});
         self.pid = 0;
         self.thread_count = 0;
         self.state = .idle;

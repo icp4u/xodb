@@ -1,6 +1,6 @@
 //! ELF image reader: a validated, typed view over a borrowed byte slice.
 //!
-//! Accepts ELF64 little-endian x86-64/AArch64 executables (ET_EXEC) and shared
+//! Accepts ELF32 big-endian m68k executables (ET_EXEC) and shared
 //! objects/PIEs (ET_DYN). Anything else is rejected by `Image.parse` with a
 //! specific error. Live targets and archive consumers also check their supported ISA.
 //!
@@ -43,10 +43,10 @@ pub const Error = error{
     BadMapping,
 };
 
-const ehdr_size = 64;
-const phdr_size = 56;
-const shdr_size = 64;
-const sym_size = 24;
+const ehdr_size = 52;
+const phdr_size = 32;
+const shdr_size = 40;
+const sym_size = 16;
 const shn_undef = 0;
 const shn_loreserve = 0xff00;
 const shn_abs = 0xfff1;
@@ -55,7 +55,7 @@ const shn_xindex = 0xffff;
 const pn_xnum = 0xffff;
 
 pub const Type = enum { executable, shared };
-pub const Machine = enum(u16) { x86_64 = 62, aarch64 = 183, riscv = 243, _ };
+pub const Machine = enum(u16) { m68k = 4, x86_64 = 62, aarch64 = 183, riscv = 243, _ };
 pub const SegmentType = enum(u32) { null = 0, load = 1, dynamic = 2, interp = 3, note = 4, shlib = 5, phdr = 6, tls = 7, gnu_eh_frame = 0x6474e550, gnu_stack = 0x6474e551, gnu_relro = 0x6474e552, gnu_property = 0x6474e553, _ };
 pub const SectionType = enum(u32) { null = 0, progbits = 1, symtab = 2, strtab = 3, rela = 4, hash = 5, dynamic = 6, note = 7, nobits = 8, rel = 9, shlib = 10, dynsym = 11, init_array = 14, fini_array = 15, preinit_array = 16, group = 17, symtab_shndx = 18, gnu_hash = 0x6ffffff6, gnu_verdef = 0x6ffffffd, gnu_verneed = 0x6ffffffe, gnu_versym = 0x6fffffff, _ };
 /// Bits of `Segment.flags`.
@@ -155,7 +155,7 @@ pub const Located = struct {
 };
 
 fn rd(comptime T: type, b: []const u8, at: usize) T {
-    return std.mem.readInt(T, b[at..][0..@sizeOf(T)], .little);
+    return std.mem.readInt(T, b[at..][0..@sizeOf(T)], .big);
 }
 fn span(bytes: []const u8, offset: u64, size: u64) Error![]const u8 {
     const end = std.math.add(u64, offset, size) catch return error.Truncated;
@@ -211,7 +211,7 @@ pub const SymbolTable = struct {
     pub fn get(self: SymbolTable, index: u32) Error!Symbol {
         if (index >= self.count()) return error.OutOfRange;
         const e = self.entry(index);
-        const raw = rd(u16, e, 6);
+        const raw = rd(u16, e, 14);
         const placement: Placement = switch (raw) {
             shn_undef => .undefined,
             shn_abs => .absolute,
@@ -223,11 +223,11 @@ pub const SymbolTable = struct {
             .table = self.kind,
             .index = index,
             .name = try str(self.strings, rd(u32, e, 0)),
-            .value = rd(u64, e, 8),
-            .size = rd(u64, e, 16),
-            .bind = @enumFromInt(e[4] >> 4),
-            .type = @enumFromInt(e[4] & 0xf),
-            .visibility = @enumFromInt(e[5] & 3),
+            .value = rd(u32, e, 4),
+            .size = rd(u32, e, 8),
+            .bind = @enumFromInt(e[12] >> 4),
+            .type = @enumFromInt(e[12] & 0xf),
+            .visibility = @enumFromInt(e[13] & 3),
             .placement = placement,
         };
     }
@@ -245,21 +245,21 @@ pub const Image = struct {
     pub fn parse(bytes: []const u8) Error!Image {
         if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], "\x7fELF")) return error.NotElf;
         if (bytes.len < ehdr_size) return error.Truncated;
-        if (bytes[4] != 2) return error.UnsupportedClass;
-        if (bytes[5] != 1) return error.UnsupportedEncoding;
+        if (bytes[4] != 1) return error.UnsupportedClass;
+        if (bytes[5] != 2) return error.UnsupportedEncoding;
         if (bytes[6] != 1 or rd(u32, bytes, 20) != 1) return error.UnsupportedVersion;
         const machine: Machine = @enumFromInt(rd(u16, bytes, 18));
-        if (machine != .x86_64 and machine != .aarch64) return error.UnsupportedMachine;
+        if (machine != .m68k) return error.UnsupportedMachine;
         const file_type: Type = switch (rd(u16, bytes, 16)) {
             2 => .executable,
             3 => .shared,
             else => return error.UnsupportedType,
         };
-        const phoff = rd(u64, bytes, 32);
-        const shoff = rd(u64, bytes, 40);
-        var phnum: u32 = rd(u16, bytes, 56);
-        var shnum: u32 = rd(u16, bytes, 60);
-        var shstrndx: u32 = rd(u16, bytes, 62);
+        const phoff = rd(u32, bytes, 28);
+        const shoff = rd(u32, bytes, 32);
+        var phnum: u32 = rd(u16, bytes, 44);
+        var shnum: u32 = rd(u16, bytes, 48);
+        var shstrndx: u32 = rd(u16, bytes, 50);
         var section_table: []const u8 = &.{};
         if (shoff == 0) {
             // No section header table; the other section fields mean nothing.
@@ -267,19 +267,19 @@ pub const Image = struct {
             shnum = 0;
             shstrndx = 0;
         } else {
-            if (rd(u16, bytes, 58) != shdr_size) return error.BadHeader;
+            if (rd(u16, bytes, 46) != shdr_size) return error.BadHeader;
             // Section 0 holds the counts that do not fit the 16-bit header fields.
             if (shnum == 0 or shstrndx == shn_xindex or phnum == pn_xnum) {
                 const zero = try span(bytes, shoff, shdr_size);
-                if (shnum == 0) shnum = std.math.cast(u32, rd(u64, zero, 32)) orelse return error.BadHeader;
-                if (shstrndx == shn_xindex) shstrndx = rd(u32, zero, 40);
-                if (phnum == pn_xnum) phnum = rd(u32, zero, 44);
+                if (shnum == 0) shnum = std.math.cast(u32, rd(u32, zero, 20)) orelse return error.BadHeader;
+                if (shstrndx == shn_xindex) shstrndx = rd(u32, zero, 24);
+                if (phnum == pn_xnum) phnum = rd(u32, zero, 28);
             }
             section_table = try span(bytes, shoff, @as(u64, shnum) * shdr_size);
         }
         var segment_table: []const u8 = &.{};
         if (phnum != 0) {
-            if (rd(u16, bytes, 54) != phdr_size) return error.BadHeader;
+            if (rd(u16, bytes, 42) != phdr_size) return error.BadHeader;
             segment_table = try span(bytes, phoff, @as(u64, phnum) * phdr_size);
         }
         var section_names: []const u8 = &.{};
@@ -287,7 +287,7 @@ pub const Image = struct {
             if (shstrndx >= shnum) return error.BadHeader;
             const h = section_table[@as(usize, shstrndx) * shdr_size ..][0..shdr_size];
             if (rd(u32, h, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
-            section_names = try span(bytes, rd(u64, h, 24), rd(u64, h, 32));
+            section_names = try span(bytes, rd(u32, h, 16), rd(u32, h, 20));
         }
         return .{
             .bytes = bytes,
@@ -296,8 +296,8 @@ pub const Image = struct {
                 .machine = machine,
                 .os_abi = bytes[7],
                 .abi_version = bytes[8],
-                .entry = rd(u64, bytes, 24),
-                .flags = rd(u32, bytes, 48),
+                .entry = rd(u32, bytes, 24),
+                .flags = rd(u32, bytes, 36),
                 .segment_table_offset = phoff,
                 .segment_count = phnum,
                 .section_table_offset = shoff,
@@ -313,7 +313,7 @@ pub const Image = struct {
     pub fn segment(self: *const Image, index: u32) Error!Segment {
         if (index >= self.header.segment_count) return error.OutOfRange;
         const h = self.segment_table[@as(usize, index) * phdr_size ..][0..phdr_size];
-        return .{ .index = index, .type = @enumFromInt(rd(u32, h, 0)), .flags = rd(u32, h, 4), .offset = rd(u64, h, 8), .vaddr = rd(u64, h, 16), .paddr = rd(u64, h, 24), .file_size = rd(u64, h, 32), .mem_size = rd(u64, h, 40), .alignment = rd(u64, h, 48) };
+        return .{ .index = index, .type = @enumFromInt(rd(u32, h, 0)), .flags = rd(u32, h, 24), .offset = rd(u32, h, 4), .vaddr = rd(u32, h, 8), .paddr = rd(u32, h, 12), .file_size = rd(u32, h, 16), .mem_size = rd(u32, h, 20), .alignment = rd(u32, h, 28) };
     }
     /// The file-backed part of a segment.
     pub fn segmentData(self: *const Image, s: Segment) Error![]const u8 {
@@ -328,7 +328,7 @@ pub const Image = struct {
     pub fn section(self: *const Image, index: u32) Error!Section {
         if (index >= self.header.section_count) return error.OutOfRange;
         const h = self.sectionHeader(index);
-        return .{ .index = index, .name = if (self.header.section_name_index == 0) "" else try str(self.section_names, rd(u32, h, 0)), .type = @enumFromInt(rd(u32, h, 4)), .flags = rd(u64, h, 8), .addr = rd(u64, h, 16), .offset = rd(u64, h, 24), .size = rd(u64, h, 32), .link = rd(u32, h, 40), .info = rd(u32, h, 44), .alignment = rd(u64, h, 48), .entry_size = rd(u64, h, 56) };
+        return .{ .index = index, .name = if (self.header.section_name_index == 0) "" else try str(self.section_names, rd(u32, h, 0)), .type = @enumFromInt(rd(u32, h, 4)), .flags = rd(u32, h, 8), .addr = rd(u32, h, 12), .offset = rd(u32, h, 16), .size = rd(u32, h, 20), .link = rd(u32, h, 24), .info = rd(u32, h, 28), .alignment = rd(u32, h, 32), .entry_size = rd(u32, h, 36) };
     }
     /// First section with this name in table order. Names are not unique;
     /// iterate with `section` to see every match.
@@ -357,20 +357,20 @@ pub const Image = struct {
         while (i < n) : (i += 1) {
             const h = self.sectionHeader(i);
             if (rd(u32, h, 4) != want) continue;
-            if (rd(u64, h, 56) != sym_size) return error.BadSection;
-            const entries = try span(self.bytes, rd(u64, h, 24), rd(u64, h, 32));
+            if (rd(u32, h, 36) != sym_size) return error.BadSection;
+            const entries = try span(self.bytes, rd(u32, h, 16), rd(u32, h, 20));
             if (entries.len % sym_size != 0 or entries.len / sym_size > std.math.maxInt(u32)) return error.BadSection;
-            const link = rd(u32, h, 40);
+            const link = rd(u32, h, 24);
             if (link >= n) return error.BadSection;
             const sh = self.sectionHeader(link);
             if (rd(u32, sh, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
-            const strings = try span(self.bytes, rd(u64, sh, 24), rd(u64, sh, 32));
+            const strings = try span(self.bytes, rd(u32, sh, 16), rd(u32, sh, 20));
             var extended: []const u8 = &.{};
             var j: u32 = 0;
             while (j < n) : (j += 1) {
                 const x = self.sectionHeader(j);
-                if (rd(u32, x, 4) != @intFromEnum(SectionType.symtab_shndx) or rd(u32, x, 40) != i) continue;
-                extended = try span(self.bytes, rd(u64, x, 24), rd(u64, x, 32));
+                if (rd(u32, x, 4) != @intFromEnum(SectionType.symtab_shndx) or rd(u32, x, 24) != i) continue;
+                extended = try span(self.bytes, rd(u32, x, 16), rd(u32, x, 20));
                 if (extended.len != entries.len / sym_size * 4) return error.BadSection;
                 break;
             }
@@ -392,8 +392,8 @@ pub const Image = struct {
             var i: u32 = 1;
             while (i < table.count()) : (i += 1) {
                 const e = table.entry(i);
-                if (rd(u16, e, 6) == shn_undef or !strIs(table.strings, rd(u32, e, 0), name)) continue;
-                if (best) |old| if (bindRank(@truncate(e[4] >> 4)) >= bindRank(@intFromEnum(old.bind))) continue;
+                if (rd(u16, e, 14) == shn_undef or !strIs(table.strings, rd(u32, e, 0), name)) continue;
+                if (best) |old| if (bindRank(@truncate(e[12] >> 4)) >= bindRank(@intFromEnum(old.bind))) continue;
                 best = table.get(i) catch continue;
             }
         }
@@ -415,10 +415,10 @@ pub const Image = struct {
             var i: u32 = 1;
             while (i < table.count()) : (i += 1) {
                 const e = table.entry(i);
-                const value = rd(u64, e, 8);
-                const shndx = rd(u16, e, 6);
-                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(e[4]))) continue;
-                const size = rd(u64, e, 16);
+                const value = rd(u32, e, 4);
+                const shndx = rd(u16, e, 14);
+                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(e[12]))) continue;
+                const size = rd(u32, e, 8);
                 if (size != 0 and address - value >= size) {
                     if (barrier == null or value > barrier.?) barrier = value;
                     continue;
@@ -427,7 +427,7 @@ pub const Image = struct {
                 if (slot.*) |old| {
                     if (value < old.value) continue;
                     if (value == old.value) {
-                        const new = [2]u8{ typeRank(@truncate(e[4])), bindRank(@truncate(e[4] >> 4)) };
+                        const new = [2]u8{ typeRank(@truncate(e[12])), bindRank(@truncate(e[12] >> 4)) };
                         const cur = [2]u8{ typeRank(@intFromEnum(old.type)), bindRank(@intFromEnum(old.bind)) };
                         if (std.mem.order(u8, &new, &cur) != .lt) continue;
                     }
@@ -980,7 +980,7 @@ test "synthetic image: every prefix and every single-byte corruption is survivab
 fn fixture(comptime name: []const u8) ![]u8 {
     const path = "tests/fixtures/elf/out/" ++ name;
     return std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .unlimited) catch |err| {
-        std.debug.print("cannot read {s}: {s}. Run tests/fixtures/elf/build.sh, then test from the repository root.\n", .{ path, @errorName(err) });
+        @import("../m68k_log.zig").print("cannot read {s}: {s}. Run tests/fixtures/elf/build.sh, then test from the repository root.\n", .{ path, @errorName(err) });
         return error.FixtureUnavailable;
     };
 }

@@ -94,7 +94,7 @@ pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) 
         }
         return asValue(a, .{ .status = "ready", .import_id = profile.digest[0..], .view_id = view.id[0..], .weight_unit = profile.wire.unit, .samples = view.samples, .total_period = try decimal(a, view.total_period), .excluded_samples = view.graph.rejected, .excluded_period = try decimal(a, view.excluded_period), .unresolved_stack_samples = view.unresolved_samples, .node_total = view.graph.nodes.items.len, .start = start, .next = if (end < view.graph.nodes.items.len) @as(?usize, end) else null, .nodes = nodes });
     }
-    const ordinal = try number(args, "ordinal", std.math.maxInt(u64));
+    const ordinal = std.math.cast(usize, try number(args, "ordinal", std.math.maxInt(u64))) orelse return error.InvalidArguments;
     if (ordinal >= profile.wire.samples.len) return error.InvalidSample;
     const sample = profile.wire.samples[@intCast(ordinal)];
     if (start > sample.stack.len) return error.InvalidArguments;

@@ -47,6 +47,7 @@ pub const Collector = struct {
     }
     /// At most 128 records from every ring per pass; busy tasks cannot starve others.
     pub fn drain(self: *Collector, store: *model.Store) !bool {
+        if (@import("builtin").cpu.arch == .m68k) return error.SyscallsUnsupportedArchitecture;
         if (self.image_changed) return false;
         var more = false;
         for (self.slots[0..self.count], 0..) |*slot, index| {
@@ -140,6 +141,7 @@ fn openEvent(tid: i32, group: c_int, event: u16, leader: bool) c_int {
     return @intCast(c.syscall(@as(c_long, c.SYS_perf_event_open), &attr, @as(c.pid_t, tid), @as(c_int, -1), group, @as(c_ulong, c.PERF_FLAG_FD_CLOEXEC)));
 }
 pub fn start(a: std.mem.Allocator, pid: i32, tids: []const i32) !Opened {
+    if (@import("builtin").cpu.arch == .m68k) return error.SyscallsUnsupportedArchitecture;
     if (builtin.cpu.arch != .x86_64 or builtin.cpu.arch.endian() != .little) return .{ .failed = .{ .kind = .configuration, .syscall = "syscalls.architecture", .detail = "raw syscall decoding currently supports native Linux x86-64" } };
     if (pid <= 0 or tids.len == 0 or tids.len > model.max_threads) return .{ .failed = .{ .kind = .configuration, .syscall = "syscalls.scope", .detail = "select 1..32 explicit threads" } };
     for (tids, 0..) |tid, i| if (tid <= 0 or std.mem.indexOfScalar(i32, tids[0..i], tid) != null) return .{ .failed = .{ .kind = .configuration, .syscall = "syscalls.scope", .tid = tid, .detail = "invalid or duplicate selected TID" } };

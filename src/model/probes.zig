@@ -131,7 +131,7 @@ pub const Manager = struct {
                 continue;
             };
             rule_.last_error = null;
-            defer if (rule_.last_error) |err| std.debug.print("xodb: breakpoint #{d} tid={d} stopped: {s}\n", .{ rule_.id, event.tid, err });
+            defer if (rule_.last_error) |err| @import("../m68k_log.zig").print("xodb: breakpoint #{d} tid={d} stopped: {s}\n", .{ rule_.id, event.tid, err });
             if (rule_.thread_id) |wanted| {
                 var matches = false;
                 for (target.threadSlice()) |thread| if (thread.tid == event.tid and thread.id == wanted) {

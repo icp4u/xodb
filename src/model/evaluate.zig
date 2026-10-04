@@ -37,13 +37,13 @@ pub fn materialize(ctx: Context, value: Value) !Value {
         }
         var bytes: [8]u8 = @splat(0);
         @memcpy(bytes[0..size], data[0..size]);
-        v.bits = std.mem.readInt(u64, &bytes, .little);
+        v.bits = std.mem.readInt(u64, &bytes, .big) >> @intCast((8 - size) * 8);
     } else if (v.address) |address| {
         if (v.type.size == 0 or v.type.size > 8) return error.UnsupportedType;
         var bytes: [8]u8 = @splat(0);
         const size: usize = @intCast(v.type.size);
         if (try ctx.read(ctx.user, address, bytes[0..size]) != size) return error.MemoryUnreadable;
-        v.bits = std.mem.readInt(u64, &bytes, .little);
+        v.bits = std.mem.readInt(u64, &bytes, .big) >> @intCast((8 - size) * 8);
     }
     if (v.type.size == 0 or v.type.size > 8 or v.type.kind == .unknown) return error.UnsupportedType;
     if (v.type.size < 8) {
@@ -126,7 +126,7 @@ const Parser = struct {
     }
     fn pointer(self: *Parser, child: *const Type) !*const Type {
         const t = try self.ctx.allocator.create(Type);
-        t.* = .{ .name = "pointer", .kind = .pointer, .size = 8, .child = child };
+        t.* = .{ .name = "pointer", .kind = .pointer, .size = 4, .child = child };
         return t;
     }
     fn prefix(self: *Parser, depth: u32) anyerror!Value {

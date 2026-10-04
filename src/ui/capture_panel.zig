@@ -784,7 +784,7 @@ test "drawing is bounded for 1,024 threads at any size, and timings are reported
             best = @min(best, now() - started);
         }
         try testing.expect(panel.row_count <= max_rows);
-        std.debug.print("\npanel draw {d}x{d}: {d} us, {d} quads, {d} rows\n", .{ @as(u32, @intFromFloat(bounds.w)), @as(u32, @intFromFloat(bounds.h)), best / 1000, fx.r.vertices / 6, panel.row_count });
+        @import("../m68k_log.zig").print("\npanel draw {d}x{d}: {d} us, {d} quads, {d} rows\n", .{ @as(u32, @intFromFloat(bounds.w)), @as(u32, @intFromFloat(bounds.h)), best / 1000, fx.r.vertices / 6, panel.row_count });
     }
 }
 fn now() u64 {

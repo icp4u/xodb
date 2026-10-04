@@ -53,8 +53,8 @@ pub fn readFilter(args: Value) !profile.Filter {
 }
 fn derivedFlamegraph(a: Allocator, session: *Session, capture: *profile.Capture, filter: profile.Filter, args: Value) !Value {
     const derived = @import("../profile/derived.zig");
-    const start = try number(args, "start", 0);
-    const limit = try number(args, "limit", 64);
+    const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments;
     if (limit == 0 or limit > 64) return error.InvalidArguments;
     // Pages refer only to the retained result; stale citations must not start
     // a new build or reinterpret a node from the other basis.
@@ -115,14 +115,15 @@ fn derivedFlamegraph(a: Allocator, session: *Session, capture: *profile.Capture,
     });
 }
 pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Value {
+    if (@import("../target/arch.zig").native == .m68k) return error.ProfileUnsupportedArchitecture;
     if (std.mem.eql(u8, name, "get_profile_stack") or std.mem.eql(u8, name, "get_profile_stack_coverage")) return @import("sampled_stack.zig").call(a, session, name, args);
     if (std.mem.eql(u8, name, "get_profile_samples")) {
         try fields(args, &.{ "capture_id", "revision", "start", "limit" });
         const capture = session.profile orelse return error.NoProfile;
         if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
-        const start = try number(args, "start", 0);
-        const limit = try number(args, "limit", 8);
+        const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try number(args, "limit", 8)) orelse return error.InvalidArguments;
         if (start > capture.samples.len() or limit == 0 or limit > 16) return error.InvalidArguments;
         const end = @min(capture.samples.len(), start + limit);
         const Row = struct { ordinal: usize, sample: Value };
@@ -141,7 +142,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
         const raw_path = args.object.get("path") orelse return error.InvalidArguments;
         if (raw_path != .string or raw_path.string.len == 0 or raw_path.string.len > 4096 or std.mem.indexOfScalar(u8, raw_path.string, 0) != null) return error.InvalidArguments;
-        const path = try a.dupeZ(u8, raw_path.string);
+        const path = try a.dupeSentinel(u8, raw_path.string, 0);
         const selected_filter = try readFilter(args);
         try session.ensureArchiveView(selected_filter);
         if (capture.collector != null) return error.ProfileStillCollecting;
@@ -185,8 +186,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
         const filter = try readFilter(args);
         try capture.validateFilter(filter);
-        const start = try number(args, "start", 0);
-        const limit = try number(args, "limit", 64);
+        const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments;
         if (limit == 0 or limit > 128) return error.InvalidArguments;
         const app = @import("../profile/intervals.zig");
         const extent = capture.extentNs();
@@ -261,8 +262,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         const capture = session.profile orelse return error.NoProfile;
         if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
-        const start = try number(args, "start", 0);
-        const limit = try number(args, "limit", 64);
+        const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments;
         if (start > capture.history.entries.items.len or limit == 0 or limit > 64) return error.InvalidArguments;
         const end = @min(capture.history.entries.items.len, start + limit);
         const Row = struct { id: u32, time_ns: ?u64, offset_ns: ?u64, start: []const u8, end: []const u8, file_offset: []const u8, module_id: u64, device_major: u64, device_minor: u64, inode: u64, executable: bool, reason: @import("../profile/mappings.zig").Reason, path: []const u8 };
@@ -283,8 +284,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         const tid = filter.tid orelse return error.InvalidArguments;
         const index = capture.threadIndex(@intCast(tid)).?;
         const range = filter.clipped(capture.extentNs());
-        const start = try number(args, "start", 0);
-        const limit = try number(args, "limit", 128);
+        const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try number(args, "limit", 128)) orelse return error.InvalidArguments;
         if (limit == 0 or limit > 128) return error.InvalidArguments;
         const spans = try capture.schedulingSpans(a, index, range);
         defer a.free(spans);
@@ -298,7 +299,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
         const filter = try readFilter(args);
-        const page = try capture.syscallPage(a, filter, try number(args, "start", 0), try number(args, "limit", 64));
+        const page = try capture.syscallPage(a, filter, std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments, std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments);
         return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .provisional = capture.collector != null, .syscalls = capture.syscallSummary(), .rows = page.rows, .total = page.total, .next = page.next, .clock = "CLOCK_MONOTONIC", .selection = "rows overlap the relative capture-time filter; row timestamps and durations retain full original endpoints; unfinished durations are null", .scheduling = capture.schedulingSummary() });
     }
     if (std.mem.eql(u8, name, "get_profile_timeline")) {
@@ -308,8 +309,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
         const filter = try readFilter(args);
         const bins = try number(args, "bins", 128);
-        const start = try number(args, "start", 0);
-        const limit = try number(args, "limit", 64);
+        const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments;
         if (bins == 0 or bins > @import("../profile/timeline.zig").max_bins or limit == 0 or limit > 64) return error.InvalidArguments;
         var data = try capture.cpuTimeline(a, filter, @intCast(bins));
         defer data.deinit();
@@ -404,7 +405,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         break :blk &result.graph;
     };
     if (detail) {
-        const node = try number(args, "node", null);
+        const node = std.math.cast(usize, try number(args, "node", null)) orelse return error.InvalidArguments;
         if (node >= graph.nodes.items.len) return error.InvalidArguments;
         const frame = graph.nodes.items[node].frame;
         const site = capture.source(a, frame) catch null;
@@ -418,8 +419,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         for (decoded) |instruction| try instructions.append(a, .{ .address = try std.fmt.allocPrint(a, "0x{x}", .{instruction.address}), .mnemonic = try a.dupe(u8, std.mem.sliceTo(&instruction.mnemonic, 0)), .operands = try a.dupe(u8, std.mem.sliceTo(&instruction.operands, 0)) });
         return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .node = node, .evidence = .{ .mapping_id = frame.mapping_id, .module_id = frame.module_id, .lookup_address = try std.fmt.allocPrint(a, "0x{x}", .{frame.lookup_address}), .reference_basis = "mapping/address plus the view filter; node is temporary within view_id" }, .source_basis = if (capture.reanalyzed) "new analysis of identity-verified immutable assets; source text not archived" else if (capture.offline) @import("../profile/annotations.zig").basis else "retained capture ELF; current source text not certified", .mapping_id = frame.mapping_id, .mapping_note = frame.mapping_note, .mapping_coverage = @import("../profile/mappings.zig").coverage, .source = site, .instructions = instructions.items, .diagnostic = diagnostic, .assembly_basis = "retained ELF file for the recorded mapping, not live memory; sample IP or caller return address minus one is a representative location, not a per-line histogram", .target_changed = session.target.image_epoch != capture.image_epoch });
     }
-    const start = try number(args, "start", 0);
-    const limit = try number(args, "limit", 64);
+    const start = std.math.cast(usize, try number(args, "start", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try number(args, "limit", 64)) orelse return error.InvalidArguments;
     if (start >= graph.nodes.items.len or limit == 0 or limit > 64) return error.InvalidArguments;
     const end = @min(graph.nodes.items.len, start + limit);
     const Row = struct { id: u32, parent: ?u32, name: []const u8, kind: @import("../profile/flame.zig").Kind, module_id: u64, mapping_id: u32, mapping_note: []const u8, module: []const u8, address: []const u8, lookup_address: []const u8, inclusive: u64, self: u64, depth: u16, x: u64 };

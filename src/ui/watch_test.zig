@@ -288,7 +288,7 @@ test "change after truncated display prefix is still marked" {
     var fake = Fake{ .frames = &.{f_work} };
     var list = watch.WatchList{};
     defer list.deinit();
-    var text = [_]u8{'a'} ** 200;
+    var text = @as([200]u8, @splat('a'));
     fake.value = &text;
     _ = try list.add("n", watch.FrameId.of(10, 0, f_work, fake.ident, fake.gen));
     list.refresh(&fake);

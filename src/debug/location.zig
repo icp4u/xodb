@@ -18,9 +18,12 @@ pub const Context = struct {
 pub fn registers(regs: Registers) RegisterSet {
     var out: RegisterSet = @splat(null);
     if (@import("../target/linux.zig").architecture == .aarch64) {
-        inline for (std.meta.fields(Registers)[0..31], 0..) |field, i| out[i] = @field(regs, field.name);
+        inline for (@typeInfo(Registers).@"struct".field_names[0..31], 0..) |field, i| out[i] = @field(regs, field);
         out[31] = regs.sp;
         out[32] = regs.pc;
+    } else if (@import("../target/linux.zig").architecture == .m68k) {
+        inline for (@typeInfo(Registers).@"struct".field_names[0..16], 0..) |field, i| out[i] = @field(regs, field);
+        out[24] = regs.pc;
     } else {
         const x86 = [_]?u64{ regs.rax, regs.rdx, regs.rcx, regs.rbx, regs.rsi, regs.rdi, regs.rbp, regs.rsp, regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15, regs.rip };
         @memcpy(out[0..x86.len], &x86);
@@ -132,11 +135,11 @@ pub fn evaluate(ctx: Context, ops: []const Op) !Place {
             },
             OP.deref, OP.deref_size => {
                 if (count < 1) return error.MalformedExpression;
-                const size: usize = if (op.atom == OP.deref) 8 else std.math.cast(usize, op.number) orelse return error.UnsupportedLocation;
+                const size: usize = if (op.atom == OP.deref) 4 else std.math.cast(usize, op.number) orelse return error.UnsupportedLocation;
                 if (size == 0 or size > 8) return error.UnsupportedLocation;
                 var bytes: [8]u8 = @splat(0);
                 if (try ctx.read(ctx.user, stack[count - 1], bytes[0..size]) != size) return error.MemoryUnreadable;
-                stack[count - 1] = std.mem.readInt(u64, &bytes, .little);
+                stack[count - 1] = std.mem.readInt(u64, &bytes, .big) >> @intCast((8 - size) * 8);
             },
             OP.stack_value => {
                 if (count < 1) return error.MalformedExpression;
@@ -211,9 +214,10 @@ test "frame-relative locations and stack values keep runtime addresses distinct"
 }
 
 fn lowBits(data: []const u8) u64 {
+    if (data.len == 0) return 0;
     var bytes: [8]u8 = @splat(0);
     @memcpy(bytes[0..@min(8, data.len)], data[0..@min(8, data.len)]);
-    return std.mem.readInt(u64, &bytes, .little);
+    return std.mem.readInt(u64, &bytes, .big) >> @intCast((8 - @min(8, data.len)) * 8);
 }
 /// Materialize piece descriptions in target little-endian bit order. A validity
 /// mask preserves missing bits; absent pieces never become plausible zeroes.
@@ -227,6 +231,7 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
         pieces += 1;
     };
     if (pieces == 0) return evaluate(ctx, ops);
+    if (@import("builtin").cpu.arch == .m68k) return error.CompositeUnsupportedArchitecture;
     if (ops.len > 4096 or (ops[ops.len - 1].atom != OP.piece and ops[ops.len - 1].atom != OP.bit_piece)) return error.MalformedExpression;
     const data = try a.alloc(u8, (bits + 7) / 8);
     const valid = try a.alloc(u8, data.len);

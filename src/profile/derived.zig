@@ -22,7 +22,7 @@ const sample_store = @import("sample_store.zig");
 const Capture = capture_model.Capture;
 
 pub const version = "xodb-derived-flame-v1";
-pub const reason_count = @typeInfo(unwind.Reason).@"enum".fields.len;
+pub const reason_count = @typeInfo(unwind.Reason).@"enum".field_names.len;
 pub const max_reason_examples = 4;
 pub const Bucket = enum { complete, partial, leaf_only, unavailable, excluded };
 pub const bucket_meaning = .{

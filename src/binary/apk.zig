@@ -12,7 +12,7 @@ fn rd(comptime T: type, bytes: []const u8, offset: usize) T {
 fn read(fd: c_int, bytes: []u8, offset: u64) !void {
     var done: usize = 0;
     while (done < bytes.len) {
-        const n = c.pread(fd, bytes.ptr + done, bytes.len - done, std.math.cast(i64, offset + done) orelse return error.InvalidApk);
+        const n = c.pread(fd, bytes.ptr + done, bytes.len - done, std.math.cast(c.off_t, offset + done) orelse return error.InvalidApk);
         if (n < 0 and std.c._errno().* == c.EINTR) continue;
         if (n <= 0) return error.InvalidApk;
         done += @intCast(n);
@@ -23,12 +23,13 @@ pub fn find(a: A, fd: c_int, size: u64, mapped_offset: u64) !Entry {
     var signature: [4]u8 = undefined;
     try read(fd, &signature, 0);
     if (rd(u32, &signature, 0) != 0x04034b50) return error.NotElf;
-    var tail: [65535 + 22]u8 = undefined;
+    const tail = try a.alloc(u8, @intCast(@min(size, 65535 + 22)));
+    defer a.free(tail);
     const tail_size: usize = @intCast(@min(size, tail.len));
     try read(fd, tail[0..tail_size], size - tail_size);
     var pos = tail_size - 22;
     const end = while (true) {
-        if (rd(u32, &tail, pos) == 0x06054b50 and pos + 22 + @as(usize, rd(u16, &tail, pos + 20)) == tail_size) break tail[pos..][0..22];
+        if (rd(u32, tail, pos) == 0x06054b50 and pos + 22 + @as(usize, rd(u16, tail, pos + 20)) == tail_size) break tail[pos..][0..22];
         if (pos == 0) return error.InvalidApk;
         pos -= 1;
     };

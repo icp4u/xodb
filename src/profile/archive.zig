@@ -84,10 +84,10 @@ const flag_ignorable: u32 = 1;
 /// ArchiveUnsupportedValue rather than a different meaning.
 fn Codes(comptime E: type, comptime names: []const []const u8) type {
     comptime {
-        for (@typeInfo(E).@"enum".fields) |field| {
+        for (@typeInfo(E).@"enum".field_names) |field| {
             for (names) |name| {
-                if (std.mem.eql(u8, name, field.name)) break;
-            } else @compileError("archive code table lacks " ++ @typeName(E) ++ "." ++ field.name);
+                if (std.mem.eql(u8, name, field)) break;
+            } else @compileError("archive code table lacks " ++ @typeName(E) ++ "." ++ field);
         }
     }
     return struct {
@@ -498,8 +498,8 @@ pub const Resolver = struct {
     enabled: bool = false,
     fn candidate(self: Resolver, buffer: []u8, report: ImageReport) ?[:0]const u8 {
         if (!self.enabled) return null;
-        if (self.root) |root| return std.fmt.bufPrintZ(buffer, "{s}/{s}", .{ root, std.fmt.bytesToHex(report.identity.sha256, .lower) }) catch null;
-        return std.fmt.bufPrintZ(buffer, "{s}", .{report.path}) catch null;
+        if (self.root) |root| return std.fmt.bufPrintSentinel(buffer, "{s}/{s}", .{ root, std.fmt.bytesToHex(report.identity.sha256, .lower) }, 0) catch null;
+        return std.fmt.bufPrintSentinel(buffer, "{s}", .{report.path}, 0) catch null;
     }
 };
 pub const Options = struct {
@@ -791,7 +791,7 @@ fn decodeMeta(r: *Reader, self: *Capture, source: *Source, a: Allocator) !void {
     self.debugger_marker_dropped = try r.int(u64);
     self.debugger_events_lost = try r.int(u64);
     self.debugger_sequence = try r.int(u64);
-    const reasons = try r.count(@typeInfo(capture_model.Stop).@"enum".fields.len, 1);
+    const reasons = try r.count(@typeInfo(capture_model.Stop).@"enum".field_names.len, 1);
     for (0..reasons) |i| {
         const reason = try StopCode.decode(try r.code());
         if (std.mem.indexOfScalar(capture_model.Stop, self.stop_reasons[0..i], reason) != null) return error.ArchiveInconsistent;
@@ -1064,7 +1064,7 @@ fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, a: Alloca
         report.status = .invalid_elf;
         return;
     }
-    const name = try self.images.allocator.dupeZ(u8, report.path);
+    const name = try self.images.allocator.dupeSentinel(u8, report.path, 0);
     errdefer self.images.allocator.free(name);
     const module = try self.images.allocator.create(modules.Module);
     errdefer self.images.allocator.destroy(module);
@@ -1100,7 +1100,7 @@ fn publishInner(path: [:0]const u8, bytes: []const u8, state: ?*progress.Progres
     if (path.len == 0 or path.len > max_path or std.mem.indexOfScalar(u8, path, 0) != null or bytes.len > max_file_bytes) return error.ArchivePathInvalid;
     try progress.step(state, .publishing, 0);
     var buffer: [max_path + 80]u8 = undefined;
-    const temporary = try std.fmt.bufPrintZ(&buffer, "{s}.xcap-{d}-{d}.tmp", .{ path, c.getpid(), @import("../target/linux.zig").now() });
+    const temporary = try std.fmt.bufPrintSentinel(&buffer, "{s}.xcap-{d}-{d}.tmp", .{ path, c.getpid(), @import("../target/linux.zig").now() }, 0);
     const fd = c.open(temporary.ptr, c.O_WRONLY | c.O_CREAT | c.O_EXCL | c.O_CLOEXEC | c.O_NOFOLLOW, @as(c_uint, 0o600));
     if (fd < 0) return error.ArchiveOpenFailed;
     defer {
@@ -1188,7 +1188,7 @@ fn encodeAnnotations(w: Writer, original: *const Capture, state: ?*progress.Prog
             .inode = source.inode,
             .device_major = source.device_major,
             .device_minor = source.device_minor,
-            .path = try w.a.dupeZ(u8, source.path),
+            .path = try w.a.dupeSentinel(u8, source.path, 0),
             .image = source.image,
             .bias = source.bias,
             .start = source.start,

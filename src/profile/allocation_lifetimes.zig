@@ -285,5 +285,5 @@ test "maximum distinct-address history has bounded analysis memory" {
     try std.testing.expectEqual(@as(u64, max_calls * 16), view.summary.outstanding_bytes);
     view.deinit(budget.allocator());
     try std.testing.expectEqual(@as(usize, 0), budget.used);
-    std.debug.print("allocation analysis peak: {d} bytes / {d} calls\n", .{ budget.peak, max_calls });
+    @import("../m68k_log.zig").print("allocation analysis peak: {d} bytes / {d} calls\n", .{ budget.peak, max_calls });
 }

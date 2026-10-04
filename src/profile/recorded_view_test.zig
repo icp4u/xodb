@@ -191,7 +191,7 @@ test "maximum recorded snapshot fits worker budget and reports copy and build co
         var result = job.take() orelse return error.MissingView;
         defer result.deinit();
         try std.testing.expect(result.peak_bytes <= view.memory_limit);
-        std.debug.print("recorded worker: wide={} samples={d} input_bytes={d} peak_bytes={d} snapshot_us={d} build_us={d} nodes={d} rejected={d}\n", .{ wide, result.sample_count, input_bytes, result.peak_bytes, result.snapshot_ns / 1000, result.build_ns / 1000, result.graph.nodes.items.len, result.graph.rejected });
+        @import("../m68k_log.zig").print("recorded worker: wide={} samples={d} input_bytes={d} peak_bytes={d} snapshot_us={d} build_us={d} nodes={d} rejected={d}\n", .{ wide, result.sample_count, input_bytes, result.peak_bytes, result.snapshot_ns / 1000, result.build_ns / 1000, result.graph.nodes.items.len, result.graph.rejected });
     }
 }
 

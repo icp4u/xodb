@@ -40,11 +40,11 @@ pub const Job = struct {
         if (path.len == 0 or path.len > archive.max_path or std.mem.indexOfScalar(u8, path, 0) != null) return error.ArchivePathInvalid;
         const self = try a.create(Job);
         errdefer a.destroy(self);
-        self.* = .{ .id = id, .kind = kind, .path = try a.dupeZ(u8, path) };
+        self.* = .{ .id = id, .kind = kind, .path = try a.dupeSentinel(u8, path, 0) };
         return self;
     }
     pub fn start(self: *Job) !void {
-        self.thread = try std.Thread.spawn(.{}, run, .{self});
+        self.thread = try unsupportedThread(.{}, run, .{self});
     }
     fn run(self: *Job) void {
         self.execute() catch |err| {
@@ -130,3 +130,5 @@ pub const Job = struct {
     }
 };
 pub const Status = struct { id: u64, kind: []const u8, path: []const u8, done: bool, cancel_requested: bool, phase: []const u8, completed_units: usize, error_name: ?[]const u8, publication: ?archive.Publication };
+
+fn unsupportedThread(_: anytype, _: anytype, _: anytype) error{ThreadsUnavailable}!std.Thread { return error.ThreadsUnavailable; }

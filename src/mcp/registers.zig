@@ -15,7 +15,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, args: std.json.Value) !std.
         if (value != .string) return error.InvalidArguments;
         format = std.meta.stringToEnum(xstate.Format, value.string) orelse return error.InvalidArguments;
     }
-    const width = try wire.number(args, "width", state.vector_bytes * 8);
+    const width = std.math.cast(usize, try wire.number(args, "width", state.vector_bytes * 8)) orelse return error.InvalidArguments;
     if (width != 128 and width != 256 and width != 512) return error.InvalidArguments;
     if (width > state.vector_bytes * 8) return error.VectorWidthUnavailable;
     const Row = struct { name: []const u8, hex: []const u8, lanes: [][]const u8 };

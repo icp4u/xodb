@@ -18,7 +18,7 @@ fn killReap(pid: c.pid_t) void {
 }
 fn taskState(pid: c.pid_t) u8 {
     var path: [128]u8 = undefined;
-    const name = std.fmt.bufPrintZ(&path, "/proc/{d}/stat", .{pid}) catch return 0;
+    const name = std.fmt.bufPrintSentinel(&path, "/proc/{d}/stat", .{pid}, 0) catch return 0;
     const fd = c.open(name, c.O_RDONLY);
     if (fd < 0) return 0;
     defer _ = c.close(fd);
@@ -87,7 +87,7 @@ test "lifecycle: polling and cleanup leave foreign trace stops untouched" {
 test "lifecycle: exited leader permits worker memory, maps, watchpoints and detach" {
     try @import("../test_support.zig").requireLive();
     var name: [256]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&name, ".work/leader-exit-{d}-{d}.txt", .{ c.getpid(), linux.now() });
+    const path = try std.fmt.bufPrintSentinel(&name, ".work/leader-exit-{d}-{d}.txt", .{ c.getpid(), linux.now() }, 0);
     defer _ = c.unlink(path);
     var session = Session.init();
     defer session.deinit();
@@ -182,7 +182,7 @@ test "lifecycle: detached owned child is reaped without target events" {
 test "lifecycle: attaching after leader exit inspects surviving workers" {
     try @import("../test_support.zig").requireLive();
     var name: [256]u8 = undefined;
-    const path = try std.fmt.bufPrintZ(&name, ".work/attach-leader-{d}-{d}.txt", .{ c.getpid(), linux.now() });
+    const path = try std.fmt.bufPrintSentinel(&name, ".work/attach-leader-{d}-{d}.txt", .{ c.getpid(), linux.now() }, 0);
     defer _ = c.unlink(path);
     const pid = c.fork();
     if (pid == 0) {
@@ -225,7 +225,7 @@ test "lifecycle: attach during thread creation covers every surviving task" {
         try target.attach(pid);
         try equal(linux.State.stopped, target.state);
         var buf: [128]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&buf, "/proc/{d}/task", .{pid});
+        const path = try std.fmt.bufPrintSentinel(&buf, "/proc/{d}/task", .{pid}, 0);
         const dir = c.opendir(path) orelse return error.ProcessGone;
         defer _ = c.closedir(dir);
         while (c.readdir(dir)) |entry| {

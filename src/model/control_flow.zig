@@ -61,7 +61,7 @@ fn edge(graph: Graph, from: usize, kind: EdgeKind, destination: ?u64, assumed: b
 pub fn build(a: std.mem.Allocator, bytes: []const u8, address: u64) !Graph {
     if (bytes.len == 0) return error.EmptyFunction;
     if (bytes.len > max_bytes) return error.FunctionTooLarge;
-    if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+    if (address > @as(u64, std.math.maxInt(u64)) - bytes.len) return error.InvalidAddress;
     const capacity = @min(max_instructions + 1, bytes.len);
     const buffer = try a.alloc(disasm.Instruction, capacity);
     defer a.free(buffer);

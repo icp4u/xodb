@@ -465,7 +465,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         if (now < retry or (!window.dirty and now -| last_frame < 250_000_000)) continue;
         if (!ready) {
             renderer.init(&window) catch |err| {
-                std.debug.print("xodb: remote GUI renderer failed: {s}\n", .{@errorName(err)});
+                @import("../m68k_log.zig").print("xodb: remote GUI renderer failed: {s}\n", .{@errorName(err)});
                 retry = now + 1_000_000_000;
                 continue;
             };
@@ -473,7 +473,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
             font.dirty = true;
         }
         const presented = drawFrame(&renderer, font, &workspace, &window, client, label) catch |err| {
-            std.debug.print("xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
+            @import("../m68k_log.zig").print("xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
             renderer.deinit();
             ready = false;
             retry = now + 1_000_000_000;
@@ -486,7 +486,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         rendered += 1;
         if (max_frames != 0 and rendered >= max_frames) break;
     }
-    std.debug.print("xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
+    @import("../m68k_log.zig").print("xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
 }
 fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, client: *remote.Client, label: []const u8) !bool {
     if (!try r.begin(window.width, window.height)) return false;

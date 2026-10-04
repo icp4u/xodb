@@ -46,8 +46,8 @@ pub fn call(a: aType, session: *Session, name: []const u8, args: Value) !Value {
     if (coverage) {
         const filter = try common.readFilter(args);
         try capture.validateFilter(filter);
-        const start = try common.number(args, "start", 0);
-        const limit = try common.number(args, "limit", 64);
+        const start = std.math.cast(usize, try common.number(args, "start", 0)) orelse return error.InvalidArguments;
+        const limit = std.math.cast(usize, try common.number(args, "limit", 64)) orelse return error.InvalidArguments;
         if (limit == 0 or limit > 128) return error.InvalidArguments;
         const Row = struct { tid: u32, counts: Counts = .{} };
         var rows: std.ArrayList(Row) = .empty;
@@ -79,10 +79,10 @@ pub fn call(a: aType, session: *Session, name: []const u8, args: Value) !Value {
         const end = @min(rows.items.len, start + limit);
         return common.value(a, .{ .capture_id = capture.id, .revision = capture.revision, .range = filter.clipped(capture.extentNs()), .totals = totals, .unfilterable_samples = invalid, .threads = rows.items[start..end], .total_threads = rows.items.len, .next = if (end < rows.items.len) @as(?usize, end) else null, .selection = "half-open time range relative to capture start; retention follows drain order, not a guaranteed chronological prefix" });
     }
-    const ordinal = try common.number(args, "sample", null);
+    const ordinal = std.math.cast(usize, try common.number(args, "sample", null)) orelse return error.InvalidArguments;
     if (ordinal >= capture.samples.len()) return error.InvalidArguments;
-    const offset = try common.number(args, "stack_offset", 0);
-    const limit = try common.number(args, "stack_limit", 256);
+    const offset = std.math.cast(usize, try common.number(args, "stack_offset", 0)) orelse return error.InvalidArguments;
+    const limit = std.math.cast(usize, try common.number(args, "stack_limit", 256)) orelse return error.InvalidArguments;
     if (limit > 1024) return error.InvalidArguments;
     const reconstruct = if (args.object.get("reconstruct")) |v| switch (v) {
         .bool => v.bool,

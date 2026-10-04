@@ -194,7 +194,7 @@ pub const Image = struct {
     fn loadUnits(self: *Image) !void {
         if (self.units_error) |err| return err;
         if (self.units_ready) return;
-        errdefer |err| self.units_error = err;
+        errdefer self.units_error = error.MalformedDebugInfo;
         const d = self.dwarf orelse return error.NoDebugInfo;
         if (!@hasDecl(c, "dwarf_get_units")) {
             try self.loadLegacyUnits(d);
@@ -222,7 +222,7 @@ pub const Image = struct {
         if (unit.kind != std.dwarf.UT.skeleton) return &unit.die;
         if (unit.split_error) |err| return err;
         if (unit.split) |*die| return die;
-        errdefer |err| unit.split_error = err;
+        errdefer unit.split_error = error.SplitDwarfUnavailable;
         if (!self.allow_split) return error.SplitDwarfDisabled;
         if (!@hasDecl(c, "dwarf_cu_info")) return error.SplitDwarfUnsupportedByLibdw;
         if (self.split_count >= 64) return error.SplitDwarfFileLimit;
@@ -234,7 +234,7 @@ pub const Image = struct {
         var arena = std.heap.ArenaAllocator.init(self.arena.child_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const path = if (name_[0] == '/') try a.dupeZ(u8, name_) else blk: {
+        const path = if (name_[0] == '/') try a.dupeSentinel(u8, name_, 0) else blk: {
             const dir_attr = c.dwarf_attr(&unit.die, std.dwarf.AT.comp_dir, &attr) orelse return error.SplitDwarfNameMissing;
             const dir = std.mem.span(c.dwarf_formstring(dir_attr) orelse return error.SplitDwarfNameMissing);
             if (dir.len == 0 or dir.len > 4096 or dir[0] != '/') return error.SplitDwarfRequiresAbsoluteBuildPath;
@@ -399,6 +399,8 @@ pub const Image = struct {
         const normalized = try a.alloc(loc.Op, count);
         for (normalized, 0..) |*out, i| {
             out.* = .{ .atom = ops[i].atom, .number = ops[i].number, .number2 = ops[i].number2, .offset = ops[i].offset };
+            if (out.atom == std.dwarf.OP.fbreg or (out.atom >= std.dwarf.OP.breg0 and out.atom <= std.dwarf.OP.breg31) or out.atom == std.dwarf.OP.consts or out.atom == std.dwarf.OP.const1s or out.atom == std.dwarf.OP.const2s or out.atom == std.dwarf.OP.const4s) out.number = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(out.number))))));
+            if (out.atom == std.dwarf.OP.bregx) out.number2 = @bitCast(@as(i64, @as(i32, @bitCast(@as(u32, @truncate(out.number2))))));
             if (out.atom == std.dwarf.OP.implicit_value) {
                 const attribute = attr orelse return error.UnsupportedLocation;
                 var block: c.Dwarf_Block = undefined;
@@ -411,10 +413,10 @@ pub const Image = struct {
                 var unit: c.Dwarf_Die = undefined;
                 if (c.dwarf_cu_die(attribute.cu, &unit, null, null, null, null, null, null) == null) return error.MalformedDebugInfo;
                 const base = unsigned(&unit, std.dwarf.AT.addr_base) orelse return error.AddressTableUnavailable;
-                const index = std.math.mul(u64, out.number, 8) catch return error.MalformedDebugInfo;
+                const index = std.math.mul(u64, out.number, 4) catch return error.MalformedDebugInfo;
                 const offset = std.math.add(u64, base, index) catch return error.MalformedDebugInfo;
-                if (offset > self.address_table.len or self.address_table.len - offset < 8) return error.MalformedDebugInfo;
-                out.number = std.mem.readInt(u64, self.address_table[@intCast(offset)..][0..8], .little);
+                if (offset > self.address_table.len or self.address_table.len - offset < 4) return error.MalformedDebugInfo;
+                out.number = std.mem.readInt(u32, self.address_table[@intCast(offset)..][0..4], .big);
                 out.atom = if (out.atom == std.dwarf.OP.addrx or out.atom == std.dwarf.OP.GNU_addr_index) std.dwarf.OP.addr else std.dwarf.OP.constu;
             }
         }
@@ -451,9 +453,9 @@ pub const Image = struct {
             }
             const where = self.expression(a, null, ops, count, context) catch continue;
             if (where.kind == .address) {
-                var bytes: [8]u8 = undefined;
+                var bytes: [4]u8 = undefined;
                 const n = ctx.read(ctx.user, where.bits, &bytes) catch continue;
-                if (n == 8) value.* = std.mem.readInt(u64, &bytes, .little);
+                if (n == 4) value.* = std.mem.readInt(u32, &bytes, .big);
             } else value.* = loc.scalar(where, 8) catch continue;
         }
         caller[self.architecture.sp()] = cfa;
@@ -531,7 +533,7 @@ pub const Image = struct {
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
                 t.kind = .pointer;
-                if (t.size == 0) t.size = 8;
+                if (t.size == 0) t.size = 4;
                 t.child = if (reference(&die, std.dwarf.AT.type)) |child| try self.typeOf(child, depth + 1) else &unknown;
                 if (t.name.len == 0) t.name = try std.fmt.allocPrint(a, "{s} *", .{t.child.?.name});
             },

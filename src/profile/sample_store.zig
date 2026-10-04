@@ -399,7 +399,7 @@ test "exact allocation accounting and default budget hold maximum unique wide ch
     try testing.expectEqualDeep(sample, store.get(store.len() - 1));
     try testing.expectError(error.SampleLimit, store.append(a, sample));
     try testing.expectEqual(@as(u64, 1), store.refused);
-    std.debug.print("compact wide-chain budget: samples={d} used={d} peak={d} limit={d}\n", .{ store.len(), store.used_bytes, store.peak_bytes, store.budget_bytes });
+    @import("../m68k_log.zig").print("compact wide-chain budget: samples={d} used={d} peak={d} limit={d}\n", .{ store.len(), store.used_bytes, store.peak_bytes, store.budget_bytes });
 }
 
 fn allocationFailure(a: Allocator) !void {
