@@ -1,0 +1,79 @@
+#!/usr/bin/env python3
+"""Cross-build headless xodb against Jetty's installed debugger libraries.
+
+Reads the SSH host only. Writes a fresh .work/jetty-build-* directory locally;
+never installs packages, changes host policy, stages files or runs remote targets.
+"""
+import argparse
+from datetime import datetime
+import io
+import json
+import os
+from pathlib import Path, PurePosixPath
+import shlex
+import subprocess
+import tarfile
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--host', default='jetty')
+args = parser.parse_args()
+if args.host.startswith('-'):
+    parser.error('host must be an SSH alias or hostname')
+root = Path(__file__).resolve().parents[1]
+run = root / '.work' / ('jetty-build-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+run.mkdir(parents=True, exist_ok=False)
+remote = r'''import os,sys,tarfile,pathlib,subprocess,json,io
+metadata={'machine':os.uname().machine,'kernel':os.uname().release,'libc':os.confstr('CS_GNU_LIBC_VERSION')}
+if metadata['machine']!='aarch64':raise RuntimeError('expected AArch64 Jetty')
+metadata['dependencies']=subprocess.check_output(['pkg-config','--modversion','capstone','libdw','libelf']).decode().splitlines()
+with tarfile.open(fileobj=sys.stdout.buffer,mode='w|gz',dereference=True) as t:
+ data=json.dumps(metadata,indent=2).encode();item=tarfile.TarInfo('host.json');item.size=len(data);t.addfile(item,io.BytesIO(data))
+ for name in ['capstone','elfutils','dwarf.h','gelf.h','libelf.h']:
+  t.add('/usr/include/'+name,arcname='include/'+name)
+ for name in ['libcapstone','libdw','libelf']:
+  candidates=[pathlib.Path(base)/(name+'.so') for base in ['/usr/lib/aarch64-linux-gnu','/lib/aarch64-linux-gnu']]
+  source=next((p for p in candidates if p.is_file()),None)
+  if source is None:raise RuntimeError('missing development library '+name)
+  t.add(str(source),arcname='lib/'+name+'.so')
+'''
+archive = run / 'dependencies.tar.gz'
+with archive.open('xb') as out:
+    subprocess.run(['ssh','-o','BatchMode=yes','-o','ConnectTimeout=8',
+                    '-o','StrictHostKeyChecking=yes','-o','ForwardAgent=no',
+                    args.host,'python3 -c ' + shlex.quote(remote)],
+                   stdout=out, check=True, timeout=90)
+with tarfile.open(archive) as t:
+    for member in t:
+        name = PurePosixPath(member.name)
+        if name.is_absolute() or '..' in name.parts or not (member.isfile() or member.isdir()):
+            raise RuntimeError('unexpected dependency archive member')
+        destination = run / 'sysroot' / member.name
+        if member.isdir():
+            destination.mkdir(parents=True, exist_ok=True)
+        else:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            with destination.open('xb') as out:
+                out.write(t.extractfile(member).read())
+pc = run / 'pkgconfig'
+pc.mkdir()
+for package, lib in [('capstone','capstone'),('libdw','dw'),('libelf','elf')]:
+    extra = 'Requires: libelf\n' if package == 'libdw' else ''
+    (pc / (package + '.pc')).write_text(
+        'Name: '+package+'\nDescription: Jetty installed library copy\nVersion: 0\n'
+        'Libs: -L'+str(run/'sysroot/lib')+' -l'+lib+'\n'
+        'Cflags: -I'+str(run/'sysroot/include')+'\n'+extra)
+(run/'tmp').mkdir()
+env = dict(os.environ, PKG_CONFIG_SYSROOT_DIR='', PKG_CONFIG_LIBDIR=str(pc),
+           PKG_CONFIG_PATH='', ZIG_GLOBAL_CACHE_DIR=str(root/'.cache/zig-global'),
+           TMPDIR=str(run/'tmp'))
+command = ['zig','build','-Dgui=false','-Dtarget=aarch64-linux.4.9-gnu.2.27',
+           '-Doptimize=ReleaseSafe','--cache-dir',str(run/'cache'),
+           '--prefix',str(run/'out'),'--summary','all']
+(run/'command.json').write_text(json.dumps(command,indent=2)+'\n')
+print('Dependencies copied read-only from '+args.host+'. Building in '+str(run),flush=True)
+with (run/'build.log').open('x') as out:
+    result = subprocess.run(command,cwd=root,env=env,stdout=out,stderr=subprocess.STDOUT)
+print((run/'build.log').read_text())
+if result.returncode:
+    raise SystemExit(result.returncode)
+print('ARM64 binary: '+str(run/'out/bin/xodb'))

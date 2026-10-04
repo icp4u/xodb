@@ -1,0 +1,7 @@
+.zig-cache/
+.cache/
+zig-out/
+.backups/
+.work/
+*.un~
+__pycache__/

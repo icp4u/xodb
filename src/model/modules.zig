@@ -1,0 +1,420 @@
+const std = @import("std");
+const c = @import("../c.zig").api;
+const elf = @import("../binary/elf.zig");
+const apk = @import("../binary/apk.zig");
+const snapshot = @import("../binary/snapshot.zig");
+const DebugInfo = @import("../debug/info.zig").Image;
+pub const Region = struct { start: u64, end: u64, offset: u64, inode: u64, device_major: u64, device_minor: u64, permissions: [4]u8, path: []const u8 };
+pub const Module = struct {
+    id: u64,
+    inode: u64,
+    device_major: u64,
+    device_minor: u64,
+    path: [:0]const u8,
+    image: elf.Image,
+    bias: u64,
+    start: u64,
+    end: u64,
+    debug: ?DebugInfo = null,
+    debug_file: ?*const @import("../binary/debug_files.zig").File = null,
+    debug_allocator: std.mem.Allocator = std.heap.page_allocator,
+    file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.
+    mapping: []align(std.heap.page_size_min) u8,
+    owns_mapping: bool = true,
+    immutable: bool = false,
+    pub fn debugInfo(self: *Module) !*DebugInfo {
+        if (self.debug == null) self.debug = try DebugInfo.initWithCompanion(self.image, self.mapping, self.debug_file, self.debug_allocator);
+        self.debug.?.allow_split = !self.immutable;
+        return &self.debug.?;
+    }
+    pub fn symbols(self: *const Module) *const elf.Image {
+        return if (self.debug_file) |file| &file.image else &self.image;
+    }
+    pub fn linkAddress(self: *const Module, runtime: u64) !u64 {
+        if (runtime < self.bias) return error.UnmappedAddress;
+        return runtime - self.bias;
+    }
+    pub fn runtimeAddress(self: *const Module, link: u64) !u64 {
+        return std.math.add(u64, link, self.bias) catch error.InvalidAddress;
+    }
+};
+pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0 };
+pub const Modules = struct {
+    core_source: ?*const @import("../binary/core.zig").Core = null,
+    core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
+    core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
+    allocator: std.mem.Allocator,
+    regions: std.ArrayList(Region) = .empty,
+    loaded: std.ArrayList(*Module) = .empty,
+    next_id: u64 = 1,
+    pid: i32 = 0,
+    immutable: bool = false,
+    snapshot_bytes: usize = 0,
+    debug_files: ?*@import("../binary/debug_files.zig").Files = null,
+    pub fn init(a: std.mem.Allocator) Modules {
+        return .{ .allocator = a };
+    }
+    pub fn deinit(self: *Modules) void {
+        var ids = self.core_ids.valueIterator();
+        while (ids.next()) |value| switch (value.*) {
+            .id => |id| self.allocator.free(id),
+            .failure => {},
+        };
+        self.core_ids.deinit(self.allocator);
+        if (self.core_executable) |exe| {
+            self.allocator.free(exe.path);
+            self.allocator.free(exe.id);
+        }
+        for (self.regions.items) |r| self.allocator.free(r.path);
+        self.regions.deinit(self.allocator);
+        for (self.loaded.items) |m| {
+            if (m.debug) |*info| info.deinit();
+            if (m.owns_mapping) _ = c.munmap(m.mapping.ptr, m.mapping.len);
+            self.allocator.free(m.path);
+            self.allocator.destroy(m);
+        }
+        self.loaded.deinit(self.allocator);
+    }
+    pub fn fromCore(self: *Modules, core: *const @import("../binary/core.zig").Core, executable: ?[]const u8) !void {
+        self.core_source = core;
+        self.immutable = true;
+        if (executable) |name| {
+            const z = try self.allocator.dupeZ(u8, name);
+            defer self.allocator.free(z);
+            const real = c.realpath(z, null) orelse return error.CoreExecutableUnavailable;
+            defer c.free(real);
+            const fd = c.open(real, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+            if (fd < 0) return error.CoreExecutableUnavailable;
+            defer _ = c.close(fd);
+            var stat: c.struct_stat = undefined;
+            if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.CoreExecutableUnavailable;
+            const data = try snapshot.readRange(fd, 0, @intCast(stat.st_size), snapshot.per_image_limit, null);
+            defer _ = c.munmap(data.ptr, data.len);
+            const image = try elf.Image.parse(data);
+            const id = image.buildId() orelse return error.CoreExecutableBuildIdMissing;
+            const path = try self.allocator.dupeZ(u8, std.mem.span(real));
+            errdefer self.allocator.free(path);
+            self.core_executable = .{ .path = path, .id = try self.allocator.dupe(u8, id) };
+        }
+        if (self.core_executable) |exe| {
+            var matched = false;
+            for (core.mappings.items) |mapping| if (mapping.offset == 0) {
+                const id = self.coreId(mapping.path) catch continue;
+                if (std.mem.eql(u8, id, exe.id)) {
+                    matched = true;
+                    break;
+                }
+            };
+            if (!matched) return error.CoreExecutableBuildIdMismatch;
+        }
+        for (core.mappings.items) |mapping| {
+            var permissions: [4]u8 = "---p".*;
+            for (core.segments.items) |seg| if (mapping.start >= seg.start and mapping.start < seg.end) {
+                if (seg.flags & 4 != 0) permissions[0] = 'r';
+                if (seg.flags & 2 != 0) permissions[1] = 'w';
+                if (seg.flags & 1 != 0) permissions[2] = 'x';
+                break;
+            };
+            try self.regions.append(self.allocator, .{ .start = mapping.start, .end = mapping.end, .offset = mapping.offset, .inode = std.hash.Wyhash.hash(0, mapping.path), .device_major = 0, .device_minor = 0, .permissions = permissions, .path = try self.allocator.dupe(u8, mapping.path) });
+        }
+    }
+    fn coreId(self: *Modules, path: []const u8) ![]const u8 {
+        if (self.core_ids.get(path)) |value| return switch (value) {
+            .id => |id| id,
+            .failure => |err| err,
+        };
+        if (self.core_ids.count() >= 1024) return error.CoreModuleLimit;
+        const core = self.core_source orelse return error.InvalidState;
+        // Cache keys refer to immutable core metadata, never temporary requests.
+        for (core.mappings.items) |mapping| if (mapping.offset == 0 and std.mem.eql(u8, mapping.path, path)) {
+            const id = core.buildId(self.allocator, mapping) catch |err| {
+                try self.core_ids.put(self.allocator, mapping.path, .{ .failure = err });
+                return err;
+            };
+            errdefer self.allocator.free(id);
+            try self.core_ids.put(self.allocator, mapping.path, .{ .id = id });
+            return id;
+        };
+        return error.CoreModuleIdentityUnavailable;
+    }
+    pub fn refresh(self: *Modules, pid: i32) !void {
+        if (self.core_source != null) return;
+        if (pid <= 0) return;
+        self.pid = pid;
+        var path_buf: [80]u8 = undefined;
+        const path = try std.fmt.bufPrintZ(&path_buf, "/proc/{d}/maps", .{pid});
+        const file = c.fopen(path, "r") orelse return error.ProcessMapsUnavailable;
+        defer _ = c.fclose(file);
+        var new_regions: std.ArrayList(Region) = .empty;
+        errdefer {
+            for (new_regions.items) |r| self.allocator.free(r.path);
+            new_regions.deinit(self.allocator);
+        }
+        var line: [*c]u8 = null;
+        var capacity: usize = 0;
+        defer c.free(line);
+        while (true) {
+            const len = c.getline(&line, &capacity, file);
+            if (len < 0) break;
+            var fields = std.mem.tokenizeAny(u8, line[0..@intCast(len)], " \t\n");
+            const range = fields.next() orelse continue;
+            const dash = std.mem.indexOfScalar(u8, range, '-') orelse continue;
+            const start = try std.fmt.parseInt(u64, range[0..dash], 16);
+            const end = try std.fmt.parseInt(u64, range[dash + 1 ..], 16);
+            const perms = fields.next() orelse continue;
+            const offset = try std.fmt.parseInt(u64, fields.next() orelse continue, 16);
+            const device = fields.next() orelse continue;
+            const colon = std.mem.indexOfScalar(u8, device, ':') orelse continue;
+            const device_major = try std.fmt.parseInt(u64, device[0..colon], 16);
+            const device_minor = try std.fmt.parseInt(u64, device[colon + 1 ..], 16);
+            const inode = try std.fmt.parseInt(u64, fields.next() orelse continue, 10);
+            const name = std.mem.trim(u8, fields.rest(), " \t\n");
+            if (perms.len != 4) return error.InvalidMaps;
+            try new_regions.append(self.allocator, .{ .start = start, .end = end, .offset = offset, .inode = inode, .device_major = device_major, .device_minor = device_minor, .permissions = perms[0..4].*, .path = try self.allocator.dupe(u8, name) });
+        }
+        if (c.ferror(file) != 0) return error.ProcessMapsUnavailable;
+        for (self.regions.items) |r| self.allocator.free(r.path);
+        self.regions.deinit(self.allocator);
+        self.regions = new_regions;
+    }
+    pub fn load(self: *Modules, region: Region) !*Module {
+        if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
+        return self.loadRange(region, false);
+    }
+    /// A perf record describes one range at one file offset, not the current
+    /// collection of VMAs. Do not combine it with the opening/live map snapshot.
+    pub fn loadObserved(self: *Modules, region: Region) !*Module {
+        if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
+        return self.loadRange(region, true);
+    }
+    fn pageSize() !u64 {
+        const result = c.sysconf(c._SC_PAGESIZE);
+        if (result <= 0) return error.BadMapping;
+        return @intCast(result);
+    }
+    fn sameFile(a: Region, b: Region) bool {
+        return a.inode == b.inode and a.device_major == b.device_major and a.device_minor == b.device_minor and std.mem.eql(u8, a.path, b.path);
+    }
+    const Placement = struct { first: Region, end: u64, bias: u64 };
+    fn placement(self: *Modules, image: *const elf.Image, file_offset: u64, region: Region, observed: bool) !Placement {
+        if (region.offset < file_offset) return error.BadMapping;
+        var relative = region;
+        relative.offset -= file_offset;
+        if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
+        if (file_offset == 0) {
+            var first = region;
+            var end = region.end;
+            for (self.regions.items) |r| if (sameFile(r, region)) {
+                if (r.start < first.start) first = r;
+                end = @max(end, r.end);
+            };
+            return .{ .first = first, .end = end, .bias = try image.loadBias(first.start, first.offset) };
+        }
+        const page = try pageSize();
+        var first_segment: ?elf.Segment = null;
+        for (0..image.header.segment_count) |i| {
+            const segment = try image.segment(@intCast(i));
+            if (segment.type == .load and (first_segment == null or segment.vaddr < first_segment.?.vaddr)) first_segment = segment;
+        }
+        const segment = first_segment orelse return error.NoLoadSegment;
+        const header_offset = std.math.add(u64, file_offset, segment.offset - segment.offset % page) catch return error.BadMapping;
+        var found: ?Placement = null;
+        for (self.regions.items) |r| {
+            if (!sameFile(r, region) or r.offset != header_offset) continue;
+            const bias = image.loadBias(r.start, r.offset - file_offset) catch continue;
+            if (!mappingFits(image, relative, bias, page)) continue;
+            if (found != null and found.?.bias != bias) return error.AmbiguousLoadBias;
+            found = .{ .first = r, .end = r.end, .bias = bias };
+        }
+        var result = found orelse return error.BadMapping;
+        for (self.regions.items) |r| {
+            if (!sameFile(r, region) or r.offset < file_offset) continue;
+            var rel = r;
+            rel.offset -= file_offset;
+            if (!mappingFits(image, rel, result.bias, page)) continue;
+            if (r.start < result.first.start) result.first = r;
+            result.end = @max(result.end, r.end);
+        }
+        return result;
+    }
+    fn mappingFits(image: *const elf.Image, r: Region, bias: u64, page: u64) bool {
+        if (r.end <= r.start) return false;
+        for (0..image.header.segment_count) |i| {
+            const segment = image.segment(@intCast(i)) catch continue;
+            if (segment.type != .load or segment.file_size == 0) continue;
+            if (r.permissions[2] == 'x' and segment.flags & elf.pf.x == 0) continue;
+            if (r.permissions[1] == 'w' and segment.flags & elf.pf.w == 0) continue;
+            const low = segment.offset - segment.offset % page;
+            const segment_end = std.math.add(u64, segment.offset, segment.file_size) catch continue;
+            const high = std.math.add(u64, segment_end, page - 1) catch continue;
+            const file_end = high - high % page;
+            if (r.offset < low or r.offset >= file_end or r.end - r.start > file_end - r.offset) continue;
+            const virtual = std.math.sub(u64, segment.vaddr, segment.offset - low) catch continue;
+            const address = std.math.add(u64, bias, virtual) catch continue;
+            if ((std.math.add(u64, address, r.offset - low) catch continue) == r.start) return true;
+        }
+        return false;
+    }
+    fn loadRange(self: *Modules, region: Region, observed: bool) !*Module {
+        for (self.loaded.items) |m| {
+            if (m.inode != region.inode or m.device_major != region.device_major or m.device_minor != region.device_minor or (self.core_source == null and !std.mem.eql(u8, m.path, region.path))) continue;
+            const p = self.placement(&m.image, m.file_offset, region, observed) catch continue;
+            if (m.start == p.first.start and m.end >= p.end and m.bias == p.bias) return m;
+        }
+        const expected = if (self.core_source != null) try self.coreId(region.path) else null;
+        const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
+        const path = try self.allocator.dupeZ(u8, selected_path);
+        errdefer self.allocator.free(path);
+        // Only read the inode actually mapped by the target. map_files can need
+        // privileges unavailable to run-as, so exe/path retain inode checks.
+        var proc_buf: [128]u8 = undefined;
+        const map_path = try std.fmt.bufPrintZ(&proc_buf, "/proc/{d}/map_files/{x}-{x}", .{ self.pid, region.start, region.end });
+        var fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else openMatching(map_path, region);
+        if (fd < 0 and self.core_source == null) {
+            const exe_path = try std.fmt.bufPrintZ(&proc_buf, "/proc/{d}/exe", .{self.pid});
+            fd = openMatching(exe_path, region);
+        }
+        if (fd < 0 and self.core_source == null) fd = openMatching(path, region);
+        if (fd < 0) return error.BinaryIdentityUnavailable;
+        defer _ = c.close(fd);
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.BinaryUnavailable;
+        var signature: [4]u8 = undefined;
+        if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
+        const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = @intCast(stat.st_size) } else try apk.find(self.allocator, fd, @intCast(stat.st_size), region.offset);
+        if (entry.offset % try pageSize() != 0) return error.ApkEntryNotPageAligned;
+        const mapped: snapshot.Bytes = if (self.immutable or entry.offset != 0)
+            try snapshot.readRange(fd, entry.offset, entry.size, @min(snapshot.per_image_limit, snapshot.total_limit - self.snapshot_bytes), null)
+        else blk: {
+            const ptr = c.mmap(null, entry.size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
+            if (ptr == std.c.MAP_FAILED) return error.BinaryUnavailable;
+            break :blk @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr.?)))[0..entry.size];
+        };
+        errdefer _ = c.munmap(mapped.ptr, mapped.len);
+        if (entry.offset != 0) {
+            var after: c.struct_stat = undefined;
+            if (c.fstat(fd, &after) != 0 or stat.st_size != after.st_size or
+                stat.st_mtim.tv_sec != after.st_mtim.tv_sec or stat.st_mtim.tv_nsec != after.st_mtim.tv_nsec or
+                stat.st_ctim.tv_sec != after.st_ctim.tv_sec or stat.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return error.BinaryChangedDuringRead;
+        }
+        const image = try elf.Image.parse(mapped);
+        if (expected) |id| if (!std.mem.eql(u8, id, image.buildId() orelse return error.CoreModuleBuildIdMissing)) return error.CoreModuleBuildIdMismatch;
+        if (@intFromEnum(image.header.machine) != @intFromEnum(@import("../target/arch.zig").native)) return error.UnsupportedTargetArchitecture;
+        const p = try self.placement(&image, entry.offset, region, observed);
+        const module = try self.allocator.create(Module);
+        errdefer self.allocator.destroy(module);
+        module.* = .{ .id = self.next_id, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable };
+        if (self.debug_files) |files| {
+            module.debug_file = (if (entry.offset == 0) files.discover(&image, path) else files.matching(&image)) catch |err| blk: {
+                std.debug.print("xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
+                break :blk null;
+            };
+            if (module.debug_file) |file| std.debug.print("xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
+        }
+        self.next_id += 1;
+        try self.loaded.append(self.allocator, module);
+        if (self.immutable or entry.offset != 0) self.snapshot_bytes += mapped.len;
+        return module;
+    }
+    /// A later executable mapping need not be the ELF's first PT_LOAD. Accept
+    /// only a unique bias from executable segments covering its file pages.
+    pub fn observedBias(image: *const elf.Image, region: Region) !u64 {
+        const page_result = c.sysconf(c._SC_PAGESIZE);
+        if (page_result <= 0 or region.start >= region.end) return error.BadMapping;
+        const page: u64 = @intCast(page_result);
+        var found: ?u64 = null;
+        var i: u32 = 0;
+        while (i < image.header.segment_count) : (i += 1) {
+            const segment = try image.segment(i);
+            if (segment.type != .load or segment.flags & 1 == 0 or segment.file_size == 0) continue;
+            const low = segment.offset - segment.offset % page;
+            const file_end = std.math.add(u64, segment.offset, segment.file_size) catch continue;
+            const padded = std.math.add(u64, file_end, page - 1) catch continue;
+            const high = padded - padded % page;
+            if (region.offset < low or region.offset >= high or region.end - region.start > high - region.offset) continue;
+            const virtual = if (region.offset >= segment.offset)
+                std.math.add(u64, segment.vaddr, region.offset - segment.offset) catch continue
+            else
+                std.math.sub(u64, segment.vaddr, segment.offset - region.offset) catch continue;
+            if (region.start < virtual) continue;
+            const bias = region.start - virtual;
+            if (found != null and found.? != bias) return error.AmbiguousLoadBias;
+            found = bias;
+        }
+        return found orelse error.BadMapping;
+    }
+    fn openMatching(path: [:0]const u8, region: Region) c_int {
+        const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+        if (fd < 0) return -1;
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) == 0 and stat.st_mode & c.S_IFMT == c.S_IFREG and stat.st_ino == region.inode and c.major(stat.st_dev) == region.device_major and c.minor(stat.st_dev) == region.device_minor) return fd;
+        _ = c.close(fd);
+        return -1;
+    }
+    pub fn at(self: *Modules, address: u64) !*Module {
+        for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r);
+        return error.UnmappedAddress;
+    }
+    pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
+        // APKs have no offset-zero ELF mapping. Executable VMAs identify their
+        // embedded libraries; Modules.load deduplicates the other mappings.
+        for (self.regions.items) |r| {
+            if ((r.offset != 0 and r.permissions[2] != 'x') or r.path.len == 0 or r.path[0] != '/') continue;
+            const module = self.load(r) catch continue;
+            const symbol = module.symbols().findSymbol(name) orelse continue;
+            if (!symbol.hasAddress()) continue;
+            return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+        }
+        return error.SymbolNotFound;
+    }
+    pub fn symbolAt(self: *Modules, address: u64) !Symbol {
+        const module = try self.at(address);
+        const symbol = module.symbols().symbolAt(try module.linkAddress(address)) orelse return error.SymbolNotFound;
+        return .{ .module_id = module.id, .name = symbol.symbol.name, .address = try module.runtimeAddress(symbol.symbol.value), .size = symbol.symbol.size, .offset = symbol.offset };
+    }
+};
+
+test "APK placement keeps two entries and repeated load instances separate" {
+    var bytes: [64 + 56 * 2]u8 = @splat(0);
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    const wr = struct {
+        fn put(b: []u8, comptime T: type, at: usize, v: T) void {
+            std.mem.writeInt(T, b[at..][0..@sizeOf(T)], v, .little);
+        }
+    }.put;
+    wr(&bytes, u16, 16, 3);
+    wr(&bytes, u16, 18, 62);
+    wr(&bytes, u32, 20, 1);
+    wr(&bytes, u64, 32, 64);
+    wr(&bytes, u16, 52, 64);
+    wr(&bytes, u16, 54, 56);
+    wr(&bytes, u16, 56, 2);
+    for (0..2) |i| {
+        const at = 64 + i * 56;
+        wr(&bytes, u32, at, 1);
+        wr(&bytes, u32, at + 4, if (i == 0) 4 else 5);
+        wr(&bytes, u64, at + 8, i * 4096);
+        wr(&bytes, u64, at + 16, i * 4096);
+        wr(&bytes, u64, at + 32, 4096);
+        wr(&bytes, u64, at + 40, 4096);
+        wr(&bytes, u64, at + 48, 4096);
+    }
+    const image = try elf.Image.parse(&bytes);
+    var regions: [6]Region = undefined;
+    for (&regions, 0..) |*r, i| r.* = .{ .start = 0x100000 + (i / 2) * 0x10000 + (i % 2) * 4096, .end = 0x101000 + (i / 2) * 0x10000 + (i % 2) * 4096, .offset = (if (i < 4) @as(u64, 0x4000) else 0x10000) + (i % 2) * 4096, .inode = 7, .device_major = 1, .device_minor = 1, .permissions = if (i % 2 == 0) "r--p".* else "r-xp".*, .path = "/test.apk" };
+    var modules = Modules.init(std.testing.allocator);
+    modules.regions = .{ .items = &regions, .capacity = regions.len };
+    for (0..3) |i| {
+        const entry = if (i < 2) @as(u64, 0x4000) else 0x10000;
+        const placed = try modules.placement(&image, entry, regions[i * 2 + 1], false);
+        try std.testing.expectEqual(regions[i * 2].start, placed.bias);
+        try std.testing.expectEqual(regions[i * 2].start, placed.first.start);
+        try std.testing.expectEqual(regions[i * 2 + 1].end, placed.end);
+        const observed = try modules.placement(&image, entry, regions[i * 2 + 1], true);
+        try std.testing.expectEqual(placed.bias, observed.bias);
+    }
+    try std.testing.expectError(error.BadMapping, modules.placement(&image, 0x4000, regions[5], false));
+}

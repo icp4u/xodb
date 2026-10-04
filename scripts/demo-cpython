@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Native CPython argument demo. Optional arguments are passed to xodb.
+set -euo pipefail
+demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$demo_root"
+if [[ ! -x zig-out/bin/xodb ]]; then
+    printf '%s\n' 'Build xodb first with ./scripts/build' >&2
+    exit 1
+fi
+python=/opt/debug/bin/python3
+if [[ ! -x "$python" ]]; then
+    printf '%s\n' "Needs a CPython with DWARF at $python" >&2
+    exit 1
+fi
+
+# list_ass_subscript is a static function inside the python executable. An
+# explicit __setitem__ call reaches it through the type slot on every
+# iteration; a plain a[3]=42 is specialized into an inline fast path once warm.
+# any() over a generator runs forever without accumulating results. The
+# handshake ensures the loop is about to run before xodb attaches.
+coproc CPYTHON_DEMO {
+    exec "$python" -c 'import os; a=[None]*4; print(os.getpid(), flush=True); any(a.__setitem__(3, 42) for _ in iter(int, 1))'
+}
+demo_pid=$CPYTHON_DEMO_PID
+cleanup() {
+    kill "$demo_pid" 2>/dev/null || :
+    wait "$demo_pid" 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+IFS= read -r -t 10 ready_pid <&"${CPYTHON_DEMO[0]}"
+if [[ "$ready_pid" != "$demo_pid" ]]; then
+    printf '%s\n' 'Unexpected Python startup handshake' >&2
+    exit 1
+fi
+set -x
+./zig-out/bin/xodb "$@" --attach "$demo_pid" --break list_ass_subscript

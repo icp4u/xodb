@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Cross-build headless ARM64 xodb using an existing Android NDK.
+
+Only writes a fresh directory in this checkout. Does not use ADB, install an
+SDK, or deploy anything. Optional --archives supplies already-downloaded tarballs.
+"""
+import argparse
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tarfile
+import urllib.request
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--ndk', required=True, type=Path)
+parser.add_argument('--archives', type=Path)
+parser.add_argument('--jobs', type=int, default=8)
+args = parser.parse_args()
+if args.jobs < 1:
+    parser.error('--jobs must be positive')
+root = Path(__file__).resolve().parents[1]
+run = root / '.work' / ('android-build-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+run.mkdir(parents=True)
+ndk = args.ndk.resolve()
+toolchain = ndk / 'toolchains/llvm/prebuilt/linux-x86_64'
+sysroot = toolchain / 'sysroot'
+api = 29
+triple = 'aarch64-linux-android'
+crt = sysroot / 'usr/lib' / triple / str(api)
+if not (crt / 'crtbegin_dynamic.o').is_file():
+    parser.error('expected a Linux-host NDK with ARM64 API 29 support')
+prefix = run / 'prefix'
+for name in ('tmp', 'prefix/include/elfutils', 'prefix/lib/pkgconfig', 'sources', 'licenses'):
+    (run / name).mkdir(parents=True, exist_ok=True)
+env = dict(os.environ, TMPDIR=str(run / 'tmp'),
+           ZIG_GLOBAL_CACHE_DIR=str(root / '.cache/zig-global'),
+           PKG_CONFIG_LIBDIR=str(prefix / 'lib/pkgconfig'),
+           PKG_CONFIG_PATH='', PKG_CONFIG_SYSROOT_DIR='')
+commands = []
+
+
+def command(name, argv, cwd=root, extra=None):
+    commands.append({'name': name, 'cwd': str(cwd), 'argv': list(map(str, argv))})
+    print(name, flush=True)
+    with (run / (name + '.log')).open('x') as out:
+        done = subprocess.run(argv, cwd=cwd, env=env | (extra or {}),
+                              stdout=out, stderr=subprocess.STDOUT)
+    if done.returncode:
+        print((run / (name + '.log')).read_text()[-6000:])
+        raise SystemExit(f'{name} failed; evidence: {run}')
+
+
+sources = [
+    ('elfutils-0.193.tar.bz2', 'https://sourceware.org/elfutils/ftp/0.193/elfutils-0.193.tar.bz2',
+     '7857f44b624f4d8d421df851aaae7b1402cfe6bcdd2d8049f15fc07d3dde7635'),
+    ('capstone-5.0.6.tar.gz', 'https://github.com/capstone-engine/capstone/archive/refs/tags/5.0.6.tar.gz',
+     '240ebc834c51aae41ca9215d3190cc372fd132b9c5c8aa2d5f19ca0c325e28f9'),
+]
+print('Android build: ' + str(run), flush=True)
+for name, url, digest in sources:
+    archive = run / 'sources' / name
+    if args.archives:
+        shutil.copy2(args.archives.resolve() / name, archive)
+    else:
+        with urllib.request.urlopen(url, timeout=90) as response, archive.open('xb') as out:
+            shutil.copyfileobj(response, out)
+    if hashlib.sha256(archive.read_bytes()).hexdigest() != digest:
+        raise SystemExit('Source checksum mismatch: ' + name)
+    with tarfile.open(archive) as source:
+        source.extractall(run / 'sources', filter='data')
+
+elf = run / 'sources/elfutils-0.193'
+capstone = run / 'sources/capstone-5.0.6'
+# Keep originals with the exact modified source. NLS is disabled; Android has
+# no libintl header. strchr has the same result for rawmemchr(..., '\0').
+patches = [
+    (elf / 'lib/eu-config.h', '#include <libintl.h>', '/* NLS disabled for this Android build. */'),
+    (elf / 'lib/eu-config.h', '#define _(Str) dgettext ("elfutils", Str)', '#define _(Str) (Str)'),
+    (elf / 'libelf/elf_getarsym.c', "rawmemchr (str_data, '\\0')", "strchr (str_data, '\\0')"),
+]
+for index, (path, old, new) in enumerate(patches):
+    text = path.read_text()
+    if text.count(old) != 1:
+        raise SystemExit('Unexpected upstream source: ' + str(path))
+    shutil.copy2(path, path.with_name(path.name + f'.before-{index}'))
+    path.write_text(text.replace(old, new))
+
+command('capstone-configure', [
+    'cmake', '-S', str(capstone), '-B', str(run / 'capstone'), '-G', 'Ninja',
+    '-DCMAKE_TOOLCHAIN_FILE=' + str(ndk / 'build/cmake/android.toolchain.cmake'),
+    '-DANDROID_ABI=arm64-v8a', '-DANDROID_PLATFORM=android-29',
+    '-DCMAKE_BUILD_TYPE=Release', '-DBUILD_SHARED_LIBS=OFF',
+    '-DCAPSTONE_BUILD_TESTS=OFF', '-DCAPSTONE_BUILD_CSTOOL=OFF',
+    '-DCAPSTONE_ARCHITECTURE_DEFAULT=OFF', '-DCAPSTONE_ARM64_SUPPORT=ON',
+    '-DCAPSTONE_X86_SUPPORT=ON', '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+    '-DCMAKE_INSTALL_PREFIX=' + str(prefix)])
+command('capstone-build', ['cmake', '--build', str(run / 'capstone'), '-j', str(args.jobs)])
+command('capstone-install', ['cmake', '--install', str(run / 'capstone')])
+
+elf_build = run / 'elfutils'
+elf_build.mkdir()
+cc = str(toolchain / 'bin/clang') + ' --target=aarch64-linux-android29'
+extra = dict(CC=cc, CXX=str(toolchain / 'bin/clang++') + ' --target=aarch64-linux-android29',
+             AR=str(toolchain / 'bin/llvm-ar'), RANLIB=str(toolchain / 'bin/llvm-ranlib'),
+             CFLAGS='-O2 -g -fPIC -ffunction-sections -fdata-sections -Wno-error',
+             LDFLAGS='-Wl,-z,max-page-size=16384',
+             # These configure requirements belong to omitted command-line
+             # tools/libdwfl. The library subset below uses neither facility.
+             ac_cv_search_argp_parse='none required',
+             ac_cv_search__obstack_free='none required')
+command('elfutils-configure', [str(elf / 'configure'),
+    '--build=x86_64-pc-linux-gnu', '--host=aarch64-linux-android', '--prefix=' + str(prefix),
+    '--disable-debuginfod', '--disable-libdebuginfod', '--disable-nls',
+    '--disable-demangler', '--disable-symbol-versioning', '--disable-textrelcheck',
+    '--without-bzlib', '--without-lzma', '--without-zstd'], cwd=elf_build, extra=extra)
+eu_objects = 'xasprintf.o xstrdup.o xstrndup.o xmalloc.o next_prime.o crc32.o crc32_file.o eu-search.o error.o'
+libraries = [
+    ('lib', 'libeu.a', ['am_libeu_a_OBJECTS=' + eu_objects]),
+    ('libelf', 'libelf.a', []), ('libdwelf', 'libdwelf.a', []),
+    ('libebl', 'libebl.a', []), ('backends', 'libebl_backends.a', []),
+    ('libcpu', 'libcpu.a', []),
+    ('libdw', 'libdw.a', ['libdw_a_LIBADD=', 'libdwfl_objects=', 'libdwfl_stacktrace_objects=']),
+]
+for directory, library, overrides in libraries:
+    command('elfutils-' + directory, ['make', '-C', directory, '-j' + str(args.jobs), library, *overrides], cwd=elf_build)
+    shutil.copy2(elf_build / directory / library, prefix / 'lib' / library)
+for file in ('libdw/libdw.h', 'libdw/known-dwarf.h', 'libdwelf/libdwelf.h'):
+    shutil.copy2(elf / file, prefix / 'include/elfutils' / Path(file).name)
+for file in ('libdw/dwarf.h', 'libelf/libelf.h', 'libelf/gelf.h'):
+    shutil.copy2(elf / file, prefix / 'include' / Path(file).name)
+(prefix / 'lib/pkgconfig/libdw.pc').write_text(
+    'Name: libdw\nDescription: Android static libdw core (no libdwfl)\nVersion: 0.193\n'
+    'Cflags: -I' + str(prefix / 'include') + '\nLibs: -L' + str(prefix / 'lib') +
+    ' -ldw -ldwelf -lebl -lebl_backends -lcpu -leu -lelf -lz\n')
+libc = run / 'libc.txt'
+libc.write_text('include_dir=' + str(sysroot / 'usr/include') +
+                '\nsys_include_dir=' + str(sysroot / 'usr/include' / triple) +
+                '\ncrt_dir=' + str(crt) + '\nmsvc_lib_dir=\nkernel32_lib_dir=\ngcc_dir=\n')
+command('xodb-build', ['zig', 'build', 'app', '-Dgui=false', '-Dtarget=aarch64-linux-android.29',
+    '-Doptimize=ReleaseSafe', '-Dandroid-lib-dir=' + str(crt), '--libc', str(libc), '--search-prefix', str(prefix),
+    '--prefix', str(run / 'out'), '--cache-dir', str(run / 'zig-cache'), '--summary', 'all'])
+command('demo-build', [str(toolchain / 'bin/clang'), '--target=aarch64-linux-android29',
+    '-g', '-gdwarf-4', '-O0', '-fno-omit-frame-pointer', '-Wall', '-Wextra', '-Werror',
+    '-fPIE', '-pie', '-Wl,-z,max-page-size=16384', 'tests/fixtures/android/demo.c',
+    '-o', str(run / 'out/bin/xodb-android-demo')])
+shutil.copy2(root / 'tests/fixtures/android/demo.c', run / 'out/bin/demo.c')
+for directory in (elf, capstone):
+    for name in ('COPYING', 'COPYING-GPLV2', 'COPYING-LGPLV3', 'LICENSE.TXT', 'LICENSE_LLVM.TXT'):
+        if (directory / name).is_file():
+            shutil.copy2(directory / name, run / 'licenses' / (directory.name + '-' + name))
+command('elf-metadata', ['readelf', '-h', '-lW', '-dW', str(run / 'out/bin/xodb')])
+(run / 'manifest.json').write_text(json.dumps({
+    'ndk': str(ndk), 'api': api, 'target': triple, 'sources': sources, 'commands': commands,
+    'device_tested': False,
+    'xodb_sha256': hashlib.sha256((run / 'out/bin/xodb').read_bytes()).hexdigest(),
+}, indent=2) + '\n')
+print('Android binaries and demo source: ' + str(run / 'out/bin'))
+print('No ADB or device changes. Retain sources, build objects and licenses for redistribution.')

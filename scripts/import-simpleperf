@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Convert one process/event from simpleperf to xodb's offline profile format.
+
+The installed NDK decodes perf.data in this separate process. xodb reads only the
+bounded JSON result. No device access, binary upload or app execution occurs.
+"""
+import argparse
+from datetime import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+MAX_SAMPLES = 65536
+MAX_FRAMES = 65536
+MAX_SITES = 1048576
+MAX_JSON_BYTES = 64 * 1024 * 1024
+
+
+def convert(lib, source_sha256, source_bytes):
+    metadata = lib.MetaInfo()
+    if metadata.get('trace_offcpu', 'false') != 'false':
+        raise ValueError('Off-CPU recordings are not supported by this first importer')
+    if metadata.get('system_wide_collection', 'false') != 'false':
+        raise ValueError('System-wide recordings are not supported by this first importer')
+    modules, frames, samples = [], [], []
+    module_ids, frame_ids = {}, {}
+    event = pid = None
+    total_sites = 0
+
+    def site(symbol, ip):
+        path = symbol.dso_name
+        module = module_ids.get(path)
+        if module is None:
+            if len(modules) == 4096:
+                raise ValueError('Module limit exceeded')
+            module = len(modules)
+            module_ids[path] = module
+            modules.append(dict(path=path, build_id=lib.GetBuildIdForPath(path) or None))
+        name = symbol.symbol_name
+        if len(name.encode()) > 4096 or len(path.encode()) > 4096:
+            raise ValueError('Symbol/path exceeds 4096 UTF-8 bytes')
+        resolved = bool(name) and name not in ('[unknown]', 'unknown') and '[+' not in name
+        mapping = symbol.mapping.contents if symbol.mapping else None
+        start, end, offset = (mapping.start, mapping.end, mapping.pgoff) if mapping else (0, 0, 0)
+        # Group named functions without throwing away each sample's original PC.
+        # Unknown code groups only at its module-relative instruction address.
+        key = (module, name, symbol.symbol_addr, symbol.symbol_len, resolved, start, end, offset,
+               None if resolved else symbol.vaddr_in_file,
+               None if mapping or resolved else ip)
+        frame = frame_ids.get(key)
+        if frame is None:
+            if len(frames) == MAX_FRAMES:
+                raise ValueError('Frame limit exceeded')
+            frame = len(frames)
+            frame_ids[key] = frame
+            frames.append(dict(module=module, name=name or '[unknown]', resolved=resolved,
+                               symbol_address=hex(symbol.symbol_addr), symbol_size=hex(symbol.symbol_len),
+                               mapping_start=hex(start), mapping_end=hex(end), mapping_offset=hex(offset)))
+        return dict(frame=frame, ip=hex(ip), vaddr=hex(symbol.vaddr_in_file))
+
+    lib.ShowIpForUnknownSymbol()
+    while (sample := lib.GetNextSample()) is not None:
+        if len(samples) == MAX_SAMPLES:
+            raise ValueError('Sample limit exceeded; input is not silently truncated')
+        name = lib.GetEventOfCurrentSample().name
+        if event is not None and event != name:
+            raise ValueError('Multiple events would mix incompatible period units')
+        if pid is not None and pid != sample.pid:
+            raise ValueError('Multiple processes are not supported by this first importer')
+        if sample.in_kernel:
+            raise ValueError('This first importer accepts user-space CPU samples only')
+        event, pid = name, sample.pid
+        if name not in ('task-clock:u', 'cpu-clock:u', 'cpu-cycles:u'):
+            raise ValueError('Unsupported event: ' + name)
+        if sample.period <= 0 or sample.pid <= 0 or sample.tid <= 0:
+            raise ValueError('Invalid sample identity or period')
+        chain = lib.GetCallChainOfCurrentSample()
+        if chain.nr >= 256:
+            raise ValueError('Stack exceeds 256 frames')
+        total_sites += chain.nr + 1
+        if total_sites > MAX_SITES:
+            raise ValueError('Total stack-entry limit exceeded')
+        stack = [site(lib.GetSymbolOfCurrentSample(), sample.ip)]
+        stack.extend(site(chain.entries[i].symbol, chain.entries[i].ip) for i in range(chain.nr))
+        stack.reverse()
+        samples.append(dict(pid=sample.pid, tid=sample.tid, comm=sample.thread_comm,
+                            time_ns=str(sample.time), period=str(sample.period), cpu=sample.cpu, stack=stack))
+    if not samples:
+        raise ValueError('Empty recording: no sampled event to identify')
+    return dict(format='xodb.simpleperf', version=1, architecture=lib.GetArch(),
+                event=event, unit='cycles' if event == 'cpu-cycles:u' else 'nanoseconds',
+                clock=metadata.get('clockid', 'unknown'),
+                source=dict(sha256=source_sha256, bytes=source_bytes, command=lib.GetRecordCmd(),
+                            metadata=metadata, labels='simpleperf_report_lib',
+                            unwind_status='not_exported'),
+                modules=modules, frames=frames, samples=samples)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('recording', type=Path)
+    parser.add_argument('--ndk', required=True, type=Path)
+    args = parser.parse_args()
+    module = args.ndk.resolve() / 'simpleperf'
+    if not (module / 'simpleperf_report_lib.py').is_file():
+        parser.error('NDK simpleperf report library not found')
+    out = ROOT / '.work' / ('simpleperf-import-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+    out.mkdir(parents=True, mode=0o700)
+    # Decode an immutable local copy, so the digest names the bytes actually read.
+    digest = hashlib.sha256()
+    size = 0
+    with os.fdopen(os.open(args.recording, os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC), 'rb') as src, (out / 'source.perf.data').open('xb') as dst:
+        if not stat.S_ISREG(os.fstat(src.fileno()).st_mode):
+            raise ValueError('Recording must be a regular file')
+        while chunk := src.read(1024 * 1024):
+            size += len(chunk)
+            if size > 256 * 1024 * 1024:
+                raise ValueError('Recording exceeds 256 MiB')
+            digest.update(chunk)
+            dst.write(chunk)
+    sys.path.insert(0, str(module))
+    from simpleperf_report_lib import ReportLib
+    lib = ReportLib()
+    try:
+        lib.SetRecordFile(str(out / 'source.perf.data'))
+        data = convert(lib, digest.hexdigest(), size)
+    finally:
+        lib.Close()
+    encoded = json.dumps(data, ensure_ascii=True, separators=(',', ':')).encode()
+    if len(encoded) > MAX_JSON_BYTES:
+        raise ValueError('Converted profile exceeds 64 MiB')
+    path = out / 'profile.xsp.json'
+    with path.open('xb') as dst:
+        dst.write(encoded)
+    print(f"{len(data['samples'])} samples, {len(data['frames'])} frames; {data['architecture']} {data['event']}")
+    print('Open: zig-out/bin/xodb --open-profile ' + str(path))
+    return 0
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError) as exc:
+        sys.exit('import-simpleperf: ' + str(exc))

@@ -1,0 +1,124 @@
+[
+  {
+    "name": "get_session",
+    "description": "Inspect the offline session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "get_imported_profile",
+    "description": "Poll import status, event units, reported loss and sampled thread pages. Null loss counters are unknown.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "get_imported_flamegraph",
+    "description": "Poll/page a period-weighted offline flame view. Pages name an import and filter-specific view; examples cite sample ordinals. Labels come from simpleperf; unwind completeness is unavailable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "import_id": {
+          "type": "string"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32
+        },
+        "view_id": {
+          "type": "string"
+        },
+        "tid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "from_ns": {
+          "type": "string"
+        },
+        "to_ns": {
+          "type": "string"
+        },
+        "retry": {
+          "type": "boolean"
+        },
+        "tids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 2147483647
+          },
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "description": "Selected TIDs; mutually exclusive with tid. Empty selects all threads."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "import_id"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  },
+  {
+    "name": "get_imported_sample",
+    "description": "Inspect one original sample and page its reported root-to-leaf sites, raw addresses, module/build-ID metadata and symbol provenance. Labels longer than 512 bytes are explicitly shortened; the import file retains them.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "import_id": {
+          "type": "string"
+        },
+        "ordinal": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 16
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "import_id",
+        "ordinal"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true
+    }
+  }
+]

@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Summarize a simpleperf capture locally using an installed Android NDK.
+
+Writes JSON and folded stacks; optionally generates a standalone interactive SVG
+using an existing FlameGraph checkout. Does not upload profiles or open a browser.
+"""
+import argparse
+from collections import Counter
+from datetime import datetime
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def summarize(lib):
+    arch, command, metadata = lib.GetArch(), lib.GetRecordCmd(), lib.MetaInfo()
+    threads, events, libraries, leaves, depths, stacks = (Counter() for _ in range(6))
+    samples = kernel_samples = unresolved_leaves = 0
+    first = last = None
+    pids = set()
+    while (sample := lib.GetNextSample()) is not None:
+        event = lib.GetEventOfCurrentSample()
+        symbol = lib.GetSymbolOfCurrentSample()
+        chain = lib.GetCallChainOfCurrentSample()
+        if events and event.name not in events:
+            raise ValueError('Multiple event types: refusing to combine incompatible flame weights')
+        if sample.period <= 0:
+            raise ValueError('Nonpositive sample period')
+        samples += 1
+        kernel_samples += bool(sample.in_kernel)
+        pids.add(sample.pid)
+        events[event.name] += sample.period
+        threads[(sample.pid, sample.tid, sample.thread_comm)] += sample.period
+        libraries[symbol.dso_name] += sample.period
+        leaves[(symbol.symbol_name, symbol.dso_name)] += sample.period
+        unresolved_leaves += '[+' in symbol.symbol_name or symbol.symbol_name in ('[unknown]', 'unknown')
+        # The sampled PC is separate from callers. Keeping it matters: omitting
+        # it makes even a single-frame stack disappear into its thread root.
+        frames = [(symbol.symbol_name, symbol.dso_name)]
+        frames.extend((chain.entries[i].symbol.symbol_name, chain.entries[i].symbol.dso_name)
+                      for i in range(chain.nr))
+        depths[len(frames)] += 1
+        root = f'{sample.thread_comm} [{sample.pid}/{sample.tid}]'
+        labels = [root, *[f'{name} ({Path(dso).name})' for name, dso in reversed(frames)]]
+        # Folded-stack syntax reserves semicolons and newlines. Full symbol/DSO
+        # names remain intact in the JSON summary and original recording.
+        key = ';'.join(label.replace(';', ':').replace('\n', ' ').replace('\r', ' ') for label in labels)
+        stacks[key] += sample.period
+        first = sample.time if first is None else min(first, sample.time)
+        last = sample.time if last is None else max(last, sample.time)
+    summary = dict(architecture=arch, record_command=command, metadata=metadata,
+                   sample_count=samples, kernel_samples=kernel_samples, pids=sorted(pids),
+                   events=dict(events), unresolved_leaf_samples=unresolved_leaves,
+                   timestamp_span_seconds=(last - first) / 1e9 if samples else 0,
+                   stack_depth_samples=dict(sorted(depths.items())),
+                   threads=[dict(pid=k[0], tid=k[1], name=k[2], period=v) for k, v in threads.most_common()],
+                   leaf_libraries=[dict(dso=k, period=v) for k, v in libraries.most_common()],
+                   hot_leaf_symbols=[dict(symbol=k[0], dso=k[1], period=v) for k, v in leaves.most_common(30)])
+    return summary, stacks
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('recording', type=Path)
+    parser.add_argument('--ndk', required=True, type=Path, help='Installed NDK with simpleperf_report_lib.py')
+    parser.add_argument('--flamegraph', type=Path, help='Optional existing FlameGraph/flamegraph.pl')
+    args = parser.parse_args()
+    module = args.ndk.resolve() / 'simpleperf'
+    if not (module / 'simpleperf_report_lib.py').is_file():
+        parser.error('NDK simpleperf report library not found')
+    if not args.recording.is_file() or (args.flamegraph and not args.flamegraph.is_file()):
+        parser.error('Input recording or flamegraph.pl not found')
+    sys.path.insert(0, str(module))
+    from simpleperf_report_lib import ReportLib
+    lib = ReportLib()
+    try:
+        lib.SetRecordFile(str(args.recording.resolve()))
+        lib.ShowIpForUnknownSymbol()
+        summary, stacks = summarize(lib)
+    finally:
+        lib.Close()
+    out = ROOT / '.work' / ('simpleperf-report-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
+    out.mkdir(parents=True, mode=0o700)
+    (out / 'summary.json').write_text(json.dumps(summary, indent=2) + '\n')
+    (out / 'stacks.folded').write_text(''.join(f'{key} {weight}\n' for key, weight in sorted(stacks.items())))
+    if args.flamegraph and stacks:
+        event = next(iter(summary['events']))
+        unit = 'ns' if event.split(':')[0] in ('cpu-clock', 'task-clock') else 'events'
+        with (out / 'flamegraph.svg').open('xb') as svg:
+            subprocess.run(['perl', str(args.flamegraph.resolve()), '--title', 'Android CPU profile',
+                            '--subtitle', event + '; widths = sample-period weights; unresolved frames retain offsets',
+                            '--countname', unit, '--minwidth', '0.2', str(out / 'stacks.folded')],
+                           stdout=svg, check=True, timeout=30)
+    print(f"{summary['sample_count']} samples; {len(summary['threads'])} sampled threads; "
+          f"{summary['unresolved_leaf_samples']} unresolved sampled leaves")
+    print('Output: ' + str(out))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

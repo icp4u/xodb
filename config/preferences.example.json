@@ -1,0 +1,22 @@
+{
+  "profile": {
+    "duration_ms": 60000,
+    "frequency_hz": 99,
+    "sample_limit": 16384,
+    "context_switch": false,
+    "user_stack_bytes": 0,
+    "user_stack_budget_bytes": 33554432,
+    "follow_threads": true,
+    "ring_budget_bytes": 67108864
+  },
+  "symbols": {
+    "automatic": true,
+    "auto_file_bytes": 67108864,
+    "auto_total_bytes": 134217728
+  },
+  "allocations": {
+    "duration_ms": 60000,
+    "record_limit": 32768,
+    "memory_limit": 33554432
+  }
+}

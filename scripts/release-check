@@ -1,0 +1,313 @@
+#!/usr/bin/env python3
+"""Repeatable release checks on a snapshot of tracked working-tree sources."""
+import argparse
+import ctypes
+from datetime import datetime, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import platform
+import shutil
+import signal
+import secrets
+import socket
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def plan(tier, headless=False, optimize='ReleaseSafe'):
+    live = tier in ('host', 'all')
+    steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
+              '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
+    if live:
+        for name in ('mcp', 'm1-control', 'm1-source', 'm1-stepping',
+                     'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
+                     'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
+                     'm2-robustness', 'm2-sampled', 'm2-recorded-views',
+                     'm2-archive', 'm2-limits'):
+            steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
+        steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
+        steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
+    if tier in ('gui', 'all'):
+        for name, args in (
+            ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
+            ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
+            ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
+            ('gui-restart', ['tests/restart-gui.py', 'zig-out']),
+            ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
+            ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
+            ('gui-flame-status', ['tests/flame-status-gui.py']),
+            ('remote-panes', ['tests/remote-gui.py', '--bin', 'zig-out/bin', '--running-panes']),
+            ('hidden-window', ['tests/vulkan-stall.py', 'trace', '--attach-fixture']),
+            ('acquire-timeout', ['tests/vulkan-stall.py', 'acquire', '--keep-hidden', '--quit', 'signal', '--attach-fixture']),
+            ('fence-timeout', ['tests/vulkan-stall.py', 'fence', '--keep-hidden', '--quit', 'close']),
+            ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
+        ):
+            steps.append((name, [sys.executable, '-B', *args], 90))
+    return steps
+
+
+def group_members(group):
+    members = []
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            fields = (entry / 'stat').read_text().rsplit(') ', 1)[1].split()
+            if int(fields[2]) == group:
+                members.append(int(entry.name))
+        except (FileNotFoundError, ProcessLookupError, PermissionError):
+            pass
+    return members
+
+
+def stop_group(group):
+    # Each step starts a new session. Only that step and its descendants share
+    # this process group; never signal by executable name or a global PID search.
+    for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 2)):
+        try:
+            os.killpg(group, sig)
+        except ProcessLookupError:
+            break
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            # The runner is a subreaper: reap orphaned fixtures/compositors too.
+            try:
+                while os.waitpid(-group, os.WNOHANG)[0] > 0:
+                    pass
+            except ChildProcessError:
+                pass
+            if not group_members(group):
+                return []
+            time.sleep(.02)
+    return group_members(group)
+
+
+def children():
+    path = Path(f'/proc/self/task/{os.getpid()}/children')
+    return set(map(int, path.read_text().split()))
+
+
+def stop_adopted(baseline):
+    # GDB/inferiors may change process groups. As a subreaper, the runner owns
+    # those orphaned children too. Preserve any children predating this step.
+    for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 2)):
+        until = time.monotonic() + seconds
+        while time.monotonic() < until:
+            adopted = children() - baseline
+            if not adopted:
+                return []
+            for pid in adopted:
+                try:
+                    # A live unreaped child cannot have its PID reused between
+                    # this check and kill; no other thread here calls waitpid.
+                    if os.waitpid(pid, os.WNOHANG)[0] == 0:
+                        os.kill(pid, sig)
+                except (ChildProcessError, ProcessLookupError):
+                    pass
+            time.sleep(.02)
+    return sorted(children() - baseline)
+
+
+def run_step(name, argv, timeout, cwd, env, logs):
+    log = logs / (name + '.log')
+    started = time.monotonic()
+    outcome = dict(name=name, argv=argv, timeout_seconds=timeout, log=str(log), status='failed')
+    child = None
+    baseline = children()
+    with log.open('x') as stream:
+        try:
+            child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stream,
+                                     stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
+            try:
+                outcome['exit_code'] = child.wait(timeout=timeout)
+                outcome['status'] = 'passed' if child.returncode == 0 else 'failed'
+            except subprocess.TimeoutExpired:
+                outcome['status'] = 'timeout'
+            except KeyboardInterrupt:
+                outcome['status'] = 'interrupted'
+        except OSError as exc:
+            outcome['error'] = str(exc)
+        finally:
+            if child:
+                members = group_members(child.pid)
+                if members:
+                    outcome['leftover_pids'] = members
+                    outcome['remaining_pids'] = stop_group(child.pid)
+                    if outcome['status'] == 'passed':
+                        outcome['status'] = 'leaked_processes'
+                try:
+                    child.wait(timeout=1)
+                except subprocess.TimeoutExpired:
+                    outcome['status'] = 'cleanup_failed'
+                    outcome['remaining_pids'] = group_members(child.pid)
+    adopted = children() - baseline
+    if adopted:
+        outcome['adopted_pids'] = sorted(adopted)
+        remaining = stop_adopted(baseline)
+        outcome['remaining_pids'] = sorted(set(outcome.get('remaining_pids', [])) | set(remaining))
+        if outcome['status'] == 'passed':
+            outcome['status'] = 'leaked_processes'
+        if remaining:
+            outcome['status'] = 'cleanup_failed'
+    outcome['seconds'] = round(time.monotonic() - started, 3)
+    print(f"{outcome['status']:16} {name} ({outcome['seconds']:.1f}s)", flush=True)
+    return outcome
+
+
+def snapshot(destination):
+    # Copy tracked *working* contents, including local edits, but no ignored
+    # caches, captures or untracked prototypes that could hide missing inputs.
+    names = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build.zig',
+        'build.zig.zon', 'src', 'tests', 'scripts'], cwd=ROOT).decode().split('\0')
+    hashes = {}
+    for name in filter(None, names):
+        source = ROOT / name
+        if source.is_symlink():
+            raise RuntimeError(f'Test snapshot requires regular source files: {name}')
+        if not source.is_file():
+            raise RuntimeError(f'Tracked source missing: {name}')
+        target = destination / name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, target)
+        hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
+    return hashes
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all'])
+    parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
+    parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
+    parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
+    args = parser.parse_args()
+    if args.headless and args.tier != 'portable':
+        parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
+    steps = plan(args.tier, args.headless, args.optimize)
+    if args.list:
+        print(json.dumps(steps, indent=2))
+        return 0
+    # Gate currently certifies the x86-64 Linux build. ARM/device evidence is
+    # separate; do not run x86-only probes on another architecture accidentally.
+    if platform.system() != 'Linux' or platform.machine() != 'x86_64':
+        parser.error('This gate currently requires x86-64 Linux; see docs/RELIABILITY.md for device checks')
+    # Keep compositor Unix socket paths below sockaddr_un's 108-byte limit.
+    while True:
+        run = ROOT / '.work' / ('r' + secrets.token_hex(2))
+        try:
+            run.mkdir(parents=True)
+            break
+        except FileExistsError:
+            continue
+    logs = run / 'logs'
+    logs.mkdir()
+    report = dict(schema=1, tier=args.tier, gui_build=not args.headless,
+                  optimize=args.optimize, started=datetime.now(timezone.utc).isoformat(),
+                  host=platform.uname()._asdict(), steps=[], status='failed',
+                  excluded=['ARM64/device checks', 'real GPU soak'] +
+                    (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
+                     ['GUI execution'] if args.tier == 'host' else
+                     ['full host integration suite'] if args.tier == 'gui' else []))
+    print(f'Release evidence: {run}', flush=True)
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
+               XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
+    for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'DBUS_SESSION_BUS_ADDRESS'):
+        env.pop(key, None)
+    try:
+        report['revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+        report['working_changes'] = subprocess.check_output(['git', 'status', '--short', '--untracked-files=no'], cwd=ROOT, text=True)
+        required = ['zig', 'cc', 'gcc', 'clang', 'ld.lld', 'llvm-objcopy', 'objcopy', 'strip', 'pkg-config']
+        if args.tier in ('host', 'all'):
+            required += ['g++', 'clang++', 'gdb', 'strace']
+        if not args.headless:
+            required += ['wayland-scanner', 'glslc']
+        if args.tier in ('gui', 'all'):
+            required += ['sway', 'swaymsg', 'grim']
+        missing = [tool for tool in required if not shutil.which(tool)]
+        if args.tier in ('gui', 'all'):
+            try:
+                __import__('PIL.Image')
+            except ImportError:
+                missing.append('Python Pillow')
+            protocol = Path('/usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml')
+            if not protocol.is_file():
+                missing.append(str(protocol))
+            if len(str(run)) > 33:
+                missing.append('shorter checkout path (private compositor socket paths would exceed 107 bytes)')
+        if missing:
+            report.update(status='blocked', reason='Missing tools: ' + ', '.join(missing))
+            return 2
+        try:
+            left, right = socket.socketpair()
+            with left, right:
+                left.settimeout(1)
+                right.settimeout(1)
+                left.sendall(b'xodb')
+                if right.recv(4) != b'xodb':
+                    raise RuntimeError('Local IPC probe returned incorrect bytes')
+            if args.tier != 'portable':
+                with socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    listener.listen(1)
+        except OSError as exc:
+            report.update(status='blocked', reason=f'Local IPC unavailable: {exc}')
+            return 2
+        report['zig'] = subprocess.check_output(['zig', 'version'], text=True).strip()
+        if report['zig'] != '0.16.0':
+            report.update(status='blocked', reason='Expected Zig 0.16.0; found ' + report['zig'])
+            return 2
+        libs = ['capstone', 'libdw'] + ([] if args.headless else
+                ['wayland-client', 'xkbcommon', 'vulkan', 'freetype2', 'harfbuzz'])
+        deps = subprocess.run(['pkg-config', '--print-errors', '--modversion', *libs], capture_output=True, text=True)
+        report['libraries'] = dict(names=libs, versions=deps.stdout, errors=deps.stderr)
+        if deps.returncode:
+            report.update(status='blocked', reason='Missing development libraries; see libraries.errors')
+            return 2
+        for name in ('perf_event_paranoid', 'perf_event_max_sample_rate', 'perf_event_mlock_kb', 'yama/ptrace_scope'):
+            path = Path('/proc/sys/kernel') / name
+            report[name] = path.read_text().strip() if path.exists() else None
+        # Subreaper is process-local, and ensures failed tests cannot strand
+        # zombies when their own finally blocks never execute.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER
+            raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
+        tree = run
+        report['sources'] = snapshot(tree)
+        (tree / '.work/tmp').mkdir(parents=True)
+        env['TMPDIR'] = str(tree / '.work/tmp')
+        if args.tier != 'portable':
+            preflight = [('probe-build', ['cc', '-Wall', '-Wextra', '-Werror',
+                         'tests/release-probe.c', '-o', '.work/release-probe'], 30),
+                         ('capabilities', ['.work/release-probe'], 10)]
+        else:
+            preflight = []
+        for name, argv, timeout in [*preflight, *steps]:
+            result = run_step(name, argv, timeout, tree, env, logs)
+            report['steps'].append(result)
+            if name == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
+                report.update(status='blocked', reason='Owned ptrace/perf probe denied; see capabilities.log and SETUP.md')
+                return 2
+            if result['status'] != 'passed':
+                report.update(status='failed', reason=name + ': ' + result['status'])
+                return 1
+        report['status'] = 'passed'
+        return 0
+    except KeyboardInterrupt:
+        report.update(status='interrupted', reason='Interrupted by user')
+        return 130
+    except Exception as exc:
+        report.update(status='failed', reason=str(exc))
+        return 1
+    finally:
+        report['finished'] = datetime.now(timezone.utc).isoformat()
+        (run / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+        print(f"{report['status'].upper()}: {report.get('reason', args.tier + ' checks completed')}", flush=True)
+        print(f'Results: {run / "results.json"}', flush=True)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

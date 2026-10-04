@@ -1,0 +1,19 @@
+#!/bin/sh
+# Owned glibc workload: five successful allocations, one failed realloc,
+# one retained 29-byte block. No sudo unless --allocation-helper is supplied.
+set -eu
+cd "$(dirname "$0")/.."
+mkdir -p .work/tmp
+demo_dir=$(mktemp -d "$PWD/.work/demo-allocations.XXXXXXXX")
+TMPDIR="$PWD/.work/tmp" cc -pthread -g -O0 -fno-builtin -fno-omit-frame-pointer \
+  -Wall -Wextra -Werror tests/fixtures/allocations.c -o "$demo_dir/fixture"
+cat >&2 <<'HELP'
+Allocation demo:
+  Space: run to allocation_marker phase=0 (past the loader).
+  A: allocation inspector. P: start on the selected stopped thread.
+  Wait for "Tracing selected threads", then Space to run to allocation_marker phase=1.
+  P: stop capture. L: lifetimes. O: outstanding (one 29-byte block).
+  Esc: return to source. Q: close and clean up the owned child.
+If perf is denied, see docs/ALLOCATIONS.md for the explicit helper option.
+HELP
+exec ./zig-out/bin/xodb "$@" --break allocation_marker -- "$demo_dir/fixture" demo
