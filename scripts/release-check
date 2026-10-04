@@ -261,9 +261,6 @@ def main():
             report.update(status='blocked', reason=f'Local IPC unavailable: {exc}')
             return 2
         report['zig'] = subprocess.check_output(['zig', 'version'], text=True).strip()
-        if report['zig'] != '0.16.0':
-            report.update(status='blocked', reason='Expected Zig 0.16.0; found ' + report['zig'])
-            return 2
         libs = ['capstone', 'libdw'] + ([] if args.headless else
                 ['wayland-client', 'xkbcommon', 'vulkan', 'freetype2', 'harfbuzz'])
         deps = subprocess.run(['pkg-config', '--print-errors', '--modversion', *libs], capture_output=True, text=True)

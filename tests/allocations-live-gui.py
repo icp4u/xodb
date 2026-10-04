@@ -59,6 +59,8 @@ try:
         d.keys('tap',38);d.shot('04-lifetimes') # L
         d.keys('tap',24);d.shot('05-outstanding') # O
         d.keys('tap',18);d.shot('06-events') # E
+        d.keys('tap',33);time.sleep(.2);d.shot('06a-flames') # F
+        d.keys('tap',50);time.sleep(.2);d.shot('06b-outstanding-flames') # M
     subprocess.run(['swaymsg','output','HEADLESS-1','mode','720x480'],env=d.env,check=True,capture_output=True)
     time.sleep(.3);d.shot('07-small')
     d.keys('tap',1);d.shot('08-source')

@@ -195,6 +195,7 @@ pub const Workspace = struct {
     stale_regs: ?linux.Registers = null, // the same thread's registers at its previous stop
     last_draw: u64 = 0,
     animating: bool = false,
+    comparison: @import("comparison.zig").Panel = .{},
 
     const LocalRow = struct { name: []const u8, value: model.ValueSummary };
     pub fn deinit(self: *Workspace) void {
@@ -302,6 +303,7 @@ pub const Workspace = struct {
     /// Applies the queued key and button events one at a time, in order, then the
     /// pointer state. A click is handled at the position where it happened.
     pub fn input(self: *Workspace, w: *Window, session: *Session) void {
+        if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
         if (session.imported) |*state| return self.imported.input(w, state);
         const pointer = [2]f32{ w.pointer_x, w.pointer_y };
         const down = w.mouse_down;
@@ -353,6 +355,11 @@ pub const Workspace = struct {
             if (w.closing) break;
             switch (event.kind) {
                 .press, .repeat => {
+                    if (session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
+                        self.comparison.open = true;
+                        w.dirty = true;
+                        continue;
+                    }
                     if (session.process_tree) |tree| if (self.process_panel.key(tree, event)) {
                         w.dirty = true;
                         if (tree.active() != session) return;
@@ -1292,6 +1299,11 @@ pub const Workspace = struct {
         self.animating = moving or self.inspection_panel.busy(session);
     }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+        if (session.comparison) |job| if (self.comparison.open) {
+            session.profile_view_visible = false;
+            self.animating = !job.done.load(.acquire);
+            return self.comparison.draw(r, font, w, job);
+        };
         if (session.imported) |*state| return self.imported.draw(r, font, w, state);
         if (session.allocations.capture) |capture| if (capture.archived and !self.allocation_archive_seen) {
             self.allocation_archive_seen = true;

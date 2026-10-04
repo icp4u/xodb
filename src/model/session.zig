@@ -95,6 +95,8 @@ pub const Session = struct {
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
     source_step: ?SourceStep = null,
+    source_step_resumes: usize = 0,
+    source_step_batched: usize = 0,
     stepping_over: bool = false,
     run_to: ?RunTo = null,
     probes: @import("probes.zig").Manager = .{},
@@ -112,6 +114,7 @@ pub const Session = struct {
     offline: bool = false,
     imported: ?@import("../profile/imported_job.zig").State = null,
     artifact: ?archive.Opened = null,
+    comparison: ?*@import("../profile/comparison.zig").Job = null,
     archive_job: ?*ArchiveJob = null,
     /// Published reconstructed-stack view and the last failed key. A failure
     /// is never retried automatically; `retryDerived` is an explicit action.
@@ -863,6 +866,8 @@ pub const Session = struct {
         var step = SourceStep{ .tid = tid, .line = site.line, .path = undefined, .path_len = site.path.len, .over = over };
         @memcpy(step.path[0..site.path.len], site.path);
         self.source_step = step;
+        self.source_step_resumes = 0;
+        self.source_step_batched = 0;
         self.step_diagnostic = null;
         errdefer self.source_step = null;
         try self.advanceSourceStep();
@@ -871,7 +876,9 @@ pub const Session = struct {
         if (self.source_step == null) return;
         const step = &self.source_step.?;
         self.source_step.?.instructions += 1;
+        self.source_step_resumes += 1;
         self.source_step.?.return_address = null;
+        if (try self.advanceSourceBlock()) return;
         if (step.over) {
             const regs = try self.target.registers(step.tid);
             var bytes: [16]u8 = undefined;
@@ -888,6 +895,46 @@ pub const Session = struct {
             }
             try self.stepOverInstruction(step.tid);
         } else try self.target.singleStep(step.tid);
+    }
+    /// Batch a straight-line run on the current source line. A single live
+    /// thread preserves single-step peer scheduling; multi-thread/shared-VM
+    /// targets keep the instruction path. Calls, branches, traps and syscalls
+    /// are boundaries, as are source changes and existing user probes.
+    fn advanceSourceBlock(self: *Session) !bool {
+        if (linux.architecture != .x86_64) return false;
+        const step = &self.source_step.?;
+        if (self.target.sharedVm() or self.target.birth_count != 0) return false;
+        var live: usize = 0;
+        for (self.target.threadSlice()) |thread| if (thread.state != .exited) {
+            live += 1;
+        };
+        if (live != 1) return false;
+        const regs = try self.target.registers(step.tid);
+        const pc = linux.programCounter(regs);
+        var bytes: [256]u8 = undefined;
+        const n = self.target.readMemory(pc, &bytes) catch return false;
+        var instructions: [64]@import("disassembly.zig").Instruction = undefined;
+        const count = @import("disassembly.zig").decodeFlow(bytes[0..n], pc, &instructions) catch return false;
+        if (count < 3) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        var boundary: usize = 0;
+        while (boundary + 1 < count) : (boundary += 1) {
+            const inst = instructions[boundary];
+            const site = self.sourceAt(arena.allocator(), inst.address) catch break;
+            if (site.line != step.line or !std.mem.eql(u8, site.path, step.path[0..step.path_len]) or inst.flow != .ordinary) break;
+        }
+        if (boundary < 2) return false;
+        const address = instructions[boundary].address;
+        for (self.target.breakpoints[0..self.target.breakpoint_count]) |probe| {
+            if (!probe.pending and probe.address > pc and probe.address <= address) return false;
+        }
+        const probe = self.target.setBreakpoint(address, true) catch return false;
+        errdefer self.target.removeBreakpoint(probe) catch {};
+        step.return_address = address;
+        try self.target.continueExecution();
+        self.source_step_batched += boundary;
+        return true;
     }
     pub fn poll(self: *Session) !void {
         if (self.target.core != null) {
@@ -974,7 +1021,7 @@ pub const Session = struct {
                 return;
             }
             if (step.instructions >= 10000) {
-                self.step_diagnostic = "SourceStepInstructionLimit";
+                self.step_diagnostic = "SourceStepResumeLimit";
                 self.source_step = null;
                 return;
             }
@@ -1336,9 +1383,10 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.generation, .image_epoch = self.target.image_epoch, .pid = self.target.pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(linux.architecture), .state = self.target.state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.generation, .image_epoch = self.target.image_epoch, .pid = self.target.pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(linux.architecture), .state = self.target.state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        if (self.comparison) |job| job.deinit();
         if (self.archive_job) |job| {
             job.deinit();
             self.archive_job = null;
@@ -1360,7 +1408,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

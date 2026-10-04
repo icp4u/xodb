@@ -315,9 +315,21 @@ pub const Live = struct {
                     self.stop(.scope_changed);
                     break :blk null;
                 },
-                .mapping_change => blk: {
+                .mapping_change => |change| blk: {
+                    std.debug.print("xodb: allocation executable mapping changed: {s} prot={d} device={d} inode={d}\n", .{ std.mem.sliceTo(&change.name, 0), change.prot, change.device, change.inode });
                     capture.abort(.identity);
                     self.stop(.mapping_changed);
+                    break :blk null;
+                },
+                .probe_mapping => |mapping| blk: {
+                    if (capture.symbols) |symbols| for (symbols.regions.items) |region| {
+                        if (region.start < mapping.end and mapping.start < region.end) {
+                            capture.abort(.identity);
+                            self.stop(.mapping_changed);
+                            break :blk null;
+                        }
+                    };
+                    std.debug.print("xodb: allocation probe trampoline [uprobes] at 0x{x}..0x{x}\n", .{ mapping.start, mapping.end });
                     break :blk null;
                 },
                 .rename => null,

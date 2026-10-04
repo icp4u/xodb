@@ -11,10 +11,13 @@
 
 void *volatile retained;
 volatile size_t impossible = SIZE_MAX;
+volatile uint64_t workload_ns;
+static uint64_t stamp(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000+t.tv_nsec; }
 __attribute__((noinline)) void allocation_ready(void) { __asm__ volatile("" ::: "memory"); }
 __attribute__((noinline)) void allocation_done(void) { __asm__ volatile("" ::: "memory"); }
 __attribute__((noinline)) void allocation_marker(int phase) { __asm__ volatile("" : : "r"(phase) : "memory"); }
 static void delay(void) { struct timespec t = { .tv_nsec = 3000000 }; nanosleep(&t, NULL); }
+__attribute__((noinline)) void retain_block(void) { retained = malloc(29); }
 static atomic_int worker_gate;
 static void *release_worker(void *unused) {
     (void)unused;
@@ -37,12 +40,15 @@ int main(int argc, char **argv) {
         if (!child) _exit(0);
         if (child > 0) waitpid(child, NULL, 0);
     }
-    if (!strcmp(mode, "burst")) {
-        for (unsigned i = 0; i < 200000; ++i) {
+    if (!strcmp(mode, "burst") || !strcmp(mode, "benchmark")) {
+        const uint64_t start = stamp();
+        const unsigned count = !strcmp(mode, "benchmark") ? 64 : 200000;
+        for (unsigned i = 0; i < count; ++i) {
             void *p = malloc(31 + i % 16);
             __asm__ volatile("" : : "r"(p) : "memory");
             free(p);
         }
+        workload_ns = stamp() - start;
     } else {
         void *a = malloc(37); delay();
         void *b = calloc(3,17); delay();
@@ -51,7 +57,7 @@ int main(int argc, char **argv) {
         void *c = malloc(55); delay();
         resized = realloc(c,impossible); if (resized) return 4; delay();
         free(c); delay(); free(NULL); delay();
-        retained = malloc(29); delay();
+        retain_block(); delay();
     }
     if (threaded) {
         atomic_store(&worker_gate,1);

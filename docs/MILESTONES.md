@@ -92,6 +92,8 @@ current limits, and [agent tasks](AGENT_TASKS.md) for parallel M1 preparation.
   with shared MCP evaluation, expansion/paging, stale values and explicit frame
   identity limits.
 - [x] Instruction stepping, source stepping and step over, hardware watchpoints.
+  Single-thread x86-64 straight-line source batching preserves intervening stops;
+  [measured scope and fallback behavior](SOURCE_STEPPING.md).
 - [x] Configurable agent observation, execution-control, and target-mutation
   scope; generation checks, human revocation, and action audit.
 - [x] Recorded write investigations: before/after samples, thread, registers,
@@ -166,8 +168,13 @@ and reviewed; its production collector remains pending. Codex owns shared integr
 - [x] Initial scoped syscall timing and allocator uprobes, GUI/MCP evidence,
   selected time/thread filters and explicit permission/gap handling.
   [Syscalls](SYSCALL_TIMING.md) / [allocations](ALLOCATIONS.md).
-- [ ] Allocation call stacks, archives/comparisons and representative workload
-  overhead evaluation beyond the validated owned-fixture scope.
+- [x] Bounded allocation entry stacks, byte/count heap flames and allocation
+  archive save/reopen, with owned live and private GUI validation. [Scope](ALLOCATIONS.md).
+- [x] Full native CPU archive comparison: normalized function shares and
+  differential flames, with recorded annotation matching and explicit unknown
+  ancestry. [Workflow and limits](PROFILE_COMPARISON.md).
+- [ ] Representative application allocation-overhead evaluation, allocation
+  capture comparison and selected-range CPU comparison.
 - [x] Bounded static x86-64 function graphs, GUI block selection linked to
   source/assembly, and observe-scope MCP queries. [Demo and limits](M2.md).
 - [x] Initial function-range recovery from DWARF when ELF symbols are absent or

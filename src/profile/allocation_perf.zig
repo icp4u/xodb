@@ -25,7 +25,8 @@ pub const Record = struct {
         thread_exit,
         exec,
         rename,
-        mapping_change,
+        mapping_change: struct { name: [128]u8 = @splat(0), prot: u32, device: u64, inode: u64 },
+        probe_mapping: struct { start: u64, end: u64 },
         fork: struct { pid: u32, tid: u32 },
     },
 };
@@ -140,8 +141,23 @@ pub fn decode(bytes: []const u8, who: Identity) !Record {
         1, 10 => blk: {
             try task(bytes, 8, who);
             const filename: usize = if (typ == 1) 40 else 72;
-            if (tail <= filename or std.mem.indexOfScalar(u8, bytes[filename..tail], 0) == null) return error.AllocationRecordSize;
-            break :blk .mapping_change;
+            if (tail <= filename) return error.AllocationRecordSize;
+            const length = std.mem.indexOfScalar(u8, bytes[filename..tail], 0) orelse return error.AllocationRecordSize;
+            const start = try number(u64, bytes, 16);
+            const size = try number(u64, bytes, 24);
+            const end = std.math.add(u64, start, size) catch return error.AllocationRecordSize;
+            if (size == 0) return error.AllocationRecordSize;
+            // Linux creates this special anonymous executable mapping on the
+            // first probe hit. It is probe machinery, not a replaced ELF.
+            // The owner still checks for overlap with opening symbol ranges.
+            if (typ == 10 and misc & (1 << 14) == 0 and
+                std.mem.eql(u8, bytes[filename..][0..length], "[uprobes]") and
+                try number(u64, bytes, 32) == 0 and try number(u64, bytes, 40) == 0 and
+                try number(u64, bytes, 48) == 0 and (try number(u32, bytes, 64)) & ~@as(u32, 1) == 4)
+                break :blk .{ .probe_mapping = .{ .start = start, .end = end } };
+            var change: @FieldType(@FieldType(Record, "data"), "mapping_change") = .{ .prot = if (typ == 10) try number(u32, bytes, 64) else 0, .device = if (typ == 10) try number(u64, bytes, 40) else 0, .inode = if (typ == 10) try number(u64, bytes, 48) else 0 };
+            @memcpy(change.name[0..@min(length, 127)], bytes[filename..][0..@min(length, 127)]);
+            break :blk .{ .mapping_change = change };
         },
         3 => blk: {
             try task(bytes, 8, who);
@@ -334,6 +350,28 @@ test "lifecycle identities distinguish exec and selected task exit from child cr
     try std.testing.expect((try decode(&comm, identity)).data == .rename);
     put(u16, &comm, 4, 1 << 13);
     try std.testing.expect((try decode(&comm, identity)).data == .exec);
+}
+test "only anonymous uprobe trampoline metadata bypasses mapping changes" {
+    var bytes: [112]u8 = undefined;
+    header(&bytes, 10);
+    trailer(&bytes, 100);
+    put(u32, &bytes, 8, identity.pid);
+    put(u32, &bytes, 12, identity.tid);
+    put(u64, &bytes, 16, 0x4000);
+    put(u64, &bytes, 24, 4096);
+    put(u32, &bytes, 64, 5);
+    @memcpy(bytes[72..81], "[uprobes]");
+    const mapping = (try decode(&bytes, identity)).data.probe_mapping;
+    try std.testing.expectEqual(@as(u64, 0x5000), mapping.end);
+    put(u32, &bytes, 64, 4); // Host kernel uses an execute-only XOL page.
+    try std.testing.expect((try decode(&bytes, identity)).data == .probe_mapping);
+    put(u64, &bytes, 48, 9); // A file named like the special mapping is not it.
+    try std.testing.expect((try decode(&bytes, identity)).data == .mapping_change);
+    put(u64, &bytes, 48, 0);
+    bytes[73] = 'x';
+    try std.testing.expect((try decode(&bytes, identity)).data == .mapping_change);
+    put(u64, &bytes, 24, 0);
+    try std.testing.expectError(error.AllocationRecordSize, decode(&bytes, identity));
 }
 test "ambiguous event identities and unsupported PMU bit formats are rejected" {
     try validateIdentity(identity);

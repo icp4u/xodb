@@ -176,7 +176,7 @@ try:
     time.sleep(1.1)
     shot=d.shot('09-production-reopened-heap')
     with Image.open(shot) as pixels:
-        ok('GUI renders its own heap metric while MCP queries another',max(abs(a-b) for a,b in zip(pixels.convert('RGB').getpixel((40,290)),(56,87,117)))<=2)
+        ok('GUI renders its own heap metric while MCP queries another',max(abs(a-b) for a,b in zip(pixels.convert('RGB').getpixel((40,300)),(56,87,117)))<=2)
     copy=work/'allocation-copy.xoa'
     saved=d.tool('save_allocation_archive',generation=d.session()['generation'],capture_id=key['identity']['capture_id'],revision=key['revision'],path=str(copy))
     deadline=time.monotonic()+8

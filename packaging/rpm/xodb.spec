@@ -6,11 +6,10 @@ License:        GPL-3.0-only AND MIT
 Source0:        %{name}-%{version}.tar.gz
 ExclusiveArch:  x86_64
 
-# Use --with external_zig only when Zig 0.16.0 is already on PATH.
+# Use --with external_zig when a standalone Zig compiler is already on PATH.
 %bcond_with external_zig
 %if %{without external_zig}
 BuildRequires:  zig >= 0.16.0
-BuildRequires:  zig < 0.16.1
 %endif
 BuildRequires:  gcc
 BuildRequires:  pkgconfig(capstone)

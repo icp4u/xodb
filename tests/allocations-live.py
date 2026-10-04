@@ -90,6 +90,35 @@ for mode in modes:
             assert summary['successful_allocations']==5 and summary['failed_allocations']==1,summary
             lifetimes=pages(c,'get_allocation_lifetimes',cap)
             assert len(lifetimes)==5 and sum(v['state']=='outstanding' for v in lifetimes)==1,lifetimes
+            key=cap['key'];query=dict(session_id=key['identity']['session_id'],capture_id=key['identity']['capture_id'],revision=key['revision'])
+            outstanding=next(v for v in lifetimes if v['state']=='outstanding')
+            stack=c.inspect('get_allocation_stack',**query,allocation_span=outstanding['allocation_span'])
+            assert not stack['complete'] and any(f['name']=='retain_block' for f in stack['frames']),stack
+            deadline=time.monotonic()+8
+            while True:
+                heap=c.inspect('get_allocation_flamegraph',**query,metric='outstanding_bytes',limit=256)
+                if not heap.get('pending'):break
+                assert time.monotonic()<deadline,heap
+                time.sleep(.003)
+            assert heap['total_weight']==29 and any(n['name']=='retain_block' for n in heap['nodes']),heap
+            archive=(work/'balanced.xoa').resolve()
+            c.action('save_allocation_archive',capture_id=key['identity']['capture_id'],revision=key['revision'],path=str(archive))
+            deadline=time.monotonic()+8
+            while True:
+                job=c.inspect('get_archive_status')['job']
+                if job['done']:break
+                assert time.monotonic()<deadline,job
+                time.sleep(.003)
+            assert job['publication']['state']=='published',job
+            reopened=Client('observe',None,options=['--open-capture',str(archive)])
+            try:
+                restored=wait_capture(reopened,lambda v:v.get('state')=='ready')
+                assert restored['archived'] and restored['summary']==summary,restored
+                rkey=restored['key']
+                again=reopened.inspect('get_allocation_stack',session_id=rkey['identity']['session_id'],capture_id=rkey['identity']['capture_id'],revision=rkey['revision'],allocation_span=outstanding['allocation_span'])
+                assert again['frames']==stack['frames'],(again,stack)
+            finally:reopened.close()
+            (work/'balanced-heap.json').write_text(json.dumps(dict(stack=stack,heap=heap),indent=2)+'\n')
         if mode=='threads':
             assert cap['state']=='ready' and cap['first_gap'] is None,cap
             assert len(cap['threads'])==2 and cap['summary']['outstanding_bytes']==0,cap

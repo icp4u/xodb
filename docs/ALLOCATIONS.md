@@ -109,7 +109,7 @@ a separate explicit launch option, not a preferences field.
 
 | Tool | Required arguments / behavior |
 | --- | --- |
-| start_allocations | Current generation and nonempty tids; optional duration_ms, record_limit, memory_limit, mapping_address, hooks |
+| start_allocations | Current generation and nonempty tids; optional duration_ms, record_limit, memory_limit, callstacks, mapping_address, hooks |
 | stop_allocations | Current generation, session_id, capture_id; also cancels the matching pending preparation |
 | get_allocation_capture | Preparation ID/state, error/failure, stop reason, defaults, scope and retained capture key/summary |
 | get_allocation_events | session_id, capture_id, revision; exact retained events |
@@ -171,7 +171,8 @@ caller coverage. Frame pointers are required for reliable deeper callers. This
 version does not reconstruct allocation stacks using DWARF. Symbols come from
 immutable ELF snapshots taken while the selected target is stopped, with the
 existing 256 MiB per-image / 512 MiB total asset bounds. Unavailable images leave
-raw addresses. Executable mapping events end collection; unobserved unmaps,
+raw addresses. Executable mapping events end collection, except a nonoverlapping
+kernel `[uprobes]` trampoline created by the probes themselves; unobserved unmaps,
 remaps and JIT changes remain attribution limits.
 
 **F** in the allocation panel opens flames. **M** changes the weight:
@@ -215,3 +216,22 @@ with symbol-reanalysis options is rejected because they retain annotations,
 not ELF assets. `--capture-out` saves an allocation capture when no CPU capture
 is present; with both present, use the explicit allocation save operation.
 Publication requests no durability syncs.
+
+## Stack and archive validation (2026-10-04)
+
+The ReleaseSafe native helper and production debugger passed owned live checks
+for named `retain_block` caller recovery, exact requested-byte flames, archive
+save/reopen, cross-thread release, record limits, deliberate loss, target exit,
+exec, fork, cancellation and stale preparation. Private Sway tests exercise
+production capture controls and offline heap inspection. GUI and MCP flame
+workers are independent, so querying another metric cannot replace the visible
+heap graph.
+
+`tests/allocation-cost.py --helper PATH` measures a bounded 64-pair malloc/free
+burst with no probes, pairing-only probes and entry stacks, five trials each.
+On the development host, the medians were 16.2 microseconds, 442 microseconds and
+386 microseconds respectively. This short workload includes initialization and
+is too noisy to isolate incremental stack cost; both instrumented modes were
+much slower than the baseline. A 2,000-pair unpaced burst overflowed the 64 KiB
+ring and correctly suppressed lifetime totals. These are fixture measurements,
+not throughput claims for application workloads.

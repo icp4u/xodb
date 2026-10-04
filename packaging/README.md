@@ -1,6 +1,6 @@
 # Local Linux packages
 
-These recipes build the current **Linux x86-64 GUI** with Zig **0.16.0** and
+These recipes build the current **Linux x86-64 GUI** with Zig **0.16 or newer** and
 ReleaseSafe, targeting the baseline CPU rather than the builder's CPU. GNU build
 IDs let package tools associate binaries with their debug symbols. These are
 initial local packaging, not a claim of acceptance into any distribution.
@@ -66,15 +66,15 @@ dpkg-buildpackage -us -uc -b
 sudo apt install ../xodb_0.0.0-1_amd64.deb
 ```
 
-The normal dependency check expects a Zig 0.16.0 **package**. If you supplied
+The normal dependency check expects a Zig 0.16 or newer **package**. If you supplied
 the official standalone compiler on PATH instead, use the explicit build profile:
 
 ```sh
 dpkg-buildpackage -us -uc -b -Ppkg.xodb.external-zig
 ```
 
-That profile removes only the Zig package requirement. The build still checks
-`zig version` and all other package dependencies. The recipes are in
+That profile removes only the Zig package requirement. The build still records
+`zig version` and checks all other package dependencies. The recipes are in
 [`debian/`](debian/); debhelper derives shared-library runtime dependencies.
 `fonts-dejavu-core` supplies the default font, through its `fonts-dejavu-mono`
 dependency on newer releases. No personal maintainer identity is embedded;
@@ -95,8 +95,8 @@ rpmbuild -ba --define "_topdir $PWD/rpm" --define "_sourcedir $PWD" \
 RPM checks build dependencies and generates shared-library runtime requirements.
 The [spec](rpm/xodb.spec) selects Fedora's `glslc` and
 `dejavu-sans-mono-fonts`, or openSUSE's `shaderc` and `dejavu-fonts` using the
-distribution's `suse_version` macro. To use an externally supplied Zig 0.16.0
-compiler, add `--with external_zig`; the compiler version is still checked.
+distribution's `suse_version` macro. To use an externally supplied Zig
+compiler, add `--with external_zig`; the compiler version is still recorded.
 
 ## Installed files and checks
 

@@ -12,7 +12,8 @@ Run xodb as your normal user. Use sudo for granular root steps.
 
 ## Build and run
 
-Install Zig **0.16.0**, a C compiler, `pkg-config`, `wayland-scanner`, `glslc`,
+Install Zig **0.16 or newer** (no exact version pin; see the README for the tested
+baseline), a C compiler, `pkg-config`, `wayland-scanner`, `glslc`,
 and the development files for Wayland/wayland-protocols, libxkbcommon, Vulkan,
 FreeType, HarfBuzz, Capstone and elfutils libdw/libelf. The GUI needs a Wayland
 session, a working Vulkan driver and DejaVu Sans Mono (or `--font FILE`).

@@ -82,7 +82,11 @@ honest *unresolved transfer* markers. Click a block, read its source and asm,
 nothing executes.
 
 **Allocations.** Native allocator calls, reallocs, frees, lifetime and
-outstanding views — with MCP evidence. See [docs/ALLOCATIONS.md](docs/ALLOCATIONS.md).
+outstanding views, allocation caller stacks and byte/count heap flames — with
+MCP evidence and save/reopen. See [docs/ALLOCATIONS.md](docs/ALLOCATIONS.md).
+CPU archives can be compared with `--compare-capture before.xoc --open-capture after.xoc`;
+see [profile comparison](docs/PROFILE_COMPARISON.md). Single-thread x86-64 source
+stepping now batches straight-line instructions; see [source stepping](docs/SOURCE_STEPPING.md).
 
 **Themes.** Built-in dark, light and contrast palettes and custom JSON colors,
 selected at startup for local, remote and offline views. See [themes](docs/THEMES.md).
@@ -96,7 +100,7 @@ MCP. Android: native executables *and* JNI libraries inside a debug APK, over US
 ## Build and run
 
 The GUI baseline is Linux x86-64, a Wayland session, a working Vulkan driver,
-and **Zig 0.16.0**. ARM64 currently uses the headless backend. See
+and **Zig 0.16 or newer**. ARM64 currently uses the headless backend. See
 **[SETUP.md](SETUP.md)** for tracing permissions and headless builds.
 
 Install the compiler tools, development headers, shader compiler and default
@@ -112,7 +116,7 @@ XODB_FONT=/usr/share/fonts/TTF/DejaVuSansMono.ttf
 ```
 
 ```sh
-# Debian / Ubuntu (install Zig 0.16.0 separately if it is not in your repository)
+# Debian / Ubuntu (install Zig separately if it is not in your repository)
 sudo apt install build-essential pkg-config libwayland-dev libwayland-bin \
   wayland-protocols libxkbcommon-dev libvulkan-dev glslc libfreetype-dev \
   libharfbuzz-dev libcapstone-dev libdw-dev libelf-dev fonts-dejavu-core
@@ -138,8 +142,10 @@ sudo zypper install gcc zig pkgconf shaderc dejavu-fonts \
 XODB_FONT=/usr/share/fonts/truetype/DejaVuSansMono.ttf
 ```
 
-Check `zig version`: this source requires **0.16.0**, not whichever version a
-distribution happens to ship. The [official Zig downloads](https://ziglang.org/download/)
+Zig is not pinned to an exact compiler version. **0.16.0** is the last verified
+baseline; newer compilers should be checked with the build and test suite, and
+compatibility fixes are welcome. Build reports record `zig version` without
+rejecting newer releases. The [official Zig downloads](https://ziglang.org/download/)
 provide standalone toolchains. The GUI also requires the stable tablet-v2 XML
 from **wayland-protocols 1.36 or newer**; older distribution releases may need
 updated development packages. Install your GPU's Vulkan driver separately if

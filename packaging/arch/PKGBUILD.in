@@ -7,7 +7,7 @@ arch=('x86_64')
 license=('GPL-3.0-only' 'MIT')
 depends=('glibc' 'capstone' 'libelf' 'wayland' 'libxkbcommon'
          'vulkan-icd-loader' 'freetype2' 'harfbuzz' 'ttf-dejavu')
-makedepends=('zig>=0.16.0' 'zig<0.16.1' 'pkgconf' 'wayland-protocols>=1.36'
+makedepends=('zig>=0.16.0' 'pkgconf' 'wayland-protocols>=1.36'
              'vulkan-headers' 'shaderc')
 optdepends=('vulkan-driver: Vulkan implementation for your GPU'
             'openssh: remote debugging over SSH'

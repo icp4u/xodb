@@ -41,6 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var core_file: ?[:0]const u8 = null;
     var core_executable: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
+    var compare_capture: ?[:0]const u8 = null;
     var open_profile: ?[:0]const u8 = null;
     var symbols: ?[:0]const u8 = null;
     var debug_files: std.ArrayList([:0]const u8) = .empty;
@@ -84,6 +85,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
                 \\--open-profile FILE opens an imported simpleperf JSON profile (see scripts/import-simpleperf).
                 \\--open-capture FILE opens an offline archive; --symbols DIR optionally loads SHA-256-named ELF assets.
+                \\--compare-capture BASE with --open-capture AFTER compares recorded CPU sample shares; V switches views.
                 \\--resolve-capture-symbols explicitly derives new labels from verified assets; default is recorded labels.
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
                 \\Owned targets are killed on close. Attached targets are detached and preserved.
@@ -94,7 +96,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--allocation-helper")) allocation_helper = args[i];
@@ -111,6 +113,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--capture-out")) capture_out = args[i];
             if (std.mem.eql(u8, arg, "--open-profile")) open_profile = args[i];
             if (std.mem.eql(u8, arg, "--open-capture")) open_capture = args[i];
+            if (std.mem.eql(u8, arg, "--compare-capture")) compare_capture = args[i];
             if (std.mem.eql(u8, arg, "--symbols")) symbols = args[i];
             if (std.mem.eql(u8, arg, "--debug-dir")) try debug_dirs.append(a, args[i]);
             if (std.mem.eql(u8, arg, "--source-map")) try source_maps.append(a, args[i]);
@@ -125,6 +128,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--frames")) frames = try std.fmt.parseInt(u64, args[i], 10);
         } else return error.UnknownArgument;
     }
+    if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
     if (core_executable != null and core_file == null) return error.ExecutableRequiresCore;
@@ -211,6 +215,7 @@ pub fn main(init: std.process.Init) !void {
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
     if (open_profile) |path| try session.openImported(path);
+    if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
     if (attach) |pid| {
         const started = linux.now();
         std.debug.print("xodb: attaching to pid={d}\n", .{pid});
@@ -264,6 +269,7 @@ pub fn main(init: std.process.Init) !void {
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
         workspace.show_profile = open_capture != null;
+        workspace.comparison.open = compare_capture != null;
         if (open_capture != null) workspace.status = "Opening capture archive";
         if (core_file != null) workspace.status = "Read-only core dump; execution and mutation are disabled";
         var archive_status: [512]u8 = undefined;

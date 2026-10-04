@@ -1,6 +1,6 @@
 # Release reliability gate
 
-Run from an x86-64 Linux checkout with Zig 0.16.0 and the dependencies in
+Run from an x86-64 Linux checkout with Zig 0.16 or newer and the dependencies in
 [SETUP.md](../SETUP.md). Each command returns nonzero on failure or missing
 capabilities. It never changes tracing policy or contacts a device.
 
@@ -38,10 +38,13 @@ Use `--optimize Debug` for a second build mode; the default is ReleaseSafe.
 For a release candidate, require portable CI plus `all` on the configured
 workstation. A portable pass alone does not certify tracing, graphics or ARM64.
 
-The newer process-tree and privileged allocation suites are separate from
-`all`. After building the default target, also run:
+The newer source-block, comparison, process-tree and allocation suites are
+separate from `all`. After building the default target, also run:
 
 ```sh
+python3 tests/source-blocks.py
+python3 tests/comparison.py --gui
+python3 tests/allocations-gui.py
 python3 tests/process-tree.py
 python3 tests/process-capacity.py
 XODB_BUILD_PREFIX=zig-out python3 tests/process-gui.py

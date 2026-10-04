@@ -4,7 +4,6 @@ Priority: optional
 Maintainer: xodb contributors <packaging@xodb.invalid>
 Build-Depends: debhelper-compat (= 13),
  zig (>= 0.16.0) <!pkg.xodb.external-zig>,
- zig (<< 0.16.1) <!pkg.xodb.external-zig>,
  pkg-config, libcapstone-dev, libdw-dev, libelf-dev,
  libwayland-dev, libwayland-bin, wayland-protocols (>= 1.36),
  libxkbcommon-dev, libvulkan-dev, glslc, libfreetype-dev, libharfbuzz-dev

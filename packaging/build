@@ -5,10 +5,7 @@ if [ "$#" -ne 1 ]; then
     echo 'usage: packaging/build DEFAULT_FONT_PATH' >&2
     exit 2
 fi
-if [ "$(zig version)" != 0.16.0 ]; then
-    echo 'xodb packages require Zig 0.16.0 on PATH' >&2
-    exit 1
-fi
+zig version
 pkg-config --atleast-version=1.36 wayland-protocols
 # Package binaries must run on other CPUs of the same architecture.
 exec ./scripts/build app -Doptimize=ReleaseSafe -Dcpu=baseline --build-id=sha1 \
