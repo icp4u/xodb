@@ -31,6 +31,7 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check host                 # Live debugger/profiler regressions
 ./scripts/release-check gui                  # Private Sway/Vulkan regressions
 ./scripts/release-check all                  # Host plus GUI, one build
+./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution
 ```
 
@@ -55,6 +56,10 @@ python3 tests/allocations-live-gui.py --prefix zig-out --helper "$PWD/zig-out/bi
 
 The two allocation commands explicitly opt into the scoped helper described in
 [ALLOCATIONS.md](ALLOCATIONS.md). They do not belong in unprivileged portable CI.
+The `--uprobes` release option likewise opts into that helper for owned function
+fixtures. It covers invocation evidence, recipes, archive reopening and temporal
+associations locally and through the C agent. Stopped-context inspection jobs
+are covered by the ordinary host tier without that helper.
 
 ## Test source layout
 

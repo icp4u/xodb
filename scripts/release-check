@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe'):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
     live = tier in ('host', 'all')
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
@@ -30,11 +30,20 @@ def plan(tier, headless=False, optimize='ReleaseSafe'):
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits'):
+                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
+        for name in ('inspections', 'inspection-lifecycle'):
+            steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
+        if uprobes:
+            for name in ('observations-live', 'observation-recipes', 'observation-associations'):
+                args = [sys.executable, '-B', f'tests/{name}.py', '--helper', './zig-out/bin/xodb-allocation-helper']
+                steps.append((name, args, 180))
+                steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
     if tier in ('gui', 'all'):
+        steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
+                      'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600))
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-themes', ['tests/themes.py']),
@@ -167,7 +176,8 @@ def snapshot(destination):
     # Copy tracked *working* contents, including local edits, but no ignored
     # caches, captures or untracked prototypes that could hide missing inputs.
     names = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build.zig',
-        'build.zig.zon', 'src', 'tests', 'scripts'], cwd=ROOT).decode().split('\0')
+        'build.zig.zon', 'src', 'tests', 'scripts', 'examples', 'packaging',
+        'docs', 'config', 'README.md', 'LICENSE', 'SETUP.md'], cwd=ROOT).decode().split('\0')
     hashes = {}
     for name in filter(None, names):
         source = ROOT / name
@@ -188,10 +198,13 @@ def main():
     parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
+    parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
     args = parser.parse_args()
     if args.headless and args.tier != 'portable':
         parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
-    steps = plan(args.tier, args.headless, args.optimize)
+    if args.uprobes and args.tier not in ('host', 'all'):
+        parser.error('--uprobes requires the host or all tier')
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes)
     if args.list:
         print(json.dumps(steps, indent=2))
         return 0
@@ -219,6 +232,10 @@ def main():
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
+    # C live tests use presence of this opt-out, while Zig tests inspect its
+    # value. Remove it completely so host/all really exercise both runtimes.
+    if args.tier in ('host', 'all'):
+        env.pop('XODB_TEST_NO_LIVE', None)
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'DBUS_SESSION_BUS_ADDRESS'):
         env.pop(key, None)
     try:

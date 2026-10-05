@@ -62,6 +62,11 @@ For remote allocation capture, `--allocation-helper /target/path/to/helper`
 explicitly selects the existing privilege helper **on the target**; the agent
 never automatically elevates itself. [Allocation setup](ALLOCATIONS.md) applies.
 
+The same helper and matching C agent support fixed-scope x86-64 function
+entry/return observations. The C runtime owns probe setup and raw collection;
+the host retains and compares the evidence. See [function recipes and saved
+investigations](OBSERVATIONS.md) for a Ruby example and the CLI/MCP workflow.
+
 ## Supported operations
 
 | Target ISA | Execution and analysis | Additional support |

@@ -103,6 +103,7 @@ pub const Session = struct {
     run_to: ?RunTo = null,
     probes: @import("probes.zig").Manager = .{},
     memory: @import("memory.zig").Memory = .{},
+    inspections: @import("../observe/context.zig").Manager = .{},
     persistent: @import("persistent.zig").Manager = .{},
     launch_argv: []const [:0]const u8 = &.{},
     suppress_probe_resume: bool = false,
@@ -111,6 +112,13 @@ pub const Session = struct {
     /// Session defaults for future GUI captures and omitted MCP arguments.
     profile_defaults: profile.Config = .{},
     allocations: @import("../profile/allocation_live.zig").Live = .{},
+    observations: @import("../observe/live.zig").Live = .{},
+    observation_analysis: ?*@import("../observe/analysis.zig").Job = null,
+    next_observation_analysis: u64 = 1,
+    observation_associations: ?*@import("../observe/association_job.zig").Job = null,
+    next_observation_association: u64 = 1,
+    observation_archive: ?*@import("../observe/archive_job.zig").Job = null,
+    next_observation_archive: u64 = 1,
     allocation_defaults: @import("../profile/allocation_live.zig").Config = .{},
     allocation_helper: ?[:0]const u8 = null,
     offline: bool = false,
@@ -205,7 +213,113 @@ pub const Session = struct {
     }
     pub fn detach(self: *Session) !void {
         self.allocations.stop(.target_ended);
+        self.observations.stop(.target_ended);
         try self.target.detach();
+    }
+    pub fn startObservation(self: *Session, actor: Actor, tids: []const i32, config: @import("../observe/capture.zig").Config, mapping_address: u64, requests: []const @import("../profile/uprobe_hooks.zig").Request) !void {
+        if (self.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
+        if (self.observation_associations) |job| {
+            if (!job.done.load(.acquire)) return error.ObservationAssociationsBusy;
+            job.deinit();
+            self.observation_associations = null;
+        }
+        if (self.observation_analysis) |job| {
+            if (!job.done.load(.acquire)) return error.ObservationAnalysisBusy;
+            job.deinit();
+            self.observation_analysis = null;
+        }
+        if (self.target.arch() != .x86_64) return error.UnsupportedObservationArchitecture;
+        if (self.offline or self.target.core != null) return error.LiveTargetRequired;
+        const stopped = self.target.snapshot();
+        if (stopped.state != .stopped) return error.PauseBeforeObservation;
+        if (self.target.sharedVm() or stopped.birth_count > 0) return error.ProcessFamilyRequiresResolution;
+        if (tids.len == 0 or tids.len > 32) return error.InvalidObservationThreads;
+        const runtime = @import("../profile/runtime.zig");
+        const handle = self.target.handle orelse return error.LiveTargetRequired;
+        var scope: runtime.c.struct_xrt_function_scope = undefined;
+        var failure: runtime.c.struct_xrt_perf_failure = undefined;
+        if (!runtime.c.xrt_functions_capture_scope(@ptrCast(handle), tids.ptr, tids.len, &scope, &failure)) {
+            self.observations.failure = runtime.failure(failure);
+            return error.ObservationScopeCapture;
+        }
+        var context = @import("../observe/live.zig").Context{
+            .target = handle,
+            .scope = scope,
+            .producer = @import("../profile/producer.zig").describe(handle),
+            .identity = .{ .session_id = self.id, .capture_id = 0, .process_id = self.process_id, .pid = stopped.pid, .image_epoch = stopped.image_epoch, .generation = stopped.generation + @intFromBool(actor == .agent) },
+            .thread_count = tids.len,
+        };
+        for (tids, 0..) |tid, index| {
+            for (tids[0..index]) |previous| if (previous == tid) return error.InvalidObservationThreads;
+            context.threads[index] = for (self.target.threadSlice()) |thread| {
+                if (thread.tid == tid and thread.state == .stopped) break .{ .id = thread.id, .tid = tid };
+            } else return error.InvalidObservationThreads;
+        }
+        try self.refreshMaps();
+        const region = for (self.modules.regions.items) |region| {
+            if (region.permissions[2] == 'x' and region.inode != 0 and mapping_address >= region.start and mapping_address < region.end) break region;
+        } else return error.ObservationMappingNotFound;
+        try self.observations.start(context, config, region, requests, self.allocation_helper);
+        self.record(actor, "start_observation");
+    }
+    fn observationThreadsMatch(self: *const Session, threads: []const @import("../observe/capture.zig").Thread, stopped: bool) bool {
+        for (threads) |wanted| {
+            for (self.target.threadSlice()) |thread| {
+                if (thread.id == wanted.id and thread.tid == wanted.tid and thread.state != .exited and (!stopped or thread.state == .stopped)) break;
+            } else return false;
+        }
+        return true;
+    }
+    fn pollObservations(self: *Session) void {
+        // Replacement preparation keeps the old capture readable, but cannot
+        // admit a worker that would borrow it across publication of the new one.
+        if (self.observations.preparation != null) std.debug.assert(self.observation_analysis == null and self.observation_associations == null);
+        const stopped = self.target.snapshot();
+        const pending_valid = if (self.observations.pendingContext()) |context|
+            stopped.state == .stopped and stopped.pid == context.identity.pid and stopped.image_epoch == context.identity.image_epoch and stopped.generation == context.identity.generation and
+                stopped.birth_count == 0 and !self.target.sharedVm() and self.observationThreadsMatch(context.threads[0..context.thread_count], true)
+        else false;
+        const boundary: ?@import("../observe/capture.zig").Stop = if (self.observations.capture) |capture|
+            if (stopped.state == .idle or stopped.state == .exited or stopped.pid != capture.identity.pid) .target_ended
+            else if (stopped.image_epoch != capture.identity.image_epoch) .image_changed
+            else if (stopped.birth_count > 0 or self.target.sharedVm()) .scope_changed
+            else if (!self.observationThreadsMatch(capture.threads, false)) .thread_ended else null
+        else null;
+        self.observations.poll(pending_valid, boundary);
+    }
+    fn clearObservationArchive(self: *Session) !void {
+        self.pollObservationArchive();
+        if (self.observation_archive) |job| {
+            if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
+            job.deinit();
+            self.observation_archive = null;
+        }
+    }
+    pub fn saveObservation(self: *Session, path: []const u8) !u64 {
+        const capture = self.observations.capture orelse return error.NoObservation;
+        if (!capture.store.finished or self.observations.busy()) return error.ObservationStillCollecting;
+        try self.clearObservationArchive();
+        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .save, path, capture);
+        self.next_observation_archive += 1;
+        return self.observation_archive.?.id;
+    }
+    pub fn openObservation(self: *Session, path: []const u8) !void {
+        const failed_open = if (self.observation_archive) |job| job.kind == .open and job.done.load(.acquire) and job.err != null else false;
+        if (self.target.snapshot().pid != 0 or (self.offline and !failed_open) or self.profile != null or self.observations.capture != null or self.observations.busy()) return error.ConflictingTargets;
+        try self.clearObservationArchive();
+        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .open, path, null);
+        self.next_observation_archive += 1;
+        self.offline = true;
+    }
+    fn pollObservationArchive(self: *Session) void {
+        const job = self.observation_archive orelse return;
+        if (job.reaped or !job.done.load(.acquire)) return;
+        job.reaped = true;
+        job.source = null;
+        if (job.capture) |capture| {
+            self.observations.capture = capture;
+            job.capture = null;
+        }
     }
     pub fn archiveBusy(self: *const Session) bool {
         return if (self.archive_job) |job| !job.reaped else false;
@@ -620,6 +734,11 @@ pub const Session = struct {
         self.launch_argv = saved;
     }
     pub fn restart(self: *Session) !void {
+        if (self.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
+        if (self.observations.busy()) {
+            self.observations.stop(.target_ended);
+            return error.ObservationStopping;
+        }
         if (self.target.snapshot().birth_count > 0 or self.target.sharedVm()) return error.ProcessFamilyRequiresResolution;
         if (!self.target.snapshot().owned or self.launch_argv.len == 0) return error.RestartRequiresOwnedLaunch;
         if (self.target.snapshot().state != .stopped and self.target.snapshot().state != .exited and self.target.snapshot().state != .idle) return error.PauseBeforeRestart;
@@ -935,6 +1054,8 @@ pub const Session = struct {
         return true;
     }
     pub fn poll(self: *Session) !void {
+        defer self.inspections.poll(self);
+        defer self.pollObservationArchive();
         if (self.target.core != null) {
             self.memory.poll(self);
             return;
@@ -949,9 +1070,12 @@ pub const Session = struct {
         self.target.poll() catch |err| {
             self.allocations.stop(.collector_error);
             self.allocations.poll(false, .collector_error);
+            self.observations.stop(.collector_error);
+            self.observations.poll(false, .collector_error);
             return err;
         };
         self.pollAllocations();
+        self.pollObservations();
         if (self.process_tree) |tree| tree.admit(self);
         if (self.target.snapshot().birth_count > 0) {
             self.cancelStep();
@@ -1383,12 +1507,17 @@ pub const Session = struct {
         return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        if (self.observation_archive) |job| job.deinit();
+        if (self.observation_associations) |job| job.deinit();
+        if (self.observation_analysis) |job| job.deinit();
         if (self.comparison) |job| job.deinit();
         if (self.archive_job) |job| {
             job.deinit();
             self.archive_job = null;
         }
         self.allocations.deinit();
+        self.observations.deinit();
+        self.inspections.deinit();
         self.memory.deinit();
         self.persistent.deinit();
         for (self.launch_argv) |arg| std.heap.page_allocator.free(arg);

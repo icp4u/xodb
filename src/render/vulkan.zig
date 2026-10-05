@@ -22,6 +22,13 @@ fn check(result: c.VkResult) !void {
     }
 }
 
+/// A failed create leaves its output undefined. Clear it so that unwinding
+/// a partial initialization never destroys or unmaps an invalid handle.
+fn created(result: c.VkResult, output: anytype) !void {
+    if (result != c.VK_SUCCESS) output.* = null;
+    try check(result);
+}
+
 /// Vulkan enumeration counts belong to the driver. Query, allocate and retry
 /// VK_INCOMPLETE; a fixed array can make initialization fail on another GPU.
 fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime label: []const u8) !std.ArrayList(T) {
@@ -108,17 +115,22 @@ pub const Renderer = struct {
         instance_info.pApplicationInfo = &app;
         instance_info.enabledExtensionCount = extensions.len;
         instance_info.ppEnabledExtensionNames = &extensions;
-        try check(c.vkCreateInstance(&instance_info, null, &self.instance));
+        try created(c.vkCreateInstance(&instance_info, null, &self.instance), &self.instance);
         var surface_info = info(c.VkWaylandSurfaceCreateInfoKHR, c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
         surface_info.display = window.display;
         surface_info.surface = window.surface;
-        try check(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface));
+        try created(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface), &self.surface);
         var devices = try enumerate(c.VkPhysicalDevice, c.vkEnumeratePhysicalDevices, .{self.instance}, "vkEnumeratePhysicalDevices");
         defer devices.deinit(std.heap.page_allocator);
         var best: i32 = -1;
         for (devices.items) |physical| {
             var props: c.VkPhysicalDeviceProperties = undefined;
             c.vkGetPhysicalDeviceProperties(physical, &props);
+            // One unusable device must not hide another that can present.
+            if (!hasSwapchain(physical)) {
+                std.debug.print("xodb: Vulkan device {s} lacks VK_KHR_swapchain; skipped\n", .{std.mem.sliceTo(@as([]const u8, &props.deviceName), 0)});
+                continue;
+            }
             var n: u32 = 0;
             c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, null);
             if (n > 4096) return error.VulkanEnumerationLimit;
@@ -128,7 +140,11 @@ pub const Renderer = struct {
             if (n > families.len) return error.VulkanEnumerationUnstable;
             for (families[0..n], 0..) |family, i| {
                 var present: c.VkBool32 = 0;
-                try check(c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present));
+                const queried = c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present);
+                if (queried != c.VK_SUCCESS) {
+                    std.debug.print("xodb: Vulkan device {s} queue family {d} surface support query failed: {d}; skipped\n", .{ std.mem.sliceTo(@as([]const u8, &props.deviceName), 0), i, queried });
+                    continue;
+                }
                 if (present == 0 or family.queueFlags & c.VK_QUEUE_GRAPHICS_BIT == 0) continue;
                 const score: i32 = if (props.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) 3 else if (props.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) 2 else 1;
                 if (score > best) {
@@ -152,50 +168,58 @@ pub const Renderer = struct {
         device_info.pQueueCreateInfos = &queue_info;
         device_info.enabledExtensionCount = device_ext.len;
         device_info.ppEnabledExtensionNames = &device_ext;
-        try check(c.vkCreateDevice(self.physical, &device_info, null, &self.device));
+        try created(c.vkCreateDevice(self.physical, &device_info, null, &self.device), &self.device);
         c.vkGetDeviceQueue(self.device, self.family, 0, &self.queue);
         var pool_info = info(c.VkCommandPoolCreateInfo, c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
         pool_info.queueFamilyIndex = self.family;
         pool_info.flags = c.VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-        try check(c.vkCreateCommandPool(self.device, &pool_info, null, &self.pool));
+        try created(c.vkCreateCommandPool(self.device, &pool_info, null, &self.pool), &self.pool);
         var cmd_info = info(c.VkCommandBufferAllocateInfo, c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO);
         cmd_info.commandPool = self.pool;
         cmd_info.level = c.VK_COMMAND_BUFFER_LEVEL_PRIMARY;
         cmd_info.commandBufferCount = 1;
         try check(c.vkAllocateCommandBuffers(self.device, &cmd_info, &self.command));
         var semaphore_info = info(c.VkSemaphoreCreateInfo, c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
-        try check(c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.available));
+        try created(c.vkCreateSemaphore(self.device, &semaphore_info, null, &self.available), &self.available);
         var fence_info = info(c.VkFenceCreateInfo, c.VK_STRUCTURE_TYPE_FENCE_CREATE_INFO);
         fence_info.flags = c.VK_FENCE_CREATE_SIGNALED_BIT;
-        try check(c.vkCreateFence(self.device, &fence_info, null, &self.fence));
+        try created(c.vkCreateFence(self.device, &fence_info, null, &self.fence), &self.fence);
         try self.createBuffer();
         try self.createAtlas();
         try self.createDescriptors();
         try self.createSwap(window.width, window.height);
     }
+    fn hasSwapchain(physical: c.VkPhysicalDevice) bool {
+        var extensions = enumerate(c.VkExtensionProperties, c.vkEnumerateDeviceExtensionProperties, .{ physical, @as([*c]const u8, null) }, "vkEnumerateDeviceExtensionProperties") catch return false;
+        defer extensions.deinit(std.heap.page_allocator);
+        for (extensions.items) |extension| {
+            if (std.mem.eql(u8, std.mem.sliceTo(@as([]const u8, &extension.extensionName), 0), "VK_KHR_swapchain")) return true;
+        }
+        return false;
+    }
     fn memoryType(self: *Renderer, bits: u32, flags: u32) !u32 {
         var props: c.VkPhysicalDeviceMemoryProperties = undefined;
         c.vkGetPhysicalDeviceMemoryProperties(self.physical, &props);
-        for (0..props.memoryTypeCount) |i| if ((bits & (@as(u32, 1) << @intCast(i))) != 0 and (props.memoryTypes[i].propertyFlags & flags) == flags) return @intCast(i);
+        for (0..@min(props.memoryTypeCount, props.memoryTypes.len)) |i| if ((bits & (@as(u32, 1) << @intCast(i))) != 0 and (props.memoryTypes[i].propertyFlags & flags) == flags) return @intCast(i);
         return error.NoMemoryType;
     }
     fn allocate(self: *Renderer, req: c.VkMemoryRequirements, flags: u32, memory: *c.VkDeviceMemory) !void {
         var allocation = info(c.VkMemoryAllocateInfo, c.VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO);
         allocation.allocationSize = req.size;
         allocation.memoryTypeIndex = try self.memoryType(req.memoryTypeBits, flags);
-        try check(c.vkAllocateMemory(self.device, &allocation, null, memory));
+        try created(c.vkAllocateMemory(self.device, &allocation, null, memory), memory);
     }
     fn createBuffer(self: *Renderer) !void {
         var buffer_info = info(c.VkBufferCreateInfo, c.VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO);
         buffer_info.size = buffer_bytes;
         buffer_info.usage = c.VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | c.VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
         buffer_info.sharingMode = c.VK_SHARING_MODE_EXCLUSIVE;
-        try check(c.vkCreateBuffer(self.device, &buffer_info, null, &self.buffer));
+        try created(c.vkCreateBuffer(self.device, &buffer_info, null, &self.buffer), &self.buffer);
         var req: c.VkMemoryRequirements = undefined;
         c.vkGetBufferMemoryRequirements(self.device, self.buffer, &req);
         try self.allocate(req, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &self.memory);
         try check(c.vkBindBufferMemory(self.device, self.buffer, self.memory, 0));
-        try check(c.vkMapMemory(self.device, self.memory, 0, buffer_bytes, 0, &self.mapped));
+        try created(c.vkMapMemory(self.device, self.memory, 0, buffer_bytes, 0, &self.mapped), &self.mapped);
     }
     fn createView(self: *Renderer, img: c.VkImage, format: c.VkFormat, view: *c.VkImageView) !void {
         var create = info(c.VkImageViewCreateInfo, c.VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO);
@@ -203,7 +227,7 @@ pub const Renderer = struct {
         create.viewType = c.VK_IMAGE_VIEW_TYPE_2D;
         create.format = format;
         create.subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
-        try check(c.vkCreateImageView(self.device, &create, null, view));
+        try created(c.vkCreateImageView(self.device, &create, null, view), view);
     }
     fn createAtlas(self: *Renderer) !void {
         var create = info(c.VkImageCreateInfo, c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
@@ -215,7 +239,7 @@ pub const Renderer = struct {
         create.samples = c.VK_SAMPLE_COUNT_1_BIT;
         create.tiling = c.VK_IMAGE_TILING_OPTIMAL;
         create.usage = c.VK_IMAGE_USAGE_TRANSFER_DST_BIT | c.VK_IMAGE_USAGE_SAMPLED_BIT;
-        try check(c.vkCreateImage(self.device, &create, null, &self.atlas));
+        try created(c.vkCreateImage(self.device, &create, null, &self.atlas), &self.atlas);
         var req: c.VkMemoryRequirements = undefined;
         c.vkGetImageMemoryRequirements(self.device, self.atlas, &req);
         try self.allocate(req, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.atlas_memory);
@@ -227,20 +251,20 @@ pub const Renderer = struct {
         sampler.addressModeU = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler.addressModeV = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
         sampler.addressModeW = c.VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-        try check(c.vkCreateSampler(self.device, &sampler, null, &self.sampler));
+        try created(c.vkCreateSampler(self.device, &sampler, null, &self.sampler), &self.sampler);
     }
     fn createDescriptors(self: *Renderer) !void {
         const binding = c.VkDescriptorSetLayoutBinding{ .binding = 0, .descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = c.VK_SHADER_STAGE_FRAGMENT_BIT, .pImmutableSamplers = null };
         var layout = info(c.VkDescriptorSetLayoutCreateInfo, c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO);
         layout.bindingCount = 1;
         layout.pBindings = &binding;
-        try check(c.vkCreateDescriptorSetLayout(self.device, &layout, null, &self.descriptor_layout));
+        try created(c.vkCreateDescriptorSetLayout(self.device, &layout, null, &self.descriptor_layout), &self.descriptor_layout);
         const size = c.VkDescriptorPoolSize{ .type = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 };
         var pool = info(c.VkDescriptorPoolCreateInfo, c.VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO);
         pool.maxSets = 1;
         pool.poolSizeCount = 1;
         pool.pPoolSizes = &size;
-        try check(c.vkCreateDescriptorPool(self.device, &pool, null, &self.descriptor_pool));
+        try created(c.vkCreateDescriptorPool(self.device, &pool, null, &self.descriptor_pool), &self.descriptor_pool);
         var alloc = info(c.VkDescriptorSetAllocateInfo, c.VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO);
         alloc.descriptorPool = self.descriptor_pool;
         alloc.descriptorSetCount = 1;
@@ -259,7 +283,7 @@ pub const Renderer = struct {
         pipeline_layout.pSetLayouts = &self.descriptor_layout;
         pipeline_layout.pushConstantRangeCount = 1;
         pipeline_layout.pPushConstantRanges = &push;
-        try check(c.vkCreatePipelineLayout(self.device, &pipeline_layout, null, &self.layout));
+        try created(c.vkCreatePipelineLayout(self.device, &pipeline_layout, null, &self.layout), &self.layout);
     }
     fn createSwap(self: *Renderer, width: u32, height: u32) !void {
         var caps: c.VkSurfaceCapabilitiesKHR = undefined;
@@ -273,6 +297,14 @@ pub const Renderer = struct {
             break;
         };
         self.format = chosen.format;
+        // Driver-reported limits feed shifts, increments and clamps below; reject
+        // impossible values as an initialization failure, not a process abort.
+        if (caps.supportedCompositeAlpha == 0 or caps.minImageCount > 64 or
+            caps.minImageExtent.width > caps.maxImageExtent.width or caps.minImageExtent.height > caps.maxImageExtent.height)
+        {
+            std.debug.print("xodb: unusable surface capabilities: alpha 0x{x}, min images {d}, extent {d}x{d}..{d}x{d}\n", .{ caps.supportedCompositeAlpha, caps.minImageCount, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width, caps.maxImageExtent.height });
+            return error.SurfaceCapabilitiesInvalid;
+        }
         self.extent = if (caps.currentExtent.width != std.math.maxInt(u32)) caps.currentExtent else .{
             .width = std.math.clamp(width, caps.minImageExtent.width, caps.maxImageExtent.width),
             .height = std.math.clamp(height, caps.minImageExtent.height, caps.maxImageExtent.height),
@@ -323,9 +355,9 @@ pub const Renderer = struct {
             framebuffer.width = self.extent.width;
             framebuffer.height = self.extent.height;
             framebuffer.layers = 1;
-            try check(c.vkCreateFramebuffer(self.device, &framebuffer, null, &self.framebuffers[i]));
+            try created(c.vkCreateFramebuffer(self.device, &framebuffer, null, &self.framebuffers[i]), &self.framebuffers[i]);
             var sem = info(c.VkSemaphoreCreateInfo, c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
-            try check(c.vkCreateSemaphore(self.device, &sem, null, &self.finished[i]));
+            try created(c.vkCreateSemaphore(self.device, &sem, null, &self.finished[i]), &self.finished[i]);
         }
     }
     fn createPass(self: *Renderer) !void {
@@ -351,7 +383,7 @@ pub const Renderer = struct {
         pass.pSubpasses = &subpass;
         pass.dependencyCount = 1;
         pass.pDependencies = &dependency;
-        try check(c.vkCreateRenderPass(self.device, &pass, null, &self.pass));
+        try created(c.vkCreateRenderPass(self.device, &pass, null, &self.pass), &self.pass);
         self.pass_format = self.format;
         try self.createPipeline();
     }

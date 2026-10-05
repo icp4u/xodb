@@ -30,6 +30,15 @@ pub const Manager = struct {
         for (self.entries.items) |item| item.deinit();
         self.entries.deinit(A);
     }
+    /// Discard this logical probe after removing its physical site, or after
+    /// the target address space ended. Other probes retain their identities.
+    pub fn forget(self: *Manager, id: u64) void {
+        for (self.entries.items, 0..) |item, i| if (item.id == id) {
+            item.deinit();
+            _ = self.entries.swapRemove(i);
+            return;
+        };
+    }
     pub fn copyForFork(self: *const Manager, out: *Manager) !void {
         std.debug.assert(out.entries.items.len == 0);
         try out.entries.ensureTotalCapacityPrecise(A, self.entries.items.len);

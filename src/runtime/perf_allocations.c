@@ -4,6 +4,8 @@
 #include "xrt_process.h"
 #include "perf_remote.h"
 #include "xrt_remote.h"
+#include "xrt_uprobes.h"
+#include "../profile/allocation_broker.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/perf_event.h>
@@ -21,7 +23,7 @@ struct file {
 };
 struct xrt_allocations {
     struct xrt_perf *perf;
-    bool remote;
+    bool remote, functions;
     int32_t pid;
     struct file files[XRT_ALLOCATION_MAX_HOOKS];
     size_t count;
@@ -161,8 +163,8 @@ static int open_event(void *raw, int32_t tid, int group, size_t index,
     opened.config1 = (uintptr_t)path;
     return (int)syscall(SYS_perf_event_open, &opened, tid, -1, group, PERF_FLAG_FD_CLOEXEC);
 }
-struct xrt_allocations *xrt_allocations_start(const struct xrt_allocation_config *c,
-                                              struct xrt_perf_failure *f)
+static struct xrt_allocations *uprobes_start(const struct xrt_allocation_config *c,
+                                              bool functions, struct xrt_perf_failure *f)
 {
 #if !defined(__x86_64__)
     xrt_perf_fail(f, "allocations.architecture", 0, -1,
@@ -215,6 +217,7 @@ struct xrt_allocations *xrt_allocations_start(const struct xrt_allocation_config
         return NULL;
     }
     a->pid = c->pid;
+    a->functions = functions;
     a->perf = xrt_perf_create(16, 32, UINT64_MAX);
     if (!a->perf) {
         xrt_perf_fail(f, "alloc", errno, -1, "allocation rings");
@@ -275,13 +278,12 @@ struct xrt_allocations *xrt_allocations_start(const struct xrt_allocation_config
             attr->sample_type |= PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER;
         attr->sample_max_stack = stacks ? 32 : 0;
         attr->sample_stack_user = stacks ? 8 : 0;
-        attr->sample_regs_user = (UINT64_C(1) << 0) | (UINT64_C(1) << 4) | (UINT64_C(1) << 5) |
-                                 (UINT64_C(1) << 7) | (UINT64_C(1) << 8);
+        attr->sample_regs_user = functions ? XRT_FUNCTION_REGISTER_MASK : XRT_ALLOCATION_REGISTER_MASK;
         attr->flags = 1 | (UINT64_C(1) << 5) | (UINT64_C(1) << 6) | (UINT64_C(1) << 18) |
                       (UINT64_C(1) << 21) | (UINT64_C(1) << 25);
         if (!i)
             attr->flags |= (UINT64_C(1) << 9) | (UINT64_C(1) << 13) | (UINT64_C(1) << 24);
-        if (!i && c->callstacks)
+        if (!i && (c->callstacks || functions))
             attr->flags |= (UINT64_C(1) << 8) | (UINT64_C(1) << 23);
         attr->clockid = CLOCK_MONOTONIC;
     }
@@ -295,9 +297,14 @@ struct xrt_allocations *xrt_allocations_start(const struct xrt_allocation_config
             f->syscall =
                 f->error == ECANCELED ? "allocations.cancel" : "allocations.perf_event_open";
             f->detail = f->error == ECANCELED ? "allocation preparation cancelled"
+                         : functions ? "task-local function uprobe open failed"
                                               : "task-local uprobe open failed; current kernels "
                                                 "require CAP_SYS_ADMIN for creation";
         }
+        goto fail;
+    }
+    if (c->cancelled && c->cancelled(c->context)) {
+        xrt_perf_fail(f, "allocations.cancel", ECANCELED, -1, "uprobe preparation cancelled");
         goto fail;
     }
     if (!files_unchanged(a, f) || (c->enable && !xrt_allocations_enable(a, f)))
@@ -335,4 +342,299 @@ struct xrt_allocations *xrt_allocations_start_target(const struct xrt_target *t,
         xrt_perf_fail(f, "alloc", ENOMEM, -1, "remote allocation owner");
     }
     return a;
+}
+
+struct xrt_allocations *xrt_allocations_start(const struct xrt_allocation_config *c,
+                                              struct xrt_perf_failure *f)
+{
+    return uprobes_start(c, false, f);
+}
+
+struct uprobe_broker {
+    int fd, child, pid;
+    bool functions;
+    const struct xrt_allocation_config *config;
+};
+static int broker_cancel(void *raw)
+{
+    const struct uprobe_broker *b = raw;
+    return b->config->cancelled && b->config->cancelled(b->config->context);
+}
+static int broker_event(void *raw, int32_t tid, int group, int file, uint64_t offset,
+                         bool returning, bool leader, bool stacks)
+{
+    struct uprobe_broker *b = raw;
+    return b->functions
+               ? xodb_function_broker_open(b->fd, b->pid, tid, file, group, offset, returning,
+                                            leader, stacks, broker_cancel, b)
+               : xodb_allocation_broker_open(b->fd, b->pid, tid, file, group, offset, returning,
+                                              leader, stacks, broker_cancel, b);
+}
+static bool broker_cancelled(void *raw)
+{
+    return broker_cancel(raw) != 0;
+}
+static void function_failure(struct xrt_perf_failure *f)
+{
+    if (!f)
+        return;
+    /* Preserve kind/errno/TID/rollback; avoid allocator labels on function jobs. */
+    if (f->syscall && !strncmp(f->syscall, "allocations.", 12))
+        f->syscall = f->error == ECANCELED ? "functions.cancel" : "functions.prepare";
+    if (f->detail && (!strncmp(f->detail, "Allocation", 10) ||
+                      !strncmp(f->detail, "InvalidAllocation", 17)))
+        f->detail = "invalid function uprobe preparation evidence";
+    else if (f->detail && !strncmp(f->detail, "allocation ", 11))
+        f->detail = f->error == ECANCELED ? "function uprobe preparation cancelled"
+                                          : "function uprobe preparation failed";
+}
+static bool function_mapping(int32_t file_pid, const struct xrt_mapping *mapping,
+                              const struct xrt_allocation_config *c)
+{
+    if (!mapping || mapping->start >= mapping->end)
+        return false;
+    for (size_t i = 0; i < c->source_count; ++i)
+        if (c->sources[i].offset < mapping->offset ||
+            c->sources[i].offset - mapping->offset >= mapping->end - mapping->start)
+            return false;
+    int fd = -1;
+    const struct xrt_file_request request = {.kind = XRT_FILE_MAPS};
+    if (xrt_process_file(file_pid, &request, &fd) != XRT_OK)
+        return false;
+    FILE *maps = fdopen(fd, "r");
+    if (!maps) {
+        close(fd);
+        return false;
+    }
+    bool found = false;
+    char line[8192];
+    for (size_t i = 0; i < 65536 && fgets(line, sizeof(line), maps); ++i) {
+        unsigned long long start, end, offset, major, minor, inode;
+        char permissions[5];
+        if (sscanf(line, "%llx-%llx %4s %llx %llx:%llx %llu", &start, &end, permissions,
+                   &offset, &major, &minor, &inode) == 7 && permissions[2] == 'x' &&
+            start == mapping->start && end == mapping->end && offset == mapping->offset &&
+            major == mapping->device_major && minor == mapping->device_minor &&
+            inode == mapping->inode) {
+            found = true;
+            break;
+        }
+    }
+    fclose(maps);
+    return found;
+}
+static struct xrt_allocations *uprobes_start_local_scope(const struct xrt_function_scope *scope,
+                                                         const struct xrt_allocation_config *c,
+                                                         const struct xrt_mapping *mapping,
+                                                         const char *helper, bool functions,
+                                                         struct xrt_perf_failure *f)
+{
+    if (!scope || !c || !mapping || c->opener || !c->tids || !c->sources ||
+        !c->thread_count || c->thread_count > 32 || !c->source_count ||
+        c->source_count > XRT_ALLOCATION_MAX_HOOKS || scope->file_pid <= 0 ||
+        scope->breakpoint_count > 128) {
+        xrt_perf_fail(f, "config", EINVAL, -1, "invalid target uprobe configuration");
+        return NULL;
+    }
+    if (c->cancelled && c->cancelled(c->context)) {
+        xrt_perf_fail(f, "cancel", ECANCELED, -1, "uprobe preparation cancelled");
+        return NULL;
+    }
+    if (functions && !function_mapping(scope->file_pid, mapping, c)) {
+        xrt_perf_fail(f, "functions.mapping", EINVAL, -1,
+                      "function offsets must belong to the verified executable mapping");
+        return NULL;
+    }
+    if (functions) {
+        /* Mapping bounds above prove this addition cannot wrap. A live int3 at
+         * the entry would compete with perf's own instruction replacement. */
+        for (size_t i = 0; i < c->source_count; ++i) {
+            const uint64_t address = mapping->start + (c->sources[i].offset - mapping->offset);
+            for (size_t j = 0; j < scope->breakpoint_count; ++j) {
+                if (scope->breakpoint_addresses[j] == address) {
+                    xrt_perf_fail(f, "functions.breakpoint", EBUSY, -1,
+                                  "function entry overlaps an enabled software breakpoint");
+                    return NULL;
+                }
+            }
+        }
+    }
+    struct xrt_file_request request = {.kind = XRT_FILE_MAPPED, .mapping = *mapping};
+    int fd = -1;
+    if (xrt_process_file(scope->file_pid, &request, &fd) != XRT_OK) {
+        xrt_perf_fail(f, "file", ENOENT, -1, "target mapped file unavailable");
+        return NULL;
+    }
+    struct xrt_allocation_source sources[XRT_ALLOCATION_MAX_HOOKS];
+    for (size_t i = 0; i < c->source_count; ++i) {
+        sources[i] = c->sources[i];
+        sources[i].fd = fd;
+    }
+    struct xrt_allocation_config config = *c;
+    config.sources = sources;
+    struct uprobe_broker broker = {.fd = -1, .child = -1, .pid = c->pid,
+                                    .functions = functions, .config = c};
+    if (helper && *helper) {
+        if (xodb_allocation_broker_start(helper, &broker.fd, &broker.child)) {
+            close(fd);
+            xrt_perf_fail(f, "helper", errno, -1, "explicit target uprobe helper start failed");
+            return NULL;
+        }
+        config.opener = broker_event;
+        config.cancelled = broker_cancelled;
+        config.context = &broker;
+    }
+    struct xrt_allocations *a = uprobes_start(&config, functions, f);
+    xodb_allocation_broker_close(broker.fd, broker.child);
+    close(fd);
+    if (functions && !a)
+        function_failure(f);
+    return a;
+}
+bool xrt_functions_capture_scope(const struct xrt_target *t, const int32_t *tids,
+                                  size_t count, struct xrt_function_scope *out,
+                                  struct xrt_perf_failure *f)
+{
+    if (!t || !tids || !count || count > 32 || !out) {
+        xrt_perf_fail(f, "scope", EINVAL, -1, "invalid function scope request");
+        return false;
+    }
+    const struct xrt_arch *arch = xrt_target_arch(t);
+    if (!arch || arch->machine != XRT_X86_64) {
+        xrt_perf_fail(f, "functions.architecture", ENOTSUP, -1,
+                      "function uprobes currently require Linux x86-64");
+        return false;
+    }
+    struct xrt_target_view view;
+    xrt_target_view(t, &view);
+    if (view.pid <= 0 || view.state != XRT_STOPPED || view.breakpoint_count > 128) {
+        xrt_perf_fail(f, "scope", EINVAL, -1, "function observation requires a held target");
+        return false;
+    }
+    struct xrt_function_scope scope = {.remote = xrt_target_is_remote(t), .pid = view.pid,
+                                        .file_pid = tids[0], .thread_count = count};
+    for (size_t i = 0; i < count; ++i) {
+        bool found = false;
+        for (size_t j = 0; j < i; ++j)
+            if (tids[j] == tids[i]) {
+                xrt_perf_fail(f, "scope", EINVAL, tids[i], "duplicate selected thread");
+                return false;
+            }
+        for (size_t j = 0; j < view.thread_count; ++j)
+            if (view.threads[j].tid == tids[i] && view.threads[j].state == XRT_STOPPED)
+                found = true;
+        if (!found) {
+            xrt_perf_fail(f, "scope", EINVAL, tids[i], "selected thread is not held by target");
+            return false;
+        }
+        scope.tids[i] = tids[i];
+    }
+    for (size_t i = 0; i < view.breakpoint_count; ++i)
+        if (view.breakpoints[i].enabled && !view.breakpoints[i].pending)
+            scope.breakpoint_addresses[scope.breakpoint_count++] = view.breakpoints[i].address;
+    *out = scope;
+    return true;
+}
+struct xrt_allocations *xrt_uprobes_start_local(const struct xrt_target *t,
+                                               const struct xrt_allocation_config *c,
+                                               const struct xrt_mapping *mapping,
+                                               const char *helper, bool functions,
+                                               struct xrt_perf_failure *f)
+{
+    struct xrt_function_scope scope;
+    if (!c || !xrt_functions_capture_scope(t, c->tids, c->thread_count, &scope, f))
+        return NULL;
+    if (scope.remote || c->pid != scope.pid) {
+        xrt_perf_fail(f, "scope", EINVAL, -1, "invalid native target scope");
+        return NULL;
+    }
+    return uprobes_start_local_scope(&scope, c, mapping, helper, functions, f);
+}
+struct xrt_functions *xrt_functions_start_target(const struct xrt_target *t,
+                                                const struct xrt_function_config *c,
+                                                const struct xrt_mapping *mapping,
+                                                const char *helper, struct xrt_perf_failure *f)
+{
+    struct xrt_function_scope scope;
+    if (!c) {
+        xrt_perf_fail(f, "config", EINVAL, -1, "invalid function observation configuration");
+        return NULL;
+    }
+    if (!xrt_functions_capture_scope(t, c->tids, c->thread_count, &scope, f))
+        return NULL;
+    return xrt_functions_start_scoped(scope.remote ? t : NULL, &scope, c, mapping, helper, f);
+}
+struct xrt_functions *xrt_functions_start_scoped(const struct xrt_target *remote_target,
+                                                const struct xrt_function_scope *scope,
+                                                const struct xrt_function_config *c,
+                                                const struct xrt_mapping *mapping,
+                                                const char *helper, struct xrt_perf_failure *f)
+{
+    if (!scope || !c || c->pid <= 0 || !c->tids || !c->thread_count || c->thread_count > 32 ||
+        !c->sources || !c->source_count || c->source_count > XRT_FUNCTION_MAX_SOURCES ||
+        scope->pid != c->pid || scope->thread_count != c->thread_count ||
+        scope->file_pid <= 0 || scope->file_pid != scope->tids[0] ||
+        scope->breakpoint_count > 128 || scope->remote != (remote_target != NULL)) {
+        xrt_perf_fail(f, "config", EINVAL, -1, "invalid function observation configuration");
+        return NULL;
+    }
+    for (size_t i = 0; i < c->thread_count; ++i)
+        if (scope->tids[i] != c->tids[i]) {
+            xrt_perf_fail(f, "scope", EINVAL, -1, "function thread scope changed after preparation");
+            return NULL;
+        }
+    for (size_t i = 0; i < c->source_count; ++i) {
+        if (!c->sources[i].id || c->sources[i].fd < 0 || c->sources[i].fd != c->sources[0].fd) {
+            xrt_perf_fail(f, "config", EINVAL, -1, "invalid function source identity");
+            return NULL;
+        }
+        for (size_t j = 0; j < i; ++j)
+            if (c->sources[i].id == c->sources[j].id ||
+                c->sources[i].offset == c->sources[j].offset) {
+                xrt_perf_fail(f, "config", EINVAL, -1, "duplicate function source identity");
+                return NULL;
+            }
+    }
+    struct xrt_allocation_source sources[XRT_FUNCTION_MAX_SOURCES];
+    for (size_t i = 0; i < c->source_count; ++i) {
+        const struct xrt_function_source *source = &c->sources[i];
+        sources[i] = (struct xrt_allocation_source){.id = source->id, .fd = source->fd,
+                                                   .offset = source->offset,
+                                                   .identity = source->identity};
+    }
+    const struct xrt_allocation_config config = {
+        .pid = c->pid, .tids = c->tids, .thread_count = c->thread_count, .sources = sources,
+        .source_count = c->source_count, .enable = c->enable, .callstacks = c->callstacks,
+        .cancelled = c->cancelled, .context = c->context};
+    struct xrt_allocations *a;
+    if (scope->remote) {
+        struct xrt_perf *p = xrt_remote_functions_start(remote_target, &config, mapping, helper, f);
+        if (!p) {
+            function_failure(f);
+            return NULL;
+        }
+        a = xrt_allocations_remote(p);
+        if (!a) {
+            xrt_perf_destroy(p);
+            xrt_perf_fail(f, "alloc", ENOMEM, -1, "remote function owner");
+        } else
+            a->functions = true;
+    } else
+        a = uprobes_start_local_scope(scope, &config, mapping, helper, true, f);
+    return (struct xrt_functions *)a;
+}
+bool xrt_functions_enable(struct xrt_functions *functions, struct xrt_perf_failure *f)
+{
+    bool ok = xrt_allocations_enable((struct xrt_allocations *)functions, f);
+    if (!ok)
+        function_failure(f);
+    return ok;
+}
+void xrt_functions_destroy(struct xrt_functions *functions)
+{
+    xrt_allocations_destroy((struct xrt_allocations *)functions);
+}
+struct xrt_perf *xrt_functions_perf(struct xrt_functions *functions)
+{
+    return xrt_allocations_perf((struct xrt_allocations *)functions);
 }

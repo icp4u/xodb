@@ -73,18 +73,8 @@ static void result(struct xrt_codec *out, bool ok, struct xrt_perf *p,
         xrt_perf_info(p, &info);
     xrt_wire_perf_info(out, &info);
 }
-struct broker {
-    int fd, pid, target;
-};
-static int broker_open(void *raw, int32_t tid, int group, int file, uint64_t offset, bool returning,
-                       bool leader, bool stacks)
-{
-    struct broker *b = raw;
-    return xodb_allocation_broker_open(b->fd, b->target, tid, file, group, offset, returning,
-                                       leader, stacks, NULL, NULL);
-}
 static struct xrt_allocations *allocations_open(struct xrt_agent_perf *a, struct xrt_target *t,
-                                                struct xrt_codec *in, struct xrt_perf_failure *f)
+                                                struct xrt_codec *in, bool functions, struct xrt_perf_failure *f)
 {
     uint32_t count = 0;
     xrt_codec_u32(in, &count);
@@ -110,7 +100,10 @@ static struct xrt_allocations *allocations_open(struct xrt_agent_perf *a, struct
     for (uint32_t i = 0; i < count; ++i) {
         struct xrt_allocation_source *source = &a->sources[i];
         xrt_codec_u16(in, &source->id);
-        xrt_codec_u16(in, &source->kind);
+        source->kind = 0;
+        source->fd = -1;
+        if (!functions)
+            xrt_codec_u16(in, &source->kind);
         xrt_codec_u64(in, &source->offset);
         xrt_wire_file_identity(in, &source->identity);
     }
@@ -123,28 +116,8 @@ static struct xrt_allocations *allocations_open(struct xrt_agent_perf *a, struct
     if (!in->ok || in->at != in->size || memchr(a->helper, 0, length) ||
         file.kind != XRT_FILE_MAPPED || !held(t, config.tids, config.thread_count))
         return NULL;
-    int fd = -1;
-    enum xrt_status status = xrt_target_file(t, &file, &fd);
-    if (status != XRT_OK) {
-        xrt_perf_fail(f, "allocations.file", ENOENT, -1, "target mapped file unavailable");
-        return NULL;
-    }
-    for (uint32_t i = 0; i < count; ++i)
-        a->sources[i].fd = fd;
-    struct broker broker = {.fd = -1, .pid = -1, .target = t->pid};
-    if (length) {
-        if (xodb_allocation_broker_start(a->helper, &broker.fd, &broker.pid)) {
-            close(fd);
-            xrt_perf_fail(f, "allocations.helper", errno, -1, "target helper start failed");
-            return NULL;
-        }
-        config.opener = broker_open;
-        config.context = &broker;
-    }
-    struct xrt_allocations *result = xrt_allocations_start(&config, f);
-    xodb_allocation_broker_close(broker.fd, broker.pid);
-    close(fd);
-    return result;
+    return xrt_uprobes_start_local(t, &config, &file.mapping,
+                                   length ? a->helper : NULL, functions, f);
 }
 enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_target *t, uint16_t op,
                                         const uint64_t *args, void *bytes, size_t size,
@@ -160,7 +133,8 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
     struct collector *slot = NULL;
     bool ok = false;
     const bool opening =
-        op == XRT_RPC_CPU_START || op == XRT_RPC_SYSCALLS_START || op == XRT_RPC_ALLOCATIONS_START;
+        op == XRT_RPC_CPU_START || op == XRT_RPC_SYSCALLS_START || op == XRT_RPC_ALLOCATIONS_START ||
+        op == XRT_RPC_FUNCTION_START;
     if (!a || !t)
         return XRT_INVALID_ARGUMENT;
     if (opening) {
@@ -175,8 +149,8 @@ enum xrt_status xrt_agent_perf_dispatch(struct xrt_agent_perf *a, struct xrt_tar
         if (!slot || a->next_id == UINT64_MAX)
             return XRT_PROCESS_LIMIT;
         memset(slot, 0, sizeof(*slot));
-        if (op == XRT_RPC_ALLOCATIONS_START) {
-            slot->allocations = allocations_open(a, t, &in, &failure);
+        if (op == XRT_RPC_ALLOCATIONS_START || op == XRT_RPC_FUNCTION_START) {
+            slot->allocations = allocations_open(a, t, &in, op == XRT_RPC_FUNCTION_START, &failure);
             if (slot->allocations)
                 slot->perf = xrt_allocations_perf(slot->allocations);
         } else if (op == XRT_RPC_CPU_START) {

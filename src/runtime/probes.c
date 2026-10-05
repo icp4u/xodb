@@ -148,7 +148,8 @@ enum xrt_status xrt_target_breakpoint_set(struct xrt_target *t, uint64_t address
         *id = t->breakpoints[existing].id;
         return XRT_OK;
     }
-    if (t->breakpoint_count == XRT_MAX_BREAKPOINTS)
+    /* UINT64_MAX is never allocated: the counter would wrap to the absent ID. */
+    if (t->breakpoint_count == XRT_MAX_BREAKPOINTS || t->next_probe_id == UINT64_MAX)
         return XRT_BREAKPOINT_LIMIT;
     struct xrt_breakpoint p = {.id = t->next_probe_id,
                                .address = address,
@@ -177,7 +178,7 @@ enum xrt_status xrt_target_breakpoint_reserve(struct xrt_target *t, uint64_t *id
         return XRT_NOT_STOPPED;
     if (!id)
         return XRT_INVALID_ARGUMENT;
-    if (t->breakpoint_count == XRT_MAX_BREAKPOINTS)
+    if (t->breakpoint_count == XRT_MAX_BREAKPOINTS || t->next_probe_id == UINT64_MAX)
         return XRT_BREAKPOINT_LIMIT;
     *id = t->next_probe_id++;
     t->breakpoints[t->breakpoint_count++] =
@@ -197,6 +198,10 @@ enum xrt_status xrt_target_breakpoint_restore(struct xrt_target *t, uint64_t id,
         return XRT_NOT_STOPPED;
     if (!id || id == UINT64_MAX || xrt_breakpoint_index(t, id) >= 0)
         return XRT_INVALID_ARGUMENT;
+    /* Breakpoints and watchpoints share one probe-ID namespace. */
+    for (unsigned i = 0; i < XRT_MAX_WATCHPOINTS; ++i)
+        if (t->watchpoints[i].present && t->watchpoints[i].id == id)
+            return XRT_INVALID_ARGUMENT;
     if (t->breakpoint_count == XRT_MAX_BREAKPOINTS)
         return XRT_BREAKPOINT_LIMIT;
     t->breakpoints[t->breakpoint_count++] =

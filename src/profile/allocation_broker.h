@@ -9,7 +9,7 @@ struct xodb_allocation_open {
     uint32_t magic;
     int32_t pid;
     int32_t tid;
-    uint32_t flags; /* bit 0: return probe; bit 1: group leader; bit 2: entry stacks */
+    uint32_t flags; /* bit 0: return probe; bit 1: group leader; bit 2: entry stacks; bit 3: function registers */
     uint64_t offset;
 };
 struct xodb_allocation_reply { uint32_t magic; int32_t error; };
@@ -21,5 +21,9 @@ int xodb_allocation_broker_start(const char *helper, int *socket_fd, int *child_
 int xodb_allocation_broker_open(int socket_fd, int pid, int tid, int file_fd,
                                int group_fd, uint64_t offset, int return_probe,
                                int leader, int callstacks, xodb_allocation_cancel cancelled, void *context);
+/* Explicit generic-function mode; allocation requests remain byte-for-byte unchanged. */
+int xodb_function_broker_open(int socket_fd, int pid, int tid, int file_fd,
+                             int group_fd, uint64_t offset, int return_probe, int leader,
+                             int callstacks, xodb_allocation_cancel cancelled, void *context);
 void xodb_allocation_broker_close(int socket_fd, int child_pid);
 #endif

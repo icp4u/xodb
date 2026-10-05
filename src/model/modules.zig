@@ -44,6 +44,8 @@ pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size
 pub const Modules = struct {
     pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
     target: ?*const rt.struct_xrt_target = null,
+    // Worker-owned immutable snapshots must not read the owner's changing ISA.
+    expected_machine: ?u16 = null,
     core_source: ?*const @import("../binary/core.zig").Core = null,
     core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
     core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
@@ -309,7 +311,7 @@ pub const Modules = struct {
         }
         const image = try elf.Image.parse(mapped);
         if (expected) |id| if (!std.mem.eql(u8, id, image.buildId() orelse return error.CoreModuleBuildIdMissing)) return error.CoreModuleBuildIdMismatch;
-        if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedTargetArchitecture;
+        if (@intFromEnum(image.header.machine) != (self.expected_machine orelse rt.xrt_target_arch(self.target).*.machine)) return error.UnsupportedTargetArchitecture;
         const p = try self.placement(&image, entry.offset, region, observed);
         const module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);

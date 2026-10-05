@@ -68,8 +68,16 @@ Examples, rather than an exhaustive tool catalog:
 | Explain a recorded write | `investigate_write`, `get_investigation`, `get_audit` |
 | Investigate CPU cost or a stall | `start_profile`, `get_flamegraph`, `get_profile_timeline`, `get_profile_schedule` |
 | Inspect allocator activity | `start_allocations`, `stop_allocations`, `get_allocation_capture`, `get_allocation_calls`, `get_allocation_lifetimes` |
+| Retain a stopped context | `start_inspection`, `get_inspection`, `cancel_inspection`, `release_inspection` |
+| Compare individual native calls | `start_observation`, `get_observation_calls`, `compare_observation`, `associate_observation` |
 | Add or retain evidence | `add_profile_intervals`, `get_profile_intervals`, `export_profile` |
 | Deliberately change target state | `write_memory`, `write_register` |
+
+Inspection jobs retain copied registers, stack, locals, expressions and bounded
+memory reads under one stopped generation. Function observations retain raw ABI
+words and entry/return evidence, with asynchronous comparison, temporal
+association and `.xoi` save/open jobs. See [OBSERVATIONS.md](OBSERVATIONS.md) for
+commands, paging, scope and evidence limits. These features currently use CLI/MCP.
 
 Allocation tools use explicit thread/hook scope, bounded evidence and a separately
 configured helper where required; [workflow and limits](ALLOCATIONS.md#mcp).

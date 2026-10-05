@@ -27,6 +27,8 @@ with tempfile.TemporaryDirectory(prefix='xodb-package-source-') as temporary:
     (repo / 'src/main.zig').write_text('working tree\n')
     (repo / 'src/new.zig').write_text('untracked repair\n')
     (repo / 'src/new.zig').chmod(0o755)
+    (repo / 'examples').mkdir()
+    (repo / 'examples/observation.recipe.json').write_text('{"version":1}\n')
     for name in ('src/main.zig~', 'src/notes.bak', 'src/.private', 'src/AGENTS.md', 'README.md~'):
         (repo / name).write_text('must not ship\n')
     (repo / '.work').mkdir()
@@ -49,6 +51,7 @@ with tempfile.TemporaryDirectory(prefix='xodb-package-source-') as temporary:
             assert tar.extractfile(prefix + 'src/main.zig').read() == b'working tree\n'
             assert tar.extractfile(prefix + 'src/new.zig').read() == b'untracked repair\n'
             assert tar.getmember(prefix + 'src/new.zig').mode == 0o755
+            assert tar.extractfile(prefix + 'examples/observation.recipe.json').read() == b'{"version":1}\n'
             for name in ('changelog', 'rules'):
                 expected = (repo / 'packaging/debian' / name).read_bytes()
                 assert tar.extractfile(prefix + 'packaging/debian/' + name).read() == expected

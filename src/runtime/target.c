@@ -26,6 +26,7 @@ struct xrt_target *xrt_target_create(void)
 {
     struct xrt_target *t = calloc(1, sizeof(*t));
     if (t) {
+        t->remote_collectors = 0; /* Not shared until create returns. */
         t->arch = xrt_arch_native();
         t->next_thread_id = t->next_probe_id = 1;
     }

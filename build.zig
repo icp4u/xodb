@@ -66,6 +66,9 @@ pub fn build(b: *std.Build) void {
     const m2 = b.addExecutable(.{ .name = "xodb-m2-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true }) });
     m2.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/m2.c"), .flags = &.{ "-g", "-gdwarf-4", "-O0", "-fno-omit-frame-pointer" } });
     b.installArtifact(m2);
+    const observations = b.addExecutable(.{ .name = "xodb-observation-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true }) });
+    observations.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/observations.c"), .flags = &.{ "-g", "-O0", "-fno-omit-frame-pointer", "-fno-optimize-sibling-calls" } });
+    b.installArtifact(observations);
     const profile = b.addExecutable(.{ .name = "xodb-profile-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .ReleaseSafe, .link_libc = true }) });
     profile.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/profile.c"), .flags = &.{ "-g", "-gdwarf-4", "-O2", "-fno-omit-frame-pointer", "-mno-omit-leaf-frame-pointer", "-fno-optimize-sibling-calls", "-pthread" } });
     b.installArtifact(profile);
@@ -121,7 +124,22 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux and !target.result.abi.isAndroid()) {
+        const uprobes = b.addExecutable(.{ .name = "xodb-runtime-uprobes-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+        uprobes.pie = false;
+        uprobes.root_module.addIncludePath(b.path("src/runtime"));
+        for (runtime_sources) |source| uprobes.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        uprobes.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-uprobes.c"), .flags = &.{ "-std=c11", "-fno-pie", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+        test_step.dependOn(&b.addRunArtifact(uprobes).step);
+    }
     if (!target.result.abi.isAndroid()) {
+        const probe_ids = b.addExecutable(.{ .name = "xodb-runtime-probe-ids-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+        probe_ids.root_module.addIncludePath(b.path("src/runtime"));
+        for (runtime_sources) |source| probe_ids.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        probe_ids.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-probe-ids.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        const probe_ids_run = b.addRunArtifact(probe_ids);
+        probe_ids_run.addArtifactArg(agent);
+        test_step.dependOn(&probe_ids_run.step);
         const remote_tests = b.addExecutable(.{ .name = "xodb-runtime-remote-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         remote_tests.pie = false;
         remote_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -136,7 +154,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

@@ -29,7 +29,7 @@ def main():
         parser.error('Debian, RPM and Arch recipe versions must agree')
     names = subprocess.check_output(['git', 'ls-files', '--cached', '--others',
         '--exclude-standard', '-z'], cwd=ROOT).decode().split('\0')
-    directories = {'src', 'tests', 'scripts', 'docs', 'config', 'packaging'}
+    directories = {'src', 'tests', 'scripts', 'docs', 'config', 'packaging', 'examples'}
     top = {'build.zig', 'LICENSE', 'README.md', 'SETUP.md', 'ruby_flow.png'}
     selected = []
     for name in sorted(set(filter(None, names))):

@@ -25,7 +25,11 @@ pub const Config = struct {
     }
 };
 pub const Context = struct {
+    // Only a remote immutable connection handle is retained by the worker.
     target: ?*const @import("../target/runtime.zig").c.struct_xrt_target = null,
+    remote: bool = false,
+    file_pid: i32 = 0,
+    producer: ?@import("producer.zig").Producer = null,
     identity: model.Identity,
     generation: u64,
     threads: [native.max_threads]model.Thread = undefined,
@@ -80,11 +84,11 @@ const Job = struct {
         self.done.store(true, .release);
     }
     fn execute(self: *Job) !void {
-        var prepared = try hooks.prepareTarget(self.context.target, self.context.identity.pid, self.region, self.requests[0..self.request_count], hooks.image_limit, &self.cancel);
+        var prepared = try hooks.prepareTarget(self.context.target, self.context.file_pid, self.region, self.requests[0..self.request_count], hooks.image_limit, &self.cancel);
         defer prepared.close();
         var tids: [native.max_threads]i32 = undefined;
         for (self.context.threads[0..self.context.thread_count], 0..) |thread, i| tids[i] = thread.tid;
-        const remote = @import("../target/runtime.zig").c.xrt_target_is_remote(self.context.target);
+        const remote = self.context.remote;
         if (!remote) if (self.helper) |path| {
             if (broker.xodb_allocation_broker_start(path, &self.broker_fd, &self.broker_pid) != 0) return error.AllocationHelperStart;
         };
@@ -117,14 +121,15 @@ const Job = struct {
             described[i] = .{ .id = source.id, .kind = source.kind, .name = request.name, .path = self.region.path, .device = source.identity.device, .inode = source.identity.inode, .file_offset = source.offset, .link_address = location.link_address, .runtime_address = location.runtime_address };
         }
         self.capture = try model.Capture.create(a, self.context.identity, .{ .record_limit = self.config.record_limit, .memory_limit = self.config.memory_limit, .callstacks = self.config.callstacks }, self.context.threads[0..self.context.thread_count], described[0..prepared.count], 0);
-        self.capture.?.producer = @import("producer.zig").describe(self.context.target);
+        self.capture.?.producer = self.context.producer;
         if (self.config.callstacks) {
             const symbols = try a.create(modules.Modules);
             symbols.* = modules.Modules.init(a);
             self.capture.?.symbols = symbols;
             symbols.immutable = true;
+            symbols.expected_machine = @import("../target/runtime.zig").c.XRT_X86_64;
             symbols.target = self.context.target;
-            try symbols.refresh(self.context.identity.pid);
+            try symbols.refresh(self.context.file_pid);
             if (symbols.regions.items.len > 16384) return error.AllocationMapLimit;
             for (symbols.regions.items) |region| {
                 if (self.cancel.load(.acquire)) return error.AllocationPreparationCancelled;
@@ -201,6 +206,10 @@ pub const Live = struct {
             };
         }
         var context = context_;
+        context.remote = rt.xrt_target_is_remote(context_.target);
+        context.file_pid = context.threads[0].tid;
+        context.target = if (context.remote) context_.target else null;
+        context.producer = if (context.remote) @import("producer.zig").describe(context_.target) else null;
         context.identity.capture_id = self.next_id;
         self.job = try Job.create(context, config, region, requests, helper);
         self.next_id += 1;

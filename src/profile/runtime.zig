@@ -4,6 +4,7 @@ pub const c = @cImport({
     @cInclude("xrt_perf.h");
     @cInclude("xrt_remote.h");
     @cInclude("xrt_allocations.h");
+    @cInclude("xrt_uprobes.h");
 });
 pub const testing = @import("builtin").is_test;
 pub const internal = if (testing) @cImport({

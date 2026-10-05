@@ -86,7 +86,7 @@ static struct xrt_perf *start(const struct xrt_target *t, uint16_t op, const voi
         *enter = (uint16_t)(value >> 16);
     if (exit)
         *exit = (uint16_t)value;
-    ++((struct xrt_target *)t)->remote_collectors;
+    __atomic_add_fetch(&((struct xrt_target *)t)->remote_collectors, 1, __ATOMIC_SEQ_CST);
     return p;
 }
 struct xrt_perf *xrt_remote_cpu_start(const struct xrt_target *t,
@@ -148,7 +148,8 @@ void xrt_remote_perf_destroy(struct xrt_perf *p)
 {
     if (!xrt_remote_perf_op(p, XRT_RPC_PERF_DESTROY, 0, NULL))
         xrt_remote_fail(p->remote_target, XRT_TRANSPORT_FAILED);
-    --((struct xrt_target *)p->remote_target)->remote_collectors;
+    __atomic_sub_fetch(&((struct xrt_target *)p->remote_target)->remote_collectors, 1,
+                       __ATOMIC_SEQ_CST);
     free(p);
 }
 bool xrt_remote_perf_thread(const struct xrt_perf *p, size_t index, struct xrt_perf_thread *out)
@@ -261,10 +262,10 @@ void xrt_remote_perf_refresh(struct xrt_perf *p)
 {
     xrt_remote_perf_op(p, XRT_RPC_PERF_INFO, 0, NULL);
 }
-struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *t,
+static struct xrt_perf *remote_uprobes_start(const struct xrt_target *t,
                                               const struct xrt_allocation_config *config,
                                               const struct xrt_mapping *mapping, const char *helper,
-                                              struct xrt_perf_failure *f)
+                                              bool functions, struct xrt_perf_failure *f)
 {
     if (!config || !mapping || !config->tids || !config->sources || !config->thread_count ||
         config->thread_count > 32 || !config->source_count ||
@@ -300,7 +301,8 @@ struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *t,
         if (source.fd != config->sources[0].fd)
             out.ok = false;
         xrt_codec_u16(&out, &source.id);
-        xrt_codec_u16(&out, &source.kind);
+        if (!functions)
+            xrt_codec_u16(&out, &source.kind);
         xrt_codec_u64(&out, &source.offset);
         xrt_wire_file_identity(&out, &source.identity);
     }
@@ -313,7 +315,8 @@ struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *t,
         xrt_perf_fail(f, "config", EINVAL, -1, "allocation request too large");
         return NULL;
     }
-    struct xrt_perf *p = start(t, XRT_RPC_ALLOCATIONS_START, bytes, out.at, NULL, NULL, NULL, f);
+    struct xrt_perf *p = start(t, functions ? XRT_RPC_FUNCTION_START : XRT_RPC_ALLOCATIONS_START,
+                              bytes, out.at, NULL, NULL, NULL, f);
     free(bytes);
     if (p && config->cancelled && config->cancelled(config->context)) {
         xrt_perf_destroy(p);
@@ -321,4 +324,19 @@ struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *t,
         xrt_perf_fail(f, "allocations.cancel", ECANCELED, -1, "allocation preparation cancelled");
     }
     return p;
+}
+
+struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *t,
+                                              const struct xrt_allocation_config *config,
+                                              const struct xrt_mapping *mapping, const char *helper,
+                                              struct xrt_perf_failure *f)
+{
+    return remote_uprobes_start(t, config, mapping, helper, false, f);
+}
+struct xrt_perf *xrt_remote_functions_start(const struct xrt_target *t,
+                                            const struct xrt_allocation_config *config,
+                                            const struct xrt_mapping *mapping, const char *helper,
+                                            struct xrt_perf_failure *f)
+{
+    return remote_uprobes_start(t, config, mapping, helper, true, f);
 }

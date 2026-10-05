@@ -1,5 +1,9 @@
 # CPU archive comparison
 
+For individual function arguments, return words and fast/slow call durations,
+see [function observations](OBSERVATIONS.md). Its headless recipe runner produces
+`.xoi` invocation investigations; the `.xoc` workflow below compares CPU samples.
+
 ## Capture before and after
 
 An `.xoc` is a native xodb capture archive. `--capture-out FILE` chooses where

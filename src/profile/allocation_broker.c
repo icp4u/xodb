@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "allocation_broker.h"
+#include "../runtime/xrt_uprobes.h"
 #include "../runtime/mapped_file.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -94,13 +95,13 @@ int xodb_allocation_broker_start(const char *helper, int *socket_fd, int *child_
 done:
     close(pair[0]); close(pair[1]); errno = error; return -1;
 }
-int xodb_allocation_broker_open(int socket_fd, int pid, int tid, int file_fd,
+static int broker_open(int socket_fd, int pid, int tid, int file_fd,
                                int group_fd, uint64_t offset, int return_probe,
-                               int leader, int callstacks, xodb_allocation_cancel cancelled, void *context) {
+                               int leader, int callstacks, int functions, xodb_allocation_cancel cancelled, void *context) {
     if (cancelled && cancelled(context)) { errno = ECANCELED; return -1; }
     const struct xodb_allocation_open request = {
         .magic = XODB_ALLOCATION_MAGIC, .pid = pid, .tid = tid,
-        .flags = (return_probe ? 1u : 0u) | (leader ? 2u : 0u) | (callstacks ? 4u : 0u), .offset = offset,
+        .flags = (return_probe ? 1u : 0u) | (leader ? 2u : 0u) | (callstacks ? 4u : 0u) | (functions ? 8u : 0u), .offset = offset,
     };
     int fds[2] = { file_fd, group_fd };
     if (send_packet(socket_fd, &request, sizeof request, fds, group_fd < 0 ? 1 : 2)) return -1;
@@ -122,6 +123,18 @@ int xodb_allocation_broker_open(int socket_fd, int pid, int tid, int file_fd,
         return fds[0];
     }
     errno = ETIMEDOUT; return -1;
+}
+int xodb_allocation_broker_open(int socket_fd, int pid, int tid, int file_fd,
+                               int group_fd, uint64_t offset, int return_probe,
+                               int leader, int callstacks, xodb_allocation_cancel cancelled, void *context) {
+    return broker_open(socket_fd, pid, tid, file_fd, group_fd, offset, return_probe,
+                       leader, callstacks, 0, cancelled, context);
+}
+int xodb_function_broker_open(int socket_fd, int pid, int tid, int file_fd,
+                             int group_fd, uint64_t offset, int return_probe,
+                             int leader, int callstacks, xodb_allocation_cancel cancelled, void *context) {
+    return broker_open(socket_fd, pid, tid, file_fd, group_fd, offset, return_probe,
+                       leader, callstacks, 1, cancelled, context);
 }
 void xodb_allocation_broker_close(int socket_fd, int child_pid) {
     if (socket_fd >= 0) close(socket_fd);
@@ -205,7 +218,7 @@ static int mapped_offset(int pid, int fd, uint64_t offset) {
 static int open_probe(struct xodb_allocation_open request, int fds[2], size_t count, struct ucred peer, unsigned pmu, uint64_t retmask) {
     const bool leader = !!(request.flags & 2);
     const bool stacks = (request.flags & 4) && !(request.flags & 1);
-    if (request.magic != XODB_ALLOCATION_MAGIC || request.pid <= 0 || request.tid <= 0 || request.flags > 7 ||
+    if (request.magic != XODB_ALLOCATION_MAGIC || request.pid <= 0 || request.tid <= 0 || request.flags > 15 ||
         count != (leader ? 1u : 2u)) { errno = EINVAL; return -1; }
     if (held_task(request.pid, request.tid, peer) || executable_offset(fds[0], request.offset) || mapped_offset(request.pid, fds[0], request.offset)) return -1;
     char path[64]; snprintf(path, sizeof path, "/proc/self/fd/%d", fds[0]);
@@ -214,8 +227,8 @@ static int open_probe(struct xodb_allocation_open request, int fds[2], size_t co
         .config1 = (uint64_t)(uintptr_t)path, .config2 = request.offset,
         .sample_period = 1, .sample_type = PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID | PERF_SAMPLE_REGS_USER | (stacks ? PERF_SAMPLE_CALLCHAIN | PERF_SAMPLE_STACK_USER : 0),
         .sample_max_stack = stacks ? 32 : 0, .sample_stack_user = stacks ? 8 : 0,
-        .sample_regs_user = (1ull << 0) | (1ull << 4) | (1ull << 5) | (1ull << 7) | (1ull << 8),
-        .exclude_callchain_kernel = 1, .mmap = leader && (request.flags & 4), .mmap2 = leader && (request.flags & 4),
+        .sample_regs_user = request.flags & 8 ? XRT_FUNCTION_REGISTER_MASK : XRT_ALLOCATION_REGISTER_MASK,
+        .exclude_callchain_kernel = 1, .mmap = leader && (request.flags & 12), .mmap2 = leader && (request.flags & 12),
         .disabled = 1, .exclude_kernel = 1, .exclude_hv = 1, .sample_id_all = 1,
         .use_clockid = 1, .clockid = CLOCK_MONOTONIC,
         .comm = leader, .task = leader, .comm_exec = leader,

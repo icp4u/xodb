@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "start": "ruby_run_node",
+  "functions": ["rb_ary_each"],
+  "duration_ms": 5000,
+  "record_limit": 4096,
+  "memory_limit": 16777216,
+  "callstacks": true,
+  "threshold_ns": 4000000,
+  "threads": "selected"
+}

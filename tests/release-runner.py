@@ -58,10 +58,14 @@ time.sleep(60)
         self.assertTrue(result.get('adopted_pids'))
 
     def test_portable_never_schedules_live_commands(self):
-        self.assertEqual([s[0] for s in gate.plan('portable')], ['build-tests'])
+        self.assertEqual([s[0] for s in gate.plan('portable')], ['build-tests', 'package-source', 'mapping-identity'])
         names = [s[0] for s in gate.plan('all')]
-        for required in ('remote', 'm2-limits', 'm2-archive', 'hidden-window', 'wayland-read-race'):
+        for required in ('remote', 'm2-limits', 'm2-archive', 'hidden-window', 'wayland-read-race', 'vulkan-faults'):
             self.assertIn(required, names)
+        self.assertNotIn('observations-live', names)
+        observed = [s[0] for s in gate.plan('host', uprobes=True)]
+        for required in ('inspections-agent', 'inspection-lifecycle-agent', 'observations-live', 'observation-recipes-agent', 'observation-associations'):
+            self.assertIn(required, observed)
 
 
 if __name__ == '__main__':

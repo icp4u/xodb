@@ -232,7 +232,7 @@ enum xrt_status xrt_target_watchpoint_set(struct xrt_target *t, uint64_t address
     unsigned slot = 0;
     while (slot < capacity && t->watchpoints[slot].present)
         ++slot;
-    if (slot == capacity)
+    if (slot == capacity || t->next_probe_id == UINT64_MAX)
         return XRT_WATCHPOINT_LIMIT;
     uint8_t bytes[8] = {0};
     size_t count;

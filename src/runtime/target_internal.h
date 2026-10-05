@@ -27,7 +27,10 @@ struct xrt_step {
 struct xrt_target {
     /* NULL for native targets. Remote handles retain only read-only snapshots. */
     struct xrt_connection *connection;
-    uint32_t remote_id, remote_root, remote_collectors;
+    uint32_t remote_id, remote_root;
+    /* GCC/Clang __atomic accesses keep concurrent collector ownership safe.
+     * Plain storage keeps this private layout translatable by Zig @cImport. */
+    uint32_t remote_collectors;
     bool remote_shared;
     const struct xrt_arch *arch;
     bool core, owned, follow_processes;

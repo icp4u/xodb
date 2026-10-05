@@ -2,6 +2,7 @@
 #define XODB_RUNTIME_PERF_REMOTE_H
 #include "xrt_perf.h"
 #include "xrt_allocations.h"
+#include "xrt_uprobes.h"
 #include "xrt_target.h"
 #include "rpc.h"
 struct xrt_allocations *xrt_allocations_remote(struct xrt_perf *);
@@ -9,6 +10,15 @@ struct xrt_perf *xrt_remote_allocations_start(const struct xrt_target *,
                                               const struct xrt_allocation_config *,
                                               const struct xrt_mapping *, const char *,
                                               struct xrt_perf_failure *);
+/* Shared verified-file uprobe engine; function mode has no allocator-kind semantics. */
+struct xrt_allocations *xrt_uprobes_start_local(const struct xrt_target *,
+                                               const struct xrt_allocation_config *,
+                                               const struct xrt_mapping *, const char *, bool,
+                                               struct xrt_perf_failure *);
+struct xrt_perf *xrt_remote_functions_start(const struct xrt_target *,
+                                            const struct xrt_allocation_config *,
+                                            const struct xrt_mapping *, const char *,
+                                            struct xrt_perf_failure *);
 struct xrt_perf *xrt_remote_cpu_start(const struct xrt_target *, const struct xrt_cpu_config *,
                                       struct xrt_cpu_acceptance *, struct xrt_perf_failure *);
 struct xrt_perf *xrt_remote_syscalls_start(const struct xrt_target *, int32_t, const int32_t *,

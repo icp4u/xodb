@@ -13,6 +13,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 static volatile uint64_t watched;
@@ -176,6 +177,28 @@ static void probes(const char *agent, const char *self)
     OK(xrt_target_destroy(t));
     assert(kill(restarted, 0) == -1 && errno == ESRCH);
 }
+static void reap_family_child(pid_t pid)
+{
+    const uint64_t deadline = xrt_now() + UINT64_C(5000000000);
+    for (;;) {
+        int status = 0;
+        const pid_t got = waitpid(pid, &status, WNOHANG);
+        if (got == pid) {
+            assert(WIFEXITED(status) || WIFSIGNALED(status));
+            return;
+        }
+        if (got < 0) {
+            if (errno == EINTR)
+                continue;
+            /* The fixture parent may have reaped it before being destroyed. */
+            assert(errno == ECHILD);
+            assert(kill(pid, 0) == -1 && errno == ESRCH);
+            return;
+        }
+        assert(xrt_now() < deadline);
+        usleep(1000);
+    }
+}
 static void family(const char *agent, const char *self)
 {
     const char *transport[] = {agent, "--stdio", NULL};
@@ -186,7 +209,14 @@ static void family(const char *agent, const char *self)
     OK(xrt_target_set_following(parent, true));
     OK(xrt_target_continue(parent));
     uint64_t deadline = xrt_now() + UINT64_C(5000000000);
-    while (!view(parent).birth_count) {
+    for (;;) {
+        const struct xrt_target_view current = view(parent);
+        if (current.birth_count) {
+            assert(current.birth_count == 1 && !current.births[0].exited);
+            /* The parent's fork event can precede the child's initial stop. */
+            if (current.state == XRT_STOPPED && current.births[0].stopped)
+                break;
+        }
         assert(xrt_now() < deadline);
         OK(xrt_target_poll(parent));
         usleep(1000);
@@ -201,6 +231,9 @@ static void family(const char *agent, const char *self)
            view(parent).birth_count == 0);
     OK(xrt_target_destroy(child));
     OK(xrt_target_destroy(parent));
+    /* ptrace can reap its stop while the real parent's zombie remains. Own
+     * that orphan here rather than depending on PID 1 or an outer runner. */
+    reap_family_child(child_pid);
     assert(kill(child_pid, 0) == -1 && errno == ESRCH);
     assert(kill(parent_pid, 0) == -1 && errno == ESRCH);
 }
@@ -339,6 +372,7 @@ int main(int argc, char **argv)
         puts("C remote live checks explicitly skipped");
         return 0;
     }
+    assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
     probes(argv[1], self);
     if (xrt_arch_native()->machine == XRT_X86_64)
         collectors(argv[1], self);

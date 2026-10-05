@@ -88,6 +88,11 @@ CPU archives can be compared with `--compare-capture before.xoc --open-capture a
 see [profile comparison](docs/PROFILE_COMPARISON.md). Single-thread x86-64 source
 stepping now batches straight-line instructions; see [source stepping](docs/SOURCE_STEPPING.md).
 
+**Function investigations.** Headless recipes capture native function entries,
+return words and call durations, compare fast/slow cohorts, and save/reopen `.xoi`
+evidence. MCP also provides retained stopped inspections and temporal joins to
+CPU, syscall and allocation records. See [commands and limits](docs/OBSERVATIONS.md).
+
 **Themes.** Built-in dark, light and contrast palettes and custom JSON colors,
 selected at startup for local, remote and offline views. See [themes](docs/THEMES.md).
 

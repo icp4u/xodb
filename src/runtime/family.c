@@ -165,6 +165,7 @@ enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_t
             return XRT_PROCESS_LIMIT;
     }
     memset(out, 0, sizeof(*out));
+    out->remote_collectors = 0; /* Adopted handle is not published yet. */
     out->arch = t->arch;
     out->pid = pid;
     out->owned = t->owned;

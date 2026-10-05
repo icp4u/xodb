@@ -413,7 +413,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
-    if (t->remote_collectors)
+    if (__atomic_load_n(&t->remote_collectors, __ATOMIC_SEQ_CST))
         return XRT_INVALID_STATE;
     struct xrt_connection *c = t->connection;
     enum xrt_status status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_DESTROY});
