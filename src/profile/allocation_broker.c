@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
 #include "allocation_broker.h"
-#include "../binary/mapped_file.h"
+#include "../runtime/mapped_file.h"
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>

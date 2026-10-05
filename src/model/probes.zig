@@ -67,7 +67,7 @@ pub const Manager = struct {
     }
     pub fn configure(self: *Manager, target: anytype, id: u64, options: Options, enabled: bool) !void {
         const candidate = try prepare(id, options);
-        self.prune(target.breakpoints[0..target.breakpoint_count]);
+        self.prune(target.breakpointSlice());
         var slot = self.rule(id);
         if (slot == null) for (&self.rules) |*item| {
             if (item.id == 0) {
@@ -78,7 +78,7 @@ pub const Manager = struct {
         const out = slot orelse return error.BreakpointLimit;
         try target.enableBreakpoint(id, enabled);
         out.* = candidate;
-        target.generation += 1;
+        target.invalidate();
     }
     fn prune(self: *Manager, probes: []const bp.Breakpoint) void {
         for (&self.rules) |*item| {
@@ -103,13 +103,13 @@ pub const Manager = struct {
     /// breakpoint stop was filtered/logged and execution may safely continue.
     pub fn poll(self: *Manager, session: anytype, internal_id: ?u64) !bool {
         const target = &session.target;
-        self.prune(target.breakpoints[0..target.breakpoint_count]);
-        if (target.state != .stopped) return false;
+        self.prune(target.breakpointSlice());
+        if (target.snapshot().state != .stopped) return false;
         const after = self.processed_sequence;
-        self.processed_sequence = target.sequence;
+        self.processed_sequence = target.snapshot().sequence;
         var hits: usize = 0;
         var keep_stopped = false;
-        if (target.event_count > 0 and after < target.events[0].sequence - 1) {
+        if (target.snapshot().event_count > 0 and after < target.eventSlice()[0].sequence - 1) {
             session.step_diagnostic = "BreakpointEventHistoryGap";
             keep_stopped = true;
         }
@@ -122,7 +122,7 @@ pub const Manager = struct {
             hits += 1;
             if (internal_id != null and event.detail == internal_id.?) continue;
             var loader = false;
-            for (target.breakpoints[0..target.breakpoint_count]) |probe| if (probe.id == event.detail and probe.internal) {
+            for (target.breakpointSlice()) |probe| if (probe.id == event.detail and probe.internal) {
                 loader = true;
             };
             if (loader) continue;
@@ -173,7 +173,7 @@ pub const Manager = struct {
                 keep_stopped = true;
                 continue;
             }
-            var record = Log{ .sequence = 0, .breakpoint_id = rule_.id, .hit = rule_.matched_hits, .generation = target.generation, .image_epoch = target.image_epoch, .tid = event.tid, .time_ns = event.time_ns, .pc = event.pc, .expression = rule_.log_expression, .display = .{}, .bits = null, .address = null };
+            var record = Log{ .sequence = 0, .breakpoint_id = rule_.id, .hit = rule_.matched_hits, .generation = target.snapshot().generation, .image_epoch = target.snapshot().image_epoch, .tid = event.tid, .time_ns = event.time_ns, .pc = event.pc, .expression = rule_.log_expression, .display = .{}, .bits = null, .address = null };
             if (rule_.log_expression.len > 0) {
                 const value = session.evaluateExpression(a, event.tid, 0, rule_.log_expression.slice()) catch |err| {
                     rule_.last_error = @errorName(err);

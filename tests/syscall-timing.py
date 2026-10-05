@@ -11,7 +11,7 @@ work = Path('.work') / ('syscall-timing-' + datetime.now().strftime('%Y%m%dT%H%M
 subprocess.run(['cc','-g','-O0','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','tests/fixtures/syscall-timing.c','-o',str(work/'fixture')], env=dict(os.environ,TMPDIR=str((work/'tmp').resolve())),check=True)
 def perf_fds(client):
     out=[]
-    for p in Path(f'/proc/{client.p.pid}/fd').iterdir():
+    for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir():
         try:
             if 'perf_event' in os.readlink(p):out.append(p.name)
         except FileNotFoundError: pass

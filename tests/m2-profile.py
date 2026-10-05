@@ -42,7 +42,7 @@ def graph(client, capture, **filters):
     return dict(data, nodes=rows)
 
 def perf_fds(client):
-    return [os.readlink(p) for p in Path(f'/proc/{client.p.pid}/fd').iterdir() if 'perf_event' in os.readlink(p)]
+    return [os.readlink(p) for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir() if 'perf_event' in os.readlink(p)]
 
 client = Client('control', fixture, args=['3'])
 try:

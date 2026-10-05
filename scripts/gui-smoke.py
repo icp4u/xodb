@@ -14,6 +14,7 @@ os.chdir(root)
 m1 = '--m1' in sys.argv
 graph_mode = '--graph' in sys.argv
 profile_mode = '--profile' in sys.argv
+runtime_agent = '--runtime-agent' in sys.argv
 assert sum((m1,graph_mode,profile_mode)) <= 1, 'Select one fixture mode'
 render_fault = '--render-fault' in sys.argv
 glyph_stress = '--glyph-stress' in sys.argv
@@ -98,7 +99,7 @@ try:
         Path(source_path).write_text('\n'.join(''.join(chars[i:i+40]) for i in range(0,len(chars),40)) + '\n' + 'padding\n' * 150000)
         print(f'Glyph stress: {len(ids)} distinct supported glyphs')
     with (run / "xodb.log").open("wb") as log:
-        app = subprocess.Popen(["./zig-out/bin/xodb", "--mcp", "--record", str(run / "investigations.json"), "--source", source_path, "--", "./zig-out/bin/xodb-profile-fixture" if profile_mode else "./zig-out/bin/xodb-m2-fixture" if graph_mode else "./zig-out/bin/xodb-m1-fixture" if m1 else "./zig-out/bin/xodb-fixture"], env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
+        app = subprocess.Popen(["./zig-out/bin/xodb", *(["--runtime-agent", "./zig-out/bin/xodb-agent"] if runtime_agent else []), "--mcp", "--record", str(run / "investigations.json"), "--source", source_path, "--", "./zig-out/bin/xodb-profile-fixture" if profile_mode else "./zig-out/bin/xodb-m2-fixture" if graph_mode else "./zig-out/bin/xodb-m1-fixture" if m1 else "./zig-out/bin/xodb-fixture"], env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log)
     processes.append(app)
     serial = 0
     notifications = []
@@ -263,7 +264,17 @@ try:
         tid = stopped['threads'][0]['tid']
         before = tool('get_registers',tid=tid)['registers']['rip']
         click(420,65)
-        await_state('stopped',reason='single_step')
+        # Source stepping can finish at a temporary range breakpoint. Wait
+        # for this action to complete, rather than accepting the previous stop.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            stepped = snapshot()
+            if stepped['generation'] > stopped['generation'] and stepped['state'] == 'stopped' and not stepped['source_stepping']:
+                break
+            time.sleep(.02)
+        else:
+            raise AssertionError(f'Source step did not complete: {stepped}')
+        assert any(t['tid'] == tid and t['reason'] in ('single_step', 'breakpoint') for t in stepped['threads']), stepped
         assert tool('get_registers',tid=tid)['registers']['rip'] != before
         action('remove_breakpoint',id=bp)
         click(1130,195)  # expanded item->value field

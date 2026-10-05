@@ -15,6 +15,7 @@ pub const Actor = enum { human, agent };
 pub const Effect = enum { execution, mutation };
 pub const Audit = struct { sequence: u64, actor: Actor, action: []const u8, generation: u64 };
 pub const Frame = struct {
+    architecture: @import("../target/arch.zig").Arch = .x86_64,
     tid: i32 = 0,
     index: usize,
     pc: u64,
@@ -29,7 +30,7 @@ pub const Frame = struct {
     inline_diagnostic: ?[]const u8 = null,
     diagnostic: ?[]const u8 = null,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        try writer.write(.{ .index = self.index, .pc = self.pc, .lookup_pc = self.lookup_pc, .registers = self.registers[0..linux.architecture.count()], .cfa = self.cfa, .module_id = self.module_id, .symbol = self.symbol, .source = self.source, .unwind_method = self.unwind_method, .inline_frames = self.inline_frames, .inline_diagnostic = self.inline_diagnostic, .diagnostic = self.diagnostic });
+        try writer.write(.{ .index = self.index, .pc = self.pc, .lookup_pc = self.lookup_pc, .registers = self.registers[0..self.architecture.count()], .cfa = self.cfa, .module_id = self.module_id, .symbol = self.symbol, .source = self.source, .unwind_method = self.unwind_method, .inline_frames = self.inline_frames, .inline_diagnostic = self.inline_diagnostic, .diagnostic = self.diagnostic });
     }
 };
 const value_view = @import("value_view.zig");
@@ -73,10 +74,11 @@ pub const Investigation = struct {
     image_epoch: u64,
     status: enum { active, finished, capacity_reached } = .active,
     observations: std.ArrayList(Observation) = .empty,
-    before_semantics: []const u8 = if (linux.architecture == .aarch64) "value sampled at the pre-access trap; peer threads may still be running (see event.other_threads_running); check before_valid" else "value at previous debugger sample; concurrent writes can intervene",
-    pc_semantics: []const u8 = if (linux.architecture == .aarch64) "trap_pc identifies the pre-access stop; pc is the completion/interruption stop; check watch_phase, after_valid and watch_attribution; candidate watches are not confirmed hits" else "data watchpoint PC is after the instruction; preceding instruction is derived, not a recorded branch trace",
+    architecture: @import("../target/arch.zig").Arch = .x86_64,
+    before_semantics: []const u8 = "value at previous debugger sample; concurrent writes can intervene",
+    pc_semantics: []const u8 = "data watchpoint PC is after the instruction; preceding instruction is derived, not a recorded branch trace",
     pub fn jsonStringify(self: Investigation, writer: *std.json.Stringify) !void {
-        try writer.write(.{ .id = self.id, .question = self.question, .expression = self.expression, .watchpoint_id = self.watchpoint_id, .initial = self.initial, .created_generation = self.created_generation, .created_sequence = self.created_sequence, .image_epoch = self.image_epoch, .status = self.status, .observations = self.observations.items, .before_semantics = self.before_semantics, .pc_semantics = self.pc_semantics });
+        try writer.write(.{ .id = self.id, .question = self.question, .expression = self.expression, .watchpoint_id = self.watchpoint_id, .initial = self.initial, .created_generation = self.created_generation, .created_sequence = self.created_sequence, .image_epoch = self.image_epoch, .status = self.status, .observations = self.observations.items, .before_semantics = if (self.architecture == .aarch64) "value sampled at the pre-access trap; check before_valid and peer-thread evidence" else self.before_semantics, .pc_semantics = if (self.architecture == .aarch64) "trap_pc is pre-access; pc is completion/interruption; check watch_phase and attribution" else self.pc_semantics });
     }
 };
 const RunTo = struct { tid: i32, thread_id: u64, address: u64, probe: u64, owns_probe: bool, image_epoch: u64, expected_sp: ?u64 = null, cancelled: bool = false };
@@ -148,14 +150,15 @@ pub const Session = struct {
         .{ .id = 4, .kind = .free, .name = "free" },
     };
     pub fn startAllocations(self: *Session, actor: Actor, tids: []const i32, config: @import("../profile/allocation_live.zig").Config, mapping_address: ?u64, requests: []const @import("../profile/allocation_hooks.zig").Request) !void {
-        if (linux.architecture != .x86_64) return error.UnsupportedAllocationArchitecture;
+        if (self.target.arch() != .x86_64) return error.UnsupportedAllocationArchitecture;
         if (self.offline or self.target.core != null) return error.LiveTargetRequired;
-        if (self.target.state != .stopped) return error.PauseBeforeAllocationCapture;
-        if (self.target.sharedVm() or self.target.birth_count > 0) return error.ProcessFamilyRequiresResolution;
+        if (self.target.snapshot().state != .stopped) return error.PauseBeforeAllocationCapture;
+        if (self.target.sharedVm() or self.target.snapshot().birth_count > 0) return error.ProcessFamilyRequiresResolution;
         if (tids.len == 0 or tids.len > 32) return error.InvalidAllocationThreads;
         var context = @import("../profile/allocation_live.zig").Context{
-            .identity = .{ .session_id = self.id, .capture_id = 0, .process_id = self.process_id, .pid = self.target.pid, .image_epoch = self.target.image_epoch },
-            .generation = self.target.generation + @intFromBool(actor == .agent),
+            .target = self.target.handle,
+            .identity = .{ .session_id = self.id, .capture_id = 0, .process_id = self.process_id, .pid = self.target.snapshot().pid, .image_epoch = self.target.snapshot().image_epoch },
+            .generation = self.target.snapshot().generation + @intFromBool(actor == .agent),
             .thread_count = tids.len,
         };
         for (tids, 0..) |tid, index| {
@@ -188,11 +191,11 @@ pub const Session = struct {
     fn pollAllocations(self: *Session) void {
         var pending_valid = false;
         if (self.allocations.pendingContext()) |context| pending_valid =
-            self.target.state == .stopped and self.target.pid == context.identity.pid and
-            self.target.image_epoch == context.identity.image_epoch and self.target.generation == context.generation and
-            self.target.birth_count == 0 and !self.target.sharedVm() and self.allocationThreadsMatch(context.threads[0..context.thread_count], true);
+            self.target.snapshot().state == .stopped and self.target.snapshot().pid == context.identity.pid and
+            self.target.snapshot().image_epoch == context.identity.image_epoch and self.target.snapshot().generation == context.generation and
+            self.target.snapshot().birth_count == 0 and !self.target.sharedVm() and self.allocationThreadsMatch(context.threads[0..context.thread_count], true);
         const boundary: ?@import("../profile/allocation_live.zig").Stop = if (self.allocations.capture) |capture|
-            if (self.target.state == .idle or self.target.state == .exited or self.target.pid != capture.identity.pid) .target_ended else if (self.target.image_epoch != capture.identity.image_epoch) .image_changed else if (self.target.birth_count > 0 or self.target.sharedVm()) .scope_changed else if (!self.allocationThreadsMatch(capture.threads[0..capture.thread_count], false)) blk: {
+            if (self.target.snapshot().state == .idle or self.target.snapshot().state == .exited or self.target.snapshot().pid != capture.identity.pid) .target_ended else if (self.target.snapshot().image_epoch != capture.identity.image_epoch) .image_changed else if (self.target.snapshot().birth_count > 0 or self.target.sharedVm()) .scope_changed else if (!self.allocationThreadsMatch(capture.threads[0..capture.thread_count], false)) blk: {
                 for (self.target.threadSlice()) |thread| if (thread.state != .exited) break :blk .thread_ended;
                 break :blk .target_ended;
             } else null
@@ -214,12 +217,12 @@ pub const Session = struct {
         self.archive_job = null;
     }
     pub fn openImported(self: *Session, path: []const u8) !void {
-        if (self.target.pid != 0 or self.profile != null or self.offline) return error.ConflictingTargets;
+        if (self.target.snapshot().pid != 0 or self.profile != null or self.offline) return error.ConflictingTargets;
         self.imported = try @import("../profile/imported_job.zig").State.open(path);
         self.offline = true;
     }
     pub fn openArchive(self: *Session, path: []const u8, symbols: ?[]const u8, reanalyze: bool) !void {
-        if (self.target.pid != 0 or self.profile != null or self.imported != null or self.allocations.capture != null or self.allocations.preparing()) return error.ConflictingTargets;
+        if (self.target.snapshot().pid != 0 or self.profile != null or self.imported != null or self.allocations.capture != null or self.allocations.preparing()) return error.ConflictingTargets;
         try self.clearArchiveJob();
         const job = try ArchiveJob.create(self.next_archive_job, .open, path);
         errdefer job.deinit();
@@ -445,7 +448,7 @@ pub const Session = struct {
     }
     pub fn startProfile(self: *Session, request: profile.Config) !u64 {
         if (self.target.core != null) return error.ReadOnlyCore;
-        if (linux.architecture != .x86_64) return error.ProfilingUnsupportedArchitecture;
+        if (self.target.arch() != .x86_64) return error.ProfilingUnsupportedArchitecture;
         self.profile_failure = null;
         self.profile_error = null;
         self.profile_requested_threads = request.tids.len;
@@ -454,7 +457,7 @@ pub const Session = struct {
         };
         return self.openProfile(request) catch |err| {
             self.profile_error = @errorName(err);
-            std.debug.print("xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.pid, self.profile_requested_threads });
+            std.debug.print("xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.snapshot().pid, self.profile_requested_threads });
             if (self.profile_failure) |failure| std.debug.print("xodb: perf open: {s} syscall={s} errno={d} tid={d} opened_then_closed={d}; {s}\n", .{ @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.opened_then_closed, failure.detail });
             return err;
         };
@@ -465,7 +468,7 @@ pub const Session = struct {
         try request.validate();
         if (request.syscall_timing and request.tids.len == 0) return error.SyscallRequiresExplicitThreads;
         if (self.profile != null and self.profile.?.collector != null) return error.ProfileAlreadyRunning;
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.source_step != null) return error.StepInProgress;
         var tids: [perf.max_threads]i32 = undefined;
         var identities: [perf.max_threads]u64 = undefined;
@@ -487,7 +490,7 @@ pub const Session = struct {
         var config = request;
         config.follow_threads = request.follow_threads and request.tids.len == 0;
         config.tids = tids[0..count];
-        const opened = try profile.Capture.open(std.heap.page_allocator, self.next_profile_id, self.id, self.target.generation, self.target.image_epoch, self.target.pid, try self.target.stoppedTid(), config, identities[0..count], linux.now());
+        const opened = try profile.Capture.openTarget(self.target.handle, std.heap.page_allocator, self.next_profile_id, self.id, self.target.snapshot().generation, self.target.snapshot().image_epoch, self.target.snapshot().pid, try self.target.stoppedTid(), config, identities[0..count], linux.now());
         switch (opened) {
             .failed => |failure| {
                 self.profile_failure = failure;
@@ -498,8 +501,8 @@ pub const Session = struct {
                 if (self.profile) |old| self.recorded_views.retire(old);
                 self.profile = capture;
                 self.profile_view = null;
-                capture.debugger_sequence = self.target.sequence;
-                capture.addMarker(.{ .offset_ns = 0, .sequence = self.target.sequence, .tid = self.target.pid, .kind = .capture_open_stopped });
+                capture.debugger_sequence = self.target.snapshot().sequence;
+                capture.addMarker(.{ .offset_ns = 0, .sequence = self.target.snapshot().sequence, .tid = self.target.snapshot().pid, .kind = .capture_open_stopped });
                 self.profile_failure = null;
                 capture.unselected_threads = unselected;
                 if (unselected > 0) {
@@ -534,7 +537,7 @@ pub const Session = struct {
         const capture = self.profile orelse return;
         if (capture.collector == null or !capture.config.follow_threads) return;
         const now = linux.now();
-        if (capture.image_epoch != self.target.image_epoch) {
+        if (capture.image_epoch != self.target.snapshot().image_epoch) {
             capture.trusted_before_ns = 0;
             capture.stop(.image_changed, now);
             return;
@@ -551,13 +554,15 @@ pub const Session = struct {
         if (capture.collector == null) return;
         self.profileMarkers(capture);
         const now = linux.now();
+        capture.syncRemoteThreads(now);
+        if (capture.collector == null) return;
         self.retireProfileThreads(capture);
         capture.poll(now);
         if (capture.collector == null) return;
-        if (self.target.image_epoch != capture.image_epoch) {
+        if (self.target.snapshot().image_epoch != capture.image_epoch) {
             capture.trusted_before_ns = 0;
             capture.stop(.image_changed, now);
-        } else if (self.target.state == .idle or self.target.state == .exited) {
+        } else if (self.target.snapshot().state == .idle or self.target.snapshot().state == .exited) {
             capture.stop(.target_ended, now);
         } else {
             var unselected: usize = 0;
@@ -576,7 +581,7 @@ pub const Session = struct {
         }
     }
     fn profileMarkers(self: *Session, capture: *profile.Capture) void {
-        if (self.target.sequence == capture.debugger_sequence) return;
+        if (self.target.snapshot().sequence == capture.debugger_sequence) return;
         const events = self.target.eventSlice();
         if (events.len > 0 and events[0].sequence > capture.debugger_sequence + 1) {
             capture.debugger_events_lost +|= events[0].sequence - capture.debugger_sequence - 1;
@@ -598,7 +603,7 @@ pub const Session = struct {
             if (kind != .continued and kind != .detach and !capture.includesThread(event.tid)) continue;
             capture.addMarker(.{ .offset_ns = event.time_ns - capture.started_ns, .sequence = event.sequence, .tid = event.tid, .kind = kind });
         }
-        capture.debugger_sequence = self.target.sequence;
+        capture.debugger_sequence = self.target.snapshot().sequence;
     }
     pub fn launch(self: *Session, argv: []const [:0]const u8) !void {
         if (self.launch_argv.len > 0) return error.AlreadyLaunched;
@@ -615,13 +620,13 @@ pub const Session = struct {
         self.launch_argv = saved;
     }
     pub fn restart(self: *Session) !void {
-        if (self.target.birth_count > 0 or self.target.sharedVm()) return error.ProcessFamilyRequiresResolution;
-        if (!self.target.owned or self.launch_argv.len == 0) return error.RestartRequiresOwnedLaunch;
-        if (self.target.state != .stopped and self.target.state != .exited and self.target.state != .idle) return error.PauseBeforeRestart;
+        if (self.target.snapshot().birth_count > 0 or self.target.sharedVm()) return error.ProcessFamilyRequiresResolution;
+        if (!self.target.snapshot().owned or self.launch_argv.len == 0) return error.RestartRequiresOwnedLaunch;
+        if (self.target.snapshot().state != .stopped and self.target.snapshot().state != .exited and self.target.snapshot().state != .idle) return error.PauseBeforeRestart;
         if (self.archiveBusy()) return error.ArchiveBusy;
         self.allocations.stop(.target_ended);
         if (self.profile) |capture| if (capture.collector != null) capture.stop(.target_ended, linux.now());
-        if (self.target.state == .stopped) try self.persistent.remember(self);
+        if (self.target.snapshot().state == .stopped) try self.persistent.remember(self);
         // Save desired enables before replacing the address space. Thread filters
         // retain their old identity and are disabled until explicitly rebound.
         var enables: [128]bool = undefined;
@@ -633,55 +638,48 @@ pub const Session = struct {
         self.cancelStep();
         self.run_to = null;
         self.source_step = null;
-        self.target.deinit();
-        self.target.breakpoint_count = 0;
-        self.target.watchpoints = @splat(null);
-        self.target.thread_count = 0;
-        self.target.stepping = null;
-        self.target.want_run = false;
-        self.target.watchpoints_dirty = false;
-        self.target.watch_cancelled = false;
+        try self.target.reset();
         try self.target.launch(self.launch_argv);
         // Relocation happens before another event-loop policy pass can prune IDs.
         for (self.persistent.entries.items, 0..) |item, i| {
-            self.target.breakpoints[self.target.breakpoint_count] = .{ .id = item.id, .address = 0, .original = @splat(0), .pending = true, .patched = false, .enabled = enables[i] };
-            self.target.breakpoint_count += 1;
+            try self.target.restoreBreakpoint(item.id, enables[i]);
             if (self.probes.rule(item.id)) |rule| {
                 rule.matched_hits = 0;
                 if (rule.thread_id != null) {
-                    self.target.breakpoints[self.target.breakpoint_count - 1].enabled = false;
+                    try self.target.enableBreakpoint(item.id, false);
                     rule.last_error = "RestartThreadFilterNeedsSelection";
                 }
             }
         }
         self.persistent.hook = null;
         self.persistent.debug_address = null;
-        self.persistent.epoch = self.target.image_epoch;
+        self.persistent.epoch = self.target.snapshot().image_epoch;
         self.persistent.observed = 0;
         self.suppress_probe_resume = true;
         try self.persistent.poll(self);
     }
     pub fn openCore(self: *Session, path: []const u8, executable: ?[]const u8) !void {
-        if (self.target.pid != 0 or self.offline or self.imported != null or self.profile != null) return error.ConflictingTargets;
+        if (self.target.snapshot().pid != 0 or self.offline or self.imported != null or self.profile != null) return error.ConflictingTargets;
         try self.target.openCore(path);
         self.modules.debug_files = self.symbolFiles();
         try self.modules.fromCore(&self.target.core.?, executable);
-        self.maps_epoch = self.target.image_epoch;
-        self.maps_generation = self.target.generation;
+        self.maps_epoch = self.target.snapshot().image_epoch;
+        self.maps_generation = self.target.snapshot().generation;
     }
     pub fn refreshMaps(self: *Session) !void {
         if (self.target.core != null) return;
-        if (self.target.state == .stopped and self.maps_generation != self.target.generation) {
-            if (self.maps_epoch != self.target.image_epoch) {
+        if (self.target.snapshot().state == .stopped and self.maps_generation != self.target.snapshot().generation) {
+            if (self.maps_epoch != self.target.snapshot().image_epoch) {
                 const next_id = self.modules.next_id;
                 self.modules.deinit();
                 self.modules = Modules.init(std.heap.page_allocator);
                 self.modules.next_id = next_id;
-                self.maps_epoch = self.target.image_epoch;
+                self.maps_epoch = self.target.snapshot().image_epoch;
             }
             self.modules.debug_files = self.symbolFiles();
+            self.modules.target = self.target.handle;
             try self.modules.refresh(try self.target.stoppedTid());
-            self.maps_generation = self.target.generation;
+            self.maps_generation = self.target.snapshot().generation;
         }
     }
     pub fn investigateWrite(self: *Session, tid: i32, frame_index: usize, question: []const u8, expression: []const u8) !u64 {
@@ -698,7 +696,7 @@ pub const Session = struct {
         try self.investigations.ensureUnusedCapacity(a, 1);
         const watch = try self.target.setWatchpoint(address, @intCast(value.type.size), .write);
         const id = self.investigations.items.len + 1;
-        self.investigations.appendAssumeCapacity(.{ .id = id, .question = question_copy, .expression = expression_copy, .watchpoint_id = watch, .initial = summary, .created_generation = self.target.generation, .created_sequence = self.target.sequence, .image_epoch = self.target.image_epoch });
+        self.investigations.appendAssumeCapacity(.{ .architecture = self.target.arch(), .id = id, .question = question_copy, .expression = expression_copy, .watchpoint_id = watch, .initial = summary, .created_generation = self.target.snapshot().generation, .created_sequence = self.target.snapshot().sequence, .image_epoch = self.target.snapshot().image_epoch });
         return id;
     }
     pub fn investigation(self: *Session, id: u64) !*Investigation {
@@ -713,7 +711,7 @@ pub const Session = struct {
         const count: usize = @intCast(pc - symbol.address);
         if (try self.target.readMemory(symbol.address, bytes[0..count]) != count) return null;
         var instructions: [1024]@import("disassembly.zig").Instruction = undefined;
-        const n = try @import("disassembly.zig").decode(bytes[0..count], symbol.address, &instructions);
+        const n = try @import("disassembly.zig").decodeFor(self.target.arch(), bytes[0..count], symbol.address, &instructions);
         if (n == 0) return null;
         const last = instructions[n - 1];
         if (last.address + last.size != pc) return null;
@@ -723,19 +721,19 @@ pub const Session = struct {
         var bytes: [4]u8 = undefined;
         if (try self.target.readMemory(pc, &bytes) != 4) return null;
         var decoded: [1]@import("disassembly.zig").Instruction = undefined;
-        if (try @import("disassembly.zig").decode(&bytes, pc, &decoded) != 1) return null;
+        if (try @import("disassembly.zig").decodeFor(self.target.arch(), &bytes, pc, &decoded) != 1) return null;
         const inst = decoded[0];
         return .{ .address = pc, .mnemonic = try a.dupe(u8, std.mem.sliceTo(&inst.mnemonic, 0)), .operands = try a.dupe(u8, std.mem.sliceTo(&inst.operands, 0)), .source = self.sourceAt(a, pc) catch null, .basis = "decode_at_recorded_pre_access_trap_pc" };
     }
     fn captureInvestigations(self: *Session) !void {
-        if (self.target.state == .running) return;
+        if (self.target.snapshot().state == .running) return;
         const a = self.investigation_arena.allocator();
         for (self.investigations.items) |*record_| {
             var installed = false;
-            for (self.target.watchpoints) |watch| if (watch != null and watch.?.id == record_.watchpoint_id) {
+            for (self.target.watchpointSlice()) |watch| if (watch != null and watch.?.id == record_.watchpoint_id) {
                 installed = true;
             };
-            if (!installed or self.target.state != .stopped or self.target.image_epoch != record_.image_epoch) {
+            if (!installed or self.target.snapshot().state != .stopped or self.target.snapshot().image_epoch != record_.image_epoch) {
                 record_.status = .finished;
                 continue;
             }
@@ -764,11 +762,11 @@ pub const Session = struct {
                 for (variables[0..@min(64, variables.len)]) |variable| {
                     try saved_locals.append(a, .{ .name = variable.name, .value = try self.summarize(a, variable.value), .diagnostic = variable.diagnostic });
                 }
-                const observation = Observation{ .locals = try saved_locals.toOwnedSlice(a), .locals_truncated = variables.len > 64, .event = event, .captured_generation = self.target.generation, .value = value, .frames = frames, .preceding_instruction = if (event.trap_pc == null) self.precedingInstruction(a, event.pc) catch null else null, .access_instruction = if (event.trap_pc) |pc| self.armAccessInstruction(a, pc) catch null else null };
+                const observation = Observation{ .locals = try saved_locals.toOwnedSlice(a), .locals_truncated = variables.len > 64, .event = event, .captured_generation = self.target.snapshot().generation, .value = value, .frames = frames, .preceding_instruction = if (event.trap_pc == null) self.precedingInstruction(a, event.pc) catch null else null, .access_instruction = if (event.trap_pc) |pc| self.armAccessInstruction(a, pc) catch null else null };
                 try record_.observations.append(a, try retainEvidence(a, observation));
             }
         }
-        self.evidence_sequence = self.target.sequence;
+        self.evidence_sequence = self.target.snapshot().sequence;
     }
     pub fn saveInvestigations(self: *Session, path: [:0]const u8) !void {
         // Exclusive creation keeps an existing evidence file intact.
@@ -785,7 +783,7 @@ pub const Session = struct {
         try self.target.singleStep(tid);
     }
     pub fn runTo(self: *Session, tid: i32, address: u64, expected_sp: ?u64, actor: Actor) !void {
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.source_step != null or self.run_to != null) return error.StepInProgress;
         var identity: ?u64 = null;
         for (self.target.threadSlice()) |thread| if (thread.tid == tid and thread.state == .stopped) {
@@ -793,7 +791,7 @@ pub const Session = struct {
         };
         const stable_id = identity orelse return error.UnknownThread;
         var owned = true;
-        for (self.target.breakpoints[0..self.target.breakpoint_count]) |probe| if (probe.address == address) {
+        for (self.target.breakpointSlice()) |probe| if (probe.address == address) {
             if (!probe.enabled) return error.RunToDisabledBreakpoint;
             owned = false;
         };
@@ -801,7 +799,7 @@ pub const Session = struct {
         errdefer if (owned) {
             self.target.removeBreakpoint(id) catch {};
         };
-        self.run_to = .{ .tid = tid, .thread_id = stable_id, .address = address, .probe = id, .owns_probe = owned, .image_epoch = self.target.image_epoch, .expected_sp = expected_sp };
+        self.run_to = .{ .tid = tid, .thread_id = stable_id, .address = address, .probe = id, .owns_probe = owned, .image_epoch = self.target.snapshot().image_epoch, .expected_sp = expected_sp };
         errdefer self.run_to = null;
         self.step_diagnostic = null;
         try self.continueExecution(actor);
@@ -813,16 +811,16 @@ pub const Session = struct {
         const frames = try self.stack(arena.allocator(), tid, frame_index + 2);
         if (frames.len <= frame_index + 1) return error.CallerUnavailable;
         const caller = frames[frame_index + 1];
-        const sp = caller.registers[linux.architecture.sp()] orelse return error.CallerUnavailable;
+        const sp = caller.registers[self.target.arch().sp()] orelse return error.CallerUnavailable;
         try self.runTo(tid, caller.pc, sp, actor);
     }
     fn pollRunTo(self: *Session, filtered: bool) !void {
         const run = self.run_to orelse return;
-        if (self.target.image_epoch != run.image_epoch or self.target.state == .exited or self.target.state == .idle) {
+        if (self.target.snapshot().image_epoch != run.image_epoch or self.target.snapshot().state == .exited or self.target.snapshot().state == .idle) {
             self.run_to = null;
             return;
         }
-        if (self.target.state != .stopped) return;
+        if (self.target.snapshot().state != .stopped) return;
         if (self.target.sharedVm()) {
             self.run_to.?.cancelled = true;
             return;
@@ -884,11 +882,11 @@ pub const Session = struct {
             var bytes: [16]u8 = undefined;
             const n = try self.target.readMemory(linux.programCounter(regs), &bytes);
             var instructions: [1]@import("disassembly.zig").Instruction = undefined;
-            const count = try @import("disassembly.zig").decodeFlow(bytes[0..n], linux.programCounter(regs), &instructions);
+            const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], linux.programCounter(regs), &instructions);
             if (count == 1 and instructions[0].flow == .call) {
                 const address = linux.programCounter(regs) + instructions[0].size;
                 var user_breakpoint = false;
-                for (self.target.breakpoints[0..self.target.breakpoint_count]) |probe| {
+                for (self.target.breakpointSlice()) |probe| {
                     if (probe.address == address and !probe.temporary) user_breakpoint = true;
                 }
                 if (!user_breakpoint) self.source_step.?.return_address = address;
@@ -901,9 +899,9 @@ pub const Session = struct {
     /// targets keep the instruction path. Calls, branches, traps and syscalls
     /// are boundaries, as are source changes and existing user probes.
     fn advanceSourceBlock(self: *Session) !bool {
-        if (linux.architecture != .x86_64) return false;
+        if (self.target.arch() != .x86_64) return false;
         const step = &self.source_step.?;
-        if (self.target.sharedVm() or self.target.birth_count != 0) return false;
+        if (self.target.sharedVm() or self.target.snapshot().birth_count != 0) return false;
         var live: usize = 0;
         for (self.target.threadSlice()) |thread| if (thread.state != .exited) {
             live += 1;
@@ -914,7 +912,7 @@ pub const Session = struct {
         var bytes: [256]u8 = undefined;
         const n = self.target.readMemory(pc, &bytes) catch return false;
         var instructions: [64]@import("disassembly.zig").Instruction = undefined;
-        const count = @import("disassembly.zig").decodeFlow(bytes[0..n], pc, &instructions) catch return false;
+        const count = @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], pc, &instructions) catch return false;
         if (count < 3) return false;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
@@ -926,7 +924,7 @@ pub const Session = struct {
         }
         if (boundary < 2) return false;
         const address = instructions[boundary].address;
-        for (self.target.breakpoints[0..self.target.breakpoint_count]) |probe| {
+        for (self.target.breakpointSlice()) |probe| {
             if (!probe.pending and probe.address > pc and probe.address <= address) return false;
         }
         const probe = self.target.setBreakpoint(address, true) catch return false;
@@ -955,7 +953,7 @@ pub const Session = struct {
         };
         self.pollAllocations();
         if (self.process_tree) |tree| tree.admit(self);
-        if (self.target.birth_count > 0) {
+        if (self.target.snapshot().birth_count > 0) {
             self.cancelStep();
             self.pollProfile();
             self.recorded_views.poll(self.profile);
@@ -983,11 +981,11 @@ pub const Session = struct {
             try self.target.continueExecution();
             return;
         }
-        if (self.target.state == .stopped and !self.target.onlyInternalStops()) self.stepping_over = false;
-        if (self.target.state == .stopped and !self.target.sharedVm() and self.source_step == null and !self.stepping_over and self.suppress_probe_resume) {
+        if (self.target.snapshot().state == .stopped and !self.target.onlyInternalStops()) self.stepping_over = false;
+        if (self.target.snapshot().state == .stopped and !self.target.sharedVm() and self.source_step == null and !self.stepping_over and self.suppress_probe_resume) {
             var b: usize = 0;
-            while (b < self.target.breakpoint_count) {
-                const probe = self.target.breakpoints[b];
+            while (b < self.target.snapshot().breakpoint_count) {
+                const probe = self.target.breakpointSlice()[b];
                 if (probe.temporary) try self.target.removeBreakpoint(probe.id) else b += 1;
             }
         }
@@ -1003,11 +1001,11 @@ pub const Session = struct {
             }
         }
         if (self.source_step) |step| {
-            if (self.target.state == .exited or self.target.state == .idle) {
+            if (self.target.snapshot().state == .exited or self.target.snapshot().state == .idle) {
                 self.source_step = null;
                 return;
             }
-            if (self.target.state != .stopped) return;
+            if (self.target.snapshot().state != .stopped) return;
             var expected_stop = false;
             for (self.target.threadSlice()) |thread| {
                 if (thread.tid == step.tid) expected_stop = thread.reason == .single_step or (thread.reason == .breakpoint and step.return_address != null and step.return_address.? == thread.breakpoint_address);
@@ -1047,7 +1045,7 @@ pub const Session = struct {
         var bytes: [16]u8 = undefined;
         const n = try self.target.readMemory(linux.programCounter(regs), &bytes);
         var instructions: [1]@import("disassembly.zig").Instruction = undefined;
-        const count = try @import("disassembly.zig").decodeFlow(bytes[0..n], linux.programCounter(regs), &instructions);
+        const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], linux.programCounter(regs), &instructions);
         if (count == 1 and instructions[0].flow == .call) {
             _ = try self.target.setBreakpoint(linux.programCounter(regs) + instructions[0].size, true);
             try self.target.continueExecution();
@@ -1059,7 +1057,7 @@ pub const Session = struct {
         return self.target.readMemory(address, out);
     }
     pub fn functionGraph(self: *Session, a: std.mem.Allocator, address: u64) !FunctionGraph {
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         try self.refreshMaps();
         const module = try self.modules.at(address);
         const pc = try module.linkAddress(address);
@@ -1101,7 +1099,7 @@ pub const Session = struct {
         const bytes = try a.alloc(u8, @intCast(size));
         defer a.free(bytes);
         if (try self.target.readMemory(start, bytes) != bytes.len) return error.FunctionMemoryIncomplete;
-        var graph = try cfg.build(a, bytes, start);
+        var graph = try cfg.buildFor(self.target.arch(), a, bytes, start);
         errdefer graph.deinit(a);
         if (module.debugInfo()) |debug| {
             for (graph.blocks) |*block| {
@@ -1115,7 +1113,7 @@ pub const Session = struct {
                 block.source = site;
             }
         } else |_| {}
-        return .{ .generation = self.target.generation, .image_epoch = self.target.image_epoch, .module_id = module.id, .symbol = try a.dupe(u8, function_name), .link_address = link, .extent_source = extent_source, .range_index = range_index, .range_count = range_count, .graph = graph };
+        return .{ .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .module_id = module.id, .symbol = try a.dupe(u8, function_name), .link_address = link, .extent_source = extent_source, .range_index = range_index, .range_count = range_count, .graph = graph };
     }
     pub fn sourceAt(self: *Session, a: std.mem.Allocator, address: u64) !info.Site {
         try self.refreshMaps();
@@ -1155,26 +1153,26 @@ pub const Session = struct {
     }
     pub fn setSourceBreakpoint(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
         const addresses = try self.sourceAddresses(a, path, line);
-        if (addresses.len > self.target.breakpoints.len - self.target.breakpoint_count) return error.BreakpointLimit;
+        if (addresses.len > 128 - self.target.snapshot().breakpoint_count) return error.BreakpointLimit;
         const ids = try a.alloc(u64, addresses.len);
         var added: std.ArrayList(u64) = .empty;
         errdefer for (added.items) |id| self.target.removeBreakpoint(id) catch {};
         for (addresses, ids) |address, *id| {
-            const previous = self.target.breakpoint_count;
+            const previous = self.target.snapshot().breakpoint_count;
             id.* = try self.target.setBreakpoint(address, false);
-            if (self.target.breakpoint_count != previous) try added.append(a, id.*);
+            if (self.target.snapshot().breakpoint_count != previous) try added.append(a, id.*);
         }
         return ids;
     }
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         try self.refreshMaps();
         var registers = loc.registers(try self.target.registers(tid));
         var frames: std.ArrayList(Frame) = .empty;
         while (frames.items.len < @min(64, limit)) {
-            const pc = registers[linux.architecture.pc()] orelse break;
+            const pc = registers[self.target.arch().pc()] orelse break;
             if (pc == 0) break;
-            var frame = Frame{ .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) linux.architecture.callerLookup(pc) orelse break else pc, .registers = registers };
+            var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
             frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
             if (self.modules.symbolAt(frame.lookup_pc)) |symbol| frame.symbol = symbol.name else |_| {}
             const module = self.modules.at(frame.lookup_pc) catch |err| {
@@ -1204,7 +1202,7 @@ pub const Session = struct {
             frame.cfa = step.cfa;
             frame.unwind_method = @tagName(step.method);
             try frames.append(a, frame);
-            if (step.caller[linux.architecture.pc()] == registers[linux.architecture.pc()] and step.caller[linux.architecture.sp()] == registers[linux.architecture.sp()]) {
+            if (step.caller[self.target.arch().pc()] == registers[self.target.arch().pc()] and step.caller[self.target.arch().sp()] == registers[self.target.arch().sp()]) {
                 frames.items[frames.items.len - 1].diagnostic = "UnwindCycle";
                 break;
             }
@@ -1231,10 +1229,10 @@ pub const Session = struct {
     }
     pub fn frameLocalsAtDepth(self: *Session, a: std.mem.Allocator, frame: Frame, depth: usize) ![]info.Local {
         if (depth > frame.inline_frames.len) return error.InvalidInlineDepth;
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         const module = try self.modules.at(frame.lookup_pc);
         var context = LocalContext{ .session = self };
-        if (linux.architecture == .x86_64 and frame.index == 0 and frame.tid != 0) context.vector = self.target.extendedRegisters(frame.tid) catch null;
+        if (self.target.arch() == .x86_64 and frame.index == 0 and frame.tid != 0) context.vector = self.target.extendedRegisters(frame.tid) catch null;
         return (try module.debugInfo()).localsAtDepth(a, try module.linkAddress(frame.lookup_pc), .{ .registers = frame.registers, .cfa = frame.cfa, .load_bias = module.bias, .user = &context, .read = LocalContext.read, .register_data = LocalContext.register }, depth);
     }
     const LocalContext = struct {
@@ -1305,7 +1303,7 @@ pub const Session = struct {
                 return error.UnknownVariable;
             }
         };
-        return .{ .allocator = a, .user = self, .read = readTarget, .lookup = Stub.lookup };
+        return .{ .endian = self.target.arch().endian(), .allocator = a, .user = self, .read = readTarget, .lookup = Stub.lookup };
     }
     pub const ValueChild = struct { index: u64, name: []const u8, value: ValueSummary };
     pub const ValuePage = struct { value: ValueSummary, presentation: value_view.Presentation, total: u64, start: u64, next: ?u64, children: []ValueChild, basis: []const u8 = value_view.basis };
@@ -1328,7 +1326,7 @@ pub const Session = struct {
     /// Evaluates against a frame from `stack` and its locals (empty when
     /// unavailable), so several expressions can share one unwind.
     pub fn evaluateInFrame(self: *Session, a: std.mem.Allocator, frame: Frame, values: []const info.Local, text: []const u8) !eval.Value {
-        if (self.target.state != .stopped) return error.NotStopped;
+        if (self.target.snapshot().state != .stopped) return error.NotStopped;
         const Adapter = struct {
             session: *Session,
             registers: loc.RegisterSet,
@@ -1336,9 +1334,8 @@ pub const Session = struct {
             fn lookup(ptr: *anyopaque, variable_name: []const u8) !eval.Value {
                 const ctx: *@This() = @ptrCast(@alignCast(ptr));
                 if (variable_name.len > 1 and variable_name[0] == '$') {
-                    const names = linux.architecture.registerNames();
-                    for (names, 0..) |reg_name, i| if (std.mem.eql(u8, variable_name[1..], reg_name)) return .{ .type = &eval.uint_type, .bits = ctx.registers[i] orelse return error.RegisterUnavailable };
-                    return error.UnknownRegister;
+                    const number = ctx.session.target.arch().registerNumber(variable_name[1..]) orelse return error.UnknownRegister;
+                    return .{ .type = &eval.uint_type, .bits = ctx.registers[number] orelse return error.RegisterUnavailable };
                 }
                 for (ctx.values) |v| if (std.mem.eql(u8, variable_name, v.name)) return v.value;
                 return error.UnknownVariable;
@@ -1349,7 +1346,7 @@ pub const Session = struct {
             }
         };
         var adapter = Adapter{ .session = self, .registers = frame.registers, .values = values };
-        return eval.evaluate(.{ .user = &adapter, .lookup = Adapter.lookup, .read = Adapter.read, .allocator = a }, text);
+        return eval.evaluate(.{ .endian = self.target.arch().endian(), .user = &adapter, .lookup = Adapter.lookup, .read = Adapter.read, .allocator = a }, text);
     }
     pub fn authorize(self: *Session, actor: Actor, effect: Effect, generation: ?u64) !void {
         if (self.target.core != null) return error.ReadOnlyCore;
@@ -1357,7 +1354,7 @@ pub const Session = struct {
             if (self.agent_scope == .observe or (effect == .mutation and self.agent_scope != .mutate)) return error.AgentScopeDenied;
             if (generation == null) return error.GenerationRequired;
         }
-        if (generation) |g| if (g != self.target.generation) return error.StaleSnapshot;
+        if (generation) |g| try self.target.expectGeneration(g);
     }
     pub fn record(self: *Session, actor: Actor, action: []const u8) void {
         // Action names are static strings owned by the command implementation.
@@ -1366,9 +1363,9 @@ pub const Session = struct {
             std.mem.copyForwards(Audit, self.audit[0 .. self.audit.len - 1], self.audit[1..]);
             self.audit_count -= 1;
         }
-        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .action = action, .generation = self.target.generation };
+        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .action = action, .generation = self.target.snapshot().generation };
         self.audit_count += 1;
-        if (actor == .agent) self.target.event(.agent_action, self.target.pid, @intCast(self.audit_sequence));
+        if (actor == .agent) self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence));
     }
     pub fn setAgentScope(self: *Session, scope: AgentScope) void {
         if (self.process_tree) |tree| {
@@ -1376,14 +1373,14 @@ pub const Session = struct {
             return;
         }
         self.agent_scope = scope;
-        self.target.generation += 1;
+        self.target.invalidate();
         self.record(.human, "set_agent_scope");
     }
     pub fn init() Session {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.generation, .image_epoch = self.target.image_epoch, .pid = self.target.pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(linux.architecture), .state = self.target.state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
         if (self.comparison) |job| job.deinit();
@@ -1423,13 +1420,13 @@ test "agent capabilities and generation protect shared execution state" {
     session.setAgentScope(.control);
     try std.testing.expectError(error.GenerationRequired, session.authorize(.agent, .execution, null));
     try std.testing.expectError(error.StaleSnapshot, session.authorize(.agent, .execution, 0));
-    try session.authorize(.agent, .execution, session.target.generation);
-    try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .mutation, session.target.generation));
+    try session.authorize(.agent, .execution, session.target.snapshot().generation);
+    try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .mutation, session.target.snapshot().generation));
     try session.authorize(.human, .mutation, null);
     session.setAgentScope(.mutate);
-    try session.authorize(.agent, .mutation, session.target.generation);
+    try session.authorize(.agent, .mutation, session.target.snapshot().generation);
     session.setAgentScope(.observe);
-    try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .execution, session.target.generation));
+    try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .execution, session.target.snapshot().generation));
 }
 
 test "retained evidence owns enum and nested preview and frame strings" {

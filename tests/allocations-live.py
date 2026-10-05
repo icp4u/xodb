@@ -17,7 +17,7 @@ fixture=work/'fixture'
 subprocess.run(['cc','-pthread','-g','-O0','-fno-builtin','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','tests/fixtures/allocations.c','-o',str(fixture)],env=dict(os.environ,TMPDIR=str((work/'tmp').resolve())),check=True)
 def perf_fds(client):
     count=0
-    for p in Path(f'/proc/{client.p.pid}/fd').iterdir():
+    for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir():
         try:count+='perf_event' in os.readlink(p)
         except FileNotFoundError:pass
     return count

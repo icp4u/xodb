@@ -4,9 +4,11 @@ const std = @import("std");
 const OP = std.dwarf.OP;
 const Registers = @import("../target/linux.zig").Registers;
 pub const Op = struct { atom: u8, number: u64 = 0, number2: u64 = 0, offset: u64 = 0, data: ?[]const u8 = null };
-pub const RegisterSet = [33]?u64;
+pub const RegisterSet = @import("../target/runtime.zig").DwarfRegisters;
 pub const Place = struct { kind: enum { address, register, value }, bits: u64, register: ?u16 = null, data: ?[]const u8 = null, valid: ?[]const u8 = null };
 pub const Context = struct {
+    endian: std.builtin.Endian = .little,
+    address_bytes: usize = 8,
     registers: RegisterSet,
     register_data: ?*const fn (*anyopaque, u64) ?[]const u8 = null,
     cfa: ?u64 = null,
@@ -16,16 +18,7 @@ pub const Context = struct {
     read: *const fn (*anyopaque, u64, []u8) anyerror!usize,
 };
 pub fn registers(regs: Registers) RegisterSet {
-    var out: RegisterSet = @splat(null);
-    if (@import("../target/linux.zig").architecture == .aarch64) {
-        inline for (std.meta.fields(Registers)[0..31], 0..) |field, i| out[i] = @field(regs, field.name);
-        out[31] = regs.sp;
-        out[32] = regs.pc;
-    } else {
-        const x86 = [_]?u64{ regs.rax, regs.rdx, regs.rcx, regs.rbx, regs.rsi, regs.rdi, regs.rbp, regs.rsp, regs.r8, regs.r9, regs.r10, regs.r11, regs.r12, regs.r13, regs.r14, regs.r15, regs.rip };
-        @memcpy(out[0..x86.len], &x86);
-    }
-    return out;
+    return @import("../target/runtime.zig").dwarfRegisters(regs);
 }
 fn reg(ctx: Context, number: u64) !u64 {
     if (number >= ctx.registers.len) return error.UnsupportedRegister;
@@ -39,12 +32,12 @@ pub fn evaluate(ctx: Context, ops: []const Op) !Place {
         if (op.atom == OP.implicit_value) {
             const data = op.data orelse return error.MalformedExpression;
             if (data.len > 4096) return error.CompositeTooLarge;
-            return .{ .kind = .value, .bits = lowBits(data), .data = data };
+            return .{ .kind = .value, .bits = lowBits(data, ctx.endian), .data = data };
         }
         const number: ?u64 = if (op.atom >= OP.reg0 and op.atom <= OP.reg31) op.atom - OP.reg0 else if (op.atom == OP.regx) op.number else null;
         if (number) |n| if (ctx.register_data) |read| if (read(ctx.user, n)) |data| {
             if (n > std.math.maxInt(u16)) return error.UnsupportedRegister;
-            return .{ .kind = .register, .bits = lowBits(data), .data = data, .register = @intCast(n) };
+            return .{ .kind = .register, .bits = lowBits(data, ctx.endian), .data = data, .register = @intCast(n) };
         };
     }
     var stack: [128]u64 = undefined;
@@ -132,11 +125,11 @@ pub fn evaluate(ctx: Context, ops: []const Op) !Place {
             },
             OP.deref, OP.deref_size => {
                 if (count < 1) return error.MalformedExpression;
-                const size: usize = if (op.atom == OP.deref) 8 else std.math.cast(usize, op.number) orelse return error.UnsupportedLocation;
+                const size: usize = if (op.atom == OP.deref) ctx.address_bytes else std.math.cast(usize, op.number) orelse return error.UnsupportedLocation;
                 if (size == 0 or size > 8) return error.UnsupportedLocation;
                 var bytes: [8]u8 = @splat(0);
                 if (try ctx.read(ctx.user, stack[count - 1], bytes[0..size]) != size) return error.MemoryUnreadable;
-                stack[count - 1] = std.mem.readInt(u64, &bytes, .little);
+                stack[count - 1] = lowBits(bytes[0..size], ctx.endian);
             },
             OP.stack_value => {
                 if (count < 1) return error.MalformedExpression;
@@ -210,14 +203,18 @@ test "frame-relative locations and stack values keep runtime addresses distinct"
     try std.testing.expectError(error.MalformedExpression, evaluate(ctx, &.{.{ .atom = OP.plus }}));
 }
 
-fn lowBits(data: []const u8) u64 {
-    var bytes: [8]u8 = @splat(0);
-    @memcpy(bytes[0..@min(8, data.len)], data[0..@min(8, data.len)]);
-    return std.mem.readInt(u64, &bytes, .little);
+pub fn lowBits(data: []const u8, endian: std.builtin.Endian) u64 {
+    var value: u64 = 0;
+    const bytes = if (endian == .big and data.len > 8) data[data.len - 8 ..] else data[0..@min(data.len, 8)];
+    for (bytes, 0..) |byte, i| value |= @as(u64, byte) << @as(u6, @intCast(8 * (if (endian == .little) i else bytes.len - 1 - i)));
+    return value;
 }
 /// Materialize piece descriptions in target little-endian bit order. A validity
 /// mask preserves missing bits; absent pieces never become plausible zeroes.
 pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
+    if (ctx.endian == .big) for (ops) |op| {
+        if (op.atom == OP.bit_piece) return error.UnsupportedLocation;
+    };
     var bits: usize = 0;
     var pieces: usize = 0;
     for (ops) |op| if (op.atom == OP.piece or op.atom == OP.bit_piece) {
@@ -257,8 +254,9 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
             } else if (place.data) |raw| {
                 available = raw;
             } else {
-                std.mem.writeInt(u64, bytes[0..8], place.bits, .little);
-                available = bytes[0..8];
+                std.mem.writeInt(u64, bytes[0..8], place.bits, ctx.endian);
+                const width = @min((count + @as(usize, @intCast(source_bit)) + 7) / 8, ctx.address_bytes);
+                available = if (ctx.endian == .big) bytes[8 - width .. 8] else bytes[0..width];
             }
             for (0..count) |j| {
                 const src = std.math.add(u64, source_bit, j) catch continue;
@@ -271,7 +269,7 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
         }
         dest += count;
     }
-    return .{ .kind = .value, .bits = lowBits(data), .data = data, .valid = valid };
+    return .{ .kind = .value, .bits = lowBits(data, ctx.endian), .data = data, .valid = valid };
 }
 
 /// CFI and frame-base consumers need complete scalar state, never missing bits.
@@ -313,4 +311,21 @@ test "composite pieces preserve partial register, memory and bit availability" {
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 0 }, implicit.valid.?);
     try std.testing.expectError(error.CompositeTooLarge, composite(a, ctx, &.{.{ .atom = OP.piece, .number = 4097 }}));
     try std.testing.expectError(error.MalformedExpression, composite(a, ctx, &.{ .{ .atom = OP.piece, .number = 1 }, .{ .atom = OP.reg0 } }));
+}
+
+test "big endian 32 bit register pieces preserve the low bytes in target order" {
+    const Mock = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8) !usize {
+            return error.MemoryUnreadable;
+        }
+    };
+    var token: u8 = 0;
+    var regs: RegisterSet = @splat(null);
+    regs[0] = 0x12345678;
+    const ctx = Context{ .registers = regs, .endian = .big, .address_bytes = 4, .user = &token, .read = Mock.read };
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const piece = try composite(arena.allocator(), ctx, &.{ .{ .atom = OP.reg0 }, .{ .atom = OP.piece, .number = 2 }, .{ .atom = OP.reg0 }, .{ .atom = OP.piece, .number = 4 } });
+    try std.testing.expectEqualSlices(u8, &.{ 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 }, piece.data.?);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 255, 255 }, piece.valid.?);
 }

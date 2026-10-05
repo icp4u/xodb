@@ -1,4 +1,4 @@
-//! Native capture artifact, experimental format 2.5. Adapted from T11's codec.
+//! Native capture artifact, experimental format 2.6. Adapted from T11's codec.
 //! Own original bytes for lossless copying; origin and recorded labels are never
 //! reconstructed from runtime session IDs or the set of available asset files.
 const std = @import("std");
@@ -27,7 +27,7 @@ const Allocator = std.mem.Allocator;
 
 pub const magic = "XODBCAPT";
 pub const format_major: u16 = 2;
-pub const format_minor: u16 = 5;
+pub const format_minor: u16 = 6;
 pub const header_bytes = 64;
 pub const entry_bytes = 24;
 pub const machine_x86_64: u16 = 62; // EM_X86_64; addresses are that machine's user VAs
@@ -60,6 +60,7 @@ pub const Error = error{
 };
 
 pub const Tag = enum(u32) {
+    producer = 0x444f5250, // "PROD", optional remote clock provenance
     syscalls = 0x43535953, // "SYSC", required feature bit 5
     limits = 0x544d494c, // "LIMT", required feature bit 4
     meta = 0x4154454d, // "META"
@@ -172,7 +173,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.config.sample_limit == 0 or capture.config.sample_limit > capture_model.max_sample_limit) return error.ArchiveLimit;
     try validateUserState(capture);
     try validateThreadScope(capture);
-    var selected_storage: [section_order.len + 4]Tag = undefined;
+    var selected_storage: [section_order.len + 5]Tag = undefined;
     @memcpy(selected_storage[0..section_order.len], &section_order);
     var selected_count: usize = section_order.len;
     if (sampled) {
@@ -189,16 +190,21 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         selected_storage[selected_count] = .syscalls;
         selected_count += 1;
     }
+    if (capture.producer != null) {
+        selected_storage[selected_count] = .producer;
+        selected_count += 1;
+    }
     const selected = selected_storage[0..selected_count];
     if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
-    var bodies: [section_order.len + 4]std.ArrayList(u8) = @splat(.empty);
+    var bodies: [section_order.len + 5]std.ArrayList(u8) = @splat(.empty);
     defer for (&bodies) |*body| body.deinit(a);
     for (selected, bodies[0..selected.len], 0..) |tag, *body, section_index| {
         try progress.step(env.progress, .encoding, section_index);
         const w = Writer{ .a = a, .out = body };
         switch (tag) {
+            .producer => try encodeProducer(w, capture.producer.?),
             .limits => try w.int(u32, capture.config.sample_limit),
             .meta => try encodeMeta(w, capture, env),
             .threads => try encodeThreads(w, capture),
@@ -222,7 +228,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..8], magic);
     std.mem.writeInt(u16, out[8..10], format_major, .little);
-    std.mem.writeInt(u16, out[10..12], if (capture.syscalls.enabled) format_minor else if (custom_limit) 4 else 3, .little);
+    std.mem.writeInt(u16, out[10..12], if (capture.producer != null) format_minor else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
     std.mem.writeInt(u32, out[12..16], header_bytes, .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], @intCast(selected.len), .little);
@@ -236,7 +242,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
         const entry = out[header_bytes + i * entry_bytes ..][0..entry_bytes];
         std.mem.writeInt(u32, entry[0..4], @intFromEnum(tag), .little);
-        std.mem.writeInt(u32, entry[4..8], 0, .little);
+        std.mem.writeInt(u32, entry[4..8], if (tag == .producer) flag_ignorable else 0, .little);
         std.mem.writeInt(u64, entry[8..16], offset, .little);
         std.mem.writeInt(u32, entry[16..20], @intCast(body.items.len), .little);
         std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(body.items), .little);
@@ -244,6 +250,31 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         offset += body.items.len;
     }
     return out;
+}
+fn encodeProducer(w: Writer, p: @import("producer.zig").Producer) !void {
+    if (!p.supported()) return error.ArchiveUnsupportedValue;
+    try w.code(1);
+    try w.int(u16, p.machine);
+    try w.code(p.address_bits);
+    try w.flag(p.little_endian);
+    try w.flag(p.boot_id != null);
+    if (p.boot_id) |id| try w.out.appendSlice(w.a, &id);
+    try w.int(u64, p.monotonic_ns);
+    try w.int(u64, p.host_monotonic_ns);
+    try w.int(u64, p.uncertainty_ns);
+}
+fn decodeProducer(r: *Reader) !@import("producer.zig").Producer {
+    if (try r.int(u8) != 1) return error.ArchiveUnsupportedValue;
+    var p = @import("producer.zig").Producer{ .machine = try r.int(u16), .address_bits = try r.int(u8), .little_endian = try r.flag(), .boot_id = null, .monotonic_ns = 0, .host_monotonic_ns = 0, .uncertainty_ns = 0 };
+    // The profiling record decoders currently support x86-64 producers.
+    if (p.machine != machine_x86_64 or p.address_bits != 64 or !p.little_endian) return error.ArchiveUnsupportedValue;
+    if (try r.flag()) p.boot_id = (try r.take(36))[0..36].*;
+    p.monotonic_ns = try r.int(u64);
+    p.host_monotonic_ns = try r.int(u64);
+    p.uncertainty_ns = try r.int(u64);
+    if (!p.supported()) return error.ArchiveUnsupportedValue;
+    try r.end();
+    return p;
 }
 fn encodeMeta(w: Writer, capture: *const Capture, env: Environment) !void {
     // Live-session identities are provenance only; reopening never reuses them.
@@ -513,6 +544,7 @@ pub const Options = struct {
 };
 /// Offline provenance kept beside the reopened capture.
 pub const Source = struct {
+    producer: ?@import("producer.zig").Producer = null,
     format_major: u16,
     format_minor: u16,
     archive_sha256: [32]u8,
@@ -567,7 +599,7 @@ pub const Opened = struct {
     }
 };
 
-const Header = struct { syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
+const Header = struct { producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
 fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (bytes.len > limit) return error.ArchiveTooLarge;
     if (bytes.len < header_bytes) return error.ArchiveTruncated;
@@ -617,6 +649,9 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
         } else if (tag == @intFromEnum(Tag.thread_scope)) {
             if (flags != 0 or required != section_order.len or result.thread_scope != null or required_features & 8 == 0 or minor < 3) return error.ArchiveSectionLayout;
             result.thread_scope = body;
+        } else if (tag == @intFromEnum(Tag.producer)) {
+            if (flags != flag_ignorable or required != section_order.len or result.producer != null or minor < 6) return error.ArchiveSectionLayout;
+            result.producer = body;
         } else if (flags == flag_ignorable) {
             for (section_order) |known| if (tag == @intFromEnum(known)) return error.ArchiveSectionLayout;
             result.ignored += 1;
@@ -654,6 +689,11 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     std.crypto.hash.sha2.Sha256.hash(bytes, &source.archive_sha256, .{});
     var r = Reader{ .bytes = header.sections[0], .cancel = if (options.progress) |p| &p.cancel else null };
     try decodeMeta(&r, self, &source, arena.allocator());
+    if (header.producer) |body| {
+        var producer_reader = Reader{ .bytes = body };
+        self.producer = try decodeProducer(&producer_reader);
+        source.producer = self.producer;
+    }
     if (header.limits) |body| {
         var limit_reader = Reader{ .bytes = body };
         const sample_limit = try limit_reader.int(u32);

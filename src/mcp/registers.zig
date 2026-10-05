@@ -5,8 +5,8 @@ const Session = @import("../model/session.zig").Session;
 pub fn call(a: std.mem.Allocator, session: *Session, args: std.json.Value) !std.json.Value {
     try wire.fields(args, &.{ "tid", "generation", "format", "width" });
     if (session.offline) return error.OfflineSession;
-    const generation = try wire.number(args, "generation", session.target.generation);
-    if (generation != session.target.generation) return error.StaleSnapshot;
+    const generation = try wire.number(args, "generation", session.target.snapshot().generation);
+    try session.target.expectGeneration(generation);
     const tid = try wire.number(args, "tid", null);
     if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
     const state = try session.target.extendedRegisters(@intCast(tid));

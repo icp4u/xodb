@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "../profile/allocation_broker.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -11,9 +12,10 @@ pub fn build(b: *std.Build) void {
     options.addOption([]const u8, "font_path", font_path);
     module.addOptions("build_options", options);
     module.addIncludePath(b.path("src/profile"));
-    module.addCSourceFile(.{ .file = b.path("src/profile/allocation_broker.c"), .flags = &.{"-std=c11"} });
-    module.addCSourceFile(.{ .file = b.path("src/binary/mapped_file.c"), .flags = &.{"-std=c11"} });
-    if (target.result.cpu.arch == .x86_64) module.addCSourceFile(.{ .file = b.path("src/target/xstate_layout.c"), .flags = &.{"-std=c11"} });
+    module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source| {
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
     for ([_][]const u8{ "capstone", "libdw" }) |lib| module.linkSystemLibrary(lib, .{});
     if (gui) {
         const header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
@@ -47,7 +49,7 @@ pub fn build(b: *std.Build) void {
     if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux) {
         const helper = b.addExecutable(.{ .name = "xodb-allocation-helper", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         helper.root_module.addCSourceFile(.{ .file = b.path("src/profile/allocation_broker.c"), .flags = &.{ "-std=c11", "-DXODB_ALLOCATION_HELPER" } });
-        helper.root_module.addCSourceFile(.{ .file = b.path("src/binary/mapped_file.c"), .flags = &.{"-std=c11"} });
+        helper.root_module.addCSourceFile(.{ .file = b.path("src/runtime/mapped_file.c"), .flags = &.{"-std=c11"} });
         const installed_helper = b.addInstallArtifact(helper, .{});
         b.getInstallStep().dependOn(&installed_helper.step);
         app_step.dependOn(&installed_helper.step);
@@ -74,12 +76,67 @@ pub fn build(b: *std.Build) void {
     process.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/process-tree.c"), .flags = &.{ "-g", "-O0", "-fno-omit-frame-pointer" } });
     b.installArtifact(process);
     const tests = b.addTest(.{ .root_module = module });
+    const runtime_tests = b.addExecutable(.{ .name = "xodb-runtime-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    runtime_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/memory.c", "tests/runtime-memory.c" }) |source| {
+        runtime_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const register_tests = b.addExecutable(.{ .name = "xodb-runtime-register-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    register_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/registers.c", "tests/runtime-registers.c" }) |source| {
+        register_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    const process_tests = b.addExecutable(.{ .name = "xodb-runtime-process-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    process_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/process.c", "tests/runtime-process.c" }) |source| {
+        process_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    const target_tests = b.addExecutable(.{ .name = "xodb-runtime-target-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    target_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source| {
+        target_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    target_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-target.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const perf_tests = b.addExecutable(.{ .name = "xodb-runtime-perf-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    perf_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source| {
+        perf_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    wire_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
+        wire_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    const agent = b.addExecutable(.{ .name = "xodb-agent", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    const snapshot_tests = b.addExecutable(.{ .name = "xodb-runtime-snapshot-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_]*std.Build.Step.Compile{ agent, snapshot_tests }) |artifact| {
+        artifact.root_module.addIncludePath(b.path("src/runtime"));
+        for (runtime_sources) |source| artifact.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    agent.root_module.addCSourceFile(.{ .file = b.path("src/runtime/agent_main.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    snapshot_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-snapshot.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    const install_agent = b.addInstallArtifact(agent, .{});
+    b.getInstallStep().dependOn(&install_agent.step);
+    b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
+    app_step.dependOn(&install_agent.step);
+    const test_step = b.step("test", "Run unit and real target integration tests");
+    if (!target.result.abi.isAndroid()) {
+        const remote_tests = b.addExecutable(.{ .name = "xodb-runtime-remote-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+        remote_tests.pie = false;
+        remote_tests.root_module.addIncludePath(b.path("src/runtime"));
+        for (runtime_sources) |source| remote_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        remote_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-remote.c"), .flags = &.{ "-std=c11", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });
+        const remote_run = b.addRunArtifact(remote_tests);
+        remote_run.addArtifactArg(agent);
+        test_step.dependOn(&remote_run.step);
+    }
     if (target.result.abi.isAndroid()) {
         if (gui) @panic("Android currently supports -Dgui=false only");
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, profile, lifecycle, process, tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -88,5 +145,12 @@ pub fn build(b: *std.Build) void {
     const test_run = b.addRunArtifact(tests);
     test_run.step.dependOn(b.getInstallStep());
     test_run.step.dependOn(&b.addSystemCommand(&.{"tests/fixtures/elf/build.sh"}).step);
-    b.step("test", "Run unit and real target integration tests").dependOn(&test_run.step);
+    test_step.dependOn(&test_run.step);
+    test_step.dependOn(&b.addRunArtifact(runtime_tests).step);
+    test_step.dependOn(&b.addRunArtifact(register_tests).step);
+    test_step.dependOn(&b.addRunArtifact(process_tests).step);
+    test_step.dependOn(&b.addRunArtifact(target_tests).step);
+    test_step.dependOn(&b.addRunArtifact(perf_tests).step);
+    test_step.dependOn(&b.addRunArtifact(wire_tests).step);
+    test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
 }

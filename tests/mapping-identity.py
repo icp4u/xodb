@@ -13,12 +13,14 @@ import tempfile
 
 root = Path(__file__).resolve().parents[1]
 run = Path(tempfile.mkdtemp(prefix='mapping-identity-', dir=root / '.work'))
+run.chmod(0o755)
 flags = ['gcc', '-fPIC', '-O2', '-Wall', '-Wextra', '-Werror']
-subprocess.run([*flags, '-shared', str(root / 'src/binary/mapped_file.c'), '-o', str(run / 'real.so')], check=True)
-subprocess.run([*flags, '-Dfstat=xodb_test_stat', '-Dfstatfs=xodb_test_statfs', '-c', str(root / 'src/binary/mapped_file.c'), '-o', str(run / 'mapped.o')], check=True)
+subprocess.run([*flags, '-shared', str(root / 'src/runtime/mapped_file.c'), '-o', str(run / 'real.so')], check=True)
+subprocess.run([*flags, '-Dfstat=xodb_test_stat', '-Dfstatfs=xodb_test_statfs', '-c', str(root / 'src/runtime/mapped_file.c'), '-o', str(run / 'mapped.o')], check=True)
 subprocess.run([*flags, '-shared', str(run / 'mapped.o'), str(root / 'tests/fixtures/identity-stat-shim.c'), '-o', str(run / 'simulated.so')], check=True)
 directory = Path(os.environ.get('XODB_IDENTITY_TEST_DIR', run))
 with tempfile.TemporaryDirectory(prefix='xodb-identity-', dir=directory) as fixture_dir:
+    Path(fixture_dir).chmod(0o755)
     fixture = Path(fixture_dir) / 'mapped'
     fixture.write_bytes(b'x' * mmap.PAGESIZE)
     other = Path(fixture_dir) / 'other'

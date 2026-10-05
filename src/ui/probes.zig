@@ -51,7 +51,7 @@ pub const Panel = struct {
             self.open = false;
             return true;
         }
-        const count = session.target.breakpoint_count;
+        const count = session.target.snapshot().breakpoint_count;
         if (key_ == 'n') {
             self.editing = .symbol;
             self.editor.start();
@@ -69,7 +69,7 @@ pub const Panel = struct {
             return true;
         }
         if (event.kind == .repeat) return true;
-        const probe = session.target.breakpoints[self.selected];
+        const probe = session.target.breakpointSlice()[self.selected];
         if (probe.internal) {
             self.message = "Internal loader breakpoint (read-only)";
             return true;
@@ -122,7 +122,7 @@ pub const Panel = struct {
             return;
         }
         var enabled = true;
-        for (session.target.breakpoints[0..session.target.breakpoint_count]) |probe| {
+        for (session.target.breakpointSlice()) |probe| {
             if (probe.id == self.editing_id) {
                 enabled = probe.enabled;
                 break;
@@ -184,13 +184,13 @@ pub const Panel = struct {
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.text(font, b.x + 14, b.y + 10, "BREAKPOINTS   B / Esc close", theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, "N new  Space toggle  Del  C if  L log  O stop  H ignore  T thread", theme.weak);
-        const count = session.target.breakpoint_count;
+        const count = session.target.snapshot().breakpoint_count;
         const visible: usize = @intFromFloat(@max(1, (b.h - 188) / 24));
         self.selected = @min(self.selected, count -| 1);
         if (self.selected < self.scroll) self.scroll = self.selected;
         if (self.selected >= self.scroll + visible) self.scroll = self.selected - visible + 1;
         var buffer: [1024]u8 = undefined;
-        for (session.target.breakpoints[self.scroll..@min(count, self.scroll + visible)], self.scroll..) |probe, i| {
+        for (session.target.breakpointSlice()[self.scroll..@min(count, self.scroll + visible)], self.scroll..) |probe, i| {
             const y = b.y + 64 + @as(f32, @floatFromInt(i - self.scroll)) * 24;
             if (i == self.selected) try r.rect(.{ .x = b.x + 6, .y = y - 1, .w = b.w - 12, .h = 24 }, style.fade(theme.focus, 0.16));
             const rule = session.probes.rule(probe.id);
@@ -201,7 +201,7 @@ pub const Panel = struct {
         }
         if (count == 0) try r.text(font, b.x + 14, b.y + 70, "Set a source/assembly breakpoint to configure it here", theme.weak);
         const y = b.y + b.h - 112;
-        if (count > 0) if (session.probes.rule(session.target.breakpoints[self.selected].id)) |rule| {
+        if (count > 0) if (session.probes.rule(session.target.breakpointSlice()[self.selected].id)) |rule| {
             var thread_buffer: [40]u8 = undefined;
             var thread_label: []const u8 = "all";
             if (rule.thread_id) |id| {
@@ -213,7 +213,7 @@ pub const Panel = struct {
             const detail = try std.fmt.bufPrint(&buffer, "matched {d}  ignore {d}  thread {s}  {s}", .{ rule.matched_hits, rule.ignore_remaining, thread_label, rule.last_error orelse "" });
             try r.textFit(font, b.x + 14, y, b.w - 28, detail, if (rule.last_error != null) theme.warm else theme.weak);
         };
-        if (count > 0) if (session.persistent.entry(session.target.breakpoints[self.selected].id)) |definition| {
+        if (count > 0) if (session.persistent.entry(session.target.breakpointSlice()[self.selected].id)) |definition| {
             if (definition.diagnostic) |diagnostic| try r.textFit(font, b.x + 14, y, b.w - 28, diagnostic, theme.warm);
         };
         try r.textFit(font, b.x + 14, y + 24, b.w - 28, self.message, theme.text);

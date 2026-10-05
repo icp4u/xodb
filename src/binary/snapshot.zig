@@ -42,8 +42,14 @@ pub fn readRange(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel:
     return bytes;
 }
 pub fn bootId() ?[36]u8 {
-    const fd = c.open("/proc/sys/kernel/random/boot_id", c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
-    if (fd < 0) return null;
+    return bootIdTarget(null);
+}
+pub fn bootIdTarget(target: ?*const @import("../target/runtime.zig").c.struct_xrt_target) ?[36]u8 {
+    const rt = @import("../target/runtime.zig").c;
+    const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_BOOT_ID });
+    var fd: c_int = -1;
+    const status = if (target) |t| rt.xrt_target_file(t, &request, &fd) else rt.xrt_process_file(0, &request, &fd);
+    if (status != rt.XRT_OK) return null;
     defer _ = c.close(fd);
     var value: [36]u8 = undefined;
     if (c.read(fd, &value, value.len) != value.len) return null;

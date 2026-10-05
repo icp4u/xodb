@@ -1,6 +1,7 @@
 //! Independent CPU accounting for explaining a sparse user-space sample set.
 //! These are start/stop procfs snapshots, not weighted samples or wait traces.
 const std = @import("std");
+const rt = @import("runtime.zig").c;
 const c = @import("linux_perf.zig").c;
 pub const Ticks = struct { start_time: u64, user: u64, kernel: u64 };
 pub const Totals = struct {
@@ -46,12 +47,15 @@ pub fn ticksPerSecond() u64 {
     return if (hz > 0) @intCast(hz) else 0;
 }
 pub fn read(pid: i32, tid: i32) ?Ticks {
+    return readTarget(null, pid, tid);
+}
+pub fn readTarget(target: ?*const rt.struct_xrt_target, pid: i32, tid: i32) ?Ticks {
     // /proc/PID/stat aggregates a thread group. This path gives only the selected
     // task, including when TID == PID, avoiding double-counting the leader.
-    var buffer: [96]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&buffer, "/proc/{d}/task/{d}/stat", .{ pid, tid }) catch return null;
-    const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return null;
+    const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_THREAD_STAT, .tid = tid });
+    var fd: c_int = -1;
+    const status = if (target) |t| rt.xrt_target_file(t, &request, &fd) else rt.xrt_process_file(pid, &request, &fd);
+    if (status != rt.XRT_OK) return null;
     defer _ = c.close(fd);
     var bytes: [2048]u8 = undefined;
     const n = c.read(fd, &bytes, bytes.len);

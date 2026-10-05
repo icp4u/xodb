@@ -32,12 +32,12 @@ pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source
         session.record(.agent, "detach");
         return asValue(a, session.snapshot());
     }
-    const generation = try number(args, "generation", session.target.generation);
-    if (generation != session.target.generation) return error.StaleSnapshot;
+    const generation = try number(args, "generation", session.target.snapshot().generation);
+    try session.target.expectGeneration(generation);
     const frame_index = try number(args, "frame", 0);
     const tid_number = try number(args, "tid", 0);
     if (frame_index >= 64 or tid_number > std.math.maxInt(i32)) return error.InvalidArguments;
-    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.pid, .architecture = @tagName(@import("../target/arch.zig").native), .state = @tagName(session.target.state), .scope = @tagName(session.agent_scope), .owned = session.target.owned, .frame = @intCast(frame_index) };
+    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.snapshot().pid, .architecture = @tagName(session.target.arch()), .state = @tagName(session.target.snapshot().state), .scope = @tagName(session.agent_scope), .owned = session.target.snapshot().owned, .frame = @intCast(frame_index) };
     if (args.object.get("summary_only")) |summary| {
         if (summary != .bool) return error.InvalidArguments;
         if (summary.bool) return asValue(a, view);
@@ -50,7 +50,7 @@ pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source
     view.tid = if (tid_number == 0) defaultThread(threads) else @intCast(tid_number);
     var diagnostics: std.ArrayList(wire.Diagnostic) = .empty;
     if (session.step_diagnostic) |d| try diagnostics.append(a, .{ .component = "step", .message = d });
-    if (session.target.state == .stopped and view.tid != 0) {
+    if (session.target.snapshot().state == .stopped and view.tid != 0) {
         inspect(a, session, &view, &diagnostics) catch |err| try diagnostics.append(a, .{ .component = "inspection", .message = @errorName(err) });
         // Only a file explicitly supplied by the server operator is shared.
         if (source) |path| {
@@ -78,9 +78,9 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
         try diagnostics.append(a, .{ .component = "watchpoints", .message = @errorName(err) });
         break :blk null;
     };
-    view.watch_execute = @import("../target/linux.zig").architecture == .x86_64;
+    view.watch_execute = session.target.arch() == .x86_64;
     var watches: std.ArrayList(wire.Watchpoint) = .empty;
-    for (session.target.watchpoints) |maybe| if (maybe) |watch| {
+    for (session.target.watchpointSlice()) |maybe| if (maybe) |watch| {
         try watches.append(a, .{ .id = watch.id, .address = watch.address, .length = watch.length, .kind = @tagName(watch.kind) });
     };
     view.watchpoints = watches.items;
@@ -100,8 +100,8 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     }
     view.watch_hits = hits.items;
     const regs = try session.target.registers(view.tid);
-    const register_rows = try a.alloc(wire.Register, std.meta.fields(@TypeOf(regs)).len);
-    inline for (std.meta.fields(@TypeOf(regs)), 0..) |field, i| register_rows[i] = .{ .name = field.name, .value = @field(regs, field.name) };
+    const register_rows = try a.alloc(wire.Register, regs.descriptions().len);
+    for (regs.descriptions(), 0..) |desc, i| register_rows[i] = .{ .name = std.mem.span(desc.name), .value = regs.value(desc) };
     view.registers = register_rows;
     const frames = session.stack(a, view.tid, 64) catch |err| blk: {
         try diagnostics.append(a, .{ .component = "stack", .message = @errorName(err) });
@@ -131,7 +131,7 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     for (decoded[0..count], instructions) |inst, *row| row.* = .{ .address = inst.address, .mnemonic = try a.dupe(u8, std.mem.sliceTo(&inst.mnemonic, 0)), .operands = try a.dupe(u8, std.mem.sliceTo(&inst.operands, 0)) };
     view.instructions = instructions;
     var probes: std.ArrayList(wire.Breakpoint) = .empty;
-    for (session.target.breakpoints[0..session.target.breakpoint_count]) |probe| {
+    for (session.target.breakpointSlice()) |probe| {
         if (probe.temporary) continue;
         const site = session.sourceAt(a, probe.address) catch null;
         try probes.append(a, .{ .id = probe.id, .address = probe.address, .source = if (site) |s| .{ .path = s.path, .line = s.line } else null });

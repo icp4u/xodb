@@ -59,13 +59,16 @@ fn edge(graph: Graph, from: usize, kind: EdgeKind, destination: ?u64, assumed: b
 }
 /// All returned allocations belong to `a`; source metadata is filled by Session.
 pub fn build(a: std.mem.Allocator, bytes: []const u8, address: u64) !Graph {
+    return buildFor(@import("../target/arch.zig").native, a, bytes, address);
+}
+pub fn buildFor(architecture: @import("../target/arch.zig").Arch, a: std.mem.Allocator, bytes: []const u8, address: u64) !Graph {
     if (bytes.len == 0) return error.EmptyFunction;
     if (bytes.len > max_bytes) return error.FunctionTooLarge;
     if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
     const capacity = @min(max_instructions + 1, bytes.len);
     const buffer = try a.alloc(disasm.Instruction, capacity);
     defer a.free(buffer);
-    const count = try disasm.decodeFlow(bytes, address, buffer);
+    const count = try disasm.decodeFlowFor(architecture, bytes, address, buffer);
     if (count == 0) return error.UndecodableFunction;
     if (count > max_instructions) return error.InstructionLimit;
     const instructions = try a.dupe(disasm.Instruction, buffer[0..count]);

@@ -1,0 +1,146 @@
+# C runtime
+
+Target execution and kernel collection live in `src/runtime/`. Both the local
+debugger and the standalone agent use this implementation. Zig retains the GUI,
+MCP, symbols, source stepping policy, DWARF analysis, expressions, profile decoding
+and archives. See the agreed [C/Zig boundary](ZIG_TO_C.md).
+
+## Build and try it
+
+The ordinary application build also produces `zig-out/bin/xodb-agent`:
+
+```sh
+./scripts/build -Doptimize=ReleaseSafe
+./zig-out/bin/xodb --runtime-agent ./zig-out/bin/xodb-agent \
+  --break change_value -- ./zig-out/bin/xodb-m1-fixture
+```
+
+Press **Space** to reach `change_value`, **F11** to step into a source line (or an instruction when source is unavailable), **Tab** to
+inspect registers, and **F10** to step over a source line. Omitting
+`--runtime-agent` uses the same C runtime in the host process.
+
+For a target machine, build with a normal C11 compiler and Linux development
+headers. The agent links libc, pthread and libatomic; it needs no Zig, Capstone,
+libdw, graphics libraries or generated bindings. Run from a source checkout:
+
+```sh
+make -C src/runtime CC=gcc BUILD="$PWD/.work/c-runtime" all
+make -C src/runtime CC=gcc BUILD="$PWD/.work/c-runtime" check
+# Or use CC=clang and a separate BUILD directory.
+```
+
+The output is `libxrt.a` and `xodb-agent`. Copy the agent to a work directory on
+the target, then use its absolute path:
+
+```sh
+./zig-out/bin/xodb --runtime-ssh my-target --ssh-config ~/.ssh/config \
+  --runtime-agent /home/dev/xodb-build/xodb-agent \
+  --break main -- /home/dev/debug-program
+```
+
+SSH uses batch authentication and no PTY. Host command arguments are passed
+directly to exec; the remote agent path is shell-quoted. Target program arguments
+travel as separate wire strings. Relative program paths are relative to the
+agent's working directory. Source files are still resolved by the host; use the
+existing source maps when paths differ.
+
+`--headless --mcp` works with both commands. This stream is separate from the
+older `--ssh` / `--connect` GUI-to-MCP connection, which remains available.
+
+To profile through a local agent:
+
+```sh
+./zig-out/bin/xodb --runtime-agent ./zig-out/bin/xodb-agent \
+  --capture-out remote.xoc --break main -- ./zig-out/bin/xodb-profile-fixture 5
+```
+
+Press **Space** to reach `main`, **P** to start sampling, **Space** to run, then
+**P** to stop sampling while it runs (or let the target exit). Press **F** for
+flames. Exit normally to finish saving, then reopen with
+`xodb --open-capture remote.xoc`. See [capture and comparison](PROFILE_COMPARISON.md).
+For remote allocation capture, `--allocation-helper /target/path/to/helper`
+explicitly selects the existing privilege helper **on the target**; the agent
+never automatically elevates itself. [Allocation setup](ALLOCATIONS.md) applies.
+
+## Supported operations
+
+| Target ISA | Execution and analysis | Additional support |
+| --- | --- | --- |
+| x86-64 | Launch/attach, threads, signals, break/step, registers/memory, host symbols/DWARF | Hardware watches, fork/vfork coordination, SIMD/FP, CPU/syscall/allocation capture |
+| AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; no process following or remote profiling |
+| m68k | GCC-built agent tested in the VM: launch, break/step, GPR writes, ELF32 big-endian files, host disassembly, CFI and expressions | Hardware watches, FP state, process following and profiling explicitly unsupported |
+
+Kernel permissions and kernel feature availability are checked by each operation.
+Unsupported architecture/capability, permissions, transport failures and stale
+state have distinct results. AArch64 was cross-compiled during this migration;
+no new live ARM64 run is claimed. m68k big-endian DWARF bit pieces remain explicitly
+unsupported; ordinary byte pieces work. Core dumps remain host-side analysis.
+
+## Ownership and protocol
+
+Public C headers describe opaque target/collector handles, immutable views and
+explicit destruction. One OS thread owns ptrace and related target families.
+Metadata transfers and allocation preparation may run in workers; the proxy
+serializes requests, and these operations never publish a target snapshot.
+Workers must finish before destroying their target. Active collectors prevent
+target destruction. Failed detach retains its handle for an explicit retry.
+
+The private protocol is experimental version 1, with no compatibility guarantee
+between development revisions. Build host and agent from the same revision.
+The 32-byte big-endian header contains `XRT1`, u16 version/opcode, u64 request ID,
+and u32 target/status/body length/flags. Requests use flags 0; replies use flags 1.
+IDs must increase by one. Frames have a 1 MiB ceiling and a 10-second deadline;
+operation blobs have a 64 KiB ceiling. Native C structs never cross the stream.
+`rpc.h`, `wire_target.c` and `perf_wire.c` define the field order and validation.
+
+Execution mutations carry the expected authoritative generation. Replies carry
+complete bounded snapshots with contiguous event suffixes; malformed snapshots
+break the connection. Stale mutations return the current snapshot without
+executing. The agent polls and waits only on its known TIDs. A broken stream
+closes files and collectors, kills owned launches, and attempts to detach
+attached processes. Cleanup failure is reported separately in the agent's exit
+status; the host retains failed-cleanup handles.
+
+The connection supports 128 target handles, 32 file transfers and 32 collectors.
+Each target has at most 1,024 threads, 4,096 retained events, 128 software probes
+and four hardware watch slots. Mapped ELF transfers are identity-checked before,
+during and after reading (256 MiB ceiling); bounded proc metadata uses a 4 MiB
+ceiling. Host copies are sealed memfds, so analysis never silently opens the
+target's path on the host. Large debug assets must fit the existing snapshot
+budgets. Target page size, clock tick rate, register widths and endianness come
+from the agent.
+
+Remote perf fragments contain complete records and an explicit producer layout.
+Only the decoded prefix is acknowledged; the agent verifies record boundaries
+before advancing the kernel tail. Zero-consumption retries retain the bytes.
+Loss, capacity and collector failures retain the same meaning as local captures.
+The agent enrolls held newborn threads before resuming them when CPU capture
+follows threads. Syscall/allocation capture retains its explicit thread scope.
+
+Remote timestamps are correlated to the host monotonic clock using the shortest
+of four initial round trips. Half that round trip is the initial uncertainty;
+clock drift is not measured. Captures preserve target boot/clock provenance and
+use the host boot domain for normalized times. CPU archives add optional PROD
+metadata in [format 2.6](M2_ARCHIVE_FORMAT.md); native captures retain their
+previous minor version.
+
+## Verification
+
+```sh
+./scripts/build test -Doptimize=ReleaseSafe --summary all
+make -C src/runtime check
+python3 tests/runtime-agent.py
+python3 tests/runtime-host.py
+python3 scripts/gui-smoke.py --m1 --runtime-agent
+XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent python3 tests/m2-profile.py
+XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent python3 tests/m2-dynamic-threads.py
+XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent python3 tests/syscall-timing.py
+XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent python3 tests/allocations-live.py \
+  --helper "$PWD/zig-out/bin/xodb-allocation-helper"
+```
+
+The last command explicitly exercises the existing sudo helper workflow. The
+GUI test uses a private headless compositor. For the cross-ISA host check, compile
+`tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
+on m68k, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
+--fixture /path/fixture --arch m68k` to `tests/runtime-host.py`.

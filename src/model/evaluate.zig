@@ -13,6 +13,7 @@ pub fn enumeratorName(value: Value) ?[]const u8 {
 pub const Availability = enum { available, optimized_out, unavailable, unsupported };
 pub const Value = struct { type: *const Type, address: ?u64 = null, bits: u64 = 0, availability: Availability = .available, data: ?[]const u8 = null, valid: ?[]const u8 = null };
 pub const Context = struct {
+    endian: std.builtin.Endian = .little,
     user: *anyopaque,
     lookup: *const fn (*anyopaque, []const u8) anyerror!Value,
     read: *const fn (*anyopaque, u64, []u8) anyerror!usize,
@@ -37,13 +38,13 @@ pub fn materialize(ctx: Context, value: Value) !Value {
         }
         var bytes: [8]u8 = @splat(0);
         @memcpy(bytes[0..size], data[0..size]);
-        v.bits = std.mem.readInt(u64, &bytes, .little);
+        v.bits = @import("../debug/location.zig").lowBits(bytes[0..size], ctx.endian);
     } else if (v.address) |address| {
         if (v.type.size == 0 or v.type.size > 8) return error.UnsupportedType;
         var bytes: [8]u8 = @splat(0);
         const size: usize = @intCast(v.type.size);
         if (try ctx.read(ctx.user, address, bytes[0..size]) != size) return error.MemoryUnreadable;
-        v.bits = std.mem.readInt(u64, &bytes, .little);
+        v.bits = @import("../debug/location.zig").lowBits(bytes[0..size], ctx.endian);
     }
     if (v.type.size == 0 or v.type.size > 8 or v.type.kind == .unknown) return error.UnsupportedType;
     if (v.type.size < 8) {

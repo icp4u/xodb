@@ -104,15 +104,15 @@ pub const Server = struct {
             if (m > core.mappings.items.len or p > core.segments.items.len or limit == 0 or limit > 32) return error.InvalidArguments;
             const me = m + @min(limit, core.mappings.items.len - m);
             const pe = p + @min(limit, core.segments.items.len - p);
-            return asValue(a, .{ .generation = session.target.generation, .path = core.path, .file_bytes = core.size, .pid = core.pid, .command = core.command, .signal = core.signal, .threads = core.threads.items.len, .segment_total = core.segments.items.len, .mapping_total = core.mappings.items.len, .mapping_next = if (me < core.mappings.items.len) @as(?u64, me) else null, .segment_next = if (pe < core.segments.items.len) @as(?u64, pe) else null, .segments = core.segments.items[@intCast(p)..@intCast(pe)], .mappings = core.mappings.items[@intCast(m)..@intCast(me)], .read_only = true, .memory_basis = "captured PT_LOAD bytes only; omitted memory is unavailable", .symbol_basis = "local ELF build ID matched against captured notes" });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .path = core.path, .file_bytes = core.size, .pid = core.pid, .command = core.command, .signal = core.signal, .threads = core.threads.items.len, .segment_total = core.segments.items.len, .mapping_total = core.mappings.items.len, .mapping_next = if (me < core.mappings.items.len) @as(?u64, me) else null, .segment_next = if (pe < core.segments.items.len) @as(?u64, pe) else null, .segments = core.segments.items[@intCast(p)..@intCast(pe)], .mappings = core.mappings.items[@intCast(m)..@intCast(me)], .read_only = true, .memory_basis = "captured PT_LOAD bytes only; omitted memory is unavailable", .symbol_basis = "local ELF build ID matched against captured notes" });
         }
         if (std.mem.eql(u8, name, "get_stop_info")) {
             const wire = @import("profile.zig");
             try wire.fields(args, &.{ "tid", "generation" });
             const tid = try wire.number(args, "tid", 0);
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
-            if (try wire.number(args, "generation", session.target.generation) != session.target.generation) return error.StaleSnapshot;
-            return asValue(a, .{ .generation = session.target.generation, .stop = try session.target.stopInfo(@intCast(tid)) });
+            try session.target.expectGeneration(try wire.number(args, "generation", session.target.snapshot().generation));
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .stop = try session.target.stopInfo(@intCast(tid)) });
         }
         if (std.mem.eql(u8, name, "get_debug_files")) {
             try @import("profile.zig").fields(args, &.{});
@@ -162,7 +162,7 @@ pub const Server = struct {
         }
         if (member(args, "generation")) |v| {
             const generation = number(v) orelse return error.InvalidArguments;
-            if (generation != session.target.generation) return error.StaleSnapshot;
+            try session.target.expectGeneration(generation);
         }
         if (std.mem.eql(u8, name, "find_symbol")) {
             try session.refreshMaps();
@@ -173,7 +173,7 @@ pub const Server = struct {
             try session.refreshMaps();
             return asValue(a, .{ .regions = session.modules.regions.items, .load_failures = session.modules.load_failures.items });
         }
-        if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpoints[0..session.target.breakpoint_count], .watchpoints = session.target.watchpoints, .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = @import("../target/linux.zig").architecture == .x86_64 });
+        if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpointSlice(), .watchpoints = session.target.watchpointSlice(), .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = session.target.arch() == .x86_64 });
         if (std.mem.eql(u8, name, "get_investigation")) return asValue(a, (try session.investigation(number(member(args, "id")) orelse return error.InvalidArguments)).*);
         if (std.mem.eql(u8, name, "get_audit")) return asValue(a, .{ .actions = session.audit[0..session.audit_count] });
         const execution_names = [_][]const u8{ "continue", "interrupt", "step_instruction", "step_over_instruction", "step_source", "step_over", "investigate_write", "set_breakpoint", "remove_breakpoint", "set_watchpoint", "remove_watchpoint" };
@@ -238,9 +238,9 @@ pub const Server = struct {
                 if (hex.len == 0 or hex.len > 8192 or hex.len % 2 != 0) return error.InvalidArguments;
                 var bytes: [4096]u8 = undefined;
                 for (0..hex.len / 2) |i| bytes[i] = std.fmt.parseInt(u8, hex[i * 2 ..][0..2], 16) catch return error.InvalidArguments;
-                const before = session.target.generation;
+                const before = session.target.snapshot().generation;
                 session.target.writeMemory(try address(args), bytes[0 .. hex.len / 2]) catch |err| {
-                    if (session.target.generation != before) session.record(.agent, "write_memory_partial");
+                    if (session.target.snapshot().generation != before) session.record(.agent, "write_memory_partial");
                     return err;
                 };
             } else if (std.mem.eql(u8, name, "write_register")) {
@@ -254,19 +254,19 @@ pub const Server = struct {
             return asValue(a, .{ .id = created_id, .session = session.snapshot() });
         }
         if (std.mem.eql(u8, name, "get_session")) return asValue(a, session.snapshot());
-        if (std.mem.eql(u8, name, "list_threads")) return asValue(a, .{ .generation = session.target.generation, .threads = session.target.threadSlice() });
-        if (std.mem.eql(u8, name, "get_source_location")) return asValue(a, .{ .generation = session.target.generation, .source = try session.sourceAt(a, try address(args)) });
+        if (std.mem.eql(u8, name, "list_threads")) return asValue(a, .{ .generation = session.target.snapshot().generation, .threads = session.target.threadSlice() });
+        if (std.mem.eql(u8, name, "get_source_location")) return asValue(a, .{ .generation = session.target.snapshot().generation, .source = try session.sourceAt(a, try address(args)) });
         if (std.mem.eql(u8, name, "get_stack") or std.mem.eql(u8, name, "list_locals")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
-            if (std.mem.eql(u8, name, "get_stack")) return asValue(a, .{ .generation = session.target.generation, .frames = try session.stack(a, @intCast(tid), 64) });
+            if (std.mem.eql(u8, name, "get_stack")) return asValue(a, .{ .generation = session.target.snapshot().generation, .frames = try session.stack(a, @intCast(tid), 64) });
             const frame_index = if (member(args, "frame")) |v| number(v) orelse return error.InvalidArguments else 0;
             if (frame_index >= 64) return error.InvalidArguments;
             const depth = try inlineDepth(args);
             const locals = try session.localsAtDepth(a, @intCast(tid), @intCast(frame_index), depth);
             var list: std.array_list.Managed(Value) = .init(a);
             for (locals) |v| try list.append(try asValue(a, .{ .name = v.name, .parameter = v.parameter, .value = try session.summarize(a, v.value), .diagnostic = v.diagnostic }));
-            return asValue(a, .{ .generation = session.target.generation, .tid = tid, .frame = frame_index, .inline_depth = depth, .locals = Value{ .array = list } });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .tid = tid, .frame = frame_index, .inline_depth = depth, .locals = Value{ .array = list } });
         }
         if (std.mem.eql(u8, name, "get_value_children")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
@@ -281,7 +281,7 @@ pub const Server = struct {
             if (frame >= 64 or limit == 0 or limit > 64) return error.InvalidArguments;
             const expression = string(member(args, "expression")) orelse return error.InvalidArguments;
             const v = try session.evaluateAtDepth(a, @intCast(tid), @intCast(frame), try inlineDepth(args), expression);
-            return asValue(a, .{ .generation = session.target.generation, .tid = tid, .frame = frame, .expression = expression, .view = try session.valueChildren(a, v, start, @intCast(limit), raw) });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .tid = tid, .frame = frame, .expression = expression, .view = try session.valueChildren(a, v, start, @intCast(limit), raw) });
         }
         if (std.mem.eql(u8, name, "evaluate_expression")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
@@ -290,15 +290,15 @@ pub const Server = struct {
             const frame_index = if (member(args, "frame")) |v| number(v) orelse return error.InvalidArguments else 0;
             if (frame_index >= 64) return error.InvalidArguments;
             const value = try session.evaluateAtDepth(a, @intCast(tid), @intCast(frame_index), try inlineDepth(args), expression);
-            return asValue(a, .{ .generation = session.target.generation, .tid = tid, .expression = expression, .type = value.type.name, .kind = value.type.kind, .size = value.type.size, .bits = try std.fmt.allocPrint(a, "0x{x}", .{value.bits}), .availability = value.availability, .value = try session.summarize(a, value) });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .tid = tid, .expression = expression, .type = value.type.name, .kind = value.type.kind, .size = value.type.size, .bits = try std.fmt.allocPrint(a, "0x{x}", .{value.bits}), .availability = value.availability, .value = try session.summarize(a, value) });
         }
         if (std.mem.eql(u8, name, "get_registers")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
             const regs = try session.target.registers(@intCast(tid));
             var values: std.json.ObjectMap = .{};
-            inline for (std.meta.fields(@TypeOf(regs))) |field| try values.put(a, field.name, .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{@field(regs, field.name)}) });
-            return asValue(a, .{ .generation = session.target.generation, .tid = tid, .registers = Value{ .object = values } });
+            for (regs.descriptions()) |desc| try values.put(a, std.mem.span(desc.name), .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{regs.value(desc)}) });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .tid = tid, .registers = Value{ .object = values } });
         }
         if (std.mem.eql(u8, name, "read_memory")) {
             const addr = try address(args);
@@ -312,10 +312,10 @@ pub const Server = struct {
                 hex[i * 2] = digits[v >> 4];
                 hex[i * 2 + 1] = digits[v & 15];
             }
-            return asValue(a, .{ .generation = session.target.generation, .address = try std.fmt.allocPrint(a, "0x{x}", .{addr}), .bytes_read = n, .hex = hex });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .address = try std.fmt.allocPrint(a, "0x{x}", .{addr}), .bytes_read = n, .hex = hex });
         }
         if (std.mem.eql(u8, name, "get_function_graph")) {
-            if (session.target.state != .stopped) return error.NotStopped;
+            if (session.target.snapshot().state != .stopped) return error.NotStopped;
             if ((member(args, "address") != null) == (member(args, "symbol") != null)) return error.InvalidArguments;
             try session.refreshMaps();
             const addr = if (member(args, "symbol")) |value| (try session.modules.findSymbol(string(value) orelse return error.InvalidArguments)).address else try address(args);
@@ -339,7 +339,8 @@ pub const Server = struct {
             return asValue(a, .{ .generation = function.generation, .image_epoch = function.image_epoch, .module_id = function.module_id, .symbol = function.symbol[0..@min(512, function.symbol.len)], .symbol_truncated = function.symbol.len > 512, .address = try std.fmt.allocPrint(a, "0x{x}", .{graph.address}), .link_address = try std.fmt.allocPrint(a, "0x{x}", .{function.link_address}), .size = graph.size, .extent_source = function.extent_source, .range_index = function.range_index, .range_count = function.range_count, .whole_function = function.range_count == 1, .decoded_bytes = graph.decoded_bytes, .undecoded_bytes = graph.size - graph.decoded_bytes, .basis = "linear_decode_of_live_function_bytes_with_breakpoint_overlay", .execution_observed = false, .total_blocks = graph.blocks.len, .start_block = first, .next_block = if (end < graph.blocks.len) @as(?u64, end) else null, .blocks = Value{ .array = blocks }, .edges = Value{ .array = edges } });
         }
         if (std.mem.eql(u8, name, "get_instruction_effects")) {
-            if (session.target.state != .stopped) return error.NotStopped;
+            if (session.target.snapshot().state != .stopped) return error.NotStopped;
+            if (session.target.arch() != .x86_64) return error.InstructionAnalysisUnsupportedArchitecture;
             const addr = try address(args);
             const length = if (member(args, "length")) |v| number(v) orelse return error.InvalidArguments else 256;
             const limit = if (member(args, "limit")) |v| number(v) orelse return error.InvalidArguments else 16;
@@ -350,17 +351,17 @@ pub const Server = struct {
             if (n == 0) return error.FunctionMemoryIncomplete;
             const instructions = try ir.decode(a, bytes[0..n], addr, @intCast(limit));
             const decoded = if (instructions.len > 0) instructions[instructions.len - 1].address + instructions[instructions.len - 1].size - addr else 0;
-            return asValue(a, .{ .generation = session.target.generation, .image_epoch = session.target.image_epoch, .architecture = @tagName(@import("../target/arch.zig").native), .schema_version = 1, .basis = "capstone_operands_and_register_access_from_live_bytes_with_breakpoint_overlay", .execution_observed = false, .address = addr, .bytes_read = n, .decoded_bytes = decoded, .uninspected_bytes = n - decoded, .instruction_limit_reached = instructions.len == limit, .next_address = if (decoded > 0) @as(?u64, addr + decoded) else null, .instructions = instructions, .limitations = "register aliases and flag meaning are architecture-specific; explicit memory expressions are not read; implicit memory, faults and full instruction semantics are not modeled" });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .image_epoch = session.target.snapshot().image_epoch, .architecture = @tagName(session.target.arch()), .schema_version = 1, .basis = "capstone_operands_and_register_access_from_live_bytes_with_breakpoint_overlay", .execution_observed = false, .address = addr, .bytes_read = n, .decoded_bytes = decoded, .uninspected_bytes = n - decoded, .instruction_limit_reached = instructions.len == limit, .next_address = if (decoded > 0) @as(?u64, addr + decoded) else null, .instructions = instructions, .limitations = "register aliases and flag meaning are architecture-specific; explicit memory expressions are not read; implicit memory, faults and full instruction semantics are not modeled" });
         }
         if (std.mem.eql(u8, name, "disassemble")) {
             const addr = try address(args);
             var bytes: [256]u8 = undefined;
             const n = try session.target.readMemory(addr, &bytes);
             var instructions: [32]disasm.Instruction = undefined;
-            const count = try disasm.decode(bytes[0..n], addr, &instructions);
+            const count = try disasm.decodeFor(session.target.arch(), bytes[0..n], addr, &instructions);
             var list: std.array_list.Managed(Value) = .init(a);
             for (instructions[0..count]) |inst| try list.append(try asValue(a, .{ .address = try std.fmt.allocPrint(a, "0x{x}", .{inst.address}), .size = inst.size, .mnemonic = std.mem.sliceTo(@as([]const u8, &inst.mnemonic), 0), .operands = std.mem.sliceTo(@as([]const u8, &inst.operands), 0) }));
-            return asValue(a, .{ .generation = session.target.generation, .instructions = Value{ .array = list } });
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .instructions = Value{ .array = list } });
         }
         if (std.mem.eql(u8, name, "query_events")) {
             const after = if (member(args, "after")) |v| number(v) orelse return error.InvalidArguments else 0;

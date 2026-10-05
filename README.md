@@ -91,6 +91,12 @@ stepping now batches straight-line instructions; see [source stepping](docs/SOUR
 **Themes.** Built-in dark, light and contrast palettes and custom JSON colors,
 selected at startup for local, remote and offline views. See [themes](docs/THEMES.md).
 
+**C runtime.** Target control and kernel collectors have one C implementation,
+used locally and by `xodb-agent`. Build the agent with GCC or Clang; it needs no
+Zig or GUI libraries. The host GUI/MCP keeps symbols, expressions and profiling
+analysis, including cross-ISA debugging of an m68k target.
+See [C runtime builds, commands and limits](docs/C_RUNTIME.md).
+
 **Remote + ARM64.** The x86-64 workstation GUI drives a headless xodb on an
 AArch64 Jetson over SSH or LAN TCP. ARM64 hardware data watchpoints work through
 MCP. Android: native executables *and* JNI libraries inside a debug APK, over USB.

@@ -14,6 +14,7 @@ const Wire = struct {
     architecture: []const u8 = "x86_64",
     identity: model.Identity,
     origin: ?model.Identity = null,
+    producer: ?@import("producer.zig").Producer = null,
     revision: u64,
     config: model.Config,
     started_ns: u64,
@@ -49,6 +50,7 @@ pub fn encode(a: std.mem.Allocator, capture: *const model.Capture, progress: ?*P
     const body = try std.json.Stringify.valueAlloc(scratch, Wire{
         .identity = capture.identity,
         .origin = capture.origin,
+        .producer = capture.producer,
         .revision = capture.revision,
         .config = capture.config,
         .started_ns = capture.started_ns,
@@ -83,6 +85,7 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8, progress: ?*Progress) !*m
     const parsed = try std.json.parseFromSlice(Wire, budget.allocator(), body, .{ .max_value_len = 4096 });
     defer parsed.deinit();
     const saved = parsed.value;
+    if (saved.producer) |producer| if (!producer.supported()) return error.InvalidAllocationArchive;
     if (saved.version != 1 or !std.mem.eql(u8, saved.architecture, "x86_64") or saved.revision == 0 or saved.ended_ns < saved.started_ns or
         saved.records.len > saved.config.record_limit or saved.stacks.len > stacks.max_stacks or saved.labels.len > 65536) return error.InvalidAllocationArchive;
     if (saved.first_gap) |gap| {
@@ -92,6 +95,7 @@ pub fn decode(a: std.mem.Allocator, bytes: []const u8, progress: ?*Progress) !*m
     const capture = try model.Capture.create(a, saved.identity, saved.config, saved.threads, saved.hooks, saved.started_ns);
     errdefer capture.deinit();
     capture.origin = saved.origin orelse saved.identity;
+    capture.producer = saved.producer;
     capture.archived = true;
     const owned = capture.budget.allocator();
     for (saved.stacks, 0..) |stack, i| {

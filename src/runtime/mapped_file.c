@@ -14,20 +14,25 @@
 /* Obtain the same device/inode representation as proc maps without reading
  * any file bytes. Btrfs getattr substitutes a per-subvolume st_dev, whereas
  * maps reports inode->i_sb->s_dev. Inode alone is not unique across subvolumes. */
-static int mapping_identity(int fd, uint64_t ma, uint64_t mi, uint64_t ino) {
+static int mapping_identity(int fd, uint64_t ma, uint64_t mi, uint64_t ino)
+{
     long page = sysconf(_SC_PAGESIZE);
-    if (page <= 0) return 0;
+    if (page <= 0)
+        return 0;
     void *address = mmap(NULL, (size_t)page, PROT_NONE, MAP_PRIVATE, fd, 0);
-    if (address == MAP_FAILED) return 0;
+    if (address == MAP_FAILED)
+        return 0;
     FILE *maps = fopen("/proc/self/maps", "re");
     int match = 0;
     if (maps) {
         char line[8192];
         for (unsigned i = 0; i < 65536 && fgets(line, sizeof line, maps); ++i) {
             unsigned long long start, end, offset, inode;
-            unsigned major_number, minor_number; char permissions[5];
-            if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &start, &end,
-                       permissions, &offset, &major_number, &minor_number, &inode) != 7) continue;
+            unsigned major_number, minor_number;
+            char permissions[5];
+            if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &start, &end, permissions, &offset,
+                       &major_number, &minor_number, &inode) != 7)
+                continue;
             if (start <= (uintptr_t)address && (uintptr_t)address < end) {
                 match = major_number == ma && minor_number == mi && inode == ino;
                 break;
@@ -39,15 +44,19 @@ static int mapping_identity(int fd, uint64_t ma, uint64_t mi, uint64_t ino) {
     return match;
 }
 
-int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end,
-                             uint64_t ma, uint64_t mi, uint64_t inode, int strict) {
+int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end, uint64_t ma,
+                             uint64_t mi, uint64_t inode, int strict)
+{
     struct stat candidate;
-    if (fstat(fd, &candidate) || !S_ISREG(candidate.st_mode) || candidate.st_ino != inode) return 0;
+    if (fstat(fd, &candidate) || !S_ISREG(candidate.st_mode) || candidate.st_ino != inode)
+        return 0;
     struct statfs fs;
-    if (fstatfs(fd, &fs)) return 0;
+    if (fstatfs(fd, &fs))
+        return 0;
     if ((unsigned long)fs.f_type != XODB_BTRFS_SUPER_MAGIC)
         return major(candidate.st_dev) == ma && minor(candidate.st_dev) == mi;
-    if (pid <= 0 || start >= end || !mapping_identity(fd, ma, mi, inode)) return 0;
+    if (pid <= 0 || start >= end || !mapping_identity(fd, ma, mi, inode))
+        return 0;
 
     char map_path[128];
     snprintf(map_path, sizeof map_path, "/proc/%d/map_files/%llx-%llx", pid,
@@ -62,7 +71,8 @@ int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end,
         close(mapped);
         return match;
     }
-    if (strict) return 0;
+    if (strict)
+        return 0;
 
     /* Unprivileged map_files readlink is permitted independently of opening
      * the link. Compare kernel-rendered paths, not a caller's filename, in

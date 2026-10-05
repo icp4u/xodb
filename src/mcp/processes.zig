@@ -22,23 +22,23 @@ pub fn call(a: std.mem.Allocator, session: *model.Session, name: []const u8, arg
             const Pending = struct { pid: i32, parent_tid: i32, kind: []const u8, stopped: bool, exited: bool, vm_errno: i32 };
             var pending: std.ArrayList(Pending) = .empty;
             // A response is bounded even when all processes have pending births.
-            for (target.births[0..@min(target.birth_count, 8)]) |birth|
+            for (target.birthSlice()[0..@min(target.snapshot().birth_count, 8)]) |birth|
                 try pending.append(a, .{ .pid = birth.pid, .parent_tid = birth.parent_tid, .kind = @tagName(birth.kind), .stopped = birth.stopped, .exited = birth.exited, .vm_errno = birth.vm_errno });
             try rows.append(a, try wire.value(a, .{
                 .process_id = entry.id,
                 .parent_process_id = entry.parent,
                 .session_id = entry.session.id,
-                .pid = target.pid,
-                .state = @tagName(target.state),
-                .generation = target.generation,
-                .image_epoch = target.image_epoch,
+                .pid = target.snapshot().pid,
+                .state = @tagName(target.snapshot().state),
+                .generation = target.snapshot().generation,
+                .image_epoch = target.snapshot().image_epoch,
                 .kind = if (entry.kind) |kind| @tagName(kind) else "root",
-                .following = target.follow_processes,
+                .following = target.snapshot().follow_processes,
                 .shared_vm = target.sharedVm(),
-                .detach_pending = target.detach_pending,
-                .pending_count = target.birth_count,
+                .detach_pending = target.snapshot().detach_pending,
+                .pending_count = target.snapshot().birth_count,
                 .pending = pending.items,
-                .pending_truncated = target.birth_count > pending.items.len,
+                .pending_truncated = target.snapshot().birth_count > pending.items.len,
                 .admission_error = entry.admission_error,
                 .diagnostic = entry.session.step_diagnostic,
             }));
@@ -59,7 +59,7 @@ pub fn call(a: std.mem.Allocator, session: *model.Session, name: []const u8, arg
         try tree.detachFamily(session, .agent);
     } else {
         tree.retryAdmissions();
-        session.target.generation += 1;
+        session.target.invalidate();
         session.record(.agent, "retry_process_admission");
     }
     return wire.value(a, session.snapshot());

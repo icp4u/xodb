@@ -1,6 +1,7 @@
 const std = @import("std");
 const arch = @import("arch.zig");
 pub const Breakpoint = struct {
+    architecture: arch.Arch = arch.native,
     id: u64,
     address: u64,
     original: [4]u8,
@@ -12,7 +13,11 @@ pub const Breakpoint = struct {
     temporary: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         // Preserve x86's published numeric original byte. ARM64 stores one LE word.
-        const original: u32 = if (arch.native == .x86_64) self.original[0] else std.mem.readInt(u32, &self.original, .little);
+        const original: u32 = switch (self.architecture) {
+            .x86_64 => self.original[0],
+            .aarch64 => std.mem.readInt(u32, &self.original, .little),
+            .m68k => std.mem.readInt(u16, self.original[0..2], .big),
+        };
         try writer.write(.{ .id = self.id, .address = self.address, .original = original, .patched = self.patched, .temporary = self.temporary, .enabled = self.enabled, .hit_count = self.hit_count, .pending = self.pending, .internal = self.internal });
     }
 };

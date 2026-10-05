@@ -160,7 +160,7 @@ fn lift(a: std.mem.Allocator, handle: c.csh, raw: *const c.cs_insn) !Instruction
     return result;
 }
 pub fn decode(a: std.mem.Allocator, bytes: []const u8, address: u64, limit: usize) ![]Instruction {
-    if (@import("../target/arch.zig").native != .x86_64) return error.InstructionAnalysisUnsupportedArchitecture;
+    // Explicit x86-64 analysis; callers check the target ISA, not the host ISA.
     if (bytes.len == 0 or bytes.len > max_bytes or limit == 0 or limit > max_instructions) return error.InvalidAnalysisLimit;
     if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
     var handle: c.csh = 0;

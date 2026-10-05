@@ -167,12 +167,12 @@ pub const Panel = struct {
         }
     }
     fn update(self: *Panel, session: *Session, tid: i32) void {
-        if (session.target.state != .stopped) return;
-        if (!self.refresh and self.generation == session.target.generation and self.tid == tid and self.image_epoch == session.target.image_epoch) return;
-        const same = self.tid == tid and self.image_epoch == session.target.image_epoch;
+        if (session.target.snapshot().state != .stopped) return;
+        if (!self.refresh and self.generation == session.target.snapshot().generation and self.tid == tid and self.image_epoch == session.target.snapshot().image_epoch) return;
+        const same = self.tid == tid and self.image_epoch == session.target.snapshot().image_epoch;
         self.refresh = false;
-        self.generation = session.target.generation;
-        self.image_epoch = session.target.image_epoch;
+        self.generation = session.target.snapshot().generation;
+        self.image_epoch = session.target.snapshot().image_epoch;
         self.tid = tid;
         if (self.kind == .vectors) {
             self.previous = if (same) self.vector else null;
@@ -198,7 +198,7 @@ pub const Panel = struct {
         try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         var buffer: [1024]u8 = undefined;
-        const title = try std.fmt.bufPrint(&buffer, "{s}   {s} / Esc close   tid {d}   stop {d}{s}", .{ if (self.kind == .memory) "MEMORY" else "FP / SIMD", if (self.kind == .memory) "M" else "R", tid, self.generation, if (session.target.state != .stopped) " (historical: target running)" else "" });
+        const title = try std.fmt.bufPrint(&buffer, "{s}   {s} / Esc close   tid {d}   stop {d}{s}", .{ if (self.kind == .memory) "MEMORY" else "FP / SIMD", if (self.kind == .memory) "M" else "R", tid, self.generation, if (session.target.snapshot().state != .stopped) " (historical: target running)" else "" });
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, title, theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, if (self.kind == .memory) "G address  P pin  U unpin  / find  L length  N next  C cancel  PgUp/Down" else "V format  W width  Up/Down scroll  Orange = changed since previous stop", theme.weak);
         if (self.kind == .memory) try self.drawMemory(r, font, b, session) else try self.drawVectors(r, font, b);

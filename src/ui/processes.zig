@@ -31,7 +31,7 @@ pub const Panel = struct {
                 self.open = false;
             },
             'f' => {
-                try tree.setFollowing(session, !session.target.follow_processes, null, .human);
+                try tree.setFollowing(session, !session.target.snapshot().follow_processes, null, .human);
                 self.message = "Following changed for this process; existing children keep their own setting";
             },
             'r' => {
@@ -90,7 +90,7 @@ pub const Panel = struct {
         var buffer: [512]u8 = undefined;
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, try std.fmt.bufPrint(&buffer, "Viewing #{d}  /  {d} of {d} retained slots  /  MCP defaults to #1", .{ tree.active().process_id, tree.count, tree.limit }), theme.weak);
         const current = tree.entries[self.cursor];
-        try style.button(r, font, .{ .x = b.x + 12, .y = b.y + 64, .w = 166, .h = 29 }, if (current.session.target.follow_processes) "Follow: on" else "Follow: off", "F", theme.good, 0, 0);
+        try style.button(r, font, .{ .x = b.x + 12, .y = b.y + 64, .w = 166, .h = 29 }, if (current.session.target.snapshot().follow_processes) "Follow: on" else "Follow: off", "F", theme.good, 0, 0);
         try style.button(r, font, .{ .x = b.x + 187, .y = b.y + 64, .w = 145, .h = 29 }, "Retry held", "R", theme.text, 0, 0);
         try style.button(r, font, .{ .x = b.x + 342, .y = b.y + 64, .w = @min(218, b.w - 354), .h = 29 }, "Detach family", "D", theme.warm, 0, 0);
         const count: usize = @intFromFloat(@max(1, (b.h - 206) / 28));
@@ -101,7 +101,7 @@ pub const Panel = struct {
             const target = &entry.session.target;
             const y = b.y + 112 + @as(f32, @floatFromInt(i - self.first)) * 28;
             if (i == self.cursor) try style.focus(r, .{ .x = b.x + 8, .y = y - 2, .w = b.w - 16, .h = 26 }, 4, 1);
-            try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.bufPrint(&buffer, "#{d}  PID {d}  {s}  parent {any}  /  {s}{s}  held {d}", .{ entry.id, target.pid, @tagName(target.state), entry.parent, if (target.follow_processes) "follow" else "fixed", if (target.sharedVm()) " / shared VM" else "", target.birth_count }), if (i == self.cursor) theme.text else theme.weak);
+            try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.bufPrint(&buffer, "#{d}  PID {d}  {s}  parent {any}  /  {s}{s}  held {d}", .{ entry.id, target.snapshot().pid, @tagName(target.snapshot().state), entry.parent, if (target.snapshot().follow_processes) "follow" else "fixed", if (target.sharedVm()) " / shared VM" else "", target.snapshot().birth_count }), if (i == self.cursor) theme.text else theme.weak);
         }
         try r.textFit(font, b.x + 14, b.y + b.h - 78, b.w - 28, try std.fmt.bufPrint(&buffer, "Row #{d}: {s}", .{ current.id, current.admission_error orelse current.session.step_diagnostic orelse "Children stop for inspection; controls apply to the highlighted row." }), theme.text);
         try r.textFit(font, b.x + 14, b.y + b.h - 52, b.w - 28, "Detach family releases shared-vfork members and pending children.", theme.weak);

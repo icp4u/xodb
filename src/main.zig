@@ -29,6 +29,9 @@ pub fn main(init: std.process.Init) !void {
     var listen: ?[:0]const u8 = null;
     var connect: ?[:0]const u8 = null;
     var ssh: ?[:0]const u8 = null;
+    var runtime_agent: ?[:0]const u8 = null;
+    var runtime_ssh: ?[:0]const u8 = null;
+    var ssh_config: ?[:0]const u8 = null;
     var remote_xodb: [:0]const u8 = "xodb";
     var scope_explicit = false;
     var agent_scope: @import("model/session.zig").AgentScope = .observe;
@@ -65,6 +68,8 @@ pub fn main(init: std.process.Init) !void {
                 \\          click source gutter for breakpoint, D detach, J/K thread, arrows scroll, Q quit; Esc cancels archive work.
                 \\--connect ADDRESS:PORT opens the remote GUI (numeric IPv4 or [IPv6]).
                 \\--ssh HOST --remote-xodb PATH opens the GUI with a headless server over SSH.
+                \\--runtime-agent PATH uses the standalone C agent with host-side analysis.
+                \\--runtime-ssh HOST [--ssh-config FILE] runs that agent over SSH.
                 \\--listen ADDRESS:PORT serves one plaintext TCP client; requires --headless --mcp.
                 \\With --mcp, --source FILE explicitly shares that source file with remote viewers.
                 \\--allocation-helper PATH explicitly permits sudo -n to open allocation probes (see docs/ALLOCATIONS.md).
@@ -96,9 +101,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
+            if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
+            if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
+            if (std.mem.eql(u8, arg, "--ssh-config")) ssh_config = args[i];
             if (std.mem.eql(u8, arg, "--allocation-helper")) allocation_helper = args[i];
             if (std.mem.eql(u8, arg, "--process-limit")) process_limit = try std.fmt.parseInt(usize, args[i], 10);
             if (std.mem.eql(u8, arg, "--core")) core_file = args[i];
@@ -137,6 +145,9 @@ pub fn main(init: std.process.Init) !void {
     if ((debug_dirs.items.len > 0 or source_maps.items.len > 0) and (open_profile != null or open_capture != null or connect != null)) return error.SymbolOptionsRequireLiveServer;
     if (debug_files.items.len > 0 and (open_profile != null or open_capture != null or connect != null)) return error.DebugFilesRequireLiveServer;
     if (allocation_helper != null and (connect != null or ssh != null or open_capture != null or open_profile != null or core_file != null)) return error.AllocationHelperRequiresLiveServer;
+    const runtime_remote = runtime_agent != null or runtime_ssh != null;
+    if (runtime_remote and (connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null)) return error.RuntimeAgentOptionConflict;
+    if (ssh_config != null and runtime_ssh == null) return error.SshConfigRequiresRuntimeSsh;
     const remote_gui = connect != null or ssh != null;
     if (remote_gui and (headless or mcp or listen != null or open_capture != null or symbols != null or record_path != null or capture_out != null or profile_out != null)) return error.RemoteGuiOptionConflict;
     if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint != null or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
@@ -151,9 +162,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     } else @import("preferences.zig").Preferences{};
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
-    var launch_signals: [@import("target/linux.zig").launch_signal_numbers.len]std.posix.Sigaction = undefined;
-    for (@import("target/linux.zig").launch_signal_numbers, &launch_signals) |number, *action| std.posix.sigaction(number, null, action);
-    @import("target/linux.zig").launch_signals = launch_signals;
+    try @import("target/runtime.zig").saveLaunchSignals();
     _ = c.signal(c.SIGINT, onSignal);
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
@@ -191,6 +200,16 @@ pub fn main(init: std.process.Init) !void {
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
     defer session.deinit();
+    if (runtime_remote) {
+        var transport: std.ArrayList([:0]const u8) = .empty;
+        const agent = runtime_agent orelse "xodb-agent";
+        if (runtime_ssh) |host| {
+            try transport.appendSlice(a, &.{ "ssh", "-T", "-o", "BatchMode=yes" });
+            if (ssh_config) |path| try transport.appendSlice(a, &.{ "-F", path });
+            try transport.appendSlice(a, &.{ "--", host, try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" }) });
+        } else try transport.appendSlice(a, &.{ agent, "--stdio" });
+        try session.target.connectRemote(transport.items);
+    }
     var tree = ProcessTree{ .limit = process_limit };
     tree.init(session);
     defer tree.deinit();
@@ -223,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
             std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
             return err;
         };
-        std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.thread_count, @tagName(session.target.state), (linux.now() -| started) / 1_000_000 });
+        std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
     }
     if (launch.len > 0) try session.launch(launch);
     if (follow_forks) try session.target.setFollowProcesses(true);
@@ -338,7 +357,7 @@ pub fn main(init: std.process.Init) !void {
             const allocations_changed = active.allocations.serial != last_allocation_serial or allocation_state != last_allocation_state or
                 (if (active.allocations.capture) |capture| capture.revision != last_allocation_revision and current -| last_frame >= 250_000_000 else false);
             const profile_changed = if (active.profile) |capture| (capture.id != last_profile_id or capture.revision != last_profile_revision) and current -| last_frame >= 250_000_000 else false;
-            if ((if (active.imported) |state| state.serial != last_import_serial else false) or active.recorded_views.serial != last_view_serial or allocations_changed or profile_changed or window.dirty or workspace.animating or active.target.generation != last_generation or frames > 0 or current - last_frame > 1_000_000_000) {
+            if ((if (active.imported) |state| state.serial != last_import_serial else false) or active.recorded_views.serial != last_view_serial or allocations_changed or profile_changed or window.dirty or workspace.animating or active.target.snapshot().generation != last_generation or frames > 0 or current - last_frame > 1_000_000_000) {
                 if (current < render_retry) continue;
                 if (!renderer_ready) {
                     phase_started = linux.now();
@@ -368,7 +387,7 @@ pub fn main(init: std.process.Init) !void {
                 last_allocation_serial = active.allocations.serial;
                 last_allocation_state = allocation_state;
                 if (active.allocations.capture) |capture| last_allocation_revision = capture.revision;
-                last_generation = active.target.generation;
+                last_generation = active.target.snapshot().generation;
                 last_tree_revision = tree.revision;
                 last_view_serial = active.recorded_views.serial;
                 if (active.imported) |state| last_import_serial = state.serial;
@@ -461,6 +480,7 @@ test {
     std.testing.refAllDecls(@import("mcp/allocations.zig"));
     std.testing.refAllDecls(@import("mcp/allocation_control.zig"));
     _ = @import("profile/archive_test.zig");
+    _ = @import("profile/perf_test.zig");
     _ = @import("profile/recorded_view_test.zig");
     _ = @import("profile/user_state_test.zig");
     _ = @import("profile/sampled_test.zig");

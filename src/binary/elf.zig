@@ -1,6 +1,6 @@
 //! ELF image reader: a validated, typed view over a borrowed byte slice.
 //!
-//! Accepts ELF64 little-endian x86-64/AArch64 executables (ET_EXEC) and shared
+//! Accepts ELF64 little-endian x86-64/AArch64 and ELF32 big-endian m68k executables (ET_EXEC) and shared
 //! objects/PIEs (ET_DYN). Anything else is rejected by `Image.parse` with a
 //! specific error. Live targets and archive consumers also check their supported ISA.
 //!
@@ -55,7 +55,7 @@ const shn_xindex = 0xffff;
 const pn_xnum = 0xffff;
 
 pub const Type = enum { executable, shared };
-pub const Machine = enum(u16) { x86_64 = 62, aarch64 = 183, riscv = 243, _ };
+pub const Machine = enum(u16) { m68k = 4, x86_64 = 62, aarch64 = 183, riscv = 243, _ };
 pub const SegmentType = enum(u32) { null = 0, load = 1, dynamic = 2, interp = 3, note = 4, shlib = 5, phdr = 6, tls = 7, gnu_eh_frame = 0x6474e550, gnu_stack = 0x6474e551, gnu_relro = 0x6474e552, gnu_property = 0x6474e553, _ };
 pub const SectionType = enum(u32) { null = 0, progbits = 1, symtab = 2, strtab = 3, rela = 4, hash = 5, dynamic = 6, note = 7, nobits = 8, rel = 9, shlib = 10, dynsym = 11, init_array = 14, fini_array = 15, preinit_array = 16, group = 17, symtab_shndx = 18, gnu_hash = 0x6ffffff6, gnu_verdef = 0x6ffffffd, gnu_verneed = 0x6ffffffe, gnu_versym = 0x6fffffff, _ };
 /// Bits of `Segment.flags`.
@@ -157,6 +157,28 @@ pub const Located = struct {
 fn rd(comptime T: type, b: []const u8, at: usize) T {
     return std.mem.readInt(T, b[at..][0..@sizeOf(T)], .little);
 }
+pub const Format = struct {
+    is64: bool = true,
+    endian: std.builtin.Endian = .little,
+    pub fn addressBytes(self: Format) usize {
+        return if (self.is64) 8 else 4;
+    }
+    fn phSize(self: Format) usize {
+        return if (self.is64) 56 else 32;
+    }
+    fn shSize(self: Format) usize {
+        return if (self.is64) 64 else 40;
+    }
+    fn symSize(self: Format) usize {
+        return if (self.is64) 24 else 16;
+    }
+    fn read(self: Format, comptime T: type, bytes: []const u8, at: usize) T {
+        return std.mem.readInt(T, bytes[at..][0..@sizeOf(T)], self.endian);
+    }
+    fn word(self: Format, bytes: []const u8, at64: usize, at32: usize) u64 {
+        return if (self.is64) self.read(u64, bytes, at64) else self.read(u32, bytes, at32);
+    }
+};
 fn span(bytes: []const u8, offset: u64, size: u64) Error![]const u8 {
     const end = std.math.add(u64, offset, size) catch return error.Truncated;
     if (end > bytes.len) return error.Truncated;
@@ -191,6 +213,7 @@ fn typeRank(symbol_type: u4) u8 {
 }
 
 pub const SymbolTable = struct {
+    format: Format = .{},
     kind: Kind,
     /// Index of the section holding the table.
     section: u32,
@@ -203,37 +226,38 @@ pub const SymbolTable = struct {
 
     /// Entry 0 is the reserved null symbol.
     pub fn count(self: SymbolTable) u32 {
-        return @intCast(self.entries.len / sym_size);
+        return @intCast(self.entries.len / self.format.symSize());
     }
     fn entry(self: SymbolTable, index: u32) []const u8 {
-        return self.entries[@as(usize, index) * sym_size ..][0..sym_size];
+        return self.entries[@as(usize, index) * self.format.symSize() ..][0..self.format.symSize()];
     }
     pub fn get(self: SymbolTable, index: u32) Error!Symbol {
         if (index >= self.count()) return error.OutOfRange;
         const e = self.entry(index);
-        const raw = rd(u16, e, 6);
+        const raw = self.format.read(u16, e, if (self.format.is64) 6 else 14);
         const placement: Placement = switch (raw) {
             shn_undef => .undefined,
             shn_abs => .absolute,
             shn_common => .common,
-            shn_xindex => if (self.extended.len == 0) return error.BadSection else .{ .section = rd(u32, self.extended, @as(usize, index) * 4) },
+            shn_xindex => if (self.extended.len == 0) return error.BadSection else .{ .section = self.format.read(u32, self.extended, @as(usize, index) * 4) },
             else => if (raw >= shn_loreserve) .{ .reserved = raw } else .{ .section = raw },
         };
         return .{
             .table = self.kind,
             .index = index,
-            .name = try str(self.strings, rd(u32, e, 0)),
-            .value = rd(u64, e, 8),
-            .size = rd(u64, e, 16),
-            .bind = @enumFromInt(e[4] >> 4),
-            .type = @enumFromInt(e[4] & 0xf),
-            .visibility = @enumFromInt(e[5] & 3),
+            .name = try str(self.strings, self.format.read(u32, e, 0)),
+            .value = self.format.word(e, 8, 4),
+            .size = self.format.word(e, 16, 8),
+            .bind = @enumFromInt(e[if (self.format.is64) 4 else 12] >> 4),
+            .type = @enumFromInt(e[if (self.format.is64) 4 else 12] & 0xf),
+            .visibility = @enumFromInt(e[if (self.format.is64) 5 else 13] & 3),
             .placement = placement,
         };
     }
 };
 
 pub const Image = struct {
+    format: Format = .{},
     bytes: []const u8,
     header: Header,
     segment_table: []const u8,
@@ -244,22 +268,30 @@ pub const Image = struct {
     /// table, and section-name table. Entries are validated when accessed.
     pub fn parse(bytes: []const u8) Error!Image {
         if (bytes.len < 4 or !std.mem.eql(u8, bytes[0..4], "\x7fELF")) return error.NotElf;
-        if (bytes.len < ehdr_size) return error.Truncated;
-        if (bytes[4] != 2) return error.UnsupportedClass;
-        if (bytes[5] != 1) return error.UnsupportedEncoding;
-        if (bytes[6] != 1 or rd(u32, bytes, 20) != 1) return error.UnsupportedVersion;
-        const machine: Machine = @enumFromInt(rd(u16, bytes, 18));
-        if (machine != .x86_64 and machine != .aarch64) return error.UnsupportedMachine;
-        const file_type: Type = switch (rd(u16, bytes, 16)) {
+        if (bytes.len < 16) return error.Truncated;
+        if (bytes[4] != 1 and bytes[4] != 2) return error.UnsupportedClass;
+        if (bytes[5] != 1 and bytes[5] != 2) return error.UnsupportedEncoding;
+        const f = Format{ .is64 = bytes[4] == 2, .endian = if (bytes[5] == 1) .little else .big };
+        if (bytes.len < (if (f.is64) @as(usize, 64) else 52)) return error.Truncated;
+        const machine: Machine = @enumFromInt(f.read(u16, bytes, 18));
+        if (machine != .m68k) {
+            if (!f.is64) return error.UnsupportedClass;
+            if (f.endian != .little) return error.UnsupportedEncoding;
+        }
+        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k) return error.UnsupportedMachine;
+        if ((machine == .m68k) == f.is64) return error.UnsupportedClass;
+        if (f.endian != (if (machine == .m68k) std.builtin.Endian.big else .little)) return error.UnsupportedEncoding;
+        if (bytes[6] != 1 or f.read(u32, bytes, 20) != 1) return error.UnsupportedVersion;
+        const file_type: Type = switch (f.read(u16, bytes, 16)) {
             2 => .executable,
             3 => .shared,
             else => return error.UnsupportedType,
         };
-        const phoff = rd(u64, bytes, 32);
-        const shoff = rd(u64, bytes, 40);
-        var phnum: u32 = rd(u16, bytes, 56);
-        var shnum: u32 = rd(u16, bytes, 60);
-        var shstrndx: u32 = rd(u16, bytes, 62);
+        const phoff = f.word(bytes, 32, 28);
+        const shoff = f.word(bytes, 40, 32);
+        var phnum: u32 = f.read(u16, bytes, if (f.is64) 56 else 44);
+        var shnum: u32 = f.read(u16, bytes, if (f.is64) 60 else 48);
+        var shstrndx: u32 = f.read(u16, bytes, if (f.is64) 62 else 50);
         var section_table: []const u8 = &.{};
         if (shoff == 0) {
             // No section header table; the other section fields mean nothing.
@@ -267,37 +299,38 @@ pub const Image = struct {
             shnum = 0;
             shstrndx = 0;
         } else {
-            if (rd(u16, bytes, 58) != shdr_size) return error.BadHeader;
+            if (f.read(u16, bytes, if (f.is64) 58 else 46) != f.shSize()) return error.BadHeader;
             // Section 0 holds the counts that do not fit the 16-bit header fields.
             if (shnum == 0 or shstrndx == shn_xindex or phnum == pn_xnum) {
-                const zero = try span(bytes, shoff, shdr_size);
-                if (shnum == 0) shnum = std.math.cast(u32, rd(u64, zero, 32)) orelse return error.BadHeader;
-                if (shstrndx == shn_xindex) shstrndx = rd(u32, zero, 40);
-                if (phnum == pn_xnum) phnum = rd(u32, zero, 44);
+                const zero = try span(bytes, shoff, f.shSize());
+                if (shnum == 0) shnum = std.math.cast(u32, f.word(zero, 32, 20)) orelse return error.BadHeader;
+                if (shstrndx == shn_xindex) shstrndx = f.read(u32, zero, if (f.is64) 40 else 24);
+                if (phnum == pn_xnum) phnum = f.read(u32, zero, if (f.is64) 44 else 28);
             }
-            section_table = try span(bytes, shoff, @as(u64, shnum) * shdr_size);
+            section_table = try span(bytes, shoff, @as(u64, shnum) * f.shSize());
         }
         var segment_table: []const u8 = &.{};
         if (phnum != 0) {
-            if (rd(u16, bytes, 54) != phdr_size) return error.BadHeader;
-            segment_table = try span(bytes, phoff, @as(u64, phnum) * phdr_size);
+            if (f.read(u16, bytes, if (f.is64) 54 else 42) != f.phSize()) return error.BadHeader;
+            segment_table = try span(bytes, phoff, @as(u64, phnum) * f.phSize());
         }
         var section_names: []const u8 = &.{};
         if (shstrndx != 0) {
             if (shstrndx >= shnum) return error.BadHeader;
-            const h = section_table[@as(usize, shstrndx) * shdr_size ..][0..shdr_size];
-            if (rd(u32, h, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
-            section_names = try span(bytes, rd(u64, h, 24), rd(u64, h, 32));
+            const h = section_table[@as(usize, shstrndx) * f.shSize() ..][0..f.shSize()];
+            if (f.read(u32, h, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
+            section_names = try span(bytes, f.word(h, 24, 16), f.word(h, 32, 20));
         }
         return .{
+            .format = f,
             .bytes = bytes,
             .header = .{
                 .type = file_type,
                 .machine = machine,
                 .os_abi = bytes[7],
                 .abi_version = bytes[8],
-                .entry = rd(u64, bytes, 24),
-                .flags = rd(u32, bytes, 48),
+                .entry = f.word(bytes, 24, 24),
+                .flags = f.read(u32, bytes, if (f.is64) 48 else 36),
                 .segment_table_offset = phoff,
                 .segment_count = phnum,
                 .section_table_offset = shoff,
@@ -312,8 +345,8 @@ pub const Image = struct {
 
     pub fn segment(self: *const Image, index: u32) Error!Segment {
         if (index >= self.header.segment_count) return error.OutOfRange;
-        const h = self.segment_table[@as(usize, index) * phdr_size ..][0..phdr_size];
-        return .{ .index = index, .type = @enumFromInt(rd(u32, h, 0)), .flags = rd(u32, h, 4), .offset = rd(u64, h, 8), .vaddr = rd(u64, h, 16), .paddr = rd(u64, h, 24), .file_size = rd(u64, h, 32), .mem_size = rd(u64, h, 40), .alignment = rd(u64, h, 48) };
+        const h = self.segment_table[@as(usize, index) * self.format.phSize() ..][0..self.format.phSize()];
+        return .{ .index = index, .type = @enumFromInt(self.format.read(u32, h, 0)), .flags = self.format.read(u32, h, if (self.format.is64) 4 else 24), .offset = self.format.word(h, 8, 4), .vaddr = self.format.word(h, 16, 8), .paddr = self.format.word(h, 24, 12), .file_size = self.format.word(h, 32, 16), .mem_size = self.format.word(h, 40, 20), .alignment = self.format.word(h, 48, 28) };
     }
     /// The file-backed part of a segment.
     pub fn segmentData(self: *const Image, s: Segment) Error![]const u8 {
@@ -321,14 +354,14 @@ pub const Image = struct {
     }
 
     fn sectionHeader(self: *const Image, index: u32) []const u8 {
-        return self.section_table[@as(usize, index) * shdr_size ..][0..shdr_size];
+        return self.section_table[@as(usize, index) * self.format.shSize() ..][0..self.format.shSize()];
     }
     /// Index 0 is the reserved null section. Names are empty when the image
     /// has no section-name table.
     pub fn section(self: *const Image, index: u32) Error!Section {
         if (index >= self.header.section_count) return error.OutOfRange;
         const h = self.sectionHeader(index);
-        return .{ .index = index, .name = if (self.header.section_name_index == 0) "" else try str(self.section_names, rd(u32, h, 0)), .type = @enumFromInt(rd(u32, h, 4)), .flags = rd(u64, h, 8), .addr = rd(u64, h, 16), .offset = rd(u64, h, 24), .size = rd(u64, h, 32), .link = rd(u32, h, 40), .info = rd(u32, h, 44), .alignment = rd(u64, h, 48), .entry_size = rd(u64, h, 56) };
+        return .{ .index = index, .name = if (self.header.section_name_index == 0) "" else try str(self.section_names, self.format.read(u32, h, 0)), .type = @enumFromInt(self.format.read(u32, h, 4)), .flags = self.format.word(h, 8, 8), .addr = self.format.word(h, 16, 12), .offset = self.format.word(h, 24, 16), .size = self.format.word(h, 32, 20), .link = self.format.read(u32, h, if (self.format.is64) 40 else 24), .info = self.format.read(u32, h, if (self.format.is64) 44 else 28), .alignment = self.format.word(h, 48, 32), .entry_size = self.format.word(h, 56, 36) };
     }
     /// First section with this name in table order. Names are not unique;
     /// iterate with `section` to see every match.
@@ -336,7 +369,7 @@ pub const Image = struct {
         if (self.header.section_name_index == 0 or std.mem.indexOfScalar(u8, name, 0) != null) return null;
         var i: u32 = 0;
         while (i < self.header.section_count) : (i += 1) {
-            if (strIs(self.section_names, rd(u32, self.sectionHeader(i), 0), name)) return self.section(i) catch continue;
+            if (strIs(self.section_names, self.format.read(u32, self.sectionHeader(i), 0), name)) return self.section(i) catch continue;
         }
         return null;
     }
@@ -356,25 +389,25 @@ pub const Image = struct {
         var i: u32 = 0;
         while (i < n) : (i += 1) {
             const h = self.sectionHeader(i);
-            if (rd(u32, h, 4) != want) continue;
-            if (rd(u64, h, 56) != sym_size) return error.BadSection;
-            const entries = try span(self.bytes, rd(u64, h, 24), rd(u64, h, 32));
-            if (entries.len % sym_size != 0 or entries.len / sym_size > std.math.maxInt(u32)) return error.BadSection;
-            const link = rd(u32, h, 40);
+            if (self.format.read(u32, h, 4) != want) continue;
+            if (self.format.word(h, 56, 36) != self.format.symSize()) return error.BadSection;
+            const entries = try span(self.bytes, self.format.word(h, 24, 16), self.format.word(h, 32, 20));
+            if (entries.len % self.format.symSize() != 0 or entries.len / self.format.symSize() > std.math.maxInt(u32)) return error.BadSection;
+            const link = self.format.read(u32, h, if (self.format.is64) 40 else 24);
             if (link >= n) return error.BadSection;
             const sh = self.sectionHeader(link);
-            if (rd(u32, sh, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
-            const strings = try span(self.bytes, rd(u64, sh, 24), rd(u64, sh, 32));
+            if (self.format.read(u32, sh, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
+            const strings = try span(self.bytes, self.format.word(sh, 24, 16), self.format.word(sh, 32, 20));
             var extended: []const u8 = &.{};
             var j: u32 = 0;
             while (j < n) : (j += 1) {
                 const x = self.sectionHeader(j);
-                if (rd(u32, x, 4) != @intFromEnum(SectionType.symtab_shndx) or rd(u32, x, 40) != i) continue;
-                extended = try span(self.bytes, rd(u64, x, 24), rd(u64, x, 32));
-                if (extended.len != entries.len / sym_size * 4) return error.BadSection;
+                if (self.format.read(u32, x, 4) != @intFromEnum(SectionType.symtab_shndx) or self.format.read(u32, x, if (self.format.is64) 40 else 24) != i) continue;
+                extended = try span(self.bytes, self.format.word(x, 24, 16), self.format.word(x, 32, 20));
+                if (extended.len != entries.len / self.format.symSize() * 4) return error.BadSection;
                 break;
             }
-            return .{ .kind = kind, .section = i, .entries = entries, .strings = strings, .extended = extended };
+            return .{ .format = self.format, .kind = kind, .section = i, .entries = entries, .strings = strings, .extended = extended };
         }
         return null;
     }
@@ -392,8 +425,8 @@ pub const Image = struct {
             var i: u32 = 1;
             while (i < table.count()) : (i += 1) {
                 const e = table.entry(i);
-                if (rd(u16, e, 6) == shn_undef or !strIs(table.strings, rd(u32, e, 0), name)) continue;
-                if (best) |old| if (bindRank(@truncate(e[4] >> 4)) >= bindRank(@intFromEnum(old.bind))) continue;
+                if (self.format.read(u16, e, if (self.format.is64) 6 else 14) == shn_undef or !strIs(table.strings, self.format.read(u32, e, 0), name)) continue;
+                if (best) |old| if (bindRank(@truncate(e[if (self.format.is64) 4 else 12] >> 4)) >= bindRank(@intFromEnum(old.bind))) continue;
                 best = table.get(i) catch continue;
             }
         }
@@ -415,10 +448,10 @@ pub const Image = struct {
             var i: u32 = 1;
             while (i < table.count()) : (i += 1) {
                 const e = table.entry(i);
-                const value = rd(u64, e, 8);
-                const shndx = rd(u16, e, 6);
-                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(e[4]))) continue;
-                const size = rd(u64, e, 16);
+                const value = self.format.word(e, 8, 4);
+                const shndx = self.format.read(u16, e, if (self.format.is64) 6 else 14);
+                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(e[if (self.format.is64) 4 else 12]))) continue;
+                const size = self.format.word(e, 16, 8);
                 if (size != 0 and address - value >= size) {
                     if (barrier == null or value > barrier.?) barrier = value;
                     continue;
@@ -427,7 +460,7 @@ pub const Image = struct {
                 if (slot.*) |old| {
                     if (value < old.value) continue;
                     if (value == old.value) {
-                        const new = [2]u8{ typeRank(@truncate(e[4])), bindRank(@truncate(e[4] >> 4)) };
+                        const new = [2]u8{ typeRank(@truncate(e[if (self.format.is64) 4 else 12])), bindRank(@truncate(e[if (self.format.is64) 4 else 12] >> 4)) };
                         const cur = [2]u8{ typeRank(@intFromEnum(old.type)), bindRank(@intFromEnum(old.bind)) };
                         if (std.mem.order(u8, &new, &cur) != .lt) continue;
                     }
@@ -466,22 +499,22 @@ pub const Image = struct {
             const segment_ = self.segment(@intCast(i)) catch return null;
             if (segment_.type != .note) continue;
             const notes = span(self.bytes, segment_.offset, segment_.file_size) catch return null;
-            mergeBuildId(notes, &found) catch return null;
+            mergeBuildId(self.format, notes, &found) catch return null;
         }
         for (0..self.header.section_count) |i| {
             const section_ = self.section(@intCast(i)) catch return null;
             if (section_.type != .note) continue;
-            mergeBuildId(self.sectionData(section_) catch return null, &found) catch return null;
+            mergeBuildId(self.format, self.sectionData(section_) catch return null, &found) catch return null;
         }
         return found;
     }
-    fn mergeBuildId(notes: []const u8, found: *?[]const u8) !void {
+    fn mergeBuildId(format: Format, notes: []const u8, found: *?[]const u8) !void {
         var cursor: usize = 0;
         while (cursor < notes.len) {
             if (notes.len - cursor < 12) return error.BadNote;
-            const name_size: usize = rd(u32, notes, cursor);
-            const desc_size: usize = rd(u32, notes, cursor + 4);
-            const kind = rd(u32, notes, cursor + 8);
+            const name_size: usize = format.read(u32, notes, cursor);
+            const desc_size: usize = format.read(u32, notes, cursor + 4);
+            const kind = format.read(u32, notes, cursor + 8);
             const name_at = cursor + 12;
             const desc_at = std.math.add(usize, name_at, std.mem.alignForward(usize, name_size, 4)) catch return error.BadNote;
             const next = std.math.add(usize, desc_at, std.mem.alignForward(usize, desc_size, 4)) catch return error.BadNote;
@@ -664,6 +697,65 @@ fn walk(bytes: []const u8) void {
     }
     _ = image.symbolAt(image.header.entry);
     _ = image.loadBias(0x7f0000000000, 0) catch {};
+}
+
+test "ELF32 big endian m68k tables and symbols are independent of the host ABI" {
+    const W = struct {
+        fn put(bytes: []u8, comptime T: type, at: usize, value: T) void {
+            std.mem.writeInt(T, bytes[at..][0..@sizeOf(T)], value, .big);
+        }
+    };
+    var bytes: [512]u8 = @splat(0);
+    @memcpy(bytes[0..7], "\x7fELF\x01\x02\x01");
+    W.put(&bytes, u16, 16, 2);
+    W.put(&bytes, u16, 18, 4);
+    W.put(&bytes, u32, 20, 1);
+    W.put(&bytes, u32, 24, 0x1190);
+    W.put(&bytes, u32, 28, 52);
+    W.put(&bytes, u32, 32, 128);
+    W.put(&bytes, u16, 40, 52);
+    W.put(&bytes, u16, 42, 32);
+    W.put(&bytes, u16, 44, 1);
+    W.put(&bytes, u16, 46, 40);
+    W.put(&bytes, u16, 48, 4);
+    W.put(&bytes, u32, 52, 1);
+    W.put(&bytes, u32, 60, 0x1000);
+    W.put(&bytes, u32, 68, 512);
+    W.put(&bytes, u32, 72, 512);
+    W.put(&bytes, u32, 76, 5);
+    W.put(&bytes, u32, 80, 4096);
+    W.put(&bytes, u32, 172, 1);
+    W.put(&bytes, u32, 176, 6);
+    W.put(&bytes, u32, 180, 0x1190);
+    W.put(&bytes, u32, 184, 400);
+    W.put(&bytes, u32, 188, 4);
+    W.put(&bytes, u32, 212, 2);
+    W.put(&bytes, u32, 224, 320);
+    W.put(&bytes, u32, 228, 32);
+    W.put(&bytes, u32, 232, 3);
+    W.put(&bytes, u32, 244, 16);
+    W.put(&bytes, u32, 252, 3);
+    W.put(&bytes, u32, 264, 300);
+    W.put(&bytes, u32, 268, 6);
+    @memcpy(bytes[300..306], "\x00func\x00");
+    W.put(&bytes, u32, 336, 1);
+    W.put(&bytes, u32, 340, 0x1190);
+    W.put(&bytes, u32, 344, 4);
+    bytes[348] = 0x12;
+    W.put(&bytes, u16, 350, 1);
+    const image = try Image.parse(&bytes);
+    try testing.expectEqual(Machine.m68k, image.header.machine);
+    try testing.expectEqual(@as(u64, 0x1190), image.header.entry);
+    const segment = try image.segment(0);
+    try testing.expectEqual(@as(u64, 0x1000), segment.vaddr);
+    try testing.expectEqual(@as(u32, 5), segment.flags);
+    const table = (try image.symbols(.symtab)).?;
+    const symbol = try table.get(1);
+    try testing.expectEqualStrings("func", symbol.name);
+    try testing.expectEqual(@as(u64, 0x1190), symbol.value);
+    try testing.expectEqual(@as(u64, 4), symbol.size);
+    try testing.expectEqual(Placement{ .section = 1 }, symbol.placement);
+    for (0..bytes.len) |n| _ = Image.parse(bytes[0..n]) catch continue;
 }
 
 test "synthetic image: header, segments, sections, symbols" {

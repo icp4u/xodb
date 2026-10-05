@@ -1,4 +1,6 @@
 const std = @import("std");
+const runtime_api = @import("../target/runtime.zig");
+const rt = runtime_api.c;
 const c = @import("../c.zig").api;
 const elf = @import("../binary/elf.zig");
 const apk = @import("../binary/apk.zig");
@@ -41,6 +43,7 @@ pub const Module = struct {
 pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0 };
 pub const Modules = struct {
     pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
+    target: ?*const rt.struct_xrt_target = null,
     core_source: ?*const @import("../binary/core.zig").Core = null,
     core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
     core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
@@ -145,9 +148,13 @@ pub const Modules = struct {
         if (self.core_source != null) return;
         if (pid <= 0) return;
         self.pid = pid;
-        var path_buf: [80]u8 = undefined;
-        const path = try std.fmt.bufPrintZ(&path_buf, "/proc/{d}/maps", .{pid});
-        const file = c.fopen(path, "r") orelse return error.ProcessMapsUnavailable;
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_MAPS });
+        var fd: c_int = -1;
+        try runtime_api.check(if (self.target) |t| rt.xrt_target_file(t, &request, &fd) else rt.xrt_process_file(pid, &request, &fd));
+        const file = c.fdopen(fd, "r") orelse {
+            _ = c.close(fd);
+            return error.ProcessMapsUnavailable;
+        };
         defer _ = c.fclose(file);
         var new_regions: std.ArrayList(Region) = .empty;
         errdefer {
@@ -210,8 +217,8 @@ pub const Modules = struct {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
         return self.loadRange(region, true);
     }
-    fn pageSize() !u64 {
-        const result = c.sysconf(c._SC_PAGESIZE);
+    fn pageSize(self: *const Modules) !u64 {
+        const result = rt.xrt_target_page_size(self.target);
         if (result <= 0) return error.BadMapping;
         return @intCast(result);
     }
@@ -224,7 +231,7 @@ pub const Modules = struct {
         var relative = region;
         relative.offset -= file_offset;
         if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
-        const page = try pageSize();
+        const page = try self.pageSize();
         var first_segment: ?elf.Segment = null;
         for (0..image.header.segment_count) |i| {
             const segment = try image.segment(@intCast(i));
@@ -281,7 +288,7 @@ pub const Modules = struct {
         errdefer self.allocator.free(path);
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
-        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else try @import("../binary/mapped_file.zig").open(self.pid, region);
+        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else try @import("../binary/mapped_file.zig").openTarget(self.target, self.pid, region);
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
         var stat: c.struct_stat = undefined;
@@ -289,7 +296,7 @@ pub const Modules = struct {
         var signature: [4]u8 = undefined;
         if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
         const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = @intCast(stat.st_size) } else try apk.find(self.allocator, fd, @intCast(stat.st_size), region.offset);
-        if (entry.offset % try pageSize() != 0) return error.ApkEntryNotPageAligned;
+        if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
         // MAP_PRIVATE still faults against the file after truncation. Parsed
         // ELF/libdw slices must only reference owned, bounded snapshots.
         const mapped = try snapshot.readRange(fd, entry.offset, entry.size, @min(snapshot.per_image_limit, snapshot.total_limit - self.snapshot_bytes), null);
@@ -302,7 +309,7 @@ pub const Modules = struct {
         }
         const image = try elf.Image.parse(mapped);
         if (expected) |id| if (!std.mem.eql(u8, id, image.buildId() orelse return error.CoreModuleBuildIdMissing)) return error.CoreModuleBuildIdMismatch;
-        if (@intFromEnum(image.header.machine) != @intFromEnum(@import("../target/arch.zig").native)) return error.UnsupportedTargetArchitecture;
+        if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedTargetArchitecture;
         const p = try self.placement(&image, entry.offset, region, observed);
         const module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);

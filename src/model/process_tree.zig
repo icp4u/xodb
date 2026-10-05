@@ -58,25 +58,20 @@ pub const Tree = struct {
         if (session.offline or session.imported != null) return error.OfflineSession;
         if (limit) |n| if (n == 0 or n > maximum or n < self.count) return error.InvalidProcessLimit;
         if (session.target.core != null) return error.ReadOnlyCore;
-        if (session.target.state != .stopped) return error.NotStopped;
-        if (session.target.follow_processes != enabled) try session.target.setFollowProcesses(enabled) else session.target.generation += 1;
+        if (session.target.snapshot().state != .stopped) return error.NotStopped;
+        if (session.target.snapshot().follow_processes != enabled) try session.target.setFollowProcesses(enabled) else session.target.invalidate();
         if (limit) |n| try self.setLimit(n);
         session.record(actor, "set_process_following");
         self.revision += 1;
     }
-    fn familyRoot(target: *linux.Target) *linux.Target {
-        var root_target = target;
-        while (root_target.vfork_parent) |parent| root_target = parent;
-        return root_target;
-    }
     pub fn detachFamily(self: *Tree, session: *model.Session, actor: model.Actor) !void {
         if (session.offline or session.imported != null) return error.OfflineSession;
         if (session.target.core != null) return error.ReadOnlyCore;
-        if (session.target.state == .idle or session.target.state == .exited) return error.InvalidState;
-        const family = familyRoot(&session.target);
+        if (session.target.snapshot().state == .idle or session.target.snapshot().state == .exited) return error.InvalidState;
+        const family = session.target.familyRoot();
         var affected: [maximum]*model.Session = undefined;
         var n: usize = 0;
-        for (self.entries[0..self.count]) |entry| if (familyRoot(&entry.session.target) == family) {
+        for (self.entries[0..self.count]) |entry| if (entry.session.target.familyRoot() == family) {
             affected[n] = entry.session;
             n += 1;
             entry.session.cancelStep();
@@ -90,7 +85,7 @@ pub const Tree = struct {
     pub fn setScope(self: *Tree, scope: model.AgentScope) void {
         for (self.entries[0..self.count]) |entry| {
             entry.session.agent_scope = scope;
-            entry.session.target.generation += 1;
+            entry.session.target.invalidate();
             entry.session.record(.human, "set_agent_scope");
         }
         self.revision += 1;
@@ -102,24 +97,24 @@ pub const Tree = struct {
             entry.session.poll() catch |err| {
                 entry.session.cancelStep();
                 entry.session.step_diagnostic = @errorName(err);
-                if (entry.last_generation != entry.session.target.generation)
-                    std.debug.print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.pid, @errorName(err) });
+                if (entry.last_generation != entry.session.target.snapshot().generation)
+                    std.debug.print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.snapshot().pid, @errorName(err) });
             };
-            if (entry.last_generation != entry.session.target.generation) {
+            if (entry.last_generation != entry.session.target.snapshot().generation) {
                 self.revision += 1;
-                entry.last_generation = entry.session.target.generation;
+                entry.last_generation = entry.session.target.snapshot().generation;
             }
         }
     }
     pub fn admit(self: *Tree, parent: *model.Session) void {
-        if (parent.target.birth_count == 0 or parent.target.state != .stopped) return;
+        if (parent.target.snapshot().birth_count == 0 or parent.target.snapshot().state != .stopped) return;
         const entry = self.find(parent.process_id) catch return;
-        if (entry.failed_generation == parent.target.generation) return;
+        if (entry.failed_generation == parent.target.snapshot().generation) return;
         // At most one admission per parent per poll; mappings load on demand.
-        for (parent.target.births[0..parent.target.birth_count]) |birth| {
+        for (parent.target.birthSlice()) |birth| {
             if (!birth.stopped and !birth.exited) continue;
             self.adopt(parent, birth) catch |err| {
-                entry.failed_generation = parent.target.generation;
+                entry.failed_generation = parent.target.snapshot().generation;
                 entry.admission_error = @errorName(err);
                 std.debug.print("xodb: process #{d} child pid={d} held: {s}\n", .{ parent.process_id, birth.pid, @errorName(err) });
                 self.revision += 1;
@@ -131,7 +126,7 @@ pub const Tree = struct {
         }
     }
     fn adopt(self: *Tree, parent: *model.Session, birth: linux.Birth) !void {
-        if (!parent.target.follow_processes) return error.ProcessFollowingDisabled;
+        if (!parent.target.snapshot().follow_processes) return error.ProcessFollowingDisabled;
         if (self.count == self.limit) return error.ProcessLimit;
         const child = try A.create(model.Session);
         child.* = model.Session.init();
@@ -156,15 +151,12 @@ pub const Tree = struct {
         const event = try parent.target.adoptChild(birth.pid, &child.target);
         child.process_id = self.count + 1;
         child.process_tree = self;
-        child.persistent.epoch = child.target.image_epoch;
+        child.persistent.epoch = child.target.snapshot().image_epoch;
         child.persistent.observed = 0;
-        for (child.target.breakpoints[0..child.target.breakpoint_count]) |*probe| probe.hit_count = 0;
-        if (child.target.thread_count != 0) {
+        if (child.target.snapshot().thread_count != 0) {
             // Do not accidentally bind an absent parent's thread filter to a
             // new child thread with a reused small debugger ID.
-            const new_id = parent.target.next_thread_id;
-            child.target.threads[0].id = new_id;
-            child.target.next_thread_id = new_id + 1;
+            const new_id = child.target.threadSlice()[0].id;
             var parent_thread_id: ?u64 = null;
             for (parent.target.threadSlice()) |thread| if (thread.tid == birth.parent_tid) {
                 parent_thread_id = thread.id;
@@ -177,7 +169,7 @@ pub const Tree = struct {
         self.entries[self.count] = .{ .id = child.process_id, .parent = parent.process_id, .session = child, .kind = event.kind };
         self.count += 1;
         self.revision += 1;
-        std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.pid, @tagName(event.kind), parent.process_id });
+        std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
     }
     pub fn deinit(self: *Tree) void {
         // Release all target links before freeing any session. A failed detach
@@ -192,7 +184,7 @@ pub const Tree = struct {
             remaining -= 1;
             const child = self.entries[remaining].session;
             child.process_tree = null;
-            if (child.target.pid != 0 or child.target.sharedVm()) {
+            if (child.target.snapshot().pid != 0 or child.target.sharedVm()) {
                 // Main is shutting down. Keep storage alive for the root's
                 // final cleanup retry; a leaked shutdown allocation is safer
                 // than destroying a still-linked target.

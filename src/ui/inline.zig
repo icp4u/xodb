@@ -96,8 +96,8 @@ pub const Panel = struct {
     }
     pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, session: *model.Session, tid: i32, frame_index: usize) !void {
         if (!self.open) return;
-        if (self.generation != session.target.generation or self.tid != tid or self.frame != frame_index) {
-            self.generation = session.target.generation;
+        if (self.generation != session.target.snapshot().generation or self.tid != tid or self.frame != frame_index) {
+            self.generation = session.target.snapshot().generation;
             self.tid = tid;
             self.frame = frame_index;
             self.depth = 0;
@@ -112,7 +112,7 @@ pub const Panel = struct {
         var buffer: [1024]u8 = undefined;
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, try std.fmt.bufPrint(&buffer, "INLINE SCOPES   physical frame {d} / tid {d}   I / Esc close", .{ frame_index, tid }), theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, "Up/Down or click scope   E expression   Wheel/PgUp/Down locals", theme.weak);
-        if (session.target.state != .stopped) {
+        if (session.target.snapshot().state != .stopped) {
             self.visible = 0;
             try r.textFit(font, b.x + 14, b.y + 70, b.w - 28, "Target running; stop to inspect inline scopes", theme.weak);
             return;

@@ -411,14 +411,17 @@ pub const Image = struct {
                 var unit: c.Dwarf_Die = undefined;
                 if (c.dwarf_cu_die(attribute.cu, &unit, null, null, null, null, null, null) == null) return error.MalformedDebugInfo;
                 const base = unsigned(&unit, std.dwarf.AT.addr_base) orelse return error.AddressTableUnavailable;
-                const index = std.math.mul(u64, out.number, 8) catch return error.MalformedDebugInfo;
+                const index = std.math.mul(u64, out.number, self.architecture.addressBytes()) catch return error.MalformedDebugInfo;
                 const offset = std.math.add(u64, base, index) catch return error.MalformedDebugInfo;
-                if (offset > self.address_table.len or self.address_table.len - offset < 8) return error.MalformedDebugInfo;
-                out.number = std.mem.readInt(u64, self.address_table[@intCast(offset)..][0..8], .little);
+                if (offset > self.address_table.len or self.address_table.len - offset < self.architecture.addressBytes()) return error.MalformedDebugInfo;
+                out.number = loc.lowBits(self.address_table[@intCast(offset)..][0..self.architecture.addressBytes()], self.architecture.endian());
                 out.atom = if (out.atom == std.dwarf.OP.addrx or out.atom == std.dwarf.OP.GNU_addr_index) std.dwarf.OP.addr else std.dwarf.OP.constu;
             }
         }
-        return loc.composite(a, ctx, normalized);
+        var context = ctx;
+        context.endian = self.architecture.endian();
+        context.address_bytes = self.architecture.addressBytes();
+        return loc.composite(a, context, normalized);
     }
     pub fn unwind(self: *Image, a: std.mem.Allocator, pc: u64, ctx: loc.Context) !Unwind {
         var frame: ?*c.Dwarf_Frame = null;
@@ -435,7 +438,7 @@ pub const Image = struct {
         var ops: [*c]c.Dwarf_Op = null;
         var count: usize = 0;
         if (c.dwarf_frame_cfa(frame, &ops, &count) != 0 or count == 0) return error.CfaUnavailable;
-        const cfa = try loc.scalar(try self.expression(a, null, ops, count, ctx), 8);
+        const cfa = try loc.scalar(try self.expression(a, null, ops, count, ctx), ctx.address_bytes);
         var context = ctx;
         context.cfa = cfa;
         var caller: loc.RegisterSet = @splat(null);
@@ -452,9 +455,10 @@ pub const Image = struct {
             const where = self.expression(a, null, ops, count, context) catch continue;
             if (where.kind == .address) {
                 var bytes: [8]u8 = undefined;
-                const n = ctx.read(ctx.user, where.bits, &bytes) catch continue;
-                if (n == 8) value.* = std.mem.readInt(u64, &bytes, .little);
-            } else value.* = loc.scalar(where, 8) catch continue;
+                const width = self.architecture.addressBytes();
+                const n = ctx.read(ctx.user, where.bits, bytes[0..width]) catch continue;
+                if (n == width) value.* = loc.lowBits(bytes[0..width], self.architecture.endian());
+            } else value.* = loc.scalar(where, ctx.address_bytes) catch continue;
         }
         caller[self.architecture.sp()] = cfa;
         if (self.architecture == .aarch64) caller[self.architecture.pc()] = caller[self.architecture.ra()];
@@ -531,7 +535,7 @@ pub const Image = struct {
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
                 t.kind = .pointer;
-                if (t.size == 0) t.size = 8;
+                if (t.size == 0) t.size = self.architecture.addressBytes();
                 t.child = if (reference(&die, std.dwarf.AT.type)) |child| try self.typeOf(child, depth + 1) else &unknown;
                 if (t.name.len == 0) t.name = try std.fmt.allocPrint(a, "{s} *", .{t.child.?.name});
             },
@@ -694,7 +698,7 @@ pub const Image = struct {
                 var len: usize = 0;
                 if (c.dwarf_getlocation_addr(&attr, pc, &ops, &len, 1) == 1) {
                     const base = self.expression(a, &attr, ops, len, ctx) catch break;
-                    ctx.frame_base = loc.scalar(base, 8) catch break;
+                    ctx.frame_base = loc.scalar(base, ctx.address_bytes) catch break;
                 }
                 break;
             }
@@ -720,8 +724,10 @@ pub const Image = struct {
                             if (where.kind == .address) value.value.address = where.bits else {
                                 value.value.bits = where.bits;
                                 value.value.data = if (where.data) |data| try a.dupe(u8, data) else if (t.kind == .array or t.kind == .structure) blk: {
-                                    const bytes = try a.alloc(u8, 8);
-                                    std.mem.writeInt(u64, bytes[0..8], where.bits, .little);
+                                    var register_bytes: [8]u8 = undefined;
+                                    std.mem.writeInt(u64, &register_bytes, where.bits, ctx.endian);
+                                    const width: usize = @intCast(@min(t.size, ctx.address_bytes));
+                                    const bytes = try a.dupe(u8, if (ctx.endian == .big) register_bytes[8 - width ..] else register_bytes[0..width]);
                                     break :blk bytes;
                                 } else null;
                                 value.value.valid = where.valid;

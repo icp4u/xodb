@@ -74,6 +74,7 @@ pub const Capture = struct {
     offline_graph_budget: ?*@import("archive_budget.zig").Budget = null,
     archive_busy: bool = false,
     boot_id: ?[36]u8 = null,
+    producer: ?@import("producer.zig").Producer = null,
     recorded: std.AutoHashMapUnmanaged(CacheKey, annotations.Record) = .empty,
     work_cancel: ?*const std.atomic.Value(bool) = null,
     id: u64,
@@ -133,10 +134,14 @@ pub const Capture = struct {
     trusted_before_ns: u64 = std.math.maxInt(u64),
 
     pub fn open(a: std.mem.Allocator, id: u64, session_id: u64, generation: u64, image_epoch: u64, pid: i32, map_tid: i32, config: Config, debugger_ids: []const u64, started_ns: u64) !Opened {
+        return openTarget(null, a, id, session_id, generation, image_epoch, pid, map_tid, config, debugger_ids, started_ns);
+    }
+    pub fn openTarget(target: ?*const @import("../target/runtime.zig").c.struct_xrt_target, a: std.mem.Allocator, id: u64, session_id: u64, generation: u64, image_epoch: u64, pid: i32, map_tid: i32, config: Config, debugger_ids: []const u64, started_ns: u64) !Opened {
         try config.validate();
         if (config.tids.len == 0 or config.tids.len != debugger_ids.len) return error.InvalidProfileConfig;
         var images = modules.Modules.init(a);
         images.immutable = true;
+        images.target = target;
         errdefer images.deinit();
         try images.refresh(map_tid);
         if (images.regions.items.len > 16384) return error.ProfileMapLimit;
@@ -155,7 +160,7 @@ pub const Capture = struct {
         errdefer user_state.deinit(a);
         const syscall_ring_bytes = if (config.syscall_timing) syscall_perf.ringBytes(config.tids.len) else 0;
         if (syscall_ring_bytes >= config.ring_budget_bytes) return error.SyscallRingBudget;
-        const opened = try perf.start(a, .{ .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) records.user_regs_gpr_mask else 0, .user_stack_bytes = config.user_stack_bytes });
+        const opened = try perf.start(a, .{ .target = @ptrCast(target), .follow_threads = config.follow_threads, .tids = config.tids, .frequency_hz = config.frequency_hz, .max_frames = 64, .mmap_data = true, .data_pages = ringPages(config.tids.len), .ring_budget_bytes = config.ring_budget_bytes - syscall_ring_bytes, .max_sides = perf.max_sides_cap, .context_switch = config.context_switch, .user_regs_mask = if (config.user_stack_bytes != 0) records.user_regs_gpr_mask else 0, .user_stack_bytes = config.user_stack_bytes });
         switch (opened) {
             .failed => |failure| {
                 user_state.deinit(a);
@@ -167,7 +172,7 @@ pub const Capture = struct {
             .collector => |collector| {
                 errdefer collector.close();
                 var syscall_collector: ?*syscall_perf.Collector = null;
-                if (config.syscall_timing) switch (try syscall_perf.start(a, pid, config.tids)) {
+                if (config.syscall_timing) switch (try syscall_perf.startTarget(a, @ptrCast(target), pid, config.tids)) {
                     .collector => |opened_syscalls| syscall_collector = opened_syscalls,
                     .failed => |failure| {
                         var full = failure;
@@ -180,15 +185,37 @@ pub const Capture = struct {
                         return .{ .failed = full };
                     },
                 };
-                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .boot_id = @import("../binary/snapshot.zig").bootId(), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
+                self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = id, .session_id = session_id, .generation = generation, .image_epoch = image_epoch, .pid = pid, .boot_id = @import("../binary/snapshot.zig").bootId(), .producer = @import("producer.zig").describe(target), .started_ns = started_ns, .config = .{ .sample_limit = config.sample_limit, .follow_threads = config.follow_threads, .ring_budget_bytes = config.ring_budget_bytes, .frequency_hz = config.frequency_hz, .duration_ms = config.duration_ms, .context_switch = config.context_switch, .syscall_timing = config.syscall_timing, .syscall_limit = config.syscall_limit, .user_stack_bytes = config.user_stack_bytes, .user_stack_budget_bytes = if (config.user_stack_bytes == 0) 0 else config.user_stack_budget_bytes }, .samples = .{ .max_samples = config.sample_limit }, .user_state = user_state, .accepted = collector.acceptance(), .thread_count = config.tids.len, .collector = collector, .syscall_collector = syscall_collector, .syscalls = .{ .enabled = config.syscall_timing, .limit = config.syscall_limit }, .images = images, .history = history, .missing_images = missing };
                 for (debugger_ids, 0..) |debugger_id, i| {
                     self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).? };
-                    self.cpu_before[i] = activity.read(pid, config.tids[i]);
+                    self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);
                     _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{config.tids[i]}) catch unreachable;
                 }
                 return .{ .capture = self };
             },
         }
+    }
+    /// The C agent enrolls held newborns before resuming them. Import its
+    /// immutable identities before decoding records that refer to those TIDs.
+    pub fn syncRemoteThreads(self: *Capture, now: u64) void {
+        const rt = @import("../target/runtime.zig").c;
+        if (!rt.xrt_target_is_remote(self.images.target)) return;
+        const collector = self.collector orelse return;
+        const count = collector.acceptance().threads;
+        while (self.thread_count < count and self.thread_count < self.threads.len) {
+            const i = self.thread_count;
+            const thread = collector.thread(i) orelse {
+                self.enrollmentFailed(.{ .kind = .other, .syscall = "remote enroll", .detail = "collector identity unavailable" }, now);
+                return;
+            };
+            self.threads[i] = .{ .debugger_id = collector.debuggerId(i), .perf = thread, .enrolled_ns = collector.enrolledAt(i) orelse now };
+            self.cpu_before[i] = activity.readTarget(@ptrCast(self.images.target), self.pid, thread.tid);
+            _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{thread.tid}) catch unreachable;
+            self.thread_count += 1;
+            self.revision += 1;
+        }
+        self.accepted.threads = @intCast(self.thread_count);
+        if (collector.pendingFailure()) |failure| self.enrollmentFailed(failure, now);
     }
     /// Called only for a verified same-process newborn held by ptrace.
     pub fn enroll(self: *Capture, tid: i32, debugger_id: u64, now: u64) void {
@@ -207,7 +234,7 @@ pub const Capture = struct {
         }
         const i = self.thread_count;
         self.threads[i] = .{ .debugger_id = debugger_id, .perf = collector.thread(i).?, .enrolled_ns = now };
-        self.cpu_before[i] = activity.read(self.pid, tid);
+        self.cpu_before[i] = activity.readTarget(@ptrCast(self.images.target), self.pid, tid);
         _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{tid}) catch unreachable;
         self.thread_count += 1;
         self.accepted.threads = @intCast(self.thread_count);
@@ -301,7 +328,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocated_ring_bytes else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len, .snapshot_bytes = self.images.snapshot_bytes } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len, .snapshot_bytes = self.images.snapshot_bytes } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -350,8 +377,8 @@ pub const Capture = struct {
             else => "",
         };
         var totals = activity.Totals{};
-        for (self.threads[0..self.thread_count], 0..) |thread, i| totals.add(self.cpu_before[i], activity.read(self.pid, thread.perf.tid));
-        self.cpu_activity = totals.summary(activity.ticksPerSecond());
+        for (self.threads[0..self.thread_count], 0..) |thread, i| totals.add(self.cpu_before[i], activity.readTarget(@ptrCast(self.images.target), self.pid, thread.perf.tid));
+        self.cpu_activity = totals.summary(@import("../target/runtime.zig").c.xrt_target_tick_hz(self.images.target));
         self.reportStop();
     }
     fn reportStop(self: *const Capture) void {
@@ -725,7 +752,7 @@ pub const Capture = struct {
         const bytes = @min(image.mapping.len - offset, frame_.lookup_address - frame_.address + 128);
         const disasm = @import("../model/disassembly.zig");
         const decoded = try a.alloc(disasm.Instruction, 4096);
-        const count = try disasm.decode(image.mapping[offset..][0..bytes], frame_.address, decoded);
+        const count = try disasm.decodeFor(@enumFromInt(@intFromEnum(image.image.header.machine)), image.mapping[offset..][0..bytes], frame_.address, decoded);
         var first: usize = 0;
         for (decoded[0..count], 0..) |instruction, i| {
             if (instruction.address <= frame_.lookup_address) first = i;
@@ -871,6 +898,7 @@ pub const Capture = struct {
     }
 };
 pub const Summary = struct {
+    producer: ?@import("producer.zig").Producer,
     id: u64,
     session_id: u64,
     opening_generation: u64,

@@ -1,6 +1,6 @@
-# Experimental native capture format 2.4
+# Experimental native capture format 2.6
 
-This extends the integrated formats 2.0/2.1/2.2/2.3, which superseded T11's unshipped prototype 1.
+This extends the integrated formats 2.0/2.1/2.2/2.3/2.4/2.5, which superseded T11's unshipped prototype 1.
 The canonical field order and validation are in src/profile/archive.zig.
 This document describes the extension boundary; it is not a compatibility promise
 for arbitrary future formats.
@@ -34,7 +34,7 @@ The 64-byte header has these offsets:
 Each 24-byte directory entry contains u32 tag, u32 flags, u64 absolute offset,
 u32 length and u32 payload CRC32. Payloads are contiguous in directory order:
 no gaps, overlap or unaccounted trailing bytes. Flag bit 0 marks an ignorable
-extension. Known sections cannot be marked ignorable. Other flags are rejected.
+extension. Required sections cannot be marked ignorable. PROD is an optional known section and must carry this flag. Other flags are rejected.
 
 Required feature bit 0 declares recorded annotation schema 1 and is mandatory.
 Bit 1 declares extended duration semantics in META: duration_ms=0 disables the
@@ -45,7 +45,7 @@ reader rejects bit 1 explicitly. Bit 2 declares USTA schema 1 (sampled user stat
 requires minor >= 2 and a non-ignorable USTA section. Bit 3 declares thread scope
 and enrollment evidence (TSCP), requires minor >= 3 and that non-ignorable section.
 Bit 4 declares a configured sample ceiling (LIMT), requires minor >= 4 and that
-non-ignorable section. Other required bits are unsupported. Unknown required sections/features fail
+non-ignorable section. Bit 5 declares syscall evidence (SYSC), requires minor >= 5 and that non-ignorable section. Other required bits are unsupported. Unknown required sections/features fail
 explicitly; an unknown optional section is checksum/length checked, reported and
 retained inside the original bytes. Copying an opened artifact preserves its
 complete bytes and SHA-256. Re-encoding the runtime offline capture is refused.
@@ -149,3 +149,25 @@ Archives without LIMT imply 16,384. Default captures retain the 2.3 encoding and
 required bits; a nondefault value, even below 16,384, uses 2.4/bit 4. Old readers
 reject the unknown required feature instead of silently interpreting a new limit.
 Duplicate, ignorable, missing or malformed LIMT sections are rejected.
+
+
+## Remote producer metadata (2.6)
+
+Remote captures append the optional, ignorable PROD section (tag `0x444f5250`).
+Its payload is: schema u8 (1), ELF machine u16, address bits u8, little-endian
+boolean, boot-ID-present boolean, optional 36 boot-ID bytes, then three u64 values:
+producer monotonic time, corresponding host monotonic time, and uncertainty in ns.
+All scalars use the container's little-endian encoding. Duplicate PROD sections,
+invalid booleans, unsupported producer layouts, truncated fields and trailing
+bytes are rejected. Profiling currently accepts x86-64 / 64-bit / little-endian
+producers only. Captures without PROD retain their previous minor version.
+
+The C proxy translates remote samples and debugger events to the host's monotonic
+clock using the shortest of four HELLO round trips. META's capture boot ID is the
+host boot ID. PROD preserves the target boot and the fixed clock correlation;
+half the measured round trip is the initial uncertainty, with subsequent drift
+unmeasured. Older readers may ignore PROD without misinterpreting the stored
+host-domain timestamps. Original-byte copying preserves it.
+
+Standalone allocation archives also retain optional `producer` clock provenance.
+Their event times use the same host monotonic domain.

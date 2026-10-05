@@ -1,19 +1,33 @@
 const std = @import("std");
 const c = @import("../c.zig").api;
-const architecture = @import("../target/arch.zig").native;
+const Arch = @import("../target/arch.zig").Arch;
 pub const Flow = enum { ordinary, conditional, jump, call, ret, trap, system };
 pub const Instruction = struct { address: u64, size: u16, mnemonic: [32]u8, operands: [160]u8, flow: Flow = .ordinary, target: ?u64 = null };
 pub fn decode(bytes: []const u8, address: u64, out: []Instruction) !usize {
-    return decodeImpl(bytes, address, out, false);
+    return decodeFor(@import("../target/arch.zig").native, bytes, address, out);
 }
 pub fn decodeFlow(bytes: []const u8, address: u64, out: []Instruction) !usize {
-    return decodeImpl(bytes, address, out, true);
+    return decodeFlowFor(@import("../target/arch.zig").native, bytes, address, out);
 }
-fn decodeImpl(bytes: []const u8, address: u64, out: []Instruction, detail: bool) !usize {
+pub fn decodeFor(architecture: Arch, bytes: []const u8, address: u64, out: []Instruction) !usize {
+    return decodeImpl(architecture, bytes, address, out, false);
+}
+pub fn decodeFlowFor(architecture: Arch, bytes: []const u8, address: u64, out: []Instruction) !usize {
+    return decodeImpl(architecture, bytes, address, out, true);
+}
+fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instruction, detail: bool) !usize {
     if (out.len == 0 or bytes.len == 0) return 0;
     if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
     var handle: c.csh = 0;
-    if (c.cs_open(if (architecture == .aarch64) c.CS_ARCH_ARM64 else c.CS_ARCH_X86, if (architecture == .aarch64) c.CS_MODE_ARM else c.CS_MODE_64, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
+    if (c.cs_open(switch (architecture) {
+        .x86_64 => c.CS_ARCH_X86,
+        .aarch64 => c.CS_ARCH_ARM64,
+        .m68k => c.CS_ARCH_M68K,
+    }, switch (architecture) {
+        .x86_64 => c.CS_MODE_64,
+        .aarch64 => c.CS_MODE_ARM,
+        .m68k => c.CS_MODE_BIG_ENDIAN | c.CS_MODE_M68K_040,
+    }, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
     defer _ = c.cs_close(&handle);
     if (detail and c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_ON) != c.CS_ERR_OK) return error.DisassemblerDetailUnavailable;
     var instructions: [*c]c.cs_insn = null;
@@ -48,6 +62,9 @@ fn decodeImpl(bytes: []const u8, address: u64, out: []Instruction, detail: bool)
                     out[i].target = @bitCast(operand.unnamed_0.imm);
                 };
             }
+        } else if (architecture == .m68k) {
+            // Capstone group classifications apply independently of host ISA.
+            out[i].flow = if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_RET) != null or std.mem.indexOfScalar(u8, groups, c.CS_GRP_IRET) != null) .ret else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_CALL) != null) .call else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_JUMP) != null) (if (raw.id == c.M68K_INS_BRA or raw.id == c.M68K_INS_JMP) .jump else .conditional) else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_INT) != null) .trap else .ordinary;
         } else {
             out[i].flow = if (raw.id == c.X86_INS_HLT or raw.id == c.X86_INS_UD0 or raw.id == c.X86_INS_UD1 or raw.id == c.X86_INS_UD2)
                 .trap
@@ -76,4 +93,13 @@ test "decoder preserves instruction boundaries and addresses" {
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(@as(u64, 0x1001), instructions[1].address);
     try std.testing.expectEqualStrings("ret", std.mem.sliceTo(@as([]const u8, &instructions[2].mnemonic), 0));
+}
+
+test "m68k disassembly uses target byte order on a non-m68k host" {
+    var instructions: [4]Instruction = undefined;
+    const n = try decodeFlowFor(.m68k, &.{ 0x4e, 0x71, 0x4e, 0x75 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 2), n);
+    try std.testing.expectEqual(@as(u64, 0x1002), instructions[1].address);
+    try std.testing.expectEqualStrings("nop", std.mem.sliceTo(&instructions[0].mnemonic, 0));
+    try std.testing.expectEqual(Flow.ret, instructions[1].flow);
 }

@@ -234,10 +234,9 @@ pub fn normalizedSample(record: Record) !events.Event {
 }
 
 pub fn retprobeMask(format: []const u8) !u64 {
-    const text = std.mem.trim(u8, format, " \t\r\n");
-    if (!std.mem.startsWith(u8, text, "config:")) return error.AllocationPmuFormat;
-    const bit = std.fmt.parseInt(u6, text[7..], 10) catch return error.AllocationPmuFormat;
-    return @as(u64, 1) << bit;
+    var mask: u64 = undefined;
+    if (!@import("runtime.zig").c.xrt_allocation_retprobe(format.ptr, format.len, &mask)) return error.AllocationPmuFormat;
+    return mask;
 }
 
 const hooks = [_]Hook{ .{ .id = 4, .kind = .malloc, .entry_id = 100, .return_id = 101 }, .{ .id = 9, .kind = .free, .entry_id = 102, .return_id = 103 } };

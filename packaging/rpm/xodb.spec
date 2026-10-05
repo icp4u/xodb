@@ -53,5 +53,6 @@ executable; its use requires explicit administrator authorization.
 %license %{_datadir}/licenses/xodb/
 %doc %{_datadir}/doc/xodb/
 %{_bindir}/xodb
+%{_bindir}/xodb-agent
 %{_libexecdir}/xodb-allocation-helper
 %{_datadir}/applications/xodb.desktop

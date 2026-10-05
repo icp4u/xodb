@@ -211,6 +211,30 @@ test "archive extended durations round trip with an explicit required feature" {
     }
 }
 
+test "remote clock provenance round trips independently of the host boot" {
+    const capture = try fixture.build(a, .empty, null);
+    defer capture.deinit();
+    capture.boot_id = "00000000-1111-2222-3333-444444444444".*;
+    capture.producer = .{ .machine = 62, .address_bits = 64, .little_endian = true, .boot_id = "99999999-8888-7777-6666-555555555555".*, .monotonic_ns = 1000, .host_monotonic_ns = 9000, .uncertainty_ns = 50 };
+    const bytes = try archive.encode(a, capture, .{});
+    defer a.free(bytes);
+    var opened = try archive.decode(a, bytes, .{ .local_id = 2 });
+    defer opened.deinit();
+    try std.testing.expectEqual(@as(u16, 6), opened.source.format_minor);
+    try std.testing.expectEqualDeep(capture.producer, opened.capture.producer);
+    try std.testing.expectEqualDeep(capture.producer, opened.source.producer);
+    try std.testing.expectEqual(capture.boot_id, opened.source.boot_id);
+    try std.testing.expectEqual(@as(usize, 0), opened.source.ignored_sections);
+    // Keep checksums valid, so rejection proves the section itself is checked.
+    const n = std.mem.readInt(u32, bytes[24..28], .little);
+    const entry = bytes[archive.header_bytes + (n - 1) * archive.entry_bytes ..][0..archive.entry_bytes];
+    const offset = std.mem.readInt(u64, entry[8..16], .little);
+    const body = bytes[@intCast(offset)..];
+    body[0] = 2;
+    std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(body), .little);
+    try std.testing.expectError(error.ArchiveUnsupportedValue, archive.decode(a, bytes, .{ .local_id = 3 }));
+}
+
 test "archive rejects inconsistent sampled user evidence" {
     const capture = try fixture.build(a, .representative, "zig-out/bin/xodb-profile-fixture");
     defer capture.deinit();

@@ -186,43 +186,9 @@ pub fn decode(bytes: []const u8, who: Identity) !?Event {
         else => return error.SyscallUnknownRecord,
     }
 }
-fn parseValue(line: []const u8, key: []const u8) !u32 {
-    const start = (std.mem.indexOf(u8, line, key) orelse return error.SyscallFormat) + key.len;
-    const end = std.mem.indexOfScalarPos(u8, line, start, ';') orelse line.len;
-    return std.fmt.parseInt(u32, std.mem.trim(u8, line[start..end], " \t\r\n"), 10) catch error.SyscallFormat;
-}
-/// Refuse unknown/duplicate fields, ID disagreement and widths/signedness changes.
+/// Metadata validation belongs to the C collector, shared with its standalone agent.
 pub fn validateFormat(text: []const u8, id: u32, enter: bool) !void {
-    if (id == 0 or id > std.math.maxInt(u16)) return error.SyscallFormat;
-    const fields = [_][]const u8{ "unsigned short common_type", "unsigned char common_flags", "unsigned char common_preempt_count", "int common_pid", "long id", if (enter) "unsigned long args[6]" else "long ret" };
-    const offsets = [_]u32{ 0, 2, 3, 4, 8, 16 };
-    const sizes = [_]u32{ 2, 1, 1, 4, 8, if (enter) 48 else 8 };
-    const signed = [_]u32{ 0, 0, 0, 1, 1, if (enter) 0 else 1 };
-    var seen: [6]bool = @splat(false);
-    var seen_id = false;
-    var seen_name = false;
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |raw| {
-        const line = std.mem.trim(u8, raw, " \t\r");
-        if (std.mem.startsWith(u8, line, "name:")) {
-            if (seen_name or !std.mem.eql(u8, std.mem.trim(u8, line[5..], " \t"), if (enter) "sys_enter" else "sys_exit")) return error.SyscallFormat;
-            seen_name = true;
-        } else if (std.mem.startsWith(u8, line, "ID:")) {
-            if (seen_id or try parseValue(line, "ID:") != id) return error.SyscallFormat;
-            seen_id = true;
-        } else if (std.mem.startsWith(u8, line, "field:")) {
-            const end = std.mem.indexOfScalar(u8, line, ';') orelse return error.SyscallFormat;
-            const field = std.mem.trim(u8, line[6..end], " \t");
-            for (fields, 0..) |expected, i| {
-                if (!std.mem.eql(u8, field, expected)) continue;
-                if (seen[i] or try parseValue(line, "offset:") != offsets[i] or try parseValue(line, "size:") != sizes[i] or try parseValue(line, "signed:") != signed[i]) return error.SyscallFormat;
-                seen[i] = true;
-                break;
-            } else return error.SyscallFormat;
-        }
-    }
-    if (!seen_id or !seen_name) return error.SyscallFormat;
-    for (seen) |yes| if (!yes) return error.SyscallFormat;
+    if (!@import("runtime.zig").c.xrt_syscall_format(text.ptr, text.len, id, enter)) return error.SyscallFormat;
 }
 
 test "syscall missing boundaries, loss, reuse protection and storage limits" {

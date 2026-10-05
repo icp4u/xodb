@@ -148,7 +148,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         const prepared = if (!capture.offline) &(try session.recorded_views.request(capture, capture.revision, selected_filter, false)).graph else null;
         const result = try @import("../profile/export.zig").savePrepared(capture, path, selected_filter, prepared);
         session.record(.agent, "export_profile");
-        return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .generation = session.target.generation, .path = path, .format = "speedscope", .result = result, .ordering = @import("../profile/export.zig").ordering });
+        return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .generation = session.target.snapshot().generation, .path = path, .format = "speedscope", .result = result, .ordering = @import("../profile/export.zig").ordering });
     }
     if (std.mem.eql(u8, name, "add_profile_intervals")) {
         try fields(args, &.{ "generation", "capture_id", "revision", "source", "intervals" });
@@ -176,7 +176,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         }
         try capture.addIntervals(source.string, batch[0..list.array.items.len]);
         session.record(.agent, "add_profile_intervals");
-        return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .generation = session.target.generation, .added = list.array.items.len, .total = capture.application_intervals.items.items.len, .limit = app.limit, .provenance = app.provenance });
+        return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .generation = session.target.snapshot().generation, .added = list.array.items.len, .total = capture.application_intervals.items.items.len, .limit = app.limit, .provenance = app.provenance });
     }
     if (std.mem.eql(u8, name, "get_profile_intervals")) {
         try fields(args, &.{ "capture_id", "revision", "tid", "tids", "from_ns", "to_ns", "start", "limit" });
@@ -416,7 +416,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
             break :result &.{};
         };
         for (decoded) |instruction| try instructions.append(a, .{ .address = try std.fmt.allocPrint(a, "0x{x}", .{instruction.address}), .mnemonic = try a.dupe(u8, std.mem.sliceTo(&instruction.mnemonic, 0)), .operands = try a.dupe(u8, std.mem.sliceTo(&instruction.operands, 0)) });
-        return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .node = node, .evidence = .{ .mapping_id = frame.mapping_id, .module_id = frame.module_id, .lookup_address = try std.fmt.allocPrint(a, "0x{x}", .{frame.lookup_address}), .reference_basis = "mapping/address plus the view filter; node is temporary within view_id" }, .source_basis = if (capture.reanalyzed) "new analysis of identity-verified immutable assets; source text not archived" else if (capture.offline) @import("../profile/annotations.zig").basis else "retained capture ELF; current source text not certified", .mapping_id = frame.mapping_id, .mapping_note = frame.mapping_note, .mapping_coverage = @import("../profile/mappings.zig").coverage, .source = site, .instructions = instructions.items, .diagnostic = diagnostic, .assembly_basis = "retained ELF file for the recorded mapping, not live memory; sample IP or caller return address minus one is a representative location, not a per-line histogram", .target_changed = session.target.image_epoch != capture.image_epoch });
+        return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .node = node, .evidence = .{ .mapping_id = frame.mapping_id, .module_id = frame.module_id, .lookup_address = try std.fmt.allocPrint(a, "0x{x}", .{frame.lookup_address}), .reference_basis = "mapping/address plus the view filter; node is temporary within view_id" }, .source_basis = if (capture.reanalyzed) "new analysis of identity-verified immutable assets; source text not archived" else if (capture.offline) @import("../profile/annotations.zig").basis else "retained capture ELF; current source text not certified", .mapping_id = frame.mapping_id, .mapping_note = frame.mapping_note, .mapping_coverage = @import("../profile/mappings.zig").coverage, .source = site, .instructions = instructions.items, .diagnostic = diagnostic, .assembly_basis = "retained ELF file for the recorded mapping, not live memory; sample IP or caller return address minus one is a representative location, not a per-line histogram", .target_changed = session.target.snapshot().image_epoch != capture.image_epoch });
     }
     const start = try number(args, "start", 0);
     const limit = try number(args, "limit", 64);

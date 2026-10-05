@@ -25,6 +25,7 @@ pub const Config = struct {
     }
 };
 pub const Context = struct {
+    target: ?*const @import("../target/runtime.zig").c.struct_xrt_target = null,
     identity: model.Identity,
     generation: u64,
     threads: [native.max_threads]model.Thread = undefined,
@@ -79,26 +80,30 @@ const Job = struct {
         self.done.store(true, .release);
     }
     fn execute(self: *Job) !void {
-        var prepared = try hooks.prepare(self.context.identity.pid, self.region, self.requests[0..self.request_count], hooks.image_limit, &self.cancel);
+        var prepared = try hooks.prepareTarget(self.context.target, self.context.identity.pid, self.region, self.requests[0..self.request_count], hooks.image_limit, &self.cancel);
         defer prepared.close();
         var tids: [native.max_threads]i32 = undefined;
         for (self.context.threads[0..self.context.thread_count], 0..) |thread, i| tids[i] = thread.tid;
-        if (self.helper) |path| {
+        const remote = @import("../target/runtime.zig").c.xrt_target_is_remote(self.context.target);
+        if (!remote) if (self.helper) |path| {
             if (broker.xodb_allocation_broker_start(path, &self.broker_fd, &self.broker_pid) != 0) return error.AllocationHelperStart;
-        }
+        };
         defer {
             broker.xodb_allocation_broker_close(self.broker_fd, self.broker_pid);
             self.broker_fd = -1;
             self.broker_pid = -1;
         }
         const opened = try native.start(a, .{
+            .target = @ptrCast(self.context.target),
+            .mapping = self.region,
+            .remote_helper = if (remote) self.helper else null,
             .pid = self.context.identity.pid,
             .tids = tids[0..self.context.thread_count],
             .sources = prepared.sources[0..prepared.count],
             .enable = false,
             .callstacks = self.config.callstacks,
             .cancel = &self.cancel,
-            .opener = if (self.helper != null) .{ .user = self, .call = open } else null,
+            .opener = if (self.helper != null and !remote) .{ .user = self, .call = open } else null,
         });
         switch (opened) {
             .failed => |failure| {
@@ -112,11 +117,13 @@ const Job = struct {
             described[i] = .{ .id = source.id, .kind = source.kind, .name = request.name, .path = self.region.path, .device = source.identity.device, .inode = source.identity.inode, .file_offset = source.offset, .link_address = location.link_address, .runtime_address = location.runtime_address };
         }
         self.capture = try model.Capture.create(a, self.context.identity, .{ .record_limit = self.config.record_limit, .memory_limit = self.config.memory_limit, .callstacks = self.config.callstacks }, self.context.threads[0..self.context.thread_count], described[0..prepared.count], 0);
+        self.capture.?.producer = @import("producer.zig").describe(self.context.target);
         if (self.config.callstacks) {
             const symbols = try a.create(modules.Modules);
             symbols.* = modules.Modules.init(a);
             self.capture.?.symbols = symbols;
             symbols.immutable = true;
+            symbols.target = self.context.target;
             try symbols.refresh(self.context.identity.pid);
             if (symbols.regions.items.len > 16384) return error.AllocationMapLimit;
             for (symbols.regions.items) |region| {
@@ -180,7 +187,8 @@ pub const Live = struct {
     }
     pub fn start(self: *Live, context_: Context, config: Config, region: modules.Region, requests: []const hooks.Request, helper: ?[:0]const u8) !void {
         try config.validate();
-        if (linux.architecture != .x86_64) return error.UnsupportedAllocationArchitecture;
+        const rt = @import("../target/runtime.zig").c;
+        if (rt.xrt_target_arch(context_.target).*.machine != rt.XRT_X86_64) return error.UnsupportedAllocationArchitecture;
         if (self.job != null or self.collecting()) return error.AllocationBusy;
         if (context_.thread_count == 0 or context_.thread_count > native.max_threads) return error.InvalidAllocationThreads;
         if (self.capture) |capture| {

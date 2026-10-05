@@ -50,7 +50,7 @@ pub const Memory = struct {
         return error.MemorySnapshotExpired;
     }
     pub fn capture(self: *Memory, session: anytype, address: u64, length: usize) !u64 {
-        if (session.target.state != .stopped) return error.NotStopped;
+        if (session.target.snapshot().state != .stopped) return error.NotStopped;
         if (length == 0 or length > max_snapshot or address == 0 or address > std.math.maxInt(u64) - length) return error.InvalidMemoryRange;
         const bytes = try A.alloc(u8, length);
         errdefer A.free(bytes);
@@ -73,7 +73,7 @@ pub const Memory = struct {
             if (self.pinned == old.id) self.slot = (self.slot + 1) % self.snapshots.len;
         }
         if (self.snapshots[self.slot]) |old| old.deinit();
-        self.snapshots[self.slot] = .{ .id = id, .session_id = session.id, .image_epoch = session.target.image_epoch, .generation = session.target.generation, .address = address, .bytes = bytes, .valid = valid, .readable = readable };
+        self.snapshots[self.slot] = .{ .id = id, .session_id = session.id, .image_epoch = session.target.snapshot().image_epoch, .generation = session.target.snapshot().generation, .address = address, .bytes = bytes, .valid = valid, .readable = readable };
         self.slot = (self.slot + 1) % self.snapshots.len;
         return id;
     }
@@ -89,11 +89,11 @@ pub const Memory = struct {
         return if (current.bytes[offset] == baseline.bytes[old]) .same else .changed;
     }
     pub fn startSearch(self: *Memory, session: anytype, address: u64, length: usize, pattern: []const u8) !u64 {
-        if (session.target.state != .stopped) return error.NotStopped;
+        if (session.target.snapshot().state != .stopped) return error.NotStopped;
         if (length == 0 or length > max_search or address == 0 or address > std.math.maxInt(u64) - length) return error.InvalidMemoryRange;
         if (pattern.len == 0 or pattern.len > 256) return error.InvalidMemoryPattern;
         if (self.search) |search| if (search.state == .running) return error.MemorySearchBusy;
-        var search = Search{ .id = self.next_id, .generation = session.target.generation, .image_epoch = session.target.image_epoch, .address = address, .length = length, .pattern_len = pattern.len };
+        var search = Search{ .id = self.next_id, .generation = session.target.snapshot().generation, .image_epoch = session.target.snapshot().image_epoch, .address = address, .length = length, .pattern_len = pattern.len };
         @memcpy(search.pattern[0..pattern.len], pattern);
         search.prefix[0] = 0;
         var matched: usize = 0;
@@ -109,7 +109,7 @@ pub const Memory = struct {
     pub fn poll(self: *Memory, session: anytype) void {
         const search = if (self.search) |*v| v else return;
         if (search.state != .running) return;
-        if (session.target.state != .stopped or session.target.generation != search.generation or session.target.image_epoch != search.image_epoch) {
+        if (session.target.snapshot().state != .stopped or session.target.snapshot().generation != search.generation or session.target.snapshot().image_epoch != search.image_epoch) {
             search.state = .stale;
             return;
         }

@@ -38,7 +38,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Val
         if (path != .string or path.string.len == 0 or path.string.len > 4096 or std.mem.indexOfScalar(u8, path.string, 0) != null) return error.InvalidArguments;
         const id = if (allocation) try session.saveAllocationArchive(path.string) else try session.saveArchive(path.string);
         session.record(.agent, if (allocation) "save_allocation_archive" else "save_capture_archive");
-        return asValue(a, .{ .job_id = id, .generation = session.target.generation, .completion = "poll get_archive_status for publication; accepting a job does not mean the file was saved" });
+        return asValue(a, .{ .job_id = id, .generation = session.target.snapshot().generation, .completion = "poll get_archive_status for publication; accepting a job does not mean the file was saved" });
     }
     if (cancel) {
         try session.authorize(.agent, .execution, try number(args, "generation"));
@@ -50,5 +50,5 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Val
     const artifact = if (session.artifact) |*opened| opened else null;
     const digest = if (artifact) |opened| try a.dupe(u8, &std.fmt.bytesToHex(opened.source.archive_sha256, .lower)) else null;
     const view = if (artifact) |opened| try a.dupe(u8, &opened.viewId(.{})) else null;
-    return asValue(a, .{ .offline = session.offline, .generation = session.target.generation, .job = if (session.archive_job) |job| job.status() else null, .artifact_sha256 = digest, .recorded_origin = if (artifact) |opened| opened.source else null, .default_view_id = view, .view_basis = if (artifact) |opened| (if (opened.capture.reanalyzed) "verified_assets_reanalysis" else "recorded_annotations") else null, .analysis_version = @import("../profile/archive.zig").analysis_version, .decoded_allocation_peak = if (artifact) |opened| opened.budget.peak else null, .limits = .{ .archive_bytes = @import("../profile/archive.zig").max_file_bytes, .decoded_zig_bytes = @import("../profile/archive.zig").max_memory_bytes, .per_asset_bytes = @import("../binary/snapshot.zig").per_image_limit, .total_asset_bytes = @import("../binary/snapshot.zig").total_limit }, .durability = "not_requested" });
+    return asValue(a, .{ .offline = session.offline, .generation = session.target.snapshot().generation, .job = if (session.archive_job) |job| job.status() else null, .artifact_sha256 = digest, .recorded_origin = if (artifact) |opened| opened.source else null, .default_view_id = view, .view_basis = if (artifact) |opened| (if (opened.capture.reanalyzed) "verified_assets_reanalysis" else "recorded_annotations") else null, .analysis_version = @import("../profile/archive.zig").analysis_version, .decoded_allocation_peak = if (artifact) |opened| opened.budget.peak else null, .limits = .{ .archive_bytes = @import("../profile/archive.zig").max_file_bytes, .decoded_zig_bytes = @import("../profile/archive.zig").max_memory_bytes, .per_asset_bytes = @import("../binary/snapshot.zig").per_image_limit, .total_asset_bytes = @import("../binary/snapshot.zig").total_limit }, .durability = "not_requested" });
 }

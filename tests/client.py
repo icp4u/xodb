@@ -4,15 +4,26 @@ import os
 import select
 import subprocess
 import time
+from pathlib import Path
 
 class Client:
     def __init__(self, scope, executable='./zig-out/bin/xodb-m1-fixture', args=(), options=()):
         self.transcript = []
+        agent = os.environ.get('XODB_RUNTIME_AGENT') if executable is not None else None
+        if agent and '--runtime-agent' not in options:
+            options = ['--runtime-agent', agent, *options]
+        self.runtime_agent = '--runtime-agent' in options
         self.p = subprocess.Popen([os.environ.get('XODB_BIN', './zig-out/bin/xodb'), '--headless', '--mcp', '--agent-scope', scope, *options, *(['--', executable, *args] if executable is not None else [])], bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         self.id = 0
         self.call('initialize', {'protocolVersion':'2025-06-18','capabilities':{},'clientInfo':{'name':'M1-test','version':'1'}})
         self.p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         self.p.stdin.flush()
+    def collector_pid(self):
+        """Kernel perf descriptors belong to the local C agent when selected."""
+        if not self.runtime_agent: return self.p.pid
+        children = Path(f'/proc/{self.p.pid}/task/{self.p.pid}/children').read_text().split()
+        assert len(children) == 1, children
+        return int(children[0])
     def call(self, method, params=None):
         self.id += 1
         self.p.stdin.write((json.dumps({'jsonrpc':'2.0','id':self.id,'method':method,'params':params or {}})+'\n').encode())
@@ -64,4 +75,3 @@ class Client:
         try: assert self.p.wait(timeout=5)==0, self.p.stderr.read().decode()
         finally:
             if self.p.poll() is None: self.p.kill(); self.p.wait()
-

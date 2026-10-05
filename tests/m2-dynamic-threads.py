@@ -15,7 +15,7 @@ subprocess.run(['cc', '-O2', '-g', '-gdwarf-4', '-fno-omit-frame-pointer',
                env=dict(os.environ, TMPDIR=str(run / 'tmp')), check=True)
 
 def perf_fds(c):
-    return [p.name for p in Path(f'/proc/{c.p.pid}/fd').iterdir() if 'perf_event' in os.readlink(p)]
+    return [p.name for p in Path(f'/proc/{c.collector_pid()}/fd').iterdir() if 'perf_event' in os.readlink(p)]
 
 def archive_ready(c):
     deadline = time.monotonic() + 20

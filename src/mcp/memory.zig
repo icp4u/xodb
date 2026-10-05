@@ -20,7 +20,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         const search = std.mem.eql(u8, name, "search_memory");
         try wire.fields(args, if (search) &.{ "address", "length", "pattern", "encoding", "generation" } else &.{ "address", "length", "generation" });
         const generation = try wire.number(args, "generation", null);
-        if (generation != session.target.generation) return error.StaleSnapshot;
+        try session.target.expectGeneration(generation);
         const length = try wire.number(args, "length", null);
         if (length > memory.max_search) return error.InvalidArguments;
         if (!search) {

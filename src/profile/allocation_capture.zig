@@ -60,6 +60,7 @@ const Analysis = struct {
     }
 };
 pub const Capture = struct {
+    producer: ?@import("producer.zig").Producer = null,
     backing: Allocator,
     budget: Budget,
     identity: Identity,
@@ -608,6 +609,7 @@ test "heap metrics and allocation archives preserve caller citations and cross-t
     const a = std.testing.allocator;
     const capture = try Capture.create(a, test_id, .{ .callstacks = true }, &test_threads, &test_hooks, 100);
     defer capture.deinit();
+    capture.producer = .{ .machine = 62, .address_bits = 64, .little_endian = true, .boot_id = null, .monotonic_ns = 1000, .host_monotonic_ns = 2000, .uncertainty_ns = 20 };
     var stack = @import("allocation_stacks.zig").Stack{ .status = .prefix, .count = 3 };
     stack.pcs[0..3].* = .{ 0x401000, 0x402004, 0x403004 };
     const id = (try capture.stacks.intern(capture.budget.allocator(), stack)).?;
@@ -644,6 +646,7 @@ test "heap metrics and allocation archives preserve caller citations and cross-t
     const reopened = try archive.decode(a, bytes, null);
     defer reopened.deinit();
     try std.testing.expect(reopened.archived);
+    try std.testing.expectEqualDeep(capture.producer, reopened.producer);
     try std.testing.expectEqual(test_id, reopened.origin.?);
     try std.testing.expectEqualSlices(u64, stack.addresses(), reopened.stacks.entries.items[id].addresses());
     try reopened.requestAnalysis(false);

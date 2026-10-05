@@ -1,0 +1,64 @@
+#!/usr/bin/env python3
+"""The ordinary host analysis path against a standalone C agent.
+
+Native: python3 tests/runtime-host.py
+Cross ISA: add --ssh HOST --ssh-config FILE --agent PATH --fixture PATH --arch m68k.
+The remote fixture is tests/fixtures/runtime-isa.c compiled with -g -O0.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import time
+from client import Client
+
+p = argparse.ArgumentParser()
+p.add_argument('--ssh')
+p.add_argument('--ssh-config')
+p.add_argument('--agent', default='./zig-out/bin/xodb-agent')
+p.add_argument('--fixture', default='./zig-out/bin/xodb-m1-fixture')
+p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k'])
+a = p.parse_args()
+os.chdir(Path(__file__).resolve().parents[1])
+options = ['--runtime-agent', a.agent]
+if a.ssh: options += ['--runtime-ssh', a.ssh]
+if a.ssh_config: options += ['--ssh-config', a.ssh_config]
+c = Client('mutate', executable=a.fixture, options=options)
+try:
+    state = c.session()
+    assert state['architecture'] == a.arch, state
+    assert c.inspect('get_debug_view', summary_only=True)['architecture'] == a.arch
+    tid = state['threads'][0]['tid']
+    pc = 'rip' if a.arch == 'x86_64' else 'pc'
+    symbol = c.inspect('find_symbol', name='change_value')
+    bp = c.action('set_breakpoint', symbol='change_value')['id']
+    c.action('continue')
+    c.stopped('breakpoint')
+    regs = c.inspect('get_registers', tid=tid)['registers']
+    assert regs[pc] == symbol['address'], (regs, symbol)
+    instructions = c.inspect('disassemble', address=regs[pc])['instructions']
+    assert instructions and instructions[0]['address'] == regs[pc]
+    c.action('step_instruction', tid=tid)
+    c.stopped('single_step')
+    frames = c.inspect('get_stack', tid=tid)['frames']
+    assert len(frames) >= 2, frames
+    assert any(f.get('symbol') == 'main' for f in frames), frames
+    for _ in range(2):
+        c.action('step_instruction', tid=tid)
+        c.stopped('single_step')
+    value = c.inspect('evaluate_expression', tid=tid, expression='state.value')
+    assert int(value['bits'],16) == 7, value
+    if a.arch == 'm68k':
+        effects = c.tool('get_instruction_effects', address=regs[pc])
+        assert effects['result']['isError'] and effects['result']['content'][0]['text'] == 'InstructionAnalysisUnsupportedArchitecture', effects
+        assert set(['d0','a6','usp','pc','sr']).issubset(regs), regs
+        c.action('write_register',tid=tid,name='d0',value=regs['d0'])
+    c.action('remove_breakpoint', id=bp)
+    c.action('continue')
+    until = time.monotonic() + 5
+    while c.session()['state'] != 'exited':
+        assert time.monotonic() < until
+        time.sleep(.002)
+    print(f'C agent host integration passed ({a.arch}): target files, ELF, symbols, registers, break/step, disassembly, stack, expression and cleanup')
+finally:
+    c.close()

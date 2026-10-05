@@ -21,15 +21,15 @@ pub const FlowView = struct {
         self.arena.deinit();
     }
     pub fn refresh(self: *FlowView, session: *model.Session, address: u64) void {
-        if (self.generation == session.target.generation and self.anchor == address) return;
-        self.generation = session.target.generation;
+        if (self.generation == session.target.snapshot().generation and self.anchor == address) return;
+        self.generation = session.target.snapshot().generation;
         self.anchor = address;
         _ = self.arena.reset(.retain_capacity);
         self.function = null;
         self.diagnostic = null;
         self.selected = 0;
         self.scroll = 0;
-        if (session.target.state != .stopped or address == 0) return;
+        if (session.target.snapshot().state != .stopped or address == 0) return;
         self.function = session.functionGraph(self.arena.allocator(), address) catch |err| {
             self.diagnostic = @errorName(err);
             return;

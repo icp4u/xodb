@@ -8,6 +8,7 @@ const c = @import("../c.zig").api;
 const elf = @import("../binary/elf.zig");
 const snapshot = @import("../binary/snapshot.zig");
 const modules = @import("../model/modules.zig");
+const rt = @import("../target/runtime.zig").c;
 const Kind = @import("allocation_lifetimes.zig").Kind;
 pub const max_hooks = 16;
 pub const image_limit = 64 * 1024 * 1024;
@@ -44,10 +45,6 @@ pub const Prepared = struct {
 };
 fn cancelled(cancel: ?*const std.atomic.Value(bool)) !void {
     if (cancel) |flag| if (flag.load(.acquire)) return error.AllocationPreparationCancelled;
-}
-fn open(pid: i32, region: modules.Region) !c_int {
-    if (pid <= 0) return error.AllocationMappingIdentity;
-    return @import("../binary/mapped_file.zig").open(pid, region) catch error.AllocationMappingIdentity;
 }
 /// Exact defined function names only. Duplicate table entries at one address
 /// are fine; different definitions, IFUNC resolvers and data labels are not.
@@ -101,9 +98,15 @@ pub fn resolve(image: *const elf.Image, region: modules.Region, name: []const u8
     return .{ .offset = file_offset, .link_address = link, .runtime_address = runtime };
 }
 pub fn prepare(pid: i32, region: modules.Region, requests: []const Request, limit: usize, cancel: ?*const std.atomic.Value(bool)) !Prepared {
+    return prepareTarget(null, pid, region, requests, limit, cancel);
+}
+pub fn prepareTarget(target: ?*const rt.struct_xrt_target, pid: i32, region: modules.Region, requests: []const Request, limit: usize, cancel: ?*const std.atomic.Value(bool)) !Prepared {
     try cancelled(cancel);
     if (requests.len == 0 or requests.len > max_hooks or limit == 0 or limit > image_limit) return error.InvalidAllocationHooks;
-    var result = Prepared{ .fd = try open(pid, region), .count = requests.len };
+    if (pid <= 0) return error.AllocationMappingIdentity;
+    var original: rt.struct_xrt_file_identity = undefined;
+    var result = Prepared{ .fd = @import("../binary/mapped_file.zig").openIdentity(target, pid, region, &original) catch return error.AllocationMappingIdentity, .count = requests.len };
+    const target_identity = Identity{ .device = original.device, .inode = original.inode, .size = original.size, .mtime_sec = original.mtime_sec, .mtime_ns = original.mtime_ns, .ctime_sec = original.ctime_sec, .ctime_ns = original.ctime_ns };
     errdefer result.close();
     const before = try identity(result.fd);
     const bytes = snapshot.read(result.fd, limit, cancel) catch |err| return if (err == error.ArchiveCancelled) error.AllocationPreparationCancelled else err;
@@ -112,7 +115,7 @@ pub fn prepare(pid: i32, region: modules.Region, requests: []const Request, limi
     for (requests, 0..) |request, i| {
         const location = try resolve(&image, region, request.name, cancel);
         for (result.sources[0..i]) |old| if (old.id == request.id or old.offset == location.offset) return error.DuplicateAllocationHook;
-        result.sources[i] = .{ .id = request.id, .kind = request.kind, .fd = result.fd, .offset = location.offset, .identity = before };
+        result.sources[i] = .{ .id = request.id, .kind = request.kind, .fd = result.fd, .offset = location.offset, .identity = target_identity };
         result.locations[i] = location;
     }
     if (!std.meta.eql(before, try identity(result.fd))) return error.AllocationFileChanged;

@@ -49,13 +49,13 @@ const WatchSource = struct {
     locals: [watch_ui.max_entries][]const info.Local = undefined,
     local_count: usize = 0,
     pub fn stopped(self: *WatchSource) bool {
-        return self.session.target.state == .stopped;
+        return self.session.target.snapshot().state == .stopped;
     }
     pub fn ended(self: *WatchSource) bool {
-        return self.session.target.state == .exited or self.session.target.state == .idle;
+        return self.session.target.snapshot().state == .exited or self.session.target.snapshot().state == .idle;
     }
     pub fn generation(self: *WatchSource) u64 {
-        return self.session.target.generation;
+        return self.session.target.snapshot().generation;
     }
     fn slot(self: *WatchSource, tid: i32) ?usize {
         for (self.tids[0..self.stacks], 0..) |t, i| if (t == tid) return i;
@@ -63,7 +63,7 @@ const WatchSource = struct {
     }
     pub fn identity(self: *WatchSource, tid: i32) ?watch_ui.Identity {
         for (self.session.target.threadSlice()) |thread| {
-            if (thread.tid == tid and thread.state != .exited) return .{ .session = self.session.id, .image = self.session.target.image_epoch, .thread = thread.id };
+            if (thread.tid == tid and thread.state != .exited) return .{ .session = self.session.id, .image = self.session.target.snapshot().image_epoch, .thread = thread.id };
         }
         return null;
     }
@@ -339,7 +339,7 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (self.probes_panel.open and scroll != 0) {
-            self.probes_panel.wheel(scroll, session.target.breakpoint_count);
+            self.probes_panel.wheel(scroll, session.target.snapshot().breakpoint_count);
             scroll = 0;
             w.dirty = true;
         }
@@ -386,7 +386,7 @@ pub const Workspace = struct {
                         w.dirty = true;
                         continue;
                     }
-                    const inspect_tid = if (session.target.thread_count > 0) session.target.threads[@min(self.selected, session.target.thread_count - 1)].tid else 0;
+                    const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
                     if (self.allocation_panel.open and event.plain() and event.kind == .press and event.shortcut == 'p') {
                         self.toggleAllocations(session);
                         w.dirty = true;
@@ -470,7 +470,7 @@ pub const Workspace = struct {
                         continue;
                     }
                     if (self.probes_panel.open) {
-                        if (event.kind == .button_press) self.probes_panel.press(event.x, event.y, session.target.breakpoint_count);
+                        if (event.kind == .button_press) self.probes_panel.press(event.x, event.y, session.target.snapshot().breakpoint_count);
                         w.dirty = true;
                         continue;
                     }
@@ -527,11 +527,11 @@ pub const Workspace = struct {
             self.status = "Allocation capture stopping";
             return;
         }
-        if (self.selected >= session.target.thread_count) {
+        if (self.selected >= session.target.snapshot().thread_count) {
             self.status = "Select a stopped thread before allocation capture";
             return;
         }
-        const tids = [_]i32{session.target.threads[self.selected].tid};
+        const tids = [_]i32{session.target.threadSlice()[self.selected].tid};
         session.startAllocations(.human, &tids, session.allocation_defaults, null, &Session.allocation_hooks) catch |err| {
             self.status = @errorName(err);
             return;
@@ -654,7 +654,7 @@ pub const Workspace = struct {
         }
         if ((code == 50 or code == 19) and !self.show_profile) {
             self.stop_panel.open = false;
-            const address = if (self.selected_local < self.locals.len) self.locals[self.selected_local].value.address orelse (if (self.regs) |regs| regs.rsp else 0) else if (self.regs) |regs| regs.rsp else 0;
+            const address = if (self.selected_local < self.locals.len) self.locals[self.selected_local].value.address orelse (if (self.regs) |regs| linux.stackPointer(regs) else 0) else if (self.regs) |regs| linux.stackPointer(regs) else 0;
             self.probes_panel.open = false;
             self.inspection_panel.show(session, code == 19, address);
             w.dirty = true;
@@ -760,7 +760,7 @@ pub const Workspace = struct {
                 if (self.flame.capture_id == capture.id and capture.mapping_revision == self.flame.mapping_revision and (capture.trusted_before_ns == std.math.maxInt(u64) or capture.revision == self.flame.revision)) if (self.flame.selectedFrame()) |frame| {
                     if (capture.offline) {
                         self.status = "Offline capture: recorded source location shown below; historical source text is not bundled";
-                    } else if (session.target.state != .stopped or session.target.image_epoch != capture.image_epoch or session.target.pid != capture.pid) {
+                    } else if (session.target.snapshot().state != .stopped or session.target.snapshot().image_epoch != capture.image_epoch or session.target.snapshot().pid != capture.pid) {
                         self.status = "Pause in the captured image to browse; frozen assembly remains below";
                     } else {
                         session.refreshMaps() catch |err| {
@@ -797,7 +797,7 @@ pub const Workspace = struct {
             self.show_flow = !self.show_flow;
             w.dirty = true;
         }
-        if (!self.show_profile and self.show_flow and session.target.state == .stopped and self.flow.generation == session.target.generation) {
+        if (!self.show_profile and self.show_flow and session.target.snapshot().state == .stopped and self.flow.generation == session.target.snapshot().generation) {
             if (click) if (self.flow.hit(w.pointer_x, w.pointer_y)) |address| {
                 self.browse_address = address;
                 self.browse_assembly = null;
@@ -876,8 +876,8 @@ pub const Workspace = struct {
             self.selected_local = @intFromFloat((w.pointer_y - 135) / 48);
             w.dirty = true;
         }
-        if (code == 17 and session.target.state == .stopped and self.selected_local < self.locals.len and session.target.thread_count > 0) {
-            if (self.last_generation != session.target.generation) {
+        if (code == 17 and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
+            if (self.last_generation != session.target.snapshot().generation) {
                 self.status = "StaleSnapshot";
                 return;
             }
@@ -886,7 +886,7 @@ pub const Workspace = struct {
                 self.status = "NotAddressable";
                 return;
             };
-            for (session.target.watchpoints) |watch| if (watch != null and watch.?.address == address) {
+            for (session.target.watchpointSlice()) |watch| if (watch != null and watch.?.address == address) {
                 session.target.removeWatchpoint(watch.?.id) catch |err| {
                     self.status = @errorName(err);
                     return;
@@ -895,7 +895,7 @@ pub const Workspace = struct {
                 self.status = "Watchpoint removed";
                 return;
             };
-            const tid = session.target.threads[self.selected % session.target.thread_count].tid;
+            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
             _ = session.investigateWrite(tid, self.selected_frame, "Why did the selected value change?", local.name) catch |err| {
                 self.status = @errorName(err);
                 return;
@@ -903,7 +903,7 @@ pub const Workspace = struct {
             session.record(.human, "investigate_write");
             self.status = "Write investigation started";
         }
-        if (click and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and session.target.state == .stopped) {
+        if (click and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and session.target.snapshot().state == .stopped) {
             var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer scratch.deinit();
             const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
@@ -913,7 +913,7 @@ pub const Workspace = struct {
             };
             var removed = false;
             for (addresses) |address| {
-                for (session.target.breakpoints[0..session.target.breakpoint_count]) |probe| if (probe.address == address) {
+                for (session.target.breakpointSlice()) |probe| if (probe.address == address) {
                     session.target.removeBreakpoint(probe.id) catch |err| {
                         self.status = @errorName(err);
                         return;
@@ -933,8 +933,8 @@ pub const Workspace = struct {
             self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints";
             w.dirty = true;
         }
-        if ((code == 67 or code == 88) and session.target.state == .stopped and session.target.thread_count > 0) {
-            const tid = session.target.threads[self.selected % session.target.thread_count].tid;
+        if ((code == 67 or code == 88) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
+            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
             if (code == 88) session.finishFrame(tid, self.selected_frame, .human) catch |err| {
                 self.status = @errorName(err);
                 return;
@@ -974,8 +974,8 @@ pub const Workspace = struct {
             self.status = if (session.agent_scope == .observe) "Agent control revoked" else "Agent control enabled";
         }
         if (code == 87 or code == 68 or code == 57 or code == 63 or code == 64 or code == 36 or code == 37) self.browse_address = null;
-        if ((code == 87 or code == 68) and session.target.state == .stopped and session.target.thread_count > 0) {
-            const tid = session.target.threads[self.selected % session.target.thread_count].tid;
+        if ((code == 87 or code == 68) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
+            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
             session.probe_resume_actor = .human;
             if (self.current_line != null) session.startSourceStep(tid, code == 68) catch |err| {
                 self.status = @errorName(err);
@@ -1004,12 +1004,12 @@ pub const Workspace = struct {
             w.close_reason = .quit_key;
         }
         if (code == 57 or code == 63 or code == 64) {
-            if (session.target.state == .stopped) {
+            if (session.target.snapshot().state == .stopped) {
                 session.continueExecution(.human) catch |err| {
                     self.status = @errorName(err);
                     return;
                 };
-            } else if (session.target.state == .running) {
+            } else if (session.target.snapshot().state == .running) {
                 session.cancelStep();
                 session.target.interrupt() catch |err| {
                     self.status = @errorName(err);
@@ -1019,7 +1019,7 @@ pub const Workspace = struct {
             self.selected_frame = 0;
         }
         if (code == 57 or code == 63 or code == 64) session.record(.human, "continue_or_interrupt");
-        if (code == 32 and session.target.pid != 0) session.detach() catch |err| {
+        if (code == 32 and session.target.snapshot().pid != 0) session.detach() catch |err| {
             self.status = @errorName(err);
             return;
         };
@@ -1035,7 +1035,7 @@ pub const Workspace = struct {
         if (code == 103) self.source_line = @max(0, self.source_line - 3);
         self.source_line = std.math.clamp(self.source_line + w.scroll, 0, @max(0, self.source_lines - 1));
         w.scroll = 0;
-        if (session.target.thread_count > 0) self.selected %= session.target.thread_count else self.selected = 0;
+        if (session.target.snapshot().thread_count > 0) self.selected %= session.target.snapshot().thread_count else self.selected = 0;
     }
     /// Performs a setup-panel action. Start goes through the same path as P.
     fn applySetup(self: *Workspace, w: *Window, session: *Session, action: capture_panel.Action) void {
@@ -1068,7 +1068,7 @@ pub const Workspace = struct {
     /// resolved to at this stop. Same authority as W on a local.
     fn watchWrite(self: *Workspace, session: *Session, index: usize) void {
         const entry = &self.watch.entries[index];
-        if (session.target.state != .stopped or self.watch.generation == null or self.watch.generation.? != session.target.generation) {
+        if (session.target.snapshot().state != .stopped or self.watch.generation == null or self.watch.generation.? != session.target.snapshot().generation) {
             self.status = "StaleSnapshot";
             return;
         }
@@ -1092,18 +1092,18 @@ pub const Workspace = struct {
             .edited => {},
             .cancel => self.status = "Expression cancelled",
             .submit => |text| {
-                if (session.target.state != .stopped or session.target.thread_count == 0) {
+                if (session.target.snapshot().state != .stopped or session.target.snapshot().thread_count == 0) {
                     self.editor.message = "Pause the target to evaluate";
                     return;
                 }
                 self.refresh(session);
-                if (self.frames.len == 0 or self.last_generation != session.target.generation) {
+                if (self.frames.len == 0 or self.last_generation != session.target.snapshot().generation) {
                     self.editor.message = "No frame to evaluate in";
                     return;
                 }
                 const frame = self.frames[self.selected_frame];
-                const tid = session.target.threads[self.selected].tid;
-                _ = self.watch.add(text, watch_ui.FrameId.of(tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.image_epoch, .thread = session.target.threads[self.selected].id }, session.target.generation)) catch |err| {
+                const tid = session.target.threadSlice()[self.selected].tid;
+                _ = self.watch.add(text, watch_ui.FrameId.of(tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = session.target.threadSlice()[self.selected].id }, session.target.snapshot().generation)) catch |err| {
                     self.editor.message = switch (err) {
                         error.WatchListFull => "The watch list is full (16); Delete one first",
                         error.ExpressionTooLong => "Expressions are limited to 256 characters",
@@ -1136,12 +1136,12 @@ pub const Workspace = struct {
         if (self.allocation_collecting and !collecting) self.status = "Allocation capture ended; A opens evidence";
         self.allocation_busy = busy;
         self.allocation_collecting = collecting;
-        if (self.was_running_to and session.run_to == null) self.status = if (session.target.state == .stopped) "Run-to operation stopped" else "Run-to operation ended";
+        if (self.was_running_to and session.run_to == null) self.status = if (session.target.snapshot().state == .stopped) "Run-to operation stopped" else "Run-to operation ended";
         self.was_running_to = session.run_to != null;
         self.refreshWatch(session);
-        if (session.target.thread_count > 0) {
-            self.selected %= session.target.thread_count;
-            if (session.target.state == .stopped and session.target.threads[self.selected].state == .exited) {
+        if (session.target.snapshot().thread_count > 0) {
+            self.selected %= session.target.snapshot().thread_count;
+            if (session.target.snapshot().state == .stopped and session.target.threadSlice()[self.selected].state == .exited) {
                 for (session.target.threadSlice(), 0..) |thread, index| if (thread.state == .stopped) {
                     self.selected = index;
                     self.selected_frame = 0;
@@ -1149,14 +1149,14 @@ pub const Workspace = struct {
                 };
             }
         }
-        const tid = if (session.target.thread_count > 0) session.target.threads[self.selected].tid else 0;
-        if (self.last_generation == session.target.generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
-        if (self.last_generation != session.target.generation) self.browse_address = null;
+        const tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
+        if (self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
+        if (self.last_generation != session.target.snapshot().generation) self.browse_address = null;
         self.last_browse = self.browse_address;
         self.last_show_flow = self.show_flow;
         if (self.last_tid != tid) self.stale_regs = null else if (self.regs) |regs| self.stale_regs = regs;
         self.alive = 0;
-        self.last_generation = session.target.generation;
+        self.last_generation = session.target.snapshot().generation;
         self.last_tid = tid;
         self.last_frame = self.selected_frame;
         _ = self.arena.reset(.retain_capacity);
@@ -1167,7 +1167,7 @@ pub const Workspace = struct {
         self.local_diagnostic = null;
         self.regs = null;
         self.instruction_count = 0;
-        if (tid == 0 or session.target.state != .stopped) {
+        if (tid == 0 or session.target.snapshot().state != .stopped) {
             self.flow.refresh(session, 0);
             return;
         }
@@ -1176,12 +1176,12 @@ pub const Workspace = struct {
             return;
         };
         var bytes: [256]u8 = undefined;
-        const assembly_address = if (self.browse_address) |address| self.browse_assembly orelse address else self.regs.?.rip;
+        const assembly_address = if (self.browse_address) |address| self.browse_assembly orelse address else linux.programCounter(self.regs.?);
         const n = session.target.readMemory(assembly_address, &bytes) catch |err| {
             self.status = @errorName(err);
             return;
         };
-        self.instruction_count = disasm.decode(bytes[0..n], assembly_address, &self.instructions) catch 0;
+        self.instruction_count = disasm.decodeFor(session.target.arch(), bytes[0..n], assembly_address, &self.instructions) catch 0;
         const a = self.arena.allocator();
         self.frames = session.stack(a, tid, 64) catch &.{};
         if (self.frames.len > 0) {
@@ -1197,7 +1197,7 @@ pub const Workspace = struct {
             }
         }
         if (self.show_flow) {
-            const anchor = if (self.frames.len > 0) self.frames[self.selected_frame].lookup_pc else self.regs.?.rip;
+            const anchor = if (self.frames.len > 0) self.frames[self.selected_frame].lookup_pc else linux.programCounter(self.regs.?);
             self.flow.refresh(session, anchor);
         }
         if (self.browse_address) |address| {
@@ -1233,7 +1233,7 @@ pub const Workspace = struct {
         }
         self.locals = rows.toOwnedSlice(a) catch &.{};
         var lines: std.ArrayList(u32) = .empty;
-        for (session.target.breakpoints[0..session.target.breakpoint_count]) |probe| {
+        for (session.target.breakpointSlice()) |probe| {
             const site = session.sourceAt(a, probe.address) catch continue;
             if (std.mem.eql(u8, site.path, self.source_path)) lines.append(a, site.line) catch {};
         }
@@ -1284,7 +1284,7 @@ pub const Workspace = struct {
         if (style.approach(&self.alive, 1, 9, dt)) moving = true;
         // The status bar takes the color of the run state, as RAD Debugger's does.
         var target = theme.header;
-        switch (session.target.state) {
+        switch (session.target.snapshot().state) {
             .running => target = theme.pop,
             .exited => target = theme.good_pop,
             .stopped => for (session.target.threadSlice()) |thread| switch (thread.reason) {
@@ -1313,11 +1313,11 @@ pub const Workspace = struct {
         };
         self.refresh(session);
         self.animate(session);
-        const state = session.target.state;
+        const state = session.target.snapshot().state;
         const width: f32 = @floatFromInt(w.width);
         const height: f32 = @floatFromInt(w.height);
         const all = gpu.Rect{ .x = 0, .y = 0, .w = width, .h = height };
-        const selected_thread: ?linux.Thread = if (session.target.thread_count > 0) session.target.threads[self.selected] else null;
+        const selected_thread: ?linux.Thread = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected] else null;
         const thread_color = if (selected_thread) |thread| style.threadColor(thread.id) else theme.good;
         r.clip = all;
         try r.rect(all, theme.background);
@@ -1331,7 +1331,7 @@ pub const Workspace = struct {
         {
             // Run state as a pill: tinted fill and border in the state's color.
             var buffer: [64]u8 = undefined;
-            const label_text = std.fmt.bufPrint(&buffer, "#{d} {s}  PID {d}", .{ session.process_id, if (session.target.core != null) "core" else @tagName(state), session.target.pid }) catch "";
+            const label_text = std.fmt.bufPrint(&buffer, "#{d} {s}  PID {d}", .{ session.process_id, if (session.target.core != null) "core" else @tagName(state), session.target.snapshot().pid }) catch "";
             const color = switch (state) {
                 .stopped => theme.warm,
                 .running => theme.good,
@@ -1423,18 +1423,18 @@ pub const Workspace = struct {
             }
             if (self.show_flow) {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
-                try self.flow.draw(r, font, r.clip, if (self.regs) |regs| regs.rip else null);
+                try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) else null);
             } else {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", if (self.browse_address != null) "browsing / G flow" else "x86-64 / G flow");
                 if (self.instruction_count == 0) try r.text(font, left + 16, body_y + 55, "Pause to inspect instructions", theme.weak);
                 for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
                     const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
                     if (y + 20 > bottom - 10) break;
-                    if (self.regs != null and inst.address == self.regs.?.rip) {
+                    if (self.regs != null and inst.address == linux.programCounter(self.regs.?)) {
                         try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
                         try r.text(font, left + 8, y, "\u{25b6}", thread_color);
                     }
-                    try label(r, font, left + 22, y, if (self.regs != null and inst.address == self.regs.?.rip) thread_color else theme.weak, "{x:0>12}", .{inst.address});
+                    try label(r, font, left + 22, y, if (self.regs != null and inst.address == linux.programCounter(self.regs.?)) thread_color else theme.weak, "{x:0>12}", .{inst.address});
                     const mnemonic = std.mem.sliceTo(@as([]const u8, &inst.mnemonic), 0);
                     try r.text(font, left + 156, y, mnemonic, theme.neutral);
                     try r.textFit(font, left + 156 + @max(58, r.measure(font, mnemonic) + 10), y, right - left - 6 - 156 - 70, std.mem.sliceTo(@as([]const u8, &inst.operands), 0), theme.text);
@@ -1456,12 +1456,12 @@ pub const Workspace = struct {
             } else {
                 try pane(r, font, side, "REGISTERS", "changed since last stop");
                 if (self.regs) |regs| {
-                    inline for (std.meta.fields(linux.Registers), 0..) |field, i| {
+                    for (regs.descriptions(), 0..) |desc, i| {
                         const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
-                        const value = @field(regs, field.name);
-                        const changed = if (self.stale_regs) |old| @field(old, field.name) != value else false;
+                        const value = regs.value(desc);
+                        const changed = if (self.stale_regs) |old| old.architecture() == regs.architecture() and old.value(desc) != value else false;
                         if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
-                        try label(r, font, right + 14, y, theme.weak, "{s}", .{field.name});
+                        try label(r, font, right + 14, y, theme.weak, "{s}", .{std.mem.span(desc.name)});
                         try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{value});
                     }
                 } else try r.text(font, right + 14, body_y + 55, "No stopped thread", theme.weak);
@@ -1482,11 +1482,11 @@ pub const Workspace = struct {
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
-        try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.generation });
+        try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.snapshot().generation });
         if (width >= 900) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
         try self.probes_panel.draw(r, font, width, height, session);
-        const inspect_tid = if (session.target.thread_count > 0) session.target.threads[@min(self.selected, session.target.thread_count - 1)].tid else 0;
+        const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
         try self.inspection_panel.draw(r, font, width, height, session, inspect_tid);
         try self.inline_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
         try self.stop_panel.draw(r, font, width, height, session, inspect_tid);
@@ -1515,7 +1515,7 @@ pub const Workspace = struct {
             try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
             try fit(r, font, 40, y, thread_right - 12 - 40, if (i == self.selected) theme.text else theme.weak, "{d} {s}", .{ @as(u32, @intCast(thread.tid)), if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state) });
         }
-        if (session.target.thread_count == 0) try r.textFit(font, 24, bottom + 50, thread_right - 40, "Launch with -- <executable> [args]", theme.weak);
+        if (session.target.snapshot().thread_count == 0) try r.textFit(font, 24, bottom + 50, thread_right - 40, "Launch with -- <executable> [args]", theme.weak);
         const stack = gpu.Rect{ .x = thread_right, .y = bottom, .w = left - thread_right - 4, .h = height - bottom - 37 };
         try pane(r, font, stack, "STACK", "click frame / I inline");
         for (self.frames, 0..) |frame, i| {
@@ -1578,8 +1578,8 @@ const ThreadRows = struct {
 
     fn snapshot(self: *ThreadRows, session: *Session) capture_setup.Snapshot {
         const target = &session.target;
-        const live = target.core == null and target.pid != 0 and target.state != .idle and target.state != .exited;
-        const key: ?capture_setup.TargetKey = if (live) .{ .pid = target.pid, .image_epoch = target.image_epoch } else null;
+        const live = target.core == null and target.snapshot().pid != 0 and target.snapshot().state != .idle and target.snapshot().state != .exited;
+        const key: ?capture_setup.TargetKey = if (live) .{ .pid = target.snapshot().pid, .image_epoch = target.snapshot().image_epoch } else null;
         if (!std.meta.eql(key, self.key)) {
             self.key = key;
             self.name_count = 0;
@@ -1591,21 +1591,21 @@ const ThreadRows = struct {
                 .stopped => .stopped,
                 .running => .running,
                 else => .exited,
-            }, .name = self.name(target.pid, thread.id, thread.tid) };
+            }, .name = self.name(target, thread.id, thread.tid) };
             n += 1;
         };
         const collecting = if (session.profile) |capture| capture.collector != null else false;
-        return .{ .target = key, .stopped = target.state == .stopped, .offline = session.offline, .collecting = collecting, .threads = self.rows[0..n] };
+        return .{ .target = key, .stopped = target.snapshot().state == .stopped, .offline = session.offline, .collecting = collecting, .threads = self.rows[0..n] };
     }
-    fn name(self: *ThreadRows, pid: i32, id: u64, tid: i32) []const u8 {
+    fn name(self: *ThreadRows, target: *const @import("../target/linux.zig").Target, id: u64, tid: i32) []const u8 {
         for (self.names[0..self.name_count]) |*entry| if (entry.id == id) return entry.bytes[0..entry.len];
         if (self.name_count == self.names.len) return "";
-        var path: [64]u8 = undefined;
-        const z = std.fmt.bufPrintZ(&path, "/proc/{d}/task/{d}/comm", .{ pid, tid }) catch return "";
+        const rt = @import("../target/runtime.zig").c;
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_THREAD_COMM, .tid = tid });
         const entry = &self.names[self.name_count];
         entry.* = .{ .id = id, .len = 0, .bytes = undefined };
-        const fd = c.open(z.ptr, c.O_RDONLY | c.O_CLOEXEC);
-        if (fd >= 0) {
+        var fd: c_int = -1;
+        if (rt.xrt_target_file(target.handle, &request, &fd) == rt.XRT_OK) {
             defer _ = c.close(fd);
             const got = c.read(fd, &entry.bytes, entry.bytes.len);
             if (got > 0) entry.len = @intCast(std.mem.trimEnd(u8, entry.bytes[0..@intCast(got)], "\n").len);
@@ -1801,10 +1801,10 @@ test "queued frame selection refreshes locals before starting a watch" {
     const deadline = linux.now() + 3_000_000_000;
     while (linux.now() < deadline) {
         try session.poll();
-        if (session.target.state == .stopped and !session.target.onlyInternalStops()) break;
+        if (session.target.snapshot().state == .stopped and !session.target.onlyInternalStops()) break;
         _ = @import("../c.zig").api.usleep(1000);
     }
-    try std.testing.expectEqual(linux.State.stopped, session.target.state);
+    try std.testing.expectEqual(linux.State.stopped, session.target.snapshot().state);
     var workspace = Workspace{};
     defer workspace.deinit();
     workspace.refresh(&session);
@@ -1933,12 +1933,12 @@ test "duration shortcut works in a narrow profile view without changing target s
     var workspace = Workspace{ .show_profile = true };
     defer workspace.deinit();
     var w = Window{ .width = 640, .height = 480 };
-    const generation = session.target.generation;
+    const generation = session.target.snapshot().generation;
     w.input.queue[0] = .{ .kind = .press, .shortcut = 't' };
     w.input.count = 1;
     workspace.input(&w, &session);
     try std.testing.expectEqual(@as(u32, 300000), session.profile_defaults.duration_ms);
-    try std.testing.expectEqual(generation, session.target.generation);
+    try std.testing.expectEqual(generation, session.target.snapshot().generation);
     session.offline = true;
     w.input.head = 0;
     w.input.queue[0] = .{ .kind = .press, .shortcut = 't' };
@@ -1952,18 +1952,18 @@ test "capture setup: S opens it, an empty subset never starts, replacement clear
     defer session.deinit();
     // A synthetic target: clear it before teardown so cleanup never touches PID 4242.
     defer {
-        session.target.thread_count = 0;
-        session.target.pid = 0;
-        session.target.state = .idle;
+        session.target.testing().thread_count = 0;
+        session.target.testing().pid = 0;
+        session.target.testing().state = @intFromEnum(linux.State.idle);
     }
-    session.target.pid = 4242;
-    session.target.state = .stopped;
-    session.target.image_epoch = 1;
-    for (0..3) |i| session.target.threads[i] = .{ .id = i + 1, .tid = @intCast(4242 + i), .state = .stopped };
-    session.target.thread_count = 3;
+    session.target.testing().pid = 4242;
+    session.target.testing().state = @intFromEnum(linux.State.stopped);
+    session.target.testing().image_epoch = 1;
+    for (0..3) |i| session.target.testing().threads[i] = std.mem.zeroInit(@TypeOf(session.target.testing().threads[i]), .{ .id = i + 1, .tid = @as(i32, @intCast(4242 + i)), .state = @intFromEnum(linux.State.stopped) });
+    session.target.testing().thread_count = 3;
     // The synthetic inspection is already current. Setup/input assertions
     // must not issue register reads against invented operating-system PIDs.
-    var workspace = Workspace{ .show_profile = true, .last_generation = session.target.generation, .last_tid = 4242, .last_frame = 0 };
+    var workspace = Workspace{ .show_profile = true, .last_generation = session.target.snapshot().generation, .last_tid = 4242, .last_frame = 0 };
     defer workspace.deinit();
     var w = Window{};
     w.input.queue[0] = .{ .kind = .press, .shortcut = 's' };
@@ -1989,13 +1989,13 @@ test "capture setup: S opens it, an empty subset never starts, replacement clear
     // exec: the explicit choice is cleared rather than matched by TID.
     workspace.applySetup(&w, &session, .{ .toggle_thread = .{ .id = 2, .tid = 4243 } });
     try std.testing.expectEqual(@as(usize, 1), workspace.thread_selection.count);
-    session.target.image_epoch = 2;
+    session.target.testing().image_epoch = 2;
     const replaced = workspace.thread_rows.snapshot(&session);
     try std.testing.expectEqual(capture_setup.Notice.cleared_replaced, workspace.thread_selection.sync(&replaced));
     try std.testing.expectEqual(capture_setup.Mode.all, workspace.thread_selection.mode);
     // A P event queued for an earlier target cannot silently start all threads.
     workspace.applySetup(&w, &session, .{ .toggle_thread = .{ .id = 2, .tid = 4243 } });
-    session.target.image_epoch = 3;
+    session.target.testing().image_epoch = 3;
     w.input.head = 0;
     w.input.queue[0] = .{ .kind = .press, .shortcut = 'p' };
     w.input.count = 1;

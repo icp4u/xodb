@@ -14,6 +14,7 @@ env = dict(os.environ, TMPDIR=str(work / "tmp"),
            ZIG_GLOBAL_CACHE_DIR=str(work / "global"))
 command = ["zig", "test", "-O", "ReleaseSafe", "--dep", "perf",
            "-Mroot=tests/sampled-state/live.zig",
+           "-I", "src/runtime", *[str(p) for p in sorted(Path("src/runtime").glob("*.c")) if p.name != "agent_main.c"], "src/profile/allocation_broker.c",
            "-Mperf=src/profile/linux_perf.zig", "-lc"]
 with (work / "live.log").open("x") as log:
     result = subprocess.run(command, cwd=root, env=env, stdout=log,
