@@ -11,31 +11,9 @@ const Budget = @import("../profile/archive_budget.zig").Budget;
 const a = std.heap.page_allocator;
 pub const ProfileSource = struct { capture: *const Profile, id: u64, revision: u64, cpu: bool = true, syscalls: bool = false };
 pub const AllocationSource = struct { capture: *const Allocation, id: u64, revision: u64 };
-pub const Source = struct {
-    stream_id: u64,
-    kind: associations.Kind,
-    capture_id: u64,
-    revision: u64,
-    started_ns: u64,
-    ended_ns: u64,
-    stored_records: usize,
-    included_records: usize = 0,
-    excluded_metadata_records: usize = 0,
-    incomplete_records: usize = 0,
-    scope_untrusted_records: usize = 0,
-    identity_trusted_before_ns: ?u64 = null,
-    lost_records: u64 = 0,
-    lost_samples: u64 = 0,
-    throttles: u64 = 0,
-    loss_basis: []const u8,
-    discarded_records: u64 = 0,
-    unread_possible: bool = false,
-    producer: ?Producer,
-    pub fn coverageIncomplete(self: Source) bool {
-        return self.incomplete_records != 0 or self.scope_untrusted_records != 0 or self.lost_records != 0 or self.lost_samples != 0 or self.throttles != 0 or self.discarded_records != 0 or self.unread_possible;
-    }
-};
-pub const clock_basis = "native sources use host CLOCK_MONOTONIC by collector contract in the same live Session; remote timestamps were already normalized with a fixed offset, summed conversion uncertainty is retained and drift is unmeasured";
+pub const saved_evidence = @import("association_evidence.zig");
+pub const Source = saved_evidence.Source;
+pub const clock_basis = "recorded acquisition contract: native sources used host CLOCK_MONOTONIC in the same live Session; remote timestamps were already normalized with a fixed offset, summed conversion uncertainty is retained and drift is unmeasured";
 pub const allocation_basis = "allocator entry/return sample records only; metadata records excluded explicitly; event counts are not allocations, lifetimes or requested bytes";
 const Thread = struct { tid: i32, id: u64 };
 fn threadLess(_: void, lhs: Thread, rhs: Thread) bool {
@@ -61,17 +39,7 @@ fn compatible(capture: *const model.Capture, owner_session: u64, owner_process: 
     const id = capture.identity;
     if (capture.offline or owner_session != id.session_id or owner_process != id.process_id or session_id != id.session_id or process_id != id.process_id or pid != id.pid or image_epoch != id.image_epoch) return error.ObservationAssociationIdentity;
 }
-fn uncertainty(target: ?Producer, source: ?Producer) !u64 {
-    // Mixing a local and remote source under one purported Session indicates
-    // missing or inconsistent acquisition provenance, not an implicit proof.
-    if ((target == null) != (source == null)) return error.ObservationAssociationProducer;
-    if (target) |left| {
-        const right = source.?;
-        if (left.machine != right.machine or left.address_bits != right.address_bits or left.little_endian != right.little_endian or !std.meta.eql(left.boot_id, right.boot_id)) return error.ObservationAssociationProducer;
-        return std.math.add(u64, left.uncertainty_ns, right.uncertainty_ns) catch error.ObservationAssociationClockOverflow;
-    }
-    return 0;
-}
+const uncertainty = saved_evidence.uncertainty;
 pub const Job = struct {
     id: u64,
     capture: *const model.Capture,
@@ -88,6 +56,9 @@ pub const Job = struct {
     cancel: std.atomic.Value(bool) = .init(false),
     result: ?associations.Result = null,
     err: ?anyerror = null,
+    association_algorithm: []const u8 = saved_evidence.algorithm,
+    analysis_origin: @FieldType(saved_evidence.Snapshot, "analysis_origin") = .live,
+    algorithm_supported: bool = true,
     pub fn create(id: u64, capture: *const model.Capture, owner_session: u64, owner_process: u64, profile: ?ProfileSource, allocation: ?AllocationSource, selection: comparison.Selection) !*Job {
         try selection.validate();
         if (!capture.store.finished) return error.ObservationStillCollecting;
@@ -99,7 +70,7 @@ pub const Job = struct {
             .id = id,
             .capture = capture,
             .selection = selection,
-            .budget = .{ .backing = a, .limit = 64 * 1024 * 1024 },
+            .budget = .{ .backing = a, .limit = saved_evidence.memory_limit },
             .arena = undefined,
             // Domain tokens are namespaced by the verified live Session. They
             // do not pretend to be boot IDs or source capture equality proofs.
@@ -107,14 +78,54 @@ pub const Job = struct {
         };
         self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
         errdefer self.deinit();
-        if (profile) |source| try self.copyProfile(source, owner_session, owner_process);
-        if (allocation) |source| try self.copyAllocation(source, owner_session, owner_process);
+        if (profile) |source| self.copyProfile(source, owner_session, owner_process) catch |err| return saved_evidence.budgetError(&self.budget, err);
+        if (allocation) |source| self.copyAllocation(source, owner_session, owner_process) catch |err| return saved_evidence.budgetError(&self.budget, err);
         if (self.source_count == 0) return error.NoObservationAssociationSources;
         self.worker = try std.Thread.spawn(.{}, run, .{self});
         return self;
     }
+    /// Borrowed slices are valid only while this completed job is pinned.
+    /// Consumers retain IDs, then re-look up on the Session owner thread for
+    /// each use; never retain slices across job/capture replacement. An old ID
+    /// returns StaleObservationAssociations, not a view of its successor.
+    pub fn view(self: *const Job) !saved_evidence.Snapshot {
+        if (!self.done.load(.acquire)) return error.ObservationAssociationsBusy;
+        if (self.err) |err| return err;
+        if (!self.algorithm_supported) {
+            var snapshot = self.capture.saved_associations.?.snapshot;
+            snapshot.analysis_origin = .restored;
+            return snapshot;
+        }
+        return .{ .association_algorithm = self.association_algorithm, .analysis_origin = self.analysis_origin, .origin = self.origin, .selection = self.selection, .sources = self.sources[0..self.source_count], .streams = self.streams[0..self.source_count], .derived = self.result orelse return error.NoObservationAssociations };
+    }
+    pub fn fromSaved(id: u64, capture: *const model.Capture, selection: comparison.Selection, synchronous: bool, cancel_flag: ?*const std.atomic.Value(bool)) !*Job {
+        try selection.validate();
+        const saved = (capture.saved_associations orelse return error.NoSavedObservationAssociations).snapshot;
+        const self = try a.create(Job);
+        self.* = .{ .id = id, .capture = capture, .selection = selection, .budget = .{ .backing = a, .limit = saved_evidence.memory_limit }, .arena = undefined, .origin = saved.origin };
+        self.arena = std.heap.ArenaAllocator.init(self.budget.allocator());
+        errdefer self.deinit();
+        self.analysis_origin = if (synchronous) .restored else .reanalysed;
+        if (synchronous) {
+            self.association_algorithm = self.arena.allocator().dupe(u8, saved.association_algorithm) catch |err| return saved_evidence.budgetError(&self.budget, err);
+            self.algorithm_supported = std.mem.eql(u8, saved.association_algorithm, saved_evidence.algorithm);
+        }
+        const owned = self.arena.allocator();
+        for (saved.sources, saved.streams) |source, stream| {
+            try self.reserveRecords(stream.points.len + stream.intervals.len);
+            self.sources[self.source_count] = saved_evidence.clone(Source, owned, source) catch |err| return saved_evidence.budgetError(&self.budget, err);
+            self.streams[self.source_count] = saved_evidence.clone(associations.Stream, owned, stream) catch |err| return saved_evidence.budgetError(&self.budget, err);
+            self.source_count += 1;
+        }
+        if (cancel_flag) |flag| if (flag.load(.acquire)) return error.ObservationAnalysisCancelled;
+        if (synchronous) {
+            if (self.algorithm_supported) self.result = associations.build(self.budget.allocator(), &capture.store, self.origin, self.streams[0..self.source_count], .{ .selection = selection }, cancel_flag) catch |err| return saved_evidence.budgetError(&self.budget, err);
+            self.done.store(true, .release);
+        } else self.worker = try std.Thread.spawn(.{}, run, .{self});
+        return self;
+    }
     fn reserveRecords(self: *Job, count: usize) !void {
-        const limit = 1024 * 1024;
+        const limit = saved_evidence.max_records;
         if (count > limit - self.copied_records) return error.ObservationAssociationRecordLimit;
         self.copied_records += count;
     }
@@ -207,7 +218,7 @@ pub const Job = struct {
     }
     fn run(self: *Job) void {
         self.result = associations.build(self.budget.allocator(), &self.capture.store, self.origin, self.streams[0..self.source_count], .{ .selection = self.selection }, &self.cancel) catch |err| blk: {
-            self.err = err;
+            self.err = saved_evidence.budgetError(&self.budget, err);
             break :blk null;
         };
         self.done.store(true, .release);

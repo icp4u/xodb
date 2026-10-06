@@ -12,7 +12,9 @@ detailed docs. If you just want to try something, jump to
 | Catch who changes a value | **Watchpoint investigation** (**W** on a field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
+| Check whether a change made a function faster | **Repeated experiment** (`tools/experiments/run.py`) | Baseline vs changed vs unchanged control, several runs each, with honest spread ([details](OBSERVATION_EXPERIMENTS.md)) |
 | Let an AI agent help | **MCP** (`--mcp` or `--session-socket`) | The same tools for an agent; you keep **F8** to take back control |
+| Ask "what feeds this value?" or "what controls this call?" | **Static slice** (**S** on an instruction or source line; `slice_value` over MCP) | The parameters, values and branches that can reach it, with instruction and source citations and a trust label. Static possibilities, not an observed run ([details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 
 ## What is an observation?
 
@@ -56,7 +58,10 @@ different about the slow ones."*
    the slow ones get the big input".
 3. **Associations** tie the two together. They show the CPU samples, system calls
    and memory allocations that happened *during* the slow calls. That's "these
-   overlapped", not proof that one caused the other.
+   overlapped", not proof that one caused the other. A saved `.xoi` keeps that
+   evidence, so you can reopen and re-analyse it later without the program.
+4. **Experiments** repeat the whole thing across builds: "did my change make the
+   slow calls faster, or is that just run-to-run noise?"
 
 **Rule of thumb:** profile when you don't know where to look; observe when you
 know which function matters and want to know which calls are slow and why.
@@ -70,9 +75,19 @@ interpreter you can:
 - read its internal structures by name;
 - observe its native calls, e.g. how long each `sort` or array iteration takes.
 
-What you see is the interpreter's own C code. Script-level views are arriving as
-separate pieces: a Perl stack shown next to the native one, readable Perl
-values, and logical stacks for Python, Ruby and the JVM. See
+What you see is the interpreter's own C code, plus, for Perl, the script level:
+
+- **Readable Perl values.** In Locals or **E**, an `SV *` shows as `IV 42`,
+  `undef`, `PV "…"`, `AV (3 slots)` and so on, instead of raw union fields.
+  Values that aren't meaningful yet (a brand-new element) say so rather than
+  showing stale bits.
+- **The Perl stack at a native stop.** Agents ask `get_language_stack`
+  (language `perl`) for sub names and file:line, read straight from the
+  stopped interpreter without running any code in it. Each piece is tied to
+  the native interpreter-loop frame it came from, and it says `partial` when a
+  boundary can't be proven.
+
+Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 [logical frames](LOGICAL_FRAMES.md).
 
 ## Try it
@@ -81,9 +96,10 @@ values, and logical stacks for Python, Ruby and the JVM. See
 | --- | --- | --- |
 | Watch a value change | see the M1 walkthrough in the [README](../README.md) | **W** on a field, **Space**, see who wrote it |
 | Observe and browse calls | `xodb --browse-observation example-01.xoi` after the capture in [OBSERVATIONS.md](OBSERVATIONS.md#one-command-capture) | **]** / **[** move the threshold, **Tab** switches fast/slow, **E** shows the raw evidence |
-| Inside Perl | `./scripts/demo-perl` | **Space**, then **E** `key`; click frames to walk the interpreter |
+| Inside Perl | `./scripts/demo-perl` | **Space**, **E** `val` (undef: new element), **E** `av` (3 slots), **Space**, **E** `av->sv_u.svu_array[3]` (IV 42) |
 | Inside Ruby | `./scripts/demo-cruby` | the `rb_ary_store` break |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
+| What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Agent and human together | `xodb --session-socket ~/tmp/xs/s -- ./prog` | an agent drives; **F8** takes control back ([details](SHARED_SESSIONS.md)) |
 
 ## Where to go next

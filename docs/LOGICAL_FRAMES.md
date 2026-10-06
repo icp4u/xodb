@@ -351,3 +351,9 @@ totalled in `marker_weight`; stacks whose innermost frame is a marker count in
   this tree: its structs grow, `jvm_evidence_info` embeds `struct jvm_diagnostics` by
   value, and it includes `jvm_import.h` (whose `struct jvm_import` is internal).
   Recompile the host with the importer it links.
+
+## Perl
+
+[Perl values and logical stacks](PERL.md) describes the core-module-only
+cooperating exporter, stopped-memory MCP reader, and GUI scalar summaries.
+The exporter uses this version-1 format without extensions to its contract.

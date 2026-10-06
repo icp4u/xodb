@@ -98,6 +98,9 @@ pub const Session = struct {
     agent_scope: AgentScope = .observe,
     /// Set only while dispatching a shared MCP request on the owner thread.
     agent_client_id: ?u64 = null,
+    /// Set with agent_client_id: the dispatching client holds control (the
+    /// shared controller lease, or a control-scope stdio client).
+    agent_controller: bool = false,
     source_step: ?SourceStep = null,
     source_step_resumes: usize = 0,
     source_step_batched: usize = 0,
@@ -123,6 +126,8 @@ pub const Session = struct {
     next_observation_archive: u64 = 1,
     allocation_defaults: @import("../profile/allocation_live.zig").Config = .{},
     allocation_helper: ?[:0]const u8 = null,
+    /// Opt-in static analysis: worker discovery, one bounded job, cached exports.
+    static_analysis: @import("../semq/host.zig").State = .{},
     offline: bool = false,
     imported: ?@import("../profile/imported_job.zig").State = null,
     artifact: ?archive.Opened = null,
@@ -280,13 +285,12 @@ pub const Session = struct {
         const pending_valid = if (self.observations.pendingContext()) |context|
             stopped.state == .stopped and stopped.pid == context.identity.pid and stopped.image_epoch == context.identity.image_epoch and stopped.generation == context.identity.generation and
                 stopped.birth_count == 0 and !self.target.sharedVm() and self.observationThreadsMatch(context.threads[0..context.thread_count], true)
-        else false;
+        else
+            false;
         const boundary: ?@import("../observe/capture.zig").Stop = if (self.observations.capture) |capture|
-            if (stopped.state == .idle or stopped.state == .exited or stopped.pid != capture.identity.pid) .target_ended
-            else if (stopped.image_epoch != capture.identity.image_epoch) .image_changed
-            else if (stopped.birth_count > 0 or self.target.sharedVm()) .scope_changed
-            else if (!self.observationThreadsMatch(capture.threads, false)) .thread_ended else null
-        else null;
+            if (stopped.state == .idle or stopped.state == .exited or stopped.pid != capture.identity.pid) .target_ended else if (stopped.image_epoch != capture.identity.image_epoch) .image_changed else if (stopped.birth_count > 0 or self.target.sharedVm()) .scope_changed else if (!self.observationThreadsMatch(capture.threads, false)) .thread_ended else null
+        else
+            null;
         self.observations.poll(pending_valid, boundary);
     }
     fn clearObservationArchive(self: *Session) !void {
@@ -301,7 +305,7 @@ pub const Session = struct {
         const capture = self.observations.capture orelse return error.NoObservation;
         if (!capture.store.finished or self.observations.busy()) return error.ObservationStillCollecting;
         try self.clearObservationArchive();
-        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .save, path, capture);
+        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .save, path, capture, self.observation_associations);
         self.next_observation_archive += 1;
         return self.observation_archive.?.id;
     }
@@ -327,7 +331,7 @@ pub const Session = struct {
         const failed_open = if (self.observation_archive) |job| job.kind == .open and job.done.load(.acquire) and job.err != null else false;
         if (self.target.snapshot().pid != 0 or (self.offline and !failed_open) or self.profile != null or self.observations.capture != null or self.observations.busy()) return error.ConflictingTargets;
         try self.clearObservationArchive();
-        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .open, path, null);
+        self.observation_archive = try @import("../observe/archive_job.zig").Job.start(self.next_observation_archive, .open, path, null, null);
         self.next_observation_archive += 1;
         self.offline = true;
     }
@@ -336,6 +340,13 @@ pub const Session = struct {
         if (job.reaped or !job.done.load(.acquire)) return;
         job.reaped = true;
         job.source = null;
+        job.association_source = null;
+        if (job.restored_associations) |restored| {
+            restored.id = self.next_observation_association;
+            self.next_observation_association += 1;
+            self.observation_associations = restored;
+            job.restored_associations = null;
+        }
         if (job.capture) |capture| {
             self.observations.capture = capture;
             job.capture = null;
@@ -1430,6 +1441,17 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
+        const perl_preview = @import("../language/perl.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (perl_preview) |shown| {
+            result.visualization = shown;
+            const detail = shown.perl.?;
+            result.display = try std.fmt.allocPrint(a, "{s} (refcnt {d}, flags 0x{x})", .{ detail.display, detail.refcount, detail.flags });
+            result.diagnostic = shown.diagnostic;
+            return result;
+        }
         result.visualization = value_view.preview(self.valueContext(a), v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
@@ -1530,6 +1552,7 @@ pub const Session = struct {
         return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        self.static_analysis.deinit();
         if (self.observation_archive) |job| job.deinit();
         if (self.observation_associations) |job| job.deinit();
         if (self.observation_analysis) |job| job.deinit();

@@ -565,8 +565,11 @@ static void adopted_child(void)
     target->identity_admitted = 0;
     struct xrt_target *born = xrt_target_create();
     CHECK(born);
+    /* A reused handle's generation keeps increasing across adoption. */
+    born->generation = 41;
     struct xrt_birth birth;
     OK(xrt_target_adopt(target, born_pid, born, &birth));
+    CHECK(born->generation > 41);
     CHECK(born->identity_admitted && born->arch == xrt_arch_native());
     CHECK(!target->identity_admitted);
     struct xrt_target_view child_view;

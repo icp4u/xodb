@@ -56,6 +56,19 @@ pub const Preview = struct {
     truncated: bool = false,
     diagnostic: ?[]const u8 = null,
     basis: []const u8 = basis,
+    perl: ?PerlValue = null,
+};
+pub const PerlItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const PerlValue = struct {
+    stored_value_only: bool = false,
+    utf8: bool = false,
+    type: []const u8,
+    display: []const u8,
+    refcount: u32,
+    flags: u32,
+    body: u64,
+    runtime_build_id: []const u8,
+    items: []PerlItem,
 };
 pub fn preview(ctx: eval.Context, v: eval.Value) !?Preview {
     if (layout(v.type) == null) return null;

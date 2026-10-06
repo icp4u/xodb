@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Native Perl argument demo. Optional arguments are passed to xodb.
+# Native Perl demo: readable Perl values and the Perl stack at native stops.
+# Optional arguments are passed to xodb. XODB=path overrides the binary
+# (default: ./zig-out/bin/xodb from this checkout).
 set -euo pipefail
 demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$demo_root"
-if [[ ! -x zig-out/bin/xodb ]]; then
-    printf '%s\n' 'Build xodb first with ./scripts/build' >&2
+xodb=${XODB:-zig-out/bin/xodb}
+if [[ ! -x "$xodb" ]]; then
+    printf '%s\n' "Build xodb first with ./scripts/build, or set XODB=/path/to/xodb" >&2
     exit 1
 fi
 perl=/opt/debug/bin/perl
@@ -13,12 +16,11 @@ if [[ ! -x "$perl" ]]; then
     exit 1
 fi
 
-# Perl_av_store lives in libperl.so. Assigning a deleted element goes through
-# the lexical-array store op, av_fetch(lval) and then av_store(av, 3, sv) on
-# every iteration; a plain repeated $a[3]=42 reuses the existing slot instead.
-# The handshake ensures the loop is about to run before xodb attaches.
+# examples/perl-demo.pl re-stores element 3 from nested subs. Deleting first
+# forces the store op through av_fetch(lval) and av_store(av, 3, sv) on every
+# iteration. The handshake ensures the loop is running before xodb attaches.
 coproc PERL_DEMO {
-    exec "$perl" -e '$|=1; my @a=(0)x4; print "$$\n"; while (1) { delete $a[3]; $a[3]=42 }'
+    exec "$perl" examples/perl-demo.pl
 }
 demo_pid=$PERL_DEMO_PID
 cleanup() {
@@ -33,5 +35,10 @@ if [[ "$ready_pid" != "$demo_pid" ]]; then
     printf '%s\n' 'Unexpected Perl startup handshake' >&2
     exit 1
 fi
+cat >&2 <<'TIPS'
+Try: Space (stop in Perl_av_store) · E val Return (a new, undefined element)
+     E av Return (AV, 3 slots) · Space (stop in Perl_av_delete on the next round)
+     E av->sv_u.svu_array[3] Return (IV 42) · click frames to walk the interpreter
+TIPS
 set -x
-./zig-out/bin/xodb "$@" --attach "$demo_pid" --break Perl_av_store
+"$xodb" "$@" --attach "$demo_pid" --break Perl_av_store --break Perl_av_delete

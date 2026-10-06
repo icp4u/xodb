@@ -28,9 +28,10 @@ $(BUILD)/test-%: $(ROOT)/tests/runtime-%.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-remote: $(ROOT)/tests/runtime-remote.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -fno-pie -no-pie $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
-check: $(TEST_BINS) $(BUILD)/test-remote $(BUILD)/xodb-agent
+check: $(TEST_BINS) $(BUILD)/test-remote $(BUILD)/test-replies $(BUILD)/xodb-agent
 	@set -e; for test in $(TEST_BINS); do "$$test"; done
 	$(BUILD)/test-remote $(BUILD)/xodb-agent
+	$(BUILD)/test-replies $(BUILD)/xodb-agent
 # Function probes are currently x86-64 only; live checks explicitly supply a
 # helper path (and optionally an agent) to this standalone test executable.
 $(BUILD)/test-uprobes: $(ROOT)/tests/runtime-uprobes.c $(BUILD)/libxrt.a

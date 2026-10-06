@@ -32,6 +32,7 @@ pub const Capture = struct {
     budget: Budget,
     arena: std.heap.ArenaAllocator,
     offline: bool = false,
+    saved_associations: ?*@import("association_evidence.zig").Owned = null,
     recipe_json: ?[]const u8 = null,
     comparison_selection: ?@import("comparison.zig").Selection = null,
     pub fn create(a: std.mem.Allocator, identity: Identity, config: Config, threads: []const Thread, functions: []const Function) !*Capture {
@@ -78,6 +79,7 @@ pub const Capture = struct {
     }
     pub fn deinit(self: *Capture) void {
         const a = self.budget.backing;
+        if (self.saved_associations) |saved| saved.deinit();
         self.store.deinit(self.budget.allocator());
         self.arena.deinit();
         a.destroy(self);

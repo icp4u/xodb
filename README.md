@@ -95,6 +95,8 @@ stepping now batches straight-line instructions; see [source stepping](docs/SOUR
 return words and call durations, compare fast/slow cohorts, and save/reopen `.xoi`
 evidence. MCP also provides retained stopped inspections and temporal joins to
 CPU, syscall and allocation records. See [commands and limits](docs/OBSERVATIONS.md).
+For repeated baseline/variant runs with input hashes, retained failures and offline
+summaries, see [observation experiments](docs/OBSERVATION_EXPERIMENTS.md).
 
 **Themes.** Built-in dark, light and contrast palettes and custom JSON colors,
 selected at startup for local, remote and offline views. See [themes](docs/THEMES.md).

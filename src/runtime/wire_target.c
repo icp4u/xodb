@@ -1,5 +1,6 @@
 #include "wire_target.h"
 #include "target_internal.h"
+#include <stdlib.h>
 /* Signed values retain their fixed-width two's-complement bit patterns. */
 static void i32(struct xrt_codec *c, int32_t *v)
 {
@@ -101,7 +102,8 @@ static void event(struct xrt_codec *c, struct xrt_event *e)
     U64(pc);
     U8(known);
     if (c->read) {
-        if (known > 1) {
+        /* An unknown PC crosses as canonical zero. */
+        if (known > 1 || (!known && pc)) {
             c->ok = false;
             return;
         }
@@ -174,6 +176,59 @@ static int breakpoint_consistent(const struct xrt_arch *arch, const struct xrt_b
             return 1;
     }
     return 0;
+}
+static int order_u64(const void *a, const void *b)
+{
+    const uint64_t x = *(const uint64_t *)a, y = *(const uint64_t *)b;
+    return (x > y) - (x < y);
+}
+_Static_assert(XRT_MAX_BREAKPOINTS + XRT_MAX_WATCHPOINTS <= XRT_MAX_THREADS,
+               "identity scratch holds every probe");
+/* Sorts in place; O(n log n) at the 1024-thread and 132-probe maxima. */
+static int distinct(uint64_t *values, size_t count)
+{
+    qsort(values, count, sizeof(values[0]), order_u64);
+    for (size_t i = 1; i < count; ++i)
+        if (values[i] == values[i - 1])
+            return 0;
+    return 1;
+}
+/* Identities the producer allocates once: one thread record per TID, thread
+ * IDs from next_thread_id, and breakpoint and watchpoint IDs from one
+ * next_probe_id namespace. A resolved address holds at most one record. */
+static int identities_consistent(const struct xrt_target *t)
+{
+    uint64_t keys[XRT_MAX_THREADS];
+    for (size_t i = 0; i < t->thread_count; ++i) {
+        if (t->threads[i].id >= t->next_thread_id)
+            return 0;
+        keys[i] = t->threads[i].id;
+    }
+    if (!distinct(keys, t->thread_count))
+        return 0;
+    for (size_t i = 0; i < t->thread_count; ++i)
+        keys[i] = (uint32_t)t->threads[i].tid;
+    if (!distinct(keys, t->thread_count))
+        return 0;
+    size_t n = 0;
+    for (size_t i = 0; i < t->breakpoint_count; ++i)
+        keys[n++] = t->breakpoints[i].id;
+    for (unsigned i = 0; i < XRT_MAX_WATCHPOINTS; ++i) {
+        const struct xrt_watchpoint *w = &t->watchpoints[i];
+        if (!w->present)
+            continue;
+        if (w->id >= t->next_probe_id || w->address % w->length ||
+            (w->kind == XRT_WATCH_EXECUTE && w->length != 1))
+            return 0;
+        keys[n++] = w->id;
+    }
+    if (!distinct(keys, n))
+        return 0;
+    n = 0;
+    for (size_t i = 0; i < t->breakpoint_count; ++i)
+        if (!t->breakpoints[i].pending)
+            keys[n++] = t->breakpoints[i].address;
+    return distinct(keys, n);
 }
 void xrt_wire_target(struct xrt_codec *c, struct xrt_target *t)
 {
@@ -257,6 +312,18 @@ void xrt_wire_target(struct xrt_codec *c, struct xrt_target *t)
         xrt_wire_birth(c, &t->births[i]);
     if (c->read && (t->pid < 0 || !t->next_thread_id || !t->next_probe_id))
         c->ok = false;
+    if (c->read && c->ok && !identities_consistent(t))
+        c->ok = false;
+}
+static int unavailable(const struct xrt_registers *r, uint16_t id)
+{
+    for (uint8_t i = 0; i < r->absent_count && i < XRT_ABSENT_MAX; ++i)
+        if (r->absent_id[i] == id)
+            return 1;
+    for (uint8_t i = 0; i < r->unknown_count && i < XRT_ABSENT_MAX; ++i)
+        if (r->unknown_id[i] == id)
+            return 1;
+    return 0;
 }
 void xrt_wire_registers(struct xrt_codec *c, struct xrt_registers *r)
 {
@@ -288,7 +355,7 @@ void xrt_wire_registers(struct xrt_codec *c, struct xrt_registers *r)
         uint64_t value = 0;
         unsigned char *field =
             (unsigned char *)&local.values + arch->registers[i].snapshot_offset;
-        if (!c->read)
+        if (!c->read && !unavailable(&local, (uint16_t)i))
             memcpy(&value, field, 8);
         U64(value);
         if (c->ok && c->read)
@@ -311,6 +378,16 @@ void xrt_wire_registers(struct xrt_codec *c, struct xrt_registers *r)
     if (!c->ok || xrt_registers_validate(arch, &local) != XRT_OK) {
         c->ok = false;
         return;
+    }
+    /* An absent or unknown slot crosses as canonical zero; local storage may
+     * hold a sentinel, but the wire never carries one. */
+    for (unsigned i = 0; c->read && i < arch->register_count; ++i) {
+        uint64_t value;
+        memcpy(&value, (unsigned char *)&local.values + arch->registers[i].snapshot_offset, 8);
+        if (value && unavailable(&local, (uint16_t)i)) {
+            c->ok = false;
+            return;
+        }
     }
     if (c->read)
         *r = local;

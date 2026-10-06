@@ -34,5 +34,6 @@ pub const api = @cImport({
     }
     @cInclude("capstone/capstone.h");
     @cInclude("elfutils/libdw.h");
+    @cInclude("../language/perl.h");
     @cInclude("dwarf.h");
 });

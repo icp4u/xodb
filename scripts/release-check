@@ -26,11 +26,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     if live:
+        steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
+                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         for name in ('inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
@@ -47,11 +48,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-themes', ['tests/themes.py']),
+            ('gui-repeated-break', ['tests/repeated-break-gui.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
             ('gui-invocations', ['tests/invocations-gui.py']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
+            ('gui-static-analysis', ['tests/static-analysis-gui.py', 'zig-out']),
             ('gui-restart', ['tests/restart-gui.py', 'zig-out']),
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
@@ -178,7 +181,7 @@ def snapshot(destination):
     # Copy tracked *working* contents, including local edits, but no ignored
     # caches, captures or untracked prototypes that could hide missing inputs.
     names = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build.zig',
-        'build.zig.zon', 'src', 'tests', 'scripts', 'examples', 'packaging',
+        'build.zig.zon', 'src', 'tests', 'scripts', 'tools', 'examples', 'packaging',
         'docs', 'config', 'README.md', 'LICENSE', 'SETUP.md'], cwd=ROOT).decode().split('\0')
     hashes = {}
     for name in filter(None, names):

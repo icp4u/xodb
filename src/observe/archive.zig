@@ -54,6 +54,22 @@ pub const Evidence = struct {
     unread_possible: bool,
     /// Source-side rejection attempts have no fabricated raw event citation.
     rejected: u64,
+    associations: ?@import("association_evidence.zig").Snapshot = null,
+    pub fn jsonStringify(self: Evidence, writer: *std.json.Stringify) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(Evidence).@"struct".fields) |field| {
+            if (comptime std.mem.eql(u8, field.name, "associations")) {
+                if (self.associations != null) {
+                    try writer.objectField(field.name);
+                    try writer.write(self.associations);
+                }
+            } else {
+                try writer.objectField(field.name);
+                try writer.write(@field(self, field.name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 const Wire = struct { version: u32 = 1, pairing_algorithm: []const u8 = algorithm, evidence: Evidence };
 
@@ -174,6 +190,7 @@ fn replay(a: Allocator, saved: Evidence, state: ?*Progress) !calls.Store {
     // pairings or loss totals. The unrecorded attempt cannot be replayed.
     store.rejected = saved.rejected;
     store.unread_possible = saved.unread_possible;
+    if (saved.associations) |view| @import("association_evidence.zig").validate(a, view, saved.metadata, &store, if (state) |p| &p.cancel else null) catch |err| return if (err == error.ObservationAnalysisCancelled) error.ArchiveCancelled else err;
     try check(state);
     return store;
 }
@@ -183,8 +200,13 @@ pub fn encode(a: Allocator, evidence: Evidence, state: ?*Progress) ![]u8 {
     const scratch = budget.allocator();
     var checked = try replay(scratch, evidence, state);
     defer checked.deinit(scratch);
+    if (evidence.associations) |view| {
+        // A writer must not publish a snapshot the reader's owner cannot hold.
+        const owned = try @import("association_evidence.zig").Owned.create(scratch, view);
+        owned.deinit();
+    }
     try progress.step(state, .encoding, 0);
-    const body = try std.json.Stringify.valueAlloc(scratch, Wire{ .evidence = evidence }, .{});
+    const body = try std.json.Stringify.valueAlloc(scratch, Wire{ .version = if (evidence.associations == null) 1 else 2, .evidence = evidence }, .{});
     defer scratch.free(body);
     try check(state);
     return wrap(a, body);
@@ -216,13 +238,60 @@ pub fn decodeWithOptions(a: Allocator, bytes: []const u8, options: DecodeOptions
     decodeInto(self, bytes, options.progress) catch |err| return if (self.budget.denied) error.ArchiveMemoryLimit else err;
     return self;
 }
+// Count normalized record objects before the typed parser allocates their
+// arrays. Decode escaped key strings too; encoded aliases cannot evade limits.
+fn preflight(a: Allocator, bytes: []const u8, state: ?*Progress) !void {
+    var scanner = std.json.Scanner.initCompleteInput(a, bytes);
+    defer scanner.deinit();
+    const Target = enum { none, records, streams };
+    var targets: [64]Target = @splat(.none);
+    var lengths: [64]usize = @splat(0);
+    var depth: usize = 0;
+    var pending: Target = .none;
+    var count: usize = 0;
+    var steps: usize = 0;
+    while (true) {
+        if (steps % 256 == 0) try check(state);
+        steps += 1;
+        const token = try scanner.nextAllocMax(a, .alloc_if_needed, max_recipe_bytes);
+        defer switch (token) {
+            .allocated_string, .allocated_number => |s| a.free(s),
+            else => {},
+        };
+        switch (token) {
+            .string, .allocated_string => |s| pending = if (std.mem.eql(u8, s, "points") or std.mem.eql(u8, s, "intervals")) .records else if (std.mem.eql(u8, s, "streams") or std.mem.eql(u8, s, "sources")) .streams else .none,
+            .object_begin, .array_begin => {
+                if (depth == targets.len) return error.InvalidObservationArchive;
+                if (depth != 0 and targets[depth - 1] == .records) {
+                    if (count == @import("association_evidence.zig").max_records) return error.ObservationAssociationRecordLimit;
+                    count += 1;
+                }
+                if (depth != 0 and targets[depth - 1] == .streams) {
+                    lengths[depth - 1] += 1;
+                    if (lengths[depth - 1] > @import("association_evidence.zig").max_streams) return error.ObservationAssociationStreamLimit;
+                }
+                targets[depth] = if (token == .array_begin) pending else .none;
+                lengths[depth] = 0;
+                depth += 1;
+                pending = .none;
+            },
+            .object_end, .array_end => {
+                depth -= 1;
+                pending = .none;
+            },
+            .end_of_document => return,
+            else => pending = .none,
+        }
+    }
+}
 fn decodeInto(self: *Opened, bytes: []const u8, state: ?*Progress) !void {
     try progress.step(state, .decoding, 0);
     const a = self.budget.allocator();
+    try preflight(a, bytes[magic.len + 32 ..], state);
     self.bytes = try a.dupe(u8, bytes);
     self.parsed = try std.json.parseFromSlice(Wire, a, self.bytes[magic.len + 32 ..], .{ .max_value_len = max_recipe_bytes, .allocate = .alloc_always });
     const wire = self.parsed.?.value;
-    if (wire.version != 1 or !std.mem.eql(u8, wire.pairing_algorithm, algorithm)) return error.ObservationArchiveVersion;
+    if ((wire.version != 1 and wire.version != 2) or (wire.version == 1 and wire.evidence.associations != null) or (wire.version == 2 and wire.evidence.associations == null) or !std.mem.eql(u8, wire.pairing_algorithm, algorithm)) return error.ObservationArchiveVersion;
     self.store = try replay(a, wire.evidence, state);
 }
 
@@ -394,7 +463,7 @@ test "observation archive preserves authoritative perf register normalization" {
 fn rejectRawContradiction(a: Allocator, evidence: Evidence) !void {
     try std.testing.expectError(error.InvalidObservationArchive, encode(a, evidence, null));
     // Bypass encode's checks and recompute the checksum to model hostile data.
-    const body = try std.json.Stringify.valueAlloc(a, Wire{ .evidence = evidence }, .{});
+    const body = try std.json.Stringify.valueAlloc(a, Wire{ .version = if (evidence.associations == null) 1 else 2, .evidence = evidence }, .{});
     defer a.free(body);
     const bytes = try wrap(a, body);
     defer a.free(bytes);
@@ -732,4 +801,305 @@ test "observation archive rejects negative process identity and kernel addresses
     try std.testing.expectEqual(@as(usize, 0), external.used);
     try std.testing.expectError(error.ArchiveMemoryLimit, decodeWithOptions(a, bytes, .{ .memory_bytes = bytes.len + 128 }));
     try std.testing.expectError(error.ArchiveMemoryLimit, decodeWithOptions(a, bytes, .{ .memory_bytes = 512 * 1024 * 1024 + 1 }));
+}
+
+fn snapshotAllocationFailure(a: Allocator, view: @import("association_evidence.zig").Snapshot) !void {
+    const owned = try @import("association_evidence.zig").Owned.create(a, view);
+    defer owned.deinit();
+}
+fn associatedFixture(a: Allocator, remote: bool, adverse: bool) ![]u8 {
+    const saved = @import("association_evidence.zig");
+    const assoc = @import("associations.zig");
+    var store = try calls.Store.init((capture.Config{}).store());
+    defer store.deinit(a);
+    try store.feed(a, sample(.enter, 20));
+    try store.feed(a, sample(.leave, 30));
+    store.finish(.capture_end);
+    var evidence = fixture(&store);
+    const producer: ?@import("../profile/producer.zig").Producer = if (remote) .{ .machine = 62, .address_bits = 64, .little_endian = true, .boot_id = null, .monotonic_ns = 7, .host_monotonic_ns = 11, .uncertainty_ns = 1 } else null;
+    evidence.metadata.producer = producer;
+    const origin = assoc.Origin{ .origin_id = 2, .session_id = 1, .process_id = 3, .image_epoch = 4, .producer_id = 1, .clock_id = 1 };
+    const cpu = [_]assoc.Point{ .{ .ordinal = 0, .time_ns = 25, .tid = 100, .thread_id = 1 }, .{ .ordinal = 1, .time_ns = 20, .tid = 100, .thread_id = 1 }, .{ .ordinal = 2, .time_ns = null, .tid = 0 }, .{ .ordinal = 3, .time_ns = 50, .tid = 100, .thread_id = 1 } };
+    const allocations = [_]assoc.Point{ .{ .ordinal = 1, .time_ns = 24, .tid = 100, .thread_id = 1 }, .{ .ordinal = 3, .time_ns = 26, .tid = 100, .thread_id = 1 } };
+    const intervals = [_]assoc.Interval{.{ .ordinal = 0, .start_ns = 22, .end_ns = 28, .tid = 100, .thread_id = 1 }};
+    var streams: [3]assoc.Stream = undefined;
+    var sources: [3]saved.Source = undefined;
+    for (0..3) |i| {
+        const kind: assoc.Kind = switch (i) {
+            0 => .cpu,
+            1 => .syscall,
+            else => .allocation,
+        };
+        var source_origin = origin;
+        source_origin.origin_id = if (i == 2) 8 else 7;
+        const count: usize = if (i == 0) 4 else if (i == 1) 1 else 2;
+        streams[i] = .{ .id = i + 1, .origin = source_origin, .kind = kind, .clock = if (!remote) .same_domain else .{ .correlated = .{ .proof_id = i + 1, .source_producer_id = 1, .target_producer_id = 1, .source_clock_id = 1, .target_clock_id = 1, .offset_ns = 0, .uncertainty_ns = 2, .valid_start_ns = 10, .valid_end_ns = 100 } }, .points = if (i == 0) &cpu else if (i == 2) &allocations else &.{}, .intervals = if (i == 1) &intervals else &.{} };
+        sources[i] = .{ .stream_id = i + 1, .kind = kind, .capture_id = source_origin.origin_id, .revision = 1, .started_ns = 10, .ended_ns = 100, .stored_records = if (i == 2) 4 else count, .included_records = count, .excluded_metadata_records = if (i == 2) 2 else 0, .lost_records = if (i == 0) 1 else 0, .lost_samples = if (i == 0) 5 else 0, .loss_basis = "owned synthetic missing-record diagnostic", .producer = producer };
+    }
+    var derived = try assoc.build(a, &store, origin, &streams, .{ .selection = .{ .threshold_ns = 10 } }, null);
+    defer derived.deinit(a);
+    try std.testing.expectEqual(@as(u64, 7), derived.counts.records);
+    try std.testing.expectEqual(@as(u64, if (remote) 4 else 5), derived.counts.exactly_one_call);
+    try std.testing.expectEqual(@as(u64, if (remote) 1 else 0), derived.counts.crosses_boundary);
+    var view = saved.Snapshot{ .association_algorithm = saved.algorithm, .origin = origin, .selection = .{ .threshold_ns = 10 }, .sources = &sources, .streams = &streams, .derived = derived };
+    evidence.associations = view;
+    if (adverse) {
+        for (0..14) |change| {
+            const prior_source = sources[0];
+            const prior_stream = streams[0];
+            const prior_view = view;
+            switch (change) {
+                0 => view.origin.process_id += 1,
+                1 => view.origin.image_epoch += 1,
+                2 => streams[0].origin.process_id += 1,
+                3 => streams[0].origin.clock_id += 1,
+                4 => streams[0].clock = .unverified,
+                5 => sources[0].capture_id += 1,
+                6 => sources[0].included_records += 1,
+                7 => sources[0].stored_records = 1,
+                8 => view.sources = sources[0..2],
+                9 => view.derived.counts.records += 1,
+                10 => view.derived.omitted_rows += 1,
+                11 => view.derived.work_steps += 1,
+                12 => view.selection.threshold_ns = 11,
+                13 => {
+                    sources[0].producer = producer;
+                    sources[0].producer.?.uncertainty_ns = std.math.maxInt(u64);
+                },
+                else => unreachable,
+            }
+            evidence.associations = view;
+            // Rechecksum hostile data so replay, not the digest, rejects it.
+            const body = try std.json.Stringify.valueAlloc(a, Wire{ .version = 2, .evidence = evidence }, .{});
+            defer a.free(body);
+            const bytes = try wrap(a, body);
+            defer a.free(bytes);
+            const result = decode(a, bytes, null);
+            if (result) |opened| {
+                opened.deinit();
+                return error.ExpectedRejection;
+            } else |err| try std.testing.expect(err == error.InvalidSavedAssociations or err == error.ObservationAssociationClockOverflow);
+            sources[0] = prior_source;
+            streams[0] = prior_stream;
+            view = prior_view;
+        }
+        evidence.associations = view;
+        try std.testing.checkAllAllocationFailures(a, snapshotAllocationFailure, .{view});
+        try std.testing.checkAllAllocationFailures(a, encodeAllocationFailure, .{evidence});
+    }
+    return encode(a, evidence, null);
+}
+test "saved associations replay source ordinals uncertainty loss and all derived citations" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |remote| {
+        const bytes = try associatedFixture(a, remote, remote);
+        defer a.free(bytes);
+        const opened = try decode(a, bytes, null);
+        defer opened.deinit();
+        const view = opened.evidence().associations.?;
+        try std.testing.expectEqual(@as(u64, 3), view.streams[2].points[1].ordinal);
+        try std.testing.expect(view.sources[0].coverageIncomplete());
+        const owned = try @import("association_evidence.zig").Owned.create(a, view);
+        defer owned.deinit();
+        const again = try encode(a, opened.evidence(), null);
+        defer a.free(again);
+        try std.testing.expectEqualSlices(u8, bytes, again);
+        if (remote) {
+            try std.testing.checkAllAllocationFailures(a, decodeAllocationFailure, .{bytes});
+            try std.testing.expectError(error.ArchiveMemoryLimit, decodeWithOptions(a, bytes, .{ .memory_bytes = 1000 }));
+            for (0..bytes.len) |end| {
+                const attempt = decode(a, bytes[0..end], null);
+                if (attempt) |unexpected| {
+                    unexpected.deinit();
+                    return error.ExpectedTruncation;
+                } else |_| {}
+            }
+        }
+        // Optional owned fixture export supports CLI/MCP reconstruction tests.
+        const export_path = c.getenv(if (remote) "XODB_ASSOCIATION_REMOTE_FIXTURE" else "XODB_ASSOCIATION_FIXTURE");
+        if (export_path != null) {
+            const path = std.mem.span(export_path);
+            const publication = publish(path, bytes, null);
+            try std.testing.expectEqual(.published, publication.state);
+        }
+    }
+}
+test "association record preflight rejects escaped over-budget arrays before typed allocation" {
+    const a = std.testing.allocator;
+    const count = @import("association_evidence.zig").max_records + 1;
+    const prefix = "{\"po\\u0069nts\":[";
+    const bytes = try a.alloc(u8, prefix.len + count * 3 + 1);
+    defer a.free(bytes);
+    @memcpy(bytes[0..prefix.len], prefix);
+    for (0..count) |i| @memcpy(bytes[prefix.len + i * 3 ..][0..3], if (i + 1 == count) "{}]" else "{},");
+    bytes[bytes.len - 1] = '}';
+    try std.testing.expectError(error.ObservationAssociationRecordLimit, preflight(a, bytes, null));
+    var cancelled = Progress{};
+    cancelled.cancel.store(true, .release);
+    try std.testing.expectError(error.ArchiveCancelled, preflight(a, bytes, &cancelled));
+}
+
+test "association archive workers cancel open and save without partial publication" {
+    const Job = @import("archive_job.zig").Job;
+    const a = std.testing.allocator;
+    var template = "./.xodb-association-workers-XXXXXX".*;
+    const raw = c.mkdtemp(&template);
+    if (raw == null) return error.TestDirectoryFailed;
+    const dir = std.mem.span(raw);
+    _ = c.chmod(raw, 0o755);
+    defer _ = c.rmdir(raw);
+    var input_buffer: [256]u8 = undefined;
+    var output_buffer: [256]u8 = undefined;
+    const input = try std.fmt.bufPrintZ(&input_buffer, "{s}/input.xoi", .{dir});
+    const output = try std.fmt.bufPrintZ(&output_buffer, "{s}/output.xoi", .{dir});
+    defer _ = c.unlink(input.ptr);
+    const bytes = try associatedFixture(a, false, false);
+    defer a.free(bytes);
+    try std.testing.expectEqual(.published, publish(input, bytes, null).state);
+    const owner = try Job.start(1, .open, input, null, null);
+    defer owner.deinit();
+    while (!owner.done.load(.acquire)) _ = c.usleep(1000);
+    try std.testing.expect(owner.err == null and owner.capture != null and owner.restored_associations != null);
+    for (0..24) |i| {
+        const opening = i % 2 == 0;
+        const job = try Job.start(2, if (opening) .open else .save, if (opening) input else output, if (opening) null else owner.capture, if (opening) null else owner.restored_associations);
+        defer job.deinit();
+        if (i % 3 != 0) _ = c.usleep(1000);
+        job.progress.cancel.store(true, .release);
+        while (!job.done.load(.acquire)) _ = c.usleep(1000);
+        try std.testing.expect(job.status().state == .cancelled or job.status().state == .completed);
+        if (!opening) {
+            if (job.publication != null and job.publication.?.state == .published) {
+                const restored = try open(a, output, null);
+                defer restored.deinit();
+                try std.testing.expect(restored.evidence().associations != null);
+                try std.testing.expectEqual(@as(c_int, 0), c.unlink(output.ptr));
+            } else try std.testing.expect(c.access(output.ptr, c.F_OK) != 0);
+        }
+    }
+}
+
+test "association largest-record ceiling is writable readable and owned" {
+    const saved = @import("association_evidence.zig");
+    const assoc = @import("associations.zig");
+    const Job = @import("association_job.zig").Job;
+    const a = std.testing.allocator;
+    var store = try calls.Store.init((capture.Config{}).store());
+    defer store.deinit(a);
+    try store.feed(a, sample(.enter, 20));
+    try store.feed(a, sample(.leave, 30));
+    store.finish(.capture_end);
+    var evidence = fixture(&store);
+    const origin = assoc.Origin{ .origin_id = 2, .session_id = 1, .process_id = 3, .image_epoch = 4, .producer_id = 1, .clock_id = 1 };
+    var source_origin = origin;
+    source_origin.origin_id = 7;
+    const intervals = try a.alloc(assoc.Interval, saved.max_records + 1);
+    defer a.free(intervals);
+    for (intervals, 0..) |*interval, i| interval.* = .{ .ordinal = i, .start_ns = 21, .end_ns = 29, .tid = 100, .thread_id = 1 };
+    var streams = [_]assoc.Stream{.{ .id = 2, .origin = source_origin, .kind = .syscall, .clock = .same_domain, .intervals = intervals[0..saved.max_records] }};
+    var sources = [_]saved.Source{.{ .stream_id = 2, .kind = .syscall, .capture_id = 7, .revision = 1, .started_ns = 10, .ended_ns = 100, .stored_records = saved.max_records, .included_records = saved.max_records, .loss_basis = "synthetic complete intervals", .producer = null }};
+    var derived = try assoc.build(a, &store, origin, &streams, .{ .selection = .{ .threshold_ns = 10 } }, null);
+    defer derived.deinit(a);
+    const view = saved.Snapshot{ .association_algorithm = saved.algorithm, .origin = origin, .selection = .{ .threshold_ns = 10 }, .sources = &sources, .streams = &streams, .derived = derived };
+    evidence.associations = view;
+    const bytes = try encode(a, evidence, null);
+    defer a.free(bytes);
+    const opened = try decode(a, bytes, null);
+    defer opened.deinit();
+    const metadata = evidence.metadata;
+    const cap = try capture.Capture.create(a, metadata.identity, metadata.config, metadata.threads, metadata.functions);
+    defer cap.deinit();
+    for (evidence.records) |record| try cap.feed(record.event);
+    cap.store.finish(metadata.finish_reason);
+    cap.offline = true;
+    cap.saved_associations = try saved.Owned.create(a, opened.evidence().associations.?);
+    const job = try Job.fromSaved(1, cap, view.selection, true, null);
+    defer job.deinit();
+    try std.testing.expectEqual(saved.max_records, job.copied_records);
+    try std.testing.expect((try job.view()).rowsTruncated());
+    try std.testing.expect(job.budget.peak <= saved.memory_limit);
+    try std.testing.expect(cap.saved_associations.?.budget.peak <= saved.memory_limit);
+    if (c.getenv("XODB_ASSOCIATION_LARGE_FIXTURE")) |path| try std.testing.expectEqual(.published, publish(std.mem.span(path), bytes, null).state);
+    streams[0].intervals = intervals;
+    sources[0].stored_records += 1;
+    sources[0].included_records += 1;
+    try std.testing.expectError(error.ObservationAssociationRecordLimit, saved.Owned.create(a, view));
+    try std.testing.expectError(error.ObservationAssociationRecordLimit, encode(a, evidence, null));
+    // Budget denials are distinguishable from backing allocator exhaustion.
+    var budget = Budget{ .backing = a, .limit = 1 };
+    try std.testing.expectError(error.OutOfMemory, budget.allocator().alloc(u8, 2));
+    try std.testing.expectEqual(error.ObservationAssociationMemoryLimit, saved.budgetError(&budget, error.OutOfMemory));
+    budget.denied = false;
+    try std.testing.expectEqual(error.OutOfMemory, saved.budgetError(&budget, error.OutOfMemory));
+}
+
+test "unknown association algorithm retains evidence without replay and requires identifier" {
+    const saved = @import("association_evidence.zig");
+    const a = std.testing.allocator;
+    const original = try associatedFixture(a, false, false);
+    defer a.free(original);
+    const first = try decode(a, original, null);
+    defer first.deinit();
+    var evidence = first.evidence();
+    evidence.associations.?.association_algorithm = "historical-association-v0";
+    const bytes = try encode(a, evidence, null);
+    defer a.free(bytes);
+    const opened = try decode(a, bytes, null);
+    defer opened.deinit();
+    try std.testing.expectEqualSlices(u8, "historical-association-v0", opened.evidence().associations.?.association_algorithm);
+    try std.testing.expectEqual(first.store.calls.items.len, opened.store.calls.items.len);
+    const field = "\"association_algorithm\":\"historical-association-v0\",";
+    const body = bytes[magic.len + 32 ..];
+    const pos = std.mem.indexOf(u8, body, field).?;
+    const missing = try std.mem.concat(a, u8, &.{ body[0..pos], body[pos + field.len ..] });
+    defer a.free(missing);
+    const invalid = try wrap(a, missing);
+    defer a.free(invalid);
+    try std.testing.expectError(error.MissingField, decode(a, invalid, null));
+    try std.testing.expectError(error.ObservationAssociationStreamLimit, preflight(a, "{\"str\\u0065ams\":[{},{},{},{}]}", null));
+    _ = saved;
+}
+
+test "failed or cancelled association saves invocation only and running job refuses immediately" {
+    const Job = @import("archive_job.zig").Job;
+    const a = std.testing.allocator;
+    var template = "./.xodb-association-failure-XXXXXX".*;
+    const raw = c.mkdtemp(&template) orelse return error.TestDirectoryFailed;
+    _ = c.chmod(raw, 0o755);
+    defer _ = c.rmdir(raw);
+    var input_buffer: [256]u8 = undefined;
+    var output_buffer: [256]u8 = undefined;
+    const input = try std.fmt.bufPrintZ(&input_buffer, "{s}/input.xoi", .{std.mem.span(raw)});
+    const output = try std.fmt.bufPrintZ(&output_buffer, "{s}/output.xoi", .{std.mem.span(raw)});
+    defer _ = c.unlink(input.ptr);
+    defer _ = c.unlink(output.ptr);
+    const bytes = try associatedFixture(a, false, false);
+    defer a.free(bytes);
+    try std.testing.expectEqual(.published, publish(input, bytes, null).state);
+    const owner = try Job.start(1, .open, input, null, null);
+    defer owner.deinit();
+    while (!owner.done.load(.acquire)) _ = c.usleep(1000);
+    try std.testing.expect(owner.err == null);
+    const associated = owner.restored_associations.?;
+    // This restored job has no worker: its state can model each owner transition
+    // deterministically, including the running rejection without a timing race.
+    associated.done.store(false, .release);
+    try std.testing.expectError(error.ObservationAssociationsBusy, Job.start(2, .save, output, owner.capture, associated));
+    try std.testing.expect(c.access(output.ptr, c.F_OK) != 0);
+    associated.done.store(true, .release);
+    for ([_]anyerror{ error.ObservationAnalysisCancelled, error.ObservationAssociationMemoryLimit }) |failure| {
+        associated.err = failure;
+        const job = try Job.start(2, .save, output, owner.capture, associated);
+        defer job.deinit();
+        while (!job.done.load(.acquire)) _ = c.usleep(1000);
+        try std.testing.expectEqual(.completed, job.status().state);
+        try std.testing.expectEqual(@as(?bool, false), job.status().associations_saved);
+        try std.testing.expectEqualStrings(@errorName(failure), job.status().associations_omitted_reason.?);
+        const restored = try open(a, output, null);
+        defer restored.deinit();
+        try std.testing.expect(restored.evidence().associations == null);
+        try std.testing.expectEqual(@as(u32, 1), restored.parsed.?.value.version);
+        try std.testing.expectEqual(owner.capture.?.store.calls.items.len, restored.store.calls.items.len);
+        try std.testing.expectEqual(@as(c_int, 0), c.unlink(output.ptr));
+    }
 }

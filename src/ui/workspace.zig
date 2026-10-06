@@ -140,6 +140,14 @@ pub const Workspace = struct {
     allocation_archive_seen: bool = false,
     syscall_panel: @import("syscalls.zig").Panel = .{},
     inline_panel: @import("inline.zig").Panel = .{},
+    /// Static slice/control answers (S); see src/semq/host.zig.
+    static_panel: @import("static_analysis.zig").Panel = .{},
+    /// The assembly row last clicked, and whether S should use the source
+    /// cursor line instead (the most recent selection wins).
+    assembly_cursor: ?u64 = null,
+    static_from_line: bool = false,
+    static_traced: u64 = 0,
+    assembly_rows: struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, count: usize = 0 } = .{},
     inspection_panel: @import("inspection.zig").Panel = .{},
     selected_frame: usize = 0,
     last_frame: usize = std.math.maxInt(usize),
@@ -361,6 +369,11 @@ pub const Workspace = struct {
             scroll = 0;
             w.dirty = true;
         }
+        if (self.static_panel.open and scroll != 0) {
+            self.static_panel.wheel(scroll);
+            scroll = 0;
+            w.dirty = true;
+        }
         if (self.inline_panel.open and scroll != 0) {
             self.inline_panel.wheel(scroll);
             scroll = 0;
@@ -443,6 +456,12 @@ pub const Workspace = struct {
                         w.dirty = true;
                         continue;
                     }
+                    if (self.static_panel.key(session, event)) {
+                        self.traceStatic(w);
+                        self.followStatic(w);
+                        w.dirty = true;
+                        continue;
+                    }
                     if (self.inline_panel.key(session, inspect_tid, self.selected_frame, event)) {
                         w.dirty = true;
                         continue;
@@ -495,6 +514,15 @@ pub const Workspace = struct {
                     }
                     if (self.stop_panel.open) {
                         if (event.kind == .button_press) self.stop_panel.press(event.x, event.y);
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.static_panel.open) {
+                        if (event.kind == .button_press) {
+                            self.static_panel.press(session, event.x, event.y);
+                            self.traceStatic(w);
+                            self.followStatic(w);
+                        }
                         w.dirty = true;
                         continue;
                     }
@@ -558,6 +586,64 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         w.setCursor(if (self.divider_hot or self.dragging) .col_resize else .default);
+    }
+    /// S: the most recent selection (source line or assembly row), else the PC.
+    /// A line keeps all its line-table rows and every function they fall in;
+    /// the panel asks which function when there is more than one.
+    fn openStatic(self: *Workspace, w: *Window, session: *Session) void {
+        if (self.static_from_line) if (self.cursor_line) |line| {
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const a = scratch.allocator();
+            const addresses = session.sourceAddresses(a, self.source_path, line) catch &.{};
+            if (addresses.len == 0) {
+                self.status = "No code at the selected line for static analysis";
+                return;
+            }
+            var functions: std.ArrayList(@import("static_analysis.zig").Choice) = .empty;
+            for (addresses) |address| {
+                const f = session.static_analysis.resolve(a, session, address) catch continue;
+                const entry = f.runtime(f.key.entry);
+                for (functions.items) |known| {
+                    if (known.entry == entry) break;
+                } else functions.append(a, .{ .name = f.name, .entry = entry }) catch {};
+            }
+            if (functions.items.len == 0) {
+                self.status = "The selected line has no function bounds in the session's symbols";
+                return;
+            }
+            if (w.input.trace) {
+                std.debug.print("static functions:", .{});
+                for (functions.items) |f| std.debug.print(" {s}", .{f.name});
+                std.debug.print("\n", .{});
+            }
+            self.static_panel.show(.{ .line = .{ .path = self.source_path, .line = line, .addresses = addresses, .functions = functions.items } });
+            return;
+        };
+        const pc = self.assembly_cursor orelse (if (self.regs) |regs| linux.programCounter(regs) catch null else null) orelse {
+            self.status = "Pause, or select an instruction or source line, for static analysis";
+            return;
+        };
+        self.static_panel.show(.{ .pc = pc });
+    }
+    /// With XODB_INPUT_TRACE, each static answer is logged once for GUI tests.
+    fn traceStatic(self: *Workspace, w: *Window) void {
+        const panel = &self.static_panel;
+        if (!w.input.trace or panel.answers == self.static_traced) return;
+        self.static_traced = panel.answers;
+        std.debug.print("static answer: {s} | {s} | {s} | rows={d}\n", .{ panel.heading, panel.summary, panel.parameters, panel.rows.len });
+        for (panel.rows) |row| std.debug.print("static row: {s} 0x{x} {s}\n", .{ row.certainty, row.address orelse 0, row.label });
+    }
+    /// A chosen static citation browses the assembly and source to it.
+    fn followStatic(self: *Workspace, w: *Window) void {
+        const address = self.static_panel.navigate orelse return;
+        if (w.input.trace) std.debug.print("static navigate: 0x{x}\n", .{address});
+        self.static_panel.navigate = null;
+        self.browse_address = address;
+        self.browse_assembly = address;
+        self.assembly_cursor = address;
+        self.static_from_line = false;
+        self.status = "Static citation; S returns to the answer";
     }
     fn toggleAllocations(self: *Workspace, session: *Session) void {
         if (session.allocations.preparing() or session.allocations.collecting()) {
@@ -679,7 +765,17 @@ pub const Workspace = struct {
             self.probes_panel.open = false;
             self.inspection_panel.open = false;
             self.inline_panel.open = false;
+            self.static_panel.open = false;
             self.stop_panel.open = true;
+            w.dirty = true;
+            return;
+        }
+        if (code == 31 and !self.show_profile) {
+            self.stop_panel.open = false;
+            self.probes_panel.open = false;
+            self.inspection_panel.open = false;
+            self.inline_panel.open = false;
+            self.openStatic(w, session);
             w.dirty = true;
             return;
         }
@@ -687,6 +783,7 @@ pub const Workspace = struct {
             self.stop_panel.open = false;
             self.probes_panel.open = false;
             self.inspection_panel.open = false;
+            self.static_panel.open = false;
             self.inline_panel.show();
             w.dirty = true;
             return;
@@ -894,8 +991,11 @@ pub const Workspace = struct {
                     code = 0;
                     w.dirty = true;
                 }
-                if (code == 111) {
+                // Delete or BackSpace: compact keyboards (e.g. HHKB) have no
+                // dedicated Delete key.
+                if (code == 111 or code == 14) {
                     self.watch.remove(i);
+                    code = 0;
                     w.dirty = true;
                 }
                 if (code == 28) {
@@ -973,8 +1073,19 @@ pub const Workspace = struct {
         }
         if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
-            self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints";
+            self.static_from_line = true;
+            self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints, S static slice";
             w.dirty = true;
+        }
+        const rows = self.assembly_rows;
+        if (click and !self.show_profile and !self.show_flow and rows.count > 0 and w.pointer_x >= rows.x and w.pointer_x < rows.x + rows.w and w.pointer_y >= rows.y - 2 and w.pointer_y < rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * 23) {
+            const index: usize = @intFromFloat((w.pointer_y - rows.y + 2) / 23);
+            if (index < self.instruction_count) {
+                self.assembly_cursor = self.instructions[index].address;
+                self.static_from_line = false;
+                self.status = "Instruction selected; S static slice / control dependences";
+                w.dirty = true;
+            }
         }
         if ((code == 67 or code == 88) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
             const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
@@ -1498,9 +1609,12 @@ pub const Workspace = struct {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", if (self.browse_address != null) "browsing / G flow" else "x86-64 / G flow");
                 if (self.instruction_count == 0) try r.text(font, left + 16, body_y + 55, "Pause to inspect instructions", theme.weak);
                 const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
+                self.assembly_rows = .{ .x = left + 2, .y = body_y + 45, .w = right - left - 6, .count = 0 };
                 for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
                     const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
                     if (y + 20 > bottom - 10) break;
+                    self.assembly_rows.count = i + 1;
+                    if (self.assembly_cursor == inst.address and !self.static_from_line) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
                     if (current_pc != null and inst.address == current_pc.?) {
                         try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
                         try r.text(font, left + 8, y, "\u{25b6}", thread_color);
@@ -1571,6 +1685,8 @@ pub const Workspace = struct {
         const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
         try self.inspection_panel.draw(r, font, width, height, session, inspect_tid);
         try self.inline_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
+        try self.static_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
+        if (self.static_panel.open and self.static_panel.running) self.animating = true;
         try self.stop_panel.draw(r, font, width, height, session, inspect_tid);
         if (self.show_profile) try self.syscall_panel.draw(r, font, width, height, session.profile, self.flame.selection.filter);
         try self.allocation_panel.drawLive(r, font, width, height, &session.allocations, inspect_tid);
@@ -1616,7 +1732,7 @@ pub const Workspace = struct {
         const events_rect = gpu.Rect{ .x = left + 2, .y = bottom, .w = width - left - 10, .h = height - bottom - 37 };
         if (self.show_watch) {
             const wide = events_rect.w > 640;
-            try pane(r, font, events_rect, "WATCH", if (self.editor.open) "Return add  Esc cancel  Up/Down history" else if (wide) "E add  V events  Del remove  Return expand  Wheel/[] scroll  PgDn page  W write watch" else "E add  V events  Del  Return");
+            try pane(r, font, events_rect, "WATCH", if (self.editor.open) "Return add  Esc cancel  Up/Down history" else if (wide) "E add  V events  Del/Bksp remove  Return expand  Wheel/[] scroll  PgDn page  W write watch" else "E add  V events  Del  Return");
             if (self.watch_focus) try r.rect(.{ .x = events_rect.x + 1, .y = events_rect.y + 32, .w = events_rect.w - 2, .h = 2 }, theme.focus);
             self.watch_rect = events_rect;
             try watch_ui.draw(&self.watch, &self.editor, r, font, r.clip, &self.watch_hits);

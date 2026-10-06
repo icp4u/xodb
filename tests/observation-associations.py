@@ -120,7 +120,12 @@ def main():
         assert client.inspect('get_observation_associations', id=job['id'])['counts'] == result['counts']
         # Completed cancellation is harmless and cannot rewrite results.
         assert client.inspect('cancel_observation_associations', id=job['id'])['state'] == 'completed'
-        summary = {'runtime_agent': client.runtime_agent, 'counts': result['counts'], 'streams': streams,
+        archive = work/'associated.xoi'
+        saved_archive = client.action('save_observation', **key, path=str(archive))
+        saved_archive = wait(client, 'get_observation_archive', lambda v: v['state'] != 'running', id=saved_archive['id'])
+        assert saved_archive['state'] == 'completed', saved_archive
+        retained_pages = [client.inspect('get_observation_associations', id=job['id'], stream_id=s, limit=64)['source_records'] for s in (1, 2, 3)]
+        summary = {'archive': str(archive), 'runtime_agent': client.runtime_agent, 'counts': result['counts'], 'streams': streams,
                    'sources': result['sources'], 'syscall_reasons': dict(Counter(row['reason'] for row in syscall_rows)), 'checks': 'real three-source joins, exact denominators, raw citations, source replacement, stale revision, no double attribution', 'artifact': str(work)}
         (work/'result.json').write_text(json.dumps(result, indent=2)+'\n')
         (work/'summary.json').write_text(json.dumps(summary, indent=2)+'\n')
@@ -128,6 +133,20 @@ def main():
     finally:
         (work/'transcript.json').write_text(json.dumps(client.transcript, indent=2)+'\n')
         client.close()
+    # Saved evidence is sufficient after the owned target and input are deleted.
+    (work/'fixture').unlink()
+    (work/'fixture.c').unlink()
+    offline = Client('observe', None, options=['--open-observation', str(archive)])
+    try:
+        restored_id = offline.inspect('get_observation')['association_id']
+        restored = offline.inspect('get_observation_associations', id=restored_id)
+        for field in ('counts', 'sources', 'selection', 'result'):
+            assert restored[field] == result[field], field
+        for stream, original in enumerate(retained_pages, 1):
+            assert offline.inspect('get_observation_associations', id=restored_id, stream_id=stream, limit=64)['source_records'] == original
+        print('saved association replay matches after deleting executable and input')
+    finally:
+        offline.close()
 
 
 if __name__ == '__main__':

@@ -180,7 +180,10 @@ enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_t
         if (slot == XRT_MAX_THREADS)
             return XRT_PROCESS_LIMIT;
     }
+    /* A reused handle keeps counting: contexts taken before the reuse stay stale. */
+    const uint64_t generation = out->generation;
     memset(out, 0, sizeof(*out));
+    out->generation = generation;
     out->remote_collectors = 0; /* Adopted handle is not published yet. */
     admit_adopted(t, out, pid, birth.exited);
     out->pid = pid;

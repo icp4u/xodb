@@ -14,7 +14,16 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c" }) |source| {
+        module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    // Static queries (src/semq) and the supervised ghx worker driver; the
+    // Ghidra worker itself stays a separate, opt-in host tool (tools/ghx).
+    module.addIncludePath(b.path("src/semq"));
+    for ([_][]const u8{ "sha256.c", "xsq_mem.c", "xsq_graph.c", "xsq_query.c", "xsq_report.c", "ghx_host.c" }) |source| {
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/semq/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
     for (runtime_sources) |source| {
         module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
@@ -126,6 +135,12 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    const perl_tests = b.addExecutable(.{ .name = "xodb-perl-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "tests/perl-reader.c" }) |source| {
+        perl_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    perl_tests.root_module.linkSystemLibrary("libdw", .{});
+    test_step.dependOn(&b.addRunArtifact(perl_tests).step);
     const service_tests = b.addExecutable(.{ .name = "xodb-service-session-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     service_tests.root_module.addIncludePath(b.path("src/service"));
     for ([_][]const u8{ "src/service/session.c", "tests/service-session.c" }) |source_file| {
@@ -148,6 +163,13 @@ pub fn build(b: *std.Build) void {
         const probe_ids_run = b.addRunArtifact(probe_ids);
         probe_ids_run.addArtifactArg(agent);
         test_step.dependOn(&probe_ids_run.step);
+        const replies = b.addExecutable(.{ .name = "xodb-runtime-replies-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+        replies.root_module.addIncludePath(b.path("src/runtime"));
+        for (runtime_sources) |source| replies.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        replies.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-replies.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        const replies_run = b.addRunArtifact(replies);
+        replies_run.addArtifactArg(agent);
+        test_step.dependOn(&replies_run.step);
         const remote_tests = b.addExecutable(.{ .name = "xodb-runtime-remote-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         remote_tests.pie = false;
         remote_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -162,7 +184,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

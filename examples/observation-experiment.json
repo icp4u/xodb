@@ -1,0 +1,16 @@
+{
+  "version": 1,
+  "xodb": "zig-out/bin/xodb",
+  "recipe": "examples/observation.recipe.json",
+  "variants": [
+    {"name": "baseline", "exe": "experiment-before", "args": []},
+    {"name": "changed", "exe": "experiment-after", "args": []},
+    {"name": "unchanged", "exe": "experiment-before", "args": []}
+  ],
+  "repetitions": 5,
+  "warmups": 1,
+  "order": "interleaved",
+  "seed": 7,
+  "timeout_seconds": 30,
+  "output_bytes": 268435456
+}

@@ -11,7 +11,7 @@ unchanged by these additions.
 - **B** in the debugger view opens the breakpoint manager. In the profile view,
   B retains its existing flame-basis behavior.
 - Select a breakpoint with the pointer or Up/Down.
-- **Space** enables/disables it; **Delete** removes it.
+- **Space** enables/disables it; **Delete** (or **Backspace**) removes it.
 - **C** edits its condition; submit an empty expression to clear it.
 - **H** sets how many matching-thread hits to ignore.
 - **T** selects a live numeric TID; an empty entry selects all threads.
@@ -94,7 +94,21 @@ a follow-up; each physical location currently has its own ID and policy.
 **B**, then **N**, adds a symbol, including one in an unloaded library. The row
 says PENDING until resolved; conditions, log mode, enables and thread filters can
 be configured before resolution. MCP uses `set_breakpoint(symbol, generation)`;
-`--break SYMBOL` uses the same logical request. IDs remain stable as libraries
+`--break SYMBOL` uses the same logical request. Repeat it to install several
+symbols in command-line order (at most 64 occurrences, including duplicates):
+
+```sh
+xodb --break main --break change_value -- ./zig-out/bin/xodb-m1-fixture
+```
+
+Duplicate names reuse the existing logical breakpoint. An unresolved name stays
+pending without dropping the other requests. The same options work in local GUI,
+headless/MCP, shared-session and C-agent launches, and are forwarded by `--ssh`.
+For `--connect`, put all the options on the listening server's command line;
+target selection still belongs to that server. A 65th option reports
+`InitialBreakpointLimit` before launching a target.
+
+IDs remain stable as libraries
 load, unload and reload. `get_breakpoints` includes logical `definitions`, pending
 and internal flags, and loader availability/diagnostics. One internal read-only
 loader breakpoint appears while definitions require it.

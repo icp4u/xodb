@@ -18,6 +18,7 @@ pub const Module = struct {
     start: u64,
     end: u64,
     debug: ?DebugInfo = null,
+    perl_layout: ?c.struct_xpl_layout = null,
     debug_file: ?*const @import("../binary/debug_files.zig").File = null,
     debug_allocator: std.mem.Allocator = std.heap.page_allocator,
     file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.

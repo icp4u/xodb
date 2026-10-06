@@ -446,25 +446,36 @@ static int listed(const uint16_t *ids, uint8_t count, uint16_t id)
 
 enum xrt_status xrt_registers_validate(const struct xrt_arch *arch, const struct xrt_registers *regs)
 {
-    if (!arch || !regs)
+    if (!arch || !arch->registers || !regs)
         return XRT_INVALID_ARGUMENT;
     if (regs->absent_count > XRT_ABSENT_MAX || regs->unknown_count > XRT_ABSENT_MAX ||
         regs->absent_count > arch->register_count || regs->unknown_count > arch->register_count)
         return XRT_INVALID_ARGUMENT;
-    for (uint8_t i = 0; i < regs->absent_count; ++i) {
-        if (regs->absent_id[i] >= arch->register_count)
-            return XRT_INVALID_ARGUMENT;
-        for (uint8_t j = 0; j < i; ++j)
-            if (regs->absent_id[j] == regs->absent_id[i])
+    /* Descriptor ids are below register_count (a uint8_t), so one bit per id
+     * keeps duplicate and overlap checks linear. */
+    uint8_t listed_ids[32] = {0};
+    for (unsigned list = 0; list < 2; ++list) {
+        const uint16_t *ids = list ? regs->unknown_id : regs->absent_id;
+        const uint8_t count = list ? regs->unknown_count : regs->absent_count;
+        for (uint8_t i = 0; i < count; ++i) {
+            const uint16_t id = ids[i];
+            if (id >= arch->register_count || listed_ids[id / 8] & (1u << (id % 8)))
                 return XRT_INVALID_ARGUMENT;
+            listed_ids[id / 8] |= (uint8_t)(1u << (id % 8));
+        }
     }
-    for (uint8_t i = 0; i < regs->unknown_count; ++i) {
-        if (regs->unknown_id[i] >= arch->register_count ||
-            listed(regs->absent_id, regs->absent_count, regs->unknown_id[i]))
+    /* A present value never exceeds its descriptor width. Storage under an
+     * absent or unknown id may hold a sentinel and is never read. */
+    for (uint8_t i = 0; i < arch->register_count; ++i) {
+        const struct xrt_register_desc *reg = &arch->registers[i];
+        if ((size_t)reg->snapshot_offset + sizeof(uint64_t) > sizeof(regs->values))
             return XRT_INVALID_ARGUMENT;
-        for (uint8_t j = 0; j < i; ++j)
-            if (regs->unknown_id[j] == regs->unknown_id[i])
-                return XRT_INVALID_ARGUMENT;
+        if (reg->width >= 8 || listed_ids[i / 8] & (1u << (i % 8)))
+            continue;
+        uint64_t value;
+        memcpy(&value, (const unsigned char *)&regs->values + reg->snapshot_offset, sizeof(value));
+        if (value >> (8 * reg->width))
+            return XRT_INVALID_ARGUMENT;
     }
     return XRT_OK;
 }

@@ -1,0 +1,85 @@
+xsg 1
+# adapter c01_to_xsg 0.3.0 from xodb.ghidra.function_graph 0.4.1 artifact fg2-3ff0a4264db9ba7b11052e69fb54c4f8816da58639244a089570054172eb7a1f
+# producer ghidra_native_decompiler 0.4.1 ghidra a462673d2f1543d153c61d10bcd6c68f85555194 java=False
+# note: readonly ranges from the export's non-writable PT_LOAD segments
+image sha256=b9efa38521bfcb8ec718f6fece757492fda88cb7134e1fb0688a32fce7800115 build_id=75eb36c93511562dc80517a01109ba2667fe21b9 name=qx-gcc-O2
+spec language=x86:LE:64:default compiler=gcc addr_bytes=8
+producer xsq-c01-adapter 0.3.0
+source kind=c01-function-graph-0.4.1 sha256=763c36b8e93c61967812719832b1aba5445a04d6b5c854854233d76b4a7b9f05
+qualification level=qualified reasons=tail_call_inferred,unknown_call_semantics artifact=fg2-3ff0a4264db9ba7b11052e69fb54c4f8816da58639244a089570054172eb7a1f
+space 0 const constant
+space 1 OTHER other
+space 2 unique unique
+space 3 ram ram
+space 4 register register
+space 5 fspec other
+space 6 iop other
+space 7 join join
+space 8 stack stack
+readonly 0x400000 0x400708
+readonly 0x401000 0x4014b1
+readonly 0x402000 0x4023d8
+function 1 qx_alloc entry=0x4012e0
+block 0 0x4012e0
+block 1 0x401338
+block 2 0x4012e8
+block 3 0x40130d
+block 4 0x401328
+block 5 0x401312
+edge 0 1 true
+edge 0 2 false
+edge 2 3 false
+edge 2 4 true
+edge 3 4 true
+edge 3 5 false
+vn 28 2 0x25200 1 origin=vn:28
+vn 33 3 0x401338 1 annotation origin=vn:33
+vn 58 4 0x18 8 name=RBX origin=vn:58
+vn 97 2 0x8e00 8 origin=vn:97
+vn 99 0 0x10 8 origin=vn:99
+vn 117 5 0x0 8 annotation origin=vn:117
+vn 140 4 0x206 1 name=ZF origin=vn:140
+vn 142 0 0x0 4 origin=vn:142
+vn 154 3 0x401328 1 annotation origin=vn:154
+vn 166 4 0x206 1 name=ZF origin=vn:166
+vn 168 0 0x0 8 origin=vn:168
+vn 180 3 0x401328 1 annotation origin=vn:180
+vn 208 2 0x8e00 8 origin=vn:208
+vn 210 0 0x10 8 origin=vn:210
+vn 252 0 0x0 1 origin=vn:252
+vn 253 5 0x0 8 annotation origin=vn:253
+vn 280 4 0x0 8 name=RAX origin=vn:280
+vn 306 4 0x0 8 name=RAX origin=vn:306
+vn 340 0 0x0 8 origin=vn:340
+vn 341 0 0x0 8 origin=vn:341
+vn 348 4 0x0 8 name=RAX origin=vn:348
+vn 357 4 0x0 8 name=RAX origin=vn:357
+vn 445 4 0x18 8 name=RBX origin=vn:445
+vn 467 4 0x30 8 name=RSI origin=vn:467
+vn 565 4 0x38 4 input param=0 name=EDI origin=vn:565
+vn 576 4 0x30 4 input param=1 name=ESI origin=vn:576
+vn 584 4 0x10 4 input param=2 name=EDX origin=vn:584
+vn 602 0 0x0 4 origin=vn:602
+vn 607 0 0x0 8 origin=vn:607
+vn 608 0 0x1000 4 origin=vn:608
+op 10 0 0x4012e6 0 INT_LESS 28 608 565 origin=op:10
+op 12 0 0x4012e6 1 CBRANCH - 33 28 origin=op:12
+op 23 2 0x4012ed 2 INT_MULT 58 445 467 origin=op:23
+op 37 2 0x4012f5 3 INT_ADD 97 58 99 origin=op:37
+op 44 2 0x4012fd 4 CALL 348 117 97 origin=op:44
+op 54 2 0x401309 5 INT_EQUAL 140 584 142 origin=op:54
+op 59 2 0x40130b 6 CBRANCH - 154 140 origin=op:59
+op 64 3 0x40130d 0 INT_EQUAL 166 348 168 origin=op:64
+op 69 3 0x401310 1 CBRANCH - 180 166 origin=op:69
+op 79 5 0x401316 0 INT_ADD 208 58 210 origin=op:79
+op 96 5 0x401320 1 CALL 357 253 348 602 208 origin=op:96
+op 97 5 0x401320 2 RETURN - 252 357 origin=op:97
+op 107 4 0x40132c 0 COPY 280 348 origin=op:107
+op 114 4 0x401330 1 RETURN - 340 280 origin=op:114
+op 118 1 0x401338 0 COPY 306 607 origin=op:118
+op 127 1 0x40133a 1 RETURN - 341 306 origin=op:127
+op 171 2 0x4012eb 1 INT_ZEXT 445 565 origin=op:171
+op 182 2 0x4012e9 0 INT_ZEXT 467 576 origin=op:182
+call 44 target=0x401080 name=malloc
+call 96 target=0x401060 name=memset
+end

@@ -1,0 +1,218 @@
+[
+  {
+    "name": "analyze_function",
+    "description": "Export the function containing an address (or a symbol) with the supervised native Ghidra worker, admit it against the session's own image identity (SHA-256, build-id) and summarise the graph: qualification, parameters and calls. Asynchronous and cached by artifact_id: call again with the same arguments to poll (status running, failed, completed). Static possibilities, not an observed execution: answers keep the producer's qualification and say result_trust and verified_semantics=false. Without the opt-in worker the result is status unavailable with how to build it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "Runtime address (hex) inside the function; with op it names the function."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Function symbol; with op it names the function."
+        },
+        "retry": {
+          "type": "boolean",
+          "description": "Start a new job after a failed or cancelled one."
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000,
+          "description": "Worker deadline if the function still has to be analysed (default 60000)."
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "slice_value",
+    "description": "What feeds this value? Select an op by pc, source file+line or op id, and an input index (omit input for the op's output; a CALL's argument k is input k+1). A source line selects the ops at any of its line-table rows, including code inlined into a caller; a line in several functions returns status ambiguous with the functions, and rows without an exported op return no_selection with reason inlined_no_direct_op or no_op_at_line_rows. An ambiguous selection returns candidates, never a guess. Returns per-parameter relevance (direct, possible, control, irrelevant, unknown), contributing values with instruction and source citations, boundaries and limits. With tid (and frame) at a stop inside the function, observed_now lists the frame's DWARF parameter values separately. Static possibilities, not an observed execution: answers keep the producer's qualification and say result_trust and verified_semantics=false. Without the opt-in worker the result is status unavailable with how to build it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "Runtime address (hex) inside the function; with op it names the function."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Function symbol; with op it names the function."
+        },
+        "pc": {
+          "type": "string",
+          "description": "Runtime instruction address (hex): selects the ops cited at that instruction."
+        },
+        "file": {
+          "type": "string",
+          "description": "Source file (a bare name matches any directory) with line: selects the ops the debugger's line table maps there."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "op": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Op id from a previous candidate list or answer."
+        },
+        "opcode": {
+          "type": "string",
+          "description": "Keep only candidates with this p-code opcode (for example CALL, CBRANCH, STORE, RETURN)."
+        },
+        "input": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "data_only": {
+          "type": "boolean",
+          "description": "Follow data only, not control or gating dependences (default false)."
+        },
+        "tid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "frame": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 63
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Rows per list (default 64)."
+        },
+        "max_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Query time bound (default 2000)."
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000,
+          "description": "Worker deadline if the function still has to be analysed (default 60000)."
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "control_dependencies",
+    "description": "What controls this branch or operation? Select an op as for slice_value. Returns the branches that decide whether it executes, with the edge taken, direct or transitive relation, the parameters that feed each direct condition, and instruction and source citations. An ambiguous selection returns candidates. Static possibilities, not an observed execution: answers keep the producer's qualification and say result_trust and verified_semantics=false. Without the opt-in worker the result is status unavailable with how to build it.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "Runtime address (hex) inside the function; with op it names the function."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Function symbol; with op it names the function."
+        },
+        "pc": {
+          "type": "string",
+          "description": "Runtime instruction address (hex): selects the ops cited at that instruction."
+        },
+        "file": {
+          "type": "string",
+          "description": "Source file (a bare name matches any directory) with line: selects the ops the debugger's line table maps there."
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "op": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Op id from a previous candidate list or answer."
+        },
+        "opcode": {
+          "type": "string",
+          "description": "Keep only candidates with this p-code opcode (for example CALL, CBRANCH, STORE, RETURN)."
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "description": "Rows per list (default 64)."
+        },
+        "max_ms": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000,
+          "description": "Query time bound (default 2000)."
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000,
+          "description": "Worker deadline if the function still has to be analysed (default 60000)."
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "cancel_static_analysis",
+    "description": "Cancel the running static analysis job by id. A client may cancel a job it started; any other job (including one started in the GUI) only while it holds control (the shared controller lease, or a control-scope stdio client); otherwise StaticAnalysisJobNotOwned. The supervisor and its worker are stopped and reaped; a finished job is unchanged.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "job_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "required": [
+        "job_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

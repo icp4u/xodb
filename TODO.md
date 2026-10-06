@@ -16,6 +16,8 @@ see linux-ai-debugger-agents.md for an ai summary of a discussion fleshing out t
 ## Future tasks
 
 - [x] Initial startup themes: semantic colors, presets and explicit loading ([workflow](docs/THEMES.md)).
+- [ ] Live watch expressions that re-evaluate in the selected frame at every stop (like gdb `display`), next to today's pinned investigation watches.
+- [ ] Clipboard in text fields: Ctrl+V and middle-click (primary selection) paste, then copy.
 - [ ] Skinnable, flexible display: fonts/scaling, control treatments, pane arrangement and saved layouts.
 - [x] Initial AArch64 hardware data watchpoints, write investigations and remote GUI controls ([evidence/limits](docs/research/arm64-watchpoints/integration.md)).
 - [ ] AArch64 feature coverage: precise multi-watch attribution, modern ARM validation, profiling, native GUI and remaining debugger gaps.

@@ -40,6 +40,7 @@ pub fn status(a: std.mem.Allocator, session: *Session) !V {
         .finish_reason = if (capture) |v| v.store.finish_reason else null,
         .records = if (capture) |v| v.store.records.items.len else 0,
         .calls = if (capture) |v| v.store.calls.items.len else 0,
+        .association_id = if (session.observation_associations) |job| @as(?u64, job.id) else null,
         .first_gap = if (capture) |v| v.store.first_gap else null,
         .lost = if (capture) |v| v.store.lost else 0,
         .rejected = if (capture) |v| v.store.rejected else 0,

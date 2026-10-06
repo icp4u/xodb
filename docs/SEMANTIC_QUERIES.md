@@ -376,3 +376,115 @@ executable bytes is not re-checked (the worker refuses such maps).
 `ghx_supervise` writes `results.jsonl` and `worker-stderr.log` only as
 regular files: an existing FIFO, device, symlink or directory under either
 name exits 2 before any worker starts.
+
+
+# In the debugger
+
+xodb can ask these questions about a function of a live or core session:
+"what feeds this value?" (a slice) and "what controls this branch or
+operation?" (control dependences). Every answer is labelled *static
+possibilities, not an observed execution*, keeps the producer's
+qualification unchanged (`result_trust: graph_<level>`,
+`verified_semantics: false`), and cites instructions and source lines.
+
+## Enabling the worker
+
+The worker is opt-in and separate from the target and its agent. Build it once
+into one directory and pass that directory to xodb:
+
+```sh
+sh tools/ghx/build_ghidra.sh GHIDRA_CHECKOUT DIR
+make -C tools/ghx GHIDRA_CPP=DIR/ghidra-src/Ghidra/Features/Decompiler/src/decompile/cpp OUT=DIR
+xodb --static-analysis DIR -- ./program      # or XODB_STATIC_ANALYSIS=DIR
+```
+
+xodb checks for `DIR/ghx_supervise`, `DIR/ghx_worker` and the x86-64 SLEIGH
+specification under `DIR/ghidra-src`. Without them every tool answers
+`status: unavailable` with a `reason` (`not_configured`,
+`supervisor_missing`, `worker_missing`, `sleigh_missing`,
+`unsupported_architecture`) and the build commands; nothing crashes and no
+process is started.
+
+## What happens
+
+1. The function's bounds come from the session's own symbols: an ELF function
+   symbol, else the DWARF subprogram. A function without either is refused
+   (`FunctionBoundsUnavailable`); xodb never discovers functions.
+2. The image is the session's own snapshot of the mapped file. Its SHA-256 and
+   GNU build-id are the identity; the snapshot is written once to a private
+   0700 scratch directory and the worker reads exactly those bytes.
+3. One bounded job runs at a time per session (`StaticAnalysisBusy` for
+   another function). `ghx_supervise` enforces the worker deadline
+   (`deadline_ms`, default 60 s); the host gives the supervisor that deadline
+   plus 3 s before SIGTERM, then SIGKILL, and always reaps it. The
+   supervisor is started with a parent-death signal (SIGKILL) and starts the
+   worker with one too, so a killed xodb takes both down at once. A crashed,
+   hung or cancelled worker ends the job as `worker_died`, `worker_timeout` or
+   `cancelled`; a failed job is reported again until `retry` starts a new one.
+4. The export is admitted only if its image SHA-256, build-id and function entry
+   are the session's (`image_identity_mismatch`,
+   `function_identity_mismatch` otherwise), converted in process by a port of
+   the adapter above (byte-identical output, checked by a unit test) and loaded
+   with the xsq budgets. Worker refusals (`worker_refused` with the export's
+   error code) and adapter refusals (`adapter_refused`, for example the PIC
+   call-to-branch case) are kept as typed failures.
+5. Completed analyses are cached in memory by `artifact_id` for the session
+   (16 at most); the scratch directory (`$TMPDIR/xodb-static-<pid>-*`) is
+   removed when the session ends. A later xodb with the worker enabled removes
+   such directories of this user whose creating process no longer exists.
+
+## Selecting a value
+
+A selection names ops of the analysed graph by PC, by source file and line, or
+by op id. A line selects the ops cited at any of its line-table rows (or whose
+own best row is that line), so a line that exists only as code inlined into a
+caller selects the caller's ops there. A line with rows in several functions
+(two functions on one line, or a helper inlined into several callers) is
+`ambiguous` with a `functions` list; the GUI asks which function. When the
+line's rows fall in the function but no exported op is cited there, the answer
+is `no_selection` with `reason` `inlined_no_direct_op` (the rows are inlined
+code; `line_rows` names the inlined subroutines) or `no_op_at_line_rows`, never
+"no code". Several ops at one PC or line are returned as candidates; nothing is
+guessed. `opcode` (for example `CALL`) narrows the candidates, and `input`
+picks an operand (a CALL's argument *k* is input *k*+1); without `input` the
+op's output is sliced.
+
+## MCP
+
+| Tool | Answers |
+|---|---|
+| `analyze_function` (`address` or `symbol`) | job status, then the summary: bounds and their source, image identity, qualification reasons, parameters, calls. Poll with the same arguments. |
+| `slice_value` (`pc`, `file`+`line` or `op`; `input`, `data_only`) | per-parameter relevance (`direct`, `possible`, `control`, `irrelevant`, `unknown`; `irrelevant` only for an exhaustive slice), contributing values with defining and reading ops, instruction citations with source lines, boundaries, limits |
+| `control_dependencies` (same selection) | branches deciding whether the op runs, the edge, `direct`/`transitive`, and which parameters feed each direct condition |
+| `cancel_static_analysis` (`job_id`) | stops the running job |
+
+All four are observer reads (`xodbSessionAccess: observer`): they never touch
+the target. Any client may start an analysis; `cancel_static_analysis` stops
+only a job that client started, unless it holds control (the shared
+controller lease, or a control-scope stdio client). Jobs started from the GUI
+are cancelled by the human (**X**) or the controller
+(`StaticAnalysisJobNotOwned` otherwise). Addresses are runtime addresses (`link_address` is the image's).
+With `tid` (and `frame`) at a stop inside the function, `slice_value` adds
+`observed_now`: the frame's DWARF parameter values, separate from the static
+answer and never merged into it.
+
+## GUI
+
+Click an assembly row or a source line (or use the current instruction) and
+press **S**. A line with code in several functions first lists them; choose
+one (**Backspace** returns to the list). The panel shows a STATIC banner, the qualification and the
+questions for that selection; **Up/Down** and **Return** answer one. **Tab**
+switches between "what feeds" and "what controls". In an answer, **Return** or
+a click browses the assembly and source to the cited instruction; **S** brings
+the answer back, **Backspace** returns to the questions, **R** retries a failed
+analysis and **X** cancels a running one. At a stop inside the function an
+"observed now" line shows the frame's parameter values, kept apart from the
+static rows.
+
+## Limits
+
+x86-64 ELF only; one function at a time; no whole-program or interprocedural
+analysis; no type recovery. Parameters are the decompiler's inferred prototype
+matched by ABI storage, and a parameter with no input varnode is not listed. The
+cache does not outlive the session. Source citations need DWARF line tables in
+the session.

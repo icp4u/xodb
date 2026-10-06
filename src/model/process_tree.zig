@@ -144,6 +144,7 @@ pub const Tree = struct {
         child.profile_defaults = parent.profile_defaults;
         child.allocation_defaults = parent.allocation_defaults;
         child.allocation_helper = parent.allocation_helper;
+        child.static_analysis.toolchain_dir = parent.static_analysis.toolchain_dir;
         child.symbol_files = self.root().symbolFiles();
         child.source_map_owner = self.root().sourceMaps();
         // Clone logical policies before the kernel child is transferred: any

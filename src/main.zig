@@ -20,6 +20,7 @@ pub fn main(init: std.process.Init) !void {
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
     var allocation_helper: ?[:0]const u8 = null;
+    var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
     var config_path: ?[:0]const u8 = null;
     var theme_path: ?[:0]const u8 = null;
     var headless = !build_options.gui;
@@ -58,7 +59,8 @@ pub fn main(init: std.process.Init) !void {
     var debug_dirs: std.ArrayList([:0]const u8) = .empty;
     var source_maps: std.ArrayList([:0]const u8) = .empty;
     var reanalyze = false;
-    var initial_breakpoint: ?[]const u8 = null;
+    var initial_breakpoints: [64][]const u8 = undefined;
+    var initial_breakpoint_count: usize = 0;
     var launch: []const [:0]const u8 = &.{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -88,7 +90,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--debug-dir DIR replaces default /usr/lib/debug roots (repeatable); local companions are verified.
                 \\--source-map FROM=TO substitutes absolute source directory prefixes (repeatable; server paths).
                 \\--debug-file FILE explicitly supplies a build-ID-matched debug ELF (repeatable; server path).
-                \\--break SYMBOL installs a symbolic breakpoint; unloaded glibc libraries remain pending.
+                \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
+                \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
                 \\O opens process selection; MCP process_id defaults to the original process regardless of GUI selection.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
@@ -107,13 +110,15 @@ pub fn main(init: std.process.Init) !void {
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
                 \\Owned targets are killed on close. Attached targets are detached and preserved.
                 \\--frames N exits after N rendered frames for graphical smoke testing.
+                \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
+                \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\
             , .{});
             return;
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -128,6 +133,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--browse-observation")) browse_observation = args[i];
             if (std.mem.eql(u8, arg, "--observation-threshold-ns")) observation_threshold = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
+            if (std.mem.eql(u8, arg, "--static-analysis")) static_analysis = args[i];
             if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
             if (std.mem.eql(u8, arg, "--ssh-config")) ssh_config = args[i];
             if (std.mem.eql(u8, arg, "--allocation-helper")) allocation_helper = args[i];
@@ -150,7 +156,11 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--debug-dir")) try debug_dirs.append(a, args[i]);
             if (std.mem.eql(u8, arg, "--source-map")) try source_maps.append(a, args[i]);
             if (std.mem.eql(u8, arg, "--debug-file")) try debug_files.append(a, args[i]);
-            if (std.mem.eql(u8, arg, "--break")) initial_breakpoint = args[i];
+            if (std.mem.eql(u8, arg, "--break")) {
+                if (initial_breakpoint_count == initial_breakpoints.len) return error.InitialBreakpointLimit;
+                initial_breakpoints[initial_breakpoint_count] = args[i];
+                initial_breakpoint_count += 1;
+            }
             if (std.mem.eql(u8, arg, "--agent-scope")) scope_explicit = true;
             if (std.mem.eql(u8, arg, "--agent-scope")) agent_scope = std.meta.stringToEnum(@import("model/session.zig").AgentScope, args[i]) orelse return error.InvalidAgentScope;
             if (std.mem.eql(u8, arg, "--source")) source = args[i];
@@ -161,19 +171,19 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnknownArgument;
     }
     if (observation_recipe != null) {
-        if (observation_out == null or open_observation != null or browse_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
+        if (observation_out == null or open_observation != null or browse_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint_count != 0 or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
         if (launch.len == 0 and attach == null) return error.ObservationRecipeRequiresTarget;
     } else if (observation_out != null) return error.ObservationOutputRequiresRecipe;
     if (browse_observation != null and (open_observation != null or headless)) return error.BrowseObservationRequiresGui;
-    if ((open_observation != null or browse_observation != null) and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
+    if ((open_observation != null or browse_observation != null) and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint_count != 0 or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
     if (observation_threshold != null and observation_recipe == null and open_observation == null and browse_observation == null) return error.ObservationThresholdRequiresInvestigation;
     if (observation_threshold != null and (mcp or session_socket != null)) return error.ObservationThresholdUseMcpComparison;
     if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
     if (core_executable != null and core_file == null) return error.ExecutableRequiresCore;
-    if (core_file != null and (attach != null or launch.len > 0 or open_profile != null or open_capture != null or connect != null or ssh != null or initial_breakpoint != null or profile_out != null or capture_out != null or record_path != null or symbols != null or reanalyze)) return error.CoreOptionConflict;
-    if (open_profile != null and (open_capture != null or attach != null or launch.len > 0 or initial_breakpoint != null or source != null or symbols != null or reanalyze or connect != null or ssh != null or capture_out != null or profile_out != null or record_path != null)) return error.ImportOptionConflict;
+    if (core_file != null and (attach != null or launch.len > 0 or open_profile != null or open_capture != null or connect != null or ssh != null or initial_breakpoint_count != 0 or profile_out != null or capture_out != null or record_path != null or symbols != null or reanalyze)) return error.CoreOptionConflict;
+    if (open_profile != null and (open_capture != null or attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null or symbols != null or reanalyze or connect != null or ssh != null or capture_out != null or profile_out != null or record_path != null)) return error.ImportOptionConflict;
     if ((debug_dirs.items.len > 0 or source_maps.items.len > 0) and (open_profile != null or open_capture != null or connect != null)) return error.SymbolOptionsRequireLiveServer;
     if (debug_files.items.len > 0 and (open_profile != null or open_capture != null or connect != null)) return error.DebugFilesRequireLiveServer;
     if (allocation_helper != null and (connect != null or ssh != null or open_capture != null or open_profile != null or core_file != null)) return error.AllocationHelperRequiresLiveServer;
@@ -183,12 +193,12 @@ pub fn main(init: std.process.Init) !void {
     const remote_gui = connect != null or ssh != null;
     if (session_socket != null and (mcp or listen != null or remote_gui)) return error.SharedSessionOptionConflict;
     if (remote_gui and (headless or mcp or listen != null or open_capture != null or symbols != null or record_path != null or capture_out != null or profile_out != null)) return error.RemoteGuiOptionConflict;
-    if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint != null or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
+    if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint_count != 0 or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
     if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
-    if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint != null or source != null)) return error.ConflictingTargets;
+    if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
         std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
@@ -209,7 +219,7 @@ pub fn main(init: std.process.Init) !void {
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
                 for (debug_files.items) |path| try remote_args.appendSlice(a, &.{ "--debug-file", path });
-                if (initial_breakpoint) |name| try remote_args.appendSlice(a, &.{ "--break", try a.dupeZ(u8, name) });
+                for (initial_breakpoints[0..initial_breakpoint_count]) |name| try remote_args.appendSlice(a, &.{ "--break", try a.dupeZ(u8, name) });
                 if (attach) |pid| {
                     try remote_args.appendSlice(a, &.{ "--attach", try std.fmt.allocPrintSentinel(a, "{d}", .{pid}, 0) });
                 } else {
@@ -232,6 +242,11 @@ pub fn main(init: std.process.Init) !void {
     session.profile_defaults = preferences.profile.config();
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
+    session.static_analysis.toolchain_dir = static_analysis;
+    if (static_analysis != null) {
+        const swept = @import("semq/host.zig").sweepStale();
+        if (swept > 0) std.debug.print("xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
+    }
     defer session.deinit();
     // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
     var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
@@ -282,7 +297,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (launch.len > 0) try session.launch(launch);
     if (follow_forks) try session.target.setFollowProcesses(true);
-    if (initial_breakpoint) |name| {
+    for (initial_breakpoints[0..initial_breakpoint_count]) |name| {
         try session.refreshMaps();
         _ = try session.persistent.addSymbol(session, name);
     }
@@ -575,6 +590,10 @@ test {
         _ = @import("ui/invocations.zig");
     }
     std.testing.refAllDecls(@import("model/session.zig"));
+    _ = @import("semq/adapter.zig");
+    _ = @import("semq/answer.zig");
+    _ = @import("semq/host.zig");
+    std.testing.refAllDecls(@import("mcp/static_analysis.zig"));
     _ = @import("target/process_test.zig");
     std.testing.refAllDecls(@import("model/modules.zig"));
     std.testing.refAllDecls(@import("binary/apk.zig"));

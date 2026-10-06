@@ -19,6 +19,7 @@ struct xrt_connection {
     pid_t child;
     uint64_t request, producer_ns, host_ns, uncertainty_ns;
     uint32_t tick_hz, page_size;
+    uint16_t machine; /* HELLO: the row a newly created agent target starts on */
     enum xrt_status failed;
     struct xrt_target *targets[XRT_RPC_TARGETS];
     uint8_t *request_bytes, *reply;
@@ -176,6 +177,23 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         (reply.status == XRT_OK &&
          present != (call->op != XRT_RPC_HELLO && call->op != XRT_RPC_DESTROY && !no_snapshot)))
         return broken(c, XRT_PROTOCOL_ERROR);
+    /* A created target starts on the agent's HELLO row. Later snapshots keep
+     * that resolved identity, and a target's generation never decreases. */
+    if (present && (call->op == XRT_RPC_CREATE ? c->decoded->arch->machine != c->machine
+                                                : c->decoded->arch != t->arch))
+        return broken(c, XRT_PROTOCOL_ERROR);
+    if (present && c->decoded->generation < t->generation)
+        return broken(c, XRT_PROTOCOL_ERROR);
+    if (call->op == XRT_RPC_REGISTER_WRITE || call->op == XRT_RPC_CONTROL_WRITE) {
+        /* Byte 0 issued, byte 1 confirmed, both 0 or 1, all else 0. Only a
+         * confirmed write succeeds, and an issued one advanced the generation
+         * this request carried. */
+        const uint64_t issued = value & 0xff, confirmed = (value >> 8) & 0xff;
+        if (value >> 16 || issued > 1 || confirmed > issued ||
+            confirmed != (reply.status == XRT_OK) ||
+            (issued && (!present || c->decoded->generation <= generation)))
+            return broken(c, XRT_PROTOCOL_ERROR);
+    }
     if (present) {
         /* Connection identity stays immutable: metadata workers may use it
          * while the event-loop thread publishes a new target snapshot. */
@@ -405,8 +423,10 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
     }
     if (status == XRT_OK && (machine > UINT16_MAX || !xrt_arch_get((uint16_t)machine)))
         status = XRT_UNSUPPORTED_ARCHITECTURE;
-    if (status == XRT_OK)
+    if (status == XRT_OK) {
+        c->machine = (uint16_t)machine;
         status = create_remote(c, t);
+    }
     if (status != XRT_OK) {
         release_connection(c);
         free(t);
@@ -495,7 +515,7 @@ enum xrt_status xrt_remote_registers(const struct xrt_target *t, int32_t tid,
     struct xrt_registers regs = {0};
     struct xrt_codec in = xrt_codec(bytes, size, true);
     xrt_wire_registers(&in, &regs);
-    if (!in.ok || in.at != in.size)
+    if (!in.ok || in.at != in.size || xrt_arch_resolve(regs.abi) != t->arch)
         return xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
     *out = regs;
     return XRT_OK;

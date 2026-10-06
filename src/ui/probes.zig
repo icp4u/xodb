@@ -74,7 +74,7 @@ pub const Panel = struct {
             self.message = "Internal loader breakpoint (read-only)";
             return true;
         }
-        if (key_ == 0xffff) {
+        if (key_ == 0xffff or key_ == 0xff08) { // Delete or BackSpace (compact keyboards)
             session.target.removeBreakpoint(probe.id) catch |err| {
                 self.message = @errorName(err);
                 return true;

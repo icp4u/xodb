@@ -117,13 +117,14 @@ is the interpreter pointer (`my_perl`), not a Perl value. Captured native stacks
 are not Perl logical frames.
 
 `scripts/demo-perl` is the interactive counterpart of the Ruby and CPython
-demos. It attaches to a loop that stores `42` at index 3 and breaks on
-`Perl_av_store`. With DWARF, the frame's expression `key` shows **3**, and the
-stack shows `Perl_av_fetch` (with `lval` set) called from the lexical-array
-store op inside `Perl_runops_standard`. `val` is the new, still-undefined
-element: `*val` shows `sv_flags` 0. The op assigns 42 only after `av_store`
-returns, so `val->sv_u` may hold stale bits from an earlier element; don't read
-it as the stored value.
+demos. It runs `examples/perl-demo.pl`, where nested subs keep storing `42` at
+index 3, and stops in `Perl_av_store` and then `Perl_av_delete`. At the first
+stop, **E** `val` shows `undef`, the new element `av_store` is about to insert:
+Perl assigns 42 only after the call returns, so stale bits are not shown as a
+value. **E** `av` shows `AV (3 slots)`. At the `Perl_av_delete` stop,
+`av->sv_u.svu_array[3]` shows `IV 42`. Agents can read the Perl stack beside the
+native one with `get_language_stack` (`main::store_answer` → `main::tick` →
+`main`, with file and line).
 
 ## Recipes
 
@@ -292,9 +293,12 @@ to complete call intervals. Supply the observation identity and threshold, plus
 unique matches, overlapping calls, outside calls, boundary crossings and unusable
 time/identity. Remote timestamps carry conversion uncertainty and unmeasured
 drift. Association counts are samples/events, not inferred CPU time, bytes or
-causality. Source loss and excluded metadata are reported separately. These joins
-currently require ended live-session sources; `.xoi` does not bundle the separate
-CPU/allocation streams or association result.
+causality. Source loss and excluded metadata are reported separately. Saving after a successful association also retains its normalized CPU points,
+syscall intervals and allocation sample events, source capture/revision IDs,
+original ordinals, producer/clock proofs, uncertainty and derived result. Raw
+citations refer to those normalized records. Full CPU stacks, syscall payloads
+and allocation arguments are not bundled by this feature. An association is
+still temporal evidence, not causal attribution.
 
 ## Coherent stopped inspections
 
@@ -337,3 +341,86 @@ Set `XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent` for the agent variants.
 `scripts/release-check host --uprobes` includes those function suites and
 explicitly enables the built helper for the owned fixtures. The release runner
 snapshots tracked source, so new files must be added before that snapshot gate.
+
+
+## Save and reopen associated evidence
+
+For a complete owned capture/save/reopen example:
+
+```sh
+python3 tests/observation-associations.py
+# The test prints the generated archive path, then deletes its owned target/input.
+xodb --open-observation path-from-test/associated.xoi
+xodb --open-observation path-from-test/associated.xoi --mcp
+```
+
+Use the test's explicit `--helper` option only for a helper already approved on
+this host. Set `XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent` to exercise the same
+capture through the local C agent. These are headless commands; no hotkeys are
+needed. The live example needs the existing CPU/syscall/allocation collector
+permissions. Offline reopening needs none of those collection privileges.
+
+In your own MCP investigation, start the observation and selected profile or
+allocation collectors while the target is held, run the interesting interval,
+then stop all collectors. Wait for completed evidence, call
+`associate_observation` with the recorded capture identity, source IDs/revisions
+and threshold, and wait for `get_observation_associations` to finish. Only then
+call `save_observation` with `generation`, `session_id`, `capture_id` and a fresh
+`path`; poll `get_observation_archive` until publication completes. Closing the
+target or replacing the original source profile cannot alter the saved snapshot.
+Saving while analysis is running returns `ObservationAssociationsBusy`
+immediately. After a failed or cancelled analysis, saving publishes an
+invocation-only version-1 archive; archive status reports `associations_saved:
+false` and `associations_omitted_reason`. Replacement during save returns
+`ObservationArchiveBusy` immediately while the worker pins its completed source.
+
+Views borrow slices from the completed job. Consumers hold IDs and re-look up on
+the Session owner thread on each use; never retain slices across capture or job
+replacement. A replaced job ID returns `StaleObservationAssociations`. Status
+includes `association_algorithm`, `payload_version`, `analysis_origin` (live,
+restored or reanalysed), per-source counts/loss and `rows_truncated` /
+`calls_truncated` with omitted counts. These result-list limits do not truncate
+the retained source streams.
+
+On reopening, `get_observation` includes `association_id`. Use it with
+`get_observation_associations` to page results. Add `stream_id` (1 CPU, 2 syscalls,
+3 allocation) to page retained source records. `start` is an array offset;
+`ordinal` is the original source ordinal and can contain gaps where allocation
+metadata was excluded. For example, use `stream_id: 3, start: 1, limit: 1` to see
+the second retained allocation event, whose original ordinal need not be 1.
+
+For offline reanalysis, call `associate_observation` with the recorded
+`session_id`, `capture_id` and a new `threshold_ns` or existing filter fields.
+Omit live profile/allocation IDs, revisions and include flags. It uses exactly the
+retained streams. Source paging is passive; replacing/cancelling the analysis
+retains the existing controller lease classification in a shared session. CLI
+output includes `associations` status and `association_result` in addition to the
+invocation comparison. `--observation-threshold-ns` changes the invocation
+comparison; use MCP to select a different association threshold.
+
+Invocation-only archives retain payload version 1 and omit the new field.
+Archives with associated evidence use payload version 2 and
+`xodb-temporal-association-v1` inside the unchanged digest envelope. Existing
+version-1 archives remain readable; older readers reject the new association
+field as `UnknownField`. With the current algorithm, opening replays pairing and
+association classification and checks saved results/citations. An unknown
+association algorithm keeps invocation and normalized source evidence readable;
+status is `unsupported_algorithm`, labels the saved algorithm, and exposes no
+current derived result. Explicit offline reanalysis uses the current algorithm.
+Identity and clock contradictions are rejected for every algorithm.
+It never follows recorded executable/source paths. Source loss diagnostics remain
+reported claims about acquisition; absent records are not reconstructed.
+
+Limits remain 64 MiB per file and 256 MiB for decode allocations. A normalized
+snapshot has at most three streams and 262,144 aggregate records, with a 64 MiB
+owner budget and the existing 64 MiB analysis-job budget. This record ceiling is reachable even with the largest interval records;
+independent file and byte limits can still reject large invocation sets. Budget
+denials return `ObservationAssociationMemoryLimit`, not `OutOfMemory`, and saving
+checks that a snapshot fits its reader's owner budget. Stream and record arrays
+are counted before typed decoding; other semantic checks run after bounded
+allocation. Allocations are charged before they occur. These
+budgets are separate from the invocation capture's configured memory budget;
+opening temporarily holds decoded evidence, the new capture, its snapshot and
+its analysis job together. Cancellation either leaves a fully published file or
+no published file; publication refuses overwrite and does not promise power-loss
+durability.

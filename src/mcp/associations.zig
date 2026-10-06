@@ -23,7 +23,7 @@ fn exact(a: std.mem.Allocator, object: anytype) !V {
     try @import("exact.zig").observation(a, &value);
     return value;
 }
-fn status(a: std.mem.Allocator, job: *const jobs.Job) !V {
+pub fn status(a: std.mem.Allocator, job: *const jobs.Job) !V {
     const done = job.done.load(.acquire);
     const source_incomplete = for (job.sources[0..job.source_count]) |source| {
         if (source.coverageIncomplete()) break true;
@@ -31,7 +31,17 @@ fn status(a: std.mem.Allocator, job: *const jobs.Job) !V {
     return exact(a, .{
         .id = job.id,
         .identity = job.capture.identity,
-        .state = if (!done) "running" else if (if (job.err) |err| err == error.ObservationAnalysisCancelled else false) "cancelled" else if (job.err != null) "failed" else "completed",
+        .offline = job.capture.offline,
+        .association_algorithm = job.association_algorithm,
+        .algorithm_supported = job.algorithm_supported,
+        .payload_version = @as(u32, 2),
+        .analysis_origin = job.analysis_origin,
+        .rows_truncated = if (done and job.result != null) @as(?bool, job.result.?.omitted_rows != 0) else null,
+        .calls_truncated = if (done and job.result != null) @as(?bool, job.result.?.omitted_calls != 0) else null,
+        .omitted_rows = if (done and job.result != null) @as(?u64, job.result.?.omitted_rows) else null,
+        .omitted_calls = if (done and job.result != null) @as(?u64, job.result.?.omitted_calls) else null,
+        .citation_basis = "retained normalized source points/intervals and original ordinals; full sample stacks and allocation payloads are not included",
+        .state = if (!done) "running" else if (if (job.err) |err| err == error.ObservationAnalysisCancelled else false) "cancelled" else if (job.err != null) "failed" else if (!job.algorithm_supported) "unsupported_algorithm" else "completed",
         .cancel_requested = job.cancel.load(.acquire),
         .error_name = if (done) (if (job.err) |err| @errorName(err) else @as(?[]const u8, null)) else null,
         .sources = job.sources[0..job.source_count],
@@ -46,14 +56,18 @@ fn status(a: std.mem.Allocator, job: *const jobs.Job) !V {
         .peak_bytes = if (done) @as(?usize, job.budget.peak) else null,
         .basis = jobs.associations.basis,
         .clock_basis = jobs.clock_basis,
-        .thread_basis = "stable debugger IDs only for normalized live sources; missing or reused source TIDs are unusable, never silently inferred",
+        .thread_basis = "stable debugger IDs retained from acquisition; missing or reused source TIDs are unusable, never silently inferred",
         .allocation_basis = jobs.allocation_basis,
     });
 }
 pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) !V {
     if (std.mem.eql(u8, name, "associate_observation")) {
         try wire.fields(args, &.{ "session_id", "capture_id", "threshold_ns", "thread_id", "function_id", "start_ns", "end_ns", "argument_index", "argument_value", "return_value", "profile_id", "profile_revision", "include_cpu", "include_syscalls", "allocation_id", "allocation_revision" });
+        if (session.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
         const capture = session.observations.capture orelse return error.NoObservation;
+        if (capture.offline) {
+            inline for (.{ "profile_id", "profile_revision", "include_cpu", "include_syscalls", "allocation_id", "allocation_revision" }) |key| if (args.object.get(key) != null) return error.InvalidArguments;
+        }
         if (capture.identity.session_id != try wire.number(args, "session_id", null) or capture.identity.capture_id != try wire.number(args, "capture_id", null)) return error.StaleObservation;
         if (!capture.store.finished or session.observations.busy()) return error.ObservationStillCollecting;
         var selection = comparison.Selection{ .threshold_ns = try wire.number(args, "threshold_ns", null) };
@@ -77,7 +91,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         if (session.observation_associations) |old| if (!old.done.load(.acquire)) return error.ObservationAssociationsBusy;
         if (session.next_observation_association == std.math.maxInt(u64)) return error.ObservationAssociationLimit;
         // Failed creation preserves the previous completed result.
-        const candidate = try jobs.Job.create(session.next_observation_association, capture, session.id, session.process_id, profile, allocation, selection);
+        const candidate = if (capture.offline) try jobs.Job.fromSaved(session.next_observation_association, capture, selection, false, null) else try jobs.Job.create(session.next_observation_association, capture, session.id, session.process_id, profile, allocation, selection);
         if (session.observation_associations) |old| old.deinit();
         session.observation_associations = candidate;
         session.next_observation_association += 1;

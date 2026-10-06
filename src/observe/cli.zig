@@ -39,6 +39,8 @@ fn emit(a: std.mem.Allocator, session: *Session, outcome: ?recipe.Outcome, compa
     var value = try @import("../mcp/profile.zig").value(a, .{
         .observation = try @import("../mcp/observation.zig").status(a, session),
         .outcome = outcome,
+        .associations = if (session.observation_associations) |job| try @import("../mcp/associations.zig").status(a, job) else null,
+        .association_result = if (session.observation_associations) |job| job.result else null,
         .comparison = if (session.observation_analysis) |job| job.result else null,
         .comparison_error = if (comparison_error) |err| @errorName(err) else null,
         .archive = if (session.observation_archive) |job| job.status() else null,
