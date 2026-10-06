@@ -78,6 +78,8 @@ struct xrt_breakpoint {
     bool patched, enabled;
     uint64_t hit_count;
     bool pending, internal, temporary;
+    uint8_t width, isa_mode, alignment;
+    uint8_t planted[4];
 };
 struct xrt_watchpoint {
     uint64_t id, address;
@@ -102,6 +104,7 @@ struct xrt_event {
     enum xrt_event_kind kind;
     int64_t detail;
     uint64_t pc, address, before, after;
+    uint8_t pc_known;
     uint8_t size;
     bool other_threads_running, has_trap;
     uint64_t trap_pc, trap_address;
@@ -180,6 +183,8 @@ enum xrt_status xrt_target_registers(const struct xrt_target *target, int32_t ti
                                      struct xrt_registers *out);
 enum xrt_status xrt_target_register_write(struct xrt_target *target, int32_t tid, const char *name,
                                           size_t length, uint64_t value);
+enum xrt_status xrt_target_control_write(struct xrt_target *target, int32_t tid,
+                                         const struct xrt_control_request *request);
 enum xrt_status xrt_target_extended(const struct xrt_target *target, int32_t tid,
                                     struct xrt_xstate *out);
 enum xrt_status xrt_target_signal_info(const struct xrt_target *, int32_t tid,

@@ -163,15 +163,8 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
             selection.argument = .{ .index = @intCast(index), .value = try word(args, "argument_value") };
         }
         selection.validate() catch return error.InvalidArguments;
-        if (session.observation_analysis) |job| {
-            if (!job.done.load(.acquire)) return error.ObservationAnalysisBusy;
-            job.deinit();
-            session.observation_analysis = null;
-        }
-        session.observation_analysis = try @import("../observe/analysis.zig").Job.create(session.next_observation_analysis, capture, selection);
-        capture.comparison_selection = selection;
-        session.next_observation_analysis += 1;
-        return wire.value(a, .{ .id = session.observation_analysis.?.id, .state = "running", .identity = capture.identity });
+        const id = try session.compareObservation(selection);
+        return wire.value(a, .{ .id = id, .state = "running", .identity = capture.identity });
     }
     try wire.fields(args, &.{"id"});
     const job = session.observation_analysis orelse return error.NoObservationComparison;

@@ -13,26 +13,40 @@ pub const X86Registers = c.struct_xrt_x86_registers;
 pub const ArmRegisters = c.struct_xrt_arm_registers;
 pub const Registers = struct {
     raw: c.struct_xrt_registers,
+    fn row(self: Registers) ?*const c.struct_xrt_arch {
+        return c.xrt_arch_resolve(self.raw.abi);
+    }
     pub fn architecture(self: Registers) @import("arch.zig").Arch {
-        return @enumFromInt(self.raw.machine);
+        return @enumFromInt(self.raw.abi.machine);
     }
     pub fn descriptions(self: Registers) []const c.struct_xrt_register_desc {
-        const desc = c.xrt_arch_get(self.raw.machine);
+        const desc = self.row() orelse return &.{};
         return desc.*.registers[0..desc.*.register_count];
     }
-    pub fn value(self: Registers, desc: c.struct_xrt_register_desc) u64 {
-        const bytes: [*]const u8 = @ptrCast(&self.raw.values);
-        return std.mem.bytesToValue(u64, bytes[desc.snapshot_offset..][0..8]);
+    /// Reads one register through the C row. The descriptor id selects the row
+    /// member; a copied descriptor is not a membership proof.
+    pub fn value(self: Registers, desc: c.struct_xrt_register_desc) !u64 {
+        const arch = self.row() orelse return error.UnsupportedArchitecture;
+        const member = c.xrt_arch_register_id(arch, desc.id) orelse return error.UnknownRegister;
+        var out: u64 = undefined;
+        try check(c.xrt_registers_value_desc(&self.raw, member, &out));
+        return out;
     }
     pub fn named(self: Registers, name: []const u8) ?u64 {
-        const desc = c.xrt_arch_register(self.raw.machine, name.ptr, name.len);
-        return if (desc != null) self.value(desc.*) else null;
+        var out: u64 = undefined;
+        return if (c.xrt_registers_value(&self.raw, name.ptr, name.len, &out) == c.XRT_OK) out else null;
     }
     pub fn dwarf(self: Registers, number: usize) ?u64 {
-        for (self.descriptions()) |desc| if (desc.dwarf == number) return self.value(desc);
-        return null;
+        if (number > std.math.maxInt(u16)) return null;
+        var out: u64 = undefined;
+        return if (c.xrt_registers_value_dwarf(&self.raw, @intCast(number), &out) == c.XRT_OK) out else null;
     }
 };
+pub fn registerText(allocator: std.mem.Allocator, regs: Registers, desc: c.struct_xrt_register_desc) ![]u8 {
+    if (regs.value(desc)) |word| {
+        return std.fmt.allocPrint(allocator, "0x{x}", .{word});
+    } else |_| return allocator.dupe(u8, "unavailable");
+}
 pub const DwarfRegisters = [c.XRT_DWARF_REGISTER_COUNT]?u64;
 
 pub fn check(status: c.enum_xrt_status) !void {
@@ -108,6 +122,12 @@ pub fn check(status: c.enum_xrt_status) !void {
         c.XRT_FILE_UNAVAILABLE => return error.BinaryIdentityUnavailable,
         c.XRT_FILE_CHANGED => return error.BinaryChangedDuringRead,
         c.XRT_FILE_LIMIT => return error.BinarySnapshotLimit,
+        c.XRT_PARTIAL_REGISTER_WRITE => return error.PartialRegisterWrite,
+        c.XRT_REGISTER_UNAVAILABLE => return error.RegisterUnavailable,
+        c.XRT_REGISTER_NOT_WRITABLE => return error.RegisterNotWritable,
+        c.XRT_UNSUPPORTED_CONTROL => return error.UnsupportedControl,
+        c.XRT_UNSUPPORTED_MODE => return error.UnsupportedMode,
+        c.XRT_AMBIGUOUS_MATCH => return error.AmbiguousMatch,
         else => unreachable,
     }
 }
@@ -128,10 +148,11 @@ pub fn setPc(tid: i32, pc: u64) !void {
 
 pub fn dwarfRegisters(regs: Registers) DwarfRegisters {
     var values: [c.XRT_DWARF_REGISTER_COUNT]u64 = undefined;
-    check(c.xrt_registers_dwarf(&regs.raw, &values, values.len)) catch unreachable;
+    var present: [c.XRT_DWARF_REGISTER_COUNT]u8 = undefined;
+    check(c.xrt_registers_dwarf(&regs.raw, &values, &present, values.len)) catch unreachable;
     var out: DwarfRegisters = @splat(null);
-    for (regs.descriptions()) |desc| if (desc.dwarf < out.len) {
-        out[desc.dwarf] = values[desc.dwarf];
+    for (present, 0..) |flag, i| if (flag != 0) {
+        out[i] = values[i];
     };
     return out;
 }
@@ -139,8 +160,10 @@ pub fn dwarfRegisters(regs: Registers) DwarfRegisters {
 pub fn coreRegisters(words: *const [27]u64) !Registers {
     var bytes: [27 * 8]u8 = undefined;
     for (words, 0..) |word, i| std.mem.writeInt(u64, bytes[i * 8 ..][0..8], word, .little);
+    const arch = c.xrt_arch_get(c.XRT_X86_64) orelse return error.UnsupportedArchitecture;
+    const abi = c.xrt_arch_abi(arch);
     var regs: c.struct_xrt_registers = undefined;
-    try check(c.xrt_registers_decode(c.XRT_X86_64, &bytes, bytes.len, &regs));
+    try check(c.xrt_registers_decode(&abi, &bytes, bytes.len, &regs));
     return .{ .raw = regs };
 }
 
@@ -200,6 +223,30 @@ pub fn taskGone(tid: i32) bool {
 pub fn isZombie(tid: i32) bool {
     var info: c.struct_xrt_task_info = undefined;
     return c.xrt_task_inspect(tid, &info) == c.XRT_OK and info.state == 'Z';
+}
+
+test "an unavailable register is not displayed as its snapshot bytes" {
+    var words: [27]u64 = @splat(0x1111111111111111);
+    var regs = try coreRegisters(&words);
+    const rax = regs.descriptions()[3];
+    const rip = regs.descriptions()[0];
+    try std.testing.expectEqualStrings("rax", std.mem.span(rax.name));
+    try std.testing.expectEqualStrings("rip", std.mem.span(rip.name));
+    const present = try registerText(std.testing.allocator, regs, rax);
+    defer std.testing.allocator.free(present);
+    try std.testing.expectEqualStrings("0x1111111111111111", present);
+    try std.testing.expectEqual(@as(c.enum_xrt_status, c.XRT_OK),
+        c.xrt_registers_mark_absent(&regs.raw, rax.id));
+    try std.testing.expectError(error.RegisterUnavailable, regs.value(rax));
+    try std.testing.expect(regs.named("rax") == null);
+    try std.testing.expect(regs.dwarf(0) == null);
+    try std.testing.expectEqual(@as(u64, 0x1111111111111111), try regs.value(rip));
+    const hidden = try registerText(std.testing.allocator, regs, rax);
+    defer std.testing.allocator.free(hidden);
+    try std.testing.expectEqualStrings("unavailable", hidden);
+    const dense = dwarfRegisters(regs);
+    try std.testing.expect(dense[0] == null);
+    try std.testing.expectEqual(@as(?u64, 0x1111111111111111), dense[16]);
 }
 
 pub const SignalInfo = c.struct_xrt_signal_info;

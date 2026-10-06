@@ -53,7 +53,13 @@ static struct xrt_target *launch(const char *agent, uint64_t *pc)
         EXPECT(xrt_target_destroy(target) == XRT_OK);
         return NULL;
     }
-    *pc = xrt_pc(&registers);
+    uint64_t decoded_pc = 0;
+    if (xrt_registers_pc(&registers, &decoded_pc) != XRT_OK) {
+        EXPECT(0);
+        EXPECT(xrt_target_destroy(target) == XRT_OK);
+        return NULL;
+    }
+    *pc = decoded_pc;
     return target;
 }
 

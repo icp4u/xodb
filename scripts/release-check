@@ -49,6 +49,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
             ('gui-themes', ['tests/themes.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
+            ('gui-invocations', ['tests/invocations-gui.py']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
             ('gui-restart', ['tests/restart-gui.py', 'zig-out']),

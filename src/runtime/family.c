@@ -56,6 +56,10 @@ enum xrt_status xrt_execution_allowed(const struct xrt_target *t)
         return XRT_DETACH_INCOMPLETE;
     if (t->birth_count)
         return XRT_PROCESS_BIRTH_PENDING;
+    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    if (t->plant_cleanup.active)
+        return XRT_INVALID_STATE;
     for (size_t i = 0; i < XRT_MAX_THREADS; ++i)
         if (t->vfork_children[i])
             return XRT_VFORK_PARENT_BLOCKED;
@@ -121,6 +125,18 @@ enum xrt_status xrt_poll_births(struct xrt_target *t)
     }
     return XRT_OK;
 }
+/* The child image is its own identity. Re-read it; do not copy the parent's flag. */
+static void admit_adopted(const struct xrt_target *parent, struct xrt_target *out, int32_t pid,
+                          bool exited)
+{
+    out->arch = parent->arch;
+    out->identity_admitted = 0;
+    if (exited || !out->arch || xrt_process_validate_native(pid) != XRT_OK)
+        return;
+    const struct xrt_arch *native = xrt_arch_native();
+    if (out->arch == native && native && xrt_arch_validate(native) == XRT_OK)
+        out->identity_admitted = 1;
+}
 enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_target *out,
                                  struct xrt_birth *result)
 {
@@ -166,7 +182,7 @@ enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_t
     }
     memset(out, 0, sizeof(*out));
     out->remote_collectors = 0; /* Adopted handle is not published yet. */
-    out->arch = t->arch;
+    admit_adopted(t, out, pid, birth.exited);
     out->pid = pid;
     out->owned = t->owned;
     out->follow_processes = t->follow_processes;
@@ -213,9 +229,9 @@ enum xrt_status xrt_rearm_inherited(struct xrt_target *t)
         return XRT_OK;
     for (size_t i = 0; i < t->breakpoint_count; ++i) {
         struct xrt_breakpoint *probe = &t->breakpoints[i];
-        if (!probe->enabled || probe->pending || probe->patched)
+        if (!probe->enabled || probe->pending || probe->patched || !probe->width)
             continue;
-        TRY(xrt_patch_instruction(t, probe->address, t->arch->trap));
+        TRY(xrt_patch_instruction(t, probe->address, probe->planted, probe->width));
         probe->patched = true;
     }
     t->inherited_rearm = false;
@@ -240,9 +256,10 @@ enum xrt_status xrt_separate_vfork(struct xrt_target *t)
         return XRT_OK;
     for (size_t i = 0; i < parent->breakpoint_count; ++i) {
         struct xrt_breakpoint *probe = &parent->breakpoints[i];
-        if (!probe->enabled || probe->pending || probe->patched || parent->state != XRT_STOPPED)
+        if (!probe->enabled || probe->pending || probe->patched || !probe->width ||
+            parent->state != XRT_STOPPED)
             continue;
-        TRY(xrt_patch_instruction(parent, probe->address, parent->arch->trap));
+        TRY(xrt_patch_instruction(parent, probe->address, probe->planted, probe->width));
         probe->patched = true;
         xrt_sync_shared_patch(t, probe->id, true);
     }
@@ -289,6 +306,10 @@ enum xrt_status xrt_target_detach(struct xrt_target *t)
         TRY(xrt_target_interrupt(t));
         TRY(xrt_target_wait_stopped(t));
     }
+    /* Restore a half-planted trap before this process is released. */
+    if (t->plant_cleanup.active &&
+        (t->state != XRT_STOPPED || xrt_target_retry_plant_cleanup(t) != XRT_OK))
+        return XRT_INVALID_STATE;
     if (t->state == XRT_STOPPED) {
         while (t->breakpoint_count)
             TRY(xrt_target_breakpoint_remove(t, t->breakpoints[t->breakpoint_count - 1].id));
@@ -351,22 +372,26 @@ enum xrt_status xrt_target_detach_family(struct xrt_target *t)
         usleep(1000);
     }
     for (size_t i = 0; i < count; ++i)
+        if (family[i]->plant_cleanup.active &&
+            (family[i]->state != XRT_STOPPED || xrt_target_retry_plant_cleanup(family[i]) != XRT_OK))
+            return XRT_INVALID_STATE;
+    for (size_t i = 0; i < count; ++i)
         family[i]->detach_pending = true;
     for (size_t i = 0; i < count; ++i) {
         struct xrt_target *member = family[i];
         for (size_t p = 0; p < member->birth_breakpoint_count; ++p) {
             const struct xrt_breakpoint *probe = &member->birth_breakpoints[p];
-            if (probe->pending)
+            if (probe->pending || !probe->width)
                 continue;
             for (size_t b = 0; b < member->birth_count; ++b)
                 if (!member->births[b].exited)
                     TRY(xrt_patch_instruction_tid(member, member->births[b].pid, probe->address,
-                                                  probe->original));
+                                                  probe->original, probe->width));
         }
         for (size_t p = 0; p < member->breakpoint_count; ++p) {
             struct xrt_breakpoint *probe = &member->breakpoints[p];
-            if (!probe->pending && probe->patched && member->state == XRT_STOPPED)
-                TRY(xrt_patch_instruction(member, probe->address, probe->original));
+            if (!probe->pending && probe->patched && probe->width && member->state == XRT_STOPPED)
+                TRY(xrt_patch_instruction(member, probe->address, probe->original, probe->width));
             probe->patched = false;
             probe->enabled = false;
         }
@@ -507,6 +532,7 @@ enum xrt_status xrt_target_reset(struct xrt_target *t)
         return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_RESET});
     TRY(xrt_target_close(t));
     t->breakpoint_count = 0;
+    t->plant_cleanup.active = 0;
     memset(t->watchpoints, 0, sizeof(t->watchpoints));
     t->thread_count = 0;
     t->stepping = false;

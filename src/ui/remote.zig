@@ -335,7 +335,9 @@ const Workspace = struct {
                     if (index < self.values_scroll) continue;
                     const y = 132 + @as(f32, @floatFromInt(index - self.values_scroll)) * 23;
                     if (y + 20 >= bottom - 10) break;
-                    try formatted(r, font, right + 14, y, width - right - 28, theme.text, "{s: <7} {x:0>16}", .{ reg.name, reg.value });
+                    if (reg.value) |word| {
+                        try formatted(r, font, right + 14, y, width - right - 28, theme.text, "{s: <7} {x:0>16}", .{ reg.name, word });
+                    } else try formatted(r, font, right + 14, y, width - right - 28, theme.weak, "{s: <7} {s}", .{ reg.name, "unavailable" });
                 }
             } else if (self.watch_list) {
                 for (v.watchpoints, 0..) |watch, index| {

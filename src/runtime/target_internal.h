@@ -24,6 +24,14 @@ struct xrt_step {
     struct xrt_arm_watch_hit watch;
     uint64_t exec_entry_pc;
 };
+/* One unpublished plant. original holds the full prepared image, not only the
+ * bytes a short rollback managed to restore. */
+struct xrt_plant_cleanup {
+    uint8_t active;
+    uint64_t address;
+    uint8_t width;
+    uint8_t original[4];
+};
 struct xrt_target {
     /* NULL for native targets. Remote handles retain only read-only snapshots. */
     struct xrt_connection *connection;
@@ -33,6 +41,13 @@ struct xrt_target {
     uint32_t remote_collectors;
     bool remote_shared;
     const struct xrt_arch *arch;
+    uint8_t identity_admitted;
+    struct xrt_reg_io *reg_io;
+    struct xrt_mutation_result last_mutation;
+    struct xrt_plant_cleanup plant_cleanup;
+    enum xrt_status (*patch)(void *ctx, int32_t tid, uint64_t address, const void *bytes,
+                             size_t size, size_t *accepted);
+    void *patch_ctx;
     bool core, owned, follow_processes;
     int32_t pid;
     struct xrt_birth births[XRT_MAX_THREADS];
@@ -72,10 +87,17 @@ int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address);
 enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn);
 enum xrt_status xrt_memory_mutation_allowed(const struct xrt_target *t);
 enum xrt_status xrt_execution_allowed(const struct xrt_target *t);
-enum xrt_status xrt_patch_instruction(const struct xrt_target *t, uint64_t address,
-                                      const uint8_t *bytes);
-enum xrt_status xrt_patch_instruction_tid(const struct xrt_target *t, int32_t tid, uint64_t address,
-                                          const uint8_t *bytes);
+enum xrt_status xrt_patch_instruction(struct xrt_target *t, uint64_t address, const uint8_t *bytes,
+                                      size_t width);
+enum xrt_status xrt_patch_instruction_tid(struct xrt_target *t, int32_t tid, uint64_t address,
+                                          const uint8_t *bytes, size_t width);
+enum xrt_status xrt_target_patch_span(struct xrt_target *t, int32_t tid, uint64_t address,
+                                      const uint8_t *bytes, size_t width, size_t *accepted);
+enum xrt_status xrt_target_commit_plant(struct xrt_target *t, uint64_t address,
+                                        const struct xrt_probe_encoding *encoding,
+                                        const uint8_t original[4]);
+void xrt_target_apply_exec_identity(struct xrt_target *t, enum xrt_status validate_status);
+enum xrt_status xrt_target_retry_plant_cleanup(struct xrt_target *t);
 enum xrt_status xrt_rearm_inherited(struct xrt_target *t);
 void xrt_sync_shared_patch(struct xrt_target *t, uint64_t id, bool patched);
 enum xrt_status xrt_separate_vfork(struct xrt_target *t);
@@ -98,10 +120,4 @@ enum xrt_status xrt_start_arm_watch_completion(struct xrt_target *t, bool *start
 void xrt_publish_arm_watch(struct xrt_target *t, int32_t tid, const struct xrt_arm_watch_hit *hit,
                            bool completed);
 enum xrt_status xrt_restore_debug(int32_t tid, const struct xrt_debug_registers *saved);
-static inline uint64_t xrt_pc(const struct xrt_registers *regs)
-{
-    return regs->machine == XRT_M68K      ? regs->values.m68k.pc
-           : regs->machine == XRT_AARCH64 ? regs->values.arm.pc
-                                          : regs->values.x86.rip;
-}
 #endif

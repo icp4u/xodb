@@ -4,6 +4,7 @@
 #include "rpc.h"
 #include "wire_target.h"
 #include "perf_remote.h"
+#include "target_internal.h"
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -49,12 +50,9 @@ static uint32_t identity(struct agent *a, const struct xrt_target *target)
             return a->entries[i].id;
     return 0;
 }
-static bool read_only(uint16_t op)
+static uint64_t mutation_flags(const struct xrt_target *t)
 {
-    return op == XRT_RPC_HELLO || op == XRT_RPC_CREATE || op == XRT_RPC_SYNC ||
-           op == XRT_RPC_READ || op == XRT_RPC_REGISTERS || op == XRT_RPC_EXTENDED ||
-           op == XRT_RPC_WATCH_CAPACITY || op == XRT_RPC_SIGNAL_INFO || op == XRT_RPC_VIEW ||
-           op == XRT_RPC_FILE_OPEN || op == XRT_RPC_FILE_READ || op == XRT_RPC_FILE_CLOSE;
+    return (uint64_t)t->last_mutation.issued | ((uint64_t)t->last_mutation.confirmed << 8);
 }
 static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, uint64_t *value,
                                 size_t *extra_size, struct xrt_target **snapshot)
@@ -110,18 +108,26 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     }
     if (!t)
         return XRT_INVALID_STATE;
-    if (frame->op >= XRT_RPC_CPU_START) {
+    const enum xrt_rpc_class rpc_class = xrt_rpc_classify(frame->op);
+    if (rpc_class == XRT_RPC_CLASS_PROTOCOL) {
+        *snapshot = NULL;
+        return XRT_PROTOCOL_ERROR;
+    }
+    if (rpc_class == XRT_RPC_CLASS_PERF) {
         *snapshot = NULL;
         return xrt_agent_perf_dispatch(a->collectors, t, frame->op, args, data, size, value,
                                        a->extra, extra_size);
     }
-    if (!read_only(frame->op)) {
+    if (rpc_class == XRT_RPC_CLASS_FILE)
+        *snapshot = NULL;
+    if (rpc_class == XRT_RPC_CLASS_MUTATION) {
         enum xrt_status expected = xrt_target_expect(t, generation);
         if (expected != XRT_OK)
             return expected;
     }
     if (size && frame->op != XRT_RPC_LAUNCH && frame->op != XRT_RPC_WRITE &&
-        frame->op != XRT_RPC_REGISTER_WRITE && frame->op != XRT_RPC_FILE_OPEN)
+        frame->op != XRT_RPC_REGISTER_WRITE && frame->op != XRT_RPC_FILE_OPEN &&
+        frame->op != XRT_RPC_CONTROL_WRITE)
         return XRT_INVALID_ARGUMENT;
     enum xrt_status status = XRT_OK;
     switch (frame->op) {
@@ -252,9 +258,26 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         return status;
     }
     case XRT_RPC_REGISTER_WRITE:
-        return args[0] > INT32_MAX ? XRT_INVALID_PID
-                                   : xrt_target_register_write(t, (int32_t)args[0],
-                                                               (const char *)data, size, args[1]);
+        if (args[0] > INT32_MAX)
+            return XRT_INVALID_PID;
+        status = xrt_target_register_write(t, (int32_t)args[0], (const char *)data, size, args[1]);
+        *value = mutation_flags(t);
+        return status;
+    case XRT_RPC_CONTROL_WRITE: {
+        *value = 0;
+        if (args[0] > INT32_MAX || args[1] < 1 || args[1] > 2 || args[2] != 0 ||
+            size != args[1] * 8)
+            return XRT_INVALID_ARGUMENT;
+        struct xrt_control_request request = {.count = (uint8_t)args[1]};
+        struct xrt_codec body = xrt_codec(data, size, true);
+        for (uint8_t i = 0; i < request.count; ++i)
+            xrt_codec_u64(&body, &request.value[i]);
+        if (!body.ok || body.at != body.size)
+            return XRT_INVALID_ARGUMENT;
+        status = xrt_target_control_write(t, (int32_t)args[0], &request);
+        *value = mutation_flags(t);
+        return status;
+    }
     case XRT_RPC_EXTENDED: {
         if (args[0] > INT32_MAX)
             return XRT_INVALID_PID;

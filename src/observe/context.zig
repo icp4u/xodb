@@ -93,7 +93,7 @@ pub const Job = struct {
             .registers => {
                 const registers = try session.target.registers(self.request.tid);
                 var values: std.json.ObjectMap = .{};
-                for (registers.descriptions()) |desc| try values.put(a, std.mem.span(desc.name), .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{registers.value(desc)}) });
+                for (registers.descriptions()) |desc| try values.put(a, std.mem.span(desc.name), .{ .string = try @import("../target/runtime.zig").registerText(a, registers, desc) });
                 return self.encode(.{ .architecture = @tagName(registers.architecture()), .values = std.json.Value{ .object = values } });
             },
             .stack => return self.encode(.{ .frames = try session.stack(a, self.request.tid, 64), .limit = 64 }),

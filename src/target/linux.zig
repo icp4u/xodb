@@ -49,11 +49,15 @@ pub const Thread = struct { id: u64, tid: c.pid_t, state: State, signal: c_int =
 pub const X86Registers = runtime.X86Registers;
 pub const ArmRegisters = runtime.ArmRegisters;
 pub const Registers = runtime.Registers;
-pub fn programCounter(regs: Registers) u64 {
-    return regs.dwarf(regs.architecture().pc()).?;
+pub fn programCounter(regs: Registers) !u64 {
+    var out: u64 = undefined;
+    try runtime.check(runtime.c.xrt_registers_pc(&regs.raw, &out));
+    return out;
 }
-pub fn stackPointer(regs: Registers) u64 {
-    return regs.dwarf(regs.architecture().sp()).?;
+pub fn stackPointer(regs: Registers) !u64 {
+    var out: u64 = undefined;
+    try runtime.check(runtime.c.xrt_registers_role(&regs.raw, runtime.c.XRT_ROLE_SP, &out));
+    return out;
 }
 pub const Event = struct {
     sequence: u64,
@@ -62,6 +66,7 @@ pub const Event = struct {
     kind: enum { launch, attach, thread_start, thread_exiting, stop, continued, exit, detach, breakpoint_set, breakpoint_removed, breakpoint_hit, watchpoint_set, watchpoint_removed, watchpoint_hit, step_started, step_complete, memory_written, register_written, agent_action, image_replaced, process_birth, process_separated },
     detail: i64 = 0,
     pc: u64 = 0,
+    pc_known: bool = false,
     address: u64 = 0,
     before: u64 = 0,
     after: u64 = 0,
@@ -199,7 +204,7 @@ pub const Target = struct {
         if (v.sequence != self.cached_sequence or v.event_count != self.cached_events) {
             for (0..v.event_count) |i| {
                 const e = v.events[i];
-                @constCast(self).event_cache[i] = .{ .sequence = e.sequence, .time_ns = e.time_ns, .tid = e.tid, .kind = @enumFromInt(e.kind), .detail = e.detail, .pc = e.pc, .address = e.address, .before = e.before, .after = e.after, .size = e.size, .other_threads_running = e.other_threads_running, .trap_pc = if (e.has_trap) e.trap_pc else null, .trap_address = if (e.has_trap) e.trap_address else null, .trap_code = if (e.has_trap) e.trap_code else null, .watch_phase = @enumFromInt(e.watch_phase), .watch_attribution = @enumFromInt(e.watch_attribution), .before_valid = e.before_valid, .after_valid = e.after_valid };
+                @constCast(self).event_cache[i] = .{ .sequence = e.sequence, .time_ns = e.time_ns, .tid = e.tid, .kind = @enumFromInt(e.kind), .detail = e.detail, .pc = e.pc, .pc_known = e.pc_known != 0, .address = e.address, .before = e.before, .after = e.after, .size = e.size, .other_threads_running = e.other_threads_running, .trap_pc = if (e.has_trap) e.trap_pc else null, .trap_address = if (e.has_trap) e.trap_address else null, .trap_code = if (e.has_trap) e.trap_code else null, .watch_phase = @enumFromInt(e.watch_phase), .watch_attribution = @enumFromInt(e.watch_attribution), .before_valid = e.before_valid, .after_valid = e.after_valid };
             }
             @constCast(self).cached_sequence = v.sequence;
             @constCast(self).cached_events = v.event_count;
@@ -385,7 +390,7 @@ pub const Target = struct {
         const t = self.threadSlice()[index_];
         if (t.state != .stopped) return error.NotStopped;
         var result = StopInfo{ .tid = tid, .reason = t.reason, .signal = t.signal, .signal_name = signalName(t.signal), .read_only = self.core != null, .pending_delivery = self.core == null and t.signal != 0 };
-        result.pc = programCounter(try self.registers(tid));
+        result.pc = try programCounter(try self.registers(tid));
         if (self.core) |*core| {
             // Linux supplies signal info for the dumping thread; GDB may
             // also emit per-thread records. Keep the note's thread association.
@@ -458,9 +463,9 @@ test "launch, inspect executable bytes, resume, discover clone, interrupt, clean
     try target.launch(&.{"./zig-out/bin/xodb-fixture"});
     try std.testing.expectEqual(State.stopped, target.snapshot().state);
     const regs = try target.registers(target.snapshot().pid);
-    try std.testing.expect(programCounter(regs) != 0 and stackPointer(regs) != 0);
+    try std.testing.expect(try programCounter(regs) != 0 and try stackPointer(regs) != 0);
     var bytes: [32]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 32), try target.readMemory(programCounter(regs), &bytes));
+    try std.testing.expectEqual(@as(usize, 32), try target.readMemory(try programCounter(regs), &bytes));
     try std.testing.expectError(error.MemoryUnreadable, target.readMemory(1, &bytes));
     try target.continueExecution();
     try std.testing.expectError(error.NotStopped, target.registers(target.snapshot().pid));
@@ -640,15 +645,15 @@ test "persistent software breakpoint rearm, original bytes, and single step" {
     try target.continueExecution();
     try target.waitStopped();
     try std.testing.expectEqual(bp.StopReason.breakpoint, target.threadSlice()[0].reason);
-    try std.testing.expectEqual(start.named("rsi").?, programCounter(try target.registers(target.snapshot().pid)));
+    try std.testing.expectEqual(start.named("rsi").?, try programCounter(try target.registers(target.snapshot().pid)));
     try target.singleStep(target.snapshot().pid);
     try target.waitStopped();
     try std.testing.expectEqual(bp.StopReason.single_step, target.threadSlice()[0].reason);
-    try std.testing.expect(programCounter(try target.registers(target.snapshot().pid)) != start.named("rsi").?);
+    try std.testing.expect(try programCounter(try target.registers(target.snapshot().pid)) != start.named("rsi").?);
     try target.continueExecution();
     try target.waitStopped();
     try std.testing.expectEqual(bp.StopReason.breakpoint, target.threadSlice()[0].reason);
-    try std.testing.expectEqual(start.named("rsi").?, programCounter(try target.registers(target.snapshot().pid)));
+    try std.testing.expectEqual(start.named("rsi").?, try programCounter(try target.registers(target.snapshot().pid)));
     try target.removeBreakpoint(id);
     try target.continueExecution();
     const deadline = now() + 2_000_000_000;
@@ -853,10 +858,10 @@ test "first instruction step after exec consumes the syscall completion trap" {
     defer target.deinit();
     try target.launch(&.{"./zig-out/bin/xodb-m1-fixture"});
     try std.testing.expectEqual(bp.StopReason.exec, target.threadSlice()[0].reason);
-    const entry = programCounter(try target.registers(target.snapshot().pid));
+    const entry = try programCounter(try target.registers(target.snapshot().pid));
     try target.singleStep(target.snapshot().pid);
     try target.waitStopped();
     try std.testing.expectEqual(bp.StopReason.single_step, target.threadSlice()[0].reason);
     try std.testing.expectEqual(@as(c_int, 0), target.threadSlice()[0].signal);
-    try std.testing.expect(programCounter(try target.registers(target.snapshot().pid)) != entry);
+    try std.testing.expect(try programCounter(try target.registers(target.snapshot().pid)) != entry);
 }

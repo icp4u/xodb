@@ -88,7 +88,26 @@ static void event(struct xrt_codec *c, struct xrt_event *e)
     i32(c, &e->tid);
     ENUM(e->kind, XRT_EVENT_PROCESS_SEPARATED);
     i64(c, &e->detail);
-    U64(e->pc);
+    uint64_t pc = 0;
+    uint8_t known = 0;
+    if (!c->read) {
+        known = e->pc_known;
+        if (known > 1) {
+            c->ok = false;
+            return;
+        }
+        pc = known ? e->pc : 0;
+    }
+    U64(pc);
+    U8(known);
+    if (c->read) {
+        if (known > 1) {
+            c->ok = false;
+            return;
+        }
+        e->pc_known = known;
+        e->pc = known ? pc : 0;
+    }
     U64(e->address);
     U64(e->before);
     U64(e->after);
@@ -121,12 +140,54 @@ void xrt_wire_birth(struct xrt_codec *c, struct xrt_birth *b)
         debug(c, &b->saved_debug);
     i32(c, &b->vm_errno);
 }
+static int zero_bytes(const uint8_t *bytes, size_t size)
+{
+    for (size_t i = 0; i < size; ++i)
+        if (bytes[i])
+            return 0;
+    return 1;
+}
+static int breakpoint_consistent(const struct xrt_arch *arch, const struct xrt_breakpoint *p)
+{
+    if (p->pending)
+        return !p->width && !p->isa_mode && !p->alignment && !p->patched && !p->address &&
+               zero_bytes(p->planted, 4) && zero_bytes(p->original, 4);
+    if (p->width < 1 || p->width > 4)
+        return 0;
+    if (p->isa_mode != XRT_ISA_MODE_ORDINARY && p->isa_mode != XRT_ISA_MODE_ARM &&
+        p->isa_mode != XRT_ISA_MODE_THUMB)
+        return 0;
+    if (p->alignment != 1 && p->alignment != 2 && p->alignment != 4)
+        return 0;
+    if (!p->address || p->address % p->alignment)
+        return 0;
+    if (!arch || !xrt_arch_breakpoint_valid(arch->machine, p->address, p->width))
+        return 0;
+    if (!zero_bytes(p->planted + p->width, (size_t)(4 - p->width)))
+        return 0;
+    if (p->patched && !p->enabled)
+        return 0;
+    for (uint8_t i = 0; arch->probes && i < arch->probe_count; ++i) {
+        const struct xrt_probe_choice *choice = &arch->probes[i];
+        if (choice->width == p->width && choice->isa_mode == p->isa_mode &&
+            choice->alignment == p->alignment && memcmp(choice->bytes, p->planted, p->width) == 0)
+            return 1;
+    }
+    return 0;
+}
 void xrt_wire_target(struct xrt_codec *c, struct xrt_target *t)
 {
-    uint16_t machine = c->read ? 0 : (t->arch ? t->arch->machine : 0);
-    U16(machine);
+    struct xrt_abi_id abi = {0};
+    if (!c->read && t->arch)
+        abi = xrt_arch_abi(t->arch);
+    U16(abi.machine);
+    U8(abi.elf_class);
+    U8(abi.little_endian);
+    U8(abi.address_bits);
+    U8(abi.linux_abi);
+    U8(abi.isa_mode);
     if (c->read) {
-        t->arch = xrt_arch_get(machine);
+        t->arch = xrt_arch_resolve(abi);
         if (!t->arch)
             c->ok = false;
     }
@@ -170,6 +231,12 @@ void xrt_wire_target(struct xrt_codec *c, struct xrt_target *t)
         BOOL(p->pending);
         BOOL(p->internal);
         BOOL(p->temporary);
+        U8(p->width);
+        U8(p->isa_mode);
+        U8(p->alignment);
+        xrt_codec_bytes(c, p->planted, sizeof(p->planted));
+        if (c->ok && !breakpoint_consistent(t->arch, p))
+            c->ok = false;
         if (c->read && (!p->id || p->id >= t->next_probe_id))
             c->ok = false;
     }
@@ -193,21 +260,60 @@ void xrt_wire_target(struct xrt_codec *c, struct xrt_target *t)
 }
 void xrt_wire_registers(struct xrt_codec *c, struct xrt_registers *r)
 {
-    U16(r->machine);
-    const struct xrt_arch *arch = xrt_arch_get(r->machine);
+    struct xrt_registers local = {0};
+    if (!r) {
+        c->ok = false;
+        return;
+    }
+    if (!c->read)
+        local = *r;
+    U16(local.abi.machine);
+    U8(local.abi.elf_class);
+    U8(local.abi.little_endian);
+    U8(local.abi.address_bits);
+    U8(local.abi.linux_abi);
+    U8(local.abi.isa_mode);
+    uint8_t layout = c->read ? 0 : (uint8_t)XRT_ROW_LAYOUT;
+    U8(layout);
+    if (!c->ok || layout != XRT_ROW_LAYOUT) {
+        c->ok = false;
+        return;
+    }
+    const struct xrt_arch *arch = xrt_arch_resolve(local.abi);
     if (!arch) {
         c->ok = false;
         return;
     }
     for (unsigned i = 0; i < arch->register_count && c->ok; ++i) {
         uint64_t value = 0;
-        void *field = (uint8_t *)&r->values + arch->registers[i].snapshot_offset;
+        unsigned char *field =
+            (unsigned char *)&local.values + arch->registers[i].snapshot_offset;
         if (!c->read)
             memcpy(&value, field, 8);
         U64(value);
         if (c->ok && c->read)
             memcpy(field, &value, 8);
     }
+    U8(local.absent_count);
+    if (local.absent_count > XRT_ABSENT_MAX) {
+        c->ok = false;
+        return;
+    }
+    for (uint8_t i = 0; i < local.absent_count && c->ok; ++i)
+        U16(local.absent_id[i]);
+    U8(local.unknown_count);
+    if (local.unknown_count > XRT_ABSENT_MAX) {
+        c->ok = false;
+        return;
+    }
+    for (uint8_t i = 0; i < local.unknown_count && c->ok; ++i)
+        U16(local.unknown_id[i]);
+    if (!c->ok || xrt_registers_validate(arch, &local) != XRT_OK) {
+        c->ok = false;
+        return;
+    }
+    if (c->read)
+        *r = local;
 }
 void xrt_wire_xstate(struct xrt_codec *c, struct xrt_xstate *s)
 {

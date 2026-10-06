@@ -305,6 +305,24 @@ pub const Session = struct {
         self.next_observation_archive += 1;
         return self.observation_archive.?.id;
     }
+    /// Starts the single retained cohort comparison for the current ended
+    /// capture. MCP `compare_observation` and the GUI share this operation;
+    /// callers perform their own authorization first.
+    pub fn compareObservation(self: *Session, selection: @import("../observe/comparison.zig").Selection) !u64 {
+        const capture = self.observations.capture orelse return error.NoObservation;
+        if (!capture.store.finished or self.observations.busy()) return error.ObservationStillCollecting;
+        if (self.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
+        try selection.validate();
+        if (self.observation_analysis) |job| {
+            if (!job.done.load(.acquire)) return error.ObservationAnalysisBusy;
+            job.deinit();
+            self.observation_analysis = null;
+        }
+        self.observation_analysis = try @import("../observe/analysis.zig").Job.create(self.next_observation_analysis, capture, selection);
+        capture.comparison_selection = selection;
+        self.next_observation_analysis += 1;
+        return self.observation_analysis.?.id;
+    }
     pub fn openObservation(self: *Session, path: []const u8) !void {
         const failed_open = if (self.observation_archive) |job| job.kind == .open and job.done.load(.acquire) and job.err != null else false;
         if (self.target.snapshot().pid != 0 or (self.offline and !failed_open) or self.profile != null or self.observations.capture != null or self.observations.busy()) return error.ConflictingTargets;
@@ -949,7 +967,8 @@ pub const Session = struct {
         var reached = false;
         for (self.target.threadSlice()) |thread| if (thread.tid == run.tid and thread.id == run.thread_id and thread.reason == .breakpoint and thread.breakpoint_address == run.address) {
             const regs = try self.target.registers(thread.tid);
-            reached = run.expected_sp == null or linux.stackPointer(regs) == run.expected_sp.?;
+            const sp = linux.stackPointer(regs) catch null;
+            reached = run.expected_sp == null or (sp != null and sp.? == run.expected_sp.?);
         };
         if (reached or run.cancelled or !filtered) {
             if (run.owns_probe) self.target.removeBreakpoint(run.probe) catch |err| {
@@ -980,7 +999,7 @@ pub const Session = struct {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const regs = try self.target.registers(tid);
-        const site = try self.sourceAt(arena.allocator(), linux.programCounter(regs));
+        const site = try self.sourceAt(arena.allocator(), try linux.programCounter(regs));
         if (site.path.len > 4096) return error.SourcePathTooLong;
         var step = SourceStep{ .tid = tid, .line = site.line, .path = undefined, .path_len = site.path.len, .over = over };
         @memcpy(step.path[0..site.path.len], site.path);
@@ -1001,11 +1020,12 @@ pub const Session = struct {
         if (step.over) {
             const regs = try self.target.registers(step.tid);
             var bytes: [16]u8 = undefined;
-            const n = try self.target.readMemory(linux.programCounter(regs), &bytes);
+            const pc = try linux.programCounter(regs);
+            const n = try self.target.readMemory(pc, &bytes);
             var instructions: [1]@import("disassembly.zig").Instruction = undefined;
-            const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], linux.programCounter(regs), &instructions);
+            const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], pc, &instructions);
             if (count == 1 and instructions[0].flow == .call) {
-                const address = linux.programCounter(regs) + instructions[0].size;
+                const address = pc + instructions[0].size;
                 var user_breakpoint = false;
                 for (self.target.breakpointSlice()) |probe| {
                     if (probe.address == address and !probe.temporary) user_breakpoint = true;
@@ -1029,7 +1049,7 @@ pub const Session = struct {
         };
         if (live != 1) return false;
         const regs = try self.target.registers(step.tid);
-        const pc = linux.programCounter(regs);
+        const pc = try linux.programCounter(regs);
         var bytes: [256]u8 = undefined;
         const n = self.target.readMemory(pc, &bytes) catch return false;
         var instructions: [64]@import("disassembly.zig").Instruction = undefined;
@@ -1152,7 +1172,7 @@ pub const Session = struct {
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
             const regs = try self.target.registers(step.tid);
-            if (self.sourceAt(arena.allocator(), linux.programCounter(regs))) |site| {
+            if (self.sourceAt(arena.allocator(), try linux.programCounter(regs))) |site| {
                 if (site.line != step.line or !std.mem.eql(u8, site.path, step.path[0..step.path_len])) {
                     self.source_step = null;
                     return;
@@ -1169,11 +1189,12 @@ pub const Session = struct {
         self.suppress_probe_resume = true;
         const regs = try self.target.registers(tid);
         var bytes: [16]u8 = undefined;
-        const n = try self.target.readMemory(linux.programCounter(regs), &bytes);
+        const pc = try linux.programCounter(regs);
+        const n = try self.target.readMemory(pc, &bytes);
         var instructions: [1]@import("disassembly.zig").Instruction = undefined;
-        const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], linux.programCounter(regs), &instructions);
+        const count = try @import("disassembly.zig").decodeFlowFor(self.target.arch(), bytes[0..n], pc, &instructions);
         if (count == 1 and instructions[0].flow == .call) {
-            _ = try self.target.setBreakpoint(linux.programCounter(regs) + instructions[0].size, true);
+            _ = try self.target.setBreakpoint(pc + instructions[0].size, true);
             try self.target.continueExecution();
             self.stepping_over = true;
         } else try self.target.singleStep(tid);

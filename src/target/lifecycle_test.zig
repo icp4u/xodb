@@ -114,7 +114,7 @@ test "lifecycle: exited leader permits worker memory, maps, watchpoints and deta
     try equal(linux.State.stopped, target.snapshot().state);
     const worker = try target.stoppedTid();
     try expect(worker != pid);
-    try expect(linux.programCounter(try target.registers(worker)) != 0);
+    try expect(try linux.programCounter(try target.registers(worker)) != 0);
     try session.refreshMaps();
     const symbol = try session.modules.findSymbol("xodb_marker");
     var bytes: [8]u8 = undefined;
@@ -205,7 +205,7 @@ test "lifecycle: attaching after leader exit inspects surviving workers" {
     try expect(worker != pid);
     const regs = try target.registers(worker);
     var bytes: [8]u8 = undefined;
-    try equal(@as(usize, 8), try target.readMemory(linux.programCounter(regs), &bytes));
+    try equal(@as(usize, 8), try target.readMemory(try linux.programCounter(regs), &bytes));
     try target.continueExecution();
     try target.interrupt();
     try target.waitStopped();

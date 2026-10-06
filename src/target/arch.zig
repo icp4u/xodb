@@ -21,13 +21,21 @@ pub const Arch = enum(u16) {
         return if (self.descriptor().little_endian != 0) .little else .big;
     }
     pub fn pc(self: Arch) usize {
-        return self.descriptor().pc;
+        const reg = c.xrt_arch_role(self.descriptor(), c.XRT_ROLE_PC) orelse return 0;
+        return reg.*.dwarf;
     }
     pub fn sp(self: Arch) usize {
-        return self.descriptor().sp;
+        const reg = c.xrt_arch_role(self.descriptor(), c.XRT_ROLE_SP) orelse return 0;
+        return reg.*.dwarf;
     }
+    /// Dense DWARF index used by unwind. x86 16 and m68k 24 are historical
+    /// numbers; m68k 24 is the PC, not a link-register role.
     pub fn ra(self: Arch) usize {
-        return self.descriptor().ra;
+        return switch (self) {
+            .x86_64 => 16,
+            .m68k => 24,
+            .aarch64 => 30,
+        };
     }
     pub fn count(self: Arch) usize {
         return self.descriptor().dwarf_count;

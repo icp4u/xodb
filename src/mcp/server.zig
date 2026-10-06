@@ -329,7 +329,7 @@ pub const Server = struct {
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
             const regs = try session.target.registers(@intCast(tid));
             var values: std.json.ObjectMap = .{};
-            for (regs.descriptions()) |desc| try values.put(a, std.mem.span(desc.name), .{ .string = try std.fmt.allocPrint(a, "0x{x}", .{regs.value(desc)}) });
+            for (regs.descriptions()) |desc| try values.put(a, std.mem.span(desc.name), .{ .string = try @import("../target/runtime.zig").registerText(a, regs, desc) });
             return asValue(a, .{ .generation = session.target.snapshot().generation, .tid = tid, .registers = Value{ .object = values } });
         }
         if (std.mem.eql(u8, name, "read_memory")) {

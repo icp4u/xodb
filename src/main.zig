@@ -51,6 +51,7 @@ pub fn main(init: std.process.Init) !void {
     var observation_recipe: ?[:0]const u8 = null;
     var observation_out: ?[:0]const u8 = null;
     var open_observation: ?[:0]const u8 = null;
+    var browse_observation: ?[:0]const u8 = null;
     var observation_threshold: ?u64 = null;
     var symbols: ?[:0]const u8 = null;
     var debug_files: std.ArrayList([:0]const u8) = .empty;
@@ -98,6 +99,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--open-profile FILE opens an imported simpleperf JSON profile (see scripts/import-simpleperf).
                 \\--observe-recipe FILE --observation-out FILE runs a bounded headless function investigation and saves .xoi evidence.
                 \\--open-observation FILE reopens .xoi and prints cohorts; add --mcp for immutable agent queries.
+                \\--browse-observation FILE opens .xoi in the GUI invocation/cohort browser (N reopens it).
                 \\--observation-threshold-ns N overrides the fast/slow wall-duration threshold (see docs/OBSERVATIONS.md).
                 \\--open-capture FILE opens an offline archive; --symbols DIR optionally loads SHA-256-named ELF assets.
                 \\--compare-capture BASE with --open-capture AFTER compares recorded CPU sample shares; V switches views.
@@ -111,7 +113,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -123,6 +125,7 @@ pub fn main(init: std.process.Init) !void {
                 open_observation = args[i];
                 headless = true;
             }
+            if (std.mem.eql(u8, arg, "--browse-observation")) browse_observation = args[i];
             if (std.mem.eql(u8, arg, "--observation-threshold-ns")) observation_threshold = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
             if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
@@ -158,11 +161,12 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnknownArgument;
     }
     if (observation_recipe != null) {
-        if (observation_out == null or open_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
+        if (observation_out == null or open_observation != null or browse_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
         if (launch.len == 0 and attach == null) return error.ObservationRecipeRequiresTarget;
     } else if (observation_out != null) return error.ObservationOutputRequiresRecipe;
-    if (open_observation != null and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
-    if (observation_threshold != null and observation_recipe == null and open_observation == null) return error.ObservationThresholdRequiresInvestigation;
+    if (browse_observation != null and (open_observation != null or headless)) return error.BrowseObservationRequiresGui;
+    if ((open_observation != null or browse_observation != null) and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
+    if (observation_threshold != null and observation_recipe == null and open_observation == null and browse_observation == null) return error.ObservationThresholdRequiresInvestigation;
     if (observation_threshold != null and (mcp or session_socket != null)) return error.ObservationThresholdUseMcpComparison;
     if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
@@ -286,6 +290,8 @@ pub fn main(init: std.process.Init) !void {
         try @import("observe/cli.zig").run(a, session, path, observation_out.?, observation_threshold, &quitting);
         return;
     }
+    // The GUI browser never waits here: the view reports the open worker.
+    if (browse_observation) |path| try session.openObservation(path);
     if (open_observation) |path| {
         try @import("observe/cli.zig").open(a, session, path, observation_threshold, mcp or shared != null, &quitting);
         if (!mcp and shared == null) return;
@@ -332,6 +338,8 @@ pub fn main(init: std.process.Init) !void {
         var last_tree_revision: u64 = 0;
         workspace.show_profile = open_capture != null;
         workspace.comparison.open = compare_capture != null;
+        workspace.invocations.open = browse_observation != null;
+        workspace.invocations.threshold_ns = observation_threshold;
         if (open_capture != null) workspace.status = "Opening capture archive";
         if (core_file != null) workspace.status = "Read-only core dump; execution and mutation are disabled";
         var archive_status: [512]u8 = undefined;
@@ -564,6 +572,7 @@ test {
         std.testing.refAllDecls(@import("ui/timeline.zig"));
         std.testing.refAllDecls(@import("ui/capture_setup.zig"));
         std.testing.refAllDecls(@import("ui/capture_panel.zig"));
+        _ = @import("ui/invocations.zig");
     }
     std.testing.refAllDecls(@import("model/session.zig"));
     _ = @import("target/process_test.zig");

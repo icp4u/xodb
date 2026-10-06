@@ -106,6 +106,96 @@ static void files(struct xrt_target *t, const char *self)
     assert(read(fd, boot, sizeof(boot)) == 37);
     close(fd);
 }
+static int pending_clear(const struct xrt_breakpoint *probe)
+{
+    const uint8_t zero[4] = {0};
+    return probe->pending && !probe->address && !probe->width && !probe->isa_mode &&
+           !probe->alignment && !probe->patched && !memcmp(probe->planted, zero, 4) &&
+           !memcmp(probe->original, zero, 4);
+}
+static struct xrt_breakpoint breakpoint_of(struct xrt_target *t, uint64_t id)
+{
+    struct xrt_target_view current = view(t);
+    for (size_t i = 0; i < current.breakpoint_count; ++i)
+        if (current.breakpoints[i].id == id)
+            return current.breakpoints[i];
+    assert(0);
+    return (struct xrt_breakpoint){0};
+}
+static void architecture_agent(struct xrt_target *t, int32_t pid)
+{
+    assert(xrt_rpc_classify(XRT_RPC_ALLOCATIONS_START) == XRT_RPC_CLASS_PERF);
+    assert(xrt_rpc_classify(XRT_RPC_FUNCTION_START) == XRT_RPC_CLASS_PERF);
+    assert(xrt_rpc_classify(XRT_RPC_CONTROL_WRITE) == XRT_RPC_CLASS_MUTATION);
+    assert(xrt_rpc_classify(55) == XRT_RPC_CLASS_PROTOCOL);
+    uint64_t packed = 1;
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = 55, .value = &packed}) == XRT_PROTOCOL_ERROR);
+    struct xrt_registers regs;
+    OK(xrt_target_registers(t, pid, &regs));
+    uint64_t pc = 0;
+    OK(xrt_registers_pc(&regs, &pc));
+    uint64_t id = 0;
+    OK(xrt_target_breakpoint_reserve(t, &id));
+    struct xrt_breakpoint pending = breakpoint_of(t, id);
+    assert(pending.enabled && pending_clear(&pending));
+    OK(xrt_target_breakpoint_resolve(t, id, (uintptr_t)marker));
+    struct xrt_breakpoint planted = breakpoint_of(t, id);
+    assert(!planted.pending && planted.patched && planted.width == xrt_arch_native()->trap_size);
+    OK(xrt_target_breakpoint_enable(t, id, false));
+    planted = breakpoint_of(t, id);
+    assert(!planted.pending && !planted.patched && !planted.enabled && planted.width &&
+           planted.planted[0] == xrt_arch_native()->trap[0]);
+    OK(xrt_target_breakpoint_withdraw(t, id));
+    pending = breakpoint_of(t, id);
+    assert(!pending.enabled && pending_clear(&pending));
+    OK(xrt_target_breakpoint_resolve(t, id, (uintptr_t)marker));
+    planted = breakpoint_of(t, id);
+    assert(!planted.pending && !planted.patched && planted.width);
+    OK(xrt_target_breakpoint_remove(t, id));
+    OK(xrt_target_breakpoint_restore(t, id, false));
+    pending = breakpoint_of(t, id);
+    assert(pending.id == id && !pending.enabled && pending_clear(&pending));
+    OK(xrt_target_breakpoint_remove(t, id));
+    struct xrt_control_request one = {.count = 1, .value = {pc}};
+    OK(xrt_target_control_write(t, pid, &one));
+    assert(t->last_mutation.issued == 1 && t->last_mutation.confirmed == 1);
+    struct xrt_control_request two = {.count = 2, .value = {pc, pc}};
+    assert(xrt_target_control_write(t, pid, &two) == XRT_UNSUPPORTED_CONTROL);
+    assert(!t->last_mutation.issued && !t->last_mutation.confirmed);
+    uint8_t body[8];
+    uint64_t word = pc;
+    struct xrt_codec encoded = xrt_codec(body, sizeof(body), false);
+    xrt_codec_u64(&encoded, &word);
+    assert(encoded.ok);
+    const uint64_t generation = t->generation;
+    t->generation = generation - 1;
+    packed = 99;
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_CONTROL_WRITE,
+                                                  .args = {(uint64_t)pid, 1, 0},
+                                                  .data = body,
+                                                  .size = 8,
+                                                  .value = &packed}) == XRT_STALE_SNAPSHOT);
+    assert(packed == 0 && t->generation == generation);
+    packed = 99;
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_CONTROL_WRITE,
+                                                  .args = {(uint64_t)pid, 0, 0},
+                                                  .value = &packed}) == XRT_INVALID_ARGUMENT);
+    assert(packed == 0);
+    packed = 99;
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_CONTROL_WRITE,
+                                                  .args = {(uint64_t)pid, 1, 1},
+                                                  .data = body,
+                                                  .size = 8,
+                                                  .value = &packed}) == XRT_INVALID_ARGUMENT);
+    assert(packed == 0);
+    packed = 99;
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_CONTROL_WRITE,
+                                                  .args = {(uint64_t)pid, 1, 0},
+                                                  .data = body,
+                                                  .size = 3,
+                                                  .value = &packed}) == XRT_INVALID_ARGUMENT);
+    assert(packed == 0);
+}
 static void probes(const char *agent, const char *self)
 {
     const char *transport[] = {agent, "--stdio", NULL};
@@ -126,12 +216,13 @@ static void probes(const char *agent, const char *self)
     const uint64_t address = (uintptr_t)marker;
     struct xrt_registers regs;
     OK(xrt_target_registers(t, pid, &regs));
-    assert(regs.machine == xrt_arch_native()->machine);
-    if (regs.machine == XRT_X86_64) {
+    assert(regs.abi.machine == xrt_arch_native()->machine);
+    if (regs.abi.machine == XRT_X86_64) {
         struct xrt_xstate x;
         OK(xrt_target_extended(t, pid, &x));
         assert(x.vector_count >= 16);
     }
+    architecture_agent(t, pid);
     uint64_t bp, watch;
     OK(xrt_target_breakpoint_set(t, address, false, &bp));
     uint8_t overlaid[4], original[4];

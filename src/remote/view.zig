@@ -3,7 +3,7 @@ pub const Source = struct { path: []const u8, text: []const u8, truncated: bool 
 pub const Site = struct { path: []const u8, line: u32 };
 pub const Frame = struct { index: usize, pc: u64, symbol: ?[]const u8 = null, source: ?Site = null, diagnostic: ?[]const u8 = null };
 pub const Thread = struct { id: u64, tid: i32, state: []const u8, reason: []const u8 };
-pub const Register = struct { name: []const u8, value: u64 };
+pub const Register = struct { name: []const u8, value: ?u64 };
 pub const Local = struct { name: []const u8, type: []const u8, display: []const u8, availability: []const u8, address: ?u64 = null, size: u64 = 0 };
 pub const Instruction = struct { address: u64, mnemonic: []const u8, operands: []const u8 };
 pub const Breakpoint = struct { id: u64, address: u64, source: ?Site = null };

@@ -5,6 +5,7 @@
 #include "perf_remote.h"
 #include "xrt_remote.h"
 #include "xrt_uprobes.h"
+#include "target_internal.h"
 #include "../profile/allocation_broker.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -499,8 +500,14 @@ bool xrt_functions_capture_scope(const struct xrt_target *t, const int32_t *tids
         xrt_perf_fail(f, "scope", EINVAL, -1, "invalid function scope request");
         return false;
     }
-    const struct xrt_arch *arch = xrt_target_arch(t);
-    if (!arch || arch->machine != XRT_X86_64) {
+    const struct xrt_abi_id x86_64 = {.machine = XRT_X86_64,
+                                      .elf_class = XRT_ELF_CLASS_64,
+                                      .little_endian = 1,
+                                      .address_bits = 64,
+                                      .linux_abi = XRT_LINUX_ABI_NATIVE,
+                                      .isa_mode = XRT_ISA_MODE_ORDINARY};
+    const struct xrt_arch *row = xrt_arch_resolve(x86_64);
+    if (!row || !t->identity_admitted || t->arch != row) {
         xrt_perf_fail(f, "functions.architecture", ENOTSUP, -1,
                       "function uprobes currently require Linux x86-64");
         return false;

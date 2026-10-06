@@ -52,8 +52,11 @@ static void headers(void)
                           out = {0};
     uint8_t b[32];
     assert(xrt_wire_header_encode(&f, b));
-    assert(!memcmp(b, "XRT1\0\1\0\7", 8));
+    assert(!memcmp(b, "XRT1\0\2\0\7", 8));
     assert(xrt_wire_header_decode(b, &out));
+    b[5] = 1;
+    assert(!xrt_wire_header_decode(b, &out));
+    b[5] = 2;
     assert(out.request == f.request && out.target == 5 && out.size == 6 && out.flags == 1);
     for (size_t i = 0; i < 6; ++i) {
         uint8_t old = b[i];

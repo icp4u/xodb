@@ -15,22 +15,85 @@ int xrt_breakpoint_index(const struct xrt_target *t, uint64_t id)
             return (int)i;
     return -1;
 }
-enum xrt_status xrt_patch_instruction_tid(const struct xrt_target *t, int32_t tid, uint64_t address,
-                                          const uint8_t *bytes)
+enum xrt_status xrt_target_patch_span(struct xrt_target *t, int32_t tid, uint64_t address,
+                                      const uint8_t *bytes, size_t width, size_t *accepted)
 {
-    if (!t->arch || !xrt_arch_breakpoint_valid(t->arch->machine, address, t->arch->trap_size))
+    if (!accepted)
+        return XRT_INVALID_ARGUMENT;
+    *accepted = 0;
+    if (!t || !bytes || width < 1 || width > 4 || address > UINT64_MAX - width)
+        return XRT_INVALID_ARGUMENT;
+    if (t->patch)
+        return t->patch(t->patch_ctx, tid, address, bytes, width, accepted);
+    return xrt_memory_patch(tid, address, bytes, width, accepted);
+}
+enum xrt_status xrt_patch_instruction_tid(struct xrt_target *t, int32_t tid, uint64_t address,
+                                          const uint8_t *bytes, size_t width)
+{
+    if (!t->arch || !xrt_arch_breakpoint_valid(t->arch->machine, address, width))
         return XRT_INVALID_BREAKPOINT_ADDRESS;
     size_t count = 0;
-    const enum xrt_status result =
-        xrt_memory_patch(tid, address, bytes, t->arch->trap_size, &count);
-    return result != XRT_OK && count ? XRT_PARTIAL_MEMORY_WRITE : result;
+    const enum xrt_status result = xrt_target_patch_span(t, tid, address, bytes, width, &count);
+    if (result == XRT_OK && count == width)
+        return XRT_OK;
+    return count ? XRT_PARTIAL_MEMORY_WRITE : result;
 }
-enum xrt_status xrt_patch_instruction(const struct xrt_target *t, uint64_t address,
-                                      const uint8_t *bytes)
+enum xrt_status xrt_patch_instruction(struct xrt_target *t, uint64_t address, const uint8_t *bytes,
+                                      size_t width)
 {
     int32_t tid;
     TRY(xrt_target_stopped_tid(t, &tid));
-    return xrt_patch_instruction_tid(t, tid, address, bytes);
+    return xrt_patch_instruction_tid(t, tid, address, bytes, width);
+}
+enum xrt_status xrt_target_commit_plant(struct xrt_target *t, uint64_t address,
+                                        const struct xrt_probe_encoding *encoding,
+                                        const uint8_t original[4])
+{
+    if (!t || !encoding || !original)
+        return XRT_INVALID_ARGUMENT;
+    if (!t->identity_admitted)
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    if (t->plant_cleanup.active)
+        return XRT_INVALID_STATE;
+    if (encoding->width < 1 || encoding->width > 4)
+        return XRT_INVALID_ARGUMENT;
+    int32_t tid;
+    TRY(xrt_target_stopped_tid(t, &tid));
+    size_t accepted = 0;
+    const enum xrt_status status =
+        xrt_target_patch_span(t, tid, address, encoding->bytes, encoding->width, &accepted);
+    if (status == XRT_OK && accepted == encoding->width)
+        return XRT_OK;
+    if (!accepted)
+        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
+    size_t restored = 0;
+    const enum xrt_status back =
+        xrt_target_patch_span(t, tid, address, original, accepted, &restored);
+    if (back == XRT_OK && restored == accepted)
+        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
+    t->plant_cleanup.active = 1;
+    t->plant_cleanup.address = address;
+    t->plant_cleanup.width = encoding->width;
+    memcpy(t->plant_cleanup.original, original, 4);
+    return XRT_PARTIAL_MEMORY_WRITE;
+}
+enum xrt_status xrt_target_retry_plant_cleanup(struct xrt_target *t)
+{
+    if (!t || !t->plant_cleanup.active)
+        return XRT_OK;
+    if (!t->identity_admitted)
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    int32_t tid;
+    TRY(xrt_target_stopped_tid(t, &tid));
+    size_t accepted = 0;
+    const enum xrt_status status = xrt_target_patch_span(
+        t, tid, t->plant_cleanup.address, t->plant_cleanup.original, t->plant_cleanup.width,
+        &accepted);
+    if (status == XRT_OK && accepted == t->plant_cleanup.width) {
+        t->plant_cleanup.active = 0;
+        return XRT_OK;
+    }
+    return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
 }
 enum xrt_status xrt_target_read(const struct xrt_target *t, uint64_t address, void *out,
                                 size_t size, size_t *count)
@@ -58,9 +121,9 @@ enum xrt_status xrt_target_read(const struct xrt_target *t, uint64_t address, vo
     uint8_t *bytes = out;
     for (size_t b = 0; b < t->breakpoint_count; ++b) {
         const struct xrt_breakpoint *p = &t->breakpoints[b];
-        if (!p->patched)
+        if (!p->patched || !p->width)
             continue;
-        for (size_t i = 0; i < t->arch->trap_size; ++i) {
+        for (size_t i = 0; i < p->width; ++i) {
             const uint64_t at = p->address + i;
             if (at >= address && at - address < *count)
                 bytes[at - address] = p->original[i];
@@ -94,12 +157,12 @@ enum xrt_status xrt_target_write(struct xrt_target *t, uint64_t address, const v
         struct xrt_breakpoint *overlay = NULL;
         for (size_t i = 0; i < t->breakpoint_count; ++i) {
             struct xrt_breakpoint *p = &t->breakpoints[i];
-            if (at >= p->address && at - p->address < t->arch->trap_size) {
+            if (p->patched && p->width && at >= p->address && at - p->address < p->width) {
                 overlay = p;
                 break;
             }
         }
-        if (!overlay || !overlay->patched) {
+        if (!overlay) {
             size_t count;
             result = xrt_memory_patch(tid, at, &bytes[written], 1, &count);
             if (result != XRT_OK) {
@@ -117,16 +180,57 @@ enum xrt_status xrt_target_write(struct xrt_target *t, uint64_t address, const v
     }
     return result;
 }
-static enum xrt_status original_instruction(struct xrt_target *t, uint64_t address,
-                                            uint8_t bytes[4])
+static enum xrt_status admitted_native(const struct xrt_target *t)
 {
-    if (!address || !xrt_arch_breakpoint_valid(t->arch->machine, address, t->arch->trap_size))
-        return XRT_INVALID_BREAKPOINT_ADDRESS;
-    size_t count;
-    TRY(xrt_target_read(t, address, bytes, t->arch->trap_size, &count));
-    if (count != t->arch->trap_size)
-        return XRT_MEMORY_UNREADABLE;
-    return memcmp(bytes, t->arch->trap, count) == 0 ? XRT_EXISTING_TRAP_INSTRUCTION : XRT_OK;
+    if (!t || !t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    return XRT_OK;
+}
+static enum xrt_status prepare_probe(struct xrt_target *t, uint64_t address, uint8_t original[4],
+                                     struct xrt_probe_encoding *encoding)
+{
+    uint8_t raw[4] = {0};
+    size_t count = 0;
+    const enum xrt_status read = xrt_target_read(t, address, raw, sizeof(raw), &count);
+    if (read != XRT_OK)
+        return read;
+    const struct xrt_probe_request request = {.address = address,
+                                              .isa_mode = t->arch->isa_mode,
+                                              .bytes = raw,
+                                              .size = count};
+    const enum xrt_status prepared = xrt_arch_probe_prepare(t->arch, &request, encoding);
+    if (prepared != XRT_OK)
+        return prepared;
+    if (count >= encoding->width && memcmp(raw, encoding->bytes, encoding->width) == 0)
+        return XRT_EXISTING_TRAP_INSTRUCTION;
+    memset(original, 0, 4);
+    memcpy(original, raw, encoding->width);
+    return XRT_OK;
+}
+static void store_encoding(struct xrt_breakpoint *p, uint64_t address, const uint8_t original[4],
+                           const struct xrt_probe_encoding *encoding, bool patched)
+{
+    p->address = address;
+    p->width = encoding->width;
+    p->isa_mode = encoding->isa_mode;
+    p->alignment = encoding->alignment;
+    memset(p->original, 0, sizeof(p->original));
+    memset(p->planted, 0, sizeof(p->planted));
+    memcpy(p->original, original, encoding->width);
+    memcpy(p->planted, encoding->bytes, encoding->width);
+    p->pending = false;
+    p->patched = patched;
+}
+static void clear_pending(struct xrt_breakpoint *p)
+{
+    p->address = 0;
+    p->width = 0;
+    p->isa_mode = 0;
+    p->alignment = 0;
+    memset(p->planted, 0, sizeof(p->planted));
+    memset(p->original, 0, sizeof(p->original));
+    p->patched = false;
+    p->pending = true;
 }
 enum xrt_status xrt_target_breakpoint_set(struct xrt_target *t, uint64_t address, bool temporary,
                                           uint64_t *id)
@@ -141,8 +245,9 @@ enum xrt_status xrt_target_breakpoint_set(struct xrt_target *t, uint64_t address
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED)
         return XRT_NOT_STOPPED;
-    if (!id)
-        return XRT_INVALID_ARGUMENT;
+    TRY(admitted_native(t));
+    if (t->plant_cleanup.active)
+        return XRT_INVALID_STATE;
     const int existing = xrt_breakpoint_at(t, address);
     if (existing >= 0) {
         *id = t->breakpoints[existing].id;
@@ -151,13 +256,12 @@ enum xrt_status xrt_target_breakpoint_set(struct xrt_target *t, uint64_t address
     /* UINT64_MAX is never allocated: the counter would wrap to the absent ID. */
     if (t->breakpoint_count == XRT_MAX_BREAKPOINTS || t->next_probe_id == UINT64_MAX)
         return XRT_BREAKPOINT_LIMIT;
-    struct xrt_breakpoint p = {.id = t->next_probe_id,
-                               .address = address,
-                               .patched = true,
-                               .enabled = true,
-                               .temporary = temporary};
-    TRY(original_instruction(t, address, p.original));
-    TRY(xrt_patch_instruction(t, address, t->arch->trap));
+    uint8_t original[4];
+    struct xrt_probe_encoding encoding;
+    TRY(prepare_probe(t, address, original, &encoding));
+    TRY(xrt_target_commit_plant(t, address, &encoding, original));
+    struct xrt_breakpoint p = {.id = t->next_probe_id, .enabled = true, .temporary = temporary};
+    store_encoding(&p, address, original, &encoding, true);
     ++t->next_probe_id;
     t->breakpoints[t->breakpoint_count++] = p;
     xrt_target_event(t, XRT_EVENT_BREAKPOINT_SET, t->pid, (int64_t)p.id);
@@ -176,13 +280,14 @@ enum xrt_status xrt_target_breakpoint_reserve(struct xrt_target *t, uint64_t *id
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED)
         return XRT_NOT_STOPPED;
-    if (!id)
-        return XRT_INVALID_ARGUMENT;
+    TRY(admitted_native(t));
     if (t->breakpoint_count == XRT_MAX_BREAKPOINTS || t->next_probe_id == UINT64_MAX)
         return XRT_BREAKPOINT_LIMIT;
     *id = t->next_probe_id++;
-    t->breakpoints[t->breakpoint_count++] =
-        (struct xrt_breakpoint){.id = *id, .pending = true, .enabled = true};
+    t->breakpoints[t->breakpoint_count++] = (struct xrt_breakpoint){0};
+    clear_pending(&t->breakpoints[t->breakpoint_count - 1]);
+    t->breakpoints[t->breakpoint_count - 1].id = *id;
+    t->breakpoints[t->breakpoint_count - 1].enabled = true;
     xrt_target_event(t, XRT_EVENT_BREAKPOINT_SET, t->pid, (int64_t)*id);
     return XRT_OK;
 }
@@ -196,6 +301,7 @@ enum xrt_status xrt_target_breakpoint_restore(struct xrt_target *t, uint64_t id,
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;
+    TRY(admitted_native(t));
     if (!id || id == UINT64_MAX || xrt_breakpoint_index(t, id) >= 0)
         return XRT_INVALID_ARGUMENT;
     /* Breakpoints and watchpoints share one probe-ID namespace. */
@@ -204,8 +310,11 @@ enum xrt_status xrt_target_breakpoint_restore(struct xrt_target *t, uint64_t id,
             return XRT_INVALID_ARGUMENT;
     if (t->breakpoint_count == XRT_MAX_BREAKPOINTS)
         return XRT_BREAKPOINT_LIMIT;
-    t->breakpoints[t->breakpoint_count++] =
-        (struct xrt_breakpoint){.id = id, .pending = true, .enabled = enabled};
+    t->breakpoints[t->breakpoint_count] = (struct xrt_breakpoint){0};
+    clear_pending(&t->breakpoints[t->breakpoint_count]);
+    t->breakpoints[t->breakpoint_count].id = id;
+    t->breakpoints[t->breakpoint_count].enabled = enabled;
+    ++t->breakpoint_count;
     if (t->next_probe_id <= id)
         t->next_probe_id = id + 1;
     ++t->generation;
@@ -221,6 +330,9 @@ enum xrt_status xrt_target_breakpoint_resolve(struct xrt_target *t, uint64_t id,
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;
+    TRY(admitted_native(t));
+    if (t->plant_cleanup.active)
+        return XRT_INVALID_STATE;
     const int i = xrt_breakpoint_index(t, id);
     if (i < 0)
         return XRT_UNKNOWN_BREAKPOINT;
@@ -229,14 +341,12 @@ enum xrt_status xrt_target_breakpoint_resolve(struct xrt_target *t, uint64_t id,
         return XRT_BREAKPOINT_ALREADY_RESOLVED;
     if (xrt_breakpoint_at(t, address) >= 0)
         return XRT_BREAKPOINT_LOCATION_ALREADY_USED;
-    uint8_t original[4] = {0};
-    TRY(original_instruction(t, address, original));
+    uint8_t original[4];
+    struct xrt_probe_encoding encoding;
+    TRY(prepare_probe(t, address, original, &encoding));
     if (p->enabled)
-        TRY(xrt_patch_instruction(t, address, t->arch->trap));
-    p->address = address;
-    memcpy(p->original, original, sizeof(original));
-    p->pending = false;
-    p->patched = p->enabled;
+        TRY(xrt_target_commit_plant(t, address, &encoding, original));
+    store_encoding(p, address, original, &encoding, p->enabled);
     ++t->generation;
     return XRT_OK;
 }
@@ -249,15 +359,20 @@ enum xrt_status xrt_target_breakpoint_withdraw(struct xrt_target *t, uint64_t id
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;
+    TRY(admitted_native(t));
     const int i = xrt_breakpoint_index(t, id);
     if (i < 0)
         return XRT_UNKNOWN_BREAKPOINT;
     struct xrt_breakpoint *p = &t->breakpoints[i];
     if (p->patched)
-        TRY(xrt_patch_instruction(t, p->address, p->original));
-    p->address = 0;
-    p->patched = false;
-    p->pending = true;
+        TRY(xrt_patch_instruction(t, p->address, p->original, p->width));
+    const bool enabled = p->enabled;
+    const uint64_t kept = p->id;
+    const bool internal = p->internal;
+    clear_pending(p);
+    p->id = kept;
+    p->enabled = enabled;
+    p->internal = internal;
     ++t->generation;
     return XRT_OK;
 }
@@ -271,6 +386,7 @@ enum xrt_status xrt_target_breakpoint_enable(struct xrt_target *t, uint64_t id, 
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;
+    TRY(admitted_native(t));
     const int i = xrt_breakpoint_index(t, id);
     if (i < 0)
         return XRT_UNKNOWN_BREAKPOINT;
@@ -278,7 +394,7 @@ enum xrt_status xrt_target_breakpoint_enable(struct xrt_target *t, uint64_t id, 
     if (p->enabled == enabled)
         return XRT_OK;
     if (!p->pending)
-        TRY(xrt_patch_instruction(t, p->address, enabled ? t->arch->trap : p->original));
+        TRY(xrt_patch_instruction(t, p->address, enabled ? p->planted : p->original, p->width));
     p->enabled = enabled;
     p->patched = enabled && !p->pending;
     ++t->generation;
@@ -309,12 +425,13 @@ enum xrt_status xrt_target_breakpoint_remove(struct xrt_target *t, uint64_t id)
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED)
         return XRT_NOT_STOPPED;
+    TRY(admitted_native(t));
     const int i = xrt_breakpoint_index(t, id);
     if (i < 0)
         return XRT_UNKNOWN_BREAKPOINT;
     const struct xrt_breakpoint p = t->breakpoints[i];
     if (p.patched)
-        TRY(xrt_patch_instruction(t, p.address, p.original));
+        TRY(xrt_patch_instruction(t, p.address, p.original, p.width));
     t->breakpoints[i] = t->breakpoints[--t->breakpoint_count];
     xrt_target_event(t, XRT_EVENT_BREAKPOINT_REMOVED, t->pid, (int64_t)id);
     return XRT_OK;
@@ -331,12 +448,15 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
         return XRT_UNKNOWN_THREAD;
     struct xrt_registers regs;
     TRY(xrt_target_registers(t, tid, &regs));
-    const uint64_t pc = xrt_pc(&regs);
+    uint64_t pc = 0;
+    const enum xrt_status pc_status = xrt_registers_pc(&regs, &pc);
+    if (pc_status != XRT_OK)
+        return pc_status;
     uint64_t rearm = 0;
     const int b = xrt_breakpoint_at(t, pc);
     if (b >= 0 && t->breakpoints[b].enabled) {
         struct xrt_breakpoint *p = &t->breakpoints[b];
-        TRY(xrt_patch_instruction(t, p->address, p->original));
+        TRY(xrt_patch_instruction(t, p->address, p->original, p->width));
         p->patched = false;
         xrt_sync_shared_patch(t, p->id, false);
         rearm = p->id;
@@ -344,7 +464,8 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
     const enum xrt_status status =
         xrt_trace(PTRACE_SINGLESTEP, tid, 0, (uintptr_t)t->threads[i].signal);
     if (status != XRT_OK) {
-        if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address, t->arch->trap) == XRT_OK) {
+        if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                           t->breakpoints[b].width) == XRT_OK) {
             t->breakpoints[b].patched = true;
             xrt_sync_shared_patch(t, rearm, true);
         }
@@ -386,7 +507,8 @@ enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed)
         for (size_t i = 0; i < t->thread_count; ++i)
             live |= t->threads[i].state != XRT_EXITED;
         if (live) {
-            TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->arch->trap));
+            TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                      t->breakpoints[b].width));
             t->breakpoints[b].patched = true;
             xrt_sync_shared_patch(t, step.rearm, true);
         }

@@ -28,6 +28,7 @@ struct xrt_target *xrt_target_create(void)
     if (t) {
         t->remote_collectors = 0; /* Not shared until create returns. */
         t->arch = xrt_arch_native();
+        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
         t->next_thread_id = t->next_probe_id = 1;
     }
     return t;
@@ -178,6 +179,12 @@ enum xrt_status xrt_target_launch(struct xrt_target *t, const char *const argv[]
         status = XRT_EXEC_FAILED;
     if (status == XRT_OK)
         status = xrt_process_validate_native(pid);
+    if (status == XRT_OK) {
+        t->arch = xrt_arch_native();
+        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
+        if (!t->identity_admitted)
+            status = XRT_UNSUPPORTED_ARCHITECTURE;
+    }
     if (status != XRT_OK)
         xrt_target_close(t);
     return status;
@@ -321,6 +328,14 @@ enum xrt_status xrt_target_attach(struct xrt_target *t, int32_t pid)
     t->owned = false;
     t->state = XRT_RUNNING;
     const enum xrt_status result = attach(t, pid);
+    if (result == XRT_OK) {
+        t->arch = xrt_arch_native();
+        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
+        if (!t->identity_admitted) {
+            xrt_target_close(t);
+            return XRT_UNSUPPORTED_ARCHITECTURE;
+        }
+    }
     if (result != XRT_OK)
         xrt_target_close(t);
     return result;
@@ -363,7 +378,10 @@ enum xrt_status xrt_target_continue(struct xrt_target *t)
             continue;
         struct xrt_registers regs;
         TRY(xrt_target_registers(t, thread->tid, &regs));
-        const uint64_t pc = xrt_pc(&regs);
+        uint64_t pc = 0;
+        const enum xrt_status pc_status = xrt_registers_pc(&regs, &pc);
+        if (pc_status != XRT_OK)
+            return pc_status;
         if (thread->breakpoint_address && thread->breakpoint_address == pc &&
             xrt_breakpoint_at(t, pc) >= 0)
             return xrt_begin_step(t, thread->tid, false);
@@ -415,23 +433,102 @@ enum xrt_status xrt_target_registers(const struct xrt_target *t, int32_t tid,
         return XRT_READ_ONLY_CORE;
     return xrt_registers_read(tid, out);
 }
+static void unpack_mutation(struct xrt_target *t, uint64_t packed)
+{
+    t->last_mutation.issued = (uint8_t)(packed & 0xff);
+    t->last_mutation.confirmed = (uint8_t)((packed >> 8) & 0xff);
+}
+static void finish_mutation(struct xrt_target *t, int32_t tid, enum xrt_status status,
+                            struct xrt_mutation_result result)
+{
+    t->last_mutation = result;
+    if (!result.issued)
+        return;
+    if (status == XRT_OK && result.confirmed)
+        xrt_target_event(t, XRT_EVENT_REGISTER_WRITTEN, tid, 0);
+    else
+        ++t->generation;
+}
+void xrt_target_apply_exec_identity(struct xrt_target *t, enum xrt_status validate_status)
+{
+    if (!t)
+        return;
+    t->plant_cleanup.active = 0;
+    if (validate_status != XRT_OK) {
+        t->identity_admitted = 0;
+        return;
+    }
+    t->arch = xrt_arch_native();
+    t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
+}
 enum xrt_status xrt_target_register_write(struct xrt_target *t, int32_t tid, const char *name,
                                           size_t length, uint64_t value)
 {
-    if (t && t->connection)
-        return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_REGISTER_WRITE,
-                                                     .args = {(uint32_t)tid, value},
-                                                     .data = name,
-                                                     .size = length});
+    if (!t)
+        return XRT_INVALID_ARGUMENT;
+    t->last_mutation = (struct xrt_mutation_result){0};
+    if (t->connection) {
+        uint64_t packed = 0;
+        const enum xrt_status status =
+            xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_REGISTER_WRITE,
+                                                  .args = {(uint32_t)tid, value},
+                                                  .data = name,
+                                                  .size = length,
+                                                  .value = &packed});
+        unpack_mutation(t, packed);
+        return status;
+    }
+    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+        return XRT_UNSUPPORTED_ARCHITECTURE;
     if (t->core)
         return XRT_READ_ONLY_CORE;
     if (t->state != XRT_STOPPED)
         return XRT_NOT_STOPPED;
     if (xrt_thread_index(t, tid) < 0)
         return XRT_UNKNOWN_THREAD;
-    TRY(xrt_register_write(tid, name, length, value));
-    xrt_target_event(t, XRT_EVENT_REGISTER_WRITTEN, tid, 0);
-    return XRT_OK;
+    struct xrt_mutation_result result = {0};
+    const enum xrt_status status =
+        xrt_register_write_result(tid, name, length, value, t->reg_io, &result);
+    finish_mutation(t, tid, status, result);
+    return status;
+}
+enum xrt_status xrt_target_control_write(struct xrt_target *t, int32_t tid,
+                                         const struct xrt_control_request *request)
+{
+    if (!t || !request)
+        return XRT_INVALID_ARGUMENT;
+    t->last_mutation = (struct xrt_mutation_result){0};
+    if (t->connection) {
+        uint8_t body[16];
+        struct xrt_codec encoded = xrt_codec(body, sizeof(body), false);
+        for (uint8_t i = 0; i < request->count && i < 2; ++i) {
+            uint64_t word = request->value[i];
+            xrt_codec_u64(&encoded, &word);
+        }
+        if (!encoded.ok || request->count < 1 || request->count > 2)
+            return XRT_INVALID_ARGUMENT;
+        uint64_t packed = 0;
+        const enum xrt_status status = xrt_remote_call(
+            t, &(struct xrt_call){.op = XRT_RPC_CONTROL_WRITE,
+                                  .args = {(uint32_t)tid, request->count, 0},
+                                  .data = body,
+                                  .size = (size_t)request->count * 8,
+                                  .value = &packed});
+        unpack_mutation(t, packed);
+        return status;
+    }
+    if (!t->identity_admitted || !t->arch || t->arch != xrt_arch_native())
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    if (t->core)
+        return XRT_READ_ONLY_CORE;
+    if (t->state != XRT_STOPPED)
+        return XRT_NOT_STOPPED;
+    if (xrt_thread_index(t, tid) < 0)
+        return XRT_UNKNOWN_THREAD;
+    struct xrt_mutation_result result = {0};
+    const enum xrt_status status = xrt_control_write(tid, request, t->reg_io, &result);
+    finish_mutation(t, tid, status, result);
+    return status;
 }
 enum xrt_status xrt_target_signal_suppress(struct xrt_target *t, int32_t tid)
 {

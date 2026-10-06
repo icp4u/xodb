@@ -1,5 +1,6 @@
 #ifndef XODB_RUNTIME_RPC_H
 #define XODB_RUNTIME_RPC_H
+#include "xrt.h"
 #include "xrt_wire.h"
 /* Requests carry generation:u64, arg[3]:u64, then an operation-specific byte
  * string (at most 64 KiB). Replies carry value:u64, extra_size:u32, extra bytes,
@@ -62,6 +63,89 @@ enum xrt_rpc_op {
     XRT_RPC_PERF_ACK,
     XRT_RPC_PERF_INFO,
     XRT_RPC_ALLOCATIONS_START,
-    XRT_RPC_FUNCTION_START
+    XRT_RPC_FUNCTION_START,
+    XRT_RPC_CONTROL_WRITE
 };
+
+enum xrt_rpc_class {
+    XRT_RPC_CLASS_PROTOCOL = 0,
+    XRT_RPC_CLASS_PERF,
+    XRT_RPC_CLASS_FILE,
+    XRT_RPC_CLASS_READ,
+    XRT_RPC_CLASS_MUTATION
+};
+
+/* Replaces every opcode >= CPU_START inference. An unassigned opcode is not
+ * a perf operation. */
+static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
+{
+    switch ((enum xrt_rpc_op)op) {
+    case XRT_RPC_CPU_START:
+    case XRT_RPC_SYSCALLS_START:
+    case XRT_RPC_PERF_DESTROY:
+    case XRT_RPC_PERF_ENABLE:
+    case XRT_RPC_PERF_STOP:
+    case XRT_RPC_PERF_RETIRE:
+    case XRT_RPC_PERF_ENROLL:
+    case XRT_RPC_PERF_THREAD:
+    case XRT_RPC_PERF_RING:
+    case XRT_RPC_PERF_ACK:
+    case XRT_RPC_PERF_INFO:
+    case XRT_RPC_ALLOCATIONS_START:
+    case XRT_RPC_FUNCTION_START:
+        return XRT_RPC_CLASS_PERF;
+    case XRT_RPC_FILE_OPEN:
+    case XRT_RPC_FILE_READ:
+    case XRT_RPC_FILE_CLOSE:
+        return XRT_RPC_CLASS_FILE;
+    case XRT_RPC_HELLO:
+    case XRT_RPC_CREATE:
+    case XRT_RPC_SYNC:
+    case XRT_RPC_READ:
+    case XRT_RPC_REGISTERS:
+    case XRT_RPC_EXTENDED:
+    case XRT_RPC_WATCH_CAPACITY:
+    case XRT_RPC_SIGNAL_INFO:
+    case XRT_RPC_VIEW:
+        return XRT_RPC_CLASS_READ;
+    case XRT_RPC_DESTROY:
+    case XRT_RPC_LAUNCH:
+    case XRT_RPC_ATTACH:
+    case XRT_RPC_INTERRUPT:
+    case XRT_RPC_CONTINUE:
+    case XRT_RPC_STEP:
+    case XRT_RPC_WAIT_STOPPED:
+    case XRT_RPC_DETACH:
+    case XRT_RPC_DETACH_FAMILY:
+    case XRT_RPC_CLOSE:
+    case XRT_RPC_RESET:
+    case XRT_RPC_FOLLOW:
+    case XRT_RPC_ADOPT:
+    case XRT_RPC_BP_SET:
+    case XRT_RPC_BP_RESERVE:
+    case XRT_RPC_BP_RESTORE:
+    case XRT_RPC_BP_RESOLVE:
+    case XRT_RPC_BP_WITHDRAW:
+    case XRT_RPC_BP_ENABLE:
+    case XRT_RPC_BP_INTERNAL:
+    case XRT_RPC_BP_REMOVE:
+    case XRT_RPC_WATCH_SET:
+    case XRT_RPC_WATCH_REMOVE:
+    case XRT_RPC_WRITE:
+    case XRT_RPC_REGISTER_WRITE:
+    case XRT_RPC_SIGNAL_SUPPRESS:
+    case XRT_RPC_INVALIDATE:
+    case XRT_RPC_EVENT:
+    case XRT_RPC_CONTROL_WRITE:
+        return XRT_RPC_CLASS_MUTATION;
+    default:
+        return XRT_RPC_CLASS_PROTOCOL;
+    }
+}
+
+_Static_assert(XRT_FILE_LIMIT == 70, "status 70 is the file limit");
+_Static_assert(XRT_AMBIGUOUS_MATCH == 76, "status 76 is ambiguous probe match");
+_Static_assert(XRT_RPC_ALLOCATIONS_START == 52, "allocation start stays 52");
+_Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
+_Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");
 #endif

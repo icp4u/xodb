@@ -5,9 +5,9 @@ return register words, and compare fast and slow calls. Linux x86-64 SysV is the
 initial supported ABI. The C runtime collects both local and C-agent events;
 the host pairs and analyzes the retained evidence.
 
-The first interface is the headless CLI and MCP. There is no function-observation
-GUI panel or new keyboard shortcut yet. Existing **P** CPU sampling and `.xoc`
-profile comparisons continue to work independently.
+Capture is headless (CLI and MCP). A saved `.xoi` can also be browsed in the GUI;
+see [Browsing a saved investigation](#browsing-a-saved-investigation). Existing
+**P** CPU sampling and `.xoc` profile comparisons continue to work independently.
 
 ## One-command capture
 
@@ -21,10 +21,12 @@ xodb --allocation-helper "$PWD/zig-out/bin/xodb-allocation-helper" \
 
 xodb --open-observation example-01.xoi
 xodb --open-observation example-01.xoi --observation-threshold-ns 1000000
+xodb --browse-observation example-01.xoi
 ```
 
-Use a new output filename each time. The commands print JSON containing capture
-status, cohort counts, duration distributions and raw-record citations.
+Use a new output filename each time. `--open-observation` prints JSON;
+`--browse-observation` opens the same archive in the GUI ([keys](#browsing-a-saved-investigation)). The JSON
+contains capture status, cohort counts, duration distributions and raw-record citations.
 The fixture deliberately alternates short calls and an 8 ms wait: expect sixteen
 complete calls, eight on either side of the recipe's 4 ms threshold. It tests
 classification; it is not an optimization benchmark.
@@ -116,9 +118,12 @@ are not Perl logical frames.
 
 `scripts/demo-perl` is the interactive counterpart of the Ruby and CPython
 demos. It attaches to a loop that stores `42` at index 3 and breaks on
-`Perl_av_store`. With DWARF, the frame's expressions `key` and
-`val->sv_u.svu_iv` show **3** and **42**; `av` and `val` are the raw `AV *` and
-`SV *` arguments.
+`Perl_av_store`. With DWARF, the frame's expression `key` shows **3**, and the
+stack shows `Perl_av_fetch` (with `lval` set) called from the lexical-array
+store op inside `Perl_runops_standard`. `val` is the new, still-undefined
+element: `*val` shows `sv_flags` 0. The op assigns 42 only after `av_store`
+returns, so `val->sv_u` may hold stale bits from an earlier element; don't read
+it as the stored value.
 
 ## Recipes
 
@@ -204,6 +209,52 @@ atomically without replacing an existing destination. Completion means actual
 publication, not merely accepting the request. Durability sync is not requested.
 Cancellation after publication does not remove the published file.
 
+## Browsing a saved investigation
+
+```sh
+xodb --browse-observation example-01.xoi
+xodb --browse-observation example-01.xoi --observation-threshold-ns 1000000
+```
+
+`--browse-observation` opens the archive on the same worker and validation as
+`--open-observation` and shows the invocation browser. `--open-observation` itself
+stays headless. The browser starts one comparison, at the given threshold, the
+archive's saved threshold or 4 ms. Rows are drawn only for the visible window;
+scrolling and selection never start analysis.
+
+- The header shows capture identity, record/call counts, stop/finish reasons,
+  lost events, throttles, rejections, the first gap and whether an unread suffix
+  is possible.
+- The cohort summary shows the comparison ID and threshold (`fast < T <= slow`),
+  total/matched/filtered/filter-unavailable denominators, complete and incomplete
+  counts by reason, p50/p90/p99, min/max and the sum of inclusive wall durations
+  (nested or parallel calls overlap). Clicking a DI example selects its call.
+- **Tab** cycles All calls, Slow, Fast, Incomplete and Raw records. **J/K**,
+  arrows, **PgUp/PgDn**, Home/End and the wheel move; clicking selects a row.
+- The call detail shows its thread, wall duration or incomplete reason, raw
+  entry/return/parent citations, the six untyped argument words (or "not
+  captured"), the AX word and the raw entry callchain PCs. **E** and **R** open the
+  cited raw record, **P** the parent call, **C** (or Enter) returns from a record
+  to the call citing it, **Backspace** returns to the previous list. Missing
+  entries and returns are reported, never inferred.
+- **]** and **[** double or halve the threshold; **T** types it in nanoseconds.
+  Recomputation uses the same Session operation and busy rule as MCP
+  `compare_observation`; a running comparison is not replaced. **Esc** cancels
+  a running open or comparison, otherwise it closes the browser like **N**. **N**
+  in the main view reopens it with the same selection. **Q** quits.
+
+With `--session-socket`, agents read the same immutable capture. An agent's
+`compare_observation` still needs the controller lease; the human GUI does not.
+The browser follows the latest comparison, including one started by an agent,
+and keeps its selected call. **F8** grants or revokes agent control from inside
+the browser. `--observation-threshold-ns` is not accepted together with
+`--mcp` or `--session-socket`; use **T** there. A corrupt or unsupported archive
+shows its error and no evidence.
+
+Durations are entry-to-return wall time, not CPU time or causal cost. Argument
+and return words are raw registers, not typed or language-level values; PCs are
+not logical frames.
+
 ## MCP workflow
 
 For a live target, start xodb with `--headless --mcp --agent-scope control` and
@@ -274,7 +325,13 @@ python3 tests/inspection-lifecycle.py
 python3 tests/observations-live.py --helper "$PWD/zig-out/bin/xodb-allocation-helper"
 python3 tests/observation-recipes.py --helper "$PWD/zig-out/bin/xodb-allocation-helper"
 python3 tests/observation-associations.py --helper "$PWD/zig-out/bin/xodb-allocation-helper"
+python3 tests/invocations-gui.py
 ```
+
+`tests/invocations-gui.py` needs no helper: it writes owned synthetic `.xoi`
+files and drives the browser in a private headless Sway. Use a short checkout
+or `XODB_TEST_TMPDIR` so the compositor socket path fits. `python3
+tests/invocations-gui.py --fixture demo.xoi` only writes its demonstration file.
 
 Set `XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent` for the agent variants.
 `scripts/release-check host --uprobes` includes those function suites and

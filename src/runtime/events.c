@@ -78,7 +78,10 @@ static enum xrt_status poll(struct xrt_target *t)
             t->watch_cancelled = false;
             ++t->image_epoch;
             xrt_target_event(t, XRT_EVENT_IMAGE_REPLACED, tid, (int64_t)t->image_epoch);
-            TRY(xrt_process_validate_native(tid));
+            const enum xrt_status ident = xrt_process_validate_native(tid);
+            xrt_target_apply_exec_identity(t, ident);
+            if (ident != XRT_OK)
+                return ident;
         }
         unsigned long child = 0;
         if (kind == PTRACE_EVENT_FORK || kind == PTRACE_EVENT_VFORK || kind == PTRACE_EVENT_CLONE)
@@ -182,7 +185,10 @@ static enum xrt_status poll(struct xrt_target *t)
             TRY(xrt_target_registers(t, tid, &regs));
             struct xrt_signal_info info;
             TRY(xrt_signal_read(tid, &info));
-            const uint64_t pc = xrt_pc(&regs);
+            uint64_t pc = 0;
+            const enum xrt_status pc_status = xrt_registers_pc(&regs, &pc);
+            if (pc_status != XRT_OK)
+                return pc_status;
             if (t->stepping && t->step.tid == tid) {
                 const bool entry = t->step.has_exec_entry;
                 t->step.has_exec_entry = false;
@@ -217,6 +223,7 @@ static enum xrt_status poll(struct xrt_target *t)
                     t->threads[i].breakpoint_address = 0;
                     xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
                     t->events[t->event_count - 1].pc = pc;
+                    t->events[t->event_count - 1].pc_known = 1;
                 }
             } else if (t->stepping && t->step.tid == tid && info.code == TRAP_TRACE) {
                 const bool stop_after = t->step.stop_after, watch = t->step.has_watch;
@@ -226,6 +233,7 @@ static enum xrt_status poll(struct xrt_target *t)
                 t->threads[i].breakpoint_address = 0;
                 xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
                 t->events[t->event_count - 1].pc = pc;
+                t->events[t->event_count - 1].pc_known = 1;
                 if (!stop_after) {
                     t->threads[i].reason = XRT_STOP_NONE;
                     t->state = XRT_STOPPED;
@@ -247,6 +255,7 @@ static enum xrt_status poll(struct xrt_target *t)
                         ++probe->hit_count;
                     xrt_target_event(t, XRT_EVENT_BREAKPOINT_HIT, tid, (int64_t)probe->id);
                     t->events[t->event_count - 1].pc = probe->address;
+                    t->events[t->event_count - 1].pc_known = 1;
                 }
             }
         }

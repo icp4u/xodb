@@ -3,7 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
-#define XRT_WIRE_VERSION 1
+#define XRT_WIRE_VERSION 2
 #define XRT_WIRE_HEADER_SIZE 32
 #define XRT_WIRE_MAX_BODY (1024u * 1024u)
 /* Every integer is big endian. No native struct/pointer is sent. Header:

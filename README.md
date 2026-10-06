@@ -57,6 +57,9 @@ Letter shortcuts follow your active keyboard layout.
 
 ## What actually works today
 
+New here? [Which tool do I reach for?](docs/GUIDE.md) is the plain-language map
+(debugger vs profile vs observation, with demos).
+
 **Process control.** Launch or attach, continue, interrupt, detach, per-thread
 inspection. Software breakpoints by address, symbol, or file:line. Instruction
 and source stepping, step-over. Worker-thread exec, main-thread-exits-first,
@@ -192,7 +195,7 @@ the investigation. Full walkthrough and limits: [docs/M1.md](docs/M1.md).
 
 Other things to poke at: `./scripts/demo-cruby` (break on `rb_ary_store`, decode
 a Ruby VALUE by hand), `./scripts/demo-perl` (break on `Perl_av_store` and read
-`key` and `val->sv_u.svu_iv` through Perl's DWARF), the [M2 flow graph](docs/M2.md), and
+`key`, the new element and the interpreter's stack through Perl's DWARF), the [M2 flow graph](docs/M2.md), and
 [flame graphs](docs/PROFILING.md). #TODO their ruby will be stripped though
 
 

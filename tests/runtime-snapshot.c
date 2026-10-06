@@ -32,10 +32,17 @@ int main(void)
                                                .kind = XRT_EVENT_STOP,
                                                .tid = 100,
                                                .detail = -1,
-                                               .pc = UINT64_MAX - 1};
+                                               .pc = UINT64_MAX - 1,
+                                               .pc_known = 1};
     for (size_t i = 0; i < source->breakpoint_count; ++i)
-        source->breakpoints[i] = (struct xrt_breakpoint){
-            .id = i + 1, .address = 4096 + i, .enabled = true, .patched = true};
+        source->breakpoints[i] = (struct xrt_breakpoint){.id = i + 1,
+                                                        .address = 4096 + i,
+                                                        .enabled = true,
+                                                        .patched = true,
+                                                        .width = 1,
+                                                        .isa_mode = XRT_ISA_MODE_ORDINARY,
+                                                        .alignment = 1,
+                                                        .planted = {0xcc}};
     for (size_t i = 0; i < source->birth_count; ++i)
         source->births[i] = (struct xrt_birth){
             .pid = 2000 + (int32_t)i, .parent_tid = 100, .kind = XRT_BIRTH_FORK, .vm_errno = 13};
@@ -76,7 +83,7 @@ int main(void)
     assert(!in.ok);
     /* Cross-ISA register snapshots use descriptors, never host union layout. */
     struct xrt_registers regs = {
-        .machine = XRT_AARCH64,
+        .abi = xrt_arch_abi(xrt_arch_get(XRT_AARCH64)),
         .values.arm = {.x0 = UINT64_MAX, .pc = UINT64_C(0x0102030405060708)}};
     struct xrt_registers got = {0};
     out = xrt_codec(bytes, XRT_WIRE_MAX_BODY, false);
@@ -84,7 +91,7 @@ int main(void)
     assert(out.ok && bytes[0] == 0 && bytes[1] == XRT_AARCH64);
     in = xrt_codec(bytes, out.at, true);
     xrt_wire_registers(&in, &got);
-    assert(in.ok && got.machine == XRT_AARCH64 && got.values.arm.x0 == UINT64_MAX &&
+    assert(in.ok && got.abi.machine == XRT_AARCH64 && got.values.arm.x0 == UINT64_MAX &&
            got.values.arm.pc == regs.values.arm.pc);
     /* Synthetic handles deliberately contain fake PIDs; don't run teardown. */
     free(source);

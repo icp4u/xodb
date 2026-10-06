@@ -200,6 +200,7 @@ pub const Workspace = struct {
     last_draw: u64 = 0,
     animating: bool = false,
     comparison: @import("comparison.zig").Panel = .{},
+    invocations: @import("invocations.zig").View = .{},
 
     const LocalRow = struct { name: []const u8, value: model.ValueSummary };
     pub fn deinit(self: *Workspace) void {
@@ -208,6 +209,7 @@ pub const Workspace = struct {
         self.timeline_source.deinit();
         self.syscall_panel.deinit();
         self.allocation_panel.deinit();
+        self.invocations.deinit();
         self.watch.deinit();
         self.arena.deinit();
         if (self.source_buffer) |bytes| std.heap.page_allocator.free(bytes);
@@ -330,6 +332,11 @@ pub const Workspace = struct {
     pub fn input(self: *Workspace, w: *Window, session: *Session) void {
         self.sharedScopeInput(w, session);
         if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
+        if (self.invocations.open) {
+            self.invocations.input(w, session);
+            if (!self.invocations.open) self.status = "Invocation browser closed; N reopens it";
+            return;
+        }
         if (session.imported) |*state| return self.imported.input(w, state);
         const pointer = [2]f32{ w.pointer_x, w.pointer_y };
         const down = w.mouse_down;
@@ -385,6 +392,12 @@ pub const Workspace = struct {
                         self.comparison.open = true;
                         w.dirty = true;
                         continue;
+                    }
+                    if ((session.observations.capture != null or session.observation_archive != null) and event.plain() and event.kind == .press and event.shortcut == 'n') {
+                        self.invocations.open = true;
+                        w.dirty = true;
+                        // Later queued input belongs to the browser.
+                        return self.input(w, session);
                     }
                     if (session.process_tree) |tree| if (self.process_panel.key(tree, event)) {
                         w.dirty = true;
@@ -680,7 +693,11 @@ pub const Workspace = struct {
         }
         if ((code == 50 or code == 19) and !self.show_profile) {
             self.stop_panel.open = false;
-            const address = if (self.selected_local < self.locals.len) self.locals[self.selected_local].value.address orelse (if (self.regs) |regs| linux.stackPointer(regs) else 0) else if (self.regs) |regs| linux.stackPointer(regs) else 0;
+            const fallback_sp = if (self.regs) |regs| linux.stackPointer(regs) catch {
+                self.status = "RegisterUnavailable";
+                return;
+            } else 0;
+            const address = if (self.selected_local < self.locals.len) self.locals[self.selected_local].value.address orelse fallback_sp else fallback_sp;
             self.probes_panel.open = false;
             self.inspection_panel.show(session, code == 19, address);
             w.dirty = true;
@@ -1199,7 +1216,10 @@ pub const Workspace = struct {
             return;
         };
         var bytes: [256]u8 = undefined;
-        const assembly_address = if (self.browse_address) |address| self.browse_assembly orelse address else linux.programCounter(self.regs.?);
+        const assembly_address = if (self.browse_address) |address| self.browse_assembly orelse address else linux.programCounter(self.regs.?) catch |err| {
+            self.status = @errorName(err);
+            return;
+        };
         const n = session.target.readMemory(assembly_address, &bytes) catch |err| {
             self.status = @errorName(err);
             return;
@@ -1220,7 +1240,10 @@ pub const Workspace = struct {
             }
         }
         if (self.show_flow) {
-            const anchor = if (self.frames.len > 0) self.frames[self.selected_frame].lookup_pc else linux.programCounter(self.regs.?);
+            const anchor = if (self.frames.len > 0) self.frames[self.selected_frame].lookup_pc else linux.programCounter(self.regs.?) catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
             self.flow.refresh(session, anchor);
         }
         if (self.browse_address) |address| {
@@ -1342,6 +1365,12 @@ pub const Workspace = struct {
             try self.comparison.draw(r, font, w, job);
             return self.drawSharedOwnership(r, font, w, session);
         };
+        if (self.invocations.open) {
+            session.profile_view_visible = false;
+            self.animating = @import("invocations.zig").View.busy(session);
+            try self.invocations.draw(r, font, w, session, if (self.shared_clients != null) 30 else 0);
+            return self.drawSharedOwnership(r, font, w, session);
+        }
         if (session.imported) |*state| {
             try self.imported.draw(r, font, w, state);
             return self.drawSharedOwnership(r, font, w, session);
@@ -1464,18 +1493,19 @@ pub const Workspace = struct {
             }
             if (self.show_flow) {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
-                try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) else null);
+                try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) catch null else null);
             } else {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", if (self.browse_address != null) "browsing / G flow" else "x86-64 / G flow");
                 if (self.instruction_count == 0) try r.text(font, left + 16, body_y + 55, "Pause to inspect instructions", theme.weak);
+                const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
                 for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
                     const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
                     if (y + 20 > bottom - 10) break;
-                    if (self.regs != null and inst.address == linux.programCounter(self.regs.?)) {
+                    if (current_pc != null and inst.address == current_pc.?) {
                         try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
                         try r.text(font, left + 8, y, "\u{25b6}", thread_color);
                     }
-                    try label(r, font, left + 22, y, if (self.regs != null and inst.address == linux.programCounter(self.regs.?)) thread_color else theme.weak, "{x:0>12}", .{inst.address});
+                    try label(r, font, left + 22, y, if (current_pc != null and inst.address == current_pc.?) thread_color else theme.weak, "{x:0>12}", .{inst.address});
                     const mnemonic = std.mem.sliceTo(@as([]const u8, &inst.mnemonic), 0);
                     try r.text(font, left + 156, y, mnemonic, theme.neutral);
                     try r.textFit(font, left + 156 + @max(58, r.measure(font, mnemonic) + 10), y, right - left - 6 - 156 - 70, std.mem.sliceTo(@as([]const u8, &inst.operands), 0), theme.text);
@@ -1499,11 +1529,14 @@ pub const Workspace = struct {
                 if (self.regs) |regs| {
                     for (regs.descriptions(), 0..) |desc, i| {
                         const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
-                        const value = regs.value(desc);
-                        const changed = if (self.stale_regs) |old| old.architecture() == regs.architecture() and old.value(desc) != value else false;
+                        const value = regs.value(desc) catch null;
+                        const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
+                        const changed = value != null and previous != null and value.? != previous.?;
                         if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
                         try label(r, font, right + 14, y, theme.weak, "{s}", .{std.mem.span(desc.name)});
-                        try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{value});
+                        if (value) |word| {
+                            try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
+                        } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
                     }
                 } else try r.text(font, right + 14, body_y + 55, "No stopped thread", theme.weak);
             }
@@ -2151,4 +2184,34 @@ test "nonshared F8 keeps delegated and modal behavior unchanged" {
     try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
     try std.testing.expectEqual(@as(usize, 1), session.audit_count);
     try std.testing.expect(!workspace.shared_scope_changed);
+}
+
+test "N opens the invocation browser only for observation evidence" {
+    var session = Session{ .id = 1 };
+    defer session.deinit();
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    var w = Window{ .width = 1280, .height = 800 };
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = 'n' };
+    workspace.input(&w, &session);
+    try std.testing.expect(!workspace.invocations.open);
+    const identity = @import("../observe/capture.zig").Identity{ .session_id = 2, .capture_id = 1, .process_id = 1, .pid = 9, .image_epoch = 1, .generation = 1 };
+    const function = @import("../observe/capture.zig").Function{ .id = 1, .name = "f", .path = "/f", .identity = std.mem.zeroes(@import("../profile/uprobe_hooks.zig").Identity), .file_offset = 0, .link_address = 0, .runtime_address = 1 };
+    session.observations.capture = try @import("../observe/capture.zig").Capture.create(std.heap.page_allocator, identity, .{}, &.{.{ .id = 1, .tid = 9 }}, &.{function});
+    session.observations.capture.?.store.finish(.capture_end);
+    // Keys queued after N belong to the browser.
+    w.input.head = 0;
+    w.input.count = 2;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = 'n' };
+    w.input.queue[1] = .{ .kind = .press, .shortcut = keys.sym.tab };
+    workspace.input(&w, &session);
+    try std.testing.expect(workspace.invocations.open);
+    try std.testing.expectEqual(@import("invocations.zig").List.slow, workspace.invocations.list);
+    w.input.head = 0;
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = 'n' };
+    workspace.input(&w, &session);
+    try std.testing.expect(!workspace.invocations.open);
+    try std.testing.expectEqualStrings("Invocation browser closed; N reopens it", workspace.status);
 }

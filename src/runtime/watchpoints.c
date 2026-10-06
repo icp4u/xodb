@@ -324,6 +324,7 @@ enum xrt_status xrt_watch_trap(struct xrt_target *t, int32_t tid, uint64_t pc,
         xrt_target_event(t, XRT_EVENT_WATCHPOINT_HIT, tid, (int64_t)watch->id);
         struct xrt_event *event = &t->events[t->event_count - 1];
         event->pc = pc;
+        event->pc_known = 1;
         event->address = watch->address;
         event->before = watch->previous;
         event->after = after;
@@ -352,7 +353,17 @@ void xrt_publish_arm_watch(struct xrt_target *t, int32_t tid, const struct xrt_a
         const bool valid = completed && watch_value(tid, watch, &after);
         xrt_target_event(t, XRT_EVENT_WATCHPOINT_HIT, tid, (int64_t)watch->id);
         struct xrt_event *event = &t->events[t->event_count - 1];
-        event->pc = have_regs ? xrt_pc(&regs) : hit->pc;
+        event->pc = hit->pc;
+        event->pc_known = 1;
+        if (have_regs) {
+            uint64_t decoded = 0;
+            if (xrt_registers_pc(&regs, &decoded) == XRT_OK)
+                event->pc = decoded;
+            else {
+                event->pc = 0;
+                event->pc_known = 0;
+            }
+        }
         event->has_trap = true;
         event->trap_pc = hit->pc;
         event->trap_address = hit->address;

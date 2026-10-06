@@ -101,7 +101,7 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     view.watch_hits = hits.items;
     const regs = try session.target.registers(view.tid);
     const register_rows = try a.alloc(wire.Register, regs.descriptions().len);
-    for (regs.descriptions(), 0..) |desc, i| register_rows[i] = .{ .name = std.mem.span(desc.name), .value = regs.value(desc) };
+    for (regs.descriptions(), 0..) |desc, i| register_rows[i] = .{ .name = std.mem.span(desc.name), .value = regs.value(desc) catch null };
     view.registers = register_rows;
     const frames = session.stack(a, view.tid, 64) catch |err| blk: {
         try diagnostics.append(a, .{ .component = "stack", .message = @errorName(err) });
@@ -122,7 +122,7 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     }
     view.locals = local_rows;
     view.locals_truncated = local_rows.len != locals.len;
-    const pc = if (frames.len > 0) frames[view.frame].lookup_pc else @import("../target/linux.zig").programCounter(regs);
+    const pc = if (frames.len > 0) frames[view.frame].lookup_pc else try @import("../target/linux.zig").programCounter(regs);
     var bytes: [256]u8 = undefined;
     var decoded: [32]@import("../model/disassembly.zig").Instruction = undefined;
     const n = try session.target.readMemory(pc, &bytes);

@@ -128,9 +128,12 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (c->request == UINT64_MAX)
         return broken(c, XRT_PROTOCOL_ERROR);
     struct xrt_codec request = xrt_codec(c->request_bytes, XRT_WIRE_MAX_BODY, false);
-    const bool file_call = call->op >= XRT_RPC_CPU_START || call->op == XRT_RPC_FILE_OPEN ||
-                           call->op == XRT_RPC_FILE_READ || call->op == XRT_RPC_FILE_CLOSE;
-    uint64_t generation = file_call ? 0 : t->generation, args[3];
+    const enum xrt_rpc_class rpc_class = xrt_rpc_classify(call->op);
+    if (rpc_class == XRT_RPC_CLASS_PROTOCOL)
+        return XRT_PROTOCOL_ERROR;
+    const bool no_snapshot =
+        rpc_class == XRT_RPC_CLASS_PERF || rpc_class == XRT_RPC_CLASS_FILE;
+    uint64_t generation = no_snapshot ? 0 : t->generation, args[3];
     memcpy(args, call->args, sizeof(args));
     xrt_codec_u64(&request, &generation);
     for (unsigned i = 0; i < 3; ++i)
@@ -150,7 +153,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (received != XRT_WIRE_OK)
         return broken(c, received == XRT_WIRE_INVALID ? XRT_PROTOCOL_ERROR : XRT_TRANSPORT_FAILED);
     if (reply.flags != 1 || reply.request != frame.request || reply.op != frame.op ||
-        reply.target != frame.target || reply.status > XRT_FILE_LIMIT)
+        reply.target != frame.target || reply.status > XRT_AMBIGUOUS_MATCH)
         return broken(c, XRT_PROTOCOL_ERROR);
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
@@ -171,7 +174,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     }
     if (!in.ok || in.at != in.size ||
         (reply.status == XRT_OK &&
-         present != (call->op != XRT_RPC_HELLO && call->op != XRT_RPC_DESTROY && !file_call)))
+         present != (call->op != XRT_RPC_HELLO && call->op != XRT_RPC_DESTROY && !no_snapshot)))
         return broken(c, XRT_PROTOCOL_ERROR);
     if (present) {
         /* Connection identity stays immutable: metadata workers may use it
@@ -208,10 +211,11 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         memcpy(call->out, c->reply + extra_at, size);
     if (call->length)
         *call->length = size;
-    if (call->value && reply.status == XRT_OK)
+    if (call->value && (reply.status == XRT_OK || call->op == XRT_RPC_REGISTER_WRITE ||
+                        call->op == XRT_RPC_CONTROL_WRITE))
         *call->value = value;
     enum xrt_status status = (enum xrt_status)reply.status;
-    if (!file_call && call->op != XRT_RPC_VIEW && call->op != XRT_RPC_HELLO &&
+    if (!no_snapshot && call->op != XRT_RPC_VIEW && call->op != XRT_RPC_HELLO &&
         call->op != XRT_RPC_READ && call->op != XRT_RPC_REGISTERS && call->op != XRT_RPC_EXTENDED &&
         call->op != XRT_RPC_WATCH_CAPACITY) {
         enum xrt_status synced = xrt_remote_sync_family(t);
