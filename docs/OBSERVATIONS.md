@@ -108,8 +108,9 @@ Use a Perl build whose `libperl.so` keeps its symbol table and DWARF; change
 `/opt/debug/bin/perl` to its path. `Perl_pp_sort` is a local symbol of
 `libperl.so` and runs once per `sort` op. A numeric `sort { $a <=> $b }` does
 not go through the exported `Perl_sortsv_flags`, so observe the op itself.
-Twenty complete calls are expected, and the 4 ms split should separate the
-small and large sorts on this host. In a threaded Perl the first argument word
+Twenty complete calls are expected: on the reference host the ten small sorts
+take about 5 µs and the ten large ones about 4 ms, so the recipe's 1 ms split
+separates them with margin. Durations depend on the machine and Perl build. In a threaded Perl the first argument word
 is the interpreter pointer (`my_perl`), not a Perl value. Captured native stacks
 are not Perl logical frames.
 

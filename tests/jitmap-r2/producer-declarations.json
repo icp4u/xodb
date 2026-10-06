@@ -1,0 +1,24 @@
+{
+ "format": "xodb-jitmap-producer-declarations/1",
+ "note": "Measured, version-specific producer facts. Applied only to the exact runtime version listed; any other version runs with no declared bias/slack and is reported as declaration_status=none_for_version. Not universal behavior.",
+ "declarations": [
+  {
+   "runtime": "node v26.8.2",
+   "artifact": "jitdump (--perf-prof)",
+   "debug_address_bias": 64,
+   "slack_ns": 1000,
+   "header_time_clock": "producer_defined_unrelated (observed CLOCK_REALTIME microseconds)",
+   "evidence": "27 of 38 debug records had their first entry at code_start + 0x40; with bias 0 one record fell outside its range, with 0x40 none. Every record timestamp was a multiple of 1000 ns.",
+   "measured_by": "measured on Node v26.8.2, 2026-10-05; re-checked by tests/jitmap-runtime-producers.py when the same version runs"
+  },
+  {
+   "runtime": "CPython 3.14.7",
+   "artifact": "jitdump (-Xperf_jit)",
+   "debug_address_bias": 0,
+   "slack_ns": 0,
+   "header_time_clock": "producer_defined_unrelated (measured CLOCK_REALTIME microseconds against time.time_ns())",
+   "evidence": "header timestamp matched time.time_ns()//1000 taken in the same process to within 4 ms",
+   "measured_by": "measured on CPython 3.14.7, 2026-10-05"
+  }
+ ]
+}

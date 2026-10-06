@@ -1,0 +1,6 @@
+1:
+2026-ÿ0-05 01:02:03
+Full thread dump T (1 m):
+
+"a" #1 [2] os_prio=0 tid=0x1 nid=2 runnable
+	at A.b(A.java:1)

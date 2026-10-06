@@ -6,6 +6,6 @@
   "record_limit": 4096,
   "memory_limit": 16777216,
   "callstacks": true,
-  "threshold_ns": 4000000,
+  "threshold_ns": 1000000,
   "threads": "selected"
 }

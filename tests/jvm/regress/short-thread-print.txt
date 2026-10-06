@@ -1,0 +1,4 @@
+1:
+x
+Full thread dump Test (1 mixed mode):
+x
