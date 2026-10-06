@@ -83,6 +83,42 @@ decode array contents or Ruby types from that word, and captured native stacks
 are not Ruby logical frames. This example demonstrates call observation and
 input-dependent latency, not an optimized implementation of the workload.
 
+## Perl example
+
+The same shape works for Perl. This workload sorts a small and a large array in
+turn. Capture its native `Perl_pp_sort` calls after Perl reaches `perl_run`:
+
+```sh
+xodb --allocation-helper "$PWD/zig-out/bin/xodb-allocation-helper" \
+  --observe-recipe examples/perl-observation.recipe.json \
+  --observation-out perl-01.xoi \
+  -- /opt/debug/bin/perl -e '
+    my @small = map { ($_ * 7919) % 1000 } 1..120;
+    my @large = map { ($_ * 7919) % 100_003 } 1..100_000;
+    my $total = 0;
+    for my $i (0..19) {
+        my @sorted = sort { $a <=> $b } ($i % 2 ? @large : @small);
+        $total += $sorted[0];
+    }'
+
+xodb --open-observation perl-01.xoi
+```
+
+Use a Perl build whose `libperl.so` keeps its symbol table and DWARF; change
+`/opt/debug/bin/perl` to its path. `Perl_pp_sort` is a local symbol of
+`libperl.so` and runs once per `sort` op. A numeric `sort { $a <=> $b }` does
+not go through the exported `Perl_sortsv_flags`, so observe the op itself.
+Twenty complete calls are expected, and the 4 ms split should separate the
+small and large sorts on this host. In a threaded Perl the first argument word
+is the interpreter pointer (`my_perl`), not a Perl value. Captured native stacks
+are not Perl logical frames.
+
+`scripts/demo-perl` is the interactive counterpart of the Ruby and CPython
+demos. It attaches to a loop that stores `42` at index 3 and breaks on
+`Perl_av_store`. With DWARF, the frame's expressions `key` and
+`val->sv_u.svu_iv` show **3** and **42**; `av` and `val` are the raw `AV *` and
+`SV *` arguments.
+
 ## Recipes
 
 ```json

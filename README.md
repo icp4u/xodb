@@ -191,7 +191,8 @@ Locals, press **W** · **Space** again and watch it catch the store · **Q** sav
 the investigation. Full walkthrough and limits: [docs/M1.md](docs/M1.md).
 
 Other things to poke at: `./scripts/demo-cruby` (break on `rb_ary_store`, decode
-a Ruby VALUE by hand), the [M2 flow graph](docs/M2.md), and
+a Ruby VALUE by hand), `./scripts/demo-perl` (break on `Perl_av_store` and read
+`key` and `val->sv_u.svu_iv` through Perl's DWARF), the [M2 flow graph](docs/M2.md), and
 [flame graphs](docs/PROFILING.md). #TODO their ruby will be stripped though
 
 
