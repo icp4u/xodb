@@ -1,0 +1,248 @@
+xsg 1
+# SYNTHETIC: hand-authored unit graphs. Not compiled code and not exported by
+# Ghidra. Used only for unit assertions; end-to-end claims use compiled exports.
+image sha256=unknown build_id=unknown name=synthetic-units
+spec language=x86:LE:64:default compiler=synthetic addr_bytes=8
+producer hand-authored 1
+source kind=synthetic sha256=none
+space 0 const constant
+space 1 ram ram
+space 2 register register
+space 3 unique unique
+space 4 stack stack
+readonly 0x5000 0x6000
+
+# --- alloc_guard(uint32 count, uint32 size, int flag): guard + zext multiply
+function 1 alloc_guard entry=0x1000
+block 10 0x1000
+block 11 0x1010
+block 12 0x1020
+edge 10 11 true
+edge 10 12 false
+vn 100 2 0x38 4 input param=0 name=count
+vn 101 2 0x30 4 input param=1 name=size
+vn 102 2 0x10 4 input param=2 name=flag
+vn 103 0 0x3e8 4
+vn 104 3 0x100 1
+vn 105 1 0x1010 1 annotation
+vn 106 0 0x0 8
+vn 107 0 0x0 4
+vn 108 3 0x200 8
+vn 109 3 0x208 8
+vn 110 3 0x210 8
+vn 111 0 0x10 8
+vn 112 3 0x218 8
+vn 113 1 0x2000 8 annotation
+vn 114 2 0x0 8 name=result
+vn 115 0 0x0 4
+op 1000 10 0x1000 0 INT_LESS 104 103 100 origin=0x1000:0
+op 1001 10 0x1004 1 CBRANCH - 105 104 origin=0x1004:1
+op 1002 11 0x1010 0 RETURN - 107 106 origin=0x1010:2
+op 1003 12 0x1020 0 INT_ZEXT 108 100 origin=0x1020:3
+op 1004 12 0x1024 1 INT_ZEXT 109 101 origin=0x1024:4
+op 1005 12 0x1028 2 INT_MULT 110 108 109 origin=0x1028:5
+op 1006 12 0x102c 3 INT_ADD 112 110 111 origin=0x102c:6
+op 1007 12 0x1030 4 CALL 114 113 112 origin=0x1030:7
+op 1008 12 0x1034 5 RETURN - 115 114 origin=0x1034:8
+call 1007 target=0x2000 name=malloc
+
+# --- signed_len(int len): signed comparison, sign extension
+function 2 signed_len entry=0x1100
+block 20 0x1100
+block 21 0x1110
+block 22 0x1120
+edge 20 21 true
+edge 20 22 false
+vn 200 2 0x38 4 input param=0 name=len
+vn 201 0 0x0 4
+vn 202 3 0x100 1
+vn 203 1 0x1110 1 annotation
+vn 204 0 0x0 8
+vn 205 0 0x0 4
+vn 206 3 0x200 8
+vn 207 1 0x2000 8 annotation
+vn 208 2 0x0 8
+vn 209 0 0x0 4
+op 2000 20 0x1100 0 INT_SLESS 202 200 201
+op 2001 20 0x1104 1 CBRANCH - 203 202
+op 2002 21 0x1110 0 RETURN - 205 204
+op 2003 22 0x1120 0 INT_SEXT 206 200
+op 2004 22 0x1124 1 CALL 208 207 206
+op 2005 22 0x1128 2 RETURN - 209 208
+call 2004 target=0x2000 name=malloc
+
+# --- sum(int *a, int n): loop with phi merges and a load
+function 3 sum entry=0x1200
+block 30 0x1200
+block 31 0x1210
+block 32 0x1220
+block 33 0x1230
+edge 30 31 fall
+edge 31 32 true
+edge 31 33 false
+edge 32 31 jump
+vn 300 2 0x38 8 input param=0 name=a
+vn 301 2 0x30 4 input param=1 name=n
+vn 302 0 0x0 4
+vn 303 3 0x100 4 name=i
+vn 304 3 0x104 4 name=s
+vn 305 3 0x108 1
+vn 306 1 0x1220 1 annotation
+vn 307 3 0x110 8
+vn 308 0 0x4 8
+vn 309 3 0x118 8
+vn 310 3 0x120 4
+vn 311 3 0x124 4
+vn 312 0 0x1 4
+vn 313 3 0x128 4
+vn 314 1 0x1210 1 annotation
+vn 315 0 0x0 4
+vn 316 0 0x1 4
+vn 317 0 0x0 4
+op 3000 31 0x1210 0 MULTIEQUAL 303 302 313
+op 3001 31 0x1210 1 MULTIEQUAL 304 315 311
+op 3002 31 0x1214 2 INT_SLESS 305 303 301
+op 3003 31 0x1218 3 CBRANCH - 306 305
+op 3004 32 0x1220 0 INT_SEXT 307 303
+op 3005 32 0x1224 1 PTRADD 309 300 307 308
+op 3006 32 0x1228 2 LOAD 310 316 309
+op 3007 32 0x122c 3 INT_ADD 311 304 310
+op 3008 32 0x1230 4 INT_ADD 313 303 312
+op 3009 32 0x1234 5 BRANCH - 314
+op 3010 33 0x1240 0 RETURN - 317 304
+op 3011 30 0x1200 0 COPY 318 301
+
+vn 318 3 0x300 4
+
+# --- alias(int *p, int *q): pointer alias counterexample
+function 4 alias entry=0x1300
+block 40 0x1300
+vn 400 2 0x38 8 input param=0 name=p
+vn 401 2 0x30 8 input param=1 name=q
+vn 402 0 0x1 4
+vn 403 0 0x2 4
+vn 404 3 0x100 4
+vn 405 0 0x1 4
+vn 406 0 0x0 4
+op 4000 40 0x1300 0 STORE - 405 400 402
+op 4001 40 0x1304 1 STORE - 405 401 403
+op 4002 40 0x1308 2 LOAD 404 405 400
+op 4003 40 0x130c 3 RETURN - 406 404
+# NOTE: vn 405 (constant space id 1 = ram) is shared by the memory ops above.
+
+# --- frame(int a, int b): non-escaping stack slots and a call
+function 5 frame entry=0x1400
+block 50 0x1400
+vn 500 2 0x38 4 input param=0 name=a
+vn 501 2 0x30 4 input param=1 name=b
+vn 502 2 0x20 8 input spacebase name=RSP
+vn 503 0 0xfffffffffffffff0 8
+vn 504 0 0xfffffffffffffff4 8
+vn 505 3 0x100 8
+vn 506 3 0x108 8
+vn 507 3 0x110 8
+vn 508 3 0x118 4
+vn 509 0 0x1 4
+vn 510 1 0x3000 8 annotation
+vn 511 0 0x0 4
+vn 512 0 0xfffffffffffffff0 8
+op 5000 50 0x1400 0 PTRSUB 505 502 503
+op 5001 50 0x1404 1 PTRSUB 506 502 504
+op 5002 50 0x1408 2 STORE - 509 505 500
+op 5003 50 0x140c 3 STORE - 509 506 501
+op 5004 50 0x1410 4 CALL - 510
+op 5005 50 0x1414 5 PTRSUB 507 502 512
+op 5006 50 0x1418 6 LOAD 508 509 507
+op 5007 50 0x141c 7 RETURN - 511 508
+call 5004 target=0x3000 name=opaque_fn
+
+# --- escape(int a): escaping stack slot; a call may write it
+function 6 escape entry=0x1500
+block 60 0x1500
+vn 600 2 0x38 4 input param=0 name=a
+vn 601 2 0x20 8 input spacebase name=RSP
+vn 602 0 0xfffffffffffffff0 8
+vn 603 3 0x100 8
+vn 604 3 0x108 4
+vn 605 0 0x1 4
+vn 606 1 0x3100 8 annotation
+vn 607 0 0x0 4
+vn 608 3 0x110 4
+op 6000 60 0x1500 0 PTRSUB 603 601 602
+op 6001 60 0x1504 1 STORE - 605 603 600
+op 6002 60 0x1508 2 CALL - 606 603
+op 6003 60 0x150c 3 LOAD 604 605 603
+op 6004 60 0x1510 4 INT_ADD 608 604 607
+op 6005 60 0x1514 5 RETURN - 607 608
+call 6002 target=0x3100 name=fill
+
+# --- dispatch(fp, x): function-pointer call, CALLOTHER, INDIRECT, read-only load
+function 7 dispatch entry=0x1600
+block 70 0x1600
+vn 700 2 0x38 8 input param=0 name=fp
+vn 701 2 0x30 4 input param=1 name=x
+vn 702 2 0x0 4 name=r
+vn 703 3 0x100 4
+vn 704 0 0x7 4
+vn 705 4 0xfffffffffffffff8 4 input addrtied name=local
+vn 706 4 0xfffffffffffffff8 4 name=local2
+vn 707 0 0x5010 8
+vn 708 3 0x108 4
+vn 709 0 0x1 4
+vn 710 3 0x110 4
+vn 711 3 0x118 4
+vn 712 3 0x120 4
+vn 713 0 0x0 4
+op 7000 70 0x1600 0 CALLIND 702 700 701
+op 7001 70 0x1600 1 INDIRECT 706 705 @7000
+op 7002 70 0x1604 2 CALLOTHER 703 704 701
+op 7003 70 0x1608 3 LOAD 708 709 707
+op 7004 70 0x160c 4 INT_ADD 710 702 703
+op 7005 70 0x1610 5 INT_ADD 711 710 708
+op 7006 70 0x1614 6 INT_ADD 712 711 706
+op 7007 70 0x1618 7 RETURN - 713 712
+
+# --- spin(c): nonterminating region and a guarded op
+function 8 spin entry=0x1700
+block 80 0x1700
+block 81 0x1710
+block 82 0x1720
+edge 80 81 true
+edge 80 82 false
+edge 81 81 jump
+vn 800 2 0x38 1 input param=0 name=c
+vn 801 1 0x1710 1 annotation
+vn 802 1 0x1710 1 annotation
+vn 803 3 0x100 1
+vn 804 0 0x0 4
+op 8000 80 0x1700 0 CBRANCH - 801 800
+op 8001 81 0x1710 0 BRANCH - 802
+op 8002 82 0x1720 0 BOOL_NEGATE 803 800
+op 8003 82 0x1724 1 RETURN - 804 803
+
+# --- jump(x): unresolved indirect branch
+function 9 jump entry=0x1800
+block 90 0x1800
+block 91 0x1810
+block 92 0x1820
+edge 90 91 true
+edge 90 92 false
+vn 900 2 0x38 8 input param=0 name=x
+vn 901 3 0x100 1
+vn 902 0 0x0 8
+vn 903 1 0x1810 1 annotation
+vn 904 0 0x0 4
+op 9000 90 0x1800 0 INT_EQUAL 901 900 902
+op 9001 90 0x1804 1 CBRANCH - 903 901
+op 9002 91 0x1810 0 BRANCHIND - 900
+op 9003 92 0x1820 0 RETURN - 904 900
+
+# --- weird(x): unknown opcode stays a barrier
+function 10 weird entry=0x1900
+block 100 0x1900
+vn 1000 2 0x38 4 input param=0 name=x
+vn 1001 3 0x100 4
+vn 1002 0 0x0 4
+op 10000 100 0x1900 0 VENDOR_MAGIC 1001 1000
+op 10001 100 0x1904 1 RETURN - 1002 1001
+end
