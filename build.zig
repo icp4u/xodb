@@ -13,6 +13,8 @@ pub fn build(b: *std.Build) void {
     module.addOptions("build_options", options);
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
+    module.addIncludePath(b.path("src/service"));
+    module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     for (runtime_sources) |source| {
         module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
@@ -124,6 +126,12 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    const service_tests = b.addExecutable(.{ .name = "xodb-service-session-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    service_tests.root_module.addIncludePath(b.path("src/service"));
+    for ([_][]const u8{ "src/service/session.c", "tests/service-session.c" }) |source_file| {
+        service_tests.root_module.addCSourceFile(.{ .file = b.path(source_file), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    test_step.dependOn(&b.addRunArtifact(service_tests).step);
     if (target.result.cpu.arch == .x86_64 and target.result.os.tag == .linux and !target.result.abi.isAndroid()) {
         const uprobes = b.addExecutable(.{ .name = "xodb-runtime-uprobes-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
         uprobes.pie = false;

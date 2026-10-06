@@ -44,6 +44,35 @@ static int mapping_identity(int fd, uint64_t ma, uint64_t mi, uint64_t ino)
     return match;
 }
 
+/* The candidate descriptor is already open and pins its inode while maps is
+ * read. A matching live VMA therefore cannot refer to a freed inode whose
+ * number the candidate later reused. This is an identity check at observation
+ * time, not a promise that a running target keeps the mapping afterwards. */
+static int mapping_present(int pid, uint64_t start, uint64_t end, uint64_t ma, uint64_t mi,
+                           uint64_t ino)
+{
+    if (start >= end)
+        return 0;
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
+    FILE *maps = fopen(path, "re");
+    if (!maps)
+        return 0;
+    int match = 0;
+    char line[8192];
+    for (unsigned i = 0; i < 65536 && !match && fgets(line, sizeof line, maps); ++i) {
+        unsigned long long s, e, offset, inode;
+        unsigned major_number, minor_number;
+        char permissions[5];
+        if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &s, &e, permissions, &offset,
+                   &major_number, &minor_number, &inode) == 7)
+            match = s < end && start < e && major_number == ma && minor_number == mi &&
+                    inode == ino;
+    }
+    fclose(maps);
+    return match;
+}
+
 int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end, uint64_t ma,
                              uint64_t mi, uint64_t inode, int strict)
 {
@@ -54,7 +83,8 @@ int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end, uint
     if (fstatfs(fd, &fs))
         return 0;
     if ((unsigned long)fs.f_type != XODB_BTRFS_SUPER_MAGIC)
-        return major(candidate.st_dev) == ma && minor(candidate.st_dev) == mi;
+        return major(candidate.st_dev) == ma && minor(candidate.st_dev) == mi &&
+               (pid <= 0 || mapping_present(pid, start, end, ma, mi, inode));
     if (pid <= 0 || start >= end || !mapping_identity(fd, ma, mi, inode))
         return 0;
 

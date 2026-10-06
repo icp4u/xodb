@@ -20,6 +20,7 @@ see linux-ai-debugger-agents.md for an ai summary of a discussion fleshing out t
 - [x] Initial AArch64 hardware data watchpoints, write investigations and remote GUI controls ([evidence/limits](docs/research/arm64-watchpoints/integration.md)).
 - [ ] AArch64 feature coverage: precise multi-watch attribution, modern ARM validation, profiling, native GUI and remaining debugger gaps.
 - [ ] Investigate debugging additional architectures and the hardware/emulation needed to validate them.
+- [ ] Serial and kernel debugging on much more varied targets: speak the GDB remote serial protocol as a client (gdbserver, QEMU/emulator stubs, kgdb over serial or network, OpenOCD/JTAG probes, bare-metal and RTOS stubs). Treat a stub as another target backend beside ptrace and the C agent, with honest capability discovery (qSupported, target.xml register descriptions, no-ack, non-stop) and explicit gaps where a stub cannot provide what ptrace does.
 - [ ] Periodic agent reassessment of unmet wants: what useful workflows are missing from both the implementation and the plan?
 
 Scope and review cadence: [future work](docs/MILESTONES.md#future-display-and-architecture-work).

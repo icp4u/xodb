@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Forward an MCP client's stdio bytes to an existing xodb Unix socket.
+
+No JSON parsing or MCP framing is added. Each direction buffers at most 256 KiB
+and applies backpressure until its destination accepts more bytes.
+"""
+import argparse
+import os
+import selectors
+import socket
+import sys
+
+BUFFER_LIMIT = 256 * 1024
+CHUNK_SIZE = 16 * 1024
+
+
+def relay(peer, input_fd=0, output_fd=1):
+    to_peer = bytearray()
+    to_output = bytearray()
+    input_open = True
+    peer_open = True
+    write_closed = False
+    unsent = False
+    original_blocking = {}
+    # poll handles both pipes and redirected regular stdio files on Linux.
+    with selectors.PollSelector() as selector:
+        def interest(fd, events):
+            registered = selector.get_map().get(fd)
+            if not events:
+                if registered is not None:
+                    selector.unregister(fd)
+            elif registered is None:
+                selector.register(fd, events)
+            elif registered.events != events:
+                selector.modify(fd, events)
+
+        try:
+            for fd in (input_fd, output_fd):
+                original_blocking[fd] = os.get_blocking(fd)
+                os.set_blocking(fd, False)
+            peer.setblocking(False)
+            while True:
+                if not input_open and not to_peer and not write_closed and peer_open:
+                    peer.shutdown(socket.SHUT_WR)
+                    write_closed = True
+                if not peer_open:
+                    # A server disconnect ends this bridge even if the MCP
+                    # client's stdin remains open. Flush received bytes first.
+                    input_open = False
+                    unsent |= bool(to_peer)
+                    to_peer.clear()
+                    if not to_output:
+                        if unsent:
+                            raise ConnectionError("session closed before buffered input was sent")
+                        return
+                interest(input_fd, selectors.EVENT_READ if input_open and peer_open and len(to_peer) < BUFFER_LIMIT else 0)
+                interest(output_fd, selectors.EVENT_WRITE if to_output else 0)
+                interest(peer.fileno(),
+                         (selectors.EVENT_READ if peer_open and len(to_output) < BUFFER_LIMIT else 0) |
+                         (selectors.EVENT_WRITE if peer_open and to_peer else 0))
+                for key, events in selector.select():
+                    if key.fd == input_fd:
+                        if not peer_open:
+                            continue
+                        try:
+                            data = os.read(input_fd, min(CHUNK_SIZE, BUFFER_LIMIT - len(to_peer)))
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        if data:
+                            to_peer.extend(data)
+                        else:
+                            input_open = False
+                    elif key.fd == output_fd:
+                        try:
+                            sent = os.write(output_fd, to_output)
+                        except (BlockingIOError, InterruptedError):
+                            continue
+                        if not sent:
+                            raise BrokenPipeError("stdout accepted zero bytes")
+                        del to_output[:sent]
+                    else:
+                        if events & selectors.EVENT_READ:
+                            try:
+                                data = peer.recv(min(CHUNK_SIZE, BUFFER_LIMIT - len(to_output)))
+                            except (BlockingIOError, InterruptedError):
+                                data = None
+                            if data:
+                                to_output.extend(data)
+                            elif data is not None:
+                                peer_open = False
+                        if events & selectors.EVENT_WRITE and peer_open and to_peer:
+                            try:
+                                sent = peer.send(to_peer)
+                            except (BlockingIOError, InterruptedError):
+                                continue
+                            if not sent:
+                                raise BrokenPipeError("session socket accepted zero bytes")
+                            del to_peer[:sent]
+        finally:
+            for fd, blocking in original_blocking.items():
+                os.set_blocking(fd, blocking)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("socket", help="absolute path passed to xodb --session-socket")
+    options = parser.parse_args()
+    if not os.path.isabs(options.socket):
+        parser.error("socket path must be absolute")
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as peer:
+            peer.settimeout(5)
+            peer.connect(options.socket)
+            relay(peer)
+        return 0
+    except KeyboardInterrupt:
+        print("session-client: interrupted", file=sys.stderr)
+        return 130
+    except (OSError, ValueError) as error:
+        print(f"session-client: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

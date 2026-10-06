@@ -213,6 +213,12 @@ and register writes. Every control action must present the current session
 `generation`, so stale agents get rejected. **F8** revokes control from the GUI
 mid-flight. There's an action audit. There's no embedded LLM — bring your own.
 
+For several agents on one debugger, use `--session-socket /absolute/private/path/xodb.sock`
+with the GUI or `--headless`, then connect each MCP client through
+`scripts/session-client /absolute/private/path/xodb.sock`. Clients begin as observers;
+one can claim a time-limited controller lease. Reconnecting preserves retained
+investigations. [Shared-session commands and examples](docs/SHARED_SESSIONS.md).
+
 [MCP overview](docs/MCP_OVERVIEW.md)
 
 ## Current limits

@@ -1,5 +1,5 @@
 # Standalone C runtime: no Zig, GUI, ELF or DWARF library is required.
-# Example: make -C src/runtime BUILD=/data2/icp/Work/xodb-c-build check
+# Example: make -C src/runtime BUILD=../../.work/c-build check
 ROOT := $(abspath ../..)
 BUILD ?= $(ROOT)/.work/c-runtime
 CC ?= cc

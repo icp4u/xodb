@@ -30,9 +30,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle'):
+                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
-        for name in ('inspections', 'inspection-lifecycle'):
+        for name in ('inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
@@ -48,6 +48,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-themes', ['tests/themes.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
+            ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
             ('gui-restart', ['tests/restart-gui.py', 'zig-out']),

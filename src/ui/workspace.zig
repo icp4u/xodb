@@ -119,6 +119,10 @@ const WatchSource = struct {
 };
 
 pub const Workspace = struct {
+    shared_clients: ?usize = null,
+    shared_controller: ?u64 = null,
+    /// Owner loop consumes this even when several toggles restore the old scope.
+    shared_scope_changed: bool = false,
     imported: @import("imported.zig").View = .{},
     source: []const u8 = "",
     source_path: []const u8 = "No source file selected",
@@ -300,9 +304,31 @@ pub const Workspace = struct {
         const navigation = code == 36 or code == 37 or code == 103 or code == 108;
         return if (event.kind == .repeat and !navigation) 0 else code;
     }
+    fn toggleAgentScope(self: *Workspace, session: *Session) void {
+        session.setAgentScope(if (session.agent_scope == .observe) .control else .observe);
+        self.status = if (session.agent_scope == .observe) "Agent control revoked" else "Agent control enabled";
+        if (self.shared_clients != null) {
+            self.shared_scope_changed = true;
+            self.shared_controller = null;
+        }
+    }
+    fn sharedScopeInput(self: *Workspace, w: *Window, session: *Session) void {
+        if (self.shared_clients == null or w.closing) return;
+        // Scope control belongs to the human even while a delegated view or
+        // text editor owns ordinary input. The queue is bounded to 64 events.
+        for (0..w.input.count) |offset| {
+            const event = &w.input.queue[(w.input.head + offset) % keys.capacity];
+            if (event.kind != .press or !event.plain() or event.shortcut != keys.sym.f8) continue;
+            self.toggleAgentScope(session);
+            w.dirty = true;
+            // No text/key action can replay this press in a delegated handler.
+            event.* = .{ .kind = .release };
+        }
+    }
     /// Applies the queued key and button events one at a time, in order, then the
     /// pointer state. A click is handled at the position where it happened.
     pub fn input(self: *Workspace, w: *Window, session: *Session) void {
+        self.sharedScopeInput(w, session);
         if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
         if (session.imported) |*state| return self.imported.input(w, state);
         const pointer = [2]f32{ w.pointer_x, w.pointer_y };
@@ -969,10 +995,7 @@ pub const Workspace = struct {
             self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / 25)));
             w.dirty = true;
         }
-        if (code == 66) { // F8: human revokes or grants agent execution control.
-            session.setAgentScope(if (session.agent_scope == .observe) .control else .observe);
-            self.status = if (session.agent_scope == .observe) "Agent control revoked" else "Agent control enabled";
-        }
+        if (code == 66) self.toggleAgentScope(session); // F8 or the Agent button.
         if (code == 87 or code == 68 or code == 57 or code == 63 or code == 64 or code == 36 or code == 37) self.browse_address = null;
         if ((code == 87 or code == 68) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
             const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
@@ -1298,13 +1321,31 @@ pub const Workspace = struct {
         }
         self.animating = moving or self.inspection_panel.busy(session);
     }
+    fn drawSharedOwnership(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+        const count = self.shared_clients orelse return;
+        const width: f32 = @floatFromInt(w.width);
+        const height: f32 = @floatFromInt(w.height);
+        r.clip = .{ .x = 0, .y = 0, .w = width, .h = height };
+        const top = @max(0, height - 30);
+        try r.rect(.{ .x = 0, .y = top, .w = width, .h = height - top }, theme.header);
+        try r.rect(.{ .x = 0, .y = top, .w = width, .h = 1 }, theme.status_border);
+        if (self.shared_controller) |owner| {
+            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / controller #{d} / {d} clients", .{ @tagName(session.agent_scope), owner, count });
+        } else {
+            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / no controller / {d} clients", .{ @tagName(session.agent_scope), count });
+        }
+    }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
         if (session.comparison) |job| if (self.comparison.open) {
             session.profile_view_visible = false;
             self.animating = !job.done.load(.acquire);
-            return self.comparison.draw(r, font, w, job);
+            try self.comparison.draw(r, font, w, job);
+            return self.drawSharedOwnership(r, font, w, session);
         };
-        if (session.imported) |*state| return self.imported.draw(r, font, w, state);
+        if (session.imported) |*state| {
+            try self.imported.draw(r, font, w, state);
+            return self.drawSharedOwnership(r, font, w, session);
+        }
         if (session.allocations.capture) |capture| if (capture.archived and !self.allocation_archive_seen) {
             self.allocation_archive_seen = true;
             self.show_profile = false;
@@ -1482,7 +1523,15 @@ pub const Workspace = struct {
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
-        try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.snapshot().generation });
+        if (self.shared_clients) |count| {
+            if (self.shared_controller) |owner| {
+                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(session.agent_scope), owner, count });
+            } else {
+                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / no controller / {d} clients", .{ self.status, @tagName(session.agent_scope), count });
+            }
+        } else {
+            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.snapshot().generation });
+        }
         if (width >= 900) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
         try self.probes_panel.draw(r, font, width, height, session);
@@ -2006,4 +2055,100 @@ test "capture setup: S opens it, an empty subset never starts, replacement clear
     session.offline = true;
     workspace.applySetup(&w, &session, .{ .set_duration = 10000 });
     try std.testing.expect(session.profile_defaults.duration_ms != 10000);
+}
+
+test "shared F8 precedes imported input and consumes only plain presses" {
+    var session = Session{ .id = 1, .agent_scope = .control, .imported = .{} };
+    defer session.deinit();
+    var workspace = Workspace{ .shared_clients = 2, .shared_controller = 7 };
+    defer workspace.deinit();
+    var w = Window{};
+    // Exercise wraparound and preserve an unrelated imported-view shortcut.
+    w.input.head = keys.capacity - 1;
+    w.input.count = 4;
+    w.input.queue[keys.capacity - 1] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    w.input.queue[0] = .{ .kind = .repeat, .shortcut = keys.sym.f8 };
+    w.input.queue[1] = .{ .kind = .press, .shortcut = keys.sym.f8, .mods = .{ .ctrl = true } };
+    w.input.queue[2] = .{ .kind = .press, .shortcut = 'i' };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 1), session.audit_count);
+    try std.testing.expect(workspace.shared_scope_changed and workspace.shared_controller == null);
+    try std.testing.expect(workspace.imported.inspector);
+    try std.testing.expectEqual(@as(usize, 0), w.input.count);
+    workspace.shared_scope_changed = false;
+    w.input.head = 0;
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 2), session.audit_count);
+    try std.testing.expect(workspace.shared_scope_changed);
+}
+
+test "shared F8 bypasses a modal editor without double toggling normal input" {
+    var session = Session{ .id = 1, .agent_scope = .control };
+    defer session.deinit();
+    var workspace = Workspace{ .shared_clients = 1 };
+    defer workspace.deinit();
+    workspace.allocation_save_editor.start();
+    var w = Window{};
+    w.input.count = 3;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    w.input.queue[1] = .{ .kind = .repeat, .shortcut = keys.sym.f8 };
+    w.input.queue[2] = .{ .kind = .press, .shortcut = 'x', .text_len = 1 };
+    w.input.queue[2].text_bytes[0] = 'x';
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 1), session.audit_count);
+    try std.testing.expect(workspace.allocation_save_editor.open);
+    try std.testing.expectEqualStrings("x", workspace.allocation_save_editor.text.slice());
+    workspace.allocation_save_editor.open = false;
+    w.input.head = 0;
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 2), session.audit_count);
+    // A revoke+grant batch must still tell the owner loop to revoke the old lease.
+    workspace.shared_scope_changed = false;
+    w.input.head = 0;
+    w.input.count = 2;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    w.input.queue[1] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 4), session.audit_count);
+    try std.testing.expect(workspace.shared_scope_changed);
+}
+
+test "nonshared F8 keeps delegated and modal behavior unchanged" {
+    var session = Session{ .id = 1, .agent_scope = .control, .imported = .{} };
+    defer session.deinit();
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    var w = Window{};
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 0), session.audit_count);
+    session.imported.?.deinit();
+    session.imported = null;
+    workspace.allocation_save_editor.start();
+    w.input.head = 0;
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 0), session.audit_count);
+    workspace.allocation_save_editor.open = false;
+    w.input.head = 0;
+    w.input.count = 1;
+    w.input.queue[0] = .{ .kind = .press, .shortcut = keys.sym.f8 };
+    workspace.input(&w, &session);
+    try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 1), session.audit_count);
+    try std.testing.expect(!workspace.shared_scope_changed);
 }

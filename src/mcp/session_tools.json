@@ -1,0 +1,83 @@
+[
+  {
+    "name": "get_session_clients",
+    "description": "List connected observers, the exclusive controller and its lease. Session-wide; no process_id.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "claim_session_control",
+    "description": "Claim or renew the sole controller lease. Uses original process generation from get_session; human scope remains authoritative.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "ttl_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 60000,
+          "default": 30000
+        }
+      },
+      "required": [
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "lease"
+    }
+  },
+  {
+    "name": "release_session_control",
+    "description": "Release your controller lease without stopping the shared session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "lease"
+    }
+  },
+  {
+    "name": "get_session_events",
+    "description": "Page the bounded session connection/lease journal. A gap requires resync using get_session_clients; target events use query_events.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "after": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128,
+          "default": 32
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

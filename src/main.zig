@@ -8,6 +8,7 @@ const Renderer = @import("render/vulkan.zig").Renderer;
 const Font = @import("render/font.zig").Font;
 const Workspace = @import("ui/workspace.zig").Workspace;
 const Server = @import("mcp/server.zig").Server;
+const SharedSession = @import("mcp/shared.zig").Endpoint;
 const linux = @import("target/linux.zig");
 var quitting: c.sig_atomic_t = 0;
 fn onSignal(signal: c_int) callconv(.c) void {
@@ -23,6 +24,7 @@ pub fn main(init: std.process.Init) !void {
     var theme_path: ?[:0]const u8 = null;
     var headless = !build_options.gui;
     var mcp = false;
+    var session_socket: ?[:0]const u8 = null;
     var follow_forks = false;
     var process_limit: usize = 32;
     var attach: ?i32 = null;
@@ -74,6 +76,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--ssh HOST --remote-xodb PATH opens the GUI with a headless server over SSH.
                 \\--runtime-agent PATH uses the standalone C agent with host-side analysis.
                 \\--runtime-ssh HOST [--ssh-config FILE] runs that agent over SSH.
+                \\--session-socket PATH serves local MCP observers and one leased controller (GUI or --headless).
                 \\--listen ADDRESS:PORT serves one plaintext TCP client; requires --headless --mcp.
                 \\With --mcp, --source FILE explicitly shares that source file with remote viewers.
                 \\--allocation-helper PATH explicitly permits sudo -n to open allocation probes (see docs/ALLOCATIONS.md).
@@ -108,12 +111,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
-            if (std.mem.eql(u8, arg, "--observe-recipe")) { observation_recipe = args[i]; headless = true; }
+            if (std.mem.eql(u8, arg, "--observe-recipe")) {
+                observation_recipe = args[i];
+                headless = true;
+            }
             if (std.mem.eql(u8, arg, "--observation-out")) observation_out = args[i];
-            if (std.mem.eql(u8, arg, "--open-observation")) { open_observation = args[i]; headless = true; }
+            if (std.mem.eql(u8, arg, "--open-observation")) {
+                open_observation = args[i];
+                headless = true;
+            }
             if (std.mem.eql(u8, arg, "--observation-threshold-ns")) observation_threshold = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
             if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
@@ -125,6 +134,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--connect")) connect = args[i];
             if (std.mem.eql(u8, arg, "--ssh")) ssh = args[i];
             if (std.mem.eql(u8, arg, "--remote-xodb")) remote_xodb = args[i];
+            if (std.mem.eql(u8, arg, "--session-socket")) session_socket = args[i];
             if (std.mem.eql(u8, arg, "--listen")) listen = args[i];
             if (std.mem.eql(u8, arg, "--config")) config_path = args[i];
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
@@ -148,12 +158,12 @@ pub fn main(init: std.process.Init) !void {
         } else return error.UnknownArgument;
     }
     if (observation_recipe != null) {
-        if (observation_out == null or open_observation != null or mcp or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
+        if (observation_out == null or open_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
         if (launch.len == 0 and attach == null) return error.ObservationRecipeRequiresTarget;
     } else if (observation_out != null) return error.ObservationOutputRequiresRecipe;
     if (open_observation != null and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint != null or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
     if (observation_threshold != null and observation_recipe == null and open_observation == null) return error.ObservationThresholdRequiresInvestigation;
-    if (observation_threshold != null and mcp) return error.ObservationThresholdUseMcpComparison;
+    if (observation_threshold != null and (mcp or session_socket != null)) return error.ObservationThresholdUseMcpComparison;
     if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
@@ -167,11 +177,12 @@ pub fn main(init: std.process.Init) !void {
     if (runtime_remote and (connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null)) return error.RuntimeAgentOptionConflict;
     if (ssh_config != null and runtime_ssh == null) return error.SshConfigRequiresRuntimeSsh;
     const remote_gui = connect != null or ssh != null;
+    if (session_socket != null and (mcp or listen != null or remote_gui)) return error.SharedSessionOptionConflict;
     if (remote_gui and (headless or mcp or listen != null or open_capture != null or symbols != null or record_path != null or capture_out != null or profile_out != null)) return error.RemoteGuiOptionConflict;
     if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint != null or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
-    if (headless and !mcp and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
+    if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint != null or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
@@ -218,6 +229,9 @@ pub fn main(init: std.process.Init) !void {
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
     defer session.deinit();
+    // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
+    var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
+    defer if (shared) |*endpoint| endpoint.deinit();
     if (runtime_remote) {
         var transport: std.ArrayList([:0]const u8) = .empty;
         const agent = runtime_agent orelse "xodb-agent";
@@ -273,8 +287,8 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (open_observation) |path| {
-        try @import("observe/cli.zig").open(a, session, path, observation_threshold, mcp, &quitting);
-        if (!mcp) return;
+        try @import("observe/cli.zig").open(a, session, path, observation_threshold, mcp or shared != null, &quitting);
+        if (!mcp and shared == null) return;
     }
     const server = try a.create(Server);
     server.* = .{ .source_path = source };
@@ -287,8 +301,11 @@ pub fn main(init: std.process.Init) !void {
     if (headless) {
         while (quitting == 0) {
             try tree.poll();
-            try server.pump(session);
-            if (server.closed and server.queued == 0) break;
+            if (mcp) {
+                try server.pump(session);
+                if (server.closed and server.queued == 0) break;
+            }
+            if (shared) |*endpoint| try endpoint.pump(session);
             _ = c.usleep(2000);
         }
         try finishRequestedArchive(session, capture_out);
@@ -373,8 +390,21 @@ pub fn main(init: std.process.Init) !void {
                 try server.pump(session);
                 if (server.closed and server.queued == 0) break;
             }
+            if (shared) |*endpoint| try endpoint.pump(session);
             phase_started = linux.now();
+            if (shared != null and workspace.shared_clients == null) workspace.shared_clients = 0;
             workspace.input(&window, active);
+            if (shared) |*endpoint| {
+                if (workspace.shared_scope_changed) {
+                    try endpoint.revoke();
+                    workspace.shared_scope_changed = false;
+                }
+                const ownership = try endpoint.state(session);
+                const owner: ?u64 = if (ownership.controller == 0) null else ownership.controller;
+                if (workspace.shared_clients != ownership.peer_count or workspace.shared_controller != owner) window.dirty = true;
+                workspace.shared_clients = ownership.peer_count;
+                workspace.shared_controller = owner;
+            }
             if (tree.active() != active) continue;
             reportSlow("workspace input/inspection", phase_started);
             if (window.closing or quitting != 0) break;

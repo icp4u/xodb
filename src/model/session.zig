@@ -13,7 +13,7 @@ pub const FunctionGraph = struct { generation: u64, image_epoch: u64, module_id:
 pub const AgentScope = enum { observe, control, mutate };
 pub const Actor = enum { human, agent };
 pub const Effect = enum { execution, mutation };
-pub const Audit = struct { sequence: u64, actor: Actor, action: []const u8, generation: u64 };
+pub const Audit = struct { sequence: u64, actor: Actor, client_id: ?u64 = null, action: []const u8, generation: u64 };
 pub const Frame = struct {
     architecture: @import("../target/arch.zig").Arch = .x86_64,
     tid: i32 = 0,
@@ -96,6 +96,8 @@ pub const Session = struct {
     maps_epoch: u64 = 0,
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
+    /// Set only while dispatching a shared MCP request on the owner thread.
+    agent_client_id: ?u64 = null,
     source_step: ?SourceStep = null,
     source_step_resumes: usize = 0,
     source_step_batched: usize = 0,
@@ -1487,7 +1489,7 @@ pub const Session = struct {
             std.mem.copyForwards(Audit, self.audit[0 .. self.audit.len - 1], self.audit[1..]);
             self.audit_count -= 1;
         }
-        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .action = action, .generation = self.target.snapshot().generation };
+        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .client_id = if (actor == .agent) self.agent_client_id else null, .action = action, .generation = self.target.snapshot().generation };
         self.audit_count += 1;
         if (actor == .agent) self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence));
     }

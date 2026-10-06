@@ -2,6 +2,10 @@
  * ELF/DWARF, GUI or analysis libraries. All inferiors belong to this test. */
 #define _GNU_SOURCE 1
 #include "xrt_target.h"
+#include "mapped_file.h"
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>
@@ -245,12 +249,45 @@ static void legacy_vectors(void)
     }
     CHECK(xrt_xstate_decode_legacy(NULL, 512, &decoded) == XRT_INVALID_ARGUMENT);
 }
+/* No inode-reuse timing is needed for the permanent regression: once its
+ * VMA is gone, even a still-open descriptor is not a live backing mapping. */
+static void mapping_identity(void)
+{
+    const long page = sysconf(_SC_PAGESIZE);
+    CHECK(page > 0);
+    const int fd = memfd_create("mapping-identity-fixture", MFD_CLOEXEC);
+    CHECK(fd >= 0 && ftruncate(fd, page) == 0);
+    void *address = mmap(NULL, (size_t)page, PROT_NONE, MAP_PRIVATE, fd, 0);
+    CHECK(address != MAP_FAILED);
+    struct stat st;
+    CHECK(fstat(fd, &st) == 0);
+    const uint64_t start = (uintptr_t)address, end = start + (uint64_t)page;
+    const uint64_t ma = major(st.st_dev), mi = minor(st.st_dev), ino = st.st_ino;
+    CHECK(xodb_mapped_file_matches(fd, getpid(), start, end, ma, mi, ino, 0) == 1);
+    CHECK(xodb_mapped_file_matches(fd, getpid(), end, start, ma, mi, ino, 0) == 0);
+    child = fork();
+    CHECK(child >= 0);
+    if (!child)
+        _exit(0);
+    siginfo_t info;
+    CHECK(waitid(P_PID, (id_t)child, &info, WEXITED | WNOWAIT) == 0);
+    CHECK(xodb_mapped_file_matches(fd, child, start, end, ma, mi, ino, 0) == 0);
+    CHECK(waitpid(child, NULL, 0) == child);
+    child = 0;
+    CHECK(munmap(address, (size_t)page) == 0);
+    CHECK(xodb_mapped_file_matches(fd, getpid(), start, end, ma, mi, ino, 0) == 0);
+    /* Explicit path-only callers keep the weaker device/inode comparison. */
+    CHECK(xodb_mapped_file_matches(fd, 0, start, end, ma, mi, ino, 0) == 1);
+    CHECK(close(fd) == 0);
+}
+
 int main(int argc, char **argv)
 {
     if (argc == 2 && strcmp(argv[1], "--fixture") == 0)
         return 17;
     CHECK(atexit(cleanup) == 0);
     alarm(30);
+    mapping_identity();
     core_snapshot();
     legacy_vectors();
     if (getenv("XODB_TEST_NO_LIVE") || !xrt_arch_native()) {

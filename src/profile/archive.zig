@@ -1065,17 +1065,27 @@ fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, a: Alloca
     var buffer: [max_path + 256]u8 = undefined;
     const path = resolver.candidate(&buffer, report.*) orelse return;
     report.opened_path = try a.dupe(u8, path);
-    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
-    if (fd < 0) {
+    // The recorded path comes from the archive. O_PATH pins the inode without
+    // running FIFO/device open semantics; only a regular file is reopened.
+    const pinned = c.open(path.ptr, c.O_PATH | c.O_CLOEXEC);
+    if (pinned < 0) {
         report.status = .missing;
         return;
     }
-    defer _ = c.close(fd);
+    defer _ = c.close(pinned);
     var stat: c.struct_stat = undefined;
-    if (c.fstat(fd, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) {
+    if (c.fstat(pinned, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) {
         report.status = .unreadable;
         return;
     }
+    var proc: [64]u8 = undefined;
+    const reopen = std.fmt.bufPrintZ(&proc, "/proc/self/fd/{d}", .{pinned}) catch unreachable;
+    const fd = c.open(reopen.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+    if (fd < 0) {
+        report.status = .unreadable;
+        return;
+    }
+    defer _ = c.close(fd);
     if (stat.st_size != report.identity.file_bytes) {
         report.status = .size_mismatch;
         return;
@@ -1521,4 +1531,33 @@ fn decodeSyscalls(r: *Reader, self: *Capture) !void {
     try store.items.ensureTotalCapacityPrecise(self.allocator, count);
     for (0..count) |_| store.items.appendAssumeCapacity(.{ .thread_index = try r.int(u16), .nr = try r.int(i64), .exit_nr = try r.opt(i64), .entry_ns = try r.opt(u64), .exit_ns = try r.opt(u64), .result = try r.opt(i64), .reason = try SyscallReasonCode.decode(try r.code()) });
     try r.end();
+}
+
+test "archive resolver refuses FIFO without an open side effect" {
+    const notify = @cImport({ @cInclude("sys/inotify.h"); });
+    var directory = "archive-resolver-XXXXXX".*;
+    const dir = c.mkdtemp(&directory) orelse return error.TestUnexpectedResult;
+    defer _ = c.rmdir(dir);
+    try std.testing.expectEqual(@as(c_int, 0), c.chmod(dir, 0o755));
+    var path_buffer: [128]u8 = undefined;
+    const path = try std.fmt.bufPrintZ(&path_buffer, "{s}/fifo", .{std.mem.span(dir)});
+    try std.testing.expectEqual(@as(c_int, 0), c.mkfifo(path, 0o600));
+    defer _ = c.unlink(path);
+    const monitor = notify.inotify_init1(notify.IN_NONBLOCK | notify.IN_CLOEXEC);
+    try std.testing.expect(monitor >= 0);
+    defer _ = c.close(monitor);
+    try std.testing.expect(notify.inotify_add_watch(monitor, path, notify.IN_OPEN) >= 0);
+    const fixture = @import("archive_fixture.zig");
+    const capture = try fixture.build(std.testing.allocator, .empty, null);
+    defer capture.deinit();
+    var report = ImageReport{ .id = 1, .path = path, .opened_path = "", .status = .not_requested, .identity = identify(""), .placement = .{ .device_major = 0, .device_minor = 0, .inode = 0, .bias = 0, .start = 0, .end = 4096 } };
+    try loadImage(capture, &report, .{}, capture.arena.allocator(), null);
+    try std.testing.expectEqual(ImageStatus.not_requested, report.status);
+    try loadImage(capture, &report, .{ .enabled = true }, capture.arena.allocator(), null);
+    try std.testing.expectEqual(ImageStatus.unreadable, report.status);
+    // An ordinary nonblocking FIFO open emits IN_OPEN, even if closed at once.
+    // O_PATH must emit no event; this checks the side effect without races.
+    var events: [256]u8 = undefined;
+    try std.testing.expectEqual(@as(isize, -1), c.read(monitor, &events, events.len));
+    try std.testing.expectEqual(@as(c_int, c.EAGAIN), std.c._errno().*);
 }

@@ -79,7 +79,13 @@ pub const Tree = struct {
             if (entry.session.profile) |capture| if (capture.collector != null) try entry.session.stopProfile();
         };
         try session.target.detachProcessFamily();
-        for (affected[0..n]) |member| member.record(actor, "detach_process_family");
+        const client_id = session.agent_client_id;
+        for (affected[0..n]) |member| {
+            const previous_client = member.agent_client_id;
+            member.agent_client_id = client_id;
+            member.record(actor, "detach_process_family");
+            member.agent_client_id = previous_client;
+        }
         self.retryAdmissions();
     }
     pub fn setScope(self: *Tree, scope: model.AgentScope) void {
