@@ -19,6 +19,16 @@ pub fn main(init: std.process.Init) !void {
     const startup_started = linux.now();
     const a = init.arena.allocator();
     const args = try init.minimal.args.toSlice(a);
+    // lsof-top is a separate terminal program over the C fd scanner. Only
+    // xodb's own options count: a launched program's arguments follow "--".
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (!std.mem.eql(u8, arg, "--lsof-top")) continue;
+        const argv = try a.alloc(?[*:0]u8, args.len + 1);
+        for (args, 0..) |text, k| argv[k] = @constCast(text.ptr);
+        argv[args.len] = null;
+        std.process.exit(@intCast(c.xodb_lsof_top(@intCast(args.len), @ptrCast(argv.ptr)) & 0xff));
+    }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
     var config_path: ?[:0]const u8 = null;
@@ -112,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
                 \\Owned targets are killed on close. Attached targets are detached and preserved.
                 \\--frames N exits after N rendered frames for graphical smoke testing.
+                \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\

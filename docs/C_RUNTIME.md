@@ -29,8 +29,9 @@ make -C src/runtime CC=gcc BUILD="$PWD/.work/c-runtime" check
 # Or use CC=clang and a separate BUILD directory.
 ```
 
-The output is `libxrt.a` and `xodb-agent`. Copy the agent to a work directory on
-the target, then use its absolute path:
+The output is `libxrt.a`, `xodb-agent` and `xodb-lsof-top` (the
+[live open-file view](LSOF_TOP.md), the same program as `xodb --lsof-top`).
+Copy the agent to a work directory on the target, then use its absolute path:
 
 ```sh
 ./zig-out/bin/xodb --runtime-ssh my-target --ssh-config ~/.ssh/config \

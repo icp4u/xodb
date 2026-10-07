@@ -33,7 +33,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis'):
+                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis',
+                     'lsof-top'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         for name in ('inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))

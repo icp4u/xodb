@@ -8,12 +8,12 @@ CPPFLAGS += -I$(CURDIR)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wswitch-enum
 LDLIBS += -latomic -pthread
-SOURCES := memory arch registers process target probes watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files loader elf_symbols mapped_file perf_wire agent_perf remote_perf allocation_broker
+SOURCES := memory arch registers process target probes watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
-TESTS := memory registers process target perf wire snapshot symbols
+TESTS := memory registers process target perf wire snapshot symbols fdscan
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))
 .PHONY: all check clean
-all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent
+all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent $(BUILD)/xodb-lsof-top
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/allocation_broker.o: $(ROOT)/src/profile/allocation_broker.c | $(BUILD)
@@ -24,6 +24,9 @@ $(BUILD)/libxrt.a: $(OBJECTS)
 	$(AR) rcs $@ $^
 $(BUILD)/xodb-agent: agent_main.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
+# lsof-top for machines that run only the agent; xodb --lsof-top is the same program.
+$(BUILD)/xodb-lsof-top: $(ROOT)/src/lsoftop/main.c $(ROOT)/src/lsoftop/lsoftop.c $(BUILD)/libxrt.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(ROOT)/src/lsoftop/main.c $(ROOT)/src/lsoftop/lsoftop.c $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-%: $(ROOT)/tests/runtime-%.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-remote: $(ROOT)/tests/runtime-remote.c $(BUILD)/libxrt.a
@@ -41,5 +44,5 @@ check: $(BUILD)/test-loader $(TEST_BINS) $(BUILD)/test-remote $(BUILD)/test-repl
 $(BUILD)/test-uprobes: $(ROOT)/tests/runtime-uprobes.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -fno-pie -no-pie $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 clean:
-	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(TEST_BINS) $(BUILD)/libxrt.a $(BUILD)/xodb-agent
+	rm -f $(OBJECTS) $(OBJECTS:.o=.d) $(TEST_BINS) $(BUILD)/libxrt.a $(BUILD)/xodb-agent $(BUILD)/xodb-lsof-top
 -include $(OBJECTS:.o=.d)

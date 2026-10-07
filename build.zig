@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "../profile/allocation_broker.c" };
+const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "../profile/allocation_broker.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -25,6 +25,8 @@ pub fn build(b: *std.Build) void {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    // lsof-top: a terminal view over the runtime's fd scanner (xodb --lsof-top).
+    module.addCSourceFile(.{ .file = b.path("src/lsoftop/lsoftop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // Static queries (src/semq) and the supervised ghx worker driver; the
     // Ghidra worker itself stays a separate, opt-in host tool (tools/ghx).
     module.addIncludePath(b.path("src/semq"));
@@ -118,6 +120,9 @@ pub fn build(b: *std.Build) void {
     const process = b.addExecutable(.{ .name = "xodb-process-fixture", .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true }) });
     process.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/process-tree.c"), .flags = &.{ "-g", "-O0", "-fno-omit-frame-pointer" } });
     b.installArtifact(process);
+    const fd_fixture = b.addExecutable(.{ .name = "xodb-fd-fixture", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fd_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/fd-activity.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    b.installArtifact(fd_fixture);
     const tests = b.addTest(.{ .root_module = module });
     if (capstone_link == .vendored) {
         // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
@@ -151,6 +156,11 @@ pub fn build(b: *std.Build) void {
         perf_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdscan_tests = b.addExecutable(.{ .name = "xodb-runtime-fdscan-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdscan_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdscan.c" }) |source| {
+        fdscan_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     wire_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
@@ -269,7 +279,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -285,5 +295,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(target_tests).step);
     test_step.dependOn(&b.addRunArtifact(perf_tests).step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
     test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
 }
