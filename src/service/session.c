@@ -23,7 +23,7 @@ struct xsvc {
     struct xsvc_peer peers[XSVC_MAX_PEERS];
     struct xsvc_event events[XSVC_EVENT_CAPACITY];
     size_t peer_count, event_count;
-    uint64_t next_id, now_ns, controller, expires_ns, revision, sequence;
+    uint64_t next_id, now_ns, controller, expires_ns, revision, sequence, lease_id;
     unsigned scope;
     uint64_t accept_error_count;
     int last_accept_errno;
@@ -289,6 +289,7 @@ enum xsvc_result xsvc_claim(struct xsvc *s, uint64_t id, uint32_t ttl, uint64_t 
         return XSVC_SCOPE_DENIED;
     if (s->controller && s->controller != id)
         return XSVC_CONTROLLER_BUSY;
+    if (!s->controller) s->lease_id = s->sequence + 1;
     s->controller = id;
     s->expires_ns = now + duration;
     event(s, now, id, XSVC_ACQUIRED);
@@ -351,6 +352,7 @@ enum xsvc_result xsvc_state(const struct xsvc *s, struct xsvc_state *out)
         return XSVC_BAD_REQUEST;
     *out = (struct xsvc_state){.controller = s->controller,
                                 .expires_ns = s->expires_ns,
+                                .lease_id = s->lease_id,
                                 .revision = s->revision,
                                 .latest_sequence = s->sequence,
                                 .oldest_sequence = s->event_count ? s->sequence - s->event_count + 1 : 0,

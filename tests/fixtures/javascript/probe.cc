@@ -1,6 +1,9 @@
 #include <node.h>
 #include <dlfcn.h>
 #include <cstdio>
+#include <cerrno>
+#include <cstdlib>
+#include <poll.h>
 #include <string>
 #include <sys/prctl.h>
 #include <unistd.h>
@@ -47,7 +50,16 @@ static void probe(const v8::FunctionCallbackInfo<v8::Value>& args) {
     size_t sent = 0;
     while (sent < out.size()) {
         ssize_t n = write(STDOUT_FILENO, out.data() + sent, out.size() - sent);
-        if (n <= 0) return;
+        if (n < 0 && errno == EINTR) continue;
+        // Node can make stdout nonblocking. Preserve the entire oracle record
+        // before stopping, even when it exceeds the pipe's available space.
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            pollfd output = {STDOUT_FILENO, POLLOUT, 0};
+            int ready;
+            do { ready = poll(&output, 1, 10000); } while (ready < 0 && errno == EINTR);
+            if (ready > 0 && (output.revents & POLLOUT)) continue;
+        }
+        if (n <= 0) abort();
         sent += (size_t)n;
     }
     xodb_node_probe(args[0]);

@@ -1201,11 +1201,15 @@ pub const Workspace = struct {
             w.close_reason = .quit_key;
         }
         if (code == 57 or code == 63 or code == 64) {
-            if (session.target.snapshot().state == .stopped) {
+            if (session.pending_continue != null) {
+                session.cancelStep();
+                self.status = "Pending continue cancelled";
+            } else if (session.target.snapshot().state == .stopped) {
                 session.continueExecution(.human) catch |err| {
                     self.status = @errorName(err);
                     return;
                 };
+                if (session.pending_continue != null) self.status = "Resolving symbols; Space cancels the queued continue";
             } else if (session.target.snapshot().state == .running) {
                 session.cancelStep();
                 session.target.interrupt() catch |err| {
@@ -1603,7 +1607,7 @@ pub const Workspace = struct {
             const label_text: []const u8 = switch (b.code) {
                 57 => if (session.target.core != null) "Read-only" else switch (state) {
                     .running => "Pause",
-                    .stopped => "Continue",
+                    .stopped => if (session.pending_continue != null) "Cancel" else "Continue",
                     .exited => "Exited",
                     .idle => "No target",
                 },

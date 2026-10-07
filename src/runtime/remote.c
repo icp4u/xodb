@@ -19,10 +19,13 @@ struct symbol_range { uint64_t offset; size_t size; };
 struct symbol_partial {
     struct xrt_file_identity identity;
     uint32_t target;
+    uint64_t file, epoch;
+    size_t request_size;
     int fd;
     uint64_t bytes;
     size_t count;
     struct symbol_range ranges[4096];
+    unsigned char request[];
 };
 struct xrt_connection {
     pthread_mutex_t mutex;
@@ -65,6 +68,16 @@ static enum xrt_status budget_status(const struct xrt_file_budget *budget)
     if (budget->cancel && *budget->cancel) return XRT_DISCOVERY_CANCELLED;
     if (xrt_now() >= budget->deadline_ns) return XRT_DISCOVERY_PENDING;
     if (budget->bytes >= budget->limit_bytes) return XRT_DISCOVERY_BUDGET;
+    return XRT_OK;
+}
+/* An open or other reply may consume the entire time slice. Permit one
+ * bounded symbol read anyway; byte and cancellation limits always apply. */
+static enum xrt_status read_budget_status(const struct xrt_file_budget *budget)
+{
+    if (!budget) return XRT_OK;
+    if (budget->cancel && *budget->cancel) return XRT_DISCOVERY_CANCELLED;
+    if (budget->bytes >= budget->limit_bytes) return XRT_DISCOVERY_BUDGET;
+    if (budget->reads && xrt_now() >= budget->deadline_ns) return XRT_DISCOVERY_PENDING;
     return XRT_OK;
 }
 static enum xrt_status broken(struct xrt_connection *c, enum xrt_status status)
@@ -195,10 +208,14 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     struct xrt_connection *c = t->connection;
     if (c->failed != XRT_OK)
         return c->failed;
-    /* Close/cleanup must still be able to release a file after its budget. */
-    enum xrt_status policy = budget_status(current_budget(c));
-    if (call->op != XRT_RPC_FILE_CLOSE && policy != XRT_OK)
-        return policy;
+    /* Discovery budgets govern file transfer, not target control. In
+     * particular, the read that finishes a symbol view may cross its deadline;
+     * installing the resulting breakpoint must still precede any resume. */
+    if (call->op == XRT_RPC_FILE_OPEN || call->op == XRT_RPC_FILE_READ) {
+        enum xrt_status policy = call->op == XRT_RPC_FILE_READ ?
+            read_budget_status(current_budget(c)) : budget_status(current_budget(c));
+        if (policy != XRT_OK) return policy;
+    }
     if (call->size > XRT_RPC_DATA_MAX || (call->size && !call->data))
         return XRT_INVALID_ARGUMENT;
     if (c->request == UINT64_MAX)
@@ -318,10 +335,31 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     }
     return status;
 }
+/* The connection mutex is recursive. Discard before changing a target's
+ * lifetime so no retained agent descriptor outlives its target slot. */
+static void discard_symbols(struct xrt_connection *c)
+{
+    struct symbol_partial *p = c->symbols;
+    if (!p) return;
+    c->symbols = NULL;
+    for (unsigned i = 0; i < XRT_RPC_TARGETS; ++i)
+        if (c->targets[i] && c->targets[i]->remote_id == p->target) {
+            (void)invoke(c->targets[i], &(struct xrt_call){
+                .op = XRT_RPC_FILE_CLOSE, .args = {p->file}});
+            break;
+        }
+    if (p->fd >= 0) close(p->fd);
+    free(p);
+}
 enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xrt_call *call)
 {
     struct xrt_connection *c = target->connection;
     pthread_mutex_lock(&c->mutex);
+    if ((call->op == XRT_RPC_DESTROY || call->op == XRT_RPC_LAUNCH ||
+         call->op == XRT_RPC_ATTACH || call->op == XRT_RPC_DETACH ||
+         call->op == XRT_RPC_DETACH_FAMILY || call->op == XRT_RPC_CLOSE || call->op == XRT_RPC_RESET) &&
+        c->symbols && (c->symbols->target == target->remote_id || call->op == XRT_RPC_DETACH_FAMILY))
+        discard_symbols(c);
     enum xrt_status status = invoke(target, call);
     pthread_mutex_unlock(&c->mutex);
     return status;
@@ -697,7 +735,7 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
             return got == (ssize_t)size ? XRT_OK : XRT_FILE_UNAVAILABLE;
         }
     }
-    enum xrt_status status = budget_status(r->budget);
+    enum xrt_status status = read_budget_status(r->budget);
     if (status != XRT_OK) return status;
     if (r->budget && size > r->budget->limit_bytes - r->budget->bytes)
         return XRT_DISCOVERY_BUDGET;
@@ -706,7 +744,7 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
     size_t got = 0;
     status = xrt_remote_call(r->target, &(struct xrt_call){.op = XRT_RPC_FILE_READ,
             .args = {r->id, at, size}, .out = out, .capacity = size, .length = &got});
-    if (r->budget) r->budget->bytes += got;
+    if (r->budget) { r->budget->bytes += got; ++r->budget->reads; }
     if (status != XRT_OK) return status;
     if (got != size) return XRT_FILE_CHANGED;
     size_t written = 0;
@@ -722,7 +760,8 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
 }
 /* Owner-thread API. A completed result is a sealed symbol-only projection,
  * never suitable for instruction bytes, unwind data, DWARF or export. One
- * incomplete file survives a discovery pass; every FILE_CLOSE still runs. */
+ * incomplete file and its verified agent descriptor survive between slices.
+ * FILE_READ and the final FILE_CLOSE revalidate the same original identity. */
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
         const struct xrt_file_request *request, int *out, uint64_t *resident)
 {
@@ -734,80 +773,90 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
     pthread_mutex_unlock(&c->mutex);
     enum xrt_status status = budget_status(budget);
     if (status != XRT_OK) return status;
-    if (budget && budget->files >= 256) return XRT_DISCOVERY_BUDGET;
     unsigned char *bytes = malloc(XRT_RPC_DATA_MAX);
     if (!bytes) return XRT_OUT_OF_MEMORY;
     struct xrt_file_request copy = *request;
     struct xrt_codec wire = xrt_codec(bytes, XRT_RPC_DATA_MAX, false);
     xrt_wire_file_request(&wire, &copy, NULL, 0);
     if (!wire.ok) { free(bytes); return XRT_INVALID_ARGUMENT; }
-    unsigned char meta[128];
-    size_t size = 0;
-    uint64_t id = 0;
-    status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_OPEN,
-            .data = bytes, .size = wire.at, .value = &id, .out = meta,
-            .capacity = sizeof(meta), .length = &size});
-    free(bytes);
-    if (status != XRT_OK) return status;
-    struct xrt_codec in = xrt_codec(meta, size, true);
-    struct xrt_file_identity identity = {0};
-    bool regular = false, retain = false;
-    xrt_codec_bool(&in, &regular);
-    xrt_wire_file_identity(&in, &identity);
-    if (!in.ok || in.at != in.size || !id || id > UINT32_MAX || !regular ||
-        identity.size <= 0 || identity.size > 256 * 1024 * 1024) {
-        status = xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
-        goto done;
-    }
-    if (budget) ++budget->files;
-    for (size_t i = 0; i < c->not_elf_count; ++i) {
-        if (!same_identity(&identity, &c->not_elf[i])) continue;
-        if (budget) ++budget->negative_hits;
-        retain = true; // Do not discard another file's partial progress.
-        status = XRT_FILE_UNAVAILABLE;
-        goto done;
-    }
-    if (c->symbols && (c->symbols->target != t->remote_id || !same_identity(&identity, &c->symbols->identity))) {
-        close(c->symbols->fd); free(c->symbols); c->symbols = NULL;
+    if (c->symbols && (c->symbols->target != t->remote_id || c->symbols->epoch != t->image_epoch ||
+        c->symbols->request_size != wire.at || memcmp(c->symbols->request, bytes, wire.at))) {
+        pthread_mutex_lock(&c->mutex);
+        discard_symbols(c);
+        pthread_mutex_unlock(&c->mutex);
     }
     if (!c->symbols) {
-        c->symbols = calloc(1, sizeof(*c->symbols));
-        if (!c->symbols) { status = XRT_OUT_OF_MEMORY; goto done; }
-        c->symbols->fd = memfd_create("xodb-symbols", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        c->symbols->identity = identity;
-        c->symbols->target = t->remote_id;
-        if (c->symbols->fd < 0 || ftruncate(c->symbols->fd, identity.size) != 0) {
-            status = XRT_FILE_UNAVAILABLE;
-            goto done;
+        if (budget && budget->files >= 256) { free(bytes); return XRT_DISCOVERY_BUDGET; }
+        unsigned char meta[128];
+        size_t size = 0;
+        uint64_t id = 0;
+        status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_OPEN,
+                .args = {XRT_RPC_FILE_SYMBOLS}, .data = bytes, .size = wire.at,
+                .value = &id, .out = meta, .capacity = sizeof(meta), .length = &size});
+        if (status != XRT_OK) {
+            free(bytes);
+            return status == XRT_FILE_LIMIT ? XRT_SYMBOL_AGENT_UPDATE_REQUIRED : status;
         }
+        struct xrt_codec in = xrt_codec(meta, size, true);
+        struct xrt_file_identity identity = {0};
+        bool regular = false;
+        xrt_codec_bool(&in, &regular);
+        xrt_wire_file_identity(&in, &identity);
+        if (!in.ok || in.at != in.size || !id || id > UINT32_MAX || !regular || identity.size <= 0) {
+            free(bytes);
+            return xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
+        }
+        if (budget) ++budget->files;
+        for (size_t i = 0; i < c->not_elf_count; ++i) {
+            if (!same_identity(&identity, &c->not_elf[i])) continue;
+            if (budget) ++budget->negative_hits;
+            free(bytes);
+            status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {id}});
+            return status == XRT_OK ? XRT_FILE_UNAVAILABLE : status;
+        }
+        c->symbols = calloc(1, sizeof(*c->symbols) + wire.at);
+        if (!c->symbols) {
+            free(bytes);
+            (void)xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {id}});
+            return XRT_OUT_OF_MEMORY;
+        }
+        struct symbol_partial *p = c->symbols;
+        p->fd = memfd_create("xodb-symbols", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        p->identity = identity;
+        p->target = t->remote_id;
+        p->epoch = t->image_epoch;
+        p->file = id;
+        p->request_size = wire.at;
+        memcpy(p->request, bytes, wire.at);
+        if (p->fd < 0 || ftruncate(p->fd, identity.size) != 0) status = XRT_FILE_UNAVAILABLE;
     } else if (budget) budget->resumed_bytes = c->symbols->bytes;
-    struct symbol_reader reader = {t, id, c->symbols, budget};
-    status = xrt_elf_symbols(symbol_read, &reader, c->symbols->fd, (uint64_t)identity.size);
-    if (status == XRT_FILE_UNAVAILABLE && c->symbols->count &&
-        c->symbols->ranges[0].offset == 0) {
+    free(bytes);
+    struct symbol_partial *p = c->symbols;
+    struct symbol_reader reader = {t, p->file, p, budget};
+    if (status == XRT_OK) status = xrt_elf_symbols(symbol_read, &reader, p->fd, (uint64_t)p->identity.size);
+    if (status == XRT_FILE_UNAVAILABLE && p->count && p->ranges[0].offset == 0) {
         unsigned char magic[4];
-        if (pread(c->symbols->fd, magic, 4, 0) == 4 && memcmp(magic, "\177ELF", 4)) {
+        if (pread(p->fd, magic, 4, 0) == 4 && memcmp(magic, "\177ELF", 4)) {
             size_t slot = c->not_elf_next++ % 256;
-            c->not_elf[slot] = identity;
+            c->not_elf[slot] = p->identity;
             if (c->not_elf_count < 256) ++c->not_elf_count;
             if (budget) ++budget->skipped;
         }
     }
-    retain = status == XRT_DISCOVERY_PENDING || status == XRT_DISCOVERY_BUDGET || status == XRT_DISCOVERY_CANCELLED;
+    if (status == XRT_DISCOVERY_PENDING || status == XRT_DISCOVERY_BUDGET || status == XRT_DISCOVERY_CANCELLED)
+        return status;
     if (budget && (status == XRT_INVALID_ARGUMENT || status == XRT_FILE_LIMIT)) ++budget->skipped;
-done:;
-    enum xrt_status closed = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {id}});
-    if (closed != XRT_OK) { status = closed; retain = false; }
-    if (status == XRT_OK && fcntl(c->symbols->fd, F_ADD_SEALS,
+    enum xrt_status closed = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {p->file}});
+    if (closed != XRT_OK) status = closed;
+    if (status == XRT_OK && fcntl(p->fd, F_ADD_SEALS,
             F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0)
         status = XRT_FILE_UNAVAILABLE;
     if (status == XRT_OK) {
-        *out = c->symbols->fd;
-        *resident = c->symbols->bytes;
-        free(c->symbols); c->symbols = NULL;
-    } else if (!retain && c->symbols) {
-        close(c->symbols->fd); free(c->symbols); c->symbols = NULL;
-    }
+        *out = p->fd;
+        *resident = p->bytes;
+    } else if (p->fd >= 0) close(p->fd);
+    free(p);
+    c->symbols = NULL;
     return status;
 }
 /* File bytes cross in bounded chunks. A private sealed memfd lets existing
@@ -854,8 +903,14 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
     xrt_wire_file_identity(&in, &identity);
     int fd = -1;
     if (!in.ok || in.at != in.size || !id || id > UINT32_MAX ||
-        (regular && (identity.size <= 0 || identity.size > 256 * 1024 * 1024))) {
+        (regular && identity.size <= 0)) {
         status = xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
+        goto done;
+    }
+    /* A valid large file is a policy refusal, not a broken transport. The
+     * symbol projection API can consume bounded sections from this file. */
+    if (regular && identity.size > 256 * 1024 * 1024) {
+        status = XRT_FILE_LIMIT;
         goto done;
     }
     if (budget && regular) {

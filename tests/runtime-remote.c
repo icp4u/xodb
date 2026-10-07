@@ -8,6 +8,7 @@
 #include "xrt_perf.h"
 #include "perf_internal.h"
 #include "remote_internal.h"
+#include "wire_target.h"
 #include "perf_wire.h"
 #include <signal.h>
 #include <stdio.h>
@@ -52,7 +53,7 @@ static void wait_exit(struct xrt_target *t)
         usleep(1000);
     }
 }
-static void files(struct xrt_target *t, const char *self)
+static void files(struct xrt_target *t, const char *self, bool latency)
 {
     struct xrt_file_request request = {.kind = XRT_FILE_MAPS};
     int fd = -1;
@@ -89,12 +90,28 @@ static void files(struct xrt_target *t, const char *self)
         xrt_target_file_budget(t, &budget);
         uint64_t resident = 0;
         binary = -1;
-        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) == XRT_DISCOVERY_BUDGET);
-        assert(binary == -1 && budget.bytes == 16);
+        if (latency) budget.deadline_ns = xrt_now() + UINT64_C(25000000);
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) ==
+               (latency ? XRT_DISCOVERY_PENDING : XRT_DISCOVERY_BUDGET));
+        assert(binary == -1 && budget.bytes == 16 && budget.files == 1 && budget.reads == 1);
         budget = (struct xrt_file_budget){.limit_bytes = 1024 * 1024,
                                          .deadline_ns = xrt_now() + UINT64_C(2000000000)};
-        OK(xrt_remote_symbol_file(t, &request, &binary, &resident));
-        assert(budget.resumed_bytes == 16 && resident > 16 && resident < 1024 * 1024);
+        if (latency) {
+            unsigned slices = 0;
+            enum xrt_status status;
+            do {
+                budget = (struct xrt_file_budget){.limit_bytes = 1024 * 1024,
+                    .deadline_ns = xrt_now() + UINT64_C(25000000)};
+                status = xrt_remote_symbol_file(t, &request, &binary, &resident);
+                assert(status == XRT_OK || status == XRT_DISCOVERY_PENDING);
+                assert(budget.reads == 1 && budget.files == 0);
+                assert(++slices < 128);
+            } while (status != XRT_OK);
+        } else {
+            OK(xrt_remote_symbol_file(t, &request, &binary, &resident));
+            assert(budget.files == 0); // Retained handle, not just retained bytes.
+        }
+        assert((latency || budget.resumed_bytes == 16) && resident > 16 && resident < 1024 * 1024);
         assert((fcntl(binary, F_GET_SEALS) & F_SEAL_WRITE) != 0);
         assert(pread(binary, elf, sizeof(elf), 0) == 4 && !memcmp(elf, "\177ELF", 4));
         close(binary);
@@ -104,6 +121,24 @@ static void files(struct xrt_target *t, const char *self)
         assert(xrt_remote_symbol_file(t, &request, &binary, &resident) == XRT_DISCOVERY_CANCELLED);
         assert(binary == -1);
         xrt_target_file_budget(t, NULL);
+        /* Exhausting current-agent slots is a resource refusal, never an
+         * instruction to update an already current agent. */
+        unsigned char encoded[8192], meta[128];
+        struct xrt_codec wire = xrt_codec(encoded, sizeof(encoded), false);
+        xrt_wire_file_request(&wire, &request, NULL, 0);
+        assert(wire.ok);
+        uint64_t handles[32], unused = 0;
+        struct xrt_call open = {.op = XRT_RPC_FILE_OPEN, .args = {XRT_RPC_FILE_SYMBOLS},
+            .data = encoded, .size = wire.at, .out = meta, .capacity = sizeof(meta)};
+        for (unsigned i = 0; i < 32; ++i) {
+            open.value = &handles[i];
+            OK(xrt_remote_call(t, &open));
+        }
+        open.value = &unused;
+        assert(xrt_remote_call(t, &open) == XRT_FILE_UNAVAILABLE);
+        assert(xrt_remote_symbol_file(t, &request, &binary, &resident) == XRT_FILE_UNAVAILABLE);
+        for (unsigned i = 0; i < 32; ++i)
+            OK(xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {handles[i]}}));
         ++request.mapping.inode;
         assert(xrt_target_file(t, &request, &binary) == XRT_FILE_UNAVAILABLE);
         found = true;
@@ -234,7 +269,7 @@ static void probes(const char *agent, const char *self)
     OK(xrt_target_launch(t, argv));
     struct xrt_target_view v = view(t);
     assert(v.state == XRT_STOPPED && v.owned && v.thread_count == 1);
-    files(t, self);
+    files(t, self, false);
     const int32_t pid = v.pid;
     const uint64_t address = (uintptr_t)marker;
     struct xrt_registers regs;
@@ -479,7 +514,7 @@ static void collectors(const char *agent, const char *self)
     xrt_perf_destroy(p);
     OK(xrt_target_destroy(t));
 }
-static int delayed_proxy(const char *agent)
+static int delayed_proxy(const char *agent, bool symbols)
 {
     int pair[2];
     assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
@@ -505,10 +540,11 @@ static int delayed_proxy(const char *agent)
         enum xrt_wire_result got = xrt_wire_read(STDIN_FILENO, &frame, body, XRT_WIRE_MAX_BODY, 10000);
         if (got == XRT_WIRE_EOF) break;
         assert(got == XRT_WIRE_OK);
-        bool delay = frame.op == XRT_RPC_READ && !delayed;
+        bool delay = symbols ? (frame.op == XRT_RPC_FILE_OPEN || frame.op == XRT_RPC_FILE_READ) :
+            frame.op == XRT_RPC_READ && !delayed;
         assert(xrt_wire_write(pair[0], &frame, body, 10000) == XRT_WIRE_OK);
         assert(xrt_wire_read(pair[0], &frame, body, XRT_WIRE_MAX_BODY, 10000) == XRT_WIRE_OK);
-        if (delay) { usleep(350000); delayed = true; }
+        if (delay) { usleep(symbols ? 35000 : 350000); delayed = true; }
         assert(xrt_wire_write(STDOUT_FILENO, &frame, body, 10000) == XRT_WIRE_OK);
     }
     free(body); close(pair[0]);
@@ -530,15 +566,34 @@ static void late_reply(const char *agent, const char *self)
     size_t got = 0;
     OK(xrt_target_read(target, (uint64_t)(uintptr_t)marker, bytes, sizeof(bytes), &got));
     assert(got == sizeof(bytes) && xrt_now() > budget.deadline_ns);
-    assert(xrt_target_read(target, (uint64_t)(uintptr_t)marker, bytes, sizeof(bytes), &got) == XRT_DISCOVERY_PENDING);
+    /* Only file requests yield. Registers, memory and breakpoint control must
+     * still work under the exhausted budget that completed discovery. */
+    struct xrt_file_request file = {.kind = XRT_FILE_MAPS};
+    int fd = -1;
+    assert(xrt_target_file(target, &file, &fd) == XRT_DISCOVERY_PENDING);
+    OK(xrt_target_read(target, (uint64_t)(uintptr_t)marker, bytes, sizeof(bytes), &got));
+    struct xrt_registers regs;
+    OK(xrt_target_registers(target, view(target).pid, &regs));
+    uint64_t id;
+    OK(xrt_target_breakpoint_reserve(target, &id));
+    OK(xrt_target_breakpoint_resolve(target, id, (uintptr_t)marker));
+    assert(!breakpoint_of(target, id).pending);
+    OK(xrt_target_breakpoint_remove(target, id));
+    budget.deadline_ns = xrt_now() + UINT64_C(2000000000);
+    budget.bytes = budget.limit_bytes;
+    assert(xrt_target_file(target, &file, &fd) == XRT_DISCOVERY_BUDGET);
+    OK(xrt_target_breakpoint_reserve(target, &id));
+    OK(xrt_target_breakpoint_resolve(target, id, (uintptr_t)marker));
+    OK(xrt_target_breakpoint_remove(target, id));
     xrt_target_file_budget(target, NULL);
     OK(xrt_target_read(target, (uint64_t)(uintptr_t)marker, bytes, sizeof(bytes), &got));
     OK(xrt_target_destroy(target));
-    puts("C discovery deadline: delayed in-flight reply completed, next request deferred, connection reused");
+    puts("C discovery deadline: file requests defer; breakpoint installation and reads remain usable");
 }
 int main(int argc, char **argv)
 {
-    if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2]);
+    if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2], false);
+    if (argc == 3 && !strcmp(argv[1], "--symbol-delay-proxy")) return delayed_proxy(argv[2], true);
     if (argc == 2 && !strcmp(argv[1], "--cpu-fixture")) {
         volatile unsigned long value = 7;
         for (unsigned i = 0; i < 80000000; ++i)
@@ -573,6 +628,14 @@ int main(int argc, char **argv)
     }
     assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
     late_reply(argv[1], self);
+    struct xrt_target *slow = NULL;
+    const char *transport[] = {self, "--symbol-delay-proxy", argv[1], NULL};
+    const char *fixture[] = {self, "--fixture", NULL};
+    OK(xrt_target_remote(transport, &slow));
+    OK(xrt_target_launch(slow, fixture));
+    files(slow, self, true);
+    OK(xrt_target_destroy(slow));
+    puts("C symbol discovery: delayed opens permit a read; later slices retain the agent file");
     probes(argv[1], self);
     if (xrt_arch_native()->machine == XRT_X86_64)
         collectors(argv[1], self);

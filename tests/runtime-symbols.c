@@ -21,7 +21,7 @@ static void put(unsigned char *p, uint64_t value, unsigned n, bool little)
 }
 static void one(bool wide)
 {
-    const uint64_t size = UINT64_C(64) * 1024 * 1024, shoff = size-4096, symoff = size-8192;
+    const uint64_t size = UINT64_C(512) * 1024 * 1024, shoff = size-4096, symoff = size-8192;
     const unsigned hs = wide ? 64 : 52, ss = wide ? 64 : 40, syms = wide ? 24 : 16;
     unsigned char header[64] = {0}, sections[256] = {0}, symbols[48] = {0};
     memcpy(header, ELFMAG, SELFMAG); header[4] = wide ? 2 : 1; header[5] = wide ? 1 : 2; header[6] = 1;
@@ -69,6 +69,6 @@ static void one(bool wide)
 int main(void)
 {
     one(true);one(false);
-    puts("C sparse symbols: 64 MiB ELF64/ELF32, byte order, omitted code, bad links/ranges and policy refusal passed");
+    puts("C sparse symbols: 512 MiB ELF64/ELF32, byte order, omitted code, bad links/ranges and policy refusal passed");
     return 0;
 }

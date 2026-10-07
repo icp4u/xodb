@@ -313,11 +313,12 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         return XRT_OK;
     case XRT_RPC_FILE_OPEN: {
         *snapshot = NULL;
+        if (args[0] > XRT_RPC_FILE_SYMBOLS) return XRT_INVALID_ARGUMENT;
         unsigned slot = 0;
         while (slot < 32 && a->files[slot].id)
             ++slot;
         if (slot == 32 || a->next_file == UINT32_MAX)
-            return XRT_FILE_LIMIT;
+            return XRT_FILE_UNAVAILABLE;
         struct xrt_file_request request = {0};
         struct xrt_codec file = xrt_codec(data, size, true);
         xrt_wire_file_request(&file, &request, a->file_path, sizeof(a->file_path));
@@ -333,8 +334,11 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
                                     .regular = request.kind == XRT_FILE_MAPPED};
         if (opened.regular) {
             status = xrt_file_identity(fd, &opened.identity);
-            if (status == XRT_OK &&
-                (opened.identity.size <= 0 || opened.identity.size > 256 * 1024 * 1024))
+            /* Opening a verified file allocates only a descriptor. Lift the
+             * body-size policy only for explicitly requested symbol ranges. */
+            if (status == XRT_OK && opened.identity.size <= 0)
+                status = XRT_FILE_UNAVAILABLE;
+            if (status == XRT_OK && !args[0] && opened.identity.size > 256 * 1024 * 1024)
                 status = XRT_FILE_LIMIT;
             if (status != XRT_OK) {
                 close(fd);

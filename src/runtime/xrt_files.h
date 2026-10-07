@@ -40,7 +40,7 @@ enum xrt_status xrt_file_unchanged(int fd, const struct xrt_file_identity *);
  * the scope; clear it before returning to the event loop. */
 struct xrt_file_budget {
     uint64_t limit_bytes, deadline_ns, bytes, files, negative_hits, skipped;
-    uint64_t resumed_bytes;
+    uint64_t resumed_bytes, reads;
     const volatile sig_atomic_t *cancel;
 };
 void xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *);

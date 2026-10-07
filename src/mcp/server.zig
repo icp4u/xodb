@@ -104,6 +104,9 @@ pub const Server = struct {
         var local = Value{ .object = .empty };
         var fields = args.object.iterator();
         while (fields.next()) |field| if (!std.mem.eql(u8, field.key_ptr.*, "process_id")) try local.object.put(a, field.key_ptr.*, field.value_ptr.*);
+        const previous_lease = session.agent_lease;
+        session.agent_lease = if (self.shared) |peer| @import("../service/lease.zig").Lease.capture(peer.service, peer.client_id) else null;
+        defer session.agent_lease = previous_lease;
         const previous_client = session.agent_client_id;
         session.agent_client_id = if (self.shared) |peer| peer.client_id else null;
         defer session.agent_client_id = previous_client;

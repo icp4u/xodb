@@ -84,7 +84,9 @@ enum xrt_status {
     /* Host-side discovery policy results; never sent by an older agent. */
     XRT_DISCOVERY_CANCELLED,
     XRT_DISCOVERY_PENDING,
-    XRT_DISCOVERY_BUDGET
+    XRT_DISCOVERY_BUDGET,
+    /* A symbol-purpose FILE_OPEN was refused by an older agent's size cap. */
+    XRT_SYMBOL_AGENT_UPDATE_REQUIRED
 };
 
 #endif

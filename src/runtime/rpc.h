@@ -10,6 +10,10 @@
 #define XRT_RPC_DATA_MAX 65536
 #define XRT_RPC_TARGETS 128
 #define XRT_RPC_REQUEST_PREFIX 32
+/* FILE_OPEN arg[0]: allow a verified large mapped file for bounded symbol
+ * ranges. Zero preserves the ordinary 256 MiB snapshot policy, including
+ * requests from older hosts. Older agents may still refuse large images. */
+#define XRT_RPC_FILE_SYMBOLS UINT64_C(1)
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,

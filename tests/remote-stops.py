@@ -50,14 +50,14 @@ server = shared.Server(root, work, Path(os.environ.get('XODB_BIN', root / 'zig-o
 results = {}
 try:
     one, two = shared.Client(server, 'owner'), shared.Client(server, 'observer')
-    first = shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'exec stop')
+    first = shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'exec stop')
     server.remember_target(first)
     one.tool('claim_session_control')
     ready_symbol = one.call('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'remote_ready'}})['result']['structuredContent']
     ready = ready_symbol['address']
     address = one.call('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'remote_hit'}})['result']['structuredContent']['address']
     one.action('run_to', tid=first['threads'][0]['tid'], address=ready)
-    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and len(s['threads']) == 2, 'fixture ready')
+    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending') and len(s['threads']) == 2, 'fixture ready')
     # Materializing full unwind/debug data preserves the ID already returned
     # by the lightweight remote symbol lookup.
     frame = one.tool('get_stack', tid=first['pid'])['frames'][0]
@@ -66,7 +66,7 @@ try:
     start = time.monotonic()
     probe = one.action('set_breakpoint', symbol='remote_hit')['id']
     one.action('continue')
-    state = shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'persistent stop')
+    state = shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'persistent stop')
     results['first_stop_seconds'] = time.monotonic() - start
     bp = one.tool('get_breakpoints')
     results['breakpoints'] = bp
@@ -75,13 +75,13 @@ try:
     assert bp['loader_reads']['bytes'] < 16384, bp
     for _ in range(3):
         one.action('continue')
-        shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'repeated persistent stop')
+        shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'repeated persistent stop')
     # Missing symbols must not copy dummy mappings. Identity-keyed negative
     # results are exercised on the executable dummy maps, not just path skips.
     missing = one.action('set_breakpoint', symbol='owned_missing_symbol')['id']
     before = one.tool('get_breakpoints')['symbol_transfer']
     one.action('continue')
-    shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'negative symbol retry')
+    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'negative symbol retry')
     after = one.tool('get_breakpoints')['symbol_transfer']
     assert before['bytes'] < 8 * 1024 * 1024 and after['bytes'] < 65536, (before, after)
     assert after['negative_hits'] >= 9, after
@@ -96,7 +96,7 @@ try:
         os.utime(changed, ns=(previous.st_atime_ns, previous.st_mtime_ns + 1000000000))
     prefix(b'\x7fELF')
     one.action('continue')
-    shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'changed file retry')
+    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'changed file retry')
     changed_stats = one.tool('get_breakpoints')['symbol_transfer']
     assert changed_stats['bytes'] > after['bytes'], changed_stats
     assert changed_stats['bytes'] < 65536, changed_stats
@@ -104,7 +104,7 @@ try:
     results['changed_identity'] = changed_stats
     prefix(b'\0' * 4)
     one.action('continue')
-    shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'restored non-ELF signature')
+    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'restored non-ELF signature')
     restored_stats = one.tool('get_breakpoints')['symbol_transfer']
     assert restored_stats['bytes'] < 65536 and restored_stats['negative_hits'] >= 8, restored_stats
     results['restored_identity'] = restored_stats
@@ -117,7 +117,7 @@ try:
     late = one.action('set_breakpoint', symbol='remote_late_hit')
     assert late['pending'], late
     one.action('continue')
-    shared.eventually(one.session, lambda s: s['state'] == 'stopped', 'late dlopen breakpoint', timeout=30)
+    shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'late dlopen breakpoint', timeout=30)
     late_state = one.tool('get_breakpoints')
     assert not next(p for p in late_state['breakpoints'] if p['id'] == late['id'])['pending'], late_state
     results['late_dlopen'] = late_state['symbol_transfer']

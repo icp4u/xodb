@@ -162,6 +162,8 @@ static void test_policy(void)
     OK(xsvc_tick(s, 3, XSVC_CONTROL));
     OK(xsvc_claim(s, a.id, 100, 4));
     CHECK(state(s).expires_ns == UINT64_C(100000004));
+    const uint64_t lease = state(s).lease_id;
+    CHECK(lease != 0);
     OK(xsvc_check(s, a.id, 5));
     CHECK(xsvc_check(s, b.id, 5) == XSVC_CONTROL_REQUIRED);
     CHECK(xsvc_authorize(s, a.id, XSVC_MUTATE, 5) == XSVC_SCOPE_DENIED);
@@ -169,6 +171,7 @@ static void test_policy(void)
     CHECK(xsvc_release(s, b.id, 6) == XSVC_CONTROL_REQUIRED);
     OK(xsvc_claim(s, a.id, 200, 7));
     CHECK(state(s).expires_ns == UINT64_C(200000007));
+    CHECK(state(s).lease_id == lease);
     OK(xsvc_tick(s, 8, XSVC_CONTROL));
     CHECK(state(s).controller == a.id);
     OK(xsvc_check(s, a.id, UINT64_C(200000006)));
@@ -182,6 +185,7 @@ static void test_policy(void)
     OK(xsvc_tick(s, UINT64_C(200000012), XSVC_CONTROL));
     CHECK(state(s).controller == 0);
     OK(xsvc_claim(s, a.id, 100, UINT64_C(200000013)));
+    CHECK(state(s).lease_id != lease);
     OK(xsvc_release(s, a.id, UINT64_C(200000014)));
     CHECK(state(s).controller == 0);
     OK(xsvc_claim(s, b.id, 100, UINT64_C(200000015)));
@@ -191,6 +195,12 @@ static void test_policy(void)
     OK(xsvc_claim(s, a.id, 100, UINT64_C(200000017)));
     OK(xsvc_tick(s, UINT64_C(200000018), XSVC_OBSERVE));
     CHECK(state(s).controller == 0 && xsvc_check(s, a.id, UINT64_C(200000018)) == XSVC_SCOPE_DENIED);
+    OK(xsvc_tick(s, UINT64_C(200000019), XSVC_CONTROL));
+    OK(xsvc_claim(s, a.id, 100, UINT64_C(200000020)));
+    const uint64_t before_release = state(s).lease_id;
+    OK(xsvc_release(s, a.id, UINT64_C(200000021)));
+    OK(xsvc_claim(s, a.id, 100, UINT64_C(200000022)));
+    CHECK(state(s).lease_id != before_release);
     struct xsvc_event events[XSVC_EVENT_CAPACITY];
     size_t count = 0;
     bool gap = true;

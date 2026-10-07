@@ -148,7 +148,7 @@ const Workspace = struct {
             return;
         }
         if (index == 0 or index == 4) {
-            client.action(if (index == 4) "detach" else if (running) "interrupt" else "continue", .{ .generation = view.generation }) catch |err| {
+            client.action(if (index == 4) "detach" else if (running or view.continue_pending) "interrupt" else "continue", .{ .generation = view.generation }) catch |err| {
                 self.status = @errorName(err);
                 return;
             };
@@ -282,7 +282,7 @@ const Workspace = struct {
         try r.text(font, 18, 14, "xodb", theme.neutral);
         try r.textFit(font, 82, 14, width - 98, label, theme.text);
         for (buttons, 0..) |b, i| {
-            const text = if (i == 0 and live_view != null and std.mem.eql(u8, live_view.?.state, "running")) "Interrupt" else if (i == 5 and self.registers) "Locals" else if (i == 6 and self.watch_list) "Remove" else if (i == 7 and self.watch_list) "Locals" else b.name;
+            const text = if (i == 0 and live_view != null and live_view.?.continue_pending) "Cancel" else if (i == 0 and live_view != null and std.mem.eql(u8, live_view.?.state, "running")) "Interrupt" else if (i == 5 and self.registers) "Locals" else if (i == 6 and self.watch_list) "Remove" else if (i == 7 and self.watch_list) "Locals" else b.name;
             const live = i == 5 or i == 7 or (facts.state == .ready and !facts.busy and live_view != null and !std.mem.eql(u8, live_view.?.scope, "observe") and (std.mem.eql(u8, live_view.?.state, "stopped") or (std.mem.eql(u8, live_view.?.state, "running") and (i == 0 or i == 4))));
             const hovered = window.pointer_y >= 50 and window.pointer_y < 79 and window.pointer_x >= b.x and window.pointer_x < b.x + b.width;
             try style.button(r, font, .{ .x = b.x, .y = 50, .w = b.width, .h = 29 }, text, b.key, if (!live) theme.weak else if (i == 0) theme.good else theme.text, if (hovered and live) 1 else 0, 0);
@@ -584,4 +584,17 @@ test "remote stopped history is released on detach, exit or target replacement" 
         workspace.accept(try testSnapshot(next));
         try std.testing.expect(workspace.last_stop == null);
     }
+}
+
+test "remote continue control cancels a queued resume at a stopped target" {
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    workspace.accept(try testSnapshot(.{ .session_id = 1, .generation = 7, .pid = 100, .architecture = "x86_64", .state = "stopped", .scope = "control", .owned = true, .continue_pending = true }));
+    var client = remote.Client{ .endpoint = .{ .tcp = "127.0.0.1:1" }, .state = .ready, .busy = false };
+    defer client.deinit();
+    workspace.invoke(&client, 0);
+    const command = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, client.pending.?, .{});
+    defer command.deinit();
+    try std.testing.expectEqualStrings("interrupt", remote.string(remote.field(command.value, "name")));
+    try std.testing.expectEqual(@as(i64, 7), remote.field(remote.field(command.value, "arguments"), "generation").integer);
 }

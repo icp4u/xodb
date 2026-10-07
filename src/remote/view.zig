@@ -19,6 +19,7 @@ pub const View = struct {
     state: []const u8,
     scope: []const u8,
     owned: bool,
+    continue_pending: bool = false,
     tid: i32 = 0,
     frame: usize = 0,
     threads: []const Thread = &.{},

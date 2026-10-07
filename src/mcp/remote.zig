@@ -37,7 +37,7 @@ pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source
     const frame_index = try number(args, "frame", 0);
     const tid_number = try number(args, "tid", 0);
     if (frame_index >= 64 or tid_number > std.math.maxInt(i32)) return error.InvalidArguments;
-    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.snapshot().pid, .architecture = @tagName(session.target.arch()), .state = @tagName(session.target.snapshot().state), .scope = @tagName(session.agent_scope), .owned = session.target.snapshot().owned, .frame = @intCast(frame_index) };
+    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.snapshot().pid, .architecture = @tagName(session.target.arch()), .state = @tagName(session.target.snapshot().state), .scope = @tagName(session.agent_scope), .continue_pending = session.pending_continue != null, .owned = session.target.snapshot().owned, .frame = @intCast(frame_index) };
     if (args.object.get("summary_only")) |summary| {
         if (summary != .bool) return error.InvalidArguments;
         if (summary.bool) return asValue(a, view);

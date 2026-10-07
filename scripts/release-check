@@ -45,6 +45,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
+        steps.append(('symbol-discovery', [sys.executable, '-B', 'tests/symbol-discovery.py'], 240))
+        steps.append(('symbol-discovery-install', [sys.executable, '-B', 'tests/symbol-discovery-install.py'], 150))
+        for delay in (25, 50, 100):
+            steps.append((f'symbol-discovery-latency-{delay}', [sys.executable, '-B',
+                          'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
+                          '--read-delay-ms', '0', '--rate', '10000000000',
+                          '--timeout', '70', '--cases', 'complete', 'interrupt'], 150))
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
         if node:
@@ -66,6 +73,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
             ('gui-clipboard', ['tests/clipboard-gui.py']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
+            ('gui-symbol-discovery', ['tests/symbol-discovery-gui.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
             ('gui-invocations', ['tests/invocations-gui.py']),

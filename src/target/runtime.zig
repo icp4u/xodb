@@ -126,6 +126,7 @@ pub fn check(status: c.enum_xrt_status) !void {
         c.XRT_DISCOVERY_CANCELLED => return error.SymbolDiscoveryCancelled,
         c.XRT_DISCOVERY_PENDING => return error.SymbolDiscoveryPending,
         c.XRT_DISCOVERY_BUDGET => return error.SymbolDiscoveryBudgetExceeded,
+        c.XRT_SYMBOL_AGENT_UPDATE_REQUIRED => return error.SymbolFileAgentUpdateRequired,
         c.XRT_PARTIAL_REGISTER_WRITE => return error.PartialRegisterWrite,
         c.XRT_REGISTER_UNAVAILABLE => return error.RegisterUnavailable,
         c.XRT_REGISTER_NOT_WRITABLE => return error.RegisterNotWritable,

@@ -379,7 +379,10 @@ pub const Modules = struct {
         return error.UnmappedAddress;
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
-        if (rt.xrt_target_is_remote(self.target)) return self.symbolLookup(name, false);
+        if (rt.xrt_target_is_remote(self.target)) {
+            var cursor = SymbolCursor{};
+            return self.symbolLookup(name, false, &cursor);
+        }
         // APKs have no offset-zero ELF mapping. Executable VMAs identify their
         // embedded libraries; Modules.load deduplicates the other mappings.
         var failure: ?anyerror = null;
@@ -443,12 +446,35 @@ pub const Modules = struct {
     /// Automatic lookup can span multiple passes. Completed immutable symbol
     /// views are reused; a policy stop must return immediately so the next pass
     /// can resume the same unfinished file.
-    pub fn automaticSymbolAddress(self: *Modules, name: []const u8) !u64 {
-        return (try self.symbolLookup(name, true)).address;
+    pub const SymbolCursor = struct { next: usize = 0, failure: ?anyerror = null };
+    pub fn automaticSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
+        return (try self.symbolLookup(name, true, cursor)).address;
     }
-    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool) !Symbol {
-        var failure: ?anyerror = null;
-        regions: for (self.regions.items) |r| {
+    /// Restoring an address needs image identity and load placement, not code
+    /// or DWARF. Use the resumable symbol projection for remote files so the
+    /// whole image cannot exceed an automatic-discovery slice's byte budget.
+    pub fn restoredAddress(self: *Modules, region: Region, build_id: []const u8, offset: u64) !u64 {
+        const symbols = if (rt.xrt_target_is_remote(self.target)) self.symbolImage(region) catch |err| blk: {
+            // APKs keep their existing full-image reader and policy limits.
+            if (err == error.UnsupportedMode) break :blk null;
+            return err;
+        } else null;
+        if (symbols) |image| {
+            const id = image.buildId() orelse return error.BreakpointImageHasNoBuildId;
+            if (!std.mem.eql(u8, id, build_id)) return error.BreakpointBuildIdMismatch;
+            const p = try self.placement(image, 0, region, false);
+            return std.math.add(u64, offset, p.bias) catch error.InvalidAddress;
+        }
+        const module = try self.load(region);
+        const id = module.image.buildId() orelse return error.BreakpointImageHasNoBuildId;
+        if (!std.mem.eql(u8, id, build_id)) return error.BreakpointBuildIdMismatch;
+        return module.runtimeAddress(offset);
+    }
+    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, cursor: *SymbolCursor) !Symbol {
+        var failure = cursor.failure;
+        defer cursor.failure = failure;
+        regions: while (cursor.next < self.regions.items.len) : (cursor.next += 1) {
+            const r = self.regions.items[cursor.next];
             // Reuse an existing full image (and its verified debug companion).
             for (self.loaded.items) |module| {
                 if (r.inode != module.inode or r.device_major != module.device_major or

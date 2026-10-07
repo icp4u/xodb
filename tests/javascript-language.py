@@ -33,6 +33,26 @@ subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-g', '-O0', '-fno-o
                 '-fPIC', '-shared', '-I'+args.include, '-DNODE_GYP_MODULE_NAME=xodb_probe',
                 'tests/fixtures/javascript/probe.cc', '-o', str(addon)], check=True, timeout=90)
 checks, evidence = [], []
+# Force the oracle producer to encounter a full nonblocking pipe. A missing
+# or truncated record must fail here, before any debugger comparisons run.
+producer = subprocess.Popen([node, '--allow-natives-syntax',
+    'tests/fixtures/javascript/scenarios.js', 'optimized'],
+    env=dict(os.environ, XODB_NODE_PROBE=str(addon)), stdin=subprocess.PIPE,
+    stdout=subprocess.PIPE, stderr=subprocess.PIPE, pipesize=4096)
+try:
+    assert producer.stdout.readline() == b'ready\n'
+    producer.stdin.write(b'go\n'); producer.stdin.flush()
+    time.sleep(.1)
+    output, errors = producer.communicate(timeout=15)
+    assert producer.returncode == 0, errors
+    records = [json.loads(line) for line in output.splitlines()]
+    assert [r['label'] for r in records if 'frames' in r] == [
+        'nested', 'closure', 'class', 'async', 'promise', 'generator',
+        'deep', 'optimized', 'inlined'], records
+    checks.append('fixture: all ground-truth records survive pipe backpressure')
+finally:
+    if producer.poll() is None:
+        producer.kill(); producer.communicate(timeout=5)
 large_library = work/'large.so'
 subprocess.run(['cc', '-shared', '-fPIC', '-x', 'c', '-', '-o', str(large_library)],
     input='int owned_large_library(void) { return 7; }\n', text=True, check=True, timeout=30)

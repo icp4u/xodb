@@ -98,6 +98,13 @@ pub const Session = struct {
     agent_scope: AgentScope = .observe,
     /// Set only while dispatching a shared MCP request on the owner thread.
     agent_client_id: ?u64 = null,
+    agent_lease: ?@import("../service/lease.zig").Lease = null,
+    pending_continue: ?struct {
+        generation: u64,
+        epoch: u64,
+        actor: Actor,
+        lease: ?@import("../service/lease.zig").Lease,
+    } = null,
     /// Set with agent_client_id: the dispatching client holds control (the
     /// shared controller lease, or a control-scope stdio client).
     agent_controller: bool = false,
@@ -950,6 +957,7 @@ pub const Session = struct {
         if (c.fwrite(bytes.ptr, 1, bytes.len, file) != bytes.len or c.fflush(file) != 0) return error.EvidenceWriteFailed;
     }
     pub fn stepInstruction(self: *Session, tid: i32) !void {
+        if (self.persistent.resolving) return error.SymbolDiscoveryPending;
         self.suppress_probe_resume = true;
         try self.target.singleStep(tid);
     }
@@ -1023,11 +1031,22 @@ pub const Session = struct {
     pub fn continueExecution(self: *Session, actor: Actor) !void {
         try self.persistent.remember(self);
         try self.persistent.poll(self);
+        self.probe_resume_actor = actor;
+        if (self.persistent.resolving) {
+            const snapshot_ = self.target.snapshot();
+            self.pending_continue = .{ .generation = snapshot_.generation, .epoch = snapshot_.image_epoch, .actor = actor, .lease = if (actor == .agent) self.agent_lease else null };
+            self.suppress_probe_resume = true;
+            return;
+        }
+        self.pending_continue = null;
+        if (actor == .agent) if (self.agent_lease) |lease| {
+            if (!lease.valid(linux.now(), @intFromEnum(self.agent_scope))) return error.ControlLeaseRequired;
+        };
         try self.target.continueExecution();
         self.suppress_probe_resume = false;
-        self.probe_resume_actor = actor;
     }
     pub fn cancelStep(self: *Session) void {
+        self.pending_continue = null;
         self.stepping_over = false;
         self.suppress_probe_resume = true;
         if (self.run_to) |*run| run.cancelled = true;
@@ -1036,6 +1055,7 @@ pub const Session = struct {
     pub fn startSourceStep(self: *Session, tid: i32, over: bool) !void {
         try self.persistent.remember(self);
         try self.persistent.poll(self);
+        if (self.persistent.resolving) return error.SymbolDiscoveryPending;
         self.suppress_probe_resume = true;
         if (self.source_step != null) return error.StepInProgress;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1133,6 +1153,8 @@ pub const Session = struct {
         self.target.new_thread_observer = .{ .context = self, .before_resume = profileNewThread };
         defer self.target.new_thread_observer = null;
         self.target.poll() catch |err| {
+            self.persistent.resolving = false;
+            self.cancelStep();
             self.allocations.stop(.collector_error);
             self.allocations.poll(false, .collector_error);
             self.observations.stop(.collector_error);
@@ -1148,7 +1170,18 @@ pub const Session = struct {
             self.recorded_views.poll(self.profile);
             return;
         }
+        if (self.pending_continue) |pending| {
+            const snapshot_ = self.target.snapshot();
+            if (snapshot_.state != .stopped or snapshot_.generation != pending.generation or snapshot_.image_epoch != pending.epoch or
+                (pending.actor == .agent and (self.agent_scope == .observe or
+                    (if (pending.lease) |lease| !lease.valid(linux.now(), @intFromEnum(self.agent_scope)) else false))))
+            {
+                self.cancelStep();
+                self.step_diagnostic = "DeferredContinueCancelled";
+            }
+        }
         self.persistent.poll(self) catch |err| {
+            self.cancelStep();
             self.suppress_probe_resume = true;
             self.step_diagnostic = @errorName(err);
             std.debug.print("xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
@@ -1157,6 +1190,23 @@ pub const Session = struct {
         self.pollProfile();
         self.recorded_views.poll(self.profile);
         try self.captureInvestigations();
+        if (self.pending_continue) |*pending| pending.generation = self.target.snapshot().generation;
+        // Keep breakpoint events unconsumed until their symbol discovery has
+        // completed. Otherwise an internal loader stop could resume too soon.
+        if (self.persistent.resolving) return;
+        if (self.pending_continue) |pending| {
+            // A slice can cross the lease deadline. Recheck immediately before
+            // resuming, even when the same peer has since reclaimed control.
+            if (pending.lease) |lease| if (!lease.valid(linux.now(), @intFromEnum(self.agent_scope))) {
+                self.cancelStep();
+                self.step_diagnostic = "DeferredContinueCancelled";
+                return;
+            };
+            self.pending_continue = null;
+            try self.target.continueExecution();
+            self.suppress_probe_resume = false;
+            return;
+        }
         const internal_id = if (self.run_to) |run| (if (run.owns_probe) run.probe else null) else null;
         const filtered = try self.probes.poll(self, internal_id);
         try self.pollRunTo(filtered);
@@ -1228,6 +1278,7 @@ pub const Session = struct {
         }
     }
     pub fn stepOverInstruction(self: *Session, tid: i32) !void {
+        if (self.persistent.resolving) return error.SymbolDiscoveryPending;
         self.stepping_over = false;
         self.suppress_probe_resume = true;
         const regs = try self.target.registers(tid);
@@ -1615,7 +1666,15 @@ pub const Session = struct {
         }
         self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .client_id = if (actor == .agent) self.agent_client_id else null, .action = action, .generation = self.target.snapshot().generation };
         self.audit_count += 1;
-        if (actor == .agent) self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence));
+        if (actor == .agent) {
+            self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence));
+            // Recording the accepted deferred command changes the generation
+            // itself. Other later actions must still cancel that command.
+            if (self.pending_continue) |*pending| {
+                if (std.mem.eql(u8, action, "continue") or std.mem.eql(u8, action, "run_to") or std.mem.eql(u8, action, "finish"))
+                    pending.generation = self.target.snapshot().generation;
+            }
+        }
     }
     pub fn setAgentScope(self: *Session, scope: AgentScope) void {
         if (self.process_tree) |tree| {
@@ -1630,7 +1689,7 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
         self.static_analysis.deinit();
@@ -1662,7 +1721,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

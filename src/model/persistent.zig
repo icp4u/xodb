@@ -14,6 +14,7 @@ pub const Entry = struct {
     offset: u64 = 0,
     diagnostic: ?[]const u8 = null,
     enabled: bool = true,
+    cursor: @import("modules.zig").Modules.SymbolCursor = .{},
     fn deinit(self: Entry) void {
         if (self.path.len > 0) A.free(self.path);
     }
@@ -21,6 +22,71 @@ pub const Entry = struct {
         try writer.write(.{ .id = self.id, .symbol = self.symbol, .path = self.path, .offset = self.offset, .diagnostic = self.diagnostic });
     }
 };
+
+test "a yielded install or image read keeps resolution pending until retried" {
+    const modules = @import("modules.zig");
+    const MockTarget = struct {
+        handle: ?*rt.struct_xrt_target = null,
+        site: [1]bp.Breakpoint = .{.{ .id = 1, .address = 0, .original = @splat(0), .pending = true }},
+        failure: ?anyerror = null,
+        pub fn breakpointSlice(self: *@This()) []const bp.Breakpoint {
+            return &self.site;
+        }
+        pub fn resolveBreakpoint(self: *@This(), _: u64, address: u64) !void {
+            if (self.failure) |err| return err;
+            self.site[0].address = address;
+            self.site[0].pending = false;
+        }
+    };
+    const MockModules = struct {
+        regions: struct { items: []const modules.Region } = .{ .items = &.{.{
+            .start = 0x1000,
+            .end = 0x2000,
+            .offset = 0,
+            .inode = 1,
+            .device_major = 0,
+            .device_minor = 0,
+            .permissions = "r-xp".*,
+            .path = "fixture",
+        }} },
+        pub fn automaticSymbolAddress(_: *@This(), _: []const u8, _: *modules.Modules.SymbolCursor) !u64 {
+            return 0x1234;
+        }
+        pub fn restoredAddress(_: *@This(), _: modules.Region, _: []const u8, _: u64) !u64 {
+            return error.SymbolDiscoveryPending;
+        }
+    };
+    const MockSession = struct {
+        target: MockTarget = .{},
+        modules: MockModules = .{},
+        pub fn refreshMaps(_: *@This()) !void {}
+    };
+    var manager = Manager{};
+    defer manager.deinit();
+    try manager.entries.append(A, .{ .id = 1, .symbol = try policy.Text.init("fixture_hit") });
+    var session = MockSession{};
+    for ([_]anyerror{ error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded }) |err| {
+        session.target.failure = err;
+        try manager.resolve(&session);
+        try std.testing.expect(manager.resolving);
+        try std.testing.expect(session.target.site[0].pending);
+        try std.testing.expectEqualStrings(@errorName(err), manager.entries.items[0].diagnostic.?);
+    }
+    session.target.failure = null;
+    try manager.resolve(&session);
+    try std.testing.expect(!manager.resolving);
+    try std.testing.expect(!session.target.site[0].pending);
+    try std.testing.expectEqual(@as(u64, 0x1234), session.target.site[0].address);
+    try std.testing.expect(manager.entries.items[0].diagnostic == null);
+    // Restoring an address by build ID has the same scheduling obligation.
+    session.target.site[0].pending = true;
+    manager.entries.items[0].symbol = .{};
+    manager.entries.items[0].build_id_len = 1;
+    manager.entries.items[0].path = try A.dupe(u8, "fixture");
+    try manager.resolve(&session);
+    try std.testing.expect(manager.resolving);
+    try std.testing.expectEqualStrings("SymbolDiscoveryPending", manager.entries.items[0].diagnostic.?);
+}
 pub const Manager = struct {
     entries: std.ArrayList(Entry) = .empty,
     hook: ?u64 = null,
@@ -28,6 +94,7 @@ pub const Manager = struct {
     loader_status: []const u8 = "not requested",
     epoch: u64 = 0,
     observed: u64 = 0,
+    resolving: bool = false,
     loader_attempt: u64 = 0,
     file_reads: rt.struct_xrt_file_budget = std.mem.zeroes(rt.struct_xrt_file_budget),
     cancel: ?*const volatile @import("../c.zig").api.sig_atomic_t = null,
@@ -93,8 +160,10 @@ pub const Manager = struct {
         self.entries.appendAssumeCapacity(.{ .id = id, .symbol = text });
         errdefer _ = self.entries.pop();
         self.epoch = session.target.snapshot().image_epoch;
+        if (!self.resolving) self.file_reads = std.mem.zeroes(rt.struct_xrt_file_budget);
         try self.resolve(session);
         self.installHook(session);
+        self.observed = session.target.snapshot().generation;
         return id;
     }
     /// Capture ordinary physical breakpoints before restart or a loader deletion.
@@ -161,7 +230,21 @@ pub const Manager = struct {
         self.loader_status = "glibc loader rendezvous";
         self.loader_attempt = 0;
     }
+    /// A yielded lookup, image read or install leaves the same item unfinished.
+    /// Never publish a completed pass or allow its queued continue in this case.
+    fn resolutionError(self: *Manager, item: *Entry, err: anyerror) !bool {
+        item.diagnostic = @errorName(err);
+        switch (err) {
+            error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => {
+                self.resolving = true;
+                return true;
+            },
+            error.SymbolDiscoveryCancelled => return err,
+            else => return false,
+        }
+    }
     fn resolve(self: *Manager, session: anytype) !void {
+        self.resolving = false;
         var pending = false;
         for (self.entries.items) |item| if (probe(session, item.id)) |current| {
             if (current.pending) {
@@ -171,32 +254,36 @@ pub const Manager = struct {
         };
         if (!pending) return;
         try session.refreshMaps();
-        self.file_reads = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
-            .limit_bytes = 32 * 1024 * 1024,
-            .deadline_ns = @import("../target/linux.zig").now() + 2_000_000_000,
+        var slice = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
+            .limit_bytes = 128 * 1024,
+            .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
             .cancel = self.cancel,
         });
-        rt.xrt_target_file_budget(session.target.handle, &self.file_reads);
-        defer rt.xrt_target_file_budget(session.target.handle, null);
+        rt.xrt_target_file_budget(session.target.handle, &slice);
+        defer {
+            rt.xrt_target_file_budget(session.target.handle, null);
+            self.file_reads.bytes +|= slice.bytes;
+            self.file_reads.files +|= slice.files;
+            self.file_reads.negative_hits +|= slice.negative_hits;
+            self.file_reads.skipped +|= slice.skipped;
+            self.file_reads.resumed_bytes = @max(self.file_reads.resumed_bytes, slice.resumed_bytes);
+        }
         for (self.entries.items) |*item| {
             const current = probe(session, item.id) orelse continue;
             if (!current.pending) continue;
             var address: ?u64 = null;
             if (item.symbol.len > 0) {
-                if (session.modules.automaticSymbolAddress(item.symbol.slice())) |resolved| address = resolved else |err| {
-                    item.diagnostic = @errorName(err);
+                if (session.modules.automaticSymbolAddress(item.symbol.slice(), &item.cursor)) |resolved| address = resolved else |err| {
+                    if (try self.resolutionError(item, err)) return;
                     continue;
                 }
             } else if (item.build_id_len > 0) {
                 for (session.modules.regions.items) |region| {
                     if (region.permissions[2] != 'x' or !std.mem.eql(u8, region.path, item.path)) continue;
-                    const module = session.modules.load(region) catch continue;
-                    const id = module.image.buildId() orelse continue;
-                    if (!std.mem.eql(u8, id, item.build_id[0..item.build_id_len])) {
-                        item.diagnostic = "BreakpointBuildIdMismatch";
+                    address = session.modules.restoredAddress(region, item.build_id[0..item.build_id_len], item.offset) catch |err| {
+                        if (try self.resolutionError(item, err)) return;
                         continue;
-                    }
-                    address = try module.runtimeAddress(item.offset);
+                    };
                     break;
                 }
                 if (address == null) {
@@ -205,14 +292,17 @@ pub const Manager = struct {
                 }
             } else continue;
             session.target.resolveBreakpoint(item.id, address.?) catch |err| {
-                item.diagnostic = @errorName(err);
+                if (try self.resolutionError(item, err)) return;
                 continue;
             };
             item.diagnostic = null;
         }
     }
     pub fn poll(self: *Manager, session: anytype) !void {
-        if (session.target.snapshot().state != .stopped or session.target.snapshot().stepping != null or session.target.sharedVm() or session.target.snapshot().detach_pending) return;
+        if (session.target.snapshot().state != .stopped or session.target.snapshot().stepping != null or session.target.sharedVm() or session.target.snapshot().detach_pending) {
+            self.resolving = false;
+            return;
+        }
         if (self.epoch == session.target.snapshot().image_epoch) for (self.entries.items) |*item| {
             if (probe(session, item.id)) |current| item.enabled = current.enabled;
         };
@@ -229,6 +319,7 @@ pub const Manager = struct {
         }
         self.prune(session);
         if (self.entries.items.len == 0) {
+            self.resolving = false;
             if (self.hook) |id| {
                 try session.target.removeBreakpoint(id);
                 self.hook = null;
@@ -236,8 +327,18 @@ pub const Manager = struct {
             }
             return;
         }
-        if (self.observed == session.target.snapshot().generation) return;
+        if (self.observed == session.target.snapshot().generation and !self.resolving) return;
+        const continuing = self.observed == session.target.snapshot().generation and self.resolving;
+        if (!continuing) {
+            self.file_reads = std.mem.zeroes(rt.struct_xrt_file_budget);
+            for (self.entries.items) |*item| item.cursor = .{};
+        }
         self.observed = session.target.snapshot().generation;
+        defer self.observed = session.target.snapshot().generation;
+        if (continuing) {
+            try self.resolve(session);
+            return;
+        }
         self.installHook(session);
         var loader_hit = false;
         if (self.hook) |id| for (session.target.threadSlice()) |thread| {

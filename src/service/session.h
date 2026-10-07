@@ -42,6 +42,8 @@ struct xsvc_event {
 };
 struct xsvc_state {
     uint64_t controller, expires_ns, revision, latest_sequence, oldest_sequence;
+    /* Stable across renewal, different after release/expiry/reclaim. */
+    uint64_t lease_id;
     unsigned scope;
     size_t peer_count;
     uint64_t accept_error_count; /* Recoverable accept errors, saturates at XSVC_MAX_ID. */

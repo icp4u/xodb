@@ -182,8 +182,10 @@ An older agent without auxiliary-vector support reports that it needs updating.
 
 Remote symbol lookup skips device, anonymous, memfd and deleted mappings.
 Automatic breakpoint resolution also skips files without executable mappings
-and has a 32 MiB, 256-file, two-second budget per pass. Explicit `find_symbol`
-uses the same symbol-only reader and caches, without a discovery time slice. Non-ELF signature failures are remembered by device,
+and yields after a 25 ms or 128 KiB slice, between bounded transport requests.
+Unfinished discovery resumes at the same stop, keeping its file and region
+progress. Explicit `find_symbol` uses the same symbol-only reader and caches,
+without an automatic-discovery time slice. Non-ELF signature failures are remembered by device,
 inode, size, mtime and ctime; replaced or modified files are checked again.
 `get_breakpoints` reports `loader_reads` and `symbol_transfer` counters, including
 negative-cache hits, skipped files, resumed bytes, cached symbol images and
@@ -193,10 +195,21 @@ sections do not count against a symbol search. A 64 MiB or 244 MiB image can
 therefore resolve a breakpoint without a complete download.
 
 Completed symbol views are immutable, sealed snapshots, separate from full
-binary/debug images. One incomplete file retains its ranged reads across passes;
-its inode version is checked again before resuming. No partial view is published.
-The file limit remains 256 MiB; selected symbol data is limited to 64 MiB per
-image, with 1,024 cached images and 128 MiB of cached source bytes per module collection. Unsupported or
+binary/debug images. One incomplete file retains its ranged reads and agent
+file descriptor across passes; every read and the final close verify its inode
+version. No partial view is published. Each slice permits at least one bounded
+read even if opening the file consumed the time budget; cancellation and byte
+limits still apply. This lets discovery advance when round-trip latency exceeds
+the nominal 25 ms slice.
+Ranged symbol reads have no 256 MiB whole-file ceiling: a tested executable
+with 300 MiB of real data transfers only its selected metadata. The host requests
+this using the symbol-purpose flag on FILE_OPEN; ordinary requests, including
+older hosts, retain the snapshot cap. An older agent can still refuse the large
+image without ending the session; `SymbolFileAgentUpdateRequired` means
+"agent needs updating: large symbol files unsupported". Native sessions without
+`--runtime-agent` still have the 256 MiB image limit, including symbol lookup.
+Selected symbol
+data is limited to 64 MiB per image, with 1,024 cached images and 128 MiB of cached source bytes per module collection. Unsupported or
 malformed ELF metadata is reported. Sectionless ELF dynamic-symbol lookup is not provided by this symbol-only path.
 APK lookup, code inspection and DWARF loading keep the existing full-image
 reader and its limits. Module IDs remain stable when a full view is loaded. Verified host debug companions can supply symbols using the build ID.
@@ -206,8 +219,47 @@ reader and its limits. Module IDs remain stable when a full view is loaded. Veri
 file-budget exhaustion and cancellation. A searched but absent symbol remains
 `BreakpointSymbolNotLoaded`. SIGINT cancels between requests. A reply already in
 flight retains the normal ten-second transport timeout, including file cleanup;
-crossing a discovery deadline never closes a healthy transport. This remains
-bounded synchronous work, so the last request can extend a pass beyond two seconds.
+crossing a discovery deadline never closes a healthy transport. One in-flight
+request can extend the slice; this is cooperative scheduling, not a hard
+network-response deadline.
+Measured observer latency at 1 MiB/s was 90 ms worst through a local stdio proxy
+and 680 ms through real SSH. These are separate measurements, not a latency
+guarantee; queued channel data and control replies can extend the wait.
+
+A `continue` requested during automatic discovery is queued while the target
+stays stopped. `get_session` exposes `symbol_discovery_pending` and
+`continue_pending`; wait for both to clear when waiting for a visible stop.
+An internal loader stop also stays stopped until its discovery completes.
+A symbol that never loads can hold the first stop for a complete search of all
+eligible mappings (13 seconds in a 200-library SSH test at 1 MiB/s). Cancel
+cancels the queued continue; discovery finishes while the target stays stopped.
+Installing a resolved breakpoint is outside the file-transfer budget. A yielded
+installation keeps discovery pending until it succeeds or returns a terminal
+diagnostic. Restoring a saved address by build ID uses the same bounded symbol
+metadata and load-placement reads, so it does not require a full image inside
+one slice. Background installation can change the generation while stopped:
+clients must refresh `get_session` and retry a rejected `StaleSnapshot` action.
+Interrupt, a changed target generation or image, scope loss, and controller
+lease expiry/release cancel the queued continue. Reclaiming control, even as
+the same client, does not revive it. Renewing an unbroken lease preserves it.
+`DeferredContinueCancelled` reports cancellation of a queued continue. The
+controller's own state-changing action during the hold, such as adding a
+breakpoint, also cancels it. A fresh continue can resume after cancellation. In the GUI the Continue button
+becomes Cancel while a continue is queued; Space cancels it without running the
+target. Instruction/source-step requests
+while discovery is unfinished return `SymbolDiscoveryPending` for retry.
+`symbol_transfer` counters accumulate across the slices at the stop and reset
+for the next generation. A relocation failure that prevents completing the pass
+cancels queued continue, run-to and finish, preserving the stop and reporting
+`step_diagnostic`; a new explicit action is required.
+
+Try the owned large-file/slow-transport regression with
+`python3 tests/symbol-discovery.py`. It uses a local agent proxy, two MCP clients,
+and a generated 300 MiB executable under the test work directory.
+`python3 tests/symbol-discovery-install.py` uses a sparse library with symbol
+tables above 1 GiB and forces the completing read past its deadline. It checks
+the first call, the first call after Interrupt followed by a fresh continue,
+and address-breakpoint restoration after restart in a 256 KiB executable.
 
 `run_to` and frame finish run until the requested stop, another visible stop or
 user cancellation. There is no implicit wall-clock deadline. Frame finish also

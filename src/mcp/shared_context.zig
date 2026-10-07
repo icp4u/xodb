@@ -1,9 +1,7 @@
 const std = @import("std");
 const Session = @import("../model/session.zig").Session;
 const linux = @import("../target/linux.zig");
-pub const c = @cImport({
-    @cInclude("session.h");
-});
+pub const c = @import("../service/lease.zig").c;
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 pub const definitions = @embedFile("session_tools.json");
