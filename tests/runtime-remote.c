@@ -257,6 +257,33 @@ static void probes(const char *agent, const char *self)
     assert(xrt_target_breakpoint_set(t, address, false, NULL) == XRT_INVALID_ARGUMENT);
     OK(xrt_target_read(t, address, overlaid, trap, &count));
     assert(count == trap && !memcmp(original, overlaid, trap));
+    if (!xrt_arch_native()->hardware_step) {
+        assert(xrt_target_watchpoint_set(t, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch) ==
+               XRT_UNSUPPORTED_ARCHITECTURE);
+        --t->generation;
+        assert(xrt_target_continue(t) == XRT_STALE_SNAPSHOT);
+        assert(view(t).state == XRT_STOPPED);
+        OK(xrt_target_continue(t));
+        OK(xrt_target_wait_stopped(t));
+        assert(view(t).threads[0].reason == XRT_STOP_BREAKPOINT);
+        struct xrt_signal_info sig;
+        OK(xrt_target_signal_info(t, pid, &sig));
+        assert(sig.number == SIGTRAP);
+        assert(xrt_target_continue(t) == XRT_UNSUPPORTED_CONTROL);
+        assert(xrt_target_step(t, pid) == XRT_UNSUPPORTED_CONTROL);
+        assert(view(t).state == XRT_STOPPED && view(t).breakpoints[0].patched);
+        OK(xrt_target_breakpoint_remove(t, bp));
+        OK(xrt_target_continue(t));
+        wait_exit(t);
+        uint64_t epoch = view(t).image_epoch;
+        OK(xrt_target_reset(t));
+        OK(xrt_target_launch(t, argv));
+        assert(view(t).image_epoch > epoch);
+        int32_t restarted = view(t).pid;
+        OK(xrt_target_destroy(t));
+        assert(kill(restarted, 0) == -1 && errno == ESRCH);
+        return;
+    }
     OK(xrt_target_watchpoint_set(t, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch));
     /* A stale client cannot resume the authoritative agent target. */
     --t->generation;

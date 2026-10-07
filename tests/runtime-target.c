@@ -99,13 +99,20 @@ static void launch_restart(void)
     }
     uint64_t pc = 0;
     OK(xrt_registers_pc(&regs, &pc));
-    OK(xrt_target_step(target, before.pid));
-    OK(xrt_target_wait_stopped(target));
-    CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP);
-    OK(xrt_target_registers(target, before.pid, &regs));
-    uint64_t stepped = 0;
-    OK(xrt_registers_pc(&regs, &stepped));
-    CHECK(stepped != pc);
+    if (xrt_arch_native()->hardware_step) {
+        OK(xrt_target_step(target, before.pid));
+        OK(xrt_target_wait_stopped(target));
+        CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP);
+        OK(xrt_target_registers(target, before.pid, &regs));
+        uint64_t stepped = 0;
+        OK(xrt_registers_pc(&regs, &stepped));
+        CHECK(stepped != pc);
+    } else {
+        /* hardware_step 0 refuses single-step before the kernel is asked. */
+        CHECK(xrt_target_step(target, before.pid) == XRT_UNSUPPORTED_CONTROL);
+        CHECK(view().state == XRT_STOPPED);
+        CHECK(view().threads[0].reason != XRT_STOP_SINGLE_STEP);
+    }
     uint64_t pending;
     OK(xrt_target_breakpoint_reserve(target, &pending));
     OK(xrt_target_expect(target, view().generation));
@@ -168,12 +175,31 @@ static void attach_probes(bool automatic_step)
     uint8_t memory[8];
     OK(xrt_target_read(target, (uintptr_t)data, memory, sizeof(memory), &count));
     CHECK(memcmp(memory, (uint8_t[]){1, 2, 7, 8, 9, 6, 7, 8}, 8) == 0);
-    OK(xrt_target_watchpoint_set(target, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch));
+    if (xrt_arch_native()->hardware_step)
+        OK(xrt_target_watchpoint_set(target, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch));
+    else
+        CHECK(xrt_target_watchpoint_set(target, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch) ==
+              XRT_UNSUPPORTED_ARCHITECTURE);
     CHECK(write(gate[1], "x", 1) == 1);
     close(gate[1]);
     OK(xrt_target_continue(target));
     OK(xrt_target_wait_stopped(target));
     CHECK(view().threads[0].reason == XRT_STOP_BREAKPOINT && view().breakpoints[0].hit_count == 1);
+    if (!xrt_arch_native()->hardware_step) {
+        /* Resume from a planted breakpoint uses one hardware step. */
+        CHECK(xrt_target_continue(target) == XRT_UNSUPPORTED_CONTROL);
+        CHECK(xrt_target_step(target, child) == XRT_UNSUPPORTED_CONTROL);
+        CHECK(view().state == XRT_STOPPED && view().breakpoints[0].patched);
+        OK(xrt_target_breakpoint_remove(target, bp));
+        OK(xrt_target_continue(target));
+        wait_exit();
+        CHECK(view().events[view().event_count - 1].detail == 23);
+        CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+        child = 0;
+        xrt_target_destroy(target);
+        target = NULL;
+        return;
+    }
     if (automatic_step) {
         OK(xrt_target_continue(target));
     } else {
@@ -484,7 +510,9 @@ static void foundation(void)
     OK(xrt_target_breakpoint_remove(target, id));
 
     const struct xrt_arch *native = xrt_arch_native();
-    const char *scratch = native->machine == XRT_X86_64 ? "r10" : "x9";
+    const char *scratch = native->machine == XRT_X86_64       ? "r10"
+                          : native->machine == XRT_LOONGARCH ? "r12"
+                                                             : "x9";
     struct reg_bank bank = {0};
     struct xrt_reg_io io = {.read = bank_read, .write = bank_write, .ctx = &bank};
     target->reg_io = &io;

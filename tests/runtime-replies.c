@@ -12,6 +12,7 @@
 #include "remote_internal.h"
 #include "wire_target.h"
 #include "xrt_remote.h"
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdio.h>
@@ -692,7 +693,13 @@ static int child(int threads)
 {
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 64 * 1024);
+    /* 64 KiB is below PTHREAD_STACK_MIN on some ABIs. A rejected size leaves
+       the default stack, and the process then runs out of tasks. */
+    size_t stack = 64 * 1024;
+    if (stack < (size_t)PTHREAD_STACK_MIN)
+        stack = (size_t)PTHREAD_STACK_MIN;
+    if (pthread_attr_setstacksize(&attr, stack))
+        return 2;
     for (int i = 0; i < threads; ++i) {
         pthread_t thread;
         if (pthread_create(&thread, &attr, sleeper, NULL))
@@ -700,6 +707,65 @@ static int child(int threads)
     }
     for (;;)
         pause();
+}
+
+/* Stay inside a cgroup task limit. An unlimited or unknown limit keeps the
+   full table. The margin covers the agent and the child process. */
+static int task_room(void)
+{
+    FILE *file = fopen("/proc/self/cgroup", "r");
+    if (!file)
+        return -1;
+    char line[256];
+    char *path = NULL;
+    while (fgets(line, sizeof(line), file)) {
+        char *mark = strstr(line, "::");
+        if (!mark)
+            continue;
+        path = mark + 2;
+        char *end = strchr(path, '\n');
+        if (end)
+            *end = 0;
+        break;
+    }
+    fclose(file);
+    if (!path || path[0] != '/')
+        return -1;
+    char name[320];
+    if (snprintf(name, sizeof(name), "/sys/fs/cgroup%s/pids.max", path) >= (int)sizeof(name))
+        return -1;
+    file = fopen(name, "r");
+    if (!file)
+        return -1;
+    char text[64];
+    if (!fgets(text, sizeof(text), file)) {
+        fclose(file);
+        return -1;
+    }
+    fclose(file);
+    if (strncmp(text, "max", 3) == 0)
+        return -1;
+    char *past = NULL;
+    const long limit = strtol(text, &past, 10);
+    if (past == text || limit <= 0 || limit > 1000000)
+        return -1;
+    if (snprintf(name, sizeof(name), "/sys/fs/cgroup%s/pids.current", path) >= (int)sizeof(name))
+        return -1;
+    long current = 0;
+    file = fopen(name, "r");
+    if (file) {
+        if (fgets(text, sizeof(text), file))
+            current = strtol(text, NULL, 10);
+        fclose(file);
+    }
+    if (current < 0)
+        current = 0;
+    const long room = limit - current - 32;
+    if (room < 1)
+        return 1;
+    if (room > INT_MAX)
+        return -1;
+    return (int)room;
 }
 
 static void real_agent(const char *agent, const char *self, int threads)
@@ -740,10 +806,15 @@ static void real_agent(const char *agent, const char *self, int threads)
                                          &id) == XRT_OK);
     EXPECT(xrt_target_breakpoint_reserve(t, &id) == XRT_OK);
     uint8_t capacity = 0;
-    EXPECT(xrt_target_watchpoint_capacity(t, &capacity) == XRT_OK);
-    for (unsigned i = 0; i < capacity; ++i)
-        EXPECT(xrt_target_watchpoint_set(t, (sp & ~UINT64_C(7)) + 8 * i, 8, XRT_WATCH_WRITE,
-                                         &id) == XRT_OK);
+    if (arch->machine == XRT_X86_64 || arch->machine == XRT_AARCH64) {
+        EXPECT(xrt_target_watchpoint_capacity(t, &capacity) == XRT_OK);
+        for (unsigned i = 0; i < capacity; ++i)
+            EXPECT(xrt_target_watchpoint_set(t, (sp & ~UINT64_C(7)) + 8 * i, 8, XRT_WATCH_WRITE,
+                                             &id) == XRT_OK);
+    } else {
+        EXPECT(xrt_target_watchpoint_capacity(t, &capacity) == XRT_UNSUPPORTED_ARCHITECTURE);
+        capacity = 0;
+    }
     EXPECT(xrt_target_control_write(t, tid, &(struct xrt_control_request){.count = 1,
                                                                           .value = {pc}}) ==
            XRT_OK);
@@ -786,8 +857,16 @@ int main(int argc, char **argv)
     self[length] = 0;
     canonical_unavailable();
     const int mismatched = crafted_replies(self);
+    int threads = XRT_MAX_THREADS - 1;
+    if (argc > 2)
+        threads = atoi(argv[2]);
+    else {
+        const int room = task_room();
+        if (room > 0 && threads > room)
+            threads = room;
+    }
     if (argc > 1)
-        real_agent(argv[1], self, argc > 2 ? atoi(argv[2]) : XRT_MAX_THREADS - 1);
+        real_agent(argv[1], self, threads);
     if (mismatched || failures) {
         fprintf(stderr, "runtime replies: %d unexpected outcome(s), %u failure(s)\n", mismatched,
                 failures);

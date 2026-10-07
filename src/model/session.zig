@@ -1357,10 +1357,20 @@ pub const Session = struct {
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         try self.refreshMaps();
-        var registers = loc.registers(try self.target.registers(tid));
+        const raw_registers = try self.target.registers(tid);
+        var registers = loc.registers(raw_registers);
         var frames: std.ArrayList(Frame) = .empty;
         while (frames.items.len < @min(64, limit)) {
-            const pc = registers[self.target.arch().pc()] orelse break;
+            const arch_ = self.target.arch();
+            const slot = arch_.pc();
+            // LoongArch csr_era has no DWARF number. The top frame uses the
+            // kernel PC; a caller frame's PC is the return-address column.
+            const pc = if (slot < registers.len)
+                registers[slot] orelse break
+            else if (frames.items.len == 0)
+                linux.programCounter(raw_registers) catch break
+            else
+                registers[arch_.ra()] orelse break;
             if (pc == 0) break;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
             frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
@@ -1392,7 +1402,9 @@ pub const Session = struct {
             frame.cfa = step.cfa;
             frame.unwind_method = @tagName(step.method);
             try frames.append(a, frame);
-            if (step.caller[self.target.arch().pc()] == registers[self.target.arch().pc()] and step.caller[self.target.arch().sp()] == registers[self.target.arch().sp()]) {
+            const caller_pc = if (slot < step.caller.len) step.caller[slot] else step.caller[arch_.ra()];
+            const frame_pc: ?u64 = if (slot < registers.len) registers[slot] else pc;
+            if (caller_pc == frame_pc and step.caller[arch_.sp()] == registers[arch_.sp()]) {
                 frames.items[frames.items.len - 1].diagnostic = "UnwindCycle";
                 break;
             }

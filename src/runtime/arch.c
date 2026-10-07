@@ -11,6 +11,14 @@ static const struct xrt_register_desc x86_registers[] = {XRT_X86_REGISTERS(X86_D
      XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
 static const struct xrt_register_desc arm_registers[] = {XRT_ARM_REGISTERS(ARM_DESC)};
 #undef ARM_DESC
+/* r0 is the kernel's saved slot. The ISA hard-wires $r0 to zero, and Linux
+ * keeps the syscall-restart flag here. A write would not show up in the
+ * program and would change restart. */
+#define LOONGARCH_DESC(name, dwarf, word, id, role)                                                \
+    {#name, id, dwarf, offsetof(struct xrt_loongarch_registers, name), (word) * 8, 8, role,       \
+     (id) == 0 ? XRT_REG_READ_ONLY : XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
+static const struct xrt_register_desc loongarch_registers[] = {XRT_LOONGARCH_REGISTERS(LOONGARCH_DESC)};
+#undef LOONGARCH_DESC
 #define M68K_DESC(name, dwarf, offset, width, id, role)                                            \
     {#name, id, dwarf, offsetof(struct xrt_m68k_registers, name), offset, width, role,            \
      XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
@@ -23,6 +31,8 @@ static const struct xrt_probe_choice m68k_probes[] = {
     {XRT_ISA_MODE_ORDINARY, 2, 2, 0, {0x4e, 0x4f, 0, 0}, {0, 0, 0, 0}}};
 static const struct xrt_probe_choice arm_probes[] = {
     {XRT_ISA_MODE_ORDINARY, 4, 4, 0, {0x00, 0x00, 0x20, 0xd4}, {0, 0, 0, 0}}};
+static const struct xrt_probe_choice loongarch_probes[] = {
+    {XRT_ISA_MODE_ORDINARY, 4, 4, 0, {0x00, 0x00, 0x2a, 0x00}, {0, 0, 0, 0}}};
 
 static const struct xrt_arch architectures[] = {
     {.machine = XRT_M68K,
@@ -85,11 +95,32 @@ static const struct xrt_arch architectures[] = {
      .hardware_step = 1,
      .probes = arm_probes,
      .probe_count = 1},
+    {.machine = XRT_LOONGARCH,
+     .kernel_gpr_bytes = 360,
+     .address_bits = 64,
+     .little_endian = 1,
+     .register_count = 35,
+     .dwarf_count = 32,
+     .trap_size = 4,
+     .trap_alignment = 4,
+     .breakpoint_adjust = 0,
+     .caller_adjust = 4,
+     .trap = {0x00, 0x00, 0x2a, 0x00},
+     .registers = loongarch_registers,
+     .elf_class = XRT_ELF_CLASS_64,
+     .linux_abi = XRT_LINUX_ABI_NATIVE,
+     .isa_mode = XRT_ISA_MODE_ORDINARY,
+     .control_kind = XRT_CONTROL_SINGLE_PC,
+     .tracer_bits = 64,
+     .hardware_step = 0,
+     .probes = loongarch_probes,
+     .probe_count = 1},
 };
 
 static int product_machine(uint16_t machine)
 {
-    return machine == XRT_M68K || machine == XRT_X86_64 || machine == XRT_AARCH64;
+    return machine == XRT_M68K || machine == XRT_X86_64 || machine == XRT_AARCH64 ||
+           machine == XRT_LOONGARCH;
 }
 
 static int choice_bounds(const struct xrt_probe_choice *choice)
@@ -258,10 +289,11 @@ const struct xrt_arch *xrt_arch_resolve_in(struct xrt_abi_id id,
 
 const struct xrt_arch *xrt_arch_resolve(struct xrt_abi_id id)
 {
-    const struct xrt_arch *rows[3];
-    for (size_t i = 0; i < 3; ++i)
+    const struct xrt_arch *rows[sizeof(architectures) / sizeof(architectures[0])];
+    const size_t count = sizeof(architectures) / sizeof(architectures[0]);
+    for (size_t i = 0; i < count; ++i)
         rows[i] = &architectures[i];
-    return xrt_arch_resolve_in(id, rows, 3);
+    return xrt_arch_resolve_in(id, rows, count);
 }
 
 const struct xrt_arch *xrt_arch_native(void)
@@ -273,6 +305,8 @@ const struct xrt_arch *xrt_arch_native(void)
     arch = xrt_arch_get(XRT_AARCH64);
 #elif defined(__m68k__)
     arch = xrt_arch_get(XRT_M68K);
+#elif defined(__loongarch_lp64) && defined(__loongarch_double_float)
+    arch = xrt_arch_get(XRT_LOONGARCH);
 #endif
     if (!arch || arch->tracer_bits != sizeof(long) * 8)
         return NULL;

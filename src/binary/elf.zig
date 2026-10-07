@@ -1,7 +1,7 @@
 //! ELF image reader: a validated, typed view over a borrowed byte slice.
 //!
-//! Accepts ELF64 little-endian x86-64/AArch64 and ELF32 big-endian m68k executables (ET_EXEC) and shared
-//! objects/PIEs (ET_DYN). Anything else is rejected by `Image.parse` with a
+//! Accepts ELF64 little-endian x86-64/AArch64/LoongArch and ELF32 big-endian m68k executables
+//! (ET_EXEC) and shared objects/PIEs (ET_DYN). Anything else is rejected by `Image.parse` with a
 //! specific error. Live targets and archive consumers also check their supported ISA.
 //!
 //! Ownership: `Image` never allocates and never copies. It borrows `bytes`,
@@ -55,7 +55,7 @@ const shn_xindex = 0xffff;
 const pn_xnum = 0xffff;
 
 pub const Type = enum { executable, shared };
-pub const Machine = enum(u16) { m68k = 4, x86_64 = 62, aarch64 = 183, riscv = 243, _ };
+pub const Machine = enum(u16) { m68k = 4, x86_64 = 62, aarch64 = 183, riscv = 243, loongarch = 258, _ };
 pub const SegmentType = enum(u32) { null = 0, load = 1, dynamic = 2, interp = 3, note = 4, shlib = 5, phdr = 6, tls = 7, gnu_eh_frame = 0x6474e550, gnu_stack = 0x6474e551, gnu_relro = 0x6474e552, gnu_property = 0x6474e553, _ };
 pub const SectionType = enum(u32) { null = 0, progbits = 1, symtab = 2, strtab = 3, rela = 4, hash = 5, dynamic = 6, note = 7, nobits = 8, rel = 9, shlib = 10, dynsym = 11, init_array = 14, fini_array = 15, preinit_array = 16, group = 17, symtab_shndx = 18, gnu_hash = 0x6ffffff6, gnu_verdef = 0x6ffffffd, gnu_verneed = 0x6ffffffe, gnu_versym = 0x6fffffff, _ };
 /// Bits of `Segment.flags`.
@@ -278,7 +278,7 @@ pub const Image = struct {
             if (!f.is64) return error.UnsupportedClass;
             if (f.endian != .little) return error.UnsupportedEncoding;
         }
-        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k) return error.UnsupportedMachine;
+        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k and machine != .loongarch) return error.UnsupportedMachine;
         if ((machine == .m68k) == f.is64) return error.UnsupportedClass;
         if (f.endian != (if (machine == .m68k) std.builtin.Endian.big else .little)) return error.UnsupportedEncoding;
         if (bytes[6] != 1 or f.read(u32, bytes, 20) != 1) return error.UnsupportedVersion;
@@ -900,6 +900,16 @@ test "synthetic image: unsupported formats are rejected by name" {
     try testing.expectError(error.NotElf, Image.parse(""));
     try testing.expectError(error.NotElf, Image.parse("\x7fEL"));
     try testing.expectError(error.Truncated, Image.parse(Synthetic.init().buf[0..63]));
+}
+
+test "ELF64 little-endian LoongArch is accepted" {
+    var s = Synthetic.init();
+    s.buf[18] = 0x02;
+    s.buf[19] = 0x01;
+    const image = try Image.parse(&s.buf);
+    try testing.expectEqual(Machine.loongarch, image.header.machine);
+    try testing.expect(image.format.is64);
+    try testing.expectEqual(std.builtin.Endian.little, image.format.endian);
 }
 
 test "synthetic image: malformed headers and tables return errors" {

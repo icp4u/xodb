@@ -6,6 +6,7 @@ pub const Arch = enum(u16) {
     m68k = c.XRT_M68K,
     x86_64 = c.XRT_X86_64,
     aarch64 = c.XRT_AARCH64,
+    loongarch64 = c.XRT_LOONGARCH,
     pub fn descriptor(self: Arch) *const c.struct_xrt_arch {
         return c.xrt_arch_get(@intFromEnum(self));
     }
@@ -35,6 +36,7 @@ pub const Arch = enum(u16) {
             .x86_64 => 16,
             .m68k => 24,
             .aarch64 => 30,
+            .loongarch64 => 1,
         };
     }
     pub fn count(self: Arch) usize {
@@ -67,4 +69,9 @@ test "breakpoint PC and caller lookup have separate ISA rules" {
     try std.testing.expectEqual(@as(?u64, 0xfff), Arch.x86_64.breakpointPc(0x1000));
     try std.testing.expectEqual(@as(?u64, null), Arch.x86_64.breakpointPc(0));
     try std.testing.expectEqual(@as(?u64, null), Arch.aarch64.callerLookup(3));
+    try std.testing.expectEqual(@as(?u64, 0x1000), Arch.loongarch64.breakpointPc(0x1000));
+    try std.testing.expectEqual(@as(?u64, 0xffc), Arch.loongarch64.callerLookup(0x1000));
+    try std.testing.expectEqual(@as(?u64, null), Arch.loongarch64.callerLookup(3));
+    try std.testing.expect(Arch.loongarch64.validBreakpoint(0x1000, 4));
+    try std.testing.expect(!Arch.loongarch64.validBreakpoint(0x1002, 4));
 }

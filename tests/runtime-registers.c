@@ -399,9 +399,10 @@ static void contract(void)
 
     const struct xrt_arch *native = xrt_arch_native();
     CHECK(native);
-    const char *scratch = native->machine == XRT_X86_64   ? "r10"
-                          : native->machine == XRT_AARCH64 ? "x9"
-                                                           : "d2";
+    const char *scratch = native->machine == XRT_X86_64      ? "r10"
+                          : native->machine == XRT_AARCH64    ? "x9"
+                          : native->machine == XRT_LOONGARCH  ? "r12"
+                                                              : "d2";
     const struct xrt_register_desc *field =
         xrt_arch_register(native->machine, scratch, strlen(scratch));
     CHECK(field && field->kernel_offset + field->width < native->kernel_gpr_bytes);
@@ -434,6 +435,145 @@ static void contract(void)
     CHECK(result.issued && !result.confirmed && bank.writes == 1 && bank.reads == 2);
 }
 
+static void loongarch_replay(void)
+{
+    const struct xrt_arch *arch = xrt_arch_get(XRT_LOONGARCH);
+    struct xrt_registers regs;
+    struct xrt_step_resources step;
+    struct xrt_probe_request request;
+    struct xrt_probe_encoding encoding;
+    unsigned char image[361];
+    unsigned char saved_bytes[sizeof(regs)];
+    uint64_t values[XRT_DWARF_REGISTER_COUNT];
+    uint8_t present[XRT_DWARF_REGISTER_COUNT];
+    uint64_t pc = 99;
+    uint64_t scanned = 7;
+    CHECK(arch && xrt_arch_validate(arch) == XRT_OK);
+    CHECK(arch->kernel_gpr_bytes == 360 && arch->register_count == 35 && arch->dwarf_count == 32);
+    CHECK(arch->hardware_step == 0 && arch->breakpoint_adjust == 0 && arch->caller_adjust == 4);
+    CHECK(arch->trap_size == 4 && arch->trap[0] == 0x00 && arch->trap[1] == 0x00 &&
+          arch->trap[2] == 0x2a && arch->trap[3] == 0x00);
+    CHECK(xrt_arch_resolve(xrt_arch_abi(arch)) == arch);
+    {
+        struct xrt_abi_id foreign = xrt_arch_abi(arch);
+        foreign.little_endian = 0;
+        CHECK(xrt_arch_resolve(foreign) == NULL);
+    }
+    CHECK(xrt_arch_step_resources(arch, XRT_ISA_MODE_ORDINARY, &step) == XRT_OK);
+    CHECK(step.hardware_step == 0 && step.software_probes == 0);
+    memset(&encoding, 0x5a, sizeof(encoding));
+    request = (struct xrt_probe_request){.address = 0x1000,
+                                         .isa_mode = XRT_ISA_MODE_ORDINARY,
+                                         .bytes = arch->trap,
+                                         .size = 4};
+    CHECK(xrt_arch_probe_prepare(arch, &request, &encoding) == XRT_OK);
+    CHECK(encoding.width == 4 && encoding.bytes[2] == 0x2a);
+    CHECK(xrt_arch_breakpoint_pc(XRT_LOONGARCH, 0x1000, &pc) && pc == 0x1000);
+    CHECK(xrt_arch_caller_pc(XRT_LOONGARCH, 0x1000, &pc) && pc == 0xffc);
+    CHECK(!xrt_arch_caller_pc(XRT_LOONGARCH, 3, &pc) && pc == 0xffc);
+    CHECK(xrt_arch_breakpoint_valid(XRT_LOONGARCH, 0x1000, 4));
+    CHECK(!xrt_arch_breakpoint_valid(XRT_LOONGARCH, 0x1002, 4));
+    memset(image, 0, sizeof(image));
+    for (size_t i = 0; i < 45; ++i)
+        for (size_t b = 0; b < 8; ++b)
+            image[1 + i * 8 + b] = (unsigned char)(word(i) >> (b * 8));
+    memset(&regs, 0xa5, sizeof(regs));
+    CHECK(xrt_registers_decode(&((struct xrt_abi_id){0}), image + 1, 320, &regs) ==
+          XRT_UNSUPPORTED_ARCHITECTURE);
+    CHECK(xrt_registers_decode(NULL, image + 1, 360, &regs) == XRT_INVALID_ARGUMENT);
+    {
+        const struct xrt_abi_id abi = xrt_arch_abi(arch);
+        memcpy(saved_bytes, &regs, sizeof(regs));
+        CHECK(xrt_registers_decode(&abi, image + 1, 320, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(memcmp(&regs, saved_bytes, sizeof(regs)) == 0);
+        CHECK(xrt_registers_decode(&abi, image + 1, 359, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(xrt_registers_decode(&abi, image + 1, 361, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(xrt_registers_decode(&abi, NULL, 360, &regs) == XRT_INVALID_ARGUMENT);
+        CHECK(xrt_registers_decode(&abi, image + 1, 360, &regs) == XRT_OK);
+    }
+    CHECK(regs.values.loongarch.r0 == word(0) && regs.values.loongarch.r1 == word(1));
+    CHECK(regs.values.loongarch.r3 == word(3) && regs.values.loongarch.r12 == word(12));
+    CHECK(regs.values.loongarch.r31 == word(31) && regs.values.loongarch.orig_a0 == word(32));
+    CHECK(regs.values.loongarch.pc == word(33) && regs.values.loongarch.badv == word(34));
+    CHECK(image[1 + 12 * 8] == (unsigned char)(word(12) & 0xff));
+    memset(values, 0xa5, sizeof(values));
+    memset(present, 0xa5, sizeof(present));
+    CHECK(xrt_registers_dwarf(&regs, values, present, XRT_DWARF_REGISTER_COUNT) == XRT_OK);
+    for (size_t i = 0; i < 32; ++i) {
+        CHECK(values[i] == word(i) && present[i] == 1);
+        CHECK(strcmp(xrt_arch_dwarf_name(XRT_LOONGARCH, (uint16_t)i), arch->registers[i].name) == 0);
+    }
+    CHECK(present[32] == 0 && values[32] == UINT64_C(0xa5a5a5a5a5a5a5a5));
+    CHECK(xrt_registers_value_dwarf(&regs, 32, &scanned) == XRT_UNKNOWN_REGISTER && scanned == 7);
+    CHECK(xrt_arch_dwarf_name(XRT_LOONGARCH, 32) == NULL);
+    CHECK(xrt_registers_pc(&regs, &pc) == XRT_OK && pc == word(33));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_SP, &pc) == XRT_OK && pc == word(3));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_RA, &pc) == XRT_OK && pc == word(1));
+    CHECK(arch->registers[0].access == XRT_REG_READ_ONLY && strcmp(arch->registers[0].name, "r0") == 0);
+    CHECK(arch->registers[12].access == XRT_REG_READ_WRITE);
+    {
+        unsigned char raw[360];
+        memset(raw, 0, sizeof(raw));
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r0", 2, 1) == XRT_REGISTER_NOT_WRITABLE);
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r12", 3, 1) == XRT_OK);
+    }
+}
+
+/* A LoongArch NT_PRSTATUS get fills 280 bytes and leaves the reserved tail.
+ * Writes and confirmation must not depend on that tail; an unnamed byte that
+ * does change after a write (x86 orig_rax) still unconfirms it. */
+struct partial_bank {
+    unsigned char image[XRT_GPR_BYTES_MAX];
+    size_t fill;
+    int writes, flip;
+};
+static enum xrt_status partial_read(void *ctx, int32_t tid, const struct xrt_arch *arch,
+                                    unsigned char *raw, size_t size)
+{
+    struct partial_bank *bank = ctx;
+    (void)tid;
+    (void)arch;
+    memcpy(raw, bank->image, bank->fill < size ? bank->fill : size);
+    if (bank->writes && bank->flip >= 0)
+        raw[bank->flip] ^= 1;
+    return XRT_OK;
+}
+static enum xrt_status partial_write(void *ctx, int32_t tid, const struct xrt_arch *arch,
+                                     const unsigned char *raw, size_t size)
+{
+    struct partial_bank *bank = ctx;
+    (void)tid;
+    (void)arch;
+    memcpy(bank->image, raw, bank->fill < size ? bank->fill : size);
+    ++bank->writes;
+    return XRT_OK;
+}
+static void scribble(void)
+{
+    volatile unsigned char junk[4096];
+    for (size_t i = 0; i < sizeof(junk); ++i)
+        junk[i] = 0xee;
+}
+static void partial_regsets(void)
+{
+    struct partial_bank bank = {.fill = 280, .flip = -1};
+    struct xrt_reg_io io = {.read = partial_read, .write = partial_write, .ctx = &bank};
+    struct xrt_mutation_result result = {0};
+    unsigned char image[XRT_GPR_BYTES_MAX];
+    memset(bank.image, 0x11, sizeof(bank.image));
+    memset(image, 0, sizeof(image));
+    memcpy(image, bank.image, 280);
+    scribble();
+    CHECK(xrt_registers_mutate(xrt_arch_get(XRT_LOONGARCH), &io, 1, image, &result) == XRT_OK &&
+          result.confirmed);
+    const struct xrt_arch *x86 = xrt_arch_get(XRT_X86_64);
+    bank = (struct partial_bank){.fill = x86->kernel_gpr_bytes, .flip = 15 * 8};
+    memset(bank.image, 0x22, sizeof(bank.image));
+    memcpy(image, bank.image, sizeof(image));
+    CHECK(xrt_registers_mutate(x86, &io, 1, image, &result) == XRT_PARTIAL_REGISTER_WRITE &&
+          result.issued && !result.confirmed);
+}
+
 static void stopped_child(const char *executable)
 {
     const pid_t parent = getpid();
@@ -460,6 +600,8 @@ int main(int argc, char **argv)
 {
     descriptors();
     contract();
+    loongarch_replay();
+    partial_regsets();
     const struct xrt_arch *arch = xrt_arch_native();
     const char *no_live = getenv("XODB_TEST_NO_LIVE");
     if (!arch || (no_live && strcmp(no_live, "1") == 0)) {
@@ -488,19 +630,29 @@ int main(int argc, char **argv)
     CHECK(xrt_registers_dwarf(&before, values, present, XRT_DWARF_REGISTER_COUNT) == XRT_OK);
     const struct xrt_register_desc *pc_reg = xrt_arch_role(arch, XRT_ROLE_PC);
     const struct xrt_register_desc *sp_reg = xrt_arch_role(arch, XRT_ROLE_SP);
-    CHECK(pc_reg && sp_reg && present[pc_reg->dwarf] && present[sp_reg->dwarf]);
-    CHECK(values[pc_reg->dwarf] != 0 && values[sp_reg->dwarf] != 0);
-    const char *scratch = arch->machine == XRT_X86_64 ? "r10" : "x9";
+    CHECK(pc_reg && sp_reg && present[sp_reg->dwarf] && values[sp_reg->dwarf] != 0);
+    uint64_t pc_value = 0;
+    if (pc_reg->dwarf == XRT_DWARF_NONE)
+        CHECK(xrt_registers_pc(&before, &pc_value) == XRT_OK && pc_value != 0);
+    else {
+        CHECK(present[pc_reg->dwarf] && values[pc_reg->dwarf] != 0);
+        pc_value = values[pc_reg->dwarf];
+    }
+    const char *scratch = arch->machine == XRT_X86_64     ? "r10"
+                          : arch->machine == XRT_LOONGARCH ? "r12"
+                                                           : "x9";
     CHECK(xrt_register_write(child, scratch, strlen(scratch), UINT64_C(0xabcdef1234567890)) ==
           XRT_OK);
     CHECK(xrt_registers_read(child, &after) == XRT_OK);
     if (arch->machine == XRT_X86_64)
         CHECK(after.values.x86.r10 == UINT64_C(0xabcdef1234567890));
+    else if (arch->machine == XRT_LOONGARCH)
+        CHECK(after.values.loongarch.r12 == UINT64_C(0xabcdef1234567890));
     else
         CHECK(after.values.arm.x9 == UINT64_C(0xabcdef1234567890));
     CHECK(xrt_register_write(child, "fs_base", 7, 0) == XRT_UNKNOWN_REGISTER);
     CHECK(xrt_register_write(child, "rax\0", 4, 0) == XRT_UNKNOWN_REGISTER);
-    CHECK(xrt_register_write_pc(child, values[pc_reg->dwarf]) == XRT_OK);
+    CHECK(xrt_register_write_pc(child, pc_value) == XRT_OK);
 #if defined(__x86_64__) && !defined(__ILP32__)
     CHECK(ptrace(PTRACE_GETREGS, child, (void *)0, &kernel_after) == 0);
     kernel_before.r10 = UINT64_C(0xabcdef1234567890);

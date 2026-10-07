@@ -25,6 +25,9 @@ static enum xrt_status ptrace_read(void *ctx, int32_t tid, const struct xrt_arch
     if (arch->machine == XRT_M68K)
         return ptrace(PTRACE_GETREGS, tid, (void *)0, raw) == -1 ? ptrace_failure() : XRT_OK;
 #endif
+    /* LoongArch fills 280 of its 360 NT_PRSTATUS bytes and still reports
+       360; the reserved tail is whatever the buffer held. */
+    memset(raw, 0, size);
     struct iovec io = {.iov_base = raw, .iov_len = size};
     if (ptrace(PTRACE_GETREGSET, tid, (void *)(uintptr_t)1, &io) == -1)
         return ptrace_failure();
@@ -166,6 +169,7 @@ enum xrt_status xrt_registers_mutate(const struct xrt_arch *arch, struct xrt_reg
     if (written != XRT_OK)
         return written;
     unsigned char got[XRT_GPR_BYTES_MAX];
+    memset(got, 0, sizeof(got));
     const enum xrt_status read = io->read(io->ctx, tid, arch, got, arch->kernel_gpr_bytes);
     if (read != XRT_OK)
         return read;
@@ -215,6 +219,7 @@ enum xrt_status xrt_register_write_result(int32_t tid, const char *name, size_t 
     if (!io)
         io = &local;
     unsigned char raw[XRT_GPR_BYTES_MAX];
+    memset(raw, 0, sizeof(raw));
     const enum xrt_status read = io->read(io->ctx, tid, arch, raw, arch->kernel_gpr_bytes);
     if (read != XRT_OK)
         return read;
@@ -263,6 +268,7 @@ enum xrt_status xrt_control_write(int32_t tid, const struct xrt_control_request 
     if (!io)
         io = &local;
     unsigned char raw[XRT_GPR_BYTES_MAX];
+    memset(raw, 0, sizeof(raw));
     const enum xrt_status read = io->read(io->ctx, tid, arch, raw, arch->kernel_gpr_bytes);
     if (read != XRT_OK)
         return read;

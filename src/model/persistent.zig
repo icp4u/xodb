@@ -122,6 +122,13 @@ pub const Manager = struct {
     }
     fn installHook(self: *Manager, session: anytype) void {
         if (self.hook != null or self.entries.items.len == 0) return;
+        // Resuming a planted breakpoint takes a hardware step. Skip discovery
+        // when the row cannot take that step. Symbols already in the maps
+        // still resolve.
+        if (session.target.arch().descriptor().hardware_step == 0) {
+            self.loader_status = "loader rendezvous needs a hardware step";
+            return;
+        }
         // Retry incomplete bootstrap metadata at later stops, at most once
         // per second. No symbol search across mapped files belongs here.
         const now = @import("../target/linux.zig").now();

@@ -439,6 +439,12 @@ enum xrt_status xrt_target_breakpoint_remove(struct xrt_target *t, uint64_t id)
 enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_after)
 {
     TRY(xrt_execution_allowed(t));
+    /* No hardware step means a planted breakpoint cannot be resumed. Refuse
+       before rearm or unpatch. A machine-specific software plan belongs
+       before this check. The row keeps hardware_step 0 until a debug unit
+       is measured. */
+    if (!t->arch || t->arch->hardware_step == 0)
+        return XRT_UNSUPPORTED_CONTROL;
     TRY(xrt_rearm_inherited(t));
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;

@@ -18,15 +18,18 @@ pub fn decodeFlowFor(architecture: Arch, bytes: []const u8, address: u64, out: [
 fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instruction, detail: bool) !usize {
     if (out.len == 0 or bytes.len == 0) return 0;
     if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
+    if (architecture == .loongarch64) return error.DisassemblerUnavailable;
     var handle: c.csh = 0;
     if (c.cs_open(switch (architecture) {
         .x86_64 => c.CS_ARCH_X86,
         .aarch64 => c.CS_ARCH_ARM64,
         .m68k => c.CS_ARCH_M68K,
+        .loongarch64 => unreachable,
     }, switch (architecture) {
         .x86_64 => c.CS_MODE_64,
         .aarch64 => c.CS_MODE_ARM,
         .m68k => c.CS_MODE_BIG_ENDIAN | c.CS_MODE_M68K_040,
+        .loongarch64 => unreachable,
     }, &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
     defer _ = c.cs_close(&handle);
     if (detail and c.cs_option(handle, c.CS_OPT_DETAIL, c.CS_OPT_ON) != c.CS_ERR_OK) return error.DisassemblerDetailUnavailable;
@@ -93,6 +96,11 @@ test "decoder preserves instruction boundaries and addresses" {
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(@as(u64, 0x1001), instructions[1].address);
     try std.testing.expectEqualStrings("ret", std.mem.sliceTo(@as([]const u8, &instructions[2].mnemonic), 0));
+}
+
+test "loongarch disassembly is explicitly unavailable" {
+    var instructions: [1]Instruction = undefined;
+    try std.testing.expectError(error.DisassemblerUnavailable, decodeFor(.loongarch64, &.{ 0x00, 0x00, 0x2a, 0x00 }, 0x1000, &instructions));
 }
 
 test "m68k disassembly uses target byte order on a non-m68k host" {
