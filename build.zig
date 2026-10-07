@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) void {
     portable_query.cpu_features_sub = .empty;
     const portable_target = b.resolveTargetQuery(portable_query);
     const gui = b.option(bool, "gui", "Build the Wayland/Vulkan interface (disable for headless MCP)") orelse true;
+    const capstone_link = b.option(enum { system, vendored }, "capstone", "Link system Capstone, or the private static prefix from scripts/build-capstone") orelse .system;
     const font_path = b.option([]const u8, "font-path", "Default GUI font (runtime --font overrides this)") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
@@ -37,7 +38,19 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/frames/bundle.c", "src/profile/logical_frames.c", "src/profile/jitmap.c", "src/import/jvm_json.c", "src/import/jvm_import.c", "src/import/jvm_query.c", "src/import/jvm_lframes.c", "src/import/sha256.c", "src/import/jvm_budget.c", "src/import/jvm_evidence.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
-    for ([_][]const u8{ "capstone", "libdw" }) |lib| module.linkSystemLibrary(lib, .{});
+    module.linkSystemLibrary("libdw", .{});
+    switch (capstone_link) {
+        .system => module.linkSystemLibrary("capstone", .{}),
+        .vendored => {
+            module.addIncludePath(b.path(".work/capstone/include"));
+            module.addLibraryPath(b.path(".work/capstone/lib"));
+            module.linkSystemLibrary("capstone", .{
+                .use_pkg_config = .no,
+                .preferred_link_mode = .static,
+                .search_strategy = .no_fallback,
+            });
+        },
+    }
     if (gui) {
         const header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
         const xdg_header = header.addOutputFileArg("xdg-shell-client-protocol.h");
@@ -106,6 +119,11 @@ pub fn build(b: *std.Build) void {
     process.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/process-tree.c"), .flags = &.{ "-g", "-O0", "-fno-omit-frame-pointer" } });
     b.installArtifact(process);
     const tests = b.addTest(.{ .root_module = module });
+    if (capstone_link == .vendored) {
+        // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
+        exe.use_llvm = true;
+        tests.use_llvm = true;
+    }
     const runtime_tests = b.addExecutable(.{ .name = "xodb-runtime-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     runtime_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/memory.c", "tests/runtime-memory.c" }) |source| {

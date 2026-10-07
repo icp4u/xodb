@@ -20,7 +20,7 @@ protocol-generated files are bundled for distribution.
 | FreeType | FTL OR GPL-2.0-or-later | Glyph rasterization |
 | HarfBuzz | MIT | Text shaping |
 | elfutils libdw/libelf | Headers: LGPL-3.0-or-later OR GPL-2.0-or-later | M1 DWARF and CFI decoding; dynamically linked |
-| Capstone | BSD-3-Clause | x86-64/AArch64 instruction decoding |
+| Capstone | BSD-3-Clause | x86-64, AArch64, and m68k instruction decoding. LoongArch64 decoding uses the optional private Capstone 6 prefix |
 | DejaVu fonts | custom | Default installed font; not bundled |
 | wlr-protocols | MIT | Private pointer protocol used only by GUI tests |
 
@@ -142,6 +142,48 @@ source archives, modified and original files, objects, manifests and upstream
 license notices together under `.work/`. Its libdw subset excludes libdwfl and
 command-line tools; optional non-zlib compression is disabled. No AOSP/Termux
 implementation is copied. [Build details and redistribution boundary](research/android-native-build.md).
+
+## Private Capstone 6
+
+`scripts/build-capstone` fetches the Capstone 6.x release tag
+`6.0.0-Alpha11` from
+`https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha11.tar.gz`
+and checks sha256
+`635bc456097c3cfe69da28bfeb196a5e1d0b7631accb2ddaf7cd00cb587957bb`.
+A stable `6.0.0` tarball was not published when this pin was chosen.
+The script configures a static PIC build at `-O2` for X86, AArch64, M68K, and
+LoongArch, installs it under `.work/capstone`, and keeps the upstream license
+notices beside that prefix. `.work/` is gitignored, so the tarball and the
+built library stay out of the source tree. The script does not install or
+upgrade system packages. The system Capstone remains the default link.
+
+`scripts/build -Dcapstone=system` (the default) links that system library and
+keeps the Capstone 5.x behavior, including an explicit LoongArch disassembly
+refusal. `scripts/build -Dcapstone=vendored` ignores pkg-config for Capstone and
+links `.work/capstone/lib/libcapstone.a`. Capstone 6 renames the AArch64
+architecture, detail struct, and instruction ids; the decoder selects those
+names from `CS_API_MAJOR`. Run `scripts/build-capstone` before the vendored
+build. The vendored executable and unit tests use Zig's LLVM backend: Zig
+0.16's self-hosted Debug backend segfaults while compiling the translated
+Capstone 6 header. `scripts/release-check` stays on the system library unless
+`--capstone vendored` is passed. That mode copies `.work/capstone` into the
+source snapshot, because the snapshot otherwise omits gitignored trees, and
+passes `-Dcapstone=vendored` to the build step.
+
+Flow classes and branch targets were compared on about 1.3 M real x86-64,
+AArch64 and m68k instructions and matched exactly. Capstone 6 changes some
+operand text:
+
+- **AArch64:** no `#` on branch and `adr`/`adrp` addresses; decimal shift and
+  bitfield immediates; `{ v0.s }` list spacing; signed post-index offsets;
+  unsigned logical immediates; element-sized SVE immediates.
+- **x86-64:** redundant `cs:`/`ds:` segment prefixes are not printed; `comisd`
+  memory operands are `qword ptr`.
+- **m68k:** indexed operands print a `$0` displacement, and FPU conditional
+  branches show their condition.
+
+Numeric instruction ids differ because Capstone 6 renumbered the enums; flow
+classification uses the named constants from the header that was compiled in.
 
 ## APK mappings and explicit debug companions
 

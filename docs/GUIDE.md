@@ -114,7 +114,7 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Agent and human together | `xodb --session-socket ~/tmp/xs/s -- ./prog` | an agent drives; **F8** takes control back ([details](SHARED_SESSIONS.md)) |
-| Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Instruction step, assembly, and hardware watches report unsupported. Remove the breakpoint before continuing |
+| Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Assembly is shown when xodb was built with `-Dcapstone=vendored` after `scripts/build-capstone`; with the default system Capstone, MCP `disassemble` reports `DisassemblerUnavailable` and the assembly pane stays empty. Instruction step and hardware watches report unsupported. Remove the breakpoint before continuing |
 
 ## Where to go next
 

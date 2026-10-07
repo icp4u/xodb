@@ -212,6 +212,7 @@ def main():
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
     parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
     parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
+    parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
     args = parser.parse_args()
     if args.headless and args.tier != 'portable':
         parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
@@ -220,6 +221,8 @@ def main():
     if args.perl and args.tier not in ('gui', 'all'):
         parser.error('--perl requires the gui or all tier')
     steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl)
+    if args.capstone == 'vendored':
+        steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
         print(json.dumps(steps, indent=2))
         return 0
@@ -237,7 +240,7 @@ def main():
             continue
     logs = run / 'logs'
     logs.mkdir()
-    report = dict(schema=1, tier=args.tier, gui_build=not args.headless,
+    report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
                   optimize=args.optimize, perl_live_display=bool(args.perl), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
@@ -278,6 +281,12 @@ def main():
         if missing:
             report.update(status='blocked', reason='Missing tools: ' + ', '.join(missing))
             return 2
+        capstone_prefix = ROOT / '.work' / 'capstone'
+        if args.capstone == 'vendored' and not (
+                (capstone_prefix / 'lib' / 'libcapstone.a').is_file()
+                and (capstone_prefix / 'include' / 'capstone' / 'capstone.h').is_file()):
+            report.update(status='blocked', reason='Vendored Capstone prefix missing; run scripts/build-capstone')
+            return 2
         try:
             left, right = socket.socketpair()
             with left, right:
@@ -311,6 +320,10 @@ def main():
             raise OSError(ctypes.get_errno(), 'PR_SET_CHILD_SUBREAPER')
         tree = run
         report['sources'] = snapshot(tree)
+        if args.capstone == 'vendored':
+            # The snapshot keeps gitignored trees out. The vendored build looks
+            # for this prefix relative to the snapshot root.
+            shutil.copytree(capstone_prefix, tree / '.work' / 'capstone')
         (tree / '.work/tmp').mkdir(parents=True)
         env['TMPDIR'] = str(tree / '.work/tmp')
         if args.tier != 'portable':

@@ -74,7 +74,7 @@ investigations](OBSERVATIONS.md) for a Ruby example and the CLI/MCP workflow.
 | x86-64 | Launch/attach, threads, signals, break/step, registers/memory, host symbols/DWARF | Hardware watches, fork/vfork coordination, SIMD/FP, CPU/syscall/allocation capture |
 | AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; no process following or remote profiling |
 | m68k | GCC-built agent tested in the VM: launch, break/step, GPR writes, ELF32 big-endian files, host disassembly, CFI and expressions | Hardware watches, FP state, process following and profiling explicitly unsupported |
-| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions | Hardware watches, disassembly, CPU/syscall/allocation capture and uprobes explicitly unsupported. Single-step is refused while the row's hardware step is off. `r0` is read-only. This slice reads the general regset |
+| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | Hardware watches, CPU/syscall/allocation capture and uprobes explicitly unsupported. The default system Capstone 5.x build reports disassembly unavailable. Single-step is refused while the row's hardware step is off. `r0` is read-only. This slice reads the general regset |
 
 Kernel permissions and kernel feature availability are checked by each operation.
 Unsupported architecture/capability, permissions, transport failures and stale
@@ -150,10 +150,11 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` or `--arch loongarch64` to `tests/runtime-host.py`.
-On LoongArch64 that script expects disassembly, instruction step, watchpoints,
-profile and uprobes to report unsupported, and it removes the breakpoint before
-continuing. Instruction step and continue-from-breakpoint return unsupported
-control. The row is LP64D, little-endian ELF machine 258. `csr_era` is the PC
+On LoongArch64 that script expects instruction step, watchpoints, profile and
+uprobes to report unsupported, and it removes the breakpoint before continuing.
+Disassembly is refused on the system Capstone 5.x build and decoded when the
+binary was built with `-Dcapstone=vendored`. Instruction step and
+continue-from-breakpoint return unsupported control. The row is LP64D, little-endian ELF machine 258. `csr_era` is the PC
 and has no DWARF number; `r1` is the return-address column and `r3` is the stack
 pointer. `r0` is read-only: the value is the kernel's saved slot, not the
 architectural zero register. The glibc loader rendezvous is skipped, before

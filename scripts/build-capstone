@@ -1,0 +1,122 @@
+#!/usr/bin/env python3
+"""Build a private static Capstone 6 prefix for host disassembly.
+
+The default xodb build keeps linking the system Capstone. This script does not
+install or upgrade system packages. It checks a pinned upstream tarball and
+installs a static, PIC, -O2 library under .work/capstone, which git ignores.
+Pass -Dcapstone=vendored to scripts/build to link that prefix.
+"""
+import argparse
+import hashlib
+import os
+import shutil
+import subprocess
+import tarfile
+import urllib.request
+from pathlib import Path
+
+URL = 'https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha11.tar.gz'
+SHA256 = '635bc456097c3cfe69da28bfeb196a5e1d0b7631accb2ddaf7cd00cb587957bb'
+ARCHIVE_NAME = 'capstone-6.0.0-Alpha11.tar.gz'
+SOURCE_DIR_NAME = 'capstone-6.0.0-Alpha11'
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--jobs', type=int, default=4)
+args = parser.parse_args()
+if args.jobs < 1:
+    parser.error('--jobs must be positive')
+
+os.umask(0o022)
+root = Path(__file__).resolve().parents[1]
+cache = root / '.work' / 'cache'
+prefix = root / '.work' / 'capstone'
+build = root / '.work' / 'capstone-build'
+archive = cache / ARCHIVE_NAME
+stamp = prefix / 'BUILD-STAMP'
+cmake_flags = [
+    '-G', 'Unix Makefiles',
+    '-DCMAKE_BUILD_TYPE=Release',
+    '-DCMAKE_C_FLAGS_RELEASE=-O2 -DNDEBUG',
+    '-DCMAKE_POSITION_INDEPENDENT_CODE=ON',
+    '-DCAPSTONE_BUILD_SHARED_LIBS=OFF',
+    '-DCAPSTONE_BUILD_STATIC_LIBS=ON',
+    '-DCAPSTONE_BUILD_CSTOOL=OFF',
+    '-DCAPSTONE_BUILD_LEGACY_TESTS=OFF',
+    '-DCAPSTONE_BUILD_CSTEST=OFF',
+    '-DCAPSTONE_ARCHITECTURE_DEFAULT=OFF',
+    '-DCAPSTONE_X86_SUPPORT=ON',
+    '-DCAPSTONE_AARCH64_SUPPORT=ON',
+    '-DCAPSTONE_M68K_SUPPORT=ON',
+    '-DCAPSTONE_LOONGARCH_SUPPORT=ON',
+    '-DCMAKE_INSTALL_PREFIX=' + str(prefix),
+]
+stamp_text = 'url ' + URL + '\nsha256 ' + SHA256 + '\n' + ' '.join(cmake_flags) + '\n'
+if stamp.is_file() and stamp.read_text() == stamp_text and (prefix / 'lib' / 'libcapstone.a').is_file():
+    print('Capstone prefix is up to date: ' + str(prefix), flush=True)
+    raise SystemExit(0)
+
+for path in (cache, prefix, build):
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def sha256(path):
+    digest = hashlib.sha256()
+    with path.open('rb') as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def logged(name, argv, cwd):
+    print(name, flush=True)
+    log = build / (name + '.log')
+    with log.open('w') as out:
+        done = subprocess.run(argv, cwd=cwd, stdout=out, stderr=subprocess.STDOUT)
+    if done.returncode:
+        print(log.read_text()[-6000:])
+        raise SystemExit(name + ' failed; evidence: ' + str(log))
+
+
+if not archive.is_file() or sha256(archive) != SHA256:
+    partial = archive.with_suffix(archive.suffix + '.partial')
+    with urllib.request.urlopen(URL, timeout=120) as response, partial.open('wb') as out:
+        shutil.copyfileobj(response, out)
+    os.replace(partial, archive)
+if sha256(archive) != SHA256:
+    raise SystemExit('Source checksum mismatch: ' + ARCHIVE_NAME)
+
+source_root = build / 'src'
+if source_root.exists():
+    shutil.rmtree(source_root)
+source_root.mkdir()
+with tarfile.open(archive) as source:
+    source.extractall(source_root, filter='data')
+source = source_root / SOURCE_DIR_NAME
+if not (source / 'CMakeLists.txt').is_file():
+    raise SystemExit('Unexpected archive layout: ' + ARCHIVE_NAME)
+
+configure = build / 'cmake'
+if configure.exists():
+    shutil.rmtree(configure)
+logged('configure', ['cmake', '-S', str(source), '-B', str(configure), *cmake_flags], root)
+logged('build', ['cmake', '--build', str(configure), '-j', str(args.jobs)], root)
+logged('install', ['cmake', '--install', str(configure)], root)
+
+license_dir = prefix / 'share' / 'licenses' / 'capstone'
+license_dir.mkdir(parents=True, exist_ok=True)
+for name in ('LICENSE.TXT', 'LICENSE_LLVM.TXT'):
+    source_license = source / name
+    if source_license.is_file():
+        shutil.copy2(source_license, license_dir / name)
+notices = source / 'LICENSES'
+if notices.is_dir():
+    destination = license_dir / 'LICENSES'
+    if destination.exists():
+        shutil.rmtree(destination)
+    shutil.copytree(notices, destination)
+if not (prefix / 'lib' / 'libcapstone.a').is_file():
+    raise SystemExit('Install did not produce libcapstone.a')
+if not (prefix / 'include' / 'capstone' / 'capstone.h').is_file():
+    raise SystemExit('Install did not produce capstone.h')
+stamp.write_text(stamp_text)
+print('Capstone prefix: ' + str(prefix), flush=True)

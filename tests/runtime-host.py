@@ -41,7 +41,15 @@ try:
         def refused(tool_name, text, **args):
             response = c.tool(tool_name, generation=c.session()['generation'], **args)
             assert response['result']['isError'] and response['result']['content'][0]['text'] == text, response
-        refused('disassemble', 'DisassemblerUnavailable', address=regs[pc])
+        # System Capstone 5 reports unavailable. The private Capstone 6 build decodes.
+        dis = c.tool('disassemble', generation=c.session()['generation'], address=regs[pc])
+        if dis['result']['isError']:
+            assert dis['result']['content'][0]['text'] == 'DisassemblerUnavailable', dis
+            disasm_note = 'disassembly refused'
+        else:
+            instructions = dis['result']['structuredContent']['instructions']
+            assert instructions and instructions[0]['address'] == regs[pc], dis
+            disasm_note = 'disassembly decoded'
         refused('step_instruction', 'UnsupportedControl', tid=tid)
         refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
         refused('start_profile', 'ProfilingUnsupportedArchitecture')
@@ -79,7 +87,7 @@ try:
         assert time.monotonic() < until
         time.sleep(.002)
     if a.arch == 'loongarch64':
-        print('C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; disassembly, step, watchpoints, profile and uprobes refused')
+        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; step, watchpoints, profile and uprobes refused')
     else:
         print(f'C agent host integration passed ({a.arch}): target files, ELF, symbols, registers, break/step, disassembly, stack, expression and cleanup')
 finally:
