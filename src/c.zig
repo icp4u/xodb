@@ -38,5 +38,7 @@ pub const api = @cImport({
     @cInclude("elfutils/libdw.h");
     @cInclude("../language/perl.h");
     @cInclude("../language/python.h");
+    @cInclude("../language/javascript.h");
+    @cInclude("../language/lua.h");
     @cInclude("dwarf.h");
 });

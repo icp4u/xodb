@@ -13,6 +13,7 @@ detailed docs. If you just want to try something, jump to
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
+| Read Lua values and coroutine stacks at a native stop | **Lua view** (`scripts/demo-lua`, **E** `L`; MCP `get_language_stack`) | Bounded values and source lines from stopped memory; separate coroutine observations ([details](LUA.md)) |
 | Label JIT code in a native profile | **JIT evidence** (MCP import, then **I** in the profile) | Time-aware names, candidate citations and explicit ambiguity; raw PCs stay intact |
 | Check whether a change made a function faster | **Repeated experiment** (`tools/experiments/run.py`) | Baseline vs changed vs unchanged control, several runs each, with honest spread ([details](OBSERVATION_EXPERIMENTS.md)) |
 | Let an AI agent help | **MCP** (`--mcp` or `--session-socket`) | The same tools for an agent; you keep **F8** to take back control |
@@ -68,7 +69,7 @@ different about the slow ones."*
 **Rule of thumb:** profile when you don't know where to look; observe when you
 know which function matters and want to know which calls are slow and why.
 
-## Interpreted languages (Ruby, Python, Perl)
+## Interpreted languages (Ruby, Python, Perl, JavaScript, Lua)
 
 xodb debugs interpreters as the C programs they are. With a debug build of the
 interpreter you can:
@@ -77,7 +78,7 @@ interpreter you can:
 - read its internal structures by name;
 - observe its native calls, e.g. how long each `sort` or array iteration takes.
 
-What you see is the interpreter's own C code, plus, for Perl and CPython, the
+What you see is the interpreter's own C code, plus, for Perl, CPython and V8, the
 script level:
 
 - **Readable Perl values.** In Locals or **E**, an `SV *` shows as `IV 42`,
@@ -90,13 +91,25 @@ script level:
   Freed or overwritten objects and inconsistent headers are marked; no
   `__repr__` or other code runs in the target. Needs CPython DWARF types.
 - **The script's stack at a native stop.** Agents ask `get_language_stack`
-  (language `perl` or `python`) for sub/function names and file:line, read
+  (language `perl`, `python` or `javascript`) for sub/function names and file:line, read
   straight from the stopped interpreter without running any code in it. Each
   piece is tied to the native interpreter-loop frame it came from, and it says
   `partial` when a boundary can't be proven. For CPython the tie is proved by
   the activation's entry frame lying in that native frame's stack, so it works
   across threads, subinterpreters, generators and `coroutine.send()`, and on a
   stripped `/usr/bin/python3` 3.14 as well. See [CPython](PYTHON.md) and [Perl](PERL.md).
+- **Readable JavaScript values.** A DWARF-identified V8 `Local<Value>` or
+  internal `Tagged<T>` shows numbers, strings, bounded arrays/objects, function
+  names and class names. The JavaScript stack includes columns when its code
+  identity and source table are proved. No getters, coercions, or target code
+  run. Support is deliberately tied to verified V8 layouts; see
+  [JavaScript](JAVASCRIPT.md) for supported builds and partial results.
+
+- **Readable Lua values.** `TValue *` and `lua_State *` previews cover PUC Lua
+  5.4.9 and 5.2.4 with DWARF. Lua stacks keep coroutines separate, report source
+  lines and C boundaries, and mark unknown names and native alignment partial.
+  Try `LUA=lua5.4 scripts/demo-lua`, **Space**, then **E**, `L`, **Return**.
+  See [Lua](LUA.md).
 
 Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 [logical frames](LOGICAL_FRAMES.md).
@@ -110,6 +123,7 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Observe and browse calls | `xodb --browse-observation example-01.xoi` after the capture in [OBSERVATIONS.md](OBSERVATIONS.md#one-command-capture) | **]** / **[** move the threshold, **Tab** switches fast/slow, **E** shows the raw evidence |
 | Inside Perl | `./scripts/demo-perl` | **Space**, **Shift+E** `val` and `av` (live rows that update every stop), then keep pressing **Space**: `val` undef ↔ not in scope, `av` 3 ↔ 4 slots |
 | Inside CPython | `./scripts/demo-python` | **Space**, **E** `value` (list (8 items)), **E** `key` (str 'answer'), **E** `mp` (dict); in a second terminal `./scripts/demo-python stack` prints `record` ← `tick` ← `<module>` with file:line and the list's items |
+| Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Inside Ruby | `./scripts/demo-cruby` | the `rb_ary_store` break |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |

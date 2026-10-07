@@ -569,6 +569,11 @@ pub const Image = struct {
                     if (c.dwarf_siblingof(&child, &child) != 0) break;
                 };
                 t.fields = try fields.toOwnedSlice(a);
+                const js_handle = c.xjs_dwarf_handle(&die);
+                if (js_handle != 0) {
+                    t.javascript_handle = @intCast(js_handle);
+                    t.kind = .structure;
+                }
             },
             std.dwarf.TAG.array_type => {
                 t.kind = .array;

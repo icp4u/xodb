@@ -58,6 +58,38 @@ pub const Preview = struct {
     basis: []const u8 = basis,
     perl: ?PerlValue = null,
     python: ?PythonValue = null,
+    javascript: ?JavaScriptValue = null,
+    lua: ?LuaValue = null,
+};
+pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const LuaValue = struct {
+    type: []const u8,
+    display: []const u8,
+    object: u64,
+    array_capacity: u64,
+    hash_capacity: u64,
+    runtime_version: []const u8,
+    runtime_build_id: []const u8,
+    layout_source: []const u8 = "same-image DWARF",
+    type_proof: []const u8,
+    liveness: []const u8 = "unproved; header consistency is not GC liveness",
+    memory_reads: usize,
+    memory_bytes: usize,
+    items: []LuaItem,
+};
+pub const JavaScriptItem = struct { tagged: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const JavaScriptValue = struct {
+    type: []const u8,
+    display: []const u8,
+    tagged: u64,
+    map: u64,
+    instance_type: u16,
+    runtime_version: []const u8,
+    runtime_build_id: []const u8,
+    layout_source: []const u8,
+    memory_reads: usize,
+    memory_bytes: usize,
+    items: []JavaScriptItem,
 };
 pub const PerlItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
 pub const PerlValue = struct {

@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+cd "$(dirname "$0")/.."
+demo_root="$PWD"
+xodb="${XODB:-$PWD/zig-out/bin/xodb}"
+node="${NODE:-node}"
+node_include="${NODE_INCLUDE:-/usr/include/node}"
+session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-node-$(id -u)"
+socket="$session_dir/session.sock"
+
+if [[ "${1-}" == stack ]]; then
+    shift
+    if [[ ! -S "$socket" ]]; then
+        printf '%s\n' 'Start scripts/demo-node first, then stop at its breakpoint.' >&2
+        exit 1
+    fi
+    exec python3 - "$socket" "$demo_root" "$@" <<'PY'
+import json, os, socket, sys
+path, root, expressions = sys.argv[1], sys.argv[2], sys.argv[3:] or ['value']
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(path)
+stream = connection.makefile('rwb', buffering=0)
+sequence = 0
+def call(method, params):
+    global sequence
+    sequence += 1
+    stream.write((json.dumps({'jsonrpc': '2.0', 'id': sequence, 'method': method, 'params': params}) + '\n').encode())
+    while True:
+        line = stream.readline()
+        if not line:
+            sys.exit('xodb closed the session')
+        reply = json.loads(line)
+        if reply.get('id') == sequence:
+            return reply
+def tool(name, fatal=True, **arguments):
+    reply = call('tools/call', {'name': name, 'arguments': arguments})
+    problem = reply['error']['message'] if 'error' in reply else reply['result']['content'][0]['text'] if reply['result'].get('isError') else None
+    if problem and fatal:
+        sys.exit(name + ': ' + problem)
+    return problem if problem else reply['result']['structuredContent']
+call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'demo-node', 'version': '1'}})
+stream.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+session = tool('get_session')
+if session['state'] != 'stopped':
+    sys.exit('The demo is running: press Space in xodb to stop it, then run this again.')
+if not any(t['reason'] == 'breakpoint' for t in session['threads']):
+    sys.exit('Press Space in xodb to reach the first Node probe, then run this again.')
+tid = next((t['tid'] for t in session['threads'] if t['reason'] == 'breakpoint'), session['threads'][0]['tid'])
+def shown(path):
+    return os.path.relpath(path, root) if path and path.startswith(root + '/') else path
+for segment in tool('get_language_stack', tid=tid, language='javascript')['segments']:
+    anchor = segment['anchor']
+    where = f"native frame #{anchor['frame']} {anchor['symbol'] or '(unnamed)'}" if anchor else 'no native anchor'
+    print(f"JavaScript / V8 {segment['runtime']['version']}: {segment['state']} "
+          f"({segment['reason'] or 'complete'}), anchored at {where}")
+    for frame in segment['frames']:
+        print(f"  {frame['name']:<12} {shown(frame['file'])}:{frame['line']}:{frame['column']}")
+for expression in expressions:
+    value = tool('evaluate_expression', False, tid=tid, frame=0, expression=expression)
+    if isinstance(value, str):
+        print(f"{expression}: not available in this native frame ({value})")
+        continue
+    value = value['value']
+    print(f"{expression} = {value['display']}")
+    for item in (((value.get('visualization') or {}).get('javascript') or {}).get('items') or []):
+        print(f"    {item['key']}: {item['display']}")
+PY
+fi
+if [[ ! -x "$xodb" ]]; then
+    printf '%s\n' 'Build xodb with scripts/build, or set XODB=/path/to/xodb.' >&2
+    exit 1
+fi
+mkdir -p -m 700 "$session_dir"
+if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
+    printf '%s\n' 'The demo session directory must be private and owned by you.' >&2
+    exit 1
+fi
+if [[ -S "$socket" ]] && python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$socket" 2>/dev/null; then
+    printf '%s\n' 'Another Node demo session is already running.' >&2
+    exit 1
+fi
+rm -f "$socket"
+"${CXX:-c++}" -std=c++20 -g -O0 -fno-omit-frame-pointer -fPIC -shared \
+    -I"$node_include" -DNODE_GYP_MODULE_NAME=xodb_probe examples/node-probe.cc -o "$session_dir/probe.node"
+coproc NODE_DEMO {
+    exec env XODB_NODE_PROBE="$session_dir/probe.node" "$node" examples/node-demo.js
+}
+demo_pid=$NODE_DEMO_PID
+cleanup() {
+    kill "$demo_pid" 2>/dev/null || :
+    wait "$demo_pid" 2>/dev/null || :
+    rm -f "$socket" "$session_dir/probe.node"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+IFS= read -r -t 10 ready_pid <&"${NODE_DEMO[0]}"
+if [[ "$ready_pid" != "$demo_pid" ]]; then
+    printf '%s\n' 'Unexpected Node startup handshake.' >&2
+    exit 1
+fi
+cat >&2 <<'TIPS'
+Try: Space (run to xodb_node_stop) · E value Return (add a readable JS watch)
+     Space (next value: numbers, string, array, object, class, function)
+     In another terminal: scripts/demo-node stack
+     The stack shows inspect <- tick with file:line:column where proved.
+     Unknown layouts and code positions remain explicitly partial.
+TIPS
+"$xodb" --session-socket "$socket" "$@" --attach "$demo_pid" --break xodb_node_stop

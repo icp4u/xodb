@@ -1,0 +1,131 @@
+# JavaScript at a native stop
+
+Run `scripts/demo-node`, press **Space**, then **E**, enter `value`, and press
+**Return**. Each **Space** reaches another native probe with a number, string,
+array, object, class instance or function. In another terminal,
+`scripts/demo-node stack` prints the physical JavaScript frames and readable
+value elements.
+
+The demo needs Node, its matching development headers, a C++ compiler, and a
+built GUI xodb. Set `NODE`, `NODE_INCLUDE`, `CXX` or `XODB` to override them.
+It compiles `examples/node-probe.cc` with DWARF into a private temporary
+session directory, runs only `examples/node-demo.js`, and removes its probe
+on exit. It does not install anything or modify Node.
+
+## Verified layouts
+
+The initial reader supports Linux x86-64, uncompressed pointers, sandbox off,
+and V8 **14.6.202.34-node.28** (Node **26.8.2**). It compares the loaded build-id,
+version string and published `v8dbg_*` constants with the identified ELF image.
+It selects the main executable using the kernel's program-header address;
+the supported Node build embeds V8 there. An unrelated addon that exceeds
+the full-image limit does not disable previews. Split-library V8 runtimes
+and targets without that main-image evidence remain unsupported.
+Missing, inconsistent, ambiguous or unsupported metadata produces a diagnostic.
+It never chooses the closest version.
+
+Some offsets are absent from the published metadata. Their exact-version table
+in `src/language/javascript_v8_14_6.h` cites the upstream Node tag and V8 source.
+Same-image DWARF constants, when available, are checked before using that table;
+any disagreement refuses the layout. Outputs identify `postmortem-metadata`,
+`version-table`, or `version-table+dwarf-crosscheck` as their layout source.
+An incomplete DWARF check also refuses, preserving its work, unit, depth or
+malformed-data reason; it is not reported as a layout mismatch.
+
+Frame code identity also needs configuration-dependent builtin and dispatch
+facts. These are currently established by either the required same-image DWARF
+constants or the tested stock build-id
+`93f82af1eac24ff5123595e6669572c93421c436`. Another build can show independently
+verified names and scripts but gets `JavaScriptFrameConfigUnavailable` and null
+positions until its configuration is proved. The Node executable does not need
+DWARF for the tested stock profile; the native variable's owning addon does
+need DWARF to prove its V8 handle layout.
+
+## Values
+
+Locals and expression watches recognize V8 `Local<T>` and internal `Tagged<T>`
+only when their namespace, size and single-word handle representation are
+proved by DWARF. Previews include smis, heap numbers, booleans, null, undefined,
+strings, fast arrays, fast in-object data properties, function names and
+proved constructor names. A base constructor's name is not substituted for a
+subclass: its initial map must match the receiver's root map and the receiver's
+prototype must still match that initial map. Otherwise the preview uses `Object`
+with `JavaScriptConstructorNameUnproved`. Ordinary object literals retain the
+generic `Object` name when their copied map's constructor and prototype agree;
+that alone adds no diagnostic. Strings handle
+sequential, cons, sliced, thin and cached
+external one- or two-byte representations. Uncached external strings refuse
+because recovering their data would require calling a virtual method.
+
+Each preview keeps at most eight elements, three aggregate levels and 128
+UTF-16 string units. Control characters and invisible formatting characters are
+escaped. Dictionary properties, out-of-object and boxed double fields, and
+unsupported object kinds carry diagnostics. A child failure stays on its item
+so independently decoded siblings remain visible; exhausting the shared read
+budget still stops the preview. Double arrays distinguish the verified hole
+encoding from `NaN`. Boxed holes remain item-local unsupported objects when
+their type is not available in the published metadata. Accessors are identified and
+never invoked. There is no `toString`, coercion, getter or inferior call.
+The optional undefined-double encoding is refused because its build option
+is not proved by the exported metadata.
+
+Malformed maps, failed reads and inconsistent bounds are explicit failures.
+A readable, consistent heap header is not proof that an object is still live;
+this interface makes no garbage-collector liveness guarantee, and the MCP
+basis states that explicitly. Sequential-string value previews also check that
+the claimed aligned end reaches another readable object header. A failure adds
+the advisory `JavaScriptStringExtentUnproved` while preserving the bounded
+preview: valid large strings and fresh allocations need not have a following
+object. Payload reads use at most the claimed length and the 128-unit preview
+limit, and truncation is marked. A
+plausible following header is only a consistency check, not an independent
+proof of the allocation extent; stale or consistently corrupted heap data
+can still pass it.
+
+## Physical JavaScript stack
+
+An observer can call:
+
+```json
+{"name":"get_language_stack","arguments":{"tid":1234,"language":"javascript"}}
+```
+
+Use a thread ID from `list_threads`. The result has a generation and segments,
+each anchored to a retained native-unwind V8 API-exit frame. Frames carry name,
+script, line, column, kind, raw frame pointer and PC, plus a partial reason when
+needed. Positions come from bytecode or verified active Code source tables.
+They are never replaced by a function's declaration line.
+The optional `frame` argument is the first native frame to search for an
+anchor, not a logical JavaScript frame index. Nameless eval scripts may retain
+proved line/column values with `file: null` and an explicit name diagnostic.
+
+The reader follows at most 256 frame links and retains at most 64 JavaScript
+frames. It stops at a V8 entry boundary, so the segment remains `partial` with
+`JavaScriptEntryBoundary`. Optimized code that has changed, baseline position
+encodings not yet supported, and unresolved inline positions retain null
+line/column values with reasons. Async causal frames are not reconstructed;
+only the physical stopped stack is reported.
+
+Every operation has an 8192-read and 2 MiB memory budget. Source-position tables
+are capped at 16 KiB, and source scanning is bounded. Deep stacks and large
+sources may therefore return partial results. Reading does not resume the
+target or change registers.
+
+## Checks
+
+`scripts/build test -Doptimize=ReleaseSafe -Dgui=true -j1` includes the synthetic
+memory and DWARF tests. Run the owned live fixtures explicitly:
+
+```sh
+python3 tests/javascript-language.py --node /usr/bin/node
+python3 tests/javascript-gui.py --node /usr/bin/node --work .work/node-gui
+```
+
+The GUI check creates a private headless compositor. Pass `--include DIR` for
+matching headers when testing a different Node build. A selected unsupported
+runtime is a failed check, not an automatically skipped success.
+The live fixture compares each proved position, including frame zero, with
+V8's own stack captured at the native call site. It covers a proved TurboFan
+position and a genuinely inlined call whose physical frame must keep a null
+position. It also loads an owned sparse 300 MiB library to check that unrelated
+large files do not disable the reader.

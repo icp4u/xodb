@@ -19,12 +19,14 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=()):
     live = tier in ('host', 'all')
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
+    steps.append(('javascript-dwarf', [sys.executable, '-B', 'tests/javascript-dwarf.py'], 60))
+    steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
     if live:
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
@@ -44,6 +46,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None)
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
+        if node:
+            steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
+        for index, (executable, source, library) in enumerate(lua):
+            sdk = ['--source', source, '--library', library]
+            steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))
+            steps.append((f'lua-embedded-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--strace', '--adversarial', '--work', f'.work/lua-embedded-{index}'], 180))
+            steps.append((f'lua-interpreter-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--lua', executable, '--work', f'.work/lua-interpreter-{index}'], 180))
+            steps.append((f'lua-refusals-{index}', [sys.executable, '-B', 'tests/lua-refusals.py', *sdk, '--work', f'.work/lua-refusals-{index}'], 120))
     if tier in ('gui', 'all'):
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                       'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600))
@@ -73,6 +83,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None)
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
             steps.append((name, [sys.executable, '-B', *args], 90))
+        if node:
+            steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
+        if lua:
+            selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
+            steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))
     return steps
 
 
@@ -212,6 +227,9 @@ def main():
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
     parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
     parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
+    parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
+    parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
+    parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
     args = parser.parse_args()
     if args.headless and args.tier != 'portable':
@@ -220,7 +238,11 @@ def main():
         parser.error('--uprobes requires the host or all tier')
     if args.perl and args.tier not in ('gui', 'all'):
         parser.error('--perl requires the gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl)
+    if args.node and args.tier == 'portable':
+        parser.error('--node requires the host, gui or all tier')
+    if args.lua and args.tier == 'portable':
+        parser.error('--lua requires the host, gui or all tier')
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
@@ -241,13 +263,15 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
                      ['GUI execution'] if args.tier == 'host' else
                      ['full host integration suite'] if args.tier == 'gui' else []) +
-                    (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []))
+                    (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
+                    (['Node.js language checks (use --node PATH)'] if args.tier != 'portable' and not args.node else []) +
+                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier != 'portable' and not args.lua else []))
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')

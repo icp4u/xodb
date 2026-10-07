@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+set -euo pipefail
+umask 022
+cd "$(dirname "$0")/.."
+demo_root="$PWD"
+xodb="${XODB:-$PWD/zig-out/bin/xodb}"
+lua="${LUA:-lua5.4}"
+session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-lua-$(id -u)"
+socket="$session_dir/session.sock"
+if [[ "${1-}" == stack ]]; then
+    shift
+    if [[ ! -S "$socket" ]]; then
+        printf '%s\n' 'Start scripts/demo-lua, then press Space to reach print.' >&2
+        exit 1
+    fi
+    exec python3 - "$socket" "$demo_root" "$@" <<'PY'
+import json, os, socket, sys
+path, root, expressions = sys.argv[1], sys.argv[2], sys.argv[3:] or ['L']
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(path)
+stream = connection.makefile('rwb', buffering=0)
+sequence = 0
+def call(method, params):
+    global sequence
+    sequence += 1
+    stream.write((json.dumps({'jsonrpc': '2.0', 'id': sequence, 'method': method, 'params': params}) + '\n').encode())
+    while True:
+        line = stream.readline()
+        if not line:
+            sys.exit('xodb closed the session')
+        reply = json.loads(line)
+        if reply.get('id') == sequence:
+            return reply
+def tool(name, fatal=True, **arguments):
+    reply = call('tools/call', {'name': name, 'arguments': arguments})
+    problem = reply['error']['message'] if 'error' in reply else reply['result']['content'][0]['text'] if reply['result'].get('isError') else None
+    if problem and fatal:
+        sys.exit(name + ': ' + problem)
+    return problem if problem else reply['result']['structuredContent']
+call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'demo-lua', 'version': '1'}})
+stream.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+session = tool('get_session')
+if session['state'] != 'stopped':
+    sys.exit('The demo is running: press Space in xodb to stop it, then run this again.')
+if not any(t['reason'] == 'breakpoint' for t in session['threads']):
+    sys.exit('Press Space in xodb to reach the first Lua print call, then run this again.')
+tid = next((t['tid'] for t in session['threads'] if t['reason'] == 'breakpoint'), session['threads'][0]['tid'])
+def shown(path):
+    return os.path.relpath(path, root) if path and path.startswith(root + '/') else path
+for segment in tool('get_language_stack', tid=tid, language='lua')['segments']:
+    anchor = segment['anchor']
+    where = f"native frame #{anchor['frame']} {anchor['symbol'] or '(unnamed)'}" if anchor else 'no native anchor'
+    print(f"Lua {segment['runtime']['version']}: {segment['state']} "
+          f"({segment['reason'] or 'complete'}), anchored at {where}")
+    for frame in segment['frames']:
+        print(f"  {frame['name']:<12} {shown(frame['file'])}:{frame['line']}")
+for expression in expressions:
+    value = tool('evaluate_expression', False, tid=tid, frame=0, expression=expression)
+    if isinstance(value, str):
+        print(f"{expression}: not available in this native frame ({value})")
+        continue
+    value = value['value']
+    print(f"{expression} = {value['display']}")
+    for item in (((value.get('visualization') or {}).get('lua') or {}).get('items') or []):
+        print(f"    {item['key']}: {item['display']}")
+PY
+fi
+if [[ ! -x "$xodb" ]]; then
+    printf '%s\n' 'Build xodb with scripts/build, or set XODB to its executable.' >&2
+    exit 1
+fi
+if ! command -v "$lua" >/dev/null; then
+    printf '%s\n' 'Set LUA to a debug-built Lua 5.4.9 or Lua 5.2.4 interpreter.' >&2
+    exit 1
+fi
+mkdir -p -m 700 "$session_dir"
+if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
+    printf '%s\n' 'The demo session directory must be private and owned by you.' >&2
+    exit 1
+fi
+if [[ -S "$socket" ]] && python3 -c 'import socket,sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$socket" 2>/dev/null; then
+    printf '%s\n' 'Another Lua demo session is already running.' >&2
+    exit 1
+fi
+rm -f "$socket"
+cat >&2 <<'TIPS'
+Try: Space (stop inside print) · E L Return (watch the state and its top value)
+     Space (next value: integer, number, string, table, closure)
+     In another terminal: scripts/demo-lua stack
+     Lua stacks show source lines and C boundaries; missing names stay partial.
+     Reading a value never invokes its metamethods. Space resumes normal Lua code.
+TIPS
+exec "$xodb" --session-socket "$socket" "$@" --break luaB_print -- "$lua" examples/lua-demo.lua

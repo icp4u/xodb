@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/lua.c", "src/language/lua_layout.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -203,6 +203,29 @@ pub fn build(b: *std.Build) void {
     }
     python_tests.root_module.linkSystemLibrary("libdw", .{});
     test_step.dependOn(&b.addRunArtifact(python_tests).step);
+    const lua_tests = b.addExecutable(.{ .name = "xodb-lua-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/lua.c", "tests/lua-memory.c" }) |source| {
+        lua_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    test_step.dependOn(&b.addRunArtifact(lua_tests).step);
+    const javascript_tests = b.addExecutable(.{ .name = "xodb-javascript-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/javascript.c", "src/language/javascript_layout.c", "tests/javascript-reader.c" }) |source| {
+        javascript_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    javascript_tests.root_module.linkSystemLibrary("libdw", .{});
+    test_step.dependOn(&b.addRunArtifact(javascript_tests).step);
+    const javascript_layout_tests = b.addExecutable(.{ .name = "xodb-javascript-layout-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/javascript_layout.c", "tests/javascript-layout.c" }) |source| {
+        javascript_layout_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    javascript_layout_tests.root_module.linkSystemLibrary("libdw", .{});
+    const layout_run = b.addRunArtifact(javascript_layout_tests);
+    for ([_][]const u8{ "good", "bad" }, 0..) |name, i| {
+        const layout_fixture = b.addExecutable(.{ .name = b.fmt("xodb-javascript-layout-{s}", .{name}), .root_module = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true }) });
+        layout_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/javascript/layout.cc"), .flags = &.{ "-std=c++17", "-g", "-fstandalone-debug", "-fno-eliminate-unused-debug-types", if (i == 0) "-DWRONG_LAYOUT=0" else "-DWRONG_LAYOUT=8" } });
+        layout_run.addArtifactArg(layout_fixture);
+    }
+    test_step.dependOn(&layout_run.step);
     const service_tests = b.addExecutable(.{ .name = "xodb-service-session-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     service_tests.root_module.addIncludePath(b.path("src/service"));
     for ([_][]const u8{ "src/service/session.c", "tests/service-session.c" }) |source_file| {
@@ -246,7 +269,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests, python_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

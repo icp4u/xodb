@@ -1485,6 +1485,26 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
+        const lua_preview = @import("../language/lua.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (lua_preview) |shown| {
+            result.visualization = shown;
+            result.display = if (shown.lua.?.display.len > 0) shown.lua.?.display else shown.diagnostic orelse "Lua value unavailable";
+            result.diagnostic = shown.diagnostic;
+            return result;
+        }
+        const javascript_preview = @import("../language/javascript.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (javascript_preview) |shown| {
+            result.visualization = shown;
+            result.display = shown.javascript.?.display;
+            result.diagnostic = shown.diagnostic;
+            return result;
+        }
         const perl_preview = @import("../language/perl.zig").preview(self, a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;

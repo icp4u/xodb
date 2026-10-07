@@ -1,0 +1,6 @@
+local install = assert(package.loadlib(arg[1], 'luaopen_xodb_probe'))
+install()
+io.write('ready\n')
+io.flush()
+assert(io.read('*l') == 'go')
+dofile(arg[2])
