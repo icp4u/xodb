@@ -16,14 +16,31 @@ pub const Font = struct {
     row_height: u32 = 0,
     dirty: bool = true,
     degraded: bool = false,
+    pixel: bool = false,
     pub fn init(self: *Font, path: [:0]const u8) !void {
+        return self.initMode(path, false);
+    }
+    /// Startup selection only. The original smooth path keeps its exact flags.
+    pub fn initSelected(self: *Font, path: [:0]const u8, fallback: [:0]const u8) !void {
+        const pixel = @import("../appearance.zig").active.font.pixel;
+        self.initMode(path, pixel) catch |err| {
+            std.debug.print("xodb: Font failed: {s}; using default font; {s}\n", .{ @errorName(err), path });
+            self.* = .{};
+            try self.initMode(fallback, pixel);
+        };
+    }
+    pub fn initMode(self: *Font, path: [:0]const u8, pixel: bool) !void {
+        self.pixel = pixel;
         if (c.FT_Init_FreeType(&self.library) != 0) return error.FontLibraryFailed;
         errdefer _ = c.FT_Done_FreeType(self.library);
         if (c.FT_New_Face(self.library, path.ptr, 0, &self.face) != 0) return error.FontNotFound;
         errdefer _ = c.FT_Done_Face(self.face);
         if (c.FT_Set_Pixel_Sizes(self.face, 0, 16) != 0) return error.FontSizeFailed;
         self.hb = c.hb_ft_font_create_referenced(self.face) orelse return error.FontShapeFailed;
+        errdefer c.hb_font_destroy(self.hb);
+        if (pixel) c.hb_ft_font_set_load_flags(self.hb, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME);
         self.buffer = c.hb_buffer_create() orelse return error.FontShapeFailed;
+        errdefer c.hb_buffer_destroy(self.buffer);
         self.pixels[0] = 255;
         // Reserve the missing-glyph box before source text can fill the cache.
         _ = try self.glyph(0);
@@ -38,9 +55,12 @@ pub const Font = struct {
         if (id >= self.slots.len) return error.GlyphFailed;
         if (self.slots[id] != 0) return self.glyphs[self.slots[id] - 1];
         if (self.count == self.glyphs.len) return error.GlyphCacheFull;
-        if (c.FT_Load_Glyph(self.face, id, c.FT_LOAD_RENDER) != 0) return error.GlyphFailed;
+        const flags: c_int = @as(c_int, c.FT_LOAD_RENDER) | (if (self.pixel) @as(c_int, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME) else @as(c_int, 0));
+        if (c.FT_Load_Glyph(self.face, id, flags) != 0) return error.GlyphFailed;
         const slot = self.face.*.glyph.*;
         const bitmap = slot.bitmap;
+        if (bitmap.width > 0 and bitmap.rows > 0 and (self.pixel or bitmap.pixel_mode != c.FT_PIXEL_MODE_GRAY) and bitmap.pixel_mode != c.FT_PIXEL_MODE_MONO) return error.FontBitmapUnsupported;
+        if (bitmap.width + 3 >= atlas_size or bitmap.rows + 3 >= atlas_size) return error.GlyphAtlasFull;
         if (self.x + bitmap.width + 1 >= atlas_size) {
             self.x = 2;
             self.y += self.row_height + 1;
@@ -52,7 +72,11 @@ pub const Font = struct {
             const source_row = if (bitmap.pitch >= 0) row else bitmap.rows - 1 - row;
             const src = bitmap.buffer + source_row * @as(usize, @intCast(@abs(bitmap.pitch)));
             const start = (self.y + row) * atlas_size + self.x;
-            @memcpy(self.pixels[start..][0..bitmap.width], src[0..bitmap.width]);
+            if (bitmap.pixel_mode == c.FT_PIXEL_MODE_MONO) {
+                for (0..bitmap.width) |col| self.pixels[start + col] = if (src[col / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(col % 8))) != 0) 255 else 0;
+            } else {
+                @memcpy(self.pixels[start..][0..bitmap.width], src[0..bitmap.width]);
+            }
         }
         self.x += bitmap.width + 1;
         self.row_height = @max(self.row_height, bitmap.rows);
@@ -63,3 +87,18 @@ pub const Font = struct {
         return g;
     }
 };
+
+test "pixel glyph atlas has binary nonempty coverage" {
+    const font = try std.testing.allocator.create(Font);
+    defer std.testing.allocator.destroy(font);
+    font.* = .{};
+    try font.initMode(@import("build_options").font_path ++ "", true);
+    defer font.deinit();
+    for ("Aa@0123") |ch| _ = try font.glyph(c.FT_Get_Char_Index(font.face, ch));
+    var ink: usize = 0;
+    for (font.pixels) |value| {
+        try std.testing.expect(value == 0 or value == 255);
+        if (value == 255) ink += 1;
+    }
+    try std.testing.expect(ink > 1);
+}

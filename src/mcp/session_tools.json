@@ -15,13 +15,14 @@
   },
   {
     "name": "claim_session_control",
-    "description": "Claim or renew the sole controller lease. Uses original process generation from get_session; human scope remains authoritative.",
+    "description": "Claim or renew the sole controller lease independently of target generations. Human scope remains authoritative; target actions still require a fresh generation.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "generation": {
           "type": "integer",
-          "minimum": 0
+          "minimum": 0,
+          "description": "Legacy optional argument, validated but ignored. Target generations do not identify controller leases."
         },
         "ttl_ms": {
           "type": "integer",
@@ -30,9 +31,7 @@
           "default": 30000
         }
       },
-      "required": [
-        "generation"
-      ],
+      "required": [],
       "additionalProperties": false
     },
     "annotations": {

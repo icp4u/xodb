@@ -25,8 +25,8 @@ must claim again after scope changes, even if the new scope permits control.
 Human controls do not need a lease. The GUI shows the controller and client
 count; the action audit records the responsible `client_id`.
 
-For a headless session, add `--headless` to the same command. A client can obtain the current generation with `get_session`, claim
-control, then call `continue` with the latest generation to reach the breakpoint. Keep xodb running while clients connect and disconnect.
+For a headless session, add `--headless` to the same command. A client can claim
+control, obtain the current generation with `get_session`, then call `continue` with that generation to reach the breakpoint. Keep xodb running while clients connect and disconnect.
 The socket is the MCP endpoint; do not add `--mcp`.
 
 The socket path must be absolute, in a private directory. xodb creates a mode 0600
@@ -105,8 +105,7 @@ class Peer:
         assert not result.get("isError"), result
         return result["structuredContent"]
     def claim(self):
-        state = self.tool("get_session")  # original process generation
-        return self.tool("claim_session_control", generation=state["generation"],
+        return self.tool("claim_session_control",
                          ttl_ms=30000)
     def close(self):
         self.p.stdin.close()
@@ -170,15 +169,14 @@ a later resume. Actions such as `continue` still take the latest target
 | Tool | Arguments | Behavior |
 | --- | --- | --- |
 | `get_session_clients` | none | Returns your client ID, connected IDs, controller ID or null, remaining lease milliseconds, scope, journal sequence bounds and transient accept-error diagnostics. |
-| `claim_session_control` | required `generation`; optional `ttl_ms` | Claim when free, or renew the same connection's claim. TTL 100–60000 ms; default 30000 ms. Uses original process generation from `get_session`, with no `process_id`. |
+| `claim_session_control` | optional `ttl_ms` | Claim when free, or renew the same connection's claim. TTL 100–60000 ms; default 30000 ms. Independent of target generations, with no `process_id`. The legacy optional `generation` is validated but ignored. |
 | `release_session_control` | none | Release your claim without stopping the debugger or deleting evidence. |
 | `get_session_events` | `after` default 0; `limit` default 32, range 1–128 | Poll connection/lease policy events with a cursor. No push subscription. |
 
 Only one connection owns control. A competing claim returns `ControllerBusy`;
 an operation requiring an unheld lease returns `ControlLeaseRequired`. Expiry,
 controller disconnect, release, or any GUI scope change revokes the claim.
-Renew before expiry by calling `claim_session_control` again with a fresh
-original-process generation; there is no transferable lease token. A reconnect
+Renew before expiry by calling `claim_session_control` again; there is no transferable lease token. A reconnect
 must claim afresh. Revocation blocks new actions; it does not cancel accepted
 execution commands or jobs, and does not automatically interrupt a running target.
 Scope `observe` permits observation but does not grant a

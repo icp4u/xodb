@@ -1,6 +1,6 @@
 //! Expression entry and a bounded watch list (T19).
 //!
-//! Each entry keeps the thread and frame it was typed in. A frame is found
+//! Pinned entries keep the thread and frame they were typed in. A frame is found
 //! again by its canonical frame address (CFA) plus function, never by index
 //! alone; when it no longer exists the entry says "frame gone" and keeps its
 //! last value only as a labelled past observation. While the target runs,
@@ -65,7 +65,8 @@ pub const FrameId = struct {
         return self.persistent() and self.cfa == frame.cfa and self.module == frame.module and self.function == frame.function;
     }
 };
-pub const State = enum { pending, value, failed, frame_gone, thread_gone, context_changed, stack_unavailable, stale };
+pub const Mode = enum { pinned, live };
+pub const State = enum { pending, value, failed, frame_gone, thread_gone, context_changed, stack_unavailable, stale, not_in_scope };
 pub const Child = struct { name: []const u8, display: []const u8 };
 /// One evaluation, filled by the context. Slices live until the next refresh.
 pub const Result = union(enum) {
@@ -76,12 +77,14 @@ pub const Result = union(enum) {
 pub const Entry = struct {
     text: Text(max_text) = .{},
     frame: FrameId,
+    mode: Mode = .pinned,
     state: State = .pending,
     display: Text(max_display) = .{},
     type_name: Text(max_type) = .{},
     available: bool = false,
     /// `display` holds a value from a successful evaluation.
     has_value: bool = false,
+    ever_resolved: bool = false,
     failure: ?anyerror = null,
     /// Value at the previous stop, for change marking.
     previous: u64 = 0,
@@ -100,9 +103,21 @@ pub const Entry = struct {
     pub fn expression(self: *const Entry) []const u8 {
         return self.text.slice();
     }
+    fn unavailableDisplay(self: *Entry, state: State) void {
+        self.state = state;
+        self.has_value = false;
+        self.available = false;
+        self.display.len = 0;
+        self.type_name.len = 0;
+        self.changed = false;
+        self.resolved_index = null;
+        self.expandable = false;
+        self.children = &.{};
+    }
 };
 
 pub const WatchList = struct {
+    pub const Selection = struct { tid: i32, index: usize };
     entries: [max_entries]Entry = undefined,
     count: usize = 0,
     selected: ?usize = null,
@@ -111,6 +126,7 @@ pub const WatchList = struct {
     /// Generation of the last evaluation; null forces the next one.
     generation: ?u64 = null,
     dirty: bool = true,
+    display_frame: ?Selection = null,
     arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     /// Evaluations performed, for tests and measurements.
     evaluations: u64 = 0,
@@ -126,11 +142,14 @@ pub const WatchList = struct {
         self.arena.deinit();
     }
     pub fn add(self: *WatchList, text: []const u8, frame: FrameId) !usize {
+        return self.addMode(text, frame, .pinned);
+    }
+    pub fn addMode(self: *WatchList, text: []const u8, frame: FrameId, mode: Mode) !usize {
         const trimmed = std.mem.trim(u8, text, " \t");
         if (trimmed.len == 0) return error.EmptyExpression;
         if (trimmed.len > max_text) return error.ExpressionTooLong;
         if (self.count == max_entries) return error.WatchListFull;
-        var entry = Entry{ .frame = frame };
+        var entry = Entry{ .frame = frame, .mode = mode };
         entry.text.set(trimmed);
         self.entries[self.count] = entry;
         self.count += 1;
@@ -138,6 +157,20 @@ pub const WatchList = struct {
         self.reveal_selection = true;
         self.dirty = true;
         return self.count - 1;
+    }
+    pub fn setDisplayFrame(self: *WatchList, selection: ?Selection) void {
+        if (std.meta.eql(self.display_frame, selection)) return;
+        self.display_frame = selection;
+        for (self.items()) |entry| if (entry.mode == .live) {
+            self.dirty = true;
+            break;
+        };
+    }
+    pub fn toggleMode(self: *WatchList, index: usize, frame: FrameId) void {
+        if (index >= self.count) return;
+        const old = self.entries[index];
+        self.entries[index] = .{ .text = old.text, .frame = frame, .mode = if (old.mode == .pinned) .live else .pinned };
+        self.dirty = true;
     }
     pub fn remove(self: *WatchList, index: usize) void {
         if (index >= self.count) return;
@@ -187,7 +220,7 @@ pub const WatchList = struct {
         if (!ctx.stopped()) {
             // Only current results go stale; "frame gone" and "thread gone"
             // already describe an older observation and stay as they are.
-            for (self.items()) |*entry| if (entry.state == .value or entry.state == .failed) {
+            for (self.items()) |*entry| if (entry.state == .value or entry.state == .failed or entry.state == .not_in_scope) {
                 entry.state = .stale;
             };
             self.generation = null;
@@ -202,6 +235,29 @@ pub const WatchList = struct {
         for (self.items()) |*entry| {
             entry.children = &.{};
             entry.resolved_index = null;
+            if (entry.mode == .live) {
+                const selected = self.display_frame orelse {
+                    entry.unavailableDisplay(.not_in_scope);
+                    continue;
+                };
+                const identity = ctx.identity(selected.tid) orelse {
+                    entry.unavailableDisplay(.not_in_scope);
+                    continue;
+                };
+                const stack = switch (ctx.stack(selected.tid)) {
+                    .unavailable => {
+                        entry.unavailableDisplay(.stack_unavailable);
+                        continue;
+                    },
+                    .frames => |frames| frames.items,
+                };
+                if (selected.index >= stack.len) {
+                    entry.unavailableDisplay(.not_in_scope);
+                    continue;
+                }
+                entry.frame = FrameId.of(selected.tid, selected.index, stack[selected.index], identity, generation);
+                entry.state = .pending;
+            }
             // Terminal observations cannot be resurrected by CFA/TID reuse.
             if (entry.state == .frame_gone or entry.state == .thread_gone or entry.state == .context_changed) continue;
             const identity = ctx.identity(entry.frame.tid) orelse {
@@ -241,6 +297,7 @@ pub const WatchList = struct {
                 .value => |v| {
                     entry.state = .value;
                     entry.has_value = true;
+                    entry.ever_resolved = true;
                     entry.failure = null;
                     entry.display.set(v.display);
                     entry.type_name.set(v.type_name);
@@ -253,7 +310,7 @@ pub const WatchList = struct {
                     entry.next = v.next;
                 },
                 .failed => |err| {
-                    entry.state = .failed;
+                    entry.state = if (entry.mode == .live and entry.ever_resolved and err == error.UnknownVariable) .not_in_scope else .failed;
                     entry.has_value = false;
                     entry.failure = err;
                     entry.display.len = 0;
@@ -269,7 +326,7 @@ pub const WatchList = struct {
 /// Plain words for evaluator and target errors. A typo must never look like a value.
 pub fn explain(err: anyerror) []const u8 {
     return switch (err) {
-        error.UnknownVariable => "no variable with that name in this frame",
+        error.UnknownVariable => "unknown name here",
         error.UnknownRegister => "unknown register; use a name from the Registers pane",
         error.RegisterUnavailable => "register not recovered in this frame",
         error.UnknownField => "no field with that name",
@@ -297,59 +354,325 @@ pub fn explain(err: anyerror) []const u8 {
     };
 }
 
-/// The one-line expression field. Owns Escape, BackSpace, Return, Up/Down,
-/// chords and typed text while open, so typing never triggers letter or Space
-/// shortcuts. Function keys pass through.
+/// Shared single-line editing. Clipboard bytes enter through insert(), never
+/// through the key queue; only a physical Return can submit a field.
 pub const Editor = struct {
     open: bool = false,
+    mode: Mode = .pinned,
     text: Text(max_text) = .{},
     history: [max_history]Text(max_text) = undefined,
     history_count: usize = 0,
     history_at: ?usize = null,
     message: []const u8 = "",
+    limit: usize = max_text,
+    digits_only: bool = false,
+    allow_empty: bool = false,
+    history_enabled: bool = true,
+    cursor: ?usize = null,
+    anchor: ?usize = null,
+    epoch: u64 = 0,
+    selection_dirty: bool = false,
+    dragging: bool = false,
+    bounds: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    positions: [max_text + 1]f32 = @splat(0),
+    view_start: usize = 0,
     pub const Action = union(enum) { edited, cancel, submit: []const u8 };
+    const Window = @import("../platform/wayland.zig").Window;
+    const c = @import("../c.zig").api;
+
     pub fn start(self: *Editor) void {
         self.open = true;
+        self.mode = .pinned;
         self.text.len = 0;
         self.history_at = null;
         self.message = "";
+        self.limit = max_text;
+        self.digits_only = false;
+        self.allow_empty = false;
+        self.history_enabled = true;
+        self.cursor = null;
+        self.anchor = null;
+        self.epoch +%= 1;
+        self.selection_dirty = false;
+        self.dragging = false;
+        self.bounds.w = 0;
+        self.view_start = 0;
+    }
+    fn at(self: *const Editor) usize {
+        return @min(self.cursor orelse self.text.len, self.text.len);
+    }
+    fn previous(self: *const Editor, pos: usize) usize {
+        var n = pos -| 1;
+        while (n > 0 and self.text.bytes[n] & 0xc0 == 0x80) n -= 1;
+        return n;
+    }
+    fn next(self: *const Editor, pos: usize) usize {
+        var n = @min(pos + 1, self.text.len);
+        while (n < self.text.len and self.text.bytes[n] & 0xc0 == 0x80) n += 1;
+        return n;
+    }
+    fn range(self: *const Editor) [2]usize {
+        const pos = self.at();
+        const a = @min(self.anchor orelse pos, self.text.len);
+        return .{ @min(pos, a), @max(pos, a) };
+    }
+    pub fn selectedText(self: *const Editor) []const u8 {
+        const selected = self.range();
+        return self.text.bytes[selected[0]..selected[1]];
+    }
+    fn move(self: *Editor, pos: usize, extend: bool) void {
+        if (extend) {
+            if (self.anchor == null) self.anchor = self.at();
+        } else self.anchor = null;
+        self.cursor = pos;
+        self.selection_dirty = true;
+    }
+    fn erase(self: *Editor, from: usize, to: usize) void {
+        std.mem.copyForwards(u8, self.text.bytes[from..], self.text.bytes[to..self.text.len]);
+        self.text.len -= to - from;
+        self.cursor = from;
+        self.anchor = null;
+        self.history_at = null;
+        self.view_start = 0;
+        self.selection_dirty = true;
+    }
+    /// Keeps complete UTF-8 characters, removing controls, format characters
+    /// and line separators so pasted text cannot hide or reorder an expression.
+    /// The caller's numeric filter and byte limit apply equally to typing/paste.
+    pub fn insert(self: *Editor, bytes: []const u8, transfer_truncated: bool) void {
+        const selected = self.range();
+        var clean: [max_text]u8 = undefined;
+        var len: usize = 0;
+        var i: usize = 0;
+        var removed = false;
+        var truncated = transfer_truncated;
+        const room = @min(self.limit, max_text) -| (self.text.len - (selected[1] - selected[0]));
+        while (i < bytes.len) {
+            const n = std.unicode.utf8ByteSequenceLength(bytes[i]) catch {
+                removed = true;
+                i += 1;
+                continue;
+            };
+            if (n > bytes.len - i) {
+                removed = true;
+                break;
+            }
+            const cp = std.unicode.utf8Decode(bytes[i..][0..n]) catch {
+                removed = true;
+                i += 1;
+                continue;
+            };
+            const piece = bytes[i..][0..n];
+            i += n;
+            if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f) or c.xtext_format(cp) != 0 or cp == 0x2028 or cp == 0x2029 or (self.digits_only and (cp < '0' or cp > '9'))) {
+                removed = true;
+                continue;
+            }
+            if (len + n > room) {
+                truncated = true;
+                break;
+            }
+            @memcpy(clean[len..][0..n], piece);
+            len += n;
+        }
+        // Empty or wholly refused text must not delete the selection.
+        if (len > 0) {
+            self.erase(selected[0], selected[1]);
+            const pos = self.at();
+            std.mem.copyBackwards(u8, self.text.bytes[pos + len ..][0 .. self.text.len - pos], self.text.bytes[pos..self.text.len]);
+            @memcpy(self.text.bytes[pos..][0..len], clean[0..len]);
+            self.text.len += len;
+            self.cursor = pos + len;
+        }
+        self.message = if (truncated) "Paste/text truncated to field limit" else if (removed) "Controls or invalid characters removed" else "";
     }
     pub fn key(self: *Editor, event: keys.Event) ?Action {
-        if (!self.open or event.kind == .release) return null;
-        // Function keys are not text: F5-F11 (run, step, agent) keep working.
+        if (!self.open or (event.kind != .press and event.kind != .repeat)) return null;
+        // Function keys remain available while editing.
         if (event.shortcut >= 0xffbe and event.shortcut <= 0xffc9) return null;
         switch (event.shortcut) {
             keys.sym.escape => {
                 self.open = false;
+                self.dragging = false;
                 return .cancel;
             },
-            0xff08 => {
-                self.text.len -|= 1;
+            0xff51, 0xff53, 0xff50, 0xff57 => {
+                const selected = self.range();
+                const pos = switch (event.shortcut) {
+                    0xff50 => 0,
+                    0xff57 => self.text.len,
+                    0xff51 => if (!event.mods.shift and selected[0] != selected[1]) selected[0] else self.previous(self.at()),
+                    else => if (!event.mods.shift and selected[0] != selected[1]) selected[1] else self.next(self.at()),
+                };
+                self.move(pos, event.mods.shift);
+                return .edited;
+            },
+            0xff08, 0xffff => {
+                var selected = self.range();
+                if (selected[0] == selected[1]) {
+                    if (event.shortcut == 0xff08) selected[0] = self.previous(selected[0]) else selected[1] = self.next(selected[1]);
+                }
+                self.erase(selected[0], selected[1]);
+                self.message = "";
                 return .edited;
             },
             0xff0d, 0xff8d => {
                 const value = std.mem.trim(u8, self.text.slice(), " \t");
-                if (value.len == 0) return .edited;
-                self.remember(value);
+                if (value.len == 0 and !self.allow_empty) return .edited;
+                if (value.len > 0 and self.history_enabled) self.remember(value);
                 return .{ .submit = self.text.slice() };
             },
             keys.sym.up, keys.sym.down => {
-                self.recall(event.shortcut == keys.sym.up);
+                if (self.history_enabled) self.recall(event.shortcut == keys.sym.up);
                 return .edited;
             },
             else => {},
         }
         if (event.mods.ctrl and event.shortcut == 'u') {
-            self.text.len = 0;
+            self.erase(0, self.text.len);
+            self.message = "";
             return .edited;
         }
-        if (!event.plain()) return .edited;
-        for (event.text()) |ch| if (ch >= 0x20 and ch < 0x7f and self.text.len < max_text) {
-            self.text.bytes[self.text.len] = ch;
-            self.text.len += 1;
-        };
-        self.history_at = null;
+        if (event.plain() and event.text().len > 0) self.insert(event.text(), false);
         return .edited;
+    }
+    /// Bind a completion to this exact field opening. Leaving it (including
+    /// window focus loss) closes its pipe and discards any pending result.
+    pub fn focus(w: *Window, editor: ?*Editor) void {
+        const e = if (w.input.focused) editor else null;
+        if (!w.input.focused) if (editor) |v| {
+            v.dragging = false;
+            if (std.mem.eql(u8, v.message, "Pasting...")) {
+                v.message = "Paste cancelled (focus changed)";
+                w.dirty = true;
+            }
+        };
+        c.xclip_focus(w.clipboard, if (e) |v| @intFromPtr(v) else 0, if (e) |v| v.epoch else 0);
+        if (e) |v| {
+            if (v.dragging) {
+                if (w.mouse_down) {
+                    const pos = v.position(w.pointer_x);
+                    if (pos != v.at()) {
+                        v.move(pos, true);
+                        w.dirty = true;
+                    }
+                }
+            }
+            var result: c.xclip_result = undefined;
+            if (c.xclip_take(w.clipboard, &result) and result.destination == @intFromPtr(v) and result.epoch == v.epoch) {
+                switch (result.status) {
+                    c.XCLIP_READY, c.XCLIP_TRUNCATED => v.insert(result.bytes[0..result.size], result.status == c.XCLIP_TRUNCATED),
+                    c.XCLIP_TIMEOUT => v.message = "Paste timed out; field unchanged",
+                    c.XCLIP_UNAVAILABLE => v.message = "Clipboard has no plain text",
+                    else => v.message = "Paste failed; field unchanged",
+                }
+                if (w.input.trace) std.debug.print("editor clipboard result={d} bytes={d} field_bytes={d} cursor={d}\n", .{ result.status, result.size, v.text.len, v.at() });
+                w.dirty = true;
+            } else if (!c.xclip_pending(w.clipboard) and std.mem.eql(u8, v.message, "Pasting...")) {
+                v.message = "Paste cancelled (focus changed)";
+                w.dirty = true;
+            }
+            if (v.selection_dirty) {
+                v.selection_dirty = false;
+                const selected = v.selectedText();
+                if (selected.len > 0) _ = c.xclip_copy(w.clipboard, true, w.last_input_serial, selected.ptr, selected.len);
+            }
+        }
+    }
+    fn inside(self: *const Editor, x: f32, y: f32) bool {
+        return x >= self.bounds.x and x < self.bounds.x + self.bounds.w and y >= self.bounds.y and y < self.bounds.y + self.bounds.h;
+    }
+    fn position(self: *const Editor, x: f32) usize {
+        var pos = self.view_start;
+        while (pos < self.text.len) {
+            const n = self.next(pos);
+            if (x < (self.positions[pos] + self.positions[n]) / 2) return pos;
+            pos = n;
+        }
+        return self.text.len;
+    }
+    /// Handles only field-local clipboard and pointer selection events.
+    pub fn clipboard(self: *Editor, w: *Window, event: keys.Event) bool {
+        if (!self.open or !w.input.focused) return false;
+        if (event.kind == .button_release and event.code == 272 and self.dragging) {
+            self.move(self.position(event.x), true);
+            self.dragging = false;
+            w.dirty = true;
+            return true;
+        }
+        if (event.kind == .button_press and self.inside(event.x, event.y)) {
+            if (event.code == 272) {
+                self.move(self.position(event.x), event.mods.shift);
+                if (self.anchor == null) self.anchor = self.at();
+                self.dragging = true;
+                w.dirty = true;
+                return true;
+            }
+            if (event.code == 274) {
+                const status = c.xclip_request(w.clipboard, true);
+                // An absent primary-selection protocol must not move the
+                // cursor or cancel another transfer.
+                if (status == c.XCLIP_IDLE) return true;
+                if (status == c.XCLIP_UNAVAILABLE) {
+                    var ignored: c.xclip_result = undefined;
+                    _ = c.xclip_take(w.clipboard, &ignored);
+                    return true;
+                }
+                if (status == c.XCLIP_PENDING or status == c.XCLIP_READY or status == c.XCLIP_TRUNCATED) self.move(self.position(event.x), false);
+                w.dirty = true;
+                return true;
+            }
+        }
+        if ((event.kind != .press and event.kind != .repeat) or !event.mods.ctrl or event.mods.alt or event.mods.logo) return false;
+        if (event.shortcut == 'v') {
+            if (event.kind == .press) {
+                const status = c.xclip_request(w.clipboard, false);
+                if (status == c.XCLIP_PENDING) self.message = "Pasting...";
+                w.dirty = true;
+            }
+            return true;
+        }
+        if (event.shortcut == 'c') {
+            if (event.kind == .press) {
+                const selected = self.selectedText();
+                const bytes = if (selected.len > 0) selected else self.text.slice();
+                self.message = if (c.xclip_copy(w.clipboard, false, w.last_input_serial, bytes.ptr, bytes.len)) "Copied text" else "Clipboard unavailable";
+                w.dirty = true;
+            }
+            return true;
+        }
+        return false;
+    }
+    pub fn draw(self: *Editor, r: *gpu.Renderer, font: *Font, bounds: gpu.Rect) !void {
+        self.bounds = bounds;
+        const clip = r.clip;
+        defer r.clip = clip;
+        r.clip = .{ .x = @max(bounds.x, clip.x), .y = @max(bounds.y, clip.y), .w = 0, .h = 0 };
+        r.clip.w = @max(0, @min(bounds.x + bounds.w, clip.x + clip.w) - r.clip.x);
+        r.clip.h = @max(0, @min(bounds.y + bounds.h, clip.y + clip.h) - r.clip.y);
+        const block = @import("../appearance.zig").active.block_selection;
+        const cell = if (block) r.measure(font, " ") else 1;
+        const pos = self.at();
+        self.view_start = @min(self.view_start, pos);
+        while (self.view_start < pos and r.measure(font, self.text.bytes[self.view_start..pos]) > bounds.w - (if (block) cell + 2 else 3)) self.view_start = self.next(self.view_start);
+        var i = self.view_start;
+        while (true) {
+            self.positions[i] = bounds.x + r.measure(font, self.text.bytes[self.view_start..i]);
+            if (i == self.text.len) break;
+            i = self.next(i);
+        }
+        const selected = self.range();
+        if (selected[0] != selected[1] and selected[1] > self.view_start) {
+            const x = self.positions[@max(self.view_start, selected[0])];
+            try r.rect(.{ .x = x, .y = bounds.y, .w = self.positions[selected[1]] - x, .h = bounds.h }, style.fade(theme.focus, 0.35));
+        }
+        try r.text(font, bounds.x, bounds.y, self.text.bytes[self.view_start..self.text.len], theme.text);
+        if (block) {
+            try r.rect(.{ .x = @round(self.positions[pos]), .y = @round(bounds.y + 2), .w = cell, .h = 16 }, theme.focus);
+            // The shared editor can insert in the middle after a click/paste.
+            // Keep the character under the block readable in the panel color.
+            if (pos < self.text.len) try r.text(font, self.positions[pos], bounds.y, self.text.bytes[pos..self.next(pos)], theme.surface);
+        } else try r.rect(.{ .x = self.positions[pos], .y = bounds.y, .w = 1, .h = bounds.h }, theme.focus);
     }
     fn remember(self: *Editor, value: []const u8) void {
         if (self.history_count > 0 and std.mem.eql(u8, self.history[(self.history_count - 1) % max_history].slice(), value)) return;
@@ -360,15 +683,18 @@ pub const Editor = struct {
     fn recall(self: *Editor, older: bool) void {
         const kept = @min(self.history_count, max_history);
         if (kept == 0) return;
-        // Positions count back from the newest entry: 0 is the newest.
-        const at: usize = if (self.history_at) |p| (if (older) @min(p + 1, kept - 1) else p -| 1) else if (older) 0 else return;
+        const index: usize = if (self.history_at) |p| (if (older) @min(p + 1, kept - 1) else p -| 1) else if (older) 0 else return;
         if (!older and self.history_at != null and self.history_at.? == 0) {
             self.history_at = null;
             self.text.len = 0;
-            return;
+        } else {
+            self.history_at = index;
+            self.text = self.history[(self.history_count - 1 - index) % max_history];
         }
-        self.history_at = at;
-        self.text = self.history[(self.history_count - 1 - at) % max_history];
+        self.cursor = null;
+        self.anchor = null;
+        self.view_start = 0;
+        self.selection_dirty = true;
     }
 };
 
@@ -384,14 +710,14 @@ fn frameTag(buffer: []u8, entry: *const Entry, with_tid: bool) []const u8 {
         else => blk: {
             var tid_buffer: [16]u8 = undefined;
             const tid = if (with_tid) std.fmt.bufPrint(&tid_buffer, "{d} ", .{entry.frame.tid}) catch "" else "";
-            break :blk if (entry.resolved_index) |i| std.fmt.bufPrint(buffer, "{s}{s}#{d} {s}", .{ tid, if (entry.unverified) "CFA match " else if (!entry.frame.persistent()) "stop only " else "", i, name }) catch "" else std.fmt.bufPrint(buffer, "{s}{s}", .{ tid, name }) catch "";
+            break :blk if (entry.resolved_index) |i| std.fmt.bufPrint(buffer, "{s}{s}#{d} {s}", .{ tid, if (entry.mode == .live) "selected " else if (entry.unverified) "CFA match " else if (!entry.frame.persistent()) "stop only " else "", i, name }) catch "" else std.fmt.bufPrint(buffer, "{s}{s}", .{ tid, name }) catch "";
         },
     };
 }
 
 /// Rows: the open editor, then entries and expanded children. Keeps the
 /// selected entry in view. Returns per-row entry indices for hit testing.
-pub fn draw(list: *WatchList, editor: *const Editor, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, hits: *[64]?usize) !void {
+pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, hits: *[64]?usize) !void {
     const row_h: f32 = 23;
     var y = rect.y + 8;
     const x = rect.x + 12;
@@ -399,12 +725,7 @@ pub fn draw(list: *WatchList, editor: *const Editor, r: *gpu.Renderer, font: *Fo
     for (hits) |*h| h.* = null;
     if (editor.open) {
         try r.shape(.{ .x = rect.x + 6, .y = y - 3, .w = rect.w - 12, .h = row_h + 2 }, style.fade(theme.focus, 0.18), .{ .radii = @splat(5) });
-        var buffer: [max_text + 8]u8 = undefined;
-        const shown = std.fmt.bufPrint(&buffer, "> {s}_", .{editor.text.slice()}) catch "";
-        // Keep the end of long input visible.
-        var start: usize = 0;
-        while (start < shown.len and r.measure(font, shown[start..]) > w) start += 1;
-        try r.text(font, x, y, shown[start..], theme.text);
+        try editor.draw(r, font, .{ .x = x, .y = y, .w = w, .h = row_h });
         y += row_h + 2;
         if (editor.message.len > 0) {
             try r.textFit(font, x, y, w, editor.message, theme.warm);
@@ -453,11 +774,11 @@ pub fn draw(list: *WatchList, editor: *const Editor, r: *gpu.Renderer, font: *Fo
         list.reveal_selection = false;
     }
     list.first_row = @min(list.first_row, n -| visible);
-    const type_w: f32 = if (w > 560) 150 else 0;
     for (rows[list.first_row..n], 0..) |row, k| {
         if (k >= visible or k >= hits.len) break;
         hits[k] = row.entry;
         const entry = &list.entries[row.entry];
+        const type_w: f32 = if (w > 560 and entry.state == .value) 150 else 0;
         const ry = y + @as(f32, @floatFromInt(k)) * row_h;
         if (row.child) |c| {
             var buffer: [320]u8 = undefined;
@@ -474,7 +795,8 @@ pub fn draw(list: *WatchList, editor: *const Editor, r: *gpu.Renderer, font: *Fo
         var tag_buffer: [160]u8 = undefined;
         const tag = frameTag(&tag_buffer, entry, w > 560);
         const tag_w = if (w > 560) @min(r.measure(font, tag), w * 0.35) else 0;
-        const expr = entry.expression();
+        var expression_buffer: [max_text + 8]u8 = undefined;
+        const expr = if (entry.mode == .live) std.fmt.bufPrint(&expression_buffer, "~ {s}", .{entry.expression()}) catch entry.expression() else entry.expression();
         const expr_w = @min(r.measure(font, expr), w * 0.4);
         try r.textFit(font, x, ry, expr_w, expr, theme.neutral);
         const value_x = x + expr_w + 10;
@@ -485,7 +807,8 @@ pub fn draw(list: *WatchList, editor: *const Editor, r: *gpu.Renderer, font: *Fo
             .value => .{ std.fmt.bufPrint(&value_buffer, "= {s}{s}", .{ marker, entry.display.slice() }) catch "", if (entry.available) theme.text else theme.weak },
             .failed => .{ std.fmt.bufPrint(&value_buffer, "error: {s}", .{explain(entry.failure.?)}) catch "", theme.warm },
             .pending => .{ "not evaluated yet", theme.weak },
-            .stale => .{ if (!entry.has_value) "stale: running" else std.fmt.bufPrint(&value_buffer, "= {s}  (stale: running)", .{entry.display.slice()}) catch "", theme.weak },
+            .not_in_scope => .{ "not in scope here", theme.weak },
+            .stale => .{ if (!entry.has_value) "stale: running" else std.fmt.bufPrint(&value_buffer, "stale: running / {s}", .{entry.display.slice()}) catch "stale: running", theme.weak },
             .frame_gone => .{ if (entry.has_value) std.fmt.bufPrint(&value_buffer, "frame gone; last seen {s}", .{entry.display.slice()}) catch "" else "frame gone", theme.warm },
             .thread_gone => .{ "thread gone", theme.warm },
             .context_changed => .{ "frame identity changed; re-add", theme.warm },

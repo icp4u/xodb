@@ -30,6 +30,7 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check portable --headless  # No GUI development dependencies
 ./scripts/release-check host                 # Live debugger/profiler regressions
 ./scripts/release-check gui                  # Private Sway/Vulkan regressions
+./scripts/release-check gui --perl /path/to/debug/perl # Also the Perl live-row demo (5.44 + DWARF)
 ./scripts/release-check all                  # Host plus GUI, one build
 ./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution

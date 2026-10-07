@@ -13,6 +13,7 @@ enum {
     ROK = 0x800,
     UV_FLAG = 0x80000000u,
     HV_AUX = 0x02000000,
+    OBJECT = 0x00100000,
     CV_NAMED = 0x8000
 };
 static int read_bytes(struct xpl_reader *r, uint64_t address, void *out, size_t n) {
@@ -130,6 +131,14 @@ static int cv_name(const struct xpl_layout *l, struct xpl_reader *r, uint64_t cv
         return 0;
     return snprintf(out, cap, "%s::%s", package, short_name) < (int)cap;
 }
+static int gv_name(const struct xpl_layout *l, struct xpl_reader *r, uint64_t body, char *out, size_t cap) {
+    uint64_t name = at(l, r, body, XPL_GVNAME), stash = at(l, r, body, XPL_GVSTASH);
+    char short_name[192] = {0}, package[256] = {0};
+    if (!name || !hek(l, r, name, short_name, sizeof short_name) ||
+        !stash || !stash_name(l, r, stash, package, sizeof package))
+        return 0;
+    return snprintf(out, cap, "%s::%s", package, short_name) < (int)cap;
+}
 struct file_cache { uint64_t address; const struct xpl_frame *frame; };
 static void location(const struct xpl_layout *l, struct xpl_reader *r, uint64_t cop, struct xpl_frame *f,
                      struct file_cache *cache, unsigned *cache_count) {
@@ -200,7 +209,8 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
                 return;
             }
             uint64_t address = array + delta;
-            unsigned kind = (unsigned)at(l, r, address, XPL_CXTYPE) & 15;
+            unsigned context = (unsigned)at(l, r, address, XPL_CXTYPE);
+            unsigned kind = context & 15;
             if (r->error)
                 break;
             if (kind > 13) {
@@ -215,12 +225,14 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
                 return;
             }
             struct xpl_frame *f = &out->frames[out->count++];
-            f->context_type = kind;
+            /* cop.h CxTRY: CXt_EVAL with CXp_TRY (0x80). Keep the flag
+             * in the observation so try is not presented as an eval. */
+            f->context_type = kind == 11 && (context & 0x80) ? 0x8b : kind;
             f->context_address = address;
             f->cv = at(l, r, address, kind == 11 ? XPL_EVALCV : XPL_SUBCV);
             location(l, r, cop, f, cache, &cache_count);
             if (kind == 11) {
-                snprintf(f->name, sizeof f->name, "(eval)");
+                snprintf(f->name, sizeof f->name, "%s", (context & 0x80) ? "(try)" : "(eval)");
                 /* CxOLD_OP_TYPE is blk_u16 >> 7; OP_ENTEREVAL is 352 in
                  * the verified 5.44.0 profile. Block eval, try, G_EVAL and
                  * ithread entry legitimately have no eval CV. */
@@ -260,7 +272,7 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
 }
 static void value(const struct xpl_layout *, struct xpl_reader *, uint64_t, struct xpl_value *, unsigned);
 static void item(const struct xpl_layout *l, struct xpl_reader *r, uint64_t address, struct xpl_value_item *out,
-                 unsigned depth) {
+                 unsigned depth, char (*class_name)[256]) {
     out->address = address;
     if (!address) {
         strcpy(out->type, "hole");
@@ -269,6 +281,7 @@ static void item(const struct xpl_layout *l, struct xpl_reader *r, uint64_t addr
     }
     struct xpl_value child;
     value(l, r, address, &child, depth);
+    if (class_name) memcpy(*class_name, child.class_name, sizeof child.class_name);
     snprintf(out->type, sizeof out->type, "%s", child.type);
     snprintf(out->display, sizeof out->display, "%.191s", child.display);
     out->reason = child.reason;
@@ -312,7 +325,7 @@ static void value(const struct xpl_layout *l, struct xpl_reader *r, uint64_t add
             goto inconsistent;
         snprintf(out->display, sizeof out->display, "RV -> 0x%" PRIx64, u);
         if (!depth) {
-            item(l, r, u, &out->items[out->item_count++], 1);
+            item(l, r, u, &out->items[out->item_count++], 1, &out->class_name);
             strcpy(out->items[0].key, "referent");
         }
     } else if (type == SV_AV) {
@@ -330,7 +343,7 @@ static void value(const struct xpl_layout *l, struct xpl_reader *r, uint64_t add
                     goto inconsistent;
                 uint64_t sv = number(r, u + i * 8, 8);
                 struct xpl_value_item *entry = &out->items[out->item_count++];
-                item(l, r, sv, entry, 1);
+                item(l, r, sv, entry, 1, NULL);
                 snprintf(entry->key, sizeof entry->key, "[%" PRIu64 "]", i);
                 if (r->error)
                     break;
@@ -364,7 +377,7 @@ static void value(const struct xpl_layout *l, struct xpl_reader *r, uint64_t add
                     seen[visited++] = he;
                     uint64_t key = at(l, r, he, XPL_HEKEY), sv = at(l, r, he, XPL_HEVAL);
                     struct xpl_value_item *entry = &out->items[out->item_count++];
-                    item(l, r, sv, entry, 1);
+                    item(l, r, sv, entry, 1, NULL);
                     if (!key || !hek(l, r, key, entry->key, sizeof entry->key)) {
                         strcpy(entry->key, "(key unavailable)");
                         entry->reason = r->error ? r->error : "HashKeyUnavailable";
@@ -381,8 +394,7 @@ static void value(const struct xpl_layout *l, struct xpl_reader *r, uint64_t add
         }
     } else if (type == SV_GV) {
         strcpy(out->type, "GV");
-        uint64_t name = at(l, r, out->body, XPL_GVNAME);
-        if (!name || !hek(l, r, name, out->display, sizeof out->display)) {
+        if (!gv_name(l, r, out->body, out->display, sizeof out->display)) {
             strcpy(out->display, "GV (name unavailable)");
             out->reason = "GvNameUnavailable";
         }
@@ -436,6 +448,22 @@ static void value(const struct xpl_layout *l, struct xpl_reader *r, uint64_t add
         strcpy(out->type, "unsupported");
         snprintf(out->display, sizeof out->display, "SV type %u", type);
         out->reason = "SvTypeUnsupported";
+    }
+    /* SvSTASH is valid only for a blessed SVt_PVMG-or-later body. Never
+     * invoke overload/magic or guess a package from a pointer's type name. */
+    if (out->flags & OBJECT) {
+        if (type < 7 || !out->body) goto inconsistent;
+        uint64_t stash = at(l, r, out->body, XPL_BLESS_STASH);
+        if (!stash || !stash_name(l, r, stash, out->class_name, sizeof out->class_name)) {
+            out->class_name[0] = 0;
+            if (!out->reason) out->reason = "ClassNameUnavailable";
+        }
+    }
+    if (out->class_name[0]) {
+        char display[sizeof out->display];
+        memcpy(display, out->display, sizeof display);
+        int n = snprintf(out->display, sizeof out->display, "%s %s", out->class_name, display);
+        out->truncated |= n >= (int)sizeof out->display;
     }
     if (r->error)
         goto unreadable;

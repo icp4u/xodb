@@ -3,6 +3,8 @@ const std = @import("std");
 const policy = @import("probes.zig");
 const bp = @import("../target/breakpoints.zig");
 const A = std.heap.page_allocator;
+const runtime = @import("../target/runtime.zig");
+const rt = runtime.c;
 pub const Entry = struct {
     id: u64,
     symbol: policy.Text = .{},
@@ -26,6 +28,10 @@ pub const Manager = struct {
     loader_status: []const u8 = "not requested",
     epoch: u64 = 0,
     observed: u64 = 0,
+    loader_attempt: u64 = 0,
+    file_reads: rt.struct_xrt_file_budget = std.mem.zeroes(rt.struct_xrt_file_budget),
+    cancel: ?*const volatile @import("../c.zig").api.sig_atomic_t = null,
+    loader_reads: rt.struct_xrt_loader = std.mem.zeroes(rt.struct_xrt_loader),
     pub fn deinit(self: *Manager) void {
         for (self.entries.items) |item| item.deinit();
         self.entries.deinit(A);
@@ -51,6 +57,7 @@ pub const Manager = struct {
         out.debug_address = self.debug_address;
         out.loader_status = self.loader_status;
         out.epoch = self.epoch;
+        out.cancel = self.cancel;
     }
     pub fn entry(self: *Manager, id: u64) ?*Entry {
         for (self.entries.items) |*v| if (v.id == id) return v;
@@ -115,40 +122,61 @@ pub const Manager = struct {
     }
     fn installHook(self: *Manager, session: anytype) void {
         if (self.hook != null or self.entries.items.len == 0) return;
-        session.refreshMaps() catch {
-            self.loader_status = "maps unavailable";
+        // Retry incomplete bootstrap metadata at later stops, at most once
+        // per second. No symbol search across mapped files belongs here.
+        const now = @import("../target/linux.zig").now();
+        if (self.loader_attempt != 0 and now -| self.loader_attempt < 1_000_000_000) return;
+        self.loader_attempt = now;
+        var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{ .limit_bytes = 128 * 1024, .deadline_ns = now + 2_000_000_000, .cancel = self.cancel });
+        rt.xrt_target_file_budget(session.target.handle, &budget);
+        defer rt.xrt_target_file_budget(session.target.handle, null);
+        runtime.check(rt.xrt_target_loader(session.target.handle, &self.loader_reads, self.cancel)) catch |err| {
+            self.loader_status = if (err == error.InvalidArgument and rt.xrt_target_is_remote(session.target.handle)) "agent needs updating: loader metadata unsupported" else @errorName(err);
             return;
         };
-        const debug = session.modules.findSymbol("_r_debug") catch {
-            self.loader_status = "no loader rendezvous; resolve at ordinary stops";
+        const function = self.loader_reads.break_address;
+        const debug = self.loader_reads.debug_address;
+        if (function == 0 or debug == 0) {
+            self.loader_status = "loader not initialized; resolve at ordinary stops";
             return;
-        };
-        // The exported bootstrap function is available before r_brk is initialized.
-        const function = session.modules.findSymbol("_dl_debug_state") catch {
-            self.loader_status = "no glibc loader hook; resolve at ordinary stops";
-            return;
-        };
-        for (session.target.breakpointSlice()) |v| if (!v.pending and v.address == function.address) {
+        }
+        for (session.target.breakpointSlice()) |v| if (!v.pending and v.address == function) {
             self.loader_status = "loader address already has a user breakpoint";
             return;
         };
-        const id = session.target.setBreakpoint(function.address, false) catch |err| {
+        const id = session.target.setBreakpoint(function, false) catch |err| {
             self.loader_status = @errorName(err);
             return;
         };
         session.target.markBreakpointInternal(id, true) catch return;
         self.hook = id;
-        self.debug_address = debug.address;
+        self.debug_address = debug;
         self.loader_status = "glibc loader rendezvous";
+        self.loader_attempt = 0;
     }
     fn resolve(self: *Manager, session: anytype) !void {
+        var pending = false;
+        for (self.entries.items) |item| if (probe(session, item.id)) |current| {
+            if (current.pending) {
+                pending = true;
+                break;
+            }
+        };
+        if (!pending) return;
         try session.refreshMaps();
+        self.file_reads = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
+            .limit_bytes = 32 * 1024 * 1024,
+            .deadline_ns = @import("../target/linux.zig").now() + 2_000_000_000,
+            .cancel = self.cancel,
+        });
+        rt.xrt_target_file_budget(session.target.handle, &self.file_reads);
+        defer rt.xrt_target_file_budget(session.target.handle, null);
         for (self.entries.items) |*item| {
             const current = probe(session, item.id) orelse continue;
             if (!current.pending) continue;
             var address: ?u64 = null;
             if (item.symbol.len > 0) {
-                if (session.modules.findSymbol(item.symbol.slice())) |symbol| address = symbol.address else |err| {
+                if (session.modules.automaticSymbolAddress(item.symbol.slice())) |resolved| address = resolved else |err| {
                     item.diagnostic = @errorName(err);
                     continue;
                 }
@@ -184,6 +212,7 @@ pub const Manager = struct {
         if (self.epoch != session.target.snapshot().image_epoch) {
             self.hook = null;
             self.debug_address = null;
+            self.loader_attempt = 0;
             self.epoch = session.target.snapshot().image_epoch;
             // Exec invalidated physical locations; preserve logical identities.
             for (self.entries.items) |item| if (probe(session, item.id) == null) {

@@ -210,7 +210,7 @@ pub const Panel = struct {
         try r.textFit(font, b.x + 14, y, b.w - 28, self.message, theme.text);
         if (self.editor.open) {
             try style.box(r, .{ .x = b.x + 10, .y = y + 24, .w = b.w - 20, .h = 27 }, theme.background, theme.focus, @splat(3));
-            try r.textFit(font, b.x + 16, y + 28, b.w - 32, self.editor.text.slice(), theme.text);
+            try self.editor.draw(r, font, .{ .x = b.x + 16, .y = y + 28, .w = b.w - 32, .h = 22 });
         } else if (self.kind == .memory) {
             const label = try std.fmt.bufPrint(&buffer, "0x{x}   scan {d} bytes   baseline {d}   ?? unreadable", .{ self.address, self.search_length, self.baseline orelse 0 });
             try r.textFit(font, b.x + 14, y + 28, b.w - 28, label, theme.weak);

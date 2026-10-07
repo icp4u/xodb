@@ -3,6 +3,7 @@
 #include "xrt.h"
 #include <stdint.h>
 #include <stddef.h>
+#include <signal.h>
 struct xrt_target;
 struct xrt_file_identity {
     uint64_t device, inode;
@@ -17,7 +18,8 @@ enum xrt_file_kind {
     XRT_FILE_MAPS,
     XRT_FILE_THREAD_STAT,
     XRT_FILE_BOOT_ID,
-    XRT_FILE_THREAD_COMM
+    XRT_FILE_THREAD_COMM,
+    XRT_FILE_AUXV
 };
 struct xrt_file_request {
     enum xrt_file_kind kind;
@@ -33,4 +35,18 @@ enum xrt_status xrt_target_file(const struct xrt_target *, const struct xrt_file
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, int *fd);
 enum xrt_status xrt_file_identity(int fd, struct xrt_file_identity *);
 enum xrt_status xrt_file_unchanged(int fd, const struct xrt_file_identity *);
+/* Owner-thread scope for automatic remote symbol discovery. Explicit user
+ * file requests keep their normal limits. The borrowed budget must outlive
+ * the scope; clear it before returning to the event loop. */
+struct xrt_file_budget {
+    uint64_t limit_bytes, deadline_ns, bytes, files, negative_hits, skipped;
+    uint64_t resumed_bytes;
+    const volatile sig_atomic_t *cancel;
+};
+void xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *);
+/* Owner thread only. Remote ELF symbol-only sparse projection; do not use for
+ * debug information or code bytes. Partial transfers resume on the next pass.
+ * The output fd is sealed; resident counts retained source bytes, not holes. */
+enum xrt_status xrt_remote_symbol_file(const struct xrt_target *, const struct xrt_file_request *,
+                                      int *fd, uint64_t *resident);
 #endif

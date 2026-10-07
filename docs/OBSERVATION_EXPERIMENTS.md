@@ -104,7 +104,12 @@ is claimed. The pinned bytes are rehashed after the memfd is sealed.
 The child xodb and its target inherit `RLIMIT_FSIZE` (the remaining per-file
 allowance) and `RLIMIT_CORE=0`. The aggregate run directory is checked after each
 run, before publishing a completed result. Exceeding it stops later runs and
-records `output_budget`; retained files can already exceed the allowance because
+records `output_budget` in the row's optional `additional_reasons`. An earlier
+timeout, failure or cancellation remains the primary `status` and `error`;
+cancellation still exits 130. A run that otherwise succeeded is marked
+`output_budget`, with no successful result. Summaries count the additional
+budget reason separately from primary outcomes. Older manifests without this
+optional field remain readable; reading the new field needs the current runner. Retained files can already exceed the allowance because
 per-file limits do not constrain the sum. This is a bounded experiment runner,
 not a filesystem quota or a sandbox for arbitrary target output elsewhere.
 

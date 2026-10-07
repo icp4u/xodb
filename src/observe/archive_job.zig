@@ -14,6 +14,7 @@ pub const Job = struct {
     association_source: ?*const associations.Job = null,
     associations_omitted_reason: ?[]const u8 = null,
     associations_saved: bool = false,
+    associations_fallback_reason: ?[]const u8 = null,
     restored_associations: ?*associations.Job = null,
     worker: ?std.Thread = null,
     progress: archive.Progress = .{},
@@ -26,14 +27,17 @@ pub const Job = struct {
         if (path.len == 0 or path.len > 4096 or std.mem.indexOfScalar(u8, path, 0) != null) return error.ArchivePathInvalid;
         if (kind == .save and (source == null or !source.?.store.finished or source.?.ended_ns == null)) return error.ObservationStillCollecting;
         var omitted: ?[]const u8 = null;
+        var fallback: ?[]const u8 = null;
         if (associated) |job| {
             if (kind != .save or source != job.capture) return error.InvalidSavedAssociations;
             if (!job.done.load(.acquire)) return error.ObservationAssociationsBusy;
-            if (job.err) |err| omitted = @errorName(err) else _ = try job.view();
+            if (job.err) |err| {
+                if (source.?.saved_associations != null) fallback = @errorName(err) else omitted = @errorName(err);
+            } else try associations.saved_evidence.limits(try job.view());
         }
         const self = try a.create(Job);
         errdefer a.destroy(self);
-        self.* = .{ .id = id, .kind = kind, .path = try a.dupeZ(u8, path), .source = source, .association_source = if (omitted == null) associated else null, .associations_omitted_reason = omitted };
+        self.* = .{ .id = id, .kind = kind, .path = try a.dupeZ(u8, path), .source = source, .association_source = if (omitted == null and fallback == null) associated else null, .associations_omitted_reason = omitted, .associations_fallback_reason = fallback };
         errdefer a.free(self.path);
         self.worker = try std.Thread.spawn(.{}, run, .{self});
         return self;
@@ -101,11 +105,11 @@ pub const Job = struct {
         self.restored_associations = restored;
         self.capture = capture;
     }
-    pub fn status(self: *const Job) struct { id: u64, kind: @FieldType(Job, "kind"), path: []const u8, state: enum { running, completed, cancelled, failed }, phase: @import("../profile/archive_progress.zig").Phase, units: usize, error_name: ?[]const u8, publication: ?archive.Publication, sha256: ?[]const u8, associations_saved: ?bool, associations_omitted_reason: ?[]const u8 } {
+    pub fn status(self: *const Job) struct { id: u64, kind: @FieldType(Job, "kind"), path: []const u8, state: enum { running, completed, cancelled, failed }, phase: @import("../profile/archive_progress.zig").Phase, units: usize, error_name: ?[]const u8, publication: ?archive.Publication, sha256: ?[]const u8, associations_saved: ?bool, associations_omitted_reason: ?[]const u8, associations_fallback_reason: ?[]const u8 } {
         const done = self.done.load(.acquire);
         const failed = done and (self.err != null or (self.publication != null and self.publication.?.state != .published));
         const cancelled = done and ((if (self.err) |err| err == error.ArchiveCancelled else false) or (if (self.publication) |p| p.state != .published and p.error_name != null and std.mem.eql(u8, p.error_name.?, "ArchiveCancelled") else false));
-        return .{ .associations_saved = if (done and self.kind == .save) self.associations_saved else null, .associations_omitted_reason = self.associations_omitted_reason, .id = self.id, .kind = self.kind, .path = self.path, .state = if (!done) .running else if (cancelled) .cancelled else if (failed) .failed else .completed, .phase = self.progress.phase.load(.acquire), .units = self.progress.units.load(.acquire), .error_name = if (done) (if (self.err) |err| @errorName(err) else if (self.publication) |p| p.error_name else null) else null, .publication = if (done) self.publication else null, .sha256 = if (done and self.digest != null) &self.digest.? else null };
+        return .{ .associations_saved = if (done and self.kind == .save) self.associations_saved else null, .associations_omitted_reason = self.associations_omitted_reason, .associations_fallback_reason = self.associations_fallback_reason, .id = self.id, .kind = self.kind, .path = self.path, .state = if (!done) .running else if (cancelled) .cancelled else if (failed) .failed else .completed, .phase = self.progress.phase.load(.acquire), .units = self.progress.units.load(.acquire), .error_name = if (done) (if (self.err) |err| @errorName(err) else if (self.publication) |p| p.error_name else null) else null, .publication = if (done) self.publication else null, .sha256 = if (done and self.digest != null) &self.digest.? else null };
     }
     pub fn deinit(self: *Job) void {
         self.progress.cancel.store(true, .release);

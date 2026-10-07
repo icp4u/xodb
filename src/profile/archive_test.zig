@@ -369,3 +369,20 @@ test "syscall archives preserve partial boundaries, limits and raw results" {
     original.syscalls.items.items[1].exit_ns = begin + 1;
     try std.testing.expectError(error.ArchiveInconsistent, archive.encode(a, original, .{}));
 }
+
+test "invalid optional frame evidence survives without blocking native capture" {
+    const capture = try fixture.build(a, .representative, null);
+    defer capture.deinit();
+    const native = try archive.encode(a, capture, .{});
+    defer a.free(native);
+    const copied = try archive.attachFrames(a, native, null);
+    defer a.free(copied);
+    try std.testing.expectEqualSlices(u8, native, copied);
+    const malformed = try archive.attachFrames(a, native, "invalid frame envelope");
+    defer a.free(malformed);
+    var opened = try archive.decode(a, malformed, .{ .local_id = 1 });
+    defer opened.deinit();
+    try std.testing.expectEqual(capture.samples.len(), opened.capture.samples.len());
+    try std.testing.expectEqualStrings("invalid frame envelope", opened.frame_bundle.?);
+    try std.testing.expectEqual(.retained_opaque, opened.source.frame_attachments.?.state);
+}

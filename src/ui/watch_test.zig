@@ -145,7 +145,7 @@ test "changes are marked against the previous stop only" {
     fake.fail = error.UnknownVariable;
     list.refresh(&fake);
     try std.testing.expect(!list.entries[0].changed);
-    try std.testing.expectEqualStrings("no variable with that name in this frame", watch.explain(list.entries[0].failure.?));
+    try std.testing.expectEqualStrings("unknown name here", watch.explain(list.entries[0].failure.?));
     fake.gen = 5;
     fake.fail = null;
     fake.value = "9";
@@ -309,4 +309,113 @@ test "exit does not leave live watches labelled running or read the target" {
     list.refresh(&fake);
     try std.testing.expectEqual(watch.State.thread_gone, list.entries[0].state);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "live displays follow selected frames, retain scope failures and never evaluate while running" {
+    var fake = Fake{ .frames = &.{ f_work, f_main } };
+    var list = watch.WatchList{};
+    defer list.deinit();
+    const id = watch.FrameId.of(10, 0, f_work, fake.ident, fake.gen);
+    _ = try list.addMode("val", id, .live);
+    _ = try list.add("pinned", id);
+    list.setDisplayFrame(.{ .tid = 10, .index = 0 });
+    list.refresh(&fake);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    list.refresh(&fake);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    list.setDisplayFrame(.{ .tid = 10, .index = 1 });
+    list.refresh(&fake);
+    try std.testing.expectEqual(@as(?usize, 1), list.entries[0].resolved_index);
+    try std.testing.expectEqual(@as(?usize, 0), list.entries[1].resolved_index);
+    fake.running = true;
+    const calls = fake.calls;
+    list.refresh(&fake);
+    try std.testing.expectEqual(calls, fake.calls);
+    try std.testing.expectEqual(watch.State.stale, list.entries[0].state);
+    fake.running = false;
+    fake.gen += 1;
+    fake.frames = &.{f_main};
+    fake.fail = error.UnknownVariable;
+    const unknown = try list.addMode("never_seen", id, .live);
+    list.setDisplayFrame(.{ .tid = 10, .index = 0 });
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.State.not_in_scope, list.entries[0].state);
+    try std.testing.expectEqual(watch.State.failed, list.entries[unknown].state);
+    try std.testing.expectEqual(error.UnknownVariable, list.entries[unknown].failure.?);
+    fake.gen += 1;
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.State.not_in_scope, list.entries[0].state);
+    try std.testing.expectEqual(watch.State.failed, list.entries[unknown].state);
+    try std.testing.expect(!list.entries[0].has_value);
+    try std.testing.expectEqualStrings("", list.entries[0].display.slice());
+    try std.testing.expectEqual(watch.State.frame_gone, list.entries[1].state);
+    fake.gen += 1;
+    fake.fail = null;
+    fake.frames = &.{f_work_again};
+    fake.value = "undef";
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.State.value, list.entries[0].state);
+    try std.testing.expectEqualStrings("undef", list.entries[0].display.slice());
+    try std.testing.expectEqual(watch.State.frame_gone, list.entries[1].state);
+    const current = watch.FrameId.of(10, 0, f_work_again, fake.ident, fake.gen);
+    list.toggleMode(0, current);
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.Mode.pinned, list.entries[0].mode);
+    fake.gen += 1;
+    fake.frames = &.{f_main};
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.State.frame_gone, list.entries[0].state);
+    list.toggleMode(0, watch.FrameId.of(10, 0, f_main, fake.ident, fake.gen));
+    list.refresh(&fake);
+    try std.testing.expectEqual(watch.Mode.live, list.entries[0].mode);
+    try std.testing.expectEqual(watch.State.value, list.entries[0].state);
+}
+
+test "editor paste replaces selection without submitting and respects UTF-8 boundaries" {
+    var editor = watch.Editor{};
+    editor.start();
+    const epoch = editor.epoch;
+    editor.insert("aéλz", false);
+    _ = editor.key(press(0xff51, "", false));
+    _ = editor.key(press(0xff08, "", false));
+    try std.testing.expectEqualStrings("aéz", editor.text.slice());
+    var left = press(0xff51, "", false);
+    left.mods.shift = true;
+    _ = editor.key(left);
+    try std.testing.expectEqualStrings("é", editor.selectedText());
+    editor.insert("\r\n\x1b", false);
+    try std.testing.expectEqualStrings("aéz", editor.text.slice());
+    editor.insert("nv\n", false);
+    try std.testing.expectEqualStrings("anvz", editor.text.slice());
+    try std.testing.expect(editor.open);
+    _ = editor.key(press(0xffff, "", false));
+    try std.testing.expectEqualStrings("anv", editor.text.slice());
+    editor.start();
+    try std.testing.expect(editor.epoch != epoch);
+    editor.limit = 3;
+    editor.insert("éλ", false);
+    try std.testing.expectEqualStrings("é", editor.text.slice());
+    try std.testing.expect(std.mem.indexOf(u8, editor.message, "truncated") != null);
+    editor.start();
+    editor.digits_only = true;
+    editor.limit = 4;
+    editor.insert("12\nabc34\x005", false);
+    try std.testing.expectEqualStrings("1234", editor.text.slice());
+    try std.testing.expect(editor.open);
+}
+
+test "pasted format characters cannot hide text or erase a selection" {
+    var editor = watch.Editor{};
+    editor.start();
+    editor.insert("é\u{ad}\u{61c}\u{200b}\u{202e}\u{2066}\u{feff}\u{e0061}λ", false);
+    try std.testing.expectEqualStrings("éλ", editor.text.slice());
+    try std.testing.expect(editor.message.len > 0);
+    var left = press(0xff51, "", false);
+    left.mods.shift = true;
+    _ = editor.key(left);
+    try std.testing.expectEqualStrings("λ", editor.selectedText());
+    editor.insert("\u{202a}\u{2069}", false);
+    try std.testing.expectEqualStrings("éλ", editor.text.slice());
+    try std.testing.expectEqualStrings("λ", editor.selectedText());
+    try std.testing.expect(editor.open);
 }

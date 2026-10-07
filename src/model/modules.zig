@@ -19,6 +19,7 @@ pub const Module = struct {
     end: u64,
     debug: ?DebugInfo = null,
     perl_layout: ?c.struct_xpl_layout = null,
+    python_layout: ?c.struct_xpy_layout = null,
     debug_file: ?*const @import("../binary/debug_files.zig").File = null,
     debug_allocator: std.mem.Allocator = std.heap.page_allocator,
     file_offset: u64 = 0, // ELF entry offset in the backing file; zero for standalone ELF.
@@ -43,6 +44,14 @@ pub const Module = struct {
 };
 pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0 };
 pub const Modules = struct {
+    // These sealed sparse views contain symbols and placement metadata only.
+    // Keep them outside Module so debug/unwind/code paths can never see holes.
+    const SymbolImage = struct {
+        region: Region,
+        bytes: []align(std.heap.page_size_min) u8,
+        image: elf.Image,
+        instances: std.ArrayList(struct { bias: u64, id: u64 }) = .empty,
+    };
     pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
     target: ?*const rt.struct_xrt_target = null,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
@@ -59,10 +68,18 @@ pub const Modules = struct {
     snapshot_bytes: usize = 0,
     debug_files: ?*@import("../binary/debug_files.zig").Files = null,
     load_failures: std.ArrayList(LoadFailure) = .empty,
+    symbol_images: std.ArrayList(SymbolImage) = .empty,
+    symbol_bytes: u64 = 0,
     pub fn init(a: std.mem.Allocator) Modules {
         return .{ .allocator = a };
     }
     pub fn deinit(self: *Modules) void {
+        for (self.symbol_images.items) |*item| {
+            item.instances.deinit(self.allocator);
+            _ = c.munmap(item.bytes.ptr, item.bytes.len);
+            self.allocator.free(item.region.path);
+        }
+        self.symbol_images.deinit(self.allocator);
         self.clearFailures();
         self.load_failures.deinit(self.allocator);
         var ids = self.core_ids.valueIterator();
@@ -316,7 +333,7 @@ pub const Modules = struct {
         const p = try self.placement(&image, entry.offset, region, observed);
         const module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
-        module.* = .{ .id = self.next_id, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable };
+        module.* = .{ .id = try self.moduleId(region, p.bias), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable };
         if (self.debug_files) |files| {
             module.debug_file = (if (entry.offset == 0) files.discover(&image, path) else files.matching(&image)) catch |err| blk: {
                 std.debug.print("xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
@@ -324,7 +341,6 @@ pub const Modules = struct {
             };
             if (module.debug_file) |file| std.debug.print("xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
         }
-        self.next_id += 1;
         try self.loaded.append(self.allocator, module);
         self.snapshot_bytes += mapped.len;
         return module;
@@ -361,6 +377,7 @@ pub const Modules = struct {
         return error.UnmappedAddress;
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
+        if (rt.xrt_target_is_remote(self.target)) return self.symbolLookup(name, false);
         // APKs have no offset-zero ELF mapping. Executable VMAs identify their
         // embedded libraries; Modules.load deduplicates the other mappings.
         var failure: ?anyerror = null;
@@ -375,6 +392,119 @@ pub const Modules = struct {
             return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
         }
         return failure orelse error.SymbolNotFound;
+    }
+    fn symbolImage(self: *Modules, region: Region) !*const elf.Image {
+        for (self.symbol_images.items) |*item| if (sameFile(item.region, region)) return &item.image;
+        const path = try self.allocator.dupeZ(u8, region.path);
+        errdefer self.allocator.free(path);
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{
+            .kind = rt.XRT_FILE_MAPPED,
+            .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path.ptr },
+        });
+        var fd: c_int = -1;
+        var resident: u64 = 0;
+        if (self.symbol_images.items.len >= 1024 or self.symbol_bytes >= 128 * 1024 * 1024) return error.SymbolSnapshotLimit;
+        try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident));
+        defer _ = c.close(fd);
+        if (resident > 128 * 1024 * 1024 - self.symbol_bytes) return error.SymbolSnapshotLimit;
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0) return error.BinaryUnavailable;
+        const size: usize = @intCast(stat.st_size);
+        const ptr = c.mmap(null, size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
+        if (ptr == c.MAP_FAILED) return error.OutOfMemory;
+        const bytes: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr)))[0..size];
+        errdefer _ = c.munmap(bytes.ptr, bytes.len);
+        const image = try elf.Image.parse(bytes);
+        if (@intFromEnum(image.header.machine) != rt.xrt_target_arch(self.target).*.machine) return error.UnsupportedTargetArchitecture;
+        var saved = region;
+        saved.path = path;
+        try self.symbol_images.append(self.allocator, .{ .region = saved, .bytes = bytes, .image = image });
+        self.symbol_bytes += resident;
+        return &self.symbol_images.items[self.symbol_images.items.len - 1].image;
+    }
+    // Reserve one ID per mapped instance. Loading its complete ELF/DWARF view
+    // later must preserve the ID already cited by a remote symbol lookup.
+    fn moduleId(self: *Modules, region: Region, bias: u64) !u64 {
+        for (self.symbol_images.items) |*item| {
+            if (!sameFile(item.region, region)) continue;
+            for (item.instances.items) |instance| if (instance.bias == bias) return instance.id;
+            if (item.instances.items.len >= 1024) return error.SymbolSnapshotLimit;
+            const id = self.next_id;
+            try item.instances.append(self.allocator, .{ .bias = bias, .id = id });
+            self.next_id += 1;
+            return id;
+        }
+        const id = self.next_id;
+        self.next_id += 1;
+        return id;
+    }
+    /// Automatic lookup can span multiple passes. Completed immutable symbol
+    /// views are reused; a policy stop must return immediately so the next pass
+    /// can resume the same unfinished file.
+    pub fn automaticSymbolAddress(self: *Modules, name: []const u8) !u64 {
+        return (try self.symbolLookup(name, true)).address;
+    }
+    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool) !Symbol {
+        var failure: ?anyerror = null;
+        regions: for (self.regions.items) |r| {
+            // Reuse an existing full image (and its verified debug companion).
+            for (self.loaded.items) |module| {
+                if (r.inode != module.inode or r.device_major != module.device_major or
+                    r.device_minor != module.device_minor or !std.mem.eql(u8, r.path, module.path)) continue;
+                const p = self.placement(&module.image, module.file_offset, r, false) catch continue;
+                if (p.bias != module.bias) continue;
+                if (module.symbols().findSymbol(name)) |symbol| {
+                    if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                }
+                continue :regions;
+            }
+            if ((if (automatic) r.permissions[2] != 'x' else r.offset != 0 and r.permissions[2] != 'x') or
+                r.path.len == 0 or r.path[0] != '/' or
+                std.mem.startsWith(u8, r.path, "/dev/") or
+                std.mem.startsWith(u8, r.path, "/memfd:") or
+                std.mem.endsWith(u8, r.path, " (deleted)")) continue;
+            if (!rt.xrt_target_is_remote(self.target)) {
+                const module = self.load(r) catch |err| {
+                    if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
+                    continue;
+                };
+                const symbol = module.symbols().findSymbol(name) orelse continue;
+                if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                continue;
+            }
+            const image = self.symbolImage(r) catch |err| {
+                switch (err) {
+                    error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => return err,
+                    error.UnsupportedMode => {
+                        // APKs retain the existing full-image path and limits.
+                        const module = self.load(r) catch |load_err| {
+                            if (failure == null) failure = load_err;
+                            continue;
+                        };
+                        if (module.symbols().findSymbol(name)) |symbol| {
+                            if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                        }
+                    },
+                    error.NotElf, error.BinaryIdentityUnavailable => {},
+                    else => if (failure == null) {
+                        failure = err;
+                    },
+                }
+                continue;
+            };
+            const symbols = if (self.debug_files) |files| blk: {
+                const companion = files.discover(image, r.path) catch null;
+                break :blk if (companion) |file| &file.image else image;
+            } else image;
+            const symbol = symbols.findSymbol(name) orelse continue;
+            if (!symbol.hasAddress()) continue;
+            const p = self.placement(image, 0, r, false) catch |err| {
+                if (failure == null) failure = err;
+                continue;
+            };
+            return .{ .module_id = try self.moduleId(r, p.bias), .name = symbol.name, .address = std.math.add(u64, symbol.value, p.bias) catch return error.InvalidAddress, .size = symbol.size };
+        }
+        return failure orelse if (automatic) error.BreakpointSymbolNotLoaded else error.SymbolNotFound;
     }
     pub fn symbolAt(self: *Modules, address: u64) !Symbol {
         const module = try self.at(address);

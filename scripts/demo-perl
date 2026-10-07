@@ -36,9 +36,10 @@ if [[ "$ready_pid" != "$demo_pid" ]]; then
     exit 1
 fi
 cat >&2 <<'TIPS'
-Try: Space (stop in Perl_av_store) · E val Return (a new, undefined element)
-     E av Return (AV, 3 slots) · Space (stop in Perl_av_delete on the next round)
-     E av->sv_u.svu_array[3] Return (IV 42) · click frames to walk the interpreter
+Try: Space (stop in Perl_av_store) · Shift+E val Return (a new, undefined element)
+     Shift+E av Return (AV, 3 slots) · Space (stop in Perl_av_delete on the next round)
+     Live rows update each stop; val is out of scope in delete, then undef at store
+     Shift+L converts a selected row to/from a pinned watch; click frames to change context
 TIPS
 set -x
 "$xodb" "$@" --attach "$demo_pid" --break Perl_av_store --break Perl_av_delete

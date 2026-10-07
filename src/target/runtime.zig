@@ -7,6 +7,7 @@ pub const c = @cImport({
     @cInclude("xrt_target.h");
     @cInclude("xrt_remote.h");
     @cInclude("xrt_files.h");
+    @cInclude("xrt_loader.h");
 });
 
 pub const X86Registers = c.struct_xrt_x86_registers;
@@ -122,6 +123,9 @@ pub fn check(status: c.enum_xrt_status) !void {
         c.XRT_FILE_UNAVAILABLE => return error.BinaryIdentityUnavailable,
         c.XRT_FILE_CHANGED => return error.BinaryChangedDuringRead,
         c.XRT_FILE_LIMIT => return error.BinarySnapshotLimit,
+        c.XRT_DISCOVERY_CANCELLED => return error.SymbolDiscoveryCancelled,
+        c.XRT_DISCOVERY_PENDING => return error.SymbolDiscoveryPending,
+        c.XRT_DISCOVERY_BUDGET => return error.SymbolDiscoveryBudgetExceeded,
         c.XRT_PARTIAL_REGISTER_WRITE => return error.PartialRegisterWrite,
         c.XRT_REGISTER_UNAVAILABLE => return error.RegisterUnavailable,
         c.XRT_REGISTER_NOT_WRITABLE => return error.RegisterNotWritable,
@@ -235,8 +239,7 @@ test "an unavailable register is not displayed as its snapshot bytes" {
     const present = try registerText(std.testing.allocator, regs, rax);
     defer std.testing.allocator.free(present);
     try std.testing.expectEqualStrings("0x1111111111111111", present);
-    try std.testing.expectEqual(@as(c.enum_xrt_status, c.XRT_OK),
-        c.xrt_registers_mark_absent(&regs.raw, rax.id));
+    try std.testing.expectEqual(@as(c.enum_xrt_status, c.XRT_OK), c.xrt_registers_mark_absent(&regs.raw, rax.id));
     try std.testing.expectError(error.RegisterUnavailable, regs.value(rax));
     try std.testing.expect(regs.named("rax") == null);
     try std.testing.expect(regs.dwarf(0) == null);

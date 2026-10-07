@@ -590,7 +590,13 @@ pub const Renderer = struct {
         c.hb_shape(font.hb, font.buffer, null, 0);
         var count: u32 = 0;
         const glyphs = c.hb_buffer_get_glyph_infos(font.buffer, &count);
-        return .{ .glyphs = glyphs, .positions = c.hb_buffer_get_glyph_positions(font.buffer, null), .count = count };
+        const positions = c.hb_buffer_get_glyph_positions(font.buffer, null);
+        if (font.pixel) for (positions[0..count]) |*position| {
+            position.x_advance = @intFromFloat(@round(@as(f64, @floatFromInt(position.x_advance)) / 64) * 64);
+            position.x_offset = @intFromFloat(@round(@as(f64, @floatFromInt(position.x_offset)) / 64) * 64);
+            position.y_offset = @intFromFloat(@round(@as(f64, @floatFromInt(position.y_offset)) / 64) * 64);
+        };
+        return .{ .glyphs = glyphs, .positions = positions, .count = count };
     }
     /// Draws one shaped glyph and returns the pen position after it.
     fn glyphAt(self: *Renderer, font: *fonts.Font, id: u32, pos: c.hb_glyph_position_t, pen: f32, y: f32, color: Color) !f32 {

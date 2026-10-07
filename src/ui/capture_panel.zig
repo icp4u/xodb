@@ -12,6 +12,7 @@ const style = @import("style.zig");
 const theme = style.theme;
 const profile = @import("../profile/capture.zig");
 const setup = @import("capture_setup.zig");
+const Editor = @import("watch.zig").Editor;
 
 pub const row_h: f32 = 22;
 pub const max_rows = 64;
@@ -51,6 +52,7 @@ pub const Panel = struct {
     cursor: usize = 0,
     anchor: ?setup.ThreadRef = null,
     editing: Field = .none,
+    editor: Editor = .{},
     number: setup.NumberField = setup.NumberField.begin(.duration_s),
     filter: [32]u8 = undefined,
     filter_len: usize = 0,
@@ -104,17 +106,16 @@ pub const Panel = struct {
     /// Keys while the panel is open. Returns null when the key is not the
     /// panel's (the workspace then handles it, e.g. P and T). While a field is
     /// being edited, text, BackSpace, Return and Escape belong to the field.
+    /// Function keys deliberately reach the workspace, like other editors:
+    /// F5/F6 control execution without committing the capture setting.
     pub fn key(self: *Panel, event: keys.Event, snapshot: *const setup.Snapshot, limits: setup.Limits) ?Action {
         if (!self.open or event.kind == .release) return null;
         if (self.editing != .none) {
-            switch (event.shortcut) {
-                0xff1b => return .{ .edit = .none }, // Escape cancels the edit only
-                0xff08 => {
-                    if (self.editing == .filter) self.filter_len -|= 1 else self.number.backspace();
-                    self.first = 0;
-                    return .{ .edit = self.editing };
-                },
-                0xff0d => {
+            const action = self.editor.key(event) orelse return null;
+            self.syncEditor();
+            switch (action) {
+                .cancel => return .{ .edit = .none },
+                .submit => {
                     if (self.editing == .filter) return .{ .edit = .none };
                     const value = self.number.commit(limits) catch |err| {
                         self.message = switch (err) {
@@ -127,19 +128,8 @@ pub const Panel = struct {
                     self.message = "";
                     return if (self.editing == .duration) .{ .set_duration = value } else .{ .set_frequency = value };
                 },
-                else => {},
+                .edited => return .{ .edit = self.editing },
             }
-            if (!event.plain()) return .{ .edit = self.editing };
-            const typed = event.text();
-            if (self.editing == .filter) {
-                for (typed) |ch| if (ch >= 0x20 and ch < 0x7f and self.filter_len < self.filter.len) {
-                    self.filter[self.filter_len] = ch;
-                    self.filter_len += 1;
-                };
-                self.first = 0;
-                self.cursor = 0;
-            } else self.number.type_(typed);
-            return .{ .edit = self.editing };
         }
         if (!event.plain()) return null;
         const navigation = switch (event.shortcut) {
@@ -158,6 +148,23 @@ pub const Panel = struct {
             's' => return .close,
             'y' => return .toggle_syscalls,
             else => return null,
+        }
+    }
+    /// Mirror edits (including asynchronous paste) into the existing validated
+    /// number and live thread-name filter models.
+    pub fn syncEditor(self: *Panel) void {
+        if (!self.open or self.editing == .none) return;
+        const text = self.editor.text.slice();
+        if (self.editing == .filter) {
+            if (!std.mem.eql(u8, self.filterText(), text)) {
+                self.filter_len = @min(text.len, self.filter.len);
+                @memcpy(self.filter[0..self.filter_len], text[0..self.filter_len]);
+                self.first = 0;
+                self.cursor = 0;
+            }
+        } else {
+            self.number.len = @min(text.len, self.number.digits.len);
+            @memcpy(self.number.digits[0..self.number.len], text[0..self.number.len]);
         }
     }
     fn moveCursor(self: *Panel, delta: i32) void {
@@ -182,6 +189,7 @@ pub const Panel = struct {
             .close => {
                 self.open = false;
                 self.editing = .none;
+                self.editor.open = false;
                 return .closed;
             },
             .edit => |field| {
@@ -197,16 +205,28 @@ pub const Panel = struct {
                         var buffer: [12]u8 = undefined;
                         self.number.type_(std.fmt.bufPrint(&buffer, "{d}", .{defaults.frequency_hz}) catch "");
                     }
+                    if (field == .none) self.editor.open = false else {
+                        self.editor.start();
+                        self.editor.history_enabled = false;
+                        self.editor.allow_empty = true;
+                        self.editor.digits_only = field != .filter;
+                        self.editor.limit = if (field == .filter) self.filter.len else self.number.digits.len;
+                        const text = if (field == .filter) self.filterText() else self.number.text();
+                        @memcpy(self.editor.text.bytes[0..text.len], text);
+                        self.editor.text.len = text.len;
+                    }
                 }
                 return .redraw;
             },
             .set_duration => |ms| {
                 defaults.duration_ms = ms;
                 self.editing = .none;
+                self.editor.open = false;
             },
             .set_frequency => |hz| {
                 defaults.frequency_hz = hz;
                 self.editing = .none;
+                self.editor.open = false;
             },
             .toggle_scheduling => defaults.context_switch = !defaults.context_switch,
             .toggle_syscalls => {
@@ -543,8 +563,9 @@ pub const Panel = struct {
             try label(r, font, area.x, y, area.w, theme.weak, "Next: {d} Hz / {s} / {s}", .{ d.frequency_hz, setup.durationText(&buffer, d.duration_ms), scope });
         }
         y += 26;
-        if (self.message.len > 0) {
-            try r.textFit(font, area.x, y, area.w, self.message, theme.warm);
+        const message = if (self.editing != .none and self.editor.message.len > 0) self.editor.message else self.message;
+        if (message.len > 0) {
+            try r.textFit(font, area.x, y, area.w, message, theme.warm);
             y += 22;
         }
         return y;
@@ -553,9 +574,10 @@ pub const Panel = struct {
         const rect = gpu.Rect{ .x = x, .y = y, .w = @min(w, 200), .h = 26 };
         const editing = self.editing == field;
         try style.box(r, rect, if (editing) theme.header else theme.background, if (editing) theme.focus else theme.border, @splat(4));
-        var buffer: [48]u8 = undefined;
-        const text = if (editing) std.fmt.bufPrint(&buffer, "{s}_ {s}", .{ self.number.text(), unit }) catch "" else shown;
-        try r.textFit(font, rect.x + 8, rect.y + 4, rect.w - 16, text, if (editing or active) theme.text else theme.weak);
+        if (editing) {
+            try self.editor.draw(r, font, .{ .x = rect.x + 8, .y = rect.y + 4, .w = rect.w - 50, .h = 22 });
+            try r.textFit(font, rect.x + rect.w - 36, rect.y + 4, 30, unit, theme.weak);
+        } else try r.textFit(font, rect.x + 8, rect.y + 4, rect.w - 16, shown, if (active) theme.text else theme.weak);
         self.addHit(rect, .{ .edit = field });
         if (editing) try r.textFit(font, rect.x + rect.w + 10, y + 4, w - rect.w - 10, if (field == .duration) "Return applies; 0 = until stopped" else "Return applies; 1 to 1000", theme.weak);
     }
@@ -564,9 +586,10 @@ pub const Panel = struct {
         const filter_rect = gpu.Rect{ .x = area.x, .y = area.y, .w = @min(area.w * 0.45, 260), .h = 26 };
         const editing = self.editing == .filter;
         try style.box(r, filter_rect, if (editing) theme.header else theme.background, if (editing) theme.focus else theme.border, @splat(4));
-        var buffer: [64]u8 = undefined;
-        const shown = if (self.filter_len == 0 and !editing) "Filter by name or TID" else std.fmt.bufPrint(&buffer, "{s}{s}", .{ self.filterText(), if (editing) "_" else "" }) catch "";
-        try r.textFit(font, filter_rect.x + 8, filter_rect.y + 4, filter_rect.w - 16, shown, if (self.filter_len == 0 and !editing) theme.weak else theme.text);
+        if (editing) {
+            try self.editor.draw(r, font, .{ .x = filter_rect.x + 8, .y = filter_rect.y + 4, .w = filter_rect.w - 16, .h = 22 });
+            if (self.editor.message.len > 0) try r.textFit(font, area.x, area.y + area.h - 22, area.w, self.editor.message, theme.warm);
+        } else try r.textFit(font, filter_rect.x + 8, filter_rect.y + 4, filter_rect.w - 16, if (self.filter_len == 0) "Filter by name or TID" else self.filterText(), if (self.filter_len == 0) theme.weak else theme.text);
         self.addHit(filter_rect, .{ .edit = .filter });
         const add_rect = gpu.Rect{ .x = filter_rect.x + filter_rect.w + 8, .y = area.y, .w = 128, .h = 26 };
         if (add_rect.x + add_rect.w <= area.x + area.w) try self.hitButton(r, font, add_rect, "Add shown", "", theme.text, .select_matching);
@@ -584,7 +607,7 @@ pub const Panel = struct {
         self.matching = matching;
         const top = area.y + 34;
         try r.textFit(font, area.x, top, area.w, "      TID  name", theme.weak);
-        self.list = .{ .x = area.x, .y = top + 22, .w = area.w, .h = @max(0, area.y + area.h - top - 22) };
+        self.list = .{ .x = area.x, .y = top + 22, .w = area.w, .h = @max(0, area.y + area.h - top - 22 - @as(f32, if (editing and self.editor.message.len > 0) 22 else 0)) };
         self.visible_rows = @min(max_rows, @as(usize, @intFromFloat(self.list.h / row_h)));
         self.first = @min(self.first, matching -| self.visible_rows);
         self.cursor = @min(self.cursor, matching -| 1);
@@ -719,6 +742,12 @@ test "panel actions select ranges and matches, edit numbers and keep Escape loca
     // Numeric rate: type, commit; out-of-range keeps the field open.
     _ = try panel.apply(.{ .edit = .frequency }, &snapshot, &defaults, &selection);
     try testing.expectEqualStrings("99", panel.number.text());
+    for ([_]u32{ keys.sym.f5, keys.sym.f6 }) |key| {
+        try testing.expect(panel.key(.{ .kind = .press, .shortcut = key }, &snapshot, .{}) == null);
+        try testing.expectEqual(Field.frequency, panel.editing);
+        try testing.expectEqualStrings("99", panel.number.text());
+        try testing.expectEqual(@as(u32, 99), defaults.frequency_hz);
+    }
     _ = panel.key(.{ .kind = .press, .shortcut = 0xff08 }, &snapshot, .{});
     _ = panel.key(.{ .kind = .press, .shortcut = 0xff08 }, &snapshot, .{});
     _ = panel.key(.{ .kind = .press, .shortcut = '2', .text_len = 4, .text_bytes = "2500".* ++ @as([12]u8, @splat(0)) }, &snapshot, .{});

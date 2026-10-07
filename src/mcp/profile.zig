@@ -125,11 +125,11 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         const limit = try number(args, "limit", 8);
         if (start > capture.samples.len() or limit == 0 or limit > 16) return error.InvalidArguments;
         const end = @min(capture.samples.len(), start + limit);
-        const Row = struct { ordinal: usize, sample: Value };
+        const Row = struct { ordinal: usize, sample: Value, jit: ?@import("../frames/jit.zig").Summary };
         var rows: std.ArrayList(Row) = .empty;
         for (start..end) |ordinal| {
             const sample = capture.samples.get(ordinal);
-            try rows.append(a, .{ .ordinal = ordinal, .sample = try value(a, .{ .ip = if (sample.ip_present) @as(?u64, sample.ip) else null, .ip_exact = sample.ip_exact, .pid = if (sample.tid_present) @as(?u32, sample.pid) else null, .tid = if (sample.tid_present) @as(?u32, sample.tid) else null, .time_ns = if (sample.time_present) @as(?u64, sample.time_ns) else null, .period = if (sample.period_present) @as(?u64, sample.period) else null, .weight = if (sample.weight_present) @as(?u64, sample.weight) else null, .cpu_mode = sample.cpu_mode, .callchain = sample.callchain, .frames = sample.frames[0..sample.frame_count], .user_state = @import("sampled_stack.zig").summary(capture, sample) }) });
+            try rows.append(a, .{ .ordinal = ordinal, .jit = if (session.frames.jit_view) |view| (if (view.sample(capture, ordinal, session.frames.evidence_revision)) |prepared| @import("../frames/jit.zig").summary(prepared.leaf) else null) else null, .sample = try value(a, .{ .ip = if (sample.ip_present) @as(?u64, sample.ip) else null, .ip_exact = sample.ip_exact, .pid = if (sample.tid_present) @as(?u32, sample.pid) else null, .tid = if (sample.tid_present) @as(?u32, sample.tid) else null, .time_ns = if (sample.time_present) @as(?u64, sample.time_ns) else null, .period = if (sample.period_present) @as(?u64, sample.period) else null, .weight = if (sample.weight_present) @as(?u64, sample.weight) else null, .cpu_mode = sample.cpu_mode, .callchain = sample.callchain, .frames = sample.frames[0..sample.frame_count], .user_state = @import("sampled_stack.zig").summary(capture, sample) }) });
         }
         return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .artifact_sha256 = if (session.artifact) |*artifact| try a.dupe(u8, &std.fmt.bytesToHex(artifact.source.archive_sha256, .lower)) else null, .samples = rows.items, .total = capture.samples.len(), .next = if (end < capture.samples.len()) @as(?usize, end) else null });
     }

@@ -368,7 +368,11 @@ def control_checks(server):
     for name, args in [('continue', {}), ('set_breakpoint', {'symbol': 'change_value'}),
                        ('start_inspection', {'tid': tid, 'registers': True, 'stack': False})]:
         expect_error(one.raw(name, generation=one.session()['generation'], **args), 'ControlLeaseRequired')
-    expect_error(one.raw('claim_session_control', generation=initial['generation'] + 1), 'StaleSnapshot')
+    # Acquiring a lease is independent of the running target's snapshot.
+    one.tool('claim_session_control', generation=initial['generation'] + 1)
+    one.tool('release_session_control')
+    one.tool('claim_session_control')
+    one.tool('release_session_control')
     for ttl in (0, 99, 60001):
         expect_invalid(controller.raw('claim_session_control', generation=controller.session()['generation'], ttl_ms=ttl))
     controller.claim(ttl_ms=1000)

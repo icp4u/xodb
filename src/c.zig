@@ -23,8 +23,10 @@ pub const api = @cImport({
     @cInclude("sys/stat.h");
     @cInclude("sys/sysmacros.h");
     @cInclude("../runtime/mapped_file.h");
+    @cInclude("../text.h");
     if (gui) {
         @cInclude("wayland-client.h");
+        @cInclude("../platform/clipboard.h");
         @cInclude("xdg-shell-client-protocol.h");
         @cInclude("cursor-shape-v1-client-protocol.h");
         @cInclude("vulkan/vulkan.h");
@@ -35,5 +37,6 @@ pub const api = @cImport({
     @cInclude("capstone/capstone.h");
     @cInclude("elfutils/libdw.h");
     @cInclude("../language/perl.h");
+    @cInclude("../language/python.h");
     @cInclude("dwarf.h");
 });

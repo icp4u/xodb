@@ -357,3 +357,189 @@ totalled in `marker_weight`; stacks whose innermost frame is a marker count in
 [Perl values and logical stacks](PERL.md) describes the core-module-only
 cooperating exporter, stopped-memory MCP reader, and GUI scalar summaries.
 The exporter uses this version-1 format without extensions to its contract.
+
+## CPython
+
+[CPython values and stacks](PYTHON.md) describes the stopped-memory MCP reader
+(`get_language_stack` with language `python`) and GUI object summaries. Its
+frames use the logical-frame vocabulary but its response is not an importable
+version-1 document.
+
+
+## Session and GUI integration
+
+`xodb --open-frames FILE` opens logical-frame JSONL or a saved `.xof` bundle.
+Add `--headless --mcp --agent-scope control` to use the same importer without a
+GUI. It works offline and with a native session. Imported frames remain a
+separate segment: matching names or timestamps do not create a native/logical
+bridge, and a producer-declared PC grants no native debugger authority.
+
+For a quick owned Python recording:
+
+```sh
+python3 tests/logical-frames/python_workload.py frames.jsonl frames-meta.json .5 10
+xodb --open-frames frames.jsonl
+```
+
+The list orders functions by exact inclusive weight; self weight is shown beside
+it. The header reports method, units, partial/unknown/marker weights, incomplete
+input and read stability. **J/K** select, **Enter** explicitly reads the selected
+source file, **T** cycles logical threads, **[ / ]** cycle imported sources,
+**L** switches to/from the native workspace, and **Esc** cancels pending work.
+Source previews are limited to regular UTF-8 files of at most 1 MiB. A recorded
+SHA-256 is compared with the opened file; changed or unverified identity is
+shown. Merely opening an archive never follows recorded source paths. Preview
+strings are shortened for display; the original bytes and full MCP rows remain
+available.
+
+### Agent workflow
+
+These are tool argument objects, passed through ordinary MCP `tools/call`:
+
+1. `import_logical_frames` with `{"path":"frames.jsonl","kind":"logical"}`.
+   JVM sources use `jfr` (JFR JSON export), `thread_dump` (Thread.dump_to_file
+   JSON), `thread_print` (Thread.print text), or `coroutines` (DebugProbes export).
+   Optional `jvm_kind` selects the documented C importer event-kind ordinal;
+   the original source and its selected kind are retained together.
+2. Poll `get_frame_status` until `status` is `ready` or `failed`. Inspect
+   `error_name`, read stability, provenance, limits, completeness and warnings.
+3. Take `source_id` and `index` from the returned source. Pass `source` and
+   `source_id` to `get_frame_threads`, `get_frame_stacks`,
+   `get_frame_functions`, or `get_frame_aggregate`. Pages use `start`/`limit`,
+   at most 64 rows, and return `next`. Counts are exact decimal strings.
+4. `get_frame_stack` adds `stack` (the stack ordinal) and pages its frames.
+   JVM rows preserve inline/native-method distinctions, virtual-thread state,
+   coroutine parents and heuristic text provenance. A JVM native method is not
+   a machine stack frame.
+5. `get_frame_citation` with the source identity, `basis:"source"` (original
+   bytes) or `basis:"logical"` (the adapted logical document), `offset` and
+   `length` returns at most 4,096 cited bytes in hex. Offsets are byte offsets.
+6. `select_frame_aggregate` with the identity and optional `thread` explicitly
+   recomputes a selection. `save_frames` with `{"path":"frames.xof"}` saves
+   the sources; poll status and check `publication.state == "published"`.
+   `open_frame_bundle` reopens it. `cancel_frame_job` requests cancellation.
+
+Accessors are observer tools. Import, selection, preparation, cancellation and
+save require the controller lease in shared sessions and control scope. One
+worker runs at a time per session; conflicting requests return `FrameBusy`.
+Failures leave the last successfully published evidence intact.
+
+### JIT labels in native samples
+
+Import a **completed** owned Node `--perf-prof` jitdump or CPython `-Xperf_jit`
+export with `import_jit_map`. A perf-map uses `kind:"perfmap"`; jitdump uses
+`kind:"jitdump"`. The `declaration` object records facts measured during the
+capture, not guesses from the filename. It includes:
+
+- `pid`, plus `start_ticks` and `boot_id` together when the process incarnation
+  is known. These must match the native capture's recorded incarnation.
+- `clock:{kind,scope}`: the producer's timestamp domain and an optional 32-hex
+  scope identifier. An unknown clock stays unknown. A clock conversion can be
+  declared using `mapping:"offset"` or `"perf_tsc"`, `target_clock` and the
+  associated offset/conversion fields, uncertainty and `measured_by` provenance.
+- `capture_clock` and nonempty `capture_clock_evidence` may identify a native
+  CLOCK_MONOTONIC capture's scope. Measure the collector and target time
+  namespaces while they are alive; a shared boot ID alone does not prove this.
+  Remote producer clocks are conservatively left unverified here.
+- Optional `coverage_end`, `slack`, `header_time_in_clock`, `debug_address_bias`
+  and `label` retain producer-specific evidence. `header_time_in_clock` defaults
+  false: Node versions may encode the header timestamp differently from record
+  timestamps. Do not declare them identical without checking the producer.
+
+For example, after measuring the facts, the agent calls:
+
+```json
+{"path":"jit.dump","kind":"jitdump","declaration":{
+  "pid":4242,"start_ticks":123,
+  "boot_id":"aaaaaaaa-0000-4000-8000-000000000001",
+  "clock":{"kind":"monotonic","scope":"11111111111111111111111111111111"},
+  "capture_clock":{"kind":"monotonic","scope":"11111111111111111111111111111111"},
+  "capture_clock_evidence":"collector and owned target time namespaces were measured equal before collection",
+  "header_time_in_clock":false
+}}
+```
+
+Those identity and scope values are synthetic placeholders, not defaults.
+Omitting evidence is supported; it produces unverified labels rather than
+invented confidence. The import owns the source bytes and declarations.
+
+CPython `-X perf_jit` does not emit a jitdump close record. For attribution,
+also declare `coverage_end`, measured in the declared clock after the final
+sample and before the owned process exits (for example `"coverage_end":900000000`
+when that measured boundary was 900,000,000 ticks). Without this explicit
+boundary the retained code can be inspected, but its lifetime coverage is
+unverified and cannot produce a resolved label. Do not infer coverage from file
+mtime or the last code-load record.
+
+After polling frame status, call `prepare_jit_profile` with `capture_id`,
+`revision`, `start` and `limit` (1–64 samples). The worker resolves the sampled
+leaf at its exact PC and recorded user callers at return PC minus one. Poll
+frame status again, then use `get_jit_profile` for sample summaries,
+`get_jit_stack` with `ordinal` for paged caller summaries, and
+`get_jit_candidates` with `ordinal` and optional `frame` for candidates (omitting
+`frame` selects the sampled leaf). Names have 256-byte previews, explicit
+truncation/encoding, and original source offsets and lengths for full citations.
+Views are keyed by capture/revision and evidence revision; stale views are refused.
+`get_profile_samples` also includes a prepared leaf summary.
+
+In the GUI open the native profile, press **I** for the sample inspector and use
+**[ / ]** for samples. Completed labels are prepared asynchronously. The view
+keeps raw PCs visible and shows `resolved`, `ambiguous` with candidate count, or
+`unverified`. Perf-map input cannot become resolved. An unverified file read
+also cannot become a resolved host label, even when the lifetime resolver alone
+finds a unique object. Its separate `resolver_outcome` remains available.
+
+### Persistence and limits
+
+`.xof` is the standalone evidence bundle: magic `XODBFRAM`, payload version 1,
+SHA-256 body and per-source checksums, typed source records, original source
+bytes and selection/declaration metadata. It retains up to eight sources with
+64 MiB of aggregate original input. The host's import/aggregate budget is
+256 MiB, including raw bytes, owned C evidence, decoder scratch and copied host
+aggregates. Limit failures are typed (`FrameInputLimit`, `FrameMemoryLimit`,
+`JitMemoryLimit`, `FrameResponseLimit`); no partial replacement is published.
+MCP responses are bounded to 512 KiB; reduce the page size when necessary.
+Standalone frame saves poll cancellation during hashing and copying. Native
+capture saves currently finish encoding the frame attachment before observing
+archive-job cancellation. This phase is bounded to 64 MiB of source input,
+eight metadata records of at most 32 KiB each, and bundle headers; it has no
+wall-clock deadline. Shutdown waits for that phase to drain. Cancellation is
+checked again before publishing the native archive.
+
+Saving a native capture with imported evidence adds the optional `FRAM` section
+in XOC 2.7, inside the existing 256 MiB file limit. Native evidence bytes stay
+unchanged, the unmodified XOC 2.6 reader skips this section, and captures with
+no attachment retain the previous writer output. A corrupt or future frame
+payload leaves native evidence inspectable: `get_archive_status` reports a
+bounded `recorded_origin.frame_attachments` summary (retained bytes and SHA-256),
+never the raw bundle. Only the frame worker validates that optional payload.
+`frame_attachments` reports restoration state, a typed reason and, on successful
+restoration, counts, source IDs and input digests; `get_frame_status.archive_attachment` and the GUI
+show the same persistent failure. XOC envelope and section CRC checks still apply.
+Re-saving an older minor-6 capture that already carries FRAM upgrades its header
+to minor 7 and recomputes the header CRC. Its retained sections stay unchanged,
+but the whole file is therefore not byte-identical.
+
+Opening an attached capture alongside `--open-frames` never replaces either
+input silently. If the separate import was active or already loaded, restoration
+is `not_loaded`. Reopen the capture by itself to load its retained attachments,
+then import additional sources. Saving refuses `ArchiveFrameAttachmentConflict`
+if any original source is missing, including after replacing the workspace with
+another bundle. Once the frame worker has finished, `get_frame_status` also
+reports `status: "conflict"` and `error_name: "ArchiveFrameAttachmentConflict"`
+at the top level; the separately imported sources remain inspectable. An active
+job still reports `pending`, and a failed frame job retains its own diagnostic.
+This version has no archive attachment removal command. A
+successful save reports retained, added and removed counts (removed is zero);
+an opaque attachment copied without importing anything reports
+`opaque_preserved:true` and an unknown count when its envelope cannot be read.
+Plain resaves preserve the original metadata, including unknown optional fields.
+
+The saved algorithm identifier records how to recompute analysis. An unknown
+identifier leaves original evidence readable and marks aggregates stale;
+explicit selection/preparation recomputes them with the current implementation.
+An out-of-range saved thread selection similarly reports `selection_stale`
+without discarding the source. Import failures include the C reader's bounded
+line, byte offset and diagnostic message when available.
+JIT query views are recomputed, not saved as authoritative native symbols.
+Reopen does not need the original runtime, source files, jitdump or perf-map.

@@ -18,7 +18,8 @@ sub descend { my ($n)=@_; if ($n) { descend($n-1) } else { array_leaf() } }
 sub value_leaf {
     my ($integer, $number, $string) = (42, 3.25, "hello\x00bytes");
     my @array = (0, 1, 2, 42); my %hash = (answer => 42, label => 'demo');
-    XodbLFrames::emit($export); ready(); XodbFixture::inspect($integer,$number,$string,\$integer,\@array,\%hash,\&value_leaf,\*STDOUT);
+    my $object = bless \%hash, 'Fixture::Nested::Widget';
+    XodbLFrames::emit($export); ready(); XodbFixture::inspect($integer,$number,$string,$object,\@array,\%hash,\&value_leaf,\*Fixture::Nested::Widget::entry);
 }
 sub inside { value_leaf(); }
 if ($mode eq 'array') { descend(4); }

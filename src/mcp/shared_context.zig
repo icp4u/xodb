@@ -90,10 +90,9 @@ pub const Context = struct {
             if (!allowed) return error.InvalidArguments;
         }
         if (std.mem.eql(u8, name, "claim_session_control")) {
-            const generation = try number(args, "generation", null);
+            _ = try number(args, "generation", 0); // Legacy argument: claims change the lease, not the target.
             const ttl = try number(args, "ttl_ms", 30000);
             if (ttl < c.XSVC_MIN_TTL_MS or ttl > c.XSVC_MAX_TTL_MS) return error.InvalidArguments;
-            try root.target.expectGeneration(generation);
             try check(c.xsvc_claim(self.service, self.client_id, @intCast(ttl), linux.now()));
         } else if (std.mem.eql(u8, name, "release_session_control")) {
             try check(c.xsvc_release(self.service, self.client_id, linux.now()));

@@ -1060,7 +1060,7 @@ test "unknown association algorithm retains evidence without replay and requires
     _ = saved;
 }
 
-test "failed or cancelled association saves invocation only and running job refuses immediately" {
+test "failed association retains a saved snapshot or saves invocation only; running job refuses immediately" {
     const Job = @import("archive_job.zig").Job;
     const a = std.testing.allocator;
     var template = "./.xodb-association-failure-XXXXXX".*;
@@ -1087,19 +1087,88 @@ test "failed or cancelled association saves invocation only and running job refu
     try std.testing.expectError(error.ObservationAssociationsBusy, Job.start(2, .save, output, owner.capture, associated));
     try std.testing.expect(c.access(output.ptr, c.F_OK) != 0);
     associated.done.store(true, .release);
-    for ([_]anyerror{ error.ObservationAnalysisCancelled, error.ObservationAssociationMemoryLimit }) |failure| {
+    const retained = owner.capture.?.saved_associations.?;
+    for ([_]anyerror{ error.ObservationAnalysisCancelled, error.ObservationAssociationMemoryLimit }) |failure| for ([_]bool{ true, false }) |has_saved| {
+        owner.capture.?.saved_associations = if (has_saved) retained else null;
+        defer owner.capture.?.saved_associations = retained;
         associated.err = failure;
         const job = try Job.start(2, .save, output, owner.capture, associated);
         defer job.deinit();
         while (!job.done.load(.acquire)) _ = c.usleep(1000);
         try std.testing.expectEqual(.completed, job.status().state);
-        try std.testing.expectEqual(@as(?bool, false), job.status().associations_saved);
-        try std.testing.expectEqualStrings(@errorName(failure), job.status().associations_omitted_reason.?);
+        try std.testing.expectEqual(@as(?bool, has_saved), job.status().associations_saved);
+        if (has_saved) {
+            try std.testing.expect(job.status().associations_omitted_reason == null);
+            try std.testing.expectEqualStrings(@errorName(failure), job.status().associations_fallback_reason.?);
+        } else {
+            try std.testing.expectEqualStrings(@errorName(failure), job.status().associations_omitted_reason.?);
+            try std.testing.expect(job.status().associations_fallback_reason == null);
+        }
         const restored = try open(a, output, null);
         defer restored.deinit();
-        try std.testing.expect(restored.evidence().associations == null);
-        try std.testing.expectEqual(@as(u32, 1), restored.parsed.?.value.version);
+        try std.testing.expectEqual(@as(u32, if (has_saved) 2 else 1), restored.parsed.?.value.version);
+        if (has_saved) {
+            const saved = @import("association_evidence.zig");
+            try std.testing.expect(saved.equal(saved.Snapshot, retained.snapshot, restored.evidence().associations.?));
+        } else try std.testing.expect(restored.evidence().associations == null);
         try std.testing.expectEqual(owner.capture.?.store.calls.items.len, restored.store.calls.items.len);
         try std.testing.expectEqual(@as(c_int, 0), c.unlink(output.ptr));
-    }
+    };
+}
+
+test "live association above snapshot ceiling remains readable and only save is refused" {
+    const a = std.testing.allocator;
+    const assoc = @import("association_job.zig");
+    const Profile = @import("../profile/capture.zig").Capture;
+    const count = assoc.saved_evidence.max_records + 1;
+    var store = try calls.Store.init((capture.Config{}).store());
+    defer store.deinit(a);
+    store.finish(.capture_end);
+    const m = fixture(&store).metadata;
+    const target = try capture.Capture.create(a, m.identity, m.config, m.threads, m.functions);
+    defer target.deinit();
+    target.started_ns = 10;
+    target.ended_ns = 100;
+    target.stop_reason = .manual;
+    try target.feed(sample(.enter, 20));
+    try target.feed(sample(.leave, 30));
+    target.store.finish(.capture_end);
+    // Synthetic ended profile: only the sample store is owned; no collector,
+    // target, image resolver or filesystem access is involved.
+    var source = Profile{
+        .allocator = a,
+        .arena = undefined,
+        .id = 7,
+        .session_id = m.identity.session_id,
+        .generation = 1,
+        .image_epoch = m.identity.image_epoch,
+        .pid = m.identity.pid,
+        .started_ns = 10,
+        .ended_ns = 100,
+        .config = .{},
+        .accepted = undefined,
+        .thread_count = 1,
+        .collector = null,
+        .images = undefined,
+        .status = .manual,
+        .samples = .{ .max_samples = count },
+    };
+    defer source.samples.deinit(a);
+    source.accepted.clockid = 1;
+    source.threads[0] = .{ .debugger_id = 1, .perf = .{ .tid = 100, .event_id = 1, .start_time_ticks = 1, .start_time_known = true } };
+    for (0..count) |_| try source.samples.append(a, .{ .pid = @intCast(m.identity.pid), .tid = 100, .tid_present = true, .time_ns = 25, .time_present = true });
+    const job = try assoc.Job.create(1, target, m.identity.session_id, m.identity.process_id, .{ .capture = &source, .id = 7, .revision = source.revision }, null, .{ .threshold_ns = 10 });
+    defer job.deinit();
+    while (!job.done.load(.acquire)) _ = c.usleep(1000);
+    const view = try job.view();
+    try std.testing.expectEqual(count, view.streams[0].points.len);
+    try std.testing.expectEqual(@as(u64, count), view.derived.counts.records);
+    try std.testing.expectEqual(@as(u64, count), view.derived.counts.exactly_one_call);
+    try std.testing.expectError(error.ObservationAssociationRecordLimit, @import("archive_job.zig").Job.start(2, .save, "unused-above-save-limit.xoi", target, job));
+    try std.testing.expectEqual(count, (try job.view()).streams[0].points.len);
+    var status_arena = std.heap.ArenaAllocator.init(a);
+    defer status_arena.deinit();
+    const status = try @import("../mcp/associations.zig").status(status_arena.allocator(), job);
+    try std.testing.expect(status.object.get("payload_version").? == .null);
+    try std.testing.expectEqual(@as(i64, 2), status.object.get("would_save_as").?.integer);
 }

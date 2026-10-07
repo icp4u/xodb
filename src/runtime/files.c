@@ -60,9 +60,11 @@ enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *r, 
     char path[96];
     switch (r->kind) {
     case XRT_FILE_MAPS:
+    case XRT_FILE_AUXV:
         if (pid <= 0)
             return XRT_INVALID_PID;
-        snprintf(path, sizeof(path), "/proc/%d/maps", pid);
+        snprintf(path, sizeof(path), "/proc/%d/%s", pid,
+                 r->kind == XRT_FILE_MAPS ? "maps" : "auxv");
         break;
     case XRT_FILE_THREAD_STAT:
     case XRT_FILE_THREAD_COMM:

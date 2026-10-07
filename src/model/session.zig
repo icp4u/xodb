@@ -81,7 +81,7 @@ pub const Investigation = struct {
         try writer.write(.{ .id = self.id, .question = self.question, .expression = self.expression, .watchpoint_id = self.watchpoint_id, .initial = self.initial, .created_generation = self.created_generation, .created_sequence = self.created_sequence, .image_epoch = self.image_epoch, .status = self.status, .observations = self.observations.items, .before_semantics = if (self.architecture == .aarch64) "value sampled at the pre-access trap; check before_valid and peer-thread evidence" else self.before_semantics, .pc_semantics = if (self.architecture == .aarch64) "trap_pc is pre-access; pc is completion/interruption; check watch_phase and attribution" else self.pc_semantics });
     }
 };
-const RunTo = struct { tid: i32, thread_id: u64, address: u64, probe: u64, owns_probe: bool, image_epoch: u64, expected_sp: ?u64 = null, cancelled: bool = false };
+const RunTo = struct { tid: i32, thread_id: u64, address: u64, probe: u64, owns_probe: bool, image_epoch: u64, expected_sp: ?u64 = null, cancelled: bool = false, ignored_stops: usize = 0 };
 const SourceStep = struct { tid: i32, line: u32, path: [4096]u8, path_len: usize, over: bool, instructions: usize = 0, return_address: ?u64 = null };
 pub const Session = struct {
     id: u64,
@@ -129,6 +129,7 @@ pub const Session = struct {
     /// Opt-in static analysis: worker discovery, one bounded job, cached exports.
     static_analysis: @import("../semq/host.zig").State = .{},
     offline: bool = false,
+    frames: @import("../frames/state.zig").State = .{},
     imported: ?@import("../profile/imported_job.zig").State = null,
     artifact: ?archive.Opened = null,
     comparison: ?*@import("../profile/comparison.zig").Job = null,
@@ -353,6 +354,7 @@ pub const Session = struct {
         }
     }
     pub fn archiveBusy(self: *const Session) bool {
+        if (self.frames.job) |job| if (job.capture != null) return true;
         return if (self.archive_job) |job| !job.reaped else false;
     }
     fn clearArchiveJob(self: *Session) !void {
@@ -360,6 +362,9 @@ pub const Session = struct {
         if (self.archiveBusy()) return error.ArchiveBusy;
         if (self.archive_job) |job| job.deinit();
         self.archive_job = null;
+    }
+    pub fn openFrames(self: *Session, path: []const u8) !void {
+        try self.frames.open(path);
     }
     pub fn openImported(self: *Session, path: []const u8) !void {
         if (self.target.snapshot().pid != 0 or self.profile != null or self.offline) return error.ConflictingTargets;
@@ -439,6 +444,7 @@ pub const Session = struct {
         if (capture.collector != null) return .{ .unavailable = error.ArchiveStillCollecting };
         if (capture.config.user_stack_bytes == 0) return .{ .unavailable = error.SampledStacksDisabled };
         capture.validateFilter(filter) catch |err| return .{ .unavailable = err };
+        if (self.frames.job) |job| if (job.capture != null) return .{ .unavailable = error.FrameBusy };
         const key = derived.Key.of(capture, filter);
         if (self.derived) |*published| if (std.meta.eql(published.key, key)) return .{ .ready = &published.view };
         if (self.derived_failure) |failure| if (std.meta.eql(failure.key, key)) return .{ .failed = failure.err };
@@ -470,6 +476,7 @@ pub const Session = struct {
         return .{ .pending = .{ .done = 0, .total = capture.samples.len() } };
     }
     pub fn requestProfileStack(self: *Session, ordinal: usize) !*ArchiveJob {
+        if (self.frames.job) |job| if (job.capture != null) return error.FrameBusy;
         self.pollArchive();
         const capture = self.profile orelse return error.NoProfile;
         if (capture.collector != null) return error.ArchiveStillCollecting;
@@ -491,11 +498,18 @@ pub const Session = struct {
         return job;
     }
     pub fn saveArchive(self: *Session, path: []const u8) !u64 {
+        self.frames.poll();
+        const attachment_save = try self.frames.archiveSave();
         try self.clearArchiveJob();
         const capture = self.profile orelse return error.NoProfile;
         if (capture.collector != null) return error.ArchiveStillCollecting;
         const job = try ArchiveJob.create(self.next_archive_job, .save, path);
         errdefer job.deinit();
+        job.attachment_save = attachment_save;
+        if (self.frames.count > 0) {
+            self.frames.pinned = true;
+            job.frames = &self.frames;
+        }
         if (self.artifact) |*artifact| job.original_bytes = artifact.bytes else {
             capture.archive_busy = true;
             job.capture = capture;
@@ -524,6 +538,11 @@ pub const Session = struct {
         if (job.reaped or !job.done.load(.acquire)) return;
         job.join();
         job.reaped = true;
+        if (job.frames) |frames| {
+            frames.pinned = false;
+            job.frames = null;
+        }
+
         if (job.kind == .derived) {
             // Publish only for the capture that is still current.
             const current = if (self.profile) |capture| std.meta.eql(job.derived_key, @import("../profile/derived.zig").Key.of(capture, job.filter)) else false;
@@ -576,6 +595,7 @@ pub const Session = struct {
         }
         if (job.opened) |opened| {
             self.artifact = opened;
+            if (opened.frame_bundle) |bytes| self.frames.restoreArchive(bytes);
             self.dropDerived();
             self.profile = self.artifact.?.capture;
             job.opened = null;
@@ -803,6 +823,7 @@ pub const Session = struct {
         }
         self.persistent.hook = null;
         self.persistent.debug_address = null;
+        self.persistent.loader_attempt = 0;
         self.persistent.epoch = self.target.snapshot().image_epoch;
         self.persistent.observed = 0;
         self.suppress_probe_resume = true;
@@ -976,12 +997,22 @@ pub const Session = struct {
             return;
         }
         var reached = false;
-        for (self.target.threadSlice()) |thread| if (thread.tid == run.tid and thread.id == run.thread_id and thread.reason == .breakpoint and thread.breakpoint_address == run.address) {
-            const regs = try self.target.registers(thread.tid);
-            const sp = linux.stackPointer(regs) catch null;
-            reached = run.expected_sp == null or (sp != null and sp.? == run.expected_sp.?);
+        var foreign_hit = false;
+        for (self.target.threadSlice()) |thread| if (thread.reason == .breakpoint and thread.breakpoint_address == run.address) {
+            if (thread.tid == run.tid and thread.id == run.thread_id) {
+                const regs = try self.target.registers(thread.tid);
+                const sp = linux.stackPointer(regs) catch null;
+                reached = run.expected_sp == null or (sp != null and sp.? == run.expected_sp.?);
+            } else foreign_hit = true;
         };
-        if (reached or run.cancelled or !filtered) {
+        if (filtered and foreign_hit and !reached and !self.run_to.?.cancelled) {
+            self.run_to.?.ignored_stops += 1;
+            if (self.run_to.?.ignored_stops >= 64) {
+                self.run_to.?.cancelled = true;
+                self.step_diagnostic = "RunToNoProgress";
+            }
+        }
+        if (reached or self.run_to.?.cancelled or !filtered) {
             if (run.owns_probe) self.target.removeBreakpoint(run.probe) catch |err| {
                 if (err != error.UnknownBreakpoint) return err;
             };
@@ -1093,6 +1124,7 @@ pub const Session = struct {
             self.memory.poll(self);
             return;
         }
+        self.frames.poll();
         if (self.imported) |*state| {
             state.poll();
             return;
@@ -1452,6 +1484,23 @@ pub const Session = struct {
             result.diagnostic = shown.diagnostic;
             return result;
         }
+        const python_preview = @import("../language/python.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (python_preview) |shown| {
+            result.visualization = shown;
+            const detail = shown.python.?;
+            // A rejected head has no meaningful refcount (N7).
+            result.display = if (std.mem.eql(u8, detail.type, "freed") or std.mem.eql(u8, detail.type, "invalid"))
+                try a.dupe(u8, detail.display)
+            else if (detail.immortal)
+                try std.fmt.allocPrint(a, "{s} (immortal)", .{detail.display})
+            else
+                try std.fmt.allocPrint(a, "{s} (refcnt {d})", .{ detail.display, detail.refcount });
+            result.diagnostic = shown.diagnostic;
+            return result;
+        }
         result.visualization = value_view.preview(self.valueContext(a), v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
@@ -1568,6 +1617,7 @@ pub const Session = struct {
         self.persistent.deinit();
         for (self.launch_argv) |arg| std.heap.page_allocator.free(arg);
         if (self.launch_argv.len > 0) std.heap.page_allocator.free(self.launch_argv);
+        self.frames.deinit();
         if (self.imported) |*state| state.deinit();
         self.recorded_views.deinit();
         if (self.archive_job) |job| job.deinit();

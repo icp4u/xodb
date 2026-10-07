@@ -219,7 +219,7 @@ pub const Panel = struct {
         try r.textFit(font, b.x + 14, y + 24, b.w - 28, self.message, theme.text);
         if (self.editor.open) {
             try style.box(r, .{ .x = b.x + 10, .y = y + 48, .w = b.w - 20, .h = 27 }, theme.background, theme.focus, @splat(3));
-            try r.textFit(font, b.x + 16, y + 52, b.w - 32, self.editor.text.slice(), theme.text);
+            try self.editor.draw(r, font, .{ .x = b.x + 16, .y = y + 52, .w = b.w - 32, .h = 22 });
         } else if (session.probes.log_count > 0) {
             const log = &session.probes.logs[session.probes.log_count - 1];
             const message = try std.fmt.bufPrint(&buffer, "Log #{d} tid {d}: {s} = {s}  (dropped {d})", .{ log.sequence, log.tid, log.expression.slice(), log.display.slice(), session.probes.dropped_logs });

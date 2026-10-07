@@ -11,6 +11,7 @@ const Budget = @import("../profile/archive_budget.zig").Budget;
 const a = std.heap.page_allocator;
 pub const ProfileSource = struct { capture: *const Profile, id: u64, revision: u64, cpu: bool = true, syscalls: bool = false };
 pub const AllocationSource = struct { capture: *const Allocation, id: u64, revision: u64 };
+pub const max_live_records = 1024 * 1024;
 pub const saved_evidence = @import("association_evidence.zig");
 pub const Source = saved_evidence.Source;
 pub const clock_basis = "recorded acquisition contract: native sources used host CLOCK_MONOTONIC in the same live Session; remote timestamps were already normalized with a fixed offset, summed conversion uncertainty is retained and drift is unmeasured";
@@ -125,7 +126,7 @@ pub const Job = struct {
         return self;
     }
     fn reserveRecords(self: *Job, count: usize) !void {
-        const limit = saved_evidence.max_records;
+        const limit = max_live_records;
         if (count > limit - self.copied_records) return error.ObservationAssociationRecordLimit;
         self.copied_records += count;
     }

@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None):
     live = tier in ('host', 'all')
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
@@ -27,7 +27,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     if live:
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
-        for name in ('mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
+        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
@@ -41,6 +41,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
                 steps.append((name, args, 180))
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
+        steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
+        steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
     if tier in ('gui', 'all'):
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
@@ -48,6 +50,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-themes', ['tests/themes.py']),
+            ('gui-vga', ['tests/vga.py']),
+            ('gui-frames', ['tests/frames-gui.py']),
+            ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
+            ('gui-clipboard', ['tests/clipboard-gui.py']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
@@ -56,6 +62,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False):
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
             ('gui-static-analysis', ['tests/static-analysis-gui.py', 'zig-out']),
             ('gui-restart', ['tests/restart-gui.py', 'zig-out']),
+            ('gui-run-control', ['tests/run-control-gui.py']),
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
@@ -204,12 +211,15 @@ def main():
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
     parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
+    parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
     args = parser.parse_args()
     if args.headless and args.tier != 'portable':
         parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
         parser.error('--uprobes requires the host or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes)
+    if args.perl and args.tier not in ('gui', 'all'):
+        parser.error('--perl requires the gui or all tier')
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl)
     if args.list:
         print(json.dumps(steps, indent=2))
         return 0
@@ -228,12 +238,13 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless,
-                  optimize=args.optimize, started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
                      ['GUI execution'] if args.tier == 'host' else
-                     ['full host integration suite'] if args.tier == 'gui' else []))
+                     ['full host integration suite'] if args.tier == 'gui' else []) +
+                    (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []))
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')

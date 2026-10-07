@@ -428,7 +428,7 @@ void xrt_wire_file_identity(struct xrt_codec *c, struct xrt_file_identity *v)
 void xrt_wire_file_request(struct xrt_codec *c, struct xrt_file_request *r, char *path,
                            size_t capacity)
 {
-    ENUM(r->kind, XRT_FILE_THREAD_COMM);
+    ENUM(r->kind, XRT_FILE_AUXV);
     i32(c, &r->tid);
     struct xrt_mapping *m = &r->mapping;
     U64(m->start);

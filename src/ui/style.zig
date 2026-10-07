@@ -45,13 +45,20 @@ pub fn shadow(r: *gpu.Renderer, rect: gpu.Rect, radius: f32, strength: f32) !voi
 
 /// Filled box with a one-pixel border.
 pub fn box(r: *gpu.Renderer, rect: gpu.Rect, fill: gpu.Color, edge: gpu.Color, radii: [4]f32) !void {
-    try r.shape(rect, fill, .{ .radii = radii });
-    try r.shape(rect, edge, .{ .radii = radii, .border = 1 });
+    const corners = if (appearance.active.block_selection) @as([4]f32, @splat(0)) else radii;
+    try r.shape(rect, fill, .{ .radii = corners });
+    try r.shape(rect, edge, .{ .radii = corners, .border = 1 });
 }
 
 /// Selection: translucent focus overlay plus a focus-colored border, scaled by `t`
 /// (overlay alpha 0x14/255 as in RAD Debugger's `focus overlay`).
 pub fn focus(r: *gpu.Renderer, rect: gpu.Rect, radius: f32, t: f32) !void {
+    if (appearance.active.block_selection) {
+        if (t <= 0.01) return;
+        try r.rect(rect, theme.pop);
+        try r.shape(rect, theme.focus, .{ .border = 1 });
+        return;
+    }
     try r.shape(rect, fade(theme.focus, 0.11 * t), .{ .radii = @splat(radius) });
     try r.shape(rect, fade(theme.focus, 0.75 * t), .{ .radii = @splat(radius), .border = 1 });
 }

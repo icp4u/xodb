@@ -48,6 +48,7 @@ pub fn main(init: std.process.Init) !void {
     var core_executable: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
     var compare_capture: ?[:0]const u8 = null;
+    var open_frames: ?[:0]const u8 = null;
     var open_profile: ?[:0]const u8 = null;
     var observation_recipe: ?[:0]const u8 = null;
     var observation_out: ?[:0]const u8 = null;
@@ -84,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
                 \\With --mcp, --source FILE explicitly shares that source file with remote viewers.
                 \\--allocation-helper PATH explicitly permits sudo -n to open allocation probes (see docs/ALLOCATIONS.md).
                 \\A opens allocations; P in that panel starts/stops capture on the selected thread.
-                \\--theme FILE|builtin:dark|builtin:light|builtin:contrast selects GUI colors at startup.
+                \\--theme FILE|builtin:dark|builtin:light|builtin:contrast|builtin:vga selects the GUI theme at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
                 \\T cycles the next capture duration in the profile view; 0 in config/MCP means until stopped.
                 \\--debug-dir DIR replaces default /usr/lib/debug roots (repeatable); local companions are verified.
@@ -99,6 +100,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
+                \\--open-frames FILE opens logical-frame JSONL or a saved .xof bundle.
                 \\--open-profile FILE opens an imported simpleperf JSON profile (see scripts/import-simpleperf).
                 \\--observe-recipe FILE --observation-out FILE runs a bounded headless function investigation and saves .xoi evidence.
                 \\--open-observation FILE reopens .xoi and prints cohorts; add --mcp for immutable agent queries.
@@ -118,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -149,6 +151,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
             if (std.mem.eql(u8, arg, "--profile-out")) profile_out = args[i];
             if (std.mem.eql(u8, arg, "--capture-out")) capture_out = args[i];
+            if (std.mem.eql(u8, arg, "--open-frames")) open_frames = args[i];
             if (std.mem.eql(u8, arg, "--open-profile")) open_profile = args[i];
             if (std.mem.eql(u8, arg, "--open-capture")) open_capture = args[i];
             if (std.mem.eql(u8, arg, "--compare-capture")) compare_capture = args[i];
@@ -183,6 +186,7 @@ pub fn main(init: std.process.Init) !void {
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
     if (core_executable != null and core_file == null) return error.ExecutableRequiresCore;
     if (core_file != null and (attach != null or launch.len > 0 or open_profile != null or open_capture != null or connect != null or ssh != null or initial_breakpoint_count != 0 or profile_out != null or capture_out != null or record_path != null or symbols != null or reanalyze)) return error.CoreOptionConflict;
+    if (open_frames != null and (open_profile != null or connect != null or ssh != null or observation_recipe != null or open_observation != null or browse_observation != null)) return error.FrameOptionConflict;
     if (open_profile != null and (open_capture != null or attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null or symbols != null or reanalyze or connect != null or ssh != null or capture_out != null or profile_out != null or record_path != null)) return error.ImportOptionConflict;
     if ((debug_dirs.items.len > 0 or source_maps.items.len > 0) and (open_profile != null or open_capture != null or connect != null)) return error.SymbolOptionsRequireLiveServer;
     if (debug_files.items.len > 0 and (open_profile != null or open_capture != null or connect != null)) return error.DebugFilesRequireLiveServer;
@@ -238,6 +242,7 @@ pub fn main(init: std.process.Init) !void {
     if (listen) |endpoint| connection = try @import("remote/transport.zig").acceptOne(endpoint, &quitting);
     const session = try a.create(Session);
     session.* = Session.init();
+    session.persistent.cancel = &quitting;
     session.agent_scope = agent_scope;
     session.profile_defaults = preferences.profile.config();
     session.allocation_defaults = preferences.allocations;
@@ -257,7 +262,11 @@ pub fn main(init: std.process.Init) !void {
         if (runtime_ssh) |host| {
             try transport.appendSlice(a, &.{ "ssh", "-T", "-o", "BatchMode=yes" });
             if (ssh_config) |path| try transport.appendSlice(a, &.{ "-F", path });
-            try transport.appendSlice(a, &.{ "--", host, try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" }) });
+            // Retain a remote shell to translate a signal into 128 + signo.
+            // SSH otherwise collapses a directly signalled agent to exit 255.
+            const agent_command = try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" });
+            const command = try std.fmt.allocPrintSentinel(a, "({s}); xodb_status=$?; exit \"$xodb_status\"", .{agent_command}, 0);
+            try transport.appendSlice(a, &.{ "--", host, command });
         } else try transport.appendSlice(a, &.{ agent, "--stdio" });
         try session.target.connectRemote(transport.items);
     }
@@ -285,6 +294,7 @@ pub fn main(init: std.process.Init) !void {
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
     if (open_profile) |path| try session.openImported(path);
+    if (open_frames) |path| try session.openFrames(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
     if (attach) |pid| {
         const started = linux.now();
@@ -342,7 +352,7 @@ pub fn main(init: std.process.Init) !void {
         var render_retry: u64 = 0;
         const font = try a.create(Font);
         font.* = .{};
-        try font.init(font_path);
+        try font.initSelected(font_path, @import("build_options").font_path ++ "");
         defer font.deinit();
         var workspaces: [@import("model/process_tree.zig").maximum]?*Workspace = @splat(null);
         workspaces[0] = try a.create(Workspace);
@@ -352,6 +362,7 @@ pub fn main(init: std.process.Init) !void {
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
         workspace.show_profile = open_capture != null;
+        workspace.logical_frames.open = open_frames != null;
         workspace.comparison.open = compare_capture != null;
         workspace.invocations.open = browse_observation != null;
         workspace.invocations.threshold_ns = observation_threshold;
@@ -578,6 +589,7 @@ test {
     std.testing.refAllDecls(@import("profile/sample_state.zig"));
     std.testing.refAllDecls(@import("profile/unwind.zig"));
     if (build_options.gui) {
+        std.testing.refAllDecls(@import("render/font.zig"));
         std.testing.refAllDecls(@import("platform/input.zig"));
         std.testing.refAllDecls(@import("ui/workspace.zig"));
         std.testing.refAllDecls(@import("ui/allocations.zig"));

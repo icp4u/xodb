@@ -1,4 +1,4 @@
-//! Native capture artifact, experimental format 2.6. Adapted from T11's codec.
+//! Native capture artifact, experimental format 2.7. Adapted from T11's codec.
 //! Own original bytes for lossless copying; origin and recorded labels are never
 //! reconstructed from runtime session IDs or the set of available asset files.
 const std = @import("std");
@@ -27,7 +27,8 @@ const Allocator = std.mem.Allocator;
 
 pub const magic = "XODBCAPT";
 pub const format_major: u16 = 2;
-pub const format_minor: u16 = 6;
+pub const format_minor: u16 = 7;
+pub const frames_tag: u32 = 0x4d415246; // FRAM: optional evidence bundle
 pub const header_bytes = 64;
 pub const entry_bytes = 24;
 pub const machine_x86_64: u16 = 62; // EM_X86_64; addresses are that machine's user VAs
@@ -120,6 +121,7 @@ pub const Environment = struct {
     progress: ?*progress.Progress = null,
     saved_realtime_ns: ?u64 = null,
     encoder: []const u8 = "xodb archive 2.2",
+    frame_bundle: ?[]const u8 = null,
 };
 /// Identity of one ELF file as it was mapped during capture.
 pub const ImageIdentity = struct { file_bytes: u64, sha256: [32]u8, build_id: ?[]const u8 };
@@ -228,7 +230,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..8], magic);
     std.mem.writeInt(u16, out[8..10], format_major, .little);
-    std.mem.writeInt(u16, out[10..12], if (capture.producer != null) format_minor else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
+    std.mem.writeInt(u16, out[10..12], if (capture.producer != null) @as(u16, 6) else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
     std.mem.writeInt(u32, out[12..16], header_bytes, .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], @intCast(selected.len), .little);
@@ -249,6 +251,60 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         @memcpy(out[offset..][0..body.items.len], body.items);
         offset += body.items.len;
     }
+    if (env.frame_bundle) |bundle| {
+        defer a.free(out);
+        return attachFrames(a, out, bundle);
+    }
+    return out;
+}
+/// Copy native sections byte-for-byte, including unknown optional sections.
+/// Null leaves the entire file byte-identical. Existing FRAM is replaced only
+/// when a caller explicitly supplies a completed attachment owner.
+pub fn attachFrames(a: Allocator, bytes: []const u8, bundle: ?[]const u8) ![]u8 {
+    _ = try readHeader(bytes, max_file_bytes);
+    const frames = bundle orelse return a.dupe(u8, bytes);
+    if (frames.len > @import("../frames/c.zig").api.XFB_MAX_BYTES) return error.ArchiveTooLarge;
+    const count = std.mem.readInt(u32, bytes[24..28], .little);
+    var old_length: usize = 0;
+    var had_frames = false;
+    for (0..count) |i| {
+        const entry = bytes[header_bytes + i * entry_bytes ..][0..entry_bytes];
+        if (std.mem.readInt(u32, entry[0..4], .little) == frames_tag) {
+            had_frames = true;
+            old_length = std.mem.readInt(u32, entry[16..20], .little);
+        }
+    }
+    const new_count = count + @as(u32, if (had_frames) 0 else 1);
+    if (new_count > 64) return error.ArchiveSectionLayout;
+    const total = bytes.len - old_length + frames.len + (if (had_frames) @as(usize, 0) else entry_bytes);
+    if (total > max_file_bytes) return error.ArchiveTooLarge;
+    const out = try a.alloc(u8, total);
+    @memcpy(out[0..header_bytes], bytes[0..header_bytes]);
+    std.mem.writeInt(u16, out[10..12], @max(format_minor, std.mem.readInt(u16, bytes[10..12], .little)), .little);
+    std.mem.writeInt(u64, out[16..24], total, .little);
+    std.mem.writeInt(u32, out[24..28], new_count, .little);
+    std.mem.writeInt(u32, out[56..60], std.hash.Crc32.hash(out[0..56]), .little);
+    var offset: usize = header_bytes + new_count * entry_bytes;
+    var next: usize = 0;
+    for (0..count) |i| {
+        const entry = bytes[header_bytes + i * entry_bytes ..][0..entry_bytes];
+        if (std.mem.readInt(u32, entry[0..4], .little) == frames_tag) continue;
+        const dest = out[header_bytes + next * entry_bytes ..][0..entry_bytes];
+        @memcpy(dest, entry);
+        const old_offset: usize = @intCast(std.mem.readInt(u64, entry[8..16], .little));
+        const length = std.mem.readInt(u32, entry[16..20], .little);
+        @memcpy(out[offset..][0..length], bytes[old_offset..][0..length]);
+        std.mem.writeInt(u64, dest[8..16], offset, .little);
+        offset += length;
+        next += 1;
+    }
+    const entry = out[header_bytes + next * entry_bytes ..][0..entry_bytes];
+    std.mem.writeInt(u32, entry[0..4], frames_tag, .little);
+    std.mem.writeInt(u32, entry[4..8], flag_ignorable, .little);
+    std.mem.writeInt(u64, entry[8..16], offset, .little);
+    std.mem.writeInt(u32, entry[16..20], @intCast(frames.len), .little);
+    std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(frames), .little);
+    @memcpy(out[offset..], frames);
     return out;
 }
 fn encodeProducer(w: Writer, p: @import("producer.zig").Producer) !void {
@@ -543,7 +599,13 @@ pub const Options = struct {
     progress: ?*progress.Progress = null,
 };
 /// Offline provenance kept beside the reopened capture.
+pub const FrameSummary = struct {
+    state: enum { retained_opaque } = .retained_opaque,
+    bytes: usize,
+    sha256: []const u8,
+};
 pub const Source = struct {
+    frame_attachments: ?FrameSummary = null,
     producer: ?@import("producer.zig").Producer = null,
     format_major: u16,
     format_minor: u16,
@@ -572,6 +634,8 @@ pub const Opened = struct {
     capture: *Capture,
     source: Source,
     bytes: []const u8,
+    /// Opaque optional evidence, borrowed from bytes, never an MCP status field.
+    frame_bundle: ?[]const u8 = null,
     budget: *Budget,
     resolution_id: [32]u8,
     /// Owns `source` strings and reports. The capture owns its own memory.
@@ -599,7 +663,7 @@ pub const Opened = struct {
     }
 };
 
-const Header = struct { producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
+const Header = struct { frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
 fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (bytes.len > limit) return error.ArchiveTooLarge;
     if (bytes.len < header_bytes) return error.ArchiveTruncated;
@@ -652,6 +716,9 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
         } else if (tag == @intFromEnum(Tag.producer)) {
             if (flags != flag_ignorable or required != section_order.len or result.producer != null or minor < 6) return error.ArchiveSectionLayout;
             result.producer = body;
+        } else if (tag == frames_tag) {
+            if (flags != flag_ignorable or required != section_order.len or result.frames != null) return error.ArchiveSectionLayout;
+            result.frames = body;
         } else if (flags == flag_ignorable) {
             for (section_order) |known| if (tag == @intFromEnum(known)) return error.ArchiveSectionLayout;
             result.ignored += 1;
@@ -686,6 +753,14 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     errdefer self.deinit();
     self.offline = true;
     var source = Source{ .format_major = format_major, .format_minor = header.minor, .archive_sha256 = undefined, .file_bytes = bytes.len, .capture_id = 0, .session_id = 0, .generation = 0, .image_epoch = 0, .pid = 0, .revision = 0, .boot_id = null, .saved_realtime_ns = null, .encoder = "", .images = &.{}, .ignored_sections = header.ignored, .optional_features = header.optional_features };
+    if (header.frames) |body| {
+        // Optional payload validation belongs to the frame worker. Native
+        // decode retains the bytes regardless of frame version or contents.
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(body, &digest, .{});
+        source.frame_attachments = .{ .bytes = body.len, .sha256 = try arena.allocator().dupe(u8, &std.fmt.bytesToHex(digest, .lower)) };
+        try progress.step(options.progress, .decoding, body.len);
+    }
     std.crypto.hash.sha2.Sha256.hash(bytes, &source.archive_sha256, .{});
     var r = Reader{ .bytes = header.sections[0], .cancel = if (options.progress) |p| &p.cancel else null };
     try decodeMeta(&r, self, &source, arena.allocator());
@@ -770,7 +845,8 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     self.work_cancel = null;
     // Large immutable evidence gets an exact allocation, avoiding arena growth slack.
     const retained = try a.dupe(u8, bytes);
-    return .{ .capture = self, .source = source, .arena = arena, .bytes = retained, .budget = budget, .resolution_id = resolution.finalResult() };
+    const frame_bundle = if (header.frames) |body| retained[@intFromPtr(body.ptr) - @intFromPtr(bytes.ptr) ..][0..body.len] else null;
+    return .{ .capture = self, .source = source, .arena = arena, .bytes = retained, .frame_bundle = frame_bundle, .budget = budget, .resolution_id = resolution.finalResult() };
 }
 fn decodeMeta(r: *Reader, self: *Capture, source: *Source, a: Allocator) !void {
     source.capture_id = try r.int(u64);
@@ -1534,7 +1610,9 @@ fn decodeSyscalls(r: *Reader, self: *Capture) !void {
 }
 
 test "archive resolver refuses FIFO without an open side effect" {
-    const notify = @cImport({ @cInclude("sys/inotify.h"); });
+    const notify = @cImport({
+        @cInclude("sys/inotify.h");
+    });
     var directory = "archive-resolver-XXXXXX".*;
     const dir = c.mkdtemp(&directory) orelse return error.TestUnexpectedResult;
     defer _ = c.rmdir(dir);

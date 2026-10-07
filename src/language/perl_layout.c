@@ -50,6 +50,7 @@ static const struct field_spec specs[XPL_FIELD_COUNT] = {
     {"HE", "hent_next", 8},
     {"HE", "hent_hek", 8},
     {"HE", "he_valu.hent_val", 8},
+    {"XPVMG", "xmg_stash", 8},
 };
 static int type_of(Dwarf_Die *die, Dwarf_Die *out) {
     Dwarf_Attribute attr;
@@ -126,11 +127,14 @@ const char *xpl_layout_build(Dwarf *dwarf, const uint8_t *id, size_t id_len, con
      * macro profile. In particular the unthreaded COP has a GV, not cop_file. */
     Dwarf_Off offset = 0, next;
     size_t header;
-    unsigned visited = 0, found = 0;
+    unsigned visited = 0, found = 0, units = 0;
     unsigned char have[XPL_FIELD_COUNT] = {0};
-    for (unsigned units = 0; units < 64 && found < XPL_FIELD_COUNT; ++units) {
+    for (; units < 64 && found < XPL_FIELD_COUNT; ++units) {
         uint8_t address_size;
-        if (dwarf_nextcu(dwarf, offset, &next, &header, NULL, &address_size, NULL))
+        int status = dwarf_nextcu(dwarf, offset, &next, &header, NULL, &address_size, NULL);
+        if (status < 0)
+            return "PerlMalformedDwarf";
+        if (status > 0)
             break;
         if (address_size != 8 || next <= offset)
             return "PerlLayoutUnsupported";
@@ -165,8 +169,16 @@ const char *xpl_layout_build(Dwarf *dwarf, const uint8_t *id, size_t id_len, con
             }
         } while (!dwarf_siblingof(&die, &die));
     }
-    if (found != XPL_FIELD_COUNT || !out->context_size)
+    if (found != XPL_FIELD_COUNT || !out->context_size) {
+        /* An exhausted search and a complete search with missing types are
+         * different outcomes. Probe only the next header, not another DIE. */
+        if (units == 64) {
+            int status = dwarf_nextcu(dwarf, offset, &next, &header, NULL, NULL, NULL);
+            if (status < 0) return "PerlMalformedDwarf";
+            if (status == 0) return "PerlDwarfUnitLimit";
+        }
         return "PerlDwarfTypesUnavailable";
+    }
     memcpy(out->build_id, id, id_len);
     out->build_id_len = (uint8_t)id_len;
     memcpy(out->version, version, 3);

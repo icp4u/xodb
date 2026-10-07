@@ -65,7 +65,7 @@ pub const Inspector = struct {
         return null;
     }
 
-    pub fn draw(self: *Inspector, r: *gpu.Renderer, font: *Font, bounds: gpu.Rect, capture: *const profile.Capture, stack: Stack) !void {
+    pub fn draw(self: *Inspector, r: *gpu.Renderer, font: *Font, bounds: gpu.Rect, capture: *const profile.Capture, stack: Stack, jit: ?*const @import("../frames/jit.zig").Sample) !void {
         self.bounds = bounds;
         if (!self.open) return;
         const saved = r.clip;
@@ -91,6 +91,10 @@ pub const Inspector = struct {
         y += 20;
         try label(r, font, bounds.x + 14, y, w, theme.text, "Sampled PC 0x{x}{s} (leaf lookup uses this exact PC; callers use return PC - 1)", .{ sample.ip, if (sample.ip_present) "" else " (absent)" });
         y += 24;
+        if (jit) |labels| if (labels.leaf) |leaf| {
+            try label(r, font, bounds.x + 14, y, w, if (std.mem.eql(u8, leaf.outcome, "resolved")) theme.good else theme.warm, "JIT {s} ({d} candidates): {s}", .{ leaf.outcome, leaf.total_candidates, if (leaf.candidates.len > 0) leaf.candidates[0].name else "no matching code" });
+            y += 22;
+        };
         try r.rect(.{ .x = bounds.x + 10, .y = y, .w = bounds.w - 20, .h = 1 }, theme.border);
         y += 6;
         const half = (bounds.w - 36) / 2;
@@ -112,7 +116,12 @@ pub const Inspector = struct {
         var shown: usize = 0;
         for (sample.frames[recorded_start..sample.frame_count], recorded_start..) |item, i| {
             if (shown == rows) break;
-            const text = if (item.marker) std.fmt.bufPrint(&buffer, "{d: >2} [context {s}]", .{ i, @tagName(item.context) }) catch "" else std.fmt.bufPrint(&buffer, "{d: >2} 0x{x} {s}", .{ i, item.address, @tagName(item.context) }) catch "";
+            const text = if (item.marker) std.fmt.bufPrint(&buffer, "{d: >2} [context {s}]", .{ i, @tagName(item.context) }) catch "" else blk: {
+                if (jit) |labels| if (i < labels.frames.len) if (labels.frames[i]) |jit_label| {
+                    if (jit_label.candidates.len > 0) break :blk std.fmt.bufPrint(&buffer, "{d: >2} 0x{x} [{s}: {d}] {s}", .{ i, item.address, jit_label.outcome, jit_label.total_candidates, jit_label.candidates[0].name }) catch "";
+                };
+                break :blk std.fmt.bufPrint(&buffer, "{d: >2} 0x{x} {s}", .{ i, item.address, @tagName(item.context) }) catch "";
+            };
             try r.textFit(font, left, y + @as(f32, @floatFromInt(shown)) * 20, half, text, if (item.marker) theme.weak else theme.text);
             shown += 1;
         }

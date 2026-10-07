@@ -442,7 +442,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     const font = try a.create(Font);
     defer a.destroy(font);
     font.* = .{};
-    try font.init(font_path);
+    try font.initSelected(font_path, @import("build_options").font_path ++ "");
     defer font.deinit();
     var workspace = Workspace{};
     defer workspace.deinit();

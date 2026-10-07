@@ -26,7 +26,14 @@ protocol-generated files are bundled for distribution.
 
 Build tools: Zig, `pkg-config`, `wayland-scanner`, `glslc`, and a C compiler.
 The executable also uses the system C runtime for Linux process and event APIs.
-GUI tests additionally use Python 3, Sway, `swaymsg`, and `grim`.
+GUI tests additionally use Python 3, Sway, `swaymsg`, and `grim`. Clipboard tests
+also need `wl-copy`/`wl-paste` (wl-clipboard), Tesseract, and the wlr data-control
+protocol XML from wlr-protocols.
+
+Clipboard input uses the compositor's core `wl_data_device` protocol. Middle-click
+paste additionally uses the optional `zwp_primary_selection_device_manager_v1`
+protocol; its absence leaves regular clipboard copy/paste available. No clipboard
+manager or wl-clipboard command is needed by the application itself.
 
 Implementation references:
 

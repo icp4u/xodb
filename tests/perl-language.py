@@ -149,6 +149,10 @@ def main():
                     assert values[name]['diagnostic'] is None,(name,values[name])
                 assert values['integer']['display'].startswith('IV 42 ('), values['integer']
                 assert values['number']['display'].startswith('NV 3.25 ('),values['number']
+                assert values['glob']['display'].startswith('Fixture::Nested::Widget::entry ('), values['glob']
+                for name in ('reference', 'hash'):
+                    assert values[name]['visualization']['perl']['class_name'] == 'Fixture::Nested::Widget', values[name]
+                    assert values[name]['display'].startswith('Fixture::Nested::Widget '), values[name]
                 assert 'hello\\x00bytes' in values['string']['display'],values['string']
                 assert values['array']['visualization']['perl']['items'][3]['display']=='IV 42',values['array']
                 assert any(i['key']=='answer' and i['display']=='IV 42' for i in values['hash']['visualization']['perl']['items']), values['hash']
@@ -230,7 +234,10 @@ def main():
                 assert len(segment['frames']) == 128 and segment['memory_reads'] < 4096, segment
             else:
                 assert all(s['state'] == 'complete' and s['reason'] is None for s in segments), segments
-                assert any(f['context_type'] == 'eval' for s in segments for f in s['frames']), segments
+                context_type = 'try' if mode == 'try' else 'eval'
+                assert any(f['context_type'] == context_type for s in segments for f in s['frames']), segments
+                if mode == 'try':
+                    assert any(f['name'] == '(try)' and f['context_type'] == 'try' for s in segments for f in s['frames']), segments
             checks.append('stopped contexts '+mode)
         finally:
             if c:

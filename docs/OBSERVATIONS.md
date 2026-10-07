@@ -369,15 +369,19 @@ call `save_observation` with `generation`, `session_id`, `capture_id` and a fres
 `path`; poll `get_observation_archive` until publication completes. Closing the
 target or replacing the original source profile cannot alter the saved snapshot.
 Saving while analysis is running returns `ObservationAssociationsBusy`
-immediately. After a failed or cancelled analysis, saving publishes an
-invocation-only version-1 archive; archive status reports `associations_saved:
-false` and `associations_omitted_reason`. Replacement during save returns
+immediately. After failed or cancelled offline reanalysis, saving retains the
+original saved association snapshot and reports `associations_fallback_reason`.
+Without an earlier saved snapshot, saving publishes an invocation-only version-1
+archive; status reports `associations_saved: false` and
+`associations_omitted_reason`. Replacement during save returns
 `ObservationArchiveBusy` immediately while the worker pins its completed source.
 
 Views borrow slices from the completed job. Consumers hold IDs and re-look up on
 the Session owner thread on each use; never retain slices across capture or job
 replacement. A replaced job ID returns `StaleObservationAssociations`. Status
-includes `association_algorithm`, `payload_version`, `analysis_origin` (live,
+includes `association_algorithm`, `payload_version` (the input archive version;
+null for live evidence), `would_save_as` (2, subject to save limits),
+`analysis_origin` (live,
 restored or reanalysed), per-source counts/loss and `rows_truncated` /
 `calls_truncated` with omitted counts. These result-list limits do not truncate
 the retained source streams.
@@ -413,7 +417,11 @@ reported claims about acquisition; absent records are not reconstructed.
 
 Limits remain 64 MiB per file and 256 MiB for decode allocations. A normalized
 snapshot has at most three streams and 262,144 aggregate records, with a 64 MiB
-owner budget and the existing 64 MiB analysis-job budget. This record ceiling is reachable even with the largest interval records;
+owner budget. Live analysis retains its separate 1,048,576-record ceiling and
+64 MiB job budget; records too large for that budget return
+`ObservationAssociationMemoryLimit`. Saving more than 262,144 source records
+returns `ObservationAssociationRecordLimit` without discarding the live result.
+The snapshot record ceiling is reachable even with the largest interval records;
 independent file and byte limits can still reject large invocation sets. Budget
 denials return `ObservationAssociationMemoryLimit`, not `OutOfMemory`, and saving
 checks that a snapshot fits its reader's owner budget. Stream and record arrays

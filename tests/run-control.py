@@ -3,7 +3,7 @@
 from datetime import datetime
 import os
 from pathlib import Path
-import subprocess
+import subprocess,time
 from client import Client
 root=Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -34,4 +34,29 @@ try:
     assert c.inspect('get_breakpoints')['breakpoints'][0]['id']==shared
     assert c.inspect('evaluate_expression',tid=tid,expression='answer')['value']['display']=='15'
 finally:c.close()
-print('Finish through recursive return sites, run-to and shared probe ownership passed:',run)
+for mode, symbol in [('sleep','wait_seven'), ('fib','fib')]:
+    c=Client('control',str(binary),args=[mode])
+    try:
+        probe=c.action('set_breakpoint',symbol=symbol)['id']
+        c.action('continue');tid=c.stopped()['pid']
+        if mode=='fib':
+            c.action('continue');c.stopped()
+            # At entry the prologue has not stored n in its DWARF stack slot.
+            assert [f['symbol'] for f in c.inspect('get_stack',tid=tid)['frames'][:3]]==['fib','fib','main']
+        c.action('remove_breakpoint',id=probe)
+        start=time.monotonic();c.action('finish',tid=tid,frame=0)
+        deadline=start+30
+        while time.monotonic()<deadline:
+            snap=c.session()
+            if snap['state']=='stopped' and snap['running_to'] is None:break
+            assert snap['state']!='exited',snap
+            time.sleep(.01)
+        else:raise AssertionError(('finish timeout',snap))
+        assert snap['step_diagnostic'] is None,snap
+        if mode=='sleep':
+            assert 6.5<time.monotonic()-start<15
+            assert c.inspect('get_stack',tid=tid)['frames'][0]['symbol']=='main'
+        else:
+            assert c.inspect('evaluate_expression',tid=tid,expression='n')['value']['display']=='13'
+    finally:c.close()
+print('Finish through recursive return sites and a seven-second function, run-to and shared probe ownership passed:',run)

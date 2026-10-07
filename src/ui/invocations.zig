@@ -264,6 +264,8 @@ pub const View = struct {
     }
     pub fn input(self: *View, w: *Window, session: *Session) void {
         self.trace = w.input.trace;
+        watch_ui.Editor.focus(w, if (self.editor.open) &self.editor else null);
+        defer watch_ui.Editor.focus(w, if (self.open and self.editor.open) &self.editor else null);
         self.sync(session);
         const value = capture(session);
         if (w.scroll != 0) {
@@ -276,6 +278,8 @@ pub const View = struct {
         }
         while (w.input.next()) |event| {
             if (w.closing) return;
+            watch_ui.Editor.focus(w, if (self.editor.open) &self.editor else null);
+            if (self.editor.open and self.editor.clipboard(w, event)) continue;
             if (event.kind == .button_press and event.code == 272) {
                 w.dirty = true;
                 const v = value orelse continue;
@@ -384,6 +388,8 @@ pub const View = struct {
     }
     pub fn draw(self: *View, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session, reserved: f32) !void {
         self.trace = w.input.trace;
+        watch_ui.Editor.focus(w, if (self.editor.open) &self.editor else null);
+        defer watch_ui.Editor.focus(w, if (self.open and self.editor.open) &self.editor else null);
         self.sync(session);
         const width: f32 = @floatFromInt(w.width);
         const height: f32 = @floatFromInt(w.height);
@@ -505,7 +511,7 @@ pub const View = struct {
             const b = Rect{ .x = width / 2 - 260, .y = height / 2 - 50, .w = 520, .h = 92 };
             try style.box(r, b, theme.header, theme.focus, @splat(8));
             try r.textFit(font, b.x + 10, b.y + 8, b.w - 20, "Cohort threshold (ns)", theme.focus);
-            try r.textFit(font, b.x + 10, b.y + 34, b.w - 20, self.editor.text.slice(), theme.text);
+            try self.editor.draw(r, font, .{ .x = b.x + 10, .y = b.y + 34, .w = b.w - 20, .h = 22 });
             try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.editor.message, theme.warm);
         }
         if (self.message.len > 0) try label(r, font, 18, footer - 24, width - 36, theme.warm, "{s}", .{self.message});

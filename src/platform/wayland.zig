@@ -8,6 +8,8 @@ pub const Cursor = enum(u32) { default = 1, col_resize = 30 };
 pub const Window = struct {
     display: *c.wl_display = undefined,
     registry: ?*c.wl_registry = null,
+    clipboard: ?*c.xclip = null,
+    last_input_serial: u32 = 0,
     compositor: ?*c.wl_compositor = null,
     wm: ?*c.xdg_wm_base = null,
     seat: ?*c.wl_seat = null,
@@ -46,6 +48,8 @@ pub const Window = struct {
         errdefer self.input.deinit();
         self.display = c.wl_display_connect(null) orelse return error.WaylandUnavailable;
         errdefer c.wl_display_disconnect(self.display);
+        self.clipboard = c.xclip_create(self.display);
+        errdefer c.xclip_destroy(self.clipboard);
         self.registry = c.wl_display_get_registry(self.display);
         _ = c.wl_registry_add_listener(self.registry, &registry_listener, self);
         if (c.wl_display_roundtrip(self.display) < 0) return error.WaylandDisconnected;
@@ -71,6 +75,7 @@ pub const Window = struct {
         if (self.wm) |v| c.xdg_wm_base_destroy(v);
         if (self.compositor) |v| c.wl_compositor_destroy(v);
         if (self.registry) |v| c.wl_registry_destroy(v);
+        c.xclip_destroy(self.clipboard);
         c.wl_display_disconnect(self.display);
         self.input.deinit();
     }
@@ -89,6 +94,7 @@ pub const Window = struct {
         }
         self.keyboard = null;
         self.input.seatRemoved();
+        c.xclip_focus(self.clipboard, 0, 0);
     }
     fn dropPointer(self: *Window) void {
         if (self.cursor_device) |v| c.wp_cursor_shape_device_v1_destroy(v);
@@ -135,6 +141,7 @@ pub const Window = struct {
         self.frame_callback = null;
     }
     pub fn pump(self: *Window, timeout_ms: i32) !void {
+        if (c.xclip_tick(self.clipboard)) self.dirty = true;
         // Graphics libraries can read another queue on this display. Reserve a
         // read before polling: poll + dispatch can block after another reader
         // consumes the fd's readiness. Every reservation must be read or cancelled.
@@ -151,7 +158,8 @@ pub const Window = struct {
             if (std.c._errno().* != c.EAGAIN) return error.WaylandDisconnected;
             fd.events |= c.POLLOUT;
         }
-        const n = c.poll(&fd, 1, timeout_ms);
+        const wait_ms = if (c.xclip_busy(self.clipboard)) (if (timeout_ms < 0) 20 else @min(timeout_ms, 20)) else timeout_ms;
+        const n = c.poll(&fd, 1, wait_ms);
         if (n < 0) {
             if (std.c._errno().* == c.EINTR) return;
             return error.WaylandPollFailed;
@@ -163,6 +171,7 @@ pub const Window = struct {
         } else c.wl_display_cancel_read(self.display);
         if (fd.revents & c.POLLOUT != 0 and c.wl_display_flush(self.display) < 0 and std.c._errno().* != c.EAGAIN) return error.WaylandDisconnected;
         if (c.wl_display_dispatch_pending(self.display) < 0) return error.WaylandDisconnected;
+        if (c.xclip_tick(self.clipboard)) self.dirty = true;
     }
 };
 fn now() u64 {
@@ -238,9 +247,11 @@ fn enter(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface, _: ?*
 }
 fn leave(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, _: ?*c.wl_surface) callconv(.c) void {
     window(data).input.leave();
+    c.xclip_focus(window(data).clipboard, 0, 0);
 }
-fn key(data: ?*anyopaque, _: ?*c.wl_keyboard, _: u32, time: u32, code: u32, state: u32) callconv(.c) void {
+fn key(data: ?*anyopaque, _: ?*c.wl_keyboard, serial: u32, time: u32, code: u32, state: u32) callconv(.c) void {
     const pressed = state == c.WL_KEYBOARD_KEY_STATE_PRESSED;
+    window(data).last_input_serial = serial;
     window(data).input.key(time, code, pressed, now());
     if (pressed) window(data).dirty = true;
 }
@@ -268,10 +279,11 @@ fn motion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: i32, y: i32) callconv
     // Hover changes are detected by the workspace; motion alone redraws only while dragging.
     if (window(data).mouse_down) window(data).dirty = true;
 }
-fn button(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, time: u32, code: u32, state: u32) callconv(.c) void {
+fn button(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, time: u32, code: u32, state: u32) callconv(.c) void {
     const w = window(data);
     const pressed = state == c.WL_POINTER_BUTTON_STATE_PRESSED;
     // Every edge is queued, so a press and release in one dispatch is still a click.
+    w.last_input_serial = serial;
     w.input.button(time, code, pressed, w.pointer_x, w.pointer_y);
     if (code == 272) w.mouse_down = pressed;
     w.dirty = true;

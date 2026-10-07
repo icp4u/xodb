@@ -69,8 +69,11 @@ if mode in ('timeout','cancel'):
  (w/'child-pid').write_text(str(p.pid)); time.sleep(60)
 if mode=='output':
  while True: os.write(1,b'x'*65536)
-if mode=='twofiles':
+if mode.startswith('twofiles'):
  for i in range(5): (destination.parent/f'extra-{i}').write_bytes(b'x'*(1536*1024))
+ if mode=='twofiles_failed': sys.exit(7)
+ if mode in ('twofiles_timeout','twofiles_cancel'):
+  (w/'budget-ready').write_text('ready'); time.sleep(60)
 if mode=='input':
  (w/'pin-ready').write_text('ready'); time.sleep(.4); (w/'pin-read').write_bytes(pathlib.Path(args[1]).read_bytes())
 duration=([5,6,7] if mode=='changed' else [10,12,14])[index%3]
@@ -264,6 +267,69 @@ int main(int argc, char **argv) {
         self.assertTrue(all(row["status"] == "not_run" for row in value["runs"][1:]))
         row = json.loads((self.work / "aggregate-output/run-000/result.json").read_text())
         self.assertEqual(row["status"], "output_budget")
+
+    def test_aggregate_budget_preserves_timeout_failure_and_cancellation(self):
+        for terminal in ("timeout", "failed", "cancelled"):
+            with self.subTest(terminal=terminal):
+                spec = copy.deepcopy(self.spec)
+                spec.update(repetitions=1, warmups=0, order="ordered", output_bytes=r.RESERVE + 6*1024*1024,
+                            timeout_seconds=1 if terminal == "timeout" else 20)
+                spec["variants"][0]["args"] = ["twofiles_" + ("cancel" if terminal == "cancelled" else terminal)]
+                if terminal == "cancelled":
+                    # Cancel the last run: no later schedule iteration can
+                    # accidentally restore a cancellation overwritten by budget.
+                    spec["variants"] = [spec["variants"][0], spec["variants"][-1]]
+                    spec["variants"][0]["args"] = ["baseline"]
+                    spec["variants"][-1]["args"] = ["twofiles_cancel"]
+                label = "aggregate-" + terminal
+                marker = self.work / "budget-ready"
+                if marker.exists(): marker.unlink()
+                if terminal == "cancelled":
+                    proc = self.launch(label, spec, False)
+                    try:
+                        deadline = time.monotonic() + 10
+                        while not marker.exists():
+                            self.assertIsNone(proc.poll())
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(.01)
+                        proc.send_signal(signal.SIGINT)
+                        out, err = proc.communicate(timeout=10)
+                        self.assertEqual(proc.returncode, 130, err)
+                    finally:
+                        if proc.poll() is None: proc.kill(); proc.communicate(timeout=10)
+                else:
+                    self.assertEqual(self.launch(label, spec).returncode, 1)
+                value = self.manifest(label)
+                r.validate_manifest(value)
+                row = value["runs"][-1 if terminal == "cancelled" else 0]
+                self.assertEqual(row["status"], terminal)
+                self.assertEqual(row["additional_reasons"], ["output_budget"])
+                self.assertTrue(row["cleanup_verified"])
+                self.assertIsNone(row["result"])
+                self.assertEqual(value["state"], "cancelled" if terminal == "cancelled" else "output_budget")
+                summary = r.summarize(value)["variants"][row["variant"]]
+                self.assertEqual(summary["statuses"][terminal], 1)
+                self.assertEqual(summary["additional_reasons"]["output_budget"], 1)
+                self.assertEqual(json.loads((self.work / label / f"run-{row['index']:03d}/result.json").read_text()), row)
+
+    def test_last_run_budget_reason_validates_without_unstarted_rows(self):
+        spec = copy.deepcopy(self.spec)
+        spec.update(repetitions=1, warmups=0, order="ordered", output_bytes=r.RESERVE + 6*1024*1024, timeout_seconds=1)
+        spec["variants"] = [spec["variants"][0], spec["variants"][-1]]
+        spec["variants"][-1]["args"] = ["twofiles_timeout"]
+        self.assertEqual(self.launch("last-budget", spec).returncode, 1)
+        value = self.manifest("last-budget")
+        r.validate_manifest(value)
+        self.assertEqual([row["status"] for row in value["runs"]], ["completed", "timeout"])
+        self.assertEqual(value["state"], "output_budget")
+        altered = copy.deepcopy(value)
+        altered["state"] = "completed_with_failures"
+        with self.assertRaisesRegex(ValueError, "disclose interruption"):
+            r.validate_manifest(altered)
+        altered = copy.deepcopy(value)
+        altered["runs"][-1]["additional_reasons"] = ["cancelled"]
+        with self.assertRaisesRegex(ValueError, "additional run reasons"):
+            r.validate_manifest(altered)
 
     def test_sealed_inode_rechecked_after_write_window(self):
         original = fcntl.fcntl

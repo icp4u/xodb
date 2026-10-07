@@ -167,7 +167,7 @@ pub const Panel = struct {
         try r.textFit(font, b.x + 14, b.y + b.h - 64, b.w - 28, if (self.message_len > 0) self.message[0..self.message_len] else "Scopes are logical calls; frame numbers and machine registers stay physical", theme.weak);
         if (self.editor.open) {
             try style.box(r, .{ .x = b.x + 10, .y = b.y + b.h - 38, .w = b.w - 20, .h = 27 }, theme.background, theme.focus, @splat(3));
-            try r.textFit(font, b.x + 16, b.y + b.h - 34, b.w - 32, self.editor.text.slice(), theme.text);
+            try self.editor.draw(r, font, .{ .x = b.x + 16, .y = b.y + b.h - 34, .w = b.w - 32, .h = 22 });
         }
     }
 };

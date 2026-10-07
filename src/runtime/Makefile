@@ -8,9 +8,9 @@ CPPFLAGS += -I$(CURDIR)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wswitch-enum
 LDLIBS += -latomic -pthread
-SOURCES := memory arch registers process target probes watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files mapped_file perf_wire agent_perf remote_perf allocation_broker
+SOURCES := memory arch registers process target probes watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files loader elf_symbols mapped_file perf_wire agent_perf remote_perf allocation_broker
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
-TESTS := memory registers process target perf wire snapshot
+TESTS := memory registers process target perf wire snapshot symbols
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))
 .PHONY: all check clean
 all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent
@@ -28,8 +28,12 @@ $(BUILD)/test-%: $(ROOT)/tests/runtime-%.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-remote: $(ROOT)/tests/runtime-remote.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -fno-pie -no-pie $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
-check: $(TEST_BINS) $(BUILD)/test-remote $(BUILD)/test-replies $(BUILD)/xodb-agent
+$(BUILD)/test-loader: $(ROOT)/tests/runtime-loader.c $(BUILD)/libxrt.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -fno-pie -no-pie $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
+check: $(BUILD)/test-loader $(TEST_BINS) $(BUILD)/test-remote $(BUILD)/test-replies $(BUILD)/xodb-agent
 	@set -e; for test in $(TEST_BINS); do "$$test"; done
+	$(BUILD)/test-loader
+	$(BUILD)/test-loader $(BUILD)/xodb-agent
 	$(BUILD)/test-remote $(BUILD)/xodb-agent
 	$(BUILD)/test-replies $(BUILD)/xodb-agent
 # Function probes are currently x86-64 only; live checks explicitly supply a

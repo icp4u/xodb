@@ -82,12 +82,15 @@ def main():
         cancelled_path = work / 'after-cancel.xoi'
         saved = client.action('save_observation', **key, path=str(cancelled_path))
         final = wait(client, 'get_observation_archive', id=saved['id'])
-        assert final['state'] == 'completed' and not final['associations_saved'], final
-        assert final['associations_omitted_reason'] == 'ObservationAnalysisCancelled'
+        assert final['state'] == 'completed' and final['associations_saved'], final
+        assert final['associations_omitted_reason'] is None
+        assert final['associations_fallback_reason'] == 'ObservationAnalysisCancelled'
         payload = json.loads(cancelled_path.read_bytes()[len(MAGIC) + 32:])
-        assert payload['version'] == 1 and 'associations' not in payload['evidence']
-        for reader in [binary, *([str(args.parent_bin)] if args.parent_bin else [])]:
-            proc = subprocess.run([reader, '--open-observation', str(cancelled_path)], capture_output=True, timeout=30)
+        assert payload['version'] == 2 and payload['evidence']['associations'] == json.loads(args.large_fixture.read_bytes()[len(MAGIC) + 32:])['evidence']['associations']
+        # Restored association evidence is v2; older invocation-only readers
+        # are checked on the separate v1 save below.
+        for reader in [binary]:
+            proc = subprocess.run([reader, '--headless', '--open-observation', str(cancelled_path)], capture_output=True, timeout=30)
             assert proc.returncode == 0, proc.stderr
             assert json.loads(proc.stdout)['observation']['offline']
     finally:
@@ -99,7 +102,7 @@ def main():
     body = json.dumps(payload, separators=(',', ':')).encode()
     unknown = work / 'older-algorithm.xoi'
     unknown.write_bytes(MAGIC + hashlib.sha256(body).digest() + body)
-    proc = subprocess.run([binary, '--open-observation', str(unknown)], capture_output=True, timeout=30)
+    proc = subprocess.run([binary, '--headless', '--open-observation', str(unknown)], capture_output=True, timeout=30)
     assert proc.returncode == 0, proc.stderr
     cli = json.loads(proc.stdout)
     assert cli['associations']['state'] == 'unsupported_algorithm'
@@ -120,10 +123,34 @@ def main():
         assert analysed['analysis_origin'] == 'reanalysed' and analysed['counts'] == original['counts']
     finally:
         client.close()
+    # Compatibility applies to invocation-only v1, not the retained v2 evidence.
+    payload['version'] = 1
+    payload['evidence'].pop('associations')
+    body = json.dumps(payload, separators=(',', ':')).encode()
+    invocation_only = work / 'invocation-only.xoi'
+    invocation_only.write_bytes(MAGIC + hashlib.sha256(body).digest() + body)
+    v1_saved = work / 'invocation-only-resaved.xoi'
+    client = Client('control', None, options=['--open-observation', str(invocation_only)])
+    try:
+        assert wait(client, 'get_observation_archive', id=1)['state'] == 'completed'
+        observed = client.inspect('get_observation')
+        assert observed.get('association_id') is None
+        key = {k: observed['identity'][k] for k in ('session_id', 'capture_id')}
+        saved = client.action('save_observation', **key, path=str(v1_saved))
+        final = wait(client, 'get_observation_archive', id=saved['id'])
+        assert final['state'] == 'completed' and not final['associations_saved'], final
+    finally:
+        client.close()
+    saved_payload = json.loads(v1_saved.read_bytes()[len(MAGIC) + 32:])
+    assert saved_payload['version'] == 1 and 'associations' not in saved_payload['evidence']
+    for reader in [binary, *([str(args.parent_bin)] if args.parent_bin else [])]:
+        proc = subprocess.run([reader, '--headless', '--open-observation', str(v1_saved)], capture_output=True, timeout=30)
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(proc.stdout)['observation']['offline']
     print(json.dumps({'status': 'pass', 'work': str(work), 'busy_save_seconds': busy_save,
                       'busy_analysis_seconds': busy_analysis, 'parent_reader': bool(args.parent_bin),
                       'cases': ['save pins source', 'running analysis denies save', 'stale IDs',
-                                'cancel then save v1', 'unknown algorithm opens', 'explicit reanalysis']}))
+                                'cancel then retain saved v2 evidence', 'unknown algorithm opens', 'explicit reanalysis', 'invocation-only v1 readers']}))
 
 
 if __name__ == '__main__':

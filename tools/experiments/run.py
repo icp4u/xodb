@@ -472,8 +472,12 @@ def run(spec, root):
             # RLIMIT_FSIZE bounds each child file, not their sum.
             run_bytes = directory_bytes(folder)
             if used + run_bytes + len(encoded(row)) + RESERVE > spec["output_bytes"]:
-                row["status"], row["error"], row["result"] = "output_budget", "aggregate run output budget", None
-                halted = "output_budget"
+                row["additional_reasons"] = ["output_budget"]
+                if row["status"] in ("completed", "incomplete"):
+                    row["status"], row["error"], row["result"] = "output_budget", "aggregate run output budget", None
+                # Timeout, cancellation and cleanup failure remain the primary
+                # outcome. In particular, cancellation must still exit 130.
+                halted = halted or "output_budget"
             manifest["runs"].append(row)
             publish(folder / "result.json", row)
             used += run_bytes + (folder / "result.json").stat().st_size
@@ -482,7 +486,8 @@ def run(spec, root):
             used += (root / f"checkpoint-{item['index']:03d}.json").stat().st_size
         manifest["state"] = halted or ("completed" if all(r["status"] == "completed" for r in manifest["runs"]) else "completed_with_failures")
         publish(root / "manifest.json", manifest)
-        if halted != "output_budget" and used + (root / "manifest.json").stat().st_size > spec["output_bytes"]:
+        budget_recorded = halted == "output_budget" or any("output_budget" in row.get("additional_reasons", []) for row in manifest["runs"])
+        if not budget_recorded and used + (root / "manifest.json").stat().st_size > spec["output_bytes"]:
             raise ValueError("output accounting exceeded budget")
         return manifest
     finally:
@@ -520,7 +525,12 @@ def validate_manifest(value):
     if plan["schedule"] != expected or len(value["runs"]) != len(expected):
         raise ValueError("schedule/denominator mismatch")
     for wanted, row in zip(expected, value["runs"]):
-        keys(row, set(wanted) | {"status", "error", "exit_code", "wall_ns", "cleanup_verified", "archive", "stdout", "stderr", "result"})
+        keys(row, set(wanted) | {"status", "error", "exit_code", "wall_ns", "cleanup_verified", "archive", "stdout", "stderr", "result"}, {"additional_reasons"})
+        reasons = row.get("additional_reasons", [])
+        if type(reasons) is not list or reasons not in ([], ["output_budget"]):
+            raise ValueError("invalid additional run reasons")
+        if reasons and row["status"] in ("completed", "incomplete", "not_run"):
+            raise ValueError("budget overrun cannot claim success or an unstarted run")
         if any(row[k] != v for k, v in wanted.items()) or row["status"] not in STATUSES or type(row["cleanup_verified"]) is not bool:
             raise ValueError("invalid run identity/status")
         if type(row["index"]) is not int or type(row["repetition"]) is not int or type(row["warmup"]) is not bool:
@@ -545,10 +555,10 @@ def validate_manifest(value):
     statuses = [row["status"] for row in value["runs"]]
     if (value["state"] == "completed") != all(s == "completed" for s in statuses):
         raise ValueError("manifest completion contradicts run outcomes")
-    if value["state"] == "completed_with_failures" and any(s in ("not_run", "cancelled", "output_budget") for s in statuses):
+    if value["state"] == "completed_with_failures" and (any(s in ("not_run", "cancelled", "output_budget") for s in statuses) or any(row.get("additional_reasons") for row in value["runs"])):
         raise ValueError("manifest must disclose interruption")
     if value["state"] in ("cancelled", "output_budget", "cleanup_failed"):
-        if not any(row["status"] == value["state"] or row["error"] == value["state"] or (value["state"] == "cleanup_failed" and not row["cleanup_verified"]) for row in value["runs"]):
+        if not any(row["status"] == value["state"] or row["error"] == value["state"] or value["state"] in row.get("additional_reasons", []) or (value["state"] == "cleanup_failed" and not row["cleanup_verified"]) for row in value["runs"]):
             raise ValueError("missing interruption evidence")
     return value
 
@@ -580,6 +590,7 @@ def summarize(value):
                 means.append(Fraction(total, count))
                 counts.append(count)
         stats = {"planned": len(measured), "warmups": len(rows)-len(measured), "statuses": {s: sum(r["status"] == s for r in measured) for s in sorted(STATUSES)}, "eligible_runs": len(means), "complete_calls_per_eligible_run": counts}
+        stats["additional_reasons"] = {"output_budget": sum("output_budget" in row.get("additional_reasons", []) for row in measured)}
         if means:
             median = statistics.median(means)
             medians[variant["name"]] = median

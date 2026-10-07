@@ -149,3 +149,74 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on m68k, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` to `tests/runtime-host.py`.
+
+## Portable agent startup and bounded breakpoint discovery
+
+Zig builds `xodb-agent` and the allocation helper for the target's baseline CPU,
+independently of the workstation CPU. The GUI can still use the selected host
+CPU. A baseline ISA does not lower the selected libc version: build against the
+remote machine's libc/ABI when those differ. Agent startup failures report the
+transport exit status or signal; SIGILL includes a CPU compatibility hint. SSH
+retains a shell so a signalled agent can report its signal-derived exit status.
+The remote account's login shell must accept POSIX shell syntax for this wrapper.
+
+Loader rendezvous discovery reads `auxv`, the executable's `PT_DYNAMIC` /
+`DT_DEBUG`, and (during early startup) only the interpreter's dynamic exports.
+It downloads no complete image. Reads are limited to 128 KiB / 128 requests and
+two seconds between requests; unsupported or uninitialized metadata leaves
+explicit loader status and resolves pending breakpoints at later ordinary stops.
+An older agent without auxiliary-vector support reports that it needs updating.
+
+Remote symbol lookup skips device, anonymous, memfd and deleted mappings.
+Automatic breakpoint resolution also skips files without executable mappings
+and has a 32 MiB, 256-file, two-second budget per pass. Explicit `find_symbol`
+uses the same symbol-only reader and caches, without a discovery time slice. Non-ELF signature failures are remembered by device,
+inode, size, mtime and ctime; replaced or modified files are checked again.
+`get_breakpoints` reports `loader_reads` and `symbol_transfer` counters, including
+negative-cache hits, skipped files, resumed bytes, cached symbol images and
+retained symbol bytes. Only ELF headers, build-ID notes, dynamic metadata,
+symbol tables and their linked string and extended-index tables cross the transport. Large code, data and DWARF
+sections do not count against a symbol search. A 64 MiB or 244 MiB image can
+therefore resolve a breakpoint without a complete download.
+
+Completed symbol views are immutable, sealed snapshots, separate from full
+binary/debug images. One incomplete file retains its ranged reads across passes;
+its inode version is checked again before resuming. No partial view is published.
+The file limit remains 256 MiB; selected symbol data is limited to 64 MiB per
+image, with 1,024 cached images and 128 MiB of cached source bytes per module collection. Unsupported or
+malformed ELF metadata is reported. Sectionless ELF dynamic-symbol lookup is not provided by this symbol-only path.
+APK lookup, code inspection and DWARF loading keep the existing full-image
+reader and its limits. Module IDs remain stable when a full view is loaded. Verified host debug companions can supply symbols using the build ID.
+
+`SymbolDiscoveryPending` means a time slice ended with more discovery to do;
+`SymbolDiscoveryBudgetExceeded` and `SymbolDiscoveryCancelled` distinguish byte/
+file-budget exhaustion and cancellation. A searched but absent symbol remains
+`BreakpointSymbolNotLoaded`. SIGINT cancels between requests. A reply already in
+flight retains the normal ten-second transport timeout, including file cleanup;
+crossing a discovery deadline never closes a healthy transport. This remains
+bounded synchronous work, so the last request can extend a pass beyond two seconds.
+
+`run_to` and frame finish run until the requested stop, another visible stop or
+user cancellation. There is no implicit wall-clock deadline. Frame finish also
+matches the selected caller's stack position; deeper recursive returns by that
+thread are progress, not wrong-thread hits. `RunToNoProgress` stops after 64 hits
+by other threads. The owned temporary probe is removed; an existing user probe
+remains. These internal stops retain truthful target
+generations. Controller lease acquisition is independent of target generations,
+so it remains available during the operation; execution and mutation still
+require a fresh generation.
+
+For an owned remote fixture, copy the matching baseline agent and fixture to the
+lab machine, then run:
+
+```sh
+xodb --runtime-ssh lab --runtime-agent ./xodb-agent \
+  --break change_value -- ./xodb-m1-fixture w
+```
+
+Press **Space** to reach `change_value`, **F10** to step, and **Space** again to
+continue. The runtime-agent route uses the normal local workspace and its panes.
+`python3 tests/remote-stops.py` checks the owned many-mapping fixture locally;
+add `--ssh-config FILE --ssh-host HOST` for an owned SSH server sharing the test
+checkout. It loads 200 real ELF libraries plus large and late-loaded libraries.
+The test does not create keys or alter SSH configuration.

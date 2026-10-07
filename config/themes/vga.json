@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "id": "user.vga",
+  "base": "builtin:vga",
+  "font": { "pixel": true },
+  "colors": {
+    "background": "#0000AA",
+    "text": "#AAAAAA",
+    "focus": "#55FFFF",
+    "warm": "#FFFF55"
+  }
+}

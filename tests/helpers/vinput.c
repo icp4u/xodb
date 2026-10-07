@@ -11,6 +11,8 @@
  *   detach         destroy the keyboard while keys may still be held
  *   m X Y          move the pointer          click X Y   move, press, release
  *   fastclick X Y  move, then press and release in one batch
+ *   fastdrag X Y X Y  left drag with all edges sent in one batch
+ *   middle X Y     middle button at X/Y; button CODE STATE sends a pointer edge
  *   w MS           wait
  */
 #define _GNU_SOURCE
@@ -119,16 +121,33 @@ int main(int argc, char **argv) {
             if (state) xkb_state_unref(state);
             state = NULL;
             settle(120);
-        } else if (!strcmp(cmd, "m") || !strcmp(cmd, "click") || !strcmp(cmd, "fastclick")) {
+        } else if (!strcmp(cmd, "fastdrag")) {
+            int x = atoi(argv[++i]), y = atoi(argv[++i]);
+            zwlr_virtual_pointer_v1_motion_absolute(pointer, t++, x, y, width, height);
+            zwlr_virtual_pointer_v1_button(pointer, t++, 272, WL_POINTER_BUTTON_STATE_PRESSED);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            x = atoi(argv[++i]); y = atoi(argv[++i]);
+            zwlr_virtual_pointer_v1_motion_absolute(pointer, t++, x, y, width, height);
+            zwlr_virtual_pointer_v1_button(pointer, t++, 272, WL_POINTER_BUTTON_STATE_RELEASED);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            settle(120);
+        } else if (!strcmp(cmd, "button")) {
+            int code = atoi(argv[++i]);
+            int pressed = atoi(argv[++i]);
+            zwlr_virtual_pointer_v1_button(pointer, t++, code, pressed ? WL_POINTER_BUTTON_STATE_PRESSED : WL_POINTER_BUTTON_STATE_RELEASED);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            settle(60);
+        } else if (!strcmp(cmd, "m") || !strcmp(cmd, "click") || !strcmp(cmd, "fastclick") || !strcmp(cmd, "middle")) {
             zwlr_virtual_pointer_v1_motion_absolute(pointer, t++, atoi(argv[i + 1]), atoi(argv[i + 2]), width, height);
             zwlr_virtual_pointer_v1_frame(pointer);
             i += 2;
             settle(80);
-            if (cmd[0] != 'm') {
-                zwlr_virtual_pointer_v1_button(pointer, t++, 272, WL_POINTER_BUTTON_STATE_PRESSED);
+            if (strcmp(cmd, "m")) {
+                unsigned button = !strcmp(cmd, "middle") ? 274 : 272;
+                zwlr_virtual_pointer_v1_button(pointer, t++, button, WL_POINTER_BUTTON_STATE_PRESSED);
                 zwlr_virtual_pointer_v1_frame(pointer);
                 if (cmd[0] == 'c') settle(60);
-                zwlr_virtual_pointer_v1_button(pointer, t++, 272, WL_POINTER_BUTTON_STATE_RELEASED);
+                zwlr_virtual_pointer_v1_button(pointer, t++, button, WL_POINTER_BUTTON_STATE_RELEASED);
                 zwlr_virtual_pointer_v1_frame(pointer);
                 wl_display_flush(display);
                 settle(80);

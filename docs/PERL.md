@@ -12,16 +12,24 @@ CPAN packages, or Perl installation are needed to build xodb itself.
 scripts/demo-perl
 ```
 
-Press **Space** to stop at `Perl_av_store`, then **E**, type `val`, **Enter**.
+Press **Space** to stop at `Perl_av_store`, then **Shift+E**, type `val`, **Enter**.
+Add `av` the same way. These live rows update at each stop; `val` says
+`not in scope here` in `Perl_av_delete` and recovers on the next store.
+**E** still adds an activation-pinned watch; **Shift+L** converts a selected row.
 The new element is **undef (refcnt 1, flags 0x0)**: the assignment of 42 happens
 *after* this call. Stale bits in `sv_u` are not a value. `av` displays an array
 summary. A defined scalar at a later stop displays `IV 42` once its IOK flag is
 set. The automated XS fixture also supplies an already initialized IV 42.
 
 The visualizer shows IV/UV, NV, escaped PV bytes, one reference level, at most
-eight AV slots or HV entries, and CV/GV names. Refcount and flags remain visible.
+eight AV slots or HV entries, and package-qualified CV/GV names. Blessed values
+also show their full stash name (for example `Fixture::Widget HV (2 entries)`);
+MCP exposes it as `value.visualization.perl.class_name`. A reference's class
+comes from its one-level referent preview. Refcount and flags remain visible.
 MCP includes bounded elements under `value.visualization.perl.items`. GUI watches
 show the same summary; expanding a native pointer still exposes its DWARF fields.
+Locals labels `sv_u` as `raw union (not a value)`; the field expression remains
+usable for deliberate raw inspection.
 PV previews read at most 128 bytes; shortened output is marked `truncated`.
 Unmapped memory, freed scalars, inconsistent flags and unavailable names have
 explicit diagnostics. Magic is never invoked: these are stored values, not the
@@ -132,6 +140,13 @@ Deep context stacks are read from their newest end. At most 128 frames and
 or `ContextLimit`. Source filenames are cached within one read and a failed or
 truncated filename is null. Block eval, try, G_EVAL and ithread entry may have
 no eval CV; only string eval requires one.
+`try {}` contexts are labeled `(try)` with `context_type: "try"`, rather than
+being presented as eval calls. They remain visible as stopped-runtime evidence,
+even though Perl's `caller()` omits them.
+
+Layout discovery scans at most 64 DWARF compilation units and 200,000 top-level
+entries. Exhausting those bounds reports `PerlDwarfUnitLimit` or `PerlDwarfLimit`;
+finishing the search without the required types reports `PerlDwarfTypesUnavailable`.
 
 Magical scalar previews carry `stored_value_only` and the diagnostic
 `StoredValueOnlyMagicNotInvoked`; no magic is invoked. PV previews report the

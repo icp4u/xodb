@@ -67,7 +67,7 @@ accepts appearance settings but never opens the selected theme file.
 ```
 
 Only `version` is required. The default base is `builtin:dark`; bases must be
-one of the three built-in presets. File inheritance is unsupported. Optional
+one of the four built-in presets. File inheritance is unsupported. Optional
 `id` is 1–64 printable ASCII characters without spaces. The file is limited to
 64 KiB; duplicate/unknown keys, unsupported versions and invalid values are
 rejected. Diagnostics identify the selected file and offending field.
@@ -112,3 +112,44 @@ edits or the former hotkey, small windows, imported and remote views, and
 headless operation. The GUI
 release tier includes this test. Existing debugger/profile/remote and renderer
 fault checks continue to cover their controls and evidence behavior.
+
+## VGA look and pixel fonts
+
+`builtin:vga` opts into a DOS-style blue background, light-grey text, cyan and
+yellow emphasis, square selections and a block expression cursor. It keeps
+breakpoints, unavailable values, stale evidence and loss labels visible. The
+original dark theme remains the default.
+
+For the matching 8×16 font, download the Linux pack from the
+[Oldschool PC Font Resource](https://int10h.org/oldschool-pc-fonts/download/),
+by [VileR](https://int10h.org/oldschool-pc-fonts/). The font remakes are licensed
+under [CC BY-SA 4.0](https://int10h.org/oldschool-pc-fonts/readme/#legal_stuff).
+Extract `ttf - Px (pixel outline)/Px437_IBM_VGA_8x16.ttf` into a directory of
+your choice; no font files are bundled with xodb.
+
+```sh
+xodb --theme builtin:vga --font './fonts/Px437_IBM_VGA_8x16.ttf' -- path/to/program
+```
+
+Use **Space** to continue, **B** for breakpoints and **E** for the expression
+entry with its block cursor. `PxPlus_IBM_VGA_8x16.ttf` from the same pack provides
+more Unicode glyphs. The 437 variant uses a missing-glyph box for characters it
+does not contain.
+
+The theme selects monochrome FreeType rendering at **16 physical pixels**, the
+VGA 8×16 font's native height. Glyph coverage is binary and shaped positions
+snap to integer pixels. Scalable pixel-outline fonts and matching monochrome 16-pixel
+bitmap strikes work; other bitmap strike sizes fall back if FreeType cannot
+select 16 pixels. Embedded grayscale/color bitmaps are unsupported in pixel mode
+and use the existing missing-glyph fallback (or default-font retry if initialization
+fails). There is no fractional font scaling or change to pane sizes.
+With no `--font`, VGA uses the normal installed font in monochrome mode. A missing
+or invalid selected font prints a diagnostic and retries the configured default
+font. If that font also fails, startup reports the error.
+
+[config/themes/vga.json](../config/themes/vga.json) is an editable example. A
+version-1 theme can set `"font": { "pixel": true }` independently of its colors;
+`false` restores smooth glyphs. The default is inherited from its built-in base
+(VGA uses `true`, the other presets use `false`). The only font field is `pixel`,
+a boolean. Fonts and themes are selected once at startup, including remote GUI
+clients; there are no theme hotkeys or live reload.

@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# Native CPython demo: readable Python values and the Python stack at native
+# stops, read from stopped memory without running code in the target.
+#
+#   scripts/demo-python [XODB OPTIONS]   GUI attached to examples/python-demo.py
+#   scripts/demo-python stack [EXPR...]  from another terminal, while stopped:
+#                                        print the Python stack and values
+#
+# XODB=path overrides the binary (default: ./zig-out/bin/xodb from this
+# checkout); PYTHON=path the interpreter (default: a DWARF build in /opt/debug).
+set -euo pipefail
+demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$demo_root"
+xodb=${XODB:-zig-out/bin/xodb}
+python=${PYTHON:-/opt/debug/bin/python3}
+# A private per-user directory holds the shared-session socket.
+session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-python-$(id -u)"
+socket="$session_dir/session.sock"
+
+if [[ "${1-}" == stack ]]; then
+    shift
+    if [[ ! -S "$socket" ]]; then
+        printf '%s\n' "No running demo session at $socket; start scripts/demo-python first" >&2
+        exit 1
+    fi
+    exec python3 - "$socket" "$demo_root" "$@" <<'PY'
+import json, os, socket, sys
+path, root, expressions = sys.argv[1], sys.argv[2], sys.argv[3:] or ['key', 'value']
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(path)
+stream = connection.makefile('rwb', buffering=0)
+sequence = 0
+def call(method, params):
+    global sequence
+    sequence += 1
+    stream.write((json.dumps({'jsonrpc': '2.0', 'id': sequence, 'method': method, 'params': params}) + '\n').encode())
+    while True:
+        line = stream.readline()
+        if not line:
+            sys.exit('xodb closed the session')
+        reply = json.loads(line)
+        if reply.get('id') == sequence:
+            return reply
+def tool(name, fatal=True, **arguments):
+    reply = call('tools/call', {'name': name, 'arguments': arguments})
+    problem = reply['error']['message'] if 'error' in reply else reply['result']['content'][0]['text'] if reply['result'].get('isError') else None
+    if problem and fatal:
+        sys.exit(name + ': ' + problem)
+    return problem if problem else reply['result']['structuredContent']
+call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'demo-python', 'version': '1'}})
+stream.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+session = tool('get_session')
+if session['state'] != 'stopped':
+    sys.exit('The demo is running: press Space in xodb to stop it, then run this again.')
+tid = next((t['tid'] for t in session['threads'] if t['reason'] == 'breakpoint'), session['threads'][0]['tid'])
+def shown(path):
+    return os.path.relpath(path, root) if path and path.startswith(root + '/') else path
+for segment in tool('get_language_stack', tid=tid, language='python')['segments']:
+    anchor = segment['anchor']
+    where = f"native frame #{anchor['frame']} {anchor['symbol'] or '(unnamed)'}" if anchor else 'no native anchor'
+    instance = segment['runtime_instance']
+    print(f"Python {segment['runtime']['version']} interpreter {instance['address'] if instance else '?'}: "
+          f"{segment['state']}{' (' + segment['reason'] + ')' if segment['reason'] else ''}, anchored at {where}")
+    for frame in segment['frames']:
+        print(f"  {frame['name']:<12} {shown(frame['file'])}:{frame['line']}")
+for expression in expressions:
+    value = tool('evaluate_expression', False, tid=tid, frame=0, expression=expression)
+    if isinstance(value, str):
+        print(f"{expression}: not available in this native frame ({value})")
+        continue
+    value = value['value']
+    print(f"{expression} = {value['display']}")
+    for item in (((value.get('visualization') or {}).get('python') or {}).get('items') or []):
+        print(f"    {item['key']}: {item['display']}")
+PY
+fi
+
+if [[ ! -x "$xodb" ]]; then
+    printf '%s\n' "Build xodb first with ./scripts/build, or set XODB=/path/to/xodb" >&2
+    exit 1
+fi
+if [[ ! -x "$python" ]]; then
+    printf '%s\n' "Needs a CPython with DWARF at $python (or set PYTHON=...)" >&2
+    exit 1
+fi
+mkdir -p -m 700 "$session_dir"
+if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
+    printf '%s\n' "$session_dir must be a private directory owned by you" >&2
+    exit 1
+fi
+if [[ -S "$socket" ]] && python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$socket" 2>/dev/null; then
+    printf '%s\n' "Another demo session is running at $socket" >&2
+    exit 1
+fi
+rm -f "$socket"
+
+# examples/python-demo.py stores a fresh list into a dict from nested
+# functions. `table[key] = items` is specialized to STORE_SUBSCR_DICT, which
+# calls _PyDict_SetItem_Take2(mp, key, value) on every iteration. The
+# handshake ensures the loop is running before xodb attaches.
+coproc PYTHON_DEMO {
+    exec "$python" examples/python-demo.py
+}
+demo_pid=$PYTHON_DEMO_PID
+cleanup() {
+    kill "$demo_pid" 2>/dev/null || :
+    wait "$demo_pid" 2>/dev/null || :
+    rm -f "$socket"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+IFS= read -r -t 10 ready_pid <&"${PYTHON_DEMO[0]}"
+if [[ "$ready_pid" != "$demo_pid" ]]; then
+    printf '%s\n' 'Unexpected Python startup handshake' >&2
+    exit 1
+fi
+cat >&2 <<'TIPS'
+Try: Space (stop in _PyDict_SetItem_Take2) · E value Return (list (8 items))
+     E key Return (str 'answer') · E mp Return (dict (2 items)) · Space (next round)
+     In another terminal: scripts/demo-python stack   (record <- tick <- <module>,
+     with file:line, plus the list's items: the round number, a big int, a float,
+     'héllo', bytes, None, True and a tuple)
+TIPS
+set -x
+"$xodb" --session-socket "$socket" "$@" --attach "$demo_pid" --break _PyDict_SetItem_Take2

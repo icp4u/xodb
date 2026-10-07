@@ -80,7 +80,11 @@ enum xrt_status {
     XRT_REGISTER_NOT_WRITABLE,
     XRT_UNSUPPORTED_CONTROL,
     XRT_UNSUPPORTED_MODE,
-    XRT_AMBIGUOUS_MATCH
+    XRT_AMBIGUOUS_MATCH,
+    /* Host-side discovery policy results; never sent by an older agent. */
+    XRT_DISCOVERY_CANCELLED,
+    XRT_DISCOVERY_PENDING,
+    XRT_DISCOVERY_BUDGET
 };
 
 #endif

@@ -124,6 +124,8 @@ pub const Workspace = struct {
     /// Owner loop consumes this even when several toggles restore the old scope.
     shared_scope_changed: bool = false,
     imported: @import("imported.zig").View = .{},
+    logical_frames: @import("frames.zig").View = .{},
+    jit_requested: ?struct { capture: u64, revision: u64, evidence: u64, ordinal: usize } = null,
     source: []const u8 = "",
     source_path: []const u8 = "No source file selected",
     source_line: i32 = 0,
@@ -212,6 +214,7 @@ pub const Workspace = struct {
 
     const LocalRow = struct { name: []const u8, value: model.ValueSummary };
     pub fn deinit(self: *Workspace) void {
+        self.logical_frames.deinit();
         self.flow.deinit();
         self.flame.deinit();
         self.timeline_source.deinit();
@@ -335,10 +338,40 @@ pub const Workspace = struct {
             event.* = .{ .kind = .release };
         }
     }
+    fn activeEditor(self: *Workspace, session: *Session) ?*watch_ui.Editor {
+        if (self.logical_frames.open or (session.comparison != null and self.comparison.open) or session.imported != null) return null;
+        if (self.invocations.open) return if (self.invocations.editor.open) &self.invocations.editor else null;
+        if (session.process_tree != null and self.process_panel.open) return null;
+        if (self.allocation_save_editor.open) return &self.allocation_save_editor;
+        if (self.allocation_panel.open or self.syscall_panel.open or self.stop_panel.open or self.static_panel.open) return null;
+        if (self.inline_panel.open) return if (self.inline_panel.editor.open) &self.inline_panel.editor else null;
+        if (self.inspection_panel.open) return if (self.inspection_panel.editor.open) &self.inspection_panel.editor else null;
+        if (self.probes_panel.open) return if (self.probes_panel.editor.open) &self.probes_panel.editor else null;
+        if (self.editor.open) return &self.editor;
+        if (self.show_profile and self.setup.open and self.setup.editor.open) return &self.setup.editor;
+        return null;
+    }
+    fn clipboardFocus(self: *Workspace, w: *Window, session: *Session) void {
+        watch_ui.Editor.focus(w, self.activeEditor(session));
+        self.setup.syncEditor();
+    }
     /// Applies the queued key and button events one at a time, in order, then the
     /// pointer state. A click is handled at the position where it happened.
     pub fn input(self: *Workspace, w: *Window, session: *Session) void {
         self.sharedScopeInput(w, session);
+        self.clipboardFocus(w, session);
+        defer self.clipboardFocus(w, session);
+        if (self.show_profile and self.inspector.open and session.frames.hasJit()) if (session.profile) |capture| {
+            const key: @typeInfo(@FieldType(Workspace, "jit_requested")).optional.child = .{ .capture = capture.id, .revision = capture.revision, .evidence = session.frames.evidence_revision, .ordinal = self.inspector.ordinal };
+            if (capture.collector == null and !capture.archive_busy and !session.frames.busy() and (self.jit_requested == null or !std.meta.eql(self.jit_requested.?, key))) {
+                session.frames.prepareJit(capture, if (session.artifact) |artifact| artifact.source else null, self.inspector.ordinal, 1) catch |err| {
+                    self.status = @errorName(err);
+                };
+                self.jit_requested = key;
+            }
+        };
+
+        if (self.logical_frames.open) return self.logical_frames.input(w, &session.frames);
         if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
         if (self.invocations.open) {
             self.invocations.input(w, session);
@@ -399,14 +432,16 @@ pub const Workspace = struct {
         w.mouse_down = self.dragging or down; // replay a pending drag release in order
         while (w.input.next()) |event| {
             if (w.closing) break;
+            self.clipboardFocus(w, session);
+            if (self.activeEditor(session)) |editor| if (editor.clipboard(w, event)) continue;
             switch (event.kind) {
                 .press, .repeat => {
-                    if (session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
+                    if (self.activeEditor(session) == null and session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
                         self.comparison.open = true;
                         w.dirty = true;
                         continue;
                     }
-                    if ((session.observations.capture != null or session.observation_archive != null) and event.plain() and event.kind == .press and event.shortcut == 'n') {
+                    if (self.activeEditor(session) == null and (session.observations.capture != null or session.observation_archive != null) and event.plain() and event.kind == .press and event.shortcut == 'n') {
                         self.invocations.open = true;
                         w.dirty = true;
                         // Later queued input belongs to the browser.
@@ -481,6 +516,11 @@ pub const Workspace = struct {
                             continue;
                         }
                     }
+                    if (!self.show_profile and self.show_watch and self.watch_focus and event.kind == .press and event.plain() and event.mods.shift and event.shortcut == 'l') {
+                        self.toggleWatchMode(session);
+                        w.dirty = true;
+                        continue;
+                    }
                     if (self.show_profile and self.setup.open) {
                         const snapshot = self.thread_rows.snapshot(session);
                         if (self.setup.key(event, &snapshot, .{})) |action| {
@@ -488,9 +528,15 @@ pub const Workspace = struct {
                             continue;
                         }
                     }
+                    if (event.kind == .press and event.plain() and event.shortcut == 'l' and (session.frames.count > 0 or session.frames.job != null or session.frames.attachment.failure != null)) {
+                        self.logical_frames.open = true;
+                        w.dirty = true;
+                        return self.logical_frames.input(w, &session.frames);
+                    }
                     const code = binding(event);
                     if (code == 0) continue;
                     self.step(w, session, false, code);
+                    if (code == 18 and self.editor.open) self.editor.mode = if (event.mods.shift) .live else .pinned;
                 },
                 .button_press, .button_release => {
                     if (event.code != 272) continue;
@@ -1254,7 +1300,7 @@ pub const Workspace = struct {
                 }
                 const frame = self.frames[self.selected_frame];
                 const tid = session.target.threadSlice()[self.selected].tid;
-                _ = self.watch.add(text, watch_ui.FrameId.of(tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = session.target.threadSlice()[self.selected].id }, session.target.snapshot().generation)) catch |err| {
+                _ = self.watch.addMode(text, watch_ui.FrameId.of(tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = session.target.threadSlice()[self.selected].id }, session.target.snapshot().generation), self.editor.mode) catch |err| {
                     self.editor.message = switch (err) {
                         error.WatchListFull => "The watch list is full (16); Delete one first",
                         error.ExpressionTooLong => "Expressions are limited to 256 characters",
@@ -1262,12 +1308,29 @@ pub const Workspace = struct {
                     };
                     return;
                 };
-                self.status = "Watch added; later CFA matches cannot prove call lifetime between stops";
+                self.status = if (self.editor.mode == .live) "Live display added; updates in the selected frame at each stop / Shift+L pins it" else "Watch added; later CFA matches cannot prove call lifetime between stops / Shift+L makes it live";
                 self.editor.open = false;
                 self.watch_focus = true;
                 self.refreshWatch(session);
             },
         }
+    }
+    fn toggleWatchMode(self: *Workspace, session: *Session) void {
+        const index = self.watch.selected orelse return;
+        if (session.target.snapshot().state != .stopped) {
+            self.status = "Pause in the desired frame to change the watch mode";
+            return;
+        }
+        self.refresh(session);
+        if (self.frames.len == 0 or session.target.snapshot().thread_count == 0) {
+            self.status = "No selected frame to bind the watch";
+            return;
+        }
+        const thread = session.target.threadSlice()[self.selected];
+        const frame = self.frames[self.selected_frame];
+        self.watch.toggleMode(index, watch_ui.FrameId.of(thread.tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = thread.id }, session.target.snapshot().generation));
+        self.status = if (self.watch.entries[index].mode == .live) "Live display: follows the selected frame / Shift+L pins it" else "Watch pinned to the selected frame / Shift+L makes it live";
+        self.refreshWatch(session);
     }
     /// Top of the bottom row (threads, stack, events/watch). Short windows give
     /// the watch view more rows; the source and assembly panes shrink instead.
@@ -1276,11 +1339,14 @@ pub const Workspace = struct {
     }
     fn refreshWatch(self: *Workspace, session: *Session) void {
         if (self.watch.count == 0) return;
+        self.watch.setDisplayFrame(if (self.selected < session.target.snapshot().thread_count) .{ .tid = session.target.threadSlice()[self.selected].tid, .index = self.selected_frame } else null);
         var source = WatchSource{ .session = session };
         defer source.scratch.deinit();
         self.watch.refresh(&source);
     }
     fn refresh(self: *Workspace, session: *Session) void {
+        // Live displays use the selected frame after this refresh clamps it.
+        defer self.refreshWatch(session);
         const busy = session.allocations.preparing();
         const collecting = session.allocations.collecting();
         if (self.allocation_busy and !busy) self.status = if (session.allocations.err) |err| @errorName(err) else if (collecting) "Allocation capture ready; Space continues" else "Allocation preparation ended";
@@ -1289,7 +1355,6 @@ pub const Workspace = struct {
         self.allocation_collecting = collecting;
         if (self.was_running_to and session.run_to == null) self.status = if (session.target.snapshot().state == .stopped) "Run-to operation stopped" else "Run-to operation ended";
         self.was_running_to = session.run_to != null;
-        self.refreshWatch(session);
         if (session.target.snapshot().thread_count > 0) {
             self.selected %= session.target.snapshot().thread_count;
             if (session.target.snapshot().state == .stopped and session.target.threadSlice()[self.selected].state == .exited) {
@@ -1384,7 +1449,11 @@ pub const Workspace = struct {
             for (structure.fields[0..@min(8, structure.fields.len)]) |field| {
                 const expression = std.fmt.allocPrint(a, "{s}{s}{s}", .{ v.name, if (is_pointer) "->" else ".", field.name }) catch continue;
                 const address = std.math.add(u64, base, field.offset) catch continue;
-                const value = session.summarize(a, .{ .type = field.type, .address = address }) catch continue;
+                var value = session.summarize(a, .{ .type = field.type, .address = address }) catch continue;
+                if (summary.visualization) |shown| {
+                    if (shown.perl != null and std.mem.eql(u8, field.name, "sv_u"))
+                        value.display = std.fmt.allocPrint(a, "raw union (not a value): {s}", .{value.display}) catch continue;
+                }
                 rows.append(a, .{ .name = expression, .value = value }) catch {};
             }
         }
@@ -1470,6 +1539,13 @@ pub const Workspace = struct {
         }
     }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+        if (self.logical_frames.open) {
+            session.profile_view_visible = false;
+            self.animating = session.frames.busy();
+            try self.logical_frames.draw(r, font, w, &session.frames);
+            return self.drawSharedOwnership(r, font, w, session);
+        }
+
         if (session.comparison) |job| if (self.comparison.open) {
             session.profile_view_visible = false;
             self.animating = !job.done.load(.acquire);
@@ -1583,7 +1659,9 @@ pub const Workspace = struct {
                         const red = style.fade(theme.breakpoint, 0.13);
                         try r.shape(row, red, .{ .colors = .{ red, style.fade(red, 0), red, style.fade(red, 0) } });
                     }
-                    if (self.cursor_line == line_number) try r.rect(row, style.fade(theme.focus, 0.08));
+                    if (self.cursor_line == line_number) {
+                        if (@import("../appearance.zig").active.block_selection) try style.focus(r, row, 0, 1) else try r.rect(row, style.fade(theme.focus, 0.08));
+                    }
                     if (current) {
                         try style.threadLine(r, row, if (self.browse_address != null) theme.focus else thread_color, self.alive, 16);
                         try r.text(font, 24, y, if (self.browse_address != null) "\u{25c6}" else "\u{25b6}", if (self.browse_address != null) theme.focus else thread_color);
@@ -1659,7 +1737,7 @@ pub const Workspace = struct {
             try self.timeline.draw(r, font, .{ .x = 8, .y = bottom, .w = width - 16, .h = height - bottom - 37 }, timeline_data);
             if (self.inspector.open) if (session.profile) |capture| {
                 self.inspector.sync(capture, self.flame.selection.filter);
-                try self.inspector.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, capture, inspectorStack(session, self.inspector.ordinal));
+                try self.inspector.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, capture, inspectorStack(session, self.inspector.ordinal), if (session.frames.jit_view) |view| view.sample(capture, self.inspector.ordinal, session.frames.evidence_revision) else null);
             };
             if (self.setup.open) {
                 const snapshot = self.thread_rows.snapshot(session);
@@ -1670,7 +1748,9 @@ pub const Workspace = struct {
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
-        if (self.shared_clients) |count| {
+        if (session.frames.attachment.failure) |err| {
+            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ @tagName(session.frames.attachment.state), @errorName(err) });
+        } else if (self.shared_clients) |count| {
             if (self.shared_controller) |owner| {
                 try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(session.agent_scope), owner, count });
             } else {
@@ -1695,7 +1775,7 @@ pub const Workspace = struct {
             const b = gpu.Rect{ .x = 32, .y = 102, .w = @max(0, width - 64), .h = 92 };
             try style.box(r, b, theme.background, theme.focus, @splat(6));
             try r.textFit(font, b.x + 10, b.y + 8, b.w - 20, "Save allocation archive: enter a new file path; Enter saves, Esc cancels", theme.text);
-            try r.textFit(font, b.x + 10, b.y + 34, b.w - 20, self.allocation_save_editor.text.slice(), theme.text);
+            try self.allocation_save_editor.draw(r, font, .{ .x = b.x + 10, .y = b.y + 34, .w = b.w - 20, .h = 22 });
             try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.allocation_save_editor.message, theme.warm);
         }
         if (session.process_tree) |tree| try self.process_panel.draw(tree, r, font, width, height);
@@ -1732,7 +1812,7 @@ pub const Workspace = struct {
         const events_rect = gpu.Rect{ .x = left + 2, .y = bottom, .w = width - left - 10, .h = height - bottom - 37 };
         if (self.show_watch) {
             const wide = events_rect.w > 640;
-            try pane(r, font, events_rect, "WATCH", if (self.editor.open) "Return add  Esc cancel  Up/Down history" else if (wide) "E add  V events  Del/Bksp remove  Return expand  Wheel/[] scroll  PgDn page  W write watch" else "E add  V events  Del  Return");
+            try pane(r, font, events_rect, "WATCH", if (self.editor.open) (if (self.editor.mode == .live) "Live / Up/Down history  Return add  Esc cancel" else "Pinned / Up/Down history  Return add  Esc cancel") else if (wide) "E/Shift+E add  V events  [] scroll  Shift+L convert  Del remove  Return expand  W write" else "E/Shift+E add  V events  [] scroll");
             if (self.watch_focus) try r.rect(.{ .x = events_rect.x + 1, .y = events_rect.y + 32, .w = events_rect.w - 2, .h = 2 }, theme.focus);
             self.watch_rect = events_rect;
             try watch_ui.draw(&self.watch, &self.editor, r, font, r.clip, &self.watch_hits);

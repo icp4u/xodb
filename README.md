@@ -51,9 +51,11 @@ selected block's disassembly, decoded `VALUE` locals, threads, stack, and the
 event timeline.*
 
 Keys, in brief: **F10** step over · **G** graph/asm · **P** profile · **F**
-flames · **E** expression entry · **V** watch/events · **Tab** locals/registers
+flames · **E** pinned expression · **Shift+E** live display · **Shift+L** convert selected watch · **V** watch/events · **Tab** locals/registers
 · **J/K** threads · **D** detach · **F8** grant or yank agent control.
-Letter shortcuts follow your active keyboard layout.
+Letter shortcuts follow your active keyboard layout. In text fields, **Ctrl+V**
+pastes, **middle-click** pastes the primary selection, and **Ctrl+C** copies.
+See [text editing](docs/GUIDE.md#text-editing-and-clipboard).
 
 ## What actually works today
 

@@ -1,7 +1,10 @@
+#define _GNU_SOURCE
 #include "../src/language/perl.h"
 #include <assert.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 /* An owned synthetic address space; invalid addresses never reach a real
  * pointer. Offsets intentionally differ from a real interpreter layout. */
@@ -202,6 +205,83 @@ static void malformed_values(struct xpl_layout *l) {
     xpl_value_read(l, &r, 0x1100, &v);
     assert(!strcmp(v.reason, "PerlReadLimit") && attempts == 0);
 }
+static void names(struct xpl_layout *l) {
+    memset(memory, 0, sizeof memory);
+    /* A nested stash, a GV belonging to it and a blessed hash referent. */
+    sv(0x6000, 12 | 0x02000000, 0x7000, 0);
+    uint64_t aux = 0x7000 + l->fields[XPL_HVAUX].offset;
+    field(l, aux, XPL_HVNAME, 0x7800);
+    field(l, aux, XPL_HVNAMECOUNT, 0);
+    put(0x7800, strlen("Fixture::Nested::Widget"), 4);
+    str(0x7804, "Fixture::Nested::Widget");
+    sv(0x1100, 9, 0x2000, 0);
+    field(l, 0x2000, XPL_GVSTASH, 0x6000);
+    field(l, 0x2000, XPL_GVNAME, 0x3000);
+    put(0x3000, 5, 4); str(0x3004, "entry");
+    struct xpl_reader r = reader();
+    struct xpl_value v;
+    xpl_value_read(l, &r, 0x1100, &v);
+    assert(!v.reason && !strcmp(v.display, "Fixture::Nested::Widget::entry"));
+    sv(0x5100, 12 | 0x00100000, 0x5200, 0);
+    field(l, 0x5200, XPL_HVKEYS, 0); field(l, 0x5200, XPL_HVMAX, 7);
+    field(l, 0x5200, XPL_BLESS_STASH, 0x6000);
+    sv(0x5600, 0x801, 0, 0x5100);
+    r = reader(); xpl_value_read(l, &r, 0x5600, &v);
+    assert(!v.reason && !strcmp(v.class_name, "Fixture::Nested::Widget"));
+    assert(strstr(v.display, "Fixture::Nested::Widget RV ->") == v.display);
+    assert(!strcmp(v.items[0].display, "Fixture::Nested::Widget HV (0 entries)"));
+    /* HvNAME aliases are a bounded single-pointer indirection. */
+    field(l, aux, XPL_HVNAMECOUNT, 2); field(l, aux, XPL_HVNAME, 0x7900);
+    put(0x7900, 0x7800, 8);
+    r = reader(); xpl_value_read(l, &r, 0x5100, &v);
+    assert(!v.reason && !strcmp(v.class_name, "Fixture::Nested::Widget"));
+    size_t reads = attempts;
+    for (size_t i = 1; i <= reads; ++i) {
+        fail_at = i; r = reader(); xpl_value_read(l, &r, 0x5100, &v); assert(v.reason);
+    }
+    fail_at = 0;
+    field(l, 0x5200, XPL_BLESS_STASH, 0);
+    r = reader(); xpl_value_read(l, &r, 0x5100, &v);
+    assert(!strcmp(v.reason, "ClassNameUnavailable") && !v.class_name[0]);
+    put(0x3000, 192, 4);
+    r = reader(); xpl_value_read(l, &r, 0x1100, &v);
+    assert(!strcmp(v.reason, "GvNameUnavailable") && !strcmp(v.display, "GV (name unavailable)"));
+}
+static void le(unsigned char *out, uint64_t n, size_t size) {
+    for (size_t i = 0; i < size; ++i) out[i] = (unsigned char)(n >> (8 * i));
+}
+static void layout_units(unsigned units, const char *expected) {
+    /* An ELF with only empty DWARF4 compilation units. The sixty-fourth
+     * unit is EOF in one case and a real search limit in the other. */
+    unsigned char elf[1280] = {0};
+    memcpy(elf, "\177ELF\2\1\1", 7);
+    le(elf+16, 1, 2); le(elf+18, 62, 2); le(elf+20, 1, 4);
+    le(elf+40, 1024, 8); le(elf+52, 64, 2);
+    le(elf+58, 64, 2); le(elf+60, 4, 2); le(elf+62, 1, 2);
+    static const char names[] = "\0.shstrtab\0.debug_abbrev\0.debug_info\0";
+    memcpy(elf+64, names, sizeof names);
+    memcpy(elf+128, "\1\21\0\0\0\0", 6);
+    for (unsigned i = 0; i < units; ++i) {
+        unsigned char *cu = elf+160+i*12;
+        le(cu, 8, 4); le(cu+4, 4, 2); cu[10]=8; cu[11]=1;
+    }
+    const unsigned section_names[] = {1, 11, 25}, offsets[] = {64, 128, 160};
+    const unsigned sizes[] = {sizeof names, 6, units*12};
+    for (unsigned i = 0; i < 3; ++i) {
+        unsigned char *sh = elf+1024+(i+1)*64;
+        le(sh, section_names[i], 4); le(sh+4, i==0 ? 3 : 1, 4);
+        le(sh+24, offsets[i], 8); le(sh+32, sizes[i], 8); le(sh+48, 1, 8);
+    }
+    int fd = memfd_create("perl-layout-test", MFD_CLOEXEC); assert(fd>=0);
+    assert(write(fd, elf, sizeof elf)==sizeof elf);
+    assert(lseek(fd, 0, SEEK_SET)==0);
+    Dwarf *dw = dwarf_begin(fd, DWARF_C_READ); assert(dw);
+    unsigned char id[] = {1}, version[] = {5,44,0};
+    struct xpl_layout l;
+    const char *why = xpl_layout_build(dw, id, sizeof id, version, &l);
+    assert(why && !strcmp(why, expected));
+    dwarf_end(dw); close(fd);
+}
 static void stacks(struct xpl_layout *l) {
     memset(memory, 0, sizeof memory);
     const uint64_t interp = 0x1100, si = 0x2000, array = 0x3000, cv = 0x4000, body = 0x5000, cop = 0x6000;
@@ -249,6 +329,11 @@ static void stacks(struct xpl_layout *l) {
     r = reader();
     xpl_stack_read(l, &r, interp, &out);
     assert(!strcmp(out.frames[0].reason, "EvalCvUnavailable"));
+    field(l, array + 4 * l->context_size, XPL_CXTYPE, 0x8b);
+    field(l, array + 4 * l->context_size, XPL_EVALOP, 407u << 7);
+    r = reader(); xpl_stack_read(l, &r, interp, &out);
+    assert(!out.reason && !out.frames[0].reason && out.frames[0].context_type == 0x8b);
+    assert(!strcmp(out.frames[0].name, "(try)"));
     field(l, array + 4 * l->context_size, XPL_CXTYPE, 9);
     // Terminator at the final byte of a readable page does not require a
     // following page; an unreadable pathname never leaves a plausible prefix.
@@ -319,6 +404,10 @@ int main(void) {
     assert(!strcmp(xpl_layout_check(&l, l.build_id, 3, version), "PerlVersionMismatch"));
     values(&l);
     malformed_values(&l);
+    names(&l);
+    layout_units(1, "PerlDwarfTypesUnavailable");
+    layout_units(64, "PerlDwarfTypesUnavailable");
+    layout_units(65, "PerlDwarfUnitLimit");
     stacks(&l);
     puts("Perl memory reader: values, stale undef bits, bounded previews, identity refusal, corrupt contexts and "
          "every-read failure passed");

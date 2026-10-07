@@ -49,6 +49,7 @@ enum xpl_field {
     XPL_HENEXT,
     XPL_HEKEY,
     XPL_HEVAL,
+    XPL_BLESS_STASH,
     XPL_FIELD_COUNT
 };
 struct xpl_field_info {
@@ -98,6 +99,7 @@ struct xpl_value {
     uint64_t address, body, count;
     uint32_t flags, refcount;
     char type[16], display[256];
+    char class_name[256]; /* verified stash name; referent's class for an RV */
     uint8_t bytes[128];
     size_t byte_count, item_count;
     int truncated, stored_value_only, utf8;

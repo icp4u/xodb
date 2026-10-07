@@ -44,6 +44,12 @@ fn text(a: A, bytes: []const u8) ![]const u8 {
 fn reason(a: A, ptr: [*c]const u8) !?[]const u8 {
     return if (ptr == null) null else try a.dupe(u8, std.mem.span(ptr));
 }
+fn layoutError(message: [*c]const u8) anyerror {
+    inline for (.{ error.PerlDwarfUnitLimit, error.PerlDwarfLimit, error.PerlMalformedDwarf, error.PerlDwarfTypesUnavailable }) |err| {
+        if (std.mem.eql(u8, std.mem.span(message), @errorName(err))) return err;
+    }
+    return error.PerlLayoutUnsupported;
+}
 fn profile(session: *model.Session, module: *Module) !*const c.struct_xpl_layout {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (session.target.arch() != .x86_64) return error.PerlArchitectureUnsupported;
@@ -65,8 +71,8 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xpl_layout
     if (!std.mem.eql(u8, &version, &.{ 5, 44, 0 })) return error.PerlVersionUnsupported;
     if (module.perl_layout == null) {
         var layout: c.struct_xpl_layout = undefined;
-        if (c.xpl_layout_build((try module.debugInfo()).dwarf, id.ptr, id.len, &version, &layout) != null)
-            return error.PerlLayoutUnsupported;
+        const failure = c.xpl_layout_build((try module.debugInfo()).dwarf, id.ptr, id.len, &version, &layout);
+        if (failure != null) return layoutError(failure);
         module.perl_layout = layout;
     }
     if (c.xpl_layout_check(&module.perl_layout.?, id.ptr, id.len, &version) != null) return error.PerlBuildIdMismatch;
@@ -144,6 +150,7 @@ fn segment(session: *model.Session, a: A, frame: model.Frame, anchored: bool) !S
             9 => "sub",
             10 => "format",
             11 => "eval",
+            0x8b => "try",
             else => "main",
         },
         .cv = try hex(a, f.cv),
@@ -337,6 +344,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .perl = .{
             .type = try text(a, std.mem.sliceTo(&raw.type, 0)),
             .display = try text(a, std.mem.sliceTo(&raw.display, 0)),
+            .class_name = if (raw.class_name[0] != 0) try text(a, std.mem.sliceTo(&raw.class_name, 0)) else null,
             .refcount = raw.refcount,
             .flags = raw.flags,
             .stored_value_only = raw.stored_value_only != 0,
@@ -346,4 +354,10 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
             .items = items,
         },
     };
+}
+
+test "Perl layout search bounds retain their diagnostics" {
+    try std.testing.expectEqual(error.PerlDwarfUnitLimit, layoutError("PerlDwarfUnitLimit"));
+    try std.testing.expectEqual(error.PerlDwarfTypesUnavailable, layoutError("PerlDwarfTypesUnavailable"));
+    try std.testing.expectEqual(error.PerlDwarfLimit, layoutError("PerlDwarfLimit"));
 }

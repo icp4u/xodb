@@ -17,6 +17,8 @@ pub const Job = struct {
     allocation: ?*@import("allocation_capture.zig").Capture = null,
     allocation_opened: ?*@import("allocation_capture.zig").Capture = null,
     original_bytes: ?[]const u8 = null,
+    frames: ?*@import("../frames/state.zig").State = null,
+    attachment_save: ?@import("../frames/state.zig").AttachmentSave = null,
     sample_ordinal: usize = 0,
     capture_id: u64 = 0,
     capture_revision: u64 = 0,
@@ -95,11 +97,19 @@ pub const Job = struct {
             .save => {
                 var encoded: ?[]u8 = null;
                 defer if (encoded) |bytes| a.free(bytes);
-                const bytes = self.original_bytes orelse blk: {
+                const native_bytes = self.original_bytes orelse blk: {
                     encoded = try archive.encode(a, self.capture.?, .{ .writer_boot_id = @import("../binary/snapshot.zig").bootId(), .progress = &self.progress });
                     break :blk encoded.?;
                 };
-                self.publication = archive.publish(self.path, bytes, &self.progress);
+                if (self.progress.cancel.load(.acquire)) {
+                    self.publication = archive.publish(self.path, native_bytes, &self.progress);
+                    return;
+                }
+                const attached = if (self.frames) |frames| try frames.encode(null) else null;
+                defer if (attached) |data| data.deinit();
+                const with_frames = if (attached) |data| try archive.attachFrames(a, native_bytes, data.bytes()) else null;
+                defer if (with_frames) |data| a.free(data);
+                self.publication = archive.publish(self.path, with_frames orelse native_bytes, &self.progress);
             },
         }
     }
@@ -112,6 +122,7 @@ pub const Job = struct {
     pub fn deinit(self: *Job) void {
         self.progress.cancel.store(true, .release);
         self.join();
+        if (self.frames) |frames| frames.pinned = false;
         if (self.capture) |capture| capture.archive_busy = false;
         if (self.allocation) |capture| capture.archive_busy = false;
         if (self.allocation_opened) |capture| capture.deinit();
@@ -126,7 +137,7 @@ pub const Job = struct {
     }
     pub fn status(self: *const Job) Status {
         const done = self.done.load(.acquire);
-        return .{ .id = self.id, .kind = @tagName(self.kind), .path = self.path, .done = done, .cancel_requested = self.progress.cancel.load(.acquire), .phase = @tagName(self.progress.phase.load(.acquire)), .completed_units = self.progress.units.load(.acquire), .error_name = if (done and self.failure != null) @errorName(self.failure.?) else null, .publication = if (done) self.publication else null };
+        return .{ .id = self.id, .kind = @tagName(self.kind), .path = self.path, .done = done, .cancel_requested = self.progress.cancel.load(.acquire), .phase = @tagName(self.progress.phase.load(.acquire)), .completed_units = self.progress.units.load(.acquire), .error_name = if (done and self.failure != null) @errorName(self.failure.?) else null, .publication = if (done) self.publication else null, .frame_attachments = if (done and self.publication != null and self.publication.?.state == .published) self.attachment_save else null };
     }
 };
-pub const Status = struct { id: u64, kind: []const u8, path: []const u8, done: bool, cancel_requested: bool, phase: []const u8, completed_units: usize, error_name: ?[]const u8, publication: ?archive.Publication };
+pub const Status = struct { id: u64, kind: []const u8, path: []const u8, done: bool, cancel_requested: bool, phase: []const u8, completed_units: usize, error_name: ?[]const u8, publication: ?archive.Publication, frame_attachments: ?@import("../frames/state.zig").AttachmentSave };
