@@ -17,7 +17,9 @@ def error(response, name):
 def checkpoint(client):
     bp = client.action('set_breakpoint', symbol='profile_ready')['id']
     client.action('continue')
-    result = client.stopped('breakpoint')
+    # Reaching the checkpoint is the property, not its speed: the 640-thread
+    # fixture starts slowly on a loaded host.
+    result = client.stopped('breakpoint', seconds=30)
     client.action('remove_breakpoint', id=bp)
     return result
 
@@ -41,10 +43,36 @@ def graph(client, capture, **filters):
             end += child['inclusive']
     return dict(data, nodes=rows)
 
+def cpu_ticks(pid, tids=None):
+    """Per-task (utime, stime) clock ticks from procfs, summed: the same
+    source xodb's cpu_activity reads, so the two bracket each other."""
+    user = system = 0
+    for task in Path(f'/proc/{pid}/task').iterdir():
+        if tids is not None and int(task.name) not in tids: continue
+        fields = (task/'stat').read_text().rsplit(') ', 1)[1].split()
+        user += int(fields[11]); system += int(fields[12])
+    return user, system
+
+def ms(ticks):
+    return ticks*1000//os.sysconf('SC_CLK_TCK')
+
+def run_until(pid, enough, minimum, tids=None, seconds=20):
+    """Let the target run at least MINIMUM s of wall time and until ENOUGH
+    holds for its procfs CPU since now. Wall time alone proves nothing on a
+    loaded host: the scheduler decides how much CPU a fixed sleep buys."""
+    base = cpu_ticks(pid, tids)
+    begin = time.monotonic()
+    while True:
+        now = cpu_ticks(pid, tids)
+        delta = (now[0]-base[0], now[1]-base[1])
+        if time.monotonic()-begin >= minimum and enough(delta): return delta
+        assert time.monotonic()-begin < seconds, (delta, 'target got too little CPU')
+        time.sleep(.02)
+
 def perf_fds(client):
     return [os.readlink(p) for p in Path(f'/proc/{client.collector_pid()}/fd').iterdir() if 'perf_event' in os.readlink(p)]
 
-client = Client('control', fixture, args=['3'])
+client = Client('control', fixture, args=['6'])
 try:
     stop = checkpoint(client)
     tid = stop['threads'][0]['tid']
@@ -63,7 +91,10 @@ try:
     assert client.inspect('get_profile')['capture']['stored_samples'] == 0
     error(client.tool('start_profile',generation=client.session()['generation']), 'ProfileAlreadyRunning')
     client.action('continue')
-    time.sleep(.85)
+    # Samples follow the target's CPU time, not wall time. 300 ms of CPU
+    # (~60 samples) puts both hot paths in the graph whatever the load; an
+    # idle host reaches it within the original 0.85 s.
+    run_until(stop['pid'], lambda d: d[0] >= 30, .85, seconds=4)
     live = client.inspect('get_profile')['capture']
     assert live['stored_samples'] > 15 and live['status'] == 'collecting', live
     stopped_capture = client.action('stop_profile',capture_id=opened['id'])['capture']
@@ -95,7 +126,7 @@ try:
     assert client.session()['generation']==stable and client.inspect('get_registers',tid=tid)==regs
     # A stopped capture survives actual process exit, including ELF-backed source/assembly.
     client.action('continue')
-    deadline=time.monotonic()+5
+    deadline=time.monotonic()+15
     while client.session()['state']!='exited':
         assert time.monotonic()<deadline
         time.sleep(.02)
@@ -123,7 +154,12 @@ for mode in ('duration','mappings','exit'):
             assert time.monotonic()<deadline
             time.sleep(.02)
         expected={'duration':'duration','mappings':'target_ended','exit':'target_ended'}[mode]
-        assert capture['status']==expected and capture['stored_samples']>5, capture
+        # A 250 ms wall-clock capture buys the target only its CPU share of
+        # that on a loaded host. task_clock samples at 199 Hz of CPU time, so
+        # require the samples that CPU time yields (5+ when unloaded).
+        floor=5
+        if mode=='duration': floor=min(5, capture['cpu_activity']['user_ms']*199//1000//2)
+        assert capture['status']==expected and capture['stored_samples']>floor, capture
         assert not perf_fds(client)
         data=graph(client,capture)
         assert data['samples']==capture['stored_samples']
@@ -145,7 +181,7 @@ for mode in ('duration','mappings','exit'):
 # Explicit scope and thread identity: all threads yield symbols; subsets retain
 # addresses without assuming that an unobserved thread left mappings unchanged.
 for subset in (False,True):
-    client=Client('control',fixture,args=['2','threads'])
+    client=Client('control',fixture,args=['30','threads'])
     try:
         stop=checkpoint(client)
         tids=[t['tid'] for t in stop['threads'] if t['state']!='exited']
@@ -153,7 +189,10 @@ for subset in (False,True):
         selected=tids[:1] if subset else tids
         opened=client.action('start_profile',tids=selected,frequency_hz=199,duration_ms=5000)['capture']
         assert len(perf_fds(client))==len(selected)
-        client.action('continue');time.sleep(.45)
+        client.action('continue')
+        # 10 ticks of user CPU per selected thread is ~20 samples at 199 Hz.
+        began=time.monotonic()
+        for tid in selected: run_until(stop['pid'],lambda d:d[0]>=10,max(0,.45-(time.monotonic()-began)),tids={tid})
         capture=client.action('stop_profile',capture_id=opened['id'])['capture']
         data=graph(client,capture)
         counts=[graph(client,capture,tid=tid)['samples'] for tid in selected]
@@ -175,18 +214,31 @@ for subset in (False,True):
 # sleeping is a separate low-CPU case. Many idle threads exercise the old cap,
 # reply size, all-thread accounting and fd cleanup without saturating the host.
 for mode in ('kernel', 'sleep', 'many'):
-    client=Client('control',fixture,args=['5',mode])
+    client=Client('control',fixture,args=['5' if mode=='sleep' else '30',mode])
     try:
         stop=checkpoint(client)
         count=sum(t['state']!='exited' for t in stop['threads'])
         assert count==(640 if mode=='many' else 1),count
         metadata=client.inspect('get_profile')
         assert metadata['thread_limit']==1024
-        opened=client.action('start_profile',duration_ms=5000,frequency_hz=199)['capture']
+        pid=stop['pid']
+        before=cpu_ticks(pid)  # all tasks are stopped: equals xodb's start snapshot
+        # The stop below is manual; the duration only bounds a failed run.
+        opened=client.action('start_profile',duration_ms=30000,frequency_hz=199)['capture']
         assert len(perf_fds(client))==count
-        client.action('continue');time.sleep(.65)
+        client.action('continue')
+        # Kernel and many: the busy thread must have spent >300 ms of CPU
+        # (31+ ticks; 40 leaves margin) before the stop, whatever the load.
+        # Sleep: 0.65 s of wall time, since its point is how little CPU it uses.
+        need={'kernel':lambda d:d[1]>=40,'many':lambda d:d[0]>=40,'sleep':lambda d:True}[mode]
+        ran=run_until(pid,need,.65)
         capture=client.action('stop_profile',capture_id=opened['id'])['capture']
+        after=cpu_ticks(pid)
         cpu=capture['cpu_activity']
+        # xodb snapshots per task between our two readings, so its totals lie
+        # between what had run when we stopped waiting and what had run after.
+        low=(ms(ran[0]),ms(ran[1]));high=(ms(after[0]-before[0]),ms(after[1]-before[1]))
+        assert low[0]<=cpu['user_ms']<=high[0] and low[1]<=cpu['kernel_ms']<=high[1],(cpu,low,high)
         assert cpu['complete'] and cpu['available_threads']==count,cpu
         assert capture['status']=='manual' and not perf_fds(client),capture
         if mode=='kernel':
@@ -194,7 +246,9 @@ for mode in ('kernel', 'sleep', 'many'):
         elif mode=='sleep':
             assert cpu['user_ms']+cpu['kernel_ms']<200,cpu
         else:
-            assert cpu['user_ms']>300 and cpu['user_ms']<1600,cpu
+            # The upper bracket above is per-task procfs: 639 idle threads
+            # added no CPU and no task (the leader) was counted twice.
+            assert cpu['user_ms']>300,cpu
             assert capture['stored_samples']>15,capture
         print(f'{mode}: {count} threads; {capture["stored_samples"]} samples; CPU {cpu["user_ms"]} ms user / {cpu["kernel_ms"]} ms kernel; all fds closed',flush=True)
         (run/(mode+'.capture.json')).write_text(json.dumps(capture,indent=2)+'\n')

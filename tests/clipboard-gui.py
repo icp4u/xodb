@@ -55,14 +55,11 @@ def paste(d, text):
     copy(d, text); chord(d, 47); time.sleep(.15)
 
 def shot(d, name):
-    path = d.shot(name)
-    text = subprocess.run(['tesseract', path, 'stdout', '--psm', '11'], capture_output=True, text=True, check=True, timeout=10).stdout
-    Path(path + '.txt').write_text(text)
-    return ' '.join(text.lower().split())
+    return ' '.join(h.ocr(d.shot(name), '--psm', '11').lower().split())
 
 def click_word(d, word, index=0):
     path = d.shot('find-' + word)
-    tsv = subprocess.run(['tesseract', path, 'stdout', '--psm', '11', 'tsv'], capture_output=True, text=True, check=True, timeout=10).stdout
+    tsv = h.ocr(path, '--psm', '11', 'tsv')
     words = [row for row in csv.DictReader(io.StringIO(tsv), delimiter='\t') if row['text'].lower() == word]
     row = sorted(words, key=lambda w: (int(w['top']), int(w['left'])))[index]
     d.keys('click', int(row['left']) + int(row['width']) // 2, int(row['top']) + int(row['height']) // 2)

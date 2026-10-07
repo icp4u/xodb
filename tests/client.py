@@ -61,8 +61,8 @@ class Client:
     def session(self): return self.inspect('get_session')
     def action(self, tool_name, **args):
         return self.inspect(tool_name, generation=self.session()['generation'], **args)
-    def stopped(self, reason=None):
-        deadline = time.monotonic()+5
+    def stopped(self, reason=None, seconds=5):
+        deadline = time.monotonic()+seconds
         while time.monotonic()<deadline:
             session = self.session()
             if session['state']=='stopped' and (reason is None or any(t['reason']==reason for t in session['threads'])):

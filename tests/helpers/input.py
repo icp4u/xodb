@@ -79,7 +79,28 @@ class Display:
         self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "input-test", "version": "1"}})
         self.app.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         self.app.stdin.flush()
-        time.sleep(0.5)
+        self.wait_focused()
+
+    def wait_focused(self, seconds=60):
+        """Wait until the compositor has mapped and focused the window.
+
+        A key injected before then reaches no client, or only its release
+        does, once the first frame is late on a loaded host. Sway sends
+        wl_keyboard.enter before any later key on the same connection, so
+        input after this point is delivered. An application that exits
+        without a window is left for the caller to diagnose."""
+        def views(node):
+            yield node
+            for child in node.get("nodes", []) + node.get("floating_nodes", []):
+                yield from views(child)
+        deadline = time.monotonic() + seconds
+        while self.app.poll() is None:
+            done = subprocess.run(["swaymsg", "-r", "-t", "get_tree"], env=self.env, capture_output=True, text=True, timeout=30)
+            if done.returncode == 0 and any(v.get("pid") == self.app.pid and v.get("focused") and v.get("visible") for v in views(json.loads(done.stdout))):
+                return
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"window was not mapped and focused in {seconds} s; log tail: {self.tail()}")
+            time.sleep(0.05)
 
     def request(self, method, params=None):
         self.serial += 1
@@ -173,6 +194,38 @@ class Display:
             except subprocess.TimeoutExpired:
                 p.kill()
                 p.wait()
+
+def load_scale():
+    """How oversubscribed the host is now: 1 when idle, more when shared."""
+    return max(1.0, os.getloadavg()[0] / len(os.sched_getaffinity(0)))
+
+def ocr(path, *options):
+    """Tesseract text for a capture, also saved beside it as PATH.txt.
+
+    One OpenMP thread: libgomp's spinning barriers make a default
+    multithreaded run take minutes, not seconds, once its threads are
+    preempted on a loaded host. The timeout only bounds a broken run."""
+    env = dict(os.environ, OMP_THREAD_LIMIT="1")
+    text = subprocess.run(["tesseract", path, "stdout", *options], env=env, capture_output=True, text=True, check=True, timeout=60 * load_scale()).stdout
+    with open(path + ".txt", "w") as f:
+        f.write(text)
+    return text
+
+def ocr_until(d, name, check, *options, seconds=20):
+    """Capture and read the screen until CHECK accepts the normalized text.
+
+    Keys and MCP calls change state before the next frame is presented, and
+    a loaded host presents late. Each caller's CHECK must reject the frame
+    before the change, so a stale frame cannot pass. Returns the last text;
+    callers still assert CHECK on it."""
+    deadline = time.monotonic() + seconds * load_scale()
+    attempt = 0
+    while True:
+        text = " ".join(ocr(d.shot(name if attempt == 0 else f"{name}-retry{attempt}"), *options).lower().split())
+        if check(text) or time.monotonic() > deadline:
+            return text
+        attempt += 1
+        time.sleep(0.1)
 
 def differs(a, b, region):
     """True if two captures differ inside region "WxH+X+Y"."""

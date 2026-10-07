@@ -30,12 +30,12 @@ subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-I', str(work), 'tests/hel
 checks = []
 
 
-def shot(d, name):
-    time.sleep(.25)
-    path = d.shot(name)
-    text = subprocess.run(['tesseract', path, 'stdout', '--psm', '11'], capture_output=True, text=True, check=True, timeout=10).stdout.lower()
-    Path(path + '.txt').write_text(text)
-    return " ".join(text.split())
+def shot(d, name, check):
+    # Each check also rejects the previous step's screen, so waiting for it
+    # cannot accept a frame presented before the change.
+    text = h.ocr_until(d, name, check, '--psm', '11')
+    assert check(text), text
+    return text
 
 
 def add(d, keys, live=True):
@@ -46,7 +46,7 @@ def add(d, keys, live=True):
 def next_stop(d, code=57):
     generation = d.session()['generation']
     d.keys('tap', code)
-    state = d.wait(lambda s: s['state'] == 'stopped' and s['generation'] > generation)
+    state = d.wait(lambda s: s['state'] == 'stopped' and s['generation'] > generation, 30)
     assert state
     return state
 
@@ -57,35 +57,28 @@ try:
     d.tool('set_breakpoint', generation=d.session()['generation'], file='tests/fixtures/m1.c', line=9)
     next_stop(d)
     add(d, [30, 50, 24, 22, 49, 20])  # amount, live
-    text = shot(d, 'm1-first-live')
-    assert 'selected #0' in text and re.search(r'amount\s*=?\s*5\b', text), text
+    shot(d, 'm1-first-live', lambda t: 'selected #0' in t and re.search(r'amount\s*=?\s*5\b', t))
     add(d, [30, 50, 24, 22, 49, 20], live=False)
     # Select main (frame 1), then change_value again: no resume is needed.
     d.keys('click', 300, 658)
-    text = shot(d, 'm1-main-selected')
-    assert 'not in scope here' in text and re.search(r'amount\s*=?\s*5\b', text), text
+    shot(d, 'm1-main-selected', lambda t: 'not in scope here' in t and re.search(r'amount\s*=?\s*5\b', t))
     d.keys('click', 300, 630)
-    text = shot(d, 'm1-frame-restored')
-    assert 'not in scope here' not in text and re.search(r'amount\s*=?\s*5\b', text), text
+    shot(d, 'm1-frame-restored', lambda t: 'not in scope here' not in t and re.search(r'amount\s*=?\s*5\b', t))
     next_stop(d, 88)  # finish selected frame: main is now current
-    text = shot(d, 'm1-frame-gone')
-    assert 'not in scope here' in text and 'frame gone' in text, text
+    shot(d, 'm1-frame-gone', lambda t: 'not in scope here' in t and 'frame gone' in t)
     next_stop(d)
-    text = shot(d, 'm1-second-live')
-    assert re.search(r'amount\s*=?\s*9\b', text) and 'frame gone' in text, text
+    shot(d, 'm1-second-live', lambda t: re.search(r'amount\s*=?\s*9\b', t) and 'frame gone' in t)
     # E leaves watch focus on the last row; restore focus after stack clicks.
     d.keys('tap', 18, 'tap', 1, 'down', 42, 'tap', 38, 'up', 42)
-    text = shot(d, 'm1-pinned-to-live')
-    assert 'live display:' in text and 'frame gone' not in text, text
+    shot(d, 'm1-pinned-to-live', lambda t: 'live display:' in t and 'frame gone' not in t)
     d.keys('down', 42, 'tap', 38, 'up', 42)
-    assert 'watch pinned to the selected frame' in shot(d, 'm1-live-to-pinned')
+    shot(d, 'm1-live-to-pinned', lambda t: 'watch pinned to the selected frame' in t)
     add(d, [44, 44, 44, 44])  # a name never observed in any selected frame
-    assert 'unknown name' in shot(d, 'm1-unknown-name')
+    shot(d, 'm1-unknown-name', lambda t: 'unknown name' in t)
     d.keys('tap', 18)
-    assert 'up/down history' in shot(d, 'm1-editor-history')
+    shot(d, 'm1-editor-history', lambda t: 'up/down history' in t)
     d.keys('tap', 1)
-    text = shot(d, 'm1-watch-hints')
-    assert 'v events' in text and 'scroll' in text, text
+    shot(d, 'm1-watch-hints', lambda t: 'v events' in t and 'scroll' in t)
     checks.append('M1: live follows selected frame and next call; pinned activation stays gone; both conversions work')
 finally:
     if d: d.close(); d = None
@@ -104,17 +97,13 @@ if args.perl:
         assert symbol == 'Perl_av_store', symbol
         add(d, [47, 30, 38])  # val
         add(d, [30, 47])      # av
-        text = shot(d, 'perl-store')
-        assert 'undef' in text and '3 slots' in text, text
+        shot(d, 'perl-store', lambda t: 'undef' in t and '3 slots' in t)
         next_stop(d)
         assert d.tool('get_stack', tid=target.pid)['frames'][0]['symbol'] == 'Perl_av_delete'
-        text = shot(d, 'perl-delete')
-        assert 'not in scope here' in text and '4 slots' in text, text
-        assert 'undef' not in text.split('watch', 1)[-1], text
+        shot(d, 'perl-delete', lambda t: 'not in scope here' in t and '4 slots' in t and 'undef' not in t.split('watch', 1)[-1])
         next_stop(d)
         assert d.tool('get_stack', tid=target.pid)['frames'][0]['symbol'] == 'Perl_av_store'
-        text = shot(d, 'perl-store-again')
-        assert 'undef' in text and '3 slots' in text and 'not in scope here' not in text, text
+        shot(d, 'perl-store-again', lambda t: 'undef' in t and '3 slots' in t and 'not in scope here' not in t)
         # A pointer preview used to consume the available width before the
         # stale suffix. Check this row itself, not a nearby shorter value.
         d.keys('down', 42, 'tap', 18, 'up', 42, 'tap', 50, 'tap', 21,
@@ -123,8 +112,7 @@ if args.perl:
             d.tool('remove_breakpoint', generation=d.session()['generation'], id=bp['id'])
         d.tool('continue', generation=d.session()['generation'])
         assert d.wait(lambda s: s['state'] == 'running')
-        text = shot(d, 'perl-running-stale')
-        assert re.search(r'my_perl\s+stale:\s*running', text), text
+        shot(d, 'perl-running-stale', lambda t: re.search(r'my_perl\s+stale:\s*running', t))
         assert d.session()['state'] == 'running'
         checks.append('Perl demo: val undef -> not in scope -> undef; av 3 -> 4 -> 3 slots, without re-adding')
     finally:

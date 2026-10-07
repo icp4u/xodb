@@ -44,10 +44,7 @@ def ready(d):
 
 def shot(d, name):
     time.sleep(.3)
-    path = d.shot(name)
-    r = subprocess.run(['tesseract', path, 'stdout'], capture_output=True, text=True, check=True, timeout=15)
-    Path(path + '.txt').write_text(r.stdout)
-    return r.stdout.lower()
+    return h.ocr(d.shot(name)).lower()
 
 
 if not paths:

@@ -43,31 +43,53 @@ try:
     d.keys('tap', 25)
     d.keys('tap', 57)
     samples = []
-    header = None
     active_jobs = 0
-    def warning_pixels(path):
+    def warm_pixels(path, box):
         with Image.open(path) as image:
-            rgb = image.convert('RGB').crop((20, 176, 1250, 195))
-            pixels = rgb.tobytes()
+            pixels = image.convert('RGB').crop(box).tobytes()
             return sum(r > 110 and r > g*1.15 and g > b*1.2
                        for r, g, b in zip(pixels[0::3], pixels[1::3], pixels[2::3]))
-    for i in range(20):
+    def warning_pixels(path):
+        return warm_pixels(path, (20, 176, 1250, 195))
+    # The keys only queue P and Space; the first presented frame of a running
+    # capture can lag far behind on a loaded host. The reference toolbar must
+    # come from a frame that shows it: capture collecting, flames displayed,
+    # and the warm Stop capture button on screen. Earlier frames still show
+    # the source view, whose syntax colours are not warning emphasis.
+    assert d.wait(lambda s: (lambda p: p['capture'] is not None and p['capture']['status'] == 'collecting'
+                             and p['displayed_view'] is not None and p['displayed_view']['visible'])(d.tool('get_profile')), 30), d.tail()
+    deadline = time.monotonic()+30
+    settle = 0
+    while warm_pixels(d.shot(f'settle-{settle:02}'), (215, 97, 380, 125)) < 100:
+        assert time.monotonic() < deadline, 'Running capture toolbar never presented'
+        settle += 1
+        time.sleep(.05)
+    with Image.open(d.shot('reference')) as image:
+        header = image.convert('RGB').crop((10, 96, 1250, 125))
+    # At least 20 frames, and enough of them that two were taken while a
+    # snapshot refresh was in flight: a slow host may refresh less often
+    # than 20 quick frames span. Every frame is checked either way.
+    frames = 0
+    deadline = time.monotonic()+20
+    while frames < 20 or active_jobs < 2:
+        assert time.monotonic() < deadline, (frames, active_jobs, samples)
         profile = d.tool('get_profile')
         active_jobs += profile['recorded_view_job'] is not None
         samples.append(profile['capture']['stored_samples'])
-        path = Path(d.shot(f'live-{i:02}'))
+        path = Path(d.shot(f'live-{frames:02}'))
         assert warning_pixels(path) == 0, f'Routine refresh flashed a warning: {path.relative_to(root)}'
         with Image.open(path) as image:
             current = image.convert('RGB').crop((10, 96, 1250, 125))
-        if header is None:
-            header = current
         assert ImageChops.difference(header, current).getbbox() is None, 'Static toolbar moved'
+        frames += 1
         time.sleep(.05)
     assert active_jobs >= 2 and samples[-1] > samples[0], (active_jobs, samples)
     # This file is owned test scratch; retain its previous state before changing it.
     (work/'gate.before-failure').write_bytes((work/'gate').read_bytes())
     (work/'gate').write_text('fail')
-    deadline = time.monotonic()+3
+    # Promptly, scaled for load: the next refresh spawns at most every 250 ms
+    # of UI time, which a loaded host stretches.
+    deadline = time.monotonic()+3*h.load_scale()
     i = 0
     while True:
         path = Path(d.shot(f'failure-{i:02}'))
@@ -78,7 +100,7 @@ try:
         time.sleep(.1)
     d.app.stdin.close()
     assert d.app.wait(timeout=5) == 0, d.tail()
-    (work/'results.json').write_text(json.dumps({'live_frames':20, 'active_jobs':active_jobs, 'first_samples':samples[0], 'last_samples':samples[-1], 'failure_warning':True}, indent=2)+'\n')
+    (work/'results.json').write_text(json.dumps({'live_frames':frames, 'settle_frames':settle, 'active_jobs':active_jobs, 'first_samples':samples[0], 'last_samples':samples[-1], 'failure_warning':True}, indent=2)+'\n')
     print('Live refresh stays neutral; failed worker stays orange; toolbar stable:', work.relative_to(root))
 finally:
     if d:
