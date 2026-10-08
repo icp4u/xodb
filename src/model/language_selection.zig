@@ -40,6 +40,7 @@ pub fn Stack(comptime language: Tab) type {
         .perl => @import("../language/perl.zig").Stack,
         .lua => @import("../language/lua.zig").Stack,
         .javascript => @import("../language/javascript.zig").Stack,
+        .ruby => @import("../language/ruby.zig").Stack,
         else => @compileError("a language stack is required"),
     };
 }
@@ -49,6 +50,7 @@ pub fn read(comptime language: Tab, session: *model.Session, a: A, tid: i32) !St
         .perl => @import("../language/perl.zig").stack(session, a, tid, 0),
         .lua => @import("../language/lua.zig").stack(session, a, tid, 0, null),
         .javascript => @import("../language/javascript.zig").stack(session, a, tid, 0),
+        .ruby => @import("../language/ruby.zig").stack(session, a, tid, 0),
         else => unreachable,
     };
 }
@@ -59,8 +61,8 @@ pub const Cache = struct {
     arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     key: ?CacheKey = null,
     native: ?[]model.Frame = null,
-    stacks: std.meta.Tuple(&.{ ?Stack(.python), ?Stack(.perl), ?Stack(.lua), ?Stack(.javascript) }) = .{ null, null, null, null },
-    errors: [4]?anyerror = @splat(null),
+    stacks: std.meta.Tuple(&.{ ?Stack(.python), ?Stack(.perl), ?Stack(.lua), ?Stack(.javascript), ?Stack(.ruby) }) = .{ null, null, null, null, null },
+    errors: [5]?anyerror = @splat(null),
     pub fn deinit(self: *Cache) void {
         self.arena.deinit();
     }
@@ -68,7 +70,7 @@ pub const Cache = struct {
         _ = self.arena.reset(.free_all);
         self.key = null;
         self.native = null;
-        self.stacks = .{ null, null, null, null };
+        self.stacks = .{ null, null, null, null, null };
         self.errors = @splat(null);
     }
     fn prepare(self: *Cache, session: *model.Session, tid: i32) !void {
@@ -160,7 +162,7 @@ pub fn selectNative(session: *model.Session, tid: i32, frame: usize) !void {
     @memcpy(native, borrowed_native);
     if (frame >= native.len) return error.InvalidFrame;
     var offers = Offers{};
-    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript }) |language| {
+    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby }) |language| {
         if (session.language_tabs.visible(language)) {
             if (cachedRead(language, session, tid)) |stack| {
                 try appendOffers(&offers, language, stack, frame, native);
@@ -231,7 +233,7 @@ pub fn selectLogical(session: *model.Session, tid: i32, language: Tab, segment: 
     const borrowed_native = try cachedNative(session, tid);
     const native = native_storage[0..borrowed_native.len];
     @memcpy(native, borrowed_native);
-    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript }) |candidate| {
+    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby }) |candidate| {
         if (language == candidate) {
             const stack = try cachedRead(candidate, session, tid);
             return fromStack(session, candidate, tid, stack, segment, frame, native);

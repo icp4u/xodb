@@ -48,12 +48,13 @@ pub const Result = struct {
     memory_bytes: usize,
 };
 pub fn supported(language: Tab) bool {
-    return language == .lua or language == .perl or language == .python or language == .javascript;
+    return language == .lua or language == .perl or language == .python or language == .javascript or language == .ruby;
 }
 pub fn read(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !Result {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (tid <= 0 or segment >= 64 or frame >= 64 or start > 4096 or limit == 0 or limit > 32) return error.InvalidArguments;
     return switch (language) {
+        .ruby => @import("../language/ruby.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .lua => @import("../language/lua.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .perl => @import("../language/perl.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .python => @import("../language/python.zig").readLocals(session, a, tid, segment, frame, start, limit),
@@ -68,6 +69,7 @@ pub fn evaluate(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (tid <= 0 or segment >= 64 or frame >= 64 or text.len == 0 or text.len > 128 or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidArguments;
     return switch (language) {
+        .ruby => @import("../language/ruby.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .lua => @import("../language/lua.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .perl => @import("../language/perl.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .python => @import("../language/python.zig").evaluateLocal(session, a, tid, segment, frame, text),

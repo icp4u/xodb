@@ -197,10 +197,10 @@ They are development packaging, not published distribution packages.
 Locals, press **W** · **Space** again and watch it catch the store · **Q** saves
 the investigation. Full walkthrough and limits: [docs/M1.md](docs/M1.md).
 
-Other things to poke at: `./scripts/demo-cruby` (break on `rb_ary_store`, decode
-a Ruby VALUE by hand), `./scripts/demo-perl` (break on `Perl_av_store` and read
+Other things to poke at: `./scripts/demo-cruby` (break on `rb_ary_store`, inspect
+Ruby frames and named locals with the supported DWARF runtime), `./scripts/demo-perl` (break on `Perl_av_store` and read
 `key`, the new element and the interpreter's stack through Perl's DWARF), the [M2 flow graph](docs/M2.md), and
-[flame graphs](docs/PROFILING.md). #TODO their ruby will be stripped though
+[flame graphs](docs/PROFILING.md).
 
 
 ## Agents

@@ -6,8 +6,8 @@ const Modules = @import("modules.zig").Modules;
 const rt = @import("../target/runtime.zig").c;
 const Text = @import("probes.zig").Text;
 const selection = @import("language_selection.zig");
-pub const Tab = enum { registers, native, python, perl, lua, javascript };
-pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript };
+pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby };
+pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby };
 pub fn title(tab: Tab) []const u8 {
     return switch (tab) {
         .registers => "Regs",
@@ -16,6 +16,7 @@ pub fn title(tab: Tab) []const u8 {
         .perl => "Perl",
         .lua => "Lua",
         .javascript => "JS",
+        .ruby => "Ruby",
     };
 }
 pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8 };
@@ -40,7 +41,7 @@ pub const State = struct {
     revision: u64 = 0,
     epoch: u64 = std.math.maxInt(u64),
     generation: u64 = std.math.maxInt(u64),
-    entries: [4]Entry = @splat(.{}),
+    entries: [5]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
     pub fn deinit(self: *State) void {
@@ -124,7 +125,7 @@ pub const State = struct {
         };
         const entry = &self.entries[self.next];
         if (!entry.found) {
-            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E" };
+            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version" };
             var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
                 .limit_bytes = 128 * 1024,
                 .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
@@ -156,6 +157,7 @@ pub const State = struct {
             1 => @import("../language/perl.zig").describe(session, a),
             2 => @import("../language/lua.zig").describe(session, a),
             3 => @import("../language/javascript.zig").describe(session, a),
+            4 => @import("../language/ruby.zig").describe(session, a),
             else => unreachable,
         };
         const d = description catch |err| {
@@ -194,7 +196,7 @@ pub const State = struct {
     }
     pub fn jsonStringify(self: State, writer: anytype) !void {
         const Item = struct { tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
-        var items: [6]Item = undefined;
+        var items: [order.len]Item = undefined;
         for (order, 0..) |tab, i| {
             items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
             if (i >= 2) {

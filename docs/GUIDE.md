@@ -148,11 +148,14 @@ These are retained context slots: lexical visibility is unproved and stack-only
 names are not shown. A shadowed lexical name may have a different value.
 **E** refuses bare names with `JavaScriptLexicalUnproved`; it does not guess from
 an outer context. See [JavaScript](JAVASCRIPT.md#context-storage-in-the-javascript-pane).
+In **Ruby**, select a logical frame for VM-stack locals and escaped closure
+environments. **E** accepts a bare local/capture name; the closest lexical scope
+wins. See [Ruby](RUBY.md) for the initial supported revision and explicit refusals.
 **E** in **C/C++** still uses the
 native expression/watch view. Language storage addresses must be resolved again
 after resume; **W** does not set a hardware watchpoint on them.
 
-What you see is the interpreter's own C code, plus, for Perl, CPython and V8, the
+What you see is the interpreter's own C code, plus, for Perl, CPython, CRuby and V8, the
 script level:
 
 - **Readable Perl values.** In Locals or **E**, an `SV *` shows as `IV 42`,
@@ -165,7 +168,7 @@ script level:
   Freed or overwritten objects and inconsistent headers are marked; no
   `__repr__` or other code runs in the target. Needs CPython DWARF types.
 - **The script's stack at a native stop.** Agents ask `get_language_stack`
-  (language `perl`, `python` or `javascript`) for sub/function names and file:line, read
+  (language `perl`, `python`, `javascript`, `lua` or `ruby`) for sub/function names and file:line, read
   straight from the stopped interpreter without running any code in it. Each
   piece is tied to the native interpreter-loop frame it came from, and it says
   `partial` when a boundary can't be proven. For CPython the tie is proved by
@@ -186,7 +189,12 @@ script level:
   Interrupted native I/O frames retain lower Lua state evidence; ambiguous state
   arguments appear as separate segments. See [Lua](LUA.md).
 
-Logical stacks for Python, Ruby and the JVM are arriving as imports; see
+- **CRuby frames and locals.** `scripts/demo-cruby`, **Space**, choose **Ruby**,
+  select **tick**, then **E**, `round`, **Return**. Native `VALUE` previews and
+  named stack/escaped-environment bindings are read without target calls.
+  The initial exact-revision DWARF profile and refusals are in [Ruby](RUBY.md).
+
+Imported logical frames, including JVM exports, remain separate evidence; see
 [logical frames](LOGICAL_FRAMES.md).
 
 ## Try it
@@ -198,8 +206,8 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Observe and browse calls | `xodb --browse-observation example-01.xoi` after the capture in [OBSERVATIONS.md](OBSERVATIONS.md#one-command-capture) | **]** / **[** move the threshold, **Tab** switches fast/slow, **E** shows the raw evidence |
 | Inside Perl | `./scripts/demo-perl` | **Space**, **Shift+E** `val` and `av` (live rows that update every stop), then keep pressing **Space**: `val` undef ↔ not in scope, `av` 3 ↔ 4 slots |
 | Inside CPython | `./scripts/demo-python` | **Space**, **E** `value` (list (8 items)), **E** `key` (str 'answer'), **E** `mp` (dict); in a second terminal `./scripts/demo-python stack` prints `record` ← `tick` ← `<module>` with file:line and the list's items |
+| Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **E** `round` **Return**; continue to watch the next iteration |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
-| Inside Ruby | `./scripts/demo-cruby` | the `rb_ary_store` break |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Live open files | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --lsof-top --redact --pid PIDS` | **1** files advancing, **3** the leaker growing, **4** the deleted file's pinned bytes, **Enter** on any row to drill in |

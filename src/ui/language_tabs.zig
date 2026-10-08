@@ -33,7 +33,7 @@ fn revealRow(scroll: usize, index: usize, visible: usize) usize {
     return scroll;
 }
 pub const Panel = struct {
-    hits: [6]?gpu.Rect = @splat(null),
+    hits: [tabs.order.len]?gpu.Rect = @splat(null),
     content_y: f32 = 135,
     arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     rows: []Row = &.{},
@@ -247,6 +247,12 @@ pub const Panel = struct {
             }) catch {
                 self.message = "OutOfMemory";
             },
+            .ruby => self.collect(selection.cachedRead(.ruby, session, tid) catch |err| {
+                self.message = @errorName(err);
+                return;
+            }) catch {
+                self.message = "OutOfMemory";
+            },
             .javascript => self.collect(selection.cachedRead(.javascript, session, tid) catch |err| {
                 self.message = @errorName(err);
                 return;
@@ -300,6 +306,7 @@ pub const Panel = struct {
             .perl => preview.perl != null,
             .lua => preview.lua != null,
             .javascript => preview.javascript != null,
+            .ruby => preview.ruby != null,
             else => false,
         };
     }
@@ -362,7 +369,9 @@ pub const Panel = struct {
         const has_named = named.supported(state.selected);
         const remaining = @max(0, rect.y + rect.h - 8 - y);
         var native_count: usize = 0;
-        for (native_values) |value| if (nativeMatches(state.selected, value.value)) { native_count += 1; };
+        for (native_values) |value| if (nativeMatches(state.selected, value.value)) {
+            native_count += 1;
+        };
         const named_min: f32 = if (self.editor.open) 140 else if (logical != null) (if (state.selected == .javascript) @as(f32, if (self.expression_len != 0) 160 else 135) else 112) else 64;
         const layout = sectionLayout(remaining, has_named, native_count, self.native_policy, named_min);
         self.native_collapsed = layout.collapsed;

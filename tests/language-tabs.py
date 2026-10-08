@@ -134,11 +134,11 @@ def case(label, executable, language=None, args=()):
             job = next(j for j in owner.tool('get_debug_metadata')['jobs'] if j['kind'] == 'javascript')
             owner.tool('cancel_debug_metadata', id=job['id'])
             cancelled = s.eventually(lambda: observer.tool('get_language_tabs'), lambda v:
-                v['view']['tabs'][-1]['reason'] == 'DebugMetadataCancelled', 'cancel withdraws proof')
+                next(t for t in v['view']['tabs'] if t['tab']=='javascript')['reason'] == 'DebugMetadataCancelled', 'cancel withdraws proof')
             assert cancelled['view']['selected'] == 'javascript'
             owner.tool('retry_debug_metadata', id=job['id'])
             after = s.eventually(lambda: observer.tool('get_language_tabs'), lambda v:
-                v['view']['complete'] and v['view']['tabs'][-1]['status'] == 'ready', 'retry refreshes proof', timeout=60)
+                v['view']['complete'] and next(t for t in v['view']['tabs'] if t['tab']=='javascript')['status'] == 'ready', 'retry refreshes proof', timeout=60)
             assert after['view']['selected'] == 'javascript'
         report.update(status='pass', before=before, after=after, seconds=time.monotonic()-start)
     except BaseException as exc:

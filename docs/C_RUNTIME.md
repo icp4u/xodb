@@ -109,6 +109,10 @@ between the type check and read open. Metadata, network-filesystem lookup and
 kernel I/O can still outlast the cooperative budget; `O_NONBLOCK` does not
 provide a hard timeout on a hung filesystem.
 
+GCC DWARF 2–4 can encode a trailing-slash `#line` filename as an empty
+filename, which terminates the file table. Later entries in that table are then
+unavailable for source fetching; GDB shares this availability loss.
+
 DWARF is a path list, not a trust certificate. A hostile executable can list
 other absolute regular files readable by the **agent account**. These checks
 prevent path-resolution escapes and special-file access; they do not establish

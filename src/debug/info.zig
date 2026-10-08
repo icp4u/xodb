@@ -139,7 +139,7 @@ pub const Image = struct {
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
     pending_aliases: std.AutoHashMapUnmanaged(*const eval.Type, Alias) = .empty,
     address_table: []const u8,
-    const Alias = struct { target: *const eval.Type, name: []const u8 };
+    const Alias = struct { target: *const eval.Type, name: []const u8, ruby_value: bool = false };
     pub fn init(binary: elf.Image, bytes: []u8) !Image {
         return initWithAllocator(binary, bytes, std.heap.page_allocator);
     }
@@ -550,7 +550,7 @@ pub const Image = struct {
                     t.* = target.*;
                     const alias = name(&die);
                     if (alias.len > 0) t.name = alias;
-                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias });
+                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias, .ruby_value = c.xrb_dwarf_value(&die) != 0 });
                 }
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
@@ -621,6 +621,7 @@ pub const Image = struct {
         while (it.next()) |entry| {
             var target = entry.value_ptr.target;
             var alias_name = entry.value_ptr.name;
+            var ruby_value = entry.value_ptr.ruby_value;
             var hops: usize = 0;
             while (self.pending_aliases.get(target)) |alias| : (hops += 1) {
                 if (hops == 64) {
@@ -628,11 +629,13 @@ pub const Image = struct {
                     break;
                 }
                 if (alias_name.len == 0) alias_name = alias.name;
+                ruby_value = ruby_value or alias.ruby_value;
                 target = alias.target;
             }
             const out = @constCast(entry.key_ptr.*);
             out.* = target.*;
             if (alias_name.len > 0) out.name = alias_name;
+            out.ruby_value = out.ruby_value or ruby_value;
         }
         self.pending_aliases.clearRetainingCapacity();
     }

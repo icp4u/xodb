@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None):
     live = tier in ('host', 'all')
     language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
     gui_language_args = [*language_args]
@@ -32,6 +32,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
+    steps.append(('source-paths-build', ['cc', '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
+                  'tests/source-paths.c', 'src/debug/source_paths.c', 'src/debug/dwarf_cursor.c',
+                  'src/binary/object.c', '-o', '.work/source-paths-check'], 60))
+    steps.append(('source-paths', [sys.executable, '-B', 'tests/source-paths.py',
+                  '--check', '.work/source-paths-check', '--work', '.work/source-paths'], 120))
     steps.append(('shared-readiness', [sys.executable, '-B', 'tests/shared-readiness.py'], 30))
     steps.append(('javascript-dwarf', [sys.executable, '-B', 'tests/javascript-dwarf.py'], 60))
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
@@ -99,6 +104,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'perl-named-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pn{int(remote)}'], 180))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
+        if ruby:
+            for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+                steps.append(('ruby-language'+suffix, [sys.executable, '-B', 'tests/ruby-language.py', '--ruby', ruby, '--strace', '--work', '.work/ruby'+suffix, *extra], 300))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('javascript-context'+suffix, [sys.executable, '-B', 'tests/javascript-context.py', '--node', node, '--include', node_include, '--work', '.work/js-context'+suffix, '--strace', *extra], 1200))
@@ -163,6 +171,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
+        if ruby:
+            steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300))
         if node:
             steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200))
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800))
@@ -334,6 +344,7 @@ def main():
     parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
     parser.add_argument('--padwalker', help='Built test-only PadWalker tree for Perl named-local oracle checks; requires --perl')
     parser.add_argument('--python', help='Include language-tab and cached-selection checks using this debug CPython runtime')
+    parser.add_argument('--ruby', help='Include the exact supported CRuby DWARF runtime and its matching development headers')
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -349,11 +360,13 @@ def main():
         parser.error('--padwalker requires --perl')
     if args.python and args.tier == 'portable':
         parser.error('--python requires the host, gui or all tier')
+    if args.ruby and args.tier == 'portable':
+        parser.error('--ruby requires the host, gui or all tier')
     if args.node and args.tier == 'portable':
         parser.error('--node requires the host, gui or all tier')
     if args.lua and args.tier == 'portable':
         parser.error('--lua requires the host, gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker)
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
@@ -374,13 +387,14 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), python_language=bool(args.python), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
                      ['GUI execution'] if args.tier == 'host' else
                      ['full host integration suite'] if args.tier == 'gui' else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
+                    (['Ruby language checks (use --ruby PATH)'] if args.tier != 'portable' and not args.ruby else []) +
                     (['Node.js language checks (use --node PATH)'] if args.tier != 'portable' and not args.node else []) +
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier != 'portable' and not args.lua else []) +
                     (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier != 'portable' and not args.padwalker else []))

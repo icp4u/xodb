@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/lua.c", "src/language/lua_layout.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -318,6 +318,11 @@ pub fn build(b: *std.Build) void {
         lua_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     }
     test_step.dependOn(&b.addRunArtifact(lua_tests).step);
+    const ruby_tests = b.addExecutable(.{ .name = "xodb-ruby-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/ruby.c", "tests/ruby-reader.c" }) |source| {
+        ruby_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    test_step.dependOn(&b.addRunArtifact(ruby_tests).step);
     const javascript_tests = b.addExecutable(.{ .name = "xodb-javascript-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     for ([_][]const u8{ "src/language/javascript.c", "src/language/javascript_layout.c", "tests/javascript-reader.c" }) |source| {
         javascript_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
@@ -379,7 +384,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

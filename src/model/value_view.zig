@@ -62,7 +62,9 @@ pub const Preview = struct {
     python: ?PythonValue = null,
     javascript: ?JavaScriptValue = null,
     lua: ?LuaValue = null,
+    ruby: ?RubyValue = null,
 };
+pub const RubyValue = struct { value: @import("language_locals.zig").Value, tagged: u64, runtime_version: []const u8, runtime_build_id: []const u8, memory_reads: usize, memory_bytes: usize, liveness: []const u8 = "unproved; consistent tags do not prove GC liveness" };
 pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, advisory: bool = false };
 pub const LuaValue = struct {
     advisory: bool = false,

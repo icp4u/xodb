@@ -30,7 +30,7 @@ def check_native_values(display, tid, language, label):
         # source-pane text. Value identity itself is checked by each fixture.
         normalize = lambda v: re.sub(r'[^a-z0-9]', '', v.lower())
         wanted = normalize(values[0]['value']['display'].split()[0])
-        expected = 'CONTEXT STORAGE' if language == 'javascript' else 'NAMED LOCALS' if language in ('lua', 'perl', 'python') else 'Variables by name'
+        expected = 'CONTEXT STORAGE' if language == 'javascript' else 'NAMED LOCALS' if language in ('lua', 'perl', 'python', 'ruby') else 'Variables by name'
         if 'Native frame' in text and expected in text and wanted in normalize(text): break
         assert time.monotonic()<deadline, (values[0], text)
         time.sleep(.1)

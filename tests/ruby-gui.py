@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Ruby stack, native VALUEs and named locals on a private compositor."""
+import argparse,importlib.util,json,os,re,select,subprocess,time
+from pathlib import Path
+from PIL import Image,ImageOps
+from helpers.language_selection import check_native_values
+p=argparse.ArgumentParser(description=__doc__);p.add_argument('--ruby',required=True);p.add_argument('--work',type=Path,required=True);a=p.parse_args()
+root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
+w=(a.work/'.work/input-rby').resolve();w.mkdir(parents=True,mode=0o755)
+spec=importlib.util.spec_from_file_location('private_input',root/'tests/helpers/input.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h);h.WORK=str(w)
+for name in ('tmp','cache/mesa','cache/nvidia'):(w/name).mkdir(parents=True,exist_ok=True)
+for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
+ subprocess.run(['wayland-scanner','client-header',xml,str(w/(stem+'.h'))],check=True,timeout=10)
+ subprocess.run(['wayland-scanner','private-code',xml,str(w/(stem+'.c'))],check=True,timeout=10)
+h.HELPER=str(w/'vinput');subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(w),'tests/helpers/vinput.c',str(w/'virtual-pointer.c'),str(w/'virtual-keyboard.c'),'-lwayland-client','-lxkbcommon','-lm','-o',h.HELPER],check=True,timeout=60)
+headers=json.loads(subprocess.check_output([a.ruby,'-rjson','-rrbconfig','-e','puts JSON.generate(RbConfig::CONFIG.values_at("rubyhdrdir","rubyarchhdrdir","DLEXT"))'],text=True,timeout=30))
+addon=w/('xodb_probe.'+headers[2]);subprocess.run(['cc','-g','-O0','-fno-omit-frame-pointer','-fPIC','-shared','-I'+headers[0],'-I'+headers[1],'tests/fixtures/ruby/probe.c','-o',str(addon)],check=True,timeout=60)
+target=subprocess.Popen([a.ruby,'tests/fixtures/ruby/locals.rb','plain'],env=dict(os.environ,XODB_RUBY_PROBE=str(addon)),stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+d=None
+try:
+ assert select.select([target.stdout],[],[],15)[0] and target.stdout.readline()==b'ready\n'
+ d=h.Display(str(root),['--agent-scope','control','--attach',str(target.pid)])
+ d.tool('set_breakpoint',generation=d.session()['generation'],symbol='xodb_ruby_stop')
+ d.tool('continue',generation=d.session()['generation']);target.stdin.write(b'go\n');target.stdin.flush();assert d.stopped('breakpoint')
+ assert json.loads(target.stdout.readline())['label']=='plain-slots'
+ def stack():
+  deadline=time.monotonic()+120
+  while True:
+   reply=d.request('tools/call',{'name':'get_language_stack','arguments':{'tid':target.pid,'language':'ruby'}})
+   if not reply.get('isError'):return reply['structuredContent']
+   assert reply['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,reply
+   time.sleep(.02)
+ def choose(name,last=False):
+  s=stack();rows=[(si,fi) for si,part in enumerate(s['segments']) for fi,f in enumerate(part['frames']) if f['name']==name]
+  si,fi=rows[-1 if last else 0];args=dict(generation=d.session()['generation'],tid=target.pid,language='ruby',segment=si,frame=fi)
+  selected=d.tool('select_language_frame',**args)['view'];assert selected['logical_selection']['anchor_basis']=='reader_segment'
+  return args
+ native=check_native_values(d,target.pid,'ruby','ruby')
+ args=choose('plain_slots');generation=d.session()['generation'];regs=d.tool('get_registers',tid=target.pid)
+ normalize=lambda t:re.sub(r'[^a-z0-9]','',t.lower())
+ def visible(label,wanted):
+  deadline=time.monotonic()+30
+  while True:
+   shot=d.shot(label);crop=shot+'.side.png'
+   with Image.open(shot) as image:
+    pane=ImageOps.invert(image.crop((1013,130,1272,578)).convert('L'));pane.resize((pane.width*3,pane.height*3)).save(crop)
+   text=subprocess.run(['tesseract',crop,'stdout','--psm','6'],env=dict(d.env,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
+   Path(shot+'.side.txt').write_text(text)
+   if all(word in normalize(text) for word in wanted):return text
+   assert time.monotonic()<deadline,text
+   time.sleep(.05)
+ first=visible('ruby-locals',['namedlocals','seed7','plainslots'])
+ d.keys('tap',18,'tap',31,'tap',18,'tap',18,'tap',32,'tap',28)
+ expression=visible('ruby-expression',['eseed7','expressionresultabove'])
+ assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
+ for label in ('sample','recursive-0'):
+  previous=d.session()['generation'];d.tool('continue',generation=previous)
+  assert d.wait(lambda s:s['generation']>previous and s['state']=='stopped' and any(t['reason']=='breakpoint' for t in s['threads']))
+  assert json.loads(target.stdout.readline())['label']==label
+ args=choose('recursive',last=True)
+ deadline=time.monotonic()+30
+ while True:
+  recursive=visible('ruby-recursive',['recursive','namedlocals','depth2'])
+  if recursive.lower().count('recursive')>=3:break
+  assert time.monotonic()<deadline,recursive
+  time.sleep(.05)
+ d.keys('tap',66);assert d.wait(lambda s:s['agent_scope']=='observe')
+ args['generation']=d.session()['generation'];regs=d.tool('get_registers',tid=target.pid)
+ locals_=d.tool('get_language_locals',**args);value=d.tool('evaluate_language_expression',expression='depth',**args)
+ assert value['rows'][0]['value']['display']=='2' and not value['diagnostic'],value
+ assert d.session()['generation']==args['generation'] and d.tool('get_registers',tid=target.pid)==regs
+ (w/'results.json').write_text(json.dumps(dict(status='pass',native=native,locals=locals_,first=first,expression=expression,recursive=recursive,observer=True),indent=2)+'\n')
+finally:
+ if d:d.close()
+ if target.poll() is None:target.kill()
+ target.wait(timeout=10)
+print('Ruby GUI: named locals, expression label, three recursive frames, native VALUEs and observer reads passed')

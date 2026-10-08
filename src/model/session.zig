@@ -1583,6 +1583,16 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
+        const ruby_preview = @import("../language/ruby.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (ruby_preview) |shown| {
+            result.visualization = shown;
+            result.display = shown.ruby.?.value.display;
+            result.diagnostic = shown.diagnostic;
+            return result;
+        }
         const lua_preview = @import("../language/lua.zig").preview(self, a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
