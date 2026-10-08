@@ -31,7 +31,8 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check host                 # Live debugger/profiler regressions
 ./scripts/release-check gui                  # Private Sway/Vulkan regressions
 ./scripts/release-check gui --perl /path/to/debug/perl # Also the Perl live-row demo (5.44 + DWARF)
-./scripts/release-check all                  # Host plus GUI, one build
+./scripts/release-check all                  # Host plus focused GUI, one build
+./scripts/release-check periodic-gui         # Full graphics and delayed-discovery matrices
 ./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution
 ./scripts/release-check periodic --headless  # Portable checks plus readelf source-path differential
@@ -67,7 +68,7 @@ tiers to validate language adapters.
 
 Use `--optimize Debug` for a second build mode; the default is ReleaseSafe.
 For a release candidate, require portable CI plus `all` on the configured
-workstation. A portable pass alone does not certify tracing, graphics or ARM64.
+workstation, plus `periodic-gui` for the full graphics and delayed-discovery matrices. An `all` pass deliberately excludes those matrices; its result records that exclusion. A portable pass alone does not certify tracing, graphics or ARM64.
 
 The newer source-block, comparison, process-tree and allocation suites are
 separate from `all`. After building the default target, also run:
@@ -192,3 +193,30 @@ With a debug Perl and a separately built test-only PadWalker tree, add
 named-local sanitizer/oracle, local and C-agent MCP, and shared-observer checks.
 The gui/all gate also exercises Perl named locals, sigil-name entry and the
 collapsible native-object section on a private display. Nothing is installed.
+
+## Focused checks and periodic matrices
+
+Run `scripts/release-check all` for ordinary changes and
+`scripts/release-check periodic-gui` periodically and before release. Scheduling
+changes do not change a test failure into a skip. The full existing commands
+and their assertions remain in the periodic lane; this runner does not install
+a scheduler. Use `--list` to see the exact commands.
+
+| Area | Ordinary host/gui/all | Explicit periodic coverage |
+| --- | --- | --- |
+| Vulkan faults | Baseline, partial and poisoned creation, present loss/recovery, ten-lifetime late-init failure with host/Vulkan accounting, actual resize; existing hidden/acquire/fence/Wayland tests also remain | Complete startup/create/poison/frame/resize matrix |
+| Overview | Redacted identity, unavailable-state reasons, all-panel layout at 1280×720 redacted, animation/shutdown; live overview test remains | Complete panel/theme/sort/search/action/redaction and resolution matrix |
+| Clipboard | Control/format filtering, truncation, UTF-8 edits, stalled transfer and stale-editor checks | All cursor/selection, middle-click, editor, profile and archive threshold cases |
+| Symbol discovery | Normal discovery and install cases, including completion, interruption and unavailable symbols | Same completion/interruption assertions at 25/50/100 ms per reply |
+
+`periodic --headless` includes the source-path differential and delayed-discovery
+matrix without graphics. `periodic-gui` includes those plus the three full GUI
+matrices. Runtime SDK flags are rejected in both because these lanes do not
+schedule runtime-specific checks; run the ordinary lane with those flags too.
+Neither periodic lane is the performance lane: its correctness failures remain
+failures under load. `perf` reports measurements separately.
+
+The focused GUI checks retain the existing synchronization and timeout rules.
+They do not claim a new presentation acknowledgement or a timing-flake fix.
+Other expensive suites, including memdefrag and runtime-specific GUIs, still run
+in their original lanes pending separately reviewed coverage changes.

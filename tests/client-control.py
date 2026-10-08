@@ -39,3 +39,39 @@ for replies, states, calls in [
     assert len(client.actions) == calls, client.actions
 
 print('Initial continue: bounded stale retry, unchanged refusal and state checks passed')
+
+class StopSequence(Client):
+    def __init__(self, observations):
+        self.observations = iter(observations)
+        self.reads = 0
+    def session(self):
+        self.reads += 1
+        return next(self.observations)
+
+def stop(generation, state='stopped', reason='breakpoint', discovery=False, continuing=False):
+    return dict(generation=generation, state=state, threads=[dict(reason=reason)],
+                symbol_discovery_pending=discovery, continue_pending=continuing)
+
+# The first breakpoint is an internal loader rendezvous. Completion permits
+# automatic execution, so its generation must never be handed to a caller as
+# the requested user breakpoint's generation.
+sequence = [stop(11, discovery=True), stop(12, continuing=True),
+            stop(13, state='running'), stop(14, reason='interrupt'), stop(15)]
+client = StopSequence(sequence)
+assert client.stopped('breakpoint') == sequence[-1]
+assert client.reads == len(sequence)
+
+# An explicit interrupt can stop discovery. Preserve that stopped outcome;
+# this helper does not send continue or retry any control operation.
+interrupted = stop(21, reason='interrupt')
+assert StopSequence([stop(20, discovery=True), interrupted]).stopped() == interrupted
+for pending in ('discovery', 'continuing'):
+    client = StopSequence([stop(30, **{pending: True}), stop(31, state='exited')])
+    try:
+        client.stopped()
+    except AssertionError:
+        pass
+    else:
+        raise AssertionError('pending work hid a target exit')
+    assert client.reads == 2
+print('Stop wait: discovery and deferred continue settle; real breakpoint, interrupt and exit remain distinct')

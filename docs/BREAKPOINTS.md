@@ -113,6 +113,20 @@ load, unload and reload. `get_breakpoints` includes logical `definitions`, pendi
 and internal flags, and loader availability/diagnostics. One internal read-only
 loader breakpoint appears while definitions require it.
 
+An MCP `get_session` response with `state: "stopped"` can describe that internal
+loader rendezvous while `symbol_discovery_pending: true`. This is more visible
+through the C agent because discovery spans several owner turns. The accepted
+continue may resume automatically after discovery and reach the requested user
+breakpoint. Those intervening steps and continues correctly advance generation.
+
+Before treating a breakpoint stop as ready for inspection, poll until the
+session is stopped, `symbol_discovery_pending` and `continue_pending` are both
+false, and the desired thread stop reason matches. `get_breakpoints` identifies
+internal loader hooks; `query_events` distinguishes them from the user's hit.
+Use the current generation for a subsequent control call and handle
+`StaleSnapshot` if state changes again. A pending discovery can still be
+interrupted explicitly; polling does not itself grant permission to resume.
+
 **F4** or MCP `restart(generation)` restarts the original owned launch. Pause first
 if it is running. It also works after exit. The old owned process is killed and
 reaped before launching again; attached processes reject restart. Original argv

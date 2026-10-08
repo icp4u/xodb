@@ -77,6 +77,9 @@ pub fn status(a: Allocator, capture: *model.Capture) !Value {
 /// Caller supplies the explicitly routed process's capture. Arguments do not
 /// mutate target state or change the GUI's selected process/thread.
 pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Value) !Value {
+    return callOwned(a, current, name, args, .{});
+}
+pub fn callOwned(a: Allocator, current: ?*model.Capture, name: []const u8, args: Value, requester: @import("../service/job_owner.zig").Requester) !Value {
     const is_status = std.mem.eql(u8, name, "get_allocation_capture");
     const records = std.mem.eql(u8, name, "get_allocation_events");
     const spans = std.mem.eql(u8, name, "get_allocation_calls");
@@ -128,7 +131,7 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
         const value = args.object.get("metric") orelse Value{ .string = "allocated_bytes" };
         if (value != .string or start > @import("../profile/flame.zig").max_nodes) return error.InvalidArguments;
         const metric = std.meta.stringToEnum(@import("../profile/allocation_heap.zig").Metric, value.string) orelse return error.InvalidArguments;
-        const view = (try capture.heapView(filter, metric, .mcp)) orelse return wire.value(a, .{ .key = key, .pending = true, .metric = metric, .filter = filter });
+        const view = (try capture.heapViewOwned(filter, metric, .mcp, requester)) orelse return wire.value(a, .{ .key = key, .pending = true, .metric = metric, .filter = filter });
         if (start > view.graph.nodes.items.len) return error.InvalidArguments;
         const end = @min(view.graph.nodes.items.len, start + limit);
         var nodes: std.ArrayList(Value) = .empty;
@@ -170,7 +173,7 @@ pub fn call(a: Allocator, current: ?*model.Capture, name: []const u8, args: Valu
     // Validate before spawning work, including strict boolean and cursor bounds.
     const retry = try boolean(args, "retry");
     if (start > @import("../profile/allocation_lifetimes.zig").max_calls) return error.InvalidArguments;
-    try capture.requestAnalysis(retry);
+    try capture.requestAnalysisOwned(retry, requester);
     if (capture.state == .analyzing) return wire.value(a, .{ .key = key, .pending = true, .analysis_algorithm = model.algorithm });
     const page = try capture.lifetimePage(a, key, filter, @intCast(start), @intCast(limit));
     defer a.free(page.rows);

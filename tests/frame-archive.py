@@ -90,12 +90,22 @@ raw = (root / 'tests/logical-frames/regress/c05-weight-overflow.jsonl').read_byt
 logical = work / 'input.jsonl'; logical.write_bytes(raw)
 source = args.capture.resolve() if args.capture else work / 'native.xoc'
 if not args.capture:
-    c = Client('control', './zig-out/bin/xodb-profile-fixture', args=['2', 'threads'])
+    c = Client('control', './zig-out/bin/xodb-profile-fixture', args=['120', 'threads'])
     try:
         bp = c.action('set_breakpoint', symbol='profile_ready')['id']
         c.action('continue'); c.stopped('breakpoint'); c.action('remove_breakpoint', id=bp)
-        cap = c.action('start_profile', frequency_hz=199)['capture']
-        c.action('continue'); time.sleep(.3)
+        cap = c.action('start_profile', frequency_hz=199, duration_ms=0)['capture']
+        c.action('continue')
+        # Archive tests need retained samples, independent of CPU share or
+        # collector frequency. The fixture outlives this bounded observation.
+        deadline = time.monotonic() + 30
+        while True:
+            current = c.inspect('get_profile')['capture']
+            assert current['id'] == cap['id'], current
+            if current['stored_samples'] > 0: break
+            assert current['status'] == 'collecting', current
+            assert time.monotonic() < deadline, ('no retained CPU sample', current)
+            time.sleep(.01)
         c.action('stop_profile', capture_id=cap['id'])
         save(c, source)
     finally: c.close()

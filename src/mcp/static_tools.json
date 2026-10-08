@@ -34,7 +34,7 @@
     },
     "annotations": {
       "readOnlyHint": true,
-      "xodbSessionAccess": "observer"
+      "xodbSessionAccess": "controller"
     }
   },
   {
@@ -118,7 +118,7 @@
     },
     "annotations": {
       "readOnlyHint": true,
-      "xodbSessionAccess": "observer"
+      "xodbSessionAccess": "controller"
     }
   },
   {
@@ -185,7 +185,7 @@
     },
     "annotations": {
       "readOnlyHint": true,
-      "xodbSessionAccess": "observer"
+      "xodbSessionAccess": "controller"
     }
   },
   {

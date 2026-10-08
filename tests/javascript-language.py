@@ -76,8 +76,14 @@ def audit(client, target, name):
         'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
         '-p',str(client.p.pid)], stderr=subprocess.PIPE)
     try:
-        time.sleep(.5)
-        assert tracer.poll() is None, tracer.stderr.read().decode()
+        deadline = time.monotonic() + 10
+        while True:
+            assert tracer.poll() is None, tracer.stderr.read().decode()
+            status = Path(f'/proc/{client.p.pid}/status').read_text()
+            attached = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:'))
+            if attached == tracer.pid: break
+            assert time.monotonic() < deadline, 'strace did not attach before the audit deadline'
+            time.sleep(.01)
         for _ in range(2):
             client.inspect('get_language_stack',tid=target.pid,language='javascript')
             client.inspect('evaluate_expression',tid=target.pid,frame=0,expression='value')

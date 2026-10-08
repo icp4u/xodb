@@ -48,8 +48,9 @@ cancel/retry; control scope still denies memory/register mutations. This applies
 to stdio MCP as well as shared sessions, including after the human presses F8.
 Shared clients additionally need the controller lease for tools marked
 `xodbSessionAccess=controller` or `mutator`, even when those tools only create
-read-only inspection jobs. Private stdio inspection jobs keep their existing
-read-only access.
+read-only inspection jobs. Only private headless stdio sessions keep the
+read-only job exception. A GUI, session socket, or human scope change removes
+that exception, including after F8 returns control to the human.
 
 ## Connect an MCP client
 
@@ -236,3 +237,37 @@ the session and existing clients alive. `get_session_clients` reports
 JSON-safe integer and the last errno remains available after recovery. These
 failures do not add journal entries or emit repeated logs. A later pump retries
 accepting connections after resources become available.
+
+## Retained job ownership
+
+`readOnlyHint` describes target effects, not authority over the human's retained
+work. A GUI's observe-scope MCP client cannot capture/replace memory snapshots,
+start/cancel searches, replace observation comparisons/associations, or occupy
+profile/allocation view jobs. This includes direct calls to tools omitted from
+`tools/list`, before and after F8 revokes control. Pure evidence/status reads
+remain available. The controller can still perform those workflows.
+
+Memory snapshots, searches, inspections, observation jobs and profile/allocation
+work retain the identity that created them: human, private stdio client, or a
+shared client ID. Replacement, eviction, cancellation and release require that
+owner, the human, or current controller authority. A null stdio client ID never
+means the human. Authority is checked at the action; a job does not retain an
+expired controller grant. Shared-session dispatch still requires its lease.
+
+A private headless stdio session has one client and retains its existing
+read-only inspection workflow. Adding a session socket or GUI removes that
+exception. Scope changes through the human controls latch shared-job protection;
+returning to observe does not restore the private-session exception. Child
+process sessions inherit the same policy. Frontends that queue calls must route
+them through `Server.tool()` and carry this session policy to the owner.
+
+When a reconstructed-stack view cannot replace an existing job because its
+archive slot is busy or the requester lacks ownership, that request is
+unavailable. It does not cache a reconstruction failure for the capture/filter;
+a later permitted request can try again once the slot is available. Failures
+from actually starting or running reconstruction still remain recorded for that
+capture/filter. This does not bypass the controller policy for derived-view tools.
+
+The static-analysis starter tools are declared controller operations because
+they may launch bounded external work; cached/status/export observer tools keep
+their classifications. This does not change the worker's implementation.

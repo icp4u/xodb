@@ -7,6 +7,36 @@ const Budget = @import("archive_budget.zig").Budget;
 const a = std.testing.allocator;
 const elf_path = "zig-out/bin/xodb-profile-fixture";
 
+test "recorded jobs preserve human pending and published views against another owner" {
+    const jobs = @import("../service/job_owner.zig");
+    const peer = jobs.Requester{ .owner = jobs.Owner.agent(7) };
+    const other = jobs.Requester{ .owner = jobs.Owner.agent(8) };
+    const control = jobs.Requester{ .owner = peer.owner, .controller = true };
+    const capture = try fixture.build(a, .representative, null);
+    defer capture.deinit();
+    var state = view.State{};
+    defer state.deinit();
+    // Keep this pending job unscheduled so the cancellation assertion cannot
+    // accidentally observe an already finished worker.
+    const human = try view.Job.create(1, capture, .{});
+    state.job = human;
+    state.request_owner = .{};
+    try std.testing.expectError(error.JobNotOwned, state.requestOwned(capture, capture.revision, .{ .tid = 4100 }, false, peer));
+    try std.testing.expect(state.job == human);
+    try std.testing.expect(!human.cancel.load(.acquire));
+    try human.start();
+    human.join();
+    const published = try state.requestOwned(capture, capture.revision, .{}, false, other);
+    const nodes = published.graph.nodes.items.len;
+    try std.testing.expectError(error.JobNotOwned, state.requestOwned(capture, capture.revision, .{ .tid = 4100 }, false, peer));
+    try std.testing.expectEqual(nodes, state.result.?.graph.nodes.items.len);
+    try std.testing.expectError(error.ProfileViewPending, state.requestOwned(capture, capture.revision, .{ .tid = 4100 }, false, control));
+    state.job.?.join();
+    _ = try state.requestOwned(capture, capture.revision, .{ .tid = 4100 }, false, peer);
+    try std.testing.expectError(error.JobNotOwned, state.requestOwned(capture, capture.revision, .{}, false, other));
+    try std.testing.expectError(error.ProfileViewPending, state.requestOwned(capture, capture.revision, .{}, false, peer));
+}
+
 fn compare(left: *const flame.Graph, right: *const flame.Graph) !void {
     try std.testing.expectEqualDeep(left.nodes.items, right.nodes.items);
     try std.testing.expectEqual(left.rejected, right.rejected);

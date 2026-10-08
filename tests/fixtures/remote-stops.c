@@ -4,11 +4,12 @@
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdio.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <sys/mman.h>
 #include <unistd.h>
 
-volatile unsigned long hits;
+volatile uint64_t hits;
 __attribute__((noinline)) void remote_hit(void) { ++hits; }
 __attribute__((noinline)) void remote_ready(void) { __asm__ volatile ("" ::: "memory"); }
 static void *waiting_thread(void *unused)

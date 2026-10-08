@@ -6,6 +6,7 @@ const Session = @import("session.zig").Session;
 const Tab = @import("language_tabs.zig").Tab;
 const lua = @import("../language/lua.zig");
 const python = @import("../language/python.zig");
+const perl = @import("../language/perl.zig");
 const Capture = @import("../language/watch.zig").Capture;
 const A = std.mem.Allocator;
 const Attempt = struct { id: u64, generation: u64, metadata: u64 };
@@ -18,7 +19,7 @@ pub const State = struct {
         self.core = null;
     }
     pub fn add(self: *State, session: *Session, language: Tab, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !u64 {
-        if (language != .lua and language != .python) return error.LanguageWatchRuntimeUnsupported;
+        if (language != .lua and language != .python and language != .perl) return error.LanguageWatchRuntimeUnsupported;
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
         if (segment >= 64 or frame >= 64 or tid <= 0) return error.InvalidArguments;
         if (c.xlw_count(self.core) >= c.XLW_ENTRIES) return error.LanguageWatchLimit;
@@ -27,6 +28,7 @@ pub const State = struct {
         const capture = switch (language) {
             .lua => try lua.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             .python => try python.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .perl => try perl.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             else => unreachable,
         };
         if (self.core == null) self.core = c.xlw_create() orelse return error.OutOfMemory;
@@ -81,6 +83,7 @@ pub const State = struct {
             const capture = (switch (scope.language) {
                 c.XLW_LUA => lua.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 c.XLW_PYTHON => python.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_PERL => perl.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 else => error.LanguageWatchRuntimeUnsupported,
             }) catch |err| {
                 if (session.target.snapshot().state != .stopped or session.target.snapshot().generation != snapshot.generation) return;
@@ -100,7 +103,11 @@ pub const State = struct {
         for (entries, 0..) |*entry, ordinal| {
             var view: c.struct_xlw_view = undefined;
             try check(c.xlw_get(self.core, ordinal, &view));
-            entry.* = .{ .id = view.id, .language = if (view.scope.language == c.XLW_PYTHON) .python else .lua, .expression = try a.dupe(u8, std.mem.span(view.expression)), .observed_generation = view.observed_generation, .session = view.scope.session, .image_epoch = view.scope.image, .thread_id = view.scope.thread, .runtime_location = view.scope.runtime[1], .frame_location = view.scope.frame[0], .prototype = view.scope.frame[1], .selector = if (binding(view.scope)) .binding else .expression, .declaration = if (binding(view.scope)) view.scope.frame[3] else null, .state = switch (view.state) {
+            entry.* = .{ .semantics = if (view.scope.language == c.XLW_PERL) "stopped complete scalar representations; public IOK/NOK/POK changes count; no coercion or automatic interruption" else sample_semantics, .identity = if (view.scope.language == c.XLW_PERL) "stackinfo/context index and CV match; continuous activation lifetime between stops unproved" else frame_identity, .id = view.id, .language = switch (view.scope.language) {
+                c.XLW_PYTHON => .python,
+                c.XLW_PERL => .perl,
+                else => .lua,
+            }, .expression = try a.dupe(u8, std.mem.span(view.expression)), .observed_generation = view.observed_generation, .session = view.scope.session, .image_epoch = view.scope.image, .thread_id = view.scope.thread, .runtime_location = view.scope.runtime[1], .frame_location = view.scope.frame[0], .prototype = view.scope.frame[1], .selector = if (binding(view.scope)) .binding else .expression, .declaration = if (binding(view.scope)) view.scope.frame[3] else null, .state = switch (view.state) {
                 c.XLW_PENDING => .pending,
                 c.XLW_VALUE => .value,
                 c.XLW_UNAVAILABLE => .unavailable,
@@ -135,6 +142,8 @@ pub const Value = struct { generation: u64, kind: u32, type: []const u8, display
 fn value(a: A, v: c.struct_xlw_value) !Value {
     return .{ .generation = v.generation, .kind = v.kind, .type = try a.dupe(u8, std.mem.span(v.type)), .display = try a.dupe(u8, std.mem.span(v.display)), .comparison_bytes = v.size };
 }
+const sample_semantics = "stopped typed-byte comparison; storage re-resolved each stop; no automatic interruption";
+const frame_identity = "frame location and code/prototype match; continuous activation lifetime between stops unproved";
 pub const Entry = struct {
     id: u64,
     language: Tab,
@@ -154,6 +163,6 @@ pub const Entry = struct {
     comparison: enum { not_compared, same_slot_equal, same_slot_different },
     current: ?Value,
     previous: ?Value,
-    semantics: []const u8 = "stopped typed-byte comparison; storage re-resolved each stop; no automatic interruption",
-    identity: []const u8 = "frame location and code/prototype match; continuous activation lifetime between stops unproved",
+    semantics: []const u8 = sample_semantics,
+    identity: []const u8 = frame_identity,
 };

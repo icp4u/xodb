@@ -36,6 +36,7 @@ pub const State = enum { pending, running, completed, cancelled, failed };
 pub const Kind = enum { registers, stack, locals, expression, memory };
 pub const Item = struct { kind: Kind, index: usize, json: ?[]const u8 = null, diagnostic: ?[]const u8 = null };
 pub const Job = struct {
+    owner: @import("../service/job_owner.zig").Owner = .{},
     id: u64,
     identity: Identity,
     threads: []const Thread,
@@ -182,6 +183,9 @@ pub const Manager = struct {
         };
     }
     pub fn start(self: *Manager, session: anytype, request: Request) !*Job {
+        return self.startOwned(session, request, .{});
+    }
+    pub fn startOwned(self: *Manager, session: anytype, request: Request, requester: @import("../service/job_owner.zig").Requester) !*Job {
         try request.validate();
         if (session.offline or session.imported != null) return error.LiveOrCoreRequired;
         try session.target.expectGeneration(request.generation);
@@ -202,7 +206,7 @@ pub const Manager = struct {
         } else return error.InspectionLimit;
         if (self.next_id == std.math.maxInt(u64)) return error.InspectionLimit;
         const job = try self.allocator.create(Job);
-        job.* = .{ .id = self.next_id, .identity = .{ .session_id = session.id, .process_id = session.process_id, .pid = snapshot.pid, .generation = snapshot.generation, .image_epoch = snapshot.image_epoch, .thread_id = selected, .tid = request.tid, .frame = request.frame }, .threads = &.{}, .request = request, .budget = .{ .backing = self.allocator, .limit = memory_limit }, .arena = undefined };
+        job.* = .{ .owner = requester.owner, .id = self.next_id, .identity = .{ .session_id = session.id, .process_id = session.process_id, .pid = snapshot.pid, .generation = snapshot.generation, .image_epoch = snapshot.image_epoch, .thread_id = selected, .tid = request.tid, .frame = request.frame }, .threads = &.{}, .request = request, .budget = .{ .backing = self.allocator, .limit = memory_limit }, .arena = undefined };
         job.arena = std.heap.ArenaAllocator.init(job.budget.allocator());
         errdefer job.deinit();
         const a = job.arena.allocator();
@@ -229,8 +233,12 @@ pub const Manager = struct {
         return error.UnknownInspection;
     }
     pub fn release(self: *Manager, id: u64) !void {
+        return self.releaseOwned(id, .{});
+    }
+    pub fn releaseOwned(self: *Manager, id: u64, requester: @import("../service/job_owner.zig").Requester) !void {
         for (&self.jobs) |*job| if (job.*) |v| {
             if (v.id == id) {
+                try v.owner.require(requester);
                 v.deinit();
                 job.* = null;
                 return;

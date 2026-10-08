@@ -94,12 +94,17 @@ struct xpl_frame {
     char name[256], file[1024];
     uint32_t line, context_type;
     uint64_t cv, context_address, cop;
+    /* cxstack can move; stackinfo/index locates its current entry. This is a
+     * location identity, not proof of an activation surviving between stops. */
+    uint64_t stackinfo, context_index;
+    int identity_proved;
     const char *reason;
 };
 struct xpl_stack {
     struct xpl_frame frames[XPL_MAX_FRAMES];
     size_t count;
     uint64_t interpreter, op, stackinfo;
+    int chain_complete; /* separate structural completion from display errors */
     const char *reason; /* null means the bounded walk reached its root */
 };
 /* Caller keeps the entire process stopped for the duration of each operation.
@@ -147,4 +152,25 @@ void xpl_locals_read(const struct xpl_layout *, struct xpl_reader *, uint64_t in
                      size_t frame, size_t start, size_t limit, struct xpl_locals *);
 void xpl_local_find(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
                     size_t frame, const char *name, struct xpl_locals *);
+/* A retained declaration remains that ordinal even while a same-named inner
+ * declaration is visible. Its name is exact declared bytes, not an expression;
+ * Unicode names are allowed. Inactive or mismatched declarations are refused. */
+void xpl_local_binding(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
+                       size_t frame, uint64_t ordinal, const char *name, struct xpl_locals *);
+#define XPL_SAMPLE_BYTES 4096
+enum xpl_sample_kind { XPL_SAMPLE_UNDEF = 0, XPL_SAMPLE_IV = 1, XPL_SAMPLE_NV = 2,
+                       XPL_SAMPLE_PV = 4, XPL_SAMPLE_UNSIGNED = 8 };
+struct xpl_sample {
+    uint32_t kind;
+    size_t size;
+    uint8_t bytes[XPL_SAMPLE_BYTES];
+    char type[32], display[256];
+    const char *reason;
+};
+/* Complete stored scalar representations, not Perl eq/== or coercion. Public
+ * IOK/NOK/POK bits all contribute (dualvars included); cache/validity changes
+ * are observable. PV is canonical LE32 characters, with byte PV as Latin-1.
+ * Magic, references, containers and non-Unicode UTF-8 are refused. */
+void xpl_sample_read(const struct xpl_layout *, struct xpl_reader *, uint64_t sv,
+                     struct xpl_sample *);
 #endif

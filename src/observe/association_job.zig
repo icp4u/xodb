@@ -42,6 +42,7 @@ fn compatible(capture: *const model.Capture, owner_session: u64, owner_process: 
 }
 const uncertainty = saved_evidence.uncertainty;
 pub const Job = struct {
+    owner: @import("../service/job_owner.zig").Owner = .{},
     id: u64,
     capture: *const model.Capture,
     selection: comparison.Selection,

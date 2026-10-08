@@ -45,10 +45,23 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if tier == 'perf':
         steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
                       '--work', '.work/perf-observers'], 180))
+        steps.append(('remote-stop-measurements', [sys.executable, '-B', 'tests/remote-stops.py', '--perf'], 180))
         return steps
-    if tier == 'periodic':
+    if tier in ('periodic', 'periodic-gui'):
         steps.append(('source-paths-differential', [sys.executable, '-B', 'tests/source-paths-differential.py',
                       '--check', '.work/source-paths-check', '--work', '.work/source-differential', '--cases', '1500'], 300))
+        for delay in (25, 50, 100):
+            steps.append((f'symbol-discovery-latency-{delay}', [sys.executable, '-B',
+                          'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
+                          '--read-delay-ms', '0', '--rate', '10000000000',
+                          '--timeout', '70', '--cases', 'complete', 'interrupt'], 150))
+        if tier == 'periodic-gui':
+            steps += [
+                ('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
+                 'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600),
+                ('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900),
+                ('gui-clipboard', [sys.executable, '-B', 'tests/clipboard-gui.py'], 90),
+            ]
         return steps
     if live:
         for remote in (False, True):
@@ -63,10 +76,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis',
                      'lsof-top', 'fdactivity'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
-        for name in ('inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
@@ -87,11 +100,6 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
         steps.append(('symbol-discovery', [sys.executable, '-B', 'tests/symbol-discovery.py'], 240))
         steps.append(('symbol-discovery-install', [sys.executable, '-B', 'tests/symbol-discovery-install.py'], 150))
-        for delay in (25, 50, 100):
-            steps.append((f'symbol-discovery-latency-{delay}', [sys.executable, '-B',
-                          'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
-                          '--read-delay-ms', '0', '--rate', '10000000000',
-                          '--timeout', '70', '--cases', 'complete', 'interrupt'], 150))
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('source-fetch', [sys.executable, '-B', 'tests/source-fetch.py'], 180))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
@@ -115,6 +123,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'perl-named-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pn{int(remote)}'], 180))
+                steps.append((f'perl-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pw{int(remote)}'], 300))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if ruby:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
@@ -152,7 +161,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'lua-context-{index}-{int(companion)}', [sys.executable, '-B', 'tests/lua-context.py', *sdk, '--strace', *(['--companion'] if companion else []), '--work', f'.work/lua-context-{index}-{int(companion)}'], 120))
     if tier in ('gui', 'all'):
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
-                      'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600))
+                      'zig-out/bin/xodb', '.work/vulkan-faults.json',
+                      'baseline', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
+                      'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'], 600))
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('gui-themes', ['tests/themes.py']),
@@ -160,12 +171,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
-            ('gui-clipboard', ['tests/clipboard-gui.py']),
+            ('gui-clipboard', ['tests/clipboard-gui.py', '--focused']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
             ('gui-symbol-discovery', ['tests/symbol-discovery-gui.py']),
             ('gui-remote-caller', ['tests/remote-caller-gui.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
+            ('gui-shared-jobs', ['tests/shared-job-gui.py', '--work', '.work/input-jobs']),
+            ('gui-shared-jobs-agent', ['tests/shared-job-gui.py', '--work', '.work/input-joba', '--agent', 'zig-out/bin/xodb-agent']),
             ('gui-fdactivity', ['tests/fdactivity-gui.py']),
             ('gui-invocations', ['tests/invocations-gui.py']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
@@ -184,7 +197,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         ):
             steps.append((name, [sys.executable, '-B', *args], 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
         # Many OCR passes on a private display; bounded well above its usual few minutes.
-        steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900))
+        steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
@@ -203,6 +216,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240))
         if perl and padwalker:
             steps.append(('perl-named-gui', [sys.executable, '-B', 'tests/perl-locals-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/png'], 180))
+            steps.append(('perl-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/pwg'], 180))
         if lua:
             selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
             steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))
@@ -356,7 +370,7 @@ def snapshot(destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'perf'])
+    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf'])
     parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
@@ -374,17 +388,17 @@ def main():
         parser.error('--headless is for the portable, periodic or perf tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
         parser.error('--uprobes requires the host or all tier')
-    if args.perl and args.tier in ('portable', 'periodic', 'perf'):
+    if args.perl and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--perl requires the host, gui or all tier')
     if args.padwalker and not args.perl:
         parser.error('--padwalker requires --perl')
-    if args.python and args.tier in ('portable', 'periodic', 'perf'):
+    if args.python and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--python requires the host, gui or all tier')
-    if args.ruby and args.tier in ('portable', 'periodic', 'perf'):
+    if args.ruby and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--ruby requires the host, gui or all tier')
-    if args.node and args.tier in ('portable', 'periodic', 'perf'):
+    if args.node and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--node requires the host, gui or all tier')
-    if args.lua and args.tier in ('portable', 'periodic', 'perf'):
+    if args.lua and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--lua requires the host, gui or all tier')
     steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby)
     if args.capstone == 'vendored':
@@ -410,15 +424,18 @@ def main():
                   optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
-                    (['live ptrace/perf checks', 'GUI execution'] if args.tier in ('portable', 'periodic') else
+                    (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
+                     ['full host integration suite', 'GUI execution'] if args.tier == 'periodic' else
+                     ['full host integration suite', 'runtime-specific GUI checks'] if args.tier == 'periodic-gui' else
                      ['GUI execution'] if args.tier == 'host' else
                      ['full host integration suite'] if args.tier == 'gui' else
                      ['full host integration suite', 'GUI execution'] if args.tier == 'perf' else []) +
+                    (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)'] if args.tier in ('all', 'gui', 'host') else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
-                    (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.ruby else []) +
-                    (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.node else []) +
-                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.lua else []) +
-                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.padwalker else []))
+                    (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.ruby else []) +
+                    (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.node else []) +
+                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.lua else []) +
+                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.padwalker else []))
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
@@ -432,16 +449,16 @@ def main():
         report['revision'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
         report['working_changes'] = subprocess.check_output(['git', 'status', '--short', '--untracked-files=no'], cwd=ROOT, text=True)
         required = ['zig', 'cc', 'gcc', 'clang', 'ld.lld', 'llvm-objcopy', 'objcopy', 'strip', 'pkg-config']
-        if args.tier in ('host', 'all'):
+        if args.tier in ('host', 'all', 'periodic', 'periodic-gui'):
             required += ['g++', 'clang++', 'gdb', 'strace']
-        if args.tier == 'periodic':
+        if args.tier in ('periodic', 'periodic-gui'):
             required += ['readelf']
         if not args.headless:
             required += ['wayland-scanner', 'glslc']
-        if args.tier in ('gui', 'all'):
+        if args.tier in ('gui', 'all', 'periodic-gui'):
             required += ['sway', 'swaymsg', 'grim']
         missing = [tool for tool in required if not shutil.which(tool)]
-        if args.tier in ('gui', 'all'):
+        if args.tier in ('gui', 'all', 'periodic-gui'):
             try:
                 __import__('PIL.Image')
             except ImportError:
@@ -477,7 +494,7 @@ def main():
                 left.sendall(b'xodb')
                 if right.recv(4) != b'xodb':
                     raise RuntimeError('Local IPC probe returned incorrect bytes')
-            if args.tier not in ('portable', 'periodic'):
+            if args.tier != 'portable':
                 with socket.socket() as listener:
                     listener.bind(('127.0.0.1', 0))
                     listener.listen(1)
@@ -508,7 +525,7 @@ def main():
             shutil.copytree(capstone_prefix, tree / '.work' / 'capstone')
         (tree / '.work/tmp').mkdir(parents=True)
         env['TMPDIR'] = str(tree / '.work/tmp')
-        if args.tier not in ('portable', 'periodic'):
+        if args.tier != 'portable':
             preflight = [('probe-build', ['cc', '-Wall', '-Wextra', '-Werror',
                          'tests/release-probe.c', '-o', '.work/release-probe'], 30),
                          ('capabilities', ['.work/release-probe'], 10)]

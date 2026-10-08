@@ -164,13 +164,16 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
             selection.argument = .{ .index = @intCast(index), .value = try word(args, "argument_value") };
         }
         selection.validate() catch return error.InvalidArguments;
-        const id = try session.compareObservation(selection);
+        const id = try session.compareObservationOwned(selection, session.jobRequester());
         return wire.value(a, .{ .id = id, .state = "running", .identity = capture.identity });
     }
     try wire.fields(args, &.{"id"});
     const job = session.observation_analysis orelse return error.NoObservationComparison;
     if (job.id != try wire.number(args, "id", null)) return error.StaleObservationComparison;
-    if (std.mem.eql(u8, name, "cancel_observation_comparison")) job.cancel.store(true, .release);
+    if (std.mem.eql(u8, name, "cancel_observation_comparison")) {
+        try job.owner.require(session.jobRequester());
+        job.cancel.store(true, .release);
+    }
     const done = job.done.load(.acquire);
     return exact(a, .{ .id = job.id, .identity = job.capture.identity, .state = if (!done) "running" else if (job.err != null) "failed" else "completed", .error_name = if (done) (if (job.err) |err| @errorName(err) else @as(?[]const u8, null)) else null, .result = if (done) job.result else null, .peak_bytes = if (done) @as(?usize, job.budget.peak) else null, .basis = "measured entry-to-return wall duration, not CPU cost; incomplete calls excluded; raw words are untyped" });
 }

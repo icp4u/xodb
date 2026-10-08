@@ -94,4 +94,11 @@ enum xsvc_result xsvc_events(const struct xsvc *service, uint64_t after,
  * revokes with SCOPE_CHANGED (client_id names the revoked owner, or zero).
  * Tick/claim/release/check may first emit EXPIRED. Rejected policy requests can
  * therefore observe expiry, while invalid requests cannot advance state. */
+/* Retained host work: human, the single stdio client, or a named shared peer.
+ * The caller supplies current controller authority; no lease is retained here.
+ * Invalid identities fail closed, even for a controller. */
+enum xsvc_job_kind { XSVC_JOB_HUMAN, XSVC_JOB_STDIO, XSVC_JOB_SHARED };
+struct xsvc_job_owner { uint64_t client; unsigned kind; };
+bool xsvc_job_may_change(struct xsvc_job_owner owner,
+                          struct xsvc_job_owner requester, bool controller);
 #endif

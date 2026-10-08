@@ -6,6 +6,7 @@ const Progress = @import("archive_progress.zig").Progress;
 const a = std.heap.page_allocator;
 pub const Job = struct {
     pub const DerivedOwner = enum { gui, mcp };
+    owner: @import("../service/job_owner.zig").Owner = .{},
     derived_owner: DerivedOwner = .mcp,
     id: u64,
     kind: enum { open, save, view, stack, derived, allocation_save },

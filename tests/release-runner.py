@@ -118,17 +118,54 @@ time.sleep(60)
         for required in ('inspections-agent', 'inspection-lifecycle-agent', 'observations-live', 'observation-recipes-agent', 'observation-associations'):
             self.assertIn(required, observed)
 
+    def test_preferences_cover_both_live_backends(self):
+        for tier in ('host', 'all'):
+            commands = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            self.assertEqual(commands['m2-preferences'][-1], 'tests/m2-preferences.py')
+            self.assertEqual(commands['m2-preferences-agent'][:2],
+                             ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
+            self.assertEqual(commands['m2-preferences-agent'][-1], 'tests/m2-preferences.py')
+        for tier in ('portable', 'periodic', 'gui', 'perf'):
+            self.assertFalse({'m2-preferences', 'm2-preferences-agent'} &
+                             {name for name, _, _ in gate.plan(tier)})
+
     def test_measurements_are_explicit_and_separate(self):
         perf = {s[0] for s in gate.plan('perf', headless=True)}
         self.assertIn('observer-measurements', perf)
+        self.assertIn('remote-stop-measurements', perf)
+        command = next(cmd for name, cmd, _ in gate.plan('perf') if name == 'remote-stop-measurements')
+        self.assertEqual(command[-2:], ['tests/remote-stops.py', '--perf'])
         self.assertFalse(perf & {'mcp', 'vulkan-faults', 'gui-overview'})
-        for tier in ('portable', 'host', 'gui', 'all', 'periodic'):
-            self.assertNotIn('observer-measurements', {s[0] for s in gate.plan(tier)})
-        # Correctness matrices retain their original coverage until explicitly
-        # replaced by focused checks, independently of performance evidence.
-        all_names = {s[0] for s in gate.plan('all')}
-        self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-clipboard',
-                         'symbol-discovery-latency-25', 'symbol-discovery-latency-100'} <= all_names)
+        for tier in ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui'):
+            self.assertFalse({'observer-measurements', 'remote-stop-measurements'} &
+                             {s[0] for s in gate.plan(tier)})
+    def test_periodic_keeps_complete_matrices_and_quick_keeps_lifecycles(self):
+        regular = {name: argv for name, argv, _ in gate.plan('all')}
+        periodic = {name: argv for name, argv, _ in gate.plan('periodic-gui')}
+        for name, script in (('gui-overview', 'tests/overview-gui.py'),
+                             ('gui-clipboard', 'tests/clipboard-gui.py')):
+            self.assertEqual(periodic[name], [sys.executable, '-B', script])
+            self.assertEqual(regular[name], [sys.executable, '-B', script, '--focused'])
+        self.assertEqual(periodic['vulkan-faults'], [sys.executable, '-B',
+            'tests/vulkan-fault.py', 'zig-out/bin/xodb', '.work/vulkan-faults.json'])
+        self.assertEqual(set(regular['vulkan-faults'][5:]), {
+            'baseline', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
+            'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'})
+        for delay in (25, 50, 100):
+            name = f'symbol-discovery-latency-{delay}'
+            self.assertNotIn(name, regular)
+            self.assertEqual(periodic[name], [sys.executable, '-B',
+                'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
+                '--read-delay-ms', '0', '--rate', '10000000000', '--timeout', '70',
+                '--cases', 'complete', 'interrupt'])
+        self.assertTrue({'symbol-discovery', 'symbol-discovery-install',
+            'm2-limits', 'm2-archive', 'hidden-window', 'acquire-timeout',
+            'fence-timeout', 'wayland-read-race', 'gui-overview-live'} <= regular.keys())
+        headless = {name for name, _, _ in gate.plan('periodic', headless=True)}
+        self.assertTrue({'source-paths-differential', 'symbol-discovery-latency-25',
+            'symbol-discovery-latency-50', 'symbol-discovery-latency-100'} <= headless)
+        self.assertFalse(headless & {'vulkan-faults', 'gui-overview', 'gui-clipboard'})
+
 
 
 if __name__ == '__main__':

@@ -152,12 +152,14 @@ In **Ruby**, select a logical frame for VM-stack locals and escaped closure
 environments. **E** accepts a bare local/capture name; the closest lexical scope
 wins. See [Ruby](RUBY.md) for the initial supported revision and explicit refusals.
 **E** in **C/C++** still uses the
-native expression/watch view. In **Lua**, click a named binding then **W**, or use
-**Shift+E** with a bare name, to compare complete bounded values at each stop.
+native expression/watch view. In **Lua**, **Python** or **Perl**, click a named
+binding then **W**, or use **Shift+E** with a local name (`$name` in Perl), to
+compare complete bounded scalar values at each stop.
 **V** opens the runtime watch list; changed rows show old and new values. Storage
 is resolved again after resume/GC. These watches observe stops; they do not
-interrupt a running process. Other language watch adapters are not yet available.
-See [Lua watches](LUA.md#runtime-watches) for scope and comparison limits.
+interrupt a running process. JS and Ruby watch adapters are not yet available.
+See [Lua watches](LUA.md#runtime-watches), [Python watches](PYTHON.md#runtime-watches)
+and [Perl watches](PERL.md#runtime-watches) for scope and comparison limits.
 
 What you see is the interpreter's own C code, plus, for Perl, CPython, CRuby and V8, the
 script level:

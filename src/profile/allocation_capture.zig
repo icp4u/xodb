@@ -60,6 +60,7 @@ const Analysis = struct {
     }
 };
 pub const Capture = struct {
+    analysis_owner: ?@import("../service/job_owner.zig").Owner = null,
     producer: ?@import("producer.zig").Producer = null,
     backing: Allocator,
     budget: Budget,
@@ -210,10 +211,15 @@ pub const Capture = struct {
         self.revision += 1;
     }
     pub fn requestAnalysis(self: *Capture, retry: bool) !void {
+        return self.requestAnalysisOwned(retry, .{});
+    }
+    pub fn requestAnalysisOwned(self: *Capture, retry: bool, requester: @import("../service/job_owner.zig").Requester) !void {
         self.poll();
         if (!self.store.finished) return error.AllocationStillCollecting;
         if (self.ended_ns == null) return error.AllocationCaptureNotFinalized;
         if (self.state == .analyzing or self.state == .ready) return;
+        if (self.analysis_owner) |owner| try owner.require(requester);
+        self.analysis_owner = requester.owner;
         if (self.store.first_gap != null) {
             self.state = .unavailable;
             self.failure = error.AllocationEvidenceGap;
@@ -295,13 +301,17 @@ pub const Capture = struct {
         self.done.store(true, .release);
     }
     pub fn heapView(self: *Capture, filter: Filter, metric: @import("allocation_heap.zig").Metric, owner: @import("allocation_heap.zig").Owner) !?*const @import("allocation_heap.zig").View {
-        try self.requestAnalysis(false);
+        return self.heapViewOwned(filter, metric, owner, .{});
+    }
+    pub fn heapViewOwned(self: *Capture, filter: Filter, metric: @import("allocation_heap.zig").Metric, owner: @import("allocation_heap.zig").Owner, requester: @import("../service/job_owner.zig").Requester) !?*const @import("allocation_heap.zig").View {
+        try self.requestAnalysisOwned(false, requester);
         if (self.worker != null) return null;
         if (self.state != .ready) return self.failure orelse error.AllocationAnalysisPending;
         const key_ = @import("allocation_heap.zig").Key{ .capture = self.key(), .filter = filter, .metric = metric };
         const slot = &self.heap_jobs[@intFromEnum(owner)];
         if (slot.*) |job| {
             if (!std.meta.eql(job.key, key_)) {
+                try job.request_owner.require(requester);
                 job.cancel.store(true, .release);
                 if (!job.done.load(.acquire)) return null;
                 job.deinit();
@@ -313,6 +323,7 @@ pub const Capture = struct {
             }
         }
         slot.* = try @import("allocation_heap.zig").Job.create(self, filter, metric);
+        slot.*.?.request_owner = requester.owner;
         return null;
     }
     pub fn cancelAnalysis(self: *Capture) void {
@@ -425,6 +436,34 @@ fn waitAnalysis(capture: *Capture) !void {
         if (capture.worker != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
     }
     if (capture.worker != null) return error.TestAnalysisDeadline;
+}
+test "allocation view replacement preserves a different owner's retained result" {
+    const jobs = @import("../service/job_owner.zig");
+    const peer = jobs.Requester{ .owner = jobs.Owner.agent(7) };
+    const other = jobs.Requester{ .owner = jobs.Owner.agent(8) };
+    const control = jobs.Requester{ .owner = peer.owner, .controller = true };
+    const capture = try Capture.create(std.testing.allocator, test_id, .{}, &test_threads, &test_hooks, 100);
+    defer capture.deinit();
+    try capture.feed(0, testSample(110, .enter, .malloc, 100, 24, 0));
+    try capture.feed(0, testSample(120, .leave, .malloc, 100, 0, 99));
+    try capture.finish(160, false);
+    try capture.requestAnalysis(false);
+    try waitAnalysis(capture);
+    _ = try capture.heapView(.{}, .allocated_bytes, .mcp);
+    const human = capture.heap_jobs[1].?;
+    human.thread.?.join();
+    human.thread = null;
+    try std.testing.expectError(error.JobNotOwned, capture.heapViewOwned(.{}, .allocations, .mcp, peer));
+    try std.testing.expect(capture.heap_jobs[1].? == human);
+    try std.testing.expect(!human.cancel.load(.acquire));
+    const cached = (try capture.heapViewOwned(.{}, .allocated_bytes, .mcp, peer)).?;
+    try std.testing.expectEqual(@as(u64, 24), cached.graph.nodes.items[0].inclusive);
+    _ = try capture.heapViewOwned(.{}, .allocations, .mcp, control);
+    const owned = capture.heap_jobs[1].?;
+    owned.thread.?.join();
+    owned.thread = null;
+    try std.testing.expectError(error.JobNotOwned, capture.heapViewOwned(.{}, .allocated_bytes, .mcp, other));
+    _ = try capture.heapViewOwned(.{}, .allocated_bytes, .mcp, peer);
 }
 test "allocation capture worker preserves thread scope, nested evidence and lifetime citations" {
     const a = std.testing.allocator;

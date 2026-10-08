@@ -19,9 +19,12 @@ import time
 from PIL import Image
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--focused', action='store_true', help='focused redaction, unavailable-state, layout and shutdown checks; default runs the full matrix')
 parser.add_argument('--shots', type=Path, help='save the redacted panel screenshots here')
 parser.add_argument('--keep', action='store_true', help='keep the work directory')
 args = parser.parse_args()
+if args.focused and args.shots:
+    parser.error('--shots requires the full matrix')
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 os.umask(0o022)
@@ -164,90 +167,101 @@ shots = args.shots.resolve() if args.shots else None
 if shots:
     shots.mkdir(parents=True, exist_ok=True)
 
-# 1. Every panel renders (dark), with OCR anchors; pausing keeps the frame still.
-d = Overview(['--pause'])
-try:
-    anchors = {'summary': ['CPU', 'Memory'], 'performance': ['Total CPU'], 'processes': ['burner'], 'memory': ['composition'],
-               'disk': ['Queue depth'], 'disk_space': ['Filesystems'], 'network': ['Receive'], 'connections': ['ESTABLISHED'],
-               'power': ['Sensors'], 'system': ['Collector'], 'users': ['Sessions'], 'services': ['Observed daemon', 'PID', 'Uptime', 'RSS'],
-               'apps': ['packages']}
-    keys = ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n0', 'tab', 'tab', 'tab']
-    for panel, key in zip(PANELS, keys):
-        d.tap(key)
-        shot = d.shot('dark-' + panel)
-        text = ocr(shot, (240, 52, 1920, 1052)) + ocr(shot, (240, 52, 1920, 260))
-        missing = [a for a in anchors[panel] if a.lower() not in text.lower()]
-        check(f'panel {panel} renders', colorful(shot) > 40 and not missing, f'missing {missing}' if missing else '')
-    check('no draw failures in log', 'Draw failed' not in d.text() and 'frame failed' not in d.text(), d.text()[-300:])
-    # Unavailable reasons are visible, not zeros.
-    d.tap('n9')
-    text = ocr(d.shot('power-reasons'), (240, 52, 700, 280))
-    check('CPU package power shows its reason', 'needs privilege' in text.lower(), text[:200])
-    d.tap('n1')
-    text = ocr(d.shot('summary-honesty'), (1360, 540, 1920, 1052))
-    check('summary lists unmeasured items', 'not measured' in text.lower() and 'privilege' in text.lower(), text[:300])
-    # Theme cycle: dark -> light changes the background brightness.
-    before = mean(d.shot('theme-before'), (300, 600, 600, 700))
-    d.tap('t')
-    after = mean(d.shot('theme-light'), (300, 600, 600, 700))
-    check('t cycles to the light theme', sum(after) > sum(before) + 200, f'{before} -> {after}')
-    d.tap('t')
-    green = mean(d.shot('theme-green'), (0, 0, 1920, 1080))
-    check('t cycles to green phosphor', green[1] > green[0] * 1.5 and green[1] > green[2] * 1.5, green)
-    for _ in range(4):
+# The quick path exercises a real redacted frame; the default retains every
+# original panel/theme/action assertion for the periodic matrix.
+if args.focused:
+    d = Overview(['--pause', '--redact', '--panel', 'system'])
+    try:
+        text = ocr(d.shot('system-redacted'), (240, 52, 1080, 400))
+        check('redaction hides the hostname', 'demo-host' not in text and 'redac' in text, text[:300])
+        check('redaction hides kernel release and distribution', '6.12.0' not in text and 'Example Linux' not in text and 'kernel hidden' in text, text[:300])
+    finally:
+        d.close()
+else:
+    # 1. Every panel renders (dark), with OCR anchors; pausing keeps the frame still.
+    d = Overview(['--pause'])
+    try:
+        anchors = {'summary': ['CPU', 'Memory'], 'performance': ['Total CPU'], 'processes': ['burner'], 'memory': ['composition'],
+                   'disk': ['Queue depth'], 'disk_space': ['Filesystems'], 'network': ['Receive'], 'connections': ['ESTABLISHED'],
+                   'power': ['Sensors'], 'system': ['Collector'], 'users': ['Sessions'], 'services': ['Observed daemon', 'PID', 'Uptime', 'RSS'],
+                   'apps': ['packages']}
+        keys = ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n0', 'tab', 'tab', 'tab']
+        for panel, key in zip(PANELS, keys):
+            d.tap(key)
+            shot = d.shot('dark-' + panel)
+            text = ocr(shot, (240, 52, 1920, 1052)) + ocr(shot, (240, 52, 1920, 260))
+            missing = [a for a in anchors[panel] if a.lower() not in text.lower()]
+            check(f'panel {panel} renders', colorful(shot) > 40 and not missing, f'missing {missing}' if missing else '')
+        check('no draw failures in log', 'Draw failed' not in d.text() and 'frame failed' not in d.text(), d.text()[-300:])
+        # Unavailable reasons are visible, not zeros.
+        d.tap('n9')
+        text = ocr(d.shot('power-reasons'), (240, 52, 700, 280))
+        check('CPU package power shows its reason', 'needs privilege' in text.lower(), text[:200])
+        d.tap('n1')
+        text = ocr(d.shot('summary-honesty'), (1360, 540, 1920, 1052))
+        check('summary lists unmeasured items', 'not measured' in text.lower() and 'privilege' in text.lower(), text[:300])
+        # Theme cycle: dark -> light changes the background brightness.
+        before = mean(d.shot('theme-before'), (300, 600, 600, 700))
         d.tap('t')
-    # Processes: sort and search.
-    d.tap('n3')
-    text = ocr(d.shot('sorted-cpu'))
-    first_rows = text[:900]
-    check('CPU sort puts the burner near the top', 'burner' in first_rows, first_rows[:300])
-    d.tap('s')  # memory
-    text = ocr(d.shot('sorted-memory'))
-    check('s cycles sort to memory', 'Memory ▼' in text or 'Memory v' in text or 'browser' in text[:900], text[:300])
-    d.keys('tap', KEY['slash'], 'tap', KEY['w'], 'tap', 19, 'tap', 23, 'tap', 20, 'tap', 18, 'tap', 19)  # "writer"
-    d.tap('enter')
-    text = ocr(d.shot('search-writer'))
-    check('search filters to the writer and its ancestors', 'writer' in text and 'burner' not in text, text[:400])
-    # Open in debugger: select the match and press Enter.
-    children_path = Path(f'/proc/{d.app.pid}/task/{d.app.pid}/children')
-    children_before = children_path.read_text()
-    d.tap('down', 'down', 'down', 'down', 'enter')
-    time.sleep(0.3)
-    log = d.text()
-    text = ocr(d.shot('replay-action-refused'), (0, 1052, 1050, 1080))
-    check('replay refuses process actions', 'process actions require a live process' in text and children_path.read_text() == children_before, text)
-finally:
-    d.close()
+        after = mean(d.shot('theme-light'), (300, 600, 600, 700))
+        check('t cycles to the light theme', sum(after) > sum(before) + 200, f'{before} -> {after}')
+        d.tap('t')
+        green = mean(d.shot('theme-green'), (0, 0, 1920, 1080))
+        check('t cycles to green phosphor', green[1] > green[0] * 1.5 and green[1] > green[2] * 1.5, green)
+        for _ in range(4):
+            d.tap('t')
+        # Processes: sort and search.
+        d.tap('n3')
+        text = ocr(d.shot('sorted-cpu'))
+        first_rows = text[:900]
+        check('CPU sort puts the burner near the top', 'burner' in first_rows, first_rows[:300])
+        d.tap('s')  # memory
+        text = ocr(d.shot('sorted-memory'))
+        check('s cycles sort to memory', 'Memory ▼' in text or 'Memory v' in text or 'browser' in text[:900], text[:300])
+        d.keys('tap', KEY['slash'], 'tap', KEY['w'], 'tap', 19, 'tap', 23, 'tap', 20, 'tap', 18, 'tap', 19)  # "writer"
+        d.tap('enter')
+        text = ocr(d.shot('search-writer'))
+        check('search filters to the writer and its ancestors', 'writer' in text and 'burner' not in text, text[:400])
+        # Open in debugger: select the match and press Enter.
+        children_path = Path(f'/proc/{d.app.pid}/task/{d.app.pid}/children')
+        children_before = children_path.read_text()
+        d.tap('down', 'down', 'down', 'down', 'enter')
+        time.sleep(0.3)
+        log = d.text()
+        text = ocr(d.shot('replay-action-refused'), (0, 1052, 1050, 1080))
+        check('replay refuses process actions', 'process actions require a live process' in text and children_path.read_text() == children_before, text)
+    finally:
+        d.close()
 
-# 2. Redaction hides private text (OCR), without and with --redact.
-d = Overview(['--pause', '--panel', 'system'])
-try:
-    plain = ocr(d.shot('system-plain'), (240, 52, 1080, 400))
-    check('unredacted System Info shows the synthetic hostname', 'demo-host' in plain, plain[:300])
-    d.tap('n3')
-    proc_plain = ocr(d.shot('processes-plain'), (1560, 100, 1920, 940))
-    check('unredacted processes show arguments', 'api-tok' in proc_plain, proc_plain[:300])
-finally:
-    d.close()
-d = Overview(['--pause', '--redact', '--panel', 'system'])
-try:
-    text = ocr(d.shot('system-redacted'), (240, 52, 1080, 400))
-    check('redaction hides the hostname', 'demo-host' not in text and 'redac' in text, text[:300])
-    check('redaction hides kernel release and distribution', '6.12.0' not in text and 'Example Linux' not in text and 'kernel hidden' in text, text[:300])
-    leaks = []
-    for panel, key in zip(PANELS, ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n0']):
-        d.tap(key)
-        t = ocr(d.shot('redacted-' + panel))
-        for secret in ('demo-host', 'SECRET', 'api-token', '192.0.2.10', '198.51.100', '2001:db8', '::1234', 'CAMERA', '/home/demo', '02:00:5e', 'burner', 'writer', 'browser', '6.12.0', 'Example Linux'):
-            if secret in t:
-                leaks.append((panel, secret))
-    check('redaction hides hosts, addresses, arguments and private mounts on every panel', not leaks, leaks)
-    d.tap('n0', 'tab', 'tab')
-    service_text = ocr(d.shot('services-redacted'), (240, 52, 1920, 1052))
-    check('Services redacts init, names, users and cgroups', 'redacted' in service_text and
-          all(secret not in service_text for secret in ('uid:0', 'udevd', '/system.slice', 'init: init')), service_text[:450])
-finally:
-    d.close()
+    # 2. Redaction hides private text (OCR), without and with --redact.
+    d = Overview(['--pause', '--panel', 'system'])
+    try:
+        plain = ocr(d.shot('system-plain'), (240, 52, 1080, 400))
+        check('unredacted System Info shows the synthetic hostname', 'demo-host' in plain, plain[:300])
+        d.tap('n3')
+        proc_plain = ocr(d.shot('processes-plain'), (1560, 100, 1920, 940))
+        check('unredacted processes show arguments', 'api-tok' in proc_plain, proc_plain[:300])
+    finally:
+        d.close()
+    d = Overview(['--pause', '--redact', '--panel', 'system'])
+    try:
+        text = ocr(d.shot('system-redacted'), (240, 52, 1080, 400))
+        check('redaction hides the hostname', 'demo-host' not in text and 'redac' in text, text[:300])
+        check('redaction hides kernel release and distribution', '6.12.0' not in text and 'Example Linux' not in text and 'kernel hidden' in text, text[:300])
+        leaks = []
+        for panel, key in zip(PANELS, ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n0']):
+            d.tap(key)
+            t = ocr(d.shot('redacted-' + panel))
+            for secret in ('demo-host', 'SECRET', 'api-token', '192.0.2.10', '198.51.100', '2001:db8', '::1234', 'CAMERA', '/home/demo', '02:00:5e', 'burner', 'writer', 'browser', '6.12.0', 'Example Linux'):
+                if secret in t:
+                    leaks.append((panel, secret))
+        check('redaction hides hosts, addresses, arguments and private mounts on every panel', not leaks, leaks)
+        d.tap('n0', 'tab', 'tab')
+        service_text = ocr(d.shot('services-redacted'), (240, 52, 1920, 1052))
+        check('Services redacts init, names, users and cgroups', 'redacted' in service_text and
+              all(secret not in service_text for secret in ('uid:0', 'udevd', '/system.slice', 'init: init')), service_text[:450])
+    finally:
+        d.close()
 
 # 2b. Unmeasured topology and sockets show reasons, never package 0 or tcp 0.
 d = Overview(['--pause', '--panel', 'performance'], source=unmeasured)
@@ -276,8 +290,8 @@ finally:
     d.close()
 
 # 2c. No two labels collide, at 1920x1080 and 1280x720 (layout audit in the binary).
-for size in ((1920, 1080), (1600, 900), (1280, 720)):
-    for extra in ([], ['--redact']):
+for size in (((1280, 720),) if args.focused else ((1920, 1080), (1600, 900), (1280, 720))):
+    for extra in ((['--redact'],) if args.focused else ([], ['--redact'])):
         d = Overview(['--pause', *extra], size=size, env_extra={'XODB_OVERVIEW_LAYOUT': '1'})
         try:
             for key in ['n1', 'n2', 'n3', 'n4', 'n5', 'n6', 'n7', 'n8', 'n9', 'n0', 'tab', 'tab', 'tab']:
@@ -290,23 +304,24 @@ for size in ((1920, 1080), (1600, 900), (1280, 720)):
         finally:
             d.close()
 
-# 3. Small window stays usable.
-d = Overview(['--pause'], size=(1280, 720))
-try:
-    for panel, key in (('summary', 'n1'), ('processes', 'n3'), ('performance', 'n2')):
-        d.tap(key)
-        shot = d.shot('small-' + panel)
-        check(f'1280x720 {panel} renders', colorful(shot) > 30)
-    d.tap('n0', 'tab', 'tab')
-    for theme in ('dark', 'green'):
-        if theme == 'green':
-            d.tap('t', 't')
-        shot = d.shot('small-services-' + theme)
-        text = ocr(shot, (200, 52, 1280, 680))
-        check('1280x720 Services fields in ' + theme, all(x.lower() in text.lower() for x in ('Observed daemon', 'PID', 'User', 'State', 'Uptime', 'CPU', 'RSS', 'udevd')), text[:450])
-    check('1280x720 no draw failures', 'Draw failed' not in d.text() and 'frame failed' not in d.text())
-finally:
-    d.close()
+if not args.focused:
+    # 3. Small window stays usable.
+    d = Overview(['--pause'], size=(1280, 720))
+    try:
+        for panel, key in (('summary', 'n1'), ('processes', 'n3'), ('performance', 'n2')):
+            d.tap(key)
+            shot = d.shot('small-' + panel)
+            check(f'1280x720 {panel} renders', colorful(shot) > 30)
+        d.tap('n0', 'tab', 'tab')
+        for theme in ('dark', 'green'):
+            if theme == 'green':
+                d.tap('t', 't')
+            shot = d.shot('small-services-' + theme)
+            text = ocr(shot, (200, 52, 1280, 680))
+            check('1280x720 Services fields in ' + theme, all(x.lower() in text.lower() for x in ('Observed daemon', 'PID', 'User', 'State', 'Uptime', 'CPU', 'RSS', 'udevd')), text[:450])
+        check('1280x720 no draw failures', 'Draw failed' not in d.text() and 'frame failed' not in d.text())
+    finally:
+        d.close()
 
 # 4. Live replay animation: unpaused, samples advance and the view reports its overhead.
 d = Overview(['--interval-ms', '250', '--frames', '0'])

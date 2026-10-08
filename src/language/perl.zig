@@ -90,6 +90,9 @@ pub const Frame = struct {
     provenance: []const u8 = "external_read",
     cv: []const u8,
     context_address: []const u8,
+    stackinfo: u64 = 0,
+    context_index: u64 = 0,
+    identity_proved: bool = false,
     reason: ?[]const u8,
 };
 pub const Segment = struct {
@@ -98,6 +101,7 @@ pub const Segment = struct {
     anchor: ?Anchor,
     additional_anchors: []Anchor = &.{},
     source_kind: []const u8 = "stopped_snapshot",
+    chain_complete: bool = false,
     state: []const u8,
     reason: ?[]const u8,
     frames: []Frame,
@@ -155,6 +159,9 @@ fn segment(session: *model.Session, a: A, frame: model.Frame, anchored: bool) !S
         },
         .cv = try hex(a, f.cv),
         .context_address = try hex(a, f.context_address),
+        .stackinfo = f.stackinfo,
+        .context_index = f.context_index,
+        .identity_proved = f.identity_proved != 0,
         .reason = try reason(a, f.reason),
     };
     return .{
@@ -162,6 +169,7 @@ fn segment(session: *model.Session, a: A, frame: model.Frame, anchored: bool) !S
         .runtime_instance = .{ .address = try hex(a, pointer) },
         .anchor = anchor,
         .state = if (raw.reason == null) "complete" else "partial",
+        .chain_complete = raw.chain_complete != 0,
         .reason = try reason(a, raw.reason),
         .frames = frames,
         .current_op = if (raw.op != 0) try hex(a, raw.op) else null,
@@ -173,6 +181,7 @@ fn constrainBoundary(s: *Segment, unresolved_inner: bool) void {
     if (unresolved_inner and s.runtime_instance != null) {
         s.state = "partial";
         s.reason = "InnerInterpreterAnchorUnresolved";
+        s.chain_complete = false;
     }
 }
 // Only the retained native anchor order establishes "inner" and "outer".
@@ -203,6 +212,7 @@ fn constrainSkipped(a: A, segment_: *Segment, skipped: []const SkippedAnchor) !v
     segment_.additional_anchors = anchors;
     segment_.state = "partial";
     segment_.reason = "RepeatedInterpreterAnchorBoundaryUnavailable";
+    segment_.chain_complete = false;
 }
 
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
@@ -240,6 +250,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
                 previous.additional_anchors = anchors;
                 previous.state = "partial";
                 previous.reason = "RepeatedInterpreterAnchorBoundaryUnavailable";
+                previous.chain_complete = false;
                 duplicate = true;
                 break;
             };
@@ -452,4 +463,112 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .memory_reads = r.reads,
         .memory_bytes = r.bytes,
     };
+}
+
+const WatchCapture = @import("watch.zig").Capture;
+// Runtime words: module/interpreter/stackinfo. Frame words: context index + 1
+// (zero for main)/CV/binding selector/pad declaration. Never retain cxstack.
+fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, expected_context: u64, row: ?usize) !void {
+    const module = try valueModule(session);
+    if (module.id != capture.scope.runtime[0]) return error.PerlWatchRuntimeChanged;
+    const layout = try profile(session, module);
+    var r = reader(session);
+    defer {
+        capture.reads = r.reads;
+        capture.bytes = r.bytes;
+    }
+    const raw = try a.create(c.struct_xpl_locals);
+    if (row) |index| {
+        c.xpl_locals_read(layout, &r, capture.scope.runtime[1], frame, index, 1, raw);
+    } else if (capture.scope.frame[2] != 0) {
+        c.xpl_local_binding(layout, &r, capture.scope.runtime[1], frame, capture.scope.frame[3], capture.expression, raw);
+    } else c.xpl_local_find(layout, &r, capture.scope.runtime[1], frame, capture.expression, raw);
+    if (raw.cv != 0 and (raw.cv != capture.scope.frame[1] or raw.context_address != expected_context)) return error.StaleLanguageFrame;
+    if (raw.reason != null or raw.count != 1) {
+        capture.diagnostic = try a.dupeZ(u8, if (raw.reason != null) std.mem.span(raw.reason) else "PerlWatchBindingUnavailable");
+        return;
+    }
+    const item = &raw.items[0];
+    if (row != null) {
+        capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&item.name, 0));
+        if (capture.expression.len == 0 or capture.expression.len > c.XLW_EXPRESSION) return error.PerlWatchNameTooLong;
+        if (!std.unicode.utf8ValidateSlice(capture.expression)) return error.PerlWatchNameInvalid;
+        capture.scope.frame[2] = 1;
+        capture.scope.frame[3] = item.ordinal;
+    }
+    if (item.reason != null) {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(item.reason));
+        return;
+    }
+    const sample = try a.create(c.struct_xpl_sample);
+    c.xpl_sample_read(layout, &r, item.sv, sample);
+    if (sample.reason != null) {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(sample.reason));
+        return;
+    }
+    capture.observation = c.XLW_COMPLETE;
+    capture.sample = .{ .kind = sample.kind, .bytes = &sample.bytes, .size = sample.size, .type = &sample.type, .display = &sample.display };
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    if ((expression == null) == (row == null)) return error.InvalidArguments;
+    if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
+    if (row) |index| if (index >= c.XPL_MAX_PAD_NAMES) return error.InvalidArguments;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment_ = observed.segments[segment_index];
+    const instance_ = segment_.runtime_instance orelse return error.PerlWatchRuntimeUnproved;
+    if (frame >= segment_.frames.len) return error.InvalidLanguageFrame;
+    const selected = segment_.frames[frame];
+    if (!selected.identity_proved) return error.PerlWatchFrameUnproved;
+    if (!std.mem.eql(u8, selected.context_type, "sub") and !std.mem.eql(u8, selected.context_type, "main")) return error.PerlWatchFrameUnsupported;
+    const thread = for (session.target.threadSlice()) |entry| {
+        if (entry.tid == tid) break entry.id;
+    } else return error.InvalidThread;
+    var capture = WatchCapture{ .scope = .{
+        .language = c.XLW_PERL,
+        .session = session.id,
+        .image = session.target.snapshot().image_epoch,
+        .thread = thread,
+        .runtime = .{ (try valueModule(session)).id, try std.fmt.parseInt(u64, instance_.address, 0), selected.stackinfo, 0 },
+        .frame = .{ if (selected.stackinfo == 0) 0 else selected.context_index + 1, try std.fmt.parseInt(u64, selected.cv, 0), 0, 0 },
+    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    try watchValue(session, a, &capture, frame, try std.fmt.parseInt(u64, selected.context_address, 0), row);
+    if (row != null and capture.scope.frame[2] == 0) return error.PerlWatchBindingUnavailable;
+    try session.target.expectGeneration(observed.generation);
+    return capture;
+}
+pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
+    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
+    const module_id = (try valueModule(session)).id;
+    if (module_id != scope.runtime[0]) {
+        capture.scope.runtime[0] = module_id;
+        capture.diagnostic = try a.dupeZ(u8, "PerlWatchRuntimeChanged");
+        return capture;
+    }
+    var saw_runtime = false;
+    var complete = true;
+    for (observed.segments) |segment_| {
+        const instance_ = segment_.runtime_instance orelse continue;
+        if (try std.fmt.parseInt(u64, instance_.address, 0) != scope.runtime[1]) continue;
+        saw_runtime = true;
+        complete = complete and segment_.chain_complete;
+        for (segment_.frames, 0..) |frame, index| {
+            if (frame.stackinfo != scope.runtime[2] or (if (frame.stackinfo == 0) @as(u64, 0) else frame.context_index + 1) != scope.frame[0]) continue;
+            if (!frame.identity_proved) {
+                capture.diagnostic = try a.dupeZ(u8, frame.reason orelse "PerlWatchFrameUnproved");
+                return capture;
+            }
+            if (try std.fmt.parseInt(u64, frame.cv, 0) != scope.frame[1]) continue;
+            try watchValue(session, a, &capture, index, try std.fmt.parseInt(u64, frame.context_address, 0), null);
+            try session.target.expectGeneration(observed.generation);
+            return capture;
+        }
+    }
+    if (saw_runtime and complete) {
+        capture.observation = c.XLW_FRAME_GONE;
+        capture.diagnostic = try a.dupeZ(u8, "PerlWatchFrameGone");
+    } else capture.diagnostic = try a.dupeZ(u8, "PerlWatchFrameNotObserved");
+    try session.target.expectGeneration(observed.generation);
+    return capture;
 }

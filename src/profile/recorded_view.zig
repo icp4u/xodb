@@ -49,6 +49,7 @@ pub const Result = struct {
     }
 };
 pub const Job = struct {
+    request_owner: @import("../service/job_owner.zig").Owner = .{},
     id: u64,
     owner: enum { gui, mcp } = .mcp,
     key: Key,
@@ -176,6 +177,7 @@ pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture 
 /// Event-loop owned coordinator: only finished jobs may be joined during poll.
 /// One published view and one job; MCP reads never rebuild or clone the graph.
 pub const State = struct {
+    request_owner: ?@import("../service/job_owner.zig").Owner = null,
     job: ?*Job = null,
     result: ?Result = null,
     failure: ?struct { key: Key, err: anyerror } = null,
@@ -215,6 +217,9 @@ pub const State = struct {
         return false;
     }
     pub fn request(self: *State, capture: *Capture, revision: u64, filter: model.Filter, retry: bool) !*const Result {
+        return self.requestOwned(capture, revision, filter, retry, .{});
+    }
+    pub fn requestOwned(self: *State, capture: *Capture, revision: u64, filter: model.Filter, retry: bool, requester: @import("../service/job_owner.zig").Requester) !*const Result {
         self.poll(capture);
         try capture.validateFilter(filter);
         var key = Key.of(capture, filter);
@@ -223,21 +228,25 @@ pub const State = struct {
         if (self.job) |job| if (job.key.eql(key) and !job.cancel.load(.acquire)) return error.ProfileViewPending;
         if (self.failure) |failure| if (failure.key.eql(key) and !retry) return failure.err;
         if (revision != capture.revision) return error.StaleProfile;
+        if (self.request_owner) |owner| try owner.require(requester);
         if (self.failure) |failure| if (failure.key.capture_id == capture.id and std.meta.eql(failure.key.filter, filter)) {
             if (!retry) return failure.err;
             self.failure = null;
         };
         if (self.job) |job| {
+            try job.request_owner.require(requester);
             // An explicit filter change supersedes pending work; retry with the
             // then-current revision once cancellation completes. No snapshot
             // has been accepted for this key yet.
             if (!std.meta.eql(job.key.filter, filter) or job.key.capture_id != capture.id) job.cancel.store(true, .release);
             return error.ProfileViewBusy;
         }
+        self.request_owner = requester.owner;
         const job = Job.create(self.next_job, capture, filter) catch |err| {
             self.failed(key, err);
             return err;
         };
+        job.request_owner = requester.owner;
         job.start() catch |err| {
             job.deinit();
             self.failed(key, err);
@@ -252,6 +261,7 @@ pub const State = struct {
     /// Transfer the old source to its worker, or free it immediately. Safe even
     /// when a previous retired source is still pinned by the sole job.
     pub fn retire(self: *State, capture: *Capture) void {
+        self.request_owner = null;
         if (self.result) |*result| result.deinit();
         self.result = null;
         self.failure = null;

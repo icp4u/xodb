@@ -5,6 +5,7 @@ const comparison = @import("comparison.zig");
 const model = @import("capture.zig");
 const Budget = @import("../profile/archive_budget.zig").Budget;
 pub const Job = struct {
+    owner: @import("../service/job_owner.zig").Owner = .{},
     id: u64,
     capture: *const model.Capture,
     selection: comparison.Selection,

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Clipboard/editing regression tests on an owned private Wayland compositor."""
+import argparse
 import csv
 import io
 import importlib.util
@@ -10,6 +11,9 @@ import select
 import subprocess
 import time
 
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--focused', action='store_true', help='focused transfer bounds, Unicode, stalled source and stale-editor checks; default runs all editors and selection cases')
+args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root); os.umask(0o022)
 
@@ -93,33 +97,34 @@ try:
     assert field(d) == 'amount'
     assert d.session()['generation'] == generation
     passed('bidi, zero-width, BOM and tag format characters are removed from paste')
-    d.keys('tap', 105, 'tap', 105, 'tap', 105)  # cursor after amo
-    paste(d, ' + ')
-    assert field(d) == 'amo + unt'
-    d.keys('down', 42, 'tap', 105, 'tap', 105, 'tap', 105, 'up', 42)
-    assert subprocess.run(['wl-paste', '--primary', '--no-newline'], env=d.env, capture_output=True, check=True, timeout=3).stdout == b' + '
-    assert field(d) == ' + '
-    paste(d, '_')
-    assert field(d) == 'amo_unt'
-    passed('paste inserts at cursor; Shift-selection owns primary and copies/replaces selected text')
-    chord(d, 22)
-    paste(d, 'nv')
-    assert field(d) == 'nv'
-    passed('field typing/paste preserves local N and V ownership')
-    copy(d, 'MID', primary=True)
-    d.keys('layout', 'us', 'middle', 640, 638)  # between n and v, in the expression field
-    assert field(d) == 'nMIDv'
-    d.keys('layout', 'us', 'middle', 300, 638)  # outside the text field: must not paste
-    assert field(d) == 'nMIDv'
-    passed('middle-click inserts primary selection only inside the text field')
-    chord(d, 22)
-    paste(d, 'mouse')
-    d.keys('layout', 'us', 'fastdrag', 630, 638, 659, 638)
-    assert field(d) == 'mou'
-    assert subprocess.run(['wl-paste', '--primary', '--no-newline'], env=d.env, capture_output=True, check=True, timeout=3).stdout == b'mou'
-    paste(d, 'X')
-    assert field(d) == 'Xse'
-    passed('batched mouse drag selects, publishes primary and replaces the selection')
+    if not args.focused:
+        d.keys('tap', 105, 'tap', 105, 'tap', 105)  # cursor after amo
+        paste(d, ' + ')
+        assert field(d) == 'amo + unt'
+        d.keys('down', 42, 'tap', 105, 'tap', 105, 'tap', 105, 'up', 42)
+        assert subprocess.run(['wl-paste', '--primary', '--no-newline'], env=d.env, capture_output=True, check=True, timeout=3).stdout == b' + '
+        assert field(d) == ' + '
+        paste(d, '_')
+        assert field(d) == 'amo_unt'
+        passed('paste inserts at cursor; Shift-selection owns primary and copies/replaces selected text')
+        chord(d, 22)
+        paste(d, 'nv')
+        assert field(d) == 'nv'
+        passed('field typing/paste preserves local N and V ownership')
+        copy(d, 'MID', primary=True)
+        d.keys('layout', 'us', 'middle', 640, 638)  # between n and v, in the expression field
+        assert field(d) == 'nMIDv'
+        d.keys('layout', 'us', 'middle', 300, 638)  # outside the text field: must not paste
+        assert field(d) == 'nMIDv'
+        passed('middle-click inserts primary selection only inside the text field')
+        chord(d, 22)
+        paste(d, 'mouse')
+        d.keys('layout', 'us', 'fastdrag', 630, 638, 659, 638)
+        assert field(d) == 'mou'
+        assert subprocess.run(['wl-paste', '--primary', '--no-newline'], env=d.env, capture_output=True, check=True, timeout=3).stdout == b'mou'
+        paste(d, 'X')
+        assert field(d) == 'Xse'
+        passed('batched mouse drag selects, publishes primary and replaces the selection')
 
 
     chord(d, 22)
@@ -151,58 +156,60 @@ try:
     time.sleep(.8)
     assert field(d) == 'x'
     passed('late paste cannot land in a closed and reopened editor')
-    d.keys('tap', 1, 'tap', 48, 'tap', 46)  # E cancel; B breakpoints; C condition
-    paste(d, 'amount == 5')
-    assert field(d) == 'amount == 5'
-    assert all(p['condition'] != 'amount == 5' for p in d.tool('get_breakpoints')['policies'])
-    d.keys('tap', 28)
-    assert any(p['condition'] == 'amount == 5' for p in d.tool('get_breakpoints')['policies'])
-    passed('breakpoint field pastes locally and applies only on Return')
-    d.keys('tap', 1, 'tap', 33, 'tap', 31)  # B close; F profile; S setup
-    defaults = d.tool('get_profile')['defaults']
-    click_word(d, 'custom', 1)  # frequency
-    chord(d, 22)
-    paste(d, '2a\n50')
-    assert field(d) == '250'
-    assert d.tool('get_profile')['defaults']['frequency_hz'] == defaults['frequency_hz']
-    d.keys('tap', 28)
-    assert d.tool('get_profile')['defaults']['frequency_hz'] == 250
-    click_word(d, 'custom')  # duration; rate now displays its numeric value
-    chord(d, 22)
-    paste(d, '2')
-    d.keys('tap', 28)
-    assert d.tool('get_profile')['defaults']['duration_ms'] == 2000
-    passed('capture rate and duration keep numeric filtering and Return validation')
-    click_word(d, 'filter')
-    paste(d, 'worker' * 20)
-    assert 'truncated' in shot(d, '04-filter-truncated')
-    assert field(d) == ('worker' * 20)[:32]
-    d.keys('tap', 28)
-    passed('capture thread filter uses the same clipboard with a visible 32-byte bound')
+    if not args.focused:
+        d.keys('tap', 1, 'tap', 48, 'tap', 46)  # E cancel; B breakpoints; C condition
+        paste(d, 'amount == 5')
+        assert field(d) == 'amount == 5'
+        assert all(p['condition'] != 'amount == 5' for p in d.tool('get_breakpoints')['policies'])
+        d.keys('tap', 28)
+        assert any(p['condition'] == 'amount == 5' for p in d.tool('get_breakpoints')['policies'])
+        passed('breakpoint field pastes locally and applies only on Return')
+        d.keys('tap', 1, 'tap', 33, 'tap', 31)  # B close; F profile; S setup
+        defaults = d.tool('get_profile')['defaults']
+        click_word(d, 'custom', 1)  # frequency
+        chord(d, 22)
+        paste(d, '2a\n50')
+        assert field(d) == '250'
+        assert d.tool('get_profile')['defaults']['frequency_hz'] == defaults['frequency_hz']
+        d.keys('tap', 28)
+        assert d.tool('get_profile')['defaults']['frequency_hz'] == 250
+        click_word(d, 'custom')  # duration; rate now displays its numeric value
+        chord(d, 22)
+        paste(d, '2')
+        d.keys('tap', 28)
+        assert d.tool('get_profile')['defaults']['duration_ms'] == 2000
+        passed('capture rate and duration keep numeric filtering and Return validation')
+        click_word(d, 'filter')
+        paste(d, 'worker' * 20)
+        assert 'truncated' in shot(d, '04-filter-truncated')
+        assert field(d) == ('worker' * 20)[:32]
+        d.keys('tap', 28)
+        passed('capture thread filter uses the same clipboard with a visible 32-byte bound')
 
 finally:
     if d: d.close()
 
-# Threshold editing runs through the observation browser's separate input loop.
-fixture = module('invocation_fixture', root / 'tests/invocations-gui.py')
-archive = work / 'demo.xoi'; fixture.write_fixture(archive)
-d = None
-try:
-    d = h.Display(str(root), ['--browse-observation', str(archive), '--agent-scope', 'control'])
-    time.sleep(.3)
-    d.keys('tap', 20)  # T threshold
-    paste(d, '1250000')
-    assert field(d) == '1250000'
-    assert (d.tool('get_observation')['comparison_selection'] or {}).get('threshold_ns') != 1250000
-    d.keys('tap', 28)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        result = d.tool('get_observation')['comparison_selection'] or {}
-        if result.get('threshold_ns') == 1250000: break
-        time.sleep(.05)
-    assert result['threshold_ns'] == 1250000, result
-    passed('observation threshold paste waits for explicit Return')
-finally:
-    if d: d.close()
+if not args.focused:
+    # Threshold editing runs through the observation browser's separate input loop.
+    fixture = module('invocation_fixture', root / 'tests/invocations-gui.py')
+    archive = work / 'demo.xoi'; fixture.write_fixture(archive)
+    d = None
+    try:
+        d = h.Display(str(root), ['--browse-observation', str(archive), '--agent-scope', 'control'])
+        time.sleep(.3)
+        d.keys('tap', 20)  # T threshold
+        paste(d, '1250000')
+        assert field(d) == '1250000'
+        assert (d.tool('get_observation')['comparison_selection'] or {}).get('threshold_ns') != 1250000
+        d.keys('tap', 28)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            result = d.tool('get_observation')['comparison_selection'] or {}
+            if result.get('threshold_ns') == 1250000: break
+            time.sleep(.05)
+        assert result['threshold_ns'] == 1250000, result
+        passed('observation threshold paste waits for explicit Return')
+    finally:
+        if d: d.close()
 (work / 'results.json').write_text(json.dumps({'passed': checks}, indent=2))
 print('Clipboard GUI:', len(checks), 'groups passed;', work.relative_to(root))

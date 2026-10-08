@@ -9,7 +9,7 @@ the worker-dependent cases are reported as "skip"; everything else still runs.
 Owned fixtures only: tests/fixtures/semq/qx.c and tools/ghx/fixtures/fx.c,
 built here. Cases:
   absent    no worker: every tool is a typed "unavailable" with how to build;
-            incomplete directories name the missing piece; tools are observer reads
+            incomplete directories name the missing piece; private headless jobs stay available
   lifecycle a real ghx_supervise with fake workers: a hung worker hits its
             deadline, a crashing one is worker_died, cancel stops a running job;
             each failure is bounded and leaves no child process behind; failures
@@ -121,7 +121,7 @@ def absent():
         entry = symbol(c, 'qx_alloc')
         listed = {t['name']: t for t in c.call('tools/list')['result']['tools']}
         names = ('analyze_function', 'slice_value', 'control_dependencies', 'cancel_static_analysis')
-        check('absent: tools listed to an observe-scope client as observer reads', all(n in listed and listed[n]['annotations']['xodbSessionAccess'] == 'observer' and listed[n]['annotations']['readOnlyHint'] for n in names), sorted(listed)[:5])
+        check('absent: private headless observe keeps target-read-only jobs with declared shared access', all(n in listed and listed[n]['annotations']['xodbSessionAccess'] == ('observer' if n == 'cancel_static_analysis' else 'controller') and listed[n]['annotations']['readOnlyHint'] for n in names), sorted(listed)[:5])
         for name, args in (('analyze_function', {'address': hex(entry)}), ('slice_value', {'pc': hex(entry), 'input': 0}), ('control_dependencies', {'pc': hex(entry)}), ('slice_value', {'file': 'qx.c', 'line': 14})):
             r = tool(c, name, **args)
             check(f'absent: {name} {sorted(args)} is typed unavailable', r.get('status') == 'unavailable' and r['static_analysis']['reason'] == 'not_configured' and 'build_ghidra.sh' in r['static_analysis']['how_to_build'], r)
@@ -393,15 +393,20 @@ def ownership():
     server = shared.Server(root, work, xodb, O2, 'control', options=['--static-analysis', str(hang)], fixture_args=())
     try:
         a = shared.Client(server, 'owner'); b = shared.Client(server, 'other')
+        shared.expect_error(a.raw('analyze_function', symbol='qx_alloc'), 'ControlLeaseRequired')
+        a.claim()
         job = a.tool('analyze_function', symbol='qx_alloc', deadline_ms=600000)['job']['id']
+        a.tool('release_session_control')
         denied = b.raw('cancel_static_analysis', job_id=job)
         check('ownership: an observer cannot cancel another client\'s job', denied.get('result', {}).get('isError') and denied['result']['content'][0]['text'] == 'StaticAnalysisJobNotOwned', denied)
         b.claim()
         ok = b.tool('cancel_static_analysis', job_id=job)
         check('ownership: the controller may cancel any job', ok.get('status') in ('cancelling', 'cancelled'), ok)
         b.tool('release_session_control')
+        a.claim()
         r = shared.eventually(lambda: a.tool('analyze_function', symbol='qx_alloc'), lambda v: v.get('status') != 'running', 'cancelled', timeout=10)
         mine = a.tool('analyze_function', symbol='qx_alloc', retry=True, deadline_ms=600000)['job']['id']
+        a.tool('release_session_control')
         own = a.tool('cancel_static_analysis', job_id=mine)
         check('ownership: a client may cancel its own job without control', r.get('status') == 'cancelled' and own.get('status') in ('cancelling', 'cancelled'), (r.get('status'), own.get('status')))
     finally:

@@ -36,8 +36,14 @@ try:
         data=c.tool('get_flamegraph',**args)['result']['structuredContent']
     metrics['max_ping_ms']=max(pings);metrics['worker']=data['worker']
     # Collection proceeds without invalidating the pinned published graph.
-    time.sleep(.3)
-    current=c.inspect('get_profile')['capture'];assert current['stored_samples']>snapshot_count,current
+    deadline=time.monotonic()+10
+    while True:
+        current=c.inspect('get_profile')['capture']
+        assert current['id']==cap['id'],current
+        if current['stored_samples']>snapshot_count:break
+        assert current['status']=='collecting',current
+        assert time.monotonic()<deadline,('collector did not advance',current)
+        time.sleep(.01)
     page=c.inspect('get_flamegraph',**args)
     assert page['snapshot_samples']==snapshot_count and page['revision']==args['revision']
     assert page['current_revision']>page['revision'],page

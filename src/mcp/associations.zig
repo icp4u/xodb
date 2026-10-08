@@ -89,10 +89,14 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         } else if (args.object.get("include_cpu") != null or args.object.get("include_syscalls") != null) return error.InvalidArguments;
         var allocation: ?jobs.AllocationSource = null;
         if (args.object.get("allocation_id") != null or args.object.get("allocation_revision") != null) allocation = .{ .capture = session.allocations.capture orelse return error.NoAllocationCapture, .id = try wire.number(args, "allocation_id", null), .revision = try wire.number(args, "allocation_revision", null) };
-        if (session.observation_associations) |old| if (!old.done.load(.acquire)) return error.ObservationAssociationsBusy;
+        if (session.observation_associations) |old| {
+            try old.owner.require(session.jobRequester());
+            if (!old.done.load(.acquire)) return error.ObservationAssociationsBusy;
+        }
         if (session.next_observation_association == std.math.maxInt(u64)) return error.ObservationAssociationLimit;
         // Failed creation preserves the previous completed result.
         const candidate = if (capture.offline) try jobs.Job.fromSaved(session.next_observation_association, capture, selection, false, null) else try jobs.Job.create(session.next_observation_association, capture, session.id, session.process_id, profile, allocation, selection);
+        candidate.owner = session.jobRequester().owner;
         if (session.observation_associations) |old| old.deinit();
         session.observation_associations = candidate;
         session.next_observation_association += 1;
@@ -103,6 +107,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
     const job = session.observation_associations orelse return error.NoObservationAssociations;
     if (job.id != try wire.number(args, "id", null)) return error.StaleObservationAssociations;
     if (!get) {
+        try job.owner.require(session.jobRequester());
         if (!job.done.load(.acquire)) job.cancel.store(true, .release);
         return status(a, job);
     }

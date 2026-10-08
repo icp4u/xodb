@@ -78,6 +78,7 @@ pub fn build(a: std.mem.Allocator, capture: *const model.Capture, filter: model.
 }
 
 pub const Job = struct {
+    request_owner: @import("../service/job_owner.zig").Owner = .{},
     key: Key,
     capture: *const model.Capture,
     budget: Budget,

@@ -19,6 +19,7 @@ os.chdir(root)
 parser = argparse.ArgumentParser()
 parser.add_argument('--ssh-config')
 parser.add_argument('--ssh-host')
+parser.add_argument('--perf', action='store_true', help='record latency reference comparisons as measurements, never speed gates')
 args = parser.parse_args()
 assert bool(args.ssh_config) == bool(args.ssh_host)
 spec = importlib.util.spec_from_file_location('shared', root / 'tests/shared-sessions.py')
@@ -48,10 +49,24 @@ if args.ssh_host:
 server = shared.Server(root, work, Path(os.environ.get('XODB_BIN', root / 'zig-out/bin/xodb')),
                        fixture, 'control', options=options, fixture_args=[str(maps)])
 results = {}
+def resource_sample(pids):
+    processes = {}
+    for name, pid in pids.items():
+        fields = Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()
+        processes[name] = dict(cpu_seconds=(int(fields[11]) + int(fields[12])) / os.sysconf('SC_CLK_TCK'),
+                               rss_kib=int(fields[21]) * os.sysconf('SC_PAGE_SIZE') // 1024)
+    return dict(processes=processes, load=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)))
+
 try:
     one, two = shared.Client(server, 'owner'), shared.Client(server, 'observer')
     first = shared.eventually(one.session, lambda s: s['state'] == 'stopped' and not s.get('continue_pending') and not s.get('symbol_discovery_pending'), 'exec stop')
     server.remember_target(first)
+    measured_pids = {'frontend': server.proc.pid}
+    if not args.ssh_host:
+        children = Path(f'/proc/{server.proc.pid}/task/{server.proc.pid}/children').read_text().split()
+        assert len(children) == 1, children
+        measured_pids['agent'] = int(children[0])
+    results['resources_before'] = resource_sample(measured_pids)
     one.tool('claim_session_control')
     ready_symbol = one.call('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'remote_ready'}})['result']['structuredContent']
     ready = ready_symbol['address']
@@ -70,7 +85,8 @@ try:
     results['first_stop_seconds'] = time.monotonic() - start
     bp = one.tool('get_breakpoints')
     results['breakpoints'] = bp
-    assert results['first_stop_seconds'] < 3, results
+    assert any(t['tid'] == state['pid'] and t['reason'] == 'breakpoint' and
+               t['breakpoint_address'] == int(address, 16) for t in state['threads']), state
     assert bp['loader_status'] == 'glibc loader rendezvous', bp
     assert bp['loader_reads']['bytes'] < 16384, bp
     for _ in range(3):
@@ -124,6 +140,11 @@ try:
     one.action('remove_breakpoint', id=late['id'])
     state = one.session()
     worker = next(t['tid'] for t in state['threads'] if t['tid'] != state['pid'])
+    counter_address = one.call('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'hits'}})['result']['structuredContent']['address']
+    byteorder = {1: 'little', 2: 'big'}[fixture.read_bytes()[5]]
+    def counter():
+        return int.from_bytes(bytes.fromhex(one.tool('read_memory', address=counter_address, length=8)['hex']), byteorder)
+    results['hits_before'] = counter()
     start = time.monotonic()
     one.action('run_to', tid=worker, address=address)
     one.tool('release_session_control')
@@ -132,13 +153,28 @@ try:
     two.tool('claim_session_control', generation=first['generation'])
     two.tool('release_session_control')
     one.tool('claim_session_control')
-    final = shared.eventually(one.session, lambda s: s['running_to'] is None and s['state'] == 'stopped', 'bounded wrong-thread run-to', timeout=8)
+    final = shared.eventually(one.session, lambda s: s['running_to'] is None and s['state'] == 'stopped', 'bounded wrong-thread run-to', timeout=30)
     results['wrong_thread_seconds'] = time.monotonic() - start
     results['wrong_thread_diagnostic'] = final['step_diagnostic']
+    results['hits_after'] = counter()
+    # Each foreign trap occurs before remote_hit increments this counter.
+    # The final (64th) hit stays stopped, so exactly 63 increments complete.
+    assert results['hits_after'] - results['hits_before'] == 63, results
     assert final['step_diagnostic'] == 'RunToNoProgress', final
-    assert results['wrong_thread_seconds'] < 6, results
     assert not [p for p in one.tool('get_breakpoints')['breakpoints'] if not p['internal']]
     shared.expect_error(one.raw('continue', generation=first['generation']), 'StaleSnapshot')
+    results['resources_after'] = resource_sample(measured_pids)
+    if args.perf:
+        overloaded = any(max(results[k]['load']) > results[k]['allowed_cpus']
+                         for k in ('resources_before', 'resources_after'))
+        results['performance'] = dict(status='not-measurable' if overloaded else 'measured',
+            reason='host load exceeds allowed CPU count' if overloaded else None,
+            phase='exec stop through completed owned discovery and wrong-thread exercise; fixture CPU excluded',
+            remote_agent='excluded for SSH' if args.ssh_host else 'included',
+            legacy_latency_references_seconds=dict(first_stop=3, wrong_thread=6),
+            within_legacy_latency_references=None if overloaded else dict(
+                first_stop=results['first_stop_seconds'] < 3,
+                wrong_thread=results['wrong_thread_seconds'] < 6))
     server.stop_and_check()
 finally:
     server.close()

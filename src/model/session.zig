@@ -100,6 +100,9 @@ pub const Session = struct {
     maps_epoch: u64 = 0,
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
+    /// A human GUI or multiple clients can retain jobs in this session. Never
+    /// use target-read-only hints to grant them another owner's job slots.
+    shared_jobs: bool = false,
     /// Set only while dispatching a shared MCP request on the owner thread.
     agent_client_id: ?u64 = null,
     agent_lease: ?@import("../service/lease.zig").Lease = null,
@@ -326,16 +329,21 @@ pub const Session = struct {
     /// capture. MCP `compare_observation` and the GUI share this operation;
     /// callers perform their own authorization first.
     pub fn compareObservation(self: *Session, selection: @import("../observe/comparison.zig").Selection) !u64 {
+        return self.compareObservationOwned(selection, .{});
+    }
+    pub fn compareObservationOwned(self: *Session, selection: @import("../observe/comparison.zig").Selection, requester: @import("../service/job_owner.zig").Requester) !u64 {
         const capture = self.observations.capture orelse return error.NoObservation;
         if (!capture.store.finished or self.observations.busy()) return error.ObservationStillCollecting;
         if (self.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
         try selection.validate();
         if (self.observation_analysis) |job| {
+            try job.owner.require(requester);
             if (!job.done.load(.acquire)) return error.ObservationAnalysisBusy;
             job.deinit();
             self.observation_analysis = null;
         }
         self.observation_analysis = try @import("../observe/analysis.zig").Job.create(self.next_observation_analysis, capture, selection);
+        self.observation_analysis.?.owner = requester.owner;
         capture.comparison_selection = selection;
         self.next_observation_analysis += 1;
         return self.observation_analysis.?.id;
@@ -356,6 +364,7 @@ pub const Session = struct {
         job.association_source = null;
         if (job.restored_associations) |restored| {
             restored.id = self.next_observation_association;
+            if (!self.shared_jobs) restored.owner = @import("../service/job_owner.zig").Owner.agent(null);
             self.next_observation_association += 1;
             self.observation_associations = restored;
             job.restored_associations = null;
@@ -370,9 +379,15 @@ pub const Session = struct {
         return if (self.archive_job) |job| !job.reaped else false;
     }
     fn clearArchiveJob(self: *Session) !void {
+        return self.clearArchiveJobOwned(.{});
+    }
+    fn clearArchiveJobOwned(self: *Session, requester: @import("../service/job_owner.zig").Requester) !void {
         self.pollArchive();
         if (self.archiveBusy()) return error.ArchiveBusy;
-        if (self.archive_job) |job| job.deinit();
+        if (self.archive_job) |job| {
+            try job.owner.require(requester);
+            job.deinit();
+        }
         self.archive_job = null;
     }
     pub fn openFrames(self: *Session, path: []const u8) !void {
@@ -388,6 +403,7 @@ pub const Session = struct {
         try self.clearArchiveJob();
         const job = try ArchiveJob.create(self.next_archive_job, .open, path);
         errdefer job.deinit();
+        if (!self.shared_jobs) job.owner = @import("../service/job_owner.zig").Owner.agent(null);
         job.local_id = self.next_profile_id;
         job.reanalyze = reanalyze;
         if (symbols) |root| job.symbols = try std.heap.page_allocator.dupeZ(u8, root);
@@ -398,6 +414,9 @@ pub const Session = struct {
         self.next_profile_id += 1;
     }
     pub fn ensureArchiveView(self: *Session, filter: profile.Filter) !void {
+        return self.ensureArchiveViewOwned(filter, .{});
+    }
+    pub fn ensureArchiveViewOwned(self: *Session, filter: profile.Filter, requester: @import("../service/job_owner.zig").Requester) !void {
         const capture = self.profile orelse return error.NoProfile;
         if (!capture.offline) return;
         try capture.validateFilter(filter);
@@ -409,8 +428,9 @@ pub const Session = struct {
                 if (job.failure) |err| return err;
             }
         }
-        try self.clearArchiveJob();
+        try self.clearArchiveJobOwned(requester);
         const job = try ArchiveJob.create(self.next_archive_job, .view, "offline flame graph");
+        job.owner = requester.owner;
         job.capture = capture;
         job.filter = filter;
         job.start() catch |err| {
@@ -450,6 +470,9 @@ pub const Session = struct {
         return .{ .failed = err };
     }
     pub fn requestDerivedOwned(self: *Session, filter: profile.Filter, owner: ArchiveJob.DerivedOwner) DerivedState {
+        return self.requestDerivedFor(filter, owner, if (owner == .gui) .{} else self.jobRequester());
+    }
+    pub fn requestDerivedFor(self: *Session, filter: profile.Filter, owner: ArchiveJob.DerivedOwner, requester: @import("../service/job_owner.zig").Requester) DerivedState {
         const derived = @import("../profile/derived.zig");
         self.pollArchive();
         const capture = self.profile orelse return .{ .unavailable = error.NoProfile };
@@ -465,13 +488,15 @@ pub const Session = struct {
             // A superseded reconstruction is cancelled; a different kind of
             // job (save, open, inspection) finishes first.
             if (job.kind == .derived and job.derived_owner == owner) {
+                job.owner.require(requester) catch |err| return .{ .unavailable = err };
                 job.superseded = true;
                 job.progress.cancel.store(true, .release);
             }
             return .{ .pending = .{ .done = 0, .total = capture.samples.len() } };
         };
-        self.clearArchiveJob() catch |err| return self.failDerived(key, err);
+        self.clearArchiveJobOwned(requester) catch |err| return .{ .unavailable = err };
         const job = ArchiveJob.create(self.next_archive_job, .derived, "reconstructed stack flame view") catch |err| return self.failDerived(key, err);
+        job.owner = requester.owner;
         job.capture = capture;
         job.capture_id = capture.id;
         job.capture_revision = capture.revision;
@@ -488,6 +513,9 @@ pub const Session = struct {
         return .{ .pending = .{ .done = 0, .total = capture.samples.len() } };
     }
     pub fn requestProfileStack(self: *Session, ordinal: usize) !*ArchiveJob {
+        return self.requestProfileStackOwned(ordinal, .{});
+    }
+    pub fn requestProfileStackOwned(self: *Session, ordinal: usize, requester: @import("../service/job_owner.zig").Requester) !*ArchiveJob {
         if (self.frames.job) |job| if (job.capture != null) return error.FrameBusy;
         self.pollArchive();
         const capture = self.profile orelse return error.NoProfile;
@@ -496,9 +524,10 @@ pub const Session = struct {
         if (self.archive_job) |job| {
             if (job.kind == .stack and job.capture_id == capture.id and job.capture_revision == capture.revision and job.sample_ordinal == ordinal) return job;
         }
-        try self.clearArchiveJob();
+        try self.clearArchiveJobOwned(requester);
         const job = try ArchiveJob.create(self.next_archive_job, .stack, "sampled stack reconstruction");
         errdefer job.deinit();
+        job.owner = requester.owner;
         job.capture = capture;
         job.capture_id = capture.id;
         job.capture_revision = capture.revision;
@@ -600,7 +629,7 @@ pub const Session = struct {
                 job.failure = error.ArchiveCancelled;
             } else {
                 self.allocations.capture = capture;
-                capture.requestAnalysis(false) catch {};
+                capture.requestAnalysisOwned(false, .{ .owner = job.owner }) catch {};
                 std.debug.print("xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
             }
             job.allocation_opened = null;
@@ -1736,6 +1765,7 @@ pub const Session = struct {
         }
     }
     pub fn setAgentScope(self: *Session, scope: AgentScope) void {
+        self.shared_jobs = true;
         if (self.process_tree) |tree| {
             tree.setScope(scope);
             return;
@@ -1743,6 +1773,9 @@ pub const Session = struct {
         self.agent_scope = scope;
         self.target.invalidate();
         self.record(.human, "set_agent_scope");
+    }
+    pub fn jobRequester(self: *const Session) @import("../service/job_owner.zig").Requester {
+        return .{ .owner = @import("../service/job_owner.zig").Owner.agent(self.agent_client_id), .controller = self.agent_controller };
     }
     pub fn init() Session {
         return .{ .id = linux.now() };

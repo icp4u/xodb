@@ -82,7 +82,10 @@ class Client:
         deadline = time.monotonic()+seconds
         while time.monotonic()<deadline:
             session = self.session()
-            if session['state']=='stopped' and (reason is None or any(t['reason']==reason for t in session['threads'])):
+            # A loader rendezvous is also a breakpoint stop. Remote discovery
+            # may expose it across owner turns before the accepted continue
+            # resumes. Wait for discovery/run-control work to settle first.
+            if session['state']=='stopped' and not session['symbol_discovery_pending'] and not session['continue_pending'] and (reason is None or any(t['reason']==reason for t in session['threads'])):
                 return session
             assert session['state']!='exited', session
             time.sleep(.002)

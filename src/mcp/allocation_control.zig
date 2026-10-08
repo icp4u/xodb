@@ -84,7 +84,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         session.record(.agent, "stop_allocations");
         return status(a, session);
     }
-    return evidence.call(a, session.allocations.capture, name, args);
+    return evidence.callOwned(a, session.allocations.capture, name, args, session.jobRequester());
 }
 test "allocation control preserves observation scope and rejects malformed starts" {
     var session = Session.init();

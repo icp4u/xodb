@@ -518,6 +518,112 @@ static void named_locals(struct xpl_layout *l) {
     puts("Perl named locals: lexical scopes, recursive pads, shadows, pagination, exact lookup, every-read failure and 2000 corrupt objects passed");
 }
 
+static void watch_samples(struct xpl_layout *l) {
+    struct xpl_sample a, b;
+    struct xpl_reader r;
+    memset(memory, 0, sizeof memory);
+    sv(0x1100, 0x101, 0, 42); r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    assert(!a.reason && a.kind==XPL_SAMPLE_IV && a.size==8 && a.bytes[0]==42);
+    sv(0x1200, 0x105, 0x2000, 0);field(l,0x2000,XPL_IV,42);
+    r=reader();xpl_sample_read(l,&r,0x1200,&b);
+    assert(!b.reason && b.kind==a.kind && b.size==a.size && !memcmp(a.bytes,b.bytes,a.size));
+    sv(0x1100, 0x80000101u, 0, 42);r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(!b.reason && b.kind==(XPL_SAMPLE_IV|XPL_SAMPLE_UNSIGNED) && b.kind!=a.kind);
+    sv(0x1100,0,0,UINT64_MAX);r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    assert(!a.reason && a.kind==XPL_SAMPLE_UNDEF && !a.size && !strcmp(a.display,"undef"));
+    /* Equal display is not a complete comparison of a dualvar. */
+    sv(0x1100,0x505,0x2000,0x3000);str(0x3000,"same");
+    field(l,0x2000,XPL_PVCUR,4);field(l,0x2000,XPL_PVLEN,5);field(l,0x2000,XPL_IV,1);
+    r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    field(l,0x2000,XPL_IV,2);r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(!a.reason && !b.reason && a.kind==(XPL_SAMPLE_IV|XPL_SAMPLE_PV) && b.kind==a.kind);
+    assert(a.size==24 && b.size==a.size && memcmp(a.bytes,b.bytes,a.size));
+    assert(strstr(a.display,"IV 1") && strstr(b.display,"IV 2") && strstr(a.display,"same"));
+    /* PV encoding flags alone do not change its sequence of characters. */
+    sv(0x1100,0x403,0x2000,0x3000);put(0x3000,0xe4,1);
+    field(l,0x2000,XPL_PVCUR,1);field(l,0x2000,XPL_PVLEN,8);
+    r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    sv(0x1100,0x20000403u,0x2000,0x3000);put(0x3000,0xa4c3,2);field(l,0x2000,XPL_PVCUR,2);
+    r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(!a.reason && !b.reason && a.size==4 && a.bytes[0]==0xe4 && a.kind==b.kind && !memcmp(a.bytes,b.bytes,a.size));
+    sv(0x1100,0x403,0x2000,0x3000);memset(memory+0x3000-0x1000,'x',1025);
+    field(l,0x2000,XPL_PVCUR,1024);field(l,0x2000,XPL_PVLEN,1026);
+    r=reader();xpl_sample_read(l,&r,0x1100,&a);assert(!a.reason && a.size==4096);
+    put(0x3000+1023,'y',1);r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(!b.reason && a.size==b.size && memcmp(a.bytes,b.bytes,a.size));
+    field(l,0x2000,XPL_PVCUR,1025);r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(b.reason && !strcmp(b.reason,"PerlWatchSampleLimit"));
+    /* Interior NUL is part of the value, not a string terminator. */
+    field(l,0x2000,XPL_PVCUR,3);put(0x3000,0x620061,3);
+    r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    assert(!a.reason && a.size==12 && a.bytes[0]=='a' && !a.bytes[4] && a.bytes[8]=='b');
+    const uint64_t invalid_utf8[]={0xff,0x80c0,0x80a0ed,0x808090f4};
+    const unsigned lengths[]={1,2,3,4};
+    sv(0x1100,0x20000403u,0x2000,0x3000);
+    for(unsigned i=0;i<4;++i) {
+        put(0x3000,invalid_utf8[i],lengths[i]);field(l,0x2000,XPL_PVCUR,lengths[i]);
+        r=reader();xpl_sample_read(l,&r,0x1100,&a);
+        assert(a.reason && !strcmp(a.reason,"PerlWatchUtf8Unsupported"));
+    }
+    sv(0x1100,0x202,0x2000,0);field(l,0x2000,XPL_NV,0);
+    r=reader();xpl_sample_read(l,&r,0x1100,&a);
+    field(l,0x2000,XPL_NV,UINT64_C(1)<<63);r=reader();xpl_sample_read(l,&r,0x1100,&b);
+    assert(!a.reason && !b.reason && a.kind==XPL_SAMPLE_NV && memcmp(a.bytes,b.bytes,8));
+    const unsigned refuse[]={0x200101,0x400101,0x800101,0x100007,0x801,11,12,13,8,4,16,255};
+    for(size_t i=0;i<sizeof refuse/sizeof *refuse;++i) {
+        sv(0x1100,refuse[i],0x2000,42);r=reader();xpl_sample_read(l,&r,0x1100,&a);assert(a.reason);
+    }
+    sv(0x1100,0x403,0x2000,0x3000);field(l,0x2000,XPL_PVCUR,512);field(l,0x2000,XPL_PVLEN,513);
+    memset(memory+0x3000-0x1000,'q',512);r=reader();xpl_sample_read(l,&r,0x1100,&a);assert(!a.reason);
+    size_t reads=attempts;
+    for(size_t i=1;i<=reads;++i) {
+        fail_at=i;r=reader();xpl_sample_read(l,&r,0x1100,&a);assert(a.reason);
+    }
+    fail_at=0;
+    puts("Perl samples: complete dual representations, relocated equal scalars, exact numeric bits, Unicode/byte equivalence, long/NUL strings, limits, magic refusal and every-read failure passed");
+}
+static void watch_bindings(struct xpl_layout *l) {
+    struct xpl_locals *out=calloc(1,sizeof *out);assert(out);
+    struct xpl_stack *first=calloc(1,sizeof *first),*second=calloc(1,sizeof *second);assert(first && second);
+    named_fixture(l);struct xpl_reader r=reader();xpl_stack_read(l,&r,0x1100,first);
+    assert(first->chain_complete && first->frames[0].identity_proved);
+    memcpy(memory+0x3500-0x1000,memory+0x3000-0x1000,l->context_size);
+    field(l,0x2000,XPL_CXSTACK,0x3500);r=reader();xpl_stack_read(l,&r,0x1100,second);
+    assert(second->chain_complete && second->frames[0].identity_proved);
+    assert(first->frames[0].context_address!=second->frames[0].context_address);
+    assert(first->frames[0].stackinfo==second->frames[0].stackinfo && first->frames[0].context_index==second->frames[0].context_index && first->frames[0].cv==second->frames[0].cv);
+    field(l,0x5000,XPL_CVNAME,0);r=reader();xpl_stack_read(l,&r,0x1100,second);
+    assert(second->reason && !strcmp(second->reason,"PartialFrames") && second->chain_complete && second->frames[0].identity_proved);
+    field(l,0x2000,XPL_SIPREV,0x2000);r=reader();xpl_stack_read(l,&r,0x1100,second);
+    assert(!second->chain_complete && !strcmp(second->reason,"StackInfoCycle"));
+    named_fixture(l);r=reader();xpl_local_binding(l,&r,0x1100,0,1,"$x",out);
+    assert(!out->reason && out->count==1 && out->items[0].ordinal==1 && !strcmp(out->items[0].value.display,"IV 101"));
+    r=reader();xpl_local_find(l,&r,0x1100,0,"$x",out);
+    assert(!out->reason && out->items[0].ordinal==2 && !strcmp(out->items[0].value.display,"IV 102"));
+    r=reader();xpl_local_binding(l,&r,0x1100,0,3,"$expired",out);
+    assert(out->reason && !strcmp(out->reason,"PerlWatchBindingUnavailable") && !out->count);
+    r=reader();xpl_local_binding(l,&r,0x1100,0,1,"$other",out);
+    assert(out->reason && !strcmp(out->reason,"PerlWatchBindingUnavailable") && !out->count);
+    r=reader();xpl_local_binding(l,&r,0x1100,0,7,"$masked",out);
+    assert(out->reason && !strcmp(out->reason,"PerlPackageVariableUnread") && !out->count);
+    r=reader();xpl_local_binding(l,&r,0x1100,0,UINT64_MAX,"$x",out);
+    assert(out->reason && !attempts);
+    r=reader();xpl_local_binding(l,&r,0x1100,0,1,"$x",out);assert(!out->reason);
+    size_t reads=attempts;
+    for(size_t i=1;i<=reads;++i) {fail_at=i;r=reader();xpl_local_binding(l,&r,0x1100,0,1,"$x",out);assert(out->reason);}
+    fail_at=0;
+    named_fixture(l);
+    str(0x15000+512,"$\xc3\xa9");field(l,0x11000+512,XPL_NAMELEN,3);
+    r=reader();xpl_locals_read(l,&r,0x1100,0,0,32,out);
+    assert(!out->reason && out->count==4);
+    r=reader();xpl_local_binding(l,&r,0x1100,0,1,"$\xc3\xa9",out);
+    assert(!out->reason && out->count==1 && out->items[0].ordinal==1);
+    r=reader();xpl_local_find(l,&r,0x1100,0,"$\xc3\xa9",out);
+    assert(out->reason && !strcmp(out->reason,"UnsupportedPerlExpression") && !attempts);
+    free(out);free(first);free(second);
+    puts("Perl watch bindings: relocatable context identity, structural completion, retained shadowed declaration, inactive/package refusal and every-read failure passed");
+}
+
 int main(void) {
     struct xpl_layout l = layout();
     assert(!xpl_layout_check(&l, l.build_id, l.build_id_len, l.version));
@@ -532,6 +638,8 @@ int main(void) {
     layout_units(65, "PerlDwarfUnitLimit");
     stacks(&l);
     named_locals(&l);
+    watch_samples(&l);
+    watch_bindings(&l);
     puts("Perl memory reader: values, stale undef bits, bounded previews, identity refusal, corrupt contexts and "
          "every-read failure passed");
     return 0;

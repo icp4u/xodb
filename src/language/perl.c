@@ -231,6 +231,8 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
              * in the observation so try is not presented as an eval. */
             f->context_type = kind == 11 && (context & 0x80) ? 0x8b : kind;
             f->context_address = address;
+            f->stackinfo = si;
+            f->context_index = (uint64_t)(uint32_t)ix;
             f->cv = at(l, r, address, kind == 11 ? XPL_EVALCV : XPL_SUBCV);
             location(l, r, cop, f, cache, &cache_count);
             if (kind == 11) {
@@ -244,6 +246,7 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
                 snprintf(f->name, sizeof f->name, "(unavailable sub)");
                 f->reason = r->error ? r->error : "CvNameUnavailable";
             }
+            f->identity_proved = f->cv != 0 && !r->error;
             if (f->reason && !out->reason)
                 out->reason = "PartialFrames";
             cop = at(l, r, address, XPL_OLDCOP);
@@ -265,12 +268,14 @@ void xpl_stack_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t i
     struct xpl_frame *main = &out->frames[out->count++];
     main->cv = at(l, r, interpreter, XPL_MAINCV);
     main->context_type = 0;
+    main->identity_proved = main->cv != 0 && !r->error;
     snprintf(main->name, sizeof main->name, "main");
     location(l, r, cop, main, cache, &cache_count);
     if (!main->cv && !main->reason)
         main->reason = "MainCvUnavailable";
     if (main->reason || r->error)
         out->reason = r->error ? r->error : "PartialFrames";
+    out->chain_complete = !r->error;
 }
 static void value(const struct xpl_layout *, struct xpl_reader *, uint64_t, struct xpl_value *, unsigned);
 static void item(const struct xpl_layout *l, struct xpl_reader *r, uint64_t address, struct xpl_value_item *out,
@@ -572,10 +577,11 @@ static int pad_frame(const struct xpl_layout *l, struct xpl_reader *r, uint64_t 
     return !r->error;
 }
 static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
-                       size_t frame, size_t start, size_t limit, const char *find, struct xpl_locals *out) {
+                       size_t frame, size_t start, size_t limit, const char *find, const uint64_t *ordinal, struct xpl_locals *out) {
     memset(out, 0, sizeof *out);
     out->interpreter = interpreter; out->frame = frame; out->start = start;
-    if (find && !lexical_name(find)) { out->reason = "UnsupportedPerlExpression"; return; }
+    if (find && !ordinal && !lexical_name(find)) { out->reason = "UnsupportedPerlExpression"; return; }
+    if (ordinal && *ordinal >= XPL_MAX_PAD_SLOTS) { out->reason = "PerlWatchBindingUnavailable"; return; }
     uint64_t names = 0, slots = 0; int64_t last = -1;
     if (!pad_frame(l, r, interpreter, frame, out, &names, &slots, &last)) {
         if (r->error) out->reason = r->error;
@@ -587,6 +593,7 @@ static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_
     /* Highest active slot wins. Retain package declarations in the seen set:
      * an inner `our $x` must mask an outer `my $x`, not expose the outer value. */
     for (int64_t i = last; i >= 0 && !r->error; --i) {
+        if (ordinal && (uint64_t)i != *ordinal) continue;
         uint64_t pn = number(r, pointer_slot(r, names, (uint64_t)i), 8);
         if (!pn) continue;
         uint64_t pv = at(l, r, pn, XPL_NAMEPV);
@@ -647,17 +654,110 @@ static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_
     else if (find && !out->count && !out->reason) {
         /* The active pad is proved; CvOUTSIDE/file-scope lexicals and globals
          * were not searched, so this is not proof that the name is absent. */
-        out->reason = "PerlOuterScopeUnread";
+        out->reason = ordinal ? "PerlWatchBindingUnavailable" : "PerlOuterScopeUnread";
     }
     out->truncated = !find && start < out->total && out->count < out->total - start;
     free(bindings);
 }
 void xpl_locals_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                      size_t frame, size_t start, size_t limit, struct xpl_locals *out) {
-    pad_locals(l, r, interpreter, frame, start, limit, NULL, out);
+    pad_locals(l, r, interpreter, frame, start, limit, NULL, NULL, out);
 }
 void xpl_local_find(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                     size_t frame, const char *name, struct xpl_locals *out) {
     /* NULL must not silently become an enumeration request. */
-    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", out);
+    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", NULL, out);
+}
+
+void xpl_local_binding(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
+                       size_t frame, uint64_t ordinal, const char *name, struct xpl_locals *out) {
+    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", &ordinal, out);
+}
+
+static int sample_number(struct xpl_sample *out, uint64_t n, size_t bytes) {
+    if (bytes > sizeof out->bytes - out->size) {
+        out->reason = "PerlWatchSampleLimit";
+        return 0;
+    }
+    for (size_t i = 0; i < bytes; ++i) out->bytes[out->size++] = (uint8_t)(n >> (i * 8));
+    return 1;
+}
+static void sample_display(struct xpl_sample *out, const char *part) {
+    size_t used = strlen(out->display);
+    snprintf(out->display + used, sizeof out->display - used, "%s%s", used ? "; " : "", part);
+}
+void xpl_sample_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t sv,
+                     struct xpl_sample *out) {
+    memset(out, 0, sizeof *out);
+    uint64_t body; uint32_t flags, refs;
+    if (!head(l, r, sv, &body, &flags, &refs)) {
+        out->reason = r->error ? r->error : "PerlWatchSvUnavailable";
+        return;
+    }
+    unsigned type = flags & 255;
+    if (flags & (0x00e00000u | OBJECT)) {
+        out->reason = "PerlWatchMagicOrObjectUnsupported"; return;
+    }
+    if ((flags & ROK) || !(type == 0 || type == SV_IV || type == SV_NV || type == SV_PV ||
+                           type == SV_PVIV || type == SV_PVNV || type == 7)) {
+        out->reason = "PerlWatchValueUnsupported"; return;
+    }
+    if (((flags & IOK) && type != SV_IV && type < SV_PVIV) ||
+        ((flags & NOK) && type != SV_NV && type < SV_PVNV) ||
+        ((flags & POK) && type != SV_PV && type < SV_PVIV)) {
+        out->reason = "InconsistentSv"; return;
+    }
+    out->kind = ((flags & IOK) ? XPL_SAMPLE_IV : 0) | ((flags & NOK) ? XPL_SAMPLE_NV : 0) |
+                ((flags & POK) ? XPL_SAMPLE_PV : 0) | ((flags & IOK) && (flags & UV_FLAG) ? XPL_SAMPLE_UNSIGNED : 0);
+    char text[256];
+    if (flags & IOK) {
+        uint64_t iv = at(l, r, type == SV_IV ? sv : body, type == SV_IV ? XPL_UNION : XPL_IV);
+        if (!sample_number(out, iv, 8)) return;
+        if (flags & UV_FLAG) snprintf(text, sizeof text, "UV %" PRIu64, iv);
+        else snprintf(text, sizeof text, "IV %" PRId64, (int64_t)iv);
+        sample_display(out, text);
+    }
+    if (flags & NOK) {
+        uint64_t bits = at(l, r, body, XPL_NV);
+        if (!sample_number(out, bits, 8)) return;
+        double nv; memcpy(&nv, &bits, sizeof nv);
+        snprintf(text, sizeof text, "NV %.17g", nv); sample_display(out, text);
+    }
+    if (flags & POK) {
+        uint64_t n = at(l, r, body, XPL_PVCUR), capacity = at(l, r, body, XPL_PVLEN);
+        uint64_t pv = at(l, r, sv, XPL_UNION);
+        if (!pv || (capacity && n >= capacity)) { out->reason = "InconsistentSv"; return; }
+        uint8_t bytes[XPL_SAMPLE_BYTES];
+        if (n > sizeof bytes) { out->reason = "PerlWatchSampleLimit"; return; }
+        if (n && !read_bytes(r, pv, bytes, (size_t)n)) { out->reason = r->error; return; }
+        for (size_t i = 0; i < n;) {
+            uint32_t ch = bytes[i++];
+            if ((flags & 0x20000000u) && ch >= 128) {
+                unsigned left; uint32_t minimum;
+                if (ch >= 0xc2 && ch <= 0xdf) { left = 1; ch &= 31; minimum = 0x80; }
+                else if (ch >= 0xe0 && ch <= 0xef) { left = 2; ch &= 15; minimum = 0x800; }
+                else if (ch >= 0xf0 && ch <= 0xf4) { left = 3; ch &= 7; minimum = 0x10000; }
+                else { out->reason = "PerlWatchUtf8Unsupported"; return; }
+                if (left > n - i) { out->reason = "PerlWatchUtf8Unsupported"; return; }
+                for (unsigned j = 0; j < left; ++j) {
+                    unsigned c = bytes[i++];
+                    if ((c & 0xc0) != 0x80) { out->reason = "PerlWatchUtf8Unsupported"; return; }
+                    ch = (ch << 6) | (c & 63);
+                }
+                if (ch < minimum || ch > 0x10ffff || (ch >= 0xd800 && ch <= 0xdfff)) {
+                    out->reason = "PerlWatchUtf8Unsupported"; return;
+                }
+            }
+            if (!sample_number(out, ch, 4)) return;
+        }
+        struct xpl_value preview;
+        xpl_value_read(l, r, sv, &preview);
+        if (preview.reason) { out->reason = preview.reason; return; }
+        sample_display(out, preview.display);
+    }
+    if (r->error) { out->reason = r->error; return; }
+    unsigned valid = out->kind & (XPL_SAMPLE_IV | XPL_SAMPLE_NV | XPL_SAMPLE_PV);
+    strcpy(out->type, valid == 0 ? "undef" : valid == XPL_SAMPLE_IV ? (flags & UV_FLAG ? "UV" : "IV") :
+           valid == XPL_SAMPLE_NV ? "NV" : valid == XPL_SAMPLE_PV ? "PV" : "dual");
+    if (!valid) strcpy(out->display, "undef");
 }

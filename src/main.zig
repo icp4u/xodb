@@ -284,6 +284,7 @@ pub fn main(init: std.process.Init) !void {
     session.* = Session.init();
     session.persistent.cancel = &quitting;
     session.agent_scope = agent_scope;
+    session.shared_jobs = !headless or session_socket != null;
     session.profile_defaults = preferences.profile.config();
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
@@ -684,6 +685,8 @@ test {
     _ = @import("memdefrag/dos.zig");
     _ = @import("memdefrag/tui.zig");
     std.testing.refAllDecls(@import("model/session.zig"));
+    std.testing.refAllDecls(@import("model/memory.zig"));
+    _ = @import("model/job_owner_test.zig");
     _ = @import("model/remote_source.zig");
     _ = @import("model/remote_owner.zig");
     _ = @import("semq/adapter.zig");

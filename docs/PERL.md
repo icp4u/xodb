@@ -148,6 +148,46 @@ the code loaded by the runtime. Invalid UTF-8, embedded NULs or oversized
 identities are refused rather than silently renamed. Depth limits are explicit.
 There is no asynchronous sampling or cross-thread snapshot claim.
 
+## Runtime watches
+
+Run `./scripts/demo-perl`, press **Space**, select **Perl** and the logical
+`main::tick` frame. Press **Shift+E**, type `$round`, and press **Return**.
+Press **Space** through the next delete/store stops: the iteration number
+changes. **V** opens the runtime watch list. These watches sample debugger
+stops; they do not interrupt a running program.
+
+Click a named row and press **W** to retain that pad declaration. An inner
+`my $x` does not retarget a watch on an outer `$x`; the outer declaration becomes
+unavailable when its lexical scope ends. **Shift+E** with `$x` instead resolves
+the currently visible ASCII sigil/identifier in the retained logical frame at
+every stop. W also accepts Unicode names because it retains a declaration
+identity rather than parsing an expression. Arbitrary Perl expressions, package variables and object paths are unsupported.
+
+Comparison uses complete stored scalar representations, not Perl `eq` or `==`.
+All public IOK/NOK/POK representations participate, so dualvars include both
+numeric and string values and a change to validity/cache state can count as a
+change. Integers retain signedness, NVs retain exact bits, and strings compare
+characters (a byte PV maps to Latin-1; UTF-8 is decoded). Equivalent byte/UTF-8
+encodings compare equal. Previews may be short, but comparison never uses the
+preview. Canonical samples are capped at 4096 bytes; pure strings therefore fit
+up to 1024 characters. Oversized samples, non-Unicode/malformed UTF-8, magic,
+references, containers and unproved storage report unavailable; no coercion,
+overload or magic runs in the target.
+
+The context array may move during recursion. Watches retain the interpreter,
+stackinfo, context index and CV and resolve the current context and pad again.
+Those keys still do not prove continuous activation lifetime between stops.
+Rows keep the **activation unproved** caveat, including on differences. A
+complete walk that observes the frame absent marks it gone permanently;
+reusing the slot does not revive the watch. Partial walks leave it unavailable.
+Only ordinary sub/main frames are currently watchable.
+
+MCP uses `add_language_watch` with `language: "perl"` and either a sigiled
+`expression` or a named-local row index; `get_language_watches` reads the shared
+list and `remove_language_watch` removes an entry. Add/remove require control
+scope and, in a shared session, the controller lease. F8 revokes that authority;
+human watch controls remain available.
+
 ## Verification
 
 ```sh
@@ -164,6 +204,8 @@ python3 tests/perl-component.py --perl /path/to/debug/perl --padwalker /path/to/
 python3 tests/perl-locals.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-named --strace
 python3 tests/perl-locals-shared.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-shared --strace
 python3 tests/perl-locals-gui.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-gui
+python3 tests/perl-watches.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-watches --strace
+python3 tests/language-watches-gui.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-watch-gui
 ```
 
 Add `--agent zig-out/bin/xodb-agent` to named-local and shared tests for C-agent

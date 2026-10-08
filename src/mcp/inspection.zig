@@ -44,17 +44,18 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
             request.memory = ranges;
         }
         request.validate() catch return error.InvalidArguments;
-        return summary(a, try session.inspections.start(session, request));
+        return summary(a, try session.inspections.startOwned(session, request, session.jobRequester()));
     }
     const get = std.mem.eql(u8, name, "get_inspection");
     try wire.fields(args, if (get) &.{ "id", "start", "limit" } else &.{"id"});
     const id = try wire.number(args, "id", null);
     if (std.mem.eql(u8, name, "release_inspection")) {
-        try session.inspections.release(id);
+        try session.inspections.releaseOwned(id, session.jobRequester());
         return wire.value(a, .{ .id = id, .released = true });
     }
     const job = try session.inspections.find(id);
     if (!get) {
+        try job.owner.require(session.jobRequester());
         if (job.active()) job.state = .cancelled;
         return summary(a, job);
     }

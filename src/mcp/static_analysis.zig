@@ -220,13 +220,15 @@ fn functionAddress(session: *Session, args: V) !?u64 {
     return address;
 }
 
-test "static tool definitions are observer reads" {
+test "static starters require controller while cached reads remain observers" {
     const parsed = try std.json.parseFromSlice(V, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
         const annotations = definition.object.get("annotations").?;
         try std.testing.expect(annotations.object.get("readOnlyHint").?.bool);
-        try std.testing.expectEqualStrings("observer", annotations.object.get("xodbSessionAccess").?.string);
+        const name = definition.object.get("name").?.string;
+        const starter = std.mem.eql(u8, name, "analyze_function") or std.mem.eql(u8, name, "slice_value") or std.mem.eql(u8, name, "control_dependencies");
+        try std.testing.expectEqualStrings(if (starter) "controller" else "observer", annotations.object.get("xodbSessionAccess").?.string);
     }
 }

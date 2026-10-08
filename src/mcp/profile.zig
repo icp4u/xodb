@@ -143,9 +143,9 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (raw_path != .string or raw_path.string.len == 0 or raw_path.string.len > 4096 or std.mem.indexOfScalar(u8, raw_path.string, 0) != null) return error.InvalidArguments;
         const path = try a.dupeZ(u8, raw_path.string);
         const selected_filter = try readFilter(args);
-        try session.ensureArchiveView(selected_filter);
+        try session.ensureArchiveViewOwned(selected_filter, session.jobRequester());
         if (capture.collector != null) return error.ProfileStillCollecting;
-        const prepared = if (!capture.offline) &(try session.recorded_views.request(capture, capture.revision, selected_filter, false)).graph else null;
+        const prepared = if (!capture.offline) &(try session.recorded_views.requestOwned(capture, capture.revision, selected_filter, false, session.jobRequester())).graph else null;
         const result = try @import("../profile/export.zig").savePrepared(capture, path, selected_filter, prepared);
         session.record(.agent, "export_profile");
         return value(a, .{ .capture_id = capture.id, .revision = capture.revision, .generation = session.target.snapshot().generation, .path = path, .format = "speedscope", .result = result, .ordering = @import("../profile/export.zig").ordering });
@@ -380,7 +380,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
                 if (given != .string or !std.mem.eql(u8, given.string, expected)) return error.StaleArchiveView;
             } else if (detail or page_start > 0) return error.ArchiveViewRequired;
         }
-        try session.ensureArchiveView(filter);
+        try session.ensureArchiveViewOwned(filter, session.jobRequester());
         owned_graph = try capture.graph(a, filter);
         break :blk &owned_graph.?;
     } else blk: {
@@ -392,7 +392,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
         if (args.object.get("view_id")) |given| {
             if (given != .string or !std.mem.eql(u8, given.string, view_id.?) or !session.recorded_views.retained(key)) return error.StaleProfileView;
         } else if (detail or page_start > 0) return error.ProfileViewRequired;
-        const result = session.recorded_views.request(capture, revision, filter, retry) catch |err| {
+        const result = session.recorded_views.requestOwned(capture, revision, filter, retry, session.jobRequester()) catch |err| {
             if (err != error.ProfileViewPending) return err;
             const job = session.recorded_views.job.?;
             return value(a, .{ .capture_id = capture.id, .revision = revision, .current_revision = capture.revision, .view_id = view_id, .basis = "recorded", .pending = true, .job_id = job.id, .snapshot_samples = job.sample_count });

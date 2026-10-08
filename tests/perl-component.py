@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import subprocess
@@ -57,10 +58,30 @@ if a.sanitize:
 run('oracle-version', [a.perl, '-MPadWalker', '-e', 'print "$PadWalker::VERSION\n"'], env)
 r = run('oracle', [a.perl, 'tests/fixtures/perl/named.pl', shared], env)
 assert '81 bindings, 20 frames, 9 snapshots passed' in r.stdout, r.stdout
+named_result = r.stdout.splitlines()[-1]
+watch = a.work/'watches.so'
+run('watch-oracle-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE', '-shared', '-fPIC',
+    '-g3', '-O0', *sanitize, '-DXODB_PERL_WATCH_ORACLE', '-I'+config['archlib']+'/CORE',
+    'tests/fixtures/perl/watches.c', *source, '-ldw', '-lelf', '-o', watch])
+# The cooperating program's own macros produce expected bytes; its separately
+# linked C reader asserts every complete/refused result before the stopped hook.
+watch_run = subprocess.run([a.perl,'tests/fixtures/perl/watches.pl',str(watch)], input='go\n',
+    env=env, capture_output=True, text=True, timeout=90)
+(a.work/'watch-oracle.log').write_text(watch_run.stdout+watch_run.stderr)
+assert watch_run.returncode == 0, (watch_run.returncode, watch_run.stderr)
+oracles = [json.loads(line) for line in watch_run.stdout.splitlines() if line.startswith('{')]
+samples = sum(len(frame) for oracle in oracles for frame in oracle['frames'])
+assert int(re.findall(r'verified (\d+) scalar samples',watch_run.stderr)[-1]) == samples and samples > 0
+first = oracles[0]
+assert first['label'] == 'initial'
+assert any(row['name'] == '$élan' for frame in first['frames'] for row in frame), 'Unicode oracle binding missing'
+deep = next(row for row in oracles if row['label'] == 'deep')
+assert first['context_array'] != deep['context_array'], 'oracle must observe actual context-array relocation'
 inputs = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
     for path in [image, a.padwalker/'blib/lib/PadWalker.pm', a.padwalker/'blib/arch/auto/PadWalker/PadWalker.so',
                  *sorted((image.parent).glob('*.h'))]}
 (a.work/'inputs.json').write_text(json.dumps(inputs, indent=2)+'\n')
 (a.work/'results.json').write_text(json.dumps({'reader': 'pass', 'padwalker_oracle': 'pass',
-    'bindings': 81, 'frames': 20, 'snapshots': 9, 'malformed_cases': 2000, 'sanitizers': a.sanitize}, indent=2)+'\n')
-print(r.stdout.splitlines()[-1])
+    'bindings': 81, 'frames': 20, 'snapshots': 9, 'malformed_cases': 2000, 'sanitizers': a.sanitize, 'scalar_oracle_samples':samples, 'context_array_relocated':True}, indent=2)+'\n')
+print(named_result)
+print(f'Perl stopped scalar bytes: {samples} public-macro oracle samples and context relocation passed')

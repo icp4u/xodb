@@ -109,7 +109,7 @@ pub fn call(a: aType, session: *Session, name: []const u8, args: Value) !Value {
         }
         raw = try common.value(a, .{ .abi = entry.state.abi, .regs_mask = entry.state.regs_mask, .registers = regs.items, .stack_address = if (entry.state.regs_present and entry.state.regs_mask & (1 << 7) != 0) try std.fmt.allocPrint(a, "0x{x}", .{entry.state.regs[7]}) else null, .stack_offset = offset, .stack_hex = hex, .next_offset = if (end < bytes.len) @as(?usize, end) else null });
     } else if (offset != 0) return error.InvalidArguments;
-    const job = if (reconstruct) try session.requestProfileStack(@intCast(ordinal)) else null;
+    const job = if (reconstruct) try session.requestProfileStackOwned(@intCast(ordinal), session.jobRequester()) else null;
     var derived: ?Value = null;
     if (job) |j| if (j.reaped) {
         if (j.stack_result) |result| {

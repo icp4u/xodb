@@ -24,7 +24,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
         const length = try wire.number(args, "length", null);
         if (length > memory.max_search) return error.InvalidArguments;
         if (!search) {
-            const id = try session.memory.capture(session, try address(args), @intCast(length));
+            const id = try session.memory.captureOwned(session, try address(args), @intCast(length), session.jobRequester());
             const snapshot = try session.memory.find(id);
             return wire.value(a, .{ .id = id, .generation = snapshot.generation, .image_epoch = snapshot.image_epoch, .address = try std.fmt.allocPrint(a, "0x{x}", .{snapshot.address}), .length = snapshot.bytes.len, .readable = snapshot.readable });
         }
@@ -36,7 +36,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
             for (0..pattern.len / 2) |i| bytes[i] = std.fmt.parseInt(u8, pattern[2 * i ..][0..2], 16) catch return error.InvalidArguments;
             break :blk bytes[0 .. pattern.len / 2];
         } else if (std.mem.eql(u8, encoding, "utf8")) pattern else return error.InvalidArguments;
-        const id = try session.memory.startSearch(session, try address(args), @intCast(length), data);
+        const id = try session.memory.startSearchOwned(session, try address(args), @intCast(length), data, session.jobRequester());
         return wire.value(a, .{ .id = id, .state = "running" });
     }
     if (std.mem.eql(u8, name, "read_memory_snapshot")) {
@@ -62,7 +62,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) 
     const id = try wire.number(args, "id", null);
     const search = if (session.memory.search) |*v| v else return error.NoMemorySearch;
     if (search.id != id) return error.StaleMemorySearch;
-    if (cancel and search.state == .running) search.state = .cancelled;
+    if (cancel) try session.memory.cancelSearch(id, session.jobRequester());
     const start = try wire.number(args, "start", 0);
     const limit = try wire.number(args, "limit", 64);
     if (start > search.count or limit == 0 or limit > 128) return error.InvalidArguments;

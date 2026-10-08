@@ -45,19 +45,20 @@ pub const Policy = struct {
     pub fn fromDefinition(definition: Value) !Policy {
         return .{ .required = try access(definition), .read_only = try readOnly(definition) };
     }
-    pub fn localAllowed(self: Policy, scope: @import("../model/session.zig").AgentScope) bool {
-        // Read-only retained jobs are private to a stdio session. Shared clients
-        // additionally obey xodbSessionAccess ownership even for read-only tools.
-        if (self.read_only) return true;
+    pub fn localAllowed(self: Policy, scope: @import("../model/session.zig").AgentScope, shared_state: bool) bool {
+        // A target-read-only tool may still replace retained host jobs. Only a
+        // private headless stdio session keeps the read-only job exception.
+        if (self.read_only and !shared_state) return true;
         return switch (self.required) {
             .controller => scope != .observe,
             .mutator => scope == .mutate,
-            .observer, .lease => false,
+            .observer => self.read_only,
+            .lease => false,
         };
     }
 };
-pub fn localAllowed(scope: @import("../model/session.zig").AgentScope, definition: Value) !bool {
-    return (try Policy.fromDefinition(definition)).localAllowed(scope);
+pub fn localAllowed(scope: @import("../model/session.zig").AgentScope, shared_state: bool, definition: Value) !bool {
+    return (try Policy.fromDefinition(definition)).localAllowed(scope, shared_state);
 }
 
 fn number(args: Value, key: []const u8, default: ?u64) !u64 {
@@ -171,14 +172,17 @@ test "local scope comes from policy and invalid state-changing observers fail cl
     inline for (.{ "controller", "mutator" }) |required| {
         const parsed = try std.json.parseFromSlice(Value, a, "{\"name\":\"arbitrary_name\",\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"" ++ required ++ "\"}}", .{});
         defer parsed.deinit();
-        try std.testing.expect(!try localAllowed(.observe, parsed.value));
-        try std.testing.expectEqual(std.mem.eql(u8, required, "controller"), try localAllowed(.control, parsed.value));
-        try std.testing.expect(try localAllowed(.mutate, parsed.value));
+        try std.testing.expect(!try localAllowed(.observe, false, parsed.value));
+        try std.testing.expectEqual(std.mem.eql(u8, required, "controller"), try localAllowed(.control, false, parsed.value));
+        try std.testing.expect(try localAllowed(.mutate, false, parsed.value));
     }
     const retained = try std.json.parseFromSlice(Value, a, "{\"annotations\":{\"readOnlyHint\":true,\"xodbSessionAccess\":\"controller\"}}", .{});
     defer retained.deinit();
-    for (std.enums.values(Scope)) |scope| try std.testing.expect(try localAllowed(scope, retained.value));
+    for (std.enums.values(Scope)) |scope| try std.testing.expect(try localAllowed(scope, false, retained.value));
     try std.testing.expectEqual(Access.controller, try access(retained.value));
+    try std.testing.expect(!try localAllowed(.observe, true, retained.value));
+    try std.testing.expect(try localAllowed(.control, true, retained.value));
+    try std.testing.expect(try localAllowed(.mutate, true, retained.value));
     inline for (.{
         "{\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"observer\"}}",
         "{\"annotations\":{\"xodbSessionAccess\":\"controller\"}}",
@@ -187,6 +191,6 @@ test "local scope comes from policy and invalid state-changing observers fail cl
         const invalid = try std.json.parseFromSlice(Value, a, text, .{});
         defer invalid.deinit();
         try std.testing.expectError(error.InvalidToolSessionAccess, access(invalid.value));
-        try std.testing.expectError(error.InvalidToolSessionAccess, localAllowed(.mutate, invalid.value));
+        try std.testing.expectError(error.InvalidToolSessionAccess, localAllowed(.mutate, false, invalid.value));
     }
 }

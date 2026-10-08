@@ -92,6 +92,7 @@ pub const Tree = struct {
     pub fn setScope(self: *Tree, scope: model.AgentScope) void {
         for (self.entries[0..self.count]) |entry| {
             entry.session.agent_scope = scope;
+            entry.session.shared_jobs = true;
             entry.session.target.invalidate();
             entry.session.record(.human, "set_agent_scope");
         }
@@ -142,6 +143,7 @@ pub const Tree = struct {
             A.destroy(child);
         }
         child.agent_scope = self.root().agent_scope;
+        child.shared_jobs = self.root().shared_jobs;
         child.profile_defaults = parent.profile_defaults;
         child.allocation_defaults = parent.allocation_defaults;
         child.allocation_helper = parent.allocation_helper;

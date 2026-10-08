@@ -382,3 +382,14 @@ enum xsvc_result xsvc_events(const struct xsvc *s, uint64_t after,
     *gap = missing;
     return XSVC_OK;
 }
+
+static bool job_owner_valid(struct xsvc_job_owner owner) {
+    if (owner.kind == XSVC_JOB_SHARED) return owner.client > 0 && owner.client <= XSVC_MAX_ID;
+    return (owner.kind == XSVC_JOB_HUMAN || owner.kind == XSVC_JOB_STDIO) && owner.client == 0;
+}
+bool xsvc_job_may_change(struct xsvc_job_owner owner,
+                          struct xsvc_job_owner requester, bool controller) {
+    if (!job_owner_valid(owner) || !job_owner_valid(requester)) return false;
+    return requester.kind == XSVC_JOB_HUMAN || controller ||
+        (owner.kind == requester.kind && owner.client == requester.client);
+}

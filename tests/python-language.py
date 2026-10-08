@@ -315,19 +315,19 @@ def strace_audit(run, work, checks, expressions):
     st = subprocess.Popen(['strace', '-f', '-qq', '-o', str(log), '-e', 'trace=ptrace,process_vm_readv,process_vm_writev,pwrite64,pwritev,pwritev2,pread64,kill,tgkill,tkill', '-p', str(run.c.p.pid)], stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 10
-        while not log.exists() or not log.stat().st_size and time.monotonic() < deadline:
-            run.c.inspect('get_session')
-            time.sleep(0.2)
-            if log.exists():
-                break
-        time.sleep(1)
+        while True:
+            assert st.poll() is None, st.stderr.read().decode()
+            status = Path(f'/proc/{run.c.p.pid}/status').read_text()
+            attached = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:'))
+            if attached == st.pid: break
+            assert time.monotonic() < deadline, 'strace did not attach before the audit deadline'
+            time.sleep(.01)
         for _ in range(3):
             run.stack()
         for expression in expressions:
             run.value(expression)
-        time.sleep(0.5)
     finally:
-        st.send_signal(signal.SIGINT)
+        if st.poll() is None: st.send_signal(signal.SIGINT)
         st.wait(timeout=10)
     regs1, gen1, s1 = run.c.inspect('get_registers', tid=run.tid), run.c.session()['generation'], sched()
     calls = {}
