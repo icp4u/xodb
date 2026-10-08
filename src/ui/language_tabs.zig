@@ -54,6 +54,8 @@ pub const Panel = struct {
     bindings_key: ?SelectedKey = null,
     binding_start: usize = 0,
     binding_visible: usize = 0,
+    binding_selected: ?usize = null,
+    binding_hits: [32]?struct { rect: gpu.Rect, index: usize } = @splat(null),
     binding_y: f32 = std.math.inf(f32),
     expression: [128]u8 = undefined,
     expression_len: usize = 0,
@@ -61,6 +63,7 @@ pub const Panel = struct {
     expression_reason: ?[]const u8 = null,
     editor: Editor = .{},
     editor_key: ?SelectedKey = null,
+    editor_watch: bool = false,
     fn selectedKey(session: *Session) ?SelectedKey {
         const row = session.language_tabs.logical_selection orelse return null;
         if (row.generation != session.target.snapshot().generation or row.language != session.language_tabs.selected) return null;
@@ -74,17 +77,32 @@ pub const Panel = struct {
     pub fn beginExpression(self: *Panel, session: *Session) !void {
         if (!named.supported(session.language_tabs.selected)) return error.LanguageLocalsUnavailable;
         self.editor_key = selectedKey(session) orelse return error.SelectLanguageFrame;
+        self.editor_watch = false;
         self.editor.start();
     }
     pub fn submitExpression(self: *Panel, session: *Session, text: []const u8) !void {
         const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
         if (self.editor_key == null or !std.meta.eql(self.editor_key.?, selected)) return error.StaleLanguageFrame;
         if (text.len == 0 or text.len > self.expression.len) return error.InvalidArguments;
+        if (self.editor_watch) {
+            _ = try session.language_watches.add(session, selected.language, selected.tid, selected.segment, selected.frame, text, null);
+            session.record(.human, "add_language_watch");
+            self.editor.open = false;
+            return;
+        }
         @memcpy(self.expression[0..text.len], text);
         self.expression_len = text.len;
         self.bindings_key = selected;
         self.key = null;
         self.editor.open = false;
+    }
+    pub fn watchBinding(self: *Panel, session: *Session) !u64 {
+        const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
+        if (self.bindings_key == null or !std.meta.eql(self.bindings_key.?, selected)) return error.StaleLanguageFrame;
+        const index = self.binding_selected orelse return error.SelectNamedBindingForWatch;
+        const id = try session.language_watches.add(session, selected.language, selected.tid, selected.segment, selected.frame, null, index);
+        session.record(.human, "add_language_watch");
+        return id;
     }
     pub fn scrollBindings(self: *Panel, amount: i32) void {
         const result = self.bindings orelse return;
@@ -110,6 +128,22 @@ pub const Panel = struct {
                 if (key.session != session.id or key.generation != session.target.snapshot().generation or key.tab != session.language_tabs.selected) return error.StaleLanguageView;
                 self.native_policy = if (self.native_collapsed) .expanded else .collapsed;
                 self.revealed = null;
+                return true;
+            }
+        }
+        for (self.binding_hits) |maybe| if (maybe) |binding| {
+            const rect = binding.rect;
+            if (x >= rect.x and x < rect.x + rect.w and y >= rect.y and y < rect.y + rect.h) {
+                if (key.session != session.id or key.generation != session.target.snapshot().generation or key.tab != session.language_tabs.selected) return error.StaleLanguageView;
+                const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
+                if (self.bindings_key == null or !std.meta.eql(selected, self.bindings_key.?)) return error.StaleLanguageFrame;
+                self.binding_selected = binding.index;
+                return true;
+            }
+        };
+        if (self.native_header_hit) |rect| {
+            if (x >= rect.x and x < rect.x + rect.w and y >= rect.y + rect.h and y < self.binding_y) {
+                self.binding_selected = null;
                 return true;
             }
         }
@@ -163,7 +197,7 @@ pub const Panel = struct {
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, hint, theme.warm);
             y += 23;
             const reason = entry.reason.?;
-            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else reason;
+            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else if (std.mem.eql(u8, reason, "RubyStaticRuntimeUnavailable")) "Needs standalone Ruby" else if (std.mem.eql(u8, reason, "RubyVersionUnsupported")) "Revision not supported" else if (std.mem.eql(u8, reason, "RubyArchitectureUnsupported")) "Unsupported Ruby CPU" else if (std.mem.eql(u8, reason, "RubyVersionMismatch") or std.mem.eql(u8, reason, "RubyBuildIdMismatch")) "Runtime image mismatch" else reason;
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, detail, theme.weak);
         }
         self.content_y = y + 39;
@@ -219,6 +253,7 @@ pub const Panel = struct {
         self.bindings_reason = "Select a logical frame for named locals";
         const selected = selectedKey(session);
         if (selected == null or self.bindings_key == null or !std.meta.eql(selected.?, self.bindings_key.?)) {
+            self.binding_selected = null;
             self.binding_start = 0;
             self.expression_len = 0;
         }
@@ -348,6 +383,7 @@ pub const Panel = struct {
     }
     pub fn body(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, session: *Session, tid: i32, frame: usize, native_values: anytype, native_reason: ?[]const u8) !void {
         self.row_hits = @splat(null);
+        self.binding_hits = @splat(null);
         const logical = session.language_tabs.logical_selection;
         const logical_tid = if (logical) |selected| if (selected.generation == session.target.snapshot().generation and selected.language == session.language_tabs.selected) selected.tid else tid else tid;
         self.refresh(session, logical_tid, frame);
@@ -418,7 +454,7 @@ pub const Panel = struct {
         if (self.editor.open) {
             try self.editor.draw(r, font, .{ .x = rect.x + 12, .y = y, .w = rect.w - 24, .h = 25 });
             y += 29;
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, if (self.editor.message.len > 0) self.editor.message else "Return reads this stop; Esc cancels", theme.warm);
+            try r.textFit(font, rect.x + 12, y, rect.w - 24, if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
             y += 24;
         } else if (self.expression_len != 0) {
             const value = if (self.expression_result) |result| if (result.rows.len != 0) result.rows[0].value.display else result.diagnostic orelse "No binding" else self.expression_reason orelse "Value unavailable";
@@ -437,8 +473,11 @@ pub const Panel = struct {
                 y += 21;
             }
             var shown: usize = 0;
-            for (result.rows) |row| {
+            for (result.rows, 0..) |row, index| {
                 if (y + 42 > rect.y + rect.h - 8) break;
+                const bounds = gpu.Rect{ .x = rect.x + 4, .y = y - 3, .w = rect.w - 8, .h = 43 };
+                self.binding_hits[index] = .{ .rect = bounds, .index = result.start + index };
+                if (self.binding_selected != null and self.binding_selected.? == result.start + index) try style.focus(r, bounds, 4, 1);
                 var buffer: [2048]u8 = undefined;
                 const text = if (row.name.len == 0) row.value.display else std.fmt.bufPrint(&buffer, "{s} = {s}", .{ row.name, row.value.display }) catch "Value preview too long";
                 try r.textFit(font, rect.x + 12, y, rect.w - 24, text, theme.text);
@@ -479,4 +518,14 @@ test "language sections retain stack context and collapse empty native values" {
     try std.testing.expectEqual(@as(usize, 4), revealRow(5, 5, 3));
     try std.testing.expectEqual(@as(usize, 0), revealRow(0, 2, 3));
     try std.testing.expectEqual(@as(usize, 0), revealRow(5, 0, 3));
+}
+
+pub fn watchError(err: anyerror) []const u8 {
+    return switch (err) {
+        error.SelectNamedBindingForWatch => "Select a named binding before W; native previews have no watch storage",
+        error.LuaWatchBindingHasNoStorage => "This summary row has no named watch storage",
+        error.LanguageWatchRuntimeUnsupported => "Runtime watches support Lua and Python",
+        error.SelectLanguageFrame => "Select a logical frame first",
+        else => @errorName(err),
+    };
 }

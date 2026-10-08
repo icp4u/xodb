@@ -56,8 +56,16 @@ try:
     first=observer.tool('get_language_locals',**args);assert first==owner.tool('get_language_locals',**args)
     found=observer.tool('evaluate_language_expression',**args,expression='local');assert found==owner.tool('evaluate_language_expression',**args,expression='local')
     assert found['rows'][0]['value']['display']=='int 100',found
+    watch_args=args|{'expression':'depth'}
+    s.expect_error(observer.raw('add_language_watch',**watch_args),'ControlLeaseRequired')
+    added=owner.tool('add_language_watch',**watch_args)['added']
+    watches=observer.tool('get_language_watches')['watches']
+    assert watches==owner.tool('get_language_watches')['watches'] and len(watches)==1,watches
+    assert watches[0]['language']=='python' and watches[0]['current']['display']=='int 0',watches
+    s.expect_error(observer.raw('remove_language_watch',generation=generation,id=added),'ControlLeaseRequired')
     owner.tool('release_session_control');assert observer.info()['controller_id'] is None
     assert observer.tool('get_language_locals',**args)==first
+    assert observer.tool('get_language_watches')['watches']==watches
     if a.strace:
         collector=proc.pid
         if a.agent:
@@ -68,6 +76,9 @@ try:
     owner.claim(ttl_ms=60000);owner.action('continue')
     s.eventually(owner.session,lambda state:state['generation']!=generation and state['state']=='stopped','next named stop')
     s.expect_error(observer.raw('get_language_locals',**args),'StaleSnapshot')
+    s.eventually(lambda:observer.tool('get_language_watches')['watches'],lambda rows:rows[0]['state']=='gone','watched recursion frame retired')
+    owner.tool('remove_language_watch',generation=owner.session()['generation'],id=added)
+    assert observer.tool('get_language_watches')['watches']==[]
     owner.action('detach');result.update(status='pass',owner_observer_equal=True,reads_without_any_controller=True)
 finally:
     for c in server.clients:c.close()

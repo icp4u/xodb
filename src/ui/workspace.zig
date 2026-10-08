@@ -185,6 +185,7 @@ pub const Workspace = struct {
     /// Expression field (E) and watch list, shown in place of EVENTS (V).
     editor: watch_ui.Editor = .{},
     watch: watch_ui.WatchList = .{},
+    runtime_watch_panel: @import("language_watches.zig").Panel = .{},
     show_watch: bool = false,
     /// Up/Down, Delete, Return, PgUp/PgDn and W act on the watch list.
     watch_focus: bool = false,
@@ -572,7 +573,7 @@ pub const Workspace = struct {
                             continue;
                         }
                     }
-                    if (!self.show_profile and self.show_watch and self.watch_focus and event.kind == .press and event.plain() and event.mods.shift and event.shortcut == 'l') {
+                    if (@intFromEnum(session.language_tabs.selected) < 2 and !self.show_profile and self.show_watch and self.watch_focus and event.kind == .press and event.plain() and event.mods.shift and event.shortcut == 'l') {
                         self.toggleWatchMode(session);
                         w.dirty = true;
                         continue;
@@ -591,8 +592,17 @@ pub const Workspace = struct {
                     }
                     if (self.language_panel.editor.open) {
                         if (self.language_panel.editor.key(event)) |action| switch (action) {
-                            .submit => |text| self.language_panel.submitExpression(session, text) catch |err| {
-                                self.language_panel.editor.message = @errorName(err);
+                            .submit => |text| {
+                                const watching = self.language_panel.editor_watch;
+                                self.language_panel.submitExpression(session, text) catch |err| {
+                                    self.language_panel.editor.message = @import("language_tabs.zig").watchError(err);
+                                    continue;
+                                };
+                                if (watching) {
+                                    self.show_watch = true;
+                                    self.watch_focus = false;
+                                    self.status = "Runtime watch added; compares when the process stops";
+                                }
                             },
                             else => {},
                         };
@@ -602,6 +612,7 @@ pub const Workspace = struct {
                     const code = binding(event);
                     if (code == 0) continue;
                     self.step(w, session, false, code);
+                    if (code == 18 and self.language_panel.editor.open) self.language_panel.editor_watch = event.mods.shift;
                     if (code == 18 and self.editor.open) self.editor.mode = if (event.mods.shift) .live else .pinned;
                 },
                 .button_press, .button_release => {
@@ -1082,7 +1093,7 @@ pub const Workspace = struct {
             if (self.show_watch and w.scroll != 0) {
                 const r = self.watch_rect;
                 if (w.pointer_x >= r.x and w.pointer_x < r.x + r.w and w.pointer_y >= r.y and w.pointer_y < r.y + r.h) {
-                    self.watch.scrollBy(w.scroll);
+                    if (@intFromEnum(session.language_tabs.selected) >= 2) self.runtime_watch_panel.scrollBy(w.scroll) else self.watch.scrollBy(w.scroll);
                     w.scroll = 0;
                     w.dirty = true;
                 }
@@ -1091,12 +1102,23 @@ pub const Workspace = struct {
                 const r = self.watch_rect;
                 self.watch_focus = w.pointer_x >= r.x and w.pointer_x < r.x + r.w and w.pointer_y >= r.y and w.pointer_y < r.y + r.h;
                 if (self.watch_focus) {
-                    if (self.watch.rowAt(w.pointer_y, &self.watch_hits)) |i| self.watch.selected = i;
+                    if (@intFromEnum(session.language_tabs.selected) >= 2) {
+                        self.runtime_watch_panel.click(w.pointer_x, w.pointer_y);
+                    } else if (self.watch.rowAt(w.pointer_y, &self.watch_hits)) |i| self.watch.selected = i;
                     click = false;
                     w.dirty = true;
                 }
             }
-            if (self.show_watch and self.watch_focus) if (self.watch.selected) |i| {
+            if (self.show_watch and self.watch_focus and @intFromEnum(session.language_tabs.selected) >= 2) {
+                if (self.runtime_watch_panel.key(session, code) catch |err| failed: {
+                    self.status = @errorName(err);
+                    break :failed false;
+                }) {
+                    code = 0;
+                    w.dirty = true;
+                }
+            }
+            if (self.show_watch and self.watch_focus and @intFromEnum(session.language_tabs.selected) < 2) if (self.watch.selected) |i| {
                 if (code == 103 or code == 108) {
                     self.watch.reveal_selection = true;
                     self.watch.selected = if (code == 103) i -| 1 else @min(i + 1, self.watch.count - 1);
@@ -1161,7 +1183,16 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (code == 17 and @intFromEnum(session.language_tabs.selected) >= 2) {
-            self.status = "Language values must be re-resolved after resume; use E to read a name at this stop";
+            const id = self.language_panel.watchBinding(session) catch |err| {
+                self.status = @import("language_tabs.zig").watchError(err);
+                return;
+            };
+            self.runtime_watch_panel.selected = id;
+            self.runtime_watch_panel.reveal = true;
+            self.show_watch = true;
+            self.watch_focus = false;
+            self.status = "Runtime binding watch added; compares when the process stops";
+            w.dirty = true;
             return;
         }
         if (code == 17 and session.language_tabs.selected == .native and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
@@ -1988,6 +2019,13 @@ pub const Workspace = struct {
             if (where.len > 0 and stack.w > 330) try r.text(font, stack.x + stack.w - where_width - 12, y, where, theme.weak);
         }
         const events_rect = gpu.Rect{ .x = left + 2, .y = bottom, .w = width - left - 10, .h = height - bottom - 37 };
+        if (self.show_watch and @intFromEnum(session.language_tabs.selected) >= 2) {
+            try pane(r, font, events_rect, "RUNTIME WATCHES", "W binding  Shift+E name  V events  [] scroll  Del remove");
+            self.watch_rect = events_rect;
+            if (self.watch_focus) try r.rect(.{ .x = events_rect.x + 1, .y = events_rect.y + 32, .w = events_rect.w - 2, .h = 2 }, theme.focus);
+            try self.runtime_watch_panel.draw(session, r, font, r.clip);
+            return;
+        }
         if (self.show_watch) {
             const wide = events_rect.w > 640;
             try pane(r, font, events_rect, "WATCH", if (self.editor.open) (if (self.editor.mode == .live) "Live / Up/Down history  Return add  Esc cancel" else "Pinned / Up/Down history  Return add  Esc cancel") else if (wide) "E/Shift+E add  V events  [] scroll  Shift+L convert  Del remove  Return expand  W write" else "E/Shift+E add  V events  [] scroll");

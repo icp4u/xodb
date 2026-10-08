@@ -10,7 +10,7 @@ import subprocess
 
 
 def synthetic(path, version=5, wide=True, little=True, dwarf64=False,
-              bad_tail=False, bad_directory=False, forged_offset=False, odd_path=None, odd_directory=False, odd_directory_index=0, after_terminator=b''):
+              bad_tail=False, bad_directory=False, forged_offset=False, odd_path=None, odd_directory=False, odd_directory_index=0, after_terminator=b'', files_override=None):
     endian = '<' if little else '>'
     pack = lambda code, *v: struct.pack(endian + code, *v)
     off = 'Q' if dwarf64 else 'I'
@@ -32,6 +32,8 @@ def synthetic(path, version=5, wide=True, little=True, dwarf64=False,
             files = bytes([2, 1, 8, 2, 15, 4]) + odd + bytes([odd_directory_index]) + files[6:] + odd + bytes([odd_directory_index])
         else:
             files = odd + bytes([odd_directory_index, 0, 0]) + files[:-1] + odd + bytes([odd_directory_index, 0, 0, 0])
+    if files_override is not None:
+        files = files_override
     header = common + dirs + files + after_terminator + (b'\xff' if bad_tail else b'')
     line = length(pack('H', version) + (bytes([8 if wide else 4, 0]) if version == 5 else b'') + pack(off, len(header)) + header)
     abbrev = bytes([1, 0x11, 0, 0x10, 0x17, 0x1b, 8, 0, 0, 0])

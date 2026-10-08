@@ -56,11 +56,13 @@ void xl_state_read(const struct xl_layout *, struct xl_reader *, uint64_t, struc
 struct xl_frame {
     uint64_t ci, function, proto, native_function, saved_pc;
     int32_t line, defined_line;
-    int is_c, tail_call;
+    int is_c, tail_call, identity_proved;
     char name[160], file[544];
     const char *reason;
 };
 struct xl_stack {
+    /* Complete CallInfo walk, independent of name/source availability. */
+    int chain_complete;
     uint64_t state;
     size_t count;
     struct xl_frame frames[XL_STACK_FRAMES];
@@ -72,6 +74,7 @@ enum xl_local_kind { XL_LOCAL, XL_UPVALUE, XL_VARARGS };
 struct xl_local {
     enum xl_local_kind kind;
     uint32_t ordinal; /* 1-based within local or upvalue scope, as in Lua's API. */
+    uint32_t declaration; /* 0-based LocVar/upvalue index within the prototype. */
     uint64_t address;
     char name[544]; /* Escaped bytes, with explicit truncation; never evaluated. */
     int name_truncated;
@@ -95,4 +98,17 @@ void xl_locals_read(const struct xl_layout *, struct xl_reader *, uint64_t state
  * outer locals and upvalues. Calls, operators and implicit globals are refused. */
 void xl_local_find(const struct xl_layout *, struct xl_reader *, uint64_t state,
                    size_t frame, const char *expression, struct xl_locals *);
+/* Re-resolve an explicit displayed binding, distinct from lexical lookup.
+ * kind/declaration come from a canonical row in the same prototype; the
+ * adapter separately verifies the activation location/prototype each stop. */
+void xl_local_binding(const struct xl_layout *, struct xl_reader *, uint64_t state,
+                       size_t frame, enum xl_local_kind, uint32_t declaration, struct xl_locals *);
+/* Full bounded comparison bytes, independent of preview truncation. Numeric
+ * samples use exact little-endian representation (including IEEE float bits).
+ * Call only on a freshly re-resolved binding at the current stopped generation.
+ * Unsupported objects and over-cap strings return a reason, never equality. */
+#define XL_SAMPLE_BYTES 4096
+enum xl_sample_kind { XL_SAMPLE_NIL, XL_SAMPLE_BOOLEAN, XL_SAMPLE_INTEGER, XL_SAMPLE_NUMBER, XL_SAMPLE_STRING };
+const char *xl_value_sample(const struct xl_layout *, struct xl_reader *, uint64_t,
+                            unsigned char *, size_t, size_t *, enum xl_sample_kind *);
 #endif

@@ -42,7 +42,18 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
     steps.append(('demo-binary', [sys.executable, '-B', 'tests/demo-binary.py'], 30))
     steps.append(('client-control', [sys.executable, '-B', 'tests/client-control.py'], 30))
+    if tier == 'perf':
+        steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
+                      '--work', '.work/perf-observers'], 180))
+        return steps
+    if tier == 'periodic':
+        steps.append(('source-paths-differential', [sys.executable, '-B', 'tests/source-paths-differential.py',
+                      '--check', '.work/source-paths-check', '--work', '.work/source-differential', '--cases', '1500'], 300))
+        return steps
     if live:
+        for remote in (False, True):
+            steps.append((f'controller-scope-{int(remote)}', [sys.executable, '-B', 'tests/controller-scope.py',
+                          '--work', f'.work/scope{int(remote)}', *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
         steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
         steps.append(('memory-observer', [sys.executable, '-B', 'tests/memory-observer.py'], 180))
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
@@ -90,6 +101,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'python-named-{int(remote)}', [sys.executable, '-B', 'tests/python-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pyn{int(remote)}'], 180))
+                steps.append((f'python-watches-{int(remote)}', [sys.executable, '-B', 'tests/python-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pyw{int(remote)}'], 240))
                 steps.append((f'python-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/python-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/pys{int(remote)}'], 180))
             if lua:
                 mixed = [*sdk, '--lua-source', lua[0][1]]
@@ -119,6 +131,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 prefix = ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'language-selection-{index}-{int(remote)}', [*prefix, sys.executable, '-B', 'tests/language-selection.py', '--include', source, '--library', library, *([] if remote else ['--strace']), '--work', f'.work/language-selection-{index}-{int(remote)}'], 120))
             steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))
+            for remote in (False, True):
+                agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append((f'lua-watches-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watches.py', *sdk, *agent, '--strace', '--work', f'.work/lw{index}{int(remote)}'], 180))
+                steps.append((f'lua-watch-coroutine-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watch-coroutine.py', *sdk, *agent, '--work', f'.work/lwc{index}{int(remote)}'], 120))
+                steps.append((f'lua-watch-reuse-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watch-reuse.py', *sdk, *agent, '--work', f'.work/lwr{index}{int(remote)}'], 120))
             steps.append((f'lua-named-{index}', [sys.executable, '-B', 'tests/lua-locals.py', *sdk, '--strace', '--work', f'.work/lua-named-{index}'], 120))
             steps.append((f'lua-named-agent-{index}', [sys.executable, '-B', 'tests/lua-locals.py', *sdk, '--agent', 'zig-out/bin/xodb-agent', '--strace', '--work', f'.work/lua-named-agent-{index}'], 120))
             steps.append((f'lua-named-shared-{index}', [sys.executable, '-B', 'tests/lua-locals-shared.py', *sdk, '--strace', '--work', f'.work/lns{index}'], 120))
@@ -180,6 +197,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         if python:
             steps.append(('python-gui', [sys.executable, '-B', 'tests/python-gui.py', '--python', python, '--work', '.'], 240))
             steps.append(('python-named-gui', [sys.executable, '-B', 'tests/python-locals-gui.py', '--python', python, '--work', '.work/pyg'], 180))
+            steps.append(('python-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--python', python, '--work', '.work/pywg'], 180))
         if perl:
             steps.append(('perl-gui-fixtures', [sys.executable, '-B', 'tests/perl-language.py', '--perl', perl, '--work', '.work/pgf'], 180))
             steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240))
@@ -190,6 +208,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))
             for index, (_, source, library) in enumerate(lua):
                 steps.append((f'lua-named-gui-{index}', [sys.executable, '-B', 'tests/lua-locals-gui.py', '--source', source, '--library', library, '--work', f'.work/lng{index}'], 120))
+                steps.append((f'lua-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--source', source, '--library', library, '--work', f'.work/lwg{index}'], 180))
+                steps.append((f'lua-watch-reuse-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--reuse', '--source', source, '--library', library, '--work', f'.work/lwrg{index}'], 180))
     return steps
 
 
@@ -336,7 +356,7 @@ def snapshot(destination):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all'])
+    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'perf'])
     parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
@@ -350,21 +370,21 @@ def main():
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
     args = parser.parse_args()
-    if args.headless and args.tier != 'portable':
-        parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
+    if args.headless and args.tier not in ('portable', 'periodic', 'perf'):
+        parser.error('--headless is for the portable, periodic or perf tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
         parser.error('--uprobes requires the host or all tier')
-    if args.perl and args.tier == 'portable':
+    if args.perl and args.tier in ('portable', 'periodic', 'perf'):
         parser.error('--perl requires the host, gui or all tier')
     if args.padwalker and not args.perl:
         parser.error('--padwalker requires --perl')
-    if args.python and args.tier == 'portable':
+    if args.python and args.tier in ('portable', 'periodic', 'perf'):
         parser.error('--python requires the host, gui or all tier')
-    if args.ruby and args.tier == 'portable':
+    if args.ruby and args.tier in ('portable', 'periodic', 'perf'):
         parser.error('--ruby requires the host, gui or all tier')
-    if args.node and args.tier == 'portable':
+    if args.node and args.tier in ('portable', 'periodic', 'perf'):
         parser.error('--node requires the host, gui or all tier')
-    if args.lua and args.tier == 'portable':
+    if args.lua and args.tier in ('portable', 'periodic', 'perf'):
         parser.error('--lua requires the host, gui or all tier')
     steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby)
     if args.capstone == 'vendored':
@@ -388,16 +408,17 @@ def main():
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
                   optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
-                  host=platform.uname()._asdict(), steps=[], status='failed',
+                  host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
-                    (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
+                    (['live ptrace/perf checks', 'GUI execution'] if args.tier in ('portable', 'periodic') else
                      ['GUI execution'] if args.tier == 'host' else
-                     ['full host integration suite'] if args.tier == 'gui' else []) +
+                     ['full host integration suite'] if args.tier == 'gui' else
+                     ['full host integration suite', 'GUI execution'] if args.tier == 'perf' else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
-                    (['Ruby language checks (use --ruby PATH)'] if args.tier != 'portable' and not args.ruby else []) +
-                    (['Node.js language checks (use --node PATH)'] if args.tier != 'portable' and not args.node else []) +
-                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier != 'portable' and not args.lua else []) +
-                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier != 'portable' and not args.padwalker else []))
+                    (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.ruby else []) +
+                    (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.node else []) +
+                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.lua else []) +
+                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'periodic', 'perf') and not args.padwalker else []))
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
@@ -413,6 +434,8 @@ def main():
         required = ['zig', 'cc', 'gcc', 'clang', 'ld.lld', 'llvm-objcopy', 'objcopy', 'strip', 'pkg-config']
         if args.tier in ('host', 'all'):
             required += ['g++', 'clang++', 'gdb', 'strace']
+        if args.tier == 'periodic':
+            required += ['readelf']
         if not args.headless:
             required += ['wayland-scanner', 'glslc']
         if args.tier in ('gui', 'all'):
@@ -454,7 +477,7 @@ def main():
                 left.sendall(b'xodb')
                 if right.recv(4) != b'xodb':
                     raise RuntimeError('Local IPC probe returned incorrect bytes')
-            if args.tier != 'portable':
+            if args.tier not in ('portable', 'periodic'):
                 with socket.socket() as listener:
                     listener.bind(('127.0.0.1', 0))
                     listener.listen(1)
@@ -485,7 +508,7 @@ def main():
             shutil.copytree(capstone_prefix, tree / '.work' / 'capstone')
         (tree / '.work/tmp').mkdir(parents=True)
         env['TMPDIR'] = str(tree / '.work/tmp')
-        if args.tier != 'portable':
+        if args.tier not in ('portable', 'periodic'):
             preflight = [('probe-build', ['cc', '-Wall', '-Wextra', '-Werror',
                          'tests/release-probe.c', '-o', '.work/release-probe'], 30),
                          ('capabilities', ['.work/release-probe'], 10)]
@@ -500,7 +523,14 @@ def main():
             if result['status'] != 'passed':
                 report.update(status='failed', reason=name + ': ' + result['status'])
                 return 1
-        report['status'] = 'passed'
+        if args.tier == 'perf':
+            measurements = json.loads((tree / '.work/perf-observers/results.json').read_text())
+            if measurements['status'] not in ('measured', 'not-measurable'):
+                raise ValueError('Observer measurements did not complete')
+            report['measurements'] = measurements
+            report['status'] = 'not-measurable' if measurements['status'] == 'not-measurable' else 'passed'
+        else:
+            report['status'] = 'passed'
         return 0
     except KeyboardInterrupt:
         report.update(status='interrupted', reason='Interrupted by user')
@@ -509,6 +539,7 @@ def main():
         report.update(status='failed', reason=str(exc))
         return 1
     finally:
+        report['load_end'] = os.getloadavg()
         report['finished'] = datetime.now(timezone.utc).isoformat()
         (run / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
         print(f"{report['status'].upper()}: {report.get('reason', args.tier + ' checks completed')}", flush=True)

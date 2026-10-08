@@ -31,7 +31,18 @@ try:
     s.expect_error(observer.raw('select_language_frame',**args),'ControlLeaseRequired')
     first=observer.tool('get_language_locals',**args);assert first==owner.tool('get_language_locals',**args)
     value=observer.tool('evaluate_language_expression',**args,expression='shadow');assert value==owner.tool('evaluate_language_expression',**args,expression='shadow');assert value['rows'][0]['value']['display'].endswith(' 100'),value
-    report={'status':'pass','owner_observer_values_equal':True,'no_selection_lease':True}
+    assert tools['get_language_watches']['annotations']['readOnlyHint'] and tools['get_language_watches']['annotations']['xodbSessionAccess']=='observer'
+    owner_tools={t['name']:t for t in owner.call('tools/list')['result']['tools']}
+    for name in ('add_language_watch','remove_language_watch'):
+        assert not owner_tools[name]['annotations']['readOnlyHint'] and owner_tools[name]['annotations']['xodbSessionAccess']=='controller'
+    s.expect_error(observer.raw('add_language_watch',**args,expression='shadow'),'ControlLeaseRequired')
+    created=owner.tool('add_language_watch',**args,expression='shadow');watch_id=created['added']
+    watched=observer.tool('get_language_watches');assert watched==owner.tool('get_language_watches')
+    assert watched['watches'][0]['current']['display'].endswith(' 100'),watched
+    s.expect_error(observer.raw('remove_language_watch',generation=generation,id=watch_id),'ControlLeaseRequired')
+    owner.tool('remove_language_watch',generation=generation,id=watch_id)
+    assert not observer.tool('get_language_watches')['watches']
+    report={'status':'pass','owner_observer_values_equal':True,'no_selection_lease':True,'shared_watches':'owner creates/removes; observer reads same result, mutations require lease'}
     if a.strace:
         collector=server.proc.pid
         if a.agent:

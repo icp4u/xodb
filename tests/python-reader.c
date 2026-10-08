@@ -113,7 +113,7 @@ static uint64_t ascii(const char *s) {
 static uint64_t small_int(int64_t v) {
     uint64_t o = object(L.types[XPY_TYPE_LONG], 32, 3);
     uint64_t mag = v < 0 ? (uint64_t)-v : (uint64_t)v;
-    put(o + 16, v == 0 ? 1 | (1u << 3) : ((uint64_t)1 << 3) | (v < 0 ? 2 : 0), 8);
+    put(o + 16, v == 0 ? 1 : ((uint64_t)1 << 3) | (v < 0 ? 2 : 0), 8);
     put(o + 24, mag, 4);
     return o;
 }
@@ -134,6 +134,100 @@ static uint64_t list(const uint64_t *items, size_t n) {
 static void read_value(uint64_t address, struct xpy_value *v) {
     struct xpy_reader r = reader();
     xpy_value_read(&L, &r, address, v);
+}
+static void samples(void) {
+    uint8_t a[XPY_SAMPLE_BYTES + 1], b[XPY_SAMPLE_BYTES + 1];
+    size_t n, m;
+    enum xpy_sample_kind k, q;
+    struct xpy_reader r = reader();
+    assert(!xpy_value_sample(&L, &r, L.types[XPY_NONE_OBJECT], NULL, 0, &n, &k));
+    assert(!n && k == XPY_SAMPLE_NONE);
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, L.types[XPY_TRUE_OBJECT], a, sizeof a, &n, &k));
+    assert(n == 1 && k == XPY_SAMPLE_BOOL && a[0] == 1);
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, L.types[XPY_FALSE_OBJECT], a, sizeof a, &n, &k));
+    assert(n == 1 && k == XPY_SAMPLE_BOOL && a[0] == 0);
+    uint64_t zero = small_int(0);
+    put(zero + 16, 1, 8); /* zero has no digits, irrespective of allocated storage */
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, zero, a, sizeof a, &n, &k));
+    assert(n == 1 && k == XPY_SAMPLE_INT && a[0] == 1);
+    uint64_t integer = small_int(-42);
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, integer, a, sizeof a, &n, &k));
+    assert(n == 5 && k == XPY_SAMPLE_INT && a[0] == 2 && a[1] == 42);
+    struct xpy_local immediate = {.immediate = 1, .immediate_integer = -42};
+    r = reader();
+    assert(!xpy_local_sample(&L, &r, &immediate, b, sizeof b, &m, &q));
+    assert(!attempts && n == m && k == q && !memcmp(a, b, n));
+    immediate.immediate_integer = INT64_MIN;
+    assert(!xpy_local_sample(&L, &r, &immediate, b, sizeof b, &m, &q) && m == 13 && b[0] == 2);
+    immediate.immediate_integer = 0;
+    assert(!xpy_local_sample(&L, &r, &immediate, b, sizeof b, &m, &q) && m == 1 && b[0] == 1);
+    uint64_t large = object(L.types[XPY_TYPE_LONG], 24 + 40 * 4, 1);
+    put(large + 16, 40u << 3, 8); put(large + 24 + 39 * 4, 1, 4);
+    struct xpy_value va, vb;
+    read_value(large, &va);
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, large, a, sizeof a, &n, &k));
+    put(large + 24, 7, 4); read_value(large, &vb);
+    r = reader();
+    assert(!xpy_value_sample(&L, &r, large, b, sizeof b, &m, &q));
+    assert(va.truncated && !strcmp(va.display, vb.display));
+    assert(n == m && k == q && memcmp(a, b, n));
+    put(large + 24 + 39 * 4, 0, 4); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, large, b, sizeof b, &m, &q), "InconsistentIntDigit") && !m);
+    uint64_t real = object(L.types[XPY_TYPE_FLOAT], 24, 1);
+    put(real + 16, UINT64_C(0x8000000000000000), 8); r = reader();
+    assert(!xpy_value_sample(&L, &r, real, a, sizeof a, &n, &k));
+    assert(k == XPY_SAMPLE_FLOAT && n == 8 && a[7] == 0x80);
+    put(real + 16, UINT64_C(0x7ff8000000000001), 8); r = reader();
+    assert(!xpy_value_sample(&L, &r, real, a, sizeof a, &n, &k));
+    put(real + 16, UINT64_C(0x7ff8000000000002), 8); r = reader();
+    assert(!xpy_value_sample(&L, &r, real, b, sizeof b, &m, &q));
+    assert(n == m && k == q && memcmp(a, b, n));
+    uint8_t raw[XPY_SAMPLE_BYTES + 1]; memset(raw, 'a', sizeof raw);
+    raw[0] = 0; raw[100] = 0xff;
+    uint64_t blob = bytes_object(raw, XPY_SAMPLE_BYTES);
+    memset(a, 0xa5, sizeof a); r = reader();
+    assert(!xpy_value_sample(&L, &r, blob, a, sizeof a, &n, &k));
+    assert(k == XPY_SAMPLE_BYTES_KIND && n == XPY_SAMPLE_BYTES && !memcmp(a, raw, n) && a[n] == 0xa5);
+    put(blob + 16, XPY_SAMPLE_BYTES + 1, 8); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, blob, a, sizeof a, &n, &k), "PythonWatchSampleLimit") && !n);
+    uint64_t text = str_kind(raw + 101, 300, 1, 1);
+    read_value(text, &va); r = reader();
+    assert(!xpy_value_sample(&L, &r, text, a, sizeof a, &n, &k));
+    put(text + 40 + 299, 'b', 1); read_value(text, &vb); r = reader();
+    assert(!xpy_value_sample(&L, &r, text, b, sizeof b, &m, &q));
+    assert(n == 1200 && k == XPY_SAMPLE_STR && n == m && k == q && memcmp(a, b, n));
+    assert(va.truncated && !strcmp(va.display, vb.display));
+    uint8_t latin[] = { 'x', 0xe9 }, wide[] = { 'x', 0, 0xe9, 0 };
+    uint64_t one = str_kind(latin, 2, 1, 0), two = str_kind(wide, 2, 2, 0);
+    r = reader(); assert(!xpy_value_sample(&L, &r, one, a, sizeof a, &n, &k));
+    r = reader(); assert(!xpy_value_sample(&L, &r, two, b, sizeof b, &m, &q));
+    assert(n == m && k == q && !memcmp(a, b, n));
+    uint8_t cps[] = {0, 0xd8, 0, 0, 0xff, 0xff, 0x10, 0}; /* lone surrogate and Unicode maximum */
+    uint64_t unicode = str_kind(cps, 2, 4, 0);
+    r = reader(); assert(!xpy_value_sample(&L, &r, unicode, a, sizeof a, &n, &k));
+    assert(n == sizeof cps && !memcmp(a, cps, n));
+    put(unicode + 56 + 4, 0x110000, 4); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, unicode, a, sizeof a, &n, &k), "InconsistentStr"));
+    uint64_t oversized = str_kind(raw + 101, 1025, 1, 1); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, oversized, a, sizeof a, &n, &k), "PythonWatchSampleLimit") && !n);
+    uint64_t subclass = object(type_object("Number", 1u << 24), 32, 1); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, subclass, a, sizeof a, &n, &k), "PythonWatchValueUnsupported"));
+    uint64_t container = list(NULL, 0); r = reader();
+    assert(!strcmp(xpy_value_sample(&L, &r, container, a, sizeof a, &n, &k), "PythonWatchValueUnsupported"));
+    r = reader(); assert(!xpy_value_sample(&L, &r, text, a, sizeof a, &n, &k));
+    size_t reads = attempts;
+    for (size_t i = 1; i <= reads; ++i) {
+        r = reader(); fail_at = i;
+        assert(xpy_value_sample(&L, &r, text, a, sizeof a, &n, &k) && !n);
+    }
+    fail_at = 0;
+    put(integer + 16, 9, 8); r = reader(); /* zero sign with a nonzero digit count */
+    assert(!strcmp(xpy_value_sample(&L, &r, integer, a, sizeof a, &n, &k), "InconsistentInt"));
 }
 static void values(void) {
     struct xpy_value v;
@@ -436,6 +530,8 @@ static void stacks(void) {
     struct xpy_reader r = reader();
     xpy_stack_read(&L, &r, 4242, ranges, 2, 0, &s);
     assert(!s.reason && s.thread_states == 1 && s.segment_count == 2 && s.count == 3);
+    assert(s.segments[0].chain_complete && s.segments[1].chain_complete);
+    assert(s.frames[0].identity_proved && s.frames[1].identity_proved && s.frames[2].identity_proved);
     assert(s.segments[0].anchor == 0 && s.segments[0].count == 2 && !s.segments[0].reason);
     assert(s.segments[0].entry_frame == e1 && s.segments[1].anchor == 1 && s.segments[1].entry_frame == e2);
     assert(!strcmp(s.frames[0].name, "Outer.inner") && s.frames[0].line == 5 && !strcmp(s.frames[0].file, "/w/demo.py"));
@@ -446,6 +542,7 @@ static void stacks(void) {
     /* first=1: segment 0 is proven but retains nothing; segment 1 keeps all */
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 1, &s);
     assert(s.segment_count == 2 && s.segments[0].skipped && !s.segments[0].count && s.segments[0].anchor == 0);
+    assert(!s.segments[0].chain_complete && !s.segments[1].chain_complete);
     assert(s.segments[1].count == 1 && s.segments[1].first == 0 && !strcmp(s.frames[0].name, "<module>") && s.frames[0].line == 2);
     /* entry frame outside every native activation: unanchored, partial */
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges + 1, 1, 0, &s);
@@ -465,6 +562,10 @@ static void stacks(void) {
     put(g, small_int(3), 8);
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
     assert(!strcmp(s.frames[1].reason, "ExecutableNotCode") && !strcmp(s.segments[0].reason, "PartialFrames"));
+    assert(!s.frames[1].identity_proved && s.segments[0].chain_complete);
+    put(g, gen | 2, 8);
+    xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
+    assert(!s.frames[1].identity_proved && !strcmp(s.frames[1].reason, "ExecutableStackRefInvalid"));
     put(g, gen, 8);
     put(top + 56, inner + 4096, 8);
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
@@ -473,6 +574,7 @@ static void stacks(void) {
     put(g + 74, 9, 1);
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
     assert(!strcmp(s.segments[0].reason, "FrameOwnerInvalid"));
+    assert(!s.segments[0].chain_complete);
     put(g + 74, XPY_OWNED_BY_CSTACK, 1); /* only 3.14 has a C-stack owner */
     L.version = 0x031000a0;
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
@@ -483,6 +585,7 @@ static void stacks(void) {
     put(m + 8, g, 8);
     xpy_stack_read(&L, (r = reader(), &r), 4242, ranges, 2, 0, &s);
     assert(!strcmp(s.segments[s.segment_count - 1].reason, "FrameCycle"));
+    for (size_t i = 0; i < s.segment_count; ++i) assert(!s.segments[i].chain_complete);
     put(m + 8, e2, 8);
     /* deep recursion: retained and examined frames are bounded */
     uint64_t prev = e1;
@@ -676,6 +779,7 @@ int main(int argc, char **argv) {
     }
     setup();
     values();
+    samples();
     lines();
     stacks();
     named_locals();

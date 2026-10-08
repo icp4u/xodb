@@ -14,7 +14,7 @@ detailed docs. If you just want to try something, jump to
 | Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
 | Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
-| Catch who changes a value | **Watchpoint investigation** (**W** on a field) | Every write, with the code and stack that made it |
+| Catch who changes a native value | **Watchpoint investigation** (**W** on a C/C++ field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
@@ -152,8 +152,12 @@ In **Ruby**, select a logical frame for VM-stack locals and escaped closure
 environments. **E** accepts a bare local/capture name; the closest lexical scope
 wins. See [Ruby](RUBY.md) for the initial supported revision and explicit refusals.
 **E** in **C/C++** still uses the
-native expression/watch view. Language storage addresses must be resolved again
-after resume; **W** does not set a hardware watchpoint on them.
+native expression/watch view. In **Lua**, click a named binding then **W**, or use
+**Shift+E** with a bare name, to compare complete bounded values at each stop.
+**V** opens the runtime watch list; changed rows show old and new values. Storage
+is resolved again after resume/GC. These watches observe stops; they do not
+interrupt a running process. Other language watch adapters are not yet available.
+See [Lua watches](LUA.md#runtime-watches) for scope and comparison limits.
 
 What you see is the interpreter's own C code, plus, for Perl, CPython, CRuby and V8, the
 script level:
@@ -206,6 +210,7 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Observe and browse calls | `xodb --browse-observation example-01.xoi` after the capture in [OBSERVATIONS.md](OBSERVATIONS.md#one-command-capture) | **]** / **[** move the threshold, **Tab** switches fast/slow, **E** shows the raw evidence |
 | Inside Perl | `./scripts/demo-perl` | **Space**, **Shift+E** `val` and `av` (live rows that update every stop), then keep pressing **Space**: `val` undef ↔ not in scope, `av` 3 ↔ 4 slots |
 | Inside CPython | `./scripts/demo-python` | **Space**, **E** `value` (list (8 items)), **E** `key` (str 'answer'), **E** `mp` (dict); in a second terminal `./scripts/demo-python stack` prints `record` ← `tick` ← `<module>` with file:line and the list's items |
+| Compare Lua values at each stop | `./scripts/demo-lua` | **Space**, **Lua**, select the loop frame at `lua-demo.lua:9`, **Shift+E** `value` **Return**, then **Space**. **V** shows changes; table/function values are explicitly unavailable. |
 | Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **E** `round` **Return**; continue to watch the next iteration |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |

@@ -60,8 +60,8 @@ static void escape(char *out, size_t cap, const unsigned char *s, size_t n) {
     }
     if (cap) out[k] = 0;
 }
-static int string(const struct xl_layout *p, struct xl_reader *r, uint64_t at, char *out, size_t cap,
-                  uint64_t *length, int *truncated) {
+static int string_extent(const struct xl_layout *p, struct xl_reader *r, uint64_t at,
+                         uint64_t *size, uint64_t *data) {
     unsigned tag = (unsigned)field(p, r, at, XL_GC_TAG);
     if (r->error) return 0;
     if ((tag != 4 && tag != 20) || !header(p, r, at, tag)) return fail(r, "LuaStringInvalid");
@@ -81,8 +81,14 @@ static int string(const struct xl_layout *p, struct xl_reader *r, uint64_t at, c
     if (r->error || offset >= INT64_MAX || n >= INT64_MAX - offset ||
         at >= user_end || offset >= user_end - at || n >= user_end - at - offset)
         return fail(r, "LuaStringLengthInvalid");
+    *size = n; *data = add(r, at, offset); return !r->error;
+}
+static int string(const struct xl_layout *p, struct xl_reader *r, uint64_t at, char *out, size_t cap,
+                  uint64_t *length, int *truncated) {
+    uint64_t n, data;
+    if (!string_extent(p, r, at, &n, &data)) return 0;
     unsigned char bytes[XL_STRING_BYTES]; size_t count = n > sizeof bytes ? sizeof bytes : (size_t)n;
-    if (!read_bytes(r, add(r, at, offset), bytes, count)) return 0;
+    if (!read_bytes(r, data, bytes, count)) return 0;
     escape(out, cap, bytes, count); *length = n; *truncated = n > count;
     return 1;
 }
@@ -374,10 +380,12 @@ void xl_stack_read(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         f->line = f->defined_line = -1;
         if (is_c) {
             if (tag == 102 && header(p, r, bits, 38)) bits = field(p, r, bits, XL_CC_FUNC);
+            if (!r->error) f->identity_proved = 1;
             f->native_function = bits; copy(f->name, sizeof f->name, "<C function>");
         } else if (header(p, r, bits, 6)) {
             f->proto = field(p, r, bits, XL_LC_PROTO);
             if (header(p, r, f->proto, p->version[1] == 4 ? 10 : 9)) {
+                f->identity_proved = 1;
                 uint64_t source = field(p, r, f->proto, XL_PROTO_SOURCE); uint64_t n; int truncated = 0;
                 f->defined_line = (int32_t)field(p, r, f->proto, XL_PROTO_LINE);
                 if (source) string(p, r, source, f->file, sizeof f->file, &n, &truncated);
@@ -399,6 +407,7 @@ void xl_stack_read(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         if (field(p, r, prev, XL_CI_NEXT) != ci) { out->reason = r->error ? r->error : "LuaCallInfoLinkMismatch"; return; }
         ci = prev;
     }
+    out->chain_complete = 1;
 }
 
 static int locals_stack_reason(const char *reason) {
@@ -416,8 +425,9 @@ static void local_name(const struct xl_layout *p, struct xl_reader *r, uint64_t 
     if (!length) out->reason = "LuaLocalNameUnavailable";
     else if (out->name_truncated) out->reason = "LuaLocalNameTruncated";
 }
+struct local_selector { enum xl_local_kind kind; uint32_t declaration; };
 static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
-                    size_t frame, size_t start, size_t limit, const char *expression, struct xl_locals *out) {
+                    size_t frame, size_t start, size_t limit, const char *expression, const struct local_selector *selector, struct xl_locals *out) {
     memset(out, 0, sizeof *out);
     out->state = state; out->frame = frame; out->start = start;
     if (expression) {
@@ -536,6 +546,15 @@ static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         if (selected == SIZE_MAX) { out->reason = "LuaNameNotFound"; return; }
         start = selected; limit = 1; out->start = selected;
     }
+    if (selector) {
+        size_t selected = SIZE_MAX;
+        if (selector->kind == XL_LOCAL) {
+            for (size_t i=0; i<nactive; ++i)
+                if ((active[i]-table)/p->sizes[XL_T_LOCVAR] == selector->declaration) { selected=i; break; }
+        } else if (selector->kind == XL_UPVALUE && selector->declaration < nup) selected=nactive+selector->declaration;
+        if (selected == SIZE_MAX) { out->reason="LuaWatchBindingNotActive"; return; }
+        start=selected;limit=1;out->start=selected;
+    }
     for (size_t i = start; i < out->total && out->count < limit; ++i) {
         struct xl_local *item = &out->items[out->count++];
         uint64_t name;
@@ -548,11 +567,12 @@ static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         }
         if (i < nactive) {
             item->kind = XL_LOCAL; item->ordinal = (uint32_t)i + 1;
+            item->declaration = (uint32_t)((active[i]-table)/p->sizes[XL_T_LOCVAR]);
             item->address = add(r, base, i * stride);
             name = field(p, r, active[i], XL_LOCAL_NAME);
         } else {
             size_t index = i - nactive;
-            item->kind = XL_UPVALUE; item->ordinal = (uint32_t)index + 1;
+            item->kind = XL_UPVALUE; item->ordinal = (uint32_t)index + 1; item->declaration = (uint32_t)index;
             uint64_t uv = word(r, add(r, closure, p->fields[XL_LC_UP].offset + index * 8), 8);
             if (!header(p, r, uv, p->version[1] == 4 ? 9 : 10)) {
                 item->reason = r->error; out->reason = r->error; return;
@@ -576,10 +596,58 @@ static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
 
 void xl_locals_read(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
                     size_t frame, size_t start, size_t limit, struct xl_locals *out) {
-    locals(p, r, state, frame, start, limit, NULL, out);
+    locals(p, r, state, frame, start, limit, NULL, NULL, out);
 }
 void xl_local_find(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
                    size_t frame, const char *expression, struct xl_locals *out) {
     if (!expression) { memset(out, 0, sizeof *out); out->reason = "LuaExpressionUnsupported"; return; }
-    locals(p, r, state, frame, 0, 1, expression, out);
+    locals(p, r, state, frame, 0, 1, expression, NULL, out);
+}
+
+/* Canonical comparison reads are separate from the display's 128-byte string
+ * preview. No object pointer or unused TValue padding enters the sample. */
+const char *xl_value_sample(const struct xl_layout *p, struct xl_reader *r, uint64_t at,
+                            unsigned char *bytes, size_t cap, size_t *size, enum xl_sample_kind *kind) {
+    if (!bytes || !size || !kind || cap > XL_SAMPLE_BYTES) return "LuaWatchSampleArguments";
+    *size = 0;
+    unsigned tag = (unsigned)field(p, r, at, XL_TAG), version = p->version[1];
+    if (r->error) return r->error;
+    uint64_t bits = 0;
+    if (nil(tag, version)) { *kind = XL_SAMPLE_NIL; return NULL; }
+    if (tag == 1 || (version == 4 && tag == 17)) {
+        if (!cap) return "LuaWatchSampleLimit";
+        if (version == 2) {
+            bits = field(p, r, at, XL_BITS);
+            if (r->error) return r->error;
+            if ((uint32_t)bits > 1) return "LuaBooleanInvalid";
+        }
+        *kind = XL_SAMPLE_BOOLEAN; *size = 1;
+        bytes[0] = version == 4 ? tag == 17 : (uint32_t)bits != 0; return NULL;
+    }
+    if (tag == 3 || (version == 4 && tag == 19)) {
+        if (cap < 8) return "LuaWatchSampleLimit";
+        bits = field(p, r, at, XL_BITS); if (r->error) return r->error;
+        *kind = version == 4 && tag == 3 ? XL_SAMPLE_INTEGER : XL_SAMPLE_NUMBER;
+        *size = 8; for (unsigned i=0; i<8; ++i) bytes[i] = (unsigned char)(bits >> (8*i));
+        return NULL;
+    }
+    if (tag == 68 || tag == 84) {
+        bits = field(p, r, at, XL_BITS); if (r->error) return r->error;
+        if (!header(p, r, bits, tag & 63)) return r->error;
+        uint64_t length, data;
+        if (!string_extent(p, r, bits, &length, &data)) return r->error;
+        if (length > cap) return "LuaWatchSampleLimit";
+        if (!read_bytes(r, data, bytes, (size_t)length)) return r->error;
+        *kind = XL_SAMPLE_STRING; *size = (size_t)length; return NULL;
+    }
+    return "LuaWatchValueUnsupported";
+}
+
+void xl_local_binding(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                       size_t frame, enum xl_local_kind kind, uint32_t declaration, struct xl_locals *out) {
+    if ((kind != XL_LOCAL && kind != XL_UPVALUE) || declaration >= 4096) {
+        memset(out,0,sizeof *out);out->reason="LuaWatchBindingInvalid";return;
+    }
+    struct local_selector selector={.kind=kind,.declaration=declaration};
+    locals(p,r,state,frame,0,1,NULL,&selector,out);
 }

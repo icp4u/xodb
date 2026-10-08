@@ -152,6 +152,7 @@ pub const Frame = struct {
     code: []const u8,
     instruction: []const u8,
     reason: ?[]const u8,
+    identity_proved: bool = false,
 };
 pub const Segment = struct {
     runtime: Runtime,
@@ -162,6 +163,7 @@ pub const Segment = struct {
     reason: ?[]const u8,
     frames: []Frame,
     examined_frames: usize,
+    chain_complete: bool = false,
     /// Symbolized interpreter-loop frames (not the innermost) that own no
     /// entry frame on the chain: their Python frames may be merged here.
     unanchored_loop_frames: []const usize = &.{},
@@ -255,6 +257,7 @@ fn readRuntime(session: *model.Session, a: A, module: *Module, tid: i32, native:
                 .code = try hex(a, f.code),
                 .instruction = try hex(a, f.instr),
                 .reason = try reason(a, f.reason),
+                .identity_proved = f.identity_proved != 0,
             };
         }
         // A whole-read limit is reported once, below; proven segments keep
@@ -267,6 +270,7 @@ fn readRuntime(session: *model.Session, a: A, module: *Module, tid: i32, native:
             .reason = try reason(a, s.reason),
             .frames = frames,
             .examined_frames = s.examined,
+            .chain_complete = s.chain_complete != 0,
         };
     }
     // Only the innermost interpreter loop may lack its entry frame (prologue
@@ -435,6 +439,123 @@ pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
     return readBindings(session, a, tid, segment, frame, 0, 1, expression);
+}
+
+const WatchCapture = @import("watch.zig").Capture;
+// The adapter owns the meanings of scope words: runtime = module/interpreter/
+// interpreter-id/thread-state, frame = frame/code/selector-flags/declaration.
+const watch_binding: u64 = 1;
+const watch_generator: u64 = 2;
+fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, row: ?usize) !void {
+    const module = try runtimeModule(session);
+    if (module.id != capture.scope.runtime[0]) return error.PythonWatchRuntimeChanged;
+    const layout = try profile(session, module);
+    var r = reader(session);
+    defer {
+        capture.reads = r.reads;
+        capture.bytes = r.bytes;
+    }
+    const raw = try a.create(c.struct_xpy_locals);
+    if (row) |index| {
+        c.xpy_locals_read(layout, &r, capture.scope.frame[0], capture.scope.frame[1], index, 1, raw);
+    } else if (capture.scope.frame[2] & watch_binding != 0) {
+        c.xpy_locals_read(layout, &r, capture.scope.frame[0], capture.scope.frame[1], @intCast(capture.scope.frame[3]), 1, raw);
+    } else c.xpy_local_find(layout, &r, capture.scope.frame[0], capture.scope.frame[1], capture.expression, raw);
+    if (raw.reason != null or raw.count != 1) {
+        const why: [*c]const u8 = if (raw.reason != null) raw.reason else "PythonWatchBindingUnavailable";
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(why));
+        return;
+    }
+    const item = &raw.items[0];
+    if (item.name_reason != null) {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(item.name_reason));
+        return;
+    }
+    if (row != null) {
+        capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&item.name, 0));
+        if (capture.expression.len == 0 or capture.expression.len > c.XLW_EXPRESSION) return error.PythonWatchNameTooLong;
+        capture.scope.frame[2] |= watch_binding;
+        capture.scope.frame[3] = item.ordinal;
+    }
+    const bytes = try a.alloc(u8, c.XPY_SAMPLE_BYTES);
+    var length: usize = 0;
+    var kind: c.enum_xpy_sample_kind = undefined;
+    if (c.xpy_local_sample(layout, &r, item, bytes.ptr, bytes.len, &length, &kind)) |why| {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(why));
+        return;
+    }
+    capture.observation = c.XLW_COMPLETE;
+    capture.sample = .{ .kind = kind, .bytes = bytes.ptr, .size = length, .type = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.type, 0))).ptr, .display = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.display, 0))).ptr };
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    if ((expression == null) == (row == null)) return error.InvalidArguments;
+    if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
+    if (row) |index| if (index >= c.XPY_MAX_LOCALS) return error.InvalidArguments;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment = observed.segments[segment_index];
+    const instance = segment.runtime_instance orelse return error.PythonWatchRuntimeUnproved;
+    if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
+    const selected = segment.frames[frame];
+    if (!selected.identity_proved) return error.PythonWatchFrameUnproved;
+    const thread = for (session.target.threadSlice()) |entry| {
+        if (entry.tid == tid) break entry.id;
+    } else return error.InvalidThread;
+    var capture = WatchCapture{ .scope = .{
+        .language = c.XLW_PYTHON,
+        .session = session.id,
+        .image = session.target.snapshot().image_epoch,
+        .thread = thread,
+        .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, instance.address, 0), instance.interpreter_id, try std.fmt.parseInt(u64, instance.thread_state, 0) },
+        .frame = .{ try std.fmt.parseInt(u64, selected.frame_address, 0), try std.fmt.parseInt(u64, selected.code, 0), if (std.mem.eql(u8, selected.owner, "generator")) watch_generator else 0, 0 },
+    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    try watchValue(session, a, &capture, row);
+    if (row != null and capture.scope.frame[2] & watch_binding == 0) return error.PythonWatchBindingUnavailable;
+    try session.target.expectGeneration(observed.generation);
+    return capture;
+}
+pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
+    const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
+    const module_id = (try runtimeModule(session)).id;
+    if (module_id != scope.runtime[0]) {
+        capture.scope.runtime[0] = module_id;
+        capture.diagnostic = try a.dupeZ(u8, "PythonWatchRuntimeChanged");
+        return capture;
+    }
+    var saw_state = false;
+    var complete = true;
+    for (observed.segments) |segment| {
+        const instance = segment.runtime_instance orelse continue;
+        if (try std.fmt.parseInt(u64, instance.address, 0) != scope.runtime[1] or
+            try std.fmt.parseInt(u64, instance.thread_state, 0) != scope.runtime[3]) continue;
+        if (instance.interpreter_id != scope.runtime[2]) {
+            capture.scope.runtime[2] = instance.interpreter_id;
+            capture.diagnostic = try a.dupeZ(u8, "PythonWatchRuntimeChanged");
+            return capture;
+        }
+        saw_state = true;
+        complete = complete and segment.chain_complete;
+        for (segment.frames) |frame| {
+            if (try std.fmt.parseInt(u64, frame.frame_address, 0) != scope.frame[0]) continue;
+            if (!frame.identity_proved) {
+                capture.diagnostic = try a.dupeZ(u8, frame.reason orelse "PythonWatchFrameUnproved");
+                return capture;
+            }
+            if (try std.fmt.parseInt(u64, frame.code, 0) != scope.frame[1]) continue;
+            try watchValue(session, a, &capture, null);
+            try session.target.expectGeneration(observed.generation);
+            return capture;
+        }
+    }
+    // A suspended generator is intentionally absent from the thread chain.
+    // Never read its remembered address or mistake that absence for retirement.
+    if (saw_state and complete and scope.frame[2] & watch_generator == 0) {
+        capture.observation = c.XLW_FRAME_GONE;
+        capture.diagnostic = try a.dupeZ(u8, "PythonWatchFrameGone");
+    } else capture.diagnostic = try a.dupeZ(u8, if (scope.frame[2] & watch_generator != 0) "PythonWatchGeneratorNotObserved" else "PythonWatchFrameNotObserved");
+    try session.target.expectGeneration(observed.generation);
+    return capture;
 }
 fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
     const named = @import("../model/language_locals.zig");

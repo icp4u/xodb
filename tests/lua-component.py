@@ -26,7 +26,7 @@ def run(source, name):
     assert result.returncode==0,result.stdout+result.stderr
     return result
 r=run('tests/lua-reader.c','reader')
-assert '22 values, 9 stacks, 32 exact frame positions passed' in r.stdout,r.stdout
+assert '23 values, 9 stacks, 32 exact frame positions passed' in r.stdout,r.stdout
 named=run('tests/lua-locals.c','locals')
 assert 'named locals:' in named.stdout and 'callbacks passed' in named.stdout,named.stdout
 inputs={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path(a.source).glob('*.h'))}

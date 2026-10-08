@@ -242,6 +242,45 @@ one header and one table read per frame (5,000 recursive frames: about 4,300
 reads). The response reports `memory_reads`, `memory_bytes` and
 `native_stack_incomplete`.
 
+## Runtime watches
+
+Run `scripts/demo-python`, press **Space**, choose **Python**, select **tick**,
+then **Shift+E**, `round`, **Return**. **Space** reaches the next iteration.
+Click a named binding and press **W** to watch its exact declaration instead.
+The runtime WATCH pane shares its list with MCP; **Delete** removes a selected
+watch and **[ ]** scrolls. C/C++ keeps its hardware watchpoint behavior.
+
+The C reader resolves the interpreter, thread state, frame/code pair and binding
+at each stop. Fast locals, parameters, cells and free variables use the same
+validated storage rules as named-local reads, including immediate stackref
+integers. A deleted or uninitialized variable stays unavailable and can recover.
+No Python expression, descriptor, property or target function runs.
+
+Comparisons use complete scalar samples, independently of truncated previews:
+exact builtin `None`, bool, int, float, str and bytes. Integers compare canonical
+sign/digits, so boxing alone does not change a value. Floats compare exact bits,
+including signed zero and NaN payloads; this is not Python `==`. Strings compare
+Unicode code points, including lone surrogates. The 4096-byte sample cap allows
+1024 Unicode code points, 4096 bytes, or 1023 base-2^30 integer digits plus sign.
+Subclasses, containers, object paths and oversized values have an explicit reason
+and retain the last complete baseline; a preview is never treated as equality.
+
+Matching a frame location and code object does **not** prove continuous activation
+between stops: the demo's successive calls to `tick` are an example. The C result
+and MCP `comparison` describe `same_slot_equal` or `same_slot_different`; the GUI
+labels differences **DIFF (activation unproved)**. A frame proved absent from a
+complete retained chain is permanently retired. Suspended generators and
+coroutines are deliberately absent from that chain, so their watches remain
+unavailable until observed again; remembered frame addresses are never followed.
+Their close and reuse entirely between observations also cannot be proved.
+
+At most 16 watches share the process's C comparison state, allocated as needed.
+`add_language_watch` accepts `language: "python"`, generation, tid, segment and
+frame, plus either a bare `expression` or an absolute named-local `row` index.
+Add/remove require the controller lease. `get_language_watches` returns cached
+results to observers without a lease or target reads. Watches compare only when
+execution stops and do not interrupt it automatically.
+
 ## Verification
 
 ```sh

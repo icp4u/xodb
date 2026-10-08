@@ -65,3 +65,42 @@ The layout contract is derived from CRuby's `vm_core.h`, `iseq.c`, `symbol.c`,
 `symbol.h`, `darray.h`, `internal/numeric.h`, public value headers and `zjit.h` at
 the revision above. DWARF also proves the succinct line-table implementation;
 without that proof, source lines remain unavailable.
+
+## Adding a CRuby revision
+
+A new revision needs a proved C reader profile, not just another accepted version
+string. The current profile uses `XRB_VERSION` and `XRB_REVISION` in
+`src/language/ruby.h`; `ruby_layout.c` checks that exact pair and the DWARF
+contract, while `ruby.zig` verifies the loaded runtime and selects the reader.
+
+1. Build the candidate standalone CRuby with DWARF and matching development
+   headers. Record its exact source revision and build ID. Check the upstream
+   structures and semantics used by the existing profile: VALUE tags, control
+   frames, environment flags and escaped environments, local tables, symbol
+   names, succinct line tables and JIT frame markers.
+2. Update the C profile only where supported by that revision's source and
+   runtime evidence. `ruby_types.inc`, `ruby_fields.inc` and
+   `ruby_constants.inc` describe the type/field/enum checks. Compare resolved
+   offsets and widths independently with GDB or an owned C probe built against
+   the candidate's headers. DWARF proves layout; it does not prove macro or
+   flag semantics. Keep those rules in the C implementation.
+3. Extend the explicit version/revision checks to select the verified profile,
+   preserving the old profile's checks and tests. If semantics differ, add a
+   separately keyed C profile instead of guessing from a nearby version. A
+   deliberate replacement of the sole profile must also update the documented
+   supported revision. Shared-library or architecture support is separate work.
+4. Run the reader's malformed-memory and callback-failure tests, then the local,
+   agent and GUI commands above with the candidate interpreter. Compare locals
+   and captures against cooperating `Binding#local_variables` and
+   `Binding#local_variable_get` observations across methods, closures, recursion,
+   escaped environments, fibers and GC. Audit that inspection leaves registers,
+   generation and target scheduling unchanged and performs no target writes.
+5. Keep wrong-revision/build-ID, missing-DWARF and unsupported-kind negative
+   controls. Test source lines separately from frame names. If claiming live JIT
+   coverage, first prove the fixture reached a JIT frame and the guard; a missing
+   native execution-context argument is an earlier refusal, not that coverage.
+   Finish with the full release gate and independent review before enabling the
+   revision in the documented supported set.
+
+No interpreter calls, Ruby `inspect`, coercions or getters are needed to add a
+profile. An unproved field, encoding or runtime identity must stay unavailable.

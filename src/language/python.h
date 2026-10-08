@@ -137,6 +137,7 @@ struct xpy_frame {
     uint32_t line, code_flags;
     uint64_t address, code, instr;
     uint8_t owner;
+    uint8_t identity_proved; /* validated executable code object */
     const char *reason;
 };
 /* Native interpreter activations on one stopped thread, innermost first:
@@ -151,6 +152,7 @@ struct xpy_segment {
     size_t first, count;     /* slice of xpy_stack.frames */
     size_t examined;         /* frames examined, including unretained */
     int skipped;             /* anchored before `first`: frames not retained */
+    int chain_complete;      /* entire thread-state chain walked and retained */
     const char *reason;      /* null means complete */
 };
 struct xpy_stack {
@@ -186,6 +188,17 @@ struct xpy_value {
 };
 void xpy_value_read(const struct xpy_layout *, struct xpy_reader *, uint64_t, struct xpy_value *);
 
+/* Complete canonical samples for stopped-value comparison. Display previews
+ * are never equality evidence. Exact builtin scalars only; subclasses and
+ * containers are refused. Integers use sign plus little-endian base-2^30
+ * digits, str uses little-endian Unicode code points (including surrogates),
+ * floats preserve IEEE bits, and bytes preserves all bytes. */
+#define XPY_SAMPLE_BYTES 4096
+enum xpy_sample_kind { XPY_SAMPLE_NONE, XPY_SAMPLE_BOOL, XPY_SAMPLE_INT,
+                       XPY_SAMPLE_FLOAT, XPY_SAMPLE_STR, XPY_SAMPLE_BYTES_KIND };
+const char *xpy_value_sample(const struct xpy_layout *, struct xpy_reader *, uint64_t,
+                             void *, size_t capacity, size_t *length, enum xpy_sample_kind *);
+
 #define XPY_MAX_LOCALS 4096
 #define XPY_LOCAL_PAGE 32
 enum xpy_local_scope { XPY_LOCAL, XPY_PARAMETER, XPY_CELL, XPY_FREE };
@@ -196,6 +209,7 @@ struct xpy_local {
     enum xpy_local_scope scope;
     uint64_t slot_address, address;
     int hidden, immediate;
+    int64_t immediate_integer;
     struct xpy_value value;
 };
 struct xpy_locals {
@@ -212,4 +226,8 @@ void xpy_locals_read(const struct xpy_layout *, struct xpy_reader *, uint64_t fr
                      size_t start, size_t limit, struct xpy_locals *);
 void xpy_local_find(const struct xpy_layout *, struct xpy_reader *, uint64_t frame, uint64_t code,
                     const char *name, struct xpy_locals *);
+/* Use a row just resolved in this stopped generation, never a saved slot.
+ * Immediate stackrefs and boxed integers produce the same canonical bytes. */
+const char *xpy_local_sample(const struct xpy_layout *, struct xpy_reader *, const struct xpy_local *,
+                             void *, size_t capacity, size_t *length, enum xpy_sample_kind *);
 #endif

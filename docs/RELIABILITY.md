@@ -34,7 +34,36 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check all                  # Host plus GUI, one build
 ./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution
+./scripts/release-check periodic --headless  # Portable checks plus readelf source-path differential
+./scripts/release-check perf --headless      # Owned observer RPC measurements; no speed thresholds
 ```
+
+The explicit `periodic` tier starts the periodic correctness lane. It includes
+portable checks and 1,500 deterministic malformed/valid DWARF 2–4 file tables,
+compared with GNU readelf: every authorized path must appear in readelf's table.
+Stricter refusals are counted separately. It is excluded from `all`; run it in a
+scheduled job or when changing the source-path parser. This tier performs no
+live target or GUI checks and rejects live-runtime options. Reports record the
+host load and available CPU count; correctness still fails on a counterexample
+under load. This is not a performance benchmark or a replacement for `all`.
+Other slow matrices remain in their existing tiers until focused replacements
+preserve their lifecycle and fault assertions.
+
+The separate `perf` tier is excluded from `all`. Its first benchmark measures
+cached `get_session` RPCs on an owned stopped fixture, locally and through the
+C agent. It warms the transport before recording CPU and resident memory at
+the same boundaries, and saves each RPC duration plus host load samples. The
+fixed request count defines the workload, not a throughput requirement.
+These measurements include RPC and harness overhead; they do not measure GUI
+latency, tracing overhead or language-reader performance.
+
+If any sampled load average exceeds the allowed CPU count, the measurement
+and top-level report say **not-measurable** and return zero. The raw observations
+remain available but are not performance evidence. Crashes, failed requests,
+target state/register changes and missing capabilities still fail or block
+normally, including under load. No existing correctness check is removed by
+this initial lane. It rejects runtime SDK options; use the ordinary host/GUI
+tiers to validate language adapters.
 
 Use `--optimize Debug` for a second build mode; the default is ReleaseSafe.
 For a release candidate, require portable CI plus `all` on the configured
@@ -97,7 +126,7 @@ tests report their existing architecture skips on x86-64.
 - Original `zig-out`, fixture outputs, caches and the interactive desktop are
   untouched. GUI scripts create private headless Sway displays; the runner
   strips inherited display/session variables before starting any test.
-- Every tier probes local Unix-socket communication. Host/gui/all also probe
+- Every tier probes local Unix-socket communication. Host/gui/all/perf also probe
   loopback binding, ptrace on an owned child and a user-only perf event.
   Missing tools or denied probes return **2 (blocked)** with diagnostics. A
   successful probe is necessary, not proof that every requested perf feature

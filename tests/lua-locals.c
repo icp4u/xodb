@@ -49,6 +49,7 @@ static void compare(lua_State *L, const struct xl_local *item) {
 }
 static void inspect_state(lua_State *L) {
     struct xl_locals *out = calloc(1, sizeof *out); assert(out);
+    struct xl_locals *selected = calloc(1, sizeof *selected); assert(selected);
     struct xl_reader r = reader();
     xl_locals_read(&layout, &r, (uintptr_t)L, 0, 0, 3, out);
     /* The current callback is C; suspended coroutines start in a Lua frame. */
@@ -74,6 +75,12 @@ static void inspect_state(lua_State *L) {
                     ++seen_varargs; ++vararg_checks; continue;
                 }
                 assert(!item->reason && !item->name_truncated && item->address);
+                struct xl_reader binding_reader = reader();
+                xl_local_binding(&layout, &binding_reader, (uintptr_t)L, index, item->kind, item->declaration, selected);
+                assert(!selected->reason && selected->count == 1);
+                assert(selected->items[0].kind == item->kind && selected->items[0].declaration == item->declaration);
+                assert(selected->items[0].address == item->address && !strcmp(selected->items[0].name, item->name));
+                assert(!strcmp(selected->items[0].value.display, item->value.display));
                 const char *name;
                 if (item->kind == XL_LOCAL) {
                     assert(item->ordinal == ++seen_locals);
@@ -132,6 +139,10 @@ static void inspect_state(lua_State *L) {
         assert(out->reason && !strcmp(out->reason, "LuaNameNotFound") && !out->count);
         r = reader(); xl_local_find(&layout, &r, (uintptr_t)L, index, "f()", out);
         assert(out->reason && !strcmp(out->reason, "LuaExpressionUnsupported") && !r.reads);
+        r = reader(); xl_local_binding(&layout, &r, (uintptr_t)L, index, XL_LOCAL, 4095, selected);
+        assert(selected->reason && !strcmp(selected->reason, "LuaWatchBindingNotActive") && !selected->count);
+        r = reader(); xl_local_binding(&layout, &r, (uintptr_t)L, index, XL_VARARGS, 0, selected);
+        assert(selected->reason && !strcmp(selected->reason, "LuaWatchBindingInvalid") && !r.reads);
         ++frames;
     }
     r = reader(); r.reads = XL_READ_LIMIT;
@@ -139,7 +150,7 @@ static void inspect_state(lua_State *L) {
     assert(out->reason && !strcmp(out->reason, "LuaReadBudget"));
     r = reader(); xl_locals_read(&layout, &r, (uintptr_t)L, XL_STACK_FRAMES, 0, 3, out);
     assert(out->reason && !strcmp(out->reason, "LuaLocalsRequestInvalid"));
-    free(out);
+    free(selected);free(out);
 }
 static void malformed(lua_State *L) {
     CallInfo *ci = L->ci; size_t index = 0;

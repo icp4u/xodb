@@ -24,8 +24,8 @@ subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(work),str(root/'tests/
                 str(work/'virtual-pointer.c'),str(work/'virtual-keyboard.c'),
                 '-lwayland-client','-lxkbcommon','-lm','-o',h.HELPER],check=True)
 source = work/'fixture.c'
-source.write_text('#include <unistd.h>\nvolatile int done;\n'
-                  '__attribute__((noinline)) void wait_seven(void) { sleep(7); }\n'
+source.write_text('#include <time.h>\nvolatile int done; volatile unsigned wait_status = ~0u;\n'
+                  '__attribute__((noinline)) void wait_seven(void) { const struct timespec delay = {7, 0}; wait_status = nanosleep(&delay, 0) != 0; }\n'
                   'int main(void) { wait_seven();\n    done=1; return 0; }\n')
 fixture = work/'fixture'
 subprocess.run(['cc','-g','-O0','-fno-omit-frame-pointer',str(source),'-o',str(fixture)],check=True)
@@ -42,12 +42,14 @@ for action in ('finish','line'):
         assert d.tool('get_stack',tid=tid)['frames'][0]['symbol']=='wait_seven'
         probe=next(p for p in d.tool('get_breakpoints')['breakpoints'] if not p['internal'])
         d.tool('remove_breakpoint',generation=d.session()['generation'],id=probe['id'])
-        start=time.monotonic()
         if action=='finish':d.keys('tap',88)
         else:d.keys('click',220,239,'tap',67)
-        state=d.wait(lambda s:s['state']=='stopped' and s['running_to'] is None,seconds=15)
+        state=d.wait(lambda s:s['state']=='stopped' and s['running_to'] is None,seconds=30)
         assert state and state['step_diagnostic'] is None,state
-        assert 6.5<time.monotonic()-start<15,(action,state)
+        # Retain the long-function regression without an elapsed-time speed
+        # assertion: nanosleep succeeded without interruption.
+        marker=d.request('tools/call',{'name':'find_symbol','arguments':{'name':'wait_status'}})['structuredContent']['address']
+        assert d.tool('read_memory',address=marker,length=4)['hex']=='00000000',(action,state)
         assert d.tool('get_stack',tid=tid)['frames'][0]['symbol']=='main'
         d.shot(action+'-returned')
     finally:

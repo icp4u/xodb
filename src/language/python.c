@@ -637,6 +637,88 @@ void xpy_value_read(const struct xpy_layout *l, struct xpy_reader *r, uint64_t a
     value(l, r, address, out, 0);
 }
 
+/* ---- complete scalar samples -------------------------------------- */
+static void sample_number(uint8_t *out, uint64_t v, size_t n) {
+    for (size_t i = 0; i < n; ++i) out[i] = (uint8_t)(v >> (8 * i));
+}
+const char *xpy_value_sample(const struct xpy_layout *l, struct xpy_reader *r, uint64_t address,
+                             void *buffer, size_t capacity, size_t *length, enum xpy_sample_kind *kind) {
+    if (!length || !kind) return "InvalidArguments";
+    *length = 0;
+    if (!l || !r || !r->read || (!buffer && capacity)) return "InvalidArguments";
+    if (capacity > XPY_SAMPLE_BYTES) capacity = XPY_SAMPLE_BYTES;
+    uint8_t *out = buffer;
+    struct head h;
+    const char *why = object_head(l, r, address, &h, 0);
+    if (why) return why;
+    size_t n = 0;
+    enum xpy_sample_kind k;
+    if (type_is(l, h.type, XPY_TYPE_NONE)) {
+        if (address != l->types[XPY_NONE_OBJECT]) return "NoneTypeInstanceIsNotNone";
+        k = XPY_SAMPLE_NONE;
+    } else if (type_is(l, h.type, XPY_TYPE_BOOL)) {
+        if (!(h.type_flags & TPFLAGS_LONG)) return "InconsistentTypeFlags";
+        if (address != l->types[XPY_TRUE_OBJECT] && address != l->types[XPY_FALSE_OBJECT])
+            return "BoolIsNeitherTrueNorFalse";
+        if (capacity < 1) return "PythonWatchSampleLimit";
+        k = XPY_SAMPLE_BOOL; n = 1; out[0] = address == l->types[XPY_TRUE_OBJECT];
+    } else if (type_is(l, h.type, XPY_TYPE_LONG)) {
+        if (!(h.type_flags & TPFLAGS_LONG)) return "InconsistentTypeFlags";
+        uint64_t tag = at(l, r, address, XPY_LONG_TAG, 8), digits = tag >> 3;
+        unsigned sign = tag & 3;
+        if (r->error) return r->error;
+        if (sign == 3 || (sign == 1 ? digits != 0 : digits == 0)) return "InconsistentInt";
+        if (!capacity || digits > (capacity - 1) / 4) return "PythonWatchSampleLimit";
+        k = XPY_SAMPLE_INT; n = 1 + (size_t)digits * 4; out[0] = (uint8_t)sign;
+        uint64_t data = address + field(l, XPY_LONG_DIGIT);
+        if (data < address) return "InvalidAddress";
+        if (digits && !read_bytes(r, data, out + 1, n - 1)) return r->error;
+        for (size_t i = 0; i < digits; ++i) {
+            uint64_t v = le(out + 1 + i * 4, 4);
+            if (v >> LONG_SHIFT || (i + 1 == digits && !v)) return "InconsistentIntDigit";
+        }
+    } else if (type_is(l, h.type, XPY_TYPE_FLOAT)) {
+        if (capacity < 8) return "PythonWatchSampleLimit";
+        uint64_t bits = at(l, r, address, XPY_FLOAT_VALUE, 8);
+        if (r->error) return r->error;
+        k = XPY_SAMPLE_FLOAT; n = 8; sample_number(out, bits, n);
+    } else if (type_is(l, h.type, XPY_TYPE_BYTES)) {
+        if (!(h.type_flags & TPFLAGS_BYTES)) return "InconsistentTypeFlags";
+        int64_t size = (int64_t)at(l, r, address, XPY_BYTES_SIZE, 8);
+        if (r->error) return r->error;
+        if (size < 0) return "InconsistentBytes";
+        if ((uint64_t)size > capacity) return "PythonWatchSampleLimit";
+        uint64_t data = address + field(l, XPY_BYTES_VALUE);
+        if (data < address) return "InvalidAddress";
+        k = XPY_SAMPLE_BYTES_KIND; n = (size_t)size;
+        if (n && !read_bytes(r, data, out, n)) return r->error;
+    } else if (type_is(l, h.type, XPY_TYPE_UNICODE)) {
+        if (!(h.type_flags & TPFLAGS_UNICODE)) return "InconsistentTypeFlags";
+        uint64_t state = at(l, r, address, XPY_STR_STATE, 4);
+        int64_t chars = (int64_t)at(l, r, address, XPY_STR_LENGTH, 8);
+        if (r->error) return r->error;
+        unsigned width = (state >> 2) & 7, compact = (state >> 5) & 1, ascii = (state >> 6) & 1;
+        if (chars < 0 || (width != 1 && width != 2 && width != 4) || (ascii && width != 1))
+            return "InconsistentStr";
+        if ((uint64_t)chars > capacity / 4) return "PythonWatchSampleLimit";
+        uint64_t offset = field(l, ascii ? XPY_STR_ASCII_SIZE : XPY_STR_COMPACT_SIZE);
+        if (address > UINT64_MAX - offset) return "InvalidAddress";
+        uint64_t data = address + offset;
+        if (!compact) data = pointer(l, r, address, XPY_STR_COMPACT_SIZE);
+        if (r->error) return r->error;
+        uint8_t raw[XPY_SAMPLE_BYTES];
+        if (chars && !read_bytes(r, data, raw, (size_t)chars * width)) return r->error;
+        k = XPY_SAMPLE_STR; n = (size_t)chars * 4;
+        for (size_t i = 0; i < (size_t)chars; ++i) {
+            uint64_t cp = le(raw + i * width, width);
+            if (cp > 0x10ffff || (ascii && cp > 127)) return "InconsistentStr";
+            sample_number(out + i * 4, cp, 4);
+        }
+    } else return "PythonWatchValueUnsupported";
+    *length = n; *kind = k;
+    return NULL;
+}
+
 /* ---- line table (Objects/locations.md, 3.11+) ------------------------ */
 struct stream {
     const struct xpy_layout *l;
@@ -760,6 +842,7 @@ static void frame_detail(const struct xpy_layout *l, struct xpy_reader *r, const
                          struct xpy_frame *f, struct code_cache *cache, unsigned *cached) {
     for (unsigned i = 0; i < *cached; ++i)
         if (cache[i].code == f->code) {
+            f->identity_proved = 1;
             memcpy(f->name, stack->frames[cache[i].frame].name, sizeof f->name);
             memcpy(f->file, stack->frames[cache[i].frame].file, sizeof f->file);
             f->code_flags = cache[i].flags;
@@ -771,6 +854,7 @@ static void frame_detail(const struct xpy_layout *l, struct xpy_reader *r, const
         f->reason = r->error ? r->error : "ExecutableNotCode";
         return;
     }
+    f->identity_proved = 1;
     uint64_t base = f->code;
     uint64_t filename = pointer(l, r, base, XPY_CO_FILENAME), qualname = pointer(l, r, base, XPY_CO_QUALNAME);
     uint64_t table = pointer(l, r, base, XPY_CO_LINETABLE);
@@ -859,6 +943,8 @@ static void walk(const struct xpy_layout *l, struct xpy_reader *r, uint64_t ts, 
     uint64_t frame = pointer(l, r, ts, XPY_TS_FRAME);
     if (r->error)
         return;
+    size_t segment_start = out->segment_count;
+    int retained_complete = 1;
     struct xpy_segment *s = open_segment(out, ts, interp, id);
     if (!s) {
         out->reason = "SegmentLimit";
@@ -905,8 +991,10 @@ static void walk(const struct xpy_layout *l, struct xpy_reader *r, uint64_t ts, 
                 } else {
                     s->anchor = k;
                     s->entry_frame = frame;
-                    if ((size_t)k < first)
+                    if ((size_t)k < first) {
                         rewind_segment(out, s, cache, cached);
+                        retained_complete = 0;
+                    }
                 }
                 s->examined = examined;
                 s = open_segment(out, ts, interp, id);
@@ -931,7 +1019,10 @@ static void walk(const struct xpy_layout *l, struct xpy_reader *r, uint64_t ts, 
                 f->instr = le(raw + field(l, XPY_FR_INSTR), 8);
                 if (owner == XPY_OWNED_BY_FRAME_OBJECT)
                     f->reason = "FrameOwnedByFrameObject";
-                frame_detail(l, r, out, f, cache, cached);
+                if (le(raw + field(l, XPY_FR_EXECUTABLE), 8) & 2)
+                    f->reason = "ExecutableStackRefInvalid";
+                else
+                    frame_detail(l, r, out, f, cache, cached);
                 s->count = out->count - s->first;
                 if (r->error) {
                     s->reason = r->error;
@@ -939,8 +1030,9 @@ static void walk(const struct xpy_layout *l, struct xpy_reader *r, uint64_t ts, 
                 }
                 if (f->reason && !s->reason && strcmp(f->reason, "LineUnavailable"))
                     s->reason = "PartialFrames";
-            } else if (!s->reason) {
-                s->reason = "FrameLimit";
+            } else {
+                retained_complete = 0;
+                if (!s->reason) s->reason = "FrameLimit";
             }
         }
         /* Brent's cycle detection on frame addresses; no re-reads. */
@@ -961,6 +1053,9 @@ static void walk(const struct xpy_layout *l, struct xpy_reader *r, uint64_t ts, 
     /* The chain ended at its root: an empty trailing segment holds nothing. */
     if (!pending && !s->reason)
         --out->segment_count;
+    if (!frame && !r->error && retained_complete)
+        for (size_t i = segment_start; i < out->segment_count; ++i)
+            out->segments[i].chain_complete = 1;
 }
 void xpy_stack_read(const struct xpy_layout *l, struct xpy_reader *r, uint32_t tid, const struct xpy_range *ranges,
                     size_t range_count, size_t first, struct xpy_stack *out) {
@@ -1132,6 +1227,7 @@ static void local_value(const struct xpy_layout *l, struct xpy_reader *r, const 
         uint64_t magnitude = bits >> 2;
         int64_t integer = bits >> 63 ? -(int64_t)((UINT64_C(1) << 62) - magnitude) : (int64_t)magnitude;
         out->immediate = 1;
+        out->immediate_integer = integer;
         snprintf(out->value.type, sizeof out->value.type, "int");
         snprintf(out->value.display, sizeof out->value.display, "int %" PRId64, integer);
         return;
@@ -1241,4 +1337,23 @@ void xpy_local_find(const struct xpy_layout *l, struct xpy_reader *r, uint64_t f
         return;
     }
     locals_read(l, r, frame, code, 0, 1, name, out);
+}
+const char *xpy_local_sample(const struct xpy_layout *l, struct xpy_reader *r, const struct xpy_local *local,
+                             void *buffer, size_t capacity, size_t *length, enum xpy_sample_kind *kind) {
+    if (!length || !kind) return "InvalidArguments";
+    *length = 0;
+    if (!local || (!buffer && capacity)) return "InvalidArguments";
+    if (local->reason) return local->reason;
+    if (!local->immediate) return xpy_value_sample(l, r, local->address, buffer, capacity, length, kind);
+    uint64_t magnitude = local->immediate_integer < 0 ?
+        -(uint64_t)local->immediate_integer : (uint64_t)local->immediate_integer;
+    uint8_t raw[13]; size_t n = 1;
+    raw[0] = !magnitude ? 1 : local->immediate_integer < 0 ? 2 : 0;
+    while (magnitude) {
+        sample_number(raw + n, magnitude & ((UINT64_C(1) << LONG_SHIFT) - 1), 4);
+        n += 4; magnitude >>= LONG_SHIFT;
+    }
+    if (capacity < n) return "PythonWatchSampleLimit";
+    memcpy(buffer, raw, n); *length = n; *kind = XPY_SAMPLE_INT;
+    return NULL;
 }

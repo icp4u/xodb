@@ -27,8 +27,39 @@ pub fn access(definition: Value) !Access {
     if (annotations != .object) return error.InvalidToolSessionAccess;
     const value = annotations.object.get("xodbSessionAccess") orelse return error.MissingToolSessionAccess;
     if (value != .string) return error.InvalidToolSessionAccess;
-    return std.meta.stringToEnum(Access, value.string) orelse error.InvalidToolSessionAccess;
+    const required = std.meta.stringToEnum(Access, value.string) orelse return error.InvalidToolSessionAccess;
+    if (!try readOnly(definition) and required == .observer) return error.InvalidToolSessionAccess;
+    return required;
 }
+pub fn readOnly(definition: Value) !bool {
+    if (definition != .object) return error.InvalidToolSessionAccess;
+    const annotations = definition.object.get("annotations") orelse return error.InvalidToolSessionAccess;
+    if (annotations != .object) return error.InvalidToolSessionAccess;
+    const value = annotations.object.get("readOnlyHint") orelse return error.InvalidToolSessionAccess;
+    if (value != .bool) return error.InvalidToolSessionAccess;
+    return value.bool;
+}
+pub const Policy = struct {
+    required: Access,
+    read_only: bool,
+    pub fn fromDefinition(definition: Value) !Policy {
+        return .{ .required = try access(definition), .read_only = try readOnly(definition) };
+    }
+    pub fn localAllowed(self: Policy, scope: @import("../model/session.zig").AgentScope) bool {
+        // Read-only retained jobs are private to a stdio session. Shared clients
+        // additionally obey xodbSessionAccess ownership even for read-only tools.
+        if (self.read_only) return true;
+        return switch (self.required) {
+            .controller => scope != .observe,
+            .mutator => scope == .mutate,
+            .observer, .lease => false,
+        };
+    }
+};
+pub fn localAllowed(scope: @import("../model/session.zig").AgentScope, definition: Value) !bool {
+    return (try Policy.fromDefinition(definition)).localAllowed(scope);
+}
+
 fn number(args: Value, key: []const u8, default: ?u64) !u64 {
     const value = args.object.get(key) orelse return default orelse error.InvalidArguments;
     if (value != .integer or value.integer < 0) return error.InvalidArguments;
@@ -132,4 +163,30 @@ test "session access classification is mandatory and independent of readOnlyHint
     const job = try std.json.parseFromSlice(Value, a, "{\"annotations\":{\"readOnlyHint\":true,\"xodbSessionAccess\":\"controller\"}}", .{});
     defer job.deinit();
     try std.testing.expectEqual(Access.controller, try access(job.value));
+}
+
+test "local scope comes from policy and invalid state-changing observers fail closed" {
+    const a = std.testing.allocator;
+    const Scope = @import("../model/session.zig").AgentScope;
+    inline for (.{ "controller", "mutator" }) |required| {
+        const parsed = try std.json.parseFromSlice(Value, a, "{\"name\":\"arbitrary_name\",\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"" ++ required ++ "\"}}", .{});
+        defer parsed.deinit();
+        try std.testing.expect(!try localAllowed(.observe, parsed.value));
+        try std.testing.expectEqual(std.mem.eql(u8, required, "controller"), try localAllowed(.control, parsed.value));
+        try std.testing.expect(try localAllowed(.mutate, parsed.value));
+    }
+    const retained = try std.json.parseFromSlice(Value, a, "{\"annotations\":{\"readOnlyHint\":true,\"xodbSessionAccess\":\"controller\"}}", .{});
+    defer retained.deinit();
+    for (std.enums.values(Scope)) |scope| try std.testing.expect(try localAllowed(scope, retained.value));
+    try std.testing.expectEqual(Access.controller, try access(retained.value));
+    inline for (.{
+        "{\"annotations\":{\"readOnlyHint\":false,\"xodbSessionAccess\":\"observer\"}}",
+        "{\"annotations\":{\"xodbSessionAccess\":\"controller\"}}",
+        "{\"annotations\":{\"readOnlyHint\":\"false\",\"xodbSessionAccess\":\"controller\"}}",
+    }) |text| {
+        const invalid = try std.json.parseFromSlice(Value, a, text, .{});
+        defer invalid.deinit();
+        try std.testing.expectError(error.InvalidToolSessionAccess, access(invalid.value));
+        try std.testing.expectError(error.InvalidToolSessionAccess, localAllowed(.mutate, invalid.value));
+    }
 }

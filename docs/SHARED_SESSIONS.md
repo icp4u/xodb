@@ -41,6 +41,16 @@ socket still belongs to this xodb session. Scope is the upper bound set by
 `--agent-scope observe|control|mutate`; a claim cannot raise it. Use `mutate` only
 when the intended client needs register or memory writes.
 
+Tool visibility and call authorization use the declared policy. Calling a hidden
+state-changing tool directly is also refused: observe scope denies every
+`readOnlyHint=false` tool, including watch creation/removal and metadata job
+cancel/retry; control scope still denies memory/register mutations. This applies
+to stdio MCP as well as shared sessions, including after the human presses F8.
+Shared clients additionally need the controller lease for tools marked
+`xodbSessionAccess=controller` or `mutator`, even when those tools only create
+read-only inspection jobs. Private stdio inspection jobs keep their existing
+read-only access.
+
 ## Connect an MCP client
 
 Use the stdio bridge as the MCP client's executable:

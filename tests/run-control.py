@@ -54,7 +54,10 @@ for mode, symbol in [('sleep','wait_seven'), ('fib','fib')]:
         else:raise AssertionError(('finish timeout',snap))
         assert snap['step_diagnostic'] is None,snap
         if mode=='sleep':
-            assert 6.5<time.monotonic()-start<15
+            # The fixture proves the full sleep completed. Host descheduling
+            # may delay observing its return; the loop deadline bounds hangs.
+            marker=c.inspect('find_symbol',name='wait_status')['address']
+            assert c.inspect('read_memory',address=marker,length=4)['hex']=='00000000',snap
             assert c.inspect('get_stack',tid=tid)['frames'][0]['symbol']=='main'
         else:
             assert c.inspect('evaluate_expression',tid=tid,expression='n')['value']['display']=='13'

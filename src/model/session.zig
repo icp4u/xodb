@@ -96,6 +96,7 @@ pub const Session = struct {
     source_maps: @import("source_maps.zig").Maps = .{},
     metadata: @import("debug_metadata.zig").State = .{},
     language_tabs: @import("language_tabs.zig").State = .{},
+    language_watches: @import("language_watches.zig").State = .{},
     maps_epoch: u64 = 0,
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
@@ -1144,6 +1145,7 @@ pub const Session = struct {
         return true;
     }
     pub fn poll(self: *Session) !void {
+        defer self.language_watches.poll(self);
         defer self.language_tabs.poll(self);
         defer self.metadata.poll(self);
         defer self.inspections.poll(self);
@@ -1749,6 +1751,7 @@ pub const Session = struct {
         return .{ .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        self.language_watches.deinit();
         self.language_tabs.deinit();
         self.metadata.deinit();
         self.static_analysis.deinit();

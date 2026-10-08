@@ -202,6 +202,7 @@ pub const Frame = struct {
     prototype: ?[]const u8,
     native_function: ?[]const u8,
     tail_call: bool,
+    identity_proved: bool,
     reason: ?[]const u8,
 };
 pub const Segment = struct {
@@ -214,6 +215,7 @@ pub const Segment = struct {
     reason: ?[]const u8,
     anchor_scope: []const u8 = "recovered state argument only; no inferred native/logical frame merge",
     frames: []Frame,
+    chain_complete: bool,
     memory_reads: usize,
     memory_bytes: usize,
 };
@@ -305,9 +307,9 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
                     if (symbol.offset == 0) name = try a.dupe(u8, symbol.name);
                 } else |_| {}
             }
-            out.* = .{ .name = name, .file = if (f.file[0] != 0) try a.dupe(u8, std.mem.sliceTo(&f.file, 0)) else null, .line = if (f.line > 0) @intCast(f.line) else null, .defined_line = if (f.defined_line >= 0) @intCast(f.defined_line) else null, .kind = if (f.is_c != 0) "C" else "Lua", .call_info = try hex(a, f.ci), .function_slot = try hex(a, f.function), .prototype = if (f.proto != 0) try hex(a, f.proto) else null, .native_function = if (f.native_function != 0) try hex(a, f.native_function) else null, .tail_call = f.tail_call != 0, .reason = try reason(a, f.reason) };
+            out.* = .{ .name = name, .file = if (f.file[0] != 0) try a.dupe(u8, std.mem.sliceTo(&f.file, 0)) else null, .line = if (f.line > 0) @intCast(f.line) else null, .defined_line = if (f.defined_line >= 0) @intCast(f.defined_line) else null, .kind = if (f.is_c != 0) "C" else "Lua", .call_info = try hex(a, f.ci), .function_slot = try hex(a, f.function), .prototype = if (f.proto != 0) try hex(a, f.proto) else null, .native_function = if (f.native_function != 0) try hex(a, f.native_function) else null, .tail_call = f.tail_call != 0, .identity_proved = f.identity_proved != 0, .reason = try reason(a, f.reason) };
         }
-        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
+        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .chain_complete = raw.chain_complete != 0, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
         if (r.@"error") |why| {
             if (std.mem.eql(u8, std.mem.span(why), "LuaReadBudget")) break;
             r.@"error" = null;
@@ -397,4 +399,105 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .memory_reads = r.reads,
         .memory_bytes = r.bytes,
     };
+}
+
+/// A location watch re-resolves storage at every stop. CallInfo/prototype
+/// matching does not prove an activation survived unseen between stops.
+pub const WatchCapture = @import("watch.zig").Capture;
+fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, page: ?usize) !void {
+    const module = try runtimeModule(session);
+    if (module.id != capture.scope.runtime[0]) return error.LuaWatchRuntimeChanged;
+    const layout = try profile(session, module);
+    var r = reader(session);
+    const raw = try a.create(c.struct_xl_locals);
+    const state = capture.scope.runtime[1];
+    if (page) |index| {
+        c.xl_locals_read(layout, &r, state, frame, index, 1, raw);
+    } else if (capture.scope.frame[2] == 0) {
+        c.xl_local_find(layout, &r, state, frame, capture.expression, raw);
+    } else {
+        c.xl_local_binding(layout, &r, state, frame, if (capture.scope.frame[2] == 1) c.XL_LOCAL else c.XL_UPVALUE, @intCast(capture.scope.frame[3]), raw);
+    }
+    defer {
+        capture.reads = r.reads;
+        capture.bytes = r.bytes;
+    }
+    if (raw.call_info != 0 and raw.call_info != capture.scope.frame[0]) return error.StaleLanguageFrame;
+    const why: [*c]const u8 = if (raw.reason != null) raw.reason else if (raw.count != 1) "LuaWatchBindingUnavailable" else raw.items[0].reason;
+    if (why) |message| {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(message));
+        return;
+    }
+    const item = &raw.items[0];
+    if (item.kind == c.XL_VARARGS or item.address == 0) return error.LuaWatchBindingHasNoStorage;
+    if (item.name_truncated != 0) return error.LuaWatchNameTruncated;
+    if (page != null) {
+        capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&item.name, 0));
+        if (capture.expression.len > c.XLW_EXPRESSION) return error.LuaWatchNameTooLong;
+        capture.scope.frame[2] = if (item.kind == c.XL_LOCAL) 1 else 2;
+        capture.scope.frame[3] = item.declaration;
+    }
+    const bytes = try a.alloc(u8, c.XL_SAMPLE_BYTES);
+    var length: usize = 0;
+    var kind: c.enum_xl_sample_kind = undefined;
+    if (c.xl_value_sample(layout, &r, item.address, bytes.ptr, bytes.len, &length, &kind)) |message| {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(message));
+        return;
+    }
+    capture.observation = c.XLW_COMPLETE;
+    capture.sample = .{ .kind = kind, .bytes = bytes.ptr, .size = length, .type = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.type, 0))).ptr, .display = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.display, 0))).ptr };
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    if ((expression == null) == (row == null)) return error.InvalidArguments;
+    if (expression) |text| if (text.len == 0 or text.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidArguments;
+    if (row) |index| if (index >= 4096) return error.InvalidArguments;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment = observed.segments[segment_index];
+    if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
+    const selected = segment.frames[frame];
+    if (!selected.identity_proved or !std.mem.eql(u8, selected.kind, "Lua") or selected.prototype == null) return error.LuaWatchFrameUnproved;
+    const stable_thread = for (session.target.threadSlice()) |thread| {
+        if (thread.tid == tid) break thread.id;
+    } else return error.InvalidThread;
+    var capture = WatchCapture{ .scope = .{ .language = c.XLW_LUA, .session = session.id, .image = session.target.snapshot().image_epoch, .thread = stable_thread, .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 }, .frame = .{ try std.fmt.parseInt(u64, selected.call_info, 0), try std.fmt.parseInt(u64, selected.prototype.?, 0), 0, 0 } }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    try watchValue(session, a, &capture, frame, row);
+    // A row whose binding cannot be established must not become a name watch.
+    if (row != null and capture.scope.frame[2] == 0) return error.LuaWatchBindingUnavailable;
+    try session.target.expectGeneration(observed.generation);
+    return capture;
+}
+pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
+    const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
+    const module_id = (try runtimeModule(session)).id;
+    if (module_id != scope.runtime[0]) {
+        capture.scope.runtime[0] = module_id;
+        capture.diagnostic = try a.dupeZ(u8, "LuaWatchRuntimeChanged");
+        return capture;
+    }
+    for (observed.segments) |segment| {
+        if (try std.fmt.parseInt(u64, segment.runtime_instance.address, 0) != scope.runtime[1]) continue;
+        for (segment.frames, 0..) |frame, index| {
+            if (try std.fmt.parseInt(u64, frame.call_info, 0) != scope.frame[0]) continue;
+            if (!frame.identity_proved) {
+                capture.diagnostic = try a.dupeZ(u8, frame.reason orelse "LuaWatchFrameUnproved");
+                return capture;
+            }
+            if (frame.prototype == null or try std.fmt.parseInt(u64, frame.prototype.?, 0) != scope.frame[1]) break;
+            try watchValue(session, a, &capture, index, null);
+            try session.target.expectGeneration(observed.generation);
+            return capture;
+        }
+        // Only a complete canonical CallInfo walk establishes absence. Native
+        // pairing may remain partial independently of that walk.
+        if (segment.chain_complete) {
+            capture.observation = c.XLW_FRAME_GONE;
+            capture.diagnostic = try a.dupeZ(u8, "LuaWatchFrameGone");
+        } else capture.diagnostic = try a.dupeZ(u8, segment.reason orelse "LuaWatchFrameUnproved");
+        try session.target.expectGeneration(observed.generation);
+        return capture;
+    }
+    capture.diagnostic = try a.dupeZ(u8, "LuaWatchCoroutineNotObserved");
+    return capture;
 }

@@ -118,6 +118,18 @@ time.sleep(60)
         for required in ('inspections-agent', 'inspection-lifecycle-agent', 'observations-live', 'observation-recipes-agent', 'observation-associations'):
             self.assertIn(required, observed)
 
+    def test_measurements_are_explicit_and_separate(self):
+        perf = {s[0] for s in gate.plan('perf', headless=True)}
+        self.assertIn('observer-measurements', perf)
+        self.assertFalse(perf & {'mcp', 'vulkan-faults', 'gui-overview'})
+        for tier in ('portable', 'host', 'gui', 'all', 'periodic'):
+            self.assertNotIn('observer-measurements', {s[0] for s in gate.plan(tier)})
+        # Correctness matrices retain their original coverage until explicitly
+        # replaced by focused checks, independently of performance evidence.
+        all_names = {s[0] for s in gate.plan('all')}
+        self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-clipboard',
+                         'symbol-discovery-latency-25', 'symbol-discovery-latency-100'} <= all_names)
+
 
 if __name__ == '__main__':
     unittest.main()

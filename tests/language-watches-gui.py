@@ -1,0 +1,139 @@
+#!/usr/bin/env python3
+"""Create and observe runtime watches through an owned private display."""
+import argparse,csv,importlib.util,io,json,os,queue,re,select,subprocess,threading,time
+from pathlib import Path
+from PIL import Image,ImageOps
+p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--reuse',action='store_true');p.add_argument('--source');p.add_argument('--library');p.add_argument('--python');p.add_argument('--work',type=Path,required=True)
+a=p.parse_args()
+if bool(a.python)==bool(a.source or a.library) or (not a.python and not (a.source and a.library)):p.error('choose --python or both --source and --library')
+if a.python and a.reuse:p.error('--reuse uses the Lua fixture')
+root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
+w=(a.work/'.work/input-lwatch').resolve();w.mkdir(parents=True,mode=0o755)
+fixture=w/'host';language='python' if a.python else 'lua'
+source=root/('tests/fixtures/python/named.c' if a.python else 'tests/fixtures/lua/named.c')
+if a.python:
+    spec=importlib.util.spec_from_file_location('python_component',root/'tests/python-component.py');component=importlib.util.module_from_spec(spec);spec.loader.exec_module(component)
+    component.compile_fixture(a.python,w)
+    target_command=[a.python,str(root/'tests/fixtures/python/watches.py')]
+    target_env=dict(os.environ,PYTHONPATH=str(w))
+else:
+    subprocess.run(['cc','-std=c11','-g','-O0','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I'+a.source,'tests/fixtures/lua/watch-reuse.c' if a.reuse else 'tests/fixtures/lua/watches.c',a.library,'-lm','-ldl','-o',str(fixture)],check=True,timeout=90)
+    target_command=[str(fixture)];target_env=os.environ.copy()
+spec=importlib.util.spec_from_file_location('private_input',root/'tests/helpers/input.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h);h.WORK=str(w)
+for name in ('tmp','cache/mesa','cache/nvidia'):(w/name).mkdir(parents=True,exist_ok=True)
+for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
+    subprocess.run(['wayland-scanner','client-header',xml,str(w/(stem+'.h'))],check=True,timeout=10)
+    subprocess.run(['wayland-scanner','private-code',xml,str(w/(stem+'.c'))],check=True,timeout=10)
+h.HELPER=str(w/'vinput');subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(w),'tests/helpers/vinput.c',str(w/'virtual-pointer.c'),str(w/'virtual-keyboard.c'),'-lwayland-client','-lxkbcommon','-lm','-o',h.HELPER],check=True,timeout=60)
+os.environ['XDG_CACHE_HOME']=str(w/'cache')
+target=subprocess.Popen(target_command,env=target_env,stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=subprocess.PIPE);d=None;result={'status':'running'}
+try:
+    assert select.select([target.stdout],[],[],10)[0] and target.stdout.readline()==b'ready\n'
+    lines=queue.Queue()
+    def drain():
+        for line in target.stdout:lines.put(line)
+    thread=threading.Thread(target=drain,daemon=True);thread.start()
+    d=h.Display(str(root),['--agent-scope','control','--attach',str(target.pid)])
+    line=next(i for i,s in enumerate(source.read_text().splitlines(),1) if 'NAMED_STOP' in s)
+    d.tool('set_breakpoint',generation=d.session()['generation'],file=str(source),line=line)
+    d.tool('continue',generation=d.session()['generation']);target.stdin.write(b'go\n' if a.python else b'g');target.stdin.flush();assert d.stopped('breakpoint')
+    json.loads(lines.get(timeout=10));generation=d.session()['generation'];regs=d.tool('get_registers',tid=target.pid)
+    segment,frame=0,1
+    if a.python:
+        deadline=time.monotonic()+60
+        while True:
+            reply=d.request('tools/call',{'name':'get_language_stack','arguments':{'tid':target.pid,'language':'python'}})
+            if not reply.get('isError'):break
+            assert reply['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,reply
+            time.sleep(.02)
+        stack=reply['structuredContent']
+        segment,frame=next((s,f) for s,part in enumerate(stack['segments']) for f,row in enumerate(part['frames']) if row['name']=='outer.<locals>.watched')
+    args=dict(generation=generation,tid=target.pid,language=language,segment=segment,frame=frame)
+    d.tool('select_language_frame',**args)
+    normalize=lambda t:re.sub(r'[^a-z0-9]','',t.lower())
+    def visible(label,wanted,box):
+        deadline=time.monotonic()+30
+        while True:
+            shot=d.shot(label);crop=shot+'.crop.png'
+            with Image.open(shot) as image:
+                pane=ImageOps.invert(image.crop(box).convert('L'));pane.resize((pane.width*3,pane.height*3)).save(crop)
+            text=subprocess.run(['tesseract',crop,'stdout','--psm','6'],env=dict(d.env,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
+            Path(shot+'.txt').write_text(text)
+            if all(x in normalize(text) for x in wanted):return shot,text
+            assert time.monotonic()<deadline,text
+            time.sleep(.05)
+    initial,changed=(10,20) if a.reuse else (7,8)
+    numeric='int' if a.python else 'integer' if '/lua-5.4' in a.library else 'number'
+    if a.python:
+        bindings=d.tool('get_language_locals',**args)['rows']
+        visible('named-ready',['namedlocals',normalize(bindings[0]['name'])],(1013,130,1272,578))
+        index=next(i for i,row in enumerate(bindings) if row['name']=='x')
+        for _ in range(index):d.keys('scroll',1150,540,1)
+    if a.reuse:
+        visible('reuse-first-binding',['v'+numeric+str(initial)],(1013,130,1272,578))
+        d.keys('scroll',1150,540,1)
+    shot,_=visible('named-x',['x'+numeric+str(initial)],(1013,130,1272,578))
+    tsv=subprocess.run(['tesseract',shot+'.crop.png','stdout','--psm','6','tsv'],env=dict(d.env,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
+    candidates=[v for v in csv.DictReader(io.StringIO(tsv),delimiter='\t') if v['text'].lower()=='x'];assert candidates,tsv
+    row=candidates[-1];d.keys('click',1013+int(row['left'])//3+5,130+int(row['top'])//3+5,'tap',17)
+    deadline=time.monotonic()+10
+    while True:
+        rows=d.tool('get_language_watches')['watches']
+        if len(rows)==1:break
+        assert time.monotonic()<deadline,rows;time.sleep(.02)
+    assert rows[0]['selector']=='binding' and rows[0]['expression']=='x' and rows[0]['current']['display']==numeric+' '+str(initial),rows
+    _,result['initial']=visible('watch-binding',['runtimewatches','binding','now'+numeric+str(initial)],(600,585,1272,764))
+    if a.reuse:
+        before_stack=d.tool('get_language_stack',tid=target.pid,language='lua')
+        location=tuple(before_stack['segments'][segment]['frames'][frame][key] for key in ('call_info','prototype'))
+    # Shift+E creates a name expression watch; ordinary E stays a stopped read.
+    d.keys('down',42,'tap',18,'up',42,'tap',45,'tap',28)
+    deadline=time.monotonic()+10
+    while True:
+        rows=d.tool('get_language_watches')['watches']
+        if len(rows)==2:break
+        assert time.monotonic()<deadline,rows;time.sleep(.02)
+    assert rows[1]['selector']=='expression' and rows[1]['expression']=='x',rows
+    assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
+    d.keys('tap',57);assert d.wait(lambda s:s['generation']>generation and s['state']=='stopped' and any(t['reason']=='breakpoint' for t in s['threads']))
+    json.loads(lines.get(timeout=10));generation=d.session()['generation']
+    if a.reuse:
+        after_stack=d.tool('get_language_stack',tid=target.pid,language='lua')
+        actual=tuple(after_stack['segments'][segment]['frames'][frame][key] for key in ('call_info','prototype'))
+        assert actual==location,('reuse precondition failed',location,actual)
+        result['reuse_precondition']={'same_call_info_and_prototype':True,'first':location,'second':actual}
+    deadline=time.monotonic()+20
+    while True:
+        rows=d.tool('get_language_watches')['watches']
+        if all(v['observed_generation']==generation and v['changed'] for v in rows):break
+        assert time.monotonic()<deadline,rows;time.sleep(.02)
+    assert all(v['current']['display']==numeric+' '+str(changed) and v['previous']['display']==numeric+' '+str(initial) for v in rows),rows
+    _,result['changed']=visible('watch-changed',['diffactivationunproved','now'+numeric+str(changed),'before',str(initial)],(600,585,1272,764))
+    # F8 returns agent control to the human. Hidden tools must also refuse
+    # direct calls with valid watch arguments, without removing either entry.
+    d.keys('tap',66)
+    state=d.wait(lambda s:s['agent_scope']=='observe');assert state
+    listed={v['name'] for v in d.request('tools/list')['tools']}
+    assert 'add_language_watch' not in listed and 'remove_language_watch' not in listed
+    for name,arguments in (
+        ('add_language_watch',dict(generation=state['generation'],language=language,tid=target.pid,segment=segment,frame=frame,expression='x')),
+        ('remove_language_watch',dict(generation=state['generation'],id=rows[0]['id'])),
+    ):
+        reply=d.request('tools/call',{'name':name,'arguments':arguments})
+        assert reply.get('isError') and reply['content'][0]['text']=='AgentScopeDenied',reply
+    assert len(d.tool('get_language_watches')['watches'])==2
+    result['observe_scope_direct_calls']='denied after human F8'
+    # Delete removes a shared model entry, visible through MCP immediately.
+    d.keys('click',850,639,'tap',111)
+    deadline=time.monotonic()+10
+    while len(d.tool('get_language_watches')['watches'])!=1:
+        assert time.monotonic()<deadline;time.sleep(.02)
+    result['status']='pass';result['watches']=rows;result['display_dir']=d.dir
+finally:
+    if d:d.close()
+    if target.poll() is None:target.kill()
+    target.wait(timeout=10)
+    if 'thread' in locals():thread.join(timeout=5)
+    (w/'results.json').write_text(json.dumps(result,indent=2)+'\n')
+print('Runtime watch GUI: W binding, Shift+E expression, old/new change and Delete share the MCP model')

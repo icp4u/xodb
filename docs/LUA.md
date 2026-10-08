@@ -139,3 +139,47 @@ storage address or expression name. The count comes from the verified frame
 layout and is checked against stack bounds; invalid metadata stays unavailable.
 Click the native-objects section header to collapse or expand it, independently
 of named locals and the logical stack.
+
+## Runtime watches
+
+Run `scripts/demo-lua`, press **Space**, choose **Lua**, and select the loop frame
+at `lua-demo.lua:9`. **Shift+E**, `value`, **Return** adds an expression watch;
+**Space** reaches the next printed value. **V** toggles events and runtime
+watches. Click a watch then **Delete** to remove it; **[ ]** scrolls the list.
+The C/C++ tab keeps its native watch view.
+
+Clicking a named row and pressing **W** watches that exact local declaration or
+upvalue, including an outer binding shadowed by another row of the same name.
+**Shift+E** follows ordinary lexical name lookup at each stop. Neither operation
+executes Lua or installs a raw heap watchpoint. Native decoded previews and the
+vararg summary do not provide a named watch binding.
+
+The reader resolves the coroutine, CallInfo, prototype and binding again at every
+stop. Stack relocation and GC cannot leave a saved value-slot address in use.
+An observed return retires the watch permanently. An unobserved coroutine or an
+unreadable frame stays unavailable, retaining the last complete value. Matching
+frame locations and prototypes does not prove that a call survived continuously
+between stops; a returned call can reuse its location entirely between stops.
+The C comparison result and MCP `comparison` therefore say `same_slot_equal`
+or `same_slot_different`, never that an activation survived. `changed` describes
+the complete byte difference at that slot. The GUI labels differences **DIFF
+(activation unproved)** and keeps the old and new values visible. Seeing a frame
+absent on a complete walk permanently retires its watch, so a later reused slot
+cannot revive it. An unobserved coroutine is not proof of a returned frame.
+
+Comparison covers nil, booleans, integers, floating-point representations and
+complete strings up to 4096 bytes. Floating-point comparison uses exact bits
+(including signed zero and NaN payloads), not Lua operator semantics. A change
+outside the displayed string prefix still marks the watch changed. Longer
+strings, tables, functions and other objects have explicit unavailability
+reasons. Property/table paths and the other runtime adapters remain future work.
+Sixteen watches per process allocate storage as needed. Missing observations
+never count as equality; old/new generations identify the last complete baseline.
+These watches report changes **when execution stops**, and do not cause a stop.
+
+MCP `add_language_watch` takes the current `generation`, `language: "lua"`,
+`tid`, `segment`, `frame`, and exactly one of `expression` or `row` (the absolute
+index in `get_language_locals`). `remove_language_watch` takes `generation` and
+`id`. Both require the controller lease in a shared session. Observers can call
+`get_language_watches` without a lease; it reads cached comparison results with
+current/previous generations, state and a reason, and performs no target reads.

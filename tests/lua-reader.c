@@ -46,10 +46,12 @@ static void check_stack(lua_State *L) {
     if (stack.reason && strcmp(stack.reason, "LuaFunctionNameUnavailable")) {
         fprintf(stderr, "stack: %s frames=%zu\n", stack.reason, stack.count); abort();
     }
+    assert(stack.chain_complete);
     lua_Debug ar; unsigned index = 0;
     for (; lua_getstack(L, (int)index, &ar); ++index) {
         assert(index < stack.count); assert(lua_getinfo(L, "Sln", &ar));
         struct xl_frame *f = &stack.frames[index];
+        assert(f->identity_proved);
         int is_c = !strcmp(ar.what, "C");
         if (f->is_c != is_c || (!is_c && (f->line != ar.currentline || strcmp(f->file, ar.source)))) {
             fprintf(stderr, "frame %u C=%d/%d line=%d/%d file=%s/%s reason=%s\n", index,
@@ -86,13 +88,13 @@ static void check_stack(lua_State *L) {
     lua_State snapshot = *L; CallInfo bad = *L->ci;
     snapshot.ci = &bad; bad.previous = &bad; bad.next = &bad;
     r = reader(); xl_stack_read(&layout, &r, (uintptr_t)&snapshot, &stack);
-    assert(stack.reason && !strcmp(stack.reason, "LuaCallInfoCycle"));
+    assert(!stack.chain_complete && stack.reason && !strcmp(stack.reason, "LuaCallInfoCycle"));
     bad.previous = NULL;
     r = reader(); xl_stack_read(&layout, &r, (uintptr_t)&snapshot, &stack);
-    assert(stack.reason && !strcmp(stack.reason, "LuaCallInfoInvalid"));
+    assert(!stack.chain_complete && stack.reason && !strcmp(stack.reason, "LuaCallInfoInvalid"));
     bad.previous = L->ci->previous;
     r = reader(); xl_stack_read(&layout, &r, (uintptr_t)&snapshot, &stack);
-    assert(stack.reason && !strcmp(stack.reason, "LuaCallInfoLinkMismatch"));
+    assert(!stack.chain_complete && stack.reason && !strcmp(stack.reason, "LuaCallInfoLinkMismatch"));
 }
 static int inspect(lua_State *L) {
     int count = lua_gettop(L);
@@ -102,6 +104,27 @@ static int inspect(lua_State *L) {
         if (v.advisory) assert(v.reason && (!strcmp(v.reason, "LuaStringExtentUnproved") || !strcmp(v.reason, "LuaTableExtentUnproved")) && v.truncated);
         if (v.reason && !v.advisory) { fprintf(stderr, "value %d: %s\n", i, v.reason); abort(); }
         int type = lua_type(L, i);
+        /* The runtime API is the owned fixture's oracle, independent of the
+         * comparison reader. Embedded NULs and bytes beyond preview length
+         * remain part of the comparison; oversized strings refuse. */
+        unsigned char bytes[XL_SAMPLE_BYTES]; size_t size = 0; enum xl_sample_kind kind;
+        struct xl_reader compare_reader = reader();
+        const char *why = xl_value_sample(&layout, &compare_reader, (uintptr_t)argument(L, i), bytes, sizeof bytes, &size, &kind);
+        if (type == LUA_TNIL) assert(!why && kind == XL_SAMPLE_NIL && size == 0);
+        else if (type == LUA_TBOOLEAN) assert(!why && kind == XL_SAMPLE_BOOLEAN && size == 1 && bytes[0] == lua_toboolean(L, i));
+        else if (type == LUA_TNUMBER) {
+            uint64_t expected; double number = lua_tonumber(L, i); memcpy(&expected, &number, 8);
+            enum xl_sample_kind expected_kind = XL_SAMPLE_NUMBER;
+#if LUA_VERSION_NUM == 504
+            if (lua_isinteger(L, i)) { expected = (uint64_t)lua_tointeger(L, i); expected_kind = XL_SAMPLE_INTEGER; }
+#endif
+            assert(!why && kind == expected_kind && size == 8);
+            for (unsigned j=0; j<8; ++j) assert(bytes[j] == (unsigned char)(expected >> (8*j)));
+        } else if (type == LUA_TSTRING) {
+            size_t length; const char *data = lua_tolstring(L, i, &length);
+            if (length > sizeof bytes) assert(why && !strcmp(why, "LuaWatchSampleLimit") && size == 0);
+            else assert(!why && kind == XL_SAMPLE_STRING && size == length && !memcmp(bytes, data, length));
+        } else assert(why && !strcmp(why, "LuaWatchValueUnsupported"));
         const char *want = type == LUA_TNIL ? "nil" : type == LUA_TBOOLEAN ? "boolean" :
             type == LUA_TNUMBER ? "number" : type == LUA_TSTRING ? "string" : type == LUA_TTABLE ? "table" :
             type == LUA_TFUNCTION ? (lua_iscfunction(L, i) ? "C function" : "function") :
@@ -173,7 +196,7 @@ int main(int argc, char **argv) {
         "local captured = 73\n"
         "local function closure() return captured end\n"
         "local function nested(n)\n"
-        " if n > 0 then nested(n-1) else inspect(nil, false, true, 42, -73, 3.5, 'hi', string.rep('x',300), 'a\\0b\\255', {1,2,x='hi'}, closure, inspect, coroutine.running()) end\n"
+        " if n > 0 then nested(n-1) else inspect(nil, false, true, 42, -73, 3.5, 'hi', string.rep('x',300), string.rep('y',5000), 'a\\0b\\255', {1,2,x='hi'}, closure, inspect, coroutine.running()) end\n"
         "end\n"
         "nested(3)\n"
         "function inner() inspect('C-Lua-C') end\n"
