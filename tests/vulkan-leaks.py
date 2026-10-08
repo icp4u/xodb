@@ -13,9 +13,17 @@ p.add_argument('binary', type=Path)
 p.add_argument('--work', required=True, type=Path, help='Fresh short path containing /.work/')
 p.add_argument('--load', action='store_true', help='Four busy loops share two CPUs with the owned test')
 p.add_argument('--rounds', type=int, default=1)
+p.add_argument('--cpus', help='Explicit comma-separated CPU set; required for --load, otherwise retain inherited affinity')
 p.add_argument('--mode', action='append', choices=('honest', 'heap16', 'heap1', 'small', 'fd', 'thread', 'peak'))
 a = p.parse_args()
 assert 1 <= a.rounds <= 4
+allowed = os.sched_getaffinity(0)
+if a.load and not a.cpus: p.error('--load requires an explicit --cpus set')
+try: cpus = sorted(set(map(int, a.cpus.split(',')))) if a.cpus else sorted(allowed)
+except ValueError: p.error('--cpus must contain comma-separated CPU numbers')
+if not cpus or not set(cpus) <= allowed: p.error('--cpus must be a nonempty subset of inherited affinity')
+if a.load and len(cpus) != 2: p.error('--load requires exactly two allowed CPUs')
+if a.cpus: os.sched_setaffinity(0, cpus)
 os.umask(0o022)
 root = Path(__file__).resolve().parents[1]
 w = a.work.resolve()
@@ -28,9 +36,6 @@ for name in ('tests/vulkan-fault.c', 'tests/vulkan-fault.py', 'tests/helpers/dis
 original = (source / 'tests/vulkan-fault.c').read_text()
 loads, rows = [], []
 load_at_start = os.getloadavg()
-cpus = sorted(os.sched_getaffinity(0))[:2]
-assert len(cpus) == 2
-os.sched_setaffinity(0, cpus)
 helpers = r'''
 #include <fcntl.h>
 /* Deliberately leaked resources, confined to this owned test process. Volatile
@@ -76,7 +81,10 @@ mutant = mutant.replace(allocation, r'''    VkMemoryAllocateInfo bigger = *i;
 try:
     if a.load:
         for _ in range(4):
-            loads.append(subprocess.Popen([sys.executable, '-c', 'while True: pass'],
+            # Outlive every bounded case, but still die if this harness is
+            # SIGKILLed before its finally block. GNU timeout owns the group.
+            load_seconds = 120 + 100 * a.rounds * len(a.mode or ('honest', 'heap16', 'heap1', 'small', 'fd', 'thread', 'peak'))
+            loads.append(subprocess.Popen(['timeout', '--kill-after=2', str(load_seconds), sys.executable, '-c', 'while True: pass'],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL))
     for round_ in range(a.rounds):
         for mode in a.mode or ('honest', 'heap16', 'heap1', 'small', 'fd', 'thread', 'peak'):
