@@ -6,6 +6,20 @@
 static enum xrt_status wait_known(struct xrt_target *t, int32_t *tid, int *status)
 {
     *tid = 0;
+    /* The held vfork child is not a thread of this target. Drain it first so
+     * an exit stop cannot sit uncollected while the parent waits in vfork. */
+    if (t->vfork_hold) {
+        const pid_t got = waitpid(t->vfork_hold, status, __WALL | WNOHANG);
+        if (got > 0) {
+            *tid = got;
+            return XRT_OK;
+        }
+        if (got < 0 && errno == ECHILD) {
+            t->vfork_hold = 0;
+            t->vfork_hold_detach = 0;
+        } else if (got < 0 && errno != EINTR)
+            return XRT_WAIT_FAILED;
+    }
     for (size_t i = 0; i < t->thread_count; ++i) {
         const pid_t got = waitpid(t->threads[i].tid, status, __WALL | WNOHANG);
         if (got > 0) {
@@ -17,14 +31,144 @@ static enum xrt_status wait_known(struct xrt_target *t, int32_t *tid, int *statu
     }
     return XRT_OK;
 }
+/* Fork inherits patched bytes in its own address space. Put the original
+ * instruction back in that child before it can execute the word. user_probes
+ * restores breakpoints as well as temporary step traps. Never call this for a
+ * vfork: the child shares the parent's pages, so the write would clear the
+ * parent's traps while the record stayed patched. */
+static enum xrt_status restore_child_probes(struct xrt_target *t, int32_t child, int user_probes)
+{
+    for (size_t p = 0; p < t->breakpoint_count; ++p) {
+        const struct xrt_breakpoint *probe = &t->breakpoints[p];
+        if (!probe->patched || !probe->width)
+            continue;
+        if (!user_probes && !probe->temporary)
+            continue;
+        const enum xrt_status status =
+            xrt_patch_instruction_tid(t, child, probe->address, probe->original, probe->width);
+        if (status != XRT_OK)
+            return status;
+    }
+    return XRT_OK;
+}
+/* x86 can adopt a birth. Every other row refuses process following, so a held
+ * child would leave continue and step stuck on PROCESS_BIRTH_PENDING. */
+static int row_cannot_follow(const struct xrt_target *t)
+{
+    return t->arch && t->arch->machine != XRT_X86_64;
+}
+/* Move every probe the record still calls patched. The flag is the list of
+ * traps to put back; only the shared bytes change. */
+static enum xrt_status rewrite_patched(struct xrt_target *t, int plant)
+{
+    for (size_t p = 0; p < t->breakpoint_count; ++p) {
+        const struct xrt_breakpoint *probe = &t->breakpoints[p];
+        if (!probe->patched || !probe->width)
+            continue;
+        TRY(xrt_patch_instruction(t, probe->address, plant ? probe->planted : probe->original,
+                                  probe->width));
+    }
+    return XRT_OK;
+}
+static enum xrt_status on_held_vfork_child(struct xrt_target *t, int status)
+{
+    const int32_t child = t->vfork_hold;
+    if (!child)
+        return XRT_OK;
+    if (WIFEXITED(status) || WIFSIGNALED(status)) {
+        t->vfork_hold = 0;
+        t->vfork_hold_detach = 0;
+        return XRT_OK;
+    }
+    if (!WIFSTOPPED(status))
+        return XRT_OK;
+    if (t->vfork_hold_detach) {
+        const enum xrt_status detached = xrt_trace(PTRACE_DETACH, child, 0, 0);
+        t->vfork_hold = 0;
+        t->vfork_hold_detach = 0;
+        return detached == XRT_PROCESS_GONE ? XRT_OK : detached;
+    }
+    const unsigned kind = (unsigned)status >> 16;
+    const int sig = WSTOPSIG(status);
+    /* A trap left in the shared image must not be delivered. Other signals pass. */
+    const int pass = kind == 0 && sig != SIGTRAP && sig != SIGSTOP ? sig : 0;
+    return xrt_trace(PTRACE_CONT, child, 0, (uintptr_t)pass);
+}
+enum xrt_status xrt_detach_held_vfork(struct xrt_target *t)
+{
+    if (!t->vfork_hold)
+        return XRT_OK;
+    t->vfork_hold_detach = 1;
+    int status = 0;
+    const pid_t got = waitpid(t->vfork_hold, &status, __WALL | WNOHANG);
+    if (got == t->vfork_hold)
+        return on_held_vfork_child(t, status);
+    if (got < 0 && errno == ECHILD) {
+        t->vfork_hold = 0;
+        t->vfork_hold_detach = 0;
+        return XRT_OK;
+    }
+    if (got < 0 && errno != EINTR)
+        return XRT_WAIT_FAILED;
+    const enum xrt_status detached = xrt_trace(PTRACE_DETACH, t->vfork_hold, 0, 0);
+    if (detached == XRT_OK) {
+        t->vfork_hold = 0;
+        t->vfork_hold_detach = 0;
+        return XRT_OK;
+    }
+    if (detached != XRT_PROCESS_GONE)
+        return detached;
+    /* Still running. The next stop, including the interrupt, detaches it. */
+    const enum xrt_status interrupted = xrt_trace(PTRACE_INTERRUPT, t->vfork_hold, 0, 0);
+    if (interrupted == XRT_PROCESS_GONE) {
+        t->vfork_hold = 0;
+        t->vfork_hold_detach = 0;
+        return XRT_OK;
+    }
+    return interrupted;
+}
+void xrt_drop_vfork_hold(struct xrt_target *t)
+{
+    if (!t)
+        return;
+    const int32_t child = t->vfork_hold;
+    t->vfork_hold = 0;
+    t->vfork_release = 0;
+    t->vfork_hold_detach = 0;
+    if (child <= 0)
+        return;
+    kill(child, SIGKILL);
+    for (;;) {
+        int status = 0;
+        const pid_t got = waitpid(child, &status, __WALL);
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got < 0 || WIFEXITED(status) || WIFSIGNALED(status))
+            return;
+        if (WIFSTOPPED(status))
+            xrt_trace(PTRACE_CONT, child, 0, (uintptr_t)SIGKILL);
+    }
+}
 static enum xrt_status poll(struct xrt_target *t)
 {
+    int held_spins = 0;
     for (;;) {
         int32_t tid;
         int status = 0;
         TRY(wait_known(t, &tid, &status));
         if (!tid)
             break;
+        if (t->vfork_hold && tid == t->vfork_hold) {
+            /* A trap we failed to lift would stop the child forever. Detach
+             * rather than spin; VFORK_DONE still replants the parent. */
+            if (++held_spins > 32) {
+                TRY(xrt_detach_held_vfork(t));
+                continue;
+            }
+            TRY(on_held_vfork_child(t, status));
+            continue;
+        }
+        held_spins = 0;
         int i = xrt_thread_index(t, tid);
         assert(i >= 0);
         if (WIFEXITED(status) || WIFSIGNALED(status)) {
@@ -33,8 +177,21 @@ static enum xrt_status poll(struct xrt_target *t)
             t->threads[i] = t->threads[--t->thread_count];
             if (!t->thread_count) {
                 t->state = XRT_EXITED;
+                xrt_drop_vfork_hold(t);
                 TRY(xrt_separate_vfork(t));
                 t->stepping = false;
+                /* The process is gone, so the successor trap cannot be
+                 * unpatched. Drop it from the view; restart does not reinstall
+                 * a temporary probe. */
+                size_t kept = 0;
+                for (size_t p = 0; p < t->breakpoint_count; ++p) {
+                    if (t->breakpoints[p].temporary)
+                        continue;
+                    if (kept != p)
+                        t->breakpoints[kept] = t->breakpoints[p];
+                    ++kept;
+                }
+                t->breakpoint_count = kept;
             } else if (t->stepping && t->step.tid == tid)
                 TRY(xrt_stop_peers(t));
             continue;
@@ -88,12 +245,71 @@ static enum xrt_status poll(struct xrt_target *t)
             TRY(xrt_trace(PTRACE_GETEVENTMSG, tid, 0, (uintptr_t)&child));
         if (kind == PTRACE_EVENT_FORK || kind == PTRACE_EVENT_VFORK ||
             (kind == PTRACE_EVENT_CLONE && !xrt_traced_member((int32_t)child, t->pid))) {
+            if (row_cannot_follow(t)) {
+                const int stepping_here = t->stepping && t->step.tid == tid;
+                const int shared = kind == PTRACE_EVENT_VFORK;
+                if (shared) {
+                    /* The child shares this image and starts stopped. Lift every
+                     * trap so a user breakpoint or a successor plant cannot kill
+                     * it, keep it traced, and let it run. The records stay
+                     * patched. Userspace on the parent waits until VFORK_DONE
+                     * puts the traps back. A software step then hits its
+                     * successor with the real child pid. */
+                    TRY(rewrite_patched(t, 0));
+                    t->vfork_hold = (int32_t)child;
+                    t->vfork_release = 1;
+                    t->vfork_hold_detach = 0;
+                    const enum xrt_status ran = xrt_trace(PTRACE_CONT, (int32_t)child, 0, 0);
+                    if (ran != XRT_OK && ran != XRT_PROCESS_GONE)
+                        return ran;
+                    t->threads[i].signal = 0;
+                    if (stepping_here || t->want_run) {
+                        TRY(xrt_trace(PTRACE_CONT, tid, 0, 0));
+                        t->threads[i].state = XRT_RUNNING;
+                        t->threads[i].reason = XRT_STOP_NONE;
+                        continue;
+                    }
+                    TRY(xrt_stop_peers(t));
+                    continue;
+                }
+                /* Separate address space. The parent's traps stay where they are. */
+                TRY(restore_child_probes(t, (int32_t)child, 1));
+                TRY(xrt_trace(PTRACE_DETACH, (int32_t)child, 0, 0));
+                t->threads[i].signal = 0;
+                if (stepping_here || t->want_run) {
+                    /* A hardware step is still one instruction. CONT would run
+                     * past it. A software step is resumed with CONT because its
+                     * successor trap is already planted in this address space. */
+                    const int hardware_step = stepping_here && !t->step.software;
+                    TRY(xrt_trace(hardware_step ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, 0));
+                    t->threads[i].state = XRT_RUNNING;
+                    t->threads[i].reason = XRT_STOP_NONE;
+                    continue;
+                }
+                TRY(xrt_stop_peers(t));
+                continue;
+            }
+            TRY(restore_child_probes(t, (int32_t)child, 0));
+            /* x86, following off: a software step must not leave the child
+             * stopped or holding the successor trap. */
+            if (t->stepping && t->step.software && t->step.tid == tid && !t->follow_processes) {
+                TRY(xrt_trace(PTRACE_DETACH, (int32_t)child, 0, 0));
+                TRY(xrt_finish_step(t, true));
+                t->threads[i].signal = 0;
+                t->threads[i].reason = XRT_STOP_SINGLE_STEP;
+                t->threads[i].breakpoint_address = 0;
+                TRY(xrt_stop_peers(t));
+                continue;
+            }
             assert(t->birth_count < XRT_MAX_THREADS);
             if (!t->birth_count) {
                 t->birth_image_epoch = t->image_epoch;
-                t->birth_breakpoint_count = t->breakpoint_count;
-                memcpy(t->birth_breakpoints, t->breakpoints,
-                       t->breakpoint_count * sizeof(t->breakpoints[0]));
+                t->birth_breakpoint_count = 0;
+                for (size_t p = 0; p < t->breakpoint_count; ++p) {
+                    if (t->breakpoints[p].temporary)
+                        continue;
+                    t->birth_breakpoints[t->birth_breakpoint_count++] = t->breakpoints[p];
+                }
                 memcpy(t->birth_watchpoints, t->watchpoints, sizeof(t->watchpoints));
                 t->birth_next_probe_id = t->next_probe_id;
             }
@@ -119,6 +335,23 @@ static enum xrt_status poll(struct xrt_target *t)
         if (kind == PTRACE_EVENT_VFORK_DONE) {
             t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_VFORK_DONE;
+            if (t->vfork_release) {
+                /* The child has exec'd or exited, so this image is the parent's
+                 * alone. Put back every probe the record still calls patched,
+                 * then detach the child before userspace runs. */
+                TRY(rewrite_patched(t, 1));
+                t->vfork_release = 0;
+                TRY(xrt_detach_held_vfork(t));
+                const int stepping_here = t->stepping && t->step.tid == tid;
+                if (stepping_here || t->want_run) {
+                    const int hardware_step = stepping_here && !t->step.software;
+                    TRY(xrt_trace(hardware_step ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, 0));
+                    t->threads[i].state = XRT_RUNNING;
+                    t->threads[i].reason = XRT_STOP_NONE;
+                } else
+                    TRY(xrt_stop_peers(t));
+                continue;
+            }
             if (t->want_run) {
                 TRY(xrt_trace(PTRACE_CONT, tid, 0, 0));
                 t->threads[i].state = XRT_RUNNING;
@@ -162,7 +395,7 @@ static enum xrt_status poll(struct xrt_target *t)
         /* Consume only queued debugger interrupts. A genuine group stop or
          * explicit Pause must interrupt a previous run/step request. */
         if (kind == PTRACE_EVENT_STOP && sig == SIGTRAP && t->stepping && t->step.tid == tid &&
-            !t->step.interrupted) {
+            !t->step.interrupted && !t->step.software) {
             TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
             t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_NONE;
@@ -189,6 +422,14 @@ static enum xrt_status poll(struct xrt_target *t)
             const enum xrt_status pc_status = xrt_registers_pc(&regs, &pc);
             if (pc_status != XRT_OK)
                 return pc_status;
+            if (t->stepping && t->step.software && t->step.tid == tid) {
+                int handled = 0;
+                TRY(xrt_software_step_hit(t, i, pc, &handled));
+                if (handled == 2)
+                    continue;
+                if (handled == 1)
+                    goto software_stopped;
+            }
             if (t->stepping && t->step.tid == tid) {
                 const bool entry = t->step.has_exec_entry;
                 t->step.has_exec_entry = false;
@@ -196,7 +437,18 @@ static enum xrt_status poll(struct xrt_target *t)
                     t->arch->machine == XRT_X86_64
                         ? info.code == TRAP_BRKPT
                         : info.code == SI_USER && info.has_sender && !info.sender;
-                if (entry && pc == t->step.exec_entry_pc && exec_trap) {
+                /* m68k syscall return clears the trace bit and posts SIGTRAP
+                 * with SI_KERNEL before the stepped instruction runs. One more
+                 * single-step leaves that signal stop with the trace bit set.
+                 * exec_entry_pc is the pc at PTRACE_SINGLESTEP, then cleared
+                 * so a second kernel trap is reported. */
+                const bool m68k_delayed = t->arch->machine == XRT_M68K && !t->step.software &&
+                                          info.code == SI_KERNEL && t->step.exec_entry_pc != 0 &&
+                                          pc == t->step.exec_entry_pc;
+                if ((entry && pc == t->step.exec_entry_pc && exec_trap && !t->step.software) ||
+                    m68k_delayed) {
+                    if (m68k_delayed)
+                        t->step.exec_entry_pc = 0;
                     TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
                     t->threads[i].signal = 0;
                     t->threads[i].reason = XRT_STOP_NONE;
@@ -259,6 +511,7 @@ static enum xrt_status poll(struct xrt_target *t)
                 }
             }
         }
+    software_stopped:
         if (t->stepping && t->step.tid == tid)
             TRY(xrt_finish_step(t, false));
         xrt_target_event(t, XRT_EVENT_STOP, tid, sig);

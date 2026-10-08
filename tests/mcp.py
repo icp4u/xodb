@@ -34,6 +34,16 @@ def request(method, params=None):
 def tool(name, arguments=None):
     return request("tools/call", {"name": name, "arguments": arguments or {}})
 
+def observation(name, arguments=None):
+    deadline = time.monotonic() + 5
+    while True:
+        reply = tool(name, arguments)
+        result = reply.get('result', {}).get('structuredContent', {})
+        if result and all(not group['pending'] for group in result['cache'].values()) and not result['process_detail_pending']:
+            return result
+        assert time.monotonic() < deadline, reply
+        time.sleep(.02)
+
 pid = None
 try:
     assert request("tools/list")["error"]["code"] == -32002
@@ -69,6 +79,20 @@ try:
     assert tool("read_memory", {"address": registers["rip"], "length": 4097})["error"]["code"] == -32602
     assert tool("get_session", {"unexpected": True})["error"]["code"] == -32602
     assert tool("continue")["result"]["isError"]
+    # Whole-system observer tools answer without the target and agree with /proc.
+    names = {t["name"] for t in tools}
+    assert {"get_overview", "list_processes", "get_process", "get_connections", "get_sensors"} <= names
+    observed = observation("get_process", {"pid": pid})["processes"]["rows"][0]
+    stat = Path(f"/proc/{pid}/stat").read_text()
+    assert observed["pid"] == pid and observed["start_ticks"] == int(stat[stat.rindex(")") + 2:].split()[19])
+    assert observed["state"] in "tT" and observed["ppid"] == process.pid
+    listed = observation("list_processes", {"sort": "pid", "limit": 5, "redact": True})["processes"]
+    assert listed["shown"] == 5 and all(row["cmdline"] == {"state": "unavailable", "why": "redacted"} for row in listed["rows"])
+    overview = observation("get_overview", {"limit": 3})
+    assert overview["memory"]["total"] == int(Path("/proc/meminfo").read_text().split()[1]) * 1024
+    assert overview["groups"]["cpu"]["state"] == "ok" and "connections" not in overview
+    assert tool("get_process", {"pid": 2147483647})["result"]["isError"]
+    assert tool("list_processes", {"sort": "bogus"})["error"]["code"] == -32602
     assert request("not/a/method")["error"]["code"] == -32601
     process.stdin.write(b'{broken json}\n')
     process.stdin.flush()

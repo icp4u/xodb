@@ -15,9 +15,9 @@ import tarfile
 import urllib.request
 from pathlib import Path
 
-URL = 'https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha11.tar.gz'
-SHA256 = '635bc456097c3cfe69da28bfeb196a5e1d0b7631accb2ddaf7cd00cb587957bb'
-ARCHIVE_NAME = 'capstone-6.0.0-Alpha11.tar.gz'
+URL = 'https://github.com/capstone-engine/capstone/releases/download/6.0.0-Alpha11/capstone-6.0.0-Alpha11.tar.xz'
+SHA256 = '9883a30a139142caaa01694b1cb0f5e2fee6f029f10c60140a03ff1446ddc988'
+ARCHIVE_NAME = 'capstone-6.0.0-Alpha11.tar.xz'
 SOURCE_DIR_NAME = 'capstone-6.0.0-Alpha11'
 
 parser = argparse.ArgumentParser(description=__doc__)

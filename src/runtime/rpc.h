@@ -14,6 +14,10 @@
  * ranges. Zero preserves the ordinary 256 MiB snapshot policy, including
  * requests from older hosts. Older agents may still refuse large images. */
 #define XRT_RPC_FILE_SYMBOLS UINT64_C(1)
+/* HELLO arg[0] requests an optional u64 capability suffix. Old hosts keep the
+ * original 16-byte response; old agents ignore the request and return 16. */
+#define XRT_RPC_HELLO_CAPABILITIES UINT64_C(1)
+#define XRT_RPC_CAP_SOURCE UINT64_C(1)
 enum xrt_rpc_op {
     XRT_RPC_HELLO = 1,
     XRT_RPC_CREATE,
@@ -68,7 +72,8 @@ enum xrt_rpc_op {
     XRT_RPC_PERF_INFO,
     XRT_RPC_ALLOCATIONS_START,
     XRT_RPC_FUNCTION_START,
-    XRT_RPC_CONTROL_WRITE
+    XRT_RPC_CONTROL_WRITE,
+    XRT_RPC_SOURCE_OPEN
 };
 
 enum xrt_rpc_class {
@@ -101,6 +106,7 @@ static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
     case XRT_RPC_FILE_OPEN:
     case XRT_RPC_FILE_READ:
     case XRT_RPC_FILE_CLOSE:
+    case XRT_RPC_SOURCE_OPEN:
         return XRT_RPC_CLASS_FILE;
     case XRT_RPC_HELLO:
     case XRT_RPC_CREATE:
@@ -152,4 +158,5 @@ _Static_assert(XRT_AMBIGUOUS_MATCH == 76, "status 76 is ambiguous probe match");
 _Static_assert(XRT_RPC_ALLOCATIONS_START == 52, "allocation start stays 52");
 _Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
 _Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");
+_Static_assert(XRT_RPC_SOURCE_OPEN == 55, "source open is opcode 55");
 #endif

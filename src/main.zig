@@ -29,6 +29,11 @@ pub fn main(init: std.process.Init) !void {
         argv[args.len] = null;
         std.process.exit(@intCast(c.xodb_lsof_top(@intCast(args.len), @ptrCast(argv.ptr)) & 0xff));
     }
+    // The overview is its own window and session with no debug target.
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--overview")) return @import("ui/overview/run.zig").main(args, startup_started);
+    }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
     var config_path: ?[:0]const u8 = null;
@@ -39,6 +44,8 @@ pub fn main(init: std.process.Init) !void {
     var follow_forks = false;
     var process_limit: usize = 32;
     var attach: ?i32 = null;
+    var expected_start: ?u64 = null;
+    var start_profile = false;
     var listen: ?[:0]const u8 = null;
     var connect: ?[:0]const u8 = null;
     var ssh: ?[:0]const u8 = null;
@@ -49,6 +56,7 @@ pub fn main(init: std.process.Init) !void {
     var scope_explicit = false;
     var agent_scope: @import("model/session.zig").AgentScope = .observe;
     var source: ?[:0]const u8 = null;
+    var fetch_source = false;
     var font_path: [:0]const u8 = build_options.font_path ++ "";
     var frames: u64 = 0;
     var record_path: ?[:0]const u8 = null;
@@ -76,6 +84,10 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
+        if (std.mem.eql(u8, arg, "--start-profile")) {
+            start_profile = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 \\xodb — native Linux debugger (M1 workstation baseline)
@@ -99,6 +111,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
                 \\T cycles the next capture duration in the profile view; 0 in config/MCP means until stopped.
                 \\--debug-dir DIR replaces default /usr/lib/debug roots (repeatable); local companions are verified.
+                \\--fetch-source opts in to bounded source copies from --runtime-ssh/--runtime-agent; local files and --source-map win.
                 \\--source-map FROM=TO substitutes absolute source directory prefixes (repeatable; server paths).
                 \\--debug-file FILE explicitly supplies a build-ID-matched debug ELF (repeatable; server path).
                 \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
@@ -107,6 +120,8 @@ pub fn main(init: std.process.Init) !void {
                 \\O opens process selection; MCP process_id defaults to the original process regardless of GUI selection.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
+                \\--expected-start-ticks N refuses attach if the sampled process identity changed.
+                \\--start-profile attaches, starts a 99 Hz / 10 s CPU capture, and resumes the target.
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
@@ -123,15 +138,16 @@ pub fn main(init: std.process.Init) !void {
                 \\Owned targets are killed on close. Attached targets are detached and preserved.
                 \\--frames N exits after N rendered frames for graphical smoke testing.
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
+                \\--overview opens the system overview (no target); xodb --overview --help lists its options.
                 \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\
             , .{});
             return;
-        } else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
+        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -160,6 +176,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--listen")) listen = args[i];
             if (std.mem.eql(u8, arg, "--config")) config_path = args[i];
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
+            if (std.mem.eql(u8, arg, "--expected-start-ticks")) expected_start = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--profile-out")) profile_out = args[i];
             if (std.mem.eql(u8, arg, "--capture-out")) capture_out = args[i];
             if (std.mem.eql(u8, arg, "--open-frames")) open_frames = args[i];
@@ -208,10 +225,12 @@ pub fn main(init: std.process.Init) !void {
     const remote_gui = connect != null or ssh != null;
     if (session_socket != null and (mcp or listen != null or remote_gui)) return error.SharedSessionOptionConflict;
     if (remote_gui and (headless or mcp or listen != null or open_capture != null or symbols != null or record_path != null or capture_out != null or profile_out != null)) return error.RemoteGuiOptionConflict;
+    if (fetch_source and (runtime_agent == null and runtime_ssh == null or connect != null or ssh != null or core_file != null or open_profile != null or open_capture != null)) return error.SourceFetchRequiresRuntimeAgent;
     if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint_count != 0 or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
     if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
+    if ((expected_start != null or start_profile) and (attach == null or runtime_remote or remote_gui)) return error.IdentityRequiresLocalAttach;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
@@ -289,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
     session.debug_files.auto_total_limit = preferences.symbols.auto_total_bytes;
     for (debug_dirs.items) |path| try session.debug_files.addRoot(path);
     for (source_maps.items) |spec| try session.source_maps.add(spec);
+    session.fetch_source = fetch_source;
     for (debug_files.items) |path| session.debug_files.add(path) catch |err| {
         std.debug.print("xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
@@ -308,12 +328,21 @@ pub fn main(init: std.process.Init) !void {
     if (open_frames) |path| try session.openFrames(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
     if (attach) |pid| {
+        if (expected_start) |ticks| try @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks });
         const started = linux.now();
         std.debug.print("xodb: attaching to pid={d}\n", .{pid});
         session.target.attach(pid) catch |err| {
             std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
             return err;
         };
+        if (expected_start) |ticks| @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks }) catch |err| {
+            session.target.detach() catch {};
+            return err;
+        };
+        if (start_profile) {
+            _ = try session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
+            try session.continueExecution(.human);
+        }
         std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
     }
     if (launch.len > 0) try session.launch(launch);
@@ -333,7 +362,7 @@ pub fn main(init: std.process.Init) !void {
         if (!mcp and shared == null) return;
     }
     const server = try a.create(Server);
-    server.* = .{ .source_path = source };
+    server.* = .{ .source_path = source, .overview_shared = if (shared) |*endpoint| endpoint.collector() else null };
     if (listen != null) {
         server.input_fd = connection.fd;
         server.output_fd = connection.fd;
@@ -344,6 +373,7 @@ pub fn main(init: std.process.Init) !void {
         while (quitting == 0) {
             try tree.poll();
             if (mcp) {
+                try server.overviewTick();
                 try server.pump(session);
                 if (server.closed and server.queued == 0) break;
             }
@@ -432,6 +462,7 @@ pub fn main(init: std.process.Init) !void {
                 }
             }
             if (mcp) {
+                try server.overviewTick();
                 try server.pump(session);
                 if (server.closed and server.queued == 0) break;
             }
@@ -611,12 +642,22 @@ test {
         std.testing.refAllDecls(@import("ui/capture_setup.zig"));
         std.testing.refAllDecls(@import("ui/capture_panel.zig"));
         _ = @import("ui/invocations.zig");
+        _ = @import("ui/overview/theme.zig");
+        _ = @import("ui/overview/model.zig");
+        _ = @import("ui/overview/history.zig");
+        _ = @import("ui/overview/draw.zig");
+        _ = @import("ui/overview/replay.zig");
+        _ = @import("ui/overview/sysstat.zig");
+        _ = @import("ui/overview/view.zig");
+        _ = @import("ui/overview/run.zig");
     }
     std.testing.refAllDecls(@import("model/session.zig"));
+    _ = @import("model/remote_source.zig");
     _ = @import("semq/adapter.zig");
     _ = @import("semq/answer.zig");
     _ = @import("semq/host.zig");
     std.testing.refAllDecls(@import("mcp/static_analysis.zig"));
+    std.testing.refAllDecls(@import("mcp/overview.zig"));
     _ = @import("target/process_test.zig");
     std.testing.refAllDecls(@import("model/modules.zig"));
     std.testing.refAllDecls(@import("binary/apk.zig"));

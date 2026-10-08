@@ -255,8 +255,18 @@ static void synthetic(void)
     CHECK(xrt_fdscan_create(&budget, &s) == XRT_OK);
     CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
     const uint32_t all = v.process_count;
+    uint64_t baseline_ns = v.scan_ns;
+    /* Measure this filesystem/CPU, including the PID enumeration that must
+     * precede useful work. A fixed 1 ms can expire before the first process
+     * on emulated guests. Repeated scans reduce cold-cache/scheduling noise. */
+    for (unsigned trial = 0; trial < 2; trial++) {
+        CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+        CHECK(v.process_count == all);
+        if (v.scan_ns < baseline_ns)
+            baseline_ns = v.scan_ns;
+    }
     xrt_fdscan_destroy(s);
-    budget.budget_ms = 1;
+    budget.budget_ms = (uint32_t)(baseline_ns / UINT64_C(8000000)) + 1;
     CHECK(xrt_fdscan_create(&budget, &s) == XRT_OK);
     static unsigned char seen[4000];
     uint32_t covered = 0, polls = 0, first_scan = 0, stale_max = 0;
@@ -288,7 +298,8 @@ static void synthetic(void)
             stale_max = stale;
     }
     CHECK(first_scan < all && covered == all && stale_max > 0);
-    printf("budget 1 ms: %u of %u processes in the first scan; all reached after %u scans\n", first_scan, all, polls);
+    printf("budget %u ms (baseline %llu us): %u of %u processes in the first scan; all reached after %u scans\n",
+           budget.budget_ms, (unsigned long long)(baseline_ns / 1000), first_scan, all, polls);
     xrt_fdscan_destroy(s);
 }
 
@@ -521,6 +532,38 @@ static void remove_tree(const char *path)
     rmdir(path);
 }
 
+static void expected_identity(void)
+{
+    fake_process(600, "old", 0, 77, 1);
+    fake_fd(600, 3, "pipe:[23]", NULL);
+    const int32_t pid = 600;
+    struct xrt_fdscan_options o = { .include_self = 1, .proc = root, .pids = &pid, .pid_count = 1, .expected_start = 77 };
+    struct xrt_fdscan *s;
+    struct xrt_fd_snapshot v;
+    CHECK(xrt_fdscan_create(&o, &s) == XRT_OK);
+    CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+    CHECK(v.process_count == 1 && v.processes[0].start == 77 && v.fd_count == 1);
+    char original[512], saved[512];
+    snprintf(original, sizeof(original), "%s/600", root);
+    snprintf(saved, sizeof(saved), "%s/saved", root);
+    CHECK(rename(original, saved) == 0);
+    fake_process(600, "replacement", 0, 88, 2);
+    fake_fd(600, 4, "pipe:[999]", NULL);
+    CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+    CHECK(v.process_count == 1 && v.processes[0].start == 77 && !strcmp(v.processes[0].comm, "old") && v.fds[0].fd == 3);
+    remove_tree(saved); /* exit: a new task at the same numeric path is not followed */
+    CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+    CHECK(v.process_count == 0 && v.fd_count == 0 && v.gone == 1);
+    xrt_fdscan_destroy(s);
+    CHECK(xrt_fdscan_create(&o, &s) == XRT_OK); /* new directory, wrong identity */
+    CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+    CHECK(v.process_count == 0 && v.fd_count == 0 && v.gone == 1);
+    xrt_fdscan_destroy(s);
+    o.pid_count = 0;
+    CHECK(xrt_fdscan_create(&o, &s) == XRT_INVALID_ARGUMENT);
+    remove_tree(original);
+}
+
 int main(void)
 {
     const char *tmp = getenv("TMPDIR");
@@ -532,6 +575,7 @@ int main(void)
         return 1;
     }
     chmod(root, 0755);
+    expected_identity();
     synthetic();
     remove_tree(root);
     strcpy(root, template);

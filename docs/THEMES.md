@@ -18,6 +18,9 @@ saved-capture, imported-profile and remote GUI views. Successful loading is
 silent. There are no theme hotkeys, popups, file watchers or live reload.
 Restart xodb to apply edits or choose a different theme.
 
+`xodb --overview` is the exception: it has its own palettes, which `t` cycles
+(see [OVERVIEW.md](OVERVIEW.md)).
+
 An invalid theme falls back to built-in dark with a diagnostic on stderr.
 The bounded regular-file reader rejects FIFOs, devices, directories and
 oversized files. Theme loading completes before the GUI starts.

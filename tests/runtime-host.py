@@ -41,16 +41,29 @@ try:
         def refused(tool_name, text, **args):
             response = c.tool(tool_name, generation=c.session()['generation'], **args)
             assert response['result']['isError'] and response['result']['content'][0]['text'] == text, response
-        # System Capstone 5 reports unavailable. The private Capstone 6 build decodes.
+        # The host binary records the Capstone major it was compiled with.
+        # Major 6 decodes LoongArch. An older major refuses it.
+        blob = Path(os.environ.get('XODB_BIN', './zig-out/bin/xodb')).read_bytes()
+        marker = b'xodb-capstone-api-major:'
+        at = blob.find(marker)
+        assert at >= 0, 'host binary has no Capstone major marker'
+        end = at + len(marker)
+        while end < len(blob) and 48 <= blob[end] <= 57:
+            end += 1
+        major = int(blob[at + len(marker):end])
         dis = c.tool('disassemble', generation=c.session()['generation'], address=regs[pc])
-        if dis['result']['isError']:
-            assert dis['result']['content'][0]['text'] == 'DisassemblerUnavailable', dis
-            disasm_note = 'disassembly refused'
-        else:
+        if major >= 6:
             instructions = dis['result']['structuredContent']['instructions']
             assert instructions and instructions[0]['address'] == regs[pc], dis
             disasm_note = 'disassembly decoded'
-        refused('step_instruction', 'UnsupportedControl', tid=tid)
+        else:
+            assert dis['result']['isError'] and dis['result']['content'][0]['text'] == 'DisassemblerUnavailable', dis
+            disasm_note = 'disassembly refused'
+        c.action('step_instruction', tid=tid)
+        c.stopped('single_step')
+        stepped = c.inspect('get_registers', tid=tid)['registers']
+        assert stepped[pc] != regs[pc], (stepped[pc], regs[pc])
+        assert stepped['r0'] == regs['r0'], (stepped['r0'], regs['r0'])
         refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
         refused('start_profile', 'ProfilingUnsupportedArchitecture')
         refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
@@ -87,7 +100,7 @@ try:
         assert time.monotonic() < until
         time.sleep(.002)
     if a.arch == 'loongarch64':
-        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; step, watchpoints, profile and uprobes refused')
+        print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; watchpoints, profile and uprobes refused')
     else:
         print(f'C agent host integration passed ({a.arch}): target files, ELF, symbols, registers, break/step, disassembly, stack, expression and cleanup')
 finally:

@@ -1,6 +1,7 @@
 /* Build with arch.c/registers.c and an ordinary C compiler. An optional argv[1]
  * names an i386 executable for the x86-64 live ABI-mismatch regression. */
 #define _GNU_SOURCE 1
+#include "loongarch_step.h"
 #include "rpc.h"
 #include "xrt_arch.h"
 #include <errno.h>
@@ -243,7 +244,8 @@ static void contract(void)
     CHECK(xrt_rpc_classify(XRT_RPC_CREATE) == XRT_RPC_CLASS_READ);
     CHECK(xrt_rpc_classify(XRT_RPC_FILE_OPEN) == XRT_RPC_CLASS_FILE);
     CHECK(xrt_rpc_classify(0) == XRT_RPC_CLASS_PROTOCOL);
-    CHECK(xrt_rpc_classify(55) == XRT_RPC_CLASS_PROTOCOL);
+    CHECK(xrt_rpc_classify(XRT_RPC_SOURCE_OPEN) == XRT_RPC_CLASS_FILE);
+    CHECK(xrt_rpc_classify(56) == XRT_RPC_CLASS_PROTOCOL);
     CHECK(XRT_PARTIAL_REGISTER_WRITE == 71 && XRT_AMBIGUOUS_MATCH == 76);
 
     const struct xrt_arch *x86 = xrt_arch_get(XRT_X86_64);
@@ -460,7 +462,7 @@ static void loongarch_replay(void)
         CHECK(xrt_arch_resolve(foreign) == NULL);
     }
     CHECK(xrt_arch_step_resources(arch, XRT_ISA_MODE_ORDINARY, &step) == XRT_OK);
-    CHECK(step.hardware_step == 0 && step.software_probes == 0);
+    CHECK(step.hardware_step == 0 && step.software_probes == 2);
     memset(&encoding, 0x5a, sizeof(encoding));
     request = (struct xrt_probe_request){.address = 0x1000,
                                          .isa_mode = XRT_ISA_MODE_ORDINARY,
@@ -516,6 +518,90 @@ static void loongarch_replay(void)
         memset(raw, 0, sizeof(raw));
         CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r0", 2, 1) == XRT_REGISTER_NOT_WRITABLE);
         CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r12", 3, 1) == XRT_OK);
+    }
+    uint64_t gpr[32];
+    struct xrt_loongarch_plan plan;
+    memset(gpr, 0, sizeof(gpr));
+    gpr[0] = 0x84;
+    gpr[1] = 0x4321;
+    gpr[4] = 0x1000;
+    CHECK(xrt_loongarch_plan(0x1000, 0x00100000u, gpr, 0, NULL, 0, NULL) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_loongarch_plan(0x1000, 0x00100000u, gpr, 0, NULL, 1, &plan) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_loongarch_plan(0x1000, 0x00100000u, gpr, 0, NULL, 17, &plan) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_loongarch_plan(0x1001, 0x00100000u, gpr, 0, NULL, 0, &plan) == XRT_UNSUPPORTED_CONTROL);
+    CHECK(xrt_loongarch_plan(0x1000, 0x00100000u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.emulate == 0 && plan.count == 1 && plan.pc[0] == 0x1004);
+    CHECK(xrt_loongarch_plan(0x1000, 0x002b0064u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x1004);
+    CHECK(xrt_loongarch_plan(0x1000, 0x40000481u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.emulate == 0 && plan.count == 2 && plan.pc[0] == 0x41004 && plan.pc[1] == 0x1004);
+    CHECK(xrt_loongarch_plan(0x1000, 0x50000400u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.emulate == 0 && plan.count == 1 && plan.pc[0] == 0x1004);
+    CHECK(xrt_loongarch_plan(0x1000, 0x50000200u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == UINT64_C(0xfffffffff8001000));
+    CHECK(xrt_loongarch_plan(0x1000, 0x5000f800u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x10f8);
+    CHECK(xrt_loongarch_plan(0x1000, 0x50000000u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.emulate == 1 && plan.count == 0);
+    CHECK(xrt_loongarch_plan(0x1000, 0x54000000u, gpr, 0, NULL, 0, &plan) == XRT_UNSUPPORTED_CONTROL);
+    CHECK(xrt_loongarch_plan(0x1000, 0x4c000020u, gpr, 1u << 1, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == gpr[1]);
+    CHECK(xrt_loongarch_plan(0x1000, 0x4c000000u, gpr, 1u, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0);
+    CHECK(xrt_loongarch_plan(0x1000, 0x4c001000u, gpr, 1u, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 16);
+    CHECK(xrt_loongarch_plan(0x1000, 0x4c000080u, gpr, 1u << 4, NULL, 0, &plan) ==
+          XRT_UNSUPPORTED_CONTROL);
+    CHECK(xrt_loongarch_plan(0x1000, 0x4c000080u, gpr, 0, NULL, 0, &plan) == XRT_REGISTER_UNAVAILABLE);
+    CHECK(xrt_loongarch_plan(0x1000, 0x58000000u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x1004);
+    CHECK(xrt_loongarch_plan(0x1000, 0x58000400u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x1004);
+    /* Reviewer encodings: bceqz/bcnez are two-successor branches. +0 collapses
+     * onto the step PC, so only the fall-through is planted. jiscr stays refused. */
+    CHECK(xrt_loongarch_plan(0x1000, 0x48000000u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x1004); /* bceqz $fcc0, +0 */
+    CHECK(xrt_loongarch_plan(0x1000, 0x48000800u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 2 && plan.pc[0] == 0x1008 && plan.pc[1] == 0x1004); /* bceqz $fcc0, +8 */
+    CHECK(xrt_loongarch_plan(0x1000, 0x48000100u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 1 && plan.pc[0] == 0x1004); /* bcnez $fcc0, +0 */
+    CHECK(xrt_loongarch_plan(0x1000, 0x48000900u, gpr, 0, NULL, 0, &plan) == XRT_OK);
+    CHECK(plan.count == 2 && plan.pc[0] == 0x1008 && plan.pc[1] == 0x1004); /* bcnez $fcc0, +8 */
+    CHECK(xrt_loongarch_plan(0x1000, 0x48000200u, gpr, 0, NULL, 0, &plan) == XRT_UNSUPPORTED_CONTROL);
+    CHECK(xrt_loongarch_plan(0x1000, 0x002a0000u, gpr, 0, NULL, 0, &plan) == XRT_UNSUPPORTED_CONTROL);
+    {
+        const uint32_t forward[] = {0x00100000u, 0x21000000u, 0x43fff59fu};
+        CHECK(xrt_loongarch_plan(0x2000, 0x20000000u, gpr, 0, forward, 3, &plan) == XRT_OK);
+        CHECK(plan.emulate == 0 && plan.count == 1 && plan.pc[0] == 0x2010);
+    }
+    {
+        uint32_t forward[16];
+        for (int i = 0; i < 16; ++i)
+            forward[i] = 0x00100000u;
+        CHECK(xrt_loongarch_plan(0x2000, 0x20000000u, gpr, 0, forward, 16, &plan) ==
+              XRT_UNSUPPORTED_CONTROL);
+    }
+    {
+        const uint32_t forward[] = {0x20000000u, 0x21000000u};
+        CHECK(xrt_loongarch_plan(0x2000, 0x20000000u, gpr, 0, forward, 2, &plan) ==
+              XRT_UNSUPPORTED_CONTROL);
+    }
+    {
+        const uint32_t forward[] = {0x23000000u};
+        CHECK(xrt_loongarch_plan(0x2000, 0x20000000u, gpr, 0, forward, 1, &plan) ==
+              XRT_UNSUPPORTED_CONTROL);
+    }
+    {
+        /* addi.w then jirl then sc.w. The jirl would use GPRs from ll time. */
+        const uint32_t forward[] = {0x0280058cu, 0x4c000180u, 0x2100008cu};
+        gpr[12] = 0x9000;
+        CHECK(xrt_loongarch_plan(0x2000, 0x2000008cu, gpr, ~1u, forward, 3, &plan) ==
+              XRT_UNSUPPORTED_CONTROL);
+    }
+    {
+        const uint32_t forward[] = {0x54000400u, 0x21000000u};
+        CHECK(xrt_loongarch_plan(0x2000, 0x20000000u, gpr, 0, forward, 2, &plan) ==
+              XRT_UNSUPPORTED_CONTROL);
     }
 }
 

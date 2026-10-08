@@ -1,0 +1,130 @@
+[
+  {
+    "name": "get_overview",
+    "description": "Whole-system overview of this machine, independent of any debug target: uptime, load, per-CPU utilisation, frequency and topology, memory with swap/zswap and pressure, disks, filesystems, network, power and thermals, users, services, installed packages, system info, the top processes by CPU and the collector's own cost. Every value is a number or {state, why}; an unavailable value is never reported as 0. Rates are between this and the previous observation (interval_s). Reads the shared cache without sampling. A first request may be pending until the owner tick; inspect cache group ages and poll. Process detail requests refresh full IO/fd fields on that tick.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100,
+          "description": "Rows for processes and sensors, default 10"
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide user names, hosts, kernel/distro, command lines, addresses and private paths in this reply; does not change the shared cache."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "list_processes",
+    "description": "List system processes sorted by cpu, memory (RSS), io (storage bytes/s), fds, threads, start or pid. Identity is pid plus start_ticks. Fields this account cannot read (other users' io and fds) are unavailable with the reason. Reads the shared cache without sampling. A first request may be pending until the owner tick; inspect cache group ages and poll. Process detail requests refresh full IO/fd fields on that tick.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "sort": {
+          "type": "string",
+          "enum": [
+            "cpu",
+            "memory",
+            "io",
+            "fds",
+            "threads",
+            "start",
+            "pid"
+          ]
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "description": "Default 25"
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide user names, hosts, kernel/distro, command lines, addresses and private paths in this reply; does not change the shared cache."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_process",
+    "description": "One system process by pid with its sockets: CPU %, memory, io, fds, threads, user, cgroup and command line. Reads the shared cache without sampling. A first request may be pending until the owner tick; inspect cache group ages and poll. Process detail requests refresh full IO/fd fields on that tick.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide user names, hosts, kernel/distro, command lines, addresses and private paths in this reply; does not change the shared cache."
+        }
+      },
+      "required": [
+        "pid"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_connections",
+    "description": "TCP, UDP and unix sockets from sock_diag with owner pid where this account can see it, plus totals. Reads the shared cache without sampling. A first request may be pending until the owner tick; inspect cache group ages and poll. Process detail requests refresh full IO/fd fields on that tick.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2000,
+          "description": "Default 100"
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide user names, hosts, kernel/distro, command lines, addresses and private paths in this reply; does not change the shared cache."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_sensors",
+    "description": "Power and thermals: every hwmon sensor with label, max and crit, GPU busy/power/temperature/VRAM, CPU package power (RAPL) and supplies, plus CPU and disk temperatures. Reads the shared cache without sampling. A first request may be pending until the owner tick; inspect cache group ages and poll. Process detail requests refresh full IO/fd fields on that tick.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

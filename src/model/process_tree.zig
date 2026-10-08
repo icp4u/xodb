@@ -147,6 +147,7 @@ pub const Tree = struct {
         child.static_analysis.toolchain_dir = parent.static_analysis.toolchain_dir;
         child.symbol_files = self.root().symbolFiles();
         child.source_map_owner = self.root().sourceMaps();
+        child.fetch_source = self.root().fetch_source;
         // Clone logical policies before the kernel child is transferred: any
         // allocation failure leaves that birth safely owned by its parent.
         try parent.persistent.copyForFork(&child.persistent);

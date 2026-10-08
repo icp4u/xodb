@@ -159,6 +159,7 @@ struct xrt_fdscan_options {
     uint32_t budget_ms;     /* 0: unbounded scan time */
     const int32_t *pids;    /* restrict to these processes; NULL: all of /proc */
     uint32_t pid_count;
+    uint64_t expected_start; /* nonzero: exactly one pid; pin its proc directory and require this start tick */
     int include_self;
     const char *proc;       /* procfs root; NULL: "/proc" */
 };

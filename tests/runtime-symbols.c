@@ -43,9 +43,9 @@ static void one(bool wide)
     put(symbols+syms+(wide ? 6 : 14), 3, 2, wide);
     int input=memfd_create("symbol-input",0), output=memfd_create("symbol-output",0);
     assert(input>=0 && output>=0 && !ftruncate(input,(off_t)size) && !ftruncate(output,(off_t)size));
-    assert(pwrite(input,header,hs,0)==hs);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==4*ss);
-    assert(pwrite(input,symbols,2*syms,(off_t)symoff)==2*syms);
+    assert(pwrite(input,header,hs,0)==(ssize_t)hs);
+    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
+    assert(pwrite(input,symbols,2*syms,(off_t)symoff)==(ssize_t)(2*syms));
     assert(pwrite(input,"\0named_function\0",16,(off_t)(symoff+128))==16);
     assert(pwrite(input,"NOT SYMBOL DATA!",16,4096)==16);
     struct input in={input,0,false};
@@ -58,11 +58,11 @@ static void one(bool wide)
     assert(pread(output,got,2,wide ? 62 : 50)==2 && !got[0] && !got[1]);
     in.refuse=true; assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_DISCOVERY_PENDING); in.refuse=false;
     put(sections+ss+(wide ? 40 : 24), 4, 4, wide);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==4*ss);
+    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
     assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
     put(sections+ss+(wide ? 40 : 24), 2, 4, wide);
     put(sections+2*ss+(wide ? 32 : 20), size, wide ? 8 : 4, wide);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==4*ss);
+    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
     assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
     close(input);close(output);
 }

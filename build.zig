@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "../profile/allocation_broker.c" };
+const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -16,6 +16,7 @@ pub fn build(b: *std.Build) void {
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", gui);
+    options.addOption(bool, "capstone_vendored", capstone_link == .vendored);
     options.addOption([]const u8, "font_path", font_path);
     module.addOptions("build_options", options);
     module.addIncludePath(b.path("src/profile"));
@@ -27,6 +28,9 @@ pub fn build(b: *std.Build) void {
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // lsof-top: a terminal view over the runtime's fd scanner (xodb --lsof-top).
     module.addCSourceFile(.{ .file = b.path("src/lsoftop/lsoftop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    // Host-only whole-system observer (overview view and MCP); not part of the agent.
+    for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c" }) |source|
+        module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // Static queries (src/semq) and the supervised ghx worker driver; the
     // Ghidra worker itself stays a separate, opt-in host tool (tools/ghx).
     module.addIncludePath(b.path("src/semq"));
@@ -44,6 +48,16 @@ pub fn build(b: *std.Build) void {
     switch (capstone_link) {
         .system => module.linkSystemLibrary("capstone", .{}),
         .vendored => {
+            // Zig 0.16 filesystem calls take an Io. Existence is mode 0 (F_OK).
+            const io = b.graph.io;
+            b.build_root.handle.access(io, ".work/capstone/lib/libcapstone.a", .{}) catch {
+                std.debug.print("vendored Capstone prefix is missing; run scripts/build-capstone\n", .{});
+                std.process.exit(1);
+            };
+            b.build_root.handle.access(io, ".work/capstone/include/capstone/capstone.h", .{}) catch {
+                std.debug.print("vendored Capstone prefix is missing; run scripts/build-capstone\n", .{});
+                std.process.exit(1);
+            };
             module.addIncludePath(b.path(".work/capstone/include"));
             module.addLibraryPath(b.path(".work/capstone/lib"));
             module.linkSystemLibrary("capstone", .{
@@ -128,6 +142,10 @@ pub fn build(b: *std.Build) void {
         // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
         exe.use_llvm = true;
         tests.use_llvm = true;
+        // libcapstone.a is linked statically. A search path must not become a
+        // RUNPATH; that would record the build tree in the binary.
+        exe.each_lib_rpath = false;
+        tests.each_lib_rpath = false;
     }
     const runtime_tests = b.addExecutable(.{ .name = "xodb-runtime-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     runtime_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -136,7 +154,7 @@ pub fn build(b: *std.Build) void {
     }
     const register_tests = b.addExecutable(.{ .name = "xodb-runtime-register-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     register_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/registers.c", "tests/runtime-registers.c" }) |source| {
+    for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/registers.c", "src/runtime/loongarch_step.c", "tests/runtime-registers.c" }) |source| {
         register_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     const process_tests = b.addExecutable(.{ .name = "xodb-runtime-process-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -174,6 +192,16 @@ pub fn build(b: *std.Build) void {
     }
     agent.root_module.addCSourceFile(.{ .file = b.path("src/runtime/agent_main.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     snapshot_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-snapshot.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    const sysstat_tests = b.addExecutable(.{ .name = "xodb-runtime-sysstat-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    sysstat_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c", "tests/runtime-sysstat.c" }) |source| {
+        sysstat_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
+    const sys_services_tests = b.addExecutable(.{ .name = "xodb-runtime-services-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    sys_services_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c", "tests/runtime-services.c" }) |source| {
+        sys_services_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    }
     const loader_tests = b.addExecutable(.{ .name = "xodb-runtime-loader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     loader_tests.pie = false;
     loader_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -279,7 +307,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -297,4 +325,6 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
     test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
+    test_step.dependOn(&b.addRunArtifact(sysstat_tests).step);
+    test_step.dependOn(&b.addRunArtifact(sys_services_tests).step);
 }

@@ -191,11 +191,13 @@ pub const Manager = struct {
     }
     fn installHook(self: *Manager, session: anytype) void {
         if (self.hook != null or self.entries.items.len == 0) return;
-        // Resuming a planted breakpoint takes a hardware step. Skip discovery
-        // when the row cannot take that step. Symbols already in the maps
-        // still resolve.
-        if (session.target.arch().descriptor().hardware_step == 0) {
-            self.loader_status = "loader rendezvous needs a hardware step";
+        // Resuming a planted breakpoint needs a hardware step or software
+        // successors. Skip discovery when the row has neither. Symbols already
+        // in the maps still resolve.
+        var step_resources = std.mem.zeroes(rt.struct_xrt_step_resources);
+        const step_status = rt.xrt_arch_step_resources(session.target.arch().descriptor(), rt.XRT_ISA_MODE_ORDINARY, &step_resources);
+        if (step_status != rt.XRT_OK or (step_resources.hardware_step == 0 and step_resources.software_probes == 0)) {
+            self.loader_status = "loader rendezvous needs a hardware or software step";
             return;
         }
         // Retry incomplete bootstrap metadata at later stops, at most once

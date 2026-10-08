@@ -309,6 +309,10 @@ enum xrt_status xrt_target_detach(struct xrt_target *t)
         TRY(xrt_target_interrupt(t));
         TRY(xrt_target_wait_stopped(t));
     }
+    /* A shared vfork child is not one of our threads. Detach it before the
+     * parent is released, or the parent stays blocked in the kernel. */
+    TRY(xrt_detach_held_vfork(t));
+    t->vfork_release = 0;
     /* Restore a half-planted trap before this process is released. */
     if (t->plant_cleanup.active &&
         (t->state != XRT_STOPPED || xrt_target_retry_plant_cleanup(t) != XRT_OK))
@@ -443,6 +447,7 @@ enum xrt_status xrt_target_close(struct xrt_target *t)
         return XRT_OK;
     }
     xrt_reap_detached(t);
+    xrt_drop_vfork_hold(t);
     if (!t->pid)
         return XRT_OK;
     if (t->owned)

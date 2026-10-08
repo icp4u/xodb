@@ -21,9 +21,11 @@ pub const api = @cImport({
     @cInclude("sys/prctl.h");
     @cInclude("sys/mman.h");
     @cInclude("sys/stat.h");
+    @cInclude("sys/file.h");
     @cInclude("sys/sysmacros.h");
     @cInclude("../runtime/mapped_file.h");
     @cInclude("../lsoftop/lsoftop.h");
+    @cInclude("../runtime/xrt_sysstat.h");
     @cInclude("../text.h");
     if (gui) {
         @cInclude("wayland-client.h");

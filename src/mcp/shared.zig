@@ -12,6 +12,12 @@ pub const Endpoint = struct {
     service: *c.struct_xsvc,
     clients: [c.XSVC_MAX_PEERS]?Client = @splat(null),
     source_path: ?[:0]const u8,
+    overview: @import("overview.zig").State = .{},
+    overview_shared: ?*@import("overview.zig").State = null,
+    overview_only: bool = false,
+    pub fn collector(self: *Endpoint) *@import("overview.zig").State {
+        return self.overview_shared orelse &self.overview;
+    }
     const Client = struct { id: u64, server: *Server, accepted: u64, progressed: u64 };
     pub fn init(path: [:0]const u8, source: ?[:0]const u8) !Endpoint {
         const service = c.xsvc_open(path.ptr) orelse {
@@ -27,6 +33,7 @@ pub const Endpoint = struct {
             slot.* = null;
         };
         c.xsvc_close(self.service);
+        self.overview.deinit();
     }
     fn drop(self: *Endpoint, slot: *?Client) void {
         const client = slot.* orelse return;
@@ -47,6 +54,7 @@ pub const Endpoint = struct {
         return result;
     }
     pub fn pump(self: *Endpoint, root: *Session) !void {
+        if (self.overview_shared == null) _ = try self.overview.tick(linux.now(), 0, false);
         try context.check(c.xsvc_tick(self.service, linux.now(), @intFromEnum(root.agent_scope)));
         // Bound accept work even when the listener is being flooded.
         for (0..c.XSVC_MAX_PEERS) |_| {
@@ -58,7 +66,7 @@ pub const Endpoint = struct {
                 _ = c.xsvc_drop(self.service, peer.id, linux.now());
                 continue;
             };
-            server.* = .{ .input_fd = peer.fd, .output_fd = peer.fd, .source_path = self.source_path, .shared = .{ .service = self.service, .client_id = peer.id }, .request_limit = 1 };
+            server.* = .{ .input_fd = peer.fd, .output_fd = peer.fd, .source_path = self.source_path, .shared = .{ .service = self.service, .client_id = peer.id }, .request_limit = 1, .overview_shared = self.collector(), .overview_only = self.overview_only };
             server.init() catch {
                 allocator.destroy(server);
                 _ = c.xsvc_drop(self.service, peer.id, linux.now());

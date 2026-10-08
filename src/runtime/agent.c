@@ -5,6 +5,8 @@
 #include "wire_target.h"
 #include "perf_remote.h"
 #include "target_internal.h"
+#include "xrt_source.h"
+#include "source_budget.h"
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -20,13 +22,14 @@ struct agent_file {
     uint32_t id, target;
     int fd;
     uint64_t position;
-    bool regular;
+    bool regular, source;
     struct xrt_file_identity identity;
 };
 struct agent {
     struct xrt_agent_perf *collectors;
     struct entry entries[XRT_RPC_TARGETS];
     uint32_t next_id, next_file;
+    struct xrt_source_budget source_budget;
     struct agent_file files[32];
     char file_path[8192];
     uint8_t *request, *reply, *extra;
@@ -83,6 +86,10 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         xrt_codec_u64(&extra, &now);
         xrt_codec_u32(&extra, &hz);
         xrt_codec_u32(&extra, &page);
+        if (args[0] == XRT_RPC_HELLO_CAPABILITIES) {
+            uint64_t caps = XRT_RPC_CAP_SOURCE;
+            xrt_codec_u64(&extra, &caps);
+        }
         *extra_size = extra.at;
         *value = arch ? arch->machine : 0;
         return arch ? XRT_OK : XRT_UNSUPPORTED_ARCHITECTURE;
@@ -127,7 +134,7 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     }
     if (size && frame->op != XRT_RPC_LAUNCH && frame->op != XRT_RPC_WRITE &&
         frame->op != XRT_RPC_REGISTER_WRITE && frame->op != XRT_RPC_FILE_OPEN &&
-        frame->op != XRT_RPC_CONTROL_WRITE)
+        frame->op != XRT_RPC_CONTROL_WRITE && frame->op != XRT_RPC_SOURCE_OPEN)
         return XRT_INVALID_ARGUMENT;
     enum xrt_status status = XRT_OK;
     switch (frame->op) {
@@ -311,6 +318,42 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
             xrt_target_event(t, (enum xrt_event_kind)args[0], (int32_t)args[1], detail);
         }
         return XRT_OK;
+    case XRT_RPC_SOURCE_OPEN: {
+        struct xrt_source_file meta = {.reason=XRT_SOURCE_INVALID_REQUEST};
+        unsigned slot = 0;
+        while (slot < 32 && a->files[slot].id) ++slot;
+        status = XRT_INVALID_ARGUMENT;
+        struct xrt_file_request request = {0};
+        struct xrt_codec file = xrt_codec(data, size, true);
+        xrt_wire_file_request(&file, &request, a->file_path, sizeof a->file_path);
+        if (slot == 32 || a->next_file == UINT32_MAX) {
+            meta.reason=XRT_SOURCE_COUNT_LIMIT; status=XRT_FILE_LIMIT;
+        } else if (file.ok && file.at < file.size && file.size-file.at <= 4096 &&
+            data[file.size-1] == 0 && !memchr(data+file.at,0,file.size-file.at-1) &&
+            args[0] == t->image_epoch && !args[1] && !args[2] && t->state == XRT_STOPPED) {
+            if (!xrt_source_budget_take(&a->source_budget,xrt_now())) {
+                meta.reason=XRT_SOURCE_COUNT_LIMIT; status=XRT_FILE_LIMIT;
+            } else {
+                int fd=-1;
+                status=xrt_source_local(t,&request,(const char *)data+file.at,&fd,&meta);
+                if (status==XRT_OK) {
+                    struct agent_file opened={.id=++a->next_file,.target=frame->target,
+                        .fd=fd,.regular=true,.source=true,.identity=meta.identity};
+                    a->files[slot]=opened; *value=opened.id;
+                }
+            }
+        }
+        struct xrt_codec extra=xrt_codec(a->extra,XRT_RPC_DATA_MAX,false);
+        uint32_t reason=(uint32_t)meta.reason;
+        xrt_codec_u32(&extra,&reason);
+        if (status==XRT_OK) {
+            xrt_wire_file_identity(&extra,&meta.identity);
+            xrt_codec_u32(&extra,&meta.build_id_size);
+            xrt_codec_bytes(&extra,meta.build_id,meta.build_id_size);
+        }
+        *extra_size=extra.at;
+        return status;
+    }
     case XRT_RPC_FILE_OPEN: {
         *snapshot = NULL;
         if (args[0] > XRT_RPC_FILE_SYMBOLS) return XRT_INVALID_ARGUMENT;
@@ -374,6 +417,8 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         if (args[2] > XRT_RPC_DATA_MAX || args[1] > INT64_MAX ||
             (!file->regular && args[1] != file->position))
             return XRT_INVALID_ARGUMENT;
+        if (file->source && (file->identity.size < 0 || args[1] > (uint64_t)file->identity.size ||
+            args[2] > (uint64_t)file->identity.size - args[1])) return XRT_INVALID_ARGUMENT;
         ssize_t got;
         do {
             got = file->regular ? pread(file->fd, a->extra, (size_t)args[2], (off_t)args[1])

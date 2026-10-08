@@ -29,6 +29,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
     steps.append(('demo-binary', [sys.executable, '-B', 'tests/demo-binary.py'], 30))
     if live:
+        steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
+        steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
@@ -54,6 +56,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                           '--read-delay-ms', '0', '--rate', '10000000000',
                           '--timeout', '70', '--cases', 'complete', 'interrupt'], 150))
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
+        steps.append(('source-fetch', [sys.executable, '-B', 'tests/source-fetch.py'], 180))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
         if node:
             steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
@@ -100,6 +103,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
             steps.append((name, [sys.executable, '-B', *args], 90))
+        # Many OCR passes on a private display; bounded well above its usual few minutes.
+        steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900))
+        steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         if node:
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
             steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
@@ -324,11 +330,20 @@ def main():
             report.update(status='blocked', reason='Missing tools: ' + ', '.join(missing))
             return 2
         capstone_prefix = ROOT / '.work' / 'capstone'
+        capstone_lib = capstone_prefix / 'lib' / 'libcapstone.a'
         if args.capstone == 'vendored' and not (
-                (capstone_prefix / 'lib' / 'libcapstone.a').is_file()
+                capstone_lib.is_file()
                 and (capstone_prefix / 'include' / 'capstone' / 'capstone.h').is_file()):
             report.update(status='blocked', reason='Vendored Capstone prefix missing; run scripts/build-capstone')
             return 2
+        if args.capstone == 'vendored':
+            stamp_path = capstone_prefix / 'BUILD-STAMP'
+            report['capstone_build_stamp'] = stamp_path.read_text() if stamp_path.is_file() else None
+            digest = hashlib.sha256()
+            with capstone_lib.open('rb') as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b''):
+                    digest.update(chunk)
+            report['capstone_lib_sha256'] = digest.hexdigest()
         try:
             left, right = socket.socketpair()
             with left, right:

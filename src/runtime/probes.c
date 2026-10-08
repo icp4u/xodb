@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include "loongarch_step.h"
 
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address)
 {
@@ -45,37 +46,76 @@ enum xrt_status xrt_patch_instruction(struct xrt_target *t, uint64_t address, co
     TRY(xrt_target_stopped_tid(t, &tid));
     return xrt_patch_instruction_tid(t, tid, address, bytes, width);
 }
+enum xrt_status xrt_target_commit_bytes(struct xrt_target *t, uint64_t address,
+                                        const uint8_t bytes[4], const uint8_t rollback[4],
+                                        uint8_t width)
+{
+    if (!t || !bytes || !rollback)
+        return XRT_INVALID_ARGUMENT;
+    if (!t->identity_admitted)
+        return XRT_UNSUPPORTED_ARCHITECTURE;
+    if (t->plant_cleanup.active)
+        return XRT_INVALID_STATE;
+    if (width < 1 || width > 4)
+        return XRT_INVALID_ARGUMENT;
+    int32_t tid;
+    TRY(xrt_target_stopped_tid(t, &tid));
+    size_t accepted = 0;
+    const enum xrt_status status = xrt_target_patch_span(t, tid, address, bytes, width, &accepted);
+    if (status == XRT_OK && accepted == width)
+        return XRT_OK;
+    if (!accepted)
+        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
+    size_t restored = 0;
+    const enum xrt_status back =
+        xrt_target_patch_span(t, tid, address, rollback, accepted, &restored);
+    if (back == XRT_OK && restored == accepted)
+        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
+    t->plant_cleanup.active = 1;
+    t->plant_cleanup.address = address;
+    t->plant_cleanup.width = width;
+    memcpy(t->plant_cleanup.original, rollback, 4);
+    return XRT_PARTIAL_MEMORY_WRITE;
+}
 enum xrt_status xrt_target_commit_plant(struct xrt_target *t, uint64_t address,
                                         const struct xrt_probe_encoding *encoding,
                                         const uint8_t original[4])
 {
     if (!t || !encoding || !original)
         return XRT_INVALID_ARGUMENT;
-    if (!t->identity_admitted)
-        return XRT_UNSUPPORTED_ARCHITECTURE;
-    if (t->plant_cleanup.active)
-        return XRT_INVALID_STATE;
-    if (encoding->width < 1 || encoding->width > 4)
+    return xrt_target_commit_bytes(t, address, encoding->bytes, original, encoding->width);
+}
+enum xrt_status xrt_target_commit_owned(struct xrt_target *t, uint64_t address,
+                                        const uint8_t bytes[4], const uint8_t rollback[4],
+                                        uint8_t width)
+{
+    if (!t || !bytes || !rollback)
         return XRT_INVALID_ARGUMENT;
-    int32_t tid;
-    TRY(xrt_target_stopped_tid(t, &tid));
-    size_t accepted = 0;
-    const enum xrt_status status =
-        xrt_target_patch_span(t, tid, address, encoding->bytes, encoding->width, &accepted);
-    if (status == XRT_OK && accepted == encoding->width)
+    /* The patch seam is how a host test simulates a multi-byte trap. */
+    if (!t->patch && (!t->arch || !xrt_arch_breakpoint_valid(t->arch->machine, address, width)))
+        return XRT_INVALID_BREAKPOINT_ADDRESS;
+    return xrt_target_commit_bytes(t, address, bytes, rollback, width);
+}
+enum xrt_status xrt_target_settle_plant_cleanup(struct xrt_target *t, int drop_if_exited)
+{
+    if (!t)
+        return XRT_INVALID_ARGUMENT;
+    if (!t->plant_cleanup.active)
         return XRT_OK;
-    if (!accepted)
-        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
-    size_t restored = 0;
-    const enum xrt_status back =
-        xrt_target_patch_span(t, tid, address, original, accepted, &restored);
-    if (back == XRT_OK && restored == accepted)
-        return status != XRT_OK ? status : XRT_PARTIAL_MEMORY_WRITE;
-    t->plant_cleanup.active = 1;
-    t->plant_cleanup.address = address;
-    t->plant_cleanup.width = encoding->width;
-    memcpy(t->plant_cleanup.original, original, 4);
-    return XRT_PARTIAL_MEMORY_WRITE;
+    if (drop_if_exited && t->state == XRT_EXITED) {
+        t->plant_cleanup.active = 0;
+        return XRT_OK;
+    }
+    if (t->state != XRT_STOPPED)
+        return XRT_INVALID_STATE;
+    const enum xrt_status status = xrt_target_retry_plant_cleanup(t);
+    if (status == XRT_OK)
+        return XRT_OK;
+    if (drop_if_exited && status == XRT_PROCESS_GONE) {
+        t->plant_cleanup.active = 0;
+        return XRT_OK;
+    }
+    return XRT_INVALID_STATE;
 }
 enum xrt_status xrt_target_retry_plant_cleanup(struct xrt_target *t)
 {
@@ -365,7 +405,7 @@ enum xrt_status xrt_target_breakpoint_withdraw(struct xrt_target *t, uint64_t id
         return XRT_UNKNOWN_BREAKPOINT;
     struct xrt_breakpoint *p = &t->breakpoints[i];
     if (p->patched)
-        TRY(xrt_patch_instruction(t, p->address, p->original, p->width));
+        TRY(xrt_target_commit_owned(t, p->address, p->original, p->planted, p->width));
     const bool enabled = p->enabled;
     const uint64_t kept = p->id;
     const bool internal = p->internal;
@@ -394,7 +434,8 @@ enum xrt_status xrt_target_breakpoint_enable(struct xrt_target *t, uint64_t id, 
     if (p->enabled == enabled)
         return XRT_OK;
     if (!p->pending)
-        TRY(xrt_patch_instruction(t, p->address, enabled ? p->planted : p->original, p->width));
+        TRY(xrt_target_commit_owned(t, p->address, enabled ? p->planted : p->original,
+                                    enabled ? p->original : p->planted, p->width));
     p->enabled = enabled;
     p->patched = enabled && !p->pending;
     ++t->generation;
@@ -431,18 +472,282 @@ enum xrt_status xrt_target_breakpoint_remove(struct xrt_target *t, uint64_t id)
         return XRT_UNKNOWN_BREAKPOINT;
     const struct xrt_breakpoint p = t->breakpoints[i];
     if (p.patched)
-        TRY(xrt_patch_instruction(t, p.address, p.original, p.width));
+        TRY(xrt_target_commit_owned(t, p.address, p.original, p.planted, p.width));
     t->breakpoints[i] = t->breakpoints[--t->breakpoint_count];
     xrt_target_event(t, XRT_EVENT_BREAKPOINT_REMOVED, t->pid, (int64_t)id);
+    return XRT_OK;
+}
+static enum xrt_status unplant_overlay(struct xrt_target *t, uint64_t id)
+{
+    const int b = xrt_breakpoint_index(t, id);
+    if (b < 0)
+        return XRT_OK;
+    struct xrt_breakpoint *p = &t->breakpoints[b];
+    if (!p->patched)
+        return XRT_OK;
+    TRY(xrt_target_commit_owned(t, p->address, p->original, p->planted, p->width));
+    p->patched = false;
+    xrt_sync_shared_patch(t, id, false);
+    return XRT_OK;
+}
+static enum xrt_status drop_owned_probe(struct xrt_target *t, uint64_t id, uint8_t owned)
+{
+    if (!id)
+        return XRT_OK;
+    if (owned == 1)
+        return xrt_target_breakpoint_remove(t, id);
+    if (owned == 2)
+        return unplant_overlay(t, id);
+    return XRT_OK;
+}
+static void restore_rearm(struct xrt_target *t, uint64_t rearm)
+{
+    if (!rearm)
+        return;
+    const int b = xrt_breakpoint_index(t, rearm);
+    if (b < 0 || t->breakpoints[b].patched)
+        return;
+    struct xrt_breakpoint *p = &t->breakpoints[b];
+    if (xrt_target_commit_owned(t, p->address, p->planted, p->original, p->width) == XRT_OK) {
+        p->patched = true;
+        xrt_sync_shared_patch(t, rearm, true);
+    } else {
+        t->inherited_rearm = true;
+        ++t->generation;
+    }
+}
+static enum xrt_status plant_one(struct xrt_target *t, uint64_t address, uint64_t *id,
+                                 uint8_t *owned)
+{
+    *id = 0;
+    *owned = 0;
+    const int existing = xrt_breakpoint_at(t, address);
+    if (existing >= 0) {
+        struct xrt_breakpoint *p = &t->breakpoints[existing];
+        if (!p->enabled) {
+            /* A disabled user probe still needs a trap for this step. Plant
+             * under the record and unplant it afterwards; do not delete it. */
+            TRY(xrt_target_commit_owned(t, p->address, p->planted, p->original, p->width));
+            p->patched = true;
+            xrt_sync_shared_patch(t, p->id, true);
+            *id = p->id;
+            *owned = 2;
+            return XRT_OK;
+        }
+        *id = p->id;
+        return XRT_OK;
+    }
+    const enum xrt_status planted = xrt_target_breakpoint_set(t, address, true, id);
+    if (planted == XRT_EXISTING_TRAP_INSTRUCTION) {
+        /* A program break 0, including __builtin_trap, already stops here. */
+        *id = 0;
+        *owned = 0;
+        return XRT_OK;
+    }
+    if (planted != XRT_OK)
+        return planted;
+    const enum xrt_status marked = xrt_target_breakpoint_internal(t, *id, true);
+    if (marked != XRT_OK) {
+        const enum xrt_status removed = xrt_target_breakpoint_remove(t, *id);
+        *id = 0;
+        return removed != XRT_OK ? removed : marked;
+    }
+    *owned = 1;
+    return XRT_OK;
+}
+enum xrt_status xrt_software_plant(struct xrt_target *t, const uint64_t *pcs, uint8_t count,
+                                   uint64_t ids[2], uint8_t owned[2])
+{
+    if (!t || !pcs || !ids || !owned || !count || count > 2)
+        return XRT_INVALID_ARGUMENT;
+    ids[0] = ids[1] = 0;
+    owned[0] = owned[1] = 0;
+    for (uint8_t i = 0; i < count; ++i) {
+        if (i && pcs[i] == pcs[0]) {
+            ids[i] = ids[0];
+            continue;
+        }
+        const enum xrt_status status = plant_one(t, pcs[i], &ids[i], &owned[i]);
+        if (status != XRT_OK) {
+            const enum xrt_status rolled = drop_owned_probe(t, ids[0], owned[0]);
+            ids[0] = ids[1] = 0;
+            owned[0] = owned[1] = 0;
+            return rolled != XRT_OK ? rolled : status;
+        }
+    }
+    return XRT_OK;
+}
+static enum xrt_status read_word(struct xrt_target *t, uint64_t address, uint32_t *out)
+{
+    uint8_t buf[4];
+    size_t count = 0;
+    const enum xrt_status status = xrt_target_read(t, address, buf, 4, &count);
+    if (status != XRT_OK)
+        return status;
+    if (count != 4)
+        return XRT_MEMORY_UNREADABLE;
+    *out = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
+           ((uint32_t)buf[3] << 24);
+    return XRT_OK;
+}
+static enum xrt_status loongarch_software_begin(struct xrt_target *t, int32_t tid, bool stop_after)
+{
+    TRY(xrt_target_settle_plant_cleanup(t, 0));
+    TRY(xrt_rearm_inherited(t));
+    if (t->state != XRT_STOPPED || t->stepping)
+        return XRT_NOT_STOPPED;
+    TRY(xrt_ensure_watches(t));
+    const int i = xrt_thread_index(t, tid);
+    if (i < 0)
+        return XRT_UNKNOWN_THREAD;
+    struct xrt_registers regs;
+    TRY(xrt_target_registers(t, tid, &regs));
+    uint64_t pc = 0;
+    TRY(xrt_registers_pc(&regs, &pc));
+    uint32_t insn = 0;
+    TRY(read_word(t, pc, &insn));
+    uint32_t forward[16];
+    uint8_t nforward = 0;
+    for (; nforward < 16; ++nforward) {
+        if (pc > UINT64_MAX - 4ull * (nforward + 1))
+            break;
+        uint32_t word = 0;
+        if (read_word(t, pc + 4ull * (nforward + 1), &word) != XRT_OK)
+            break;
+        forward[nforward] = word;
+    }
+    /* Architectural r0 is zero. The ptrace word is the kernel restart slot. */
+    uint64_t gpr[32] = {0};
+    uint32_t known = 0;
+    for (uint16_t d = 1; d < 32; ++d) {
+        uint64_t value = 0;
+        if (xrt_registers_value_dwarf(&regs, d, &value) != XRT_OK)
+            continue;
+        gpr[d] = value;
+        known |= 1u << d;
+    }
+    struct xrt_loongarch_plan plan;
+    const enum xrt_status planned =
+        xrt_loongarch_plan(pc, insn, gpr, known, nforward ? forward : NULL, nforward, &plan);
+    if (planned != XRT_OK)
+        return planned;
+    /* rt_sigreturn does not resume at pc+4. Refuse before any plant. */
+    if ((insn & 0xffff8000u) == 0x002b0000u && (known & (1u << 11)) && gpr[11] == 139)
+        return XRT_UNSUPPORTED_CONTROL;
+    if (plan.emulate) {
+        t->threads[i].reason = XRT_STOP_SINGLE_STEP;
+        t->threads[i].breakpoint_address = 0;
+        t->stepping = false;
+        xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
+        t->events[t->event_count - 1].pc = pc;
+        t->events[t->event_count - 1].pc_known = 1;
+        return XRT_OK;
+    }
+    uint64_t rearm = 0;
+    const int at = xrt_breakpoint_at(t, pc);
+    if (at >= 0 && t->breakpoints[at].enabled && t->breakpoints[at].patched) {
+        struct xrt_breakpoint *p = &t->breakpoints[at];
+        TRY(xrt_target_commit_owned(t, p->address, p->original, p->planted, p->width));
+        p->patched = false;
+        xrt_sync_shared_patch(t, p->id, false);
+        rearm = p->id;
+    }
+    uint64_t ids[2] = {0};
+    uint8_t owned[2] = {0};
+    const enum xrt_status planted = xrt_software_plant(t, plan.pc, plan.count, ids, owned);
+    if (planted != XRT_OK) {
+        restore_rearm(t, rearm);
+        return planted;
+    }
+    const enum xrt_status resumed =
+        xrt_trace(PTRACE_CONT, tid, 0, (uintptr_t)t->threads[i].signal);
+    if (resumed != XRT_OK) {
+        enum xrt_status rolled = drop_owned_probe(t, ids[0], owned[0]);
+        if (owned[1]) {
+            const enum xrt_status second = drop_owned_probe(t, ids[1], owned[1]);
+            if (rolled == XRT_OK)
+                rolled = second;
+        }
+        restore_rearm(t, rearm);
+        return rolled != XRT_OK ? rolled : resumed;
+    }
+    t->step = (struct xrt_step){.tid = tid,
+                                .rearm = rearm,
+                                .stop_after = stop_after,
+                                .has_exec_entry = t->threads[i].reason == XRT_STOP_EXEC,
+                                .exec_entry_pc = pc,
+                                .software = 1,
+                                .successor_count = plan.count,
+                                .probe_owned = {owned[0], owned[1]},
+                                .successor_pc = {plan.pc[0], plan.pc[1]},
+                                .probe_id = {ids[0], ids[1]}};
+    t->threads[i].signal = 0;
+    t->threads[i].reason = XRT_STOP_NONE;
+    t->threads[i].state = XRT_RUNNING;
+    t->stepping = true;
+    t->want_run = false;
+    t->state = XRT_RUNNING;
+    xrt_target_event(t, XRT_EVENT_STEP_STARTED, tid, 0);
+    return XRT_OK;
+}
+enum xrt_status xrt_software_step_hit(struct xrt_target *t, int thread_index, uint64_t pc,
+                                      int *handled)
+{
+    if (!handled)
+        return XRT_INVALID_ARGUMENT;
+    *handled = 0;
+    if (!t || thread_index < 0 || (size_t)thread_index >= t->thread_count)
+        return XRT_INVALID_ARGUMENT;
+    if (!t->stepping || !t->step.software || t->step.tid != t->threads[thread_index].tid)
+        return XRT_OK;
+    int which = -1;
+    for (uint8_t s = 0; s < t->step.successor_count; ++s)
+        if (t->step.successor_pc[s] == pc)
+            which = (int)s;
+    if (which < 0)
+        return XRT_OK;
+    /* The stop PC is already the successor. Do not write r0 or the PC. */
+    const bool stop_after = t->step.stop_after;
+    const int at = xrt_breakpoint_at(t, pc);
+    const bool user_stop = at >= 0 && !t->breakpoints[at].internal;
+    const uint64_t user_id = user_stop ? t->breakpoints[at].id : 0;
+    TRY(xrt_finish_step(t, true));
+    struct xrt_thread *thread = &t->threads[thread_index];
+    thread->signal = 0;
+    if (user_stop) {
+        const int b = xrt_breakpoint_index(t, user_id);
+        thread->reason = XRT_STOP_BREAKPOINT;
+        thread->breakpoint_address = pc;
+        if (b >= 0 && t->breakpoints[b].hit_count != UINT64_MAX)
+            ++t->breakpoints[b].hit_count;
+        xrt_target_event(t, XRT_EVENT_BREAKPOINT_HIT, thread->tid, (int64_t)user_id);
+        t->events[t->event_count - 1].pc = pc;
+        t->events[t->event_count - 1].pc_known = 1;
+        *handled = 1;
+        return XRT_OK;
+    }
+    thread->reason = XRT_STOP_SINGLE_STEP;
+    thread->breakpoint_address = 0;
+    xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, thread->tid, 0);
+    t->events[t->event_count - 1].pc = pc;
+    t->events[t->event_count - 1].pc_known = 1;
+    if (!stop_after) {
+        thread->reason = XRT_STOP_NONE;
+        t->state = XRT_STOPPED;
+        TRY(xrt_target_continue(t));
+        *handled = 2;
+        return XRT_OK;
+    }
+    *handled = 1;
     return XRT_OK;
 }
 enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_after)
 {
     TRY(xrt_execution_allowed(t));
-    /* No hardware step means a planted breakpoint cannot be resumed. Refuse
-       before rearm or unpatch. A machine-specific software plan belongs
-       before this check. The row keeps hardware_step 0 until a debug unit
-       is measured. */
+    /* Hardware step stays 0 on this row. Software successors run before the
+       refusal, and only for LoongArch. Other rows still refuse before rearm. */
+    if (t->arch && t->arch->machine == XRT_LOONGARCH && t->arch->hardware_step == 0)
+        return loongarch_software_begin(t, tid, stop_after);
     if (!t->arch || t->arch->hardware_step == 0)
         return XRT_UNSUPPORTED_CONTROL;
     TRY(xrt_rearm_inherited(t));
@@ -507,14 +812,39 @@ enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed)
     if (!t->stepping)
         return XRT_OK;
     const struct xrt_step step = t->step;
+    if (step.software) {
+        /* The stop is classified before the aggregate state is recomputed, so
+         * a just-stopped single thread still looks RUNNING. Removal requires
+         * the stopped state. Owned probes go before the user probe is replanted. */
+        xrt_recompute_state(t);
+        if (step.probe_owned[0] == 2 && step.probe_id[0]) {
+            TRY(unplant_overlay(t, step.probe_id[0]));
+            t->step.probe_owned[0] = 0;
+        } else if (step.probe_owned[0] && step.probe_id[0]) {
+            TRY(xrt_target_breakpoint_remove(t, step.probe_id[0]));
+            t->step.probe_owned[0] = 0;
+        }
+        if (step.probe_owned[1] == 2 && step.probe_id[1] && step.probe_id[1] != step.probe_id[0]) {
+            TRY(unplant_overlay(t, step.probe_id[1]));
+            t->step.probe_owned[1] = 0;
+        } else if (step.probe_owned[1] && step.probe_id[1] && step.probe_id[1] != step.probe_id[0]) {
+            TRY(xrt_target_breakpoint_remove(t, step.probe_id[1]));
+            t->step.probe_owned[1] = 0;
+        }
+    }
     const int b = step.rearm ? xrt_breakpoint_index(t, step.rearm) : -1;
     if (b >= 0) {
         bool live = false;
         for (size_t i = 0; i < t->thread_count; ++i)
             live |= t->threads[i].state != XRT_EXITED;
         if (live) {
-            TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
-                                      t->breakpoints[b].width));
+            if (step.software) {
+                TRY(xrt_target_settle_plant_cleanup(t, 0));
+                TRY(xrt_target_commit_owned(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                            t->breakpoints[b].original, t->breakpoints[b].width));
+            } else
+                TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                          t->breakpoints[b].width));
             t->breakpoints[b].patched = true;
             xrt_sync_shared_patch(t, step.rearm, true);
         }

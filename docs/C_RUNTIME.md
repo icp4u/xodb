@@ -55,15 +55,77 @@ Copy the agent to a work directory on the target, then use its absolute path:
 
 ```sh
 ./zig-out/bin/xodb --runtime-ssh my-target --ssh-config ~/.ssh/config \
-  --runtime-agent /home/dev/xodb-build/xodb-agent \
-  --break main -- /home/dev/debug-program
+  --runtime-agent /target/work/xodb-agent \
+  --break main -- /target/work/debug-program
 ```
 
 SSH uses batch authentication and no PTY. Host command arguments are passed
 directly to exec; the remote agent path is shell-quoted. Target program arguments
 travel as separate wire strings. Relative program paths are relative to the
-agent's working directory. Source files are still resolved by the host; use the
-existing source maps when paths differ.
+agent's working directory. Source files resolve locally by default; use
+`--source-map /target/build=/local/source` when paths differ.
+
+To fetch missing source files from the agent, opt in explicitly:
+
+```sh
+xodb --fetch-source --runtime-ssh my-target --ssh-config ~/.ssh/config \
+  --runtime-agent /target/work/xodb-agent \
+  --break main -- /target/work/debug-program
+```
+
+Press **Space** to reach `main`. The source pane says **remote copy** when its
+text came from the agent. Fetching supplies the local GUI source pane; the
+separate MCP source-sharing policy remains controlled by `--source`.
+Local files take precedence, and an explicit
+`--source-map` always wins, even when its mapped file is missing. This option
+belongs to the C-agent connection; it is not available on `--ssh` / `--connect`.
+An older agent stays usable and displays **Source: agent needs updating** when
+a missing source needs fetching.
+
+The agent verifies the mapped ELF and accepts only absolute paths listed in
+its DWARF line-table headers, resolving relative entries with the recorded compilation
+directory. Each source must be a regular file no larger than 1 MiB. Authorization
+is bounded to 1,024 requests per one-second connection window, 8,192 compilation
+units, 64 MiB of metadata reads and a cooperative 250 ms processing budget per
+request. The request window renews, so ordinary stepping never exhausts a
+lifetime quota; it limits the rate, not total requests over time. Reads are capped again by the authorized size on the agent. Unsupported or exhausted metadata produces
+a diagnostic. This version supports uncompressed DWARF 2–5 in the mapped ELF;
+split/separate debug files, files added by line-program `define_file` opcodes,
+and embedded ELF objects are not fetched.
+
+Both requested paths and DWARF spellings are normalized lexically before
+matching: repeated separators, `.` and in-root `..` are collapsed. This supports
+out-of-tree builds with paths such as `build/../src/main.c`; attempts to ascend
+above `/` refuse. The normalized spelling is then resolved within the target's
+root using `openat2`. Every remaining symlink or magic link, and normalized path
+under `/proc`, `/sys` or `/dev`, is refused. Symlinked work trees and merged-usr
+aliases such as `/bin` or `/lib` therefore need their real directory spelling.
+Procfs, sysfs, devpts, debugfs, tracefs and cgroup2 filesystems are also refused
+after pinning. Kernels without `openat2` report `SourceKernelNeedsOpenat2`;
+there is no less restricted fallback. The agent first pins the path with
+`O_PATH`, verifies a regular file and its size/filesystem, then opens that same
+owned descriptor for reading. Changing a pathname cannot substitute a device
+between the type check and read open. Metadata, network-filesystem lookup and
+kernel I/O can still outlast the cooperative budget; `O_NONBLOCK` does not
+provide a hard timeout on a hung filesystem.
+
+DWARF is a path list, not a trust certificate. A hostile executable can list
+other absolute regular files readable by the **agent account**. These checks
+prevent path-resolution escapes and special-file access; they do not establish
+that named text belongs to a trustworthy project. Enable fetching only for
+executables whose source paths you trust, especially with a privileged agent.
+Use explicit local source maps when that trust is unavailable.
+
+Copies use a private cache under `$XDG_CACHE_HOME/xodb-source-v1`, or
+`~/.cache/xodb-source-v1`. The key includes build ID, source path, size, mtime
+and descriptor identity. Every use reauthorizes the path and validates current
+metadata, including cache hits; missing or changed files never silently use an
+old copy. The fixed slots retain at most 128 complete files plus 128 temporary
+files (at most 256 MiB plus small headers). A nonblocking lease lets a later
+writer recover a crash-leftover temporary; a live writer is left alone. Cache
+failures only disable caching. A failed fetch clears the remote-copy label.
+The label describes a current copy: it does not certify that the text is the
+same revision used to compile the executable.
 
 `--headless --mcp` works with both commands. This stream is separate from the
 older `--ssh` / `--connect` GUI-to-MCP connection, which remains available.
@@ -95,7 +157,7 @@ investigations](OBSERVATIONS.md) for a Ruby example and the CLI/MCP workflow.
 | x86-64 | Launch/attach, threads, signals, break/step, registers/memory, host symbols/DWARF | Hardware watches, fork/vfork coordination, SIMD/FP, CPU/syscall/allocation capture |
 | AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; no process following or remote profiling |
 | m68k | GCC-built agent tested in the VM: launch, break/step, GPR writes, ELF32 big-endian files, host disassembly, CFI and expressions | Hardware watches, FP state, process following and profiling explicitly unsupported |
-| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | Hardware watches, CPU/syscall/allocation capture and uprobes explicitly unsupported. The default system Capstone 5.x build reports disassembly unavailable. Single-step is refused while the row's hardware step is off. `r0` is read-only. This slice reads the general regset |
+| LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | Hardware watches, CPU/syscall/allocation capture and uprobes explicitly unsupported. The default system Capstone 5.x build reports disassembly unavailable. Instruction step is a software step; hardware step stays off. `r0` is read-only. This slice reads the general regset |
 
 Kernel permissions and kernel feature availability are checked by each operation.
 Unsupported architecture/capability, permissions, transport failures and stale
@@ -112,8 +174,10 @@ serializes requests, and these operations never publish a target snapshot.
 Workers must finish before destroying their target. Active collectors prevent
 target destruction. Failed detach retains its handle for an explicit retry.
 
-The private protocol is experimental version 1, with no compatibility guarantee
+The private protocol is experimental version 2, with no compatibility guarantee
 between development revisions. Build host and agent from the same revision.
+The source-fetch capability is negotiated with an optional HELLO suffix, so
+agents predating that operation keep their original handshake.
 The 32-byte big-endian header contains `XRT1`, u16 version/opcode, u64 request ID,
 and u32 target/status/body length/flags. Requests use flags 0; replies use flags 1.
 IDs must increase by one. Frames have a 1 MiB ceiling and a 10-second deadline;
@@ -171,17 +235,40 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` or `--arch loongarch64` to `tests/runtime-host.py`.
-On LoongArch64 that script expects instruction step, watchpoints, profile and
-uprobes to report unsupported, and it removes the breakpoint before continuing.
-Disassembly is refused on the system Capstone 5.x build and decoded when the
-binary was built with `-Dcapstone=vendored`. Instruction step and
-continue-from-breakpoint return unsupported control. The row is LP64D, little-endian ELF machine 258. `csr_era` is the PC
-and has no DWARF number; `r1` is the return-address column and `r3` is the stack
-pointer. `r0` is read-only: the value is the kernel's saved slot, not the
-architectural zero register. The glibc loader rendezvous is skipped, before
-loader discovery, because resuming a planted breakpoint takes a hardware step.
-The measured agent ran under QEMU loongarch64 with no hardware watchpoint unit,
-so this row keeps hardware step off until a machine with a debug unit is measured.
+On LoongArch64 that script steps one instruction, refuses watchpoints, profile and
+uprobes, and removes the breakpoint before continuing. Disassembly is refused on
+the system Capstone 5.x build and decoded when the binary was built with
+`-Dcapstone=vendored`. Instruction step and continue-from-breakpoint plant
+temporary software successors; conditional branches plant both successors,
+`jirl` uses the GPRs, and an `ll`/`sc` pair steps as one unit or is refused.
+Hardware step stays off. The row is LP64D, little-endian ELF machine 258.
+`csr_era` is the PC and has no DWARF number; `r1` is the return-address column
+and `r3` is the stack pointer. `r0` is read-only: the value is the kernel's
+restart slot, not the architectural zero register. The glibc loader rendezvous
+uses that software step. The measured agent ran under QEMU loongarch64
+`-cpu la464` with no hardware watchpoint unit, so this row keeps hardware step
+off until a machine with a debug unit is measured.
+`step_over` and `step_over_instruction` need the vendored Capstone 6 build.
+The system Capstone 5 library cannot decode this architecture, so those two
+commands report disassembly unavailable. Instruction step does not use the
+disassembler.
+A user breakpoint on an instruction inside an `ll`/`sc` window livelocks
+`continue`: the trap clears LLbit, `sc` fails, and the retry returns to the
+breakpoint. Stepping that window as one unit is unaffected.
+A successor that is already `break 0` is not planted again. The program's trap
+stops the thread and the step ends there. `rt_sigreturn` is refused instead of
+resumed at the next instruction. A temporary step probe still listed after the
+process exits during a step is dropped from the view, and restart does not
+reinstall it.
+This row cannot follow a child. A fork or clone is detached after every patched
+probe is restored in the child, and the parent is resumed. The parent's
+successor trap stays planted, so a step over `fork` stops after the syscall
+returns. A `vfork` shares that image. The child stays traced and the traps are
+lifted while it runs, so a breakpoint on its path cannot kill it. At
+`PTRACE_EVENT_VFORK_DONE` every probe the record still calls patched is planted
+again and the child is detached. The parent then resumes, and a step over
+`vfork` stops after the syscall returns with the child pid. x86 still holds
+the birth for the user to adopt.
 
 ## Portable agent startup and bounded breakpoint discovery
 

@@ -89,6 +89,7 @@ pub const Session = struct {
     process_tree: ?*@import("process_tree.zig").Tree = null,
     symbol_files: ?*@import("../binary/debug_files.zig").Files = null,
     source_map_owner: ?*const @import("source_maps.zig").Maps = null,
+    fetch_source: bool = false,
     target: linux.Target = .{},
     modules: Modules = Modules.init(std.heap.page_allocator),
     debug_files: @import("../binary/debug_files.zig").Files = .{ .allocator = std.heap.page_allocator },
@@ -1367,6 +1368,20 @@ pub const Session = struct {
             site.path = mapped;
         }
         return site;
+    }
+    pub fn remoteSource(self: *Session, a: std.mem.Allocator, site: info.Site) ![]u8 {
+        if (!self.fetch_source or site.original_path != null) return error.RemoteSourceDisabled;
+        const rt = @import("../target/runtime.zig").c;
+        const module = try self.modules.at(site.address);
+        if (module.file_offset != 0) return error.RemoteSourceEmbeddedImageUnsupported;
+        for (self.modules.regions.items) |region| {
+            if (site.address < region.start or site.address >= region.end) continue;
+            const path = try a.dupeZ(u8, region.path);
+            defer a.free(path);
+            const request = rt.struct_xrt_file_request{ .kind = rt.XRT_FILE_MAPPED, .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path } };
+            return @import("remote_source.zig").fetch(a, self.target.handle orelse return error.RemoteSourceUnavailable, &request, site.path, module.image.buildId() orelse return error.SourceBuildIdMissing);
+        }
+        return error.UnmappedAddress;
     }
     pub fn sourceAddresses(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
         try self.refreshMaps();

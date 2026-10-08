@@ -3,6 +3,10 @@ const c = @import("../c.zig").api;
 const Arch = @import("../target/arch.zig").Arch;
 pub const Flow = enum { ordinary, conditional, jump, call, ret, trap, system };
 pub const Instruction = struct { address: u64, size: u16, mnemonic: [32]u8, operands: [160]u8, flow: Flow = .ordinary, target: ?u64 = null };
+/// Kept in the host binary so a test can read which Capstone major was compiled in.
+export fn xodbCapstoneApiMajor() [*:0]const u8 {
+    return "xodb-capstone-api-major:" ++ std.fmt.comptimePrint("{d}", .{c.CS_API_MAJOR});
+}
 pub fn decode(bytes: []const u8, address: u64, out: []Instruction) !usize {
     return decodeFor(@import("../target/arch.zig").native, bytes, address, out);
 }
@@ -152,6 +156,15 @@ test "decoder preserves instruction boundaries and addresses" {
     try std.testing.expectEqual(@as(usize, 3), n);
     try std.testing.expectEqual(@as(u64, 0x1001), instructions[1].address);
     try std.testing.expectEqualStrings("ret", std.mem.sliceTo(@as([]const u8, &instructions[2].mnemonic), 0));
+}
+
+test "vendored Capstone reports major 6 or newer" {
+    if (!@import("build_options").capstone_vendored) return;
+    try std.testing.expect(c.CS_API_MAJOR >= 6);
+    var major: c_int = 0;
+    var minor: c_int = 0;
+    _ = c.cs_version(&major, &minor);
+    try std.testing.expect(major >= 6);
 }
 
 test "loongarch disassembly follows the linked Capstone" {

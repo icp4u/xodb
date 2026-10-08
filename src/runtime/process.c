@@ -30,10 +30,12 @@ enum xrt_status xrt_process_save_launch_signals(void)
 
 uintptr_t xrt_process_options(bool owned, bool follow)
 {
-    const struct xrt_arch *arch = xrt_arch_native();
-    /* Even with following disabled, hold x86 children before they execute
-     * inherited software traps. The coordinator decides adoption/release. */
-    const bool births = follow || (arch && arch->machine == XRT_X86_64);
+    /* Even with following disabled, hold children before they execute
+     * inherited software traps. The coordinator decides adoption/release.
+     * Every architecture is included so a software step on a non-x86 row
+     * cannot leave a fork child with a planted successor. */
+    const bool births = true;
+    (void)follow;
     return PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXEC | PTRACE_O_TRACEEXIT |
            (births ? PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEVFORKDONE : 0) |
            (owned ? PTRACE_O_EXITKILL : 0);

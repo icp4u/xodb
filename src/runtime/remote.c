@@ -4,6 +4,7 @@
 #include "target_internal.h"
 #include "wire_target.h"
 #include "elf_symbols.h"
+#include "xrt_source.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -32,6 +33,7 @@ struct xrt_connection {
     int fd;
     pid_t child;
     uint64_t request, producer_ns, host_ns, uncertainty_ns;
+    uint64_t capabilities;
     uint32_t tick_hz, page_size;
     uint16_t machine; /* HELLO: the row a newly created agent target starts on */
     enum xrt_status failed;
@@ -505,10 +507,11 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
     /* Repeat after transport startup. Pick the shortest round trip so SSH
      * authentication/startup delay does not dominate the clock estimate. */
     for (unsigned probe = 0; probe < 4 && status == XRT_OK; ++probe) {
-        uint8_t meta[16];
+        uint8_t meta[24];
         size_t meta_size = 0;
         const uint64_t before = xrt_now();
         status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_HELLO,
+                                                       .args = {XRT_RPC_HELLO_CAPABILITIES},
                                                        .value = &machine,
                                                        .out = meta,
                                                        .capacity = sizeof(meta),
@@ -522,10 +525,17 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         xrt_codec_u64(&in, &producer);
         xrt_codec_u32(&in, &hz);
         xrt_codec_u32(&in, &page);
+        uint64_t capabilities = 0;
+        if (in.size == 24) xrt_codec_u64(&in, &capabilities);
         if (!in.ok || in.at != in.size || !hz || !page || (page & (page - 1)) || after < before) {
             status = XRT_PROTOCOL_ERROR;
             break;
         }
+        if (probe && c->capabilities != capabilities) {
+            status=XRT_PROTOCOL_ERROR;
+            break;
+        }
+        c->capabilities=capabilities;
         if (after - before < shortest) {
             shortest = after - before;
             c->producer_ns = producer;
@@ -549,6 +559,10 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
     }
     *out = t;
     return XRT_OK;
+}
+bool xrt_target_source_capable(const struct xrt_target *t)
+{
+    return t && t->connection && (t->connection->capabilities & XRT_RPC_CAP_SOURCE) != 0;
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {

@@ -8,6 +8,7 @@ detailed docs. If you just want to try something, jump to
 
 | I want to… | Use | You get |
 | --- | --- | --- |
+| See what is using the machine | **System overview** (`--overview`) | Live CPU, memory, disk, network and processes; unknown values show reasons. **L** opens files, **F** profiles, **Enter** attaches after a cost/access confirmation. `--session-socket PATH` shares the same cache with observer-only MCP clients. |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
 | Catch who changes a value | **Watchpoint investigation** (**W** on a field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |

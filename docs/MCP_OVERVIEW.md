@@ -73,6 +73,7 @@ Examples, rather than an exhaustive tool catalog:
 | Add or retain evidence | `add_profile_intervals`, `get_profile_intervals`, `export_profile` |
 | Ask static questions about a function | `analyze_function`, `slice_value`, `control_dependencies`, `cancel_static_analysis` (opt-in worker; observers may start a bounded host-side analysis but cancel only their own; [details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 | Deliberately change target state | `write_memory`, `write_register` |
+| Look at the whole machine (no target needed) | `get_overview`, `list_processes`, `get_process`, `get_connections`, `get_sensors` (observer-only; every value is a number or `{state, why}`, never a silent 0) |
 
 Inspection jobs retain copied registers, stack, locals, expressions and bounded
 memory reads under one stopped generation. Function observations retain raw ABI

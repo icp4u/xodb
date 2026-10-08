@@ -23,6 +23,11 @@ struct xrt_step {
     bool stop_after, interrupted, has_watch, has_exec_entry;
     struct xrt_arm_watch_hit watch;
     uint64_t exec_entry_pc;
+    /* software is set only after the resume has been issued. probe_owned marks
+     * temporary probes this step planted and must remove. A user probe already
+     * at a successor keeps probe_owned clear. */
+    uint8_t software, successor_count, probe_owned[2];
+    uint64_t successor_pc[2], probe_id[2];
 };
 /* One unpublished plant. original holds the full prepared image, not only the
  * bytes a short rollback managed to restore. */
@@ -59,6 +64,12 @@ struct xrt_target {
     struct xrt_watchpoint birth_watchpoints[4];
     uint64_t birth_next_probe_id;
     struct xrt_target *vfork_parent, *vfork_children[XRT_MAX_THREADS];
+    /* Non-x86 shared vfork. The child stays traced until VFORK_DONE.
+     * release means the shared image currently holds original bytes while the
+     * breakpoint records still say patched. hold_detach asks the next child
+     * stop to detach rather than resume. */
+    int32_t vfork_hold;
+    uint8_t vfork_release, vfork_hold_detach;
     int32_t reap_tids[2048];
     size_t reap_count;
     enum xrt_state state;
@@ -93,14 +104,25 @@ enum xrt_status xrt_patch_instruction_tid(struct xrt_target *t, int32_t tid, uin
                                           const uint8_t *bytes, size_t width);
 enum xrt_status xrt_target_patch_span(struct xrt_target *t, int32_t tid, uint64_t address,
                                       const uint8_t *bytes, size_t width, size_t *accepted);
+enum xrt_status xrt_target_commit_bytes(struct xrt_target *t, uint64_t address,
+                                        const uint8_t bytes[4], const uint8_t rollback[4],
+                                        uint8_t width);
 enum xrt_status xrt_target_commit_plant(struct xrt_target *t, uint64_t address,
                                         const struct xrt_probe_encoding *encoding,
                                         const uint8_t original[4]);
+enum xrt_status xrt_target_commit_owned(struct xrt_target *t, uint64_t address,
+                                        const uint8_t bytes[4], const uint8_t rollback[4],
+                                        uint8_t width);
 void xrt_target_apply_exec_identity(struct xrt_target *t, enum xrt_status validate_status);
 enum xrt_status xrt_target_retry_plant_cleanup(struct xrt_target *t);
+enum xrt_status xrt_target_settle_plant_cleanup(struct xrt_target *t, int drop_if_exited);
 enum xrt_status xrt_rearm_inherited(struct xrt_target *t);
 void xrt_sync_shared_patch(struct xrt_target *t, uint64_t id, bool patched);
 enum xrt_status xrt_separate_vfork(struct xrt_target *t);
+/* Kill a child still traced across a shared vfork. The process is going away. */
+void xrt_drop_vfork_hold(struct xrt_target *t);
+/* Detach that child. It keeps running. ESRCH means it is already gone. */
+enum xrt_status xrt_detach_held_vfork(struct xrt_target *t);
 size_t xrt_shared_family(struct xrt_target *t, struct xrt_target *out[32]);
 enum xrt_status xrt_poll_births(struct xrt_target *t);
 enum xrt_status xrt_stop_peers(struct xrt_target *t);
@@ -111,6 +133,15 @@ bool xrt_traced_member(int32_t tid, int32_t group);
 bool xrt_task_zombie(int32_t tid);
 enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_after);
 enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed);
+/* Plant count temporary internal probes. On failure every probe this call
+ * planted is removed, or the cleanup record stays and the status is not OK. */
+enum xrt_status xrt_software_plant(struct xrt_target *t, const uint64_t *pcs, uint8_t count,
+                                   uint64_t ids[2], uint8_t owned[2]);
+/* *handled is 0 if this stop is not a software-step successor, 1 if the step
+ * completed in the stopped state, and 2 if stop_after was clear and the thread
+ * was resumed. */
+enum xrt_status xrt_software_step_hit(struct xrt_target *t, int thread_index, uint64_t pc,
+                                      int *handled);
 enum xrt_status xrt_configure_watches(struct xrt_target *t, int32_t tid);
 enum xrt_status xrt_configure_arm_watches(struct xrt_target *t, int32_t tid, bool enabled);
 enum xrt_status xrt_ensure_watches(struct xrt_target *t);

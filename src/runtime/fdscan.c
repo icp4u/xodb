@@ -45,6 +45,7 @@ struct key {
 };
 struct xrt_fdscan {
     struct xrt_fdscan_options o;
+    int expected_dir;
     int32_t *pids;
     int proc;
     int32_t self, detail;
@@ -103,6 +104,7 @@ enum xrt_status xrt_fdscan_create(const struct xrt_fdscan_options *options, stru
     struct xrt_fdscan *s = calloc(1, sizeof(*s));
     if (!s)
         return XRT_OUT_OF_MEMORY;
+    s->expected_dir = -1;
     if (options)
         s->o = *options;
     if (!s->o.max_processes)
@@ -112,7 +114,7 @@ enum xrt_status xrt_fdscan_create(const struct xrt_fdscan_options *options, stru
     if (!s->o.max_strings)
         s->o.max_strings = 16u << 20;
     if (s->o.max_processes > (1u << 24) || s->o.max_fds > (1u << 26) || s->o.max_strings < 16 ||
-        s->o.pid_count > s->o.max_processes || (s->o.pid_count && !s->o.pids)) {
+        s->o.pid_count > s->o.max_processes || (s->o.pid_count && !s->o.pids) || (s->o.expected_start && s->o.pid_count != 1)) {
         free(s);
         return XRT_INVALID_ARGUMENT;
     }
@@ -147,6 +149,12 @@ enum xrt_status xrt_fdscan_create(const struct xrt_fdscan_options *options, stru
         xrt_fdscan_destroy(s);
         return e == EACCES ? XRT_PERMISSION_DENIED : XRT_FILE_UNAVAILABLE;
     }
+    if (s->o.expected_start) {
+        char name[32];
+        snprintf(name, sizeof(name), "%d", s->pids[0]);
+        s->expected_dir = openat(s->proc, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (s->expected_dir < 0) { xrt_fdscan_destroy(s); return XRT_PROCESS_GONE; }
+    }
     s->epoch = clock_ns(CLOCK_MONOTONIC);
     *out = s;
     return XRT_OK;
@@ -161,6 +169,8 @@ void xrt_fdscan_destroy(struct xrt_fdscan *s)
         return;
     if (s->proc >= 0)
         close(s->proc);
+    if (s->expected_dir >= 0)
+        close(s->expected_dir);
     for (int i = 0; i < 2; i++) {
         free(s->s[i].procs);
         free(s->s[i].unseen);
@@ -288,7 +298,8 @@ static void classify(const char *link, size_t n, const struct stat *st, int have
 static int fdinfo(int proc, int32_t pid, int32_t fd, struct xrt_fd *f)
 {
     char name[48], text[512];
-    snprintf(name, sizeof(name), "%d/fdinfo/%d", pid, fd);
+    if (pid) snprintf(name, sizeof(name), "%d/fdinfo/%d", pid, fd);
+    else snprintf(name, sizeof(name), "fdinfo/%d", fd);
     if (slurp(proc, name, text, sizeof(text)) < 0)
         return 0;
     const char *flags = strstr(text, "flags:");
@@ -382,8 +393,10 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
                          int32_t pid, uint64_t now)
 {
     char name[48], text[1024];
-    snprintf(name, sizeof(name), "%d/stat", pid);
-    const ssize_t n = slurp(s->proc, name, text, sizeof(text));
+    const int proc = s->expected_dir >= 0 ? s->expected_dir : s->proc;
+    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "stat");
+    else snprintf(name, sizeof(name), "%d/stat", pid);
+    const ssize_t n = slurp(proc, name, text, sizeof(text));
     char *close_paren = n > 0 ? strrchr(text, ')') : NULL;
     char *open_paren = n > 0 ? strchr(text, '(') : NULL;
     unsigned long long fields[20] = {0};
@@ -398,6 +411,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         }
     }
     const uint64_t start = fields[19];
+    if (s->o.expected_start && start != s->o.expected_start) return GONE;
     if (fields[6] & PF_KTHREAD) {
         unseen(s, c, pid, 0, start, 1, 0);
         return UNSEEN;
@@ -415,14 +429,16 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
     }
     struct stat st;
     uint32_t uid = old ? old->uid : was_unseen ? was_unseen->uid : 0;
-    snprintf(name, sizeof(name), "%d", pid);
+    if (s->expected_dir >= 0) snprintf(name, sizeof(name), ".");
+    else snprintf(name, sizeof(name), "%d", pid);
     if (recheck) {
-        if (fstatat(s->proc, name, &st, 0))
+        if (fstatat(proc, name, &st, 0))
             return GONE;
         uid = st.st_uid;
     }
-    snprintf(name, sizeof(name), "%d/fd", pid);
-    const int fd_dir = openat(s->proc, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "fd");
+    else snprintf(name, sizeof(name), "%d/fd", pid);
+    const int fd_dir = openat(proc, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd_dir < 0) {
         if (errno != EACCES && errno != EPERM)
             return GONE;
@@ -458,15 +474,17 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         p->cmdline_length = p->cmdline ? old->cmdline_length : 0;
     } else {
         char line[CMDLINE_MAX];
-        snprintf(name, sizeof(name), "%d/cmdline", pid);
-        const ssize_t got = slurp(s->proc, name, line, sizeof(line));
+        if (s->expected_dir >= 0) snprintf(name, sizeof(name), "cmdline");
+    else snprintf(name, sizeof(name), "%d/cmdline", pid);
+        const ssize_t got = slurp(proc, name, line, sizeof(line));
         if (got > 0) {
             p->cmdline = put(s, c, line, (size_t)got);
             p->cmdline_length = p->cmdline ? (uint32_t)got : 0;
         }
     }
-    snprintf(name, sizeof(name), "%d/io", pid);
-    if (slurp(s->proc, name, text, sizeof(text)) > 0) {
+    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "io");
+    else snprintf(name, sizeof(name), "%d/io", pid);
+    if (slurp(proc, name, text, sizeof(text)) > 0) {
         p->rchar = field(text, "rchar:");
         p->wchar = field(text, "wchar:");
         p->read_bytes = field(text, "read_bytes:");
@@ -573,7 +591,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         if (!same || whole || seekable(f)) {
             const uint64_t last = f->pos;
             const int had = same && (was->flags & XRT_FD_INFO);
-            if (fdinfo(s->proc, pid, f->fd, f) && had && f->pos > last) {
+            if (fdinfo(proc, s->expected_dir >= 0 ? 0 : pid, f->fd, f) && had && f->pos > last) {
                 f->advance = f->pos - last;
                 f->rate = per_second(f->advance, p->interval_ns);
             }

@@ -7,6 +7,7 @@ pub const c = @cImport({
     @cInclude("xrt_target.h");
     @cInclude("xrt_remote.h");
     @cInclude("xrt_files.h");
+    @cInclude("xrt_source.h");
     @cInclude("xrt_loader.h");
 });
 

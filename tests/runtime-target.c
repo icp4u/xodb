@@ -8,6 +8,7 @@
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -99,7 +100,9 @@ static void launch_restart(void)
     }
     uint64_t pc = 0;
     OK(xrt_registers_pc(&regs, &pc));
-    if (xrt_arch_native()->hardware_step) {
+    struct xrt_step_resources step_resources;
+    OK(xrt_arch_step_resources(xrt_arch_native(), XRT_ISA_MODE_ORDINARY, &step_resources));
+    if (step_resources.hardware_step || step_resources.software_probes) {
         OK(xrt_target_step(target, before.pid));
         OK(xrt_target_wait_stopped(target));
         CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP);
@@ -108,7 +111,7 @@ static void launch_restart(void)
         OK(xrt_registers_pc(&regs, &stepped));
         CHECK(stepped != pc);
     } else {
-        /* hardware_step 0 refuses single-step before the kernel is asked. */
+        /* No hardware step and no software successors: refuse before the kernel. */
         CHECK(xrt_target_step(target, before.pid) == XRT_UNSUPPORTED_CONTROL);
         CHECK(view().state == XRT_STOPPED);
         CHECK(view().threads[0].reason != XRT_STOP_SINGLE_STEP);
@@ -175,21 +178,42 @@ static void attach_probes(bool automatic_step)
     uint8_t memory[8];
     OK(xrt_target_read(target, (uintptr_t)data, memory, sizeof(memory), &count));
     CHECK(memcmp(memory, (uint8_t[]){1, 2, 7, 8, 9, 6, 7, 8}, 8) == 0);
-    if (xrt_arch_native()->hardware_step)
+    uint8_t watch_slots = 0;
+    const enum xrt_status watch_cap = xrt_target_watchpoint_capacity(target, &watch_slots);
+    const int watches = watch_cap == XRT_OK && watch_slots > 0;
+    if (watches)
         OK(xrt_target_watchpoint_set(target, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch));
     else
-        CHECK(xrt_target_watchpoint_set(target, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch) ==
-              XRT_UNSUPPORTED_ARCHITECTURE);
+        CHECK(watch_cap == XRT_UNSUPPORTED_ARCHITECTURE);
     CHECK(write(gate[1], "x", 1) == 1);
     close(gate[1]);
     OK(xrt_target_continue(target));
     OK(xrt_target_wait_stopped(target));
     CHECK(view().threads[0].reason == XRT_STOP_BREAKPOINT && view().breakpoints[0].hit_count == 1);
-    if (!xrt_arch_native()->hardware_step) {
-        /* Resume from a planted breakpoint uses one hardware step. */
-        CHECK(xrt_target_continue(target) == XRT_UNSUPPORTED_CONTROL);
-        CHECK(xrt_target_step(target, child) == XRT_UNSUPPORTED_CONTROL);
-        CHECK(view().state == XRT_STOPPED && view().breakpoints[0].patched);
+    struct xrt_step_resources step_resources;
+    OK(xrt_arch_step_resources(xrt_arch_native(), XRT_ISA_MODE_ORDINARY, &step_resources));
+    if (!watches) {
+        if (step_resources.hardware_step || step_resources.software_probes) {
+            if (automatic_step) {
+                OK(xrt_target_continue(target));
+                OK(xrt_target_wait_stopped(target));
+                CHECK(view().threads[0].reason == XRT_STOP_BREAKPOINT &&
+                      view().breakpoints[0].hit_count == 2);
+            } else {
+                OK(xrt_target_step(target, child));
+                OK(xrt_target_wait_stopped(target));
+                CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP && view().breakpoints[0].patched);
+                struct xrt_registers stepped_regs;
+                OK(xrt_target_registers(target, child, &stepped_regs));
+                uint64_t stepped = 0;
+                OK(xrt_registers_pc(&stepped_regs, &stepped));
+                CHECK(stepped != address);
+            }
+        } else {
+            CHECK(xrt_target_continue(target) == XRT_UNSUPPORTED_CONTROL);
+            CHECK(xrt_target_step(target, child) == XRT_UNSUPPORTED_CONTROL);
+            CHECK(view().state == XRT_STOPPED && view().breakpoints[0].patched);
+        }
         OK(xrt_target_breakpoint_remove(target, bp));
         OK(xrt_target_continue(target));
         wait_exit();
@@ -512,6 +536,7 @@ static void foundation(void)
     const struct xrt_arch *native = xrt_arch_native();
     const char *scratch = native->machine == XRT_X86_64       ? "r10"
                           : native->machine == XRT_LOONGARCH ? "r12"
+                          : native->machine == XRT_M68K      ? "d2"
                                                              : "x9";
     struct reg_bank bank = {0};
     struct xrt_reg_io io = {.read = bank_read, .write = bank_write, .ctx = &bank};
@@ -699,6 +724,260 @@ static void detach_owed_cleanup(void)
     }
 }
 
+#if defined(__loongarch__)
+extern void loong_b(void);
+extern void loong_b_land(void);
+extern void loong_beq(void);
+extern void loong_beq_land(void);
+extern void loong_bne(void);
+extern void loong_bne_insn(void);
+extern void loong_bne_next(void);
+extern void loong_jirl(void);
+extern void loong_jirl_insn(void);
+extern void loong_jirl_land(void);
+extern void loong_ll(void);
+extern void loong_ll_insn(void);
+extern void loong_ll_land(void);
+extern uint32_t loong_ll_cell;
+/* Gaps are nop, not break 0: that word is the software breakpoint, so a successor there is refused as an existing trap. */
+__asm__(".text\n"
+        ".globl loong_b\n"
+        ".type loong_b, @function\n"
+        "loong_b:\n\t"
+        "b loong_b_land\n\t"
+        "nop\n"
+        ".globl loong_b_land\n"
+        "loong_b_land:\n\t"
+        "jirl $zero, $ra, 0\n"
+        ".globl loong_beq\n"
+        ".type loong_beq, @function\n"
+        "loong_beq:\n\t"
+        "beq $zero, $zero, loong_beq_land\n\t"
+        "nop\n"
+        ".globl loong_beq_land\n"
+        "loong_beq_land:\n\t"
+        "jirl $zero, $ra, 0\n"
+        ".globl loong_bne\n"
+        ".type loong_bne, @function\n"
+        "loong_bne:\n\t"
+        "ori $a0, $zero, 1\n"
+        ".globl loong_bne_insn\n"
+        "loong_bne_insn:\n\t"
+        "beq $a0, $zero, loong_bne_trap\n"
+        ".globl loong_bne_next\n"
+        "loong_bne_next:\n\t"
+        "b loong_bne_land\n"
+        "loong_bne_trap:\n\t"
+        "nop\n"
+        "loong_bne_land:\n\t"
+        "jirl $zero, $ra, 0\n"
+        ".globl loong_jirl\n"
+        ".type loong_jirl, @function\n"
+        "loong_jirl:\n\t"
+        "pcalau12i $t0, %pc_hi20(loong_jirl_land)\n\t"
+        "addi.d $t0, $t0, %pc_lo12(loong_jirl_land)\n"
+        ".globl loong_jirl_insn\n"
+        "loong_jirl_insn:\n\t"
+        "jirl $zero, $t0, 0\n\t"
+        "nop\n"
+        ".globl loong_jirl_land\n"
+        "loong_jirl_land:\n\t"
+        "jirl $zero, $ra, 0\n"
+        ".globl loong_ll\n"
+        ".type loong_ll, @function\n"
+        "loong_ll:\n\t"
+        "pcalau12i $a0, %pc_hi20(loong_ll_cell)\n\t"
+        "addi.d $a0, $a0, %pc_lo12(loong_ll_cell)\n\t"
+        "pcalau12i $a1, %pc_hi20(loong_ll_flag)\n\t"
+        "addi.d $a1, $a1, %pc_lo12(loong_ll_flag)\n"
+        ".globl loong_ll_insn\n"
+        "loong_ll_insn:\n\t"
+        "ll.w $t0, $a0, 0\n\t"
+        "addi.w $t0, $t0, 1\n\t"
+        "ld.w $t1, $a1, 0\n\t"
+        "beqz $t1, loong_ll_sc\n\t"
+        "st.w $zero, $a0, 0\n\t"
+        "st.w $zero, $a1, 0\n"
+        "loong_ll_sc:\n\t"
+        "sc.w $t0, $a0, 0\n\t"
+        "beqz $t0, loong_ll_insn\n"
+        ".globl loong_ll_land\n"
+        "loong_ll_land:\n\t"
+        "jirl $zero, $ra, 0\n"
+        ".section .data\n"
+        ".align 2\n"
+        ".globl loong_ll_cell\n"
+        "loong_ll_cell:\n\t"
+        ".word 0\n"
+        ".globl loong_ll_flag\n"
+        "loong_ll_flag:\n\t"
+        ".word 1\n"
+        ".text\n");
+static void raw_mem(pid_t pid, uint64_t address, uint8_t out[4])
+{
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/mem", (int)pid);
+    const int fd = open(path, O_RDONLY);
+    CHECK(fd >= 0);
+    CHECK(pread(fd, out, 4, (off_t)address) == 4);
+    CHECK(close(fd) == 0);
+}
+static void gpr_snapshot(int32_t tid, uint64_t out[32], uint64_t *pc)
+{
+    struct xrt_registers regs;
+    OK(xrt_target_registers(target, tid, &regs));
+    OK(xrt_registers_pc(&regs, pc));
+    for (uint16_t i = 0; i < 32; ++i)
+        OK(xrt_registers_value_dwarf(&regs, i, &out[i]));
+}
+static void expect_stable(const uint64_t before[32], const uint64_t after[32], uint32_t ignore)
+{
+    for (uint16_t i = 0; i < 32; ++i) {
+        if (ignore & (1u << i))
+            continue;
+        CHECK(before[i] == after[i]);
+    }
+}
+static int patched_at(uint64_t address)
+{
+    for (size_t i = 0; i < view().breakpoint_count; ++i)
+        if (view().breakpoints[i].address == address)
+            return view().breakpoints[i].patched;
+    return 0;
+}
+static void expect_bytes(pid_t pid, uint64_t user, uint64_t landing, const uint8_t user_orig[4],
+                         const uint8_t land_orig[4], size_t probes)
+{
+    uint8_t over[4], raw_user[4], raw_land[4];
+    size_t count = 0;
+    const uint8_t trap[4] = {0x00, 0x00, 0x2a, 0x00};
+    OK(xrt_target_read(target, user, over, 4, &count));
+    CHECK(count == 4 && memcmp(over, user_orig, 4) == 0 && patched_at(user));
+    raw_mem(pid, user, raw_user);
+    raw_mem(pid, landing, raw_land);
+    CHECK(memcmp(raw_user, trap, 4) == 0 && memcmp(raw_land, land_orig, 4) == 0);
+    CHECK(view().breakpoint_count == probes);
+    for (size_t i = 0; i < view().breakpoint_count; ++i)
+        CHECK(!view().breakpoints[i].temporary);
+}
+static void loong_live(void)
+{
+    alarm(90);
+    int gate[2];
+    CHECK(pipe(gate) == 0);
+    const pid_t parent = getpid();
+    child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            _exit(1);
+        close(gate[1]);
+        char byte;
+        if (read(gate[0], &byte, 1) != 1)
+            _exit(2);
+        close(gate[0]);
+        loong_b();
+        loong_beq();
+        loong_bne();
+        loong_jirl();
+        loong_ll();
+        _exit(23);
+    }
+    close(gate[0]);
+    target = xrt_target_create();
+    CHECK(target);
+    OK(xrt_target_attach(target, child));
+    const uint64_t sites[] = {(uintptr_t)loong_b, (uintptr_t)loong_beq, (uintptr_t)loong_bne_insn,
+                              (uintptr_t)loong_jirl_insn, (uintptr_t)loong_ll_insn};
+    uint64_t ids[5];
+    for (size_t i = 0; i < 5; ++i)
+        OK(xrt_target_breakpoint_set(target, sites[i], false, &ids[i]));
+    uint8_t b_orig[4], b_land[4], beq_orig[4], beq_land[4], bne_orig[4], bne_next[4];
+    uint8_t jirl_orig[4], jirl_land[4], ll_orig[4], ll_land[4];
+    size_t count = 0;
+    OK(xrt_target_read(target, sites[0], b_orig, 4, &count));
+    OK(xrt_target_read(target, (uintptr_t)loong_b_land, b_land, 4, &count));
+    OK(xrt_target_read(target, sites[1], beq_orig, 4, &count));
+    OK(xrt_target_read(target, (uintptr_t)loong_beq_land, beq_land, 4, &count));
+    OK(xrt_target_read(target, sites[2], bne_orig, 4, &count));
+    OK(xrt_target_read(target, (uintptr_t)loong_bne_next, bne_next, 4, &count));
+    OK(xrt_target_read(target, sites[3], jirl_orig, 4, &count));
+    OK(xrt_target_read(target, (uintptr_t)loong_jirl_land, jirl_land, 4, &count));
+    OK(xrt_target_read(target, sites[4], ll_orig, 4, &count));
+    OK(xrt_target_read(target, (uintptr_t)loong_ll_land, ll_land, 4, &count));
+    CHECK(write(gate[1], "x", 1) == 1);
+    close(gate[1]);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    CHECK(view().threads[0].reason == XRT_STOP_BREAKPOINT);
+    struct xrt_registers regs;
+    OK(xrt_target_registers(target, child, &regs));
+    uint64_t pc = 0;
+    OK(xrt_registers_pc(&regs, &pc));
+    CHECK(pc == sites[0]);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    OK(xrt_target_registers(target, child, &regs));
+    OK(xrt_registers_pc(&regs, &pc));
+    CHECK(view().threads[0].reason == XRT_STOP_BREAKPOINT && pc == sites[1]);
+    expect_bytes(child, sites[0], (uintptr_t)loong_b_land, b_orig, b_land, 5);
+    uint64_t before[32], after[32], before_pc = 0, after_pc = 0;
+    gpr_snapshot(child, before, &before_pc);
+    OK(xrt_target_step(target, child));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, after, &after_pc);
+    CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP && after_pc == (uintptr_t)loong_beq_land);
+    expect_stable(before, after, 0);
+    expect_bytes(child, sites[1], (uintptr_t)loong_beq_land, beq_orig, beq_land, 5);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, before, &before_pc);
+    CHECK(before_pc == sites[2] && view().threads[0].reason == XRT_STOP_BREAKPOINT);
+    OK(xrt_target_step(target, child));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, after, &after_pc);
+    CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP && after_pc == (uintptr_t)loong_bne_next);
+    expect_stable(before, after, 0);
+    expect_bytes(child, sites[2], (uintptr_t)loong_bne_next, bne_orig, bne_next, 5);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, before, &before_pc);
+    CHECK(before_pc == sites[3] && view().threads[0].reason == XRT_STOP_BREAKPOINT);
+    OK(xrt_target_step(target, child));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, after, &after_pc);
+    CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP && after_pc == (uintptr_t)loong_jirl_land);
+    expect_stable(before, after, 0);
+    expect_bytes(child, sites[3], (uintptr_t)loong_jirl_land, jirl_orig, jirl_land, 5);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, before, &before_pc);
+    CHECK(before_pc == sites[4] && view().threads[0].reason == XRT_STOP_BREAKPOINT);
+    OK(xrt_target_step(target, child));
+    OK(xrt_target_wait_stopped(target));
+    gpr_snapshot(child, after, &after_pc);
+    CHECK(view().threads[0].reason == XRT_STOP_SINGLE_STEP && after_pc == (uintptr_t)loong_ll_land);
+    expect_stable(before, after, (1u << 4) | (1u << 5) | (1u << 12) | (1u << 13));
+    CHECK(before[0] == after[0]);
+    expect_bytes(child, sites[4], (uintptr_t)loong_ll_land, ll_orig, ll_land, 5);
+    uint32_t cell = 0;
+    OK(xrt_target_read(target, (uintptr_t)&loong_ll_cell, &cell, sizeof(cell), &count));
+    CHECK(count == sizeof(cell) && cell == 1);
+    for (size_t i = 0; i < 5; ++i)
+        OK(xrt_target_breakpoint_remove(target, ids[i]));
+    OK(xrt_target_continue(target));
+    wait_exit();
+    CHECK(view().events[view().event_count - 1].detail == 23);
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+    child = 0;
+    xrt_target_destroy(target);
+    target = NULL;
+    puts("C target: loongarch software step passed");
+}
+#else
+static void loong_live(void) {}
+#endif
+
 int main(int argc, char **argv)
 {
     /* LeakSanitizer's exit helper cannot ptrace our already-traced fixture.
@@ -735,6 +1014,7 @@ int main(int argc, char **argv)
     attach_probes(true);
     adopted_child();
     detach_owed_cleanup();
+    loong_live();
     puts("C target: launch, restart, attach, stepping, breakpoint overlays/rearm, watches, "
          "generations, cleanup passed");
     return 0;

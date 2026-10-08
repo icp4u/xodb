@@ -579,6 +579,19 @@ pub const Renderer = struct {
         vertices[self.vertices..][0..6].* = .{ v[0], v[1], v[3], v[0], v[3], v[2] };
         self.vertices += 6;
     }
+    /// Fraction of this frame's vertex buffer already used (0..1).
+    pub fn used(self: *const Renderer) f32 {
+        return @as(f32, @floatFromInt(self.vertices * @sizeOf(Vertex))) / vertex_bytes;
+    }
+    /// One flat-shaded triangle with a color per corner. Not clipped: callers
+    /// clip polygons first (ui/overview/draw.zig does).
+    pub fn triangle(self: *Renderer, p: [3][2]f32, colors: [3]Color) !void {
+        if ((self.vertices + 3) * @sizeOf(Vertex) > vertex_bytes) return error.VertexBufferFull;
+        const white = @as(f32, 0.5) / fonts.atlas_size;
+        const vertices: [*]Vertex = @ptrCast(@alignCast(self.mapped.?));
+        for (0..3) |i| vertices[self.vertices + i] = .{ .position = p[i], .uv = .{ white, white }, .color = colors[i] };
+        self.vertices += 3;
+    }
     pub fn rect(self: *Renderer, r: Rect, color: Color) !void {
         try self.quad(r, .{ .x = @as(f32, 0.5) / fonts.atlas_size, .y = @as(f32, 0.5) / fonts.atlas_size, .w = 0, .h = 0 }, color);
     }

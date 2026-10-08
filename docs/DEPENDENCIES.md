@@ -145,11 +145,11 @@ implementation is copied. [Build details and redistribution boundary](research/a
 
 ## Private Capstone 6
 
-`scripts/build-capstone` fetches the Capstone 6.x release tag
-`6.0.0-Alpha11` from
-`https://github.com/capstone-engine/capstone/archive/refs/tags/6.0.0-Alpha11.tar.gz`
+`scripts/build-capstone` fetches the Capstone 6.x release asset
+`capstone-6.0.0-Alpha11.tar.xz` from
+`https://github.com/capstone-engine/capstone/releases/download/6.0.0-Alpha11/capstone-6.0.0-Alpha11.tar.xz`
 and checks sha256
-`635bc456097c3cfe69da28bfeb196a5e1d0b7631accb2ddaf7cd00cb587957bb`.
+`9883a30a139142caaa01694b1cb0f5e2fee6f029f10c60140a03ff1446ddc988`.
 A stable `6.0.0` tarball was not published when this pin was chosen.
 The script configures a static PIC build at `-O2` for X86, AArch64, M68K, and
 LoongArch, installs it under `.work/capstone`, and keeps the upstream license
@@ -167,8 +167,10 @@ build. The vendored executable and unit tests use Zig's LLVM backend: Zig
 0.16's self-hosted Debug backend segfaults while compiling the translated
 Capstone 6 header. `scripts/release-check` stays on the system library unless
 `--capstone vendored` is passed. That mode copies `.work/capstone` into the
-source snapshot, because the snapshot otherwise omits gitignored trees, and
-passes `-Dcapstone=vendored` to the build step.
+source snapshot, because the snapshot otherwise omits gitignored trees,
+records that prefix's `BUILD-STAMP` and the sha256 of `libcapstone.a` in the
+results, and passes `-Dcapstone=vendored` to the build step. The static
+library is not given a runtime search path.
 
 Flow classes and branch targets were compared on about 1.3 M real x86-64,
 AArch64 and m68k instructions and matched exactly. Capstone 6 changes some

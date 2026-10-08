@@ -292,8 +292,7 @@ int main(int argc, char **argv)
     CHECK(xrt_process_options(true, true) & PTRACE_O_EXITKILL);
     const uintptr_t births = PTRACE_O_TRACEFORK | PTRACE_O_TRACEVFORK | PTRACE_O_TRACEVFORKDONE;
     CHECK((xrt_process_options(false, true) & births) == births);
-    if (xrt_arch_native() && xrt_arch_native()->machine == XRT_X86_64)
-        CHECK((xrt_process_options(false, false) & births) == births);
+    CHECK((xrt_process_options(false, false) & births) == births);
     CHECK(xrt_process_launch(NULL, false, &child) == XRT_INVALID_ARGUMENT && child == 0);
     const char *empty[] = {NULL};
     CHECK(xrt_process_launch(empty, false, &child) == XRT_INVALID_ARGUMENT && child == 0);

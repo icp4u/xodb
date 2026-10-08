@@ -452,9 +452,10 @@ enum xrt_status xrt_arch_step_resources(const struct xrt_arch *arch, uint8_t isa
         found |= arch->probes && arch->probes[i].isa_mode == isa_mode;
     if (!found)
         return XRT_UNSUPPORTED_MODE;
-    *out = (struct xrt_step_resources){.max_probes = XRT_STEP_PROBE_MAX,
-                                       .hardware_step = arch->hardware_step,
-                                       .software_probes = 0};
+    *out = (struct xrt_step_resources){
+        .max_probes = XRT_STEP_PROBE_MAX,
+        .hardware_step = arch->hardware_step,
+        .software_probes = arch->machine == XRT_LOONGARCH && !arch->hardware_step ? 2 : 0};
     return XRT_OK;
 }
 

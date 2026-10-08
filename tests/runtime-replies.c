@@ -12,6 +12,7 @@
 #include "remote_internal.h"
 #include "wire_target.h"
 #include "xrt_remote.h"
+#include <errno.h>
 #include <limits.h>
 #include <pthread.h>
 #include <signal.h>
@@ -694,16 +695,30 @@ static int child(int threads)
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     /* 64 KiB is below PTHREAD_STACK_MIN on some ABIs. A rejected size leaves
-       the default stack, and the process then runs out of tasks. */
+       the default stack, and the process then runs out of tasks. glibc also
+       rejects a stack smaller than the static TLS image. A sanitizer runtime
+       keeps a signal stack there, so the second attempt uses 1 MiB. */
     size_t stack = 64 * 1024;
     if (stack < (size_t)PTHREAD_STACK_MIN)
         stack = (size_t)PTHREAD_STACK_MIN;
-    if (pthread_attr_setstacksize(&attr, stack))
-        return 2;
-    for (int i = 0; i < threads; ++i) {
-        pthread_t thread;
-        if (pthread_create(&thread, &attr, sleeper, NULL))
+    for (int attempt = 0;; ++attempt) {
+        if (pthread_attr_setstacksize(&attr, stack))
             return 2;
+        int grew = 0;
+        for (int i = 0; i < threads; ++i) {
+            pthread_t thread;
+            const int created = pthread_create(&thread, &attr, sleeper, NULL);
+            if (created == 0)
+                continue;
+            if (i == 0 && attempt == 0 && created == EINVAL && stack < 1024 * 1024) {
+                stack = 1024 * 1024;
+                grew = 1;
+                break;
+            }
+            return 2;
+        }
+        if (!grew)
+            break;
     }
     for (;;)
         pause();

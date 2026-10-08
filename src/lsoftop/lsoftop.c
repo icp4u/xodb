@@ -2351,6 +2351,7 @@ static void usage(FILE *to)
 {
     fputs("usage: xodb --lsof-top [options]\n"
           "  --interval SECONDS   sampling period (default 1; 0.25 .. 60)\n"
+          "  --expected-start-ticks N  pin one --pid to this sampled identity\n"
           "  --pid PID            only these processes (repeatable, or a comma list)\n"
           "  --view NAME          files, processes, leaks or deleted (default processes)\n"
           "  --once               print one text frame after --samples scans and exit\n"
@@ -2426,7 +2427,7 @@ int xodb_lsof_top(int argc, char **argv)
         else if (!strcmp(a, "--ascii"))
             u->ascii = 1;
         else if (!next && (!strcmp(a, "--interval") || !strcmp(a, "--samples") || !strcmp(a, "--max-processes") || !strcmp(a, "--max-fds") ||
-                           !strcmp(a, "--budget-ms") || !strcmp(a, "--pid") || !strcmp(a, "--view") || !strcmp(a, "--size"))) {
+                           !strcmp(a, "--budget-ms") || !strcmp(a, "--expected-start-ticks") || !strcmp(a, "--pid") || !strcmp(a, "--view") || !strcmp(a, "--size"))) {
             fprintf(stderr, "lsof-top: %s needs a value\n", a);
             usage(stderr);
             return 2;
@@ -2447,6 +2448,13 @@ int xodb_lsof_top(int argc, char **argv)
                 o.max_fds = (uint32_t)value;
             else
                 o.budget_ms = (uint32_t)value;
+            i++;
+        } else if (!strcmp(a, "--expected-start-ticks")) {
+            char *end;
+            errno = 0;
+            const unsigned long long start = strtoull(next, &end, 10);
+            if (errno || !*next || *next == '-' || *end || !start) goto bad;
+            o.expected_start = start;
             i++;
         } else if (!strcmp(a, "--pid")) {
             for (const char *p = next; *p;) {
@@ -2506,6 +2514,10 @@ int xodb_lsof_top(int argc, char **argv)
         u->short_host[0] = 0;
     if (u->redact) {
         user_name(u, getuid()); /* the invoking user is always substituted */
+    }
+    if (o.expected_start && npids != 1) {
+        fprintf(stderr, "lsof-top: expected start requires exactly one --pid\n");
+        return 2;
     }
     o.pids = npids ? pids : NULL;
     o.pid_count = npids;

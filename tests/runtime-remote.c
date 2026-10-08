@@ -185,9 +185,10 @@ static void architecture_agent(struct xrt_target *t, int32_t pid)
     assert(xrt_rpc_classify(XRT_RPC_ALLOCATIONS_START) == XRT_RPC_CLASS_PERF);
     assert(xrt_rpc_classify(XRT_RPC_FUNCTION_START) == XRT_RPC_CLASS_PERF);
     assert(xrt_rpc_classify(XRT_RPC_CONTROL_WRITE) == XRT_RPC_CLASS_MUTATION);
-    assert(xrt_rpc_classify(55) == XRT_RPC_CLASS_PROTOCOL);
+    assert(xrt_rpc_classify(XRT_RPC_SOURCE_OPEN) == XRT_RPC_CLASS_FILE);
+    assert(xrt_rpc_classify(56) == XRT_RPC_CLASS_PROTOCOL);
     uint64_t packed = 1;
-    assert(xrt_remote_call(t, &(struct xrt_call){.op = 55, .value = &packed}) == XRT_PROTOCOL_ERROR);
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = 56, .value = &packed}) == XRT_PROTOCOL_ERROR);
     struct xrt_registers regs;
     OK(xrt_target_registers(t, pid, &regs));
     uint64_t pc = 0;
@@ -292,9 +293,10 @@ static void probes(const char *agent, const char *self)
     assert(xrt_target_breakpoint_set(t, address, false, NULL) == XRT_INVALID_ARGUMENT);
     OK(xrt_target_read(t, address, overlaid, trap, &count));
     assert(count == trap && !memcmp(original, overlaid, trap));
-    if (!xrt_arch_native()->hardware_step) {
-        assert(xrt_target_watchpoint_set(t, (uintptr_t)&watched, 8, XRT_WATCH_WRITE, &watch) ==
-               XRT_UNSUPPORTED_ARCHITECTURE);
+    uint8_t watch_slots = 0;
+    const enum xrt_status watch_cap = xrt_target_watchpoint_capacity(t, &watch_slots);
+    if (watch_cap != XRT_OK) {
+        assert(watch_cap == XRT_UNSUPPORTED_ARCHITECTURE);
         --t->generation;
         assert(xrt_target_continue(t) == XRT_STALE_SNAPSHOT);
         assert(view(t).state == XRT_STOPPED);
@@ -304,9 +306,17 @@ static void probes(const char *agent, const char *self)
         struct xrt_signal_info sig;
         OK(xrt_target_signal_info(t, pid, &sig));
         assert(sig.number == SIGTRAP);
-        assert(xrt_target_continue(t) == XRT_UNSUPPORTED_CONTROL);
-        assert(xrt_target_step(t, pid) == XRT_UNSUPPORTED_CONTROL);
-        assert(view(t).state == XRT_STOPPED && view(t).breakpoints[0].patched);
+        struct xrt_step_resources step_resources;
+        OK(xrt_arch_step_resources(xrt_arch_native(), XRT_ISA_MODE_ORDINARY, &step_resources));
+        if (step_resources.hardware_step || step_resources.software_probes) {
+            OK(xrt_target_step(t, pid));
+            OK(xrt_target_wait_stopped(t));
+            assert(view(t).threads[0].reason == XRT_STOP_SINGLE_STEP && view(t).breakpoints[0].patched);
+        } else {
+            assert(xrt_target_continue(t) == XRT_UNSUPPORTED_CONTROL);
+            assert(xrt_target_step(t, pid) == XRT_UNSUPPORTED_CONTROL);
+            assert(view(t).state == XRT_STOPPED && view(t).breakpoints[0].patched);
+        }
         OK(xrt_target_breakpoint_remove(t, bp));
         OK(xrt_target_continue(t));
         wait_exit(t);

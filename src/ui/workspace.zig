@@ -135,6 +135,7 @@ pub const Workspace = struct {
     source_line: i32 = 0,
     source_lines: i32 = 0,
     source_truncated: bool = false,
+    source_remote: bool = false,
     current_line: ?u32 = null,
     cursor_line: ?u32 = null,
     was_running_to: bool = false,
@@ -203,6 +204,9 @@ pub const Workspace = struct {
     regs: ?linux.Registers = null,
     instructions: [32]disasm.Instruction = undefined,
     instruction_count: usize = 0,
+    /// Set when disassembly failed while the target was stopped. Null means
+    /// the pane is empty because there is nothing to show yet.
+    assembly_error: ?[]const u8 = null,
     hot: [buttons.len]f32 = @splat(0),
     pressed: [buttons.len]f32 = @splat(0),
     hovered: ?usize = null,
@@ -231,16 +235,25 @@ pub const Workspace = struct {
         if (self.source_name) |name| std.heap.page_allocator.free(name);
     }
     pub fn loadSource(self: *Workspace, path: []const u8) !void {
-        if (std.mem.eql(u8, path, self.source_path) and self.source.len > 0) return;
+        if (!self.source_remote and std.mem.eql(u8, path, self.source_path) and self.source.len > 0) return;
         const a = std.heap.page_allocator;
         const name = try a.dupeZ(u8, path);
         errdefer a.free(name);
-        const file = c.fopen(name, "rb") orelse return error.SourceFileUnavailable;
-        defer _ = c.fclose(file);
+        const fd = c.open(name, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+        if (fd < 0) return error.SourceFileUnavailable;
+        defer _ = c.close(fd);
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.SourceFileUnavailable;
         const bytes = try a.alloc(u8, 1024 * 1024);
         errdefer a.free(bytes);
-        const n = c.fread(bytes.ptr, 1, bytes.len, file);
-        if (c.ferror(file) != 0) return error.SourceReadFailed;
+        var n: usize = 0;
+        while (n < bytes.len) {
+            const count = c.read(fd, bytes.ptr + n, bytes.len - n);
+            if (count < 0 and c.__errno_location().* == c.EINTR) continue;
+            if (count < 0) return error.SourceReadFailed;
+            if (count == 0) break;
+            n += @intCast(count);
+        }
         self.cursor_line = null;
         if (self.source_buffer) |old| a.free(old);
         if (self.source_name) |old| a.free(old);
@@ -248,8 +261,39 @@ pub const Workspace = struct {
         self.source_name = name;
         self.source = bytes[0..n];
         self.source_lines = @intCast(std.mem.count(u8, self.source, "\n") + @intFromBool(n > 0 and bytes[n - 1] != '\n'));
-        self.source_truncated = n == bytes.len and c.fgetc(file) != c.EOF;
+        self.source_truncated = stat.st_size > bytes.len;
+        self.source_remote = false;
         self.source_path = name;
+    }
+    fn loadSite(self: *Workspace, session: *Session, site: @import("../debug/info.zig").Site) !void {
+        self.loadSource(site.path) catch |err| {
+            if (!session.fetch_source or site.original_path != null or !session.target.isRemote()) return err;
+            const a = std.heap.page_allocator;
+            const bytes = session.remoteSource(a, site) catch |remote_err| {
+                // Do not display an old remote copy as this stop's source.
+                if (self.source_remote) {
+                    self.source = "";
+                    self.source_lines = 0;
+                    self.source_remote = false;
+                    self.source_path = "";
+                    self.source_truncated = false;
+                    self.cursor_line = null;
+                }
+                return remote_err;
+            };
+            errdefer a.free(bytes);
+            const name = try a.dupeZ(u8, site.path);
+            if (self.source_buffer) |old| a.free(old);
+            if (self.source_name) |old| a.free(old);
+            self.source_buffer = bytes;
+            self.source_name = name;
+            self.source_path = name;
+            self.source = bytes;
+            self.source_lines = @intCast(std.mem.count(u8, bytes, "\n") + @intFromBool(bytes.len > 0 and bytes[bytes.len - 1] != '\n'));
+            self.source_truncated = false;
+            self.source_remote = true;
+            self.cursor_line = null;
+        };
     }
     /// The key bindings, as the evdev codes `step` tests for. A key is matched by
     /// its logical identity, and never with Ctrl, Alt, or Logo held. Only
@@ -1391,6 +1435,7 @@ pub const Workspace = struct {
         self.local_diagnostic = null;
         self.regs = null;
         self.instruction_count = 0;
+        self.assembly_error = null;
         if (tid == 0 or session.target.snapshot().state != .stopped) {
             self.flow.refresh(session, 0);
             return;
@@ -1408,14 +1453,17 @@ pub const Workspace = struct {
             self.status = @errorName(err);
             return;
         };
-        self.instruction_count = disasm.decodeFor(session.target.arch(), bytes[0..n], assembly_address, &self.instructions) catch 0;
+        self.instruction_count = disasm.decodeFor(session.target.arch(), bytes[0..n], assembly_address, &self.instructions) catch |err| blk: {
+            self.assembly_error = @errorName(err);
+            break :blk 0;
+        };
         const a = self.arena.allocator();
         self.frames = session.stack(a, tid, 64) catch &.{};
         if (self.frames.len > 0) {
             self.selected_frame = @min(self.selected_frame, self.frames.len - 1);
             if (self.frames[self.selected_frame].source) |site| {
-                self.loadSource(site.path) catch |err| {
-                    self.status = @errorName(err);
+                self.loadSite(session, site) catch |err| {
+                    self.status = if (err == error.SourceAgentNeedsUpdating) "Source: agent needs updating" else @errorName(err);
                 };
                 if (std.mem.eql(u8, self.source_path, site.path)) {
                     self.current_line = site.line;
@@ -1433,7 +1481,9 @@ pub const Workspace = struct {
         if (self.browse_address) |address| {
             self.current_line = null;
             if (session.sourceAt(a, address)) |site| {
-                self.loadSource(site.path) catch {};
+                self.loadSite(session, site) catch |err| {
+                    self.status = if (err == error.SourceAgentNeedsUpdating) "Source: agent needs updating" else @errorName(err);
+                };
                 if (std.mem.eql(u8, self.source_path, site.path)) {
                     self.current_line = site.line;
                     self.source_line = @intCast(site.line -| 6);
@@ -1644,7 +1694,7 @@ pub const Workspace = struct {
             session.profile_view = if (self.flame.graph != null and (self.flame.basis == .recorded or reconstructed == .ready)) .{ .capture_id = self.flame.capture_id, .revision = self.flame.revision, .filter = self.flame.built_filter, .view_id = self.flame.view_id, .sample_count = self.flame.sample_count, .basis = @enumFromInt(@intFromEnum(self.flame.basis)) } else null;
         } else {
             const source_rect = gpu.Rect{ .x = 8, .y = body_y, .w = left - 12, .h = bottom - body_y - 5 };
-            try pane(r, font, source_rect, if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
+            try pane(r, font, source_rect, if (self.source_remote) "SOURCE / remote copy" else if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
             if (self.source.len == 0) {
                 try r.text(font, 24, body_y + 58, "Open a file with --source <path>", theme.weak);
                 try r.text(font, 24, body_y + 86, "Stop in code with DWARF to follow source.", theme.weak);
@@ -1692,8 +1742,20 @@ pub const Workspace = struct {
                 try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
                 try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) catch null else null);
             } else {
-                try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", if (self.browse_address != null) "browsing / G flow" else "x86-64 / G flow");
-                if (self.instruction_count == 0) try r.text(font, left + 16, body_y + 55, "Pause to inspect instructions", theme.weak);
+                var arch_subtitle: [64]u8 = undefined;
+                const assembly_detail = if (self.browse_address != null)
+                    "browsing / G flow"
+                else
+                    std.fmt.bufPrint(&arch_subtitle, "{s} / G flow", .{@tagName(session.target.arch())}) catch "G flow";
+                try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", assembly_detail);
+                if (self.instruction_count == 0) {
+                    var unavailable: [96]u8 = undefined;
+                    const message = if (self.assembly_error) |name|
+                        std.fmt.bufPrint(&unavailable, "assembly unavailable: {s}", .{name}) catch "assembly unavailable"
+                    else
+                        "Pause to inspect instructions";
+                    try r.text(font, left + 16, body_y + 55, message, theme.weak);
+                }
                 const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
                 self.assembly_rows = .{ .x = left + 2, .y = body_y + 45, .w = right - left - 6, .count = 0 };
                 for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
@@ -1726,7 +1788,8 @@ pub const Workspace = struct {
                     try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
                 }
             } else {
-                try pane(r, font, side, "REGISTERS", "changed since last stop");
+                const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
+                try pane(r, font, side, "REGISTERS", if (restart_slot) "r0 is the kernel restart slot" else "changed since last stop");
                 if (self.regs) |regs| {
                     for (regs.descriptions(), 0..) |desc, i| {
                         const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
@@ -1734,7 +1797,13 @@ pub const Workspace = struct {
                         const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
                         const changed = value != null and previous != null and value.? != previous.?;
                         if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
-                        try label(r, font, right + 14, y, theme.weak, "{s}", .{std.mem.span(desc.name)});
+                        const name = std.mem.span(desc.name);
+                        try label(r, font, right + 14, y, theme.weak, "{s}", .{name});
+                        if (restart_slot and std.mem.eql(u8, name, "r0")) {
+                            const tag = "slot";
+                            const tag_x = right + 14 + r.measure(font, name) + 6;
+                            if (tag_x + r.measure(font, tag) <= right + 80) try r.text(font, tag_x, y, tag, theme.weak);
+                        }
                         if (value) |word| {
                             try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
                         } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
