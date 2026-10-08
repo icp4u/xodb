@@ -75,6 +75,7 @@ pub const Tree = struct {
             affected[n] = entry.session;
             n += 1;
             entry.session.cancelStep();
+            entry.session.metadata.invalidate();
             entry.session.allocations.stop(.target_ended);
             if (entry.session.profile) |capture| if (capture.collector != null) try entry.session.stopProfile();
         };
@@ -180,6 +181,9 @@ pub const Tree = struct {
         std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
     }
     pub fn deinit(self: *Tree) void {
+        // File workers borrow target handles, including each child's shared
+        // remote transport. Drain all of them before the first target teardown.
+        for (self.entries[0..self.count]) |entry| entry.session.metadata.deinit();
         // Release all target links before freeing any session. A failed detach
         // must not leave a dangling vfork pointer for a later parent's cleanup.
         var cleanup = self.count;

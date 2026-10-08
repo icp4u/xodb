@@ -102,7 +102,15 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
                 time.sleep(max(0, seconds - 4.8))
                 raise subprocess.TimeoutExpired(binary, seconds)
             if expect == 'cycle':
-                time.sleep(2); sample(); time.sleep(seconds - 2.5); sample()
+                time.sleep(2); sample()
+                # Slow hosts must exercise enough retirements to test slow
+                # growth too. Failure to reach the count is a failure, not a skip.
+                while time.monotonic() - started < max(seconds, 30):
+                    elapsed = time.monotonic() - started
+                    if elapsed >= seconds - .5 and log.read_text(errors='replace').count('vkfault: retired ') >= 10:
+                        break
+                    time.sleep(.25)
+                sample()
                 raise subprocess.TimeoutExpired(binary, seconds)
             app.wait(timeout=seconds)
         except subprocess.TimeoutExpired:
@@ -123,7 +131,10 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
     elapsed = time.monotonic() - started
     text = log.read_text(errors='replace')
     summary = None
+    retirements = []
     for line in text.splitlines():
+        if line.startswith('vkfault: retired '):
+            retirements.append(json.loads(line[len('vkfault: retired '):]))
         if line.startswith('vkfault: summary '):
             summary = json.loads(line[len('vkfault: summary '):])
     m = re.search(r'xodb: (\d+) frames, clean shutdown \(reason=(\w+)', text)
@@ -136,7 +147,7 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
              present_candidates=sorted(set(re.findall(r'vkfault: present candidate (.*)', text))),
              panic=bool(re.search(r'panic|Segmentation fault|reached unreachable|integer overflow|index out of bounds', text)) or (app.returncode or 0) < 0,
              violations=[l for l in text.splitlines() if l.startswith('vkfault: violation') or l.startswith('vkfault: leak')][:20],
-             summary=summary, rss_kib=rss, tail=text.splitlines()[-8:])
+             summary=summary, retirements=retirements, rss_kib=rss, tail=text.splitlines()[-8:])
     problems = []
     if r['panic']: problems.append('crash/panic')
     if app.returncode != 0: problems.append(f'exit {app.returncode}')
@@ -146,6 +157,14 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
         if summary['leaks']: problems.append(f"{summary['leaks']} leaked objects")
         if summary['violations']: problems.append(f"{summary['violations']} lifetime violations")
         if summary['live_at_exit']: problems.append(f"{summary['live_at_exit']} live objects at exit")
+        if summary['created'] != summary['destroyed']: problems.append('unbalanced Vulkan object creation/destruction')
+        allocations = summary['allocations']
+        if allocations['live_bytes'] or allocations['leaked_bytes'] or allocations['allocated_bytes'] != allocations['freed_bytes']:
+            problems.append('unbalanced Vulkan allocation bytes')
+        if summary['dirty_retirements'] or any(row['live_objects'] or row['live_bytes'] for row in retirements):
+            problems.append('Vulkan resources survived instance retirement')
+        if len(retirements) != summary['retired_instances'] or len(retirements) != summary['destroyed']['instance']:
+            problems.append('missing instance retirement accounting')
         for function in re.findall(r'(?:^|;)fail=([A-Za-z0-9_]+)@', rules):
             if summary['calls'].get(function, [0, 0])[1] == 0:
                 problems.append(f'{function} fault was never injected')
@@ -157,13 +176,30 @@ def run_case(d, shim, name, rules, frames, seconds, expect):
         if rendered: problems.append('rendered despite unusable startup')
         if not r['init_failures']: problems.append('no init failure reported')
     if expect == 'cycle' and not (r['init_failures'] + r['frame_failures']): problems.append('fault never surfaced')
-    if expect == 'cycle' and len(rss) == 2 and rss[1] - rss[0] > 65536: problems.append(f'RSS grew {rss[1] - rss[0]} KiB across renderer recreation')
+    # RSS includes loaded driver images, active GPU mappings and allocator
+    # caches. Arbitrary-phase samples remain diagnostic. Exact Vulkan balances
+    # and same-phase host samples cover completed lifetimes separately.
+    if expect == 'cycle' and len(retirements) < 10: problems.append('fewer than ten renderer lifetimes exercised')
+    if expect == 'cycle' and len(retirements) >= 10:
+        # Sampled at the same phase (just after vkDestroyInstance). Lifetimes 1-2 warm
+        # driver caches; afterwards descriptors and threads must be flat and resident
+        # memory must not climb by more than 4 MiB in total. Ten lifetimes keep
+        # enough observations after warm-up to detect 1 MiB/cycle growth.
+        settled = retirements[2:]
+        if any(row[key] < 0 for row in settled for key in ('rss_kib', 'fds', 'threads')):
+            problems.append('host resource retirement sample unavailable')
+        if any(row['peak_bytes'] > max(r['peak_bytes'] for r in retirements[:2]) for row in settled):
+            problems.append('Vulkan allocation peak grew across renderer lifetimes')
+        for key in ('fds', 'threads'):
+            if settled[-1][key] > settled[0][key]: problems.append(f"{key} grew {settled[0][key]}->{settled[-1][key]} across renderer lifetimes")
+        grew = settled[-1]['rss_kib'] - settled[0]['rss_kib']
+        if grew > 4096: problems.append(f"RSS at retirement grew {grew} KiB across {len(settled)} lifetimes")
     if expect == 'resize':
         if r['reason'] != 'signal' or not rendered: problems.append('did not render until stopped')
         if r['swapchain_requests'] < 5: problems.append(f"only {r['swapchain_requests']} swapchains for 4 resizes")
     if expect == 'observe':
         r['notes'] = problems + [f"{r['swapchain_requests']} swapchain creations for {frames} frames at a constant surface size"]
-        problems = [p for p in problems if p in ('crash/panic',) or p.startswith(('exit', 'no clean')) or 'leaked' in p or 'violations' in p]
+        problems = [p for p in problems if p in ('crash/panic',) or p.startswith(('exit', 'no clean')) or 'leaked' in p or 'violations' in p or 'Vulkan' in p or 'retirement' in p]
     r['problems'] = problems
     r['ok'] = not problems
     return r

@@ -46,6 +46,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 args = [sys.executable, '-B', f'tests/{name}.py', '--helper', './zig-out/bin/xodb-allocation-helper']
                 steps.append((name, args, 180))
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
+        steps.append(('metadata-session', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ms'], 180))
+        steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
+        storage = ['--storage', os.environ['XODB_LARGE_IMAGE_STORAGE']] if os.environ.get('XODB_LARGE_IMAGE_STORAGE') else []
+        steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
         steps.append(('symbol-discovery', [sys.executable, '-B', 'tests/symbol-discovery.py'], 240))
@@ -60,6 +64,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
         if node:
             steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
+            steps.append(('javascript-cache', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--work', '.work/js-cache'], 300))
+            steps.append(('javascript-cache-agent', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--agent', 'zig-out/bin/xodb-agent', '--work', '.work/js-cache-agent'], 300))
         for index, (executable, source, library) in enumerate(lua):
             sdk = ['--source', source, '--library', library]
             steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))

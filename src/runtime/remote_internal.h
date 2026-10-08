@@ -13,6 +13,7 @@ struct xrt_call {
     size_t capacity, *length;
 };
 enum xrt_status xrt_remote_call(const struct xrt_target *, const struct xrt_call *);
+enum xrt_status xrt_remote_background_file(const struct xrt_target *, const struct xrt_call *);
 enum xrt_status xrt_remote_health(const struct xrt_target *);
 enum xrt_status xrt_remote_fail(const struct xrt_target *, enum xrt_status);
 enum xrt_status xrt_remote_destroy(struct xrt_target *);

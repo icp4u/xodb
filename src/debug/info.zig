@@ -102,6 +102,26 @@ fn language(die: *c.Dwarf_Die) eval.Language {
     }
     return .unknown;
 }
+/// Unwind-only libdw state over C's private, bounded EH-section container.
+/// It borrows the bytes; destroy this before releasing the metadata job.
+/// It never enters Modules and cannot provide symbols, code, types or sources.
+pub const Cfi = struct {
+    decoder: Image,
+    pub fn init(architecture: @import("../target/arch.zig").Arch, bytes: []u8) !Cfi {
+        if (c.elf_version(c.EV_CURRENT) == c.EV_NONE) return error.ElfLibraryUnavailable;
+        const object = c.elf_memory(@ptrCast(bytes.ptr), bytes.len) orelse return error.InvalidUnwindImage;
+        errdefer _ = c.elf_end(object);
+        const eh = c.dwarf_getcfi_elf(object) orelse return error.NoUnwindInfo;
+        return .{ .decoder = .{ .architecture = architecture, .object = object, .debug_object = object, .dwarf = null, .eh = eh, .debug_cfi = null, .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator), .address_table = &.{} } };
+    }
+    pub fn deinit(self: *Cfi) void {
+        self.decoder.deinit();
+    }
+    pub fn unwind(self: *Cfi, a: std.mem.Allocator, pc: u64, context: loc.Context) !Unwind {
+        return self.decoder.unwind(a, pc, context);
+    }
+};
+
 pub const Image = struct {
     architecture: @import("../target/arch.zig").Arch,
     object: *c.Elf,

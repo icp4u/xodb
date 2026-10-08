@@ -94,6 +94,7 @@ pub const Session = struct {
     modules: Modules = Modules.init(std.heap.page_allocator),
     debug_files: @import("../binary/debug_files.zig").Files = .{ .allocator = std.heap.page_allocator },
     source_maps: @import("source_maps.zig").Maps = .{},
+    metadata: @import("debug_metadata.zig").State = .{},
     maps_epoch: u64 = 0,
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
@@ -228,6 +229,7 @@ pub const Session = struct {
         self.allocations.poll(pending_valid, boundary);
     }
     pub fn detach(self: *Session) !void {
+        self.metadata.invalidate();
         self.allocations.stop(.target_ended);
         self.observations.stop(.target_ended);
         try self.target.detach();
@@ -816,6 +818,7 @@ pub const Session = struct {
         self.cancelStep();
         self.run_to = null;
         self.source_step = null;
+        self.metadata.invalidate();
         try self.target.reset();
         try self.target.launch(self.launch_argv);
         // Relocation happens before another event-loop policy pass can prune IDs.
@@ -1139,6 +1142,7 @@ pub const Session = struct {
         return true;
     }
     pub fn poll(self: *Session) !void {
+        defer self.metadata.poll(self);
         defer self.inspections.poll(self);
         defer self.pollObservationArchive();
         if (self.target.core != null) {
@@ -1426,7 +1430,8 @@ pub const Session = struct {
         const raw_registers = try self.target.registers(tid);
         var registers = loc.registers(raw_registers);
         var frames: std.ArrayList(Frame) = .empty;
-        while (frames.items.len < @min(64, limit)) {
+        self.metadata.beginQuery();
+        stack_walk: while (frames.items.len < @min(64, limit)) {
             const arch_ = self.target.arch();
             const slot = arch_.pc();
             // LoongArch csr_era has no DWARF number. The top frame uses the
@@ -1441,29 +1446,38 @@ pub const Session = struct {
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
             frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
             if (self.modules.symbolAt(frame.lookup_pc)) |symbol| frame.symbol = symbol.name else |_| {}
-            const module = self.modules.at(frame.lookup_pc) catch |err| {
-                frame.diagnostic = @errorName(err);
-                try frames.append(a, frame);
-                break;
-            };
-            frame.module_id = module.id;
-            const debug = module.debugInfo() catch |err| {
-                frame.diagnostic = @errorName(err);
-                try frames.append(a, frame);
-                break;
-            };
-            frame.inline_frames = debug.inlineAt(a, try module.linkAddress(frame.lookup_pc)) catch |err| blk: {
-                frame.inline_diagnostic = @errorName(err);
-                break :blk &.{};
-            };
-            for (frame.inline_frames) |*inlined| {
-                if (inlined.call_path) |path| inlined.call_path = try self.sourceMaps().forward(a, path);
-                if (inlined.decl_path) |path| inlined.decl_path = try self.sourceMaps().forward(a, path);
-            }
-            const step = debug.unwind(a, try module.linkAddress(frame.lookup_pc), .{ .registers = registers, .load_bias = module.bias, .user = self, .read = readTarget }) catch |err| {
-                frame.diagnostic = @errorName(err);
-                try frames.append(a, frame);
-                break;
+            const step: info.Unwind = step: {
+                const module = self.modules.at(frame.lookup_pc) catch |err| {
+                    if (err == error.BinarySnapshotLimit and self.target.core == null) {
+                        break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
+                            frame.diagnostic = @errorName(metadata_error);
+                            try frames.append(a, frame);
+                            break :stack_walk;
+                        };
+                    }
+                    frame.diagnostic = @errorName(err);
+                    try frames.append(a, frame);
+                    break :stack_walk;
+                };
+                frame.module_id = module.id;
+                const debug = module.debugInfo() catch |err| {
+                    frame.diagnostic = @errorName(err);
+                    try frames.append(a, frame);
+                    break :stack_walk;
+                };
+                frame.inline_frames = debug.inlineAt(a, try module.linkAddress(frame.lookup_pc)) catch |err| blk: {
+                    frame.inline_diagnostic = @errorName(err);
+                    break :blk &.{};
+                };
+                for (frame.inline_frames) |*inlined| {
+                    if (inlined.call_path) |path| inlined.call_path = try self.sourceMaps().forward(a, path);
+                    if (inlined.decl_path) |path| inlined.decl_path = try self.sourceMaps().forward(a, path);
+                }
+                break :step debug.unwind(a, try module.linkAddress(frame.lookup_pc), .{ .registers = registers, .load_bias = module.bias, .user = self, .read = readTarget }) catch |err| {
+                    frame.diagnostic = @errorName(err);
+                    try frames.append(a, frame);
+                    break :stack_walk;
+                };
             };
             frame.cfa = step.cfa;
             frame.unwind_method = @tagName(step.method);
@@ -1704,9 +1718,10 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        self.metadata.deinit();
         self.static_analysis.deinit();
         if (self.observation_archive) |job| job.deinit();
         if (self.observation_associations) |job| job.deinit();
@@ -1736,7 +1751,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

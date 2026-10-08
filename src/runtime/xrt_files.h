@@ -35,6 +35,23 @@ enum xrt_status xrt_target_file(const struct xrt_target *, const struct xrt_file
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, int *fd);
 enum xrt_status xrt_file_identity(int fd, struct xrt_file_identity *);
 enum xrt_status xrt_file_unchanged(int fd, const struct xrt_file_identity *);
+/* Pinned regular file, without a whole-image snapshot. Open on the target's
+ * owner thread; one worker may then use the view. Join it before close. A
+ * remote view prevents destruction of its borrowed target until closed.
+ * Reads are exact and bounded; failure publishes no bytes. Identity changes
+ * poison the view permanently. No local pathname is reopened after open. */
+#define XRT_FILE_VIEW_MAX_READ 65536
+struct xrt_file_view;
+enum xrt_status xrt_target_file_view_open(const struct xrt_target *,
+        const struct xrt_file_request *, struct xrt_file_view **);
+const struct xrt_file_identity *xrt_file_view_identity(const struct xrt_file_view *);
+/* One-worker mode: a remote read yields with DISCOVERY_PENDING while a
+ * foreground RPC owns or awaits the transport. No wire request was sent. */
+void xrt_file_view_background(struct xrt_file_view *);
+int xrt_file_view_remote(const struct xrt_file_view *);
+enum xrt_status xrt_file_view_validate(struct xrt_file_view *);
+enum xrt_status xrt_file_view_read(struct xrt_file_view *, uint64_t, void *, size_t);
+enum xrt_status xrt_file_view_close(struct xrt_file_view *);
 /* Owner-thread scope for automatic remote symbol discovery. Explicit user
  * file requests keep their normal limits. The borrowed budget must outlive
  * the scope; clear it before returning to the event loop. */
@@ -49,4 +66,15 @@ void xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *)
  * The output fd is sealed; resident counts retained source bytes, not holes. */
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *, const struct xrt_file_request *,
                                       int *fd, uint64_t *resident);
+/* Worker-owned symbol projection: at most 64 MiB of selected sections, each
+ * read at most 64 KiB. Successful start owns the view; failed start does not.
+ * The local application uses this when a full-image snapshot is too large.
+ * Cancel is asynchronous; destroy joins before releasing the borrowed view.
+ * Poll is owner-thread only, returning PENDING or a sealed fd exactly once.
+ * A completed poll revalidates the original file before transferring the fd. */
+struct xrt_symbol_job;
+enum xrt_status xrt_symbol_job_start(struct xrt_file_view *, struct xrt_symbol_job **);
+enum xrt_status xrt_symbol_job_poll(struct xrt_symbol_job *, int *, uint64_t *resident);
+void xrt_symbol_job_cancel(struct xrt_symbol_job *);
+void xrt_symbol_job_destroy(struct xrt_symbol_job *);
 #endif

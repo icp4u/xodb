@@ -20,7 +20,7 @@ struct xjs_layout {
     uint64_t dwarf_fields;
     int dwarf_frame_config;
 };
-struct xjs_dwarf_profile { uint64_t fields; int frame_config; const char *error; };
+#include "javascript_profile.h"
 void xjs_dwarf_profile(Dwarf *, struct xjs_dwarf_profile *);
 /* The caller verifies every loaded constant against the identified image.
  * Missing optional fields refuse only the operation that needs them. */

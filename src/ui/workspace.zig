@@ -200,6 +200,7 @@ pub const Workspace = struct {
     allocation_busy: bool = false,
     allocation_collecting: bool = false,
     last_generation: u64 = std.math.maxInt(u64),
+    last_metadata_revision: u64 = 0,
     last_tid: i32 = 0,
     regs: ?linux.Registers = null,
     instructions: [32]disasm.Instruction = undefined,
@@ -1418,13 +1419,14 @@ pub const Workspace = struct {
             }
         }
         const tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
-        if (self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
+        if (self.last_metadata_revision == session.metadata.revision and self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
         if (self.last_generation != session.target.snapshot().generation) self.browse_address = null;
         self.last_browse = self.browse_address;
         self.last_show_flow = self.show_flow;
         if (self.last_tid != tid) self.stale_regs = null else if (self.regs) |regs| self.stale_regs = regs;
         self.alive = 0;
         self.last_generation = session.target.snapshot().generation;
+        self.last_metadata_revision = session.metadata.revision;
         self.last_tid = tid;
         self.last_frame = self.selected_frame;
         _ = self.arena.reset(.retain_capacity);
@@ -1826,8 +1828,14 @@ pub const Workspace = struct {
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
+        const metadata = session.metadata.snapshot();
+        const pending_metadata: ?@import("../model/debug_metadata.zig").JobStatus = for (metadata.items[0..metadata.count]) |job| {
+            if (!std.mem.eql(u8, job.state, "ready") and !std.mem.eql(u8, job.state, "failed") and !std.mem.eql(u8, job.state, "cancelled")) break job;
+        } else null;
         if (session.frames.attachment.failure) |err| {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ @tagName(session.frames.attachment.state), @errorName(err) });
+        } else if (pending_metadata) |job| {
+            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
         } else if (self.shared_clients) |count| {
             if (self.shared_controller) |owner| {
                 try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(session.agent_scope), owner, count });

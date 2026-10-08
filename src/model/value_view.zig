@@ -91,6 +91,7 @@ pub const JavaScriptValue = struct {
     runtime_version: []const u8,
     runtime_build_id: []const u8,
     layout_source: []const u8,
+    dwarf_fields: u64 = 0,
     memory_reads: usize,
     memory_bytes: usize,
     items: []JavaScriptItem,

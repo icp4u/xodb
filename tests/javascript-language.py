@@ -28,6 +28,8 @@ version = subprocess.check_output([node, '-p', 'process.versions.v8'], text=True
 (root/'.work').mkdir(exist_ok=True)
 work = Path(tempfile.mkdtemp(prefix='javascript-', dir=root/'.work'))
 work.chmod(0o755)
+(work/'cache').mkdir(mode=0o700)
+os.environ['XDG_CACHE_HOME'] = str(work/'cache')
 addon = work/'probe.node'
 subprocess.run([os.environ.get('CXX', 'c++'), '-std=c++20', '-g', '-O0', '-fno-omit-frame-pointer',
                 '-fPIC', '-shared', '-I'+args.include, '-DNODE_GYP_MODULE_NAME=xodb_probe',
@@ -125,10 +127,12 @@ def run(script, count, flags=(), script_args=()):
             state = client.stopped('breakpoint')
             ground = json.loads(lines.get(timeout=10))
             before = client.inspect('get_registers', tid=target.pid)
+            # Metadata is a separate bounded background job. Wait for its
+            # verified profile before comparing previews or timing reads.
+            stack = client.inspect('get_language_stack', tid=target.pid, language='javascript')
             started = time.time()
             locals_ = client.inspect('list_locals', tid=target.pid, frame=0)
             value = client.inspect('evaluate_expression', tid=target.pid, frame=0, expression='value')['value']
-            stack = client.inspect('get_language_stack', tid=target.pid, language='javascript')
             ended = time.time()
             assert client.inspect('get_registers', tid=target.pid) == before
             assert client.session()['generation'] == state['generation']

@@ -44,9 +44,13 @@ class Client:
     def tool(self, tool_name, **args):
         return self.call('tools/call', {'name':tool_name,'arguments':args})
     def inspect(self, tool_name, **args):
-        deadline = time.monotonic() + 15
+        deadline = time.monotonic() + (900 if tool_name == 'get_language_stack' else 15)
         while True:
             response = self.tool(tool_name, **args)
+            if tool_name == 'get_language_stack' and 'result' in response and response['result'].get('isError') and response['result']['content'][0]['text'] == 'DebugMetadataPending':
+                assert time.monotonic() < deadline, response
+                time.sleep(.02)
+                continue
             if tool_name == 'export_profile' and 'result' in response and response['result'].get('isError') and response['result']['content'][0]['text'] == 'ProfileViewPending':
                 assert time.monotonic() < deadline, response
                 time.sleep(.002)

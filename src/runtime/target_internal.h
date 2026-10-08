@@ -44,6 +44,7 @@ struct xrt_target {
     /* GCC/Clang __atomic accesses keep concurrent collector ownership safe.
      * Plain storage keeps this private layout translatable by Zig @cImport. */
     uint32_t remote_collectors;
+    uint32_t remote_files;
     bool remote_shared;
     const struct xrt_arch *arch;
     uint8_t identity_admitted;

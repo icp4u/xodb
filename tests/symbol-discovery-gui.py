@@ -56,6 +56,14 @@ try:
     d.shot('first-breakpoint')
     (work/'results.json').write_text(json.dumps({'status':'pass','queued':queued,'cancelled':cancelled,'settled':settled,'first_stop':stopped,'counter':counter},indent=2)+'\n')
 finally:
-    if d:d.close()
+    if d:
+        try:
+            # Finish xodb's slow-agent shutdown while its compositor is still
+            # available. The general harness stops both together and its
+            # five-second fallback can kill xodb before its child is reaped.
+            d.app.stdin.close()
+            assert d.app.wait(timeout=30) == 0, d.tail()
+        finally:
+            d.close()
     fixture.unlink(missing_ok=True)
 print('Private GUI Space cancel, stopped discovery and fresh first-hit continue passed:',work)

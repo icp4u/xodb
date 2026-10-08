@@ -33,7 +33,10 @@ Some offsets are absent from the published metadata. Their exact-version table
 in `src/language/javascript_v8_14_6.h` cites the upstream Node tag and V8 source.
 Same-image DWARF constants, when available, are checked before using that table;
 any disagreement refuses the layout. Outputs identify `postmortem-metadata`,
-`version-table`, or `version-table+dwarf-crosscheck` as their layout source.
+`version-table`, or `version-table+partial-dwarf-crosscheck` as their layout source.
+The `dwarf_fields` mask reports which supplemental table fields were observed;
+fields without a DWARF fact still use the exact-version table. A partial
+cross-check does not certify every offset used by a value or frame.
 An incomplete DWARF check also refuses, preserving its work, unit, depth or
 malformed-data reason; it is not reported as a layout mismatch.
 

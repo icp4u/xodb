@@ -3,6 +3,7 @@
 #include "xrt_files.h"
 #include "xrt_remote.h"
 #include <elf.h>
+#include <errno.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
@@ -178,26 +179,61 @@ static enum xrt_status symbol(struct reader *r, const struct dynamic *d, uint64_
     }
     return XRT_FILE_UNAVAILABLE;
 }
-static enum xrt_status discover(struct reader *r)
+static enum xrt_status auxiliary(struct reader *r, struct xrt_auxv *out)
 {
     unsigned char aux[4096];
     int fd = -1;
     struct xrt_file_request request = {.kind = XRT_FILE_AUXV};
     TRY(xrt_target_file(r->target, &request, &fd));
-    ssize_t n = read(fd, aux, sizeof(aux));
+    ssize_t n;
+    do { n = read(fd, aux, sizeof aux); } while (n < 0 && errno == EINTR);
     close(fd);
-    if (n <= 0 || n == sizeof(aux)) return XRT_FILE_UNAVAILABLE;
+    if (n <= 0 || n == sizeof aux || (size_t)n % (r->word * 2)) return XRT_FILE_UNAVAILABLE;
     r->out->bytes += (uint64_t)n;
-    uint64_t count = 0, stride = 0;
+    unsigned seen = 0;
     for (size_t i = 0; i + r->word * 2 <= (size_t)n; i += r->word * 2) {
         uint64_t key = number(r, aux + i, r->word);
         uint64_t value = number(r, aux + i + r->word, r->word);
-        if (key == AT_NULL) break;
-        if (key == AT_PHDR) r->out->main_phdr = value;
-        if (key == AT_PHNUM) count = value;
-        if (key == AT_PHENT) stride = value;
-        if (key == AT_BASE) r->out->interpreter = value;
+        if (key == AT_NULL) return XRT_OK;
+        uint64_t *field = NULL; unsigned bit = 0;
+        if (key == AT_PHDR) { field = &out->main_phdr; bit = 1; }
+        if (key == AT_PHNUM) { field = &out->phnum; bit = 2; }
+        if (key == AT_PHENT) { field = &out->phent; bit = 4; }
+        if (key == AT_BASE) { field = &out->interpreter; bit = 8; }
+        if (key == AT_PAGESZ) { field = &out->page_size; bit = 16; }
+        if (key == AT_ENTRY) { field = &out->entry; bit = 32; }
+        if (field) {
+            if (seen & bit) return XRT_FILE_UNAVAILABLE;
+            seen |= bit; *field = value;
+        }
     }
+    return XRT_FILE_UNAVAILABLE;
+}
+enum xrt_status xrt_target_auxv(const struct xrt_target *target, struct xrt_auxv *out)
+{
+    if (!target || !out) return XRT_INVALID_ARGUMENT;
+    *out = (struct xrt_auxv){0};
+    struct xrt_target_view view;
+    xrt_target_view(target, &view);
+    if (view.state != XRT_STOPPED) return XRT_NOT_STOPPED;
+    const struct xrt_arch *arch = xrt_target_arch(target);
+    if (!arch || (arch->address_bits != 32 && arch->address_bits != 64)) return XRT_UNSUPPORTED_ARCHITECTURE;
+    struct xrt_loader stats = {0};
+    struct reader r = {.target=target, .out=&stats, .word=arch->address_bits/8, .little=arch->little_endian};
+    struct xrt_auxv values = {0};
+    enum xrt_status status = auxiliary(&r, &values);
+    if (status != XRT_OK) return status;
+    if (!values.main_phdr || !values.page_size || values.page_size & (values.page_size-1)) return XRT_FILE_UNAVAILABLE;
+    *out = values;
+    return XRT_OK;
+}
+static enum xrt_status discover(struct reader *r)
+{
+    struct xrt_auxv aux = {0};
+    TRY(auxiliary(r, &aux));
+    r->out->main_phdr = aux.main_phdr;
+    r->out->interpreter = aux.interpreter;
+    uint64_t count = aux.phnum, stride = aux.phent;
     struct dynamic main = {0};
     enum xrt_status status = program_headers(r, r->out->main_phdr, count, stride, 0, false, &main);
     if (status == XRT_OK && main.debug) {

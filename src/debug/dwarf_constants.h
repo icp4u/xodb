@@ -1,6 +1,11 @@
 /* DWARF wire constants used by the standalone C readers. */
 #ifndef XODB_DWARF_CONSTANTS_H
 #define XODB_DWARF_CONSTANTS_H
+#define DW_TAG_class_type 0x02
+#define DW_TAG_enumeration_type 0x04
+#define DW_TAG_structure_type 0x13
+#define DW_TAG_namespace 0x39
+#define DW_AT_const_value 0x1c
 #define DW_AT_comp_dir 0x1b
 #define DW_AT_name 0x03
 #define DW_AT_sibling 0x01

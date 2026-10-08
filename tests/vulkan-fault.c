@@ -36,6 +36,31 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vulkan_wayland.h>
 
+#include <dirent.h>
+#include <unistd.h>
+#include <errno.h>
+#include <limits.h>
+static long host_rss_kib(void) {
+    long size = 0, resident = -1; FILE *f = fopen("/proc/self/statm", "r");
+    if (f) { if (fscanf(f, "%ld %ld", &size, &resident) != 2) resident = -1; fclose(f); }
+    long page = sysconf(_SC_PAGESIZE);
+    if (resident < 0 || page <= 0 || page % 1024 || resident > LONG_MAX / (page / 1024)) return -1;
+    return resident * (page / 1024);
+}
+static long host_fds(void) {
+    long n = 0; DIR *d = opendir("/proc/self/fd"); struct dirent *e;
+    if (!d) return -1;
+    errno = 0;
+    while ((e = readdir(d))) if (e->d_name[0] != '.') ++n;
+    int failed = errno != 0;
+    closedir(d); return failed ? -1 : n - 1; /* the directory stream itself */
+}
+static long host_threads(void) {
+    long n = -1; char line[128]; FILE *f = fopen("/proc/self/status", "r");
+    if (f) { while (fgets(line, sizeof line, f)) if (!strncmp(line, "Threads:", 8)) n = strtol(line + 8, 0, 10); fclose(f); }
+    return n;
+}
+
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int gate = -1;
 static int active(void) {
@@ -125,8 +150,11 @@ static const char *kind_names[K_KINDS] = {"instance", "surface", "device", "comm
     "image", "image_view", "sampler", "descriptor_set_layout", "descriptor_pool", "pipeline_layout", "swapchain", "render_pass",
     "shader_module", "pipeline", "framebuffer"};
 #define MAXO 8192
-static struct { uint64_t h; int kind; int pending; } objs[MAXO];
+static struct { uint64_t h, bytes; int kind; int pending; } objs[MAXO];
 static unsigned long created[K_KINDS], destroyed[K_KINDS], violations, leaks;
+static uint64_t allocated_bytes, freed_bytes, live_bytes, peak_bytes, leaked_bytes;
+static unsigned long retired_instances, dirty_retirements;
+static uint64_t lifetime_peak_bytes;
 static int gpu_pending; /* a submission without observed completion */
 static uint64_t pending_fence;
 static VkCommandBuffer inflight_cb;
@@ -134,13 +162,27 @@ static void violation(const char *what, uint64_t h) {
     ++violations;
     fprintf(stderr, "vkfault: violation %s 0x%llx\n", what, (unsigned long long)h);
 }
-static void track(int kind, uint64_t h) {
+static void track_bytes(int kind, uint64_t h, uint64_t bytes) {
     if (!active() || !h) return;
     pthread_mutex_lock(&lock);
     ++created[kind];
-    for (int i = 0; i < MAXO; ++i) if (!objs[i].h) { objs[i].h = h; objs[i].kind = kind; objs[i].pending = 0; break; }
+    int slot = -1;
+    for (int i = 0; i < MAXO; ++i) if (!objs[i].h) { slot = i; break; }
+    if (slot < 0) violation("object accounting capacity exceeded", h);
+    else {
+        objs[slot].h = h; objs[slot].kind = kind; objs[slot].pending = 0;
+        objs[slot].bytes = bytes;
+        if (UINT64_MAX - live_bytes < bytes || UINT64_MAX - allocated_bytes < bytes)
+            violation("allocation accounting overflow", h);
+        else {
+            allocated_bytes += bytes; live_bytes += bytes;
+            if (live_bytes > peak_bytes) peak_bytes = live_bytes;
+            if (live_bytes > lifetime_peak_bytes) lifetime_peak_bytes = live_bytes;
+        }
+    }
     pthread_mutex_unlock(&lock);
 }
+static void track(int kind, uint64_t h) { track_bytes(kind, h, 0); }
 static int find(uint64_t h) { for (int i = 0; i < MAXO; ++i) if (objs[i].h == h) return i; return -1; }
 static void untrack(int kind, uint64_t h) {
     if (!active() || !h) return;
@@ -149,6 +191,10 @@ static void untrack(int kind, uint64_t h) {
     if (i < 0) violation("destroy of unknown or already destroyed handle", h);
     else {
         ++destroyed[kind];
+        if (objs[i].kind != kind) violation("destroy handle type mismatch", h);
+        if (objs[i].bytes > live_bytes || UINT64_MAX - freed_bytes < objs[i].bytes)
+            violation("allocation accounting underflow", h);
+        else { live_bytes -= objs[i].bytes; freed_bytes += objs[i].bytes; }
         if (kind != K_INSTANCE && kind != K_SURFACE && kind != K_DEVICE && kind != K_SWAPCHAIN && kind != K_SHADER && gpu_pending)
             violation(kind_names[kind], h), fprintf(stderr, "vkfault: ^ destroyed while submitted work has no observed completion\n");
         objs[i].h = 0;
@@ -162,6 +208,7 @@ static void leak_check(int device_children) {
         int k = objs[i].kind;
         if (device_children ? (k != K_INSTANCE && k != K_SURFACE && k != K_DEVICE) : (k == K_SURFACE || k == K_DEVICE)) {
             ++leaks;
+            leaked_bytes += objs[i].bytes;
             fprintf(stderr, "vkfault: leak %s 0x%llx at %s\n", kind_names[k], (unsigned long long)objs[i].h, device_children ? "vkDestroyDevice" : "vkDestroyInstance");
             objs[i].h = 0;
         }
@@ -173,7 +220,12 @@ __attribute__((destructor)) static void summary(void) {
     for (int i = 0; i < MAXO; ++i) if (objs[i].h) ++live;
     fprintf(stderr, "vkfault: summary {\"live_at_exit\":%lu,\"leaks\":%lu,\"violations\":%lu,\"created\":{", live, leaks, violations);
     for (int k = 0; k < K_KINDS; ++k) fprintf(stderr, "%s\"%s\":%lu", k ? "," : "", kind_names[k], created[k]);
-    fprintf(stderr, "},\"calls\":{");
+    fprintf(stderr, "},\"destroyed\":{");
+    for (int k = 0; k < K_KINDS; ++k) fprintf(stderr, "%s\"%s\":%lu", k ? "," : "", kind_names[k], destroyed[k]);
+    fprintf(stderr, "},\"allocations\":{\"allocated_bytes\":%llu,\"freed_bytes\":%llu,\"live_bytes\":%llu,\"peak_bytes\":%llu,\"leaked_bytes\":%llu},\"retired_instances\":%lu,\"dirty_retirements\":%lu,\"calls\":{",
+        (unsigned long long)allocated_bytes, (unsigned long long)freed_bytes,
+        (unsigned long long)live_bytes, (unsigned long long)peak_bytes,
+        (unsigned long long)leaked_bytes, retired_instances, dirty_retirements);
     for (int i = 0; i < nfns; ++i) fprintf(stderr, "%s\"%s\":[%lu,%lu]", i ? "," : "", fns[i].name, fns[i].calls, fns[i].injected);
     fprintf(stderr, "}}\n");
 }
@@ -240,6 +292,19 @@ VKAPI_ATTR void VKAPI_CALL vkDestroyInstance(VkInstance h, const VkAllocationCal
     REAL(vkDestroyInstance);
     if (active() && h) { pthread_mutex_lock(&lock); leak_check(0); pthread_mutex_unlock(&lock); }
     untrack(K_INSTANCE, (uint64_t)h); real(h, a);
+    if (active() && h) {
+        /* The renderer owns one instance at a time. Check at the completed
+         * lifetime boundary, not at an arbitrary in-flight recreation phase. */
+        pthread_mutex_lock(&lock);
+        unsigned long live = 0;
+        for (int j = 0; j < MAXO; ++j) if (objs[j].h) ++live;
+        ++retired_instances;
+        if (live || live_bytes) ++dirty_retirements;
+        fprintf(stderr, "vkfault: retired {\"instance\":%lu,\"live_objects\":%lu,\"live_bytes\":%llu,\"peak_bytes\":%llu,\"rss_kib\":%ld,\"fds\":%ld,\"threads\":%ld}\n",
+                retired_instances, live, (unsigned long long)live_bytes, (unsigned long long)lifetime_peak_bytes, host_rss_kib(), host_fds(), host_threads());
+        lifetime_peak_bytes = 0;
+        pthread_mutex_unlock(&lock);
+    }
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateWaylandSurfaceKHR(VkInstance n, const VkWaylandSurfaceCreateInfoKHR *i, const VkAllocationCallbacks *a, VkSurfaceKHR *out) {
     REAL(vkCreateWaylandSurfaceKHR); VkResult r;
@@ -303,7 +368,7 @@ VKAPI_ATTR void VKAPI_CALL vkDestroySwapchainKHR(VkDevice d, VkSwapchainKHR h, c
 VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice d, const VkMemoryAllocateInfo *i, const VkAllocationCallbacks *a, VkDeviceMemory *out) {
     REAL(vkAllocateMemory); VkResult r;
     if (scheduled("vkAllocateMemory", &r)) { POISON(out); return r; }
-    r = real(d, i, a, out); if (r == VK_SUCCESS) track(K_MEMORY, (uint64_t)*out); return r;
+    r = real(d, i, a, out); if (r == VK_SUCCESS) track_bytes(K_MEMORY, (uint64_t)*out, i->allocationSize); return r;
 }
 VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice d, VkDeviceMemory h, const VkAllocationCallbacks *a) {
     REAL(vkFreeMemory); untrack(K_MEMORY, (uint64_t)h); real(d, h, a);

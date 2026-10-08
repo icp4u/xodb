@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import select
 import subprocess
+import time
 
 root = Path(__file__).resolve().parent.parent
 os.chdir(root)
@@ -57,7 +58,16 @@ try:
     target.stdin.write(b'go\n'); target.stdin.flush()
     for case in ('string', 'array', 'smi'):
         assert d.stopped('breakpoint')
-        value = d.tool('evaluate_expression', tid=target.pid, frame=0, expression='value')['value']
+        deadline = time.monotonic() + 30
+        pending = []
+        while True:
+            value = d.tool('evaluate_expression', tid=target.pid, frame=0, expression='value')['value']
+            if value['visualization'] is not None:
+                break
+            pending.append(value)
+            (work/('pending-'+case+'.json')).write_text(json.dumps(pending, indent=2)+'\n')
+            assert value['diagnostic'] == 'DebugMetadataPending' and time.monotonic() < deadline, value
+            time.sleep(.02)
         preview = value['visualization']
         assert preview['extent_advisory'] == (case != 'smi'), value
         if case == 'array':

@@ -22,6 +22,7 @@ spec=importlib.util.spec_from_file_location('private_input',root/'tests/helpers/
 h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
 h.WORK=str(work)
 for name in ('tmp','cache/mesa','cache/nvidia'):(work/name).mkdir(parents=True,exist_ok=True)
+os.environ['XDG_CACHE_HOME'] = str(work/'cache')
 for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
     subprocess.run(['wayland-scanner','client-header',xml,str(work/(stem+'.h'))],check=True,timeout=10)
     subprocess.run(['wayland-scanner','private-code',xml,str(work/(stem+'.c'))],check=True,timeout=10)
@@ -39,6 +40,12 @@ try:
     for i in range(12):
         assert d.stopped('breakpoint')
         if i!=11:d.tool('continue',generation=d.session()['generation'])
+    deadline=time.monotonic()+900
+    while True:
+        response=d.request('tools/call',{'name':'get_language_stack','arguments':{'tid':target.pid,'language':'javascript'}})
+        if not response.get('isError'):break
+        assert response['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,response
+        time.sleep(.03)
     value=d.tool('evaluate_expression',tid=target.pid,frame=0,expression='value')['value']
     assert value['display']=='Array(3) [smi 1, string "two", true]',value
     time.sleep(.3);d.shot('node-array-locals')

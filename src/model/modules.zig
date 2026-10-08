@@ -72,10 +72,12 @@ pub const Modules = struct {
     load_failures: std.ArrayList(LoadFailure) = .empty,
     symbol_images: std.ArrayList(SymbolImage) = .empty,
     symbol_bytes: u64 = 0,
+    symbol_pending: ?struct { region: Region, job: *rt.struct_xrt_symbol_job } = null,
     pub fn init(a: std.mem.Allocator) Modules {
         return .{ .allocator = a };
     }
     pub fn deinit(self: *Modules) void {
+        self.cancelSymbolJob();
         for (self.symbol_images.items) |*item| {
             item.instances.deinit(self.allocator);
             _ = c.munmap(item.bytes.ptr, item.bytes.len);
@@ -379,7 +381,7 @@ pub const Modules = struct {
         return error.UnmappedAddress;
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
-        if (rt.xrt_target_is_remote(self.target)) {
+        if (rt.xrt_target_is_remote(self.target) or !self.immutable) {
             var cursor = SymbolCursor{};
             return self.symbolLookup(name, false, &cursor);
         }
@@ -409,7 +411,11 @@ pub const Modules = struct {
         var fd: c_int = -1;
         var resident: u64 = 0;
         if (self.symbol_images.items.len >= 1024 or self.symbol_bytes >= 128 * 1024 * 1024) return error.SymbolSnapshotLimit;
-        try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident));
+        if (rt.xrt_target_is_remote(self.target)) {
+            try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident));
+        } else {
+            try self.localSymbolFile(region, &request, &fd, &resident);
+        }
         defer _ = c.close(fd);
         if (resident > 128 * 1024 * 1024 - self.symbol_bytes) return error.SymbolSnapshotLimit;
         var stat: c.struct_stat = undefined;
@@ -426,6 +432,33 @@ pub const Modules = struct {
         try self.symbol_images.append(self.allocator, .{ .region = saved, .bytes = bytes, .image = image });
         self.symbol_bytes += resident;
         return &self.symbol_images.items[self.symbol_images.items.len - 1].image;
+    }
+    fn cancelSymbolJob(self: *Modules) void {
+        if (self.symbol_pending) |pending| {
+            rt.xrt_symbol_job_destroy(pending.job);
+            self.allocator.free(pending.region.path);
+            self.symbol_pending = null;
+        }
+    }
+    fn localSymbolFile(self: *Modules, region: Region, request: *const rt.struct_xrt_file_request, fd: *c_int, resident: *u64) !void {
+        if (self.symbol_pending) |pending| {
+            if (!sameFile(pending.region, region)) self.cancelSymbolJob();
+        }
+        if (self.symbol_pending == null) {
+            const path = try self.allocator.dupe(u8, region.path);
+            errdefer self.allocator.free(path);
+            var view: ?*rt.struct_xrt_file_view = null;
+            try runtime_api.check(rt.xrt_target_file_view_open(self.target, request, &view));
+            errdefer _ = rt.xrt_file_view_close(view);
+            var job: ?*rt.struct_xrt_symbol_job = null;
+            try runtime_api.check(rt.xrt_symbol_job_start(view, &job));
+            var saved = region;
+            saved.path = path;
+            self.symbol_pending = .{ .region = saved, .job = job.? };
+        }
+        const status = rt.xrt_symbol_job_poll(self.symbol_pending.?.job, fd, resident);
+        if (status != rt.XRT_DISCOVERY_PENDING) self.cancelSymbolJob();
+        try runtime_api.check(status);
     }
     // Reserve one ID per mapped instance. Loading its complete ELF/DWARF view
     // later must preserve the ID already cited by a remote symbol lookup.
@@ -491,8 +524,9 @@ pub const Modules = struct {
                 std.mem.startsWith(u8, r.path, "/dev/") or
                 std.mem.startsWith(u8, r.path, "/memfd:") or
                 std.mem.endsWith(u8, r.path, " (deleted)")) continue;
-            if (!rt.xrt_target_is_remote(self.target)) {
+            if (!rt.xrt_target_is_remote(self.target)) local: {
                 const module = self.load(r) catch |err| {
+                    if (err == error.BinarySnapshotLimit and !self.immutable) break :local;
                     if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
                     continue;
                 };

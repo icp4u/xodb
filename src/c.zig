@@ -42,6 +42,7 @@ pub const api = @cImport({
     @cInclude("../language/perl.h");
     @cInclude("../language/python.h");
     @cInclude("../language/javascript.h");
+    @cInclude("../debug/metadata_job.h");
     @cInclude("../language/lua.h");
     @cInclude("dwarf.h");
 });

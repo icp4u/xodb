@@ -376,11 +376,8 @@ try:
     kids = [int(x) for x in Path(f'/proc/{idle.pid}/task/{idle.pid}/children').read_text().split()]
     listed = [1, writer, *kids[:150]]
     seen_rate = 0
-    # Each invocation starts a new scan cursor. Sixteen samples may not cover
-    # two laps under load, especially when PID wrap puts the writer last.
-    # Increase the observation window while retaining the same 1 ms budget.
-    for sample_count in (16, 32, 64, 128):
-        snap = lsof_json(listed, '--budget-ms', '1', samples=sample_count, interval=0.25)
+    for _ in range(4):
+        snap = lsof_json(listed, '--budget-ms', '1', samples=16, interval=0.25)
         sc = snap['scan']
         check(sc['processes'] + sc['hidden'] + sc['kernel_threads'] + sc['unscanned'] + sc['gone'] == len(listed), f'counts {sc}')
         check(sc['stale'] + sc['unscanned'] > 0, f'budget never bit {sc}')
@@ -391,8 +388,6 @@ try:
         for p in snap['processes']:
             if p['pid'] == writer and p['write_per_s'] > 0:
                 check(near(p['write_per_s'], 1 << 20, 0.1), f'budget process rate {p}')
-        if seen_rate:
-            break
     check(seen_rate, 'writer rate never shown under the budget')
     if Path('/proc/1').stat().st_uid != os.geteuid():
         check(snap['scan']['hidden'] + sc['unscanned'] >= 1, 'pid 1 counted')

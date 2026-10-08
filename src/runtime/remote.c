@@ -30,6 +30,7 @@ struct symbol_partial {
 };
 struct xrt_connection {
     pthread_mutex_t mutex;
+    uint32_t foreground_waiters;
     int fd;
     pid_t child;
     uint64_t request, producer_ns, host_ns, uncertainty_ns;
@@ -268,7 +269,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         memset(c->decoded, 0, sizeof(*c->decoded));
         xrt_wire_target(&in, c->decoded);
     }
-    if (!in.ok || in.at != in.size ||
+    if (!in.ok || in.at != in.size || (no_snapshot && present) ||
         (reply.status == XRT_OK &&
          present != (call->op != XRT_RPC_HELLO && call->op != XRT_RPC_DESTROY && !no_snapshot)))
         return broken(c, XRT_PROTOCOL_ERROR);
@@ -356,13 +357,31 @@ static void discard_symbols(struct xrt_connection *c)
 enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xrt_call *call)
 {
     struct xrt_connection *c = target->connection;
+    __atomic_add_fetch(&c->foreground_waiters, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&c->mutex);
+    __atomic_sub_fetch(&c->foreground_waiters, 1, __ATOMIC_SEQ_CST);
     if ((call->op == XRT_RPC_DESTROY || call->op == XRT_RPC_LAUNCH ||
          call->op == XRT_RPC_ATTACH || call->op == XRT_RPC_DETACH ||
          call->op == XRT_RPC_DETACH_FAMILY || call->op == XRT_RPC_CLOSE || call->op == XRT_RPC_RESET) &&
         c->symbols && (c->symbols->target == target->remote_id || call->op == XRT_RPC_DETACH_FAMILY))
         discard_symbols(c);
     enum xrt_status status = invoke(target, call);
+    pthread_mutex_unlock(&c->mutex);
+    return status;
+}
+/* Background metadata never queues ahead of an already waiting control RPC.
+ * The lock protects one FILE_READ round trip, including identity-only reads.
+ * It cannot interrupt an in-flight response; the wire timeout still applies. */
+enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
+                                          const struct xrt_call *call)
+{
+    if (!target || !target->connection || !call || call->op != XRT_RPC_FILE_READ)
+        return XRT_INVALID_ARGUMENT;
+    struct xrt_connection *c = target->connection;
+    if (__atomic_load_n(&c->foreground_waiters, __ATOMIC_SEQ_CST) ||
+        pthread_mutex_trylock(&c->mutex)) return XRT_DISCOVERY_PENDING;
+    enum xrt_status status = __atomic_load_n(&c->foreground_waiters, __ATOMIC_SEQ_CST) ?
+        XRT_DISCOVERY_PENDING : invoke(target, call);
     pthread_mutex_unlock(&c->mutex);
     return status;
 }
@@ -566,7 +585,8 @@ bool xrt_target_source_capable(const struct xrt_target *t)
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
-    if (__atomic_load_n(&t->remote_collectors, __ATOMIC_SEQ_CST))
+    if (__atomic_load_n(&t->remote_collectors, __ATOMIC_SEQ_CST) ||
+        __atomic_load_n(&t->remote_files, __ATOMIC_SEQ_CST))
         return XRT_INVALID_STATE;
     struct xrt_connection *c = t->connection;
     enum xrt_status status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_DESTROY});

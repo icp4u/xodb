@@ -8,9 +8,9 @@ CPPFLAGS += -I$(CURDIR)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wswitch-enum
 LDLIBS += -latomic -pthread -ldl
-SOURCES := memory arch registers process target probes loongarch_step watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker sysstat sysstat_nvml source binary_object dwarf_cursor source_paths
+SOURCES := memory arch registers process target probes loongarch_step watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files file_view symbol_job loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker sysstat sysstat_nvml source binary_object dwarf_cursor source_paths
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
-TESTS := memory registers process target perf wire snapshot symbols fdscan sysstat services
+TESTS := memory registers process target perf wire snapshot symbols symbol-job fdscan sysstat services
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))
 .PHONY: all check check-leaks clean
 all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent $(BUILD)/xodb-lsof-top
