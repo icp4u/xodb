@@ -9,7 +9,17 @@ const Vertex = extern struct { position: [2]f32, uv: [2]f32, color: Color, local
 /// bottom-left, bottom-right; `colors` gives one color per corner for gradients.
 pub const Shape = struct { radii: [4]f32 = @splat(0), border: f32 = 0, softness: f32 = 0, colors: ?[4]Color = null };
 const vertex_bytes = 8 * 1024 * 1024;
-const buffer_bytes = vertex_bytes + fonts.atlas_size * fonts.atlas_size;
+/// One instanced cell of a dense field (the Memory map's deep look): six
+/// vertices from one 32-byte record instead of six 60-byte vertices.
+/// `kind` bits 0-1 pick the base (0 fill, 1 hatch, 2 dots, 3 lower `fraction`
+/// in `accent`); bit 2 adds light hatching; bit 3 an inner ring and bit 4 a
+/// top-left edge, both in `overlay`; bits 8-15 hold the fraction (0-255).
+pub const Cell = extern struct { rect: [4]f32, fill: [4]u8, accent: [4]u8, overlay: [4]u8, kind: u32 };
+pub const cell_capacity = 65536 + 8192;
+const cell_offset = vertex_bytes + fonts.atlas_size * fonts.atlas_size;
+const buffer_bytes = cell_offset + cell_capacity * @sizeOf(Cell);
+/// A run of cells drawn after the vertices recorded before it, clipped to `clip`.
+const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect };
 fn info(comptime T: type, kind: c.VkStructureType) T {
     var v = std.mem.zeroes(T);
     v.sType = kind;
@@ -84,6 +94,7 @@ pub const Renderer = struct {
     pass: c.VkRenderPass = null,
     pass_format: c.VkFormat = c.VK_FORMAT_UNDEFINED,
     pipeline: c.VkPipeline = null,
+    cell_pipeline: c.VkPipeline = null,
     layout: c.VkPipelineLayout = null,
     descriptor_layout: c.VkDescriptorSetLayout = null,
     descriptor_pool: c.VkDescriptorPool = null,
@@ -101,6 +112,9 @@ pub const Renderer = struct {
     sampler: c.VkSampler = null,
     atlas_ready: bool = false,
     vertices: usize = 0,
+    cells_used: u32 = 0,
+    batches: [8]CellBatch = undefined,
+    batch_count: usize = 0,
     clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     gpu_name: [256]u8 = @splat(0),
 
@@ -341,8 +355,10 @@ pub const Renderer = struct {
         @memset(self.finished, null);
         if (self.pass != null and self.pass_format != self.format) {
             c.vkDestroyPipeline(self.device, self.pipeline, null);
+            c.vkDestroyPipeline(self.device, self.cell_pipeline, null);
             c.vkDestroyRenderPass(self.device, self.pass, null);
             self.pipeline = null;
+            self.cell_pipeline = null;
             self.pass = null;
         }
         if (self.pass == null) try self.createPass();
@@ -399,17 +415,6 @@ pub const Renderer = struct {
     fn createPipeline(self: *Renderer) !void {
         const vert_bytes align(4) = @embedFile("vert_spv").*;
         const frag_bytes align(4) = @embedFile("frag_spv").*;
-        const vert = try self.shader(&vert_bytes);
-        defer c.vkDestroyShaderModule(self.device, vert, null);
-        const frag = try self.shader(&frag_bytes);
-        defer c.vkDestroyShaderModule(self.device, frag, null);
-        var stages: [2]c.VkPipelineShaderStageCreateInfo = .{ info(c.VkPipelineShaderStageCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO), info(c.VkPipelineShaderStageCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO) };
-        stages[0].stage = c.VK_SHADER_STAGE_VERTEX_BIT;
-        stages[0].module = vert;
-        stages[0].pName = "main";
-        stages[1].stage = c.VK_SHADER_STAGE_FRAGMENT_BIT;
-        stages[1].module = frag;
-        stages[1].pName = "main";
         const binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Vertex), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX };
         const attrs = [_]c.VkVertexInputAttributeDescription{
             .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "position") },
@@ -419,11 +424,36 @@ pub const Renderer = struct {
             .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "half") },
             .{ .location = 5, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = @offsetOf(Vertex, "shape") },
         };
+        self.pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs);
+        const cell_vert align(4) = @embedFile("cell_vert_spv").*;
+        const cell_frag align(4) = @embedFile("cell_frag_spv").*;
+        const cell_binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Cell), .inputRate = c.VK_VERTEX_INPUT_RATE_INSTANCE };
+        const cell_attrs = [_]c.VkVertexInputAttributeDescription{
+            .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Cell, "rect") },
+            .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "fill") },
+            .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "accent") },
+            .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "overlay") },
+            .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32_UINT, .offset = @offsetOf(Cell, "kind") },
+        };
+        self.cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs);
+    }
+    fn makePipeline(self: *Renderer, vert_bytes: []const u8, frag_bytes: []const u8, binding: c.VkVertexInputBindingDescription, attrs: []const c.VkVertexInputAttributeDescription) !c.VkPipeline {
+        const vert = try self.shader(vert_bytes);
+        defer c.vkDestroyShaderModule(self.device, vert, null);
+        const frag = try self.shader(frag_bytes);
+        defer c.vkDestroyShaderModule(self.device, frag, null);
+        var stages: [2]c.VkPipelineShaderStageCreateInfo = .{ info(c.VkPipelineShaderStageCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO), info(c.VkPipelineShaderStageCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO) };
+        stages[0].stage = c.VK_SHADER_STAGE_VERTEX_BIT;
+        stages[0].module = vert;
+        stages[0].pName = "main";
+        stages[1].stage = c.VK_SHADER_STAGE_FRAGMENT_BIT;
+        stages[1].module = frag;
+        stages[1].pName = "main";
         var input = info(c.VkPipelineVertexInputStateCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
         input.vertexBindingDescriptionCount = 1;
         input.pVertexBindingDescriptions = &binding;
-        input.vertexAttributeDescriptionCount = attrs.len;
-        input.pVertexAttributeDescriptions = &attrs;
+        input.vertexAttributeDescriptionCount = @intCast(attrs.len);
+        input.pVertexAttributeDescriptions = attrs.ptr;
         var assembly = info(c.VkPipelineInputAssemblyStateCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO);
         assembly.topology = c.VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
         var viewport = info(c.VkPipelineViewportStateCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO);
@@ -463,7 +493,9 @@ pub const Renderer = struct {
         create.pDynamicState = &dynamic;
         create.layout = self.layout;
         create.renderPass = self.pass;
-        try check(c.vkCreateGraphicsPipelines(self.device, null, 1, &create, null, &self.pipeline));
+        var pipeline: c.VkPipeline = null;
+        try check(c.vkCreateGraphicsPipelines(self.device, null, 1, &create, null, &pipeline));
+        return pipeline;
     }
     /// Releases what depends on the extent. The swapchain handle survives to seed its replacement.
     fn destroySwap(self: *Renderer) void {
@@ -486,6 +518,7 @@ pub const Renderer = struct {
             _ = c.vkDeviceWaitIdle(self.device);
             self.destroySwap();
             if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
+            if (self.cell_pipeline != null) c.vkDestroyPipeline(self.device, self.cell_pipeline, null);
             if (self.pass != null) c.vkDestroyRenderPass(self.device, self.pass, null);
             if (self.swap != null) c.vkDestroySwapchainKHR(self.device, self.swap, null);
             c.vkDestroyPipelineLayout(self.device, self.layout, null);
@@ -528,6 +561,8 @@ pub const Renderer = struct {
             try self.createSwap(width, height);
         }
         self.vertices = 0;
+        self.cells_used = 0;
+        self.batch_count = 0;
         self.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(self.extent.width), .h = @floatFromInt(self.extent.height) };
         return true;
     }
@@ -578,6 +613,17 @@ pub const Renderer = struct {
         const vertices: [*]Vertex = @ptrCast(@alignCast(self.mapped.?));
         vertices[self.vertices..][0..6].* = .{ v[0], v[1], v[3], v[0], v[3], v[2] };
         self.vertices += 6;
+    }
+    /// Reserves `n` instanced cells, drawn above everything recorded so far and
+    /// below what follows, clipped to the current clip. Fill every record.
+    pub fn cells(self: *Renderer, n: usize) ![]Cell {
+        if (n == 0) return &.{};
+        if (self.batch_count == self.batches.len or self.cells_used + n > cell_capacity) return error.VertexBufferFull;
+        const all: [*]Cell = @ptrCast(@alignCast(@as([*]u8, @ptrCast(self.mapped.?)) + cell_offset));
+        self.batches[self.batch_count] = .{ .at = self.vertices, .first = self.cells_used, .count = @intCast(n), .clip = self.clip };
+        self.batch_count += 1;
+        defer self.cells_used += @intCast(n);
+        return all[self.cells_used..][0..n];
     }
     /// Fraction of this frame's vertex buffer already used (0..1).
     pub fn used(self: *const Renderer) f32 {
@@ -722,7 +768,26 @@ pub const Renderer = struct {
         c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
         const size = [2]f32{ @floatFromInt(self.extent.width), @floatFromInt(self.extent.height) };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
-        c.vkCmdDraw(self.command, @intCast(self.vertices), 1, 0, 0);
+        var drawn: usize = 0;
+        for (self.batches[0..self.batch_count]) |b| {
+            if (b.at > drawn) c.vkCmdDraw(self.command, @intCast(b.at - drawn), 1, @intCast(drawn), 0);
+            drawn = b.at;
+            const x0: i32 = @intFromFloat(@max(0, @floor(b.clip.x)));
+            const y0: i32 = @intFromFloat(@max(0, @floor(b.clip.y)));
+            const x1: i32 = @intFromFloat(@max(0, @min(size[0], @ceil(b.clip.x + b.clip.w))));
+            const y1: i32 = @intFromFloat(@max(0, @min(size[1], @ceil(b.clip.y + b.clip.h))));
+            if (x1 <= x0 or y1 <= y0) continue;
+            const clip = c.VkRect2D{ .offset = .{ .x = x0, .y = y0 }, .extent = .{ .width = @intCast(x1 - x0), .height = @intCast(y1 - y0) } };
+            c.vkCmdSetScissor(self.command, 0, 1, &clip);
+            c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.cell_pipeline);
+            const cells_at: u64 = cell_offset;
+            c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &cells_at);
+            c.vkCmdDraw(self.command, 6, b.count, 0, b.first);
+            c.vkCmdSetScissor(self.command, 0, 1, &scissor);
+            c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+            c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
+        }
+        if (self.vertices > drawn) c.vkCmdDraw(self.command, @intCast(self.vertices - drawn), 1, @intCast(drawn), 0);
         c.vkCmdEndRenderPass(self.command);
         try check(c.vkEndCommandBuffer(self.command));
         try check(c.vkResetFences(self.device, 1, &self.fence));

@@ -315,15 +315,16 @@ const App = struct {
             return true;
         }
         const obs = self.observer orelse return false;
-        self.reader.renew(obs, self.target, at);
-        const got = (self.reader.read(self.gpa, obs, self.target, .{ .cell_bytes = zooms[self.zoom], .anchor = self.anchor(), .redact = self.o.redact }) catch null) orelse return false;
+        const req = model.Request{ .cell_bytes = zooms[self.zoom], .anchor = self.anchor(), .redact = self.o.redact };
+        self.reader.renew(obs, self.target, req, at) catch return false;
+        const got = (self.reader.read(self.gpa, obs, self.target, req) catch null) orelse return false;
         if (self.target != null and got.map.process == null) {
             // Only the system strip so far: keep it, but do not count a scan.
             if (self.current) |p| if (p.map.process != null) {
                 got.destroy();
                 return false;
             };
-        } else if (got.map.process == null or got.map.sequence != self.counted) {
+        } else if (!got.map.pending and (got.map.process == null or got.map.sequence != self.counted)) {
             // Count scans of the target (or system publications), not the
             // interleaved system-counter refreshes of a process view.
             self.counted = got.map.sequence;

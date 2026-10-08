@@ -12,8 +12,8 @@ fn read(ctx: ?*anyopaque, address: u64, out: ?*anyopaque, n: usize) callconv(.c)
     const bytes: [*]u8 = @ptrCast(out.?);
     return if ((session.target.readMemory(address, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xjs_reader {
-    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null, .version_table = 0 };
+fn reader(session: *model.Session, cache: *c.struct_xjs_read_cache) c.struct_xjs_reader {
+    return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null, .version_table = 0, .cache = cache };
 }
 fn memory(r: *c.struct_xjs_reader, address: u64, out: []u8) !void {
     if (c.xjs_read_memory(r, address, out.ptr, out.len) == 0) return error.JavaScriptMemoryUnavailable;
@@ -38,7 +38,8 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
     if (value.availability != .available or value.type.javascript_handle == 0) return null;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
-    var r = reader(session);
+    var cache = std.mem.zeroes(c.struct_xjs_read_cache);
+    var r = reader(session, &cache);
     const layout = try session.metadata.javascript(session);
     const word_value = try eval.subvalue(value, &eval.uint_type, 0);
     var stored: [8]u8 = undefined;
@@ -110,7 +111,10 @@ pub const Frame = struct {
     frame_pointer: u64,
     pc: u64,
     function: u64,
+    shared: u64,
     code: u64,
+    context: u64,
+    bytecode: u64,
     reason: ?[]const u8,
 };
 pub const Segment = struct {
@@ -141,7 +145,8 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     const layout = try session.metadata.javascript(session);
     const native = try session.stack(a, tid, 64);
     if (first >= native.len) return error.InvalidFrame;
-    var r = reader(session);
+    var cache = std.mem.zeroes(c.struct_xjs_read_cache);
+    var r = reader(session, &cache);
     const segments = try a.alloc(Segment, 1);
     segments[0] = .{
         .runtime = .{ .version = try text(a, std.mem.sliceTo(&layout.version_string, 0)), .build_id = try buildId(a, &layout) },
@@ -177,7 +182,10 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             .frame_pointer = f.fp,
             .pc = f.pc,
             .function = f.function,
+            .shared = f.shared,
             .code = f.code,
+            .context = f.context,
+            .bytecode = f.bytecode,
             .reason = try reason(a, f.reason),
         };
         segments[0].anchor = .{ .frame = frame.index, .pc = frame.pc, .symbol = if (frame.symbol) |s| try a.dupe(u8, s) else null };
@@ -198,4 +206,96 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
     const layout = try session.metadata.javascript(session);
     return .{ .version = try text(a, std.mem.sliceTo(&layout.version_string, 0)), .build_id = try buildId(a, &layout), .basis = if (layout.dwarf_fields != 0) "postmortem metadata + partial DWARF" else "postmortem metadata" };
+}
+
+pub fn readContext(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    const named = @import("../model/language_locals.zig");
+    const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
+    if (segment >= observed.segments.len) return error.InvalidLanguageSegment;
+    const selected = observed.segments[segment];
+    if (selected.anchor == null or frame >= selected.frames.len) return error.InvalidLanguageFrame;
+    const f = selected.frames[frame];
+    if (!std.mem.eql(u8, f.kind, "interpreted") or f.bytecode == 0) return error.JavaScriptContextFrameUnproved;
+    const generation = observed.generation;
+    const id = try a.dupe(u8, selected.runtime.build_id);
+    const version = try a.dupe(u8, selected.runtime.version);
+    var expected = std.mem.zeroes(c.struct_xjs_frame);
+    expected.fp = f.frame_pointer;
+    expected.pc = f.pc;
+    expected.function = f.function;
+    expected.shared = f.shared;
+    expected.code = f.code;
+    expected.context = f.context;
+    expected.bytecode = f.bytecode;
+    @memcpy(expected.kind[0.."interpreted".len], "interpreted");
+    const layout = try session.metadata.javascript(session);
+    if (!std.mem.eql(u8, id, try buildId(a, &layout))) return error.JavaScriptBuildIdMismatch;
+    var cache = std.mem.zeroes(c.struct_xjs_read_cache);
+    var r = reader(session, &cache);
+    const raw = try a.create(c.struct_xjs_context_bindings);
+    c.xjs_context_read(&layout, &r, &expected, start, limit, raw);
+    const rows = try a.alloc(named.Row, raw.count);
+    for (raw.items[0..raw.count], rows) |item, *out| {
+        const value = &item.value;
+        const children = try a.alloc(named.Child, value.item_count);
+        for (value.items[0..value.item_count], children) |child, *dest| dest.* = .{
+            .key = try text(a, std.mem.sliceTo(&child.key, 0)),
+            .type = try text(a, std.mem.sliceTo(&child.type, 0)),
+            .display = try text(a, std.mem.sliceTo(&child.display, 0)),
+            .address = if (child.tagged > 4096 and child.tagged & 7 == 1) child.tagged - 1 else null,
+            .diagnostic = try reason(a, child.reason),
+            .advisory = child.extent_advisory != 0,
+        };
+        const why = try reason(a, item.reason);
+        out.* = .{
+            .name = try text(a, std.mem.sliceTo(&item.name, 0)),
+            .name_diagnostic = try reason(a, item.name_reason),
+            .scope = .context,
+            .context_depth = item.depth,
+            .context_address = item.context - 1,
+            .context_parameter = item.parameter != 0,
+            .provenance = "retained Context and ScopeInfo; lexical visibility unproved",
+            .ordinal = item.ordinal,
+            .address = if (value.tagged > 4096 and value.tagged & 7 == 1) value.tagged - 1 else null,
+            .slot_address = item.slot_address,
+            .storage_lifetime = "this retained stop only; moving GC requires resolving context and value again after resume",
+            .immediate = item.immediate != 0,
+            .value = .{
+                .count = if (value.count != 0) value.count else null,
+                .type = if (value.type[0] == 0) "unavailable" else try text(a, std.mem.sliceTo(&value.type, 0)),
+                .display = if (value.display[0] == 0) why orelse "Value unavailable" else try text(a, std.mem.sliceTo(&value.display, 0)),
+                .diagnostic = why,
+                .advisory = value.extent_advisory != 0,
+                .truncated = value.truncated != 0,
+                .children = children,
+            },
+        };
+    }
+    try session.target.expectGeneration(generation);
+    return .{
+        .view_kind = .context_storage,
+        .lexical_visibility = "unproved; stack-only locals and parameters are not shown because their name/register map is not retained",
+        .generation = generation,
+        .tid = tid,
+        .language = .javascript,
+        .segment = segment,
+        .frame = frame,
+        .start = raw.start,
+        .total = raw.total,
+        .truncated = raw.truncated != 0,
+        .rows = rows,
+        .diagnostic = (try reason(a, raw.reason)) orelse "JavaScriptLexicalUnproved",
+        .runtime_version = version,
+        .runtime_build_id = id,
+        .basis = "verified interpreted-frame identity; bounded Context/ScopeInfo storage, not source-level lexical bindings",
+        .memory_reads = r.reads,
+        .memory_bytes = r.bytes,
+    };
+}
+
+pub fn evaluateLocal(session: *model.Session, tid: i32, segment: usize, frame: usize) !@import("../model/language_locals.zig").Result {
+    const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
+    if (segment >= observed.segments.len) return error.InvalidLanguageSegment;
+    if (frame >= observed.segments[segment].frames.len) return error.InvalidLanguageFrame;
+    return error.JavaScriptLexicalUnproved;
 }

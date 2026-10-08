@@ -17,6 +17,15 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+static _Thread_local bool remote_io_forbidden;
+void xrt_remote_io_guard(bool forbidden) { remote_io_forbidden = forbidden; }
+static void assert_remote_io_thread(void)
+{
+    if (remote_io_forbidden) {
+        fputs("xodb: remote transport entered from a forbidden presentation thread\n", stderr);
+        abort();
+    }
+}
 struct symbol_range { uint64_t offset; size_t size; };
 struct symbol_partial {
     struct xrt_file_identity identity;
@@ -55,6 +64,7 @@ struct xrt_connection {
 void xrt_target_file_budget(const struct xrt_target *t, struct xrt_file_budget *budget)
 {
     if (t && t->connection) {
+        assert_remote_io_thread();
         pthread_mutex_lock(&t->connection->mutex);
         t->connection->file_budget = budget;
         t->connection->budget_owner = pthread_self();
@@ -216,6 +226,7 @@ const struct xrt_target *xrt_remote_root(const struct xrt_target *t)
 }
 static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_call *call)
 {
+    assert_remote_io_thread();
     struct xrt_target *t = (struct xrt_target *)target;
     struct xrt_connection *c = t->connection;
     if (c->gdb) {
@@ -374,6 +385,7 @@ static void discard_symbols(struct xrt_connection *c)
 }
 enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xrt_call *call)
 {
+    assert_remote_io_thread();
     struct xrt_connection *c = target->connection;
     __atomic_add_fetch(&c->foreground_waiters, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&c->mutex);
@@ -393,6 +405,7 @@ enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xr
 enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
                                           const struct xrt_call *call)
 {
+    assert_remote_io_thread();
     if (!target || !target->connection || !call || call->op != XRT_RPC_FILE_READ)
         return XRT_INVALID_ARGUMENT;
     struct xrt_connection *c = target->connection;
@@ -405,6 +418,7 @@ enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
 }
 enum xrt_status xrt_remote_health(const struct xrt_target *t)
 {
+    assert_remote_io_thread();
     pthread_mutex_lock(&t->connection->mutex);
     enum xrt_status status = t->connection->failed;
     if (status == XRT_OK && t->connection->gdb) status = xrt_gdb_health(t->connection->gdb);
@@ -413,6 +427,7 @@ enum xrt_status xrt_remote_health(const struct xrt_target *t)
 }
 enum xrt_status xrt_remote_fail(const struct xrt_target *t, enum xrt_status status)
 {
+    assert_remote_io_thread();
     pthread_mutex_lock(&t->connection->mutex);
     status = broken(t->connection, status);
     pthread_mutex_unlock(&t->connection->mutex);
@@ -444,6 +459,7 @@ static enum xrt_status create_remote(struct xrt_connection *c, struct xrt_target
 }
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out)
 {
+    assert_remote_io_thread();
     if (!argv || !argv[0] || !out)
         return XRT_INVALID_ARGUMENT;
     struct xrt_connection *c = calloc(1, sizeof(*c));
@@ -826,6 +842,7 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
         const struct xrt_file_request *request, int *out, uint64_t *resident)
 {
+    assert_remote_io_thread();
     if (!t || !t->connection || !request || request->kind != XRT_FILE_MAPPED || !out || !resident)
         return XRT_INVALID_ARGUMENT;
     struct xrt_connection *c = t->connection;
@@ -926,6 +943,7 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
 enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_file_request *request,
                                 int *out, struct xrt_file_identity *original)
 {
+    assert_remote_io_thread();
     pthread_mutex_lock(&t->connection->mutex);
     struct xrt_file_budget *budget = current_budget(t->connection);
     pthread_mutex_unlock(&t->connection->mutex);
@@ -1075,6 +1093,7 @@ done:;
 
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out)
 {
+    assert_remote_io_thread();
     if (!out || !endpoint) return XRT_INVALID_ARGUMENT;
     *out = NULL;
     struct xrt_target *t = xrt_target_create();
@@ -1099,6 +1118,7 @@ enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **
 bool xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_info *out)
 {
     if (!t || !t->connection || !t->connection->gdb || !out) return false;
+    assert_remote_io_thread();
     pthread_mutex_lock(&t->connection->mutex);
     xrt_gdb_info(t->connection->gdb, out);
     pthread_mutex_unlock(&t->connection->mutex);

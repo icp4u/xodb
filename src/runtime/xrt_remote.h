@@ -5,6 +5,11 @@
 /* Spawn an authenticated transport (agent executable or ssh argv) with private
  * stdio pipes. argv is passed directly to exec; no shell evaluation on the host. */
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out);
+/* Opt-in thread-local ownership assertion. A thread marked forbidden aborts
+ * before entering remote transport I/O or its connection mutex. False by
+ * default: existing loops keep their behavior until an owner is installed.
+ * This does not restrict native ptrace or immutable presentation reads. */
+void xrt_remote_io_guard(bool forbidden);
 bool xrt_target_is_remote(const struct xrt_target *);
 const struct xrt_arch *xrt_target_arch(const struct xrt_target *);
 /* Standalone service. All ptrace work runs on this one calling OS thread.

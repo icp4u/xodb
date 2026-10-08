@@ -258,11 +258,11 @@ this wall-time classification through `sensor_timing_disabled` in the C limits.
 
 The **Memory map** panel (**M**, or **m** on a Processes row) draws one
 process's virtual memory as fixed 2 MiB address cells inside its VMAs, from the
-same shared observer as the MCP tools below. **t** on the panel cycles three
+same shared observer as the MCP tools below. **t** on the panel cycles four
 looks: a Windows 9x *Disk Defragmenter* dialog, the MS-DOS 6 *DEFRAG* text
 screen (the same 80x25 composer as `xodb --memdefrag`, see
-[MEMDEFRAG.md](MEMDEFRAG.md)) and a modern grid. `--look win9x|dos|modern`
-picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
+[MEMDEFRAG.md](MEMDEFRAG.md)), a modern grid and the zoomable **deep map**
+(below). `--look win9x|dos|modern|deep` picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
 
 - Cells are address ranges, so gaps between VMAs stay visible (dark). Long
   gaps and large never-resident VMAs are one compressed cell marked with a
@@ -296,6 +296,81 @@ picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
 - A replay frame may carry a `memory_map` object (schema `xodb-memdefrag/1`,
   the same JSON as `xodb --memdefrag --json`); `tests/fixtures/memmap-synth.py`
   writes synthetic ones.
+
+For repeatable collector CPU and RSS measurements, run `python3 -B
+tests/memory-cost.py --scopes 1 --mib 1024` or `--scopes 4` under the shared
+heavy-gate wrapper. Four scopes use four owned processes, each with the requested
+base-page allocation. Private results include idle/loaded RSS, sampled peak RSS,
+whole-server CPU, load, actual publications, refresh periods and scan completeness.
+Numbers collected when load exceeds the available CPUs are marked not measurable.
+The script reports measurements without fixed timing or CPU assertions; adaptive
+refresh and per-scope costs remain visible.
+
+### Uniform memory viewport data
+
+The shared presentation model can publish up to 65536 cells in one explicit
+virtual-address viewport: 128 GiB at 2 MiB per cell, or 256 MiB at 4 KiB per
+cell. Unlike the compact overview layout, this form retains every cell in its
+half-open range, including gaps and non-resident mappings. Endpoints align to
+the cell size, which must be a multiple of the host page size. Invalid geometry
+or a viewport beyond the requested cell limit is refused before collection.
+
+One `memdefrag.Request` drives both `Reader.renew` and `Reader.read`. Its
+optional `range` clips page-state collection; `numa` requests VMA node totals.
+Smaps metadata and THP coverage still describe the whole process. Sampling
+retains the observer's CPU budget and adaptive cadence. Changing the request
+never retargets another reader's cache. While waiting for a suitable scope,
+`Map.pending` is true, cells are empty, and the process status says `pending`.
+Pending publications are not counted as completed process scans. Reprojection
+also observes cell size, anchor, limit and redaction changes even when the
+sample sequence has not changed.
+
+The additive `xodb-memdefrag/1` fields include the viewport `range`, `pending`,
+per-cell `mapping_known`, process `numa` availability, and each VMA's
+`numa_vma_totals`, `numa_page_size` and `numa_partial`. A hole in a partial VMA
+inventory stays unknown; only known holes are unmapped. NUMA values are totals
+for an entire VMA and cannot identify the node of a particular cell. Redaction
+still removes process names and non-pseudo paths. High-resolution renderers
+consume this bounded publication directly; MCP replies retain their existing
+row limit.
+
+### Deep map
+
+The fourth look is a dense field of up to 65,536 fixed cells, from 2 MiB per
+cell (128 GiB in view) down to one 4 KiB page per cell (256 MiB in view), drawn
+as one batch of instanced quads. It asks the observer for exactly the viewport
+on screen (the uniform request above), so collection follows the view.
+
+| Do | Keys and pointer |
+|---|---|
+| Zoom, keeping the cell under the pointer in place | mouse wheel, or **+**/**-** (at the pointer, else the centre) |
+| Pan | drag, arrows (an eighth of the field), Page Up/Down |
+| Fit the process's densest VMA cluster at the finest cell size that holds it | **0** (also the first view) |
+| Previous / next VMA to the top-left, selected | **[** / **]** |
+| Jump anywhere | click the minimap: the whole address space, gaps over 1 GiB compressed to breaks, the view boxed |
+| Details of a cell | hover, or click to select (Esc clears) |
+
+- Details give the range and cell size, VMA permissions and mapping (path
+  hidden under `--redact`), the state, byte counts (mapped, present, huge,
+  zero, swapped) with the known bits, and the VMA's NUMA node totals labelled
+  **VMA totals**: numa_maps has no per-page node, so none is shown per cell.
+- A moved view reaches the collector after it rests for 150 ms; renewal stays
+  at most 1 Hz and the refresh period, cost limiting and data age are shown.
+  Cells the current request has not sampled are drawn **pending** (dotted) and
+  say so on hover; data of another cell size or range is never relabelled.
+  Replays draw unrecorded zooms and ranges as pending too.
+- Unknown cells are hatched, gaps dark. The three changes stay apart: a
+  page-category flip fills green, a collapse adds a white **ring**, a split an
+  orange-red top-left **edge**. The huge zero page (HUGE|ZERO) is drawn as
+  zero page, never THP.
+- Colours ease only when a new page scan arrives, not on the system counters'
+  own 1 Hz publications, so an idle view does not redraw.
+- A replay frame may add `memory_viewports`: up to 16 explicit uniform maps
+  (each with a `range`). `tests/fixtures/memmap-synth.py --viewports` records
+  2 MiB, 128 KiB, 64 KiB and 4 KiB ones for the GUI tests.
+- `XODB_MEMMAP_PERF=1` prints frames per second and frame CPU once a second;
+  `tests/memdefrag-gui.py --only perf [--perf-binary OTHER]` measures CPU and
+  RSS on the owned fixture at 1920x1080, with and without continuous redraw.
 
 ## Memory page observations over MCP
 
@@ -333,7 +408,9 @@ Addresses are hexadecimal strings.
 Process storage grows with the observed rows and text, up to the configured caps, and
 published process arrays shrink to their populated size. The x86 `[vsyscall]`
 gate remains mapped but has unobserved page state; it has no user page tables
-and does not make an otherwise complete scan partial. A demand-time existence
+and does not make an otherwise complete scan partial. PFN-mapped areas such as
+`[vvar_vclock]` can also be skipped by the kernel page-table walk; their ranges
+remain mapped with unknown page state and no observed-byte credit. A demand-time existence
 check, at most once per second, wakes the collector after exit even when a
 cost-limited snapshot has a longer refresh period. The worker confirms the
 pinned identity and publishes the exit; a missing proc mount is not an exit.

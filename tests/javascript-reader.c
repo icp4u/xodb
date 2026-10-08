@@ -36,6 +36,146 @@ static struct xjs_value decode(uint64_t tagged) {
     xjs_value_read(&layout, &r, tagged, &v);
     assert(r.reads <= XJS_READ_LIMIT && r.bytes <= XJS_BYTE_LIMIT); return v;
 }
+static uint64_t tagged_int(int n) { return (uint64_t)(uint32_t)n << 32; }
+static uint64_t context_fixture(const char **names, const uint64_t *values, size_t n, uint64_t previous, uint64_t *scope_out) {
+    uint64_t scope = object(layout.fields[XJS_TYPE_SCOPE], 48 + n * 16);
+    put(scope + 7, 4u | (1u << 31), 4); put(scope + 15, tagged_int(1), 8);
+    put(scope + 23, tagged_int((int)n), 8);
+    uint64_t context = object(layout.fields[XJS_FIRST_CONTEXT], 32 + n * 8);
+    put(context + 7, tagged_int((int)n + 2), 8); put(context + 15, scope, 8); put(context + 23, previous, 8);
+    for (size_t i = 0; i < n; ++i) {
+        put(scope + 47 + i * 8, str(names[i]), 8);
+        put(scope + 47 + (n + i) * 8, tagged_int(65535 << 6), 8);
+        put(context + 31 + i * 8, values[i], 8);
+    }
+    *scope_out = scope; return context;
+}
+static struct xjs_context_bindings context_decode(const struct xjs_frame *f, size_t start, size_t limit) {
+    struct xjs_reader r = {.read = read_fake}; struct xjs_context_bindings out;
+    xjs_context_read(&layout, &r, f, start, limit, &out);
+    assert(r.reads <= XJS_READ_LIMIT && r.bytes <= XJS_BYTE_LIMIT); return out;
+}
+static void context_cases(struct xjs_frame f) {
+    uint64_t cells[5];
+    for (unsigned i = 0; i < 5; ++i) {
+        cells[i] = object(layout.fields[XJS_TYPE_CONTEXT_CELL], 40);
+        put(cells[i] + 23, i, 4); put(cells[i] + 7, tagged_int(100 + (int)i), 8);
+    }
+    put(cells[2] + 31, (uint32_t)-104, 4);
+    double number = 3.5; uint64_t bits; memcpy(&bits, &number, 8); put(cells[3] + 31, bits, 8);
+    const char *outer_names[] = {"constant", "smi_cell", "int_cell", "double_cell", "detached"};
+    uint64_t outer_scope, outer = context_fixture(outer_names, cells, 5, 0, &outer_scope);
+    const char *names[] = {"p", "captured", "other"};
+    uint64_t values[] = {tagged_int(7), tagged_int(41), tagged_int(9)}, scope;
+    f.context = context_fixture(names, values, 3, outer, &scope);
+    put(scope + 47 + 3 * 8, tagged_int(20), 8); /* context parameter #0 */
+    put(f.fp - 8, f.context, 8);
+    attempts = 0; struct xjs_context_bindings out = context_decode(&f, 0, 32); size_t reads = attempts;
+    assert(!out.reason && out.total == 8 && out.count == 8 && !out.truncated);
+    assert(out.items[0].parameter && !strcmp(out.items[0].name, "p") && !strcmp(out.items[0].value.display, "smi 7"));
+    assert(!out.items[1].parameter && !strcmp(out.items[1].name, "captured") && !strcmp(out.items[1].value.display, "smi 41"));
+    assert(out.items[1].depth == 0 && out.items[1].context == f.context);
+    assert(out.items[3].depth == 1 && out.items[3].context == outer);
+    assert(!strcmp(out.items[3].value.display, "smi 100") && !strcmp(out.items[4].value.display, "smi 101"));
+    assert(!strcmp(out.items[5].value.display, "number -104") && out.items[5].immediate);
+    assert(!strcmp(out.items[6].value.display, "number 3.5") && out.items[6].immediate);
+    assert(out.items[7].reason && !strcmp(out.items[7].reason, "JavaScriptContextCellStateUnsupported"));
+    struct xjs_read_cache cache = {0};
+    struct xjs_reader cached_reader = {.read=read_fake, .cache=&cache};
+    struct xjs_context_bindings cached;
+    xjs_context_read(&layout, &cached_reader, &f, 0, 32, &cached);
+    assert(!memcmp(&cached, &out, sizeof out));
+    assert(cached_reader.reads < reads && cached_reader.bytes <= XJS_BYTE_LIMIT);
+    out = context_decode(&f, 2, 2); assert(out.total == 8 && out.count == 2 && out.truncated);
+    assert(out.items[0].ordinal == 2 && out.items[1].ordinal == 3 && !strcmp(out.items[1].name, "constant"));
+    out = context_decode(&f, 8, 32); assert(!out.reason && out.total == 8 && !out.count && !out.truncated);
+    out = context_decode(&f, 0, 33); assert(out.reason && !out.count);
+    for (size_t i = 1; i <= reads; ++i) {
+        attempts = 0; fail_at = i; out = context_decode(&f, 0, 32);
+        int refused = out.reason != NULL;
+        for (size_t j = 0; j < out.count; ++j) if (j != 7) refused |= out.items[j].reason != NULL || out.items[j].name_reason != NULL;
+        /* Read failures in the deliberately detached final cell remain visible
+         * there too; the callback attempt count proves the injection occurred. */
+        if (i > attempts) { fprintf(stderr, "unreached failure %zu/%zu\n", i, attempts); assert(0); }
+        if (!refused) assert(out.count == 8 && out.items[7].reason && strcmp(out.items[7].reason, "JavaScriptContextCellStateUnsupported"));
+    }
+    fail_at = 0;
+    put(outer + 23, f.context, 8); out = context_decode(&f, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptContextCycle")); put(outer + 23, 0, 8);
+    put(scope + 23, tagged_int(4000), 8); out = context_decode(&f, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptContextSlotLimit")); put(scope + 23, tagged_int(3), 8);
+    put(scope + 7, 8, 4); out = context_decode(&f, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptDynamicContextUnsupported")); put(scope + 7, 4u | (1u << 31), 4);
+    put(scope + 47 + 3 * 8, tagged_int(1 << 6), 8); out = context_decode(&f, 0, 32);
+    assert(out.items[0].reason && !strcmp(out.items[0].reason, "JavaScriptContextParameterInvalid")); put(scope + 47 + 3 * 8, tagged_int(20), 8);
+    put(outer_scope + 7, 4, 4); out = context_decode(&f, 0, 32);
+    assert(out.items[3].reason && !strcmp(out.items[3].reason, "JavaScriptUnexpectedContextCell")); put(outer_scope + 7, 4u | (1u << 31), 4);
+    put(scope + 23, tagged_int(75), 8); put(f.context + 7, tagged_int(77), 8);
+    out = context_decode(&f, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptContextNameTableUnsupported"));
+    put(scope + 23, tagged_int(3), 8); put(f.context + 7, tagged_int(5), 8);
+    put(scope + 47 + 3 * 8, tagged_int(-1), 8); out = context_decode(&f, 0, 32);
+    assert(out.items[0].reason && !strcmp(out.items[0].reason, "JavaScriptContextPropertiesInvalid"));
+    assert(!out.items[1].reason && !strcmp(out.items[1].value.display, "smi 41"));
+    put(scope + 47 + 3 * 8, tagged_int(20), 8);
+    uint64_t saved_name; memcpy(&saved_name, memory + (scope + 47 - BASE), 8);
+    put(scope + 47, 0, 8); out = context_decode(&f, 0, 32);
+    assert(out.items[0].name_reason && !out.items[1].reason);
+    put(scope + 47, saved_name, 8);
+    /* Deterministic bounded corruption, preserving the original valid stop
+     * between cases. The reader must never escape its callback/read budgets. */
+    uint32_t seed = 0x174531;
+    for (size_t i = 0; i < 2048; ++i) {
+        seed = (uint32_t)((uint64_t)seed * 1664525u + 1013904223u);
+        size_t at = seed % (used - 8); unsigned char saved[8];
+        memcpy(saved, memory + at, 8);
+        seed = (uint32_t)((uint64_t)seed * 1664525u + 1013904223u);
+        put(BASE + at, ((uint64_t)seed << 32) | ~seed, 8);
+        out = context_decode(&f, i % 40, 1 + i % XJS_CONTEXT_PAGE);
+        assert(out.count <= XJS_CONTEXT_PAGE && out.total <= XJS_CONTEXT_BINDINGS);
+        memcpy(memory + at, saved, 8);
+    }
+    struct xjs_frame wrong = f; wrong.function += 8; out = context_decode(&wrong, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptStaleContextFrame"));
+    wrong = f; strcpy(wrong.kind, "maglev"); out = context_decode(&wrong, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptContextFrameUnproved"));
+    layout.present[XJS_TYPE_CONTEXT_CELL] = 0; out = context_decode(&f, 0, 32);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptContextCellMetadataUnavailable")); layout.present[XJS_TYPE_CONTEXT_CELL] = 1;
+    struct xjs_reader budget = {.read=read_fake, .bytes=XJS_BYTE_LIMIT}; xjs_context_read(&layout, &budget, &f, 0, 32, &out);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptReadBudget"));
+    puts("JavaScript context storage: parameters, names, cells, pages, identity, cycles, bounds and every-read refusal passed");
+}
+static void cache_cases(void) {
+    struct xjs_read_cache cache = {0};
+    struct xjs_reader r = {.read=read_fake, .cache=&cache};
+    uint64_t address = BASE + 128, first = 0, second = 0;
+    put(address, 123, 8); attempts=0; fail_at=0;
+    assert(xjs_read_memory(&r,address,&first,8) && first==123 && attempts==1);
+    assert(xjs_read_memory(&r,address,&second,8) && second==123 && attempts==1);
+    assert(r.reads==1 && r.bytes==XJS_CACHE_BLOCK);
+    /* Cache lifetime is one inspection. A new read after target changes uses
+     * a newly zeroed cache and must see the new data. */
+    put(address,456,8); memset(&cache,0,sizeof cache);
+    r=(struct xjs_reader){.read=read_fake,.cache=&cache};
+    assert(xjs_read_memory(&r,address,&first,8) && first==456);
+    /* Failed speculation must not create a false unreadable result or expose
+     * partially filled cache data; the mandatory exact read still succeeds. */
+    memset(&cache,0,sizeof cache); attempts=0; fail_at=1;
+    r=(struct xjs_reader){.read=read_fake,.cache=&cache};
+    assert(xjs_read_memory(&r,address,&first,8) && first==456 && attempts==2);
+    assert(r.reads==2 && r.bytes==XJS_CACHE_BLOCK+8);
+    fail_at=0; memset(&cache,0,sizeof cache);
+    r=(struct xjs_reader){.read=read_fake,.cache=&cache};
+    assert(!xjs_read_memory(&r,BASE+used+512,&first,8));
+    assert(!strcmp(r.error,"JavaScriptMemoryUnavailable") && r.reads==2);
+    memset(&cache,0,sizeof cache); attempts=0;
+    r=(struct xjs_reader){.read=read_fake,.cache=&cache,.reads=XJS_READ_LIMIT-1,.bytes=XJS_BYTE_LIMIT-8};
+    assert(xjs_read_memory(&r,address,&first,8) && attempts==1 && first==456);
+    assert(r.reads==XJS_READ_LIMIT && r.bytes==XJS_BYTE_LIMIT);
+    assert(!xjs_read_memory(&r,address,&second,8) && !strcmp(r.error,"JavaScriptReadBudget"));
+    put(address,0,8);
+    puts("JavaScript read batching: cache equivalence, operation lifetime, exact fallback, unreadable data and charged budgets passed");
+}
 static void stack_cases(uint64_t function, uint64_t shared) {
     const uint8_t stock_id[] = {0x93,0xf8,0x2a,0xf1,0xea,0xc2,0x4f,0xf5,0x12,0x35,
         0x95,0xe6,0x66,0x95,0x72,0xc9,0x34,0x21,0xc4,0x36};
@@ -69,6 +209,8 @@ static void stack_cases(uint64_t function, uint64_t shared) {
     if (out.frames[0].line != 2 || out.frames[0].column != 3) fprintf(stderr, "position: %d:%d\n", out.frames[0].line, out.frames[0].column);
     assert(out.frames[0].line == 2 && out.frames[0].column == 3);
     assert(!strcmp(out.reason, "JavaScriptEntryBoundary"));
+    context_cases(out.frames[0]);
+    cache_cases();
     const struct { const char *source; unsigned position; int line, column; } newline_cases[] = {
         {"a\r\nb", 2, 1, 3}, {"a\r\nb", 3, 2, 1}, {"a\rb", 2, 2, 1},
         {"a\nb", 2, 2, 1}, {"a\r\r\nb", 4, 3, 1}

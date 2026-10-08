@@ -111,12 +111,18 @@ tests report their existing architecture skips on x86-64.
   nonzero exit and leftover processes fail the gate; only that command's
   process group and adopted descendants are terminated and reaped, including
   descendants that change sessions. It stops at the first failure.
+- Every step starts with `TERM=dumb`, `LANG=LC_ALL=C.UTF-8` and `TZ=UTC`.
+  Inherited colour overrides, terminal descriptions/geometry and other locale
+  categories are removed. Tests that exercise colour, terminal size or a
+  particular locale set those capabilities explicitly in their child environment.
+  Build, SDK and test configuration variables remain available.
 - `results.json` records status, commands, timings, exit codes, logs, kernel,
   policy values, dependency versions, commit, tracked modifications and a
   SHA-256 manifest of the copied sources. Detailed test artifacts remain in
   that run's nested `.work/`. No reports are uploaded by the local runner.
 
-`tests/release-runner.py` checks nonzero exits, deadline enforcement and cleanup
+`tests/release-runner.py` runs in every tier and checks environment isolation,
+explicit test overrides, nonzero exits, deadline enforcement and cleanup
 of deliberately orphaned or signal-resistant owned children, including a child
 that escapes its original process group/session.
 

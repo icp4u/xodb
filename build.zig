@@ -89,13 +89,14 @@ pub fn build(b: *std.Build) void {
             module.addCSourceFile(.{ .file = code.addOutputFileArg(b.fmt("{s}.c", .{std.fs.path.stem(xml)})), .flags = &.{} });
         }
         for ([_][]const u8{ "wayland-client", "xkbcommon", "vulkan", "freetype2", "harfbuzz" }) |lib| module.linkSystemLibrary(lib, .{});
-        for ([_][]const u8{ "vert", "frag" }) |stage| {
+        for ([_][]const u8{ "ui", "cell" }) |name| for ([_][]const u8{ "vert", "frag" }) |stage| {
             const shader = b.addSystemCommand(&.{"glslc"});
-            shader.addFileArg(b.path(b.fmt("src/render/ui.{s}", .{stage})));
+            shader.addFileArg(b.path(b.fmt("src/render/{s}.{s}", .{ name, stage })));
             shader.addArg("-o");
-            const spv = shader.addOutputFileArg(b.fmt("ui.{s}.spv", .{stage}));
-            module.addAnonymousImport(b.fmt("{s}_spv", .{stage}), .{ .root_source_file = spv });
-        }
+            const spv = shader.addOutputFileArg(b.fmt("{s}.{s}.spv", .{ name, stage }));
+            const import = if (std.mem.eql(u8, name, "ui")) b.fmt("{s}_spv", .{stage}) else b.fmt("{s}_{s}_spv", .{ name, stage });
+            module.addAnonymousImport(import, .{ .root_source_file = spv });
+        };
     }
     const exe = b.addExecutable(.{ .name = "xodb", .root_module = module });
     const install_exe = b.addInstallArtifact(exe, .{});

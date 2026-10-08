@@ -30,6 +30,18 @@
 #define XJS_V8_SCOPE_EMPTY (1u << 29)
 /* src/common/globals.h:2048: names use a hash table at this count. */
 #define XJS_V8_SCOPE_INLINE_NAMES 75
+/* scope-info.tq ScopeFlags/VariableProperties; contexts.tq and contexts.h.
+ * Context length is a Smi; the first two elements are ScopeInfo/previous. */
+#define XJS_V8_SCOPE_CONTEXT_EXTENSION (1u << 26)
+#define XJS_V8_SCOPE_CONTEXT_CELLS (1u << 31)
+#define XJS_V8_CONTEXT_LENGTH 8
+#define XJS_V8_CONTEXT_DATA 16
+#define XJS_V8_CONTEXT_SCOPE 16
+#define XJS_V8_CONTEXT_PREVIOUS 24
+/* contexts.tq ContextCell; contexts.h State; contexts-inl.h accessors. */
+#define XJS_V8_CONTEXT_CELL_TAGGED 8
+#define XJS_V8_CONTEXT_CELL_STATE 24
+#define XJS_V8_CONTEXT_CELL_NUMBER 32
 /* src/objects/bytecode-array.tq:7-23: trusted-object header, Smi length,
  * wrapper, then protected source-position-table pointer (no sandbox). */
 #define XJS_V8_BYTECODE_POSITIONS 24

@@ -65,11 +65,12 @@ try:
     # The fixed private 1280x800 view fits one binding after the expression.
     # The hint includes both rows below the viewport and later reader pages.
     first=visible('python-named-depth',['namedlocals',str(locals_['total']-1)+'more','edepthint0','expressionresultabove'])
-    d.keys('scroll',1150,540,1)  # helper notch is two application lines
-    middle=visible('python-named-scrolled',['flagtrue','2more'])
-    d.keys('scroll',1150,540,20)
+    d.keys('scroll',1150,540,1)  # one visible row: do not skip the next binding
+    row = locals_['rows'][1]
+    middle=visible('python-named-scrolled',[normalize(row['name']+'='+row['value']['display']),str(locals_['total']-2)+'more'])
+    for _ in range(2,locals_['total']):d.keys('scroll',1150,540,1)
     last=visible('python-named-last',['deleted','pythonunboundlocal'],['more'])
-    d.keys('scroll',1150,540,-20)
+    for _ in range(1,locals_['total']):d.keys('scroll',1150,540,-1)
     visible('python-named-restored',['expressionresultabove',str(locals_['total']-1)+'more'])
     # Selecting a caller resolves the existing expression against that frame.
     d.tool('select_language_frame',**(args|{'frame':frame+1}))

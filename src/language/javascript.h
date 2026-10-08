@@ -26,12 +26,20 @@ void xjs_dwarf_profile(Dwarf *, struct xjs_dwarf_profile *);
  * Missing optional fields refuse only the operation that needs them. */
 const char *xjs_layout_check(const struct xjs_layout *, const uint8_t *, size_t, const uint32_t[4]);
 typedef int (*xjs_read_fn)(void *, uint64_t, void *, size_t);
+#define XJS_CACHE_BLOCK 256
+#define XJS_CACHE_SLOTS 32
+/* Optional operation-local read batching. Zero before one stopped inspection;
+ * never retain this cache across a resume, generation or target change. */
+struct xjs_read_cache {
+    struct { uint64_t address; uint8_t bytes[XJS_CACHE_BLOCK]; } slots[XJS_CACHE_SLOTS];
+};
 struct xjs_reader {
     void *context;
     xjs_read_fn read;
     size_t reads, bytes;
     const char *error;
     int version_table;
+    struct xjs_read_cache *cache;
 };
 int xjs_read_memory(struct xjs_reader *, uint64_t, void *, size_t);
 #define XJS_READ_LIMIT 8192
@@ -63,7 +71,7 @@ struct xjs_value {
 void xjs_value_read(const struct xjs_layout *, struct xjs_reader *, uint64_t, struct xjs_value *);
 #define XJS_STACK_FRAMES 64
 struct xjs_frame {
-    uint64_t fp, pc, function, shared, code;
+    uint64_t fp, pc, function, shared, code, context, bytecode;
     int32_t line, column;
     char name[192], file[384], kind[32];
     const char *reason;
@@ -80,6 +88,29 @@ struct xjs_stack {
 void xjs_stack_read(const struct xjs_layout *, struct xjs_reader *, uint64_t fp,
                     uint64_t pc, uint64_t root_register, uint64_t stack_lo,
                     uint64_t stack_hi, struct xjs_stack *);
+#define XJS_CONTEXT_PAGE 32
+#define XJS_CONTEXT_BINDINGS 4096
+#define XJS_CONTEXT_DEPTH 64
+struct xjs_context_binding {
+    char name[512];
+    const char *name_reason, *reason;
+    size_t ordinal, depth;
+    uint64_t context, slot_address, tagged;
+    int parameter, immediate;
+    struct xjs_value value;
+};
+struct xjs_context_bindings {
+    size_t start, total, count;
+    int truncated;
+    const char *reason;
+    struct xjs_context_binding items[XJS_CONTEXT_PAGE];
+};
+/* Only a canonical retained interpreted frame, never client-supplied pointers.
+ * Context storage does not prove lexical visibility: stack bindings can shadow
+ * these names. No bare-name lookup is provided. Re-resolve after every resume;
+ * V8 can move both the contexts and their values during garbage collection. */
+void xjs_context_read(const struct xjs_layout *, struct xjs_reader *, const struct xjs_frame *,
+                      size_t start, size_t limit, struct xjs_context_bindings *);
 /* A proved, single-word V8 C++ handle: 1 is a tagged value, 2 an indirect
  * handle slot. Zero means an unrelated or unsupported type. */
 int xjs_dwarf_handle(Dwarf_Die *);

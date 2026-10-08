@@ -53,6 +53,7 @@ pub const Panel = struct {
     bindings_reason: []const u8 = "Select a logical frame for named locals",
     bindings_key: ?SelectedKey = null,
     binding_start: usize = 0,
+    binding_visible: usize = 0,
     binding_y: f32 = std.math.inf(f32),
     expression: [128]u8 = undefined,
     expression_len: usize = 0,
@@ -87,7 +88,10 @@ pub const Panel = struct {
     }
     pub fn scrollBindings(self: *Panel, amount: i32) void {
         const result = self.bindings orelse return;
-        if (amount < 0) self.binding_start -|= @intCast(-@as(i64, amount)) else self.binding_start = @min(result.total -| 1, self.binding_start +| @as(usize, @intCast(amount)));
+        // A wheel notch can represent several lines. Never jump over rows
+        // when the viewport has room for only one or two bindings.
+        const step = @min(@max(@as(usize, 1), self.binding_visible), @as(usize, @intCast(@abs(@as(i64, amount)))));
+        if (amount < 0) self.binding_start -|= step else self.binding_start = @min(result.total -| 1, self.binding_start +| step);
         self.key = null;
     }
     pub fn deinit(self: *Panel) void {
@@ -328,7 +332,7 @@ pub const Panel = struct {
             try r.textFit(font, rect.x + 12, y + 21, rect.w - 24, value.value.display, if (value.value.diagnostic != null) theme.warm else theme.weak);
             y += 45;
         }
-        if (!self.native_collapsed and self.native_count == 0 and y + 23 <= end) try r.textFit(font, rect.x + 12, y, rect.w - 24, reason orelse "No decoded native objects", theme.weak);
+        if (!self.native_collapsed and self.native_count == 0 and y + 23 <= end) try r.textFit(font, rect.x + 12, y, rect.w - 24, if (reason) |why| (if (std.mem.eql(u8, why, "BadMapping")) "No mapped native image" else why) else "No decoded native objects", theme.weak);
         if (!named.supported(tab) and end >= rect.y + 30) {
             try r.textFit(font, rect.x + 12, end + 3, rect.w - 24, "Variables by name", theme.weak);
             const hint = try std.fmt.bufPrint(&buffer, "Not yet for {s}", .{tabs.title(tab)});
@@ -359,7 +363,7 @@ pub const Panel = struct {
         const remaining = @max(0, rect.y + rect.h - 8 - y);
         var native_count: usize = 0;
         for (native_values) |value| if (nativeMatches(state.selected, value.value)) { native_count += 1; };
-        const named_min: f32 = if (self.editor.open) 140 else if (logical != null) 112 else 64;
+        const named_min: f32 = if (self.editor.open) 140 else if (logical != null) (if (state.selected == .javascript) @as(f32, if (self.expression_len != 0) 160 else 135) else 112) else 64;
         const layout = sectionLayout(remaining, has_named, native_count, self.native_policy, named_min);
         self.native_collapsed = layout.collapsed;
         const native_top = y + layout.stack;
@@ -395,6 +399,7 @@ pub const Panel = struct {
             if (selected and row.reason != null and y + 20 < native_top) try r.textFit(font, rect.x + 12, y - 2, rect.w - 24, explanation(row.reason.?), theme.warm);
         }
         try self.nativeValues(r, font, .{ .x = rect.x, .y = native_top, .w = rect.w, .h = binding_top - native_top }, state.selected, frame, native_values, native_reason);
+        self.binding_visible = 0;
         if (!has_named) return;
         y = binding_top + 8;
         try r.rect(.{ .x = rect.x + 1, .y = binding_top, .w = rect.w - 2, .h = 1 }, theme.border);
@@ -409,14 +414,18 @@ pub const Panel = struct {
         } else if (self.expression_len != 0) {
             const value = if (self.expression_result) |result| if (result.rows.len != 0) result.rows[0].value.display else result.diagnostic orelse "No binding" else self.expression_reason orelse "Value unavailable";
             var buffer: [2048]u8 = undefined;
-            const text = std.fmt.bufPrint(&buffer, "E: {s} = {s}", .{ self.expression[0..self.expression_len], value }) catch "Value preview too long";
+            const text = std.fmt.bufPrint(&buffer, "E: {s} = {s}", .{ self.expression[0..self.expression_len], if (std.mem.eql(u8, value, "JavaScriptLexicalUnproved")) "unproved" else value }) catch "Value preview too long";
             try r.textFit(font, rect.x + 12, y, rect.w - 24, text, theme.text);
             y += 25;
         }
         if (self.bindings) |result| {
             if (result.diagnostic) |why| {
-                try r.textFit(font, rect.x + 12, y, rect.w - 24, why, theme.warm);
+                try r.textFit(font, rect.x + 12, y, rect.w - 24, if (std.mem.eql(u8, why, "JavaScriptLexicalUnproved")) "Lexical visibility" else why, theme.warm);
                 y += 23;
+            }
+            if (result.view_kind == .context_storage) {
+                try r.textFit(font, rect.x + 12, y, rect.w - 24, "Unproved; stack hidden", theme.weak);
+                y += 21;
             }
             var shown: usize = 0;
             for (result.rows) |row| {
@@ -425,20 +434,23 @@ pub const Panel = struct {
                 const text = if (row.name.len == 0) row.value.display else std.fmt.bufPrint(&buffer, "{s} = {s}", .{ row.name, row.value.display }) catch "Value preview too long";
                 try r.textFit(font, rect.x + 12, y, rect.w - 24, text, theme.text);
                 const matching_expression = if (self.expression_result) |expression| expression.rows.len == 1 and expression.rows[0].ordinal == row.ordinal and std.mem.eql(u8, expression.rows[0].name, row.name) else false;
-                const detail = row.name_diagnostic orelse row.value.diagnostic orelse if (matching_expression) "expression result above" else if (row.hidden) "hidden compiler local" else if (row.immediate) "immediate integer in frame slot" else if (row.value.advisory) "bounded preview; object lifetime unproved" else @tagName(row.scope);
+                var context_label: [80]u8 = undefined;
+                const context_detail = if (row.context_depth) |depth| try std.fmt.bufPrint(&context_label, "context #{d}{s}", .{ depth, if (row.context_parameter orelse false) " / parameter" else "" }) else null;
+                const detail = row.name_diagnostic orelse row.value.diagnostic orelse context_detail orelse if (matching_expression) "expression result above" else if (row.hidden) "hidden compiler local" else if (row.immediate) "immediate integer in frame slot" else if (row.value.advisory) "bounded preview; object lifetime unproved" else @tagName(row.scope);
                 try r.textFit(font, rect.x + 12, y + 20, rect.w - 24, detail, if (row.name_diagnostic != null or row.value.diagnostic != null) theme.warm else theme.weak);
                 y += 44;
                 shown += 1;
             }
+            self.binding_visible = shown;
             more = result.total -| (result.start + shown);
         } else try r.textFit(font, rect.x + 12, y, rect.w - 24, self.bindings_reason, theme.weak);
         if (more != 0) {
             var buffer: [48]u8 = undefined;
-            const hint = try std.fmt.bufPrint(&buffer, "▼ {d} more", .{more});
+            const hint = if (state.selected == .javascript) try std.fmt.bufPrint(&buffer, "▼ {d}", .{more}) else try std.fmt.bufPrint(&buffer, "▼ {d} more", .{more});
             const hint_width = r.measure(font, hint);
-            try r.textFit(font, rect.x + 12, heading_y, rect.w - 32 - hint_width, "NAMED LOCALS", theme.neutral);
+            try r.textFit(font, rect.x + 12, heading_y, rect.w - 32 - hint_width, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS", theme.neutral);
             try r.textFit(font, rect.x + rect.w - 12 - hint_width, heading_y, hint_width, hint, theme.weak);
-        } else try r.textFit(font, rect.x + 12, heading_y, rect.w - 24, "NAMED LOCALS  /  E name", theme.neutral);
+        } else try r.textFit(font, rect.x + 12, heading_y, rect.w - 24, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS  /  E name", theme.neutral);
     }
 };
 

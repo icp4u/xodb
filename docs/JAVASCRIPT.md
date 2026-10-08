@@ -49,6 +49,52 @@ positions until its configuration is proved. The Node executable does not need
 DWARF for the tested stock profile; the native variable's owning addon does
 need DWARF to prove its V8 handle layout.
 
+## Context storage in the JavaScript pane
+
+Run `scripts/demo-node`, press **Space**, choose the **JS** tab, and select an
+interpreted frame `inspect` to see its retained `value` and `round` parameters.
+Native V8 objects appear above **CONTEXT
+STORAGE**; click the native-section header to collapse or expand it. Scroll over
+the context rows to browse captured parameters and variables; each row includes
+its context depth. Contexts are ordered nearest first; slots keep their runtime
+order within each context. Even a one-row viewport advances without skipping
+bindings. "No mapped native image" means the selected native anchor has no
+usable mapped image for native variable inspection; the separately proved JS
+context rows remain available. The pane retains at least three stack rows at normal window
+sizes.
+
+This is **context storage — lexical visibility unproved**. Retained ScopeInfo
+names describe storage, but a block-scoped variable can shadow a same-named outer
+context slot. For example, a context may hold `captured = 41` while the active
+block's `captured` is 99. The displayed context row does not resolve that source
+expression. Stack-only locals and parameters are **not shown**: V8 does not
+retain their complete name/register map here. **E**, `captured`, **Return** in
+the JS pane gives `JavaScriptLexicalUnproved`; it never guesses an outer value.
+Native **C/C++** expressions such as the demo's `value` remain available in the
+native pane.
+
+`get_language_locals` with `language: "javascript"`, a current generation, thread,
+segment and logical-frame index returns `view_kind: "context_storage"`, the
+lexical limitation and per-row depth, context address, slot address and storage
+provenance. It is an observer read. `start` and `limit` page at most 32 rows per
+call, through at most 64 contexts and 4096 bindings, under the shared read/byte
+budget. Memory reads batch into a bounded cache (8 KiB of data plus address tags)
+created for each stopped inspection and discarded afterward. Counters include speculative reads and
+failed attempts; a failed batch falls back to the exact requested bytes.
+Addresses belong only to the retained stop: moving GC requires resolving
+the frame and storage again after resume.
+
+The initial implementation reads proved interpreted frames, function/block/catch
+and class contexts, captured parameters, and supported context-cell values.
+Optimized or unproved frames, dynamic/eval/module scopes, detached cells,
+unsupported name tables (75 or more bindings in one scope), malformed bounds
+and read failures report explicit reasons. Script/native contexts end the chain.
+An unproved frame configuration also prevents context inspection even when its
+name and script can be displayed: `get_language_locals` returns
+`JavaScriptContextFrameUnproved`. The physical stack explains the underlying
+missing proof with `JavaScriptFrameConfigUnavailable`. No target code is executed to recover names or
+values.
+
 ## Values
 
 Locals and expression watches recognize V8 `Local<T>` and internal `Tagged<T>`

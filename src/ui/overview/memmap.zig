@@ -3,7 +3,8 @@
 //! buddy fragmentation and THP/compaction activity. Three looks, cycled by
 //! `t` on this panel: a Windows 9x "Disk Defragmenter" dialog, the MS-DOS 6
 //! DEFRAG text screen (the same 80x25 composer as `xodb --memdefrag`), and a
-//! plain modern grid (the seam for the later high-resolution visualiser).
+//! plain modern grid; a fourth, the deep map (deepmap.zig), is the dense
+//! zoomable high-resolution field.
 //! Data comes from the shared memory observer; rendering copies a bounded
 //! Map under the publication lock and never reads /proc itself.
 const std = @import("std");
@@ -15,6 +16,7 @@ pub const md = @import("../../memdefrag/model.zig");
 const dos = @import("../../memdefrag/dos.zig");
 const vga = @import("../../memdefrag/vga.zig");
 const Collector = @import("../../model/system.zig").Collector;
+pub const deepmap = @import("deepmap.zig");
 const Font = @import("../../render/font.zig").Font;
 const rgb = @import("../../appearance.zig").rgb;
 const Ctx = draw.Ctx;
@@ -23,8 +25,8 @@ const Color = draw.Color;
 const fade = draw.fade;
 const mix = draw.mix;
 
-pub const Look = enum { win9x, dos, modern };
-pub const look_names = [_][]const u8{ "Windows 9x Defrag", "MS-DOS DEFRAG", "modern" };
+pub const Look = enum { win9x, dos, modern, deep };
+pub const look_names = [_][]const u8{ "Windows 9x Defrag", "MS-DOS DEFRAG", "modern", "deep map" };
 pub const Button = enum { stop, pause, legend, details, close_legend, look, picker };
 pub const Click = union(enum) { button: Button, pick: usize, cell: usize, scroll: i32 };
 const zooms = [_]u64{ 2 << 20, 512 << 10, 128 << 10, 32 << 10, 8 << 10, 4 << 10 };
@@ -44,6 +46,10 @@ pub const State = struct {
     replay_previous: ?*const md.Map = null,
     replay_stopped: bool = false,
     replay_system: md.Map = .{},
+    /// Recorded explicit viewports of the replay frame (deep look only).
+    replay_viewports: []const md.Map = &.{},
+    replay_viewports_prev: []const md.Map = &.{},
+    deep: deepmap.Deep = .{},
     accepted_at: u64 = 0,
     zoom: usize = 0,
     scroll: usize = 0,
@@ -99,6 +105,7 @@ pub const State = struct {
         self.hover = null;
         self.scroll = 0;
         self.zoom = 0;
+        self.deep.reset();
         self.deinit();
     }
 
@@ -106,20 +113,37 @@ pub const State = struct {
     pub fn refresh(self: *State, gpa: std.mem.Allocator, owner: *Collector, now: u64, paused: bool, redact: bool) bool {
         if (paused or self.replay_current != null) return false;
         const observer = owner.memoryObserver() catch return false;
-        self.reader.renew(observer, self.target, now);
         const anchor: u64 = if (self.zoom == 0) 0 else blk: {
             const mp = self.map() orelse break :blk 0;
             if (self.cursor) |i| if (i < mp.cells.len) break :blk mp.cells[i].start;
             break :blk if (mp.cells.len > 0) mp.cells[0].start else 0;
         };
-        const got = (self.reader.read(gpa, observer, self.target, .{ .cell_bytes = zooms[self.zoom], .anchor = anchor, .redact = redact }) catch null) orelse return false;
+        const req = if (self.look == .deep) deepmap.request(self, redact, now) else md.Request{ .cell_bytes = zooms[self.zoom], .anchor = anchor, .redact = redact };
+        self.reader.renew(observer, self.target, req, now) catch return false;
+        const scope_before = .{ self.reader.seen_ticket, self.reader.seen_scope };
+        const got = (self.reader.read(gpa, observer, self.target, req) catch null) orelse return false;
+        if (self.look == .deep) {
+            self.workerCost(got, now);
+            // System counters publish on their own clock; only a new page
+            // scan of the process scope is a new snapshot to animate.
+            const scanned = scope_before[0] != self.reader.seen_ticket or scope_before[1] != self.reader.seen_scope;
+            return deepmap.accept(self, got, now, scanned);
+        }
         // A process map waits for its first scan; keep the earlier one meanwhile.
         if (self.target != null and got.map.process == null) if (self.current) |cur| if (cur.map.process != null) {
             got.destroy();
             return false;
         };
-        // Worker cost over this view's own clock: publications of the process
-        // scope and of the system counters interleave, so their stamps differ.
+        self.workerCost(got, now);
+        if (self.previous) |p| p.destroy();
+        self.previous = self.current;
+        self.current = got;
+        self.accepted_at = now;
+        return true;
+    }
+    /// Worker cost over this view's own clock: publications of the process
+    /// scope and of the system counters interleave, so their stamps differ.
+    fn workerCost(self: *State, got: *md.Owned, now: u64) void {
         if (got.map.worker_cpu_ns) |w| {
             if (self.cost_at == 0 or w < self.cost_cpu) {
                 self.cost_at = now;
@@ -130,15 +154,12 @@ pub const State = struct {
                 self.cost_cpu = w;
             }
         }
-        if (self.previous) |p| p.destroy();
-        self.previous = self.current;
-        self.current = got;
-        self.accepted_at = now;
-        return true;
     }
     /// Replay: each recorded frame is one publication.
-    pub fn acceptReplay(self: *State, map_: *const md.Map, now: u64) void {
+    pub fn acceptReplay(self: *State, map_: *const md.Map, viewports: []const md.Map, now: u64) void {
         if (self.replay_current) |cur| if (cur.sequence == map_.sequence) return;
+        self.replay_viewports_prev = self.replay_viewports;
+        self.replay_viewports = viewports;
         self.costFrom(self.replay_current, map_);
         self.replay_previous = self.replay_current;
         self.replay_current = map_;
@@ -203,6 +224,7 @@ pub fn key(v: *vw.View, event: @import("../../platform/input.zig").Event, now: u
         }
         return true;
     }
+    if (s.look == .deep and deepmap.key(v, event.sym, event.shortcut, now)) return true;
     switch (event.sym) {
         0xff52 => return moveCursor(s, -@as(i64, @intCast(s.grid_cols))),
         0xff54 => return moveCursor(s, @intCast(s.grid_cols)),
@@ -258,7 +280,15 @@ fn press(v: *vw.View, b: Button, now: u64) void {
         .close_legend => s.legend = false,
         .details => s.compact = !s.compact,
         .look => {
-            s.look = @enumFromInt((@intFromEnum(s.look) + 1) % 3);
+            const was_deep = s.look == .deep;
+            s.look = @enumFromInt((@as(usize, @intFromEnum(s.look)) + 1) % look_names.len);
+            // The deep look asks for explicit viewports, the others for the
+            // compact map: never draw one's cells in the other's geometry.
+            if (was_deep != (s.look == .deep) and s.replay_current == null) {
+                s.deinit();
+                s.reader.reset();
+                s.deep.reset();
+            }
             v.setStatus("Memory map look: {s}", .{look_names[@intFromEnum(s.look)]}, now);
         },
         .picker => s.picker_open = !s.picker_open,
@@ -395,7 +425,7 @@ fn systemCellsFor(mp: *const md.Map) struct { count: usize, unit: u64 } {
 fn hex(x: u24) Color {
     return rgb(x);
 }
-fn label(v: *vw.View, buf: []u8) []const u8 {
+pub fn label(v: *vw.View, buf: []u8) []const u8 {
     const s = &v.memmap;
     const mp = s.map();
     if (mp) |x| if (x.process) |p| {
@@ -406,7 +436,7 @@ fn label(v: *vw.View, buf: []u8) []const u8 {
     if (s.target) |id| return std.fmt.bufPrint(buf, "pid {d}", .{id.pid}) catch "";
     return "System memory";
 }
-fn costText(v: *vw.View, buf: []u8) []const u8 {
+pub fn costText(v: *vw.View, buf: []u8) []const u8 {
     const s = &v.memmap;
     const mp = s.map() orelse return "cost: waiting";
     const scan_ms: ?f64 = if (mp.process) |p| @as(f64, @floatFromInt(p.scan_cpu_ns)) / 1e6 else null;
@@ -428,7 +458,7 @@ fn costAge(v: *vw.View, mp: *const md.Map, now: u64, buf: []u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s} · worker measuring", .{age}) catch "";
 }
 /// "Refresh 5.0 s (cost-limited) · age 2.1 s": shown in every look.
-fn freshness(v: *vw.View, mp: *const md.Map, now: u64, buf: []u8) []const u8 {
+pub fn freshness(v: *vw.View, mp: *const md.Map, now: u64, buf: []u8) []const u8 {
     const k = md.cadence(mp, liveNow(v, now));
     var rb: [48]u8 = undefined;
     var gb: [24]u8 = undefined;
@@ -480,7 +510,12 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         .win9x => try win9x(v, ctx, rect, now),
         .dos => try dosLook(v, ctx, rect, now),
         .modern => try modern(v, ctx, rect, now),
+        .deep => {
+            try deepmap.render(v, ctx, rect, now);
+            if (s.legend) try legend9x(v, ctx, rect, s.map());
+        },
     }
+    deepmap.perfLine(v, &s.deep, @tagName(s.look), if (s.look == .deep) s.deep.count() else 0, now);
 }
 
 /// Cell colours per look. `t` blends from the previous poll's state.
@@ -497,7 +532,7 @@ fn win9xPalette() Palette {
     p.state = .{ hex(0x2a2a2a), hex(0x2a2a2a), hex(0xb8b8b8), hex(0xb0b0b0), hex(0xb8b8b8), hex(0x7c7c7c), hex(0xe8e800), hex(0x00d8d8), hex(0x00d8d8), hex(0x1838d8), hex(0xd00000), hex(0xffffff), hex(0xe8f8f8), hex(0xd8c8f0) };
     return p;
 }
-fn modernPalette(p: *const @import("theme.zig").Palette) Palette {
+pub fn modernPalette(p: *const @import("theme.zig").Palette) Palette {
     var out: Palette = .{ .state = undefined, .changed = p.ok, .collapsed = p.text, .split = p.crit, .hatch = fade(p.hatch, 0.8), .hatch_bg = fade(p.hatch, 0.25) };
     const weak = mix(p.panel, p.accent, 0.40);
     out.state = .{ fade(p.border, 0.35), fade(p.border, 0.9), fade(p.dim, 0.35), fade(p.hatch, 0.25), fade(p.dim, 0.30), p.dim, p.warn, weak, weak, p.accent, p.crit, p.text, fade(p.text, 0.4), mix(p.panel, p.accent3, 0.45) };
@@ -923,7 +958,7 @@ fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     };
     if (s.legend) try legend9x(v, ctx, rect, mp);
 }
-fn vmaText(v: *vw.View, vma: md.Vma) []const u8 {
+pub fn vmaText(v: *vw.View, vma: md.Vma) []const u8 {
     if (v.redact) switch (vma.kind) {
         .anon, .file, .special, .hugetlb => {
             var hidden = vma;
@@ -1315,13 +1350,18 @@ fn shade(ctx: Ctx, cp: u21, cx: f32, cy: f32, cw: f32, ch: f32, scale: f32, fg: 
 
 // --- Modern ---------------------------------------------------------------------------
 
-/// Clean high-contrast grid in the overview's own palette. The later
-/// high-resolution visualiser replaces `paintGrid(.modern)` here.
+/// Clean high-contrast grid in the overview's own palette (the compact map;
+/// the deep look in deepmap.zig is the high-resolution field).
 fn modern(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
+    const side_w = try sidePanels(v, ctx, rect);
+    const main = Rect{ .x = rect.x + side_w, .y = rect.y, .w = rect.w - side_w, .h = rect.h };
+    try modernMain(v, ctx, rect, main, now);
+}
+/// The process picker and the system memory panel left of the map; returns
+/// the width taken (none in the compact view).
+pub fn sidePanels(v: *vw.View, ctx: Ctx, rect: Rect) !f32 {
     const s = &v.memmap;
     const p = ctx.p;
-    var buf: [256]u8 = undefined;
-    var lb: [64]u8 = undefined;
     const side_w: f32 = if (s.compact) 0 else std.math.clamp(rect.w * 0.23, 240, 340);
     if (!s.compact) {
         const list = Rect{ .x = rect.x, .y = rect.y, .w = side_w, .h = @floor(rect.h * 0.45) };
@@ -1343,7 +1383,13 @@ fn modern(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         try ctx.text(sys.x + 12, sys.y + 8, "System memory", p.text);
         try systemStrip(v, ctx, .{ .x = sys.x + 8, .y = sys.y + 34, .w = sys.w - 16, .h = sys.h - 40 }, .modern);
     }
-    const main = Rect{ .x = rect.x + side_w + (if (s.compact) @as(f32, 0) else 10), .y = rect.y, .w = rect.w - side_w - (if (s.compact) @as(f32, 0) else 10), .h = rect.h };
+    return if (s.compact) 0 else side_w + 10;
+}
+fn modernMain(v: *vw.View, ctx: Ctx, rect: Rect, main: Rect, now: u64) !void {
+    const s = &v.memmap;
+    const p = ctx.p;
+    var buf: [256]u8 = undefined;
+    var lb: [64]u8 = undefined;
     try ctx.panel(main);
     const mp = s.map();
     try ctx.textFit(main.x + 14, main.y + 8, main.w * 0.5, label(v, &lb), p.text);

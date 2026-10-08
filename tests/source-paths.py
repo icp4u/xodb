@@ -10,7 +10,7 @@ import subprocess
 
 
 def synthetic(path, version=5, wide=True, little=True, dwarf64=False,
-              bad_tail=False, bad_directory=False, forged_offset=False, odd_path=None, odd_directory=False, odd_directory_index=0):
+              bad_tail=False, bad_directory=False, forged_offset=False, odd_path=None, odd_directory=False, odd_directory_index=0, after_terminator=b''):
     endian = '<' if little else '>'
     pack = lambda code, *v: struct.pack(endian + code, *v)
     off = 'Q' if dwarf64 else 'I'
@@ -32,7 +32,7 @@ def synthetic(path, version=5, wide=True, little=True, dwarf64=False,
             files = bytes([2, 1, 8, 2, 15, 4]) + odd + bytes([odd_directory_index]) + files[6:] + odd + bytes([odd_directory_index])
         else:
             files = odd + bytes([odd_directory_index, 0, 0]) + files[:-1] + odd + bytes([odd_directory_index, 0, 0, 0])
-    header = common + dirs + files + (b'\xff' if bad_tail else b'')
+    header = common + dirs + files + after_terminator + (b'\xff' if bad_tail else b'')
     line = length(pack('H', version) + (bytes([8 if wide else 4, 0]) if version == 5 else b'') + pack(off, len(header)) + header)
     abbrev = bytes([1, 0x11, 0, 0x10, 0x17, 0x1b, 8, 0, 0, 0])
     unit = pack('H', version)
@@ -143,16 +143,37 @@ def main():
                                      ('dot', '.'), ('empty', '')]:
                         image = work / f'odd-{tag}-{version}-{wide}-{little}-{dwarf64}'
                         synthetic(image, version, wide, little, dwarf64, odd_path=odd)
-                        run(image, '/synthetic/build/fixture.c', 'ok')
-                        run(image, '/synthetic/build/include/header.h', 'ok')
+                        # In DWARF 2-4 an empty name terminates the table;
+                        # the apparent later rows are not entries at all.
+                        empty_end = version < 5 and odd == ''
+                        run(image, '/synthetic/build/fixture.c', 'not-found' if empty_end else 'ok')
+                        run(image, '/synthetic/build/include/header.h', 'not-found' if empty_end else 'ok')
                         run(image, '/synthetic/build/blocked.c', 'not-found')
                         invalid = work / f'odd-bad-index-{tag}-{version}-{wide}-{little}-{dwarf64}'
                         synthetic(invalid, version, wide, little, dwarf64, odd_path=odd, odd_directory_index=3)
-                        run(invalid, '/synthetic/build/fixture.c', 'malformed')
+                        run(invalid, '/synthetic/build/fixture.c', 'not-found' if empty_end else 'malformed')
                     image = work / f'odd-directory-{version}-{wide}-{little}-{dwarf64}'
                     synthetic(image, version, wide, little, dwarf64, odd_directory=True)
                     run(image, '/synthetic/build/fixture.c', 'ok')
                     run(image, '/synthetic/build/include/header.h', 'not-found')
+    # Padding, plausible filenames and invalid LEBs beyond the legacy
+    # terminator are not part of the table. Compare the standard consumer.
+    for version in [2, 3, 4]:
+        for wide in [False, True]:
+            for little in [False, True]:
+                for dwarf64 in [False, True]:
+                    for tag, tail in [('row', b'\0\0\0hidden.c\0\0\0\0\0'),
+                                      ('padding', bytes(16)), ('invalid', b'\x80' * 11)]:
+                        image = work / f'terminator-{tag}-{version}-{wide}-{little}-{dwarf64}'
+                        synthetic(image, version, wide, little, dwarf64, after_terminator=tail)
+                        run(image, '/synthetic/build/fixture.c', 'ok')
+                        run(image, '/synthetic/build/include/header.h', 'ok')
+                        run(image, '/synthetic/build/hidden.c', 'not-found')
+                        dump = subprocess.run(['readelf', '--debug-dump=rawline', str(image)],
+                                              capture_output=True, text=True, check=True, timeout=10)
+                        (work / (image.name + '.readelf.txt')).write_text(dump.stdout + dump.stderr)
+                        table = dump.stdout.split('The File Name Table', 1)[1].split('Line Number Statements', 1)[0]
+                        assert 'fixture.c' in table and 'header.h' in table and 'hidden.c' not in table, table
     # GCC and clang encode trailing slash paths differently: an empty name
     # or '.', with the apparent filename in the directory table. Test their
     # actual emitted rows as well as synthetic paths containing the slash.
@@ -160,11 +181,19 @@ def main():
         for version in [2, 3, 4, 5]:
             for tag, suffix in [('slash', '/'), ('dot', '/.')]:
                 source = work / f'line-{cc}-{version}-{tag}.c'
-                source.write_text(f'#line 1 "/synthetic/blocked.c{suffix}"\nint odd(void){{return 3;}}\n'
+                source.write_text('#line 1 "/synthetic/before.c"\nint before(void){return 3;}\n'
+                                  f'#line 1 "/synthetic/blocked.c{suffix}"\nint odd(void){{return before();}}\n'
                                   '#line 1 "/synthetic/good.c"\nint main(void){return odd();}\n')
                 image = source.with_suffix('')
                 subprocess.run([cc, '-O0', f'-gdwarf-{version}', str(source), '-o', str(image)], check=True, timeout=30)
-                run(image, '/synthetic/good.c', 'ok')
+                run(image, '/synthetic/before.c', 'ok')
+                legacy_empty = cc == 'gcc' and version < 5 and tag == 'slash'
+                run(image, '/synthetic/good.c', 'not-found' if legacy_empty else 'ok')
+                dump = subprocess.run(['readelf', '--debug-dump=rawline', str(image)],
+                                      capture_output=True, text=True, check=True, timeout=10)
+                (work / (image.name + '.readelf.txt')).write_text(dump.stdout + dump.stderr)
+                table = dump.stdout.split('The File Name Table', 1)[1].split('Line Number Statements', 1)[0]
+                assert 'before.c' in table and ('good.c' in table) != legacy_empty, table
                 run(image, '/synthetic/blocked.c', 'not-found')
     # Real compiler-produced out-of-tree paths, as used by Meson/VPATH builds.
     project = work / 'out-of-tree'

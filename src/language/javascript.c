@@ -87,6 +87,28 @@ static int read_bytes(struct xjs_reader *r, uint64_t a, void *out, size_t n) {
     if (r->error) return 0;
     if (a < 4096 || a >= (UINT64_C(1) << 63) || n > UINT64_MAX - a)
         return fail(r, "JavaScriptInvalidAddress");
+    if (r->cache && n && n <= XJS_CACHE_BLOCK) {
+        uint64_t base = a & ~(uint64_t)(XJS_CACHE_BLOCK - 1);
+        size_t offset = (size_t)(a - base), index = (size_t)(base / XJS_CACHE_BLOCK % XJS_CACHE_SLOTS);
+        if (n <= XJS_CACHE_BLOCK - offset) {
+            if (r->cache->slots[index].address == base) {
+                memcpy(out, r->cache->slots[index].bytes + offset, n);
+                return 1;
+            }
+            /* A speculative aligned block stays inside one target page. If
+             * it is unavailable, preserve exact-read behavior. Charge failed
+             * speculation too, reserving enough budget for that exact read. */
+            if (r->reads < XJS_READ_LIMIT - 1 && r->bytes <= XJS_BYTE_LIMIT - XJS_CACHE_BLOCK - n) {
+                r->cache->slots[index].address = 0;
+                ++r->reads; r->bytes += XJS_CACHE_BLOCK;
+                if (!r->read(r->context, base, r->cache->slots[index].bytes, XJS_CACHE_BLOCK)) {
+                    r->cache->slots[index].address = base;
+                    memcpy(out, r->cache->slots[index].bytes + offset, n);
+                    return 1;
+                }
+            }
+        }
+    }
     if (r->reads >= XJS_READ_LIMIT || r->bytes > XJS_BYTE_LIMIT || n > XJS_BYTE_LIMIT - r->bytes)
         return fail(r, "JavaScriptReadBudget");
     ++r->reads; r->bytes += n;
@@ -611,6 +633,7 @@ static int frame_position(const struct xjs_layout *l, struct xjs_reader *r, uint
         int64_t length = smi(r, at(l, r, b.address, XJS_BYTECODE_LENGTH, 8));
         int64_t raw_offset = smi(r, word(r, out->fp - 40, 8)) - field(l, r, XJS_BYTECODE_DATA) + 1;
         if (raw_offset < 0 || raw_offset >= length) return fail(r, "JavaScriptBytecodeOffsetInvalid");
+        out->bytecode = bytecode;
         offset = (uint64_t)raw_offset;
         table = word(r, b.address + XJS_V8_BYTECODE_POSITIONS, 8);
     } else if (kind == XJS_V8_KIND_MAGLEV || kind == XJS_V8_KIND_TURBOFAN) {
@@ -655,7 +678,7 @@ void xjs_stack_read(const struct xjs_layout *l, struct xjs_reader *r, uint64_t f
             if (!head(l, r, marker, &context) || context.type < field(l, r, XJS_FIRST_CONTEXT) ||
                 context.type > field(l, r, XJS_LAST_CONTEXT)) { out->reason = "JavaScriptFrameContextInvalid"; break; }
             struct xjs_frame *f = &out->frames[out->count];
-            f->fp = fp; f->pc = pc; f->function = word(r, fp - 16, 8);
+            f->fp = fp; f->pc = pc; f->function = word(r, fp - 16, 8); f->context = marker;
             strcpy(f->kind, "javascript");
             if (!function_name(l, r, f->function, f->name, sizeof f->name, &f->shared)) { out->reason = r->error; break; }
             ++out->count;
@@ -686,4 +709,153 @@ void xjs_stack_read(const struct xjs_layout *l, struct xjs_reader *r, uint64_t f
     }
     out->version_table = r->version_table;
     if (r->error) out->reason = r->error;
+}
+
+static void context_value(const struct xjs_layout *l, struct xjs_reader *r,
+                          uint32_t flags, struct xjs_context_binding *row) {
+    uint64_t tagged = word(r, row->slot_address, 8);
+    row->tagged = tagged;
+    if (heap(tagged)) {
+        struct head h;
+        if (!head(l, r, tagged, &h)) return;
+        if (is(l, h.type, XJS_TYPE_CONTEXT_CELL)) {
+            if (!(flags & XJS_V8_SCOPE_CONTEXT_CELLS)) {
+                fail(r, "JavaScriptUnexpectedContextCell"); return;
+            }
+            uint64_t state = word(r, h.address + XJS_V8_CONTEXT_CELL_STATE, 4);
+            if (r->error) return;
+            if (state <= 1) {
+                tagged = word(r, h.address + XJS_V8_CONTEXT_CELL_TAGGED, 8);
+                if (state == 1 && (uint32_t)tagged != 0) {
+                    fail(r, "JavaScriptContextCellStateMismatch"); return;
+                }
+            } else if (state == 2 || state == 3) {
+                uint64_t bits = word(r, h.address + XJS_V8_CONTEXT_CELL_NUMBER, state == 2 ? 4 : 8);
+                if (r->error) return;
+                double number;
+                if (state == 2) number = (int32_t)(uint32_t)bits;
+                else memcpy(&number, &bits, sizeof number);
+                copy_text(row->value.type, sizeof row->value.type, "number");
+                number_text(row->value.display, sizeof row->value.display, number);
+                row->immediate = 1;
+                return;
+            } else {
+                fail(r, "JavaScriptContextCellStateUnsupported"); return;
+            }
+        }
+    }
+    if (!r->error) xjs_value_read(l, r, tagged, &row->value);
+}
+
+void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
+                      const struct xjs_frame *frame, size_t start, size_t limit,
+                      struct xjs_context_bindings *out) {
+    memset(out, 0, sizeof *out); out->start = start;
+    if (start > XJS_CONTEXT_BINDINGS || !limit || limit > XJS_CONTEXT_PAGE) {
+        out->reason = "JavaScriptInvalidContextPage"; return;
+    }
+    if (!supplement(l, r)) goto done;
+    if (!frame_config(l) || strcmp(frame->kind, "interpreted") || !heap(frame->bytecode)) {
+        fail(r, "JavaScriptContextFrameUnproved"); goto done;
+    }
+    if (!l->present[XJS_TYPE_CONTEXT_CELL]) {
+        fail(r, "JavaScriptContextCellMetadataUnavailable"); goto done;
+    }
+    if (frame->fp < 4096 + 48 || (frame->fp & 7) ||
+        word(r, frame->fp - 8, 8) != frame->context ||
+        word(r, frame->fp - 16, 8) != frame->function ||
+        word(r, frame->fp - 32, 8) != frame->bytecode) {
+        fail(r, "JavaScriptStaleContextFrame"); goto done;
+    }
+    struct head function, shared, bytecode, code;
+    if (!head(l, r, frame->function, &function) ||
+        function.type < field(l, r, XJS_FIRST_FUNCTION) || function.type > field(l, r, XJS_LAST_FUNCTION) ||
+        at(l, r, function.address, XJS_FUNCTION_SHARED, 8) != frame->shared ||
+        !head(l, r, frame->shared, &shared) || !is(l, shared.type, XJS_TYPE_SHARED) ||
+        word(r, shared.address + XJS_V8_SHARED_DATA, 8) != frame->bytecode ||
+        !head(l, r, frame->bytecode, &bytecode) || !is(l, bytecode.type, XJS_TYPE_BYTECODE) ||
+        !head(l, r, frame->code, &code) || !is(l, code.type, XJS_TYPE_CODE)) {
+        fail(r, "JavaScriptContextCodeIdentityMismatch"); goto done;
+    }
+    unsigned kind = (unsigned)((at(l, r, code.address, XJS_CODE_FLAGS, 4) &
+                       (uint32_t)field(l, r, XJS_CODE_KIND_MASK)) >> shift(l, r, XJS_CODE_KIND_SHIFT));
+    uint64_t code_start = at(l, r, code.address, XJS_CODE_START, 8);
+    uint64_t code_size = at(l, r, code.address, XJS_CODE_SIZE, 4);
+    if (kind != XJS_V8_KIND_BUILTIN || word(r, code.address + XJS_V8_CODE_BUILTIN_ID, 2) != XJS_V8_INTERPRETER_BUILTIN ||
+        !code_start || !code_size || frame->pc <= code_start || frame->pc - code_start > code_size) {
+        fail(r, "JavaScriptContextFrameUnproved"); goto done;
+    }
+    int64_t offset = smi(r, word(r, frame->fp - 40, 8)) - field(l, r, XJS_BYTECODE_DATA) + 1;
+    int64_t length = smi(r, at(l, r, bytecode.address, XJS_BYTECODE_LENGTH, 8));
+    if (offset < 0 || offset >= length) { fail(r, "JavaScriptBytecodeOffsetInvalid"); goto done; }
+    uint64_t current = frame->context, seen[XJS_CONTEXT_DEPTH];
+    for (size_t depth = 0; depth < XJS_CONTEXT_DEPTH && !r->error; ++depth) {
+        for (size_t i = 0; i < depth; ++i) if (seen[i] == current) {
+            fail(r, "JavaScriptContextCycle"); goto done;
+        }
+        seen[depth] = current;
+        struct head context, scope;
+        if (!head(l, r, current, &context) || context.type < field(l, r, XJS_FIRST_CONTEXT) ||
+            context.type > field(l, r, XJS_LAST_CONTEXT) ||
+            !head(l, r, word(r, context.address + XJS_V8_CONTEXT_SCOPE, 8), &scope) ||
+            !is(l, scope.type, XJS_TYPE_SCOPE)) {
+            fail(r, "JavaScriptContextLayoutInvalid"); goto done;
+        }
+        uint32_t flags = (uint32_t)word(r, scope.address + XJS_V8_SCOPE_FLAGS, 4);
+        unsigned scope_type = flags & XJS_V8_SCOPE_TYPE_MASK;
+        if (r->error) goto done;
+        /* Native/script/global and synthetic empty contexts are a boundary,
+         * not lexical locals. Dynamic/eval/module environments need distinct
+         * storage rules; never walk through them and guess an outer name. */
+        if ((flags & XJS_V8_SCOPE_EMPTY) || scope_type == 0) break;
+        if ((scope_type != 2 && scope_type != 4 && scope_type != 6 && scope_type != 7) ||
+            (flags & ((1u << 4) | (1u << 23)))) {
+            fail(r, "JavaScriptDynamicContextUnsupported"); goto done;
+        }
+        int64_t slots = smi(r, word(r, context.address + XJS_V8_CONTEXT_LENGTH, 8));
+        int64_t count = smi(r, word(r, scope.address + 8 + (uint64_t)field(l, r, XJS_SCOPE_LOCALS) * 8, 8));
+        int64_t parameters = smi(r, word(r, scope.address + 8 + (uint64_t)field(l, r, XJS_SCOPE_PARAMS) * 8, 8));
+        size_t header = (flags & XJS_V8_SCOPE_CONTEXT_EXTENSION) ? 3 : 2;
+        if (r->error) goto done;
+        if (count < 0 || count > XJS_CONTEXT_BINDINGS || parameters < 0 || parameters > 65535 || slots < (int64_t)header ||
+            slots > XJS_CONTEXT_BINDINGS + 3 || count > slots - (int64_t)header ||
+            (size_t)count > XJS_CONTEXT_BINDINGS - out->total) {
+            fail(r, "JavaScriptContextSlotLimit"); goto done;
+        }
+        if (count >= XJS_V8_SCOPE_INLINE_NAMES) {
+            fail(r, "JavaScriptContextNameTableUnsupported"); goto done;
+        }
+        size_t first = out->total; out->total += (size_t)count;
+        uint64_t names = scope.address + 8 + (uint64_t)field(l, r, XJS_SCOPE_VARS) * 8;
+        for (size_t i = 0; i < (size_t)count && !r->error; ++i) {
+            size_t ordinal = first + i;
+            if (ordinal < start || out->count == limit) continue;
+            struct xjs_context_binding *row = &out->items[out->count++];
+            row->ordinal = ordinal; row->depth = depth; row->context = current;
+            row->slot_address = context.address + XJS_V8_CONTEXT_DATA + (header + i) * 8;
+            uint64_t units = 0; int cut = 0;
+            if (!string(l, r, word(r, names + i * 8, 8), row->name, sizeof row->name, &units, &cut, 0, NULL))
+                row->name_reason = r->error;
+            if (cut) row->name_reason = "JavaScriptContextNameTruncated";
+            if (r->error) { row->reason = r->error; r->error = NULL; continue; }
+            int64_t properties = smi(r, word(r, names + ((size_t)count + i) * 8, 8));
+            if (properties < 0 || properties >= (1 << 23) || (properties & 15) > 13)
+                fail(r, "JavaScriptContextPropertiesInvalid");
+            uint64_t parameter_number = ((uint64_t)properties >> 6) & 65535;
+            row->parameter = parameter_number != 65535;
+            if (row->parameter && (scope_type != 4 || parameter_number >= (uint64_t)parameters))
+                fail(r, "JavaScriptContextParameterInvalid");
+            if (!r->error) context_value(l, r, flags, row);
+            row->reason = r->error ? r->error : row->value.reason;
+            r->error = NULL;  /* Row-local refusals retain neighbouring storage. */
+        }
+        uint64_t previous = word(r, context.address + XJS_V8_CONTEXT_PREVIOUS, 8);
+        if (r->error) goto done;
+        if (!previous) break;
+        current = previous;
+        if (depth + 1 == XJS_CONTEXT_DEPTH) fail(r, "JavaScriptContextDepthLimit");
+    }
+done:
+    out->reason = r->error;
+    out->truncated = out->reason != NULL || out->total > out->start + out->count;
 }

@@ -68,7 +68,9 @@ const WatchSource = struct {
         return null;
     }
     fn frameView(session: *Session, frame: model.Frame) watch_ui.Frame {
-        const function = if (session.modules.symbolAt(frame.lookup_pc)) |symbol| symbol.address else |_| null;
+        // Frame decoration must not fetch an unloaded remote caller's library.
+        const found = if (session.target.isRemote()) session.modules.cachedSymbolAt(frame.lookup_pc) else session.modules.symbolAt(frame.lookup_pc);
+        const function = if (found) |symbol| symbol.address else |_| null;
         return .{ .cfa = frame.cfa, .symbol = frame.symbol, .module = frame.module_id, .function = function, .pc = frame.pc };
     }
     pub fn stack(self: *WatchSource, tid: i32) watch_ui.Stack {

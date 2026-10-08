@@ -29,6 +29,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         gui_language_args += ['--lua', lua[0][0]]
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
+    steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     steps.append(('shared-readiness', [sys.executable, '-B', 'tests/shared-readiness.py'], 30))
@@ -99,6 +100,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'perl-named-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pn{int(remote)}'], 180))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if node:
+            for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+                steps.append(('javascript-context'+suffix, [sys.executable, '-B', 'tests/javascript-context.py', '--node', node, '--include', node_include, '--work', '.work/js-context'+suffix, '--strace', *extra], 1200))
             steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
             steps.append(('javascript-cache', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--work', '.work/js-cache'], 300))
             steps.append(('javascript-cache-agent', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--agent', 'zig-out/bin/xodb-agent', '--work', '.work/js-cache-agent'], 300))
@@ -161,6 +164,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if node:
+            steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200))
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800))
             steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
         if python:
@@ -241,6 +245,19 @@ def stop_adopted(baseline):
     return sorted(children() - baseline)
 
 
+def child_environment(inherited):
+    # A gate has no interactive terminal. Individual tests opt into the colour,
+    # geometry or locale they exercise, after this per-step baseline is applied.
+    removed = {'NO_COLOR', 'COLORTERM', 'CLICOLOR', 'CLICOLOR_FORCE', 'FORCE_COLOR',
+               'TERM', 'TERMINFO', 'TERMINFO_DIRS', 'TERMCAP', 'TERM_PROGRAM',
+               'TERM_PROGRAM_VERSION', 'COLORFGBG', 'COLUMNS', 'LINES',
+               'LANG', 'LANGUAGE', 'TZ'}
+    env = {key: value for key, value in inherited.items()
+           if key not in removed and not key.startswith('LC_')}
+    env.update(TERM='dumb', LANG='C.UTF-8', LC_ALL='C.UTF-8', TZ='UTC')
+    return env
+
+
 def run_step(name, argv, timeout, cwd, env, logs):
     log = logs / (name + '.log')
     started = time.monotonic()
@@ -249,7 +266,7 @@ def run_step(name, argv, timeout, cwd, env, logs):
     baseline = children()
     with log.open('x') as stream:
         try:
-            child = subprocess.Popen(argv, cwd=cwd, env=env, stdout=stream,
+            child = subprocess.Popen(argv, cwd=cwd, env=child_environment(env), stdout=stream,
                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             try:
                 outcome['exit_code'] = child.wait(timeout=timeout)

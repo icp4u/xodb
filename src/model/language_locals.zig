@@ -16,6 +16,10 @@ pub const Row = struct {
     name: []const u8,
     name_diagnostic: ?[]const u8 = null,
     scope: enum { local, parameter, upvalue, cell, free, context, state, vararg },
+    context_depth: ?usize = null,
+    context_address: ?u64 = null,
+    context_parameter: ?bool = null,
+    provenance: ?[]const u8 = null,
     ordinal: usize,
     address: ?u64,
     slot_address: ?u64 = null,
@@ -25,6 +29,8 @@ pub const Row = struct {
     value: Value,
 };
 pub const Result = struct {
+    view_kind: enum { named_locals, context_storage } = .named_locals,
+    lexical_visibility: ?[]const u8 = null,
     generation: u64,
     tid: i32,
     language: Tab,
@@ -42,7 +48,7 @@ pub const Result = struct {
     memory_bytes: usize,
 };
 pub fn supported(language: Tab) bool {
-    return language == .lua or language == .perl or language == .python;
+    return language == .lua or language == .perl or language == .python or language == .javascript;
 }
 pub fn read(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !Result {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
@@ -51,7 +57,7 @@ pub fn read(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32, se
         .lua => @import("../language/lua.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .perl => @import("../language/perl.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .python => @import("../language/python.zig").readLocals(session, a, tid, segment, frame, start, limit),
-        .javascript => error.LanguageLocalsUnavailable,
+        .javascript => @import("../language/javascript.zig").readContext(session, a, tid, segment, frame, start, limit),
         else => error.InvalidArguments,
     };
 }
@@ -65,7 +71,7 @@ pub fn evaluate(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32
         .lua => @import("../language/lua.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .perl => @import("../language/perl.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .python => @import("../language/python.zig").evaluateLocal(session, a, tid, segment, frame, text),
-        .javascript => error.LanguageLocalsUnavailable,
+        .javascript => @import("../language/javascript.zig").evaluateLocal(session, tid, segment, frame),
         else => error.InvalidArguments,
     };
 }

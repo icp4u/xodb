@@ -14,10 +14,16 @@ and count is invented. Scenarios:
   system    no process: free memory by buddy block size, kcompactd active
   exited    the process exited: an explicit state, no map (not "unavailable")
 
-usage: memmap-synth.py BASE.jsonl OUT.jsonl [--scenario NAME] [--frames N]
+With --viewports the last frame of the process scenario also carries
+"memory_viewports": explicit uniform viewports (one cell per fixed interval,
+gaps included) for the deep look, at 2 MiB, 64 KiB and 4 KiB, with per-VMA
+NUMA totals. Any other zoom or range is "not recorded" and draws as pending.
+
+usage: memmap-synth.py BASE.jsonl OUT.jsonl [--scenario NAME] [--frames N] [--viewports]
        memmap-synth.py --bare OUT.jsonl [--scenario NAME] [--frames N]
 """
 import argparse
+import bisect
 import json
 
 MIB = 1 << 20
@@ -142,6 +148,74 @@ def build_cells(vmas, t, frames, scenario):
     return cells
 
 
+KIB = 1 << 10
+ARENA, HEAP = 0x7f3a00000000, 0x555555400000 + 16 * MIB
+# (cell size, first address, cells): the deep look's fit at the arena (64 KiB
+# at 1920x1080, 128 KiB at 1280x720),
+# zoomed out to 2 MiB around it, zoomed in to 4 KiB at the split, and the heap
+# one `[` before the arena (64 KiB).
+VIEWPORTS = ((2 * MIB, ARENA - 64 * 1024 * MIB, 65536), (128 * KIB, ARENA, 65536), (64 * KIB, ARENA, 65536), (64 * KIB, HEAP, 65536), (4 * KIB, ARENA + 64 * MIB, 65536))
+NUMA = {"arena": [(0, 192 * 1024), (1, 70 * 1024)], "heap": [(0, 20480)], "cache": [(1, 38400)]}
+
+
+def viewport(vmas, tags, t, frames, scenario, size, first, count, base):
+    """One explicit viewport: every cell is [a, a+size), gaps included; finer
+    cells take the page state of their 2 MiB block."""
+    starts = [v["start"] for v in vmas]
+    cells = []
+    for n in range(count):
+        a = first + n * size
+        i = bisect.bisect_right(starts, a + size - 1) - 1
+        inter = [j for j in range(max(0, i - 2), i + 1) if j >= 0 and vmas[j]["start"] < a + size and vmas[j]["end"] > a]
+        if not inter:
+            cells.append(dict(start=a, end=a + size))
+            continue
+        owner = inter[0]
+        w = vmas[owner]
+        mapped = sum(min(vmas[j]["end"], a + size) - max(vmas[j]["start"], a) for j in inter)
+        cell = dict(start=a, end=a + size, vma=owner, mapped=mapped)
+        tag = tags[owner]
+        if tag == "unscanned":
+            cells.append(cell)
+            continue
+        k = (a - w["start"]) // CELL if a >= w["start"] else 0
+        st = page_state(dict(w, tag=tag), k, t, frames, scenario)
+        prev = page_state(dict(w, tag=tag), k, t - 1, frames, scenario) if t > 0 else None
+        scale = mapped / CELL
+        for key in ("present", "huge", "file", "swapped", "zero"):
+            v = int(st.get(key, 0) * scale)
+            if v:
+                cell[key] = v
+        cell["observed"] = mapped
+        cell["known"] = SCAN_KNOWN
+        if prev is not None:
+            cell["change_known"] = PRESENT | SWAPPED | FILE
+            flips = 0
+            for bit, key in ((PRESENT, "present"), (SWAPPED, "swapped"), (FILE, "file")):
+                if bool(prev[key]) != bool(st[key]):
+                    flips |= bit
+            if flips:
+                cell["changed"] = flips
+            if w["kind"] in ("anon", "heap"):
+                cell["pmd_known"] = True
+                if st["huge"] and not prev["huge"]:
+                    cell["collapsed"] = mapped
+                if prev["huge"] and not st["huge"]:
+                    cell["split"] = mapped
+        if w["kind"] == "special":
+            cell["special"] = True
+        cells.append(cell)
+    out = {k: base[k] for k in ("schema", "sequence", "sampled_ns", "redacted", "worker_cpu_ns", "refresh_ns", "system_refresh_ns", "cost_limited", "system_cost_limited")}
+    vm = []
+    for v, tag in zip(vmas, tags):
+        v = dict(v)
+        if tag in NUMA:
+            v.update(numa_vma_totals=[dict(node=n, pages=p) for n, p in NUMA[tag]], numa_page_size=4096)
+        vm.append(v)
+    out.update(cell_bytes=size, range=dict(start=first, end=first + count * size), process=dict(base["process"], numa=dict(state="ok", reason="ok")), vmas=vm, cells=cells)
+    return out
+
+
 def system(t, frames, scenario):
     last = t == frames - 1
     grow = t / max(1, frames - 1)
@@ -167,7 +241,7 @@ def system(t, frames, scenario):
                 zones=zones, counters=counters, settings=settings)
 
 
-def memory_map(t, frames, scenario):
+def memory_map(t, frames, scenario, viewports=False):
     sys_ = system(t, frames, scenario)
     out = dict(schema="xodb-memdefrag/1", sequence=1000 + t, sampled_ns=5_000_000_000 + t * 1_000_000_000,
                redacted=False, cell_bytes=CELL, worker_cpu_ns=2_000_000 + t * 2_400_000, system=sys_,
@@ -188,9 +262,10 @@ def memory_map(t, frames, scenario):
     eligible = [i for i, v in enumerate(vmas) if v["thp_eligible"] and v["tag"] != "unscanned"]
     numerator = sum(by_vma.get(i, 0) for i in eligible)
     denominator = sum(vmas[i]["end"] - vmas[i]["start"] for i in eligible) + (128 * MIB)
+    tags = []
     for i, v in enumerate(vmas):
         v["anon_huge"] = by_vma.get(i, 0) if v["kind"] in ("anon", "heap") else 0
-        v.pop("tag")
+        tags.append(v.pop("tag"))
     fallback = scenario == "fallback"
     out["process"] = dict(
         pid=PID, start_ticks=START, name="browser", maps=dict(state="ok", reason="ok"),
@@ -202,6 +277,8 @@ def memory_map(t, frames, scenario):
         vma_count=len(vmas))
     out["vmas"] = vmas
     out["cells"] = cells
+    if viewports and t == frames - 1 and scenario == "process":
+        return out, [viewport(vmas, tags, t, frames, scenario, size, first, count, out) for size, first, count in VIEWPORTS]
     return out
 
 
@@ -211,6 +288,7 @@ def main():
     ap.add_argument("--scenario", default="process", choices=["process", "fallback", "system", "exited"])
     ap.add_argument("--frames", type=int, default=0, help="bare maps to write (default: one per base frame, or 12)")
     ap.add_argument("--bare", action="store_true")
+    ap.add_argument("--viewports", action="store_true", help="add the deep look's recorded viewports to the last frame")
     a = ap.parse_args()
     if a.bare:
         frames = a.frames or 12
@@ -224,8 +302,11 @@ def main():
     with open(out, "w") as f:
         for t, line in enumerate(lines):
             frame = json.loads(line)
-            frame["memory_map"] = memory_map(t, frames, a.scenario)
-            f.write(json.dumps(frame) + "\n")
+            mm = memory_map(t, frames, a.scenario, a.viewports)
+            if isinstance(mm, tuple):
+                mm, frame["memory_viewports"] = mm
+            frame["memory_map"] = mm
+            f.write(json.dumps(frame, separators=(",", ":")) + "\n")
 
 
 if __name__ == "__main__":

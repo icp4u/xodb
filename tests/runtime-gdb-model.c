@@ -2,6 +2,9 @@
 #include "xrt_gdbremote.h"
 #include "gdb_packet.h"
 #include "gdb_link.h"
+#include "remote_internal.h"
+#include <pthread.h>
+#include <sys/resource.h>
 #include <arpa/inet.h>
 #include <assert.h>
 #include <poll.h>
@@ -211,9 +214,55 @@ static void lifecycle_checks(void)
     }
     puts("GDB lifecycle: bounded slow inventory, full-table turnover with stable aliases, failed-link destruction pass");
 }
+/* The opt-in guard is dormant in current event loops. A future remote owner
+ * marks only the presentation thread; sibling workers may still use I/O. */
+static void *guard_worker(void *unused)
+{
+    (void)unused;
+    assert(xrt_target_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
+    assert(xrt_target_gdb_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
+    return NULL;
+}
+static void owner_guard(void)
+{
+    xrt_remote_io_guard(true);
+    pthread_t worker;
+    assert(!pthread_create(&worker, NULL, guard_worker, NULL));
+    assert(!pthread_join(worker, NULL));
+    /* Native/empty target ownership is not moved by the remote guard. */
+    struct xrt_target *native = xrt_target_create(); assert(native);
+    struct xrt_target_view view; xrt_target_view(native, &view);
+    xrt_target_file_budget(native, NULL);
+    assert(view.state == XRT_IDLE && xrt_target_destroy(native) == XRT_OK);
+    for (unsigned which = 0; which < 8; ++which) {
+        pid_t child = fork(); assert(child >= 0);
+        if (!child) {
+            struct rlimit core = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &core));
+            assert(freopen("/dev/null", "w", stderr));
+            /* Null arguments prove assertion happens before dereferencing a
+             * handle, taking a connection lock, allocating or opening I/O. */
+            if (which == 0) (void)xrt_target_remote(NULL, NULL);
+            if (which == 1) (void)xrt_target_gdb_remote(NULL, NULL);
+            if (which == 2) (void)xrt_remote_call(NULL, NULL);
+            if (which == 3) (void)xrt_remote_background_file(NULL, NULL);
+            if (which == 4) (void)xrt_remote_health(NULL);
+            if (which == 5) (void)xrt_remote_fail(NULL, XRT_OK);
+            if (which == 6) (void)xrt_remote_file(NULL, NULL, NULL, NULL);
+            if (which == 7) (void)xrt_remote_symbol_file(NULL, NULL, NULL, NULL);
+            _exit(1);
+        }
+        int status; assert(waitpid(child, &status, 0) == child);
+        assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
+    }
+    xrt_remote_io_guard(false);
+    assert(xrt_target_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
+    assert(xrt_target_gdb_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
+    puts("remote owner guard: GDB, agent, dispatch and lock entrypoints assert before I/O; worker-local state and native path preserved");
+}
 int main(void)
 {
     alarm(90);
+    owner_guard();
     lifecycle_checks();
     for (int mode = 0; mode <= 2; ++mode) {
         struct fixture f = start(mode); struct xrt_target *target = NULL;
@@ -222,6 +271,19 @@ int main(void)
             assert(status == XRT_UNSUPPORTED_ARCHITECTURE && !target); finish(f); continue;
         }
         assert(status == XRT_OK && target);
+        if (mode == 0) {
+            pid_t child = fork(); assert(child >= 0);
+            if (!child) {
+                struct rlimit core = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &core));
+                assert(freopen("/dev/null", "w", stderr));
+                xrt_remote_io_guard(true);
+                struct xrt_gdb_info guarded;
+                (void)xrt_target_gdb_info(target, &guarded);
+                _exit(1);
+            }
+            int child_status; assert(waitpid(child, &child_status, 0) == child);
+            assert(WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGABRT);
+        }
         struct xrt_gdb_info info; assert(xrt_target_gdb_info(target, &info));
         assert(info.unsupported & XRT_GDB_CAP_STEP);
         assert(mode == 1 ? (info.unsupported & XRT_GDB_CAP_THREADS) : (info.supported & XRT_GDB_CAP_THREADS));

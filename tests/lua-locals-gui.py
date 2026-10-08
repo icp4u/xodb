@@ -81,7 +81,10 @@ try:
     varargs=d.tool('get_language_locals',generation=generation,tid=tid,language='lua',segment=0,frame=1)
     summary=next(row for row in varargs['rows'] if row['scope']=='vararg')
     assert summary['name']=='' and summary['address'] is None and summary['value']['count']==3,summary
-    d.keys('scroll',1150,530,6)
+    # Scrolling is bounded by the visible row count; walk canonical rows
+    # so a one-row viewport reaches the vararg summary without skipping.
+    for _ in range(varargs['rows'].index(summary)):
+        d.keys('scroll',1150,530,1)
     deadline=time.monotonic()+20
     while True:
         screenshot=d.shot('lua-varargs');crop=screenshot+'.side.png'

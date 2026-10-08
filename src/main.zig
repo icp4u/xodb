@@ -672,6 +672,7 @@ test {
         _ = @import("ui/overview/view.zig");
         _ = @import("ui/overview/run.zig");
         _ = @import("ui/overview/memmap.zig");
+        _ = @import("ui/overview/deepmap.zig");
     }
     _ = @import("memdefrag/model.zig");
     _ = @import("memdefrag/vga.zig");
@@ -679,6 +680,7 @@ test {
     _ = @import("memdefrag/tui.zig");
     std.testing.refAllDecls(@import("model/session.zig"));
     _ = @import("model/remote_source.zig");
+    _ = @import("model/remote_owner.zig");
     _ = @import("semq/adapter.zig");
     _ = @import("semq/answer.zig");
     _ = @import("semq/host.zig");

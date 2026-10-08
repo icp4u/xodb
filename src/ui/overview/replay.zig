@@ -152,6 +152,17 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
         map.* = try @import("../../memdefrag/model.zig").fromValue(a, mm);
         s.memory_map = map;
     }
+    if (get(r, "memory_viewports")) |list| if (list == .array) {
+        const md = @import("../../memdefrag/model.zig");
+        if (list.array.items.len > 16) return error.ReplayTooLarge;
+        const maps = try a.alloc(md.Map, list.array.items.len);
+        for (list.array.items, maps) |item, *out| {
+            out.* = try md.fromValue(a, item);
+            // Only uniform viewports: each cell is one fixed interval of the range.
+            if (out.range == null) return error.MemoryMapInvalid;
+        }
+        s.memory_viewports = maps;
+    };
     if (get(r, "groups")) |groups| if (groups == .object) {
         inline for (std.meta.fields(m.Group), 0..) |g, i| {
             if (groups.object.get(g.name)) |x| {

@@ -268,17 +268,18 @@ static enum xbo_status table(struct context *c, uint64_t offset, const char *com
         if (version == 5) TRY(row(&s, ff, fn, width, &row_));
         else {
             uint64_t begin = s.pos; TRY(number(&s, 1, &value));
-            /* GCC emits an empty filename plus three entry fields for a
-             * #line spelling ending in '/'. The header boundary distinguishes
-             * that unusable row from the final zero-byte table terminator. */
-            if (!value && s.pos == s.end) { terminated = 1; break; } s.pos = begin;
+            /* DWARF 2-4 ends the filename table at the first zero byte.
+             * GCC can emit an empty name for a trailing-slash #line path;
+             * it is indistinguishable from this terminator. Keep preceding
+             * valid rows, but never authorize bytes after the terminator. */
+            if (!value) { terminated = 1; break; } s.pos = begin;
             row_.path = (struct string){LINE, s.pos, s.end}; TRY(string(&s, NULL));
             TRY(leb(&s, &row_.directory)); TRY(leb(&s, &value)); TRY(leb(&s, &value));
         }
         TRY(match(c, comp_dir, dirs, ndirs, (unsigned)version, &row_, &found));
     }
     if (!terminated) return XBO_LIMIT;
-    if (s.pos != s.end) return XBO_MALFORMED;
+    if (version == 5 && s.pos != s.end) return XBO_MALFORMED;
     if (found) c->matched = 1;
     return XBO_OK;
 }

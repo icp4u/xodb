@@ -11,10 +11,11 @@ import time
 root = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--binary', type=Path, default=root/'zig-out/bin/xodb')
+p.add_argument('--fast-only', action='store_true', help='Run only the fast transport case')
 a = p.parse_args()
 os.umask(0o022)
 os.chdir(root)
-work = root/'.work'/('rc'+str(time.time_ns())[-7:])
+work = root/'.work'/('input-rc'+str(time.time_ns())[-7:])
 work.mkdir(mode=0o755)
 spec = importlib.util.spec_from_file_location('private_input', root/'tests/helpers/input.py')
 h = importlib.util.module_from_spec(spec)
@@ -23,6 +24,11 @@ h.WORK = str(work)
 for name in ('tmp', 'cache/mesa', 'cache/nvidia', 'tree/zig-out/bin'):
     (work/name).mkdir(parents=True, exist_ok=True)
 (work/'tree/zig-out/bin/xodb').symlink_to(a.binary.resolve())
+for xml, stem in ((h.VPTR, 'virtual-pointer'), (h.VKBD, 'virtual-keyboard')):
+    subprocess.run(['wayland-scanner', 'client-header', xml, str(work/(stem+'.h'))], check=True, timeout=10)
+    subprocess.run(['wayland-scanner', 'private-code', xml, str(work/(stem+'.c'))], check=True, timeout=10)
+h.HELPER = str(work/'vinput')
+subprocess.run(['cc', '-Wall', '-Wextra', '-Werror', '-I', str(work), 'tests/helpers/vinput.c', str(work/'virtual-pointer.c'), str(work/'virtual-keyboard.c'), '-lwayland-client', '-lxkbcommon', '-lm', '-o', h.HELPER], check=True, timeout=60)
 main, library = work/'main.c', work/'caller.c'
 main.write_text('''#include <dlfcn.h>
 __attribute__((noinline)) void owned_stop(int value) { asm volatile("" : : "r"(value) : "memory"); }
@@ -49,7 +55,7 @@ subprocess.run(['cc', '-g', '-O0', '-fno-omit-frame-pointer', '-rdynamic', str(m
 subprocess.run(['cc', '-g', '-O0', '-fno-omit-frame-pointer', '-shared', '-fPIC', str(library), '-o', str(image)], check=True, timeout=60)
 assert image.stat().st_size > 16*1024*1024
 reports = []
-for slow in (True, False):
+for slow in ((False,) if a.fast_only else (True, False)):
     d = None
     try:
         os.environ['XODB_DISCOVERY_AGENT'] = str(root/'zig-out/bin/xodb-agent')
@@ -77,6 +83,17 @@ for slow in (True, False):
         assert any(j['kind'] == 'unwind' and j['image'] == str(image) and j['state'] == 'ready' for j in jobs), jobs
         assert d.session()['generation'] == generation
         row = {'slow': slow, 'frames': frames, 'jobs': jobs, 'generation': generation}
+        # A constant watch forces WatchSource.stack to decorate every frame,
+        # including the unloaded caller, without explicitly asking for its locals.
+        d.keys('tap', 18, 'tap', 10, 'tap', 9, 'tap', 8, 'tap', 7,
+               'tap', 6, 'tap', 5, 'tap', 4, 'tap', 3, 'tap', 2, 'tap', 28)
+        text = h.ocr_until(d, 'constant-watch', lambda text: '987654321' in text and 'watch' in text)
+        assert '987654321' in text and 'watch' in text, text
+        row['watch_visible'] = True
+        watched = d.tool('get_stack', tid=tid)['frames'][1]
+        assert watched['source'] is None and watched['inline_diagnostic'] == 'DebugMetadataNotLoaded', watched
+        assert d.session()['generation'] == generation
+        row['after_watch'] = watched
         if not slow:
             # Explicit caller inspection still loads complete source/locals.
             variables = d.tool('list_locals', tid=tid, frame=1)
@@ -94,4 +111,4 @@ for slow in (True, False):
                 assert d.app.wait(timeout=30) == 0, d.tail()
             finally:
                 d.close()
-print('Remote caller CFI stays responsive; explicit caller inspection retains full debug information:', work)
+print('Remote caller CFI and watch decoration keep caller metadata unloaded; explicit inspection retains full debug information:', work)

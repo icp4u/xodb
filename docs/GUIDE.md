@@ -10,6 +10,7 @@ detailed docs. If you just want to try something, jump to
 | --- | --- | --- |
 | See what is using the machine | **System overview** (`--overview`) | Live CPU, memory, disk, network and processes; unknown values show reasons. **L** opens files, **F** profiles, **Enter** attaches after a cost/access confirmation. `--session-socket PATH` shares the same cache with observer-only MCP clients. |
 | Watch a process's memory get defragmented (THP) | **Memory map** (`xodb --overview --panel memory_map`, **M**; **m** on a Processes row) and the terminal twin `xodb --memdefrag` | A Windows 9x Disk Defragmenter, an MS-DOS DEFRAG screen or a modern grid of 2 MiB cells: THP, 4 KiB, file, swapped, unknown (hatched); collapses, splits and page-state changes stay distinct; coverage, buddy fragmentation and system-wide THP/compaction activity, with the real refresh period ([details](MEMDEFRAG.md)) |
+| Zoom into one process's pages, down to single 4 KiB pages | **Memory map, deep look** (**t** to cycle, or `--look deep`) | Up to 65,536 cells from 2 MiB down to 4 KiB: wheel zoom at the pointer, drag to pan, **0** fit, **[ ]** VMA to VMA, a minimap of the whole address space; pending, unknown and the three change kinds stay distinct; hover shows range, VMA, state bits and the VMA's NUMA totals ([details](OVERVIEW.md#deep-map)) |
 | Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
 | Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
@@ -142,7 +143,12 @@ In **Python**, select a logical frame for its fast locals, cells and free
 variables. Try `scripts/demo-python`, **Space**, **Tab** to Python, select `tick`,
 then **E**, `round`, **Return**. Deleted names and module/class mapping locals
 show a reason. `E:` marks the expression result and its named row is labelled.
-JS currently shows stack evidence. **E** in **C/C++** still uses the
+In **JS**, select a proved interpreted frame to browse **CONTEXT STORAGE**.
+These are retained context slots: lexical visibility is unproved and stack-only
+names are not shown. A shadowed lexical name may have a different value.
+**E** refuses bare names with `JavaScriptLexicalUnproved`; it does not guess from
+an outer context. See [JavaScript](JAVASCRIPT.md#context-storage-in-the-javascript-pane).
+**E** in **C/C++** still uses the
 native expression/watch view. Language storage addresses must be resolved again
 after resume; **W** does not set a hardware watchpoint on them.
 
@@ -197,7 +203,8 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Live open files | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --lsof-top --redact --pid PIDS` | **1** files advancing, **3** the leaker growing, **4** the deleted file's pinned bytes, **Enter** on any row to drill in |
-| THP defrag, live | `cc -O2 -o ~/tmp/mdf tests/memdefrag-fixture.c && ~/tmp/mdf`, then `xodb --overview --memmap-pid PID --redact` (or `xodb --memdefrag --pid PID`) | type `collapse` into the fixture four times: cells turn dark blue with a white ring and **% Complete** climbs; `split` draws one red-edged cell. **t** cycles Win9x, DOS and modern |
+| THP defrag, live | `cc -O2 -o ~/tmp/mdf tests/memdefrag-fixture.c && ~/tmp/mdf`, then `xodb --overview --memmap-pid PID --redact` (or `xodb --memdefrag --pid PID`) | type `collapse` into the fixture four times: cells turn dark blue with a white ring and **% Complete** climbs; `split` draws one red-edged cell. **t** cycles Win9x, DOS, modern and deep |
+| Deep map at 4 KiB, live | the same fixture, `xodb --overview --memmap-pid PID --look deep --redact`; type `collapse` once | wheel up over the fixture's first block until the header says **4 KiB cells**: it is THP; type `split` and that block's 512 pages flash an orange edge for one refresh, then read 4 KiB anonymous on hover |
 | Visual file activity | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --overview --panel files --redact` | Watch churn and offset progress, use **[ ]** for Leak watch and Deleted, **Enter** to scope a process. **E** explains exact capture cost before starting |
 | Agent and human together | `xodb --session-socket ~/tmp/xs/s -- ./prog` | an agent drives; **F8** takes control back ([details](SHARED_SESSIONS.md)) |
 | Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Assembly is shown when xodb was built with `-Dcapstone=vendored` after `scripts/build-capstone`; with the default system Capstone, MCP `disassemble` reports `DisassemblerUnavailable` and the assembly pane stays empty. Instruction step and hardware watches report unsupported. Remove the breakpoint before continuing |

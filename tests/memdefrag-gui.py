@@ -2,12 +2,14 @@
 """The overview's Memory map panel on a private headless display.
 
 Synthetic replays (tests/fixtures/memmap-synth.py) give deterministic
-screenshots of the three looks (Windows 9x Defrag, MS-DOS DEFRAG, modern) at
+screenshots of the four looks (Windows 9x Defrag, MS-DOS DEFRAG, modern, and
+the deep map: recorded explicit viewports at 2 MiB, 64 KiB and 4 KiB) at
 1920x1080 and 1280x720, the layout audit (no label overlaps), redaction,
 unknown/hatched states, the three kinds of change, the working buttons, and
 the Processes -> Memory map hand-off. With --live it also maps an owned
 fixture that madvise(MADV_HUGEPAGE)s 1 GiB, collapses it step by step and
-forces a split. --shots DIR saves the screenshots.
+forces a split, and zooms the deep map into the split at 4 KiB. --shots DIR
+saves the screenshots; --perf records deep-map frame cost (evidence only).
 """
 import argparse
 import glob
@@ -26,7 +28,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--shots', type=Path, help='save the screenshots here')
 parser.add_argument('--live', action='store_true', help='also map the owned 1 GiB THP fixture')
 parser.add_argument('--mib', type=int, default=1024, help='fixture size for --live')
-parser.add_argument('--only', help='comma-separated sections: looks,layout,redact,states,buttons,handoff,live')
+parser.add_argument('--only', help='comma-separated sections: looks,layout,redact,states,buttons,handoff,deep,live,deeplive,perf')
+parser.add_argument('--perf', action='store_true', help='also measure deep-map frame time, CPU and RSS on the live fixture')
+parser.add_argument('--perf-binary', help='with --perf, also measure this build (e.g. the parent) in the modern look')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -51,11 +55,13 @@ replays = {}
 for scenario in ('process', 'fallback', 'system'):
     replays[scenario] = work / f'{scenario}.jsonl'
     subprocess.run([sys.executable, '-B', 'tests/fixtures/memmap-synth.py', str(base), str(replays[scenario]), '--scenario', scenario], check=True)
+replays['deep'] = work / 'deep.jsonl'
+subprocess.run([sys.executable, '-B', 'tests/fixtures/memmap-synth.py', str(base), str(replays['deep']), '--scenario', 'process', '--viewports'], check=True)
 last_map = json.loads(replays['process'].read_text().splitlines()[-1])['memory_map']
 results = []
-KEY = dict(h.KEY, n3=4, t=20, p=25, d=32, g=34, m=50, o=24, x=45, enter=28, esc=1, down=108, up=103, right=106, left=105,
+KEY = dict(h.KEY, n0=11, n3=4, t=20, p=25, d=32, g=34, m=50, o=24, x=45, enter=28, esc=1, down=108, up=103, right=106, left=105,
            pgdn=109, pgup=104, minus=12, equal=13, bracketright=27, bracketleft=26)
-sections = set((args.only or 'looks,layout,redact,states,buttons,handoff' + (',live' if args.live else '')).split(','))
+sections = set((args.only or 'looks,layout,redact,states,buttons,handoff,deep' + (',live,deeplive' if args.live else '') + (',perf' if args.perf else '')).split(','))
 shots = args.shots.resolve() if args.shots else None
 if shots:
     shots.mkdir(parents=True, exist_ok=True)
@@ -71,7 +77,7 @@ class Overview:
     """A private headless Sway (no input devices) running one overview window."""
     count = 0
 
-    def __init__(self, options, size=(1920, 1080), source=None, env_extra=None, replay=True):
+    def __init__(self, options, size=(1920, 1080), source=None, env_extra=None, replay=True, binary=None):
         Overview.count += 1
         self.size = size
         self.dir = work / f'run-{Overview.count:02d}'
@@ -105,7 +111,7 @@ class Overview:
         self.log = self.dir / 'xodb.log'
         app_env = dict(env, XODB_OVERVIEW_LAYOUT='1', **(env_extra or {}))
         source_args = ['--replay', str(source or replays['process'])] if replay else []
-        self.app = subprocess.Popen([str(root / 'zig-out/bin/xodb'), '--overview', *source_args, *options], cwd=root, env=app_env,
+        self.app = subprocess.Popen([binary or str(root / 'zig-out/bin/xodb'), '--overview', *source_args, *options], cwd=root, env=app_env,
                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=open(self.log, 'wb'))
         self.procs.append(self.app)
         h.Display.wait_focused(self)
@@ -153,6 +159,34 @@ class Overview:
         g = self.grid()
         row, col = divmod(index, g['cols'])
         return g['x'] + (col + 0.5) * g['pitch'], g['y'] + (row - g['first'] + 0.5) * g['pitch']
+
+    def deep(self):
+        """The deep field's last audit line: geometry, view and what it shows."""
+        lines = re.findall(r'memmap deep x=.*', self.text())
+        if not lines:
+            return None
+        out = {}
+        for k, v in re.findall(r'(\w+)=(\S+)', lines[-1]):
+            out[k] = v if k in ('mini', 'box') else int(v, 16) if v.startswith('0x') else float(v) if '.' in v else int(v)
+        return out
+
+    def deep_detail(self):
+        found = re.findall(r'memmap deep detail (.*)', self.text())
+        return found[-1] if found else ''
+
+    def deep_xy(self, address):
+        g = self.deep()
+        i = (address - g['origin']) // g['cell']
+        row, col = divmod(i, g['cols'])
+        return g['x'] + (col + 0.5) * g['pitch'], g['y'] + (row + 0.5) * g['pitch']
+
+    def wait_deep(self, pred, timeout=8):
+        deadline = time.monotonic() + timeout
+        while True:
+            g = self.deep()
+            if g and pred(g) or time.monotonic() > deadline:
+                return g
+            time.sleep(0.2)
 
     def rows(self):
         found = re.findall(r'memmap row (\d\d) (.*)', self.text())
@@ -393,7 +427,239 @@ if 'handoff' in sections:
     finally:
         d.close()
 
-# 6. Live: an owned 1 GiB MADV_HUGEPAGE fixture collapses step by step, then splits.
+# 6. The deep map: replayed explicit viewports at 2 MiB, 64 KiB and 4 KiB.
+MIB = 1 << 20
+ARENA, HEAP = 0x7f3a00000000, 0x555555400000 + 16 * MIB
+SPLIT_AT = ARENA + 37 * 2 * MIB      # the synthetic forced split (2 MiB block 37)
+CACHE_AT = ARENA + 1024 * MIB + 2 * MIB  # the shared file mapping (path is private)
+UNSCANNED_AT = ARENA + 1800 * MIB + 8 * MIB
+ZERO_AT = HEAP + 40 * 2 * MIB        # read-faulted onto the huge zero page
+OUTSIDE = (40, 30)                   # pointer parked on the header: keys zoom at the centre
+if 'deep' in sections:
+    CLUSTER = 2048 * MIB + 6 * 720 * 1024    # the arena through the last library
+    REC4K = (ARENA + 64 * MIB, ARENA + 64 * MIB + 65536 * 4096)
+    log2 = lambda x: x.bit_length() - 1
+    for size in ((1920, 1080), (1280, 720)):
+        tag = f'{size[0]}x{size[1]}'
+        d = Overview(['--pause', '--redact', '--panel', 'memory_map', '--look', 'deep'], size=size, source=replays['deep'])
+        try:
+            d.move(*OUTSIDE)
+            g = d.wait_deep(lambda g: g['count'] > 0)
+            time.sleep(0.5)
+            g = d.deep()
+            fit_cell = min(c for c in (4096 << k for k in range(10)) if -(-CLUSTER // c) <= g['count'])
+            shot = d.shot('deep-fit-' + tag)
+            save(shot, f'deep-fit-{fit_cell // 1024}k-{tag}.png')
+            check(f'deep {tag} renders the field', g and colorful(shot) > 30 and 'Draw failed' not in d.text(), d.text()[-300:])
+            check(f'deep {tag} fit: the arena cluster whole at the finest cell size ({fit_cell // 1024} KiB), at most 65,536 cells',
+                  g['cell'] == fit_cell and g['origin'] == ARENA and 30000 < g['count'] <= 65536, g)
+            if size[0] == 1920:
+                check('deep 1920x1080 draws more than 60,000 cells at once', g['count'] > 60000, g['count'])
+            check(f'deep {tag} recorded view: nothing pending; unknown, collapse ring, split edge and changed cells all present',
+                  g['pending'] == 0 and g['unknown'] > 0 and g['collapsed'] > 0 and g['split'] > 0 and g['changed'] > 0, g)
+            lines = d.layout_lines()
+            sized = [l for l in lines if f'layout {tag} ' in l]
+            check(f'deep {tag} layout audit: no overlapping labels', sized and all('overlaps=0 ' in l for l in sized), sized[-1:] or lines[-1:])
+            text = ocr(shot)
+            leaks = [x for x in SECRETS if x in text]
+            check(f'deep {tag} redacted shot shows no names or paths', not leaks, leaks)
+            check(f'deep {tag} legend names the three change kinds apart', all(w in text for w in ('changed', 'collapse ring', 'split edge', 'pending', 'unknown')), text[-300:])
+            # Hover: range, VMA, mapping (redacted), state bits, VMA NUMA totals.
+            d.move(*d.deep_xy(CACHE_AT))
+            det = d.deep_detail()
+            shot = d.shot('deep-hover-cache-' + tag)
+            save(shot, f'deep-hover-redacted-{tag}.png')
+            text = ocr(shot)
+            check(f'deep {tag} redacted hover: range and known bits, path hidden', '0x7f3a40' in det and 'known: present' in det and 'path hidden' in det and 'secret-cache' not in det and 'secret-cache' not in text, det)
+            check(f'deep {tag} hover shows NUMA only as VMA totals', 'VMA totals (whole VMA, not per page)' in det and 'N1 150 MiB' in det and 'VMA totals' in text, det)
+            # Click selects: the details stay when the pointer leaves; Esc clears.
+            d.click(*d.deep_xy(SPLIT_AT))
+            d.move(*OUTSIDE)
+            det = d.deep_detail()
+            check(f'deep {tag} click selects a cell and keeps its details', det.startswith('Selected 0x7f3a04a00000') and 'split from THP' in det, det)
+            d.tap('esc')
+            det = d.deep_detail()
+            check(f'deep {tag} Esc clears the selection (and keeps the process)', det.startswith('Hover or click') and d.deep()['cell'] == g['cell'], det)
+            d.move(*d.deep_xy(UNSCANNED_AT))
+            det = d.deep_detail()
+            check(f'deep {tag} unknown cell is named, not guessed', 'unknown: not observed' in det, det)
+            p = d.deep()['pitch']
+            x, y = d.deep_xy(UNSCANNED_AT + 16 * g['cell'])
+            shot = d.shot('deep-unknown-' + tag)
+            hatch = colorful(shot, (int(x - 4 * p), int(y - p / 2), int(x + 4 * p), int(y + p / 2)))
+            check(f'deep {tag} unknown cells are hatched (two tones)', hatch >= 2, hatch)
+            if size[0] == 1920:
+                save(shot, 'deep-hover-unknown-1920x1080.png')
+            d.move(*d.deep_xy(SPLIT_AT))
+            det = d.deep_detail()
+            check(f'deep {tag} split cell names the split', 'split from THP' in det, det)
+            d.move(*d.deep_xy(ARENA + 470 * 2 * MIB + 4 * MIB))
+            det = d.deep_detail()
+            check(f'deep {tag} collapsed cell names the collapse', 'collapsed into THP' in det, det)
+            # Zoom in at the split, anchored under the pointer, down to 4 KiB.
+            sx, sy = d.deep_xy(SPLIT_AT)
+            for _ in range(log2(g['cell'] // 4096)):
+                d.keys('scroll', int(sx), int(sy), -1)
+            g = d.wait_deep(lambda g: g['cell'] == 4096)
+            check(f'deep {tag} wheel zooms to 4 KiB with the split block still under the pointer',
+                  g['cell'] == 4096 and g['origin'] <= SPLIT_AT < g['origin'] + g['count'] * 4096 and abs(d.deep_xy(SPLIT_AT)[0] - sx) <= g['pitch'] + 1, g)
+            end = g['origin'] + g['count'] * 4096
+            expect = (max(0, end - REC4K[1]) + max(0, REC4K[0] - g['origin'])) // 4096
+            check(f'deep {tag} 4 KiB: 512 split cells; exactly the unrecorded part pending ({expect} cells)', g['split'] == 512 and g['pending'] == expect, g)
+            d.move(*d.deep_xy(SPLIT_AT + 4096 * 7))
+            det = d.deep_detail()
+            check(f'deep {tag} 4 KiB hover is one page', '(4 KiB)' in det and 'split from THP' in det, det)
+            shot = d.shot('deep-4k-' + tag)
+            save(shot, f'deep-4k-split-{tag}.png')
+            if expect:
+                d.move(*d.deep_xy(end - 3 * 4096))
+                det = d.deep_detail()
+                check(f'deep {tag} pending cell says not recorded, shows no data', 'pending' in det and 'not recorded' in det and 'mapped' not in det, det)
+            # Back to the fit, then 2 MiB at the centre.
+            d.move(*OUTSIDE)
+            d.tap('n0')
+            g = d.wait_deep(lambda g: g['cell'] == fit_cell)
+            check(f'deep {tag} 0 fits the process again', g['cell'] == fit_cell and g['origin'] == ARENA, g)
+            d.tap(*['minus'] * log2(2 * MIB // fit_cell))
+            g = d.wait_deep(lambda g: g['cell'] == 2 * MIB)
+            check(f'deep {tag} - zooms out to 2 MiB cells around the same place', g['cell'] == 2 * MIB and g['origin'] <= ARENA < g['origin'] + g['count'] * 2 * MIB, g)
+            shot = d.shot('deep-2m-' + tag)
+            save(shot, f'deep-2m-{tag}.png')
+            box = [float(v) for v in g['box'].split('..')]
+            check(f'deep {tag} 2 MiB: the minimap box spans the arena island', box[1] - box[0] > 20, g['box'])
+            # Pan: a drag of 20 cells left moves the view 20 cells on; arrows pan too.
+            d.tap('n0')
+            g = d.wait_deep(lambda g: g['cell'] == fit_cell)
+            x, y = d.deep_xy(ARENA + fit_cell * (g['cols'] * 10 + 40))
+            d.keys('fastdrag', int(x), int(y), int(x - 20 * g['pitch']), int(y))
+            g2 = d.wait_deep(lambda h: h['origin'] != g['origin'])
+            check(f'deep {tag} drag pans by whole cells', g2['origin'] - g['origin'] == 20 * fit_cell, (hex(g['origin']), hex(g2['origin'])))
+            d.move(*OUTSIDE)
+            d.tap('down')
+            g3 = d.wait_deep(lambda h: h['origin'] != g2['origin'])
+            check(f'deep {tag} Down pans an eighth of the field', g3['origin'] - g2['origin'] == max(1, g3['rows'] // 8) * g3['cols'] * fit_cell, (hex(g2['origin']), hex(g3['origin'])))
+            shot = d.shot('deep-pan-' + tag)
+            save(shot, f'deep-pan-{tag}.png')
+            # [ jumps VMA by VMA back to the heap (recorded at 64 KiB): the huge zero page is never THP.
+            d.tap('n0')
+            if fit_cell != 65536:
+                d.tap(*['equal'] * log2(fit_cell // 65536))
+            for _ in range(3):
+                d.tap('bracketleft')
+                g = d.wait_deep(lambda g: True)
+                if g['origin'] < ARENA:
+                    break
+            check(f'deep {tag} [ jumps to the previous VMAs, down to the heap', g['origin'] == HEAP and g['cell'] == 65536 and g['zero'] > 0, g)
+            d.move(*d.deep_xy(ZERO_AT + 65536 * 3))
+            det = d.deep_detail()
+            check(f'deep {tag} HUGE|ZERO cell reads zero page, never THP', 'zero page, not yet backed' in det and 'not THP' in det and 'THP, PMD-mapped' not in det, det)
+            shot = d.shot('deep-heap-' + tag)
+            save(shot, f'deep-heap-zero-{tag}.png')
+            d.move(*OUTSIDE)
+            d.tap('bracketright')
+            g = d.wait_deep(lambda g: g['origin'] > HEAP)
+            check(f'deep {tag} ] jumps forward again', g['origin'] > HEAP, g)
+            # Minimap: a click on the low island centres the view there.
+            mini = [float(v) for v in g['mini'].split(',')]
+            d.click(mini[0] + 16, mini[1] + mini[3] / 2)
+            g = d.wait_deep(lambda h: h['origin'] < 0x600000000000)
+            check(f'deep {tag} minimap click moves the view to that island', g['origin'] < 0x600000000000, hex(g['origin']))
+            # Pending: an unrecorded zoom (16 KiB) is all pending, never the old cells relabelled.
+            d.move(*OUTSIDE)
+            d.tap('n0')
+            g = d.wait_deep(lambda g: g['cell'] == fit_cell)
+            d.tap(*['equal'] * log2(fit_cell // 16384))
+            g = d.wait_deep(lambda g: g['cell'] == 16384)
+            check(f'deep {tag} unrecorded 16 KiB view is entirely pending', g['cell'] == 16384 and g['pending'] == g['count'], g)
+            shot = d.shot('deep-pending-' + tag)
+            save(shot, f'deep-pending-{tag}.png')
+            text = ocr(shot)
+            check(f'deep {tag} pending is labelled on screen', 'not recorded' in text.lower(), text[-200:])
+            lines = [l for l in d.layout_lines() if f'layout {tag} ' in l]
+            check(f'deep {tag} no overlapping labels across zooms and pans', lines and all('overlaps=0 ' in l for l in lines), lines[-2:])
+            # t cycles deep -> win9x.
+            d.tap('t')
+            shot = d.shot('deep-cycle')
+            check(f'deep {tag} t cycles on to the Windows 9x look', count_rgb(shot, WIN9X['desktop'], 4) > 1000 and d.app.poll() is None)
+        finally:
+            d.close()
+    # Without --redact the mapping path shows in the hover details.
+    d = Overview(['--pause', '--panel', 'memory_map', '--look', 'deep'], source=replays['deep'])
+    try:
+        d.move(*OUTSIDE)
+        d.wait_deep(lambda g: g['count'] > 0)
+        d.move(*d.deep_xy(CACHE_AT))
+        det = d.deep_detail()
+        shot = d.shot('deep-plain-hover')
+        check('deep plain hover shows the mapping path', 'secret-cache.db' in det, det)
+    finally:
+        d.close()
+
+# 6b. Frame cost (evidence; a property only when the host is not overloaded):
+# continuous redraw (--frames) of the live owned fixture, modern vs deep, and
+# optionally another build (--perf-binary, e.g. the parent) on the same fixture.
+def measure(binary, look, pid, seconds=6, redraw=True):
+    exe = str(binary)
+    d = Overview(['--panel', 'memory_map', '--look', look, '--redact', '--memmap-pid', str(pid), *(['--frames', '100000'] if redraw else [])], replay=False,
+                 env_extra={'XODB_MEMMAP_PERF': '1'}, binary=exe)
+    try:
+        d.move(*OUTSIDE)
+        app = d.app.pid
+        def cpu_rss():
+            f = open(f'/proc/{app}/stat').read().rsplit(')', 1)[1].split()
+            rss = int(re.search(r'VmRSS:\s+(\d+)', open(f'/proc/{app}/status').read()).group(1))
+            return (int(f[11]) + int(f[12])) / os.sysconf('SC_CLK_TCK'), rss
+        time.sleep(4)  # first publications and the 4 KiB-free fit settle
+        mark = len(d.text())
+        c0, r0 = cpu_rss()
+        t0 = time.monotonic()
+        peak = r0
+        while time.monotonic() - t0 < seconds:
+            time.sleep(0.5)
+            peak = max(peak, cpu_rss()[1])
+        c1, r1 = cpu_rss()
+        t1 = time.monotonic()
+        lines = re.findall(r'memmap perf look=(\w+) frames=(\d+) fps=([\d.]+) cells=(\d+) frame_cpu_ms_avg=([\d.]+) frame_cpu_ms_max=([\d.]+) builds=(\d+)', d.text()[mark:])
+        g = d.deep() if look == 'deep' else None
+        return dict(binary='this build' if exe == str(root / 'zig-out/bin/xodb') else 'other build', look=look, redraw='continuous' if redraw else 'on change', cpu_pct=round((c1 - c0) * 100 / (t1 - t0), 2),
+                    rss_mib=round(r1 / 1024, 1), rss_peak_mib=round(peak / 1024, 1), perf=lines, cells=g['count'] if g else None, load=os.getloadavg())
+    finally:
+        d.close()
+
+
+if 'perf' in sections:
+    exe = work / 'memdefrag-fixture'
+    if not exe.exists():
+        subprocess.run(['cc', '-O2', '-o', str(exe), 'tests/memdefrag-fixture.c'], check=True)
+    fx = subprocess.Popen([str(exe), str(args.mib)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        json.loads(fx.stdout.readline())
+        fx.stdin.write('collapse\n')
+        fx.stdout.readline()
+        runs = []
+        for redraw in (False, True):
+            if args.perf_binary:
+                runs.append(measure(args.perf_binary, 'modern', fx.pid, redraw=redraw))
+            runs.append(measure(root / 'zig-out/bin/xodb', 'modern', fx.pid, redraw=redraw))
+            runs.append(measure(root / 'zig-out/bin/xodb', 'deep', fx.pid, redraw=redraw))
+    finally:
+        fx.stdin.write('quit\n')
+        fx.stdin.flush()
+        fx.wait(timeout=10)
+    for r in runs:
+        print('perf', json.dumps(r), flush=True)
+    (work / 'perf.json').write_text(json.dumps(runs, indent=2) + '\n')
+    deep = runs[-1]
+    load = os.getloadavg()[0]
+    if load > os.cpu_count():
+        check('deep frame cost: not measurable (host overloaded)', True, dict(load=load))
+    else:
+        fps = [float(x[2]) for x in deep['perf']]
+        cpu = [float(x[5]) for x in deep['perf']]
+        check('deep live field at 1920x1080: over 60,000 cells at 60 fps, every frame under 16.7 ms CPU',
+              deep['cells'] and deep['cells'] > 60000 and fps and min(fps) >= 55 and max(cpu) < 16.7, deep)
+
+# 7. Live: an owned 1 GiB MADV_HUGEPAGE fixture collapses step by step, then splits.
 if 'live' in sections:
     exe = work / 'memdefrag-fixture'
     subprocess.run(['cc', '-O2', '-o', str(exe), 'tests/memdefrag-fixture.c'], check=True)
@@ -450,6 +716,82 @@ if 'live' in sections:
                 text = ocr(shot, LIVE_BOX)
             check('live reaped target shows Process N exited', expected.lower() in text.lower(), text)
             save(shot, 'live-win9x-exited.png', LIVE_BOX)
+        finally:
+            d.close()
+    finally:
+        if fx.poll() is None:
+            fx.stdin.write('quit\n')
+            fx.stdin.flush()
+        try:
+            fx.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            fx.kill()
+            fx.wait()
+
+# 8. Live deep map: the owned 1 GiB fixture collapses, the deep map zooms to
+# 4 KiB at its first huge block, then the fixture splits that block.
+DEEP_BOX = (596, 60, 1910, 1040)  # the map panel only: the side lists show the host
+if 'deeplive' in sections:
+    exe = work / 'memdefrag-fixture'
+    if not exe.exists():
+        subprocess.run(['cc', '-O2', '-o', str(exe), 'tests/memdefrag-fixture.c'], check=True)
+    fx = subprocess.Popen([str(exe), str(args.mib)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+    try:
+        ready = json.loads(fx.stdout.readline())
+        base_at = int(ready['start'], 16)
+        fx.stdin.write('collapse\n')
+        reply = json.loads(fx.stdout.readline())
+        check('deep live: fixture collapses its first quarter (rc 0 or ENOMEM)', ready['rc'] == 0 and (reply['rc'] == 0 or reply['errno'] == 12), reply)
+        d = Overview(['--panel', 'memory_map', '--look', 'deep', '--redact', '--memmap-pid', str(fx.pid)], replay=False)
+        try:
+            d.move(*OUTSIDE)
+            g = d.wait_deep(lambda g: g['count'] > 0 and g['pending'] < g['count'] and g['origin'] <= base_at < g['origin'] + g['count'] * g['cell'], 20)
+            check('deep live: the view fits the fixture and samples it', g and g['origin'] <= base_at < g['origin'] + g['count'] * g['cell'] and g['pending'] < g['count'], g)
+            shot = d.shot('deep-live-fit')
+            save(shot, 'live-deep-0-fit.png', DEEP_BOX)
+            text = ocr(shot, DEEP_BOX)
+            check('deep live: refresh cadence and data age are shown', 'Refresh' in text and 'age' in text, text[:300])
+            # Zoom to 4 KiB with the fixture's first huge block under the pointer.
+            sx, sy = d.deep_xy(base_at)
+            log2 = lambda x: x.bit_length() - 1
+            for _ in range(log2(g['cell'] // 4096)):
+                d.keys('scroll', int(sx), int(sy), -1)
+            g = d.wait_deep(lambda g: g['cell'] == 4096 and g['pending'] == 0, 20)
+            check('deep live: 4 KiB viewport requested and sampled (pending clears)', g['cell'] == 4096 and g['pending'] == 0 and g['origin'] <= base_at, g)
+            probe = base_at + 3 * 4096
+            d.move(*d.deep_xy(probe))
+            time.sleep(0.4)
+            before = d.deep_detail()
+            check('deep live: the first block is THP at 4 KiB before the split', 'THP, PMD-mapped' in before or 'collapsed into THP' in before, before)
+            shot = d.shot('deep-live-4k-before')
+            save(shot, 'live-deep-1-4k-before-split.png', DEEP_BOX)
+            seen = len(d.text())
+            fx.stdin.write('split\n')
+            split_reply = json.loads(fx.stdout.readline())
+            check('deep live: the fixture splits its first huge block (mprotect one page)', split_reply['rc'] == 0, split_reply)
+            # One publication carries the split edge; then the block reads 4 KiB.
+            deadline = time.monotonic() + 15
+            edge = None
+            after = ''
+            k = 0
+            while time.monotonic() < deadline:
+                time.sleep(0.25)
+                new = d.text()[seen:]
+                hit = re.findall(r'memmap deep x=.* split=(\d+)', new)
+                if edge is None and any(int(x) > 0 for x in hit):
+                    edge = d.shot(f'deep-live-split-{k}')
+                    k += 1
+                after = d.deep_detail()
+                if edge is not None and 'THP, PMD-mapped' not in after and 'split from THP' not in after:
+                    break
+            check('deep live: the split shows as a split edge for one publication', edge is not None, re.findall(r'split=\d+', d.text()[seen:])[-5:])
+            if edge is not None:
+                save(edge, 'live-deep-2-4k-split-edge.png', DEEP_BOX)
+            check('deep live: afterwards the probed page reads 4 KiB, not THP', '4 KiB anonymous' in after and 'THP, PMD-mapped' not in after, after)
+            shot = d.shot('deep-live-4k-after')
+            save(shot, 'live-deep-3-4k-after-split.png', DEEP_BOX)
+            leaks = [x for x in ('memdefrag-fixture', str(work)) if x in ocr(shot, DEEP_BOX)]
+            check('deep live: redacted (no fixture name or path)', not leaks, leaks)
         finally:
             d.close()
     finally:

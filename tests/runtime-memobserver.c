@@ -61,8 +61,9 @@ int main(void)
     assert(xrt_memobserver_period(UINT64_MAX) == UINT64_C(60000000000));
     unsigned before = descriptors();
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
-    char *memory = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    assert(memory != MAP_FAILED); memory[0] = 1; memory[page] = 2;
+    const size_t span = 256 * 1024 * 1024;
+    char *memory = mmap(NULL, span, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    assert(memory != MAP_FAILED); memory[0] = 1; memory[page] = 2; memory[span - page] = 3;
     struct xrt_memobserver *o = xrt_memobserver_open(NULL, NULL); assert(o);
     struct xrt_mem_view v;
     while (!xrt_memobserver_acquire(o, &v)) yield();
@@ -93,6 +94,33 @@ int main(void)
     r.start_ticks++;
     uint64_t wrong = request(o, &r); assert(wrong != first);
     scope = wait_scope(o, wrong); assert(scope.error == XRT_MEM_IDENTITY_CHANGED);
+    struct xrt_mem_request far = {.pid = r.pid, .start_ticks = r.start_ticks - 1,
+        .range_start = (uintptr_t)memory + span - 2 * page, .range_end = (uintptr_t)memory + span};
+    uint64_t tail = request(o, &far); assert(tail != first && tail != numa && tail != wrong);
+    scope = wait_scope(o, tail); assert(scope.error == XRT_MEM_OK);
+    while (!xrt_memobserver_acquire(o, &v)) yield();
+    unsigned checked = 0;
+    for (unsigned i = 0; i < XRT_MEM_SCOPES; ++i) {
+        const struct xrt_mem_scope *selected = &v.scopes[i];
+        if (selected->ticket == first) {
+            assert(selected->request.range_start == (uintptr_t)memory);
+            assert(selected->snapshot->range_start == (uintptr_t)memory);
+            ++checked; /* The new viewport did not retarget this shared ticket. */
+        } else if (selected->ticket == tail) {
+            const struct xrt_mem_process *p = selected->snapshot;
+            assert(p->range_start == far.range_start && p->range_end == far.range_end);
+            assert(p->pages_status.state == XRT_MEM_OK && p->scanned_bytes == 2 * page);
+            for (uint32_t j = 0; j < p->range_count; ++j)
+                assert(p->ranges[j].start >= far.range_start && p->ranges[j].end <= far.range_end);
+            struct xrt_mem_cell cell;
+            assert(xrt_mem_cell_read(p, NULL, far.range_end - page, far.range_end, &cell));
+            assert(cell.observed_bytes == page && (cell.known & XRT_MEM_PAGE_PRESENT) &&
+                (cell.categories & XRT_MEM_PAGE_PRESENT));
+            ++checked;
+        }
+    }
+    assert(checked == 2);
+    xrt_memobserver_release(o);
     xrt_memobserver_close(o);
     /* Closing an idle worker and closing while a fresh request is in flight
      * both return with its worker joined and all publication storage freed. */
@@ -131,8 +159,8 @@ int main(void)
     printf("memory observer: reaped publication after %llu ns; prior refresh %llu ns\n",
         (unsigned long long)(now() - exited_at), (unsigned long long)scope.refresh_ns);
     xrt_memobserver_close(o);
-    assert(munmap(memory, 2 * page) == 0);
+    assert(munmap(memory, span) == 0);
     assert(descriptors() == before);
-    puts("memory observer: lazy publication, shared scope, metadata reuse, pinned identity and teardown passed");
+    puts("memory observer: lazy publication, shared scope, metadata reuse, independent distant viewport, pinned identity and teardown passed");
     return 0;
 }

@@ -117,6 +117,7 @@ XJS_FIELD(TYPE_UNCACHED_TWO, "v8dbg_type_UncachedExternalString__UNCACHED_EXTERN
 XJS_FIELD(FIRST_CONTEXT, "v8dbg_FirstContextType")
 XJS_FIELD(LAST_CONTEXT, "v8dbg_LastContextType")
 XJS_FIELD(FUNCTION_CONTEXT, "v8dbg_class_JSFunction__context__Context")
+XJS_FIELD(TYPE_CONTEXT_CELL, "v8dbg_type_ContextCell__CONTEXT_CELL_TYPE")
 XJS_FIELD(FRAME_CONSTRUCT_ENTRY, "v8dbg_frametype_ConstructEntryFrame")
 XJS_FIELD(FRAME_INTERNAL, "v8dbg_frametype_InternalFrame")
 XJS_FIELD(FRAME_CONSTRUCT, "v8dbg_frametype_ConstructFrame")

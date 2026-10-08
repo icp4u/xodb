@@ -15,7 +15,7 @@ const c = @import("../c.zig").api;
 
 pub const schema = "xodb-memdefrag/1";
 pub const default_cell: u64 = 2 * 1024 * 1024;
-pub const max_cells: usize = 32768;
+pub const max_cells: usize = 65536;
 /// Unmapped gaps longer than this many cells, and non-resident VMAs longer
 /// than `reserved_cells`, are drawn as one compressed marker cell.
 pub const gap_cells: u64 = 4;
@@ -39,6 +39,7 @@ pub const Status = struct {
 pub const Backend = enum { pagemap_scan, pagemap_flags, none };
 pub const VmaKind = enum { anon, file, heap, stack, pseudo, special, hugetlb };
 
+pub const NumaNode = struct { node: u32, pages: u64 };
 pub const Vma = struct {
     start: u64,
     end: u64,
@@ -51,6 +52,10 @@ pub const Vma = struct {
     anon_huge: ?u64 = null,
     swap: ?u64 = null,
     locked: ?u64 = null,
+    /// These are totals for this entire VMA, not locations of individual pages.
+    numa_vma_totals: ?[]const NumaNode = null,
+    numa_page_size: ?u64 = null,
+    numa_partial: bool = false,
 };
 
 /// One fixed virtual range. Byte counts are over observed bytes; `known` is
@@ -60,6 +65,7 @@ pub const Cell = struct {
     start: u64,
     end: u64,
     vma: ?u32 = null,
+    mapping_known: bool = true,
     mapped: u64 = 0,
     observed: u64 = 0,
     present: u64 = 0,
@@ -105,6 +111,7 @@ pub const Process = struct {
     name: ?[]const u8 = null,
     maps: Status = .{},
     pages: Status = .{},
+    numa: Status = .{},
     backend: Backend = .none,
     page_size: u64 = 4096,
     pmd_size: ?u64 = null,
@@ -127,6 +134,9 @@ pub const Map = struct {
     sampled_ns: u64 = 0,
     redacted: bool = false,
     cell_bytes: u64 = default_cell,
+    /// A uniform virtual-address viewport; null means the compact overview.
+    range: ?AddressRange = null,
+    pending: bool = false,
     /// The observer worker's cumulative thread CPU time (cost indicator).
     worker_cpu_ns: ?u64 = null,
     /// Actual refresh period of the shown scope (process, or system view) and
@@ -176,10 +186,11 @@ pub const Look = struct {
 };
 
 pub fn classify(cell: Cell) Look {
+    if (!cell.mapping_known and cell.mapped == 0) return .{ .state = .unknown };
     if (cell.gap > 0) return .{ .state = if (cell.vma != null) .reserved else .gap };
     if (cell.mapped == 0) return .{ .state = .unmapped };
     if (cell.observed == 0 or cell.known & present_bit == 0) return .{ .state = .unknown };
-    var look = Look{ .state = .unknown, .partial = cell.observed < cell.mapped };
+    var look = Look{ .state = .unknown, .partial = !cell.mapping_known or cell.observed < cell.mapped };
     if (cell.special) {
         look.state = .unmovable;
     } else if (cell.present -| cell.zero == 0) {
@@ -395,6 +406,7 @@ pub fn ageText(buf: []u8, k: Cadence) []const u8 {
 /// read differently. Null when the map is usable (also when partial).
 pub fn processProblem(buf: []u8, p: Process) ?[]const u8 {
     const st = p.maps.state;
+    if (std.mem.eql(u8, st, "pending")) return std.fmt.bufPrint(buf, "Waiting for memory map of process {d}", .{p.pid}) catch "Waiting for memory map";
     if (std.mem.eql(u8, st, "ok") or std.mem.eql(u8, st, "partial")) return null;
     if (std.mem.eql(u8, st, "exited")) return std.fmt.bufPrint(buf, "Process {d} exited", .{p.pid}) catch "Process exited";
     if (std.mem.eql(u8, st, "identity_changed")) return std.fmt.bufPrint(buf, "pid {d} now belongs to another process (start changed)", .{p.pid}) catch "Identity changed";
@@ -438,12 +450,37 @@ pub fn knownText(buf: []u8, mask: u64) []const u8 {
 
 // --- Building from the observer publication --------------------------------------
 
+pub const AddressRange = struct { start: u64, end: u64 };
 pub const Request = struct {
     cell_bytes: u64 = default_cell,
-    /// Zoomed views start at this address (aligned down to the cell size).
+    /// Zoomed compact views start at this address, aligned down to cell size.
     anchor: u64 = 0,
+    /// Explicit viewports retain every fixed cell, including unmapped gaps.
+    range: ?AddressRange = null,
+    numa: bool = false,
     redact: bool = false,
     limit: usize = max_cells,
+
+    pub fn check(self: Request, page_size: u64) !void {
+        if (page_size == 0 or self.cell_bytes < page_size or self.cell_bytes % page_size != 0 or
+            self.limit == 0 or self.limit > max_cells) return error.MemoryMapInvalid;
+        if (self.range) |r| {
+            if (r.end <= r.start or r.start % self.cell_bytes != 0 or r.end % self.cell_bytes != 0)
+                return error.MemoryMapInvalid;
+            if ((r.end - r.start) / self.cell_bytes > self.limit) return error.MemoryMapTooLarge;
+        }
+    }
+    pub fn observation(self: Request, who: Identity) c.struct_xrt_mem_request {
+        var r = std.mem.zeroes(c.struct_xrt_mem_request);
+        r.pid = who.pid;
+        r.start_ticks = who.start;
+        if (self.numa) r.flags |= c.XRT_MEM_NUMA;
+        if (self.range) |span| {
+            r.range_start = span.start;
+            r.range_end = span.end;
+        }
+        return r;
+    }
 };
 
 fn status(s: c.struct_xrt_mem_status) Status {
@@ -484,6 +521,12 @@ fn vmaOf(a: std.mem.Allocator, p: *const c.struct_xrt_mem_process, i: usize, red
     };
     if (v.flags & c.XRT_MEM_VMA_HUGETLB != 0) kind = .hugetlb;
     if (v.flags & c.XRT_MEM_VMA_SPECIAL != 0) kind = .special;
+    var nodes: ?[]const NumaNode = null;
+    if (v.numa_available != 0) {
+        const copied = try a.alloc(NumaNode, @min(v.numa_count, v.numa.len));
+        for (copied, 0..) |*node, j| node.* = .{ .node = v.numa[j].node, .pages = v.numa[j].pages };
+        nodes = copied;
+    }
     return .{
         .start = v.start,
         .end = v.end,
@@ -495,6 +538,9 @@ fn vmaOf(a: std.mem.Allocator, p: *const c.struct_xrt_mem_process, i: usize, red
         .anon_huge = known(v.anon_huge, v.known, c.XRT_MEM_ANON_HUGE),
         .swap = known(v.swap, v.known, c.XRT_MEM_SWAP),
         .locked = known(v.locked, v.known, c.XRT_MEM_LOCKED),
+        .numa_vma_totals = nodes,
+        .numa_page_size = if (v.numa_page_size != 0) v.numa_page_size else null,
+        .numa_partial = v.flags & c.XRT_MEM_NUMA_CUT != 0,
     };
 }
 
@@ -553,16 +599,17 @@ const Builder = struct {
             self.truncated += 1;
             return;
         }
-        try self.cells.append(self.a, .{ .start = start, .end = end, .vma = vma, .gap = end - start, .mapped = if (vma != null) end - start else 0 });
+        try self.cells.append(self.a, .{ .start = start, .end = end, .vma = vma, .gap = end - start, .mapping_known = vma != null or self.p.maps_status.state == c.XRT_MEM_OK, .mapped = if (vma != null) end - start else 0 });
     }
     fn cell(self: *Builder, start: u64, end: u64) !void {
         if (self.full()) {
             self.truncated += 1;
             return;
         }
-        var out = Cell{ .start = start, .end = end };
+        var out = Cell{ .start = start, .end = end, .mapping_known = false };
         var raw: c.struct_xrt_mem_cell = undefined;
         if (c.xrt_mem_cell_read(self.p, self.previous, start, end, &raw) != 0) {
+            out.mapping_known = raw.mapping_known != 0;
             out.mapped = raw.mapped_bytes;
             out.changed = raw.changed_categories;
             out.change_known = raw.change_known;
@@ -588,7 +635,8 @@ const Builder = struct {
 /// publication (between xrt_memobserver_acquire and release); every string
 /// and slice is copied into `a`, so the result outlives the release.
 pub fn fromView(a: std.mem.Allocator, view: *const c.struct_xrt_mem_view, scope: ?*const c.struct_xrt_mem_scope, req: Request) !Map {
-    var map = Map{ .redacted = req.redact, .cell_bytes = req.cell_bytes, .worker_cpu_ns = view.owner_cpu_ns, .sequence = view.system_sequence, .sampled_ns = view.system_sampled_ns, .refresh_ns = view.system_refresh_ns, .system_refresh_ns = view.system_refresh_ns, .cost_limited = view.system_cost_limited != 0, .system_cost_limited = view.system_cost_limited != 0 };
+    try req.check(1);
+    var map = Map{ .range = req.range, .redacted = req.redact, .cell_bytes = req.cell_bytes, .worker_cpu_ns = view.owner_cpu_ns, .sequence = view.system_sequence, .sampled_ns = view.system_sampled_ns, .refresh_ns = view.system_refresh_ns, .system_refresh_ns = view.system_refresh_ns, .cost_limited = view.system_cost_limited != 0, .system_cost_limited = view.system_cost_limited != 0 };
     if (view.system != null) map.system = try systemOf(a, view.system);
     const sc = scope orelse return map;
     const p: *const c.struct_xrt_mem_process = sc.snapshot orelse return map;
@@ -603,6 +651,7 @@ pub fn fromView(a: std.mem.Allocator, view: *const c.struct_xrt_mem_view, scope:
         .name = if (req.redact or p.maps_status.state == c.XRT_MEM_DENIED or name.len == 0) null else try safeText(a, name),
         .maps = try copyStatus(a, p.maps_status),
         .pages = try copyStatus(a, p.pages_status),
+        .numa = try copyStatus(a, p.numa_status),
         .backend = backendOf(p),
         .page_size = p.page_size,
         .pmd_size = if (p.pmd_size_known != 0) p.pmd_size else null,
@@ -620,9 +669,17 @@ pub fn fromView(a: std.mem.Allocator, view: *const c.struct_xrt_mem_view, scope:
     const vmas = try a.alloc(Vma, p.vma_count);
     for (vmas, 0..) |*v, i| v.* = try vmaOf(a, p, i, req.redact);
     map.vmas = vmas;
-    if (p.page_size == 0 or req.cell_bytes < p.page_size or req.cell_bytes % p.page_size != 0) return map;
+    if (p.page_size == 0) return map;
+    try req.check(p.page_size);
     var b = Builder{ .a = a, .p = p, .previous = sc.previous, .limit = req.limit };
     const B = req.cell_bytes;
+    if (req.range) |span| {
+        try b.cells.ensureTotalCapacityPrecise(a, @intCast((span.end - span.start) / B));
+        var at = span.start;
+        while (at < span.end) : (at += B) try b.cell(at, at + B);
+        map.cells = try b.cells.toOwnedSlice(a);
+        return map;
+    }
     const anchor = req.anchor - req.anchor % B;
     var next: u64 = 0;
     for (p.vmas[0..p.vma_count], 0..) |v, i| {
@@ -707,25 +764,38 @@ pub const Identity = struct { pid: i32, start: u64 };
 /// publication exists, copies it into a fresh arena. Returns null when
 /// nothing changed or the publication was busy (try again next frame).
 pub const Reader = struct {
+    const Demand = struct { id: ?Identity, range: ?AddressRange, numa: bool };
     ticket: u64 = 0,
+    seen_ticket: u64 = 0,
     seen_scope: u64 = 0,
     seen_system: u64 = 0,
     seen_any: bool = false,
     requested_ns: u64 = 0,
     copy_ns: u64 = 0,
+    demand: ?Demand = null,
+    projected: ?Request = null,
+    projected_id: ?Identity = null,
 
     pub fn reset(self: *Reader) void {
         self.* = .{};
     }
-    pub fn renew(self: *Reader, observer: *c.struct_xrt_memobserver, id: ?Identity, now: u64) void {
-        // The lease lasts three seconds; renew at 1 Hz, the collector's cadence.
+    pub fn renew(self: *Reader, observer: *c.struct_xrt_memobserver, id: ?Identity, req: Request, now: u64) !void {
+        const page = c.sysconf(c._SC_PAGESIZE);
+        if (page <= 0) return error.MemoryMapInvalid;
+        try req.check(@intCast(page));
+        const wanted: ?Demand = .{ .id = id, .range = req.range, .numa = req.numa };
+        if (!std.meta.eql(self.demand, wanted)) {
+            self.demand = wanted;
+            self.ticket = 0;
+            self.seen_any = false;
+        }
+        // Bound changing viewport demand to 1 Hz too. Old shared leases expire
+        // normally; never retarget a cache another reader might still hold.
         if (self.requested_ns != 0 and now -| self.requested_ns < 1_000_000_000) return;
         if (id) |who| {
-            var r = std.mem.zeroes(c.struct_xrt_mem_request);
-            r.pid = who.pid;
-            r.start_ticks = who.start;
+            const r = req.observation(who);
             const t = c.xrt_memobserver_process(observer, &r);
-            if (t == 0) return; // busy or full: retry on the next frame
+            if (t == 0) return; // busy or full: retain pending and retry
             self.ticket = t;
         } else {
             self.ticket = 0;
@@ -737,20 +807,37 @@ pub const Reader = struct {
         var view: c.struct_xrt_mem_view = undefined;
         if (c.xrt_memobserver_acquire(observer, &view) == 0) return null;
         defer c.xrt_memobserver_release(observer);
+        return self.project(gpa, &view, id, req);
+    }
+    fn project(self: *Reader, gpa: std.mem.Allocator, view: *const c.struct_xrt_mem_view, id: ?Identity, req: Request) !?*Owned {
         var scope: ?*const c.struct_xrt_mem_scope = null;
-        if (id != null and self.ticket != 0) {
-            for (&view.scopes) |*s| if (s.ticket == self.ticket) {
-                scope = s;
+        if (id) |who| {
+            const wanted = req.observation(who);
+            if (self.ticket != 0) for (&view.scopes) |*s| {
+                if (s.ticket == self.ticket and s.request.pid == who.pid and
+                    (who.start == 0 or s.bound_start == who.start or s.request.start_ticks == who.start) and
+                    s.request.flags == wanted.flags and s.request.range_start == wanted.range_start and
+                    s.request.range_end == wanted.range_end) scope = s;
             };
         }
         const scope_seq = if (scope) |s| s.sequence else 0;
-        if (self.seen_any and scope_seq == self.seen_scope and view.system_sequence == self.seen_system) return null;
+        const scope_ticket = if (scope) |s| s.ticket else 0;
+        if (self.seen_any and scope_ticket == self.seen_ticket and scope_seq == self.seen_scope and
+            view.system_sequence == self.seen_system and std.meta.eql(self.projected, @as(?Request, req)) and
+            std.meta.eql(self.projected_id, id)) return null;
         const started = threadNs();
         const owned = try Owned.create(gpa);
         errdefer owned.destroy();
-        owned.map = try fromView(owned.arena.allocator(), &view, scope, req);
+        owned.map = try fromView(owned.arena.allocator(), view, scope, req);
+        if (id) |who| if (scope == null or scope.?.snapshot == null) {
+            owned.map.pending = true;
+            owned.map.process = .{ .pid = who.pid, .start_ticks = who.start, .page_size = 0, .maps = .{ .state = "pending", .reason = "Waiting for requested memory map publication" }, .pages = .{ .state = "pending", .reason = "Requested viewport has not been sampled" } };
+        };
+        self.seen_ticket = scope_ticket;
         self.seen_scope = scope_seq;
         self.seen_system = view.system_sequence;
+        self.projected = req;
+        self.projected_id = id;
         self.seen_any = true;
         self.copy_ns = threadNs() -| started;
         return owned;
@@ -799,8 +886,25 @@ pub fn validate(map: *const Map) !void {
     if (!std.mem.eql(u8, map.schema, schema)) return error.MemoryMapSchema;
     if (map.cells.len > max_cells) return error.MemoryMapTooLarge;
     if (map.cell_bytes == 0) return error.MemoryMapInvalid;
+    if (map.range) |span| {
+        try (Request{ .cell_bytes = map.cell_bytes, .range = span }).check(1);
+        const count = (span.end - span.start) / map.cell_bytes;
+        if (map.cells.len != 0 and map.cells.len != count) return error.MemoryMapInvalid;
+        if (map.process == null and map.cells.len != 0) return error.MemoryMapInvalid;
+        if (!map.pending and map.process != null and map.process.?.page_size != 0 and
+            map.cells.len != (span.end - span.start) / map.cell_bytes) return error.MemoryMapInvalid;
+    }
+    if (map.pending and map.cells.len != 0) return error.MemoryMapInvalid;
+    for (map.vmas) |v| if (v.numa_vma_totals) |nodes| {
+        if (nodes.len > 16) return error.MemoryMapInvalid;
+    };
     var last: u64 = 0;
-    for (map.cells) |cell| {
+    for (map.cells, 0..) |cell, index| {
+        if (map.range) |span| {
+            const first = span.start + @as(u64, @intCast(index)) * map.cell_bytes;
+            if (cell.start != first or cell.end -| cell.start != map.cell_bytes or cell.gap != 0)
+                return error.MemoryMapInvalid;
+        }
         if (cell.end <= cell.start or cell.start < last) return error.MemoryMapInvalid;
         if (cell.observed > cell.end - cell.start or cell.mapped > cell.end - cell.start) return error.MemoryMapInvalid;
         if (cell.vma) |i| if (i >= map.vmas.len) return error.MemoryMapInvalid;
@@ -951,4 +1055,178 @@ test "maps round-trip through JSON and reject disordered replay cells" {
     try std.testing.expectError(error.MemoryMapSchema, parse(a, "{\"schema\":\"other\"}"));
     var b: [24]u8 = undefined;
     try std.testing.expect(std.mem.startsWith(u8, alias(&b, 42, 7), "proc-"));
+}
+
+const ModelFixture = struct {
+    process: c.struct_xrt_mem_process,
+    vmas: [1]c.struct_xrt_mem_vma,
+    ranges: [1]c.struct_xrt_mem_range,
+    view: c.struct_xrt_mem_view,
+    const who = Identity{ .pid = 42, .start = 123 };
+    fn init(self: *ModelFixture, start: u64, end: u64) void {
+        self.* = std.mem.zeroes(ModelFixture);
+        self.process.pid = who.pid;
+        self.process.start_ticks = who.start;
+        self.process.page_size = 4096;
+        self.process.started_ns = 10;
+        self.process.maps_status.state = c.XRT_MEM_OK;
+        self.process.pages_status.state = c.XRT_MEM_OK;
+        self.process.numa_status.state = c.XRT_MEM_OK;
+        @memcpy(self.process.name[0..7], "fixture");
+        self.process.vmas = &self.vmas;
+        self.process.vma_count = 1;
+        self.process.ranges = &self.ranges;
+        self.process.range_count = 1;
+        const path = "viewport.bin";
+        self.process.paths = @constCast(path.ptr);
+        self.process.path_length = path.len;
+        self.vmas[0] = std.mem.zeroes(c.struct_xrt_mem_vma);
+        self.vmas[0].start = start;
+        self.vmas[0].end = end;
+        self.vmas[0].permissions = .{ 'r', 'w', '-', 'p', 0 };
+        self.vmas[0].rss = end - start;
+        self.vmas[0].known = c.XRT_MEM_RSS | c.XRT_MEM_VMFLAGS;
+        self.vmas[0].path_length = path.len;
+        self.ranges[0] = .{ .start = start, .end = end, .vma = 0, .backend = c.XRT_MEM_BACKEND_SCAN, .categories = present_bit | huge_bit, .known = present_bit | huge_bit | zero_bit | swapped_bit | file_bit | written_bit };
+        self.view.scopes[0].ticket = 7;
+        self.view.scopes[0].sequence = 1;
+        self.view.scopes[0].bound_start = who.start;
+        self.view.scopes[0].snapshot = &self.process;
+        self.view.scopes[0].request = (Request{}).observation(who);
+    }
+};
+
+test "memory viewport builds 65536 fixed cells and page zoom without markers" {
+    const start: u64 = 1 << 32;
+    const span = AddressRange{ .start = start, .end = start + 128 * 1024 * 1024 * 1024 };
+    var f: ModelFixture = undefined;
+    f.init(span.start, span.end);
+    // A sparse VMA is still a full grid in explicit viewport mode.
+    f.vmas[0].rss = 0;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const began = threadNs();
+    const map = try fromView(arena.allocator(), &f.view, &f.view.scopes[0], .{ .range = span });
+    const cpu = threadNs() -| began;
+    try std.testing.expectEqual(@as(usize, 65536), map.cells.len);
+    try std.testing.expectEqual(span.start, map.cells[0].start);
+    try std.testing.expectEqual(span.end, map.cells[65535].end);
+    for (map.cells) |cell| {
+        try std.testing.expectEqual(default_cell, cell.end - cell.start);
+        try std.testing.expectEqual(@as(u64, 0), cell.gap);
+    }
+    try validate(&map);
+    std.debug.print("memory viewport: 65536 cells, {d} bytes of cell storage, {d} ns projection CPU\n", .{ @sizeOf(Cell) * map.cells.len, cpu });
+    const small = AddressRange{ .start = start + default_cell, .end = start + 2 * default_cell };
+    const zoomed = try fromView(arena.allocator(), &f.view, &f.view.scopes[0], .{ .range = small, .cell_bytes = 4096 });
+    try std.testing.expectEqual(@as(usize, 512), zoomed.cells.len);
+    try std.testing.expectEqual(small.start, zoomed.cells[0].start);
+    try std.testing.expectEqual(small.end, zoomed.cells[511].end);
+    try std.testing.expectEqual(State.thp, classify(zoomed.cells[511]).state);
+    try validate(&zoomed);
+    const demand = (Request{ .range = small, .cell_bytes = 4096, .numa = true }).observation(ModelFixture.who);
+    try std.testing.expectEqual(small.start, demand.range_start);
+    try std.testing.expectEqual(small.end, demand.range_end);
+    try std.testing.expectEqual(@as(u32, c.XRT_MEM_NUMA), demand.flags);
+}
+
+test "memory viewport unknown mapping, NUMA totals and redaction survive JSON" {
+    const start: u64 = 2 * default_cell;
+    var f: ModelFixture = undefined;
+    f.init(start, start + 4096);
+    f.vmas[0].numa_available = 1;
+    f.vmas[0].numa_count = 2;
+    f.vmas[0].numa_page_size = 4096;
+    f.vmas[0].numa[0] = .{ .node = 0, .pages = 3 };
+    f.vmas[0].numa[1] = .{ .node = 2, .pages = 5 };
+    f.vmas[0].flags |= c.XRT_MEM_NUMA_CUT;
+    f.process.maps_status.state = c.XRT_MEM_PARTIAL;
+    f.process.numa_status.state = c.XRT_MEM_PARTIAL;
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const req = Request{ .range = .{ .start = start, .end = start + 8192 }, .cell_bytes = 4096, .numa = true, .redact = true };
+    const map = try fromView(arena.allocator(), &f.view, &f.view.scopes[0], req);
+    try std.testing.expectEqual(State.thp, classify(map.cells[0]).state);
+    try std.testing.expect(!map.cells[1].mapping_known);
+    try std.testing.expectEqual(State.unknown, classify(map.cells[1]).state);
+    try std.testing.expect(map.process.?.name == null and map.vmas[0].path == null);
+    try std.testing.expectEqualStrings("partial", map.process.?.numa.state);
+    try std.testing.expect(map.vmas[0].numa_partial);
+    f.vmas[0].numa[0].pages = 99;
+    try std.testing.expectEqual(@as(u64, 3), map.vmas[0].numa_vma_totals.?[0].pages);
+    const text = try toJson(arena.allocator(), &map);
+    const copy = try parse(arena.allocator(), text);
+    try std.testing.expectEqualDeep(map.range, copy.range);
+    try std.testing.expectEqual(@as(u32, 2), copy.vmas[0].numa_vma_totals.?[1].node);
+    try std.testing.expectEqual(@as(?u64, 4096), copy.vmas[0].numa_page_size);
+    try std.testing.expectEqual(State.unknown, classify(copy.cells[1]).state);
+    f.process.maps_status.state = c.XRT_MEM_OK;
+    f.vmas[0].numa_available = 0;
+    f.process.numa_status.state = c.XRT_MEM_UNAVAILABLE;
+    const complete = try fromView(arena.allocator(), &f.view, &f.view.scopes[0], req);
+    try std.testing.expectEqual(State.unmapped, classify(complete.cells[1]).state);
+    try std.testing.expect(complete.vmas[0].numa_vma_totals == null);
+}
+
+test "memory viewport geometry and hostile replay stay bounded" {
+    const page: u64 = 4096;
+    try std.testing.expectError(error.MemoryMapInvalid, (Request{ .cell_bytes = 0 }).check(page));
+    try std.testing.expectError(error.MemoryMapInvalid, (Request{ .limit = 0 }).check(page));
+    try std.testing.expectError(error.MemoryMapInvalid, (Request{ .limit = max_cells + 1 }).check(page));
+    try std.testing.expectError(error.MemoryMapInvalid, (Request{ .range = .{ .start = 2, .end = 1 } }).check(page));
+    try std.testing.expectError(error.MemoryMapInvalid, (Request{ .range = .{ .start = 0, .end = page + 1 }, .cell_bytes = page }).check(page));
+    try std.testing.expectError(error.MemoryMapTooLarge, (Request{ .range = .{ .start = 0, .end = (max_cells + 1) * page }, .cell_bytes = page }).check(page));
+    const end = std.math.maxInt(u64) - (page - 1);
+    const top = AddressRange{ .start = end - page, .end = end };
+    try (Request{ .range = top, .cell_bytes = page }).check(page);
+    const bad = [_]Cell{ .{ .start = top.start, .end = end }, .{ .start = top.start, .end = end } };
+    try std.testing.expectError(error.MemoryMapInvalid, validate(&.{ .range = top, .cell_bytes = page, .cells = &bad }));
+    try std.testing.expectError(error.MemoryMapInvalid, validate(&.{ .pending = true, .cells = bad[0..1] }));
+}
+
+test "memory viewport reader reprojects requests and never relabels another scope" {
+    const start: u64 = 2 * default_cell;
+    var f: ModelFixture = undefined;
+    f.init(start, start + 4 * 4096);
+    var req = Request{ .range = .{ .start = start, .end = start + 8192 }, .cell_bytes = 4096 };
+    f.view.scopes[0].request = req.observation(ModelFixture.who);
+    var reader = Reader{ .ticket = 7 };
+    const first = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer first.destroy();
+    try std.testing.expectEqual(@as(usize, 2), first.map.cells.len);
+    try std.testing.expect((try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)) == null);
+    req.cell_bytes = 8192;
+    const zoom = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer zoom.destroy();
+    try std.testing.expectEqual(@as(usize, 1), zoom.map.cells.len);
+    req.redact = true;
+    const redacted = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer redacted.destroy();
+    try std.testing.expect(redacted.map.process.?.name == null and redacted.map.vmas[0].path == null);
+    req.range = .{ .start = start + 8192, .end = start + 16384 };
+    const pending = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer pending.destroy();
+    try std.testing.expect(pending.map.pending and pending.map.cells.len == 0);
+    try std.testing.expectEqualDeep(req.range, pending.map.range);
+    var message: [128]u8 = undefined;
+    try std.testing.expect(std.mem.startsWith(u8, processProblem(&message, pending.map.process.?).?, "Waiting for memory map"));
+    // The new cache can start at the same sequence as the old cache.
+    reader.ticket = 8;
+    f.view.scopes[0].ticket = 8;
+    f.view.scopes[0].request = req.observation(ModelFixture.who);
+    const moved = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer moved.destroy();
+    try std.testing.expect(!moved.map.pending and moved.map.cells[0].start == start + 8192);
+    req.numa = true;
+    const need_numa = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer need_numa.destroy();
+    try std.testing.expect(need_numa.map.pending);
+    f.view.scopes[0].request.flags |= c.XRT_MEM_NUMA;
+    const numa = (try reader.project(std.testing.allocator, &f.view, ModelFixture.who, req)).?;
+    defer numa.destroy();
+    try std.testing.expect(!numa.map.pending);
+    const other = Identity{ .pid = ModelFixture.who.pid, .start = ModelFixture.who.start + 1 };
+    const reused = (try reader.project(std.testing.allocator, &f.view, other, req)).?;
+    defer reused.destroy();
+    try std.testing.expect(reused.map.pending and reused.map.process.?.start_ticks == other.start);
 }

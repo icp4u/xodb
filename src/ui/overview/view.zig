@@ -204,7 +204,7 @@ pub const View = struct {
         self.sample_time = now;
         self.samples += 1;
         if (sample.snap.fresh[@intFromEnum(m.Group.processes)]) self.rows_dirty = true;
-        if (sample.snap.memory_map) |map| self.memmap.acceptReplay(map, now);
+        if (sample.snap.memory_map) |map| self.memmap.acceptReplay(map, sample.snap.memory_viewports, now);
         self.record(&sample.snap);
     }
 
@@ -354,6 +354,7 @@ pub const View = struct {
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };
             w.dirty = true;
+            if (self.deepMap()) memmap.deepmap.motion(self);
         }
         if (w.scroll != 0) {
             self.wheel(w.scroll);
@@ -373,9 +374,13 @@ pub const View = struct {
                 },
                 .button_press => {
                     w.dirty = true;
-                    if (event.code == 272) self.click(event.x, event.y, now);
+                    // The deep map's field and minimap take presses (drag, select, jump).
+                    if (event.code == 272 and !(self.deepMap() and self.pending_action == null and memmap.deepmap.press(self, event.x, event.y))) self.click(event.x, event.y, now);
                 },
-                else => {},
+                .button_release => if (event.code == 272 and self.deepMap()) {
+                    w.dirty = true;
+                    memmap.deepmap.release(self, event.x, event.y);
+                },
             }
             if (self.quit) {
                 w.closing = true;
@@ -385,7 +390,11 @@ pub const View = struct {
         }
     }
 
+    fn deepMap(self: *const View) bool {
+        return self.panel == .memory_map and self.memmap.look == .deep and !self.memmap.legend and !self.memmap.picker_open;
+    }
     fn wheel(self: *View, lines: i32) void {
+        if (self.panel == .memory_map and self.memmap.look == .deep) return memmap.deepmap.wheel(self, lines);
         if (self.panel == .files) {
             if (lines > 0) self.files.top += @intCast(lines) else self.files.top -|= @intCast(-lines);
             return;
@@ -1167,7 +1176,7 @@ pub const View = struct {
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
-            const hints = if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
+            const hints = if (self.panel == .memory_map and self.memmap.look == .deep) "t look  wheel/+/- zoom  drag/arrows pan  0 fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
             try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
         }
     }
