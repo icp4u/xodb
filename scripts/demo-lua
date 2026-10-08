@@ -3,8 +3,8 @@ set -euo pipefail
 umask 022
 cd "$(dirname "$0")/.."
 demo_root="$PWD"
-xodb="${XODB:-$PWD/zig-out/bin/xodb}"
-lua="${LUA:-lua5.4}"
+lua="${LUA:-/opt/debug/bin/lua5.4}"
+if [[ -z "${LUA:-}" && ! -x "$lua" ]]; then lua=lua5.4; fi
 session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-lua-$(id -u)"
 socket="$session_dir/session.sock"
 if [[ "${1-}" == stack ]]; then
@@ -53,7 +53,8 @@ for segment in tool('get_language_stack', tid=tid, language='lua')['segments']:
     print(f"Lua {segment['runtime']['version']}: {segment['state']} "
           f"({segment['reason'] or 'complete'}), anchored at {where}")
     for frame in segment['frames']:
-        print(f"  {frame['name']:<12} {shown(frame['file'])}:{frame['line']}")
+        location = f"{shown(frame['file'])}:{frame['line']}" if frame['file'] is not None and frame['line'] is not None else frame['kind']
+        print(f"  {frame['name']:<12} {location}")
 for expression in expressions:
     value = tool('evaluate_expression', False, tid=tid, frame=0, expression=expression)
     if isinstance(value, str):
@@ -65,14 +66,21 @@ for expression in expressions:
         print(f"    {item['key']}: {item['display']}")
 PY
 fi
-if [[ ! -x "$xodb" ]]; then
-    printf '%s\n' 'Build xodb with scripts/build, or set XODB to its executable.' >&2
-    exit 1
-fi
+xodb="$(python3 scripts/helpers/demo-binary.py lua)"
 if ! command -v "$lua" >/dev/null; then
     printf '%s\n' 'Set LUA to a debug-built Lua 5.4.9 or Lua 5.2.4 interpreter.' >&2
     exit 1
 fi
+lua="$(command -v "$lua")"
+if command -v readelf >/dev/null; then
+    sections="$(readelf -SW "$lua" 2>/dev/null || :)"
+    if [[ ! "$sections" =~ \.(zdebug_info|debug_info)[[:space:]] ]]; then
+        printf '%s\n' 'Lua has no embedded DWARF: readable states need a debug-built interpreter or a verified matching debug companion. Set LUA to a debug build (for example /opt/debug/bin/lua5.4).' >&2
+    fi
+else
+    printf '%s\n' 'Cannot check Lua DWARF without readelf (binutils). Readable states need a debug-built interpreter or a matching debug companion.' >&2
+fi
+printf 'Using Lua: %s\n' "$lua" >&2
 mkdir -p -m 700 "$session_dir"
 if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
     printf '%s\n' 'The demo session directory must be private and owned by you.' >&2

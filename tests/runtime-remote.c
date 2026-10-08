@@ -594,27 +594,30 @@ int main(int argc, char **argv)
 {
     if (argc == 3 && !strcmp(argv[1], "--delay-proxy")) return delayed_proxy(argv[2], false);
     if (argc == 3 && !strcmp(argv[1], "--symbol-delay-proxy")) return delayed_proxy(argv[2], true);
+    /* These synthetic tracees skip exit-time LeakSanitizer, whose helper
+     * cannot ptrace an already-traced process. Memory accesses are still
+     * instrumented; the controller, proxy and agent retain leak checks. */
     if (argc == 2 && !strcmp(argv[1], "--cpu-fixture")) {
         volatile unsigned long value = 7;
         for (unsigned i = 0; i < 80000000; ++i)
             value = value * 1664525 + 1013904223;
-        return value == 0;
+        _exit(value == 0);
     }
     if (argc == 2 && !strcmp(argv[1], "--fixture")) {
         marker();
         marker();
-        return 23;
+        _exit(23);
     }
     if (argc == 2 && !strcmp(argv[1], "--fork-fixture")) {
         pid_t child = fork();
         if (child < 0)
-            return 2;
+            _exit(2);
         if (!child) {
             marker();
-            return 0;
+            _exit(0);
         }
         waitpid(child, NULL, 0);
-        return 0;
+        _exit(0);
     }
     assert(argc == 2);
     alarm(30);

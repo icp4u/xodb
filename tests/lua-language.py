@@ -14,6 +14,7 @@ from helpers.readonly import audit
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source', required=True, help='Matching Lua internal source header directory')
 p.add_argument('--library', required=True, help='Matching Lua static library with DWARF')
+p.add_argument('--cpp-host', action='store_true', help='Embed Lua in a C++ host with unrelated Node/Table/Proto types')
 p.add_argument('--lua', help='Test an installed interpreter using a probe module instead of the embedded host')
 p.add_argument('--strace', action='store_true', help='Audit observer operations on the owned stopped fixture')
 p.add_argument('--adversarial', action='store_true', help='Mutate and restore only the owned fixture to check explicit refusals')
@@ -28,8 +29,15 @@ exe = work/'lua-host'
 command = [os.environ.get('CC', 'cc'), '-std=c11', '-g', '-O0', '-fno-omit-frame-pointer',
     '-fno-optimize-sibling-calls', '-Wall', '-Wextra', '-Werror', '-I'+args.source,
     'tests/fixtures/lua/host.c']
-command += ['-DXODB_LUA_MODULE', '-shared', '-fPIC'] if args.lua else [args.library, '-lm', '-ldl']
-subprocess.run(command+['-o', str(exe)], check=True, timeout=90)
+if args.cpp_host:
+    assert not args.lua, 'C++ embedding and an installed interpreter are separate fixtures'
+    obj=work/'probe.o'
+    subprocess.run(command+['-Dmain=lua_host_main','-c','-o',str(obj)],check=True,timeout=90)
+    subprocess.run(['c++','-g','-O0','-fno-eliminate-unused-debug-types',
+        'tests/fixtures/lua/embedded.cc',str(obj),args.library,'-lm','-ldl','-o',str(exe)],check=True,timeout=90)
+else:
+    command += ['-DXODB_LUA_MODULE', '-shared', '-fPIC'] if args.lua else [args.library, '-lm', '-ldl']
+    subprocess.run(command+['-o', str(exe)], check=True, timeout=90)
 launch = [args.lua, 'tests/fixtures/lua/driver.lua', str(exe), 'tests/fixtures/lua/stopped.lua'] if args.lua else [str(exe), 'tests/fixtures/lua/stopped.lua']
 target = subprocess.Popen(launch, stdin=subprocess.PIPE,
     stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -61,7 +69,9 @@ try:
         local = client.inspect('list_locals', tid=target.pid, frame=0)
         assert client.inspect('get_registers', tid=target.pid) == registers
         assert client.session()['generation'] == stopped['generation']
-        assert value['diagnostic'] is None and value['visualization']['lua'], value
+        assert value['visualization']['lua'], value
+        if value['diagnostic'] is not None:
+            assert value['visualization']['lua']['advisory'] and value['diagnostic'] in ('LuaStringExtentUnproved','LuaTableExtentUnproved'), value
         assert state['diagnostic'] is None and state['visualization']['lua']['type']=='thread', state
         assert any(v['name']=='value' and v['value']['display']==value['display'] for v in local['locals'])
         assert len({s['runtime_instance']['address'] for s in stack['segments']})==len(stack['segments'])
@@ -143,6 +153,7 @@ try:
     for key,display in expected.items():
         assert values[key]['display']==display,(key,values[key])
     assert values['long']['visualization']['truncated'] and values['long']['visualization']['count']==300
+    assert values['long']['diagnostic']=='LuaStringExtentUnproved' and values['long']['visualization']['lua']['advisory']
     items=values['table']['visualization']['lua']['items']
     assert {(i['key'],i['display']) for i in items}=={('[1]',prefix+'1'),('[2]',prefix+'2'),('string "x"','string "hi"')},items
     closure=values['closure']['visualization']['lua']

@@ -27,6 +27,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     steps.append(('javascript-dwarf', [sys.executable, '-B', 'tests/javascript-dwarf.py'], 60))
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
+    steps.append(('demo-binary', [sys.executable, '-B', 'tests/demo-binary.py'], 30))
     if live:
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
@@ -62,6 +63,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((f'lua-embedded-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--strace', '--adversarial', '--work', f'.work/lua-embedded-{index}'], 180))
             steps.append((f'lua-interpreter-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--lua', executable, '--work', f'.work/lua-interpreter-{index}'], 180))
             steps.append((f'lua-refusals-{index}', [sys.executable, '-B', 'tests/lua-refusals.py', *sdk, '--work', f'.work/lua-refusals-{index}'], 120))
+            steps.append((f'lua-runtime-identity-{index}', [sys.executable, '-B', 'tests/lua-runtime-identity.py', *sdk, '--work', f'.work/lua-runtime-identity-{index}'], 120))
+            if len(lua) > 1:
+                _, side_source, side_library = lua[(index + 1) % len(lua)]
+                steps.append((f'lua-mixed-runtime-{index}', [sys.executable, '-B', 'tests/lua-runtime-identity.py', *sdk, '--side-source', side_source, '--side-library', side_library, '--work', f'.work/lua-mixed-runtime-{index}'], 120))
+            steps.append((f'lua-cpp-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--cpp-host', '--strace', '--adversarial', '--work', f'.work/lua-cpp-{index}'], 180))
+            for companion in (False, True):
+                steps.append((f'lua-context-{index}-{int(companion)}', [sys.executable, '-B', 'tests/lua-context.py', *sdk, '--strace', *(['--companion'] if companion else []), '--work', f'.work/lua-context-{index}-{int(companion)}'], 120))
     if tier in ('gui', 'all'):
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                       'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600))
@@ -94,6 +102,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((name, [sys.executable, '-B', *args], 90))
         if node:
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
+            steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
         if lua:
             selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
             steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))

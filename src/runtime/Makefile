@@ -12,8 +12,10 @@ SOURCES := memory arch registers process target probes watchpoints events family
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
 TESTS := memory registers process target perf wire snapshot symbols fdscan
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))
-.PHONY: all check clean
+.PHONY: all check check-leaks clean
 all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent $(BUILD)/xodb-lsof-top
+check-leaks:
+	python3 $(ROOT)/tests/runtime-leaks.py --work $(BUILD)/leak-probe
 $(BUILD):
 	mkdir -p $@
 $(BUILD)/allocation_broker.o: $(ROOT)/src/profile/allocation_broker.c | $(BUILD)

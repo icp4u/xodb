@@ -135,20 +135,100 @@ const char *xl_layout_check(const struct xl_layout *p, const uint8_t *id, size_t
     if (!id || !n || n > sizeof p->build_id || p->build_id_len != n || memcmp(p->build_id, id, n)) return "LuaBuildIdMismatch";
     return NULL;
 }
-const char *xl_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, const uint8_t v[3], struct xl_layout *out) {
-    memset(out, 0, sizeof *out);
-    if (!supported(v)) return "LuaVersionUnsupported";
-    if (!id || !n || n > sizeof out->build_id) return "LuaBuildIdUnavailable";
-    if (!dwarf) return "LuaDwarfUnavailable";
-    unsigned version = v[1] == 4; struct scan s = {0}; uint8_t have[XL_TYPE_COUNT] = {0};
-    uint64_t length;
-    if (!info_size(dwarf, &length)) return "LuaDwarfMalformed";
+/* Bare names are only candidates: an embedded host may define its own
+ * Node/Table/Proto. Accept a complete candidate only after every field and
+ * representation invariant for that type agrees with the Lua contract. */
+static int candidate(Dwarf_Die resolved, unsigned t, unsigned version,
+                     struct xl_layout *out, struct scan *s) {
+    uint64_t bytes;
+    if (!size(&resolved, &bytes)) return 0;
+    out->sizes[t] = (uint32_t)bytes;
+    for (unsigned f = 0; f < XL_FIELD_COUNT; ++f) {
+        const struct field *spec = &fields[f];
+        if (spec->owner != t || !spec->paths[version]) continue;
+        struct xl_field_info got; Dwarf_Die leaf;
+        if (!member(resolved, spec->paths[version], &got, &leaf, s)) return 0;
+        if (!kind(&leaf, spec->kind) || (spec->widths[version] && spec->widths[version] != got.size)) return 0;
+        if (f == XL_PROTO_CODE || f == XL_CI_PC) {
+            Dwarf_Die instruction; uint64_t instruction_size;
+            if (!type(&leaf, &instruction) || !resolve(&instruction, s) ||
+                !size(&instruction, &instruction_size) || instruction_size != 4 ||
+                !kind(&instruction, UNSIGNED)) return 0;
+        }
+        out->fields[f] = got;
+    }
+    if (t == XL_T_STRING || t == XL_T_TABLE || t == XL_T_LCLOSURE || t == XL_T_CCLOSURE ||
+        t == XL_T_PROTO || t == XL_T_UPVAL || t == XL_T_UDATA || t == XL_T_STATE) {
+        const char *path = !version && t == XL_T_STRING ? "tsv.tt" : !version && t == XL_T_UDATA ? "uv.tt" : "tt";
+        struct xl_field_info tag_field; Dwarf_Die leaf;
+        if (!member(resolved, path, &tag_field, &leaf, s) || tag_field.offset != 8 || tag_field.size != 1 ||
+            !kind(&leaf, UNSIGNED)) return 0;
+    }
+    return 1;
+}
+/* A host's names are not runtime provenance. First identify every CU defining
+ * the core VM or version object, and reject multiple runtime definitions before
+ * choosing any layout. Header declarations and abstract subprograms do not
+ * qualify. Both anchors may live together in an amalgamated source file. */
+static const char *runtime_units(Dwarf *dwarf, uint64_t length, uint8_t owned[8192],
+                                 struct scan *s) {
+    unsigned identifiers = 0, executors = 0;
     Dwarf_Off off = 0, next; size_t header;
     for (unsigned cu = 0; off < length; off = next, ++cu) {
         if (cu >= 8192) return "LuaDwarfUnitLimit";
         uint8_t address_size;
         int rc = dwarf_nextcu(dwarf, off, &next, &header, NULL, &address_size, NULL);
         if (rc || address_size != 8 || next <= off || next > length || header >= next - off) return "LuaDwarfMalformed";
+        Dwarf_Die unit, d;
+        if (!dwarf_offdie(dwarf, off + header, &unit)) return "LuaDwarfMalformed";
+        rc = dwarf_child(&unit, &d);
+        if (rc < 0) return "LuaDwarfMalformed";
+        if (rc > 0) continue;
+        do {
+            if (!tick(s)) return s->error;
+            int tag = dwarf_tag(&d);
+            if (tag != DW_TAG_variable && tag != DW_TAG_subprogram) continue;
+            const char *name = dwarf_diename(&d);
+            if (!name) continue;
+            int ident = tag == DW_TAG_variable && !strcmp(name, "lua_ident");
+            int execute = tag == DW_TAG_subprogram && !strcmp(name, "luaV_execute");
+            if (!ident && !execute) continue;
+            Dwarf_Attribute attr; bool declared = false;
+            if (dwarf_attr(&d, DW_AT_declaration, &attr)) {
+                if (dwarf_formflag(&attr, &declared)) return "LuaDwarfMalformed";
+                if (declared) continue;
+            }
+            if (ident && dwarf_hasattr(&d, DW_AT_location)) {
+                if (++identifiers > 1) return "LuaRuntimeMultiple";
+                owned[cu] = 1;
+            }
+            if (execute && (dwarf_hasattr(&d, DW_AT_low_pc) || dwarf_hasattr(&d, DW_AT_ranges))) {
+                if (++executors > 1) return "LuaRuntimeMultiple";
+                owned[cu] = 1;
+            }
+        } while ((rc = dwarf_siblingof(&d, &d)) == 0);
+        if (rc < 0) return "LuaDwarfMalformed";
+    }
+    return NULL;
+}
+const char *xl_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, const uint8_t v[3], struct xl_layout *out) {
+    memset(out, 0, sizeof *out);
+    if (!supported(v)) return "LuaVersionUnsupported";
+    if (!id || !n || n > sizeof out->build_id) return "LuaBuildIdUnavailable";
+    if (!dwarf) return "LuaDwarfUnavailable";
+    unsigned version = v[1] == 4; struct scan s = {0}; uint8_t have[XL_TYPE_COUNT] = {0}, seen[XL_TYPE_COUNT] = {0};
+    uint64_t length;
+    if (!info_size(dwarf, &length)) return "LuaDwarfMalformed";
+    uint8_t owned[8192] = {0};
+    const char *runtime_error = runtime_units(dwarf, length, owned, &s);
+    if (runtime_error) return runtime_error;
+    Dwarf_Off off = 0, next; size_t header;
+    for (unsigned cu = 0; off < length; off = next, ++cu) {
+        if (cu >= 8192) return "LuaDwarfUnitLimit";
+        uint8_t address_size;
+        int rc = dwarf_nextcu(dwarf, off, &next, &header, NULL, &address_size, NULL);
+        if (rc || address_size != 8 || next <= off || next > length || header >= next - off) return "LuaDwarfMalformed";
+        if (!owned[cu]) continue;
         Dwarf_Die unit, d;
         if (!dwarf_offdie(dwarf, off + header, &unit)) return "LuaDwarfMalformed";
         rc = dwarf_child(&unit, &d);
@@ -165,41 +245,26 @@ const char *xl_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, const uin
                 if (!resolve(&resolved, &s)) return s.error ? s.error : "LuaDwarfMalformed";
                 Dwarf_Attribute attr; bool declared = false;
                 if (dwarf_attr(&resolved, DW_AT_declaration, &attr) && !dwarf_formflag(&attr, &declared) && declared) continue;
-                uint64_t bytes;
-                if (!size(&resolved, &bytes)) return "LuaLayoutUnsupported";
-                if (have[t] && out->sizes[t] != bytes) return "LuaDwarfAmbiguous";
-                out->sizes[t] = (uint32_t)bytes;
+                seen[t] = 1;
+                struct xl_layout got = {0};
+                if (!candidate(resolved, t, version, &got, &s)) {
+                    if (s.error) return s.error;
+                    continue;
+                }
+                if (have[t] && out->sizes[t] != got.sizes[t]) return "LuaDwarfAmbiguous";
+                out->sizes[t] = got.sizes[t];
                 for (unsigned f = 0; f < XL_FIELD_COUNT; ++f) {
-                    const struct field *spec = &fields[f];
-                    if (spec->owner != t || !spec->paths[version]) continue;
-                    struct xl_field_info got; Dwarf_Die leaf;
-                    if (!member(resolved, spec->paths[version], &got, &leaf, &s)) return s.error ? s.error : "LuaLayoutUnsupported";
-                    if (!kind(&leaf, spec->kind) || (spec->widths[version] && spec->widths[version] != got.size)) return "LuaLayoutUnsupported";
-                    if (f == XL_PROTO_CODE || f == XL_CI_PC) {
-                        Dwarf_Die instruction; uint64_t instruction_size;
-                        if (!type(&leaf, &instruction) || !resolve(&instruction, &s) ||
-                            !size(&instruction, &instruction_size) || instruction_size != 4 ||
-                            !kind(&instruction, UNSIGNED)) return s.error ? s.error : "LuaLayoutUnsupported";
-                    }
-                    if (have[t] && memcmp(&out->fields[f], &got, sizeof got)) return "LuaDwarfAmbiguous";
-                    out->fields[f] = got;
+                    if (fields[f].owner != t || !fields[f].paths[version]) continue;
+                    if (have[t] && memcmp(&out->fields[f], &got.fields[f], sizeof got.fields[f])) return "LuaDwarfAmbiguous";
+                    out->fields[f] = got.fields[f];
                 }
                 have[t] = 1;
-                /* Every collectable representation must share the same
-                 * tag byte used by the GC-header check. */
-                if (t == XL_T_STRING || t == XL_T_TABLE || t == XL_T_LCLOSURE || t == XL_T_CCLOSURE ||
-                    t == XL_T_PROTO || t == XL_T_UPVAL || t == XL_T_UDATA || t == XL_T_STATE) {
-                    const char *path = !version && t == XL_T_STRING ? "tsv.tt" : !version && t == XL_T_UDATA ? "uv.tt" : "tt";
-                    struct xl_field_info tag_field; Dwarf_Die leaf;
-                    if (!member(resolved, path, &tag_field, &leaf, &s) || tag_field.offset != 8 || tag_field.size != 1 ||
-                        !kind(&leaf, UNSIGNED)) return s.error ? s.error : "LuaLayoutUnsupported";
-                }
             }
         } while ((rc = dwarf_siblingof(&d, &d)) == 0);
         if (rc < 0) return "LuaDwarfMalformed";
     }
     for (unsigned t = 0; t < XL_TYPE_COUNT; ++t)
-        if (types[t][version] && !have[t]) return "LuaDwarfTypesUnavailable";
+        if (types[t][version] && !have[t]) return seen[t] ? "LuaLayoutUnsupported" : "LuaDwarfTypesUnavailable";
     if (out->sizes[XL_T_VALUE] != 8 || out->sizes[XL_T_TVALUE] > 32 || out->sizes[XL_T_STACK] < out->sizes[XL_T_TVALUE] ||
         out->fields[XL_NODE_VALUE].size != out->sizes[XL_T_TVALUE] || out->fields[XL_STATE_BASE].size != out->sizes[XL_T_CI] ||
         out->fields[XL_CC_UP].size != out->sizes[XL_T_TVALUE] || out->fields[XL_GC_TAG].offset != 8 ||

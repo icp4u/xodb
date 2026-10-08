@@ -1,15 +1,11 @@
 #!/usr/bin/env bash
 # Native Perl demo: readable Perl values and the Perl stack at native stops.
-# Optional arguments are passed to xodb. XODB=path overrides the binary
-# (default: ./zig-out/bin/xodb from this checkout).
+# Optional arguments are passed to xodb. Binary order: XODB,
+# ./zig-out/bin/xodb from this checkout, then xodb on PATH.
 set -euo pipefail
 demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$demo_root"
-xodb=${XODB:-zig-out/bin/xodb}
-if [[ ! -x "$xodb" ]]; then
-    printf '%s\n' "Build xodb first with ./scripts/build, or set XODB=/path/to/xodb" >&2
-    exit 1
-fi
+xodb="$(python3 scripts/helpers/demo-binary.py perl)"
 perl=/opt/debug/bin/perl
 if [[ ! -x "$perl" ]]; then
     printf '%s\n' "Needs a Perl with DWARF at $perl" >&2

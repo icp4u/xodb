@@ -8,6 +8,11 @@ value elements.
 
 The demo needs Node, its matching development headers, a C++ compiler, and a
 built GUI xodb. Set `NODE`, `NODE_INCLUDE`, `CXX` or `XODB` to override them.
+Like the Lua, Python and Perl demos, it chooses `XODB`, then this checkout's
+`zig-out/bin/xodb`, then `xodb` on `PATH`. It prints the resolved executable and checks that its MCP
+schema advertises the JavaScript reader before starting Node. An old checkout
+binary can otherwise show `UnsupportedType` for `Local<v8::Value>` even when
+a newer installed binary works. Rebuild or set `XODB` to the current executable.
 It compiles `examples/node-probe.cc` with DWARF into a private temporary
 session directory, runs only `examples/node-demo.js`, and removes its probe
 on exit. It does not install anything or modify Node.
@@ -50,7 +55,9 @@ strings, fast arrays, fast in-object data properties, function names and
 proved constructor names. A base constructor's name is not substituted for a
 subclass: its initial map must match the receiver's root map and the receiver's
 prototype must still match that initial map. Otherwise the preview uses `Object`
-with `JavaScriptConstructorNameUnproved`. Ordinary object literals retain the
+with `JavaScriptConstructorNameUnproved`. When a field also has a reason, the
+name advisory remains separately available as `name_diagnostic`; the field
+reason remains visible in the summary and on its item. Ordinary object literals retain the
 generic `Object` name when their copied map's constructor and prototype agree;
 that alone adds no diagnostic. Strings handle
 sequential, cons, sliced, thin and cached
@@ -77,10 +84,19 @@ the claimed aligned end reaches another readable object header. A failure adds
 the advisory `JavaScriptStringExtentUnproved` while preserving the bounded
 preview: valid large strings and fresh allocations need not have a following
 object. Payload reads use at most the claimed length and the 128-unit preview
-limit, and truncation is marked. A
+limit, and truncation is marked. Items retain an independent `truncated` flag
+and a visible ellipsis even when another diagnostic is present. A
 plausible following header is only a consistency check, not an independent
 proof of the allocation extent; stale or consistently corrupted heap data
 can still pass it.
+
+The GUI dims and labels a preview whose extent check raised an advisory,
+including a container with an affected child. No exact safe byte boundary is
+known, so it conservatively marks the whole preview rather than inventing a
+proved prefix. MCP exposes `extent_advisory`; false does not certify an extent.
+A corrupt length whose claimed end lands exactly on a later valid header can
+still show neighbouring bytes without this advisory. Property-key, function-name
+and script-name strings are bounded but do not perform this extent check.
 
 ## Physical JavaScript stack
 

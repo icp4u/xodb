@@ -701,8 +701,10 @@ static void detach_owed_cleanup(void)
 
 int main(int argc, char **argv)
 {
+    /* LeakSanitizer's exit helper cannot ptrace our already-traced fixture.
+     * Only the synthetic tracee skips exit handlers; the controller does not. */
     if (argc == 2 && strcmp(argv[1], "--fixture") == 0)
-        return 17;
+        _exit(17);
     if (argc == 2 && strcmp(argv[1], "--adopt") == 0) {
         const pid_t kid = fork();
         if (kid < 0)

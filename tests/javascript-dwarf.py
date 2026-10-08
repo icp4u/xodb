@@ -55,6 +55,11 @@ int main(int argc, char **argv) {
         ('trailing-byte', unit(body) + b'\xff', abbrev, 'JavaScriptDwarfMalformed'),
         ('wrong-address-size', unit(body, 4), abbrev, 'JavaScriptDwarfMalformed'),
         ('missing-abbrev', unit(body), b'', 'JavaScriptDwarfMalformed'),
+        # Small sections are left uncompressed by objcopy. Repeated CUs force
+        # compression and exercise errors after successfully decoded units.
+        ('compressible-valid', unit(body) * 3000, abbrev, 'ok'),
+        ('compressible-mismatch', unit(body) * 2999 + unit(prefix + member[:-1] + b'\x19\0\0\0\0'), abbrev, 'JavaScriptDwarfLayoutMismatch'),
+        ('compressible-truncated', unit(body) * 2999 + struct.pack('<I', 4000010) + unit(body)[4:], abbrev, 'JavaScriptDwarfMalformed'),
     ]
     for name, info, abbreviations, expected in fixtures:
         info_file, abbrev_file = work/'info', work/'abbrev'
@@ -66,11 +71,29 @@ int main(int argc, char **argv) {
         actual = subprocess.check_output([str(executable), str(target)], text=True, timeout=10).strip()
         assert actual == expected, (name, actual, expected)
         print(name, actual)
+    def compressed_info(target, encoding):
+        data = target.read_bytes()
+        assert data[:6] == b'\x7fELF\x02\x01', 'owned fixture must be ELF64 little endian'
+        offset, = struct.unpack_from('<Q', data, 40)
+        stride, count, names = struct.unpack_from('<HHH', data, 58)
+        sections = [struct.unpack_from('<IIQQQQIIQQ', data, offset + i * stride) for i in range(count)]
+        strings = data[sections[names][4]:sections[names][4] + sections[names][5]]
+        wanted = b'.debug_info' if encoding == 'zlib' else b'.zdebug_info'
+        section = next(s for s in sections if strings[s[0]:strings.index(b'\0', s[0])] == wanted)
+        if encoding == 'zlib':
+            assert section[2] & 0x800, 'SHF_COMPRESSED is required'
+        else:
+            assert data[section[4]:section[4]+4] == b'ZLIB', 'GNU compression header is required'
+
     for encoding in ('zlib', 'zlib-gnu'):
-        target = work/encoding
-        subprocess.run(['objcopy', '--compress-debug-sections='+encoding, str(work/'valid'), str(target)],
-                       check=True, timeout=10)
-        actual = subprocess.check_output([str(executable), str(target)], text=True, timeout=10).strip()
-        assert actual == 'ok', (encoding, actual)
-        print(encoding, actual)
+        for name, _, _, expected in fixtures:
+            if not name.startswith('compressible-'):
+                continue
+            target = work/(encoding + '-' + name)
+            subprocess.run(['objcopy', '--compress-debug-sections='+encoding, str(work/name), str(target)],
+                           check=True, timeout=10)
+            compressed_info(target, encoding)
+            actual = subprocess.check_output([str(executable), str(target)], text=True, timeout=10).strip()
+            assert actual == expected, (encoding, name, actual, expected)
+            print(encoding, name, actual)
 print('JavaScript DWARF boundaries, DIE errors and compressed sections passed')

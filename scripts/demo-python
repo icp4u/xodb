@@ -6,12 +6,11 @@
 #   scripts/demo-python stack [EXPR...]  from another terminal, while stopped:
 #                                        print the Python stack and values
 #
-# XODB=path overrides the binary (default: ./zig-out/bin/xodb from this
-# checkout); PYTHON=path the interpreter (default: a DWARF build in /opt/debug).
+# Binary order: XODB, ./zig-out/bin/xodb, then xodb on PATH.
+# PYTHON=path overrides the interpreter (default: a DWARF build in /opt/debug).
 set -euo pipefail
 demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$demo_root"
-xodb=${XODB:-zig-out/bin/xodb}
 python=${PYTHON:-/opt/debug/bin/python3}
 # A private per-user directory holds the shared-session socket.
 session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-python-$(id -u)"
@@ -75,10 +74,7 @@ for expression in expressions:
 PY
 fi
 
-if [[ ! -x "$xodb" ]]; then
-    printf '%s\n' "Build xodb first with ./scripts/build, or set XODB=/path/to/xodb" >&2
-    exit 1
-fi
+xodb="$(python3 scripts/helpers/demo-binary.py python)"
 if [[ ! -x "$python" ]]; then
     printf '%s\n' "Needs a CPython with DWARF at $python (or set PYTHON=...)" >&2
     exit 1

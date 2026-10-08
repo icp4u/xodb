@@ -51,7 +51,7 @@ for lua in args.lua:
         assert d.tool('get_registers', tid=tid)==registers and d.session()['generation']==generation
         results.append({'lua':lua, 'value':state, 'stack':logical})
         d.app.stdin.close(); assert d.app.wait(timeout=10)==0
-        env = dict(d.env, LUA=lua)
+        env = dict(d.env, LUA=lua, XODB=str(root/'zig-out/bin/xodb'))
         with (Path(d.dir)/'demo.log').open('wb') as log:
             demo = subprocess.Popen(['scripts/demo-lua'], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
             socket = Path(d.runtime)/f'xodb-demo-lua-{os.getuid()}'/'session.sock'

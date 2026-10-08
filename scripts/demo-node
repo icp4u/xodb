@@ -3,7 +3,6 @@ set -euo pipefail
 umask 022
 cd "$(dirname "$0")/.."
 demo_root="$PWD"
-xodb="${XODB:-$PWD/zig-out/bin/xodb}"
 node="${NODE:-node}"
 node_include="${NODE_INCLUDE:-/usr/include/node}"
 session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-node-$(id -u)"
@@ -67,10 +66,7 @@ for expression in expressions:
         print(f"    {item['key']}: {item['display']}")
 PY
 fi
-if [[ ! -x "$xodb" ]]; then
-    printf '%s\n' 'Build xodb with scripts/build, or set XODB=/path/to/xodb.' >&2
-    exit 1
-fi
+xodb="$(python3 scripts/helpers/demo-binary.py javascript)"
 mkdir -p -m 700 "$session_dir"
 if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
     printf '%s\n' 'The demo session directory must be private and owned by you.' >&2

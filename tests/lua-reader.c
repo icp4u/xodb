@@ -59,6 +59,29 @@ static void check_stack(lua_State *L) {
         ++stack_frames;
     }
     assert(index == stack.count); ++stack_checks;
+    /* A saved PC at code[0] means entry, not a corrupt instruction pointer.
+     * This cooperating oracle changes only its own frame and restores it
+     * before asking Lua to execute or inspect anything else. */
+    for (CallInfo *ci = L->ci; ci != &L->base_ci; ci = ci->previous) {
+        if (!isLua(ci)) continue;
+#if LUA_VERSION_NUM == 504
+        Proto *proto = clLvalue(s2v(ci->func.p))->p;
+#else
+        Proto *proto = clLvalue(ci->func)->p;
+#endif
+        const Instruction *saved = ci->u.l.savedpc;
+        ci->u.l.savedpc = proto->code;
+        r = reader(); xl_stack_read(&layout, &r, (uintptr_t)L, &stack);
+        ci->u.l.savedpc = saved;
+        int found = 0;
+        for (size_t i = 0; i < stack.count; ++i) if (stack.frames[i].ci == (uintptr_t)ci) {
+            assert(stack.frames[i].reason && !strcmp(stack.frames[i].reason, "LuaFrameNotStarted"));
+            assert(stack.frames[i].line == proto->linedefined); found = 1;
+        }
+        assert(found);
+        break;
+    }
+
     luaL_traceback(L, L, "ground truth", 0); puts(lua_tostring(L, -1)); lua_pop(L, 1);
     lua_State snapshot = *L; CallInfo bad = *L->ci;
     snapshot.ci = &bad; bad.previous = &bad; bad.next = &bad;
@@ -76,7 +99,8 @@ static int inspect(lua_State *L) {
     for (int i = 1; i <= count; ++i) {
         struct xl_reader r = reader(); struct xl_value v;
         xl_value_read(&layout, &r, (uintptr_t)argument(L, i), &v);
-        if (v.reason) { fprintf(stderr, "value %d: %s\n", i, v.reason); abort(); }
+        if (v.advisory) assert(v.reason && (!strcmp(v.reason, "LuaStringExtentUnproved") || !strcmp(v.reason, "LuaTableExtentUnproved")) && v.truncated);
+        if (v.reason && !v.advisory) { fprintf(stderr, "value %d: %s\n", i, v.reason); abort(); }
         int type = lua_type(L, i);
         const char *want = type == LUA_TNIL ? "nil" : type == LUA_TBOOLEAN ? "boolean" :
             type == LUA_TNUMBER ? "number" : type == LUA_TSTRING ? "string" : type == LUA_TTABLE ? "table" :
@@ -99,7 +123,8 @@ static int inspect(lua_State *L) {
         printf("value %d %s children=%zu truncated=%d\n", i, v.display, v.item_count, v.truncated);
         for (size_t j = 0; j < v.item_count; ++j) {
             printf("  %s: %s reason=%s\n", v.items[j].key, v.items[j].display, v.items[j].reason ? v.items[j].reason : "none");
-            assert(!v.items[j].reason);
+            assert(!v.items[j].reason || (v.items[j].advisory &&
+                (!strcmp(v.items[j].reason, "LuaStringExtentUnproved") || !strcmp(v.items[j].reason, "LuaTableExtentUnproved"))));
         }
         assert(r.reads <= XL_READ_LIMIT && r.bytes <= XL_BYTE_LIMIT); ++value_checks;
     }

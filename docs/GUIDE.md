@@ -109,8 +109,9 @@ script level:
 - **Readable Lua values.** `TValue *` and `lua_State *` previews cover PUC Lua
   5.4.9 and 5.2.4 with DWARF. Lua stacks keep coroutines separate, report source
   lines and C boundaries, and mark unknown names and native alignment partial.
-  Try `LUA=lua5.4 scripts/demo-lua`, **Space**, then **E**, `L`, **Return**.
-  See [Lua](LUA.md).
+  Try `scripts/demo-lua`, **Space**, then **E**, `L`, **Return**.
+  Interrupted native I/O frames retain lower Lua state evidence; ambiguous state
+  arguments appear as separate segments. See [Lua](LUA.md).
 
 Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 [logical frames](LOGICAL_FRAMES.md).

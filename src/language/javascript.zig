@@ -186,6 +186,9 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .type = try text(a, std.mem.sliceTo(&item.type, 0)),
         .display = try text(a, std.mem.sliceTo(&item.display, 0)),
         .diagnostic = try reason(a, item.reason),
+        .truncated = item.truncated != 0,
+        .extent_advisory = item.extent_advisory != 0,
+        .name_diagnostic = try reason(a, item.name_reason),
     };
     try session.target.expectGeneration(generation);
     return .{
@@ -194,9 +197,11 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .count = raw.count,
         .element_type = value.type.name,
         .truncated = raw.truncated != 0,
+        .extent_advisory = raw.extent_advisory != 0,
         .diagnostic = try reason(a, raw.reason),
         .basis = "V8 postmortem metadata verified against the loaded image and build-id; stopped memory; no inferior calls or getters; allocation extent and GC liveness not verified",
         .javascript = .{
+            .name_diagnostic = try reason(a, raw.name_reason),
             .type = try text(a, std.mem.sliceTo(&raw.type, 0)),
             .display = try text(a, std.mem.sliceTo(&raw.display, 0)),
             .tagged = tagged,

@@ -229,7 +229,7 @@ static void signal_evidence(void)
 
 static void failed_launch(unsigned failure)
 {
-    /* The controller isolates irreversible seccomp/rlimit settings. */
+    /* The controller isolates the fault-injection settings. */
     const pid_t controller = fork();
     CHECK(controller >= 0);
     if (controller == 0) {
@@ -240,6 +240,7 @@ static void failed_launch(unsigned failure)
             _exit(42);
         const char *argv[] = {"/proc/self/exe", "--must-not-exec", NULL};
         enum xrt_status expected;
+        struct rlimit saved_limit = {0};
         if (failure == 0) {
             deny_syscall(SYS_ptrace, EACCES);
             expected = XRT_PERMISSION_DENIED;
@@ -248,8 +249,8 @@ static void failed_launch(unsigned failure)
             deny_syscall(SYS_sendto, EPIPE);
             expected = XRT_PIPE_FAILED;
         } else {
-            struct rlimit limit;
-            CHECK(getrlimit(RLIMIT_NOFILE, &limit) == 0);
+            CHECK(getrlimit(RLIMIT_NOFILE, &saved_limit) == 0);
+            struct rlimit limit = saved_limit;
             limit.rlim_cur = 0;
             CHECK(setrlimit(RLIMIT_NOFILE, &limit) == 0);
             expected = XRT_PIPE_FAILED;
@@ -260,8 +261,13 @@ static void failed_launch(unsigned failure)
         CHECK(waitpid(unrelated, &status, 0) == unrelated && WIFEXITED(status) &&
               WEXITSTATUS(status) == 42);
         CHECK(waitpid(-1, &status, WNOHANG) == -1 && errno == ECHILD);
-        if (failure != 2)
-            CHECK(fd_count() == descriptors);
+        if (failure == 2)
+            CHECK(setrlimit(RLIMIT_NOFILE, &saved_limit) == 0);
+        CHECK(fd_count() == descriptors);
+        /* Only the denied-ptrace filter prevents LSan's exit helper. The
+         * sendto failure and restored fd limit permit normal leak checks. */
+        if (failure == 0)
+            _exit(0);
         exit(0);
     }
     int status;
@@ -271,8 +277,11 @@ static void failed_launch(unsigned failure)
 
 int main(int argc, char **argv)
 {
+    /* Synthetic tracees bypass exit-time LeakSanitizer: its helper cannot
+     * ptrace a process already owned by this test. The controller still gets
+     * normal leak checks, and tracee memory accesses remain instrumented. */
     if (argc == 3 && strcmp(argv[1], "--child") == 0)
-        return child_main(strcmp(argv[2], "ignored") == 0);
+        _exit(child_main(strcmp(argv[2], "ignored") == 0));
     CHECK(argc == 1);
     CHECK(atexit(cleanup) == 0);
     alarm(30);

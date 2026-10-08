@@ -1,20 +1,38 @@
 # Lua values and stacks
 
-Run `LUA=lua5.4 scripts/demo-lua`, press **Space** to reach `print`, then
+Run `scripts/demo-lua`, press **Space** to reach `print`, then
 **E**, `L`, **Return**. The watch shows the Lua state's top value. **Space**
 advances through numbers, a string, a table and a closure. In another terminal,
 `scripts/demo-lua stack` prints the Lua frames and bounded value previews.
-`LUA=lua5.2` selects the other supported interpreter.
+The demo prefers `/opt/debug/bin/lua5.4`, falling back to `lua5.4` on `PATH`.
+Set `LUA` to another debug-built interpreter; `LUA=/opt/debug/bin/lua5.2`
+selects the other supported version. A system interpreter without DWARF cannot provide the
+native `L` argument or verified state layout. The demo warns when embedded
+DWARF is absent; a verified matching debug companion can also supply it.
+
+Like the Node, Python and Perl demos, it chooses `XODB`, then this checkout's
+`zig-out/bin/xodb`, then `xodb` on `PATH`. It prints both executables and rejects an xodb build that
+does not advertise the Lua reader. Set `XODB` explicitly to choose another build.
 
 The current profiles cover PUC Lua **5.4.9** and **5.2.4**, x86-64 Linux,
 little endian, standard 64-bit pointers and double precision numbers. The
-interpreter needs DWARF; static embedded C/C++ hosts work too. Offsets and
+interpreter needs DWARF; static embedded C/C++ hosts work too, with Lua itself
+compiled as C. Lua compiled as C++ is unsupported because its core symbol names
+are mangled. Offsets and
 strides come from the identified image's DWARF. The loaded build-id and
-`lua_ident` bytes must agree with that image. Results label the layout source.
-Shared-library runtimes, LuaJIT, stripped layouts, different versions, NaN-boxed
+`lua_ident` bytes must agree with that image. Results distinguish same-image
+DWARF from a build-id matched debug companion. Every layout type, including
+`StackValue`, must come from a compilation unit defining Lua's VM or version
+object. Unrelated host types are ignored even when their fields resemble Lua's.
+Differing valid definitions within the runtime's own units remain ambiguous.
+Distinct `lua_ident` or `luaV_execute` definitions in the main image cause
+`LuaRuntimeMultiple`, including hidden static copies and copies with identical
+layouts. Symbol tables and DWARF definitions are checked before reading states;
+the reader does not choose whichever version happens to appear first.
+Shared-library runtimes, LuaJIT, stripped layouts without a companion, different versions, NaN-boxed
 5.2 builds and other architectures are not covered by these profiles.
 
-A `TValue *` shows nil, booleans, integers (5.4), numbers, byte strings, tables,
+A `TValue *` (or Lua 5.4 `StackValue *` / `StkId`) shows nil, booleans, integers (5.4), numbers, byte strings, tables,
 closures with upvalues, C functions, userdata or threads. A `lua_State *`
 shows its top stack value and up to eight stack slots, even when the native
 frame has only an opaque public-header declaration. A complete native type
@@ -29,9 +47,16 @@ For an agent:
 
 Omit `state` to recover native `lua_State *` parameters. Supply a hexadecimal
 `state` address to inspect a particular coroutine. Each distinct state remains
-a separate observation. CallInfo links provide logical ordering and C function
+a separate observation, including multiple state arguments in one native frame.
+A frame with missing or unusable locals adds a `native_argument_diagnostics`
+entry while lower Lua frames can still provide states. If none can be recovered,
+those diagnostics accompany an empty segment list. Up to eight states and 256
+candidate arguments are retained; reaching a limit preserves the partial result.
+CallInfo links provide logical ordering and C function
 boundaries. Saved PCs and Lua line tables provide current source lines,
-including Lua 5.4 absolute-line entries. Tail-call flags do not reconstruct
+including Lua 5.4 absolute-line entries. A saved PC at function entry is labelled
+`LuaFrameNotStarted` with the definition line, rather than invalid memory.
+Tail-call flags do not reconstruct
 eliminated callers. Suspended coroutines are explicitly marked; the 5.2 reader
 interprets the saved function offset without changing the target.
 
@@ -48,10 +73,24 @@ are slot counts, not Lua's `#` operator or a complete entry count. Lua 5.2's
 hash capacity includes its shared nil dummy slot. Only a bounded set of slots
 is inspected.
 
+Layout discovery has a separate budget: 8,192 compilation units and 4 million
+DWARF work steps, returning `LuaDwarfUnitLimit` or `LuaDwarfWorkLimit` when
+exhausted. A work step is not a compilation unit; complex C++ units can exhaust
+the budget well below the unit limit. Symbol identity checks inspect at most
+1 million symbol entries and otherwise return `LuaSymbolWorkLimit`. The current
+module snapshot also limits an executable to 256 MiB. Large embedded hosts can
+therefore be refused before any Lua value is inspected; these profiles do not
+yet provide ranged DWARF loading for larger files.
+
 Header consistency cannot prove allocation extents or GC liveness. An unchanged
 stale allocation can still look readable; a corrupt length may include nearby
-readable bytes within the preview bound. A detected tag mismatch is a refusal,
-not proof that every freed object can be recognized.
+readable bytes within the preview bound. String lengths that exceed Lua's size
+limit or the supported canonical user address space are refused as
+`LuaStringLengthInvalid`. Longer strings and uninspected table capacity instead
+carry `LuaStringExtentUnproved` or `LuaTableExtentUnproved`, with `advisory: true`:
+the bounded preview remains available, while its full allocation is unproved.
+Child items carry their own diagnostics and advisory flag. A detected tag
+mismatch is a refusal, not proof that every freed object can be recognized.
 
 The semantic rules follow upstream [5.4 objects](https://www.lua.org/source/5.4/lobject.h.html),
 [5.4 states](https://www.lua.org/source/5.4/lstate.h.html),

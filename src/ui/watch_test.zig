@@ -14,6 +14,7 @@ const Fake = struct {
     stack_available: bool = true,
     complete: bool = true,
     value: []const u8 = "1",
+    extent_advisory: bool = false,
     fail: ?anyerror = null,
     calls: usize = 0,
     last_index: ?usize = null,
@@ -44,7 +45,7 @@ const Fake = struct {
         self.calls += 1;
         self.last_index = index;
         if (self.fail) |err| return .{ .failed = err };
-        return .{ .value = .{ .display = self.value, .type_name = "int", .available = true } };
+        return .{ .value = .{ .display = self.value, .type_name = "int", .available = true, .extent_advisory = self.extent_advisory } };
     }
 };
 const f_main = watch.Frame{ .cfa = 0x7000, .symbol = "main", .module = 1, .function = 100, .pc = 100 };
@@ -80,6 +81,25 @@ test "evaluates once per generation; adding or expanding re-evaluates" {
     _ = try list.add("j", watch.FrameId.of(10, 0, f_main, .{ .session = 1, .image = 0, .thread = 1 }, 1));
     list.refresh(&fake);
     try std.testing.expectEqual(@as(usize, 4), fake.calls);
+}
+
+test "extent advisory remains attached to stale values and refreshes at a stop" {
+    var fake = Fake{ .frames = &.{f_main}, .extent_advisory = true };
+    var list = watch.WatchList{};
+    defer list.deinit();
+    _ = try list.add("value", watch.FrameId.of(10, 0, f_main, .{ .session = 1, .image = 0, .thread = 1 }, 1));
+    list.refresh(&fake);
+    try std.testing.expect(list.entries[0].available and list.entries[0].extent_advisory);
+    fake.running = true;
+    fake.extent_advisory = false;
+    list.refresh(&fake);
+    try std.testing.expect(list.entries[0].extent_advisory);
+    try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    fake.running = false;
+    fake.gen += 1;
+    list.refresh(&fake);
+    try std.testing.expect(list.entries[0].available and !list.entries[0].extent_advisory);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
 }
 
 test "frame identity: follows the activation, never the index" {

@@ -49,7 +49,11 @@ int main(void) {
     v = value(&p, 68, BASE+512); assert(!v.reason && !strcmp(v.display, "string \"a\\x00b\\xff\"") && v.count==4);
     put(512+8, 20, 1); put(512+11, 255, 1); put(512+16, 300, 8);
     memset(bytes+512+24, 'x', 300);
-    v = value(&p, 84, BASE+512); assert(!v.reason && v.truncated && v.count==300);
+    v = value(&p, 84, BASE+512); assert(v.advisory && !strcmp(v.reason, "LuaStringExtentUnproved") && v.truncated && v.count==300);
+    put(512+16, UINT64_C(1) << 62, 8); v = value(&p, 84, BASE+512);
+    assert(!v.advisory && v.reason && !strcmp(v.reason, "LuaStringLengthInvalid") && !v.display[0]);
+    put(512+16, (UINT64_C(1) << 56) - (BASE+512+24), 8); v = value(&p, 84, BASE+512);
+    assert(!v.advisory && v.reason && !strcmp(v.reason, "LuaStringLengthInvalid"));
     put(512+16, UINT64_MAX, 8); v = value(&p, 84, BASE+512);
     assert(v.reason && !strcmp(v.reason, "LuaStringLengthInvalid"));
     struct xl_reader r = reader(); r.reads = XL_READ_LIMIT;
@@ -61,6 +65,12 @@ int main(void) {
     v = value(&p, 1, UINT64_C(0xdeadbeef00000001)); assert(!v.reason && !strcmp(v.display, "true"));
     v = value(&p, 1, 2); assert(v.reason && !strcmp(v.reason, "LuaBooleanInvalid"));
     p = profile(); memset(bytes, 0, sizeof bytes);
+    put(512+8, 5, 1); put(512+12, UINT64_C(1)<<30, 4);
+    put(512+16, BASE+1024, 8); put(512+24, BASE+4096, 8);
+    v = value(&p, 69, BASE+512);
+    assert(v.advisory && !strcmp(v.reason, "LuaTableExtentUnproved") && v.truncated);
+    assert(v.array_capacity == UINT64_C(1)<<30 && !strcmp(v.type, "table"));
+    memset(bytes, 0, sizeof bytes);
     put(256+8, 8, 1); put(256+32, BASE+512, 8); put(256+48, BASE+1024, 8); put(256+40, BASE+2048, 8);
     put(512, BASE+1024, 8); put(512+8, BASE+1536, 8); put(512+16, BASE+512, 8); put(512+24, BASE+512, 8); put(512+62, 2, 2);
     put(1024, 22, 1); put(1024+8, 0x1234, 8);

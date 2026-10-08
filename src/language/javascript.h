@@ -42,14 +42,19 @@ struct xjs_item {
     uint64_t tagged;
     char key[96], type[32], display[192];
     const char *reason;
+    int truncated;
+    int extent_advisory;
+    const char *name_reason;
 };
 struct xjs_value {
     uint64_t tagged, map, count;
     uint16_t instance_type;
     int truncated;
     int version_table;
+    int extent_advisory;
     char type[64], display[512];
     const char *reason;
+    const char *name_reason;
     size_t item_count;
     struct xjs_item items[XJS_PREVIEW_ITEMS];
 };

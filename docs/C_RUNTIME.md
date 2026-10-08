@@ -29,6 +29,26 @@ make -C src/runtime CC=gcc BUILD="$PWD/.work/c-runtime" check
 # Or use CC=clang and a separate BUILD directory.
 ```
 
+Run the standalone suite with ASan, UBSan and leak detection:
+
+```sh
+ASAN_OPTIONS=detect_leaks=1 UBSAN_OPTIONS=halt_on_error=1 \
+make -C src/runtime CC=clang BUILD="$PWD/.work/c-sanitized" \
+  CFLAGS='-O1 -g -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -fno-omit-frame-pointer' check
+```
+
+Synthetic tracees use `_exit` because LeakSanitizer's helper cannot trace a
+process already being traced. The process test also uses `_exit` for its
+denied-ptrace fault injector, whose inherited filter blocks that helper. The
+sendto-failure injector exits normally; the zero-fd injector restores its saved
+soft limit before exiting normally. Both retain launch-cleanup leak checks.
+Memory accesses remain instrumented in every case. The controller, proxy and
+agent exit normally with leak checks enabled.
+
+`make -C src/runtime check-leaks` verifies that distinction with Clang
+ASan/UBSan: a clean process test must pass, while a leak planted in an owned
+copy of the launch-failure cleanup code must fail with a LeakSanitizer report.
+
 The output is `libxrt.a`, `xodb-agent` and `xodb-lsof-top` (the
 [live open-file view](LSOF_TOP.md), the same program as `xodb --lsof-top`).
 Copy the agent to a work directory on the target, then use its absolute path:

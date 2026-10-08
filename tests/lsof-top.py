@@ -400,9 +400,22 @@ try:
     red = json.dumps(lsof_json(pids, '--fds', '--redact', samples=1))
     check(not private(red), f'redacted JSON leaks {private(red)}')
 
-    # A snapshot needs no terminal; the interactive view does.
-    out = subprocess.run([str(xodb), '--lsof-top'], stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
-    check(out.returncode == 2 and 'needs a terminal' in out.stderr, out.stderr)
+    # A missing/dumb TERM deliberately selects one snapshot. Other terminal
+    # types require a TTY for the interactive view, independent of our runner.
+    for term in (None, 'dumb', 'foot', 'xterm-256color'):
+        env = dict(os.environ)
+        if term is None:
+            env.pop('TERM', None)
+        else:
+            env['TERM'] = term
+        out = subprocess.run([str(xodb), '--lsof-top', '--pid', str(os.getpid()), '--redact'],
+                             env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30)
+        if term in (None, 'dumb'):
+            check(out.returncode == 0 and 'lsof-top' in out.stdout and '\x1b' not in out.stdout,
+                  f'TERM={term!r}: snapshot fallback: {out.stderr}')
+        else:
+            check(out.returncode == 2 and 'needs a terminal' in out.stderr,
+                  f'TERM={term!r}: interactive refusal: {out.stderr}')
     out = subprocess.run([str(xodb), '--lsof-top', '--interval', 'x'], capture_output=True, text=True, timeout=30)
     check(out.returncode == 2, 'bad interval accepted')
 

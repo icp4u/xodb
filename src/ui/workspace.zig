@@ -105,11 +105,15 @@ const WatchSource = struct {
         const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame), text) catch |err| return .{ .failed = err };
         const summary = self.session.summarize(a, value) catch |err| return .{ .failed = err };
         const expandable = value.type.kind == .structure or value.type.kind == .array;
-        var result = watch_ui.Result{ .value = .{ .display = summary.display, .type_name = summary.type, .available = summary.availability == .available, .expandable = expandable } };
+        const extent_advisory = if (summary.visualization) |v| v.extent_advisory else false;
+        var result = watch_ui.Result{ .value = .{ .display = summary.display, .type_name = summary.type, .available = summary.availability == .available, .extent_advisory = extent_advisory, .expandable = expandable } };
         if (page) |start| if (expandable) {
             const view = self.session.valueChildren(a, value, start, watch_ui.max_children, false) catch |err| return .{ .failed = err };
             const children = a.alloc(watch_ui.Child, view.children.len) catch return result;
-            for (view.children, children) |child, *out| out.* = .{ .name = child.name, .display = child.value.display };
+            for (view.children, children) |child, *out| {
+                const advisory = if (child.value.visualization) |v| v.extent_advisory else false;
+                out.* = .{ .name = child.name, .display = if (advisory) std.fmt.allocPrint(a, "unproved extent: {s}", .{child.value.display}) catch child.value.display else child.value.display, .extent_advisory = advisory };
+            }
             result.value.children = children;
             result.value.total = view.total;
             result.value.next = view.next;
@@ -1717,8 +1721,9 @@ pub const Workspace = struct {
                     if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = 47 }, 6, 1);
                     try r.textFit(font, right + 14, y, side.w - 24, local.name, theme.neutral);
                     const type_x = right + 14 + r.measure(font, local.name) + 14;
-                    try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, local.value.type, theme.weak);
-                    try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available) theme.text else theme.weak);
+                    const advisory = if (local.value.visualization) |v| v.extent_advisory else false;
+                    try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, if (advisory) "extent unproved" else local.value.type, theme.weak);
+                    try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
                 }
             } else {
                 try pane(r, font, side, "REGISTERS", "changed since last stop");

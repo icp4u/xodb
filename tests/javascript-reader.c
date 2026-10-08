@@ -145,6 +145,21 @@ int main(void) {
     put(array + 15, elements, 8); put(array + 23, UINT64_C(3) << 32, 8);
     v = decode(array); assert(!v.reason && v.version_table && v.count == 3 && v.item_count == 3);
     assert(!strcmp(v.display, "Array(3) [smi 42, string \" there\", undefined]"));
+    /* A wide UTF-8 preview must retain both its extent advisory and its
+     * independent truncation marker when copied into the smaller item. */
+    uint64_t wide = object(32, 272);
+    put(wide + 11, 128, 4);
+    for (size_t i = 0; i < 128; ++i) put(wide + 15 + i * 2, 0x03bb, 2);
+    put(wide - 1 + 272, 0, 8);
+    put(elements + 23, wide, 8); v = decode(array);
+    assert(v.items[1].reason && !strcmp(v.items[1].reason, "JavaScriptStringExtentUnproved"));
+    assert(v.items[1].truncated);
+    assert(v.extent_advisory && v.items[1].extent_advisory && !v.items[0].extent_advisory);
+    size_t preview = strlen(v.items[1].display);
+    assert(preview < sizeof v.items[1].display && !strcmp(v.items[1].display + preview - 3, "..."));
+    assert((preview - 3 - strlen("string \"")) % 2 == 0);
+    assert(!v.items[0].truncated && !strcmp(v.items[0].display, "smi 42"));
+    put(elements + 23, b, 8);
     layout.version_string[0] = '2'; v = decode(array);
     assert(v.reason && !strcmp(v.reason, "JavaScriptSupplementVersionUnsupported")); layout.version_string[0] = '1';
     layout.fields[XJS_CODE_WRAPPER] += 8; v = decode(array);
@@ -183,6 +198,12 @@ int main(void) {
     put(function + 55, meta + 1, 8); v = decode(obj);
     assert(v.reason && !strcmp(v.reason, "JavaScriptConstructorNameUnproved"));
     assert(!strcmp(v.type, "Object") && v.item_count == 1);
+    put(descriptors + 39, (uint64_t)layout.fields[XJS_PROP_DOUBLE] << (layout.fields[XJS_PROP_REPR_SHIFT] + 32), 8);
+    v = decode(obj);
+    assert(v.name_reason && !strcmp(v.name_reason, "JavaScriptConstructorNameUnproved"));
+    assert(v.reason && !strcmp(v.reason, "JavaScriptDoubleFieldUnsupported"));
+    assert(v.items[0].reason && !strcmp(v.items[0].reason, "JavaScriptDoubleFieldUnsupported"));
+    put(descriptors + 39, 0, 8);
     put(function + 55, map, 8);
     uint64_t unsupported = object(65000, 24);
     put(elements + 23, unsupported, 8); v = decode(array);

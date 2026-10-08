@@ -38,11 +38,12 @@ struct xl_item {
     uint64_t address;
     char key[160], type[24], display[384];
     const char *reason;
+    int advisory;
 };
 struct xl_value {
     uint64_t address, object, count, array_capacity, hash_capacity;
     uint32_t tag;
-    int truncated;
+    int truncated, advisory;
     char type[24], display[768];
     const char *reason;
     size_t item_count;

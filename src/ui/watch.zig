@@ -67,10 +67,10 @@ pub const FrameId = struct {
 };
 pub const Mode = enum { pinned, live };
 pub const State = enum { pending, value, failed, frame_gone, thread_gone, context_changed, stack_unavailable, stale, not_in_scope };
-pub const Child = struct { name: []const u8, display: []const u8 };
+pub const Child = struct { name: []const u8, display: []const u8, extent_advisory: bool = false };
 /// One evaluation, filled by the context. Slices live until the next refresh.
 pub const Result = union(enum) {
-    value: struct { display: []const u8, type_name: []const u8, available: bool, expandable: bool = false, children: []const Child = &.{}, total: ?u64 = null, next: ?u64 = null },
+    value: struct { display: []const u8, type_name: []const u8, available: bool, extent_advisory: bool = false, expandable: bool = false, children: []const Child = &.{}, total: ?u64 = null, next: ?u64 = null },
     failed: anyerror,
 };
 
@@ -82,6 +82,7 @@ pub const Entry = struct {
     display: Text(max_display) = .{},
     type_name: Text(max_type) = .{},
     available: bool = false,
+    extent_advisory: bool = false,
     /// `display` holds a value from a successful evaluation.
     has_value: bool = false,
     ever_resolved: bool = false,
@@ -107,6 +108,7 @@ pub const Entry = struct {
         self.state = state;
         self.has_value = false;
         self.available = false;
+        self.extent_advisory = false;
         self.display.len = 0;
         self.type_name.len = 0;
         self.changed = false;
@@ -303,6 +305,7 @@ pub const WatchList = struct {
                     entry.type_name.set(v.type_name);
                     entry.fingerprint = std.hash.Wyhash.hash(std.hash.Wyhash.hash(@intFromBool(v.available), v.type_name), v.display);
                     entry.available = v.available;
+                    entry.extent_advisory = v.extent_advisory;
                     entry.expandable = v.expandable;
                     if (!v.expandable) entry.expanded = false;
                     entry.children = v.children;
@@ -312,6 +315,7 @@ pub const WatchList = struct {
                 .failed => |err| {
                     entry.state = if (entry.mode == .live and entry.ever_resolved and err == error.UnknownVariable) .not_in_scope else .failed;
                     entry.has_value = false;
+                    entry.extent_advisory = false;
                     entry.failure = err;
                     entry.display.len = 0;
                     entry.expandable = false;
@@ -750,6 +754,10 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
         try r.textFit(font, x, y, w, label_context, theme.weak);
         y += row_h;
     };
+    if (list.selected) |selected| if (list.entries[selected].extent_advisory and list.entries[selected].has_value) {
+        try r.textFit(font, x, y, w, "Extent unproved / dimmed preview", theme.weak);
+        y += row_h;
+    };
     // Flatten entries and expanded children into rows.
     const Row = struct { entry: usize, child: ?usize };
     var rows: [max_entries * (max_children + 2)]Row = undefined;
@@ -788,7 +796,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
                 std.fmt.bufPrint(&buffer, "    {d}..{d} of {d}; PgDn more", .{ entry.page, next, entry.total orelse next }) catch ""
             else
                 std.fmt.bufPrint(&buffer, "    {d} item{s}", .{ entry.total orelse entry.children.len, if ((entry.total orelse entry.children.len) == 1) "" else "s" }) catch "";
-            try r.textFit(font, x, ry, w, text, if (c < entry.children.len) theme.text else theme.weak);
+            try r.textFit(font, x, ry, w, text, if (c < entry.children.len and !entry.children[c].extent_advisory) theme.text else theme.weak);
             continue;
         }
         if (list.selected != null and list.selected.? == row.entry) try style.focus(r, .{ .x = rect.x + 4, .y = ry - 3, .w = rect.w - 8, .h = row_h }, 6, 1);
@@ -815,7 +823,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
             .stack_unavailable => .{ "stack unavailable; value not refreshed", theme.warm },
         };
         if (entry.changed and entry.state == .value) try r.shape(.{ .x = value_x - 4, .y = ry - 2, .w = @min(value_w, r.measure(font, value) + 8), .h = row_h - 2 }, theme.fresh, .{ .radii = @splat(5) });
-        try r.textFit(font, value_x, ry, value_w, value, if (entry.changed and entry.state == .value) theme.warm else color);
+        try r.textFit(font, value_x, ry, value_w, value, if (entry.extent_advisory) theme.weak else if (entry.changed and entry.state == .value) theme.warm else color);
         if (type_w > 0 and entry.state == .value) try r.textFit(font, x + w - tag_w - 12 - type_w, ry, type_w - 8, entry.type_name.slice(), theme.weak);
         if (tag_w > 0) try r.textFit(font, x + w - tag_w, ry, tag_w, tag, if (entry.state == .frame_gone or entry.state == .thread_gone or entry.state == .context_changed or entry.state == .stack_unavailable or entry.unverified) theme.warm else theme.weak);
     }

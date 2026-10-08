@@ -16,7 +16,11 @@ typedef struct TValue { Value value_; unsigned char tt_; } TValue;
 typedef union StackValue { TValue val; } StackValue;
 typedef struct GCObject { HEAD; } GCObject;
 typedef struct TString { HEAD; unsigned char shrlen; union {size_t lnglen;} u; char contents[1]; } TString;
-typedef struct Table { HEAD; unsigned char flags, lsizenode; unsigned alimit; TValue *array; void *node, *lastfree; } Table;
+typedef struct Table { HEAD;
+#ifdef TABLE_PADDING
+    unsigned char unrelated_padding[8];
+#endif
+    unsigned char flags, lsizenode; unsigned alimit; TValue *array; void *node, *lastfree; } Table;
 typedef union Node { TValue i_val; struct {Value value_; unsigned char tt_, key_tt; int next; Value key_val;} u; } Node;
 typedef struct LClosure { HEAD; unsigned char nupvalues; void *p; void *upvals[1]; } LClosure;
 typedef struct CClosure { HEAD; unsigned char nupvalues; void *f; TValue upvalue[1]; } CClosure;
@@ -28,4 +32,13 @@ typedef union StkIdRel { StackValue *p; ptrdiff_t offset; } StkIdRel;
 typedef struct CallInfo { StkIdRel func, top; struct CallInfo *previous, *next; union {struct {const unsigned *savedpc;} l;} u; unsigned short callstatus; } CallInfo;
 typedef struct lua_State { HEAD; unsigned char status; StkIdRel top, stack, stack_last; void *l_G; CallInfo *ci; CallInfo base_ci; } lua_State;
 typedef struct AbsLineInfo { int pc, line; } AbsLineInfo;
+#ifndef RUNTIME_ANCHORS
+#define RUNTIME_ANCHORS 3
+#endif
+#if RUNTIME_ANCHORS & 1
+static void luaV_execute(void) { }
+#endif
+#if RUNTIME_ANCHORS & 2
+static const char lua_ident[] = "$LuaVersion: Lua 5.4.9 $";
+#endif
 int main(void) { return 0; }

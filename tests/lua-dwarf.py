@@ -38,6 +38,40 @@ int main(int argc, char **argv) {
         subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-DWRONG_NUMBER='+str(wrong),
             'tests/fixtures/lua/layout.c','-o',str(target)],check=True,timeout=30)
         check(target,'LuaLayoutUnsupported' if wrong else 'ok')
+    # A larger embedded C++ host reuses common names. These incomplete
+    # candidates must not override or conflict with the actual Lua layouts.
+    host=work/'host.o'
+    subprocess.run(['c++','-g','-O0','-fno-eliminate-unused-debug-types','-c',
+        'tests/fixtures/lua/embedded.cc','-o',str(host)],check=True,timeout=30)
+    good=work/'good.o'
+    subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-Dmain=lua_host_main','-c',
+        'tests/fixtures/lua/layout.c','-o',str(good)],check=True,timeout=30)
+    embedded=work/'embedded'
+    subprocess.run(['c++',str(host),str(good),'-o',str(embedded)],check=True,timeout=30)
+    check(embedded,'ok')
+    # Two complete field-conforming layouts that disagree are still refused.
+    # Each CU supplies one distinct runtime anchor, as separate core sources do.
+    scoped=work/'scoped.o'
+    subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-DRUNTIME_ANCHORS=1',
+        '-Dmain=lua_host_main','-c','tests/fixtures/lua/layout.c','-o',str(scoped)],check=True,timeout=30)
+    other=work/'other.o'
+    subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-DTABLE_PADDING',
+        '-DRUNTIME_ANCHORS=2','-Dmain=alternate_main','-c','tests/fixtures/lua/layout.c','-o',str(other)],check=True,timeout=30)
+    ambiguous=work/'ambiguous'
+    subprocess.run(['c++',str(host),str(scoped),str(other),'-o',str(ambiguous)],check=True,timeout=30)
+    check(ambiguous,'LuaDwarfAmbiguous')
+    # Equal layouts do not prove a single runtime. Local symbols from a second
+    # static copy and its DWARF definitions must not be merged with the first.
+    duplicate=work/'duplicate.o'
+    subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types',
+        '-Dmain=second_runtime_main','-c','tests/fixtures/lua/layout.c','-o',str(duplicate)],check=True,timeout=30)
+    dual=work/'two-runtimes'
+    subprocess.run(['c++',str(host),str(good),str(duplicate),'-o',str(dual)],check=True,timeout=30)
+    check(dual,'LuaRuntimeMultiple')
+    no_symbols=work/'two-runtimes-dwarf-only'
+    subprocess.run(['objcopy','--strip-symbol=lua_ident','--strip-symbol=luaV_execute',
+        str(dual),str(no_symbols)],check=True,timeout=10)
+    check(no_symbols,'LuaRuntimeMultiple')
     for encoding in ('zlib','zlib-gnu'):
         target=work/encoding
         subprocess.run(['objcopy','--compress-debug-sections='+encoding,str(work/'good'),str(target)],check=True,timeout=10)

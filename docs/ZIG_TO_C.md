@@ -112,9 +112,14 @@ The allocation privilege helper remains separate.
 The existing local suite passes through this boundary, including lifecycle,
 probe/family control, live profiling, loss/cancellation handling and private GUI
 checks. Standalone GCC tests exercise the C runtime without linking Zig; targeted
-Clang ASan/UBSan runs check target and collector ownership. Ptrace sanitizer runs
-disable LeakSanitizer (`ASAN_OPTIONS=detect_leaks=0`) because it starts its own
-tracer. Collector/framing tests also run with leak detection enabled.
+Clang ASan/UBSan runs check target and collector ownership with leak detection
+enabled. Synthetic tracees use `_exit` because LeakSanitizer's exit helper cannot
+trace an already-traced process. Only the denied-ptrace fault injector also
+bypasses exit handlers because its inherited filter blocks that helper. The
+sendto-failure injector exits normally, and the zero-fd injector restores its
+saved soft limit before exiting normally. Controllers, proxies, agents and
+those launch-failure paths retain ordinary leak checks. All test processes
+retain instrumented memory accesses.
 
 The standalone C agent and C host proxy now use that same API. The agent owns
 remote targets, collectors and target-file descriptors. Mapped files cross as

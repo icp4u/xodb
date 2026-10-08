@@ -301,10 +301,16 @@ static void child_value(const struct xjs_layout *l, struct xjs_reader *r, uint64
     if (r->error) return;
     value(l, r, tagged, &child, depth + 1);
     item->tagged = tagged; item->reason = child.reason;
-    if (!item->reason && (child.truncated || strlen(child.display) >= sizeof item->display))
+    item->extent_advisory = child.extent_advisory;
+    item->name_reason = child.name_reason;
+    item->truncated = child.truncated || strlen(child.display) >= sizeof item->display;
+    if (!item->reason && item->truncated)
         item->reason = "JavaScriptPreviewTruncated";
     copy_text(item->type, sizeof item->type, child.type);
-    copy_text(item->display, sizeof item->display, child.display);
+    if (strlen(child.display) >= sizeof item->display) {
+        copy_text(item->display, sizeof item->display - 3, child.display);
+        strcat(item->display, "...");
+    } else copy_text(item->display, sizeof item->display, child.display);
     /* A corrupt/unsupported child does not erase proved siblings. Resource
      * exhaustion remains fatal and the counters are never reset. */
     if (r->error && strcmp(r->error, "JavaScriptReadBudget")) r->error = NULL;
@@ -340,6 +346,7 @@ static int array(const struct xjs_layout *l, struct xjs_reader *r, const struct 
             }
         } else child_value(l, r, element, item, depth);
         if (r->error) return 0;
+        out->extent_advisory |= item->extent_advisory;
         if (item->reason && !out->reason) out->reason = item->reason;
         if (i) append_display(out, ", ");
         append_display(out, item->display);
@@ -389,6 +396,7 @@ static int object_value(const struct xjs_layout *l, struct xjs_reader *r, const 
         }
         break;
     }
+    out->name_reason = out->reason;
     copy_text(out->display, sizeof out->display, out->type); append_display(out, " {");
     if (!count) { append_display(out, "}"); return r->error == NULL; }
     uint64_t descriptors = at(l, r, h->map - 1, XJS_MAP_DESCRIPTORS, 8); struct head d;
@@ -415,7 +423,10 @@ static int object_value(const struct xjs_layout *l, struct xjs_reader *r, const 
             } else child_value(l, r, word(r, h->address + (start + index) * 8, 8), item, depth);
         }
         if (r->error) return 0;
-        if (item->reason && !out->reason) out->reason = item->reason;
+        out->extent_advisory |= item->extent_advisory;
+        /* Preserve the independent name advisory without hiding a field's
+         * reason behind it. The first field reason remains the summary. */
+        if (item->reason && (!out->reason || out->reason == out->name_reason)) out->reason = item->reason;
         if (i) append_display(out, ", ");
         append_display(out, item->key); append_display(out, ": "); append_display(out, item->display);
     }
@@ -433,7 +444,10 @@ static void value(const struct xjs_layout *l, struct xjs_reader *r, uint64_t tag
             out->map = h.map; out->instance_type = h.type;
             if (h.type < field(l, r, XJS_FIRST_NONSTRING)) {
                 strcpy(out->type, "string"); strcpy(out->display, "string ");
-                if (string(l, r, tagged, out->display + 7, sizeof out->display - 7, &out->count, &out->truncated, 1, &out->reason)) return;
+                if (string(l, r, tagged, out->display + 7, sizeof out->display - 7, &out->count, &out->truncated, 1, &out->reason)) {
+                    out->extent_advisory = out->reason && !strcmp(out->reason, "JavaScriptStringExtentUnproved");
+                    return;
+                }
             } else if (is(l, h.type, XJS_TYPE_NUMBER)) {
                 uint64_t bits = at(l, r, h.address, XJS_NUMBER, 8); double value; memcpy(&value, &bits, 8);
                 if (!r->error) { strcpy(out->type, "number"); number_text(out->display, sizeof out->display, value); return; }

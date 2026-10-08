@@ -55,7 +55,7 @@ try:
     d.app.stdin.close();assert d.app.wait(timeout=10)==0
     if target.poll() is None: target.kill(); target.wait()
     # Reuse only this private compositor to exercise the user-facing script.
-    env=dict(d.env,NODE=args.node,NODE_INCLUDE=args.include)
+    env=dict(d.env,NODE=args.node,NODE_INCLUDE=args.include,XODB=str(root/'zig-out/bin/xodb'))
     with (work/'demo.log').open('wb') as log:
         demo=subprocess.Popen(['scripts/demo-node'],env=env,stdin=subprocess.DEVNULL,stdout=log,stderr=subprocess.STDOUT,start_new_session=True)
         try:

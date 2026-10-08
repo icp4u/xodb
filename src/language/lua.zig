@@ -33,7 +33,7 @@ fn buildId(a: A, p: *const c.struct_xl_layout) ![]const u8 {
     return out;
 }
 fn layoutError(message: [*c]const u8) anyerror {
-    inline for (.{ error.LuaDwarfUnavailable, error.LuaDwarfMalformed, error.LuaDwarfUnitLimit, error.LuaDwarfWorkLimit, error.LuaDwarfTypeDepthLimit, error.LuaDwarfAmbiguous, error.LuaDwarfTypesUnavailable, error.LuaVersionUnsupported }) |err| {
+    inline for (.{ error.LuaRuntimeMultiple, error.LuaDwarfUnavailable, error.LuaDwarfMalformed, error.LuaDwarfUnitLimit, error.LuaDwarfWorkLimit, error.LuaDwarfTypeDepthLimit, error.LuaDwarfAmbiguous, error.LuaDwarfTypesUnavailable, error.LuaVersionUnsupported }) |err| {
         if (std.mem.eql(u8, std.mem.span(message), @errorName(err))) return err;
     }
     return error.LuaLayoutUnsupported;
@@ -50,6 +50,32 @@ fn fileBytes(module: *Module, address: u64, out: []u8) !void {
     }
     return error.LuaVersionUnavailable;
 }
+fn singleRuntime(module: *Module) !void {
+    // A static middleware copy may have local/hidden symbols. Do not let the
+    // ordinary global-first lookup assign its state the other copy's version.
+    // Symtab/dynsym and a debug companion can repeat the same definition.
+    const elf = @import("../binary/elf.zig");
+    var definitions: [2]?u64 = .{ null, null };
+    var remaining: u32 = 1_000_000;
+    const images = [_]*const elf.Image{ &module.image, module.symbols() };
+    for (images, 0..) |image, index| {
+        if (index == 1 and images[0] == image) continue;
+        for ([_]elf.SymbolTable.Kind{ .symtab, .dynsym }) |kind| {
+            const table = (image.symbols(kind) catch return error.LuaSymbolMalformed) orelse continue;
+            if (table.count() > remaining) return error.LuaSymbolWorkLimit;
+            remaining -= table.count();
+            var i: u32 = 1;
+            while (i < table.count()) : (i += 1) {
+                const symbol = table.get(i) catch return error.LuaSymbolMalformed;
+                if (!symbol.hasAddress()) continue;
+                const slot: usize = if (symbol.type == .object and std.mem.eql(u8, symbol.name, "lua_ident")) 0 else if (symbol.type == .func and std.mem.eql(u8, symbol.name, "luaV_execute")) 1 else continue;
+                if (definitions[slot]) |old| {
+                    if (old != symbol.value) return error.LuaRuntimeMultiple;
+                } else definitions[slot] = symbol.value;
+            }
+        }
+    }
+}
 fn runtimeModule(session: *model.Session) !*Module {
     // These profiles cover standalone interpreters and static embedded hosts.
     // Kernel PHDR evidence identifies their image without loading unrelated
@@ -59,6 +85,7 @@ fn runtimeModule(session: *model.Session) !*Module {
     _ = runtime.c.xrt_target_loader(session.target.handle, &loader, null);
     if (loader.main_phdr == 0) return error.LuaModuleIdentityUnavailable;
     const module = session.modules.at(loader.main_phdr) catch return error.LuaModuleIdentityUnavailable;
+    if (module.lua_layout == null) try singleRuntime(module);
     if (module.symbols().findSymbol("lua_ident") == null) return error.LuaRuntimeUnavailable;
     if (module.symbols().findSymbol("luaV_execute") == null) return error.LuaImplementationUnsupported;
     return module;
@@ -105,7 +132,8 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
     const state = stateType(child);
-    if (!state and !std.mem.eql(u8, child.name, "TValue") and !std.mem.eql(u8, child.name, "lua_TValue")) return null;
+    const stack_value = std.mem.eql(u8, child.name, "StackValue");
+    if (!state and !stack_value and !std.mem.eql(u8, child.name, "TValue") and !std.mem.eql(u8, child.name, "lua_TValue")) return null;
     const module = runtimeModule(session) catch |err| return if (err == error.LuaRuntimeUnavailable) null else err;
     const layout = try profile(session, module);
     if (state) {
@@ -114,6 +142,11 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         if (child.size != 0 and (child.size != layout.sizes[c.XL_T_STATE] or
             !matchesField(child, "ci", layout.fields[c.XL_STATE_CI].offset, 8) or
             !matchesField(child, if (layout.version[1] == 4) "stack.p" else "stack", layout.fields[c.XL_STATE_STACK].offset, 8))) return null;
+    } else if (stack_value) {
+        if (layout.version[1] != 4 or child.size != layout.sizes[c.XL_T_STACK] or
+            !matchesField(child, "val", 0, layout.sizes[c.XL_T_TVALUE]) or
+            !matchesField(child, "val.tt_", layout.fields[c.XL_TAG].offset, layout.fields[c.XL_TAG].size) or
+            !matchesField(child, "val.value_", layout.fields[c.XL_BITS].offset, layout.fields[c.XL_BITS].size)) return null;
     } else if (child.size != layout.sizes[c.XL_T_TVALUE] or
         !matchesField(child, "tt_", layout.fields[c.XL_TAG].offset, layout.fields[c.XL_TAG].size) or
         !matchesField(child, "value_", layout.fields[c.XL_BITS].offset, layout.fields[c.XL_BITS].size)) return null;
@@ -127,6 +160,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .type = try a.dupe(u8, std.mem.sliceTo(&item.type, 0)),
         .display = try a.dupe(u8, std.mem.sliceTo(&item.display, 0)),
         .diagnostic = try reason(a, item.reason),
+        .advisory = item.advisory != 0,
     };
     return .{
         .presentation = .scalar,
@@ -135,9 +169,11 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .element_type = child.name,
         .truncated = raw.truncated != 0,
         .diagnostic = try reason(a, raw.reason),
-        .basis = "Lua version and loaded build-id checked; same-image DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved",
+        .basis = if (module.debug_file != null) "Lua version and loaded build-id checked; build-id companion DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved" else "Lua version and loaded build-id checked; same-image DWARF; bounded stopped memory; no target calls or metamethods; GC liveness and allocation extents unproved",
         .lua = .{
             .type = try a.dupe(u8, std.mem.sliceTo(&raw.type, 0)),
+            .advisory = raw.advisory != 0,
+            .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF",
             .display = try a.dupe(u8, std.mem.sliceTo(&raw.display, 0)),
             .object = raw.object,
             .array_capacity = raw.array_capacity,
@@ -192,24 +228,20 @@ pub const Stack = struct {
 };
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 const Candidate = struct { address: u64, anchor: ?Anchor };
-fn fromFrame(session: *model.Session, a: A, frame: model.Frame) !?Candidate {
+fn fromFrame(session: *model.Session, a: A, frame: model.Frame, requested: ?u64, candidates: *std.ArrayList(Candidate)) !void {
     const locals = try session.frameLocals(a, frame);
-    var found: ?Candidate = null;
     for (locals) |local| {
         if (!local.parameter or local.value.type.kind != .pointer) continue;
         const child = local.value.type.child orelse continue;
         if (!stateType(child)) continue;
         const v = session.evaluateInFrame(a, frame, locals, local.name) catch continue;
         if (v.availability != .available or v.bits == 0) continue;
-        if (found) |previous| {
-            if (previous.address != v.bits) return error.LuaStateArgumentAmbiguous;
-            continue;
-        }
+        if (requested) |address| if (v.bits != address) continue;
         const symbol = frame.symbol orelse "<native frame>";
         const anchored = std.mem.eql(u8, symbol, "luaV_execute") or std.mem.startsWith(u8, symbol, "luaD_");
-        found = .{ .address = v.bits, .anchor = if (anchored) .{ .frame = frame.index, .pc = try hex(a, frame.pc), .symbol = try a.dupe(u8, symbol), .argument = try a.dupe(u8, local.name) } else null };
+        if (candidates.items.len == 256) return error.LuaStateCandidateLimit;
+        try candidates.append(a, .{ .address = v.bits, .anchor = if (anchored) .{ .frame = frame.index, .pc = try hex(a, frame.pc), .symbol = try a.dupe(u8, symbol), .argument = try a.dupe(u8, local.name) } else null });
     }
-    return found;
 }
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?u64) !Stack {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
@@ -227,22 +259,14 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
     for (native[first..]) |frame| {
         const symbol = frame.symbol orelse "";
         if (frame.index != first and !std.mem.eql(u8, symbol, "luaV_execute") and !std.mem.startsWith(u8, symbol, "luaD_")) continue;
-        const recovered = fromFrame(session, a, frame) catch |err| blk: {
-            // An explicit state read does not depend on debug locals in an
-            // unrelated selected frame. Retain failed anchor recovery as
-            // evidence instead of preventing the requested observation.
-            if (requested == null) return err;
+        fromFrame(session, a, frame, requested, &candidates) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            // A native frame's missing locals cannot invalidate independently
+            // recovered states in other Lua frames. Keep the failed evidence.
             try diagnostics.append(a, .{ .frame = frame.index, .reason = @errorName(err) });
-            break :blk null;
         };
-        if (recovered) |candidate| {
-            if (requested) |address| {
-                if (candidate.address != address) continue;
-            }
-            try candidates.append(a, candidate);
-        }
     }
-    if (candidates.items.len == 0) return error.LuaStateArgumentUnavailable;
+    if (candidates.items.len == 0 and diagnostics.items.len == 0) return error.LuaStateArgumentUnavailable;
     var segments: std.ArrayList(Segment) = .empty;
     var r = reader(session);
     for (candidates.items, 0..) |candidate, index| {
@@ -252,7 +276,10 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
             break;
         };
         if (seen) continue;
-        if (segments.items.len == 8) return error.LuaStateLimit;
+        if (segments.items.len == 8) {
+            try diagnostics.append(a, .{ .frame = if (candidate.anchor) |anchor| anchor.frame else first, .reason = "LuaStateLimit" });
+            break;
+        }
         var anchors: std.ArrayList(Anchor) = .empty;
         for (candidates.items[index..]) |other| if (other.address == candidate.address) {
             if (other.anchor) |anchor| try anchors.append(a, anchor);
@@ -271,7 +298,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
             }
             out.* = .{ .name = name, .file = if (f.file[0] != 0) try a.dupe(u8, std.mem.sliceTo(&f.file, 0)) else null, .line = if (f.line > 0) @intCast(f.line) else null, .defined_line = if (f.defined_line >= 0) @intCast(f.defined_line) else null, .kind = if (f.is_c != 0) "C" else "Lua", .call_info = try hex(a, f.ci), .function_slot = try hex(a, f.function), .prototype = if (f.proto != 0) try hex(a, f.proto) else null, .native_function = if (f.native_function != 0) try hex(a, f.native_function) else null, .tail_call = f.tail_call != 0, .reason = try reason(a, f.reason) };
         }
-        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout) }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
+        try segments.append(a, .{ .runtime = .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .layout_source = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" }, .runtime_instance = .{ .address = try hex(a, candidate.address) }, .anchor = if (anchors.items.len > 0) anchors.items[0] else null, .additional_anchors = if (anchors.items.len > 1) try a.dupe(Anchor, anchors.items[1..]) else &.{}, .reason = (try reason(a, raw.reason)) orelse if (anchors.items.len > 0) "LuaNativeSegmentBoundaryUnproved" else "LuaNativeAnchorUnavailable", .frames = frames, .memory_reads = r.reads - before_reads, .memory_bytes = r.bytes - before_bytes });
         if (r.@"error") |why| {
             if (std.mem.eql(u8, std.mem.span(why), "LuaReadBudget")) break;
             r.@"error" = null;

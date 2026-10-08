@@ -73,7 +73,13 @@ static int string(const struct xl_layout *p, struct xl_reader *r, uint64_t at, c
     } else {
         n = field(p, r, at, XL_STR_LEN); offset = p->sizes[XL_T_STRING];
     }
-    if (r->error || n > INT64_MAX) return fail(r, "LuaStringLengthInvalid");
+    // These profiles support x86-64 Linux. Even five-level paging has only
+    // 56 positive user-address bits. Include the allocation header and NUL;
+    // a plausible extent still does not prove the actual allocation's size.
+    const uint64_t user_end = UINT64_C(1) << 56;
+    if (r->error || offset >= INT64_MAX || n >= INT64_MAX - offset ||
+        at >= user_end || offset >= user_end - at || n >= user_end - at - offset)
+        return fail(r, "LuaStringLengthInvalid");
     unsigned char bytes[XL_STRING_BYTES]; size_t count = n > sizeof bytes ? sizeof bytes : (size_t)n;
     if (!read_bytes(r, add(r, at, offset), bytes, count)) return 0;
     escape(out, cap, bytes, count); *length = n; *truncated = n > count;
@@ -89,12 +95,12 @@ static void value(const struct xl_layout *p, struct xl_reader *r, uint64_t at, s
     if (!nil((unsigned)tag, p->version[1]) && !(p->version[1] == 4 && (tag == 1 || tag == 17)))
         bits = field(p, r, at, XL_BITS);
     if (!r->error) decode(p, r, bits, (unsigned)tag, out, depth);
-    if (r->error) out->reason = r->error;
+    if (r->error) { out->reason = r->error; out->advisory = 0; }
 }
 static void child(const struct xl_layout *p, struct xl_reader *r, uint64_t at, struct xl_item *out, unsigned depth) {
     struct xl_value v; value(p, r, at, &v, depth);
     out->address = at; copy(out->type, sizeof out->type, v.type); copy(out->display, sizeof out->display, v.display);
-    out->reason = v.reason;
+    out->reason = v.reason; out->advisory = v.advisory;
     if (r->error && strcmp(r->error, "LuaReadBudget")) r->error = NULL;
 }
 static void table(const struct xl_layout *p, struct xl_reader *r, uint64_t at, struct xl_value *out, unsigned depth) {
@@ -113,7 +119,11 @@ static void table(const struct xl_layout *p, struct xl_reader *r, uint64_t at, s
     out->array_capacity = a; out->hash_capacity = h;
     copy(out->type, sizeof out->type, "table");
     snprintf(out->display, sizeof out->display, "table (%" PRIu64 " array slots, %" PRIu64 " hash slots)", a, h);
-    if (depth >= 1) { out->truncated = a || h; return; }
+    if (depth >= 1) {
+        out->truncated = a || h;
+        if (out->truncated) { out->reason = "LuaTableExtentUnproved"; out->advisory = 1; }
+        return;
+    }
     uint64_t scanned = 0;
     for (uint64_t i = 0; i < a && scanned < 128 && out->item_count < XL_PREVIEW_ITEMS; ++i, ++scanned) {
         uint64_t slot = add(r, arr, i * p->sizes[XL_T_TVALUE]);
@@ -139,20 +149,24 @@ static void table(const struct xl_layout *p, struct xl_reader *r, uint64_t at, s
         if (r->error) { item->reason = r->error; copy(item->key, sizeof item->key, "<key unavailable>"); }
         else copy(item->key, sizeof item->key, key.display);
         if (r->error && strcmp(r->error, "LuaReadBudget")) r->error = NULL;
-        const char *key_error = item->reason;
+        const char *key_error = item->reason ? item->reason : key.reason;
+        const int key_advisory = item->reason ? 0 : key.advisory;
         child(p, r, slot, item, depth + 1);
-        if (!item->reason) item->reason = key_error;
+        if (key_error && (!item->reason || (!key_advisory && item->advisory))) {
+            item->reason = key_error; item->advisory = key_advisory;
+        }
         if (r->error) return;
     }
     out->truncated = scanned < a || hs < h;
+    if (out->truncated) { out->reason = "LuaTableExtentUnproved"; out->advisory = 1; }
     if (out->item_count) {
         copy(out->display, sizeof out->display, "table");
         size_t used = strlen(out->display);
         for (size_t i = 0; i < out->item_count && i < 4; ++i) {
             const struct xl_item *item = &out->items[i];
-            const char *key = item->key, *shown = item->reason ? item->reason : item->display;
+            const char *key = item->key, *shown = item->reason && !item->advisory ? item->reason : item->display;
             if (!strncmp(key, "string ", 7)) key += 7;
-            if (!item->reason) {
+            if (!item->reason || item->advisory) {
                 if (!strncmp(shown, "integer ", 8)) shown += 8;
                 else if (!strncmp(shown, "number ", 7) || !strncmp(shown, "string ", 7)) shown += 7;
             }
@@ -233,7 +247,9 @@ static void decode(const struct xl_layout *p, struct xl_reader *r, uint64_t bits
         char text[XL_STRING_BYTES * 4 + 1]; uint64_t length; int truncated;
         if (!string(p, r, bits, text, sizeof text, &length, &truncated)) return;
         copy(out->type, sizeof out->type, "string"); out->count = length; out->truncated = truncated;
-        snprintf(out->display, sizeof out->display, "string \"%s\"%s", text, truncated ? "..." : ""); break;
+        if (truncated) { out->reason = "LuaStringExtentUnproved"; out->advisory = 1; }
+        snprintf(out->display, sizeof out->display, "string \"%s\"%s", text, truncated ? "..." : "");
+        break;
     }
     case 69: table(p, r, bits, out, depth); break;
     case 70: copy(out->type, sizeof out->type, "function"); function(p, r, bits, out, depth); break;
@@ -273,7 +289,7 @@ void xl_state_read(const struct xl_layout *p, struct xl_reader *r, uint64_t at, 
     if (out->item_count) {
         const struct xl_item *last = &out->items[out->item_count - 1];
         snprintf(out->display, sizeof out->display, "top: %s (Lua state, %" PRIu64 " stack slots)",
-                 last->reason ? last->reason : last->display, out->count);
+                 last->reason && !last->advisory ? last->reason : last->display, out->count);
     }
 }
 
@@ -281,8 +297,14 @@ static int32_t line(const struct xl_layout *p, struct xl_reader *r, uint64_t pro
     uint64_t code = field(p, r, proto, XL_PROTO_CODE), count = field(p, r, proto, XL_PROTO_NCODE);
     uint64_t lines = field(p, r, proto, XL_PROTO_LINES), nlines = field(p, r, proto, XL_PROTO_NLINES);
     if (r->error) return -1;
-    if (!code || !count || count > INT32_MAX || savedpc <= code || savedpc - code > count * 4 || (savedpc - code) % 4) {
+    if (!code || !count || count > INT32_MAX || savedpc < code || savedpc - code > count * 4 || (savedpc - code) % 4) {
         fail(r, "LuaSavedPcInvalid"); return -1;
+    }
+    if (savedpc == code) {
+        int32_t defined = (int32_t)field(p, r, proto, XL_PROTO_LINE);
+        if (defined < 0) fail(r, "LuaLineInfoInvalid");
+        else fail(r, "LuaFrameNotStarted");
+        return defined < 0 ? -1 : defined;
     }
     uint64_t pc = (savedpc - code) / 4 - 1;
     if (!lines || !nlines) { fail(r, "LuaLineInfoUnavailable"); return -1; }

@@ -54,6 +54,8 @@ pub const Preview = struct {
     hex: ?[]const u8 = null,
     preview_bytes: usize = 0,
     truncated: bool = false,
+    /// An extent check raised an advisory; false does not certify an extent.
+    extent_advisory: bool = false,
     diagnostic: ?[]const u8 = null,
     basis: []const u8 = basis,
     perl: ?PerlValue = null,
@@ -61,8 +63,9 @@ pub const Preview = struct {
     javascript: ?JavaScriptValue = null,
     lua: ?LuaValue = null,
 };
-pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, advisory: bool = false };
 pub const LuaValue = struct {
+    advisory: bool = false,
     type: []const u8,
     display: []const u8,
     object: u64,
@@ -77,8 +80,9 @@ pub const LuaValue = struct {
     memory_bytes: usize,
     items: []LuaItem,
 };
-pub const JavaScriptItem = struct { tagged: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const JavaScriptItem = struct { tagged: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, truncated: bool = false, extent_advisory: bool = false, name_diagnostic: ?[]const u8 = null };
 pub const JavaScriptValue = struct {
+    name_diagnostic: ?[]const u8 = null,
     type: []const u8,
     display: []const u8,
     tagged: u64,
