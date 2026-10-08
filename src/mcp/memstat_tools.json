@@ -1,0 +1,158 @@
+[
+  {
+    "name": "get_memory_map",
+    "description": "Pinned process VMAs, coalesced page-state ranges or fixed address cells. Plain pagemap fallback leaves huge/written/zero unknown; NUMA is optional VMA totals only (numa=true). Cells require a range, retain unmapped gaps, and distinguish virtual-category changes from PMD mapping changes; physical migration is unknown. Pagination requires the returned cache.sequence after page one; a changed publication returns StaleMemorySnapshot. Reads one shared background cache at most once per second; first call may be pending. Four live process/range scopes, bounded scans, explicit partial/unavailable states. No target memory reads, dirty-bit resets, policy changes, or physical frame numbers. Expensive collection adapts refresh_ms toward 0.8% of one core per scope (maximum 60 seconds); requests may continue at 1 Hz. Inspect cache age and cost_limited; page-scan CPU/range bounds can separately report partial coverage.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "start_ticks": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,20}$"
+            }
+          ]
+        },
+        "range_start": {
+          "type": "string",
+          "pattern": "^0x[0-9a-fA-F]{1,16}$"
+        },
+        "range_end": {
+          "type": "string",
+          "pattern": "^0x[0-9a-fA-F]{1,16}$"
+        },
+        "view": {
+          "type": "string",
+          "enum": [
+            "vmas",
+            "ranges",
+            "cells"
+          ],
+          "default": "vmas"
+        },
+        "cell_bytes": {
+          "type": "integer",
+          "minimum": 4096,
+          "maximum": 2097152,
+          "description": "Cells only: 2097152 (default) or host base page size. Range boundaries must align."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "default": 128
+        },
+        "offset": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 0
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,20}$"
+            }
+          ]
+        },
+        "sequence": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,20}$"
+            }
+          ]
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide process names, VMA paths and inodes in this reply. Virtual addresses and pinned PID identity remain."
+        },
+        "numa": {
+          "type": "boolean",
+          "default": false,
+          "description": "Collect per-VMA NUMA totals; adds a numa_maps walk. Omitted by default."
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "pid",
+        "start_ticks"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_thp_state",
+    "description": "System-wide THP/khugepaged settings, zswap and vmstat counter deltas; optional pinned process smaps/rollup totals and eligible PMD coverage. Supply pid and start_ticks together. Counters never attribute kernel activity to a selected process. Reads one shared background cache at most once per second; first call may be pending. Four live process/range scopes, bounded scans, explicit partial/unavailable states. No target memory reads, dirty-bit resets, policy changes, or physical frame numbers. Expensive collection adapts refresh_ms toward 0.8% of one core per scope (maximum 60 seconds); requests may continue at 1 Hz. Inspect cache age and cost_limited; page-scan CPU/range bounds can separately report partial coverage.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "start_ticks": {
+          "oneOf": [
+            {
+              "type": "integer",
+              "minimum": 1
+            },
+            {
+              "type": "string",
+              "pattern": "^[0-9]{1,20}$"
+            }
+          ]
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide process names, VMA paths and inodes in this reply. Virtual addresses and pinned PID identity remain."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_fragmentation",
+    "description": "Linux buddy free blocks per zone/order and kernel fragmentation index. -1000 means a suitable allocation exists; other negative indices are valid. Zero free pages is separately visible. This index is not a completion percentage. Includes system-wide counter deltas. Reads one shared background cache at most once per second; first call may be pending. Four live process/range scopes, bounded scans, explicit partial/unavailable states. No target memory reads, dirty-bit resets, policy changes, or physical frame numbers. Expensive collection adapts refresh_ms toward 0.8% of one core per scope (maximum 60 seconds); requests may continue at 1 Hz. Inspect cache age and cost_limited; page-scan CPU/range bounds can separately report partial coverage.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "order": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 31,
+          "description": "Default order for 2 MiB using host base page size."
+        },
+        "redact": {
+          "type": "boolean",
+          "description": "Hide process names, VMA paths and inodes in this reply. Virtual addresses and pinned PID identity remain."
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

@@ -404,6 +404,7 @@ static void contract(void)
     const char *scratch = native->machine == XRT_X86_64      ? "r10"
                           : native->machine == XRT_AARCH64    ? "x9"
                           : native->machine == XRT_LOONGARCH  ? "r12"
+                          : native->machine == XRT_PPC64      ? "r12"
                                                               : "d2";
     const struct xrt_register_desc *field =
         xrt_arch_register(native->machine, scratch, strlen(scratch));
@@ -605,6 +606,105 @@ static void loongarch_replay(void)
     }
 }
 
+static void ppc64_replay(void)
+{
+    const struct xrt_arch *arch = xrt_arch_get(XRT_PPC64);
+    struct xrt_registers regs;
+    struct xrt_step_resources step;
+    struct xrt_probe_request request;
+    struct xrt_probe_encoding encoding;
+    unsigned char image[385];
+    unsigned char saved_bytes[sizeof(regs)];
+    uint64_t values[XRT_DWARF_REGISTER_COUNT];
+    uint8_t present[XRT_DWARF_REGISTER_COUNT];
+    uint64_t pc = 99;
+    CHECK(arch && xrt_arch_validate(arch) == XRT_OK);
+    CHECK(arch->kernel_gpr_bytes == 384 && arch->register_count == 44 && arch->dwarf_count == 66);
+    CHECK(arch->hardware_step == 1 && arch->breakpoint_adjust == 0 && arch->caller_adjust == 4);
+    CHECK(arch->trap_size == 4 && arch->trap[0] == 0x08 && arch->trap[1] == 0x00 &&
+          arch->trap[2] == 0xe0 && arch->trap[3] == 0x7f);
+    CHECK(xrt_arch_resolve(xrt_arch_abi(arch)) == arch);
+    {
+        struct xrt_abi_id foreign = xrt_arch_abi(arch);
+        foreign.little_endian = 0;
+        CHECK(xrt_arch_resolve(foreign) == NULL);
+    }
+    CHECK(xrt_arch_step_resources(arch, XRT_ISA_MODE_ORDINARY, &step) == XRT_OK);
+    CHECK(step.hardware_step == 1 && step.software_probes == 0);
+    memset(&encoding, 0x5a, sizeof(encoding));
+    request = (struct xrt_probe_request){.address = 0x1000,
+                                         .isa_mode = XRT_ISA_MODE_ORDINARY,
+                                         .bytes = arch->trap,
+                                         .size = 4};
+    CHECK(xrt_arch_probe_prepare(arch, &request, &encoding) == XRT_OK);
+    CHECK(encoding.width == 4 && encoding.bytes[0] == 0x08 && encoding.bytes[3] == 0x7f);
+    CHECK(xrt_arch_breakpoint_pc(XRT_PPC64, 0x1000, &pc) && pc == 0x1000);
+    CHECK(xrt_arch_caller_pc(XRT_PPC64, 0x1000, &pc) && pc == 0xffc);
+    CHECK(!xrt_arch_caller_pc(XRT_PPC64, 3, &pc) && pc == 0xffc);
+    CHECK(xrt_arch_breakpoint_valid(XRT_PPC64, 0x1000, 4));
+    CHECK(!xrt_arch_breakpoint_valid(XRT_PPC64, 0x1002, 4));
+    memset(image, 0, sizeof(image));
+    for (size_t i = 0; i < 48; ++i)
+        for (size_t b = 0; b < 8; ++b)
+            image[1 + i * 8 + b] = (unsigned char)(word(i) >> (b * 8));
+    memset(&regs, 0xa5, sizeof(regs));
+    {
+        const struct xrt_abi_id abi = xrt_arch_abi(arch);
+        memcpy(saved_bytes, &regs, sizeof(regs));
+        CHECK(xrt_registers_decode(&abi, image + 1, 383, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(memcmp(&regs, saved_bytes, sizeof(regs)) == 0);
+        CHECK(xrt_registers_decode(&abi, image + 1, 385, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(xrt_registers_decode(&abi, NULL, 384, &regs) == XRT_INVALID_ARGUMENT);
+        CHECK(xrt_registers_decode(&abi, image + 1, 384, &regs) == XRT_OK);
+    }
+    CHECK(regs.values.ppc.r0 == word(0) && regs.values.ppc.r1 == word(1));
+    CHECK(regs.values.ppc.r2 == word(2) && regs.values.ppc.r12 == word(12));
+    CHECK(regs.values.ppc.r31 == word(31) && regs.values.ppc.pc == word(32));
+    CHECK(regs.values.ppc.msr == word(33) && regs.values.ppc.orig_gpr3 == word(34));
+    CHECK(regs.values.ppc.ctr == word(35) && regs.values.ppc.lr == word(36));
+    CHECK(regs.values.ppc.xer == word(37) && regs.values.ppc.ccr == word(38));
+    CHECK(regs.values.ppc.softe == word(39) && regs.values.ppc.trap == word(40));
+    CHECK(regs.values.ppc.dar == word(41) && regs.values.ppc.dsisr == word(42));
+    CHECK(regs.values.ppc.result == word(43));
+    memset(values, 0xa5, sizeof(values));
+    memset(present, 0xa5, sizeof(present));
+    CHECK(xrt_registers_dwarf(&regs, values, present, XRT_DWARF_REGISTER_COUNT) == XRT_OK);
+    for (size_t i = 0; i < 32; ++i) {
+        CHECK(values[i] == word(i) && present[i] == 1);
+        CHECK(strcmp(xrt_arch_dwarf_name(XRT_PPC64, (uint16_t)i), arch->registers[i].name) == 0);
+    }
+    CHECK(values[65] == word(36) && present[65] == 1);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_PPC64, 65), "lr") == 0);
+    CHECK(present[32] == 0 && present[64] == 0);
+    CHECK(values[32] == UINT64_C(0xa5a5a5a5a5a5a5a5));
+    CHECK(xrt_arch_dwarf_name(XRT_PPC64, 32) == NULL);
+    CHECK(xrt_arch_dwarf_name(XRT_PPC64, 64) == NULL);
+    CHECK(xrt_arch_dwarf_name(XRT_PPC64, 66) == NULL);
+    CHECK(xrt_registers_pc(&regs, &pc) == XRT_OK && pc == word(32));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_SP, &pc) == XRT_OK && pc == word(1));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_RA, &pc) == XRT_OK && pc == word(36));
+    CHECK(arch->registers[0].access == XRT_REG_READ_WRITE && strcmp(arch->registers[0].name, "r0") == 0);
+    CHECK(arch->registers[2].access == XRT_REG_READ_WRITE && strcmp(arch->registers[2].name, "r2") == 0);
+    CHECK(arch->registers[33].access == XRT_REG_READ_ONLY && strcmp(arch->registers[33].name, "msr") == 0);
+    CHECK(arch->registers[39].access == XRT_REG_READ_ONLY && strcmp(arch->registers[39].name, "softe") == 0);
+    CHECK(arch->registers[41].access == XRT_REG_READ_ONLY && strcmp(arch->registers[41].name, "dar") == 0);
+    CHECK(arch->registers[42].access == XRT_REG_READ_ONLY && strcmp(arch->registers[42].name, "dsisr") == 0);
+    CHECK(arch->registers[43].access == XRT_REG_READ_ONLY && strcmp(arch->registers[43].name, "result") == 0);
+    CHECK(arch->registers[34].access == XRT_REG_READ_WRITE &&
+          strcmp(arch->registers[34].name, "orig_gpr3") == 0);
+    CHECK(arch->registers[40].access == XRT_REG_READ_WRITE && strcmp(arch->registers[40].name, "trap") == 0);
+    {
+        unsigned char raw[384];
+        memset(raw, 0x5a, sizeof(raw));
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r0", 2, word(0)) == XRT_OK);
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "r12", 3, word(12)) == XRT_OK);
+        CHECK(raw[0] == (unsigned char)(word(0) & 0xff));
+        CHECK(raw[383] == 0x5a);
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "msr", 3, 1) == XRT_REGISTER_NOT_WRITABLE);
+        CHECK(raw[33 * 8] == 0x5a && raw[33 * 8 + 7] == 0x5a);
+    }
+}
+
 /* A LoongArch NT_PRSTATUS get fills 280 bytes and leaves the reserved tail.
  * Writes and confirmation must not depend on that tail; an unnamed byte that
  * does change after a write (x86 orig_rax) still unconfirms it. */
@@ -658,6 +758,15 @@ static void partial_regsets(void)
     memcpy(image, bank.image, sizeof(image));
     CHECK(xrt_registers_mutate(x86, &io, 1, image, &result) == XRT_PARTIAL_REGISTER_WRITE &&
           result.issued && !result.confirmed);
+    const struct xrt_arch *ppc = xrt_arch_get(XRT_PPC64);
+    bank = (struct partial_bank){.fill = ppc->kernel_gpr_bytes, .flip = -1};
+    memset(bank.image, 0x33, sizeof(bank.image));
+    memcpy(image, bank.image, ppc->kernel_gpr_bytes);
+    CHECK(xrt_registers_mutate(ppc, &io, 1, image, &result) == XRT_OK && result.confirmed);
+    bank.flip = (int)ppc->kernel_gpr_bytes - 1;
+    bank.writes = 0;
+    CHECK(xrt_registers_mutate(ppc, &io, 1, image, &result) == XRT_PARTIAL_REGISTER_WRITE &&
+          result.issued && !result.confirmed);
 }
 
 static void stopped_child(const char *executable)
@@ -687,6 +796,7 @@ int main(int argc, char **argv)
     descriptors();
     contract();
     loongarch_replay();
+    ppc64_replay();
     partial_regsets();
     const struct xrt_arch *arch = xrt_arch_native();
     const char *no_live = getenv("XODB_TEST_NO_LIVE");
@@ -724,8 +834,9 @@ int main(int argc, char **argv)
         CHECK(present[pc_reg->dwarf] && values[pc_reg->dwarf] != 0);
         pc_value = values[pc_reg->dwarf];
     }
-    const char *scratch = arch->machine == XRT_X86_64     ? "r10"
+    const char *scratch = arch->machine == XRT_X86_64      ? "r10"
                           : arch->machine == XRT_LOONGARCH ? "r12"
+                          : arch->machine == XRT_PPC64     ? "r12"
                                                            : "x9";
     CHECK(xrt_register_write(child, scratch, strlen(scratch), UINT64_C(0xabcdef1234567890)) ==
           XRT_OK);
@@ -734,6 +845,8 @@ int main(int argc, char **argv)
         CHECK(after.values.x86.r10 == UINT64_C(0xabcdef1234567890));
     else if (arch->machine == XRT_LOONGARCH)
         CHECK(after.values.loongarch.r12 == UINT64_C(0xabcdef1234567890));
+    else if (arch->machine == XRT_PPC64)
+        CHECK(after.values.ppc.r12 == UINT64_C(0xabcdef1234567890));
     else
         CHECK(after.values.arm.x9 == UINT64_C(0xabcdef1234567890));
     CHECK(xrt_register_write(child, "fs_base", 7, 0) == XRT_UNKNOWN_REGISTER);

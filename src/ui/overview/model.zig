@@ -318,6 +318,8 @@ pub const Snapshot = struct {
     processes: []const Process = &.{},
     processes_truncated: u64 = 0,
     cost: Cost = .{},
+    /// A recorded memory map (replays only; live maps come from the observer).
+    memory_map: ?*const @import("../../memdefrag/model.zig").Map = null,
     /// False for a group copied from an earlier sample (sampled less often).
     fresh: [group_count]bool = @splat(true),
     pub fn group(self: *const Snapshot, g: Group) GroupState {

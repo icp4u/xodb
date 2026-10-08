@@ -158,6 +158,7 @@ investigations](OBSERVATIONS.md) for a Ruby example and the CLI/MCP workflow.
 | AArch64 | Existing execution backend now in C; target registers and host ISA selection | Hardware data watches; no process following or remote profiling |
 | m68k | GCC-built agent tested in the VM: launch, break/step, GPR writes, ELF32 big-endian files, host disassembly, CFI and expressions | Hardware watches, FP state, process following and profiling explicitly unsupported |
 | LoongArch64 | GCC-built agent on a LoongArch64 Linux host: launch/attach, threads, signals, software breakpoints, register and memory read/write, host symbols, CFI and expressions. Host assembly is decoded when xodb links the private Capstone 6 prefix | Hardware watches, CPU/syscall/allocation capture and uprobes explicitly unsupported. The default system Capstone 5.x build reports disassembly unavailable. Instruction step is a software step; hardware step stays off. `r0` is read-only. This slice reads the general regset |
+| ppc64le | GCC-built agent on a little-endian ELFv2 POWER host: launch/attach, threads, signals, software breakpoints, hardware single-step, register and memory read/write, host symbols, CFI and expressions. Host assembly uses Capstone's PPC decoder, including the default system library. A step at `lwarx`/`ldarx`/`lbarx`/`lharx`/`lqarx` runs through the matching store-conditional instead of single-stepping it | Hardware watches, CPU/syscall/allocation capture, uprobes and process following explicitly unsupported. VSX and VMX notes are not decoded. Function breakpoints and opening-line breakpoints stop at the ELFv2 local entry when the symbol has one |
 
 Kernel permissions and kernel feature availability are checked by each operation.
 Unsupported architecture/capability, permissions, transport failures and stale
@@ -269,6 +270,62 @@ lifted while it runs, so a breakpoint on its path cannot kill it. At
 again and the child is detached. The parent then resumes, and a step over
 `vfork` stops after the syscall returns with the child pid. x86 still holds
 the birth for the user to adopt.
+
+ppc64le is ELF machine 21, ELFCLASS64, little-endian, ELFv2. The breakpoint is
+`tw 31,0,0` (`08 00 e0 7f`), four-byte aligned, with no PC adjustment. A call's
+link register points at the next instruction, so the caller adjustment is 4.
+`r1` is the stack pointer. The link register is DWARF 65 and is published as
+`lr`. The kernel PC field is `nip`; it is published as `pc` and has no DWARF
+number, so the top frame reads it from the register role and a caller frame
+reads `lr`. `r0` and `r2` are ordinary writable GPRs. `r2` is the TOC. `orig_gpr3` and
+`trap` stay writable because they steer syscall restart. `msr`, `softe`, `dar`,
+`dsisr` and `result` are read-only: the kernel does not apply a write of those
+slots, and `msr` accepts only the single-step and branch-trace bits.
+NT_PRSTATUS is 384 bytes. The first 44 words are `pt_regs`. The kernel writes
+the remaining 32 bytes as well; confirmation covers that whole image, and those
+bytes are not named registers. Buffers are zeroed before the read. There is no
+skip mask. VMX (`NT_PPC_VMX`, 544 bytes) and VSX (`NT_PPC_VSX`, 256 bytes) were
+measured and are not decoded. Hardware single-step stopped with `TRAP_TRACE`
+under QEMU's emulated POWER9 pseries machine. That measurement is not a claim
+about every POWER implementation. On that machine an `sc` or `scv` instruction
+step overshoots by one instruction (`TRAP_TRACE` at the syscall plus 8).
+A step whose PC is `lwarx`, `ldarx`, `lbarx`, `lharx` or `lqarx` does not use
+hardware single-step: that clears the reservation, so the store-conditional
+never succeeds and the retry branch livelocks. The agent scans at most 16
+instructions for the closing `stwcx.`, `stdcx.`, `sthcx.`, `stbcx.` or
+`stqcx.`, plants temporary traps on the next instruction and on one conditional
+branch that leaves the sequence, and continues. The stop is reported as a
+single-step, and the traps are removed before that stop is published.
+A function-symbol breakpoint is planted at the ELFv2 local entry when
+`st_other` encodes one. A source line or run-to address that is exactly that
+global entry is planted there too, so a local call and a global call (which
+falls through the TOC setup) both stop. `find_symbol` still reports the ELF
+symbol value, the global entry, and `local_entry` is the byte offset. Branch
+flow is classified from the instruction word. Capstone supplies the mnemonic
+and any immediate target. Opcode 18 is a jump, or a call if LK is set. Opcode
+16 is a call if LK is set, a jump when the branch-always BO bits `(BO & 0x14)
+== 0x14` are set, and a conditional branch otherwise. `bclr` (opcode 19, XO
+16) is a return when it is unconditional and does not link. `bcctr` and
+`bctar` (XO 528 and 560) are jumps or conditional branches, and calls if they
+link. `sc` and `scv` (opcode 17) are system calls. `tw` and `td` (opcode 31,
+XO 4 and 68) are traps. A 621-instruction objdump sample had six mnemonic
+differences and no undecoded words. That sample is not the whole story. On
+guest libc, libm, bash, the dynamic loader, and an -O2 binary, system Capstone 5
+compared 965974 instructions and left 498 undecoded: 405 are `scv`, and the
+rest are POWER10 prefixed or vector forms. The same corpus has 0 flow
+disagreements on 182578 branch, trap, and system-call words. Six copies of
+word `0x41820000` are a conditional branch with displacement 0. Capstone 5
+prints `beq` and supplies no immediate, so those six have no recorded target.
+glibc on the measured kernel uses `scv` (HWCAP2 SCV is set). The word
+`0x429f0005` is `bcl 20,31`: BO is 20, the branch is always taken, LK is set,
+and the target is the next instruction, so the flow is a call. Capstone 5
+prints that word as `bdnzl`. That is a mis-print, not an alias. Watchpoints,
+profile, allocation capture, uprobes and process following stay unsupported.
+On this row a fork or clone detaches the child after patched probes are
+restored in that child, and the parent resumes. A vfork child shares the
+image: it stays traced with those probes lifted until VFORK_DONE, then the
+probes are planted again and the child is detached. A breakpoint on the
+vfork child's path does not kill it.
 
 ## Portable agent startup and bounded breakpoint discovery
 

@@ -16,6 +16,8 @@ p.add_argument('--python', type=Path)
 p.add_argument('--perl', type=Path)
 p.add_argument('--lua', type=Path)
 p.add_argument('--node', type=Path)
+p.add_argument('--unsupported-perl', type=Path)
+p.add_argument('--unsupported-lua', type=Path)
 p.add_argument('--embedded', type=Path, help='Owned host linking CPython and PUC Lua')
 a = p.parse_args()
 os.umask(0o022)
@@ -43,11 +45,18 @@ for label, exe, arguments in [('python', a.python, ('-c', 'print(1)')),
         cases.append((label, exe, [label], arguments))
 if a.embedded:
     cases.append(('embedded', a.embedded, ['python', 'lua'], ()))
+unavailable = {}
+if a.unsupported_perl:
+    cases.append(('unsupported-perl', a.unsupported_perl, [], ('-e', 'print 1')))
+    unavailable['unsupported-perl'] = ('perl', 'perl_run', 'PerlVersionUnsupported', 'Unsupported version')
+if a.unsupported_lua:
+    cases.append(('unsupported-lua', a.unsupported_lua, [], ('-e', 'print(1)')))
+    unavailable['unsupported-lua'] = ('lua', 'lua_pcallk', 'LuaImplementationUnsupported', 'Unsupported Lua build')
 results = []
 
 
 def poll_tabs(display, predicate):
-    deadline = time.monotonic() + 180
+    deadline = time.monotonic() + 900
     while True:
         result = display.tool('get_language_tabs')
         if predicate(result['view']):
@@ -59,12 +68,24 @@ for label, executable, languages, arguments in cases:
     d = None
     report = {'case': label, 'status': 'running'}
     try:
-        d = h.Display(str(root), ['--agent-scope', 'control', '--break', 'main', '--', str(executable), *arguments])
+        d = h.Display(str(root), ['--agent-scope', 'control', '--break', unavailable[label][1] if label in unavailable else 'main', '--', str(executable), *arguments])
         d.tool('continue', generation=d.session()['generation'])
         assert d.stopped('breakpoint')
         view = poll_tabs(d, lambda v: v['complete'])
         tabs = [t['tab'] for t in view['tabs'] if t['visible']]
         assert tabs == ['registers', 'native', *languages], view
+        if label in unavailable:
+            language, _, reason, hint = unavailable[label]
+            entry = next(t for t in view['tabs'] if t['tab']==language)
+            assert entry['status']=='unavailable' and entry['reason']==reason and not entry['visible'], entry
+            deadline = time.monotonic()+15
+            while True:
+                shot = d.shot(label+'-hint')
+                text = subprocess.run(['tesseract', shot, 'stdout', '--psm', '11'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30).stdout
+                if hint.lower() in text.lower(): break
+                assert time.monotonic()<deadline, text
+                time.sleep(.1)
+            (Path(shot+'.txt')).write_text(text)
         generation = d.session()['generation']
         tid = d.session()['threads'][0]['tid']
         registers = d.tool('get_registers', tid=tid)

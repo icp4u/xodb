@@ -2,6 +2,7 @@
 #include "../src/language/perl.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -396,6 +397,127 @@ static void stacks(struct xpl_layout *l) {
     xpl_stack_read(l, &r, interp, &out);
     assert(!strcmp(out.reason, "ContextTypeInvalid"));
 }
+static void named_fixture(struct xpl_layout *l) {
+    memset(memory, 0, sizeof memory);
+    l->fields[XPL_SUBDEPTH] = (struct xpl_field_info){32, 4};
+    l->fields[XPL_NAMELEN].size = l->fields[XPL_NAMEFLAGS].size = 1;
+    l->fields[XPL_NAMELOW].size = l->fields[XPL_NAMEHIGH].size = 4;
+    l->fields[XPL_COPSEQ].size = l->fields[XPL_CVDEPTH].size = 4;
+    const uint64_t interp=0x1100, si=0x2000, cx=0x3000, cv=0x4000, body=0x5000, cop=0x6000;
+    field(l, interp, XPL_CURCOP, cop); field(l, interp, XPL_STACKINFO, si); field(l, interp, XPL_MAINCV, cv);
+    field(l, si, XPL_CXSTACK, cx); field(l, si, XPL_CXIX, 0); field(l, si, XPL_CXMAX, 0);
+    field(l, cop, XPL_COPLINE, 7); field(l, cop, XPL_COPFILE, 0x6800); field(l, cop, XPL_COPSEQ, 15);
+    str(0x6800, "fixture.pl"); sv(cv, 13, body, 0);
+    field(l, body, XPL_CVNAME, 0x7000); field(l, body, XPL_CVFLAGS, 0x8000);
+    put(0x7000, 10, 4); str(0x7004, "main::leaf");
+    field(l, cx, XPL_CXTYPE, 9); field(l, cx, XPL_SUBCV, cv); field(l, cx, XPL_OLDCOP, cop);
+    field(l, cx, XPL_SUBDEPTH, 1); field(l, body, XPL_CVDEPTH, 2);
+    field(l, body, XPL_CVPADLIST, 0x8000);
+    field(l, 0x8000, XPL_PADMAX, 2); field(l, 0x8000, XPL_PADARRAY, 0x9000);
+    put(0x9000, 0xa000, 8); put(0x9008, 0xb000, 8); put(0x9010, 0xb100, 8);
+    sv(0xb000, 11, 0xc000, 0xe000); sv(0xb100, 11, 0xc800, 0xf000);
+    field(l, 0xc000, XPL_AVFILL, 8); field(l, 0xc000, XPL_AVMAX, 8);
+    field(l, 0xc800, XPL_AVFILL, 8); field(l, 0xc800, XPL_AVMAX, 8);
+    field(l, 0xa000, XPL_NAMESFILL, 8); field(l, 0xa000, XPL_NAMESMAX, 8);
+    field(l, 0xa000, XPL_NAMESARRAY, 0xd000);
+    const char *names[] = {"", "$x", "$x", "$expired", "$closed", "$state", "$masked", "$masked", "&"};
+    for (unsigned i=0;i<9;++i) {
+        uint64_t pn=0x11000+i*512, name=0x15000+i*512;
+        put(0xd000+i*8,pn,8); field(l,pn,XPL_NAMEPV,name); str(name,names[i]);
+        field(l,pn,XPL_NAMELEN,strlen(names[i])); field(l,pn,XPL_NAMELOW,10); field(l,pn,XPL_NAMEHIGH,20);
+        sv(0x20000+i*32,0x101,0,100+i); put(0xf000+i*8,0x20000+i*32,8);
+        sv(0x21000+i*32,0x101,0,200+i); put(0xe000+i*8,0x21000+i*32,8);
+    }
+    field(l,0x11000+3*512,XPL_NAMEHIGH,14);
+    field(l,0x11000+4*512,XPL_NAMEFLAGS,1); field(l,0x11000+4*512,XPL_NAMELOW,99);
+    field(l,0x11000+5*512,XPL_NAMEFLAGS,2);
+    field(l,0x11000+7*512,XPL_NAMEOUR,0x8888);
+}
+static void named_locals(struct xpl_layout *l) {
+    struct xpl_locals *out=calloc(1,sizeof *out); assert(out);
+    named_fixture(l); struct xpl_reader r=reader();
+    xpl_locals_read(l,&r,0x1100,0,0,32,out);
+    assert(!out->reason && out->count==3 && out->total==3 && out->depth==2 && !out->truncated);
+    assert(!strcmp(out->items[0].name,"$state") && out->items[0].scope==XPL_STATE);
+    assert(!strcmp(out->items[1].name,"$closed") && out->items[1].scope==XPL_OUTER);
+    assert(!strcmp(out->items[2].name,"$x") && !strcmp(out->items[2].value.display,"IV 102"));
+    size_t reads=attempts;
+    for(size_t i=1;i<=reads;++i) {
+        fail_at=i;r=reader();xpl_locals_read(l,&r,0x1100,0,0,32,out);
+        assert(out->reason && r.reads<=8192 && r.bytes<=512*1024);
+    }
+    fail_at=0;
+    for(size_t start=0;start<5;++start) {
+        r=reader();xpl_locals_read(l,&r,0x1100,0,start,1,out);
+        assert(!out->reason && out->total==3 && out->count==(start<3));
+        assert(out->truncated==(start<2));
+    }
+    r=reader();xpl_locals_read(l,&r,0x1100,0,SIZE_MAX,SIZE_MAX,out);
+    assert(!out->reason && out->total==3 && !out->count && !out->truncated);
+    r=reader();xpl_local_find(l,&r,0x1100,0,"$x",out);
+    assert(!out->reason && out->count==1 && out->items[0].ordinal==2 && out->items[0].sv==0x20040);
+    reads=attempts;
+    for(size_t i=1;i<=reads;++i) {
+        fail_at=i;r=reader();xpl_local_find(l,&r,0x1100,0,"$x",out);assert(out->reason);
+    }
+    fail_at=0;
+    const char *missing[]={"$expired","$masked","$nothing"};
+    for(unsigned i=0;i<sizeof missing/sizeof *missing;++i) {
+        r=reader();xpl_local_find(l,&r,0x1100,0,missing[i],out);
+        assert(out->reason && !strcmp(out->reason, !strcmp(missing[i], "$masked") ? "PerlPackageVariableUnread" : "PerlOuterScopeUnread") && !out->count);
+    }
+    const char *invalid[]={NULL,"","$","x","$x+1","$x[0]","$x->foo","@a()","$::x"," $x","$x ","$9x","$$x"};
+    for(unsigned i=0;i<sizeof invalid/sizeof *invalid;++i) {
+        r=reader();xpl_local_find(l,&r,0x1100,0,invalid[i],out);
+        assert(!strcmp(out->reason,"UnsupportedPerlExpression") && attempts==0);
+    }
+    char long_name[257];memset(long_name,'x',sizeof long_name);long_name[0]='$';long_name[256]=0;
+    r=reader();xpl_local_find(l,&r,0x1100,0,long_name,out);assert(!strcmp(out->reason,"UnsupportedPerlExpression"));
+    r=reader();xpl_locals_read(l,&r,0x1100,1,0,32,out);
+    assert(!out->reason && out->depth==1 && !strcmp(out->items[2].value.display,"IV 202"));
+    r=reader();xpl_locals_read(l,&r,0x1100,128,0,32,out);assert(!strcmp(out->reason,"FrameUnavailable"));
+    struct { uint64_t object; enum xpl_field field; uint64_t value; const char *reason; } bad[]={
+        {0x3000,XPL_SUBDEPTH,2,"PadDepthInvalid"}, {0x3000,XPL_SUBDEPTH,UINT32_MAX,"PadDepthInvalid"},
+        {0x5000,XPL_CVFLAGS,0x8008,"XsFrameNoPad"}, {0x6000,XPL_COPSEQ,0,"PadSequenceUnavailable"},
+        {0x6000,XPL_COPSEQ,UINT32_MAX,"PadSequenceUnavailable"}, {0x5000,XPL_CVPADLIST,0,"PadlistUnavailable"},
+        {0x8000,XPL_PADMAX,1,"PadlistInvalid"}, {0x8000,XPL_PADARRAY,UINT64_MAX-8,"PadAddressOverflow"},
+        {0xa000,XPL_NAMESFILL,9,"PadNamesInvalid"}, {0xc800,XPL_AVFILL,7,"PadValuesInvalid"},
+        {0x3000,XPL_CXTYPE,10,"FormatPadUnproved"}, {0x3000,XPL_CXTYPE,11,"EvalPadUnproved"}, {0x3000,XPL_CXTYPE,0x8b,"EvalPadUnproved"},
+        {0x11000+2*512,XPL_NAMELOW,21,"PadSequenceWrapUnsupported"},
+        {0x11000+2*512,XPL_NAMELEN,8,"PadNameInvalid"},
+    };
+    for(unsigned i=0;i<sizeof bad/sizeof *bad;++i) {
+        named_fixture(l);field(l,bad[i].object,bad[i].field,bad[i].value);
+        r=reader();xpl_locals_read(l,&r,0x1100,0,0,32,out);
+        if(!out->reason || strcmp(out->reason,bad[i].reason)) fprintf(stderr,"named case %u: %s\n",i,out->reason?out->reason:"OK");
+        assert(out->reason && !strcmp(out->reason,bad[i].reason) && !out->count);
+    }
+    named_fixture(l);field(l,0xa000,XPL_NAMESFILL,4096);field(l,0xa000,XPL_NAMESMAX,4096);
+    r=reader();xpl_locals_read(l,&r,0x1100,0,0,32,out);assert(!strcmp(out->reason,"PadSlotLimit"));
+    named_fixture(l);put(0xf000+2*8,0,8);
+    r=reader();xpl_local_find(l,&r,0x1100,0,"$x",out);
+    assert(!out->reason && out->count==1 && !strcmp(out->items[0].reason,"PadValueUnavailable"));
+    named_fixture(l);field(l,0x11000+2*512,XPL_NAMEFLAGS,0x20);
+    r=reader();xpl_local_find(l,&r,0x1100,0,"$x",out);
+    assert(!out->reason && !strcmp(out->items[0].reason,"FieldStorageUnproved") && !out->items[0].sv);
+    named_fixture(l);r=reader();r.reads=8192;xpl_locals_read(l,&r,0x1100,0,0,32,out);
+    assert(!strcmp(out->reason,"PerlReadLimit") && !attempts);
+    r=reader();r.bytes=SIZE_MAX;xpl_local_find(l,&r,0x1100,0,"$x",out);
+    assert(!strcmp(out->reason,"PerlReadLimit") && !attempts);
+    /* A fixed deterministic malformed-memory corpus, never real process data. */
+    uint32_t random=123456789;
+    for(unsigned i=0;i<2000;++i) {
+        named_fixture(l);random=random*1664525u+1013904223u;
+        unsigned which=random%(sizeof bad/sizeof *bad);random=random*1664525u+1013904223u;
+        uint64_t value=(i&1)?random:((uint64_t)random<<32)|random;
+        field(l,bad[which].object,bad[which].field,value);
+        r=reader();xpl_locals_read(l,&r,0x1100,i%3,0,32,out);
+        assert(out->count<=32 && out->total<=512 && r.reads<=8192 && r.bytes<=512*1024);
+    }
+    free(out);
+    puts("Perl named locals: lexical scopes, recursive pads, shadows, pagination, exact lookup, every-read failure and 2000 corrupt objects passed");
+}
+
 int main(void) {
     struct xpl_layout l = layout();
     assert(!xpl_layout_check(&l, l.build_id, l.build_id_len, l.version));
@@ -409,6 +531,7 @@ int main(void) {
     layout_units(64, "PerlDwarfTypesUnavailable");
     layout_units(65, "PerlDwarfUnitLimit");
     stacks(&l);
+    named_locals(&l);
     puts("Perl memory reader: values, stale undef bits, bounded previews, identity refusal, corrupt contexts and "
          "every-read failure passed");
     return 0;

@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -29,7 +29,7 @@ pub fn build(b: *std.Build) void {
     // lsof-top: a terminal view over the runtime's fd scanner (xodb --lsof-top).
     module.addCSourceFile(.{ .file = b.path("src/lsoftop/lsoftop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // Host-only whole-system observer (overview view and MCP); not part of the agent.
-    for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c" }) |source|
+    for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c", "src/runtime/memstat.c", "src/runtime/memstat_system.c", "src/runtime/memstat_process.c", "src/runtime/memstat_pages.c", "src/runtime/memstat_cells.c", "src/runtime/memobserver.c" }) |source|
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // Static queries (src/semq) and the supervised ghx worker driver; the
     // Ghidra worker itself stays a separate, opt-in host tool (tools/ghx).
@@ -185,6 +185,10 @@ pub fn build(b: *std.Build) void {
         fdevent_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     for ([_][]const u8{ "src/runtime/fdevent_count.c", "tests/runtime-fdevent-count.c" }) |source|
         fdcount_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    const fdactivity_tests = b.addExecutable(.{ .name = "xodb-fdactivity-demand-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdactivity_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdactivity.c" }) |source|
+        fdactivity_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     const fdactivity_live = b.addExecutable(.{ .name = "xodb-fdactivity-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdactivity_live.root_module.addIncludePath(b.path("src/runtime"));
     for (runtime_sources) |source|
@@ -200,6 +204,27 @@ pub fn build(b: *std.Build) void {
     const fd_events = b.addExecutable(.{ .name = "xodb-fd-events", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fd_events.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/fd-events.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     b.installArtifact(fd_events);
+    const gdb_packet_tests = b.addExecutable(.{ .name = "xodb-gdb-packet-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    gdb_packet_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/gdb_packet.c", "tests/runtime-gdb-packet.c" }) |source|
+        gdb_packet_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(gdb_packet_tests);
+    const gdb_link_tests = b.addExecutable(.{ .name = "xodb-gdb-link-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    gdb_link_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-gdb-link.c" }) |source|
+        gdb_link_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(gdb_link_tests);
+    const gdb_description_tests = b.addExecutable(.{ .name = "xodb-gdb-description-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    gdb_description_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/gdb_description.c", "tests/runtime-gdb-description.c" }) |source|
+        gdb_description_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(gdb_description_tests);
+    const gdb_model_tests = b.addExecutable(.{ .name = "xodb-gdb-model-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    gdb_model_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source|
+        gdb_model_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    gdb_model_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-gdb-model.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(gdb_model_tests);
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     wire_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
@@ -223,6 +248,22 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c", "tests/runtime-services.c" }) |source| {
         sys_services_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
+    const memstat_system_tests = b.addExecutable(.{ .name = "xodb-runtime-memstat-system-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    memstat_system_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/memstat.c", "src/runtime/memstat_system.c", "src/runtime/memstat_process.c", "src/runtime/memstat_pages.c", "src/runtime/memstat_cells.c", "src/runtime/memobserver.c", "tests/runtime-memstat-system.c" }) |source|
+        memstat_system_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const memstat_process_tests = b.addExecutable(.{ .name = "xodb-runtime-memstat-process-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    memstat_process_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/memstat.c", "src/runtime/memstat_system.c", "src/runtime/memstat_process.c", "src/runtime/memstat_pages.c", "src/runtime/memstat_cells.c", "src/runtime/memobserver.c", "tests/runtime-memstat-process.c" }) |source|
+        memstat_process_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const memstat_cells_tests = b.addExecutable(.{ .name = "xodb-runtime-memstat-cells-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    memstat_cells_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/memstat.c", "src/runtime/memstat_system.c", "src/runtime/memstat_process.c", "src/runtime/memstat_pages.c", "src/runtime/memstat_cells.c", "src/runtime/memobserver.c", "tests/runtime-memstat-cells.c" }) |source|
+        memstat_cells_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const memobserver_tests = b.addExecutable(.{ .name = "xodb-runtime-memobserver-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    memobserver_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/memstat.c", "src/runtime/memstat_system.c", "src/runtime/memstat_process.c", "src/runtime/memstat_pages.c", "src/runtime/memstat_cells.c", "src/runtime/memobserver.c", "tests/runtime-memobserver.c" }) |source|
+        memobserver_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const loader_tests = b.addExecutable(.{ .name = "xodb-runtime-loader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     loader_tests.pie = false;
     loader_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -233,6 +274,10 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    test_step.dependOn(&b.addRunArtifact(gdb_packet_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gdb_link_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gdb_description_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gdb_model_tests).step);
     const symbol_tests = b.addExecutable(.{ .name = "xodb-runtime-symbol-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     symbol_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/elf_symbols.c", "tests/runtime-symbols.c" }) |source| {
@@ -333,7 +378,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -350,9 +395,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(perf_tests).step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fdactivity_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdevent_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdcount_tests).step);
     test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
     test_step.dependOn(&b.addRunArtifact(sysstat_tests).step);
     test_step.dependOn(&b.addRunArtifact(sys_services_tests).step);
+    test_step.dependOn(&b.addRunArtifact(memobserver_tests).step);
+    test_step.dependOn(&b.addRunArtifact(memstat_cells_tests).step);
+    test_step.dependOn(&b.addRunArtifact(memstat_process_tests).step);
+    test_step.dependOn(&b.addRunArtifact(memstat_system_tests).step);
 }

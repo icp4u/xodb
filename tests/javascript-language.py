@@ -121,7 +121,7 @@ def run(script, count, flags=(), script_args=()):
         assert definition['annotations']['readOnlyHint'] and definition['annotations']['xodbSessionAccess']=='observer'
         assert 'javascript' in definition['inputSchema']['properties']['language']['enum']
         client.action('set_breakpoint', symbol='xodb_node_stop')
-        client.action('continue')
+        client.continue_initial_stop()
         target.stdin.write('go\n'); target.stdin.flush()
         for i in range(count):
             state = client.stopped('breakpoint')

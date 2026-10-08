@@ -80,6 +80,9 @@ def case(label, executable, language=None, args=()):
         generation, tid = stopped['generation'], next(t['tid'] for t in stopped['threads'] if t['state'] == 'stopped')
         registers = observer.tool('get_registers', tid=tid)
         before = ready(observer)
+        # Cold metadata discovery may outlive the control lease. Claim it for
+        # the following controller assertions, not for a guessed duration.
+        owner.claim(ttl_ms=60000)
         visible = [t['tab'] for t in before['view']['tabs'] if t['visible']]
         assert visible == ['registers', 'native'] + ([language] if language else []), before
         assert before['view']['selected'] == 'native', before
@@ -112,6 +115,7 @@ def case(label, executable, language=None, args=()):
         owner.action('step_instruction', tid=tid)
         stepped = s.eventually(owner.session, lambda x: x['state'] == 'stopped' and x['generation'] != generation, 'instruction stop')
         after = ready(observer)
+        owner.claim(ttl_ms=60000)
         assert after['view']['selected'] == selected, after
         assert after['view']['native_selection'] is None and after['view']['logical_selection'] is None, after
         if language:

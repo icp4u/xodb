@@ -13,6 +13,7 @@
  *   fastclick X Y  move, then press and release in one batch
  *   fastdrag X Y X Y  left drag with all edges sent in one batch
  *   middle X Y     middle button at X/Y; button CODE STATE sends a pointer edge
+ *   scroll X Y N   move to X/Y and send N vertical wheel steps
  *   w MS           wait
  */
 #define _GNU_SOURCE
@@ -152,6 +153,17 @@ int main(int argc, char **argv) {
                 wl_display_flush(display);
                 settle(80);
             }
+        } else if (!strcmp(cmd, "scroll")) {
+            int x = atoi(argv[++i]), y = atoi(argv[++i]);
+            int steps = atoi(argv[++i]);
+            zwlr_virtual_pointer_v1_motion_absolute(pointer, t++, x, y, width, height);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            settle(80);
+            zwlr_virtual_pointer_v1_axis_source(pointer, WL_POINTER_AXIS_SOURCE_WHEEL);
+            zwlr_virtual_pointer_v1_axis_discrete(pointer, t++, WL_POINTER_AXIS_VERTICAL_SCROLL,
+                wl_fixed_from_int(10 * steps), steps);
+            zwlr_virtual_pointer_v1_frame(pointer);
+            settle(80);
         } else if (!strcmp(cmd, "w")) {
             settle(atoi(argv[++i]));
         } else return 7;

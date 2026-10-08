@@ -5,7 +5,7 @@
 const char *const xpy_type_symbols[XPY_TYPE_COUNT] = {
     "_Py_NoneStruct", "_Py_TrueStruct", "_Py_FalseStruct", "PyType_Type",  "_PyNone_Type", "PyBool_Type",
     "PyLong_Type",    "PyFloat_Type",   "PyUnicode_Type",  "PyBytes_Type", "PyTuple_Type", "PyList_Type",
-    "PyDict_Type",    "PySet_Type",     "PyFrozenSet_Type", "PyCode_Type",
+    "PyDict_Type",    "PySet_Type",     "PyFrozenSet_Type", "PyCode_Type", "PyCell_Type",
 };
 /* Paths inside _Py_DebugOffsets (published) and inside the named native
  * structures (unpublished), in enum xpy_field order. */
@@ -48,6 +48,11 @@ const char *const xpy_field_names[XPY_FIELD_COUNT] = {
     "unicode_object.state",
     "unicode_object.length",
     "unicode_object.asciiobject_size",
+    "interpreter_frame.localsplus",
+    "interpreter_frame.stackpointer",
+    "code_object.argcount",
+    "code_object.localsplusnames",
+    "code_object.localspluskinds",
     "PyCompactUnicodeObject",
     "PyCodeObject.co_flags",
     "PyDictObject.ma_used",
@@ -57,20 +62,23 @@ const char *const xpy_field_names[XPY_FIELD_COUNT] = {
     "PyDictKeysObject.dk_nentries",
     "PyDictKeysObject.dk_indices",
     "PyDictValues.values",
+    "PyCellObject.ob_ref",
 };
 /* Generated from each version's pycore_debug_offsets.h with offsetof(). */
 static const uint16_t positions_3_14[XPY_PUBLISHED_COUNT] = {
     40,  56,  64,  72,  192, 200, 208, 216, 224, 256, 264, 272, 288, 320, 328, 336, 344, 352, 384,
     400, 408, 424, 440, 456, 464, 480, 488, 504, 536, 544, 560, 576, 584, 600, 608, 624, 632, 640,
+    280, 296, 360, 368, 376,
 };
 static const uint16_t positions_3_16[XPY_PUBLISHED_COUNT] = {
     40,  56,  64,  72,  192, 200, 208, 240, 248, 320, 328, 336, 352, 384, 392, 400, 408, 416, 448,
     464, 472, 488, 504, 552, 560, 576, 584, 600, 632, 640, 656, 672, 680, 696, 704, 720, 728, 736,
+    344, 360, 424, 432, 440,
 };
 /* sizeof(PyCompactUnicodeObject), co_flags, ma_used, dk_log2_size,
  * dk_log2_index_bytes, dk_kind, dk_nentries, dk_indices, PyDictValues.values.
  * Identical for 3.14 and the verified 3.16 prerelease headers. */
-const uint64_t xpy_unpublished_3_14[XPY_FIELD_COUNT - XPY_PUBLISHED_COUNT] = {56, 48, 16, 8, 9, 10, 24, 32, 8};
+const uint64_t xpy_unpublished_3_14[XPY_FIELD_COUNT - XPY_PUBLISHED_COUNT] = {56, 48, 16, 8, 9, 10, 24, 32, 8, 16};
 
 static int final_release(uint64_t v) {
     return ((v >> 4) & 15) == 15;
@@ -150,10 +158,11 @@ static int member(Dwarf_Die root, const char *path, uint64_t *offset, int *bit_o
     }
     return 0;
 }
-enum { T_OFFSETS, T_COMPACT, T_CODE, T_DICT, T_KEYS, T_VALUES, T_ASCII, T_KEY_ENTRY, T_UNICODE_ENTRY, T_COUNT };
+enum { T_OFFSETS, T_COMPACT, T_CODE, T_DICT, T_KEYS, T_VALUES, T_ASCII, T_KEY_ENTRY, T_UNICODE_ENTRY, T_CELL, T_STACKREF, T_COUNT };
 static const char *const type_names[T_COUNT] = {"_Py_DebugOffsets", "PyCompactUnicodeObject", "PyCodeObject",
                                                 "PyDictObject",     "PyDictKeysObject",       "PyDictValues",
-                                                "PyASCIIObject",    "PyDictKeyEntry",         "PyDictUnicodeEntry"};
+                                                "PyASCIIObject",    "PyDictKeyEntry",         "PyDictUnicodeEntry",
+                                                "PyCellObject", "_PyStackRef"};
 static const char *find_types(Dwarf *dwarf, Dwarf_Die *out) {
     unsigned char have[T_COUNT] = {0};
     unsigned found = 0, visited = 0;
@@ -175,7 +184,7 @@ static const char *find_types(Dwarf *dwarf, Dwarf_Die *out) {
             if (++visited > 4000000)
                 return "PythonDwarfLimit";
             int tag = dwarf_tag(&die);
-            if (tag != DW_TAG_typedef && tag != DW_TAG_structure_type)
+            if (tag != DW_TAG_typedef && tag != DW_TAG_structure_type && tag != DW_TAG_union_type)
                 continue;
             const char *name = dwarf_diename(&die);
             if (!name)
@@ -218,12 +227,14 @@ static const char *verify(Dwarf *dwarf, const uint16_t *positions, const uint64_
             return "PythonDebugOffsetsLayoutMismatch";
     for (unsigned i = XPY_PUBLISHED_COUNT + 1; i < XPY_FIELD_COUNT; ++i) {
         const char *dot = strchr(xpy_field_names[i], '.');
-        unsigned type = i == XPY_CO_FLAGS ? T_CODE : i == XPY_DICT_USED ? T_DICT : i == XPY_DV_VALUES ? T_VALUES : T_KEYS;
+        unsigned type = i == XPY_CO_FLAGS ? T_CODE : i == XPY_DICT_USED ? T_DICT : i == XPY_DV_VALUES ? T_VALUES : i == XPY_CELL_VALUE ? T_CELL : T_KEYS;
         if (!dot || !expect(t[type], dot + 1, unpublished[i - XPY_PUBLISHED_COUNT]))
             return "PythonLayoutMismatch";
     }
     /* The reader's macro rules: compact header size, state bit-fields and
      * dictionary entry layouts. */
+    if (!size_is(t[T_STACKREF], 8) || !expect(t[T_STACKREF], "bits", 0))
+        return "PythonStackRefUnsupported";
     if (!size_is(t[T_COMPACT], unpublished[0]) || !size_is(t[T_KEY_ENTRY], 24) || !size_is(t[T_UNICODE_ENTRY], 16) ||
         !expect(t[T_KEY_ENTRY], "me_key", 8) || !expect(t[T_KEY_ENTRY], "me_value", 16) ||
         !expect(t[T_UNICODE_ENTRY], "me_key", 0) || !expect(t[T_UNICODE_ENTRY], "me_value", 8) ||
@@ -264,7 +275,9 @@ const char *xpy_layout_build(const uint8_t *p, size_t n, Dwarf *dwarf, const uin
      * the 16-byte var-object header). */
     if (out->fields[XPY_OB_SIZE_OF] != 16 || out->fields[XPY_OB_TYPE] != 8 || out->fields[XPY_LIST_SIZE] != 16 ||
         out->fields[XPY_TUPLE_SIZE] != 16 || out->fields[XPY_STR_ASCII_SIZE] != 40 ||
-        out->fields[XPY_FR_PREVIOUS] + 8 > 4096 || out->fields[XPY_FR_OWNER] > 4096)
+        out->fields[XPY_FR_PREVIOUS] + 8 > 4096 || out->fields[XPY_FR_OWNER] > 4096 ||
+        out->fields[XPY_FR_LOCALSPLUS] > 4096 || out->fields[XPY_FR_STACKPOINTER] + 8 > out->fields[XPY_FR_LOCALSPLUS] ||
+        (out->fields[XPY_FR_LOCALSPLUS] & 7))
         return "PythonLayoutMismatch";
     if (dwarf) {
         const char *why = verify(dwarf, positions, xpy_unpublished_3_14);

@@ -114,6 +114,8 @@ fi
 cat >&2 <<'TIPS'
 Try: Space (stop in _PyDict_SetItem_Take2) · E value Return (list (8 items))
      E key Return (str 'answer') · E mp Return (dict (2 items)) · Space (next round)
+     Tab to Python · click tick · E round Return (named Python local)
+     click record · E items Return (list (8 items)); E: labels the result
      In another terminal: scripts/demo-python stack   (record <- tick <- <module>,
      with file:line, plus the list's items: the round number, a big int, a float,
      'héllo', bytes, None, True and a tuple)

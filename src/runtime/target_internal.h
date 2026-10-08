@@ -23,6 +23,12 @@ struct xrt_step {
     bool stop_after, interrupted, has_watch, has_exec_entry;
     struct xrt_arm_watch_hit watch;
     uint64_t exec_entry_pc;
+    /* Temporary traps that let a ppc64 larx/stcx. sequence run as one step.
+     * Hardware single-step clears the reservation. Not a wire field. */
+    uint64_t atomic_exit[2];
+    uint8_t atomic_original[2][4];
+    uint8_t atomic_count;
+    uint8_t atomic_owned[2];
     /* software is set only after the resume has been issued. probe_owned marks
      * temporary probes this step planted and must remove. A user probe already
      * at a successor keeps probe_owned clear. */
@@ -134,6 +140,7 @@ bool xrt_traced_member(int32_t tid, int32_t group);
 bool xrt_task_zombie(int32_t tid);
 enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_after);
 enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed);
+int xrt_atomic_step_exit(const struct xrt_target *t, uint64_t pc);
 /* Plant count temporary internal probes. On failure every probe this call
  * planted is removed, or the cleanup record stays and the status is not OK. */
 enum xrt_status xrt_software_plant(struct xrt_target *t, const uint64_t *pcs, uint8_t count,

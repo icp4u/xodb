@@ -170,6 +170,10 @@ pub const Manager = struct {
     pub fn remember(self: *Manager, session: anytype) !void {
         self.prune(session);
         if (session.target.snapshot().breakpoint_count == 0) return;
+        if (session.target.gdbRemoteInfo()) |info| if (info.libraries == .unsupported) {
+            self.loader_status = "GDB library maps unavailable; address breakpoints cannot be restored after restart";
+            return;
+        };
         try session.refreshMaps();
         for (session.target.breakpointSlice()) |v| {
             if (v.internal or v.temporary or self.entry(v.id) != null) continue;

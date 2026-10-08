@@ -8,9 +8,11 @@
 #define XRT_M68K 4
 #define XRT_X86_64 62
 #define XRT_AARCH64 183
+#define XRT_PPC64 21
 #define XRT_LOONGARCH 258
 #define XRT_DWARF_NONE UINT16_MAX
-#define XRT_DWARF_REGISTER_COUNT 33
+/* 66 covers the ELFv2 return-address column, DWARF register 65. */
+#define XRT_DWARF_REGISTER_COUNT 66
 #define XRT_GPR_BYTES_MAX 384
 #define XRT_ABSENT_MAX 48
 #define XRT_PROBE_CHOICE_MAX 2
@@ -139,6 +141,57 @@
     X(pc, XRT_DWARF_NONE, 33, 33, XRT_ROLE_PC)                                                     \
     X(badv, XRT_DWARF_NONE, 34, 34, XRT_ROLE_NONE)
 
+/* ppc64le ELFv2 NT_PRSTATUS is 48 little-endian words. The first 44 are
+ * pt_regs. The kernel writes the last four; they stay in the raw image and
+ * have no names here. nip is published as pc and has no DWARF number. r1 is
+ * the stack pointer. The link register is DWARF 65. r0 and r2 are ordinary
+ * GPRs; r2 holds the TOC. */
+#define XRT_PPC64_REGISTERS(X)                                                                     \
+    X(r0, 0, 0, 0, XRT_ROLE_NONE)                                                                  \
+    X(r1, 1, 1, 1, XRT_ROLE_SP)                                                                    \
+    X(r2, 2, 2, 2, XRT_ROLE_NONE)                                                                  \
+    X(r3, 3, 3, 3, XRT_ROLE_NONE)                                                                  \
+    X(r4, 4, 4, 4, XRT_ROLE_NONE)                                                                  \
+    X(r5, 5, 5, 5, XRT_ROLE_NONE)                                                                  \
+    X(r6, 6, 6, 6, XRT_ROLE_NONE)                                                                  \
+    X(r7, 7, 7, 7, XRT_ROLE_NONE)                                                                  \
+    X(r8, 8, 8, 8, XRT_ROLE_NONE)                                                                  \
+    X(r9, 9, 9, 9, XRT_ROLE_NONE)                                                                  \
+    X(r10, 10, 10, 10, XRT_ROLE_NONE)                                                              \
+    X(r11, 11, 11, 11, XRT_ROLE_NONE)                                                              \
+    X(r12, 12, 12, 12, XRT_ROLE_NONE)                                                              \
+    X(r13, 13, 13, 13, XRT_ROLE_NONE)                                                              \
+    X(r14, 14, 14, 14, XRT_ROLE_NONE)                                                              \
+    X(r15, 15, 15, 15, XRT_ROLE_NONE)                                                              \
+    X(r16, 16, 16, 16, XRT_ROLE_NONE)                                                              \
+    X(r17, 17, 17, 17, XRT_ROLE_NONE)                                                              \
+    X(r18, 18, 18, 18, XRT_ROLE_NONE)                                                              \
+    X(r19, 19, 19, 19, XRT_ROLE_NONE)                                                              \
+    X(r20, 20, 20, 20, XRT_ROLE_NONE)                                                              \
+    X(r21, 21, 21, 21, XRT_ROLE_NONE)                                                              \
+    X(r22, 22, 22, 22, XRT_ROLE_NONE)                                                              \
+    X(r23, 23, 23, 23, XRT_ROLE_NONE)                                                              \
+    X(r24, 24, 24, 24, XRT_ROLE_NONE)                                                              \
+    X(r25, 25, 25, 25, XRT_ROLE_NONE)                                                              \
+    X(r26, 26, 26, 26, XRT_ROLE_NONE)                                                              \
+    X(r27, 27, 27, 27, XRT_ROLE_NONE)                                                              \
+    X(r28, 28, 28, 28, XRT_ROLE_NONE)                                                              \
+    X(r29, 29, 29, 29, XRT_ROLE_NONE)                                                              \
+    X(r30, 30, 30, 30, XRT_ROLE_NONE)                                                              \
+    X(r31, 31, 31, 31, XRT_ROLE_NONE)                                                              \
+    X(pc, XRT_DWARF_NONE, 32, 32, XRT_ROLE_PC)                                                     \
+    X(msr, XRT_DWARF_NONE, 33, 33, XRT_ROLE_NONE)                                                  \
+    X(orig_gpr3, XRT_DWARF_NONE, 34, 34, XRT_ROLE_NONE)                                            \
+    X(ctr, XRT_DWARF_NONE, 35, 35, XRT_ROLE_NONE)                                                  \
+    X(lr, 65, 36, 36, XRT_ROLE_RA)                                                                 \
+    X(xer, XRT_DWARF_NONE, 37, 37, XRT_ROLE_NONE)                                                  \
+    X(ccr, XRT_DWARF_NONE, 38, 38, XRT_ROLE_NONE)                                                  \
+    X(softe, XRT_DWARF_NONE, 39, 39, XRT_ROLE_NONE)                                                \
+    X(trap, XRT_DWARF_NONE, 40, 40, XRT_ROLE_NONE)                                                 \
+    X(dar, XRT_DWARF_NONE, 41, 41, XRT_ROLE_NONE)                                                  \
+    X(dsisr, XRT_DWARF_NONE, 42, 42, XRT_ROLE_NONE)                                                \
+    X(result, XRT_DWARF_NONE, 43, 43, XRT_ROLE_NONE)
+
 /* Linux m68k GETREGS uses 32-bit words, with SR at byte 70. The historical
  * dense return-address number is 24, which is the PC, not a link-register role. */
 #define XRT_M68K_REGISTERS(X)                                                                      \
@@ -175,6 +228,9 @@ struct xrt_arm_registers {
 };
 struct xrt_loongarch_registers {
     XRT_LOONGARCH_REGISTERS(XRT_REGISTER_FIELD)
+};
+struct xrt_ppc64_registers {
+    XRT_PPC64_REGISTERS(XRT_REGISTER_FIELD)
 };
 #undef XRT_REGISTER_FIELD
 
@@ -232,6 +288,7 @@ struct xrt_registers {
         struct xrt_arm_registers arm;
         struct xrt_m68k_registers m68k;
         struct xrt_loongarch_registers loongarch;
+        struct xrt_ppc64_registers ppc;
     } values;
 };
 

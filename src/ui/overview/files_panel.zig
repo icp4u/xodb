@@ -69,7 +69,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     try ctx.panel(table);
     const proc = f.mode == .processes or f.mode == .leaks;
     try ctx.text(table.x + 12, table.y + 8, "PID / FD", ctx.p.dim);
-    try ctx.textFit(table.x + 170, table.y + 8, table.w - 470, if (f.searching or f.query_len > 0) std.fmt.bufPrint(&buf, "/ {s}_", .{f.text()}) catch "" else if (proc) "Process · fd history" else if (f.mode == .events) "FD-number history · spans reuse" else "Current path · offset progress is not exact IO", ctx.p.dim);
+    try ctx.textFit(table.x + 170, table.y + 8, table.w - 470, if (f.searching or f.query_len > 0) std.fmt.bufPrint(&buf, "/ {s}_", .{f.text()}) catch "" else if (proc) "Process · fd history" else if (f.mode == .events) "FD-number history · spans reuse" else "Path · [stale] = cached metadata", ctx.p.dim);
     try ctx.textRight(table.x + table.w - 150, table.y + 8, if (f.mode == .events) "Read bytes" else if (f.mode == .deleted) "File size" else if (proc) "Churn /s" else "Progress /s", ctx.p.dim);
     try ctx.textRight(table.x + table.w - 12, table.y + 8, if (f.mode == .events) "Write bytes" else if (f.mode == .deleted) "Disk bytes" else if (proc) "FDs" else "Offset", ctx.p.dim);
     f.visible = @max(1, @as(usize, @intFromFloat(@max(0, table.h - 42) / 34)));
@@ -172,7 +172,7 @@ fn row(v: *vw.View, ctx: Ctx, rect: Rect, item: fm.Row, now: u64) !void {
                 };
                 try ctx.polyline(points[0..n], 1.5, if (f.mode == .leaks) ctx.p.warn else ctx.p.accent, true);
             }
-            try ctx.textRight(first_right, rect.y, if (p.interval_ns == 0) "first sample" else std.fmt.bufPrint(&buf, "{d:.1}", .{p.churn_rate}) catch "", color);
+            try ctx.textRight(first_right, rect.y, if (p.flags & c.XRT_FDP_STALE != 0) "stale" else if (p.interval_ns == 0) "first sample" else std.fmt.bufPrint(&buf, "{d:.1}", .{p.churn_rate}) catch "", color);
             try ctx.textRight(right, rect.y, std.fmt.bufPrint(&buf, "{d}", .{p.count}) catch "", if (f.mode == .leaks) ctx.p.warn else color);
             v.hover(rect, "pid {d}, start {d}; growth above window low {d}; stale={}; truncated={}", .{ p.pid, p.start, p.growth, p.flags & c.XRT_FDP_STALE != 0, p.flags & c.XRT_FDP_TRUNCATED != 0 });
         },
@@ -180,10 +180,11 @@ fn row(v: *vw.View, ctx: Ctx, rect: Rect, item: fm.Row, now: u64) !void {
             const s = f.snapshot.?;
             const p = s.processes[index.process];
             const fd = s.fds[index.fd];
-            const color = if (p.flags & c.XRT_FDP_STALE != 0) ctx.p.dim else ctx.p.text;
+            const color = if (fm.State.stale(p, fd)) ctx.p.dim else ctx.p.text;
+            const retained = if (fm.State.stale(p, fd)) "[stale] " else "";
             const path = if (v.redact) "redacted" else fm.State.path(s, fd);
             const leaf = std.fs.path.basename(path);
-            const title = if (!v.redact and !std.mem.eql(u8, leaf, path)) std.fmt.bufPrint(&buf, "{s}  {s} · {s}", .{ std.mem.span(c.xrt_fd_kind_name(fd.kind)), leaf, path }) catch leaf else std.fmt.bufPrint(&buf, "{s}  {s}", .{ std.mem.span(c.xrt_fd_kind_name(fd.kind)), path }) catch path;
+            const title = if (!v.redact and !std.mem.eql(u8, leaf, path)) std.fmt.bufPrint(&buf, "{s}{s}  {s} · {s}", .{ retained, std.mem.span(c.xrt_fd_kind_name(fd.kind)), leaf, path }) catch leaf else std.fmt.bufPrint(&buf, "{s}{s}  {s}", .{ retained, std.mem.span(c.xrt_fd_kind_name(fd.kind)), path }) catch path;
             try ctx.textFit(text_x, rect.y, text_w, title, color);
             if (f.mode == .deleted) {
                 try ctx.textRight(first_right, rect.y, if (fd.flags & c.XRT_FD_STAT == 0) "unavailable" else m.bytes(&buf, @floatFromInt(fd.size)), color);
@@ -192,17 +193,17 @@ fn row(v: *vw.View, ctx: Ctx, rect: Rect, item: fm.Row, now: u64) !void {
             } else {
                 const rate = fm.State.progress(p, fd);
                 try ctx.textRight(first_right, rect.y, if (rate) |n| m.rate(&buf, n) else "unmeasured", color);
-                try ctx.textRight(right, rect.y, if (fd.flags & c.XRT_FD_INFO == 0) "unavailable" else std.fmt.bufPrint(&buf, "{d}", .{fd.pos}) catch "", color);
+                try ctx.textRight(right, rect.y, if (fd.kind != c.XRT_FD_REGULAR and fd.kind != c.XRT_FD_MEMFD) "—" else if (fd.flags & c.XRT_FD_INFO == 0) "unavailable" else std.fmt.bufPrint(&buf, "{d}", .{fd.pos}) catch "", color);
                 if (rate) |n| {
                     try ctx.bar(.{ .x = text_x, .y = rect.y + 23, .w = text_w, .h = 3 }, @min(1, @log2(@as(f64, n) + 1) / 30), fade(ctx.p.accent, 0.6));
-                    if (n > 0 and !v.paused and p.flags & c.XRT_FDP_STALE == 0) {
+                    if (n > 0 and !v.paused and !fm.State.offsetStale(p, fd)) {
                         const phase = @as(f32, @floatFromInt(now % 1_000_000_000)) / 1_000_000_000;
                         try ctx.r.shape(.{ .x = text_x + phase * @max(0, text_w - 8), .y = rect.y + 22, .w = 8, .h = 5 }, ctx.p.accent, .{ .radii = @splat(2) });
                     }
                 }
                 var flags_buf: [32]u8 = undefined;
                 const flags = if (fd.flags & c.XRT_FD_INFO != 0) std.fmt.bufPrint(&flags_buf, "0{o}", .{fd.open_flags}) catch "unavailable" else "unavailable";
-                v.hover(rect, "pid {d}, fd {d}; {s}; flags {s}; age {d} ms; stale={}; {s}", .{ p.pid, fd.fd, fm.State.progressReason(p, fd), flags, (now -| p.sampled_ns) / 1_000_000, p.flags & c.XRT_FDP_STALE != 0, path });
+                v.hover(rect, "pid {d}, fd {d}; {s}; flags {s} ({s}); offset age {d} ms; path stale={}; stat stale={}; {s}", .{ p.pid, fd.fd, fm.State.progressReason(p, fd), flags, if (fm.State.offsetStale(p, fd)) "cached" else "sampled", (now -| fd.info_sampled_ns) / 1_000_000, p.flags & c.XRT_FDP_STALE != 0 or fd.flags & c.XRT_FD_LINK_STALE != 0, p.flags & c.XRT_FDP_STALE != 0 or fd.flags & c.XRT_FD_STAT_STALE != 0, path });
             }
         },
     }

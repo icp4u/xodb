@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from types import SimpleNamespace
 from client import Client
 from helpers.readonly import audit
 
@@ -29,7 +30,7 @@ result = {'status':'running'}
 try:
     client = Client('control', str(exe), options=['--break', 'xodb_unanchored_stop'])
     client.stopped()
-    client.action('continue')
+    client.continue_initial_stop()
     state = client.stopped('breakpoint')
     tid, generation = state['pid'], state['generation']
     deadline = time.monotonic() + 30
@@ -46,6 +47,7 @@ try:
     addresses = {s['runtime_instance']['address'] for s in stack['segments']}
     assert len(addresses) == 2, stack
     registers = client.inspect('get_registers', tid=tid)
+    pc = client.inspect('get_stack', tid=tid)['frames'][0]['pc']
     native = client.action('select_native_frame', tid=tid, frame=1)['view']['native_selection']
     assert native['frame'] == 1
     selected = []
@@ -66,8 +68,14 @@ try:
     def observe():
         client.action('select_language_frame', tid=tid, language='lua', segment=0, frame=0)
         client.action('select_language_frame', tid=tid, language='lua', segment=1, frame=0)
+        # Prove the tracer reached the real reader even though selections
+        # are warm cached data. Selection must add no reads of its own.
+        client.inspect('read_memory', address=hex(pc), length=1)
     if a.strace:
-        result['readonly'] = audit(client, tid, w/'selection.strace', observe)
+        reader = SimpleNamespace(p=SimpleNamespace(pid=client.collector_pid()), inspect=client.inspect, session=client.session)
+        result['readonly'] = audit(reader, tid, w/'selection.strace', observe)
+        calls = result['readonly']['syscalls']
+        assert calls.get('process_vm_readv') == 2 and not calls.get('pread64') and not calls.get('ptrace:PTRACE_PEEKDATA'), calls
     assert client.inspect('get_registers', tid=tid)==registers and client.session()['generation']==generation
     client.action('step_instruction', tid=tid)
     client.stopped()

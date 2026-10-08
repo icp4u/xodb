@@ -73,6 +73,8 @@ fn process(a: Allocator, p: c.struct_xrt_fd_process, redact: bool, now: u64) !Va
     try set(a, &out, "fds", p.count);
     try set(a, &out, "flags", p.flags);
     try flag(a, &out, "stale", p.flags & c.XRT_FDP_STALE != 0);
+    try flag(a, &out, "quiet_hint", p.flags & c.XRT_FDP_QUIET != 0);
+    try text(a, &out, "offset_progress_state", if (p.flags & c.XRT_FDP_OFFSETS_STALE != 0) "partial; cached offsets excluded" else if (p.interval_ns == 0) "first sample" else "measured");
     try set(a, &out, "age_ms", (now -| p.sampled_ns) / 1_000_000);
     try set(a, &out, "interval_ns", p.interval_ns);
     try set(a, &out, "opened_since_scan", p.opened);
@@ -81,7 +83,7 @@ fn process(a: Allocator, p: c.struct_xrt_fd_process, redact: bool, now: u64) !Va
     const measured = p.interval_ns > 0 and p.flags & c.XRT_FDP_NO_IO == 0;
     try out.object.put(a, "logical_read_bytes_per_second", if (measured) real(p.read_rate) else .null);
     try out.object.put(a, "logical_write_bytes_per_second", if (measured) real(p.write_rate) else .null);
-    try out.object.put(a, "offset_progress_per_second", if (p.interval_ns > 0) real(p.advance_rate) else .null);
+    try out.object.put(a, "offset_progress_per_second", if (p.interval_ns > 0 and p.flags & (c.XRT_FDP_STALE | c.XRT_FDP_OFFSETS_STALE) == 0) real(p.advance_rate) else .null);
     try out.object.put(a, "sampled_fd_changes_per_second", if (p.interval_ns > 0) real(p.churn_rate) else .null);
     try text(a, &out, "io_state", if (p.flags & c.XRT_FDP_NO_IO != 0) "unavailable" else if (p.interval_ns == 0) "first sample" else if (p.flags & c.XRT_FDP_STALE != 0) "stale" else "ok");
     try set(a, &out, "growth_above_window_low", p.growth);
@@ -100,6 +102,10 @@ fn process(a: Allocator, p: c.struct_xrt_fd_process, redact: bool, now: u64) !Va
 }
 fn descriptor(a: Allocator, s: *const c.struct_xrt_fd_snapshot, p: c.struct_xrt_fd_process, fd: c.struct_xrt_fd, redact: bool, now: u64) !Value {
     var out = object();
+    const retained = p.flags & c.XRT_FDP_STALE != 0;
+    const info_stale = retained or fd.flags & c.XRT_FD_INFO_STALE != 0;
+    const path_stale = retained or fd.flags & c.XRT_FD_LINK_STALE != 0;
+    const stat_stale = retained or fd.flags & c.XRT_FD_STAT_STALE != 0;
     try set(a, &out, "pid", @intCast(p.pid));
     try set(a, &out, "start_ticks", p.start);
     try set(a, &out, "fd", @intCast(fd.fd));
@@ -107,22 +113,26 @@ fn descriptor(a: Allocator, s: *const c.struct_xrt_fd_snapshot, p: c.struct_xrt_
     const raw_path = path(s, fd);
     const path_ok = fd.flags & c.XRT_FD_LINK_CUT == 0 and std.unicode.utf8ValidateSlice(raw_path);
     try out.object.put(a, "path", if (redact) try string(a, "redacted") else if (path_ok) try string(a, raw_path) else .null);
-    try text(a, &out, "path_state", if (redact) "redacted" else if (fd.flags & c.XRT_FD_LINK_CUT != 0) "truncated" else if (!path_ok) "non-UTF-8; query by device and inode" else "ok");
+    try text(a, &out, "path_state", if (redact) "redacted" else if (fd.flags & c.XRT_FD_LINK_CUT != 0) "truncated" else if (!path_ok) "non-UTF-8; query by device and inode" else if (path_stale) "stale" else "ok");
     try flag(a, &out, "path_truncated", fd.flags & c.XRT_FD_LINK_CUT != 0);
     try flag(a, &out, "deleted", fd.flags & c.XRT_FD_DELETED != 0);
-    try flag(a, &out, "stale", p.flags & c.XRT_FDP_STALE != 0);
+    try flag(a, &out, "stale", retained or info_stale or path_stale or stat_stale);
     try set(a, &out, "age_ms", (now -| p.sampled_ns) / 1_000_000);
     const stat = fd.flags & c.XRT_FD_STAT != 0;
     try out.object.put(a, "device", if (stat) .{ .string = try std.fmt.allocPrint(a, "{d}", .{fd.device}) } else .null);
     try out.object.put(a, "inode", if (stat) .{ .string = try std.fmt.allocPrint(a, "{d}", .{fd.inode}) } else .null);
     try out.object.put(a, "size_bytes", if (stat) .{ .integer = fd.size } else .null);
     try out.object.put(a, "allocated_disk_bytes", if (stat) .{ .integer = fd.disk } else .null);
+    try text(a, &out, "stat_state", if (!stat) "unavailable" else if (stat_stale) "stale" else "ok");
     const info = fd.flags & c.XRT_FD_INFO != 0;
     try out.object.put(a, "offset", if (info) try integer(a, fd.pos) else .null);
     try out.object.put(a, "open_flags", if (info) try integer(a, fd.open_flags) else .null);
-    const progress = info and p.interval_ns > 0 and fd.flags & c.XRT_FD_OPENED == 0;
-    try out.object.put(a, "offset_advance", if (progress) try integer(a, fd.advance) else .null);
-    try out.object.put(a, "offset_progress_per_second", if (progress) real(fd.rate) else .null);
+    try text(a, &out, "fdinfo_state", if (!info) "unavailable" else if (info_stale) "stale" else "ok");
+    try out.object.put(a, "offset_age_ms", if (info) try integer(a, (now -| fd.info_sampled_ns) / 1_000_000) else .null);
+    try set(a, &out, "offset_interval_ns", fd.info_interval_ns);
+    const progress = info and fd.info_interval_ns > 0 and fd.flags & c.XRT_FD_OPENED == 0;
+    try out.object.put(a, "offset_advance", if (progress and !info_stale) try integer(a, fd.advance) else .null);
+    try out.object.put(a, "offset_progress_per_second", if (progress and !info_stale) real(fd.rate) else .null);
     try text(a, &out, "source", "poll; offset progress is not exact file IO");
     return out;
 }
@@ -204,7 +214,11 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
     const inode = try decimal(args, "inode");
     if (lookup and ((device == null) != (inode == null) or (wanted_path == null) == (device == null))) return error.InvalidArguments;
     const ctx = try owner.descriptors();
-    const request = c.struct_xrt_fdactivity_request{ .interval_ms = @intCast(interval) };
+    const poll_pid: i32 = @intCast(pid);
+    const request = c.struct_xrt_fdactivity_request{
+        .interval_ms = @intCast(interval), .poll_pids = if (pid != 0) &poll_pid else null,
+        .poll_pid_count = if (pid != 0) 1 else 0, .poll_all = if (pid == 0) 1 else 0,
+    };
     // Observer event reads neither start capture nor extend its lifetime.
     const requested: c.enum_xrt_status = if (events) c.XRT_OK else c.xrt_fdactivity_request(ctx, &request);
     if (requested == c.XRT_INVALID_STATE) return error.FdEventScopeBusy;
@@ -394,6 +408,17 @@ test "fd replies redact names and paths and preserve unavailable values" {
     try std.testing.expectEqualStrings("18446744073709551615", measured.object.get("inode").?.string);
     try std.testing.expectEqualStrings(link, measured.object.get("path").?.string);
     try std.testing.expect(measured.object.get("offset_progress_per_second").? == .null);
+    fd.info_interval_ns = 1_000_000_000;
+    fd.info_sampled_ns = 1000;
+    fd.rate = 10;
+    fd.flags |= c.XRT_FD_INFO_STALE | c.XRT_FD_LINK_STALE | c.XRT_FD_STAT_STALE;
+    const cached = try descriptor(a, &s, p, fd, false, 2_000_001_000);
+    try std.testing.expect(cached.object.get("stale").?.bool);
+    for ([_][]const u8{ "path_state", "fdinfo_state", "stat_state" }) |field|
+        try std.testing.expectEqualStrings("stale", cached.object.get(field).?.string);
+    try std.testing.expect(cached.object.get("offset_advance").? == .null);
+    try std.testing.expect(cached.object.get("offset_progress_per_second").? == .null);
+    try std.testing.expectEqual(@as(i64, 2000), cached.object.get("offset_age_ms").?.integer);
     const invalid_path = [_]u8{0xff};
     s.strings = &invalid_path;
     s.strings_length = 1;

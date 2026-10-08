@@ -44,7 +44,11 @@ pub const Module = struct {
         return std.math.add(u64, link, self.bias) catch error.InvalidAddress;
     }
 };
-pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0 };
+pub const Symbol = struct { module_id: u64, name: []const u8, address: u64, size: u64, offset: u64 = 0, entry: u64 = 0 };
+fn publishedSymbol(machine: elf.Machine, module_id: u64, symbol: elf.Symbol, address: u64) Symbol {
+    const entry: u64 = if (machine == .ppc64 and symbol.type == .func) elf.ppc64LocalEntry(symbol.other) else 0;
+    return .{ .module_id = module_id, .name = symbol.name, .address = address, .size = symbol.size, .entry = entry };
+}
 pub const Modules = struct {
     // These sealed sparse views contain symbols and placement metadata only.
     // Keep them outside Module so debug/unwind/code paths can never see holes.
@@ -406,7 +410,7 @@ pub const Modules = struct {
             };
             const symbol = module.symbols().findSymbol(name) orelse continue;
             if (!symbol.hasAddress()) continue;
-            return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+            return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
         }
         return failure orelse error.SymbolNotFound;
     }
@@ -491,7 +495,11 @@ pub const Modules = struct {
     /// can resume the same unfinished file.
     pub const SymbolCursor = struct { next: usize = 0, failure: ?anyerror = null };
     pub fn automaticSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
-        return (try self.symbolLookup(name, true, cursor)).address;
+        const found = try self.symbolLookup(name, true, cursor);
+        // ELFv2 function symbols are the global entry. Planting there misses a
+        // local call, which skips the TOC setup. The local entry is inside the
+        // same function, and a global call falls through it.
+        return std.math.add(u64, found.address, found.entry) catch error.InvalidAddress;
     }
     /// Restoring an address needs image identity and load placement, not code
     /// or DWARF. Use the resumable symbol projection for remote files so the
@@ -525,7 +533,7 @@ pub const Modules = struct {
                 const p = self.placement(&module.image, module.file_offset, r, false) catch continue;
                 if (p.bias != module.bias) continue;
                 if (module.symbols().findSymbol(name)) |symbol| {
-                    if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                    if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                 }
                 continue :regions;
             }
@@ -541,7 +549,7 @@ pub const Modules = struct {
                     continue;
                 };
                 const symbol = module.symbols().findSymbol(name) orelse continue;
-                if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                 continue;
             }
             const image = self.symbolImage(r) catch |err| {
@@ -554,7 +562,7 @@ pub const Modules = struct {
                             continue;
                         };
                         if (module.symbols().findSymbol(name)) |symbol| {
-                            if (symbol.hasAddress()) return .{ .module_id = module.id, .name = symbol.name, .address = try module.runtimeAddress(symbol.value), .size = symbol.size };
+                            if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                         }
                     },
                     error.NotElf, error.BinaryIdentityUnavailable => {},
@@ -574,7 +582,7 @@ pub const Modules = struct {
                 if (failure == null) failure = err;
                 continue;
             };
-            return .{ .module_id = try self.moduleId(r, p.bias), .name = symbol.name, .address = std.math.add(u64, symbol.value, p.bias) catch return error.InvalidAddress, .size = symbol.size };
+            return publishedSymbol(symbols.header.machine, try self.moduleId(r, p.bias), symbol, std.math.add(u64, symbol.value, p.bias) catch return error.InvalidAddress);
         }
         return failure orelse if (automatic) error.BreakpointSymbolNotLoaded else error.SymbolNotFound;
     }
@@ -597,7 +605,9 @@ pub const Modules = struct {
     pub fn symbolAt(self: *Modules, address: u64) !Symbol {
         const module = try self.at(address);
         const symbol = module.symbols().symbolAt(try module.linkAddress(address)) orelse return error.SymbolNotFound;
-        return .{ .module_id = module.id, .name = symbol.symbol.name, .address = try module.runtimeAddress(symbol.symbol.value), .size = symbol.symbol.size, .offset = symbol.offset };
+        var found = publishedSymbol(module.image.header.machine, module.id, symbol.symbol, try module.runtimeAddress(symbol.symbol.value));
+        found.offset = symbol.offset;
+        return found;
     }
 };
 

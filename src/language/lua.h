@@ -67,4 +67,32 @@ struct xl_stack {
     const char *reason;
 };
 void xl_stack_read(const struct xl_layout *, struct xl_reader *, uint64_t, struct xl_stack *);
+#define XL_LOCAL_ITEMS 32
+enum xl_local_kind { XL_LOCAL, XL_UPVALUE, XL_VARARGS };
+struct xl_local {
+    enum xl_local_kind kind;
+    uint32_t ordinal; /* 1-based within local or upvalue scope, as in Lua's API. */
+    uint64_t address;
+    char name[544]; /* Escaped bytes, with explicit truncation; never evaluated. */
+    int name_truncated;
+    const char *reason;
+    struct xl_value value;
+};
+struct xl_locals {
+    uint64_t state, call_info;
+    size_t frame, start, total, count;
+    int truncated;
+    const char *reason;
+    struct xl_local items[XL_LOCAL_ITEMS];
+};
+/* Reconstruct the CallInfo chain at this retained stop, then page named active
+ * locals and closure upvalues. Addresses expire on resume/GC/stack relocation.
+ * C temporaries are excluded. Extra varargs appear as one nameless count row
+ * with no address; they cannot be resolved through named lookup. */
+void xl_locals_read(const struct xl_layout *, struct xl_reader *, uint64_t state,
+                    size_t frame, size_t start, size_t limit, struct xl_locals *);
+/* Read-only bare ASCII identifier lookup; innermost active local shadows
+ * outer locals and upvalues. Calls, operators and implicit globals are refused. */
+void xl_local_find(const struct xl_layout *, struct xl_reader *, uint64_t state,
+                   size_t frame, const char *expression, struct xl_locals *);
 #endif

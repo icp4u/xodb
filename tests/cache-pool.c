@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "../src/binary/cache_pool.h"
+#include "../src/binary/object_cache.h"
 #include "../src/binary/cache_io.h"
 #include <assert.h>
 #include <fcntl.h>
@@ -78,7 +79,31 @@ static void check(struct xcp_entry *entry, char c) {
     if(c) assert(pread(xcp_index_fd(entry),&found,1,0)==1 && found==c);
     else assert(!st.st_size);
 }
+static enum xbo_status fixture_identity(void *context, struct xbo_identity *out) {
+    *out = *(struct xbo_identity *)context; return XBO_OK;
+}
+static enum xbo_status fixture_read(void *context, uint64_t offset, void *data, size_t size) {
+    (void)context; (void)offset; (void)data; (void)size;
+    assert(!"creating empty range metadata must not read source bytes"); return XBO_IO;
+}
+static void legacy_headers(const char *path) {
+    int dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC); assert(dir >= 0);
+    struct xcp_entry *entries[2];
+    for (unsigned n = 0; n < 2; ++n) {
+        struct xbo_identity id = identity(n + 1); id.size = UINT64_C(3400000000);
+        unsigned char build[2] = {1, (unsigned char)n};
+        assert(xcp_acquire(dir, &id, build, sizeof build, &entries[n]) == XBO_OK);
+        struct xbo_source source = {&id, fixture_identity, fixture_read};
+        struct xbc_cache *cache = NULL;
+        assert(xbc_create(&source, &id, build, sizeof build, xcp_range_fd(entries[n]),
+                          xcp_range_limit(entries[n]), &cache) == XBO_OK);
+        xbc_destroy(cache);
+    }
+    for (unsigned n = 0; n < 2; ++n) xcp_release(entries[n]);
+    close(dir);
+}
 int main(int argc,char **argv) {
+    if (argc == 3 && !strcmp(argv[1], "--legacy")) { legacy_headers(argv[2]); return 0; }
     assert(argc==2);
     if(!strcmp(argv[1],"--directory")) {
         int fd=xcp_directory();

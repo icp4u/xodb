@@ -144,3 +144,16 @@ Before tagging, record these additional results for the candidate build:
   separate device authorization and are never part of `all`.
 
 Keep pass/blocked/fail and untested configurations explicit in release notes.
+
+For language-pane coverage, pass explicit debug runtimes to `scripts/release-check
+all --python ./python --perl ./perl --node ./node --lua ./lua ./lua-src
+./liblua.a` (as one command). These flags also exercise tab discovery with the
+real runtimes, locally and through the C agent. `--python` includes a syscall
+audit: repeated selections at one retained stop do not reread target memory;
+stepping invalidates that cache. Timing numbers are evidence, not pass criteria.
+
+With a debug Perl and a separately built test-only PadWalker tree, add
+`--perl /path/to/perl --padwalker /path/to/PadWalker` to the host/all gate for
+named-local sanitizer/oracle, local and C-agent MCP, and shared-observer checks.
+The gui/all gate also exercises Perl named locals, sigil-name entry and the
+collapsible native-object section on a private display. Nothing is installed.

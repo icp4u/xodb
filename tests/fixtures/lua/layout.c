@@ -24,12 +24,13 @@ typedef struct Table { HEAD;
 typedef union Node { TValue i_val; struct {Value value_; unsigned char tt_, key_tt; int next; Value key_val;} u; } Node;
 typedef struct LClosure { HEAD; unsigned char nupvalues; void *p; void *upvals[1]; } LClosure;
 typedef struct CClosure { HEAD; unsigned char nupvalues; void *f; TValue upvalue[1]; } CClosure;
-typedef struct Proto { HEAD; void *source; int linedefined, lastlinedefined; unsigned *code; int sizecode; signed char *lineinfo; int sizelineinfo; void *abslineinfo; int sizeabslineinfo; void *upvalues; int sizeupvalues; } Proto;
+typedef struct Proto { HEAD; unsigned char is_vararg, numparams; void *source; int linedefined, lastlinedefined; unsigned *code; int sizecode; signed char *lineinfo; int sizelineinfo; void *abslineinfo; int sizeabslineinfo; void *upvalues; int sizeupvalues; void *locvars; int sizelocvars; } Proto;
 typedef struct UpVal { HEAD; union {TValue *p;} v; } UpVal;
+typedef struct LocVar { void *varname; int startpc, endpc; } LocVar;
 typedef struct Upvaldesc { void *name; } Upvaldesc;
 typedef struct Udata { HEAD; size_t len; } Udata;
 typedef union StkIdRel { StackValue *p; ptrdiff_t offset; } StkIdRel;
-typedef struct CallInfo { StkIdRel func, top; struct CallInfo *previous, *next; union {struct {const unsigned *savedpc;} l;} u; unsigned short callstatus; } CallInfo;
+typedef struct CallInfo { StkIdRel func, top; struct CallInfo *previous, *next; union {struct {const unsigned *savedpc; int nextraargs;} l;} u; unsigned short callstatus; } CallInfo;
 typedef struct lua_State { HEAD; unsigned char status; StkIdRel top, stack, stack_last; void *l_G; CallInfo *ci; CallInfo base_ci; } lua_State;
 typedef struct AbsLineInfo { int pc, line; } AbsLineInfo;
 #ifndef RUNTIME_ANCHORS

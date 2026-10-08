@@ -152,8 +152,12 @@ static void attach_probes(bool automatic_step)
         if (read(gate[0], &byte, 1) != 1)
             _exit(2);
         close(gate[0]);
-        marker();
-        marker();
+        /* A volatile indirect call uses the function-pointer address. On
+         * ELFv2 that is the global entry; a direct call in this file would
+         * skip it and miss the planted breakpoint. */
+        void (*volatile fn)(void) = marker;
+        fn();
+        fn();
         _exit(23);
     }
     close(gate[0]);
@@ -167,7 +171,7 @@ static void attach_probes(bool automatic_step)
     const size_t trap_size = xrt_arch_native()->trap_size;
     OK(xrt_target_read(target, address, original, trap_size, &count));
     CHECK(count == trap_size);
-    uint64_t bp, watch;
+    uint64_t bp, watch = 0;
     OK(xrt_target_breakpoint_set(target, address, false, &bp));
     OK(xrt_target_read(target, address, overlaid, trap_size, &count));
     CHECK(memcmp(original, overlaid, trap_size) == 0 && view().breakpoints[0].patched);
@@ -215,6 +219,8 @@ static void attach_probes(bool automatic_step)
             CHECK(view().state == XRT_STOPPED && view().breakpoints[0].patched);
         }
         OK(xrt_target_breakpoint_remove(target, bp));
+        OK(xrt_target_read(target, address, overlaid, trap_size, &count));
+        CHECK(count == trap_size && memcmp(original, overlaid, trap_size) == 0);
         OK(xrt_target_continue(target));
         wait_exit();
         CHECK(view().events[view().event_count - 1].detail == 23);
@@ -534,8 +540,9 @@ static void foundation(void)
     OK(xrt_target_breakpoint_remove(target, id));
 
     const struct xrt_arch *native = xrt_arch_native();
-    const char *scratch = native->machine == XRT_X86_64       ? "r10"
+    const char *scratch = native->machine == XRT_X86_64      ? "r10"
                           : native->machine == XRT_LOONGARCH ? "r12"
+                          : native->machine == XRT_PPC64     ? "r12"
                           : native->machine == XRT_M68K      ? "d2"
                                                              : "x9";
     struct reg_bank bank = {0};

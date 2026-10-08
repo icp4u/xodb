@@ -72,6 +72,7 @@ fn published(session: *model.Session, module: *Module, runtime: u64, link: u64, 
 fn refusal(name: []const u8) anyerror {
     const known = [_]struct { []const u8, anyerror }{
         .{ "PythonVersionUnsupported", error.PythonVersionUnsupported },
+        .{ "PythonStackRefUnsupported", error.PythonStackRefUnsupported },
         .{ "PythonFreeThreadedUnsupported", error.PythonFreeThreadedUnsupported },
         .{ "PythonLayoutUnverified", error.PythonLayoutUnverified },
         .{ "PythonLayoutMismatch", error.PythonLayoutMismatch },
@@ -86,6 +87,9 @@ fn refusal(name: []const u8) anyerror {
 fn profile(session: *model.Session, module: *Module) !*const c.struct_xpy_layout {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (session.target.arch() != .x86_64) return error.PythonArchitectureUnsupported;
+    if (module.symbols().findSymbol("_Py_stackref_get_object")) |debug_ref| {
+        if (debug_ref.hasAddress()) return error.PythonStackRefUnsupported;
+    }
     const id = module.image.buildId() orelse return error.PythonBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.PythonBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.PythonBuildIdUnavailable;
@@ -422,4 +426,87 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
     const layout = try profile(session, try runtimeModule(session));
     const runtime = try runtimeOf(a, layout);
     return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = runtime.layout };
+}
+
+/// Read a frame/code pair selected from the canonical stopped Python stack.
+/// The C reader owns name, stackref, cell and bounded-value decoding.
+pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment, frame, start, limit, null);
+}
+pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment, frame, 0, 1, expression);
+}
+fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
+    const named = @import("../model/language_locals.zig");
+    const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const selected = observed.segments[segment_index];
+    if (frame >= selected.frames.len) return error.InvalidLanguageFrame;
+    const selected_frame = selected.frames[frame];
+    const frame_address = try std.fmt.parseInt(u64, selected_frame.frame_address, 0);
+    const code = try std.fmt.parseInt(u64, selected_frame.code, 0);
+    const generation = observed.generation;
+    const version = try a.dupe(u8, selected.runtime.version);
+    const id = try a.dupe(u8, selected.runtime.build_id);
+    const stack_reason = if (selected.reason) |why| try a.dupe(u8, why) else null;
+    const layout = try profile(session, try runtimeModule(session));
+    if (!std.mem.eql(u8, id, try buildId(a, layout))) return error.PythonBuildIdMismatch;
+    var r = reader(session);
+    const raw = try a.create(c.struct_xpy_locals);
+    if (expression) |query| c.xpy_local_find(layout, &r, frame_address, code, try a.dupeZ(u8, query), raw) else c.xpy_locals_read(layout, &r, frame_address, code, start, limit, raw);
+    const rows = try a.alloc(named.Row, raw.count);
+    for (raw.items[0..raw.count], rows) |item, *out| {
+        const value = &item.value;
+        const children = try a.alloc(named.Child, value.item_count);
+        for (value.items[0..value.item_count], children) |child, *dest| dest.* = .{
+            .key = try text(a, std.mem.sliceTo(&child.key, 0)),
+            .type = try text(a, std.mem.sliceTo(&child.type, 0)),
+            .display = try text(a, std.mem.sliceTo(&child.display, 0)),
+            .address = if (child.address != 0) child.address else null,
+            .diagnostic = try reason(a, child.reason),
+            .advisory = child.reason != null,
+        };
+        const why = try reason(a, item.reason);
+        out.* = .{
+            .name = try text(a, std.mem.sliceTo(&item.name, 0)),
+            .name_diagnostic = try reason(a, item.name_reason),
+            .scope = switch (item.scope) {
+                c.XPY_PARAMETER => .parameter,
+                c.XPY_CELL => .cell,
+                c.XPY_FREE => .free,
+                else => .local,
+            },
+            .ordinal = item.ordinal,
+            .address = if (item.address != 0) item.address else null,
+            .slot_address = if (item.slot_address != 0) item.slot_address else null,
+            .hidden = item.hidden != 0,
+            .immediate = item.immediate != 0,
+            .value = .{
+                .count = value.count,
+                .type = if (value.type[0] == 0) "unavailable" else try text(a, std.mem.sliceTo(&value.type, 0)),
+                .display = if (value.display[0] == 0) why orelse "Value unavailable" else try text(a, std.mem.sliceTo(&value.display, 0)),
+                .diagnostic = why,
+                .truncated = value.truncated != 0,
+                .children = children,
+            },
+        };
+    }
+    try session.target.expectGeneration(generation);
+    return .{
+        .generation = generation,
+        .tid = tid,
+        .language = .python,
+        .segment = segment_index,
+        .frame = frame,
+        .start = raw.start,
+        .total = raw.total,
+        .truncated = raw.truncated != 0,
+        .rows = rows,
+        .diagnostic = (try reason(a, raw.reason)) orelse stack_reason,
+        .runtime_version = version,
+        .runtime_build_id = id,
+        .basis = "CPython verified build-id, published localsplus/name/kind offsets and cell layout; canonical retained frame/code; normal GIL stackrefs; fast locals only, no mapping lookup, descriptors or inferior calls",
+        .memory_reads = r.reads,
+        .memory_bytes = r.bytes,
+    };
 }

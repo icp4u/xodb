@@ -75,7 +75,19 @@ pub const State = struct {
         const ctx = try owner.descriptors();
         if (self.requested_at == 0 or now -| self.requested_at >= 500_000_000) {
             const target = if (self.mode == .events and self.event_authorized) self.event_target else null;
+            var foreground: [c.XRT_FD_INTEREST_MAX]i32 = undefined;
+            var count: usize = 0;
+            if (self.filter) |id| { foreground[0] = id.pid; count = 1; }
+            for (self.rows.items[@min(self.top, self.rows.items.len)..@min(self.rows.items.len, self.top + self.visible)]) |row| {
+                if (row == .event) continue;
+                const pid = self.identity(row).owner.pid;
+                if (std.mem.indexOfScalar(i32, foreground[0..count], pid) == null and count < foreground.len) {
+                    foreground[count] = pid;
+                    count += 1;
+                }
+            }
             const request = c.struct_xrt_fdactivity_request{
+                .poll_pids = &foreground, .poll_pid_count = @intCast(count),
                 .interval_ms = self.interval_ms,
                 .event_pid = if (target) |id| id.pid else 0,
                 .event_start = if (target) |id| id.start else 0,
@@ -209,18 +221,27 @@ pub const State = struct {
             if (row != .descriptor) continue;
             const p = s.processes[row.descriptor.process];
             if (p.flags & c.XRT_FDP_STALE != 0) continue;
-            if (progress(p, s.fds[row.descriptor.fd])) |rate| if (rate > 0) return true;
+            if (progress(p, s.fds[row.descriptor.fd])) |rate| if (rate > 0 and !offsetStale(p, s.fds[row.descriptor.fd])) return true;
         }
         return false;
     }
-    pub fn progress(p: c.struct_xrt_fd_process, fd: c.struct_xrt_fd) ?f32 {
-        return if (fd.flags & c.XRT_FD_INFO == 0 or fd.flags & c.XRT_FD_OPENED != 0 or p.interval_ns == 0 or
+    pub fn offsetStale(p: c.struct_xrt_fd_process, fd: c.struct_xrt_fd) bool {
+        return p.flags & c.XRT_FDP_STALE != 0 or fd.flags & c.XRT_FD_INFO_STALE != 0;
+    }
+    pub fn stale(p: c.struct_xrt_fd_process, fd: c.struct_xrt_fd) bool {
+        const mask: u32 = c.XRT_FD_LINK_STALE | c.XRT_FD_STAT_STALE |
+            @as(u8, if (fd.kind == c.XRT_FD_REGULAR or fd.kind == c.XRT_FD_MEMFD) c.XRT_FD_INFO_STALE else 0);
+        return p.flags & c.XRT_FDP_STALE != 0 or fd.flags & mask != 0;
+    }
+    pub fn progress(_: c.struct_xrt_fd_process, fd: c.struct_xrt_fd) ?f32 {
+        return if (fd.flags & c.XRT_FD_INFO == 0 or fd.flags & c.XRT_FD_OPENED != 0 or fd.info_interval_ns == 0 or
             (fd.kind != c.XRT_FD_REGULAR and fd.kind != c.XRT_FD_MEMFD)) null else fd.rate;
     }
     pub fn progressReason(p: c.struct_xrt_fd_process, fd: c.struct_xrt_fd) []const u8 {
         if (fd.kind != c.XRT_FD_REGULAR and fd.kind != c.XRT_FD_MEMFD) return "no seekable-file offset progress";
         if (fd.flags & c.XRT_FD_INFO == 0) return "fdinfo unavailable";
-        if (p.interval_ns == 0) return "first sample";
+        if (offsetStale(p, fd)) return "cached offset progress; stale";
+        if (fd.info_interval_ns == 0) return "first offset sample";
         if (fd.flags & c.XRT_FD_OPENED != 0) return "new descriptor; no prior identity";
         return "seekable offset progress; not exact IO";
     }
@@ -309,6 +330,7 @@ test "descriptor presentation preserves scope, unknown progress and redaction" {
         fd.fd = @intCast(i + 3);
         fd.kind = c.XRT_FD_REGULAR;
         fd.flags = c.XRT_FD_INFO | c.XRT_FD_STAT;
+        fd.info_interval_ns = 1_000_000_000;
         fd.rate = if (i == 0) 50 else 20;
         fd.link_length = 15;
     }
@@ -327,6 +349,19 @@ test "descriptor presentation preserves scope, unknown progress and redaction" {
     try std.testing.expectEqual(@as(i32, 123), state.identity(state.rows.items[0]).owner.pid);
     try std.testing.expectEqual(@as(i32, 3), state.identity(state.rows.items[0]).fd);
     try std.testing.expect(State.progress(processes[0], fds[1]) == null);
+    var cached = fds[0];
+    cached.flags |= c.XRT_FD_LINK_STALE;
+    try std.testing.expect(State.stale(processes[0], cached));
+    try std.testing.expect(!State.offsetStale(processes[0], cached));
+    cached.flags |= c.XRT_FD_INFO_STALE;
+    try std.testing.expect(State.offsetStale(processes[0], cached));
+    try std.testing.expectEqualStrings("cached offset progress; stale", State.progressReason(processes[0], cached));
+    try std.testing.expectEqual(@as(?f32, 50), State.progress(processes[0], cached));
+    var pipe = fds[1];
+    pipe.flags |= c.XRT_FD_INFO_STALE;
+    try std.testing.expect(!State.stale(processes[0], pipe));
+    pipe.flags |= c.XRT_FD_LINK_STALE;
+    try std.testing.expect(State.stale(processes[0], pipe));
     state.scope(.{ .pid = 123, .start = 11 });
     try state.rebuild(a, false);
     try std.testing.expectEqual(0, state.rows.items.len);

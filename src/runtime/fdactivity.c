@@ -14,7 +14,8 @@ struct xrt_fdactivity {
     pthread_mutex_t lock;
     pthread_cond_t wake;
     atomic_bool stop;
-    uint64_t wanted_until, fast_until, event_until;
+    uint64_t wanted_until, fast_until, event_until, poll_all_until;
+    struct { int32_t pid; uint64_t until; } poll_interest[XRT_FD_INTEREST_MAX];
     int32_t requested_pid;
     uint64_t requested_start, requested_generation;
     struct xrt_fdactivity_view view;
@@ -69,6 +70,12 @@ static void *owner(void *opaque)
         const uint32_t interval = now < a->fast_until ? 250 : 1000;
         const uint64_t generation = a->requested_generation, start = a->requested_start;
         const int32_t pid = a->requested_pid;
+        int32_t foreground[XRT_FD_INTEREST_MAX];
+        uint32_t nforeground = 0;
+        const int all_foreground = now < a->poll_all_until;
+        for (uint32_t i = 0; i < XRT_FD_INTEREST_MAX; ++i)
+            if (now < a->poll_interest[i].until)
+                foreground[nforeground++] = a->poll_interest[i].pid;
         pthread_mutex_unlock(&a->lock);
         if (event_generation != generation || !event_wanted) {
             if (events) {
@@ -114,12 +121,14 @@ static void *owner(void *opaque)
             if (!poller) {
                 const struct xrt_fdscan_options opts = {.max_processes = 16384,
                                                         .max_fds = 65536,
+                                                        .adaptive = 1,
                                                         .max_strings = 4u << 20,
                                                         .budget_ms = interval == 250 ? 5 : 10};
                 poll_status = xrt_fdscan_create(&opts, &poller);
             }
             if (poller) {
                 xrt_fdscan_budget(poller, interval == 250 ? 5 : 10);
+                (void)xrt_fdscan_interest(poller, foreground, nforeground, all_foreground);
                 struct xrt_fd_snapshot snapshot;
                 poll_status = xrt_fdscan_poll(poller, &snapshot);
                 if (poll_status == XRT_OK) {
@@ -233,8 +242,11 @@ enum xrt_status xrt_fdactivity_request(struct xrt_fdactivity *a,
                                        const struct xrt_fdactivity_request *r)
 {
     if (!a || !r || (r->interval_ms != 250 && r->interval_ms != 1000) || r->event_pid < 0 ||
+        r->poll_pid_count > XRT_FD_INTEREST_MAX || (r->poll_pid_count && !r->poll_pids) ||
         ((r->event_pid == 0) != (r->event_start == 0)) || (r->stop_events && r->event_pid))
         return XRT_INVALID_ARGUMENT;
+    for (uint32_t i = 0; i < r->poll_pid_count; ++i)
+        if (r->poll_pids[i] <= 0) return XRT_INVALID_ARGUMENT;
     if (pthread_mutex_trylock(&a->lock))
         return XRT_STALE_SNAPSHOT;
     const uint64_t now = now_ns(CLOCK_MONOTONIC);
@@ -246,6 +258,16 @@ enum xrt_status xrt_fdactivity_request(struct xrt_fdactivity *a,
     if (r->stop_events)
         a->event_until = 0;
     a->wanted_until = now + DEMAND_NS;
+    if (r->poll_all) a->poll_all_until = now + DEMAND_NS;
+    for (uint32_t i = 0; i < r->poll_pid_count; ++i) {
+        uint32_t slot = 0;
+        for (uint32_t j = 0; j < XRT_FD_INTEREST_MAX; ++j) {
+            if (a->poll_interest[j].pid == r->poll_pids[i]) { slot = j; break; }
+            if (a->poll_interest[j].until < a->poll_interest[slot].until) slot = j;
+        }
+        a->poll_interest[slot].pid = r->poll_pids[i];
+        a->poll_interest[slot].until = now + DEMAND_NS;
+    }
     if (r->interval_ms == 250)
         a->fast_until = now + DEMAND_NS;
     if (r->event_pid) {

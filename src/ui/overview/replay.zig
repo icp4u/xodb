@@ -147,6 +147,11 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     s.sequence = u64f(get(r, "sequence")).get() orelse 0;
     s.redacted = if (get(r, "redacted")) |x| x == .bool and x.bool else false;
     s.interval_s = f64f(get(r, "interval_s"));
+    if (get(r, "memory_map")) |mm| {
+        const map = try a.create(@import("../../memdefrag/model.zig").Map);
+        map.* = try @import("../../memdefrag/model.zig").fromValue(a, mm);
+        s.memory_map = map;
+    }
     if (get(r, "groups")) |groups| if (groups == .object) {
         inline for (std.meta.fields(m.Group), 0..) |g, i| {
             if (groups.object.get(g.name)) |x| {

@@ -10,6 +10,9 @@ struct xrt_fdactivity_request {
     uint32_t interval_ms; /* 250 or 1000; active faster requests win for 3s */
     int32_t event_pid;    /* zero: polling only; positive: explicit event scope */
     uint64_t event_start;
+    const int32_t *poll_pids; /* copied during request; no retained pointer */
+    uint32_t poll_pid_count;  /* at most XRT_FD_INTEREST_MAX */
+    int poll_all; /* explicit whole-snapshot demand; otherwise visible/requested pids */
     int stop_events; /* explicit authorized stop; observers leave this zero */
 };
 struct xrt_fdactivity_view {
@@ -28,6 +31,9 @@ void xrt_fdactivity_destroy(struct xrt_fdactivity *);
 /* A positive event_pid starts/renews costly host-wide syscall tracing. Callers
  * must require explicit UI consent or current controller authorization; cache
  * readers MUST NOT submit event demand. A zero-pid poll never renews events.
+ * Poll demand is merged for 3s across clients, independently of event demand.
+ * At most XRT_FD_INTEREST_MAX foreground pids are retained (oldest demand
+ * expires first when full); others remain visible with stale metadata.
  * XRT_INVALID_STATE means a different pid/start event scope is still active.
  * XRT_STALE_SNAPSHOT means a short publication lock is busy; retry later. */
 enum xrt_status xrt_fdactivity_request(struct xrt_fdactivity *,

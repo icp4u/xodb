@@ -3,7 +3,7 @@
 
 Native: python3 tests/runtime-host.py
 Cross ISA: add --ssh HOST --ssh-config FILE --agent PATH --fixture PATH --arch m68k
-or --arch loongarch64. The remote fixture is tests/fixtures/runtime-isa.c
+or --arch loongarch64 or --arch ppc64le. The remote fixture is tests/fixtures/runtime-isa.c
 compiled with -g -O0.
 """
 import argparse
@@ -18,7 +18,7 @@ p.add_argument('--ssh')
 p.add_argument('--ssh-config')
 p.add_argument('--agent', default='./zig-out/bin/xodb-agent')
 p.add_argument('--fixture', default='./zig-out/bin/xodb-m1-fixture')
-p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k', 'loongarch64'])
+p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k', 'loongarch64', 'ppc64le'])
 a = p.parse_args()
 os.chdir(Path(__file__).resolve().parents[1])
 options = ['--runtime-agent', a.agent]
@@ -36,7 +36,13 @@ try:
     c.action('continue')
     c.stopped('breakpoint')
     regs = c.inspect('get_registers', tid=tid)['registers']
-    assert regs[pc] == symbol['address'], (regs, symbol)
+    if a.arch == 'ppc64le':
+        def num(v):
+            return int(v, 16) if isinstance(v, str) else int(v)
+        # The symbol address is the global entry. The breakpoint is the local entry.
+        assert num(regs[pc]) == num(symbol['address']) + int(symbol.get('local_entry') or 0), (regs, symbol)
+    else:
+        assert regs[pc] == symbol['address'], (regs, symbol)
     if a.arch == 'loongarch64':
         def refused(tool_name, text, **args):
             response = c.tool(tool_name, generation=c.session()['generation'], **args)
@@ -93,6 +99,16 @@ try:
             assert effects['result']['isError'] and effects['result']['content'][0]['text'] == 'InstructionAnalysisUnsupportedArchitecture', effects
             assert set(['d0','a6','usp','pc','sr']).issubset(regs), regs
             c.action('write_register',tid=tid,name='d0',value=regs['d0'])
+        if a.arch == 'ppc64le':
+            def refused(tool_name, text, **args):
+                response = c.tool(tool_name, generation=c.session()['generation'], **args)
+                assert response['result']['isError'] and response['result']['content'][0]['text'] == text, response
+            refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
+            refused('start_profile', 'ProfilingUnsupportedArchitecture')
+            refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
+            refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
+            assert set(['r0', 'r1', 'r2', 'lr', 'pc']).issubset(regs), regs
+            c.action('write_register', tid=tid, name='r12', value=regs['r12'])
     c.action('remove_breakpoint', id=bp)
     c.action('continue')
     until = time.monotonic() + 5
@@ -101,6 +117,8 @@ try:
         time.sleep(.002)
     if a.arch == 'loongarch64':
         print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; watchpoints, profile and uprobes refused')
+    elif a.arch == 'ppc64le':
+        print('C agent host integration passed (ppc64le): symbols, registers, local-entry breakpoint, break/step, disassembly, stack, expression; watches, profile and uprobes refused')
     else:
         print(f'C agent host integration passed ({a.arch}): target files, ELF, symbols, registers, break/step, disassembly, stack, expression and cleanup')
 finally:

@@ -65,6 +65,19 @@ class Client:
     def session(self): return self.inspect('get_session')
     def action(self, tool_name, **args):
         return self.inspect(tool_name, generation=self.session()['generation'], **args)
+    def continue_initial_stop(self):
+        """Discovery can revise the initial stop; retry one rejected continue."""
+        for attempt in range(2):
+            state = self.session()
+            assert state['state'] == 'stopped', state
+            response = self.tool('continue', generation=state['generation'])
+            result = response.get('result', {})
+            stale = (result.get('isError') and
+                     result.get('content') == [{'type':'text', 'text':'StaleSnapshot'}])
+            if stale and attempt == 0:
+                continue
+            assert 'error' not in response and result and not result['isError'], response
+            return result['structuredContent']
     def stopped(self, reason=None, seconds=5):
         deadline = time.monotonic()+seconds
         while time.monotonic()<deadline:

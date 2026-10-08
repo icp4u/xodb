@@ -5,6 +5,7 @@ XODB_BIN selects the application; XODB_RUNTIME_AGENT selects its optional local
 C agent. Artifacts use XODB_TEST_TMPDIR, otherwise Python's TMPDIR-aware default.
 No inherited graphical session, privilege change or unrelated process is used.
 """
+import errno
 import json
 import os
 from pathlib import Path
@@ -31,6 +32,21 @@ def eventually(probe, predicate, label, timeout=TIMEOUT):
             return result
         assert time.monotonic() < deadline, (label, result)
         time.sleep(.01)
+
+
+def connect_ready(sock, path, alive, timeout=TIMEOUT):
+    """bind() publishes the path before listen(); retry only startup absence."""
+    deadline = time.monotonic() + timeout
+    while True:
+        assert alive(), 'server exited before accepting connections'
+        try:
+            sock.connect(str(path))
+            return
+        except OSError as error:
+            if error.errno not in (errno.ENOENT, errno.ECONNREFUSED):
+                raise
+            assert time.monotonic() < deadline, ('socket listener readiness', error)
+            time.sleep(.01)
 
 
 def expect_error(reply, name):
@@ -62,7 +78,10 @@ class Client:
         self.closed = False
         server.clients.append(self)
         try:
-            self.sock.connect(str(server.path))
+            # Some suites supply only a path/client registry; process liveness
+            # is an extra check when the owner exposes a process handle.
+            process = getattr(server, 'proc', None)
+            connect_ready(self.sock, server.path, lambda: process is None or process.poll() is None)
             if handshake:
                 reply = self.call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
                                   'clientInfo': {'name': label, 'version': '1'}})
@@ -156,7 +175,7 @@ class Server:
             def ready():
                 assert self.proc.poll() is None, (args, (self.work / 'server.log').read_text())
                 return self.path.exists()
-            eventually(ready, bool, 'socket listener readiness', timeout=10)
+            eventually(ready, bool, 'socket path published; Client waits for listen', timeout=10)
             assert stat.S_ISSOCK(self.path.stat().st_mode)
         except BaseException:
             self.close()

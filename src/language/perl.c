@@ -1,6 +1,7 @@
 #include "perl.h"
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 /* Perl 5.44.0 sv.h/cop.h/cv.h/hv.h macro rules. The caller first verifies the
@@ -142,6 +143,7 @@ static int gv_name(const struct xpl_layout *l, struct xpl_reader *r, uint64_t bo
 struct file_cache { uint64_t address; const struct xpl_frame *frame; };
 static void location(const struct xpl_layout *l, struct xpl_reader *r, uint64_t cop, struct xpl_frame *f,
                      struct file_cache *cache, unsigned *cache_count) {
+    f->cop = cop;
     if (!cop) {
         f->reason = "CopUnavailable";
         return;
@@ -483,4 +485,179 @@ unreadable:
 }
 void xpl_value_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t address, struct xpl_value *out) {
     value(l, r, address, out, 0);
+}
+
+
+struct pad_binding {
+    uint64_t ordinal;
+    unsigned flags, package;
+    char name[256];
+};
+static uint64_t pointer_slot(struct xpl_reader *r, uint64_t base, uint64_t index) {
+    if (!base || index > UINT64_MAX / 8 || base > UINT64_MAX - index * 8) {
+        r->error = "PadAddressOverflow";
+        return 0;
+    }
+    return base + index * 8;
+}
+static int lexical_name(const char *name) {
+    if (!name || !strchr("$@%&", name[0]) || !name[0]) return 0;
+    unsigned char ch = (unsigned char)name[1];
+    if (!(ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z'))) return 0;
+    for (size_t i = 2; i < 256; ++i) {
+        ch = (unsigned char)name[i];
+        if (!ch) return 1;
+        if (!(ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9'))) return 0;
+    }
+    return 0;
+}
+static int pad_frame(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
+                     size_t index, struct xpl_locals *out, uint64_t *names, uint64_t *slots,
+                     int64_t *last) {
+    if (index >= XPL_MAX_FRAMES) { out->reason = "FrameUnavailable"; return 0; }
+    struct xpl_stack *stack = malloc(sizeof *stack);
+    if (!stack) { out->reason = "OutOfMemory"; return 0; }
+    xpl_stack_read(l, r, interpreter, stack);
+    struct xpl_frame f = {0};
+    if (r->error || (stack->reason && strcmp(stack->reason, "PartialFrames")))
+        out->reason = r->error ? r->error : stack->reason;
+    else if (index >= stack->count) out->reason = "FrameUnavailable";
+    else f = stack->frames[index];
+    free(stack);
+    if (out->reason) return 0;
+    out->context_address = f.context_address; out->cv = f.cv;
+    if (f.context_type == 10) { out->reason = "FormatPadUnproved"; return 0; }
+    if (f.context_type != 0 && f.context_type != 9) {
+        out->reason = "EvalPadUnproved"; return 0;
+    }
+    if (!f.cv || !f.cop) { out->reason = "FramePadUnavailable"; return 0; }
+    uint64_t body; uint32_t flags, refs;
+    if (!head(l, r, f.cv, &body, &flags, &refs) || (flags & 255) != SV_CV || !body) {
+        out->reason = "PadCvInvalid"; return 0;
+    }
+    if (at(l, r, body, XPL_CVFLAGS) & 8) { out->reason = "XsFrameNoPad"; return 0; }
+    uint64_t depth = f.context_type ? at(l, r, f.context_address, XPL_SUBDEPTH) + 1 : 1;
+    uint64_t active_depth = at(l, r, body, XPL_CVDEPTH);
+    /* The main CV is run at depth zero but stores its executing pad at one. */
+    if (!depth || depth > 1024 || (f.context_type && depth > active_depth)) {
+        out->reason = "PadDepthInvalid"; return 0;
+    }
+    out->depth = (uint32_t)depth;
+    out->sequence = at(l, r, f.cop, XPL_COPSEQ);
+    if (!out->sequence || out->sequence == UINT32_MAX) {
+        out->reason = "PadSequenceUnavailable"; return 0;
+    }
+    uint64_t padlist = at(l, r, body, XPL_CVPADLIST);
+    if (!padlist) { out->reason = "PadlistUnavailable"; return 0; }
+    uint64_t max = at(l, r, padlist, XPL_PADMAX), array = at(l, r, padlist, XPL_PADARRAY);
+    if (max < depth || max > 1048576 || !array) { out->reason = "PadlistInvalid"; return 0; }
+    uint64_t namelist = number(r, pointer_slot(r, array, 0), 8);
+    uint64_t pad = number(r, pointer_slot(r, array, depth), 8);
+    if (!namelist || !pad) { out->reason = "PadUnavailable"; return 0; }
+    out->pad = pad;
+    *last = (int64_t)at(l, r, namelist, XPL_NAMESFILL);
+    int64_t name_max = (int64_t)at(l, r, namelist, XPL_NAMESMAX);
+    *names = at(l, r, namelist, XPL_NAMESARRAY);
+    if (*last < -1 || *last > name_max || name_max < -1 || name_max > 1048576 ||
+        (*last >= 0 && !*names)) { out->reason = "PadNamesInvalid"; return 0; }
+    if (*last >= XPL_MAX_PAD_SLOTS) { out->reason = "PadSlotLimit"; return 0; }
+    if (!head(l, r, pad, &body, &flags, &refs) || (flags & 255) != SV_AV || !body) {
+        out->reason = "PadValuesInvalid"; return 0;
+    }
+    int64_t fill = (int64_t)at(l, r, body, XPL_AVFILL), capacity = (int64_t)at(l, r, body, XPL_AVMAX);
+    *slots = at(l, r, pad, XPL_UNION);
+    if (fill < *last || fill < -1 || fill > capacity || capacity < -1 || capacity > 1048576 ||
+        (fill >= 0 && !*slots)) { out->reason = "PadValuesInvalid"; return 0; }
+    return !r->error;
+}
+static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
+                       size_t frame, size_t start, size_t limit, const char *find, struct xpl_locals *out) {
+    memset(out, 0, sizeof *out);
+    out->interpreter = interpreter; out->frame = frame; out->start = start;
+    if (find && !lexical_name(find)) { out->reason = "UnsupportedPerlExpression"; return; }
+    uint64_t names = 0, slots = 0; int64_t last = -1;
+    if (!pad_frame(l, r, interpreter, frame, out, &names, &slots, &last)) {
+        if (r->error) out->reason = r->error;
+        return;
+    }
+    struct pad_binding *bindings = calloc(XPL_MAX_PAD_NAMES, sizeof *bindings);
+    if (!bindings) { out->reason = "OutOfMemory"; return; }
+    size_t count = 0;
+    /* Highest active slot wins. Retain package declarations in the seen set:
+     * an inner `our $x` must mask an outer `my $x`, not expose the outer value. */
+    for (int64_t i = last; i >= 0 && !r->error; --i) {
+        uint64_t pn = number(r, pointer_slot(r, names, (uint64_t)i), 8);
+        if (!pn) continue;
+        uint64_t pv = at(l, r, pn, XPL_NAMEPV);
+        if (!pv) continue; /* unnamed temporary */
+        unsigned flags = (unsigned)at(l, r, pn, XPL_NAMEFLAGS);
+        if (!(flags & 1)) {
+            uint32_t low = (uint32_t)at(l, r, pn, XPL_NAMELOW), high = (uint32_t)at(l, r, pn, XPL_NAMEHIGH);
+            if (low == UINT32_MAX) continue; /* declaration not introduced yet */
+            if (low > high) { out->reason = "PadSequenceWrapUnsupported"; break; }
+            if (out->sequence <= low || out->sequence > high) continue;
+        }
+        uint64_t len = at(l, r, pn, XPL_NAMELEN);
+        if (len > 255) { out->reason = "PadNameInvalid"; break; }
+        if (!len) continue;
+        char name[256] = {0};
+        if (!read_bytes(r, pv, name, (size_t)len)) break;
+        if (memchr(name, 0, (size_t)len) || !strchr("$@%&", name[0])) {
+            out->reason = "PadNameInvalid"; break;
+        }
+        if (len == 1) continue; /* anonymous sub or state initialization flag */
+        size_t j = 0;
+        for (; j < count; ++j) if (!strcmp(bindings[j].name, name)) break;
+        if (j < count) continue;
+        if (count == XPL_MAX_PAD_NAMES) { out->reason = "PadNameLimit"; break; }
+        struct pad_binding *b = &bindings[count++];
+        b->ordinal = (uint64_t)i; b->flags = flags;
+        b->package = at(l, r, pn, XPL_NAMEOUR) != 0;
+        memcpy(b->name, name, sizeof b->name);
+    }
+    if (r->error) out->reason = r->error;
+    /* A partial name scan cannot establish shadowing or name absence. */
+    if (out->reason) { free(bindings); return; }
+    for (size_t i = 0; i < count; ++i) if (!bindings[i].package) ++out->total;
+    if (limit > XPL_MAX_LOCALS) limit = XPL_MAX_LOCALS;
+    size_t position = 0;
+    for (size_t i = 0; i < count && out->count < limit; ++i) {
+        const struct pad_binding *b = &bindings[i];
+        if (b->package) {
+            if (find && !strcmp(find, b->name)) out->reason = "PerlPackageVariableUnread";
+            continue;
+        }
+        if (find ? strcmp(find, b->name) != 0 : position++ < start) continue;
+        struct xpl_local *entry = &out->items[out->count++];
+        entry->ordinal = b->ordinal;
+        memcpy(entry->name, b->name, sizeof entry->name);
+        entry->scope = b->flags & 1 ? XPL_OUTER : b->flags & 2 ? XPL_STATE : XPL_LOCAL;
+        if (b->flags & 0x20) { entry->reason = "FieldStorageUnproved"; continue; }
+        entry->slot_address = pointer_slot(r, slots, b->ordinal);
+        entry->sv = number(r, entry->slot_address, 8);
+        if (!entry->sv || r->error) {
+            entry->reason = r->error ? r->error : "PadValueUnavailable";
+            continue;
+        }
+        xpl_value_read(l, r, entry->sv, &entry->value);
+        entry->reason = entry->value.reason;
+    }
+    if (r->error) out->reason = r->error;
+    else if (find && !out->count && !out->reason) {
+        /* The active pad is proved; CvOUTSIDE/file-scope lexicals and globals
+         * were not searched, so this is not proof that the name is absent. */
+        out->reason = "PerlOuterScopeUnread";
+    }
+    out->truncated = !find && start < out->total && out->count < out->total - start;
+    free(bindings);
+}
+void xpl_locals_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
+                     size_t frame, size_t start, size_t limit, struct xpl_locals *out) {
+    pad_locals(l, r, interpreter, frame, start, limit, NULL, out);
+}
+void xpl_local_find(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
+                    size_t frame, const char *name, struct xpl_locals *out) {
+    /* NULL must not silently become an enumeration request. */
+    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", out);
 }

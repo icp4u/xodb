@@ -52,6 +52,59 @@ pub fn read(comptime language: Tab, session: *model.Session, a: A, tid: i32) !St
         else => unreachable,
     };
 }
+// One retained thread per process bounds lifetime and memory. A generation,
+// image or metadata change invalidates every pointer before the next read.
+const CacheKey = struct { generation: u64, epoch: u64, metadata: u64, tid: i32 };
+pub const Cache = struct {
+    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+    key: ?CacheKey = null,
+    native: ?[]model.Frame = null,
+    stacks: std.meta.Tuple(&.{ ?Stack(.python), ?Stack(.perl), ?Stack(.lua), ?Stack(.javascript) }) = .{ null, null, null, null },
+    errors: [4]?anyerror = @splat(null),
+    pub fn deinit(self: *Cache) void {
+        self.arena.deinit();
+    }
+    pub fn clear(self: *Cache) void {
+        _ = self.arena.reset(.free_all);
+        self.key = null;
+        self.native = null;
+        self.stacks = .{ null, null, null, null };
+        self.errors = @splat(null);
+    }
+    fn prepare(self: *Cache, session: *model.Session, tid: i32) !void {
+        const snapshot = session.target.snapshot();
+        if (snapshot.state != .stopped) return error.NotStopped;
+        const key = CacheKey{ .generation = snapshot.generation, .epoch = snapshot.image_epoch, .metadata = session.metadata.revision, .tid = tid };
+        if (self.key == null or !std.meta.eql(self.key.?, key)) {
+            self.clear();
+            self.key = key;
+        }
+    }
+};
+fn cachedNative(session: *model.Session, tid: i32) ![]model.Frame {
+    const cache = &session.language_tabs.cache;
+    try cache.prepare(session, tid);
+    if (cache.native == null) cache.native = try session.stack(cache.arena.allocator(), tid, 64);
+    return cache.native.?;
+}
+/// Borrowed until the stop, thread, image or metadata changes. Presentation
+/// callers that retain strings must copy them into their own frame arena.
+pub fn cachedRead(comptime language: Tab, session: *model.Session, tid: i32) !Stack(language) {
+    const cache = &session.language_tabs.cache;
+    try cache.prepare(session, tid);
+    const index = @intFromEnum(language) - 2;
+    if (cache.errors[index]) |err| return err;
+    if (cache.stacks[index] == null) {
+        cache.stacks[index] = read(language, session, cache.arena.allocator(), tid) catch |err| {
+            // Pending discovery may advance without a stopped-generation
+            // change. Release partial allocations and let the next call retry.
+            if (std.mem.endsWith(u8, @errorName(err), "Pending") or err == error.SymbolDiscoveryBudgetExceeded) cache.clear() else cache.errors[index] = err;
+            return err;
+        };
+        try session.target.expectGeneration(cache.key.?.generation);
+    }
+    return cache.stacks[index].?;
+}
 fn diagnostic(reason: ?[]const u8) !?Text {
     return if (reason) |text| try Text.init(text) else null;
 }
@@ -64,16 +117,29 @@ fn checkedAnchor(anchor: anytype, native: []const model.Frame) !usize {
         try anchorPc(anchor) != native[anchor.frame].pc) return error.LanguageAnchorUnverified;
     return anchor.frame;
 }
-fn matches(segment: anytype, index: usize, native: []const model.Frame) !bool {
-    if (segment.anchor) |anchor| if (try checkedAnchor(anchor, native) == index) return true;
-    if (@hasField(@TypeOf(segment), "additional_anchors")) {
-        for (segment.additional_anchors) |anchor| if (try checkedAnchor(anchor, native) == index) return true;
+fn matches(segment: anytype, index: usize, native: []const model.Frame, why: *?Text) bool {
+    var matched = false;
+    if (segment.anchor) |anchor| {
+        if (checkedAnchor(anchor, native)) |found| {
+            matched = found == index;
+        } else |_| {
+            why.* = Text.init("LanguageAnchorUnverified") catch unreachable;
+        }
     }
-    return false;
+    if (@hasField(@TypeOf(segment), "additional_anchors")) {
+        for (segment.additional_anchors) |anchor| {
+            if (checkedAnchor(anchor, native)) |found| {
+                matched = matched or found == index;
+            } else |_| {
+                why.* = Text.init("LanguageAnchorUnverified") catch unreachable;
+            }
+        }
+    }
+    return matched;
 }
 fn appendOffers(offers: *Offers, language: Tab, stack: anytype, index: usize, native: []const model.Frame) !void {
     for (stack.segments, 0..) |segment, i| {
-        if (!try matches(segment, index, native)) continue;
+        if (!matches(segment, index, native, &offers.diagnostic)) continue;
         if (offers.count == offers.items.len) {
             offers.truncated = true;
             continue;
@@ -86,15 +152,17 @@ pub fn selectNative(session: *model.Session, tid: i32, frame: usize) !void {
     if (frame >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const native = try session.stack(a, tid, 64);
+    // Only index and PC are used below. Copy them before a reader can
+    // invalidate the cache while advancing metadata discovery.
+    var native_storage: [64]model.Frame = undefined;
+    const borrowed_native = try cachedNative(session, tid);
+    const native = native_storage[0..borrowed_native.len];
+    @memcpy(native, borrowed_native);
     if (frame >= native.len) return error.InvalidFrame;
     var offers = Offers{};
     inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript }) |language| {
         if (session.language_tabs.visible(language)) {
-            if (read(language, session, a, tid)) |stack| {
+            if (cachedRead(language, session, tid)) |stack| {
                 try appendOffers(&offers, language, stack, frame, native);
             } else |err| {
                 if (offers.diagnostic == null) offers.diagnostic = try Text.init(@errorName(err));
@@ -108,9 +176,10 @@ pub fn selectNative(session: *model.Session, tid: i32, frame: usize) !void {
     state.offers = offers;
     // Expose a unique segment offer, never infer an activation when several
     // language segments share a native anchor.
-    if (offers.count == 1 and !offers.truncated and offers.diagnostic == null) {
+    if (offers.count == 1 and !offers.truncated) {
         const offer = offers.items[0];
-        state.selected = offer.language;
+        // Native locals and registers remain where the user left them.
+        if (@intFromEnum(state.selected) >= 2) state.selected = offer.language;
         if (offer.first_frame) |first| state.logical_selection = .{
             .generation = generation,
             .tid = tid,
@@ -132,13 +201,17 @@ fn fromStack(session: *model.Session, language: Tab, tid: i32, stack: anytype, s
     const generation = session.target.snapshot().generation;
     if (stack.generation != generation) return error.StaleSnapshot;
     var anchor: ?usize = null;
+    var anchor_diagnostic: ?Text = null;
     if (session.language_tabs.native_selection) |selected| {
-        if (selected.generation == generation and selected.tid == tid and try matches(segment, selected.frame, native)) anchor = selected.frame;
+        if (selected.generation == generation and selected.tid == tid and matches(segment, selected.frame, native, &anchor_diagnostic)) anchor = selected.frame;
     }
-    if (anchor == null) if (segment.anchor) |value| {
-        anchor = try checkedAnchor(value, native);
+    if (anchor == null) for (native, 0..) |_, i| {
+        if (matches(segment, i, native, &anchor_diagnostic)) {
+            anchor = i;
+            break;
+        }
     };
-    const reason = if (anchor == null) "LanguageNativeAnchorUnproved" else segment.reason;
+    const reason = if (anchor == null) (if (anchor_diagnostic) |value| value.slice() else "LanguageNativeAnchorUnproved") else segment.reason;
     const selected = Logical{ .generation = generation, .tid = tid, .language = language, .segment = segment_index, .frame = frame, .native_anchor = anchor, .native_pc = if (anchor) |index| native[index].pc else null, .anchor_basis = if (anchor != null) .reader_segment else .unproved, .reason = try diagnostic(reason) };
     try session.target.expectGeneration(generation);
     const state = &session.language_tabs;
@@ -152,15 +225,39 @@ pub fn selectLogical(session: *model.Session, tid: i32, language: Tab, segment: 
     if (segment >= 64 or frame >= 64) return error.InvalidArguments;
     if (!session.language_tabs.visible(language)) return error.LanguageTabUnavailable;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const native = try session.stack(a, tid, 64);
+    // Only index and PC are used below. Copy them before a reader can
+    // invalidate the cache while advancing metadata discovery.
+    var native_storage: [64]model.Frame = undefined;
+    const borrowed_native = try cachedNative(session, tid);
+    const native = native_storage[0..borrowed_native.len];
+    @memcpy(native, borrowed_native);
     inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript }) |candidate| {
         if (language == candidate) {
-            const stack = try read(candidate, session, a, tid);
+            const stack = try cachedRead(candidate, session, tid);
             return fromStack(session, candidate, tid, stack, segment, frame, native);
         }
     }
     return error.InvalidArguments;
+}
+
+test "one invalid anchor does not discard a separate valid offer" {
+    const Anchor = struct { frame: usize, pc: []const u8 };
+    const Segment = struct { anchor: ?Anchor, additional_anchors: []const Anchor = &.{}, frames: []const u8 = "x", reason: ?[]const u8 = null };
+    var native: [2]model.Frame = undefined;
+    native[0].index = 0;
+    native[0].pc = 10;
+    native[1].index = 1;
+    native[1].pc = 20;
+    const segments = [_]Segment{
+        .{ .anchor = .{ .frame = 99, .pc = "0xa" } },
+        .{ .anchor = .{ .frame = 0, .pc = "0xa" } },
+        .{ .anchor = .{ .frame = 1, .pc = "malformed" }, .additional_anchors = &.{.{ .frame = 0, .pc = "0xa" }} },
+        .{ .anchor = .{ .frame = 1, .pc = "0xa" } },
+    };
+    var offers = Offers{};
+    try appendOffers(&offers, .lua, .{ .segments = &segments }, 0, &native);
+    try std.testing.expectEqual(@as(usize, 2), offers.count);
+    try std.testing.expectEqual(@as(usize, 1), offers.items[0].segment);
+    try std.testing.expectEqual(@as(usize, 2), offers.items[1].segment);
+    try std.testing.expectEqualStrings("LanguageAnchorUnverified", offers.diagnostic.?.slice());
 }

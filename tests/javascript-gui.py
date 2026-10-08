@@ -88,7 +88,10 @@ try:
             outputs=[]
             for iteration in range(2):
                 d.keys('tap',57)  # Space: reach the next native probe.
-                deadline=time.monotonic()+10
+                # A cold large-image metadata job can outlive a short GUI
+                # input deadline. Bound setup, but still require the actual
+                # stack/value at this distinct stop; readiness is not latency.
+                deadline=time.monotonic()+900
                 while time.monotonic()<deadline:
                     result=subprocess.run(['scripts/demo-node','stack'],env=env,capture_output=True,text=True,timeout=10)
                     if result.returncode==0 and '  inspect ' in result.stdout and 'value = ' in result.stdout and result.stdout not in outputs:break

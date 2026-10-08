@@ -230,18 +230,27 @@ pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 const Candidate = struct { address: u64, anchor: ?Anchor };
 fn fromFrame(session: *model.Session, a: A, frame: model.Frame, requested: ?u64, candidates: *std.ArrayList(Candidate)) !void {
     const locals = try session.frameLocals(a, frame);
+    var typed_parameter = false;
+    var recovered_parameter = false;
+    var unavailable: anyerror = error.LuaStateArgumentUnavailable;
     for (locals) |local| {
         if (!local.parameter or local.value.type.kind != .pointer) continue;
         const child = local.value.type.child orelse continue;
         if (!stateType(child)) continue;
+        typed_parameter = true;
+        if (local.diagnostic) |why| if (std.mem.eql(u8, why, "EntryValueUnavailable")) {
+            unavailable = error.EntryValueUnavailable;
+        };
         const v = session.evaluateInFrame(a, frame, locals, local.name) catch continue;
         if (v.availability != .available or v.bits == 0) continue;
+        recovered_parameter = true;
         if (requested) |address| if (v.bits != address) continue;
         const symbol = frame.symbol orelse "<native frame>";
         const anchored = std.mem.eql(u8, symbol, "luaV_execute") or std.mem.startsWith(u8, symbol, "luaD_");
         if (candidates.items.len == 256) return error.LuaStateCandidateLimit;
         try candidates.append(a, .{ .address = v.bits, .anchor = if (anchored) .{ .frame = frame.index, .pc = try hex(a, frame.pc), .symbol = try a.dupe(u8, symbol), .argument = try a.dupe(u8, local.name) } else null });
     }
+    if (typed_parameter and !recovered_parameter) return unavailable;
 }
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?u64) !Stack {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
@@ -313,4 +322,79 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     return .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
+}
+
+/// Select through the canonical reader stack; raw target addresses are never
+/// accepted as a substitute for the requested retained logical frame.
+pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment_index, frame, start, limit, null);
+}
+pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, text: []const u8) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment_index, frame, 0, 1, text);
+}
+fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
+    const named = @import("../model/language_locals.zig");
+    const observed = try stack(session, a, tid, 0, null);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment = observed.segments[segment_index];
+    if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
+    const state = try std.fmt.parseInt(u64, segment.runtime_instance.address, 0);
+    const module = try runtimeModule(session);
+    const layout = try profile(session, module);
+    var r = reader(session);
+    const raw = try a.create(c.struct_xl_locals);
+    if (expression) |text| c.xl_local_find(layout, &r, state, frame, try a.dupeZ(u8, text), raw) else c.xl_locals_read(layout, &r, state, frame, start, limit, raw);
+    const ci = try std.fmt.parseInt(u64, segment.frames[frame].call_info, 0);
+    if (raw.call_info != 0 and raw.call_info != ci) return error.StaleLanguageFrame;
+    const rows = try a.alloc(named.Row, raw.count);
+    for (raw.items[0..raw.count], rows) |item, *out| {
+        const value = &item.value;
+        const children = try a.alloc(named.Child, value.item_count);
+        for (value.items[0..value.item_count], children) |child, *dest| dest.* = .{
+            .key = try a.dupe(u8, std.mem.sliceTo(&child.key, 0)),
+            .type = try a.dupe(u8, std.mem.sliceTo(&child.type, 0)),
+            .display = try a.dupe(u8, std.mem.sliceTo(&child.display, 0)),
+            .address = if (child.address != 0) child.address else null,
+            .diagnostic = try reason(a, child.reason),
+            .advisory = child.advisory != 0,
+        };
+        out.* = .{
+            .name = try a.dupe(u8, std.mem.sliceTo(&item.name, 0)),
+            .name_diagnostic = try reason(a, item.reason),
+            .scope = switch (item.kind) {
+                c.XL_LOCAL => .local,
+                c.XL_VARARGS => .vararg,
+                else => .upvalue,
+            },
+            .ordinal = item.ordinal,
+            .address = if (item.address != 0) item.address else null,
+            .value = .{
+                .count = if (item.kind == c.XL_VARARGS) value.count else null,
+                .type = try a.dupe(u8, std.mem.sliceTo(&value.type, 0)),
+                .display = try a.dupe(u8, std.mem.sliceTo(&value.display, 0)),
+                .diagnostic = try reason(a, value.reason),
+                .advisory = value.advisory != 0,
+                .truncated = value.truncated != 0,
+                .children = children,
+            },
+        };
+    }
+    try session.target.expectGeneration(observed.generation);
+    return .{
+        .generation = observed.generation,
+        .tid = tid,
+        .language = .lua,
+        .segment = segment_index,
+        .frame = frame,
+        .start = raw.start,
+        .total = raw.total,
+        .truncated = raw.truncated != 0,
+        .rows = rows,
+        .diagnostic = try reason(a, raw.reason),
+        .runtime_version = segment.runtime.version,
+        .runtime_build_id = segment.runtime.build_id,
+        .basis = try std.fmt.allocPrint(a, "{s}; active LocVar scopes and closure upvalues; bounded retained memory; no target calls", .{segment.runtime.layout_source}),
+        .memory_reads = r.reads,
+        .memory_bytes = r.bytes,
+    };
 }

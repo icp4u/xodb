@@ -68,6 +68,7 @@ def spawn(mode, *args):
     return p
 
 def audit(): return Path(d.log).read_text(errors='replace')
+def process_rows(): return re.findall(r'process selection query_pid=(\d+) query_row=(-?\d+) rows=(\d+) selected_pid=(\d+) start=(\d+)', audit())
 def file_rows(): return re.findall(r'files collector opens=(\d+) sequence=(\d+) filter_pid=(\d+) start=(\d+) rows=(\d+) mode=(\w+)', audit())
 def perf_fds():
     count = 0
@@ -88,7 +89,18 @@ def scope(pid):
     if not flat: d.keys('tap', 47); flat = True
     d.keys('tap', 53, 'tap', 1, 'tap', 53) # clear the prior process query
     keys = [item for digit in str(pid) for item in ('tap', 11 if digit == '0' else int(digit) + 1)]
-    d.keys(*keys, 'tap', 28, 'tap', 108)
+    d.keys(*keys, 'tap', 28)
+    # A new fixture may miss the previous process snapshot; numeric search
+    # also matches pid prefixes and command arguments. Wait for its exact row
+    # and acknowledge the selected identity before requesting an action.
+    until(process_rows, lambda rows: rows and rows[-1][0] == str(pid) and int(rows[-1][1]) >= 0, 'queried process present')
+    birth = ticks(pid)
+    def select_exact():
+        rows = process_rows()
+        if rows and rows[-1][0] == str(pid) and int(rows[-1][1]) >= 0:
+            d.keys('tap', 102, *[item for _ in range(int(rows[-1][1])) for item in ('tap', 108)])
+        return process_rows()
+    until(select_exact, lambda rows: rows and rows[-1][3:5] == (str(pid), str(birth)), 'exact process selected')
     d.keys('tap', 38); time.sleep(.3); d.keys('tap', 28)
     birth = ticks(pid)
     until(file_rows, lambda rows: rows and rows[-1][2:4] == (str(pid), str(birth)) and int(rows[-1][4]) > 0, 'selected process fd rows')

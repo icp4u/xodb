@@ -133,9 +133,29 @@ fn birthSnapshot(v: rt.struct_xrt_birth) Birth {
 }
 /// C owns all live state. These arrays only adapt read-only C snapshots for the
 /// existing host/JSON types; no operation writes them back to the runtime.
+pub const GdbAvailability = enum { available, unsupported, failed, not_tested };
+pub const GdbRemoteInfo = struct {
+    architecture: []const u8,
+    packet_size: u32,
+    register_count: u32,
+    attached: ?bool,
+    threads: GdbAvailability,
+    step: GdbAvailability,
+    software_breakpoints: GdbAvailability,
+    watchpoints: GdbAvailability,
+    libraries: GdbAvailability,
+    binary_writes: GdbAvailability,
+    register_writes: GdbAvailability,
+    interrupt: GdbAvailability,
+    last_reason: []const u8,
+};
+fn gdbAvailability(info: rt.struct_xrt_gdb_info, bit: u64) GdbAvailability {
+    return if (info.failed & bit != 0) .failed else if (info.supported & bit != 0) .available else if (info.unsupported & bit != 0) .unsupported else .not_tested;
+}
 pub const Target = struct {
     handle: ?*rt.struct_xrt_target = null,
     core: ?@import("../binary/core.zig").Core = null,
+    gdb_cache: rt.struct_xrt_gdb_info = std.mem.zeroes(rt.struct_xrt_gdb_info),
     thread_cache: [1024]Thread = undefined,
     event_cache: [4096]Event = undefined,
     breakpoint_cache: [128]bp.Breakpoint = undefined,
@@ -162,6 +182,29 @@ pub const Target = struct {
         var raw: [256]?[*:0]const u8 = @splat(null);
         for (argv, 0..) |arg, i| raw[i] = arg.ptr;
         try runtime.check(rt.xrt_target_remote(@ptrCast(&raw), &self.handle));
+    }
+    pub fn connectGdbRemote(self: *Target, endpoint: [:0]const u8) !void {
+        if (self.handle != null or self.core != null) return error.ConflictingTargets;
+        try runtime.check(rt.xrt_target_gdb_remote(endpoint.ptr, &self.handle));
+    }
+    pub fn gdbRemoteInfo(self: *const Target) ?GdbRemoteInfo {
+        const cache = &@constCast(self).gdb_cache;
+        if (!rt.xrt_target_gdb_info(self.handle, cache)) return null;
+        return .{
+            .architecture = std.mem.sliceTo(&cache.architecture, 0),
+            .packet_size = cache.packet_size,
+            .register_count = cache.register_count,
+            .attached = if (cache.attached < 0) null else cache.attached != 0,
+            .threads = gdbAvailability(cache.*, rt.XRT_GDB_CAP_THREADS),
+            .step = gdbAvailability(cache.*, rt.XRT_GDB_CAP_STEP),
+            .software_breakpoints = gdbAvailability(cache.*, rt.XRT_GDB_CAP_SOFTWARE_BREAK),
+            .watchpoints = gdbAvailability(cache.*, rt.XRT_GDB_CAP_WATCH),
+            .libraries = gdbAvailability(cache.*, rt.XRT_GDB_CAP_LIBRARIES),
+            .binary_writes = gdbAvailability(cache.*, rt.XRT_GDB_CAP_BINARY_WRITE),
+            .register_writes = gdbAvailability(cache.*, rt.XRT_GDB_CAP_REGISTER_WRITE),
+            .interrupt = gdbAvailability(cache.*, rt.XRT_GDB_CAP_INTERRUPT),
+            .last_reason = std.mem.sliceTo(&cache.reason, 0),
+        };
     }
     fn rawView(self: *const Target) rt.struct_xrt_target_view {
         var view: rt.struct_xrt_target_view = undefined;

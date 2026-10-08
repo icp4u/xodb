@@ -98,3 +98,44 @@ The semantic rules follow upstream [5.4 objects](https://www.lua.org/source/5.4/
 [5.2 object](https://www.lua.org/source/5.2/lobject.h.html),
 [state](https://www.lua.org/source/5.2/lstate.h.html) and
 [debug](https://www.lua.org/source/5.2/ldebug.c.html) counterparts.
+
+## Named locals at a retained stop
+
+Select a Lua logical frame in the Lua tab. Its lower pane lists active `LocVar`
+bindings at the saved bytecode PC, followed by closure upvalues. Names, scopes and
+1-based ordinals keep shadowed locals distinct. Scroll in that pane to page the
+list. **E**, a bare name, **Return** resolves the innermost active local, then an
+upvalue. This reads memory; it never invokes Lua, metamethods or native functions.
+Only ASCII identifiers are supported currently; calls, operators and implicit
+global lookup are explicitly unavailable. Missing or truncated names cannot be
+used as evidence that a shadowing binding does not exist.
+
+For example, run `scripts/demo-lua`, press **Space** to a `print` stop, **Tab** to
+Lua, and click a Lua frame below the C `print` frame. Read a listed name with **E**.
+**E** in the C/C++ tab still inspects native expressions such as `L`.
+
+MCP observers use `get_language_locals` with `generation`, `tid`, `language: "lua"`,
+`segment` and logical `frame`; `start`/`limit` page up to 32 rows. The companion
+`evaluate_language_expression` accepts the same frame identity and `expression`
+instead of pagination. Both require the current generation and accept no raw
+frame addresses. They do not require the controller lease. Values reuse the
+bounded Lua renderer, including advisory table/object previews and child values.
+
+The supported debug builds remain Lua 5.4.9 and 5.2.4. LocVar and upvalue layout
+comes from the runtime's identified DWARF, including a verified build-ID companion.
+C frames, missing/stripped names, unstarted frames and malformed scope/stack
+metadata have explicit diagnostics. Suspended coroutines are separate canonical
+segments. Every returned storage address is valid only as evidence from that
+retained stop; resume, stack relocation and GC require another resolution.
+
+A native function-entry breakpoint can precede the store of a parameter into its
+DWARF-described stack slot. For a cooperating C callback that passes `lua_State *`,
+stop at a known source line after the prologue when validating parameter-based
+state discovery. Register ABI guesses are not used to repair missing proof.
+
+Unnamed extra arguments appear as a single `(vararg) ×N` summary row. Its name
+is empty, scope is `vararg`, count is available in `value.count`, and it has no
+storage address or expression name. The count comes from the verified frame
+layout and is checked against stack bounds; invalid metadata stays unavailable.
+Click the native-objects section header to collapse or expand it, independently
+of named locals and the logical stack.

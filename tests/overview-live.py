@@ -125,7 +125,7 @@ try:
     peers = [Peer(work / 's'), Peer(work / 's')]
     definitions = d.request('tools/list')['tools']
     names = {x['name'] for x in definitions}
-    expected = {'get_overview','get_process','list_processes','get_connections','get_sensors',
+    expected = {'get_overview','get_process','list_processes','get_connections','get_sensors','get_memory_map','get_thp_state','get_fragmentation',
                 'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open'}
     check('overview exposes only observer tools', names == expected and all(x['annotations']['readOnlyHint'] for x in definitions))
     shared_names = {x['name'] for x in peers[0].call('tools/list')['result']['tools']}
@@ -147,6 +147,24 @@ try:
     row = first['processes']['rows'][0]
     check('owned process identity and state agree with proc', row['pid'] == fixture.pid and row['start_ticks'] == ticks and row['state'] == 'S')
     check('full process fields are collected', row['fds'] > 0 and isinstance(row['io_read_bytes'], int))
+    def memory_peer(peer):
+        reply = peer.call('tools/call', dict(name='get_memory_map', arguments=dict(pid=fixture.pid,start_ticks=ticks,limit=1)))
+        if reply.get('error') or reply.get('result',{}).get('isError'):
+            assert 'MemoryCacheBusy' in json.dumps(reply), reply
+            return None
+        value = reply['result']['structuredContent']
+        return value if value.get('process') is not None else None
+    memory = eventually(lambda:memory_peer(peers[0]),bool,timeout=20)
+    second_memory = eventually(lambda:memory_peer(peers[1]),bool,timeout=20)
+    check('overview memory peers share one owner and pinned scope', memory['owner_instances']==second_memory['owner_instances']==1 and memory['ticket']==second_memory['ticket'] and memory['process']['start_ticks']==ticks)
+    def memory_stdio():
+        reply = d.request('tools/call', dict(name='get_memory_map', arguments=dict(pid=fixture.pid,start_ticks=ticks,limit=1)))
+        if reply.get('error') or reply.get('isError'):
+            assert 'MemoryCacheBusy' in json.dumps(reply), reply
+            return None
+        return reply['structuredContent']
+    shared_memory = eventually(memory_stdio,bool,timeout=20)
+    check('overview stdio borrows the same memory owner', shared_memory['ticket']==memory['ticket'] and shared_memory['owner_instances']==1)
     before = observed(peers[0])
     burst = [observed(peers[i % 2]) for i in range(12)]
     check('request burst reads existing samples', len({x['sequence'] for x in burst}) <= 2 and all(x['processes']['rows'][0]['start_ticks'] == ticks for x in burst))

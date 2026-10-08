@@ -36,13 +36,20 @@ pub const State = struct {
     native_selection: ?selection.Native = null,
     logical_selection: ?selection.Logical = null,
     offers: selection.Offers = .{},
+    cache: selection.Cache = .{},
     revision: u64 = 0,
     epoch: u64 = std.math.maxInt(u64),
     generation: u64 = std.math.maxInt(u64),
     entries: [4]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
+    pub fn deinit(self: *State) void {
+        self.cache.deinit();
+    }
     pub fn syncSelection(self: *State, generation: u64) void {
+        if (self.cache.key) |key| if (key.generation != generation) {
+            self.cache.clear();
+        };
         var changed = false;
         if (self.native_selection) |value| if (value.generation != generation) {
             self.native_selection = null;

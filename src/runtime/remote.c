@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #define _FILE_OFFSET_BITS 64
 #include "remote_internal.h"
+#include "gdbremote.h"
 #include "target_internal.h"
 #include "wire_target.h"
 #include "elf_symbols.h"
@@ -29,6 +30,7 @@ struct symbol_partial {
     unsigned char request[];
 };
 struct xrt_connection {
+    struct xrt_gdb *gdb;
     pthread_mutex_t mutex;
     uint32_t foreground_waiters;
     int fd;
@@ -86,6 +88,7 @@ static enum xrt_status read_budget_status(const struct xrt_file_budget *budget)
 static enum xrt_status broken(struct xrt_connection *c, enum xrt_status status)
 {
     c->failed = status;
+    if (c->gdb) xrt_gdb_abandon(c->gdb);
     if (c->fd >= 0) {
         close(c->fd);
         c->fd = -1;
@@ -139,6 +142,12 @@ static void startup_failure(struct xrt_connection *c)
 }
 static void release_connection(struct xrt_connection *c)
 {
+    if (c->gdb) {
+        xrt_gdb_free(c->gdb);
+        pthread_mutex_destroy(&c->mutex);
+        free(c);
+        return;
+    }
     if (c->symbols) {
         close(c->symbols->fd);
         free(c->symbols);
@@ -162,7 +171,7 @@ bool xrt_target_is_remote(const struct xrt_target *t)
 }
 uint64_t xrt_target_timestamp(const struct xrt_target *t, uint64_t producer)
 {
-    if (!t || !t->connection)
+    if (!t || !t->connection || t->connection->gdb)
         return producer;
     const struct xrt_connection *c = t->connection;
     if (producer >= c->producer_ns) {
@@ -188,7 +197,7 @@ uint64_t xrt_target_page_size(const struct xrt_target *t)
 }
 bool xrt_target_clock(const struct xrt_target *t, struct xrt_clock *out)
 {
-    if (!t || !t->connection || !out)
+    if (!t || !t->connection || t->connection->gdb || !out)
         return false;
     const struct xrt_connection *c = t->connection;
     *out = (struct xrt_clock){c->producer_ns, c->host_ns, c->uncertainty_ns};
@@ -209,6 +218,15 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
 {
     struct xrt_target *t = (struct xrt_target *)target;
     struct xrt_connection *c = t->connection;
+    if (c->gdb) {
+        if (c->failed != XRT_OK) return c->failed;
+        enum xrt_status status = xrt_gdb_call(c->gdb, t, call);
+        if (status == XRT_PROTOCOL_ERROR || xrt_gdb_health(c->gdb) != XRT_OK) {
+            ++t->generation;
+            (void)broken(c, status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED);
+        }
+        return status;
+    }
     if (c->failed != XRT_OK)
         return c->failed;
     /* Discovery budgets govern file transfer, not target control. In
@@ -389,6 +407,7 @@ enum xrt_status xrt_remote_health(const struct xrt_target *t)
 {
     pthread_mutex_lock(&t->connection->mutex);
     enum xrt_status status = t->connection->failed;
+    if (status == XRT_OK && t->connection->gdb) status = xrt_gdb_health(t->connection->gdb);
     pthread_mutex_unlock(&t->connection->mutex);
     return status;
 }
@@ -401,6 +420,7 @@ enum xrt_status xrt_remote_fail(const struct xrt_target *t, enum xrt_status stat
 }
 static enum xrt_status create_remote(struct xrt_connection *c, struct xrt_target *t)
 {
+    if (c->gdb) return XRT_UNSUPPORTED_PROCESS_FOLLOWING;
     unsigned slot = 0;
     while (slot < XRT_RPC_TARGETS && c->targets[slot])
         ++slot;
@@ -590,6 +610,13 @@ enum xrt_status xrt_remote_destroy(struct xrt_target *t)
         return XRT_INVALID_STATE;
     struct xrt_connection *c = t->connection;
     enum xrt_status status = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_DESTROY});
+    if (c->gdb) {
+        /* A live link can retry an unconfirmed detach. A failed link cannot:
+         * destruction releases local storage without claiming remote cleanup. */
+        if (status != XRT_OK && c->failed == XRT_OK) return status;
+        free(t); release_connection(c);
+        return XRT_OK;
+    }
     if (status != XRT_OK) {
         /* A broken stream forces agent cleanup. Exit bit 2 means its detach
          * failed; keep the handle in that case, as the local API does. */
@@ -1043,4 +1070,37 @@ done:;
         close(fd);
     free(bytes);
     return status;
+}
+
+
+enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out)
+{
+    if (!out || !endpoint) return XRT_INVALID_ARGUMENT;
+    *out = NULL;
+    struct xrt_target *t = xrt_target_create();
+    struct xrt_connection *c = calloc(1, sizeof(*c));
+    if (!t || !c) { free(t); free(c); return XRT_OUT_OF_MEMORY; }
+    c->fd = -1; c->child = -1;
+    pthread_mutexattr_t attr;
+    if (pthread_mutexattr_init(&attr)) { free(t); free(c); return XRT_OUT_OF_MEMORY; }
+    int error = pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    if (!error) error = pthread_mutex_init(&c->mutex, &attr);
+    pthread_mutexattr_destroy(&attr);
+    if (error) { free(t); free(c); return XRT_OUT_OF_MEMORY; }
+    enum xrt_status status = xrt_gdb_open(endpoint, t, &c->gdb);
+    if (status != XRT_OK) {
+        pthread_mutex_destroy(&c->mutex); free(t); free(c); return status;
+    }
+    c->targets[0] = t;
+    t->connection = c; t->remote_id = t->remote_root = 1;
+    *out = t;
+    return XRT_OK;
+}
+bool xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_info *out)
+{
+    if (!t || !t->connection || !t->connection->gdb || !out) return false;
+    pthread_mutex_lock(&t->connection->mutex);
+    xrt_gdb_info(t->connection->gdb, out);
+    pthread_mutex_unlock(&t->connection->mutex);
+    return true;
 }

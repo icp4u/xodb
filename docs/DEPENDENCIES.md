@@ -20,7 +20,7 @@ protocol-generated files are bundled for distribution.
 | FreeType | FTL OR GPL-2.0-or-later | Glyph rasterization |
 | HarfBuzz | MIT | Text shaping |
 | elfutils libdw/libelf | Headers: LGPL-3.0-or-later OR GPL-2.0-or-later | M1 DWARF and CFI decoding; dynamically linked |
-| Capstone | BSD-3-Clause | x86-64, AArch64, and m68k instruction decoding. LoongArch64 decoding uses the optional private Capstone 6 prefix |
+| Capstone | BSD-3-Clause | x86-64, AArch64, m68k, and ppc64le instruction decoding. LoongArch64 decoding uses the optional private Capstone 6 prefix |
 | DejaVu fonts | custom | Default installed font; not bundled |
 | wlr-protocols | MIT | Private pointer protocol used only by GUI tests |
 
@@ -151,8 +151,8 @@ implementation is copied. [Build details and redistribution boundary](research/a
 and checks sha256
 `9883a30a139142caaa01694b1cb0f5e2fee6f029f10c60140a03ff1446ddc988`.
 A stable `6.0.0` tarball was not published when this pin was chosen.
-The script configures a static PIC build at `-O2` for X86, AArch64, M68K, and
-LoongArch, installs it under `.work/capstone`, and keeps the upstream license
+The script configures a static PIC build at `-O2` for X86, AArch64, M68K,
+LoongArch, and PPC, installs it under `.work/capstone`, and keeps the upstream license
 notices beside that prefix. `.work/` is gitignored, so the tarball and the
 built library stay out of the source tree. The script does not install or
 upgrade system packages. The system Capstone remains the default link.

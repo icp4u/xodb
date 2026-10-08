@@ -55,6 +55,59 @@ storing a fresh list into a dict. It needs a CPython with DWARF; the default is
 under `$XDG_RUNTIME_DIR`); it never resumes the target. Before the first
 **Space** it shows wherever the attach stopped the loop.
 
+## Named locals in the Python tab
+
+Run `scripts/demo-python`, press **Space**, **Tab** to **Python**, select the
+logical `tick` frame, then **E**, `round`, **Return**. Select `record` and enter
+`items` to see its eight-element list. **Space** advances to the next store;
+select `tick` again to read the new round. `E:` labels the expression result;
+the matching named row says **expression result above**.
+
+The lower pane lists fast locals, arguments, cells and captured free variables
+for the selected activation. Empty cells and deleted/uninitialized names keep
+an explicit reason. Recursion, active generators, resumed generators and
+coroutines use that frame's slots. Module/class mapping locals report
+`PythonMappingLocalsUnavailable`; globals and arbitrary expressions are not
+looked up. A bare name is matched exactly, including UTF-8 names, without
+normalization, attributes, calls, operators or execution in the target.
+
+Shared observers use the same reader without a controller lease:
+
+```json
+{"name":"get_language_locals","arguments":{"generation":7,"tid":1234,"language":"python","segment":0,"frame":1,"start":0,"limit":16}}
+{"name":"evaluate_language_expression","arguments":{"generation":7,"tid":1234,"language":"python","segment":0,"frame":1,"expression":"round"}}
+```
+
+Use the generation, tid and logical segment/frame from your own stopped
+session. `address` is the decoded value's PyObject address, or null for an
+unbound slot or an immediate tagged integer. `slot_address` is its frame
+stack-reference slot, including for a cell; neither is stable after resume.
+`hidden` marks a compiler local and `immediate` marks an integer without an
+object. This is observation, not a hardware watchpoint or interpreter watch.
+
+Names and kinds come from the code object's published `localsplusnames` and
+`localspluskinds` offsets; the frame publishes `localsplus` and `stackpointer`.
+The cell offset and normal GIL stack-reference representation are checked
+against DWARF when present. Stackref-debug and free-threaded builds are refused.
+Reads are bounded to 4096 names, 32 rows per page, 16,384 memory reads and 2 MiB;
+value previews keep their existing limits. An incomplete name never matches a
+shortened expression.
+
+For the named-local oracle and MCP tests, use a matching interpreter with
+development headers and its `python3-config`:
+
+```sh
+python3 tests/python-component.py --python /opt/debug/bin/python3 --work out/python-component
+python3 tests/python-locals.py --python /opt/debug/bin/python3 --strace --work out/python-named
+python3 tests/python-locals-shared.py --python /opt/debug/bin/python3 --work out/python-shared
+python3 tests/python-locals-gui.py --python /opt/debug/bin/python3 --work /tmp/python-gui
+```
+
+The component and MCP tests also accept `--lua-source PATH` for a Lua 5.4
+source directory. This builds an owned executable containing both runtimes and
+checks Python → Lua → Python callbacks, including the suspended Python caller
+and Lua locals. It needs the interpreter’s embedding library.
+
 ## Values
 
 A pointer whose DWARF type starts with a CPython object head (`ob_type` at
@@ -165,8 +218,9 @@ equal the file's; otherwise `PythonDebugOffsetsMismatch` or
 image has DWARF, every table entry and every published offset position is
 checked against it (`PythonLayoutMismatch` otherwise). Development and
 pre-releases must have that DWARF (`PythonLayoutUnverified`); a 3.14 final
-release may be stripped, as `/usr/bin/python3` usually is: stacks then work,
-but values need DWARF types for `PyObject *` and are not offered.
+release may be stripped, as `/usr/bin/python3` usually is: stacks and named
+locals then work. Discovering Python object pointers among native C variables
+still needs their DWARF types.
 `PythonVersionUnsupported` and `PythonFreeThreadedUnsupported` refuse the rest.
 Several different CPython images in one process are refused
 (`PythonRuntimeAmbiguous`) rather than guessed.

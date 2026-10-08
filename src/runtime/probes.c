@@ -477,6 +477,186 @@ enum xrt_status xrt_target_breakpoint_remove(struct xrt_target *t, uint64_t id)
     xrt_target_event(t, XRT_EVENT_BREAKPOINT_REMOVED, t->pid, (int64_t)id);
     return XRT_OK;
 }
+/* XO values are (word >> 1) & 1023. lqarx 276 and stqcx. 182 are the ISA forms
+ * gdb uses; this host's llvm-mc rejected those mnemonics. st*cx. requires Rc. */
+static int ppc_xo(uint32_t word)
+{
+    return (int)((word >> 1) & 1023u);
+}
+static int ppc_is_larx(uint32_t word)
+{
+    if ((word >> 26) != 31)
+        return 0;
+    switch (ppc_xo(word)) {
+    case 20:  /* lwarx */
+    case 52:  /* lbarx */
+    case 84:  /* ldarx */
+    case 116: /* lharx */
+    case 276: /* lqarx */
+        return 1;
+    default:
+        return 0;
+    }
+}
+static int ppc_is_stcx(uint32_t word)
+{
+    if ((word >> 26) != 31 || (word & 1u) == 0)
+        return 0;
+    switch (ppc_xo(word)) {
+    case 150: /* stwcx. */
+    case 182: /* stqcx. */
+    case 214: /* stdcx. */
+    case 694: /* stbcx. */
+    case 726: /* sthcx. */
+        return 1;
+    default:
+        return 0;
+    }
+}
+static int ppc_read_word(int32_t tid, uint64_t address, uint32_t *word)
+{
+    unsigned char buf[4];
+    size_t n = 0;
+    if ((address & 3u) != 0)
+        return 0;
+    if (xrt_memory_read(tid, address, buf, 4, &n) != XRT_OK || n != 4)
+        return 0;
+    *word = (uint32_t)buf[0] | ((uint32_t)buf[1] << 8) | ((uint32_t)buf[2] << 16) |
+            ((uint32_t)buf[3] << 24);
+    return 1;
+}
+/* A planted breakpoint hides the instruction. The scan must see the original
+ * word, including when the step itself is standing on that breakpoint. */
+static int ppc_word_at(const struct xrt_target *t, int32_t tid, uint64_t address, uint32_t *word)
+{
+    const int b = xrt_breakpoint_at(t, address);
+    if (b >= 0 && t->breakpoints[b].patched && t->breakpoints[b].width == 4) {
+        const unsigned char *o = t->breakpoints[b].original;
+        if ((address & 3u) != 0)
+            return 0;
+        *word = (uint32_t)o[0] | ((uint32_t)o[1] << 8) | ((uint32_t)o[2] << 16) |
+                ((uint32_t)o[3] << 24);
+        return 1;
+    }
+    return ppc_read_word(tid, address, word);
+}
+static uint64_t ppc_bform_target(uint32_t word, uint64_t loc)
+{
+    const int32_t disp = ((int32_t)((word & 0xfffcu) << 16)) >> 16;
+    if (word & 2u)
+        return (uint64_t)(int64_t)disp;
+    return loc + (uint64_t)(int64_t)disp;
+}
+static int ppc_record_exit(struct xrt_step *step, uint64_t address)
+{
+    uint8_t i;
+    if (address == 0 || (address & 3u) != 0)
+        return 0;
+    for (i = 0; i < step->atomic_count; ++i)
+        if (step->atomic_exit[i] == address)
+            return 1;
+    if (step->atomic_count >= 2)
+        return 0;
+    step->atomic_exit[step->atomic_count++] = address;
+    return 1;
+}
+/* gdb ppc_deal_with_atomic_sequence: one conditional branch before the
+ * store-conditional, then stop on the next instruction and on a branch
+ * target that leaves [pc, stcx]. Anything else stays a hardware step. */
+static int ppc_atomic_plan(struct xrt_target *t, int32_t tid, uint64_t pc, struct xrt_step *step)
+{
+    uint32_t word = 0;
+    uint64_t loc = pc;
+    uint64_t branch_target = 0;
+    int have_branch = 0;
+    int found = 0;
+    int n;
+    if (!t->arch || t->arch->machine != XRT_PPC64 || t->arch->trap_size != 4)
+        return 0;
+    if (!ppc_word_at(t, tid, pc, &word) || !ppc_is_larx(word))
+        return 0;
+    for (n = 0; n < 16; ++n) {
+        loc += 4;
+        if (!ppc_word_at(t, tid, loc, &word))
+            return 0;
+        if ((word >> 26) == 16) {
+            if (have_branch)
+                return 0;
+            have_branch = 1;
+            branch_target = ppc_bform_target(word, loc);
+        } else if ((word >> 26) == 18 ||
+                   ((word >> 26) == 19 &&
+                    (ppc_xo(word) == 16 || ppc_xo(word) == 528 || ppc_xo(word) == 560))) {
+            return 0;
+        }
+        if (ppc_is_stcx(word)) {
+            found = 1;
+            break;
+        }
+    }
+    if (!found)
+        return 0;
+    if (!ppc_record_exit(step, loc + 4))
+        return 0;
+    if (have_branch && !(branch_target >= pc && branch_target <= loc) &&
+        !ppc_record_exit(step, branch_target))
+        return 0;
+    return step->atomic_count > 0;
+}
+static enum xrt_status ppc_atomic_restore(struct xrt_target *t, struct xrt_step *step)
+{
+    uint8_t i;
+    for (i = 0; i < step->atomic_count; ++i) {
+        if (!step->atomic_owned[i])
+            continue;
+        TRY(xrt_patch_instruction(t, step->atomic_exit[i], step->atomic_original[i], 4));
+        step->atomic_owned[i] = 0;
+    }
+    return XRT_OK;
+}
+static enum xrt_status ppc_atomic_plant(struct xrt_target *t, struct xrt_step *step)
+{
+    uint8_t kept = 0;
+    uint8_t i;
+    for (i = 0; i < step->atomic_count; ++i) {
+        const uint64_t address = step->atomic_exit[i];
+        const int existing = xrt_breakpoint_at(t, address);
+        int32_t tid = 0;
+        size_t n = 0;
+        enum xrt_status status;
+        if (existing >= 0 && t->breakpoints[existing].patched)
+            continue;
+        status = xrt_target_stopped_tid(t, &tid);
+        if (status != XRT_OK)
+            return status;
+        status = xrt_memory_read(tid, address, step->atomic_original[kept], 4, &n);
+        if (status != XRT_OK || n != 4) {
+            step->atomic_count = kept;
+            return status != XRT_OK ? status : XRT_MEMORY_UNREADABLE;
+        }
+        status = xrt_patch_instruction(t, address, t->arch->trap, 4);
+        if (status != XRT_OK) {
+            (void)xrt_patch_instruction(t, address, step->atomic_original[kept], 4);
+            step->atomic_count = kept;
+            return status;
+        }
+        step->atomic_exit[kept] = address;
+        step->atomic_owned[kept] = 1;
+        ++kept;
+    }
+    step->atomic_count = kept;
+    return XRT_OK;
+}
+int xrt_atomic_step_exit(const struct xrt_target *t, uint64_t pc)
+{
+    uint8_t i;
+    if (!t || !t->stepping)
+        return 0;
+    for (i = 0; i < t->step.atomic_count; ++i)
+        if (t->step.atomic_owned[i] && t->step.atomic_exit[i] == pc)
+            return 1;
+    return 0;
+}
 static enum xrt_status unplant_overlay(struct xrt_target *t, uint64_t id)
 {
     const int b = xrt_breakpoint_index(t, id);
@@ -764,6 +944,8 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
     if (pc_status != XRT_OK)
         return pc_status;
     uint64_t rearm = 0;
+    struct xrt_step atomic = {0};
+    const int use_atomic = ppc_atomic_plan(t, tid, pc, &atomic);
     const int b = xrt_breakpoint_at(t, pc);
     if (b >= 0 && t->breakpoints[b].enabled) {
         struct xrt_breakpoint *p = &t->breakpoints[b];
@@ -772,9 +954,32 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
         xrt_sync_shared_patch(t, p->id, false);
         rearm = p->id;
     }
+    int atomic_run = 0;
+    if (use_atomic) {
+        const enum xrt_status planted = ppc_atomic_plant(t, &atomic);
+        if (planted != XRT_OK) {
+            (void)ppc_atomic_restore(t, &atomic);
+            if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address,
+                                               t->breakpoints[b].planted,
+                                               t->breakpoints[b].width) == XRT_OK) {
+                t->breakpoints[b].patched = true;
+                xrt_sync_shared_patch(t, rearm, true);
+            } else if (rearm) {
+                t->inherited_rearm = true;
+                ++t->generation;
+            }
+            return planted;
+        }
+        /* count 0 means every exit is already a patched user breakpoint.
+         * Continue so that breakpoint is the stop, instead of single-stepping
+         * the larx and clearing the reservation. */
+        atomic_run = 1;
+    }
     const enum xrt_status status =
-        xrt_trace(PTRACE_SINGLESTEP, tid, 0, (uintptr_t)t->threads[i].signal);
+        xrt_trace(atomic_run ? PTRACE_CONT : PTRACE_SINGLESTEP, tid, 0,
+                  (uintptr_t)t->threads[i].signal);
     if (status != XRT_OK) {
+        (void)ppc_atomic_restore(t, &atomic);
         if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
                                            t->breakpoints[b].width) == XRT_OK) {
             t->breakpoints[b].patched = true;
@@ -791,7 +996,13 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
                                 .rearm = rearm,
                                 .stop_after = stop_after,
                                 .has_exec_entry = t->threads[i].reason == XRT_STOP_EXEC,
-                                .exec_entry_pc = pc};
+                                .exec_entry_pc = pc,
+                                .atomic_count = atomic_run ? atomic.atomic_count : 0};
+    if (atomic_run) {
+        memcpy(t->step.atomic_exit, atomic.atomic_exit, sizeof atomic.atomic_exit);
+        memcpy(t->step.atomic_original, atomic.atomic_original, sizeof atomic.atomic_original);
+        memcpy(t->step.atomic_owned, atomic.atomic_owned, sizeof atomic.atomic_owned);
+    }
     t->threads[i].signal = 0;
     t->threads[i].reason = XRT_STOP_NONE;
     t->threads[i].state = XRT_RUNNING;
@@ -812,6 +1023,13 @@ enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed)
     if (!t->stepping)
         return XRT_OK;
     const struct xrt_step step = t->step;
+    uint8_t ai;
+    for (ai = 0; ai < step.atomic_count; ++ai) {
+        if (!step.atomic_owned[ai])
+            continue;
+        TRY(xrt_patch_instruction(t, step.atomic_exit[ai], step.atomic_original[ai], 4));
+        t->step.atomic_owned[ai] = 0;
+    }
     if (step.software) {
         /* The stop is classified before the aggregate state is recomputed, so
          * a just-stopped single thread still looks RUNNING. Removal requires

@@ -83,8 +83,8 @@ match `lsof` on the test fixtures.
 counts (visible, `hidden`, `kernel_threads`, `unscanned`, `gone`, `stale`,
 dropped), system totals, each visible process with rates, windowed growth,
 `lifetime_low` and its kind breakdown (`--fds` adds fd tables), and the top 200
-files with holders (`files_total` says how many there were). Rates are bytes or
-fd changes per second over each process's own interval. `leaking` needs at
+files with holders (`files_total` says how many there were). Process rates use each process's own interval; descriptor offset rates use
+the interval between its offset reads. `leaking` needs at
 least six samples (`--samples 6`). Neither mode needs a terminal, and neither
 has a time budget unless `--budget-ms` asks for one.
 
@@ -95,17 +95,26 @@ as sshd rewrite theirs), and shortens paths outside system directories to
 
 ## Cost and bounds
 
-Each scan reads, per process, `stat`, `io` and the fd directory, and per fd one
-`readlink`. Regular files and directories are also stat'ed, for sizes and to
-tell a reopen from the same open; pipes, sockets and devices only when they
-change. Offsets and flags (`fdinfo`) are read for seekable files and for new or
-changed fds, plus every fd of the drilled-in process. Owners and denied tables
-are rechecked every eighth scan.
+Interactive polling prioritizes processes visible on screen or selected for
+inspection. Their paths and seekable offsets are refreshed when the scan
+budget reaches them. For background descriptors, a cached regular file needs
+only a stat of its held inode; its path and offset can stay cached. Pipes and
+sockets use their inode-bearing link text. Nonseekable flags are refreshed on
+a new descriptor or when drilling into its process.
 
-On an x86-64 desktop with 2,077 processes (702 hidden) and 9,400 fds, a scan
-took about 57 ms of CPU: 5.7 % of a core at a 1 s period and 22 % at 250 ms, in
-32 MiB RSS. Almost all of it is kernel `/proc` work, so cost scales with
-processes plus fds; a single process with 50,000 fds adds about 100 ms.
+An unchanged fd count and unchanged process IO are only a quiet-process hint.
+The scanner may retain that process's table, explicitly marked **[stale]**.
+A rename or close/reopen can preserve both hints, so retained paths and
+identities are never evidence that the file is still open. Background paths
+and seekable offsets receive a full refresh at least every eight scan
+sequences once the budget reaches the process. Bringing a process on screen
+requests fresh metadata. `--once` and `--json` use the full scan instead.
+
+Each offset rate spans the time between that descriptor's offset reads,
+including any skipped polls. A retained rate is its last measurement, not a
+new delta. Process IO still comes from `/proc/PID/io`. Owner and permission
+checks repeat every eighth scan. Cost depends on the descriptor mix, visible
+processes and quiet/background work; inspect the scan CPU time in the header.
 
 Memory is bounded at start (`--max-processes`, default 16384, for visible
 processes and again for hidden ones and kernel threads; `--max-fds`, default

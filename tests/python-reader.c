@@ -67,6 +67,8 @@ static void setup(void) {
         [XPY_DICT_KEYS] = 32,       [XPY_DICT_VALUES] = 40,    [XPY_FLOAT_VALUE] = 16,   [XPY_LONG_TAG] = 16,
         [XPY_LONG_DIGIT] = 24,      [XPY_BYTES_SIZE] = 16,     [XPY_BYTES_VALUE] = 32,   [XPY_STR_STATE] = 32,
         [XPY_STR_LENGTH] = 16,      [XPY_STR_ASCII_SIZE] = 40,
+        [XPY_FR_LOCALSPLUS] = 80, [XPY_FR_STACKPOINTER] = 64, [XPY_CO_ARGCOUNT] = 52,
+        [XPY_CO_LOCAL_NAMES] = 96, [XPY_CO_LOCAL_KINDS] = 104,
     };
     memcpy(L.fields, f, sizeof f);
     for (unsigned i = XPY_PUBLISHED_COUNT; i < XPY_FIELD_COUNT; ++i)
@@ -90,6 +92,7 @@ static void setup(void) {
     L.types[XPY_TYPE_SET] = type_object("set", 0);
     L.types[XPY_TYPE_FROZENSET] = type_object("frozenset", 0);
     L.types[XPY_TYPE_CODE] = type_object("code", 0);
+    L.types[XPY_TYPE_CELL] = type_object("cell", 0);
     L.types[XPY_NONE_OBJECT] = object(L.types[XPY_TYPE_NONE], 16, 0xC0000000u);
     L.types[XPY_TRUE_OBJECT] = object(L.types[XPY_TYPE_BOOL], 32, 0xC0000000u);
     L.types[XPY_FALSE_OBJECT] = object(L.types[XPY_TYPE_BOOL], 32, 0xC0000000u);
@@ -509,6 +512,104 @@ static void stacks(void) {
     }
     fail_at = 0;
 }
+static void named_locals(void) {
+    setup();
+    const char *names[] = {"arg", "plain", "free", "cell", "empty", "gone", "small", "shadow", "shadow", "early_cell", "\xce\xb1"};
+    const unsigned char kinds[] = {0x22, 0x20, 0x80, 0x40, 0x40, 0x20, 0x20, 0x30, 0x30, 0x60, 0x20};
+    const size_t count = sizeof kinds;
+    uint64_t co = object(L.types[XPY_TYPE_CODE], 256, 1);
+    uint64_t nt = object(L.types[XPY_TYPE_TUPLE], 24 + count * 8, 1);
+    uint64_t kt = bytes_object(kinds, count);
+    uint64_t fr = alloc(80 + count * 8);
+    uint64_t cell = object(L.types[XPY_TYPE_CELL], 24, 1);
+    uint64_t empty = object(L.types[XPY_TYPE_CELL], 24, 1);
+    uint64_t n42 = small_int(42), n99 = small_int(99);
+    put(nt + 16, count, 8);
+    for (size_t i = 0; i < count; ++i) {
+        uint64_t name = i + 1 == count ? str_kind("\xb1\x03", 1, 2, 0) : ascii(names[i]);
+        put(nt + 24 + i * 8, name, 8);
+    }
+    put(co + 48, 1, 4); put(co + 52, 1, 4);
+    put(co + 96, nt, 8); put(co + 104, kt, 8);
+    put(fr, co | 1, 8); put(fr + 64, fr + 80 + count * 8, 8);
+    put(fr + 74, XPY_OWNED_BY_GENERATOR, 1);
+    put(cell + 16, n99, 8);
+    uint64_t values[] = {n42 | 1, n99, cell, cell | 1, empty, 1, ((uint64_t)-27 << 2) | 3, 1, n42, n99, n42};
+    for (size_t i = 0; i < count; ++i) put(fr + 80 + i * 8, values[i], 8);
+    struct xpy_locals out;
+    struct xpy_reader r = reader();
+    xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+    assert(!out.reason && out.count == count && out.total == count && !out.truncated);
+    size_t successful_reads = attempts;
+    assert(out.items[0].scope == XPY_PARAMETER && out.items[0].address == n42);
+    assert(out.items[1].scope == XPY_LOCAL && out.items[1].address == n99);
+    assert(out.items[2].scope == XPY_FREE && out.items[2].address == n99);
+    assert(out.items[3].scope == XPY_CELL && out.items[3].address == n99);
+    assert(!strcmp(out.items[4].reason, "PythonUnboundLocal") && !out.items[4].address);
+    assert(!strcmp(out.items[5].reason, "PythonUnboundLocal") && !out.items[5].address);
+    assert(!out.items[6].address && out.items[6].immediate && !strcmp(out.items[6].value.display, "int -27"));
+    assert(out.items[7].hidden && out.items[8].hidden && out.items[9].address == n99);
+    assert(!strcmp(out.items[10].name, "\xce\xb1") && out.items[10].address == n42);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 2, 3, &out);
+    assert(!out.reason && out.start == 2 && out.count == 3 && out.truncated && out.items[0].ordinal == 2);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, count, 3, &out);
+    assert(!out.reason && !out.count && !out.truncated);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "shadow", &out);
+    assert(!out.reason && out.count == 1 && out.start == 8 && out.items[0].address == n42);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "\xce\xb1", &out);
+    assert(!out.reason && out.count == 1 && out.items[0].ordinal == 10);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "gone", &out);
+    assert(!out.reason && out.count == 1 && !strcmp(out.items[0].reason, "PythonUnboundLocal"));
+    r = reader(); xpy_local_find(&L, &r, fr, co, "missing", &out);
+    assert(!strcmp(out.reason, "PythonNameNotFound") && !out.count);
+    const char *queries[] = {"", "arg()", "arg.attr", "arg[0]", "arg + 1", "1arg"};
+    for (size_t i = 0; i < sizeof queries / sizeof *queries; ++i) {
+        r = reader(); xpy_local_find(&L, &r, fr, co, queries[i], &out);
+        assert(!strcmp(out.reason, "UnsupportedLanguageExpression") && !r.reads);
+    }
+    r = reader(); xpy_locals_read(&L, &r, fr, co + 16, 0, 32, &out);
+    assert(!strcmp(out.reason, "StaleLanguageFrame"));
+    put(co + 48, 0, 4);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+    assert(!strcmp(out.reason, "PythonMappingLocalsUnavailable")); put(co + 48, 1, 4);
+    put(kt + 16, count - 1, 8);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+    assert(!strcmp(out.reason, "PythonLocalNamesInvalid")); put(kt + 16, count, 8);
+    put(fr + 64, fr + 80 + 8, 8);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 0, 3, &out);
+    assert(!out.reason && !out.items[0].reason && !strcmp(out.items[1].reason, "PythonUninitializedLocal"));
+    put(fr + 64, fr + 80 + count * 8, 8);
+    put(fr + 80 + 2 * 8, n42, 8);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "free", &out);
+    assert(!strcmp(out.items[0].reason, "PythonFreeCellInvalid")); put(fr + 80 + 2 * 8, cell, 8);
+    put(fr + 80, 2, 8);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "arg", &out);
+    assert(!strcmp(out.items[0].reason, "PythonStackRefInvalid")); put(fr + 80, n42 | 1, 8);
+    /* Every individual failed read must survive in the result as evidence. */
+    for (size_t fail = 1; fail <= successful_reads; ++fail) {
+        r = reader(); fail_at = fail;
+        xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+        int unavailable = out.reason != NULL;
+        for (size_t i = 0; i < out.count; ++i)
+            unavailable |= out.items[i].name_reason != NULL ||
+                (out.items[i].reason && strcmp(out.items[i].reason, "PythonUnboundLocal"));
+        assert(unavailable);
+    }
+    fail_at = 0;
+    r = reader(); r.reads = 16384;
+    xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+    assert(!strcmp(out.reason, "PythonReadLimit"));
+    char long_name[700]; memset(long_name, 'z', sizeof long_name - 1); long_name[sizeof long_name - 1] = 0;
+    put(nt + 24, ascii(long_name), 8);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 0, 1, &out);
+    assert(out.items[0].name_reason);
+    r = reader(); xpy_local_find(&L, &r, fr, co, "missing", &out);
+    assert(out.reason && strcmp(out.reason, "PythonNameNotFound"));
+    put(nt + 16, 4097, 8); put(kt + 16, 4097, 8);
+    r = reader(); xpy_locals_read(&L, &r, fr, co, 0, 32, &out);
+    assert(!strcmp(out.reason, "PythonLocalLimit"));
+}
+
 static void layouts(void) {
     uint8_t p[XPY_DEBUG_OFFSETS_BYTES] = "xdebugpy";
     struct xpy_layout l;
@@ -525,6 +626,8 @@ static void layouts(void) {
             v = 8;
         if (i == XPY_STR_ASCII_SIZE)
             v = 40;
+        if (i == XPY_FR_LOCALSPLUS) v = 80;
+        if (i == XPY_FR_STACKPOINTER) v = 64;
         memcpy(p + pos[i], &v, 8);
     }
     assert(!xpy_layout_build(p, sizeof p, NULL, id, 3, &l) && l.fields[XPY_IS_ID] == 16 && !l.dwarf_verified);
@@ -575,6 +678,7 @@ int main(int argc, char **argv) {
     values();
     lines();
     stacks();
+    named_locals();
     layouts();
     puts("python reader: ok");
     return 0;

@@ -9,12 +9,15 @@ detailed docs. If you just want to try something, jump to
 | I want to… | Use | You get |
 | --- | --- | --- |
 | See what is using the machine | **System overview** (`--overview`) | Live CPU, memory, disk, network and processes; unknown values show reasons. **L** opens files, **F** profiles, **Enter** attaches after a cost/access confirmation. `--session-socket PATH` shares the same cache with observer-only MCP clients. |
+| Watch a process's memory get defragmented (THP) | **Memory map** (`xodb --overview --panel memory_map`, **M**; **m** on a Processes row) and the terminal twin `xodb --memdefrag` | A Windows 9x Disk Defragmenter, an MS-DOS DEFRAG screen or a modern grid of 2 MiB cells: THP, 4 KiB, file, swapped, unknown (hatched); collapses, splits and page-state changes stay distinct; coverage, buddy fragmentation and system-wide THP/compaction activity, with the real refresh period ([details](MEMDEFRAG.md)) |
+| Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
 | Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a value | **Watchpoint investigation** (**W** on a field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
+| Read Lua locals by name | **Lua** tab, click a Lua frame, **E** `count`, **Return** | Active locals and upvalues from this stop; innermost lexical binding wins; no target execution |
 | Read Lua values and coroutine stacks at a native stop | **Lua view** (`scripts/demo-lua`, **E** `L`; MCP `get_language_stack`) | Bounded values and source lines from stopped memory; separate coroutine observations ([details](LUA.md)) |
 | Label JIT code in a native profile | **JIT evidence** (MCP import, then **I** in the profile) | Time-aware names, candidate citations and explicit ambiguity; raw PCs stay intact |
 | Check whether a change made a function faster | **Repeated experiment** (`tools/experiments/run.py`) | Baseline vs changed vs unchanged control, several runs each, with honest spread ([details](OBSERVATION_EXPERIMENTS.md)) |
@@ -90,7 +93,20 @@ above that runtime's logical stack, including explicit reasons when the stop
 has no proved language frame. Selection survives stops and stays local to each
 debugged process. `get_language_tabs` reads this state; a controller holding the
 shared-session lease uses `select_language_tab` with `generation` and `tab`.
-Tab selection does not change registers or resume the target.
+Tab selection does not change registers or resume the target. The cycle goes
+from C/C++ through each available language tab, then Regs; reaching Regs can
+take more than one press. A detected runtime that cannot be read shows its
+reason below the tabs. A `*` marks a language segment offered for the selected
+native frame. Clicking or pressing **j/k** in Stack preserves C/C++ or Regs;
+only an already open language pane follows a unique language offer.
+
+Below the logical stack, **Native frame #N** lists that language's decoded
+objects from the selected C/C++ frame (`av`/`sv`, `L`, or a Node probe's
+`value`, for example). Scroll over this section to see more objects; scrolling
+over the stack moves its rows separately. Click **Native frame #N [-]** to
+collapse it and give the logical stack more room; **[+]** expands it. These are
+native variables, not logical locals. Until named logical locals arrive for a runtime, the pane says
+**Variables by name / Not yet for ...**.
 
 Click a logical frame to highlight its proved native **segment** anchor, or click
 a native frame to offer matching language segments. A segment link does not
@@ -101,10 +117,34 @@ the retained stop; a new stop clears them while keeping the chosen tab.
 `select_native_frame` and `select_language_frame` expose the same selection to
 MCP controllers. Observer clients read it with `get_language_tabs`.
 
+Use the anchor actually reported by the reader: on some debug Lua builds it
+is `luaD_callnoyield`, while xodb cannot recover the `L` argument at
+`luaV_execute`. Optimized entry-value recovery may require more DWARF support.
+Adjacent native frames are never assumed to share a state.
+
 Try `scripts/demo-lua`, press **Space**, then **Tab** to reach **Lua**.
 For JavaScript, run `scripts/demo-node`, press **Space**, then **Tab** to **JS**.
-These tabs currently present stack evidence. Named script locals and runtime-aware
-watches are separate work; **E** still evaluates native C/C++ expressions.
+In **Lua**, click a Lua logical frame to read its active named locals and closure
+upvalues. Scroll over the lower pane to page through bindings. **E**, a bare name
+such as `count`, then **Return** reads the innermost active binding at this stop;
+outer locals with the same name and upvalues remain distinct rows. Values expire
+when execution resumes, and unavailable names or slots have explicit reasons.
+Calls, operators and implicit globals are refused; no Lua code runs. Unnamed
+extra arguments have a `(vararg) ×N` row; it has no expression name or address.
+
+In **Perl**, click a subroutine logical frame to read its active `my`/`state`
+bindings and captured outer pad entries. **E** accepts a sigil-name such as
+`$value`, `@array` or `%hash`. In `scripts/demo-perl`, press **Space**, **Tab** to
+Perl, select `main::store_answer`, then **E**, `$value`, **Return** to read `IV 42`.
+Recursion uses the selected activation's pad. Eval/try/format/XS frames, fields,
+missing names and unproved storage show a reason. No magic or Perl code runs.
+In **Python**, select a logical frame for its fast locals, cells and free
+variables. Try `scripts/demo-python`, **Space**, **Tab** to Python, select `tick`,
+then **E**, `round`, **Return**. Deleted names and module/class mapping locals
+show a reason. `E:` marks the expression result and its named row is labelled.
+JS currently shows stack evidence. **E** in **C/C++** still uses the
+native expression/watch view. Language storage addresses must be resolved again
+after resume; **W** does not set a hardware watchpoint on them.
 
 What you see is the interpreter's own C code, plus, for Perl, CPython and V8, the
 script level:
@@ -157,9 +197,12 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Live open files | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --lsof-top --redact --pid PIDS` | **1** files advancing, **3** the leaker growing, **4** the deleted file's pinned bytes, **Enter** on any row to drill in |
+| THP defrag, live | `cc -O2 -o ~/tmp/mdf tests/memdefrag-fixture.c && ~/tmp/mdf`, then `xodb --overview --memmap-pid PID --redact` (or `xodb --memdefrag --pid PID`) | type `collapse` into the fixture four times: cells turn dark blue with a white ring and **% Complete** climbs; `split` draws one red-edged cell. **t** cycles Win9x, DOS and modern |
 | Visual file activity | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --overview --panel files --redact` | Watch churn and offset progress, use **[ ]** for Leak watch and Deleted, **Enter** to scope a process. **E** explains exact capture cost before starting |
 | Agent and human together | `xodb --session-socket ~/tmp/xs/s -- ./prog` | an agent drives; **F8** takes control back ([details](SHARED_SESSIONS.md)) |
 | Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Assembly is shown when xodb was built with `-Dcapstone=vendored` after `scripts/build-capstone`; with the default system Capstone, MCP `disassemble` reports `DisassemblerUnavailable` and the assembly pane stays empty. Instruction step and hardware watches report unsupported. Remove the breakpoint before continuing |
+| Debug a ppc64le program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a little-endian ELFv2 POWER host or QEMU ppc64le | **Space** runs to the breakpoint. A function breakpoint stops at the ELFv2 local entry when the symbol has one. Assembly is shown with the system Capstone. Instruction step works where `PTRACE_SINGLESTEP` stops. Hardware watches report unsupported. Remove the breakpoint before continuing |
+| Debug through gdbserver or QEMU | `xodb --gdb-remote 127.0.0.1:2345` after preparing the stub | Inspect raw registers/memory and use address breakpoints; see [GDB_REMOTE.md](GDB_REMOTE.md) for supported targets and QEMU interrupt limits |
 
 ## Where to go next
 

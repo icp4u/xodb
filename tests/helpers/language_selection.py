@@ -5,7 +5,37 @@ import re
 import subprocess
 import time
 from pathlib import Path
+from PIL import Image, ImageOps
 
+
+def check_native_values(display, tid, language, label):
+    generation = display.session()['generation']
+    display.tool('select_native_frame', generation=generation, tid=tid, frame=0)
+    display.tool('select_language_tab', generation=generation, tab=language)
+    locals_ = display.tool('list_locals', tid=tid, frame=0)['locals']
+    values = [v for v in locals_ if v['value'].get('visualization') and v['value']['visualization'].get(language)]
+    assert values, (language, locals_)
+    deadline = time.monotonic()+20
+    while True:
+        screenshot = display.shot(label+'-native-values')
+        # OCR only this private pane. Inverting and enlarging the low-contrast
+        # secondary text prevents whole-window segmentation from dropping it.
+        crop = screenshot + '.native-ocr.png'
+        with Image.open(screenshot) as image:
+            pane = ImageOps.invert(image.crop((1013, 130, 1272, 578)).convert('L'))
+            pane.resize((pane.width * 3, pane.height * 3)).save(crop)
+        run = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(display.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, timeout=30, check=True)
+        text = run.stdout
+        # Match the native section and a reader-derived name/value prefix, not
+        # source-pane text. Value identity itself is checked by each fixture.
+        normalize = lambda v: re.sub(r'[^a-z0-9]', '', v.lower())
+        wanted = normalize(values[0]['value']['display'].split()[0])
+        expected = 'NAMED LOCALS' if language in ('lua', 'perl', 'python') else 'Variables by name'
+        if 'Native frame' in text and expected in text and wanted in normalize(text): break
+        assert time.monotonic()<deadline, (values[0], text)
+        time.sleep(.1)
+    Path(screenshot+'.native-ocr.txt').write_text(text)
+    return {'name':values[0]['name'], 'display':values[0]['value']['display'], 'count':len(values)}
 
 def check(display, tid, language, label):
     deadline = time.monotonic() + 180
@@ -15,6 +45,7 @@ def check(display, tid, language, label):
             break
         assert time.monotonic() < deadline, tabs
         time.sleep(.03)
+    native_values = check_native_values(display, tid, language, label)
     generation = display.session()['generation']
     registers = display.tool('get_registers', tid=tid)
     stack = display.tool('get_language_stack', tid=tid, language=language)
@@ -78,5 +109,16 @@ def check(display, tid, language, label):
     assert display.tool('get_registers', tid=tid) == registers
     assert display.session()['generation'] == generation
     display.tool('select_language_tab', generation=generation, tab='native')
-    return {'language':language, 'segment':segment_index, 'native_anchor':anchor, 'selected_frame':frame,
+    # Native browsing must not steal the C/C++ pane, including the real j/k
+    # keyboard path. A proved offer stays available through the tab badge.
+    for tab in ('native', 'registers'):
+        display.tool('select_language_tab', generation=generation, tab=tab)
+        same = display.tool('select_native_frame', generation=generation, tid=tid, frame=anchor['frame'])['view']
+        assert same['selected'] == tab, same
+        display.keys('tap', 36, 'tap', 37)
+        assert display.tool('get_language_tabs')['view']['selected'] == tab
+    display.tool('select_language_tab', generation=generation, tab='native')
+    display.tool('select_native_frame', generation=generation, tid=tid, frame=anchor['frame'])
+    display.shot(label+'-native-offer')
+    return {'native_values':native_values, 'language':language, 'segment':segment_index, 'native_anchor':anchor, 'selected_frame':frame,
             'clicked_frame':0, 'basis':'reader_segment', 'registers_generation_unchanged':True}

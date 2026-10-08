@@ -494,6 +494,22 @@ static enum xrt_status poll(struct xrt_target *t)
                 }
             } else if (info.code == TRAP_BRKPT || info.code == SI_KERNEL) {
                 uint64_t trap_pc;
+                if (t->stepping && t->step.tid == tid && xrt_atomic_step_exit(t, pc)) {
+                    const bool stop_after = t->step.stop_after;
+                    t->threads[i].signal = 0;
+                    TRY(xrt_finish_step(t, true));
+                    t->threads[i].reason = XRT_STOP_SINGLE_STEP;
+                    t->threads[i].breakpoint_address = 0;
+                    xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
+                    t->events[t->event_count - 1].pc = pc;
+                    t->events[t->event_count - 1].pc_known = 1;
+                    if (!stop_after) {
+                        t->threads[i].reason = XRT_STOP_NONE;
+                        t->state = XRT_STOPPED;
+                        TRY(xrt_target_continue(t));
+                        continue;
+                    }
+                } else {
                 const int b = xrt_arch_breakpoint_pc(t->arch->machine, pc, &trap_pc)
                                   ? xrt_breakpoint_at(t, trap_pc)
                                   : -1;
@@ -508,6 +524,7 @@ static enum xrt_status poll(struct xrt_target *t)
                     xrt_target_event(t, XRT_EVENT_BREAKPOINT_HIT, tid, (int64_t)probe->id);
                     t->events[t->event_count - 1].pc = probe->address;
                     t->events[t->event_count - 1].pc_known = 1;
+                }
                 }
             }
         }

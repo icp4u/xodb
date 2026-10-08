@@ -60,6 +60,25 @@ static int checked_file(int dir, unsigned slot, const char *suffix, int create) 
 static int file(int dir, unsigned slot, const char *suffix) {
     return checked_file(dir, slot, suffix, 1);
 }
+/* Recognize complete version-one files before discarding old extents. The
+ * lease and range headers must name the same original object/build ID. A
+ * similarly named unrelated file or a partial/corrupt header is left alone. */
+static int retired_headers(int lease, int range) {
+    unsigned char slot[HEADER], cache[512];
+    struct stat ls, rs;
+    if (fstat(lease, &ls) || fstat(range, &rs) || ls.st_size != HEADER ||
+        xc_io(lease, slot, sizeof slot, 0, 0) || xc_io(range, cache, sizeof cache, 0, 0)) return 0;
+    if (memcmp(slot, "XODBSLOT", 8) || memcmp(cache, "XOBCACHE", 8) ||
+        xc_get(slot + 8, 4) != 1 || xc_get(cache + 8, 4) != 1 ||
+        xc_get(slot + HEADER - 4, 4) != xc_checksum(slot, HEADER - 4) ||
+        xc_get(cache + sizeof cache - 4, 4) != xc_checksum(cache, sizeof cache - 4) ||
+        !xc_get(slot + 72, 4) || xc_get(slot + 72, 4) > 64 ||
+        memcmp(slot + 16, cache + 16, 128) || xc_get(cache + 12, 4) != 16384) return 0;
+    uint64_t extent, size = xc_get(cache + 32, 8);
+    return xbc_extent(size, &extent) == XBO_OK && rs.st_size >= 0 &&
+        (uint64_t)rs.st_size == extent && xc_get(cache + 152, 8) == extent &&
+        xc_get(cache + 144, 8) == extent - size;
+}
 /* Old clients may still own v1 leases. Reclaim only known range files after
  * taking both their slot and component locks; never follow links, create old
  * entries, unlink names or wait for another session. */
@@ -72,7 +91,8 @@ static void retire_ranges(int parent) {
         if (!flock(lease, LOCK_EX | LOCK_NB)) {
             int range = checked_file(dir, slot, "ranges", 0);
             if (range >= 0) {
-                if (!flock(range, LOCK_EX | LOCK_NB)) (void)ftruncate(range, 0);
+                if (!flock(range, LOCK_EX | LOCK_NB) && retired_headers(lease, range))
+                    (void)ftruncate(range, 0);
                 close(range);
             }
         }

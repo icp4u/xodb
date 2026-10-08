@@ -50,6 +50,21 @@ enum xpl_field {
     XPL_HEKEY,
     XPL_HEVAL,
     XPL_BLESS_STASH,
+    XPL_COPSEQ,
+    XPL_SUBDEPTH,
+    XPL_CVDEPTH,
+    XPL_CVPADLIST,
+    XPL_PADMAX,
+    XPL_PADARRAY,
+    XPL_NAMESFILL,
+    XPL_NAMESMAX,
+    XPL_NAMESARRAY,
+    XPL_NAMEPV,
+    XPL_NAMELEN,
+    XPL_NAMEFLAGS,
+    XPL_NAMEOUR,
+    XPL_NAMELOW,
+    XPL_NAMEHIGH,
     XPL_FIELD_COUNT
 };
 struct xpl_field_info {
@@ -78,7 +93,7 @@ struct xpl_reader {
 struct xpl_frame {
     char name[256], file[1024];
     uint32_t line, context_type;
-    uint64_t cv, context_address;
+    uint64_t cv, context_address, cop;
     const char *reason;
 };
 struct xpl_stack {
@@ -107,4 +122,29 @@ struct xpl_value {
     struct xpl_value_item items[XPL_MAX_PREVIEW];
 };
 void xpl_value_read(const struct xpl_layout *, struct xpl_reader *, uint64_t, struct xpl_value *);
+#define XPL_MAX_LOCALS 32
+#define XPL_MAX_PAD_SLOTS 4096
+#define XPL_MAX_PAD_NAMES 512
+enum xpl_local_scope { XPL_LOCAL, XPL_OUTER, XPL_STATE };
+struct xpl_local {
+    uint64_t ordinal, slot_address, sv;
+    enum xpl_local_scope scope;
+    char name[256];
+    const char *reason;
+    struct xpl_value value;
+};
+struct xpl_locals {
+    uint64_t interpreter, context_address, cv, pad, sequence;
+    uint32_t depth;
+    size_t frame, start, total, count;
+    int truncated;
+    const char *reason;
+    struct xpl_local items[XPL_MAX_LOCALS];
+};
+/* Select by a canonical retained context ordinal, never by a caller-provided
+ * CV/pad address. Lexical lookup accepts only a sigil and ASCII identifier. */
+void xpl_locals_read(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
+                     size_t frame, size_t start, size_t limit, struct xpl_locals *);
+void xpl_local_find(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
+                    size_t frame, const char *name, struct xpl_locals *);
 #endif

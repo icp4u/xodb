@@ -475,13 +475,19 @@ static void live(void)
     {
         char path[400];
         snprintf(path, sizeof(path), "%s/written", dir);
+        struct stat written;
+        CHECK(!stat(path, &written));
         CHECK(!unlink(path));
         step(to[0], from[0]);
         CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
         const struct xrt_fd_process *w = find(&v, pids[0]);
         const struct xrt_fd *held = NULL;
         for (uint32_t i = 0; w && i < w->count; i++)
-            if (v.fds[w->first + i].kind == XRT_FD_REGULAR)
+            /* An inherited log or wrapper fd may also be regular. Match the
+             * owned fixture by its independent pre-unlink inode oracle. */
+            if ((v.fds[w->first + i].flags & XRT_FD_STAT) &&
+                v.fds[w->first + i].device == (uint64_t)written.st_dev &&
+                v.fds[w->first + i].inode == (uint64_t)written.st_ino)
                 held = &v.fds[w->first + i];
         CHECK(w && w->opened == 0 && w->closed == 0 && w->advance == 300u * 1024);
         CHECK(held && (held->flags & XRT_FD_DELETED) && !(held->flags & XRT_FD_OPENED));
@@ -570,6 +576,88 @@ static void expected_identity(void)
     remove_tree(original);
 }
 
+/* The count is not identity: unchanged-count replacement/rename must retain
+ * stale evidence until foreground demand or a periodic refresh checks it. */
+static void adaptive(void)
+{
+    const int32_t pid = 901;
+    char a[512], b[512], c[512], info[512];
+    snprintf(a, sizeof a, "%s/adaptive-a", root);
+    snprintf(b, sizeof b, "%s/adaptive-b", root);
+    snprintf(c, sizeof c, "%s/adaptive-c", root);
+    snprintf(info, sizeof info, "%s/901/fdinfo/7", root);
+    write_file(a, "first"); write_file(c, "second");
+    fake_process(pid, "adaptive", 0, 1234, 100);
+    fake_fd(pid, 7, a, "pos:\t10\nflags:\t02\n");
+    struct xrt_fdscan_options opts = {.pids=&pid, .pid_count=1, .include_self=1, .proc=root, .adaptive=1};
+    struct xrt_fdscan *s;
+    struct xrt_fd_snapshot v;
+    CHECK(xrt_fdscan_create(&opts, &s)==XRT_OK);
+    CHECK(xrt_fdscan_interest(s, NULL, 1, 0)==XRT_INVALID_ARGUMENT);
+    CHECK(xrt_fdscan_interest(s, &pid, XRT_FD_INTEREST_MAX+1, 0)==XRT_INVALID_ARGUMENT);
+    CHECK(xrt_fdscan_poll(s, &v)==XRT_OK);
+    const struct xrt_fd *f=find_fd(&v,find(&v,pid),7);
+    CHECK(f && f->pos==10 && !(f->flags & (XRT_FD_INFO_STALE|XRT_FD_LINK_STALE)));
+    CHECK(rename(a,b)==0);fake_fd(pid,7,b,"pos:\t10\nflags:\t02\n");
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    const struct xrt_fd_process *p=find(&v,pid);
+    f=find_fd(&v,p,7);
+    CHECK(p && (p->flags & XRT_FDP_QUIET) && (p->flags & XRT_FDP_STALE) && v.stale==1);
+    CHECK(f && (f->flags & XRT_FD_LINK_STALE) && !strcmp(v.strings+f->link,a));
+    CHECK(xrt_fdscan_interest(s,&pid,1,0)==XRT_OK);
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(p && !(p->flags & XRT_FDP_STALE) && p->opened==0 && p->closed==0);
+    CHECK(f && !(f->flags & XRT_FD_LINK_STALE) && !strcmp(v.strings+f->link,b));
+    CHECK(xrt_fdscan_interest(s,NULL,0,0)==XRT_OK);
+    fake_fd(pid,7,c,"pos:\t10\nflags:\t02\n");
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(p && (p->flags & XRT_FDP_STALE));
+    CHECK(f && (f->flags & XRT_FD_STAT_STALE) && !strcmp(v.strings+f->link,b));
+    CHECK(xrt_fdscan_interest(s,&pid,1,0)==XRT_OK);
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(p && p->opened==1 && p->closed==1 && !(p->flags & XRT_FDP_STALE));
+    CHECK(f && (f->flags & XRT_FD_OPENED) && !strcmp(v.strings+f->link,c));
+    const uint64_t initial=f ? f->info_sampled_ns : 0;
+    CHECK(xrt_fdscan_interest(s,NULL,0,0)==XRT_OK);
+    /* Active IO defeats the quiet hint, but background offsets stay stale. */
+    for(int round=1;round<=2;++round) {
+        fake_process(pid,"adaptive",0,1234,100+round);
+        write_file(info,"pos:\t110\nflags:\t02\n");
+        CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+        p=find(&v,pid);f=find_fd(&v,p,7);
+        CHECK(p && !(p->flags & XRT_FDP_STALE));
+        CHECK(f && f->pos==10 && f->info_sampled_ns==initial &&
+              (f->flags & XRT_FD_INFO_STALE) && (f->flags & XRT_FD_LINK_STALE) && f->advance==0);
+    }
+    CHECK(xrt_fdscan_interest(s,&pid,1,0)==XRT_OK);
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(f && f->pos==110 && f->advance==100 && f->info_interval_ns>p->interval_ns);
+    CHECK(f && f->info_interval_ns==f->info_sampled_ns-initial && p->advance_rate==f->rate);
+    CHECK(f && (double)f->rate * (double)f->info_interval_ns / 1e9 > 99.99 &&
+               (double)f->rate * (double)f->info_interval_ns / 1e9 < 100.01);
+    CHECK(unlink(info)==0);
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    f=find_fd(&v,find(&v,pid),7);
+    CHECK(f && (f->flags & XRT_FD_INFO_STALE) && f->pos==110 && f->advance==0);
+    /* PID reuse must not inherit old fd identity, ages, flags or scope. */
+    fake_process(pid,"replacement",0,9999,0);fake_fd(pid,7,c,"pos:\t4\nflags:\t02\n");
+    CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(p && p->start==9999 && (p->flags & XRT_FDP_NEW) && p->interval_ns==0);
+    CHECK(f && f->pos==4 && f->advance==0 && f->info_interval_ns==0 && !(f->flags & XRT_FD_OPENED));
+    CHECK(xrt_fdscan_interest(s,NULL,0,0)==XRT_OK);
+    fake_fd(pid,7,b,"pos:\t22\nflags:\t02\n");
+    for(int round=0;round<8;++round) CHECK(xrt_fdscan_poll(s,&v)==XRT_OK);
+    p=find(&v,pid);f=find_fd(&v,p,7);
+    CHECK(p && !(p->flags & XRT_FDP_STALE) && p->opened==1 && p->closed==1);
+    CHECK(f && f->pos==22 && !strcmp(v.strings+f->link,b) && !(f->flags & XRT_FD_LINK_STALE));
+    xrt_fdscan_destroy(s);
+}
+
 int main(void)
 {
     const char *tmp = getenv("TMPDIR");
@@ -583,6 +671,7 @@ int main(void)
     chmod(root, 0755);
     expected_identity();
     synthetic();
+    adaptive();
     remove_tree(root);
     strcpy(root, template);
     if (!mkdtemp(root)) {

@@ -51,6 +51,21 @@ static const struct field_spec specs[XPL_FIELD_COUNT] = {
     {"HE", "hent_hek", 8},
     {"HE", "he_valu.hent_val", 8},
     {"XPVMG", "xmg_stash", 8},
+    {"COP", "cop_seq", 4},
+    {"PERL_CONTEXT", "cx_u.cx_blk.blk_u.blku_sub.olddepth", 4},
+    {"XPVCV", "xcv_depth", 4},
+    {"XPVCV", "xcv_padlist_u.xcv_padlist", 8},
+    {"PADLIST", "xpadl_max", 8},
+    {"PADLIST", "xpadl_arr.xpadlarr_alloc", 8},
+    {"PADNAMELIST", "xpadnl_fill", 8},
+    {"PADNAMELIST", "xpadnl_max", 8},
+    {"PADNAMELIST", "xpadnl_alloc", 8},
+    {"PADNAME", "xpadn_pv", 8},
+    {"PADNAME", "xpadn_len", 1},
+    {"PADNAME", "xpadn_flags", 1},
+    {"PADNAME", "xpadn_ourstash", 8},
+    {"PADNAME", "xpadn_low", 4},
+    {"PADNAME", "xpadn_high", 4},
 };
 static int type_of(Dwarf_Die *die, Dwarf_Die *out) {
     Dwarf_Attribute attr;

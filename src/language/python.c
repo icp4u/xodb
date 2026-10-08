@@ -1027,3 +1027,218 @@ void xpy_stack_read(const struct xpy_layout *l, struct xpy_reader *r, uint32_t t
     if (r->error && !out->reason)
         out->reason = r->error;
 }
+
+/* ---- named fast locals --------------------------------------------- */
+enum { FAST_ARG = 0x0e, FAST_HIDDEN = 0x10, FAST_LOCAL = 0x20, FAST_CELL = 0x40, FAST_FREE = 0x80 };
+struct local_frame {
+    uint64_t slots, stackpointer, names, kinds;
+    size_t count, arguments;
+};
+static const char *locals_frame(const struct xpy_layout *l, struct xpy_reader *r,
+                                uint64_t frame, uint64_t code, struct local_frame *f) {
+    memset(f, 0, sizeof *f);
+    uint64_t executable = pointer(l, r, frame, XPY_FR_EXECUTABLE);
+    unsigned owner = (unsigned)at(l, r, frame, XPY_FR_OWNER, 1);
+    if (r->error)
+        return r->error;
+    if (!code || (executable & 2) || (executable & ~UINT64_C(1)) != code)
+        return "StaleLanguageFrame";
+    if (owner > XPY_OWNED_BY_FRAME_OBJECT)
+        return "PythonFrameOwnerUnsupported";
+    if (!exact_type(l, r, code, XPY_TYPE_CODE))
+        return r->error ? r->error : "ExecutableNotCode";
+    uint32_t flags = (uint32_t)at(l, r, code, XPY_CO_FLAGS, 4);
+    if (r->error)
+        return r->error;
+    if (!(flags & 1)) /* CO_OPTIMIZED: class/module locals use a mapping. */
+        return "PythonMappingLocalsUnavailable";
+    uint64_t names = pointer(l, r, code, XPY_CO_LOCAL_NAMES);
+    uint64_t kinds = pointer(l, r, code, XPY_CO_LOCAL_KINDS);
+    if (!exact_type(l, r, names, XPY_TYPE_TUPLE) || !exact_type(l, r, kinds, XPY_TYPE_BYTES))
+        return r->error ? r->error : "PythonLocalNamesInvalid";
+    uint64_t count = at(l, r, names, XPY_TUPLE_SIZE, 8);
+    uint64_t kind_count = at(l, r, kinds, XPY_BYTES_SIZE, 8);
+    uint64_t arguments = at(l, r, code, XPY_CO_ARGCOUNT, 4);
+    f->stackpointer = pointer(l, r, frame, XPY_FR_STACKPOINTER);
+    if (r->error)
+        return r->error;
+    if (count != kind_count || arguments > count)
+        return "PythonLocalNamesInvalid";
+    if (count > XPY_MAX_LOCALS)
+        return "PythonLocalLimit";
+    if (frame > UINT64_MAX - field(l, XPY_FR_LOCALSPLUS) - count * 8 ||
+        names > UINT64_MAX - field(l, XPY_TUPLE_ITEM) - count * 8 ||
+        kinds > UINT64_MAX - field(l, XPY_BYTES_VALUE) - count)
+        return "InvalidAddress";
+    f->slots = frame + field(l, XPY_FR_LOCALSPLUS);
+    if (f->stackpointer && ((f->stackpointer & 7) || f->stackpointer < f->slots))
+        return "PythonFrameStackInvalid";
+    f->names = names + field(l, XPY_TUPLE_ITEM);
+    f->kinds = kinds + field(l, XPY_BYTES_VALUE);
+    f->count = (size_t)count;
+    f->arguments = (size_t)arguments;
+    return NULL;
+}
+static void local_name(const struct xpy_layout *l, struct xpy_reader *r, const struct local_frame *f,
+                        size_t i, struct xpy_local *out) {
+    memset(out, 0, sizeof *out);
+    out->ordinal = i;
+    out->slot_address = f->slots + i * 8;
+    uint64_t name = number(r, f->names + i * 8, 8);
+    if (!exact_type(l, r, name, XPY_TYPE_UNICODE))
+        out->name_reason = r->error ? r->error : "PythonLocalNameInvalid";
+    else if (!unicode(l, r, name, out->name, sizeof out->name, 511, 0, NULL, &out->name_reason))
+        out->name_reason = out->name_reason ? out->name_reason : "PythonLocalNameTruncated";
+    isolate(r, &out->name_reason);
+    unsigned kind = (unsigned)number(r, f->kinds + i, 1);
+    if (r->error)
+        out->reason = r->error;
+    else if (!(kind & (FAST_LOCAL | FAST_CELL | FAST_FREE)) || (kind & 1) ||
+             ((kind & FAST_FREE) && (kind & (FAST_LOCAL | FAST_CELL))))
+        out->reason = "PythonLocalKindUnsupported";
+    out->scope = kind & FAST_FREE ? XPY_FREE : kind & FAST_CELL ? XPY_CELL :
+                 (kind & FAST_ARG) || i < f->arguments ? XPY_PARAMETER : XPY_LOCAL;
+    out->hidden = (kind & FAST_HIDDEN) != 0;
+    isolate(r, &out->reason);
+}
+static void local_value(const struct xpy_layout *l, struct xpy_reader *r, const struct local_frame *f,
+                         struct xpy_local *out) {
+    if (out->reason)
+        return;
+    if (f->stackpointer && out->slot_address >= f->stackpointer) {
+        out->reason = "PythonUninitializedLocal";
+        return;
+    }
+    uint64_t bits = number(r, out->slot_address, 8);
+    if (r->error) {
+        out->reason = r->error;
+        return;
+    }
+    if (bits == 1) {
+        out->reason = "PythonUnboundLocal";
+        return;
+    }
+    if (!bits || (bits & 3) == 2) {
+        out->reason = "PythonStackRefInvalid";
+        return;
+    }
+    if ((bits & 3) == 3) {
+        /* Normal GIL stackrefs encode signed integers in the top 62 bits.
+         * They have a slot, but no PyObject address. */
+        if (out->scope == XPY_FREE) {
+            out->reason = "PythonFreeCellInvalid";
+            return;
+        }
+        uint64_t magnitude = bits >> 2;
+        int64_t integer = bits >> 63 ? -(int64_t)((UINT64_C(1) << 62) - magnitude) : (int64_t)magnitude;
+        out->immediate = 1;
+        snprintf(out->value.type, sizeof out->value.type, "int");
+        snprintf(out->value.display, sizeof out->value.display, "int %" PRId64, integer);
+        return;
+    }
+    uint64_t address = bits & ~UINT64_C(1);
+    if (out->scope == XPY_CELL || out->scope == XPY_FREE) {
+        struct head h;
+        out->reason = object_head(l, r, address, &h, 0);
+        if (out->reason)
+            return;
+        if (type_is(l, h.type, XPY_TYPE_CELL)) {
+            address = pointer(l, r, address, XPY_CELL_VALUE);
+            if (r->error || !address) {
+                out->reason = r->error ? r->error : "PythonUnboundLocal";
+                return;
+            }
+        } else if (out->scope == XPY_FREE) {
+            out->reason = "PythonFreeCellInvalid";
+            return;
+        }
+        /* Before MAKE_CELL, and inside inlined comprehensions, a CELL
+         * slot can contain its value directly (frameobject.c). */
+    }
+    out->address = address;
+    xpy_value_read(l, r, address, &out->value);
+    out->reason = out->value.reason;
+}
+static int local_query(const char *name) {
+    if (!name || !*name)
+        return 0;
+    for (size_t i = 0; i <= 128; ++i) {
+        unsigned char ch = (unsigned char)name[i];
+        if (!ch)
+            return 1;
+        if (i == 128 || !(ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                         (i && ch >= '0' && ch <= '9') || ch >= 128))
+            return 0;
+    }
+    return 0;
+}
+static void locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
+                         size_t start, size_t limit, const char *query, struct xpy_locals *out) {
+    memset(out, 0, sizeof *out);
+    out->frame = frame;
+    out->code = code;
+    out->start = start;
+    if (start > XPY_MAX_LOCALS || !limit || limit > XPY_LOCAL_PAGE || (query && !local_query(query))) {
+        out->reason = query ? "UnsupportedLanguageExpression" : "InvalidArguments";
+        return;
+    }
+    struct local_frame f;
+    out->reason = locals_frame(l, r, frame, code, &f);
+    if (out->reason)
+        return;
+    out->total = f.count;
+    size_t end = query ? f.count : start + limit;
+    if (end > f.count)
+        end = f.count;
+    const char *unknown_name = NULL;
+    struct xpy_local match;
+    int unbound_match = 0;
+    for (size_t i = start; i < end; ++i) {
+        struct xpy_local row;
+        local_name(l, r, &f, i, &row);
+        if (row.name_reason)
+            unknown_name = row.name_reason;
+        if (!query || (!row.name_reason && !strcmp(query, row.name))) {
+            local_value(l, r, &f, &row);
+            isolate(r, &row.reason);
+            if (!query)
+                out->items[out->count++] = row;
+            else if (row.reason && (!strcmp(row.reason, "PythonUnboundLocal") || !strcmp(row.reason, "PythonUninitializedLocal"))) {
+                match = row;
+                unbound_match = 1; /* CPython picks the first initialized duplicate. */
+            } else {
+                out->items[0] = row;
+                out->start = i;
+                out->count = 1;
+                return;
+            }
+        }
+        if (r->error) {
+            out->reason = r->error;
+            out->truncated = 1;
+            return;
+        }
+    }
+    if (query) {
+        if (unbound_match) {
+            out->items[0] = match;
+            out->start = match.ordinal;
+            out->count = 1;
+        } else
+            out->reason = unknown_name ? unknown_name : "PythonNameNotFound";
+    } else
+        out->truncated = start + out->count < f.count;
+}
+void xpy_locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
+                     size_t start, size_t limit, struct xpy_locals *out) {
+    locals_read(l, r, frame, code, start, limit, NULL, out);
+}
+void xpy_local_find(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
+                    const char *name, struct xpy_locals *out) {
+    if (!name) {
+        memset(out, 0, sizeof *out);
+        out->reason = "UnsupportedLanguageExpression";
+        return;
+    }
+    locals_read(l, r, frame, code, 0, 1, name, out);
+}

@@ -44,12 +44,17 @@ enum xrt_fd_metric { XRT_FD_METRIC_FDS, XRT_FD_METRIC_CHURN, XRT_FD_METRIC_IO, X
 #define XRT_FD_INFO 4u    /* pos and open_flags were read */
 #define XRT_FD_STAT 8u    /* mode, device, inode, size and disk were read */
 #define XRT_FD_LINK_CUT 16u /* link text dropped: string arena full */
+#define XRT_FD_INFO_STALE 32u /* retained pos/flags/rate; not measured this scan */
+#define XRT_FD_LINK_STALE 64u /* retained link text; name may have changed */
+#define XRT_FD_STAT_STALE 128u /* retained stat fields; not measured this scan */
 
 /* struct xrt_fd_process.flags */
 #define XRT_FDP_NO_IO 2u     /* /proc/PID/io denied */
 #define XRT_FDP_NEW 4u       /* first sample of this identity: no deltas yet */
-#define XRT_FDP_STALE 8u     /* carried from the previous scan (time budget) */
+#define XRT_FDP_STALE 8u     /* retained (time budget or quiet-count hint) */
 #define XRT_FDP_TRUNCATED 16u /* fd table cut at the fd limit */
+#define XRT_FDP_OFFSETS_STALE 128u /* some seekable offsets were retained; rate sum is partial */
+#define XRT_FDP_QUIET 64u  /* count/io unchanged: hint only, fd identities not refreshed */
 #define XRT_FDP_LEAKING 32u  /* fd count rising steadily; see growth */
 
 #define XRT_FD_HISTORY 32
@@ -69,7 +74,8 @@ struct xrt_fd {
     uint64_t device, inode;
     int64_t size, disk;  /* st_size and st_blocks * 512 */
     uint64_t pos;
-    uint64_t advance;    /* forward offset movement over the owner's interval */
+    uint64_t info_sampled_ns, info_interval_ns; /* offset samples have their own clock */
+    uint64_t advance;    /* forward offset movement over info_interval_ns; zero while stale */
     float rate;          /* advance per second; kept while the owner is stale */
 };
 
@@ -92,6 +98,7 @@ struct xrt_fd_process {
     uint32_t first, count; /* fds[first .. first + count), ascending fd */
     uint32_t kinds[XRT_FD_KINDS];
     uint64_t rchar, wchar, read_bytes, write_bytes; /* cumulative /proc/PID/io */
+    uint64_t full_sequence; /* most recent path/seekable-offset refresh */
     uint64_t sampled_ns, interval_ns;   /* CLOCK_MONOTONIC; since this identity's previous sample */
     uint64_t d_rchar, d_wchar, advance; /* over interval_ns */
     uint32_t opened, closed;            /* fd-set changes over interval_ns */
@@ -144,7 +151,7 @@ struct xrt_fd_snapshot {
 struct xrt_fd_file {
     uint64_t device, inode;
     int64_t size, disk;
-    uint8_t kind, flags; /* XRT_FD_DELETED */
+    uint8_t kind, flags; /* XRT_FD_DELETED and per-field stale flags */
     uint32_t sample;     /* index into snapshot fds of one holder */
     uint32_t holders;    /* distinct processes */
     uint32_t fds;
@@ -160,6 +167,7 @@ struct xrt_fdscan_options {
     const int32_t *pids;    /* restrict to these processes; NULL: all of /proc */
     uint32_t pid_count;
     uint64_t expected_start; /* nonzero: exactly one pid; pin its proc directory and require this start tick */
+    int adaptive; /* opt-in: requested metadata fresh, background metadata explicitly stale */
     int include_self;
     const char *proc;       /* procfs root; NULL: "/proc" */
 };
@@ -173,6 +181,16 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *, struct xrt_fd_snapshot *);
 void xrt_fdscan_budget(struct xrt_fdscan *, uint32_t ms);
 /* Also reread fdinfo for every fd of this process (0: none). */
 void xrt_fdscan_detail(struct xrt_fdscan *, int32_t pid);
+/* Replace the foreground process set; copied, no borrowed pointer. Adaptive
+ * scans refresh their paths and seekable offsets. Nonseekable fdinfo stays
+ * stale unless detail() requests it. Background entries use one identity
+ * operation per cached descriptor, fdinfo only at periodic refresh, and a
+ * same-count/no-IO hint may retain the whole process marked stale. A path/offset
+ * refresh occurs at least every eight scan sequences when the budget reaches
+ * that process. Zero count means none; all != 0 requests every process. */
+#define XRT_FD_INTEREST_MAX 128u
+enum xrt_status xrt_fdscan_interest(struct xrt_fdscan *, const int32_t *pids,
+                                    uint32_t count, int all);
 /* Files of the latest snapshot, highest rate first. Borrowed. */
 enum xrt_status xrt_fdscan_files(struct xrt_fdscan *, const struct xrt_fd_file **, uint32_t *count);
 /* System totals per scan, oldest first; returns the number written. */

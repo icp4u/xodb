@@ -1,6 +1,7 @@
 #include "lua.h"
 #include <inttypes.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 static int fail(struct xl_reader *r, const char *why) {
@@ -398,4 +399,187 @@ void xl_stack_read(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         if (field(p, r, prev, XL_CI_NEXT) != ci) { out->reason = r->error ? r->error : "LuaCallInfoLinkMismatch"; return; }
         ci = prev;
     }
+}
+
+static int locals_stack_reason(const char *reason) {
+    return !reason || !strcmp(reason, "LuaFunctionNameUnavailable") ||
+        !strcmp(reason, "LuaSourceUnavailable") || !strcmp(reason, "LuaSourceTruncated") ||
+        !strcmp(reason, "LuaLineInfoUnavailable") || !strcmp(reason, "LuaCoroutineSuspended");
+}
+static void local_name(const struct xl_layout *p, struct xl_reader *r, uint64_t name,
+                       struct xl_local *out) {
+    uint64_t length = 0;
+    if (!name) { out->reason = "LuaLocalNameUnavailable"; return; }
+    if (!string(p, r, name, out->name, sizeof out->name, &length, &out->name_truncated)) {
+        out->reason = r->error; return;
+    }
+    if (!length) out->reason = "LuaLocalNameUnavailable";
+    else if (out->name_truncated) out->reason = "LuaLocalNameTruncated";
+}
+static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                    size_t frame, size_t start, size_t limit, const char *expression, struct xl_locals *out) {
+    memset(out, 0, sizeof *out);
+    out->state = state; out->frame = frame; out->start = start;
+    if (expression) {
+        size_t n = 0;
+        while (n <= XL_STRING_BYTES && expression[n]) ++n;
+        if (!n || n > XL_STRING_BYTES) { out->reason = "LuaExpressionUnsupported"; return; }
+        for (size_t i = 0; i < n; ++i) {
+            unsigned char c = (unsigned char)expression[i];
+            if (!(c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (i && c >= '0' && c <= '9'))) { out->reason = "LuaExpressionUnsupported"; return; }
+        }
+    }
+    if (frame >= XL_STACK_FRAMES || !limit || limit > XL_LOCAL_ITEMS) {
+        out->reason = "LuaLocalsRequestInvalid"; return;
+    }
+    /* Fixed bounded scratch on the heap; neither the interpreter's frame count
+     * nor a remote field can determine allocation size. */
+    struct xl_stack *stack = calloc(1, sizeof *stack);
+    if (!stack) { out->reason = "LuaLocalsAllocationFailed"; return; }
+    xl_stack_read(p, r, state, stack);
+    const char *why = !locals_stack_reason(stack->reason) ? stack->reason :
+        frame >= stack->count ? "LuaFrameUnavailable" : NULL;
+    if (why) { out->reason = why; free(stack); return; }
+    struct xl_frame f = stack->frames[frame];
+    free(stack);
+    out->call_info = f.ci;
+    if (f.is_c) { out->reason = "LuaCFrameLocalsUnavailable"; return; }
+    if (!locals_stack_reason(f.reason)) { out->reason = f.reason; return; }
+    uint64_t closure = field(p, r, f.function, XL_BITS);
+    if (!header(p, r, closure, 6) || field(p, r, closure, XL_LC_PROTO) != f.proto) {
+        out->reason = r->error ? r->error : "LuaFrameChanged"; return;
+    }
+    uint64_t code = field(p, r, f.proto, XL_PROTO_CODE), ncode = field(p, r, f.proto, XL_PROTO_NCODE);
+    uint64_t saved = field(p, r, f.ci, XL_CI_PC), stride = p->sizes[XL_T_STACK];
+    if (r->error) { out->reason = r->error; return; }
+    if (!code || !ncode || ncode > INT32_MAX || saved <= code || saved - code > ncode * 4 || (saved - code) % 4) {
+        out->reason = saved == code ? "LuaFrameNotStarted" : "LuaSavedPcInvalid"; return;
+    }
+    uint64_t pc = (saved - code) / 4 - 1;
+    uint64_t bottom = field(p, r, state, XL_STATE_STACK), end = field(p, r, state, XL_STATE_END);
+    uint64_t top = field(p, r, f.ci, XL_CI_TOP);
+    uint64_t base = p->version[1] == 4 ? add(r, f.function, stride) : field(p, r, f.ci, XL_CI_BASE);
+    if (r->error) { out->reason = r->error; return; }
+    if (!stride || base < bottom || base >= end || top < base || top > end ||
+        (base - bottom) % stride || (top - base) % stride) {
+        out->reason = "LuaLocalStackBoundsInvalid"; return;
+    }
+    uint64_t varargs = 0;
+    uint64_t is_vararg = field(p, r, f.proto, XL_PROTO_VARARG);
+    if (is_vararg > 1) { out->reason = "LuaVarargMetadataInvalid"; return; }
+    if (is_vararg) {
+        if (p->version[1] == 4) {
+            /* VARARGPREP must have completed before the relocated function
+             * slot and nextraargs can describe this activation. */
+            if (pc == 0) { out->reason = "LuaVarargsNotPrepared"; return; }
+            varargs = field(p, r, f.ci, XL_CI_NEXTRA);
+            if (varargs > 4096 || f.function < bottom || varargs > (f.function - bottom) / stride) {
+                out->reason = "LuaVarargBoundsInvalid"; return;
+            }
+        } else {
+            uint64_t params = field(p, r, f.proto, XL_PROTO_PARAMS);
+            if (base <= f.function || (base - f.function) % stride ||
+                (base - f.function) / stride < params + 1) {
+                out->reason = "LuaVarargBoundsInvalid"; return;
+            }
+            varargs = (base - f.function) / stride - params - 1;
+            if (varargs > 4096) { out->reason = "LuaVarargBoundsInvalid"; return; }
+        }
+    }
+    if (r->error) { out->reason = r->error; return; }
+    uint64_t table = field(p, r, f.proto, XL_PROTO_LOCALS), count = field(p, r, f.proto, XL_PROTO_NLOCALS);
+    uint64_t up = field(p, r, f.proto, XL_PROTO_UP), nup = field(p, r, f.proto, XL_PROTO_NUP);
+    uint64_t closure_nup = field(p, r, closure, XL_LC_NUP);
+    if (r->error) { out->reason = r->error; return; }
+    if (count > 4096) { out->reason = "LuaLocalsWorkLimit"; return; }
+    if ((count && (!table || !p->sizes[XL_T_LOCVAR])) || nup != closure_nup || nup > 255 ||
+        (nup && (!up || !p->sizes[XL_T_UPDESC]))) {
+        out->reason = "LuaLocalsMetadataInvalid"; return;
+    }
+    uint64_t active[256]; size_t nactive = 0; int32_t previous = -1;
+    for (uint64_t i = 0; i < count; ++i) {
+        uint64_t at = add(r, table, i * p->sizes[XL_T_LOCVAR]);
+        int32_t begin = (int32_t)field(p, r, at, XL_LOCAL_START);
+        int32_t finish = (int32_t)field(p, r, at, XL_LOCAL_END);
+        if (r->error) { out->reason = r->error; return; }
+        if (begin < previous || begin < 0 || finish < begin || (uint64_t)finish > ncode) {
+            out->reason = "LuaLocalScopeInvalid"; return;
+        }
+        previous = begin;
+        if ((uint64_t)begin > pc) break;
+        if (pc >= (uint64_t)finish) continue;
+        if (nactive == sizeof active / sizeof *active) { out->reason = "LuaLocalsWorkLimit"; return; }
+        active[nactive++] = at;
+    }
+    if (nactive > (top - base) / stride) { out->reason = "LuaLocalStackBoundsInvalid"; return; }
+    if (!count) out->reason = "LuaLocalNamesUnavailable";
+    const size_t named_count = nactive + (size_t)nup;
+    out->total = named_count + (varargs != 0);
+    if (expression) {
+        if (out->reason) return; /* Missing names could hide a shadowing local. */
+        size_t selected = SIZE_MAX;
+        /* Later active locals shadow earlier locals and every upvalue. Scan
+         * all names so missing/truncated names never become guessed absence. */
+        struct xl_local binding;
+        for (size_t i = 0; i < named_count; ++i) {
+            memset(&binding, 0, sizeof binding);
+            uint64_t name = i < nactive ? field(p, r, active[i], XL_LOCAL_NAME) :
+                field(p, r, add(r, up, (i - nactive) * p->sizes[XL_T_UPDESC]), XL_UP_NAME);
+            local_name(p, r, name, &binding);
+            if (r->error || binding.reason) { out->reason = r->error ? r->error : binding.reason; return; }
+            if (strcmp(binding.name, expression)) continue;
+            if (i < nactive) selected = i;
+            else if (selected == SIZE_MAX) selected = i;
+            else if (selected >= nactive) { out->reason = "LuaBindingAmbiguous"; return; }
+        }
+        if (selected == SIZE_MAX) { out->reason = "LuaNameNotFound"; return; }
+        start = selected; limit = 1; out->start = selected;
+    }
+    for (size_t i = start; i < out->total && out->count < limit; ++i) {
+        struct xl_local *item = &out->items[out->count++];
+        uint64_t name;
+        if (i == named_count) {
+            item->kind = XL_VARARGS;
+            item->value.count = varargs;
+            strcpy(item->value.type, "varargs");
+            snprintf(item->value.display, sizeof item->value.display, "(vararg) ×%" PRIu64, varargs);
+            continue;
+        }
+        if (i < nactive) {
+            item->kind = XL_LOCAL; item->ordinal = (uint32_t)i + 1;
+            item->address = add(r, base, i * stride);
+            name = field(p, r, active[i], XL_LOCAL_NAME);
+        } else {
+            size_t index = i - nactive;
+            item->kind = XL_UPVALUE; item->ordinal = (uint32_t)index + 1;
+            uint64_t uv = word(r, add(r, closure, p->fields[XL_LC_UP].offset + index * 8), 8);
+            if (!header(p, r, uv, p->version[1] == 4 ? 9 : 10)) {
+                item->reason = r->error; out->reason = r->error; return;
+            }
+            item->address = field(p, r, uv, XL_UP_VALUE);
+            name = field(p, r, add(r, up, index * p->sizes[XL_T_UPDESC]), XL_UP_NAME);
+        }
+        if (r->error) { item->reason = r->error; out->reason = r->error; return; }
+        if (!item->address || item->address & 7) { item->reason = "LuaLocalSlotInvalid"; out->reason = item->reason; return; }
+        local_name(p, r, name, item);
+        if (r->error) { out->reason = r->error; return; }
+        value(p, r, item->address, &item->value, 0);
+        if (r->error) {
+            out->reason = r->error;
+            if (!strcmp(r->error, "LuaReadBudget")) return;
+            r->error = NULL;
+        }
+    }
+    out->truncated = !expression && start < out->total && out->count < out->total - start;
+}
+
+void xl_locals_read(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                    size_t frame, size_t start, size_t limit, struct xl_locals *out) {
+    locals(p, r, state, frame, start, limit, NULL, out);
+}
+void xl_local_find(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                   size_t frame, const char *expression, struct xl_locals *out) {
+    if (!expression) { memset(out, 0, sizeof *out); out->reason = "LuaExpressionUnsupported"; return; }
+    locals(p, r, state, frame, 0, 1, expression, out);
 }

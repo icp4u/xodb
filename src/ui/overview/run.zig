@@ -17,6 +17,7 @@ const Session = @import("../../model/session.zig").Session;
 
 pub const usage =
     \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
+    \\               [--look win9x|dos|modern] [--memmap-pid N [--memmap-start-ticks N]]
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
     \\  show their reason; nothing unmeasured is drawn as zero.
@@ -24,15 +25,17 @@ pub const usage =
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue or mono (builtin: prefix accepted)
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps or files
+    \\                  network, connections, power, system, users, services, apps, files or memory_map
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
     \\  --files-start-ticks N  require this exact identity with --files-pid
+    \\  --look NAME     Memory map look: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG) or modern
+    \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
     \\                  at 1 Hz; off Processes, per-process IO and fd counts wait until shown)
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
     \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
     \\  --pause         start paused (replay: show the last frame with full history)
-    \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, F profile, Enter debugger (all confirmed),
+    \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
     \\      t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
     \\
 ;
@@ -51,6 +54,9 @@ pub const Options = struct {
     panel: ?vw.Panel = null,
     files_pid: ?i32 = null,
     files_start: u64 = 0,
+    look: ?vw.memmap.Look = null,
+    memmap_pid: ?i32 = null,
+    memmap_start: u64 = 0,
     interval_ms: ?u64 = null,
     paused: bool = false,
     frames: u64 = 0,
@@ -77,7 +83,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -103,6 +109,16 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.files_start = try std.fmt.parseInt(u64, value, 10);
             if (o.files_start == 0) return error.InvalidFilesIdentity;
         }
+        if (std.mem.eql(u8, arg, "--look")) o.look = std.meta.stringToEnum(vw.memmap.Look, value) orelse return error.UnknownMemoryMapLook;
+        if (std.mem.eql(u8, arg, "--memmap-pid")) {
+            const pid = try std.fmt.parseInt(i32, value, 10);
+            if (pid <= 0) return error.InvalidMemoryMapIdentity;
+            o.memmap_pid = pid;
+        }
+        if (std.mem.eql(u8, arg, "--memmap-start-ticks")) {
+            o.memmap_start = try std.fmt.parseInt(u64, value, 10);
+            if (o.memmap_start == 0) return error.InvalidMemoryMapIdentity;
+        }
         if (std.mem.eql(u8, arg, "--interval-ms")) {
             const ms = try std.fmt.parseInt(u64, value, 10);
             if (ms < 250 or ms > 10_000) return error.InvalidOverviewInterval;
@@ -113,6 +129,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
     }
     if (o.replay != null and (o.mcp or o.session_socket != null)) return error.ReplayHasNoLiveSession;
     if (o.files_start != 0 and o.files_pid == null) return error.InvalidFilesIdentity;
+    if (o.memmap_start != 0 and o.memmap_pid == null) return error.InvalidMemoryMapIdentity;
+    if (o.memmap_pid != null) {
+        if (o.replay != null or o.files_pid != null or (o.panel != null and o.panel.? != .memory_map)) return error.InvalidMemoryMapIdentity;
+        o.panel = .memory_map;
+    }
     if (o.files_pid != null) {
         if (o.replay != null or (o.panel != null and o.panel.? != .files)) return error.InvalidFilesIdentity;
         o.panel = .files;
@@ -190,6 +211,19 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
     if (o.files_pid) |pid| view.files.scope(.{ .pid = pid, .start = o.files_start });
+    if (o.look) |look| view.memmap.look = look;
+    if (o.memmap_pid) |pid| {
+        // pid + start is the identity; without --memmap-start-ticks the current start is pinned.
+        const start = if (o.memmap_start != 0) o.memmap_start else @import("../../memdefrag/tui.zig").startTicks(pid) orelse {
+            std.debug.print("xodb: overview: process {d} not found\n", .{pid});
+            return error.InvalidMemoryMapIdentity;
+        };
+        @import("../../model/process_identity.zig").validate(.{ .pid = pid, .start = start }) catch |err| {
+            std.debug.print("xodb: overview: process {d} start {d}: {s}\n", .{ pid, start, @errorName(err) });
+            return err;
+        };
+        view.memmap.open(.{ .pid = pid, .start = start }, now());
+    }
     view.source_label = if (source == .replay) "REPLAY" else "live";
     view.owns_samples = source == .live;
 
@@ -231,7 +265,8 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         const t = now();
         const frame_gap: u64 = if (view.panel == .files) 66_000_000 else 33_000_000;
         // Eases redraw at 30 fps; idle waits for the next sample or input.
-        const wait_ms: i32 = if (window.dirty) 4 else if (view.animating(t)) @intCast(@max(1, (last_frame + frame_gap -| t) / 1_000_000)) else @intCast(@min(if (shared != null or server != null) @as(u64, 20) else 250, (next_sample -| t) / 1_000_000 + 1));
+        const idle_cap: u64 = if (shared != null or server != null) 20 else if (view.panel == .memory_map) view.memmap.waitMs(t) else 250;
+        const wait_ms: i32 = if (window.dirty) 4 else if (view.animating(t)) @intCast(@max(1, (last_frame + frame_gap -| t) / 1_000_000)) else @intCast(@min(idle_cap, (next_sample -| t) / 1_000_000 + 1));
         try window.pump(window.input.timeoutMs(t, wait_ms));
         window.input.tick(now());
         view.input(&window, now());
@@ -262,6 +297,9 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
                     if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode) });
                 }
             }
+            if (view.panel == .memory_map) {
+                if (view.memmap.refresh(gpa, &collector, current, view.paused, view.redact)) window.dirty = true;
+            }
             _ = collector.tick(current, if (view.paused) 0 else view.groups(true), view.panel == .processes) catch |err| blk: {
                 view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
                 break :blk false;
@@ -287,6 +325,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
             next_sample = current + interval;
             window.dirty = true;
         } else if (view.paused) next_sample = @max(next_sample, current + 50_000_000);
+        if (view.panel == .memory_map and view.memmap.tick(current)) window.dirty = true;
         const eased = view.animating(current) and current -| last_frame >= frame_gap;
         if (!(window.dirty or eased or o.frames > 0 or current -| last_frame > 1_000_000_000)) continue;
         if (current < retry) continue;

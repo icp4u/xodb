@@ -50,6 +50,11 @@ enum xpy_field {
     XPY_STR_STATE,
     XPY_STR_LENGTH,
     XPY_STR_ASCII_SIZE,
+    XPY_FR_LOCALSPLUS,
+    XPY_FR_STACKPOINTER,
+    XPY_CO_ARGCOUNT,
+    XPY_CO_LOCAL_NAMES,
+    XPY_CO_LOCAL_KINDS,
     XPY_PUBLISHED_COUNT,
     /* not published: per-version table, DWARF-verified when available */
     XPY_STR_COMPACT_SIZE = XPY_PUBLISHED_COUNT,
@@ -61,6 +66,7 @@ enum xpy_field {
     XPY_DK_NENTRIES,
     XPY_DK_INDICES,
     XPY_DV_VALUES,
+    XPY_CELL_VALUE,
     XPY_FIELD_COUNT
 };
 enum xpy_type {
@@ -80,6 +86,7 @@ enum xpy_type {
     XPY_TYPE_SET,
     XPY_TYPE_FROZENSET,
     XPY_TYPE_CODE,
+    XPY_TYPE_CELL,
     XPY_TYPE_COUNT
 };
 extern const char *const xpy_type_symbols[XPY_TYPE_COUNT];
@@ -178,4 +185,31 @@ struct xpy_value {
     struct xpy_value_item items[XPY_MAX_PREVIEW];
 };
 void xpy_value_read(const struct xpy_layout *, struct xpy_reader *, uint64_t, struct xpy_value *);
+
+#define XPY_MAX_LOCALS 4096
+#define XPY_LOCAL_PAGE 32
+enum xpy_local_scope { XPY_LOCAL, XPY_PARAMETER, XPY_CELL, XPY_FREE };
+struct xpy_local {
+    char name[512];
+    const char *name_reason, *reason;
+    size_t ordinal;
+    enum xpy_local_scope scope;
+    uint64_t slot_address, address;
+    int hidden, immediate;
+    struct xpy_value value;
+};
+struct xpy_locals {
+    uint64_t frame, code;
+    size_t start, total, count;
+    int truncated;
+    const char *reason;
+    struct xpy_local items[XPY_LOCAL_PAGE];
+};
+/* The caller supplies a frame/code pair from the retained canonical stack,
+ * never from a client address. Mapping locals and arbitrary expressions are
+ * refused. Unbound slots keep their name and reason, without an object address. */
+void xpy_locals_read(const struct xpy_layout *, struct xpy_reader *, uint64_t frame, uint64_t code,
+                     size_t start, size_t limit, struct xpy_locals *);
+void xpy_local_find(const struct xpy_layout *, struct xpy_reader *, uint64_t frame, uint64_t code,
+                    const char *name, struct xpy_locals *);
 #endif

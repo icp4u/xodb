@@ -318,6 +318,8 @@ static void probes(const char *agent, const char *self)
             assert(view(t).state == XRT_STOPPED && view(t).breakpoints[0].patched);
         }
         OK(xrt_target_breakpoint_remove(t, bp));
+        OK(xrt_target_read(t, address, overlaid, trap, &count));
+        assert(count == trap && !memcmp(original, overlaid, trap));
         OK(xrt_target_continue(t));
         wait_exit(t);
         uint64_t epoch = view(t).image_epoch;
@@ -614,8 +616,11 @@ int main(int argc, char **argv)
         _exit(value == 0);
     }
     if (argc == 2 && !strcmp(argv[1], "--fixture")) {
-        marker();
-        marker();
+        /* ELFv2 direct calls in this file skip the global entry. The planted
+         * address is the function pointer, so the fixture must call that. */
+        void (*volatile fn)(void) = marker;
+        fn();
+        fn();
         _exit(23);
     }
     if (argc == 2 && !strcmp(argv[1], "--fork-fixture")) {
@@ -623,7 +628,8 @@ int main(int argc, char **argv)
         if (child < 0)
             _exit(2);
         if (!child) {
-            marker();
+            void (*volatile fn)(void) = marker;
+            fn();
             _exit(0);
         }
         waitpid(child, NULL, 0);

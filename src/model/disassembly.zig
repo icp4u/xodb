@@ -25,6 +25,7 @@ fn capstoneArch(architecture: Arch) c.cs_arch {
         .aarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_AARCH64 else c.CS_ARCH_ARM64,
         .m68k => c.CS_ARCH_M68K,
         .loongarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_LOONGARCH else unreachable,
+        .ppc64le => c.CS_ARCH_PPC,
     };
 }
 fn capstoneMode(architecture: Arch) c.cs_mode {
@@ -33,6 +34,8 @@ fn capstoneMode(architecture: Arch) c.cs_mode {
         .aarch64 => c.CS_MODE_ARM,
         .m68k => c.CS_MODE_BIG_ENDIAN | c.CS_MODE_M68K_040,
         .loongarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_MODE_LOONGARCH64 else unreachable,
+        // Little-endian is Capstone's default. CS_MODE_BIG_ENDIAN would select the other endian.
+        .ppc64le => c.CS_MODE_64,
     };
 }
 fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instruction, detail: bool) !usize {
@@ -125,6 +128,47 @@ fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instru
                     };
                 }
             } else unreachable;
+        } else if (architecture == .ppc64le) {
+            // Capstone 6 decodes blr as BCLR and does not put it in the RET group,
+            // so ids and groups are not the flow. The word is stable across versions.
+            // Capstone still supplies the mnemonic and any absolute immediate.
+            const ppc = raw.detail.*.unnamed_0.ppc;
+            // cs_insn is a C pointer, so bytes[0..4] is allowzero and align(2).
+            // readInt wants an ordinary *const [4]u8, so copy the word first.
+            var encoded: [4]u8 = .{ 0, 0, 0, 0 };
+            if (raw.size == 4) {
+                encoded[0] = raw.bytes[0];
+                encoded[1] = raw.bytes[1];
+                encoded[2] = raw.bytes[2];
+                encoded[3] = raw.bytes[3];
+            }
+            const word: u32 = std.mem.readInt(u32, &encoded, .little);
+            const op: u32 = word >> 26;
+            const bo: u32 = (word >> 21) & 31;
+            const always = (bo & 0x14) == 0x14;
+            const lk = (word & 1) != 0;
+            const xo: u32 = (word >> 1) & 1023;
+            out[i].flow = if (raw.size != 4)
+                .ordinary
+            else if (op == 31 and (xo == 4 or xo == 68))
+                .trap
+            else if (op == 17)
+                .system
+            else if (op == 18)
+                (if (lk) .call else .jump)
+            else if (op == 16)
+                (if (lk) .call else if (always) .jump else .conditional)
+            else if (op == 19 and xo == 16)
+                (if (lk) .call else if (always) .ret else .conditional)
+            else if (op == 19 and (xo == 528 or xo == 560))
+                (if (lk) .call else if (always) .jump else .conditional)
+            else
+                .ordinary;
+            if (out[i].flow == .call or out[i].flow == .jump or out[i].flow == .conditional) {
+                for (ppc.operands[0..ppc.op_count]) |operand| if (operand.type == c.PPC_OP_IMM) {
+                    out[i].target = @bitCast(operand.unnamed_0.imm);
+                };
+            }
         } else if (architecture == .m68k) {
             // Capstone group classifications apply independently of host ISA.
             out[i].flow = if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_RET) != null or std.mem.indexOfScalar(u8, groups, c.CS_GRP_IRET) != null) .ret else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_CALL) != null) .call else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_JUMP) != null) (if (raw.id == c.M68K_INS_BRA or raw.id == c.M68K_INS_JMP) .jump else .conditional) else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_INT) != null) .trap else .ordinary;
@@ -211,6 +255,51 @@ test "loongarch disassembly follows the linked Capstone" {
     try std.testing.expectEqualStrings("ret", std.mem.sliceTo(&instructions[0].mnemonic, 0));
     try std.testing.expectEqual(Flow.ret, instructions[0].flow);
     try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+}
+
+test "ppc64le disassembly follows the linked Capstone" {
+    var instructions: [1]Instruction = undefined;
+    const trap = try decodeFlowFor(.ppc64le, &.{ 0x08, 0x00, 0xe0, 0x7f }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), trap);
+    try std.testing.expectEqual(@as(u64, 0x1000), instructions[0].address);
+    try std.testing.expectEqual(@as(u16, 4), instructions[0].size);
+    try std.testing.expectEqualStrings("trap", std.mem.sliceTo(&instructions[0].mnemonic, 0));
+    try std.testing.expectEqual(Flow.trap, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+
+    const ret = try decodeFlowFor(.ppc64le, &.{ 0x20, 0x00, 0x80, 0x4e }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), ret);
+    try std.testing.expectEqualStrings("blr", std.mem.sliceTo(&instructions[0].mnemonic, 0));
+    try std.testing.expectEqual(Flow.ret, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+
+    const jump = try decodeFlowFor(.ppc64le, &.{ 0x10, 0x00, 0x00, 0x48 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), jump);
+    try std.testing.expectEqualStrings("b", std.mem.sliceTo(&instructions[0].mnemonic, 0));
+    try std.testing.expectEqual(Flow.jump, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1010), instructions[0].target);
+
+    const call = try decodeFlowFor(.ppc64le, &.{ 0x21, 0x00, 0x00, 0x48 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), call);
+    try std.testing.expectEqualStrings("bl", std.mem.sliceTo(&instructions[0].mnemonic, 0));
+    try std.testing.expectEqual(Flow.call, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1020), instructions[0].target);
+
+    const conditional = try decodeFlowFor(.ppc64le, &.{ 0x10, 0x00, 0x82, 0x41 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), conditional);
+    const mnemonic = std.mem.sliceTo(&instructions[0].mnemonic, 0);
+    // Capstone 5 prints beq. Capstone 6 prints bt for this BO/BI. bc is the generic form.
+    try std.testing.expect(std.mem.eql(u8, mnemonic, "beq") or std.mem.eql(u8, mnemonic, "bc") or std.mem.eql(u8, mnemonic, "bt"));
+    try std.testing.expectEqual(Flow.conditional, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1010), instructions[0].target);
+
+    // Capstone 5 names this bdnzl. Capstone 6 keeps the generic bcl. Both set LK.
+    const link = try decodeFlowFor(.ppc64le, &.{ 0x05, 0x00, 0x9f, 0x42 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), link);
+    const link_mnemonic = std.mem.sliceTo(&instructions[0].mnemonic, 0);
+    try std.testing.expect(std.mem.eql(u8, link_mnemonic, "bdnzl") or std.mem.eql(u8, link_mnemonic, "bcl"));
+    try std.testing.expectEqual(Flow.call, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1004), instructions[0].target);
 }
 
 test "m68k disassembly uses target byte order on a non-m68k host" {

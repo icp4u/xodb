@@ -44,6 +44,25 @@ from `/proc/PID/io`. Sampled opens/closes miss changes between polls. Deleted
 file sizes are per inode and must not be added across multiple holders; there
 is no claim about immediately reclaimable filesystem space.
 
+Descriptor freshness is field-specific: `path_state`, `stat_state` and
+`fdinfo_state` report `stale` for retained values; `stale: true` means at least
+one part of the row is cached. `offset_age_ms` and `offset_interval_ns` describe
+the last offset measurement. A cached rate remains readable, but
+`offset_advance` is null until a new comparable offset sample exists.
+Process `quiet_hint` identifies an unchanged-count/IO hint, not proof that its
+fd table is unchanged. `offset_progress_state` qualifies partial aggregates
+that exclude cached offsets. Query results may therefore contain an old path
+or inode, explicitly stale, after a same-count close/reopen or rename.
+
+A query with `pid` requests fresh paths and seekable offsets for that process;
+a query without `pid` requests them across the cache. Requests return the
+current snapshot immediately, so inspect its freshness and sequence on a later
+read. Concurrent clients' demands are merged for three seconds. The GUI also
+requests its visible processes. At most 128 individual PIDs retain demand;
+when full, the oldest request yields its slot. Background paths and seekable
+offsets refresh at least every eight scan sequences once reached by the
+budget. Nonseekable fdinfo may remain cached because it has no offset progress.
+
 `limit` defaults to 50 and is capped at 500. To continue, use `next_offset`
 with the returned `sequence`; a changed snapshot gives `FdSnapshotChanged`.
 Restart pagination from zero when that happens. `FdCacheBusy` is a short
@@ -163,3 +182,16 @@ request or server redaction (`FdPathLookupRedacted`), preventing guessed-path
 confirmation. Device/inode queries remain available. Numeric PIDs and device/inode identities remain
 visible to authorized local peers. Private paths and process data should stay in
 private evidence; shipped tests use owned synthetic workloads.
+
+Background polling may retain a pathname until its next full refresh. If a
+background file is unlinked, the stat identity can remain the same while the
+cached link has not yet acquired its `(deleted)` suffix. Deleted-open reporting
+therefore catches up on a foreground or periodic full refresh; it is not an
+immediate unlink-event stream. A stale `offset_progress_per_second` is null,
+including a process total with stale offsets. Per-field state and age describe
+retained offsets and paths.
+
+A polling MCP call with a `pid` requests fresh detail for that process. Omitting
+`pid` requests a full refresh of the shared cache, so whole-system polling calls
+do not benefit from the background adaptive-scan speedup. Both respect the scan
+budget and publish asynchronously; repeated calls do not sample synchronously.

@@ -27,6 +27,7 @@ pub const api = @cImport({
     @cInclude("../lsoftop/lsoftop.h");
     @cInclude("../runtime/xrt_sysstat.h");
     @cInclude("../runtime/xrt_fdactivity.h");
+    @cInclude("../runtime/xrt_memobserver.h");
     @cInclude("../text.h");
     if (gui) {
         @cInclude("wayland-client.h");

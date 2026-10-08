@@ -35,6 +35,7 @@ static const char *const sort_names[VIEWS][SORTS] = {
     { "fd", "io", "pos", NULL, NULL },
     { "pid", "io", NULL, NULL, NULL },
 };
+#define FD_STALE (XRT_FD_INFO_STALE | XRT_FD_LINK_STALE | XRT_FD_STAT_STALE)
 enum { MAX_PIDS = 4096, FILTER = 128, USERS = 64 };
 enum key { K_UP = 256, K_DOWN, K_LEFT, K_RIGHT, K_PGUP, K_PGDN, K_HOME, K_END, K_BTAB, K_ESC };
 enum color { C_NONE, C_DIM, C_ACCENT, C_TITLE, C_GOOD, C_WARN, C_ALERT, C_KIND };
@@ -56,7 +57,7 @@ struct user {
 /* Idle files of one kind held by the same set of processes share a row. */
 struct group {
     uint64_t set;
-    uint32_t kind, count, fds, first; /* first: a member file index */
+    uint32_t kind, count, fds, first, flags; /* first: a member file index */
 };
 #define GROUP 0x80000000u
 struct ui {
@@ -931,14 +932,14 @@ static void build(struct ui *u)
             qsort(u->idle, nidle, sizeof(*u->idle), by_group);
         for (uint32_t i = 0; i < nidle;) {
             const struct xrt_fd_file *f = &u->files[u->idle[i]];
-            uint32_t j = i, fds = 0;
+            uint32_t j = i, fds = 0, flags = 0;
             for (; j < nidle && u->files[u->idle[j]].kind == f->kind && u->files[u->idle[j]].holder_set == f->holder_set; j++)
-                fds += u->files[u->idle[j]].fds;
+                fds += u->files[u->idle[j]].fds, flags |= u->files[u->idle[j]].flags;
             if (j - i == 1) {
                 for (uint32_t k = i; k < j; k++)
                     list_push(u, u->idle[k]);
             } else if (u->ngroups < u->groups_cap || grow_groups(u)) {
-                u->groups[u->ngroups] = (struct group){ .set = f->holder_set, .kind = f->kind, .count = j - i, .fds = fds, .first = u->idle[i] };
+                u->groups[u->ngroups] = (struct group){ .set = f->holder_set, .kind = f->kind, .count = j - i, .fds = fds, .first = u->idle[i], .flags = flags };
                 list_push(u, GROUP | u->ngroups++);
             }
             i = j;
@@ -1242,7 +1243,10 @@ static void process_row(struct ui *u, struct row *r, const struct xrt_fd_process
         space(u, r, 1);
     }
     pen(u, r, C_NONE, 0, "1");
-    put(u, r, comm(u, p, name, sizeof(name)), 15, 0);
+    if (p->flags & XRT_FDP_STALE) {
+        snprintf(line, sizeof(line), "[stale] %s", comm(u, p, name, sizeof(name)));
+        put(u, r, line, 15, 0);
+    } else put(u, r, comm(u, p, name, sizeof(name)), 15, 0);
     pen(u, r, C_NONE, 0, NULL);
     space(u, r, 1);
     count(a, sizeof(a), p->count);
@@ -1447,6 +1451,7 @@ static void fd_row(struct ui *u, struct row *r, const struct xrt_fd *f, const st
     /* anon_inode:[eventfd] -> [eventfd]: KIND already names it, and a cut
      * on the left would leave "…inode:[eventfd]". */
     const char *shown = f->kind == XRT_FD_ANON && !strncmp(link, "anon_inode:", 11) ? link + 11 : link;
+    if ((f->flags & FD_STALE) || (p && (p->flags & XRT_FDP_STALE))) put(u, r, "[stale] ", 8, 0);
     cell(u, r, shown, strlen(shown), room(r), 0, 1);
     pen(u, r, C_NONE, 0, NULL);
 }
@@ -1502,6 +1507,10 @@ static void file_row(struct ui *u, struct row *r, const struct xrt_fd_file *f, i
     space(u, r, 1);
     pen(u, r, C_KIND, (f->flags & XRT_FD_DELETED) ? XRT_FD_KINDS : f->kind == XRT_FD_REGULAR ? -1 : f->kind, NULL);
     link_text(u, sample, link, sizeof(link));
+    /* fdinfo is not displayed for a nonseekable aggregate row. */
+    const unsigned displayed_stale = XRT_FD_LINK_STALE | XRT_FD_STAT_STALE |
+        ((f->kind == XRT_FD_REGULAR || f->kind == XRT_FD_MEMFD) ? XRT_FD_INFO_STALE : 0);
+    if (f->flags & displayed_stale) put(u, r, "[stale] ", 8, 0);
     cell(u, r, link, strlen(link), room(r), 0, 1);
     pen(u, r, C_NONE, 0, NULL);
 }
@@ -1554,6 +1563,11 @@ static void group_row(struct ui *u, struct row *r, const struct group *g)
         snprintf(text, sizeof(text), g->kind == XRT_FD_REGULAR || g->kind == XRT_FD_MEMFD ? "%u idle %s" : "%u %s, no offset data",
                  g->count, plural[g->kind]);
     pen(u, r, C_KIND, (int)g->kind == XRT_FD_REGULAR ? -1 : (int)g->kind, "1");
+    /* Group rows show counts/peers, and idle status for seekable files;
+     * they do not display cached paths or nonseekable fdinfo. */
+    const unsigned displayed_stale = XRT_FD_STAT_STALE |
+        ((g->kind == XRT_FD_REGULAR || g->kind == XRT_FD_MEMFD) ? XRT_FD_INFO_STALE : 0);
+    if (g->flags & displayed_stale) put(u, r, "[stale] ", 8, 0);
     const int hint = text_width(u, text) + 10 <= room(r);
     put(u, r, text, hint ? text_width(u, text) : room(r), 0);
     if (hint) {
@@ -2258,7 +2272,12 @@ static void jfd(struct ui *u, struct buf *b, const struct xrt_fd *f, const struc
     if (f->flags & XRT_FD_STAT)
         bprintf(b, ",\"device\":%llu,\"inode\":%llu,\"size\":%lld,\"disk\":%lld", (unsigned long long)f->device,
                 (unsigned long long)f->inode, (long long)f->size, (long long)f->disk);
-    (void)p;
+    bprintf(b, ",\"stale\":%s,\"path_stale\":%s,\"fdinfo_stale\":%s,\"stat_stale\":%s,\"offset_interval_ns\":%llu",
+            ((p->flags & XRT_FDP_STALE) || (f->flags & FD_STALE)) ? "true" : "false",
+            ((p->flags & XRT_FDP_STALE) || (f->flags & XRT_FD_LINK_STALE)) ? "true" : "false",
+            ((p->flags & XRT_FDP_STALE) || (f->flags & XRT_FD_INFO_STALE)) ? "true" : "false",
+            ((p->flags & XRT_FDP_STALE) || (f->flags & XRT_FD_STAT_STALE)) ? "true" : "false",
+            (unsigned long long)f->info_interval_ns);
     bprintf(b, ",\"generation\":%u,\"advance_per_s\":%.1f}", f->generation, f->rate);
 }
 static void json(struct ui *u, struct buf *b, int fd_tables, uint32_t limit)
@@ -2310,6 +2329,8 @@ static void json(struct ui *u, struct buf *b, int fd_tables, uint32_t limit)
                 (unsigned long long)p->rchar, (unsigned long long)p->wchar, p->read_rate, p->write_rate, p->advance_rate,
                 p->churn_rate, (p->flags & XRT_FDP_NEW) ? "true" : "false",
                 (p->flags & XRT_FDP_STALE) ? "true" : "false", (p->flags & XRT_FDP_TRUNCATED) ? "true" : "false");
+        bprintf(b, ",\"quiet_hint\":%s,\"offsets_partial\":%s",
+                (p->flags & XRT_FDP_QUIET) ? "true" : "false", (p->flags & XRT_FDP_OFFSETS_STALE) ? "true" : "false");
         bstr(b, ",\"growth_kinds\":{");
         int any = 0;
         for (int k = 0; k < XRT_FD_KINDS; k++)
@@ -2337,6 +2358,7 @@ static void json(struct ui *u, struct buf *b, int fd_tables, uint32_t limit)
         const struct xrt_fd_process *p = owner(u, f->sample);
         bprintf(b, "%s{\"kind\":\"%s\",\"path\":", i ? "," : "", xrt_fd_kind_name((enum xrt_fd_kind)f->kind));
         jstr(u, b, link, strlen(link));
+        bprintf(b, ",\"stale\":%s", (f->flags & FD_STALE) ? "true" : "false");
         bprintf(b, ",\"device\":%llu,\"inode\":%llu,\"size\":%lld,\"disk\":%lld,\"deleted\":%s,\"holders\":%u,\"fds\":%u,"
                    "\"sample_pid\":%d,\"advance_per_s\":%.1f,\"read_per_s\":%.1f,\"write_per_s\":%.1f}",
                 (unsigned long long)f->device, (unsigned long long)f->inode, (long long)f->size, (long long)f->disk,
@@ -2344,6 +2366,29 @@ static void json(struct ui *u, struct buf *b, int fd_tables, uint32_t limit)
                 f->rate, f->read_rate, f->write_rate);
     }
     bstr(b, "]}\n");
+}
+
+static void foreground(struct ui *u)
+{
+    int32_t pids[XRT_FD_INTEREST_MAX];
+    uint32_t count = 0, from = (uint32_t)u->top[u->view];
+    uint32_t to = from + (uint32_t)(u->lines > 0 ? u->lines : 24);
+    if (to > u->nlist) to = u->nlist;
+    for (uint32_t i = from; i < to; ++i) {
+        uint32_t row = u->list[i];
+        const struct xrt_fd_process *p = NULL;
+        if (u->view == V_PROCS || u->view == V_LEAKS) p = &u->snap.processes[row];
+        else if (u->view == V_FDS || u->view == V_HOLDERS) p = owner(u, row);
+        else {
+            if (row & GROUP) row = u->groups[row & ~GROUP].first;
+            p = owner(u, u->files[row].sample);
+        }
+        if (!p) continue;
+        uint32_t k = 0;
+        while (k < count && pids[k] != p->pid) ++k;
+        if (k == count && count < XRT_FD_INTEREST_MAX) pids[count++] = p->pid;
+    }
+    (void)xrt_fdscan_interest(u->scan, pids, count, 0);
 }
 
 /* ------------------------------------------------------------------- main */
@@ -2525,6 +2570,7 @@ int xodb_lsof_top(int argc, char **argv)
         o.budget_ms = (uint32_t)(u->interval * 500); /* half the period, also after +/- */
         u->budget_default = 1;
     }
+    o.adaptive = interactive;
     enum xrt_status status = xrt_fdscan_create(&o, &u->scan);
     if (status != XRT_OK) {
         fprintf(stderr, "lsof-top: cannot read /proc (status %d)\n", (int)status);
@@ -2628,6 +2674,7 @@ int xodb_lsof_top(int argc, char **argv)
         clock_gettime(CLOCK_MONOTONIC, &t);
         const uint64_t now = (uint64_t)t.tv_sec * 1000000000u + (uint64_t)t.tv_nsec;
         if (!u->frozen && now >= next) {
+            foreground(u);
             if (xrt_fdscan_poll(u->scan, &u->snap) == XRT_OK) {
                 if (!u->started)
                     u->started = u->snap.taken_ns;

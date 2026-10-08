@@ -850,6 +850,7 @@ pub const Session = struct {
         self.maps_generation = self.target.snapshot().generation;
     }
     pub fn refreshMaps(self: *Session) !void {
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) return error.GdbLibrariesUnavailable;
         if (self.target.core != null) return;
         if (self.target.snapshot().state == .stopped and self.maps_generation != self.target.snapshot().generation) {
             if (self.maps_epoch != self.target.snapshot().image_epoch) {
@@ -1285,6 +1286,7 @@ pub const Session = struct {
         }
     }
     pub fn stepOverInstruction(self: *Session, tid: i32) !void {
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.step == .unsupported) return error.UnsupportedControl;
         if (self.persistent.resolving) return error.SymbolDiscoveryPending;
         self.stepping_over = false;
         self.suppress_probe_resume = true;
@@ -1389,6 +1391,15 @@ pub const Session = struct {
         }
         return error.UnmappedAddress;
     }
+    /// GCC maps a ppc64 function's opening line to the global entry. A local
+    /// call skips it, and a global call falls through the local entry, so one
+    /// probe there catches both. Same rule as automaticSymbolAddress.
+    fn ppcLineAddress(self: *Session, address: u64) u64 {
+        if (self.target.arch() != .ppc64le) return address;
+        const symbol = self.modules.symbolAt(address) catch return address;
+        if (symbol.entry == 0 or address != symbol.address) return address;
+        return std.math.add(u64, address, symbol.entry) catch address;
+    }
     pub fn sourceAddresses(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
         try self.refreshMaps();
         var addresses: std.ArrayList(u64) = .empty;
@@ -1400,7 +1411,7 @@ pub const Session = struct {
             for (originals) |original| {
                 const rows = debug.rowsForLine(a, original, line) catch continue;
                 for (rows) |row| {
-                    const address = try module.runtimeAddress(row.address);
+                    const address = self.ppcLineAddress(try module.runtimeAddress(row.address));
                     var found = false;
                     for (addresses.items) |old| if (old == address) {
                         found = true;
@@ -1436,8 +1447,8 @@ pub const Session = struct {
         stack_walk: while (frames.items.len < @min(64, limit)) {
             const arch_ = self.target.arch();
             const slot = arch_.pc();
-            // LoongArch csr_era has no DWARF number. The top frame uses the
-            // kernel PC; a caller frame's PC is the return-address column.
+            // LoongArch csr_era and ppc64le nip have no DWARF number. The top
+            // frame uses the kernel PC; a caller frame's PC is the return-address column.
             const pc = if (slot < registers.len)
                 registers[slot] orelse break
             else if (frames.items.len == 0)
@@ -1725,9 +1736,10 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        self.language_tabs.deinit();
         self.metadata.deinit();
         self.static_analysis.deinit();
         if (self.observation_archive) |job| job.deinit();
@@ -1758,7 +1770,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

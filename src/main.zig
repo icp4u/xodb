@@ -29,6 +29,11 @@ pub fn main(init: std.process.Init) !void {
         argv[args.len] = null;
         std.process.exit(@intCast(c.xodb_lsof_top(@intCast(args.len), @ptrCast(argv.ptr)) & 0xff));
     }
+    // The memory defrag terminal view needs no window and no target.
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--memdefrag")) std.process.exit(@import("memdefrag/tui.zig").main(args));
+    }
     // The overview is its own window and session with no debug target.
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -50,6 +55,7 @@ pub fn main(init: std.process.Init) !void {
     var connect: ?[:0]const u8 = null;
     var ssh: ?[:0]const u8 = null;
     var runtime_agent: ?[:0]const u8 = null;
+    var gdb_remote: ?[:0]const u8 = null;
     var runtime_ssh: ?[:0]const u8 = null;
     var ssh_config: ?[:0]const u8 = null;
     var remote_xodb: [:0]const u8 = "xodb";
@@ -118,6 +124,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
                 \\O opens process selection; MCP process_id defaults to the original process regardless of GUI selection.
+                \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver or QEMU target.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
@@ -139,6 +146,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--frames N exits after N rendered frames for graphical smoke testing.
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
+                \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\
@@ -147,7 +155,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -162,6 +170,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--browse-observation")) browse_observation = args[i];
             if (std.mem.eql(u8, arg, "--observation-threshold-ns")) observation_threshold = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
+            if (std.mem.eql(u8, arg, "--gdb-remote")) gdb_remote = args[i];
             if (std.mem.eql(u8, arg, "--static-analysis")) static_analysis = args[i];
             if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
             if (std.mem.eql(u8, arg, "--ssh-config")) ssh_config = args[i];
@@ -206,7 +215,7 @@ pub fn main(init: std.process.Init) !void {
         if (launch.len == 0 and attach == null) return error.ObservationRecipeRequiresTarget;
     } else if (observation_out != null) return error.ObservationOutputRequiresRecipe;
     if (browse_observation != null and (open_observation != null or headless)) return error.BrowseObservationRequiresGui;
-    if ((open_observation != null or browse_observation != null) and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or connect != null or ssh != null or initial_breakpoint_count != 0 or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
+    if ((open_observation != null or browse_observation != null) and (launch.len > 0 or attach != null or core_file != null or open_capture != null or open_profile != null or runtime_agent != null or runtime_ssh != null or gdb_remote != null or connect != null or ssh != null or initial_breakpoint_count != 0 or follow_forks or capture_out != null or profile_out != null or record_path != null or allocation_helper != null or symbols != null or reanalyze)) return error.ObservationOpenOptionConflict;
     if (observation_threshold != null and observation_recipe == null and open_observation == null and browse_observation == null) return error.ObservationThresholdRequiresInvestigation;
     if (observation_threshold != null and (mcp or session_socket != null)) return error.ObservationThresholdUseMcpComparison;
     if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
@@ -219,7 +228,8 @@ pub fn main(init: std.process.Init) !void {
     if ((debug_dirs.items.len > 0 or source_maps.items.len > 0) and (open_profile != null or open_capture != null or connect != null)) return error.SymbolOptionsRequireLiveServer;
     if (debug_files.items.len > 0 and (open_profile != null or open_capture != null or connect != null)) return error.DebugFilesRequireLiveServer;
     if (allocation_helper != null and (connect != null or ssh != null or open_capture != null or open_profile != null or core_file != null)) return error.AllocationHelperRequiresLiveServer;
-    const runtime_remote = runtime_agent != null or runtime_ssh != null;
+    const runtime_remote = runtime_agent != null or runtime_ssh != null or gdb_remote != null;
+    if (gdb_remote != null and (runtime_agent != null or runtime_ssh != null or attach != null or launch.len != 0 or follow_forks or allocation_helper != null)) return error.GdbRemoteTargetBelongsToStub;
     if (runtime_remote and (connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null)) return error.RuntimeAgentOptionConflict;
     if (ssh_config != null and runtime_ssh == null) return error.SshConfigRequiresRuntimeSsh;
     const remote_gui = connect != null or ssh != null;
@@ -286,7 +296,8 @@ pub fn main(init: std.process.Init) !void {
     // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
     var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
-    if (runtime_remote) {
+    if (gdb_remote) |endpoint| try session.target.connectGdbRemote(endpoint);
+    if (runtime_agent != null or runtime_ssh != null) {
         var transport: std.ArrayList([:0]const u8) = .empty;
         const agent = runtime_agent orelse "xodb-agent";
         if (runtime_ssh) |host| {
@@ -660,7 +671,12 @@ test {
         _ = @import("ui/overview/sysstat.zig");
         _ = @import("ui/overview/view.zig");
         _ = @import("ui/overview/run.zig");
+        _ = @import("ui/overview/memmap.zig");
     }
+    _ = @import("memdefrag/model.zig");
+    _ = @import("memdefrag/vga.zig");
+    _ = @import("memdefrag/dos.zig");
+    _ = @import("memdefrag/tui.zig");
     std.testing.refAllDecls(@import("model/session.zig"));
     _ = @import("model/remote_source.zig");
     _ = @import("semq/adapter.zig");

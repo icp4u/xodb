@@ -64,6 +64,13 @@ work and cap counts remain visible. Initial process rows may wait for their
 turn in the bounded whole-system scan. Positive seekable progress animates at
 up to 15 frames per second while visible; stale, paused or unknown rows do not.
 
+Files prioritizes metadata for visible rows and the selected process. Offscreen
+paths and offsets may be retained; **[stale]** marks those rows, and hovering
+shows which fields are cached and the offset's age. An unchanged descriptor
+count is only a hint: a same-count close/reopen can leave a cached old path
+until refresh. Scroll to a process or select it to request fresh metadata;
+the scan budget still applies. Background metadata receives periodic refresh.
+
 The collector reuses at most 2,048 read-only process-stat handles, further
 limited to one eighth of the process descriptor limit. Handles are close-on-exec,
 released when their tasks disappear or the collector closes, and never reused
@@ -246,3 +253,157 @@ therefore does not make the next reading stale. Sustained slow sources keep
 the five-second refresh and its explicit stale reason, and recover immediately
 when a refresh completes quickly. Synthetic collector fixtures can disable
 this wall-time classification through `sensor_timing_disabled` in the C limits.
+
+## Memory map (defrag views)
+
+The **Memory map** panel (**M**, or **m** on a Processes row) draws one
+process's virtual memory as fixed 2 MiB address cells inside its VMAs, from the
+same shared observer as the MCP tools below. **t** on the panel cycles three
+looks: a Windows 9x *Disk Defragmenter* dialog, the MS-DOS 6 *DEFRAG* text
+screen (the same 80x25 composer as `xodb --memdefrag`, see
+[MEMDEFRAG.md](MEMDEFRAG.md)) and a modern grid. `--look win9x|dos|modern`
+picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
+
+- Cells are address ranges, so gaps between VMAs stay visible (dark). Long
+  gaps and large never-resident VMAs are one compressed cell marked with a
+  break. Hover shows the range, VMA, permissions, mapping (hidden under
+  `--redact`), state and the known category bits.
+- Colours: dark blue THP (PMD-mapped), cyan 4 KiB anonymous, yellow file or
+  shared, grey swapped or not present, red unmovable (VM_IO/VM_PFNMAP), dark
+  unmapped. A cell no page scan observed is grey-hatched; under plain
+  pagemap (no page size) present cells are hatched over their colour.
+- Three changes never share a colour: a page-category flip between the last
+  two snapshots is green (DOS: blinking `r`/`W`); a collapse into a PMD
+  mapping keeps the THP colour with a white ring (DOS: white `█`); a split gets
+  a red edge (DOS: red `▓`). Physical migration is not observable per process
+  and is never drawn.
+- The progress bar is THP coverage: AnonHugePages in THP-eligible private
+  anonymous VMAs over their PMD-aligned span. An unknown numerator or
+  denominator draws a hatched bar and "Coverage unknown", never 0 %.
+- The activity text ("Collapsing huge pages", "kcompactd compacting memory",
+  "Idle") comes only from vmstat counter deltas over the last interval and is
+  labelled system-wide.
+- Freshness is shown in every look: the map's actual refresh period, marked
+  *cost-limited* when the worker slowed an expensive map below 1 Hz to hold its
+  CPU target, and the data's age (replays say *recorded*). Transitions ease only
+  when a new snapshot arrives. Pause (**p**, or the Pause button) stops renewing
+  demand, so scans lapse after three seconds.
+- Buttons: Stop returns to the system view (free memory by buddy block size,
+  counts not positions), Pause, Legend, Hide Details (compact dialog). Keys:
+  **[ ]** previous/next process, **o** process picker (DOS), arrows move the
+  cell cursor, **+/-** zoom toward 4 KiB cells around the cursor, **g** legend,
+  **d** details, **Esc** stop.
+- A replay frame may carry a `memory_map` object (schema `xodb-memdefrag/1`,
+  the same JSON as `xodb --memdefrag --json`); `tests/fixtures/memmap-synth.py`
+  writes synthetic ones.
+
+## Memory page observations over MCP
+
+The observer tools **get_memory_map**, **get_thp_state**, and
+**get_fragmentation** also work without a debug target. One lazy background
+worker serves the overview and its MCP peers. Requests renew a three-second
+demand lease; each scope is sampled no sooner than one second after its previous
+sample finishes. Expensive sources adapt their period toward 8 ms of CPU per
+second per scope (0.8% of a core), up to 60 seconds. The decision uses thread CPU
+time, so preemption cannot mark a cheap read as costly. Replies expose refresh_ms,
+system_refresh_ms, cost_limited and cache age. Requests may continue at 1 Hz;
+cadence throttling retains sampled data. Independent scan bounds report partial
+coverage explicitly. Four expensive scopes can cost more than one. Replies never reset
+the counter-delta baseline.
+
+A process request requires both pid and start_ticks from the process list.
+Identity is checked before and after collection. A changed identity or exited
+process has an explicit state and no map rows. Four process/range scopes are
+available; a full cache or briefly held publication mutex returns
+MemoryCacheBusy. Closing a peer does not destroy the shared worker.
+
+get_memory_map defaults to VMA metadata (view "vmas"). View "ranges" returns
+coalesced page states. Optional range_start and range_end are 0x-prefixed hex
+strings defining a page-aligned half-open address interval. VMA metadata still
+covers the process; range selection limits page scanning. View "cells" requires
+a range aligned to cell_bytes: 2097152 by default, or the host base page size.
+Cells retain virtual addresses and gaps. An absent virtual page is **not**
+evidence of free physical RAM.
+
+Replies contain at most 256 rows. Pass next_offset and cache.sequence for later
+pages. An intervening publication returns StaleMemorySnapshot; restart from
+offset zero. Integers above signed 64-bit JSON range are decimal strings.
+Addresses are hexadecimal strings.
+
+Process storage grows with the observed rows and text, up to the configured caps, and
+published process arrays shrink to their populated size. The x86 `[vsyscall]`
+gate remains mapped but has unobserved page state; it has no user page tables
+and does not make an otherwise complete scan partial. A demand-time existence
+check, at most once per second, wakes the collector after exit even when a
+cost-limited snapshot has a longer refresh period. The worker confirms the
+pinned identity and publishes the exit; a missing proc mount is not an exit.
+
+Defaults bound each sample to 65536 VMAs, 16384 state ranges, 64 MiB of text
+per source and 4 MiB of paths. Page scans have a 20 ms thread-CPU budget,
+checked between ioctls spanning at most 1 GiB. A syscall already in progress
+can exceed that budget. Sparse spans no longer spend a budget proportional to
+their virtual size. Plain-pagemap fallback additionally limits work to 1048576
+base-page entries (4 GiB on a 4 KiB system). Limits, denied sources and truncation retain explicit states and a
+scan-resume address; incomplete process totals are null. Snapshot start/end
+times, scanned bytes, thread CPU time and cache age expose cost and freshness.
+These observations span an interval and are not atomic.
+
+The category/known masks have these bits:
+
+| Bit | Category | Limit |
+| --- | --- | --- |
+| 0 | present | Resident virtual mapping |
+| 1 | swapped | No swap offsets exposed |
+| 2 | file | Plain pagemap also includes shared anonymous pages |
+| 3 | huge | PMD mapping, including huge zero pages, or hugetlb; not every multi-size THP |
+| 4 | written | Known only with observable asynchronous write-protection tracking |
+| 5 | zero | Shared zero page, when the scan backend reports it |
+| 6 | exclusive | Kernel pagemap exclusivity semantics |
+| 7 | soft dirty | Observed flag, never cleared |
+| 8 | write-protection tracking | Backend support/state, not a write event |
+
+Zero without its known bit is unknown. The scan ioctl uses flags zero and never
+write-protects memory or resets dirty tracking. Older kernels fall back to high
+pagemap flags and leave huge, zero and written unknown. Physical frame numbers
+and target memory contents never enter the data. NUMA is a per-VMA histogram
+with its reported page size, when available, not exact cell locations. Request
+`numa: true` in `get_memory_map` to collect it; ordinary views avoid that extra
+walk. `smaps_rollup` is read only when smaps is partial, and otherwise reports
+that it was not requested.
+
+Cells compare successive observations of the same pinned process. The
+changed_categories/change_known masks cover present/swapped/file/written.
+Separate collapsed_bytes, split_bytes and pmd_change_known fields describe
+backed THP mapping gains/losses, not the kernel operation that caused them.
+Here THP means HUGE set and ZERO clear, with both flags known in both samples;
+writing a huge zero page can therefore count as collapse without changing HUGE.
+Conversely, backed THP becoming a huge zero page counts as a split because its
+private backing was lost, even if HUGE stays set. First
+samples and unsupported backends leave comparisons unknown. Physical migration
+is always unknown here. Replaced mappings and changes between polls can be missed.
+
+THP coverage has separately known numerator and denominator. The numerator is
+AnonHugePages in THPeligible private anonymous VMAs. The denominator is the
+PMD-aligned span wholly inside those VMAs, using the kernel's PMD size.
+File-backed COW, shmem and hugetlb are outside it; their metrics remain separate.
+Shared huge zero pages do not contribute to AnonHugePages. Unknown eligibility,
+PMD size or incomplete VMA enumeration leaves coverage unknown. A known zero
+denominator means no eligible span, not zero-percent completion.
+
+System activity comes only from cumulative vmstat deltas between successive
+system samples. Missing/reset counters and first samples have null deltas;
+gauges have none. These values cannot be attributed to the selected process or
+a particular zone. Buddy fragmentation uses the kernel extfrag formula:
+-1000 means allocation of the requested order is possible; other negative
+indices are valid. It is not a completion percentage. Free-page totals
+distinguish an empty zone from low fragmentation.
+
+Redaction removes process names, paths and inodes per reply without changing
+the raw cache. Virtual addresses and PID/start identity remain. Unsafe or
+overlong text is omitted. No tool accepts fixture roots, guessed paths, policy
+changes, system compaction, or a privileged physical-memory helper.
+
+References: Linux
+[page table metadata](https://docs.kernel.org/admin-guide/mm/pagemap.html),
+[proc memory fields](https://www.kernel.org/doc/html/next/filesystems/proc.html),
+and [THP statistics](https://docs.kernel.org/admin-guide/mm/transhuge.html).

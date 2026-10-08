@@ -19,17 +19,27 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=()):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None):
     live = tier in ('host', 'all')
+    language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
+    gui_language_args = [*language_args]
+    for executable, _, _ in lua:
+        language_args += ['--lua', executable]
+    if lua:
+        gui_language_args += ['--lua', lua[0][0]]
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
+    steps.append(('shared-readiness', [sys.executable, '-B', 'tests/shared-readiness.py'], 30))
     steps.append(('javascript-dwarf', [sys.executable, '-B', 'tests/javascript-dwarf.py'], 60))
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
     steps.append(('demo-binary', [sys.executable, '-B', 'tests/demo-binary.py'], 30))
+    steps.append(('client-control', [sys.executable, '-B', 'tests/client-control.py'], 30))
     if live:
         steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
+        steps.append(('memory-observer', [sys.executable, '-B', 'tests/memory-observer.py'], 180))
+        steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
@@ -48,8 +58,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('metadata-session', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ms'], 180))
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
-        steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt'], 180))
-        steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent'], 240))
+        steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt', *language_args], 900 if node else 240))
+        steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
+        if python:
+            for remote in (False, True):
+                agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append((f'language-selection-cache-{int(remote)}', [sys.executable, '-B', 'tests/language-selection-cache.py', '--python', python, '--work', f'.work/lc{int(remote)}', *agent], 180))
         storage = ['--storage', os.environ['XODB_LARGE_IMAGE_STORAGE']] if os.environ.get('XODB_LARGE_IMAGE_STORAGE') else []
         steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
@@ -64,6 +78,26 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('agent-startup', [sys.executable, '-B', 'tests/agent-startup.py'], 30))
         steps.append(('source-fetch', [sys.executable, '-B', 'tests/source-fetch.py'], 180))
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
+        if python:
+            sdk = ['--python', python]
+            steps.append(('python-component', [sys.executable, '-B', 'tests/python-component.py', *sdk, '--work', '.work/pyc'], 120))
+            for remote in (False, True):
+                agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append((f'python-named-{int(remote)}', [sys.executable, '-B', 'tests/python-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pyn{int(remote)}'], 180))
+                steps.append((f'python-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/python-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/pys{int(remote)}'], 180))
+            if lua:
+                mixed = [*sdk, '--lua-source', lua[0][1]]
+                steps.append(('python-lua-component', [sys.executable, '-B', 'tests/python-component.py', *mixed, '--work', '.work/pylc'], 180))
+                for remote in (False, True):
+                    agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                    steps.append((f'python-lua-named-{int(remote)}', [sys.executable, '-B', 'tests/python-locals.py', *mixed, *agent, '--strace', '--work', f'.work/pyl{int(remote)}'], 240))
+        if perl and padwalker:
+            sdk = ['--perl', perl, '--padwalker', padwalker]
+            steps.append(('perl-component', [sys.executable, '-B', 'tests/perl-component.py', *sdk, '--work', '.work/pc', '--sanitize'], 120))
+            for remote in (False, True):
+                agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append((f'perl-named-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pn{int(remote)}'], 180))
+                steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if node:
             steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
             steps.append(('javascript-cache', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--work', '.work/js-cache'], 300))
@@ -74,6 +108,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 prefix = ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'language-selection-{index}-{int(remote)}', [*prefix, sys.executable, '-B', 'tests/language-selection.py', '--include', source, '--library', library, *([] if remote else ['--strace']), '--work', f'.work/language-selection-{index}-{int(remote)}'], 120))
             steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))
+            steps.append((f'lua-named-{index}', [sys.executable, '-B', 'tests/lua-locals.py', *sdk, '--strace', '--work', f'.work/lua-named-{index}'], 120))
+            steps.append((f'lua-named-agent-{index}', [sys.executable, '-B', 'tests/lua-locals.py', *sdk, '--agent', 'zig-out/bin/xodb-agent', '--strace', '--work', f'.work/lua-named-agent-{index}'], 120))
+            steps.append((f'lua-named-shared-{index}', [sys.executable, '-B', 'tests/lua-locals-shared.py', *sdk, '--strace', '--work', f'.work/lns{index}'], 120))
+            steps.append((f'lua-named-shared-agent-{index}', [sys.executable, '-B', 'tests/lua-locals-shared.py', *sdk, '--agent', 'zig-out/bin/xodb-agent', '--strace', '--work', f'.work/lnsa{index}'], 120))
             steps.append((f'lua-embedded-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--strace', '--adversarial', '--work', f'.work/lua-embedded-{index}'], 180))
             steps.append((f'lua-interpreter-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--lua', executable, '--work', f'.work/lua-interpreter-{index}'], 180))
             steps.append((f'lua-refusals-{index}', [sys.executable, '-B', 'tests/lua-refusals.py', *sdk, '--work', f'.work/lua-refusals-{index}'], 120))
@@ -92,7 +130,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-themes', ['tests/themes.py']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-frames', ['tests/frames-gui.py']),
-            ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt']),
+            ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
             ('gui-clipboard', ['tests/clipboard-gui.py']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
@@ -116,17 +154,28 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('fence-timeout', ['tests/vulkan-stall.py', 'fence', '--keep-hidden', '--quit', 'close']),
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
-            steps.append((name, [sys.executable, '-B', *args], 90))
+            steps.append((name, [sys.executable, '-B', *args], 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
+        steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if node:
-            steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
+            steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800))
             steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
+        if python:
+            steps.append(('python-gui', [sys.executable, '-B', 'tests/python-gui.py', '--python', python, '--work', '.'], 240))
+            steps.append(('python-named-gui', [sys.executable, '-B', 'tests/python-locals-gui.py', '--python', python, '--work', '.work/pyg'], 180))
+        if perl:
+            steps.append(('perl-gui-fixtures', [sys.executable, '-B', 'tests/perl-language.py', '--perl', perl, '--work', '.work/pgf'], 180))
+            steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240))
+        if perl and padwalker:
+            steps.append(('perl-named-gui', [sys.executable, '-B', 'tests/perl-locals-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/png'], 180))
         if lua:
             selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
             steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))
+            for index, (_, source, library) in enumerate(lua):
+                steps.append((f'lua-named-gui-{index}', [sys.executable, '-B', 'tests/lua-locals-gui.py', '--source', source, '--library', library, '--work', f'.work/lng{index}'], 120))
     return steps
 
 
@@ -266,6 +315,8 @@ def main():
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
     parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
     parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
+    parser.add_argument('--padwalker', help='Built test-only PadWalker tree for Perl named-local oracle checks; requires --perl')
+    parser.add_argument('--python', help='Include language-tab and cached-selection checks using this debug CPython runtime')
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -275,13 +326,17 @@ def main():
         parser.error('--headless is for the portable tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
         parser.error('--uprobes requires the host or all tier')
-    if args.perl and args.tier not in ('gui', 'all'):
-        parser.error('--perl requires the gui or all tier')
+    if args.perl and args.tier == 'portable':
+        parser.error('--perl requires the host, gui or all tier')
+    if args.padwalker and not args.perl:
+        parser.error('--padwalker requires --perl')
+    if args.python and args.tier == 'portable':
+        parser.error('--python requires the host, gui or all tier')
     if args.node and args.tier == 'portable':
         parser.error('--node requires the host, gui or all tier')
     if args.lua and args.tier == 'portable':
         parser.error('--lua requires the host, gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua)
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
@@ -302,7 +357,7 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), lua_runtimes=len(args.lua), python_language=bool(args.python), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -310,7 +365,8 @@ def main():
                      ['full host integration suite'] if args.tier == 'gui' else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
                     (['Node.js language checks (use --node PATH)'] if args.tier != 'portable' and not args.node else []) +
-                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier != 'portable' and not args.lua else []))
+                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier != 'portable' and not args.lua else []) +
+                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier != 'portable' and not args.padwalker else []))
     print(f'Release evidence: {run}', flush=True)
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')

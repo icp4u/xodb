@@ -49,6 +49,9 @@ struct xrt_fdscan {
     int32_t *pids;
     int proc;
     int32_t self, detail;
+    int32_t interest[XRT_FD_INTEREST_MAX];
+    uint32_t ninterest;
+    int all_interest;
     struct snap s[2];
     int cur;
     uint64_t epoch, sequence;
@@ -200,6 +203,23 @@ void xrt_fdscan_detail(struct xrt_fdscan *s, int32_t pid)
 {
     if (s)
         s->detail = pid;
+}
+
+enum xrt_status xrt_fdscan_interest(struct xrt_fdscan *s, const int32_t *pids,
+                                    uint32_t count, int all)
+{
+    if (!s || count > XRT_FD_INTEREST_MAX || (count && !pids)) return XRT_INVALID_ARGUMENT;
+    for (uint32_t i = 0; i < count; ++i) if (pids[i] <= 0) return XRT_INVALID_ARGUMENT;
+    if (count) memcpy(s->interest, pids, count * sizeof(*pids));
+    s->ninterest = count;
+    s->all_interest = all != 0;
+    return XRT_OK;
+}
+static int interested(const struct xrt_fdscan *s, int32_t pid)
+{
+    if (s->all_interest || s->detail == pid) return 1;
+    for (uint32_t i = 0; i < s->ninterest; ++i) if (s->interest[i] == pid) return 1;
+    return 0;
 }
 
 /* Returns the string offset, or 0 (the empty string) when the arena is full. */
@@ -387,6 +407,7 @@ static int unseen(struct xrt_fdscan *s, struct snap *c, int32_t pid, uint32_t ui
 }
 
 enum outcome { SCANNED, UNSEEN, GONE, FULL };
+static int carry(struct xrt_fdscan *, struct snap *, const struct snap *, const struct xrt_fd_process *);
 
 static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap *prev,
                          const struct xrt_fd_process *old, const struct xrt_fd_unseen *was_unseen,
@@ -449,6 +470,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         close(fd_dir);
         return FULL;
     }
+    const uint32_t strings_before = c->nstrings;
     struct xrt_fd_process *p = &c->procs[c->nprocs];
     memset(p, 0, offsetof(struct xrt_fd_process, history));
     p->pid = pid;
@@ -531,6 +553,23 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
     const struct xrt_fd *before = old ? prev->fds + old->first : NULL;
     const uint32_t before_count = old ? old->count : 0;
     const int whole = s->detail == pid;
+    const int foreground = interested(s, pid);
+    const int full = !s->o.adaptive || !old || foreground ||
+                     s->sequence + 1 - old->full_sequence >= 8;
+    p->full_sequence = full ? s->sequence + 1 : old->full_sequence;
+    /* The count and process IO are only a hint. A close/reopen or rename can
+     * leave both unchanged, so retaining anything marks the whole row stale. */
+    if (!full && !unlisted && !(old->flags & (XRT_FDP_TRUNCATED | XRT_FDP_NO_IO)) &&
+        !(p->flags & XRT_FDP_NO_IO) && count == old->count &&
+        p->rchar == old->rchar && p->wchar == old->wchar &&
+        p->read_bytes == old->read_bytes && p->write_bytes == old->write_bytes) {
+        close(fd_dir);
+        c->nstrings = strings_before;
+        if (!carry(s, c, prev, old)) return FULL;
+        c->procs[c->nprocs - 1].flags |= XRT_FDP_QUIET;
+        ++c->view.stale;
+        return SCANNED;
+    }
     uint32_t j = 0, matched = 0;
     for (uint32_t i = 0; i < count; i++) {
         if (c->nfds == s->o.max_fds) {
@@ -540,32 +579,43 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         }
         char link[LINK_MAX];
         snprintf(name, sizeof(name), "%d", s->numbers[i]);
-        const ssize_t len = readlinkat(fd_dir, name, link, sizeof(link) - 1);
-        if (len < 0 && errno == ENOENT)
-            continue; /* closed since the listing */
+        struct xrt_fd *f = &c->fds[c->nfds];
+        while (j < before_count && before[j].fd < s->numbers[i]) j++;
+        const struct xrt_fd *was = j < before_count && before[j].fd == s->numbers[i] ? &before[j] : NULL;
+        /* Cached absolute path targets use stat for identity and size. Their
+         * path text is retained with a stale label until a full refresh.
+         * Pipes/sockets use their inode-bearing link text instead. */
+        int have = 0, cached_link = 0;
+        if (!full && was && (was->flags & XRT_FD_STAT) &&
+            !(was->flags & XRT_FD_LINK_CUT) && was->link_length && prev->strings[was->link] == '/') {
+            have = fstatat(fd_dir, name, &st, 0) == 0;
+            if (have && was->device == (uint64_t)st.st_dev && was->inode == (uint64_t)st.st_ino)
+                cached_link = 1;
+        }
+        ssize_t len;
+        if (cached_link) {
+            len = was->link_length;
+            memcpy(link, prev->strings + was->link, (size_t)len);
+        } else {
+            len = readlinkat(fd_dir, name, link, sizeof(link) - 1);
+            if (len < 0 && errno == ENOENT) continue;
+        }
         const size_t length = len < 0 ? 0 : (size_t)len;
         link[length] = 0;
-        /* Path targets are identified by device and inode, so a rename or
-         * unlink is the same open and a reopen onto this number is not. */
-        struct xrt_fd *f = &c->fds[c->nfds];
-        while (j < before_count && before[j].fd < s->numbers[i])
-            j++;
-        const struct xrt_fd *was = j < before_count && before[j].fd == s->numbers[i] ? &before[j] : NULL;
         const int path = length && link[0] == '/';
         const int text = was && !(was->flags & XRT_FD_LINK_CUT) && was->link_length == length &&
                          !memcmp(prev->strings + was->link, link, length);
-        /* Devices behind an unchanged name need no stat each scan; files,
-         * memfds and directories do (sizes, and reopen detection). */
-        const int needs = path && (!text || was->kind == XRT_FD_REGULAR || was->kind == XRT_FD_MEMFD || was->kind == XRT_FD_DIRECTORY);
-        int have = needs && fstatat(fd_dir, name, &st, 0) == 0;
+        const int needs = path && (!text || was->kind == XRT_FD_REGULAR || was->kind == XRT_FD_MEMFD || was->kind == XRT_FD_DIRECTORY || (full && s->o.adaptive));
+        if (!have && needs) have = fstatat(fd_dir, name, &st, 0) == 0;
         int same = text;
         if (was && have && (was->flags & XRT_FD_STAT) && was->link_length && prev->strings[was->link] == '/')
-            same = was->device == st.st_dev && was->inode == st.st_ino;
-        if (!same && !path) /* pipes and sockets: device and inode for grouping */
-            have = fstatat(fd_dir, name, &st, 0) == 0;
+            same = was->device == (uint64_t)st.st_dev && was->inode == (uint64_t)st.st_ino;
+        if (!same && !path) have = fstatat(fd_dir, name, &st, 0) == 0;
         if (same) {
             *f = *was;
-            f->flags &= (uint8_t)~(XRT_FD_OPENED | XRT_FD_LINK_CUT);
+            f->flags &= (uint8_t)~(XRT_FD_OPENED | XRT_FD_LINK_CUT | XRT_FD_LINK_STALE | XRT_FD_STAT_STALE);
+            if (cached_link) f->flags |= XRT_FD_LINK_STALE;
+            if (!have) f->flags |= XRT_FD_STAT_STALE;
             f->advance = 0;
             f->rate = 0;
             if (have) {
@@ -588,16 +638,24 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
             f->link_length = 0;
             c->view.cut_strings++;
         }
-        if (!same || whole || seekable(f)) {
-            const uint64_t last = f->pos;
-            const int had = same && (was->flags & XRT_FD_INFO);
-            if (fdinfo(proc, s->expected_dir >= 0 ? 0 : pid, f->fd, f) && had && f->pos > last) {
+        const int read_info = !same || whole || (seekable(f) && full);
+        const uint64_t last = f->pos, last_at = same ? was->info_sampled_ns : 0;
+        const int had = same && (was->flags & XRT_FD_INFO);
+        f->flags |= XRT_FD_INFO_STALE;
+        if (!same) f->info_interval_ns = 0;
+        if (read_info && fdinfo(proc, s->expected_dir >= 0 ? 0 : pid, f->fd, f)) {
+            f->flags &= (uint8_t)~XRT_FD_INFO_STALE;
+            f->info_sampled_ns = now;
+            f->info_interval_ns = had && now > last_at ? now - last_at : 0;
+            if (had && f->pos > last) {
                 f->advance = f->pos - last;
-                f->rate = per_second(f->advance, p->interval_ns);
+                f->rate = per_second(f->advance, f->info_interval_ns);
             }
-        }
+        } else if (had) f->rate = was->rate;
+        if (seekable(f) && (f->flags & XRT_FD_INFO_STALE)) p->flags |= XRT_FDP_OFFSETS_STALE;
         p->kinds[f->kind]++;
         p->advance += f->advance;
+        if (!(f->flags & XRT_FD_INFO_STALE)) p->advance_rate += f->rate;
         c->nfds++;
     }
     close(fd_dir);
@@ -609,7 +667,8 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
     }
     p->read_rate = per_second(p->d_rchar, p->interval_ns);
     p->write_rate = per_second(p->d_wchar, p->interval_ns);
-    p->advance_rate = per_second(p->advance, p->interval_ns);
+    /* Each fd may have a different previous offset sample. Sum its measured
+     * rate, never divide a multi-scan offset delta by one process interval. */
     p->churn_rate = per_second((uint64_t)p->opened + p->closed, p->interval_ns);
     if (!old || p->count < p->lifetime_low)
         p->lifetime_low = p->count;
@@ -629,7 +688,7 @@ static int carry(struct xrt_fdscan *s, struct snap *c, const struct snap *prev, 
         return 0;
     struct xrt_fd_process *p = &c->procs[c->nprocs++];
     *p = *old;
-    p->flags = (p->flags & ~(uint32_t)XRT_FDP_NEW) | XRT_FDP_STALE;
+    p->flags = (p->flags & ~(uint32_t)(XRT_FDP_NEW | XRT_FDP_QUIET)) | XRT_FDP_STALE | XRT_FDP_OFFSETS_STALE;
     p->d_rchar = p->d_wchar = p->advance = 0;
     p->opened = p->closed = 0;
     p->d_count = 0;
@@ -643,6 +702,7 @@ static int carry(struct xrt_fdscan *s, struct snap *c, const struct snap *prev, 
         *f = prev->fds[old->first + i];
         f->advance = 0;
         f->flags &= (uint8_t)~XRT_FD_OPENED;
+        f->flags |= XRT_FD_INFO_STALE | XRT_FD_LINK_STALE | XRT_FD_STAT_STALE;
         if (f->link_length) {
             f->link = put(s, c, prev->strings + f->link, f->link_length);
             if (!f->link) {
@@ -904,7 +964,7 @@ enum xrt_status xrt_fdscan_files(struct xrt_fdscan *s, const struct xrt_fd_file 
                     file->holder_set = (file->holder_set ^ (uint32_t)c->procs[s->keys[j].proc].pid) * 1099511628211ull;
                 }
                 file->fds++;
-                file->flags |= g->flags & XRT_FD_DELETED;
+                file->flags |= g->flags & (XRT_FD_DELETED | XRT_FD_INFO_STALE | XRT_FD_LINK_STALE | XRT_FD_STAT_STALE);
                 file->rate += g->rate;
                 if ((g->flags & XRT_FD_INFO) && (g->open_flags & O_ACCMODE) == O_RDONLY)
                     file->read_rate += g->rate;

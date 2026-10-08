@@ -368,3 +368,88 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
     const layout = try profile(session, module);
     return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
 }
+
+/// Frame selection comes from the retained canonical stack, never raw client
+/// interpreter/CV/pad addresses. The C reader revalidates that context's pad.
+pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment_index, frame, start, limit, null);
+}
+pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    return readBindings(session, a, tid, segment_index, frame, 0, 1, expression);
+}
+fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
+    const named = @import("../model/language_locals.zig");
+    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const selected = observed.segments[segment_index];
+    if (frame >= selected.frames.len) return error.InvalidLanguageFrame;
+    const instance_ = selected.runtime_instance orelse return error.PerlInterpreterUnavailable;
+    const interpreter = try std.fmt.parseInt(u64, instance_.address, 0);
+    const cv = try std.fmt.parseInt(u64, selected.frames[frame].cv, 0);
+    const context = try std.fmt.parseInt(u64, selected.frames[frame].context_address, 0);
+    const generation = observed.generation;
+    const version = try a.dupe(u8, selected.runtime.version);
+    const id = try a.dupe(u8, selected.runtime.build_id);
+    const stack_reason = if (selected.reason) |why| try a.dupe(u8, why) else null;
+    const module = if (selected.anchor) |anchor|
+        try session.modules.at(try std.fmt.parseInt(u64, anchor.pc, 0))
+    else
+        try valueModule(session);
+    const layout = try profile(session, module);
+    if (!std.mem.eql(u8, id, try buildId(a, layout))) return error.PerlBuildIdMismatch;
+    var r = reader(session);
+    const raw = try a.create(c.struct_xpl_locals);
+    if (expression) |query| c.xpl_local_find(layout, &r, interpreter, frame, try a.dupeZ(u8, query), raw) else c.xpl_locals_read(layout, &r, interpreter, frame, start, limit, raw);
+    if ((raw.cv != 0 and raw.cv != cv) or (raw.context_address != 0 and raw.context_address != context)) return error.StaleLanguageFrame;
+    const rows = try a.alloc(named.Row, raw.count);
+    for (raw.items[0..raw.count], rows) |item, *out| {
+        const value = &item.value;
+        const children = try a.alloc(named.Child, value.item_count);
+        for (value.items[0..value.item_count], children) |child, *dest| dest.* = .{
+            .key = try text(a, std.mem.sliceTo(&child.key, 0)),
+            .type = try text(a, std.mem.sliceTo(&child.type, 0)),
+            .display = try text(a, std.mem.sliceTo(&child.display, 0)),
+            .address = if (child.address != 0) child.address else null,
+            .diagnostic = try reason(a, child.reason),
+            .advisory = child.reason != null,
+        };
+        const why = try reason(a, item.reason);
+        out.* = .{
+            .name = try text(a, std.mem.sliceTo(&item.name, 0)),
+            .scope = switch (item.scope) {
+                c.XPL_OUTER => .free,
+                c.XPL_STATE => .state,
+                else => .local,
+            },
+            .ordinal = @intCast(item.ordinal),
+            .address = if (item.sv != 0) item.sv else null,
+            .slot_address = if (item.slot_address != 0) item.slot_address else null,
+            .value = .{
+                .type = if (value.type[0] == 0) "unavailable" else try text(a, std.mem.sliceTo(&value.type, 0)),
+                .display = if (value.display[0] == 0) why orelse "Value unavailable" else try text(a, std.mem.sliceTo(&value.display, 0)),
+                .diagnostic = why,
+                .advisory = value.stored_value_only != 0,
+                .truncated = value.truncated != 0,
+                .children = children,
+            },
+        };
+    }
+    try session.target.expectGeneration(generation);
+    return .{
+        .generation = generation,
+        .tid = tid,
+        .language = .perl,
+        .segment = segment_index,
+        .frame = frame,
+        .start = raw.start,
+        .total = raw.total,
+        .truncated = raw.truncated != 0,
+        .rows = rows,
+        .diagnostic = (try reason(a, raw.reason)) orelse stack_reason,
+        .runtime_version = version,
+        .runtime_build_id = id,
+        .basis = "Perl 5.44.0 threaded DWARF layout and verified build-id; canonical context CV/depth/COP lexical scope; retained pad bindings only; no magic, globals, uncaptured outer traversal or inferior calls",
+        .memory_reads = r.reads,
+        .memory_bytes = r.bytes,
+    };
+}

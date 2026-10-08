@@ -11,15 +11,16 @@ const draw = @import("draw.zig");
 const themes = @import("theme.zig");
 const panels = @import("panels.zig");
 pub const files_model = @import("files_model.zig");
+pub const memmap = @import("memmap.zig");
 pub const Ctx = draw.Ctx;
 pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO" };
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -68,6 +69,9 @@ pub const View = struct {
     paused: bool = false,
     source_label: []const u8 = "live",
     files: files_model.State = .{},
+    memmap: memmap.State = .{},
+    /// The Memory map looks draw period-styled tooltips.
+    tooltip_style: enum { overview, win9x, dos } = .overview,
     current: ?*m.Owned = null,
     previous: ?*m.Owned = null,
     /// Replay frames belong to the replay; live samples to the view.
@@ -98,7 +102,7 @@ pub const View = struct {
     visible_rows: usize = 20,
     // Interaction.
     pointer: [2]f32 = .{ -1, -1 },
-    hover_text: [160]u8 = undefined,
+    hover_text: [512]u8 = undefined,
     hover_len: usize = 0,
     hover_rect: ?Rect = null,
     status: [160]u8 = undefined,
@@ -114,6 +118,7 @@ pub const View = struct {
     layout: ?*draw.Layout = null,
     layout_reported: usize = std.math.maxInt(usize),
     layout_panel: Panel = .summary,
+    layout_size: [2]f32 = .{ 0, 0 },
     process_ns_start: u64 = 0,
     total_pct: ?f64 = null,
     action_context: ?*anyopaque = null,
@@ -130,7 +135,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events };
+    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -139,6 +144,7 @@ pub const View = struct {
     }
     pub fn deinit(self: *View) void {
         self.files.deinit(self.gpa);
+        self.memmap.deinit();
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -175,7 +181,7 @@ pub const View = struct {
         for ([_]m.Group{ .summary, .cpu, .memory, .disks, .network, .power, .sysinfo }) |g| mask |= @as(u32, 1) << @intFromEnum(g);
         const extra: []const m.Group = switch (self.panel) {
             .summary => &.{ .processes, .filesystems },
-            .processes => &.{.processes},
+            .processes, .memory_map => &.{.processes},
             .disk_space => &.{.filesystems},
             .connections => &.{ .connections, .processes },
             .users => &.{.users},
@@ -198,6 +204,7 @@ pub const View = struct {
         self.sample_time = now;
         self.samples += 1;
         if (sample.snap.fresh[@intFromEnum(m.Group.processes)]) self.rows_dirty = true;
+        if (sample.snap.memory_map) |map| self.memmap.acceptReplay(map, now);
         self.record(&sample.snap);
     }
 
@@ -321,7 +328,7 @@ pub const View = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const View, now: u64) bool {
-        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now));
+        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now));
     }
 
     pub fn setStatus(self: *View, comptime fmt: []const u8, args: anytype, now: u64) void {
@@ -401,6 +408,7 @@ pub const View = struct {
             return;
         }
         if (self.panel == .files and self.filesKey(event, now)) return;
+        if (self.panel == .memory_map and !self.searching and memmap.key(self, event, now)) return;
         if (self.searching) {
             switch (sym) {
                 0xff1b => {
@@ -426,6 +434,12 @@ pub const View = struct {
             return;
         }
         if (!event.plain()) return;
+        // One input batch can contain a search, Return, navigation and an
+        // action before the next draw. Resolve them against the new rows.
+        if (self.panel == .processes) self.buildRows() catch {
+            self.setStatus("Process rows unavailable", .{}, now);
+            return;
+        };
         if (event.kind == .repeat and (sym == 0xff0d or sym == 0xff8d or shortcut == 'l' or shortcut == 'f')) return;
         switch (sym) {
             0xff09 => return self.cycle(1), // Tab
@@ -474,6 +488,7 @@ pub const View = struct {
             },
             'l' => if (self.panel == .processes) self.requestAction(.files, now) else self.show(.files),
             'f' => self.requestAction(.profile, now),
+            'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
                 self.rows_dirty = true;
@@ -485,6 +500,7 @@ pub const View = struct {
                 self.files.dirty = true;
                 self.files.query_len = 0;
                 self.files.searching = false;
+                self.memmap.reader.reset();
                 self.setStatus("Redaction on: hostnames, users, addresses and arguments hidden (restart to show)", .{}, now);
             },
             else => {},
@@ -604,6 +620,7 @@ pub const View = struct {
         const top = &self.scroll[@intFromEnum(Panel.processes)];
         if (row < top.*) top.* = row;
         if (row >= top.* + self.visible_rows) top.* = row + 1 - self.visible_rows;
+        self.auditProcessSelection();
     }
     fn expand(self: *View, open: bool) void {
         if (self.panel != .processes or !self.tree) return;
@@ -616,6 +633,10 @@ pub const View = struct {
     }
     pub fn requestAction(self: *View, kind: actions.Kind, now: u64) void {
         if (self.panel != .processes and self.panel != .files) return;
+        if (self.panel == .processes) self.buildRows() catch {
+            self.setStatus("Process rows unavailable", .{}, now);
+            return;
+        };
         const id: Identity = if (self.panel == .files) blk: {
             // A scoped process remains selectable after an empty capture stops.
             const owner = if (self.files.selected) |selected| selected.owner else self.files.filter orelse {
@@ -702,6 +723,7 @@ pub const View = struct {
                 .file_holders => self.fileHolders(),
                 .events => self.requestAction(.events, now),
                 .stop_events => self.files.stopCapture(),
+                .memmap => |what| memmap.click(self, what, now),
             }
             return;
         }
@@ -799,7 +821,13 @@ pub const View = struct {
     /// siblings are sorted. A search keeps matches and their ancestors.
     pub fn buildRows(self: *View) !void {
         if (!self.rows_dirty) return;
+        defer self.auditProcessSelection();
         self.rows_dirty = false;
+        errdefer {
+            self.rows_dirty = true;
+            self.selected = null;
+            self.rows.clearRetainingCapacity();
+        }
         self.rows.clearRetainingCapacity();
         const s = self.snap() orelse return;
         const procs = s.processes;
@@ -884,6 +912,20 @@ pub const View = struct {
             };
         }
         self.selected_row = @min(self.selected_row, self.rows.items.len -| 1);
+        // A filtered-out identity must not remain the action target. In
+        // particular an empty search result cannot open the old selection.
+        if (self.rows.items.len == 0) self.selected = null else self.selectRow(self.selected_row);
+    }
+    fn auditProcessSelection(self: *const View) void {
+        if (@import("../../c.zig").api.getenv("XODB_OVERVIEW_AUDIT") == null) return;
+        const query_pid = std.fmt.parseInt(i32, self.searchText(), 10) catch 0;
+        var query_row: i64 = -1;
+        if (self.snap()) |snapshot| for (self.rows.items, 0..) |row, i| {
+            if (snapshot.processes[row.index].pid == query_pid) { query_row = @intCast(i); break; }
+        };
+        std.debug.print("xodb: process selection query_pid={d} query_row={d} rows={d} selected_pid={d} start={d}\n", .{
+            query_pid, query_row, self.rows.items.len, if (self.selected) |id| id.pid else 0, if (self.selected) |id| id.start else 0,
+        });
     }
     const Sorter = struct {
         view: *const View,
@@ -903,6 +945,7 @@ pub const View = struct {
         self.hover_len = 0;
         self.hover_rect = null;
         self.hit_count = 0;
+        self.tooltip_style = .overview;
         const p = self.pal();
         if (self.layout) |l| l.count = 0;
         var ctx = Ctx{ .r = r, .font = font, .p = p, .layout = self.layout };
@@ -931,7 +974,8 @@ pub const View = struct {
         if (self.layout) |l| {
             var first: [6][]const u8 = @splat("");
             const n = l.overlaps(&first);
-            if (n != self.layout_reported or self.panel != self.layout_panel) {
+            if (n != self.layout_reported or self.panel != self.layout_panel or self.layout_size[0] != self.width or self.layout_size[1] != self.height) {
+                self.layout_size = .{ self.width, self.height };
                 std.debug.print("xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\"\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5] });
                 self.layout_reported = n;
                 self.layout_panel = self.panel;
@@ -1081,6 +1125,11 @@ pub const View = struct {
                 .services => .{ .text = if (snapshot.services.len > 0) std.fmt.bufPrint(&vb, "{d} services", .{snapshot.services.len}) catch "" else snapshot.group(.services).reason },
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
+                .memory_map => .{ .text = if (self.memmap.map()) |mm| switch (memmap.md.coverage(mm)) {
+                    .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (mm.process == null) "free contiguous" else "THP" }) catch "",
+                    .none => "nothing eligible",
+                    .unknown => "coverage unknown",
+                } else "THP map when shown" },
             } else .{ .text = "" };
             const spark_w: f32 = if (detail.ring != null) 64 else 0;
             // Per-panel groups are sampled only while their panel is open.
@@ -1118,7 +1167,7 @@ pub const View = struct {
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
-            const hints = if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
+            const hints = if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
             try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
         }
     }
@@ -1133,6 +1182,22 @@ pub const View = struct {
         if (x + w > self.width - 8) x = self.width - 8 - w;
         if (y + 28 > self.height - 30) y = self.pointer[1] - 34;
         const rect = Rect{ .x = x, .y = y, .w = w, .h = 26 };
+        switch (self.tooltip_style) {
+            .overview => {},
+            .win9x => {
+                // Yellow 9x tooltip with a hard black frame.
+                try ctx.r.rect(rect, draw.Color{ 1, 1, 0.882, 1 });
+                try ctx.r.shape(rect, draw.Color{ 0, 0, 0, 1 }, .{ .border = 1 });
+                try ctx.textFit(x + 8, y + 3, w - 16, text, draw.Color{ 0, 0, 0, 1 });
+                return;
+            },
+            .dos => {
+                try ctx.r.rect(rect, draw.Color{ 0, 0, 0, 1 });
+                try ctx.r.rect(draw.inset(rect, 2), draw.Color{ 0, 0.667, 0.667, 1 });
+                try ctx.textFit(x + 8, y + 3, w - 16, text, draw.Color{ 0, 0, 0, 1 });
+                return;
+            },
+        }
         try ctx.r.shape(.{ .x = rect.x - 4, .y = rect.y - 2, .w = rect.w + 12, .h = rect.h + 10 }, fade(.{ 0, 0, 0, 1 }, 0.35), .{ .radii = @splat(8), .softness = 4 });
         try ctx.r.shape(rect, p.raised, .{ .radii = @splat(5) });
         try ctx.r.shape(rect, p.border, .{ .radii = @splat(5), .border = 1 });
@@ -1403,4 +1468,39 @@ test "action confirmation requires release, arm delay and a fresh press" {
     v.key(.{ .kind = .press, .code = 28, .sym = 0xff0d }, 1_000_000_000);
     try std.testing.expectEqual(1, calls);
     try std.testing.expect(v.pending_action == null);
+}
+
+test "queued search and actions cannot use a filtered-out process identity" {
+    var v = try View.init(std.testing.allocator);
+    defer v.deinit();
+    const o = try m.Owned.create(std.testing.allocator);
+    o.snap.processes = try o.arena.allocator().dupe(m.Process, &.{
+        .{ .pid = 123, .start = 10, .name = "old", .cpu = m.F.of(90) },
+        .{ .pid = 456, .start = 20, .name = "wanted", .cpu = m.F.of(1) },
+    });
+    v.accept(o, 1);
+    v.show(.processes);
+    v.tree = false;
+    try v.buildRows();
+    try std.testing.expectEqual(123, v.selected.?.pid);
+    const Hook = struct { fn launch(_: ?*anyopaque, _: actions.Request) !void {} };
+    v.action_hook = Hook.launch;
+    // No intervening draw: the next arrow and L must use the new filter.
+    @memcpy(v.search[0..3], "456"); v.search_len = 3; v.rows_dirty = true;
+    v.key(.{ .kind = .press, .code = 108, .sym = 0xff54 }, 2);
+    try std.testing.expectEqual(456, v.selected.?.pid);
+    v.requestAction(.files, 3);
+    try std.testing.expectEqual(456, v.pending_action.?.id.pid);
+    v.pending_action = null;
+    @memcpy(v.search[0..3], "999"); v.rows_dirty = true;
+    v.requestAction(.files, 4);
+    try std.testing.expect(v.pending_action == null and v.selected == null);
+    try std.testing.expectEqual(0, v.rows.items.len);
+    // A subsequent publication can introduce the searched-for identity.
+    const n = try m.Owned.create(std.testing.allocator);
+    n.snap.processes = try n.arena.allocator().dupe(m.Process, &.{.{ .pid = 999, .start = 30, .name = "new" }});
+    n.snap.fresh[@intFromEnum(m.Group.processes)] = true;
+    v.accept(n, 5);
+    v.requestAction(.files, 6);
+    try std.testing.expectEqual(999, v.pending_action.?.id.pid);
 }

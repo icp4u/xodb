@@ -62,7 +62,8 @@ or offset bypasses the semantic layout checks. The index does not add inherited
 names or qualified-name synthesis.
 
 The application's C cache pool chooses `$XDG_CACHE_HOME/xodb-debug-v2`, falling
-back to `$HOME/.cache/xodb-debug-v2`. Old `xodb-debug-v1` range files are truncated opportunistically only after both
+back to `$HOME/.cache/xodb-debug-v2`. Old `xodb-debug-v1` range files are
+truncated opportunistically only after both
 the slot and range-file nonblocking leases are held; busy or unsafe old entries
 are left intact and checked again on a later open. Old small name indexes remain.
 Its directory is mode 0700 and its regular
@@ -83,6 +84,14 @@ once under its lease. A second malformed result refuses; the reader never loops
 indefinitely over malformed source data. Checked range data can survive. A corrupt range is fetched again. Cache
 checksums detect corruption and incomplete writes; they do not authenticate data
 against a malicious writer with the owner's permissions.
+
+Cleanup runs when a job opens the persistent pool, not on every Node launch.
+Small local and stock stripped Node images bypass the pool, so using only
+those builds leaves old files in place. When cleanup does run, it first checks
+complete `XODBSLOT` and `XOBCACHE` version-one headers, their checksums,
+matching object/build identities and the declared extent. Unknown, truncated
+or corrupt files are retained for manual review. No cached source bytes are
+read, and active legacy leases are left alone.
 
 A first index build can take substantially longer than a direct scan: it walks
 the complete direct-name coverage before publishing candidate CUs. Progress,

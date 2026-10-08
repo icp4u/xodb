@@ -3,6 +3,7 @@
 #include "../src/language/lua.h"
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #define BASE UINT64_C(0x100000)
 static unsigned char bytes[8192];
@@ -80,6 +81,7 @@ int main(void) {
     assert(st.reason && !strcmp(st.reason, "LuaCallInfoBoundsInvalid"));
     /* Reproducible malformed-object smoke corpus. The callback never grants
      * access outside this owned byte array; budgets bound every traversal. */
+    struct xl_locals *locals = calloc(1, sizeof *locals); assert(locals);
     uint64_t seed = 7; unsigned tags[] = {0,1,3,17,19,68,84,69,70,102,71,72,255};
     for (unsigned i = 0; i < 2000; ++i) {
         for (size_t j = 256; j < sizeof bytes; ++j) { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; bytes[j] = (unsigned char)seed; }
@@ -90,7 +92,14 @@ int main(void) {
         assert(memchr(v.display, 0, sizeof v.display));
         r = reader(); xl_stack_read(&p, &r, BASE+512, &st);
         assert(r.reads <= XL_READ_LIMIT && r.bytes <= XL_BYTE_LIMIT && st.count <= XL_STACK_FRAMES);
+        put(512+8, 8, 1);
+        r = reader(); xl_locals_read(&p, &r, BASE+512, i % (XL_STACK_FRAMES+1), i, 1 + i % XL_LOCAL_ITEMS, locals);
+        assert(r.reads <= XL_READ_LIMIT && r.bytes <= XL_BYTE_LIMIT && locals->count <= XL_LOCAL_ITEMS);
+        assert(locals->reason);
+        r = reader(); xl_local_find(&p, &r, BASE+512, i % XL_STACK_FRAMES, "owned", locals);
+        assert(r.reads <= XL_READ_LIMIT && r.bytes <= XL_BYTE_LIMIT && locals->count <= 1 && locals->reason);
     }
+    free(locals);
     puts("Lua synthetic storage, bounds, cycles and 2000 malformed objects passed");
     return 0;
 }

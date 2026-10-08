@@ -12,6 +12,8 @@ pub const FdEventState = enum { inactive, requested, active };
 
 pub const Collector = struct {
     ctx: ?*c.struct_xrt_sys = null,
+    memory_ctx: ?*c.struct_xrt_memobserver = null,
+    memory_opens: u64 = 0,
     cache: ?*Snapshot = null,
     scratch: ?*Snapshot = null,
     sampled: [count]u64 = @splat(0),
@@ -70,7 +72,15 @@ pub const Collector = struct {
             a.destroy(p);
         }
         if (self.ctx) |p| c.xrt_sys_close(p);
+        if (self.memory_ctx) |p| c.xrt_memobserver_close(p);
         self.* = .{};
+    }
+    pub fn memoryObserver(self: *Collector) !*c.struct_xrt_memobserver {
+        if (self.memory_ctx == null) {
+            self.memory_ctx = c.xrt_memobserver_open(null, null) orelse return error.OutOfMemory;
+            self.memory_opens += 1;
+        }
+        return self.memory_ctx.?;
     }
     pub fn snapshot(self: *Collector) !*const Snapshot {
         if (self.cache == null) {

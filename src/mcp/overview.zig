@@ -6,14 +6,16 @@ const wire = @import("profile.zig");
 const Value = std.json.Value;
 
 const fd = @import("fd.zig");
-const system_definitions = @embedFile("overview_tools.json");
-pub const definitions = system_definitions[0 .. system_definitions.len - 2] ++ "," ++ fd.definitions[1..];
+const memstat = @import("memstat.zig");
+const base_definitions = std.mem.trim(u8, @embedFile("overview_tools.json"), " \n\r\t");
+const fd_definitions = std.mem.trim(u8, fd.definitions, " \n\r\t");
+pub const definitions = base_definitions[0 .. base_definitions.len - 1] ++ "," ++ fd_definitions[1 .. fd_definitions.len - 1] ++ "," ++ memstat.definitions[1..];
 
 pub fn handles(name: []const u8) bool {
     if (fd.handles(name)) return true;
     for ([_][]const u8{ "get_overview", "list_processes", "get_process", "get_connections", "get_sensors" }) |candidate|
         if (std.mem.eql(u8, name, candidate)) return true;
-    return false;
+    return memstat.handles(name);
 }
 
 pub const State = @import("../model/system.zig").Collector;
@@ -30,6 +32,7 @@ fn group(id: c_uint) u32 {
 
 pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) !Value {
     if (fd.handles(name)) return fd.call(a, state, name, args);
+    if (memstat.handles(name)) return memstat.call(a, state, name, args);
     var opts = std.mem.zeroes(c.struct_xrt_sys_json_opts);
     if (std.mem.eql(u8, name, "get_overview")) {
         try wire.fields(args, &.{ "limit", "redact" });
@@ -121,7 +124,7 @@ pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) 
 test "overview reads and explicit fd capture controls are advertised" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(11, parsed.value.array.items.len);
+    try std.testing.expectEqual(14, parsed.value.array.items.len);
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
         try std.testing.expectEqual(!fd.isControl(definition.object.get("name").?.string), definition.object.get("annotations").?.object.get("readOnlyHint").?.bool);

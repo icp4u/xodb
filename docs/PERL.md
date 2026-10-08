@@ -1,4 +1,4 @@
-# Perl values and logical stacks
+# Perl values, logical stacks and named locals
 
 A native stop in a threaded Perl 5.44.0 debug build can show Perl values through
 **Locals**, **E** expression watches, and MCP `evaluate_expression`. The first
@@ -34,6 +34,46 @@ PV previews read at most 128 bytes; shortened output is marked `truncated`.
 Unmapped memory, freed scalars, inconsistent flags and unavailable names have
 explicit diagnostics. Magic is never invoked: these are stored values, not the
 result of a Perl expression or tied-variable fetch.
+
+## Read named script locals
+
+In `scripts/demo-perl`, press **Space**, **Tab** to **Perl**, click the logical
+`main::store_answer` frame, then **E**, `$value`, **Return**. Its pad binding is
+`IV 42`, even though the native `val` is still the new undef array element.
+The logical stack, decoded native objects and named bindings have separate
+scroll areas. Click **Native frame #N [-]** to collapse that section and give
+the stack more space; **[+]** expands it again.
+
+Named locals use the selected canonical context's CV, recursion depth and COP
+lexical sequence. They include active `my` and `state` bindings and captured
+outer pad entries. Inner declarations shadow outer names. An inner `our`
+declaration masks an outer `my` even though package variables are not listed.
+Uncaptured outer CVs and globals are not enumerated. A name absent from the
+active pad reports `PerlOuterScopeUnread`: file-scope/CvOUTSIDE names were not
+searched. A matching `our` declaration reports `PerlPackageVariableUnread`. Eval/try/format/XS frames
+and class fields are explicitly unavailable until their storage is proved.
+
+Observers can page bindings or resolve one sigil-name at the retained stop:
+
+```json
+{"name":"get_language_locals","arguments":{"generation":7,"tid":1234,"language":"perl","segment":0,"frame":0,"start":0,"limit":16}}
+{"name":"evaluate_language_expression","arguments":{"generation":7,"tid":1234,"language":"perl","segment":0,"frame":0,"expression":"$value"}}
+```
+
+Use the actual generation, tid, segment and logical frame from your session.
+Neither tool needs a controller lease or changes selection. `address` is the
+SV object, while `slot_address` is its pointer slot in this activation's pad;
+both expire on resume. State bindings use `scope: state`, captured outer
+bindings `scope: free`. Stored-value/magic diagnostics remain visible. Missing
+bindings, corrupt metadata and stale generations never become guessed values.
+Expressions support only a sigil and ASCII identifier: no operators, calls,
+subscripts, global lookup or target execution. A nameless row is never a valid
+expression. Runtime-aware language watches remain separate work.
+
+Per-operation limits are 4096 pad slots, 512 distinct names, depth 1024,
+32 returned rows, 8192 reads and 512 KiB. Name resolution scans active names
+backwards for shadowing before returning a page; an incomplete name scan
+reports a reason rather than guessing absence.
 
 ## Read the Perl stack through MCP
 
@@ -115,6 +155,20 @@ scripts/build test -Doptimize=ReleaseSafe -j3
 python3 tests/perl-language.py --perl /path/to/debug/perl --work out/perl-test
 python3 tests/perl-gui.py --perl /path/to/debug/perl --fixtures out/perl-test --work /tmp/perl-gui-test
 ```
+
+Named-local verification additionally uses a test-only built PadWalker tree
+(`blib/lib` and `blib/arch`), supplied explicitly; it is never loaded by xodb:
+
+```sh
+python3 tests/perl-component.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-component --sanitize
+python3 tests/perl-locals.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-named --strace
+python3 tests/perl-locals-shared.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-shared --strace
+python3 tests/perl-locals-gui.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-gui
+```
+
+Add `--agent zig-out/bin/xodb-agent` to named-local and shared tests for C-agent
+transport. The owned PadWalker oracle covers recursion, closure capture, state,
+shadowing, package masking, foreach aliases, expired scopes and pagination.
 
 Use new output directories. The GUI test creates its own headless compositor;
 keep its work path short for Unix sockets. Integration covers recursive exact

@@ -391,6 +391,7 @@ pub const Workspace = struct {
         }
     }
     fn activeEditor(self: *Workspace, session: *Session) ?*watch_ui.Editor {
+        self.language_panel.syncEditor(session);
         if (self.logical_frames.open or (session.comparison != null and self.comparison.open) or session.imported != null) return null;
         if (self.invocations.open) return if (self.invocations.editor.open) &self.invocations.editor else null;
         if (session.process_tree != null and self.process_panel.open) return null;
@@ -399,6 +400,7 @@ pub const Workspace = struct {
         if (self.inline_panel.open) return if (self.inline_panel.editor.open) &self.inline_panel.editor else null;
         if (self.inspection_panel.open) return if (self.inspection_panel.editor.open) &self.inspection_panel.editor else null;
         if (self.probes_panel.open) return if (self.probes_panel.editor.open) &self.probes_panel.editor else null;
+        if (self.language_panel.editor.open) return &self.language_panel.editor;
         if (self.editor.open) return &self.editor;
         if (self.show_profile and self.setup.open and self.setup.editor.open) return &self.setup.editor;
         return null;
@@ -584,6 +586,16 @@ pub const Workspace = struct {
                         self.logical_frames.open = true;
                         w.dirty = true;
                         return self.logical_frames.input(w, &session.frames);
+                    }
+                    if (self.language_panel.editor.open) {
+                        if (self.language_panel.editor.key(event)) |action| switch (action) {
+                            .submit => |text| self.language_panel.submitExpression(session, text) catch |err| {
+                                self.language_panel.editor.message = @errorName(err);
+                            },
+                            else => {},
+                        };
+                        w.dirty = true;
+                        continue;
                     }
                     const code = binding(event);
                     if (code == 0) continue;
@@ -1049,7 +1061,12 @@ pub const Workspace = struct {
             }
         }
         if (!self.show_profile) {
-            if (code == 18) {
+            if (code == 18 and @intFromEnum(session.language_tabs.selected) >= 2) {
+                self.language_panel.beginExpression(session) catch |err| {
+                    self.status = @errorName(err);
+                };
+                w.dirty = true;
+            } else if (code == 18) {
                 self.editor.start();
                 self.show_watch = true;
                 self.watch_focus = true;
@@ -1128,7 +1145,7 @@ pub const Workspace = struct {
                 }
             }
             if (w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.scroll != 0) {
-                self.language_panel.scrollBy(w.scroll);
+                if (w.pointer_y >= self.language_panel.binding_y) self.language_panel.scrollBindings(w.scroll) else if (w.pointer_y >= self.language_panel.native_y) self.language_panel.scrollNative(w.scroll) else self.language_panel.scrollBy(w.scroll);
                 w.scroll = 0;
                 w.dirty = true;
             }
@@ -1142,7 +1159,7 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (code == 17 and @intFromEnum(session.language_tabs.selected) >= 2) {
-            self.status = "Language watches need proved local slots; this pane shows stack evidence";
+            self.status = "Language values must be re-resolved after resume; use E to read a name at this stop";
             return;
         }
         if (code == 17 and session.language_tabs.selected == .native and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
@@ -1877,7 +1894,7 @@ pub const Workspace = struct {
                 } else try r.text(font, right + 14, content_y + 10, "No stopped thread", theme.weak);
             } else {
                 const language_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
-                try self.language_panel.body(r, font, side, session, language_tid, self.selected_frame);
+                try self.language_panel.body(r, font, side, session, language_tid, self.selected_frame, self.locals, self.local_diagnostic);
             }
         }
         if (self.show_profile) {

@@ -9,7 +9,8 @@
 #define XCP_SLOT_LIMIT UINT64_C(8589934592)
 struct xcp_entry;
 /* Opens/creates $XDG_CACHE_HOME/xodb-debug-v2, or $HOME/.cache/xodb-debug-v2.
- * Best-effort reclamation truncates v1 range files only under both leases.
+ * Best-effort reclamation truncates recognized v1 range files only under
+ * both leases, after validating their matching slot/range headers.
  * Returns a private directory fd, or -1; relative environment paths refuse. */
 int xcp_directory(void);
 enum xbo_status xcp_acquire(int directory, const struct xbo_identity *,

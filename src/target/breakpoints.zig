@@ -12,10 +12,10 @@ pub const Breakpoint = struct {
     internal: bool = false,
     temporary: bool = false,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
-        // Preserve x86's published numeric original byte. ARM64 stores one LE word.
+        // Preserve x86's published numeric original byte. AArch64, LoongArch, and ppc64le store one LE word.
         const original: u32 = switch (self.architecture) {
             .x86_64 => self.original[0],
-            .aarch64, .loongarch64 => std.mem.readInt(u32, &self.original, .little),
+            .aarch64, .loongarch64, .ppc64le => std.mem.readInt(u32, &self.original, .little),
             .m68k => std.mem.readInt(u16, self.original[0..2], .big),
         };
         try writer.write(.{ .id = self.id, .address = self.address, .original = original, .patched = self.patched, .temporary = self.temporary, .enabled = self.enabled, .hit_count = self.hit_count, .pending = self.pending, .internal = self.internal });

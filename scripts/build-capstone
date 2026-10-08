@@ -48,6 +48,7 @@ cmake_flags = [
     '-DCAPSTONE_AARCH64_SUPPORT=ON',
     '-DCAPSTONE_M68K_SUPPORT=ON',
     '-DCAPSTONE_LOONGARCH_SUPPORT=ON',
+    '-DCAPSTONE_PPC_SUPPORT=ON',
     '-DCMAKE_INSTALL_PREFIX=' + str(prefix),
 ]
 stamp_text = 'url ' + URL + '\nsha256 ' + SHA256 + '\n' + ' '.join(cmake_flags) + '\n'

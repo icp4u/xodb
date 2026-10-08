@@ -545,6 +545,7 @@ int main(void)
         pid_t child = fork();
         assert(child >= 0);
         if (child == 0) {
+            prctl(PR_SET_PDEATHSIG, SIGKILL);
             prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
             close(ready[0]);
             assert(write(ready[1], "x", 1) == 1);
@@ -564,6 +565,12 @@ int main(void)
         xrt_sys_limits_default(&ll);
         ll.groups = (1u << XRT_SYS_G_PROCESSES) | (1u << XRT_SYS_G_CONNECTIONS);
         ll.max_fds_counted = 8;
+        /* This checks owned identities and fd ownership, not the default
+         * interactive scan budget. Other tasks must not crowd out our PIDs
+         * or consume the 500 ms default while the test is descheduled. */
+        ll.max_processes = 65536;
+        ll.max_connections = 65536;
+        ll.budget_ns = UINT64_C(30000000000);
         const int fd_before = own_fds();
         struct xrt_sys *live = xrt_sys_open(&ll);
         struct xrt_sys_snapshot ls = {0};
@@ -578,6 +585,11 @@ int main(void)
             if (ls.processes.proc[i].pid == child) cp = &ls.processes.proc[i];
             if (ls.processes.proc[i].pid == getpid()) me = &ls.processes.proc[i];
         }
+        if (!cp || !me)
+            fprintf(stderr, "owned process missing: child=%d self=%d rows=%u truncated=%u group=%u reason=%u detail=%s\n",
+                    cp != NULL, me != NULL, ls.processes.count, ls.processes.truncated,
+                    ls.group[XRT_SYS_G_PROCESSES].st, ls.group[XRT_SYS_G_PROCESSES].why,
+                    ls.group[XRT_SYS_G_PROCESSES].detail);
         assert(cp && me);
         assert(cp->uid.st == XRT_SYS_OK && cp->uid.v == geteuid());
         if (exercised) assert(cp->fds.why == XRT_SYS_WHY_NEEDS_PRIVILEGE);
