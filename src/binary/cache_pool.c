@@ -19,6 +19,7 @@ static int private_directory(int fd) {
     return fd >= 0 && !fstat(fd, &st) && S_ISDIR(st.st_mode) &&
         st.st_uid == geteuid() && !(st.st_mode & 077);
 }
+static void retire_ranges(int parent);
 int xcp_directory(void) {
     const char *base = getenv("XDG_CACHE_HOME");
     char *allocated = NULL;
@@ -36,16 +37,17 @@ int xcp_directory(void) {
     /* A shared cache root may be group-writable. Only the opened, owned
      * private child and its verified files are trusted. */
     if (fstat(parent, &st) || st.st_uid != geteuid()) { close(parent); return -1; }
-    if (mkdirat(parent, "xodb-debug-v1", 0700) && errno != EEXIST) { close(parent); return -1; }
-    int dir = openat(parent, "xodb-debug-v1", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (mkdirat(parent, "xodb-debug-v2", 0700) && errno != EEXIST) { close(parent); return -1; }
+    int dir = openat(parent, "xodb-debug-v2", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (!private_directory(dir)) { if (dir >= 0) close(dir); close(parent); return -1; }
+    retire_ranges(parent);
     close(parent);
-    if (!private_directory(dir)) { if (dir >= 0) close(dir); return -1; }
     return dir;
 }
-static int file(int dir, unsigned slot, const char *suffix) {
+static int checked_file(int dir, unsigned slot, const char *suffix, int create) {
     char name[32];
     snprintf(name, sizeof name, "%u.%s", slot, suffix);
-    int fd = openat(dir, name, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
+    int fd = openat(dir, name, O_RDWR | (create ? O_CREAT : 0) | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0600);
     if (fd < 0) return -1;
     struct stat st, named;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
@@ -54,6 +56,29 @@ static int file(int dir, unsigned slot, const char *suffix) {
         close(fd); return -1;
     }
     return fd;
+}
+static int file(int dir, unsigned slot, const char *suffix) {
+    return checked_file(dir, slot, suffix, 1);
+}
+/* Old clients may still own v1 leases. Reclaim only known range files after
+ * taking both their slot and component locks; never follow links, create old
+ * entries, unlink names or wait for another session. */
+static void retire_ranges(int parent) {
+    int dir = openat(parent, "xodb-debug-v1", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+    if (!private_directory(dir)) { if (dir >= 0) close(dir); return; }
+    for (unsigned slot = 0; slot < XCP_SLOTS; ++slot) {
+        int lease = checked_file(dir, slot, "lease", 0);
+        if (lease < 0) continue;
+        if (!flock(lease, LOCK_EX | LOCK_NB)) {
+            int range = checked_file(dir, slot, "ranges", 0);
+            if (range >= 0) {
+                if (!flock(range, LOCK_EX | LOCK_NB)) (void)ftruncate(range, 0);
+                close(range);
+            }
+        }
+        close(lease);
+    }
+    close(dir);
 }
 static void header(unsigned char out[HEADER], const struct xbo_identity *id,
         const unsigned char *build, size_t size) {

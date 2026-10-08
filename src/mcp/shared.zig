@@ -32,6 +32,11 @@ pub const Endpoint = struct {
             allocator.destroy(client.server);
             slot.* = null;
         };
+        // The collector can outlive the endpoint; do not retain a service pointer.
+        if (self.collector().fd_lease != null) {
+            _ = self.collector().revokeFdEvents();
+            self.collector().fd_lease = null; // C demand still has a bounded 3s expiry
+        }
         c.xsvc_close(self.service);
         self.overview.deinit();
     }
@@ -56,6 +61,7 @@ pub const Endpoint = struct {
     pub fn pump(self: *Endpoint, root: *Session) !void {
         if (self.overview_shared == null) _ = try self.overview.tick(linux.now(), 0, false);
         try context.check(c.xsvc_tick(self.service, linux.now(), @intFromEnum(root.agent_scope)));
+        self.collector().checkFdLease(linux.now(), @intFromEnum(root.agent_scope));
         // Bound accept work even when the listener is being flooded.
         for (0..c.XSVC_MAX_PEERS) |_| {
             var peer: c.struct_xsvc_peer = undefined;

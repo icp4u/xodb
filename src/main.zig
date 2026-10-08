@@ -418,6 +418,7 @@ pub fn main(init: std.process.Init) !void {
         var last_frame = linux.now();
         var last_profile_revision: u64 = 0;
         var last_profile_id: u64 = 0;
+        var last_language_revision: u64 = 0;
         var last_view_serial: u64 = 0;
         var last_import_serial: u64 = 0;
         var last_allocation_serial: u64 = 0;
@@ -467,6 +468,11 @@ pub fn main(init: std.process.Init) !void {
                 if (server.closed and server.queued == 0) break;
             }
             if (shared) |*endpoint| try endpoint.pump(session);
+            const fd_state = (server.overview_shared orelse &server.overview).fdEventState();
+            if (workspace.fd_event_state != fd_state) {
+                workspace.fd_event_state = fd_state;
+                window.dirty = true;
+            }
             phase_started = linux.now();
             if (shared != null and workspace.shared_clients == null) workspace.shared_clients = 0;
             workspace.input(&window, active);
@@ -482,6 +488,10 @@ pub fn main(init: std.process.Init) !void {
                 workspace.shared_controller = owner;
             }
             if (tree.active() != active) continue;
+            if (last_language_revision != active.language_tabs.revision) {
+                last_language_revision = active.language_tabs.revision;
+                window.dirty = true;
+            }
             reportSlow("workspace input/inspection", phase_started);
             if (window.closing or quitting != 0) break;
             const current = linux.now();

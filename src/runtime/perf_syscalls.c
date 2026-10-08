@@ -109,8 +109,8 @@ static bool metadata(bool enter, uint16_t *out, struct xrt_perf_failure *f)
         *out = (uint16_t)id;
     return ok;
 }
-struct xrt_perf *xrt_syscalls_start(int32_t pid, const int32_t *tids, size_t count, uint16_t *entry,
-                                    uint16_t *exit, struct xrt_perf_failure *f)
+static struct xrt_perf *start(int32_t pid, const int32_t *tids, size_t count, uint16_t *entry,
+                                    uint16_t *exit, struct xrt_perf_failure *f, bool loss)
 {
 #if !defined(__x86_64__)
     xrt_perf_fail(f, "syscalls.architecture", 0, -1,
@@ -145,6 +145,7 @@ struct xrt_perf *xrt_syscalls_start(int32_t pid, const int32_t *tids, size_t cou
         attrs[i].type = PERF_TYPE_TRACEPOINT;
         attrs[i].config = i ? *exit : *entry;
         attrs[i].sample_period = 1;
+        attrs[i].read_format = loss ? PERF_FORMAT_LOST : 0;
         attrs[i].sample_type =
             PERF_SAMPLE_TID | PERF_SAMPLE_TIME | PERF_SAMPLE_ID | PERF_SAMPLE_RAW;
         attrs[i].flags = 1 | (UINT64_C(1) << 18) | (UINT64_C(1) << 25);
@@ -168,4 +169,22 @@ fail:
         f->opened_then_closed += (uint16_t)xrt_perf_fd_count(p);
     xrt_perf_destroy(p);
     return NULL;
+}
+
+struct xrt_perf *xrt_syscalls_start(int32_t pid, const int32_t *tids, size_t count, uint16_t *entry,
+                                    uint16_t *exit, struct xrt_perf_failure *f)
+{
+    return start(pid, tids, count, entry, exit, f, false);
+}
+struct xrt_perf *xrt_syscalls_start_loss(int32_t pid, const int32_t *tids, size_t count, uint16_t *entry,
+                                         uint16_t *exit, struct xrt_perf_failure *f)
+{
+    struct xrt_perf_failure attempt = {0};
+    struct xrt_perf *p = start(pid, tids, count, entry, exit, &attempt, true);
+    /* Older kernels reject this read-format bit. Rollback above is complete;
+     * the fallback still exposes loss accounting as unavailable to the caller. */
+    if (!p && attempt.error == EINVAL && attempt.syscall && !strcmp(attempt.syscall, "perf_event_open"))
+        p = start(pid, tids, count, entry, exit, &attempt, false);
+    if (!p && f) *f = attempt;
+    return p;
 }

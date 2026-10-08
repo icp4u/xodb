@@ -689,8 +689,16 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *s, struct xrt_fd_snapshot *ou
         for (struct dirent *e; (e = readdir(listing));) {
             if (e->d_name[0] < '1' || e->d_name[0] > '9')
                 continue;
+            /* Bound the pid listing as well as the visible/unseen arrays. */
+            const uint32_t list_limit = s->o.max_processes * 2;
+            if (npids == list_limit) {
+                if (c->view.dropped_processes != UINT32_MAX)
+                    c->view.dropped_processes++;
+                continue;
+            }
             if (npids == cap) {
                 cap = cap ? cap * 2 : 1024;
+                if (cap > list_limit) cap = list_limit;
                 int32_t *grown = realloc(pids, cap * sizeof(*pids));
                 if (!grown) {
                     free(pids);

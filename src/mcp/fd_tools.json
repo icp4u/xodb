@@ -1,0 +1,290 @@
+[
+  {
+    "name": "get_fd_activity",
+    "description": "Read cached poll or event counts. Event reads never start or renew tracing. exact mode slows all syscalls on this machine by roughly 10 % while active; inspect exact_mode_active. start_fd_events requires control and explicit cost acknowledgement.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Filtered row offset; nonzero requires sequence from the preceding page."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Require this exact cached snapshot for pagination; live updates invalidate an earlier sequence."
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval_ms": {
+          "type": "integer",
+          "enum": [
+            250,
+            1000
+          ],
+          "default": 1000,
+          "description": "Request a shared polling interval for three seconds. Fast mode uses a 5 ms scan budget; normal mode 10 ms. Partial and stale coverage is explicit."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "mode": {
+          "type": "string",
+          "enum": [
+            "poll",
+            "events"
+          ],
+          "default": "poll"
+        },
+        "start_ticks": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Required for events; pair with pid from get_process."
+        },
+        "sort": {
+          "type": "string",
+          "enum": [
+            "pid",
+            "io",
+            "churn",
+            "fds"
+          ],
+          "default": "io"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "who_has_open",
+    "description": "Query cached descriptor holders by exact cached path text, or device+inode. Does not stat or resolve the requested path. Numeric identities are unsigned decimal strings. Missing/denied/stale/capped coverage is reported; an empty page is not proof of absence. Path lookup is refused under request or server redaction.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Filtered row offset; nonzero requires sequence from the preceding page."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Require this exact cached snapshot for pagination; live updates invalidate an earlier sequence."
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval_ms": {
+          "type": "integer",
+          "enum": [
+            250,
+            1000
+          ],
+          "default": 1000,
+          "description": "Request a shared polling interval for three seconds. Fast mode uses a 5 ms scan budget; normal mode 10 ms. Partial and stale coverage is explicit."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "path": {
+          "type": "string",
+          "maxLength": 4096
+        },
+        "device": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        },
+        "inode": {
+          "type": "string",
+          "pattern": "^[0-9]+$"
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_fd_leaks",
+    "description": "Read sustained fd-growth candidates and bounded history from the shared polling cache. Growth is a signal, not proof of a leak.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Filtered row offset; nonzero requires sequence from the preceding page."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Require this exact cached snapshot for pagination; live updates invalidate an earlier sequence."
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval_ms": {
+          "type": "integer",
+          "enum": [
+            250,
+            1000
+          ],
+          "default": 1000,
+          "description": "Request a shared polling interval for three seconds. Fast mode uses a 5 ms scan budget; normal mode 10 ms. Partial and stale coverage is explicit."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_deleted_open",
+    "description": "List cached unlinked-but-open descriptors. Size and allocated disk bytes are per file, not additive across holders; no reclaimed-space total is inferred.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Filtered row offset; nonzero requires sequence from the preceding page."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Require this exact cached snapshot for pagination; live updates invalidate an earlier sequence."
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval_ms": {
+          "type": "integer",
+          "enum": [
+            250,
+            1000
+          ],
+          "default": 1000,
+          "description": "Request a shared polling interval for three seconds. Fast mode uses a 5 ms scan budget; normal mode 10 ms. Partial and stale coverage is explicit."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "start_fd_events",
+    "description": "Start or renew one explicit 3-second capture; requires control (and the shared-session lease). exact mode slows all syscalls on this machine by roughly 10 % while active. Syscall-heavy targets may slow much more. Explicit cost acknowledgement required every renewal.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start_ticks": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "acknowledge_host_cost": {
+          "type": "boolean",
+          "const": true
+        }
+      },
+      "required": [
+        "pid",
+        "start_ticks",
+        "acknowledge_host_cost"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "controller"
+    }
+  },
+  {
+    "name": "stop_fd_events",
+    "description": "Stop exact syscall capture; requires control (and the shared-session lease). Retained counts remain readable.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {},
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "controller"
+    }
+  }
+]

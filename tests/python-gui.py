@@ -14,6 +14,7 @@ import select
 import signal
 import subprocess
 import time
+from helpers.language_selection import check as check_selection
 
 root = Path(__file__).resolve().parent.parent
 os.chdir(root)
@@ -76,6 +77,8 @@ try:
     watch(d, 'value')
     time.sleep(.3)
     d.shot('fixture-watch')
+    selection = check_selection(d, target.pid, 'python', 'python-linked')
+    (Path(d.dir)/'language-selection.json').write_text(json.dumps(selection, indent=2)+'\n')
     assert d.tool('get_registers', tid=target.pid) == regs and d.session()['generation'] == snap['generation']
     d.keys('tap', F8)
     assert d.wait(lambda s: s['agent_scope'] == 'observe')

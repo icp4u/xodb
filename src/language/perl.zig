@@ -361,3 +361,10 @@ test "Perl layout search bounds retain their diagnostics" {
     try std.testing.expectEqual(error.PerlDwarfTypesUnavailable, layoutError("PerlDwarfTypesUnavailable"));
     try std.testing.expectEqual(error.PerlDwarfLimit, layoutError("PerlDwarfLimit"));
 }
+
+/// Runtime identity and proof from the existing stopped-memory reader.
+pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    const module = try valueModule(session);
+    const layout = try profile(session, module);
+    return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
+}

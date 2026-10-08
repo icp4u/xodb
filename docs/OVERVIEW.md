@@ -23,6 +23,7 @@ samples the whole system with the bounded, unprivileged collector
 | Power & Thermals | CPU package temperature and power, GPUs, and every hwmon sensor with history |
 | System Info | host, kernel, CPU, memory, GPUs, per-group collector state and cost |
 | Users, Services, Installed Apps | utmp sessions, observed daemon processes, package database |
+| Files & IO | Descriptor tables, seekable offset progress, process churn heatmap, fd-growth sparklines, deleted holders and explicit syscall-event counts |
 
 Keys: `1`–`9`, `0`, Tab/Shift+Tab switch panels; arrows, Page Up/Down, Home/End
 move; Left/Right fold the tree; `/` search; `s` next sort, `r` reverse; `v`
@@ -52,6 +53,16 @@ scan) only while the Connections panel is open. Each group's rates span its own
 previous collection. `--interval-ms N` (250..10000) changes the fast interval;
 disks, network and power refresh at most twice per second. Process rows update
 on samples; the other panels ease transitions at one-second intervals.
+
+Files uses a separate descriptor worker shared with the FD MCP tools: default
+one-second polling with a 10 ms soft budget. `--interval-ms 250` selects 250 ms
+and a 5 ms budget for this pane; other interval values keep its one-second
+default. A faster MCP peer may temporarily select 250 ms, and the pane reports
+the actual shared cadence. The system cards and heatmap remain system-wide
+when the table is filtered to a process. Scope, cache age, denied/stale/unscanned
+work and cap counts remain visible. Initial process rows may wait for their
+turn in the bounded whole-system scan. Positive seekable progress animates at
+up to 15 frames per second while visible; stale, paused or unknown rows do not.
 
 The collector reuses at most 2,048 read-only process-stat handles, further
 limited to one eighth of the process descriptor limit. Handles are close-on-exec,
@@ -127,6 +138,55 @@ their name, in every panel and in search.
 The view redacts its copy, so a non-redacted replay is also hidden. MCP redaction
 is per reply and cannot change the shared cache or another peer's reply.
 
+Files hides all descriptor paths and process names under redaction; numeric
+PIDs, fd numbers and inode identities remain available. Turning redaction on
+clears an existing path search. A redacted MCP caller cannot test guessed paths;
+reverse lookup by numeric device/inode remains available.
+
+## Files and exact events
+
+```sh
+./zig-out/bin/xodb --overview --panel files
+./zig-out/bin/xodb --overview --files-pid 123 --files-start-ticks 456
+```
+
+The example identity is synthetic. Omitting `--files-start-ticks` binds to the
+first sampled birth identity and never follows a replacement with that PID.
+From Processes, **L** opens Files for the selected PID/start pair after a cost
+and access explanation. From other panels **L** switches to Files directly.
+**Enter** scopes the selected descriptor/process row to its process; **H** shows
+holders of that exact device/inode; **Esc** returns to the system table. **[ ]**
+cycle Files, Processes, Leak watch and Deleted; **/** searches, **S** cycles sort,
+**R** reverses. **A** offers attach and **F** offers a profile, retaining identity
+checks and the existing confirmation. Redacted attach/profile are refused.
+
+Polling progress comes from seekable offsets and is not exact IO: pread/pwrite,
+seeks, shared offsets and mmap need different interpretation. Pipes and sockets
+show unmeasured progress, with a reason on hover. Hover also shows open flags
+and age. Leak watch reports growth candidates, not proof of a leak. Deleted
+sizes describe the held inode and are not additive across holders. The FD table
+shows socket kind/inode; network peer analysis belongs to Connections.
+
+**E** opens the exact-event confirmation. **exact mode slows all syscalls on
+this machine by roughly 10 % while active**; syscall-heavy targets can slow much
+more. Opening Files, reading MCP data or revisiting retained event counts does
+not start capture. The explicit confirmation describes access, bounds and cost.
+An active warning stays visible; **E** or **Stop** ends capture. Pausing or
+leaving Files also stops it, and resume/return require a new confirmation before
+restarting. Counts remain available after stopping. Event rows refer to fd
+numbers across reuse, with no current-path attribution; loss, invalid records,
+unpaired calls and flags qualify the result. Loss or possible loss stays visible
+alongside the host-cost warning; unavailable kernel accounting is explicit.
+See [FD capture coverage](MCP_FD.md).
+Overview MCP peers remain observers: they can read a UI-started capture but
+cannot start, renew or stop one themselves. Other control-enabled sessions use
+the separate leased `start_fd_events`/`stop_fd_events` tools.
+
+The view owns its displayed copy, so pause can freeze it while an MCP peer
+continues polling. Capture activity status remains live while paused. A system
+JSON replay does not contain descriptor data; Files explicitly reports it
+unavailable. No descriptor recording format is implied.
+
 ## Themes
 
 `dark`, `light`, `green`, `amber`, `blue` (phosphor: glow, faint scanlines,
@@ -152,11 +212,11 @@ time, age and pending state; poll after a pending response. Pausing the view
 freezes its display while requested MCP groups can continue refreshing.
 
 Select a live process and press L (files), F (profile), or Enter (attach). The
-confirmation explains cost and access. Files opens a terminal with lsof-top;
+confirmation explains cost and access. Files opens in this overview window;
 profile starts a 99 Hz, ten-second capture in a debugger window. Attach stops
-the process until continued or detached. All handoffs validate the selected
-pid and start ticks at launch and in the consumer. Replay cannot launch them.
-These separate windows remain open when the overview closes.
+the process until continued or detached. All actions validate the selected PID
+and start ticks; external consumers validate again after attachment. Replay
+cannot start them. Profile and attach windows remain open when overview closes.
 
 ## NVIDIA sensors
 

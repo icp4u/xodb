@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -179,6 +179,27 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdscan.c" }) |source| {
         fdscan_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
+    const fdevent_tests = b.addExecutable(.{ .name = "xodb-fdevent-decode-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    const fdcount_tests = b.addExecutable(.{ .name = "xodb-fdevent-count-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/runtime/fdevent_decode.c", "tests/runtime-fdevent.c" }) |source|
+        fdevent_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    for ([_][]const u8{ "src/runtime/fdevent_count.c", "tests/runtime-fdevent-count.c" }) |source|
+        fdcount_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    const fdactivity_live = b.addExecutable(.{ .name = "xodb-fdactivity-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdactivity_live.root_module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source|
+        fdactivity_live.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    fdactivity_live.root_module.addCSourceFile(.{ .file = b.path("tests/fdactivity-live.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    b.installArtifact(fdactivity_live);
+    const fdactivity_scope = b.addExecutable(.{ .name = "xodb-fdactivity-scope", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdactivity_scope.root_module.addIncludePath(b.path("src/runtime"));
+    for (runtime_sources) |source|
+        fdactivity_scope.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    fdactivity_scope.root_module.addCSourceFile(.{ .file = b.path("tests/fdactivity-scope.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    b.installArtifact(fdactivity_scope);
+    const fd_events = b.addExecutable(.{ .name = "xodb-fd-events", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fd_events.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/fd-events.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    b.installArtifact(fd_events);
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     wire_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
@@ -312,7 +333,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, perl_tests, python_tests, lua_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -329,6 +350,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(perf_tests).step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fdevent_tests).step);
+    test_step.dependOn(&b.addRunArtifact(fdcount_tests).step);
     test_step.dependOn(&b.addRunArtifact(snapshot_tests).step);
     test_step.dependOn(&b.addRunArtifact(sysstat_tests).step);
     test_step.dependOn(&b.addRunArtifact(sys_services_tests).step);

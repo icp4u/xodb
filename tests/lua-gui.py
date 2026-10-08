@@ -8,6 +8,7 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+from helpers.language_selection import check as check_selection
 
 root = Path(__file__).resolve().parent.parent
 os.chdir(root)
@@ -43,6 +44,17 @@ for lua in args.lua:
         assert 'top: table {' in state['display'] and 'answer' in state['display'], state
         d.keys('tap', 18, 'down', 42, 'tap', 38, 'up', 42, 'tap', 28)
         time.sleep(.3); d.shot('lua-table-watch')
+        deadline = time.monotonic() + 30
+        while True:
+            tabs = d.tool('get_language_tabs')['view']
+            if any(t['tab'] == 'lua' and t['visible'] and t['status'] == 'ready' for t in tabs['tabs']): break
+            assert time.monotonic() < deadline, tabs
+            time.sleep(.03)
+        d.tool('select_language_tab', generation=d.session()['generation'], tab='lua')
+        time.sleep(.3); d.shot('lua-language-stack')
+        selection = check_selection(d, tid, 'lua', 'lua-linked')
+        (Path(d.dir)/'language-selection.json').write_text(json.dumps(selection, indent=2)+'\n')
+        d.tool('select_language_tab', generation=d.session()['generation'], tab='native')
         d.keys('tap', 66)
         assert d.wait(lambda s:s['agent_scope']=='observe')
         generation = d.session()['generation']; registers = d.tool('get_registers', tid=tid)

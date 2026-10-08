@@ -82,6 +82,9 @@ bool xrt_perf_enable(struct xrt_perf *, struct xrt_perf_failure *);
 bool xrt_perf_stop(struct xrt_perf *, struct xrt_perf_failure *);
 bool xrt_perf_retire(struct xrt_perf *, size_t index, struct xrt_perf_failure *);
 size_t xrt_perf_fd_count(const struct xrt_perf *);
+/* Local per-thread cumulative loss, even when the producer is idle. False if
+ * the requested read format is unsupported, unavailable or the read fails. */
+bool xrt_perf_read_lost(struct xrt_perf *, size_t index, uint64_t *lost);
 enum xrt_perf_drain_status xrt_perf_drain(struct xrt_perf *, xrt_perf_decoder, void *context);
 /* Wrap-copy for host record decoders; false for invalid lengths or ring sizes. */
 bool xrt_perf_copy(const uint8_t *ring, size_t size, uint64_t tail, void *out, size_t length);
@@ -114,6 +117,11 @@ bool xrt_syscall_format(const char *, size_t size, uint32_t id, bool enter);
 struct xrt_perf *xrt_syscalls_start(int32_t pid, const int32_t *tids, size_t count,
                                     uint16_t *enter_type, uint16_t *exit_type,
                                     struct xrt_perf_failure *);
+/* Like xrt_syscalls_start, requesting per-FD loss counters where supported.
+ * xrt_perf_read_lost reports whether those counters are actually available. */
+struct xrt_perf *xrt_syscalls_start_loss(int32_t pid, const int32_t *tids, size_t count,
+                                         uint16_t *enter_type, uint16_t *exit_type,
+                                         struct xrt_perf_failure *);
 /* A collector must be closed before its remote target handle is destroyed. */
 struct xrt_perf *xrt_cpu_start_target(const struct xrt_target *, const struct xrt_cpu_config *,
                                       struct xrt_cpu_acceptance *, struct xrt_perf_failure *);

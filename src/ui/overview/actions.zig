@@ -9,7 +9,7 @@ const c = @cImport({
     @cInclude("sys/wait.h");
 });
 const identity = @import("../../model/process_identity.zig");
-pub const Kind = enum { files, profile, attach };
+pub const Kind = enum { files, profile, attach, events };
 pub const Request = struct { kind: Kind, id: identity.Identity };
 pub const Launcher = struct {
     children: [16]c.pid_t = @splat(0),
@@ -26,6 +26,7 @@ pub const Launcher = struct {
         return failed;
     }
     pub fn launch(self: *Launcher, request: Request) !void {
+        if (request.kind == .events) return error.EventCaptureRequiresSharedCollector;
         if (self.redact and request.kind != .files) return error.RedactedDebuggerUnavailable;
         try identity.validate(request.id);
         _ = self.poll();

@@ -123,8 +123,11 @@ try:
     d = h.Display.__new__(h.Display)
     h.Display.__init__(d, str(root), ['--overview', '--panel', 'processes', '--interval-ms', '1000', '--session-socket', str(work / 's')], trace=False)
     peers = [Peer(work / 's'), Peer(work / 's')]
-    names = {x['name'] for x in d.request('tools/list')['tools']}
-    check('overview exposes only observer tools', names == {'get_overview','get_process','list_processes','get_connections','get_sensors'})
+    definitions = d.request('tools/list')['tools']
+    names = {x['name'] for x in definitions}
+    expected = {'get_overview','get_process','list_processes','get_connections','get_sensors',
+                'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open'}
+    check('overview exposes only observer tools', names == expected and all(x['annotations']['readOnlyHint'] for x in definitions))
     shared_names = {x['name'] for x in peers[0].call('tools/list')['result']['tools']}
     check('socket peers expose only observation and membership tools', shared_names == names | {'get_session_clients','get_session_events'})
     for forbidden in ('attach','claim_session_control'):
@@ -132,6 +135,13 @@ try:
         check('socket observer rejects ' + forbidden, bool(denied_peer.get('error')) and tracer(fixture.pid) == 0)
     denied = d.request('tools/call', dict(name='attach', arguments={'pid':fixture.pid}))
     check('overview MCP cannot attach', denied is None or denied.get('isError', False))
+    event_args = dict(pid=fixture.pid, start_ticks=ticks, acknowledge_host_cost=True)
+    denied_event = peers[0].call('tools/call', dict(name='start_fd_events', arguments=event_args))
+    check('overview socket cannot start costly exact capture', denied_event.get('result', {}).get('isError', False))
+    denied_event_stdio = d.request('tools/call', dict(name='start_fd_events', arguments=event_args))
+    check('overview stdio cannot start costly exact capture', denied_event_stdio is None or denied_event_stdio.get('isError', False))
+    idle_events = peers[0].tool('get_fd_activity', mode='events', pid=fixture.pid, start_ticks=ticks)
+    check('opening cached event observation leaves capture inactive', not idle_events['running'] and not idle_events['exact_mode_active'] and 'roughly 10 %' in idle_events['host_cost'])
     def observed(peer): return peer.tool('get_process', pid=fixture.pid)
     first = eventually(lambda: observed(peers[0]), lambda x: x['processes']['rows'] and not x['process_detail_pending'] and not any(g['pending'] for g in x['cache'].values()))
     row = first['processes']['rows'][0]
@@ -184,28 +194,16 @@ try:
             try: count += 'perf_event' in os.readlink(fd)
             except FileNotFoundError: pass
         return count
-    if (root/'src/lsoftop/lsoftop.c').exists():
-        d.keys('tap',38)
-        time.sleep(.3)  # deliberate confirmation after the arm delay
-        d.keys('tap',28)
-        def file_child():
-            for pid in descendants(d.app.pid):
-                try: command = Path(f'/proc/{pid}/cmdline').read_bytes().split(b'\0')
-                except FileNotFoundError: continue
-                if b'--lsof-top' in command and command[0].endswith(b'/xodb'): return pid
-            return 0
-        files = remember(eventually(file_child, bool))
-        children = descendants(d.app.pid)
-        for pid in children: remember(pid)
-        check('confirmed Files opens the selected identity in lsof-top', b'--expected-start-ticks\0'+str(ticks).encode()+b'\0' in Path(f'/proc/{files}/cmdline').read_bytes() and tracer(fixture.pid) == 0)
-        d.shot('files-handoff')
-        for pid in reversed(children):
-            try: os.kill(pid, signal.SIGTERM)
-            except ProcessLookupError: pass
-        eventually(file_child, lambda pid:pid == 0)
-        d.wait_focused()
-    else:
-        results.append(dict(check='confirmed Files needs the lsof-top integration',status='skip'))
+    cadence_audit = Path(d.log).read_text()
+    d.keys('tap',38)
+    time.sleep(.3)
+    d.keys('tap',28)
+    files_audit = eventually(lambda: Path(d.log).read_text(), lambda text: re.search(rf'filter_pid={fixture.pid} start={ticks} rows=[1-9][0-9]* mode=files', text) is not None, timeout=25)
+    check('confirmed Files opens the selected identity inside overview', f'filter_pid={fixture.pid} start={ticks}' in files_audit and tracer(fixture.pid) == 0)
+    check('Files drilldown starts no terminal child', not descendants(d.app.pid))
+    text = h.ocr(d.shot('files-pane'))
+    check('Files pane title and polling qualification are visible', 'Files' in text and ('progress' in text.lower() or 'shared polling' in text.lower()))
+    d.keys('tap',4) # Return to Processes, preserving selected identity.
     d.keys('tap',33)
     time.sleep(.3)
     d.keys('tap',28)
@@ -238,7 +236,8 @@ try:
     rows = re.findall(r'collector opens=(\d+) sequence=(\d+) groups=([0-9a-f]+) light=(true|false) processes_sample_ns=(\d+)', audit)
     check('GUI and all peers open one collector', rows and all(int(x[0]) == 1 for x in rows))
     check('Summary returns to light process sampling', any(x[3] == 'true' and int(x[2],16) & (1 << 11) for x in rows[-5:]))
-    times = sorted({int(x[4]) for x in rows if int(x[4])})
+    cadence_rows = re.findall(r'collector opens=(\d+) sequence=(\d+) groups=([0-9a-f]+) light=(true|false) processes_sample_ns=(\d+)', cadence_audit)
+    times = sorted({int(x[4]) for x in cadence_rows if int(x[4])})
     gaps = [(b-a)/1e9 for a,b in zip(times,times[1:])]
     check('process samples follow the one-second owner clock', len(gaps) >= 3 and all(.95 <= t < 1.35 for t in gaps))
     check('MCP full demand waits for owner tick', peers[0].tool('list_processes', limit=1)['process_detail_pending'])

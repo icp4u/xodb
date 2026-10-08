@@ -24,7 +24,9 @@ pub const usage =
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue or mono (builtin: prefix accepted)
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services or apps
+    \\                  network, connections, power, system, users, services, apps or files
+    \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
+    \\  --files-start-ticks N  require this exact identity with --files-pid
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
     \\                  at 1 Hz; off Processes, per-process IO and fd counts wait until shown)
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
@@ -47,6 +49,8 @@ pub const Options = struct {
     redact: bool = false,
     theme: ?[]const u8 = null,
     panel: ?vw.Panel = null,
+    files_pid: ?i32 = null,
+    files_start: u64 = 0,
     interval_ms: ?u64 = null,
     paused: bool = false,
     frames: u64 = 0,
@@ -73,7 +77,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -90,6 +94,15 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.theme = value;
         }
         if (std.mem.eql(u8, arg, "--panel")) o.panel = std.meta.stringToEnum(vw.Panel, value) orelse return error.UnknownOverviewPanel;
+        if (std.mem.eql(u8, arg, "--files-pid")) {
+            const pid = try std.fmt.parseInt(i32, value, 10);
+            if (pid <= 0) return error.InvalidFilesIdentity;
+            o.files_pid = pid;
+        }
+        if (std.mem.eql(u8, arg, "--files-start-ticks")) {
+            o.files_start = try std.fmt.parseInt(u64, value, 10);
+            if (o.files_start == 0) return error.InvalidFilesIdentity;
+        }
         if (std.mem.eql(u8, arg, "--interval-ms")) {
             const ms = try std.fmt.parseInt(u64, value, 10);
             if (ms < 250 or ms > 10_000) return error.InvalidOverviewInterval;
@@ -99,6 +112,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
         if (std.mem.eql(u8, arg, "--font")) o.font = value;
     }
     if (o.replay != null and (o.mcp or o.session_socket != null)) return error.ReplayHasNoLiveSession;
+    if (o.files_start != 0 and o.files_pid == null) return error.InvalidFilesIdentity;
+    if (o.files_pid != null) {
+        if (o.replay != null or (o.panel != null and o.panel.? != .files)) return error.InvalidFilesIdentity;
+        o.panel = .files;
+    }
     return o;
 }
 
@@ -171,6 +189,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     view.paused = o.paused;
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
+    if (o.files_pid) |pid| view.files.scope(.{ .pid = pid, .start = o.files_start });
     view.source_label = if (source == .replay) "REPLAY" else "live";
     view.owns_samples = source == .live;
 
@@ -191,6 +210,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
 
     const interval = (o.interval_ms orelse if (source == .live) @as(u64, 500) else 1000) * 1_000_000;
     collector.fast_ns = interval;
+    view.files.interval_ms = if (o.interval_ms == 250) 250 else 1000;
     // The owner clock refreshes processes at 1 Hz, independently of MCP calls.
     var next_sample: u64 = 0;
     var shown_panel = view.panel;
@@ -203,13 +223,13 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         view.sample_time = 0;
         next_sample = now() + interval;
     }
-    const frame_gap: u64 = 33_000_000;
     var ready = false;
     var retry: u64 = 0;
     var rendered: u64 = 0;
     var last_frame: u64 = 0;
     while (!window.closing and quitting == 0) {
         const t = now();
+        const frame_gap: u64 = if (view.panel == .files) 66_000_000 else 33_000_000;
         // Eases redraw at 30 fps; idle waits for the next sample or input.
         const wait_ms: i32 = if (window.dirty) 4 else if (view.animating(t)) @intCast(@max(1, (last_frame + frame_gap -| t) / 1_000_000)) else @intCast(@min(if (shared != null or server != null) @as(u64, 20) else 250, (next_sample -| t) / 1_000_000 + 1));
         try window.pump(window.input.timeoutMs(t, wait_ms));
@@ -229,6 +249,19 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         if (source == .live) {
             const started = vw.threadNs();
             collector.redact = view.redact;
+            if (view.files.event_authorized and (view.panel != .files or view.paused)) view.files.stopCapture();
+            if (view.files.refreshStatus(&collector)) window.dirty = true;
+            if (view.panel == .files) {
+                const changed = view.files.refresh(gpa, &collector, current, view.paused) catch |err| blk: {
+                    view.setStatus("Descriptor sampling failed: {s}", .{@errorName(err)}, current);
+                    break :blk false;
+                };
+                view.files.rebuild(gpa, view.redact) catch |err| view.setStatus("Descriptor list failed: {s}", .{@errorName(err)}, current);
+                if (changed) {
+                    window.dirty = true;
+                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode) });
+                }
+            }
             _ = collector.tick(current, if (view.paused) 0 else view.groups(true), view.panel == .processes) catch |err| blk: {
                 view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
                 break :blk false;

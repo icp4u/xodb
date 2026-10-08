@@ -300,12 +300,16 @@ pub const Modules = struct {
         }
         return false;
     }
-    fn loadRange(self: *Modules, region: Region, observed: bool) !*Module {
+    fn cachedRange(self: *Modules, region: Region, observed: bool) ?*Module {
         for (self.loaded.items) |m| {
             if (m.inode != region.inode or m.device_major != region.device_major or m.device_minor != region.device_minor or (self.core_source == null and !std.mem.eql(u8, m.path, region.path))) continue;
             const p = self.placement(&m.image, m.file_offset, region, observed) catch continue;
             if (m.start == p.first.start and m.end >= p.end and m.bias == p.bias) return m;
         }
+        return null;
+    }
+    fn loadRange(self: *Modules, region: Region, observed: bool) !*Module {
+        if (self.cachedRange(region, observed)) |module| return module;
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
         const path = try self.allocator.dupeZ(u8, selected_path);
@@ -375,6 +379,12 @@ pub const Modules = struct {
             found = bias;
         }
         return found orelse error.BadMapping;
+    }
+    /// Match both mapped identity and placement without opening a target file.
+    pub fn cachedAt(self: *Modules, address: u64) !*Module {
+        for (self.regions.items) |region| if (address >= region.start and address < region.end)
+            return self.cachedRange(region, false) orelse error.DebugMetadataNotLoaded;
+        return error.UnmappedAddress;
     }
     pub fn at(self: *Modules, address: u64) !*Module {
         for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r);
@@ -567,6 +577,22 @@ pub const Modules = struct {
             return .{ .module_id = try self.moduleId(r, p.bias), .name = symbol.name, .address = std.math.add(u64, symbol.value, p.bias) catch return error.InvalidAddress, .size = symbol.size };
         }
         return failure orelse if (automatic) error.BreakpointSymbolNotLoaded else error.SymbolNotFound;
+    }
+    /// Symbols already retained by discovery; never fetch a library for a label.
+    pub fn cachedSymbolAt(self: *Modules, address: u64) !Symbol {
+        if (self.cachedAt(address)) |_| return self.symbolAt(address) else |_| {}
+        for (self.regions.items) |region| {
+            if (address < region.start or address >= region.end) continue;
+            for (self.symbol_images.items) |*item| {
+                if (!sameFile(item.region, region)) continue;
+                const p = try self.placement(&item.image, 0, region, false);
+                if (address < p.bias) return error.InvalidAddress;
+                const symbol = item.image.symbolAt(address - p.bias) orelse return error.SymbolNotFound;
+                return .{ .module_id = try self.moduleId(region, p.bias), .name = symbol.symbol.name, .address = try std.math.add(u64, p.bias, symbol.symbol.value), .size = symbol.symbol.size, .offset = symbol.offset };
+            }
+            return error.DebugMetadataNotLoaded;
+        }
+        return error.UnmappedAddress;
     }
     pub fn symbolAt(self: *Modules, address: u64) !Symbol {
         const module = try self.at(address);

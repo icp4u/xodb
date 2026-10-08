@@ -172,8 +172,32 @@ static void asynchronous_failure(void)
     xrt_wire_perf_info(&in, &decoded);
     assert(!in.ok);
 }
+static void loss_counter_reads(void)
+{
+    struct xrt_perf *p = xrt_perf_create(1, 1, xrt_perf_page_size());
+    assert(p);
+    int first[2], second[2];
+    assert(pipe2(first, O_NONBLOCK | O_CLOEXEC) == 0 && pipe2(second, O_NONBLOCK | O_CLOEXEC) == 0);
+    p->count = 1;
+    p->slots[0].thread.event_count = 2;
+    p->slots[0].fds[0] = first[0]; p->slots[0].fds[1] = second[0];
+    p->slots[0].lost_read_mask = 3;
+    uint64_t data[2] = {100, 7}, lost = 0;
+    assert(write(first[1], data, sizeof data) == sizeof data);
+    data[1] = 11; assert(write(second[1], data, sizeof data) == sizeof data);
+    assert(xrt_perf_read_lost(p, 0, &lost) && lost == 18);
+    assert(!xrt_perf_read_lost(p, 1, &lost));
+    assert(!xrt_perf_read_lost(p, 0, &lost)); /* failed read is not measured zero */
+    assert(write(first[1], data, 8) == 8);
+    assert(!xrt_perf_read_lost(p, 0, &lost)); /* short format rejected */
+    p->slots[0].lost_read_mask = 0;
+    assert(!xrt_perf_read_lost(p, 0, &lost)); /* unsupported format */
+    close(first[1]); close(second[1]); xrt_perf_destroy(p);
+}
+
 int main(void)
 {
+    loss_counter_reads();
     asynchronous_failure();
     rings();
     metadata();

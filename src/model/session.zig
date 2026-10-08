@@ -95,6 +95,7 @@ pub const Session = struct {
     debug_files: @import("../binary/debug_files.zig").Files = .{ .allocator = std.heap.page_allocator },
     source_maps: @import("source_maps.zig").Maps = .{},
     metadata: @import("debug_metadata.zig").State = .{},
+    language_tabs: @import("language_tabs.zig").State = .{},
     maps_epoch: u64 = 0,
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
@@ -1142,6 +1143,7 @@ pub const Session = struct {
         return true;
     }
     pub fn poll(self: *Session) !void {
+        defer self.language_tabs.poll(self);
         defer self.metadata.poll(self);
         defer self.inspections.poll(self);
         defer self.pollObservationArchive();
@@ -1444,11 +1446,15 @@ pub const Session = struct {
                 registers[arch_.ra()] orelse break;
             if (pc == 0) break;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
-            frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
-            if (self.modules.symbolAt(frame.lookup_pc)) |symbol| frame.symbol = symbol.name else |_| {}
+            const remote_caller = frames.items.len != 0 and @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
+            if (if (remote_caller) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| frame.symbol = symbol.name else |_| {}
             const step: info.Unwind = step: {
-                const module = self.modules.at(frame.lookup_pc) catch |err| {
-                    if (err == error.BinarySnapshotLimit and self.target.core == null) {
+                // Decorating an unloaded remote caller must not download its
+                // whole library on the event loop. CFI uses the C range worker;
+                // explicit locals/source inspection can still load full DWARF.
+                const module = (if (remote_caller) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
+                    if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
+                        frame.inline_diagnostic = @errorName(err);
                         break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
                             frame.diagnostic = @errorName(metadata_error);
                             try frames.append(a, frame);
@@ -1460,6 +1466,7 @@ pub const Session = struct {
                     break :stack_walk;
                 };
                 frame.module_id = module.id;
+                frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
                 const debug = module.debugInfo() catch |err| {
                     frame.diagnostic = @errorName(err);
                     try frames.append(a, frame);

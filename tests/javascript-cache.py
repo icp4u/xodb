@@ -162,7 +162,7 @@ os.environ.pop('XDG_CACHE_HOME')
 os.environ.pop('HOME', None)
 group('no-home')
 cache = w / 'busy-cache'
-private = cache / 'xodb-debug-v1'
+private = cache / 'xodb-debug-v2'
 private.mkdir(mode=0o700, parents=True)
 os.environ['XDG_CACHE_HOME'] = str(cache)
 leases = []

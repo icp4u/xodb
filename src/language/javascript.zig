@@ -193,3 +193,9 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     try session.target.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = segments, .native_stack_incomplete = native.len == 64 or native[native.len - 1].diagnostic != null };
 }
+
+/// Runtime identity and proof from the existing stopped-memory reader.
+pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    const layout = try session.metadata.javascript(session);
+    return .{ .version = try text(a, std.mem.sliceTo(&layout.version_string, 0)), .build_id = try buildId(a, &layout), .basis = if (layout.dwarf_fields != 0) "postmortem metadata + partial DWARF" else "postmortem metadata" };
+}

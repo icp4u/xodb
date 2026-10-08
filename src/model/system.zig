@@ -8,6 +8,8 @@ pub fn bit(id: c_uint) u32 {
     return @as(u32, 1) << @intCast(id);
 }
 
+pub const FdEventState = enum { inactive, requested, active };
+
 pub const Collector = struct {
     ctx: ?*c.struct_xrt_sys = null,
     cache: ?*Snapshot = null,
@@ -21,8 +23,44 @@ pub const Collector = struct {
     light: bool = false,
     opens: u64 = 0,
     redact: bool = false,
+    fd_collector: ?*c.struct_xrt_fdactivity = null,
+    fd_opens: u64 = 0,
+    fd_event_state: FdEventState = .inactive,
+    fd_lease: ?@import("../service/lease.zig").Lease = null,
+
+    /// Cached publication only: displaying status never creates or renews capture.
+    pub fn fdEventState(self: *Collector) FdEventState {
+        const owner = self.fd_collector orelse return .inactive;
+        var view: c.struct_xrt_fdactivity_view = undefined;
+        if (c.xrt_fdactivity_acquire(owner, &view) == 0) return self.fd_event_state;
+        self.fd_event_state = if (view.event.running != 0) .active else if (view.event_requested != 0) .requested else .inactive;
+        c.xrt_fdactivity_release(owner);
+        return self.fd_event_state;
+    }
+
+    pub fn descriptors(self: *Collector) !*c.struct_xrt_fdactivity {
+        if (self.fd_collector == null) {
+            if (c.xrt_fdactivity_create(&self.fd_collector) != c.XRT_OK) return error.OutOfMemory;
+            self.fd_opens += 1;
+        }
+        return self.fd_collector.?;
+    }
+    pub fn revokeFdEvents(self: *Collector) bool {
+        if (self.fd_collector) |ctx| {
+            const stop_request = c.struct_xrt_fdactivity_request{ .interval_ms = 1000, .stop_events = 1 };
+            if (c.xrt_fdactivity_request(ctx, &stop_request) != c.XRT_OK) return false;
+        }
+        self.fd_lease = null;
+        return true;
+    }
+    pub fn checkFdLease(self: *Collector, now: u64, scope: u32) void {
+        if (self.fd_lease) |lease| if (!lease.valid(now, scope)) {
+            _ = self.revokeFdEvents(); // retry next tick if publication was busy
+        };
+    }
 
     pub fn deinit(self: *Collector) void {
+        if (self.fd_collector) |owner| c.xrt_fdactivity_destroy(owner);
         if (self.cache) |p| {
             c.xrt_sys_snapshot_free(p);
             a.destroy(p);
@@ -143,4 +181,12 @@ test "cache requests do not sample, one owner merges groups and expires demand" 
     const row = collector.cache.?.processes.proc[0];
     try std.testing.expectEqual(c.XRT_SYS_WHY_NOT_COLLECTED, row.fds.why);
     try std.testing.expectEqual(c.XRT_SYS_WHY_NOT_COLLECTED, row.io_read_bytes.why);
+}
+
+test "GUI event status does not create a descriptor collector" {
+    var owner: Collector = .{};
+    defer owner.deinit();
+    try std.testing.expectEqual(FdEventState.inactive, owner.fdEventState());
+    try std.testing.expectEqual(@as(u64, 0), owner.fd_opens);
+    try std.testing.expect(owner.fd_collector == null);
 }

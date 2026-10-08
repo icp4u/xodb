@@ -33,9 +33,9 @@ def note(name, detail):
     print(f"note {name}: {detail}", flush=True)
 
 class Display:
-    """A private headless Sway and one xodb inside it, with MCP on stdio."""
+    """A private headless Sway and one xodb inside it, with optional MCP on stdio."""
 
-    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True):
+    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True):
         Display.count = getattr(Display, "count", 0) + 1
         self.tree = tree
         self.dir = os.path.join(WORK, f"run-{Display.count:02d}")
@@ -72,13 +72,14 @@ class Display:
         if wayland_debug:
             app_env["WAYLAND_DEBUG"] = "1"
         self.log = os.path.join(self.dir, "xodb.log")
-        self.app = subprocess.Popen([os.path.join(tree, "zig-out", "bin", "xodb"), "--mcp", *args], cwd=tree, env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.log, "wb"))
+        self.app = subprocess.Popen([os.path.join(tree, "zig-out", "bin", "xodb"), *(["--mcp"] if stdio else []), *args], cwd=tree, env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.log, "wb"))
         self.procs.append(self.app)
         self.serial = 0
         self.notifications = []
-        self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "input-test", "version": "1"}})
-        self.app.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
-        self.app.stdin.flush()
+        if stdio:
+            self.request("initialize", {"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "input-test", "version": "1"}})
+            self.app.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+            self.app.stdin.flush()
         self.wait_focused()
 
     def wait_focused(self, seconds=60):

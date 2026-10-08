@@ -10,15 +10,16 @@ const h = @import("history.zig");
 const draw = @import("draw.zig");
 const themes = @import("theme.zig");
 const panels = @import("panels.zig");
+pub const files_model = @import("files_model.zig");
 pub const Ctx = draw.Ctx;
 pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps" };
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -66,6 +67,7 @@ pub const View = struct {
     redact: bool = false,
     paused: bool = false,
     source_label: []const u8 = "live",
+    files: files_model.State = .{},
     current: ?*m.Owned = null,
     previous: ?*m.Owned = null,
     /// Replay frames belong to the replay; live samples to the view.
@@ -128,7 +130,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search };
+    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -136,6 +138,7 @@ pub const View = struct {
         return .{ .gpa = gpa, .hist = hist };
     }
     pub fn deinit(self: *View) void {
+        self.files.deinit(self.gpa);
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -318,7 +321,7 @@ pub const View = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const View, now: u64) bool {
-        return self.ease(now) < 1;
+        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now));
     }
 
     pub fn setStatus(self: *View, comptime fmt: []const u8, args: anytype, now: u64) void {
@@ -376,6 +379,10 @@ pub const View = struct {
     }
 
     fn wheel(self: *View, lines: i32) void {
+        if (self.panel == .files) {
+            if (lines > 0) self.files.top += @intCast(lines) else self.files.top -|= @intCast(-lines);
+            return;
+        }
         const s = &self.scroll[@intFromEnum(self.panel)];
         if (lines > 0) s.* += @intCast(lines) else s.* -|= @intCast(-lines);
     }
@@ -389,6 +396,11 @@ pub const View = struct {
             if (sym == 0xff0d or sym == 0xff8d) self.confirmAction(now);
             return;
         }
+        if (event.kind == .press and event.plain() and event.shortcut == 'e' and self.files.exact_active) {
+            self.files.stopCapture();
+            return;
+        }
+        if (self.panel == .files and self.filesKey(event, now)) return;
         if (self.searching) {
             switch (sym) {
                 0xff1b => {
@@ -460,7 +472,7 @@ pub const View = struct {
                 self.descending = !self.descending;
                 self.rows_dirty = true;
             },
-            'l' => self.requestAction(.files, now),
+            'l' => if (self.panel == .processes) self.requestAction(.files, now) else self.show(.files),
             'f' => self.requestAction(.profile, now),
             'v' => {
                 self.tree = !self.tree;
@@ -470,6 +482,9 @@ pub const View = struct {
                 // Redaction can be turned on while recording, never off.
                 self.redact = true;
                 self.rows_dirty = true;
+                self.files.dirty = true;
+                self.files.query_len = 0;
+                self.files.searching = false;
                 self.setStatus("Redaction on: hostnames, users, addresses and arguments hidden (restart to show)", .{}, now);
             },
             else => {},
@@ -478,6 +493,81 @@ pub const View = struct {
     pub fn show(self: *View, panel: Panel) void {
         self.panel = panel;
         self.searching = false;
+        self.files.searching = false;
+        if (panel == .files) self.files.dirty = true;
+    }
+    fn filesKey(self: *View, event: @import("../../platform/input.zig").Event, now: u64) bool {
+        const f = &self.files;
+        if (f.searching) {
+            switch (event.sym) {
+                0xff1b => {
+                    f.searching = false;
+                    f.query_len = 0;
+                },
+                0xff0d, 0xff8d => f.searching = false,
+                0xff08 => if (f.query_len > 0) {
+                    f.query_len -= 1;
+                    while (f.query_len > 0 and f.query[f.query_len] & 0xc0 == 0x80) f.query_len -= 1;
+                },
+                else => {
+                    const value = event.text();
+                    if (value.len > 0 and f.query_len + value.len <= f.query.len) {
+                        @memcpy(f.query[f.query_len..][0..value.len], value);
+                        f.query_len += value.len;
+                    }
+                },
+            }
+            f.dirty = true;
+            return true;
+        }
+        if (!event.plain()) return false;
+        f.rebuild(self.gpa, self.redact) catch {
+            self.setStatus("Descriptor list unavailable: out of memory", .{}, now);
+            return true;
+        };
+        if (event.sym == 0xff1b or event.sym == 0xff08) {
+            f.all();
+            return true;
+        }
+        if (event.sym == 0xff0d or event.sym == 0xff8d) {
+            if (event.kind == .press) if (f.selected) |selected| f.scope(selected.owner);
+            return true;
+        }
+        switch (event.shortcut) {
+            '/' => f.searching = true,
+            's' => {
+                f.sort = @enumFromInt((@intFromEnum(f.sort) + 1) % 3);
+                f.dirty = true;
+            },
+            'r' => {
+                f.reverse = !f.reverse;
+                f.dirty = true;
+            },
+            '[' => f.show(@enumFromInt((@intFromEnum(f.mode) + 3) % 4)),
+            ']' => f.show(@enumFromInt((@intFromEnum(f.mode) + 1) % 4)),
+            'h' => self.fileHolders(),
+            'e' => if (event.kind == .press) {
+                if (f.event_authorized or f.exact_active) f.stopCapture() else self.requestAction(.events, now);
+            },
+            'a' => if (event.kind == .press) self.requestAction(.attach, now),
+            'f' => if (event.kind == .press) self.requestAction(.profile, now),
+            else => return false,
+        }
+        return true;
+    }
+    fn fileHolders(self: *View) void {
+        const f = &self.files;
+        f.rebuild(self.gpa, self.redact) catch return;
+        const s = f.snapshot orelse return;
+        if (f.selected_row >= f.rows.items.len) return;
+        const row = f.rows.items[f.selected_row];
+        if (row != .descriptor or row.descriptor.fd >= s.fd_count) return;
+        const fd = s.fds[row.descriptor.fd];
+        if (fd.flags & @import("../../c.zig").api.XRT_FD_STAT == 0) return;
+        f.filter = null;
+        f.file_filter = .{ .device = fd.device, .inode = fd.inode };
+        f.query_len = 0;
+        f.show(.files);
     }
     fn cycle(self: *View, by: i32) void {
         const n: i32 = panel_count;
@@ -489,6 +579,7 @@ pub const View = struct {
         self.rows_dirty = true;
     }
     fn move(self: *View, by: i32) void {
+        if (self.panel == .files) return self.files.move(by);
         if (self.panel != .processes) {
             const s = &self.scroll[@intFromEnum(self.panel)];
             if (by > 0) s.* += @intCast(by) else s.* -|= @intCast(-by);
@@ -524,9 +615,16 @@ pub const View = struct {
         self.requestAction(.attach, now);
     }
     pub fn requestAction(self: *View, kind: actions.Kind, now: u64) void {
-        if (self.panel != .processes) return;
-        const id = self.selected orelse return;
-        if (self.findProcess(id) == null) {
+        if (self.panel != .processes and self.panel != .files) return;
+        const id: Identity = if (self.panel == .files) blk: {
+            // A scoped process remains selectable after an empty capture stops.
+            const owner = if (self.files.selected) |selected| selected.owner else self.files.filter orelse {
+                self.setStatus("Select a process or descriptor first", .{}, now);
+                return;
+            };
+            break :blk .{ .pid = owner.pid, .start = owner.start };
+        } else self.selected orelse return;
+        if (self.panel == .processes and self.findProcess(id) == null) {
             self.setStatus("Process {d} exited; nothing to open", .{id.pid}, now);
             return;
         }
@@ -534,7 +632,7 @@ pub const View = struct {
             self.setStatus("Replay: process actions require a live process", .{}, now);
             return;
         }
-        if (self.redact and kind != .files) {
+        if (self.redact and (kind == .attach or kind == .profile)) {
             self.setStatus("Attach and Profile are unavailable in redaction mode: debugger windows cannot redact", .{}, now);
             return;
         }
@@ -546,6 +644,22 @@ pub const View = struct {
         if (self.confirm_key != null or now < self.confirm_after) return;
         const request = self.pending_action orelse return;
         self.pending_action = null;
+        if (request.kind == .files or request.kind == .events) {
+            @import("../../model/process_identity.zig").validate(request.id) catch |err| {
+                self.setStatus("Cannot open process: {s}", .{@errorName(err)}, now);
+                return;
+            };
+            self.files.scope(.{ .pid = request.id.pid, .start = request.id.start });
+            if (request.kind == .events) {
+                self.files.event_target = .{ .pid = request.id.pid, .start = request.id.start };
+                self.files.event_authorized = true;
+                self.files.stop_requested = false;
+                self.files.show(.events);
+            }
+            self.show(.files);
+            self.setStatus("Opened {s} for pid {d}", .{ @tagName(request.kind), request.id.pid }, now);
+            return;
+        }
         const hook = self.action_hook orelse return;
         hook(self.action_context, request) catch |err| {
             self.setStatus("Cannot open process: {s}", .{@errorName(err)}, now);
@@ -582,6 +696,12 @@ pub const View = struct {
                 .theme => self.palette = (self.palette + 1) % themes.all.len,
                 .pause => self.paused = !self.paused,
                 .search => self.searching = true,
+                .files_mode => |mode| if (mode == .events) self.requestAction(.events, now) else self.files.show(mode),
+                .files_row => |row| self.files.select(row),
+                .files_all => self.files.all(),
+                .file_holders => self.fileHolders(),
+                .events => self.requestAction(.events, now),
+                .stop_events => self.files.stopCapture(),
             }
             return;
         }
@@ -960,6 +1080,7 @@ pub const View = struct {
                 .users => .{ .text = if (snapshot.group(.users).status == .ok) std.fmt.bufPrint(&vb, "{d} sessions", .{snapshot.users.len}) catch "" else snapshot.group(.users).reason },
                 .services => .{ .text = if (snapshot.services.len > 0) std.fmt.bufPrint(&vb, "{d} services", .{snapshot.services.len}) catch "" else snapshot.group(.services).reason },
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
+                .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
             } else .{ .text = "" };
             const spark_w: f32 = if (detail.ring != null) 64 else 0;
             // Per-panel groups are sampled only while their panel is open.
@@ -990,12 +1111,14 @@ pub const View = struct {
         self.hover(orect, "Overhead over the last second, % of one core: drawing, sampling, and total for the whole process (all threads)", .{});
         // Left: hover reason, status, or key hints.
         const left_w = orect.x - 16;
-        if (self.hover_len > 0) {
+        if (self.files.exact_active) {
+            try ctx.textFit(12, rect.y + 4, left_w, "EXACT ACTIVE · all syscalls ~10% slower · E stops", p.warn);
+        } else if (self.hover_len > 0) {
             try ctx.textFit(12, rect.y + 4, left_w, self.hover_text[0..self.hover_len], p.text);
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
-            const hints = if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  / search processes  t theme  p pause  x redact  q quit";
+            const hints = if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
             try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
         }
     }
@@ -1029,9 +1152,10 @@ pub const View = struct {
         var buf: [128]u8 = undefined;
         try ctx.textFit(box.x + 20, box.y + 16, w - 40, std.fmt.bufPrint(&buf, "Open {s}: pid {d}, start {d}", .{ @tagName(request.kind), request.id.pid, request.id.start }) catch "", p.text);
         const lines: [4][]const u8 = switch (request.kind) {
-            .files => .{ "Read-only file and socket scan in a separate terminal.", "Cost: scans this process's descriptors once per second; no target pause.", "Access: your account's /proc permissions; denied fields stay unavailable.", "The sampled identity is checked on every scan. No privilege escalation." },
+            .files => .{ "Read-only descriptors in this window's Files & IO pane.", "Cost: shared scan once per second, 10 ms soft budget; no target pause.", "Access: your account's /proc permissions; denied fields stay unavailable.", "The view pins the sampled process identity. No privilege escalation." },
             .profile => .{ "Attach, start a 99 Hz CPU capture for 10 seconds, then resume.", "Cost: briefly stops all threads; perf buffers up to 64 MiB, plus symbols.", "Access: ptrace and perf_event permissions; denial is reported.", "The target is checked before and after attach. No privilege escalation." },
             .attach => .{ "Open this process in a separate debugger window.", "Cost: attaches and stops all threads until you continue or detach.", "Access: ptrace permission (same user or CAP_SYS_PTRACE).", "The target is checked before and after attach. No privilege escalation." },
+            .events => .{ "exact mode slows all syscalls on this machine by roughly 10 % while active", "Syscall-heavy targets can slow much more; up to 64 perf fds and 2 MiB rings.", "Access: native x86-64 tracepoints and perf permission; no ptrace stop.", "E stops. Pausing or leaving this pane stops capture. FD numbers span reuse." },
         };
         for (lines, 0..) |line, i| try ctx.textFit(box.x + 20, box.y + 58 + @as(f32, @floatFromInt(i)) * 30, w - 40, line, p.dim);
         const cancel = Rect{ .x = box.x + 20, .y = box.y + 222, .w = 190, .h = 36 };

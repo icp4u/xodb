@@ -37,7 +37,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis',
-                     'lsof-top'):
+                     'lsof-top', 'fdactivity'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         for name in ('inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
@@ -48,6 +48,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', *args], 180))
         steps.append(('metadata-session', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ms'], 180))
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
+        steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt'], 180))
+        steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent'], 240))
         storage = ['--storage', os.environ['XODB_LARGE_IMAGE_STORAGE']] if os.environ.get('XODB_LARGE_IMAGE_STORAGE') else []
         steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
@@ -68,6 +70,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('javascript-cache-agent', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--agent', 'zig-out/bin/xodb-agent', '--work', '.work/js-cache-agent'], 300))
         for index, (executable, source, library) in enumerate(lua):
             sdk = ['--source', source, '--library', library]
+            for remote in (False, True):
+                prefix = ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'] if remote else []
+                steps.append((f'language-selection-{index}-{int(remote)}', [*prefix, sys.executable, '-B', 'tests/language-selection.py', '--include', source, '--library', library, *([] if remote else ['--strace']), '--work', f'.work/language-selection-{index}-{int(remote)}'], 120))
             steps.append((f'lua-component-{index}', [sys.executable, '-B', 'tests/lua-component.py', *sdk, '--work', f'.work/lua-component-{index}'], 120))
             steps.append((f'lua-embedded-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--strace', '--adversarial', '--work', f'.work/lua-embedded-{index}'], 180))
             steps.append((f'lua-interpreter-{index}', [sys.executable, '-B', 'tests/lua-language.py', *sdk, '--lua', executable, '--work', f'.work/lua-interpreter-{index}'], 180))
@@ -87,12 +92,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-themes', ['tests/themes.py']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-frames', ['tests/frames-gui.py']),
+            ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt']),
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
             ('gui-clipboard', ['tests/clipboard-gui.py']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
             ('gui-symbol-discovery', ['tests/symbol-discovery-gui.py']),
+            ('gui-remote-caller', ['tests/remote-caller-gui.py']),
             ('gui-debug', ['scripts/gui-smoke.py', '--m1']),
             ('gui-shared-sessions', ['tests/shared-sessions-gui.py']),
+            ('gui-fdactivity', ['tests/fdactivity-gui.py']),
             ('gui-invocations', ['tests/invocations-gui.py']),
             ('gui-breakpoints', ['tests/breakpoint-gui.py', 'zig-out']),
             ('gui-inspection', ['tests/inspection-gui.py', 'zig-out']),
@@ -112,6 +120,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
+        steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         if node:
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
             steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))

@@ -11,9 +11,9 @@
  * limit is counted, never silently dropped.
  *
  * Polling sees only the fd set at each sample: an open and close between two
- * samples is invisible, and pipes/sockets have no offsets. A later event
- * source (tracefs syscall tracepoints) fills the same records with exact
- * counts; `source` says which produced a snapshot.
+ * samples is invisible, and pipes/sockets have no offsets. xrt_fdevent's
+ * syscall evidence is separate: its fd-number history spans reuse and must
+ * not be attributed to the current paths in this polling snapshot.
  *
  * Rates are bytes (or fd changes) per second over each process's own
  * interval. A process carried over unscanned (time budget) keeps its last

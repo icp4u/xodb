@@ -61,8 +61,11 @@ before use. Candidates still require normal CU/type validation; no cached name
 or offset bypasses the semantic layout checks. The index does not add inherited
 names or qualified-name synthesis.
 
-The application's C cache pool chooses `$XDG_CACHE_HOME/xodb-debug-v1`, falling
-back to `$HOME/.cache/xodb-debug-v1`. Its directory is mode 0700 and its regular
+The application's C cache pool chooses `$XDG_CACHE_HOME/xodb-debug-v2`, falling
+back to `$HOME/.cache/xodb-debug-v2`. Old `xodb-debug-v1` range files are truncated opportunistically only after both
+the slot and range-file nonblocking leases are held; busy or unsafe old entries
+are left intact and checked again on a later open. Old small name indexes remain.
+Its directory is mode 0700 and its regular
 files are mode 0600. The root must be owned by the current user; a group-writable
 root is allowed only with an opened, owner-checked private child. Relative roots,
 symlinks at the cache root/entry, nonprivate entries, hardlinks and nonregular
@@ -186,3 +189,11 @@ generation changes, restart, exec, fork/vfork detach, exit and shutdown, plus
 symbol lookup and first-call startup/restart breakpoints in a runnable sparse
 5 GiB image. Choose fresh work/storage paths. `release-check` includes these
 checks; `XODB_LARGE_IMAGE_STORAGE` selects its large-fixture destination.
+
+Remote stack walks use the background CFI reader for caller modules whose full
+DWARF has not been loaded. They keep source and inline information unavailable
+with `DebugMetadataNotLoaded` instead of downloading whole libraries during
+automatic stack decoration. Selecting a caller for explicit locals inspection
+can still load its full debug image; later stack walks reuse that image. The top
+frame and explicit source/locals operations retain their existing synchronous
+small-image path.

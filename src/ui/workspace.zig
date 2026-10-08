@@ -162,7 +162,7 @@ pub const Workspace = struct {
     locals: []LocalRow = &.{},
     local_diagnostic: ?[]const u8 = null,
     breakpoint_lines: []u32 = &.{},
-    show_registers: bool = false,
+    language_panel: @import("language_tabs.zig").Panel = .{},
     show_flow: bool = false,
     show_profile: bool = false,
     flame: FlameView = .{},
@@ -197,10 +197,12 @@ pub const Workspace = struct {
     reported_dropped: u64 = 0,
     reported_keymap_errors: u64 = 0,
     status: []const u8 = "Ready",
+    fd_event_state: @import("../model/system.zig").FdEventState = .inactive,
     allocation_busy: bool = false,
     allocation_collecting: bool = false,
     last_generation: u64 = std.math.maxInt(u64),
     last_metadata_revision: u64 = 0,
+    last_language_revision: u64 = 0,
     last_tid: i32 = 0,
     regs: ?linux.Registers = null,
     instructions: [32]disasm.Instruction = undefined,
@@ -223,6 +225,7 @@ pub const Workspace = struct {
 
     const LocalRow = struct { name: []const u8, value: model.ValueSummary };
     pub fn deinit(self: *Workspace) void {
+        self.language_panel.deinit();
         self.logical_frames.deinit();
         self.flow.deinit();
         self.flame.deinit();
@@ -1106,15 +1109,43 @@ pub const Workspace = struct {
                 if (code == 17) return self.watchWrite(session, i);
             };
         }
+        if (!self.show_profile and click) {
+            if (self.language_panel.hit(w.pointer_x, w.pointer_y)) |tab| {
+                session.language_tabs.select(tab) catch {};
+                click = false;
+                w.dirty = true;
+            }
+        }
+        if (!self.show_profile and @intFromEnum(session.language_tabs.selected) >= 2) {
+            if (click) {
+                const handled = self.language_panel.click(session, w.pointer_x, w.pointer_y) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                };
+                if (handled) {
+                    click = false;
+                    w.dirty = true;
+                }
+            }
+            if (w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.scroll != 0) {
+                self.language_panel.scrollBy(w.scroll);
+                w.scroll = 0;
+                w.dirty = true;
+            }
+        }
         if (code == 15) {
-            self.show_registers = !self.show_registers;
+            session.language_tabs.cycle();
             w.dirty = true;
         }
-        if (click and !self.show_registers and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
-            self.selected_local = @intFromFloat((w.pointer_y - 135) / 48);
+        if (click and session.language_tabs.selected == .native and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
+            self.selected_local = @intFromFloat((w.pointer_y - self.language_panel.content_y) / 48);
             w.dirty = true;
         }
-        if (code == 17 and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
+        if (code == 17 and @intFromEnum(session.language_tabs.selected) >= 2) {
+            self.status = "Language watches need proved local slots; this pane shows stack evidence";
+            return;
+        }
+        if (code == 17 and session.language_tabs.selected == .native and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
             if (self.last_generation != session.target.snapshot().generation) {
                 self.status = "StaleSnapshot";
                 return;
@@ -1216,6 +1247,7 @@ pub const Workspace = struct {
         if (click and !self.show_profile and w.pointer_x >= stack_x and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= stack_y and self.frames.len > 0) {
             self.browse_address = null;
             self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / 25)));
+            self.selectNative(session);
             w.dirty = true;
         }
         if (code == 66) self.toggleAgentScope(session); // F8 or the Agent button.
@@ -1286,6 +1318,7 @@ pub const Workspace = struct {
         self.source_line = std.math.clamp(self.source_line + w.scroll, 0, @max(0, self.source_lines - 1));
         w.scroll = 0;
         if (session.target.snapshot().thread_count > 0) self.selected %= session.target.snapshot().thread_count else self.selected = 0;
+        if (code == 36 or code == 37) self.selectNative(session);
     }
     /// Performs a setup-panel action. Start goes through the same path as P.
     fn applySetup(self: *Workspace, w: *Window, session: *Session, action: capture_panel.Action) void {
@@ -1397,7 +1430,27 @@ pub const Workspace = struct {
         defer source.scratch.deinit();
         self.watch.refresh(&source);
     }
+    fn selectNative(self: *Workspace, session: *Session) void {
+        if (self.selected >= session.target.snapshot().thread_count or session.target.snapshot().state != .stopped) return;
+        const tid = session.target.threadSlice()[self.selected].tid;
+        @import("../model/language_selection.zig").selectNative(session, tid, self.selected_frame) catch |err| {
+            self.status = @errorName(err);
+        };
+    }
     fn refresh(self: *Workspace, session: *Session) void {
+        session.language_tabs.enabled = true;
+        session.language_tabs.syncSelection(session.target.snapshot().generation);
+        if (self.last_language_revision != session.language_tabs.revision) {
+            self.last_language_revision = session.language_tabs.revision;
+            if (session.language_tabs.native_selection) |selected| {
+                for (session.target.threadSlice(), 0..) |thread, index| {
+                    if (thread.tid != selected.tid) continue;
+                    self.selected = index;
+                    self.selected_frame = selected.frame;
+                    break;
+                }
+            }
+        }
         // Live displays use the selected frame after this refresh clamps it.
         defer self.refreshWatch(session);
         const busy = session.allocations.preparing();
@@ -1420,7 +1473,9 @@ pub const Workspace = struct {
         }
         const tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
         if (self.last_metadata_revision == session.metadata.revision and self.last_generation == session.target.snapshot().generation and self.last_tid == tid and self.last_frame == self.selected_frame and self.last_browse == self.browse_address and self.last_show_flow == self.show_flow) return;
-        if (self.last_generation != session.target.snapshot().generation) self.browse_address = null;
+        if (self.last_generation != session.target.snapshot().generation) {
+            self.browse_address = null;
+        }
         self.last_browse = self.browse_address;
         self.last_show_flow = self.show_flow;
         if (self.last_tid != tid) self.stale_regs = null else if (self.regs) |regs| self.stale_regs = regs;
@@ -1463,6 +1518,13 @@ pub const Workspace = struct {
         self.frames = session.stack(a, tid, 64) catch &.{};
         if (self.frames.len > 0) {
             self.selected_frame = @min(self.selected_frame, self.frames.len - 1);
+            // Publish the freshly displayed default frame too; its index does
+            // not inherit a logical activation's identity from the old stop.
+            if (session.language_tabs.native_selection == null and session.language_tabs.logical_selection == null) {
+                session.language_tabs.native_selection = .{ .generation = session.target.snapshot().generation, .tid = tid, .frame = self.selected_frame };
+                session.language_tabs.revision +%= 1;
+                self.last_language_revision = session.language_tabs.revision;
+            }
             if (self.frames[self.selected_frame].source) |site| {
                 self.loadSite(session, site) catch |err| {
                     self.status = if (err == error.SourceAgentNeedsUpdating) "Source: agent needs updating" else @errorName(err);
@@ -1675,7 +1737,7 @@ pub const Workspace = struct {
             try style.button(r, font, .{ .x = b.x, .y = 50, .w = b.w, .h = 29 }, label_text, b.key, color, if (live) self.hot[i] else 0, self.pressed[i]);
         }
         _ = try style.chip(r, font, 822, 54, "TAB", theme.weak);
-        try r.text(font, 872, 55, if (self.show_registers) "locals" else "regs", theme.weak);
+        try r.text(font, 872, 55, "panes", theme.weak);
         const left = @round(width * self.split);
         const right = @round(width * 0.79);
         const bottom = if (self.show_profile) @round(height * profile_split) else self.bottomY(height);
@@ -1776,11 +1838,12 @@ pub const Workspace = struct {
                 }
             }
             const side = gpu.Rect{ .x = right + 2, .y = body_y, .w = width - right - 10, .h = bottom - body_y - 5 };
-            if (!self.show_registers) {
-                try pane(r, font, side, "LOCALS", "TAB registers");
-                if (self.local_diagnostic) |diagnostic| try r.text(font, right + 14, body_y + 48, diagnostic, theme.weak);
+            try self.language_panel.header(r, font, side, &session.language_tabs);
+            const content_y = self.language_panel.content_y;
+            if (session.language_tabs.selected == .native) {
+                if (self.local_diagnostic) |diagnostic| try r.text(font, right + 14, content_y + 4, diagnostic, theme.weak);
                 for (self.locals, 0..) |local, i| {
-                    const y = body_y + 44 + @as(f32, @floatFromInt(i)) * 48;
+                    const y = content_y + @as(f32, @floatFromInt(i)) * 48;
                     if (y + 40 > bottom - 10) break;
                     if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = 47 }, 6, 1);
                     try r.textFit(font, right + 14, y, side.w - 24, local.name, theme.neutral);
@@ -1789,12 +1852,13 @@ pub const Workspace = struct {
                     try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, if (advisory) "extent unproved" else local.value.type, theme.weak);
                     try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
                 }
-            } else {
+            } else if (session.language_tabs.selected == .registers) {
                 const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
-                try pane(r, font, side, "REGISTERS", if (restart_slot) "r0 is the kernel restart slot" else "changed since last stop");
+                const register_y = content_y + @as(f32, if (restart_slot) 23 else 0);
+                if (restart_slot) try r.textFit(font, right + 14, content_y, side.w - 24, "r0 is the kernel restart slot", theme.weak);
                 if (self.regs) |regs| {
                     for (regs.descriptions(), 0..) |desc, i| {
-                        const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
+                        const y = register_y + @as(f32, @floatFromInt(i)) * 23;
                         const value = regs.value(desc) catch null;
                         const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
                         const changed = value != null and previous != null and value.? != previous.?;
@@ -1810,7 +1874,10 @@ pub const Workspace = struct {
                             try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
                         } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
                     }
-                } else try r.text(font, right + 14, body_y + 55, "No stopped thread", theme.weak);
+                } else try r.text(font, right + 14, content_y + 10, "No stopped thread", theme.weak);
+            } else {
+                const language_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
+                try self.language_panel.body(r, font, side, session, language_tid, self.selected_frame);
             }
         }
         if (self.show_profile) {
@@ -1832,7 +1899,13 @@ pub const Workspace = struct {
         const pending_metadata: ?@import("../model/debug_metadata.zig").JobStatus = for (metadata.items[0..metadata.count]) |job| {
             if (!std.mem.eql(u8, job.state, "ready") and !std.mem.eql(u8, job.state, "failed") and !std.mem.eql(u8, job.state, "cancelled")) break job;
         } else null;
-        if (session.frames.attachment.failure) |err| {
+        if (self.fd_event_state != .inactive) {
+            const message = if (self.fd_event_state == .active)
+                (if (width >= 1100) "Exact FD capture ACTIVE: exact mode slows all syscalls on this machine by roughly 10 % while active" else "Exact FD capture ACTIVE: all host syscalls roughly 10 % slower")
+            else
+                "Exact FD capture requested: all host syscalls roughly 10 % slower while active";
+            try fit(r, font, 16, height - 23, width - 32, theme.warm, "{s}", .{message});
+        } else if (session.frames.attachment.failure) |err| {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ @tagName(session.frames.attachment.state), @errorName(err) });
         } else if (pending_metadata) |job| {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
@@ -1845,7 +1918,7 @@ pub const Workspace = struct {
         } else {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.snapshot().generation });
         }
-        if (width >= 900) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
+        if (width >= 900 and self.fd_event_state == .inactive) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
         try self.probes_panel.draw(r, font, width, height, session);
         const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
@@ -2182,6 +2255,8 @@ test "queued frame selection refreshes locals before starting a watch" {
     w.input.count = 3;
     workspace.input(&w, &session);
     try std.testing.expectEqual(@as(usize, 1), workspace.selected_frame);
+    try std.testing.expectEqual(@as(usize, 1), session.language_tabs.native_selection.?.frame);
+    try std.testing.expectEqual(session.target.snapshot().generation, session.language_tabs.native_selection.?.generation);
     try std.testing.expectEqual(@as(usize, 1), session.investigations.items.len);
     try std.testing.expectEqualStrings(workspace.locals[0].name, session.investigations.items[0].expression);
 }

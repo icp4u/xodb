@@ -19,8 +19,9 @@ static struct xcp_entry *acquire(int dir, unsigned n) {
     return entry;
 }
 static void concurrent(int dir) {
-    /* Both children start together and retain their acquired slots until the
-     * parent has received both results: success requires distinct leases. */
+    /* Both children start together and retain successes until both report.
+     * A bounded acquire may decline caching; it must return no entry, and any
+     * simultaneous successes must own distinct slots. */
     for (unsigned round = 0; round < 8; ++round) {
         int start[2], result[2], release[2];
         assert(!pipe(start) && !pipe(result) && !pipe(release));
@@ -35,18 +36,28 @@ static void concurrent(int dir) {
                 struct xbo_identity id = identity(100 + round * 2 + n);
                 unsigned char build[2] = {2, (unsigned char)n};
                 enum xbo_status status = xcp_acquire(dir, &id, build, sizeof build, &entry);
-                assert(write(result[1], &status, sizeof status) == sizeof status);
+                struct { enum xbo_status status; dev_t device; ino_t inode; } reply = { .status = status };
+                assert((status == XBO_OK && entry) || (status == XBO_AGAIN && !entry));
+                if (entry) {
+                    struct stat st;
+                    assert(!fstat(xcp_range_fd(entry), &st));
+                    reply.device = st.st_dev; reply.inode = st.st_ino;
+                }
+                assert(write(result[1], &reply, sizeof reply) == sizeof reply);
                 assert(read(release[0], &byte, 1) == 1);
                 xcp_release(entry);
-                _exit(status == XBO_OK ? 0 : 1);
+                _exit(0);
             }
         }
         close(start[0]); close(result[1]); close(release[0]);
         assert(write(start[1], "go", 2) == 2); close(start[1]);
+        struct { enum xbo_status status; dev_t device; ino_t inode; } replies[2];
         for (unsigned n = 0; n < 2; ++n) {
-            enum xbo_status status;
-            assert(read(result[0], &status, sizeof status) == sizeof status && status == XBO_OK);
+            assert(read(result[0], &replies[n], sizeof replies[n]) == sizeof replies[n]);
+            assert(replies[n].status == XBO_OK || replies[n].status == XBO_AGAIN);
         }
+        if (replies[0].status == XBO_OK && replies[1].status == XBO_OK)
+            assert(replies[0].device != replies[1].device || replies[0].inode != replies[1].inode);
         close(result[0]); assert(write(release[1], "go", 2) == 2); close(release[1]);
         for (unsigned n = 0; n < 2; ++n) {
             int status;

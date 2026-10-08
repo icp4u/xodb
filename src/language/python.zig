@@ -416,3 +416,10 @@ test "version text, code kinds and object heads" {
     const other = eval.Type{ .name = "pair", .kind = .structure, .size = 16, .fields = &.{ .{ .name = "a", .offset = 0, .type = &eval.int_type }, .{ .name = "ob_type", .offset = 0, .type = &pointer } } };
     try std.testing.expect(objectHead(&head, 0) and objectHead(&list, 0) and !objectHead(&other, 0));
 }
+
+/// Runtime identity and proof from the existing stopped-memory reader.
+pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    const layout = try profile(session, try runtimeModule(session));
+    const runtime = try runtimeOf(a, layout);
+    return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = runtime.layout };
+}

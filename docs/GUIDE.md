@@ -10,6 +10,7 @@ detailed docs. If you just want to try something, jump to
 | --- | --- | --- |
 | See what is using the machine | **System overview** (`--overview`) | Live CPU, memory, disk, network and processes; unknown values show reasons. **L** opens files, **F** profiles, **Enter** attaches after a cost/access confirmation. `--session-socket PATH` shares the same cache with observer-only MCP clients. |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
+| Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a value | **Watchpoint investigation** (**W** on a field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
@@ -19,6 +20,8 @@ detailed docs. If you just want to try something, jump to
 | Check whether a change made a function faster | **Repeated experiment** (`tools/experiments/run.py`) | Baseline vs changed vs unchanged control, several runs each, with honest spread ([details](OBSERVATION_EXPERIMENTS.md)) |
 | Let an AI agent help | **MCP** (`--mcp` or `--session-socket`) | The same tools for an agent; you keep **F8** to take back control |
 | See which files are being read, written, leaked or held after deletion, right now | **lsof-top** (`xodb --lsof-top`, a terminal view) | Top files by bytes/s, processes by fd churn and growth, leak watch, deleted-but-open files and live per-process fd tables, from unprivileged `/proc` polling ([details](LSOF_TOP.md)) |
+| Explore open files visually | **Files & IO** (`xodb --overview --panel files`) | Churn heatmap, seekable progress, fd-growth sparklines and deleted holders. **L** drills in from Processes; exact events require explicit host-cost confirmation ([details](OVERVIEW.md#files-and-exact-events)) |
+| Ask which process holds a file, or count one process's descriptor IO | **FD observers over MCP** (`get_fd_activity`, `who_has_open`, `get_fd_leaks`, `get_deleted_open`) | Shared cached polling; exact events require explicit control and slow host-wide syscalls while active. Coverage, age, loss and cost accompany the data ([details](MCP_FD.md)) |
 | Ask "what feeds this value?" or "what controls this call?" | **Static slice** (**S** on an instruction or source line; `slice_value` over MCP) | The parameters, values and branches that can reach it, with instruction and source citations and a trust label. Static possibilities, not an observed run ([details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 
 ## What is an observation?
@@ -80,6 +83,29 @@ interpreter you can:
 - read its internal structures by name;
 - observe its native calls, e.g. how long each `sort` or array iteration takes.
 
+The right pane starts with **Regs** and **C/C++** (native locals). Once a
+stopped-memory reader verifies a runtime, its tab appears. **Tab** cycles the
+visible tabs; clicking a tab selects it. The version and layout proof appear
+above that runtime's logical stack, including explicit reasons when the stop
+has no proved language frame. Selection survives stops and stays local to each
+debugged process. `get_language_tabs` reads this state; a controller holding the
+shared-session lease uses `select_language_tab` with `generation` and `tab`.
+Tab selection does not change registers or resume the target.
+
+Click a logical frame to highlight its proved native **segment** anchor, or click
+a native frame to offer matching language segments. A segment link does not
+prove a one-to-one pairing of every script activation and native frame. Rows
+without a proved anchor stay partial and leave the native selection alone.
+Distinct coroutine segments remain separate. Frame selections are scoped to
+the retained stop; a new stop clears them while keeping the chosen tab.
+`select_native_frame` and `select_language_frame` expose the same selection to
+MCP controllers. Observer clients read it with `get_language_tabs`.
+
+Try `scripts/demo-lua`, press **Space**, then **Tab** to reach **Lua**.
+For JavaScript, run `scripts/demo-node`, press **Space**, then **Tab** to **JS**.
+These tabs currently present stack evidence. Named script locals and runtime-aware
+watches are separate work; **E** still evaluates native C/C++ expressions.
+
 What you see is the interpreter's own C code, plus, for Perl, CPython and V8, the
 script level:
 
@@ -131,6 +157,7 @@ Logical stacks for Python, Ruby and the JVM are arriving as imports; see
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Live open files | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --lsof-top --redact --pid PIDS` | **1** files advancing, **3** the leaker growing, **4** the deleted file's pinned bytes, **Enter** on any row to drill in |
+| Visual file activity | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --overview --panel files --redact` | Watch churn and offset progress, use **[ ]** for Leak watch and Deleted, **Enter** to scope a process. **E** explains exact capture cost before starting |
 | Agent and human together | `xodb --session-socket ~/tmp/xs/s -- ./prog` | an agent drives; **F8** takes control back ([details](SHARED_SESSIONS.md)) |
 | Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Assembly is shown when xodb was built with `-Dcapstone=vendored` after `scripts/build-capstone`; with the default system Capstone, MCP `disassemble` reports `DisassemblerUnavailable` and the assembly pane stays empty. Instruction step and hardware watches report unsupported. Remove the breakpoint before continuing |
 

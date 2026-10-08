@@ -76,7 +76,7 @@ cache_home.chmod(0o775)
 run('managed-group-cache', fixture, cache='@')
 cache_home.chmod(0o700)
 busy = w / 'busy'
-private = busy / 'xodb-debug-v1'
+private = busy / 'xodb-debug-v2'
 private.mkdir(mode=0o700, parents=True)
 leases = []
 try:
@@ -91,7 +91,7 @@ finally:
 recovery = w / 'recovery'
 recovery.mkdir(mode=0o700)
 run('index-recovery-cold', fixture, cache='@', cache_root=recovery)
-indexes = [p for p in (recovery / 'xodb-debug-v1').glob('*.names') if p.stat().st_size]
+indexes = [p for p in (recovery / 'xodb-debug-v2').glob('*.names') if p.stat().st_size]
 assert len(indexes) == 1, indexes
 index = indexes[0]
 hash_ = 5381

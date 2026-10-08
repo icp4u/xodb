@@ -7,6 +7,7 @@ struct xrt_perf_slot {
     uint8_t *map;
     size_t map_size;
     uint64_t tail;
+    uint32_t lost_read_mask; /* event read format is exactly PERF_FORMAT_LOST */
     bool owns_map;
 };
 struct xrt_perf {

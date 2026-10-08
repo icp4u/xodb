@@ -252,6 +252,7 @@ bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *a
             goto fail;
         }
         s->fds[s->thread.event_count++] = fd;
+        if (attr.read_format == PERF_FORMAT_LOST) s->lost_read_mask |= UINT32_C(1) << i;
         call = "ioctl";
         detail = "PERF_EVENT_IOC_ID";
         if (ioctl(fd, PERF_EVENT_IOC_ID, &s->thread.event_ids[i]))
@@ -291,6 +292,23 @@ fail:;
         f->opened_then_closed = opened;
     return false;
 }
+/* PERF_FORMAT_LOST counts failed ring reservations even before a later event
+ * can emit PERF_RECORD_LOST. Each FD has its own cumulative counter. */
+bool xrt_perf_read_lost(struct xrt_perf *p, size_t index, uint64_t *lost)
+{
+    if (!p || !lost || p->remote_target || index >= p->count) return false;
+    const struct xrt_perf_slot *s = &p->slots[index];
+    *lost = 0;
+    if (!s->thread.event_count) return false;
+    for (size_t i = 0; i < s->thread.event_count; ++i) {
+        if (!(s->lost_read_mask & (UINT32_C(1) << i)) || s->fds[i] < 0) return false;
+        uint64_t count[2]; /* value, lost; no GROUP, ID or time fields */
+        if (read(s->fds[i], count, sizeof count) != sizeof count) return false;
+        *lost = UINT64_MAX - *lost < count[1] ? UINT64_MAX : *lost + count[1];
+    }
+    return true;
+}
+
 bool xrt_perf_stop(struct xrt_perf *p, struct xrt_perf_failure *f)
 {
     if (p->remote_target)

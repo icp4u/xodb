@@ -11,6 +11,7 @@ from pathlib import Path
 import select
 import subprocess
 import time
+from helpers.language_selection import check as check_selection
 
 root = Path(__file__).resolve().parent.parent
 os.chdir(root)
@@ -54,6 +55,8 @@ for mode,expression,keys,expected in [('array','val',[47,30,38],'undef ('),('val
         for key in keys: sequence.extend(['tap',key])
         sequence.extend(['tap',28]);d.keys(*sequence)
         time.sleep(.3);d.shot(mode+'-watch')
+        selection = check_selection(d, target.pid, 'perl', 'perl-linked')
+        (Path(d.dir)/'language-selection.json').write_text(json.dumps(selection, indent=2)+'\n')
         assert d.tool('get_registers',tid=target.pid)==regs and d.session()['generation']==snap['generation']
         d.keys('tap',66)
         assert d.wait(lambda s:s['agent_scope']=='observe')

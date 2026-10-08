@@ -68,9 +68,13 @@ marker either way.
 | Bytes per file | forward movement of `fdinfo` `pos` | Seekable files only; pread/pwrite and mmap IO do not move it; direction is inferred from the access mode |
 | Deleted files | `st_nlink == 0` through the fd | Size and blocks of the held inode |
 
-Exact per-fd byte counts and every open/close need syscall tracepoints; that
-event source fills the same records later. The fd table, kinds and deleted
-sizes match `lsof` on the test fixtures.
+The [MCP FD observers](MCP_FD.md) add optional syscall-return byte counts for
+one explicit process identity, started only through a control action with a
+host-wide syscall-cost acknowledgement. Observer reads cannot enable tracing.
+Their event rows keep fd-number history separate
+from current polling paths, because numbers can be closed and reused. The
+terminal view continues to use polling. Its fd table, kinds and deleted sizes
+match `lsof` on the test fixtures.
 
 ## Snapshots and JSON
 

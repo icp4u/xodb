@@ -251,6 +251,12 @@ static void synthetic(void)
         fake_process(pid, "many", 0x400100, 1, 0);
         fake_fd(pid, 0, "pipe:[1]", NULL);
     }
+    /* The directory listing is bounded too, with omitted pids reported. */
+    struct xrt_fdscan_options capped = { .include_self = 1, .proc = root, .max_processes = 2 };
+    CHECK(xrt_fdscan_create(&capped, &s) == XRT_OK);
+    CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);
+    CHECK(v.process_count <= 2 && v.unseen_count <= 2 && v.dropped_processes >= 3001);
+    xrt_fdscan_destroy(s);
     struct xrt_fdscan_options budget = { .include_self = 1, .proc = root };
     CHECK(xrt_fdscan_create(&budget, &s) == XRT_OK);
     CHECK(xrt_fdscan_poll(s, &v) == XRT_OK);

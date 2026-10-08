@@ -307,3 +307,10 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
     try session.target.expectGeneration(generation);
     return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null), .native_argument_diagnostics = try diagnostics.toOwnedSlice(a) };
 }
+
+/// Runtime identity and proof from the existing stopped-memory reader.
+pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    const module = try runtimeModule(session);
+    const layout = try profile(session, module);
+    return .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
+}
