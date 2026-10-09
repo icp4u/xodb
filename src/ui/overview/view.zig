@@ -1513,3 +1513,45 @@ test "queued search and actions cannot use a filtered-out process identity" {
     v.requestAction(.files, 6);
     try std.testing.expectEqual(999, v.pending_action.?.id.pid);
 }
+
+test "every panel draws through a resize from 0x0 to half screen with the pointer anywhere" {
+    const a = std.testing.allocator;
+    const font = try a.create(Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.init("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
+    defer font.deinit();
+    const buffer = try a.alignedAlloc(u8, .@"16", 8 * 1024 * 1024);
+    defer a.free(buffer);
+    var r = gpu.Renderer{};
+    r.mapped = buffer.ptr;
+    var v = try View.init(a);
+    defer v.deinit();
+    v.accept(try m.Owned.create(a), 1);
+    // A process map with cells, VMAs and a coverage value reaches every grid and bar.
+    const B: u64 = 2 << 20;
+    var cells: [300]memmap.md.Cell = undefined;
+    for (&cells, 0..) |*cell, i| cell.* = .{ .start = i * B, .end = (i + 1) * B, .vma = @intCast(i % 2), .mapped = B, .observed = B, .present = B, .huge = if (i % 3 == 0) B else 0 };
+    const vmas = [_]memmap.md.Vma{ .{ .start = 0, .end = 150 * B }, .{ .start = 150 * B, .end = 300 * B } };
+    const map = memmap.md.Map{ .process = .{ .pid = 7, .start_ticks = 1, .coverage_numerator = 1, .coverage_denominator = 3 }, .vmas = &vmas, .cells = &cells };
+    v.memmap.replay_current = &map;
+    var w = Window{};
+    const sizes = [_][2]u32{ .{ 0, 0 }, .{ 1, 1 }, .{ 40, 20 }, .{ 120, 60 }, .{ 300, 200 }, .{ 480, 540 }, .{ 700, 300 }, .{ 960, 1080 }, .{ 3000, 30 }, .{ 30, 2000 }, .{ 1, 1 } };
+    const pointers = [_][2]f32{ .{ -1, -1 }, .{ 0, 0 }, .{ 5, 5 }, .{ 300, 200 }, .{ 1e6, 1e6 }, .{ -1e6, 5 } };
+    for (std.enums.values(Panel)) |panel| {
+        v.panel = panel;
+        for (std.enums.values(memmap.Look)) |look| for ([_]bool{ false, true }) |compact| {
+            if (panel != .memory_map and (look != .win9x or compact)) continue;
+            v.memmap.look = look;
+            v.memmap.compact = compact;
+            for (sizes) |size| for (pointers) |pointer| {
+                w.width = size[0];
+                w.height = size[1];
+                v.pointer = pointer;
+                r.vertices = 0;
+                r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(size[0]), .h = @floatFromInt(size[1]) };
+                v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
+            };
+        };
+    }
+}

@@ -772,7 +772,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     try ctx.r.rect(.{ .x = table.x + 8, .y = table.y + 30, .w = table.w - 16, .h = 1 }, p.border);
     const row_h: f32 = 24;
     const body = Rect{ .x = table.x, .y = table.y + 34, .w = table.w, .h = table.h - 38 };
-    v.visible_rows = @max(1, @as(usize, @intFromFloat((body.h - 22) / row_h)));
+    v.visible_rows = @max(1, @as(usize, @intFromFloat(@max(0, (body.h - 22) / row_h))));
     const top = &v.scroll[@intFromEnum(vw.Panel.processes)];
     top.* = @min(top.*, v.rows.items.len -| v.visible_rows);
     if (v.rows.items.len == 0) {
@@ -1358,7 +1358,7 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
     const inner = try card(ctx, grid, "Sensors (hwmon)", "every input the kernel exposes");
     if (s.sensors.len == 0) return missing(v, ctx, inner.x, inner.y, inner.w, if (s.group(.power).status != .ok) s.group(.power).reason else "no hwmon sensors");
     const tw: f32 = if (inner.w > 1400) 260 else 230;
-    const cols: usize = @max(1, @as(usize, @intFromFloat((inner.w + 8) / (tw + 8))));
+    const cols: usize = @max(1, @as(usize, @intFromFloat(@max(0, (inner.w + 8) / (tw + 8)))));
     const sensor_rows = (s.sensors.len + cols - 1) / cols;
     const th: f32 = std.math.clamp((inner.h - 8 * @as(f32, @floatFromInt(sensor_rows - 1))) / @as(f32, @floatFromInt(sensor_rows)), 92, 170);
     const tile_w = (inner.w - 8 * @as(f32, @floatFromInt(cols - 1))) / @as(f32, @floatFromInt(cols));

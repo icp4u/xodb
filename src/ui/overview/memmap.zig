@@ -562,8 +562,8 @@ fn layoutGrid(area: Rect, count: usize, min_pitch: f32, max_pitch: f32) Grid {
         const rows = @ceil(@as(f32, @floatFromInt(@max(count, 1))) / cols);
         if (rows * p <= area.h) break;
     }
-    const cols: usize = @max(1, @as(usize, @intFromFloat(@floor(area.w / p))));
-    const visible: usize = @max(1, @as(usize, @intFromFloat(@floor(area.h / p))));
+    const cols: usize = @intFromFloat(@max(1, @floor(area.w / p)));
+    const visible: usize = @intFromFloat(@max(1, @floor(area.h / p)));
     return .{ .area = area, .cols = cols, .rows = (count + cols - 1) / cols, .visible = visible, .pitch = p, .count = count };
 }
 /// Height the grid needs at its pitch (all rows, or the area when it scrolls).
@@ -908,7 +908,7 @@ fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     switch (cov) {
         .value => |val| {
             const seg_w: f32 = 9;
-            const n_seg: usize = @intFromFloat(@floor((segs.w + 2) / (seg_w + 2)));
+            const n_seg: usize = @intFromFloat(@max(0, @floor((segs.w + 2) / (seg_w + 2))));
             const lit: usize = @intFromFloat(@round(val.fraction * @as(f64, @floatFromInt(n_seg))));
             for (0..lit) |k| try ctx.r.rect(.{ .x = segs.x + @as(f32, @floatFromInt(k)) * (seg_w + 2), .y = segs.y, .w = seg_w, .h = segs.h }, hex(0x000080));
         },
@@ -1180,7 +1180,7 @@ fn dosLook(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     // Cursor from the pointer, before composing.
     const mx = v.pointer[0] - ox;
     const my = v.pointer[1] - oy;
-    if (mx >= 0 and my >= 0) {
+    if (mx >= 0 and my >= 0 and cw > 0 and ch > 0) {
         const col: usize = @intFromFloat(mx / cw);
         const row: usize = @intFromFloat(my / ch);
         if (col >= dos.map_x and col < dos.map_x + dos.map_cols and row >= dos.map_y and row < dos.map_y + dos.map_rows and !s.picker_open and !s.legend) {
@@ -1403,7 +1403,7 @@ fn modernMain(v: *vw.View, ctx: Ctx, rect: Rect, main: Rect, now: u64) !void {
     if (cov == .value) {
         // Coverage is good when high: one colour, no heat ramp.
         const seg: f32 = 5;
-        const n_seg: usize = @intFromFloat(@floor((bar.w + 2) / (seg + 2)));
+        const n_seg: usize = @intFromFloat(@max(0, @floor((bar.w + 2) / (seg + 2))));
         const lit: usize = @intFromFloat(@round(cov.value.fraction * @as(f64, @floatFromInt(n_seg))));
         for (0..n_seg) |k| try ctx.r.rect(.{ .x = bar.x + @as(f32, @floatFromInt(k)) * (seg + 2), .y = bar.y, .w = seg, .h = bar.h }, if (k < lit) p.accent else fade(p.accent, p.ghost + 0.05));
     } else try ctx.hatch(bar);

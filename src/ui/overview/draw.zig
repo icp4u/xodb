@@ -277,7 +277,7 @@ pub const Ctx = struct {
         const v = value orelse return self.hatch(rect);
         const cell_w: f32 = if (rect.h >= 14) 5 else 4;
         const gap: f32 = 2;
-        const cells: usize = @max(1, @as(usize, @intFromFloat((rect.w + gap) / (cell_w + gap))));
+        const cells: usize = @max(1, @as(usize, @intFromFloat(@max(0, (rect.w + gap) / (cell_w + gap)))));
         const lit: usize = @intFromFloat(@round(std.math.clamp(v, 0, 1) * @as(f64, @floatFromInt(cells))));
         if (self.p.glow > 0 and lit > 0) {
             const w = @as(f32, @floatFromInt(lit)) * (cell_w + gap);
