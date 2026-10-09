@@ -9,7 +9,7 @@ a=p.parse_args()
 if sum((bool(a.node),bool(a.ruby),bool(a.python),bool(a.perl),bool(a.source or a.library)))!=1 or (not (a.node or a.python or a.perl or a.ruby) and not (a.source and a.library)):p.error('choose --node, --ruby, --python, --perl, or both --source and --library')
 if a.perl and not a.padwalker:p.error('--perl requires --padwalker')
 if (a.node or a.python or a.perl or a.ruby) and a.reuse:p.error('--reuse uses the Lua fixture')
-if a.paths and (not (a.source or a.python or a.perl) or a.reuse):p.error('--paths requires Perl, Python or Lua without --reuse')
+if a.paths and (not (a.source or a.python or a.perl or a.ruby) or a.reuse):p.error('--paths requires Ruby, Perl, Python or Lua without --reuse')
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
 w=(a.work/'.work/input-lwatch').resolve();w.mkdir(parents=True,mode=0o755)
 fixture=w/'host';language='javascript' if a.node else 'ruby' if a.ruby else 'python' if a.python else 'perl' if a.perl else 'lua'
@@ -126,7 +126,7 @@ try:
                    'tap',35,'tap',30,'tap',31,'tap',35,'down',42,'tap',26,'up',42,
                    'tap',31,'tap',46,'tap',24,'tap',19,'tap',18,'down',42,'tap',27,'up',42,'tap',28)
         else:
-            keys=(19,24,24,20,26,40,25,38,30,21,18,19,40,27,26,40,31,46,24,19,18,40,27) if a.python else (24,48,36,18,46,20,52,30)
+            keys=(23,20,18,50,31,26,11,27) if a.ruby else (19,24,24,20,26,40,25,38,30,21,18,19,40,27,26,40,31,46,24,19,18,40,27) if a.python else (24,48,36,18,46,20,52,30)
             d.keys('down',42,'tap',18,'up',42,*[value for key in keys for value in ('tap',key)],'tap',28)
     else:
         d.keys('down',42,'tap',18,'up',42,*(['down',42,'tap',5,'up',42] if a.perl else []),'tap',45,'tap',28)
@@ -140,10 +140,10 @@ try:
             rows=d.tool('get_language_watches')['watches']
             if len(rows)==2:break
             assert time.monotonic()<deadline,rows;time.sleep(.02)
-        assert rows[1]['selector']=='expression' and rows[1]['expression']==(("$hash{score}" if a.perl else "root['player']['score']" if a.python else 'object.a') if a.paths else binding_name),rows
+        assert rows[1]['selector']=='expression' and rows[1]['expression']==(("items[0]" if a.ruby else "$hash{score}" if a.perl else "root['player']['score']" if a.python else 'object.a') if a.paths else binding_name),rows
     if a.paths:
         d.keys('click',850,639,'tap',27)
-        visible('watch-path',['hashscore' if a.perl else 'rootplayerscore' if a.python else 'objecta','expression'],(600,585,1272,764))
+        visible('watch-path',['items0' if a.ruby else 'hashscore' if a.perl else 'rootplayerscore' if a.python else 'objecta','expression'],(600,585,1272,764))
     assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
     d.keys('tap',57);assert d.wait(lambda s:s['generation']>generation and s['state']=='stopped' and any(t['reason']=='breakpoint' for t in s['threads']))
     json.loads(lines.get(timeout=10))

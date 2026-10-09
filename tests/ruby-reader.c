@@ -102,6 +102,15 @@ static void samples(void) {
  #undef SAMPLE
 }
 int main(void) {
+ const char *valid[]={"root","root[0]","root[2147483647]","root[\"score\"]","root['']","root[:symbol][1][\"name\"]"};
+ const char *invalid[]={"","root()","root.x","root[-1]","root[01]","root[2147483648]","root[f()]","root[\"#{x}\"]","root[:'x']","root[1,2]","root[0][0][0][0][0][0][0][0][0]"};
+ for(size_t i=0;i<sizeof valid/sizeof *valid;++i)assert(!xrb_expression_check(valid[i]));
+ for(size_t i=0;i<sizeof invalid/sizeof *invalid;++i) {
+   assert(xrb_expression_check(invalid[i]));
+   struct xrb_reader r={.read=rd};struct xrb_path_value out;
+   xrb_path_read(&p,&r,NULL,0,invalid[i],&out);
+   assert(out.reason && !out.address && !out.tagged && !r.reads);
+ }
  samples();
  struct xrb_value v=value(15);assert(!v.reason&&!strcmp(v.display,"7"));v=value(UINT64_MAX);assert(!strcmp(v.display,"-1"));
  v=value(4);assert(!strcmp(v.display,"nil"));v=value(0);assert(!strcmp(v.display,"false"));v=value(20);assert(!strcmp(v.display,"true"));

@@ -47,8 +47,8 @@ def audit(client, target, args):
             client.inspect('get_language_locals',**args)
             value = client.inspect('evaluate_language_expression',**args,expression='seed')
             assert value['diagnostic'] is None and value['rows'][0]['value']['display']=='7', value
-            refusal = client.inspect('evaluate_language_expression',**args,expression='puts(1)')
-            assert refusal['diagnostic']=='RubyExpressionUnsupported' and not refusal['rows'], refusal
+            refusal = client.tool('evaluate_language_expression',**args,expression='puts(1)')['result']
+            assert refusal.get('isError') and refusal['content'][0]['text']=='UnsupportedRubyExpression', refusal
     finally:
         if tracer.poll() is None: tracer.send_signal(signal.SIGINT)
         tracer.wait(timeout=10)
@@ -97,8 +97,8 @@ for mode in ('plain','binding'):
    for name,value in wanted.items():
     found=client.inspect('evaluate_language_expression',expression=name,**args)
     assert found['diagnostic'] is None and len(found['rows'])==1 and plain(found['rows'][0])==value,found
-   denied=client.inspect('evaluate_language_expression',expression='puts(1)',**args)
-   assert denied['diagnostic']=='RubyExpressionUnsupported' and not denied['rows'],denied
+   denied=client.tool('evaluate_language_expression',expression='puts(1)',**args)['result']
+   assert denied.get('isError') and denied['content'][0]['text']=='UnsupportedRubyExpression',denied
    page=client.inspect('get_language_locals',start=1,limit=1,**args)
    if data['total']>1:assert page['rows'][0]==data['rows'][1],page
    assert client.inspect('get_registers',tid=target.pid)==regs and client.session()['generation']==generation

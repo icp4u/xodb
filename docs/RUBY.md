@@ -31,7 +31,7 @@ binding shadows an outer one; callers in the Ruby stack are separate activations
 Internal unnamed slots are marked hidden. Isolated environment boundaries,
 cycles, unreadable names and malformed bounds have explicit diagnostics.
 
-**E** accepts a bare ASCII local/capture name only. An unreadable inner name
+**E** accepts an ASCII local/capture name and the builtin container paths below. An unreadable inner name
 prevents lookup of a potentially shadowed outer binding. Calls, operators,
 constants, instance variables and method dispatch are unavailable; no Ruby code,
 `inspect`, coercions or getters run. A missing name is `RubyLocalNotFound`.
@@ -62,7 +62,8 @@ scripts/release-check all --ruby "$RUBY"
 ```
 
 The layout contract is derived from CRuby's `vm_core.h`, `iseq.c`, `symbol.c`,
-`symbol.h`, `darray.h`, `internal/numeric.h`, public value headers and `zjit.h` at
+`symbol.h`, `darray.h`, `internal/numeric.h`, `hash.c`, `internal/hash.h`,
+`internal/class.h`, `id_table.c`, `method.h`, public value headers and `zjit.h` at
 the revision above. DWARF also proves the succinct line-table implementation;
 without that proof, source lines remain unavailable.
 
@@ -111,7 +112,7 @@ Run `./scripts/demo-cruby`, press **Space**, open **Ruby** and select **tick**.
 Press **Shift+E**, enter `round`, then **Return**. Continue with **Space** and
 open **V** to see the current and previous complete samples. Alternatively click
 a named local and press **W** to retain that declaration; **Delete** removes the
-selected runtime watch. Ordinary **E** reads a name at the current stop.
+selected runtime watch. Ordinary **E** reads an expression at the current stop.
 
 Ruby watches compare small integers, floats, nil, booleans, and complete strings
 up to 4095 bytes plus their inline encoding index. String tails beyond the
@@ -133,3 +134,72 @@ Ruby code, getters, coercions or comparison methods.
 The exact supported revision supplies the encoding-bit rule; its names are not
 present in the runtime-owned DWARF units. The live component oracle compares
 this rule and scalar samples with the matching Ruby headers' public macros.
+
+## Builtin container paths
+
+Try `./scripts/demo-cruby`: press **Space**, choose **Ruby**, select **tick**,
+then **Shift+E**, enter `values[0]`, **Return**, and **V**. Continue with **Space**
+to compare that element at each stop. **E** reads the same expression once.
+
+Paths start with a local/capture name and follow Array slots or Hash entries:
+`items[0]`, `player["score"]`, `player[:score]`, or `state["players"][0][:score]`.
+The initial syntax accepts decimal nonnegative indices/Integer keys through
+2147483647, quoted printable ASCII String keys without escapes/interpolation,
+and `:identifier` Symbol keys. It allows eight subscriptions and 128 expression
+bytes. Calls, slicing, operators, negative indices and other syntax fail at add
+or evaluation time with `UnsupportedRubyExpression`.
+
+The C reader resolves the root and every intermediate container again at each
+stop, including after root replacement or compacting GC. Arrays use a single
+slot read. Hashes scan at most 512 stored entries, including deleted positions;
+the runtime's compact and st_table representations are supported. Every stored
+key hash or hint is checked against the runtime hash seed and supported key
+representation before a value or missing-key reason is returned. A mismatch is
+`RubyPathHashUnproved`. Missing keys and out-of-range indices remain unavailable
+and can recover at the next stop; they are never invented nil samples.
+
+Only exact builtin containers and supported String, Symbol or small Integer
+keys are inspected. Subclasses, singleton overrides, custom `[]`/`hash`/`eql?`,
+refined/prepended methods, unproved box-specific method tables, identity hashes,
+default procs/non-nil defaults and unsupported keys have explicit refusals.
+Method pointers and tables are checked in stopped memory; no Ruby methods run.
+The resulting scalar uses the complete-byte watch rules above, and the
+activation-lifetime caveat remains visible.
+
+```sh
+python3 -B tests/ruby-path-component.py --ruby "$RUBY" --sanitize --work .work/ruby-path-component
+python3 -B tests/ruby-path-watches.py --ruby "$RUBY" --strace --work .work/ruby-paths
+python3 -B tests/ruby-path-watches.py --ruby "$RUBY" --strace --agent zig-out/bin/xodb-agent --work .work/ruby-paths-agent
+```
+
+## Rails demo
+
+`scripts/demo-rails` runs `examples/rails-demo.rb`: ActiveModel `Order` and
+`LineItem` models with attributes, validations, `ActiveModel::Dirty`, a
+`Concern`, inflections, time helpers, `with_indifferent_access`,
+`in_groups_of` and `ActiveSupport::Notifications`, checked out in a loop. It
+stops in `rb_int_digits`, called by the order's Luhn validation inside
+`valid?`. No gems are committed. Install activemodel (which brings
+activesupport) for the supported debug interpreter into any directory, once:
+
+```sh
+"$RUBY" -S gem install --no-document -i "$XODB_RAILS_GEMS" activemodel
+XODB_RAILS_GEMS="$XODB_RAILS_GEMS" ./scripts/demo-rails
+```
+
+The script only reads `XODB_RAILS_GEMS`: it is put on `GEM_PATH`, and
+`GEM_HOME` is an empty per-run temporary directory, so another local user can
+share a read-only install. Without the variable, or without activemodel in it,
+the script prints the install command and exits.
+
+Press **Space**, **Tab** to **Ruby** and click **checkout!**. The frames show
+`valid?` at `validations.rb:367`, `run_validations!` and the
+`ActiveSupport::Callbacks` blocks between them. Named locals include `round`,
+`items`, `total`, `attrs` and `params`; **E** `attrs` previews the Hash with
+its Symbol keys. `params` is a `HashWithIndifferentAccess`, a Hash subclass,
+so it reports `RubyPreviewContainerClassUnsupported` instead of guessing.
+**Shift+E** `attrs[:line_items][0][:price]`, then **Space**, shows the
+price change at each stop. On **<main>**, **Shift+E** `errors[0]` is
+`RubyPathIndexOutOfRange` until an order fails its checksum.
+Frame labels are the instruction-sequence labels (`valid?`, not
+`ActiveModel::Validations#valid?`); C methods appear as `<cfunc>`.

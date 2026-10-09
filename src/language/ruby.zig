@@ -194,7 +194,37 @@ fn recoveredEc(session: *model.Session, a: A, frame: model.Frame) !u64 {
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
     return bindings(session, a, tid, segment, frame, start, limit, null);
 }
+fn checkedExpression(a: A, text: []const u8) ![:0]const u8 {
+    if (text.len == 0 or text.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, text, 0) != null) return error.UnsupportedRubyExpression;
+    const query = try a.dupeZ(u8, text);
+    if (c.xrb_expression_check(query) != null) return error.UnsupportedRubyExpression;
+    return query;
+}
+fn pathContext(module: *Module, expression: []const u8) !c.struct_xrb_path_context {
+    var context = std.mem.zeroes(c.struct_xrb_path_context);
+    context.symbols = try globalAddress(module, "ruby_global_symbols");
+    if (std.mem.indexOfScalar(u8, expression, '[') == null) return context;
+    inline for (.{
+        .{ "hash_salt", "hash_salt" },
+        .{ "hash_class", "rb_cHash" },
+        .{ "array_class", "rb_cArray" },
+        .{ "string_class", "rb_cString" },
+        .{ "integer_class", "rb_cInteger" },
+        .{ "symbol_class", "rb_cSymbol" },
+        .{ "hash_aref", "rb_hash_aref" },
+        .{ "array_aref", "rb_ary_aref" },
+        .{ "string_hash", "rb_str_hash_m" },
+        .{ "string_eql", "rb_str_eql" },
+        .{ "object_hash", "rb_obj_hash" },
+        .{ "object_eql", "rb_obj_equal" },
+        .{ "numeric_eql", "num_eql" },
+        .{ "any_hash", "rb_any_hash" },
+        .{ "any_cmp", "rb_any_cmp" },
+    }) |entry| @field(context, entry[0]) = try globalAddress(module, entry[1]);
+    return context;
+}
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !named.Result {
+    _ = try checkedExpression(a, expression);
     return bindings(session, a, tid, segment, frame, 0, 1, expression);
 }
 fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !named.Result {
@@ -209,7 +239,10 @@ fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame
     const ec = try std.fmt.parseInt(u64, segment.runtime_instance.address, 0);
     const zjit = try zjitEntry(session, module);
     const symbols = try globalAddress(module, "ruby_global_symbols");
-    if (expression) |text| c.xrb_local_find(layout, &r, ec, zjit, symbols, frame, try a.dupeZ(u8, text), raw) else c.xrb_locals_read(layout, &r, ec, zjit, symbols, frame, start, limit, raw);
+    if (expression) |text| {
+        const context = try pathContext(module, text);
+        c.xrb_expression_find(layout, &r, &context, ec, zjit, frame, try a.dupeZ(u8, text), raw);
+    } else c.xrb_locals_read(layout, &r, ec, zjit, symbols, frame, start, limit, raw);
     const rows = try a.alloc(named.Row, raw.count);
     for (raw.items[0..raw.count], rows) |item, *out| out.* = .{
         .name = try a.dupe(u8, std.mem.sliceTo(&item.name, 0)),
@@ -246,7 +279,10 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
         c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, ordinal, 1, raw);
     } else if (capture.scope.frame[2] != 0) {
         c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, @intCast(capture.scope.frame[3]), 1, raw);
-    } else c.xrb_local_find(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, capture.expression, raw);
+    } else {
+        const context = try pathContext(module, capture.expression);
+        c.xrb_expression_find(layout, &r, &context, capture.scope.runtime[1], zjit, frame, capture.expression, raw);
+    }
     if (raw.reason != null or raw.count != 1) {
         capture.diagnostic = try a.dupeZ(u8, if (raw.reason != null) std.mem.span(raw.reason) else "RubyWatchBindingUnavailable");
         return;
@@ -276,7 +312,9 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
-    if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
+    if (expression) |query| {
+        _ = try checkedExpression(a, query);
+    }
     if (row) |index| if (index >= 4096) return error.InvalidArguments;
     const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;

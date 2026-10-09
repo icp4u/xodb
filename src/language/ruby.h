@@ -81,6 +81,20 @@ void xrb_locals_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec
 void xrb_local_find(const struct xrb_layout *, struct xrb_reader *, uint64_t ec,
                     uint64_t zjit_entry, uint64_t symbols, size_t frame,
                     const char *expression, struct xrb_locals *);
+/* Addresses are resolved only in the verified loaded Ruby image. Class entries
+ * are addresses of VALUE globals, not cached object values. */
+struct xrb_path_context {
+    uint64_t symbols, hash_salt;
+    uint64_t hash_class, array_class, string_class, integer_class, symbol_class;
+    uint64_t hash_aref, array_aref, string_hash, string_eql, object_hash, object_eql, numeric_eql;
+    uint64_t any_hash, any_cmp;
+};
+struct xrb_path_value { uint64_t tagged, address; const char *reason; };
+const char *xrb_expression_check(const char *);
+void xrb_path_read(const struct xrb_layout *, struct xrb_reader *, const struct xrb_path_context *,
+                   uint64_t root, const char *, struct xrb_path_value *);
+void xrb_expression_find(const struct xrb_layout *, struct xrb_reader *, const struct xrb_path_context *,
+                         uint64_t ec, uint64_t zjit, size_t frame, const char *, struct xrb_locals *);
 /* Complete scalar bytes, separate from the bounded display preview. Strings
  * include their inline encoding index; extended encodings and object previews
  * are unavailable, never compared as complete values. */

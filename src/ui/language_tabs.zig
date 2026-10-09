@@ -72,13 +72,24 @@ pub const Panel = struct {
     pub fn syncEditor(self: *Panel, session: *Session) void {
         if (!self.editor.open) return;
         const selected = selectedKey(session);
-        if (!named.supported(session.language_tabs.selected) or selected == null or self.editor_key == null or !std.meta.eql(selected.?, self.editor_key.?)) self.editor.open = false;
+        if (!named.supported(session.language_tabs.selected)) {
+            self.editor.open = false;
+        } else if (self.editor_key == null) {
+            // E before a frame is chosen (or after a stop dropped it) still
+            // owns the keyboard, so typed text never reaches global keys.
+            // The first frame the user then selects binds the field.
+            if (selected != null) {
+                self.editor_key = selected;
+                self.editor.message = "";
+            }
+        } else if (selected == null or !std.meta.eql(selected.?, self.editor_key.?)) self.editor.open = false;
     }
     pub fn beginExpression(self: *Panel, session: *Session) !void {
         if (!named.supported(session.language_tabs.selected)) return error.LanguageLocalsUnavailable;
-        self.editor_key = selectedKey(session) orelse return error.SelectLanguageFrame;
+        self.editor_key = selectedKey(session);
         self.editor_watch = false;
         self.editor.start();
+        if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
     }
     pub fn submitExpression(self: *Panel, session: *Session, text: []const u8) !void {
         const selected = selectedKey(session) orelse return error.SelectLanguageFrame;

@@ -18,8 +18,9 @@ def deeper(n, b)
 end
 def watched
   x=7;word='x'*512;fraction=3.5;truth=true;empty=nil;object=[];large=2**100
+  items=[7]
   mark('initial',{x:x,word:word,fraction:fraction,truth:truth,empty:empty,object:object,large:large})
-  x=8;word.setbyte(511,121)
+  x=8;items[0]=8;word.setbyte(511,121)
   b=binding
   mark('changed',from_binding(b))
   word=word.dup

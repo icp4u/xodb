@@ -2,7 +2,7 @@
 #include <dwarf.h>
 #include <gelf.h>
 #include <string.h>
-enum kind { INTEGER, SIGNED, UNSIGNED, FLOAT, POINTER, ARRAY, AGGREGATE };
+enum kind { INTEGER, SIGNED, UNSIGNED, FLOAT, POINTER, ARRAY, AGGREGATE, BIT4 };
 static const char *const types[] = {
 #define XRB_TYPE(key, name) name,
 #include "ruby_types.inc"
@@ -58,7 +58,7 @@ static int size(Dwarf_Die *d, uint64_t *out) {
 }
 static int kind(Dwarf_Die *d, enum kind want) {
     int tag = dwarf_tag(d); uint64_t encoding;
-    if (want == INTEGER && tag == DW_TAG_enumeration_type) return 1;
+    if ((want == INTEGER || want == BIT4) && tag == DW_TAG_enumeration_type) return 1;
     if (want == POINTER) return tag == DW_TAG_pointer_type;
     if (want == ARRAY) return tag == DW_TAG_array_type;
     if (want == AGGREGATE) return tag == DW_TAG_structure_type || tag == DW_TAG_union_type;
@@ -69,7 +69,7 @@ static int kind(Dwarf_Die *d, enum kind want) {
     return want == SIGNED ? signed_ : want == UNSIGNED ? unsigned_ : signed_ || unsigned_;
 }
 static int member(Dwarf_Die parent, const char *path, struct xrb_field_info *out,
-                  Dwarf_Die *leaf, struct scan *s) {
+                  Dwarf_Die *leaf, struct scan *s, int bit4) {
     uint64_t offset = 0;
     for (unsigned depth = 0; depth < 16 && tick(s); ++depth) {
         if (!resolve(&parent, s)) return 0;
@@ -89,9 +89,16 @@ static int member(Dwarf_Die parent, const char *path, struct xrb_field_info *out
             if (!name || strlen(name) != len || memcmp(name, path, len)) continue;
             if (found++) { s->error = "RubyDwarfAmbiguous"; return 0; }
             Dwarf_Attribute bit;
-            if (dwarf_attr(&child, DW_AT_bit_size, &bit) || dwarf_attr(&child, DW_AT_data_bit_offset, &bit)) return 0;
+            if (bit4) {
+                uint64_t bits, bit_at;
+                /* The supported LP64 little-endian revision stores the method
+                 * type in bits 0..3. Prove both offsets rather than guessing a
+                 * bitfield ABI from the surrounding byte fields. */
+                if (dot || depth || !ud(&child,DW_AT_bit_size,&bits) || bits!=4 ||
+                    !ud(&child,DW_AT_data_bit_offset,&bit_at) || bit_at!=0) return 0;
+            } else if (dwarf_attr(&child, DW_AT_bit_size, &bit) || dwarf_attr(&child, DW_AT_data_bit_offset, &bit)) return 0;
             if (!ud(&child, DW_AT_data_member_location, &at)) {
-                if (parent_tag != DW_TAG_union_type) return 0;
+                if (parent_tag != DW_TAG_union_type && !bit4) return 0;
                 at = 0;
             }
             if (!type(&child, &selected)) { s->error = "RubyDwarfMalformed"; return 0; }
@@ -134,7 +141,7 @@ static int candidate(Dwarf_Die die, unsigned t, struct xrb_layout *out, struct s
     for (unsigned f = 0; f < XRB_FIELD_COUNT; ++f) {
         if (fields[f].owner != t) continue;
         struct xrb_field_info got; Dwarf_Die leaf;
-        if (!member(die, fields[f].path, &got, &leaf, s) ||
+        if (!member(die, fields[f].path, &got, &leaf, s, fields[f].kind == BIT4) ||
             !kind(&leaf, fields[f].kind) || got.size != fields[f].width) return 0;
         out->fields[f] = got;
     }
@@ -145,8 +152,8 @@ static int declaration(Dwarf_Die *d) {
     return dwarf_attr(d, DW_AT_declaration, &a) && (!dwarf_formflag(&a, &value) ? value : 1);
 }
 static const char *units(Dwarf *dwarf, uint64_t length, uint8_t owned[8192], struct scan *s) {
-    unsigned counts[4] = {0};
-    static const char *const names[] = {"ruby_version", "rb_vm_exec", "ruby_global_symbols", "rb_iseq_line_no"};
+    static const char *const names[] = {"ruby_version", "rb_vm_exec", "ruby_global_symbols", "rb_iseq_line_no", "rb_hash_aref", "rb_st_lookup", "rb_hash_start"};
+    unsigned counts[sizeof names/sizeof *names] = {0};
     Dwarf_Off off = 0, next; size_t header;
     for (unsigned cu = 0; off < length; off = next, ++cu) {
         uint8_t width;
@@ -164,7 +171,7 @@ static const char *units(Dwarf *dwarf, uint64_t length, uint8_t owned[8192], str
             if (tag != DW_TAG_variable && tag != DW_TAG_subprogram) continue;
             const char *name = dwarf_diename(&d);
             if (!name || declaration(&d)) continue;
-            for (unsigned i = 0; i < 4; ++i) {
+            for (unsigned i = 0; i < sizeof names/sizeof *names; ++i) {
                 if (strcmp(name, names[i])) continue;
                 int defined = (i == 0 || i == 2) ? tag == DW_TAG_variable && dwarf_hasattr(&d, DW_AT_location) :
                     tag == DW_TAG_subprogram && (dwarf_hasattr(&d, DW_AT_low_pc) || dwarf_hasattr(&d, DW_AT_ranges));
@@ -175,7 +182,7 @@ static const char *units(Dwarf *dwarf, uint64_t length, uint8_t owned[8192], str
         } while ((rc = dwarf_siblingof(&d, &d)) == 0);
         if (rc < 0) return "RubyDwarfMalformed";
     }
-    for (unsigned i = 0; i < 4; ++i) if (!counts[i]) return "RubyDwarfRuntimeUnavailable";
+    for (unsigned i = 0; i < sizeof names/sizeof *names; ++i) if (!counts[i]) return "RubyDwarfRuntimeUnavailable";
     return NULL;
 }
 const char *xrb_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n,

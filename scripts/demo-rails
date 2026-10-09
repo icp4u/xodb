@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Rails-flavoured CRuby demo: ActiveModel validations stopped in Integer#digits.
+# RUBY selects the supported debug runtime. XODB_RAILS_GEMS names a gem
+# directory holding activemodel and activesupport; it is only read.
+# Binary order: XODB, ./zig-out/bin/xodb, then xodb on PATH.
+set -euo pipefail
+demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$demo_root"
+ruby=${RUBY:-/opt/debug/bin/ruby}
+if [[ -n ${XODB:-} ]]; then
+    xodb=$XODB
+elif [[ -x zig-out/bin/xodb ]]; then
+    xodb=./zig-out/bin/xodb
+else
+    xodb=$(command -v xodb) || { printf '%s\n' 'Build xodb first with ./scripts/build' >&2; exit 1; }
+fi
+command -v "$ruby" >/dev/null
+install="$ruby -S gem install --no-document -i DIR activemodel"
+if [[ -z ${XODB_RAILS_GEMS:-} ]]; then
+    printf 'Set XODB_RAILS_GEMS=DIR after: %s (see docs/RUBY.md)\n' "$install" >&2
+    exit 1
+fi
+# Load the shared gem directory read-only: it is only on GEM_PATH, and
+# GEM_HOME is an empty per-user directory, so RubyGems never writes there.
+gem_home=$(mktemp -d "${TMPDIR:-/tmp}/xodb-rails-home.XXXXXX")
+export GEM_PATH=$XODB_RAILS_GEMS GEM_HOME=$gem_home
+if ! "$ruby" -e 'require "active_support/all"; require "active_model"' 2>/dev/null; then
+    rmdir "$gem_home"
+    printf 'No activemodel in XODB_RAILS_GEMS; install it with: %s\n' "${install/DIR/$XODB_RAILS_GEMS}" >&2
+    exit 1
+fi
+# Attach only once the example has finished loading the gems, so the
+# rb_int_digits breakpoint first fires inside the checkout loop.
+coproc RAILS_DEMO {
+    exec "$ruby" examples/rails-demo.rb
+}
+demo_pid=$RAILS_DEMO_PID
+cleanup() {
+    kill "$demo_pid" 2>/dev/null || :
+    wait "$demo_pid" 2>/dev/null || :
+    rmdir "$gem_home" 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+IFS= read -r -t 60 ready_pid <&"${RAILS_DEMO[0]}"
+if [[ "$ready_pid" != "$demo_pid" ]]; then
+    printf '%s\n' 'Unexpected Ruby startup handshake' >&2
+    exit 1
+fi
+"$xodb" "$@" --source examples/rails-demo.rb --attach "$demo_pid" --break rb_int_digits

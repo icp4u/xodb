@@ -152,7 +152,9 @@ names are not shown. A shadowed lexical name may have a different value.
 an outer context. See [JavaScript](JAVASCRIPT.md#context-storage-in-the-javascript-pane).
 In **Ruby**, select a logical frame for VM-stack locals and escaped closure
 environments. **E** accepts a bare local/capture name; the closest lexical scope
-wins. See [Ruby](RUBY.md) for the initial supported revision and explicit refusals.
+wins. Builtin paths such as `items[0]` and `player["score"]` read raw Array/Hash
+storage; custom methods and unsupported syntax refuse without running Ruby.
+See [Ruby](RUBY.md) for the supported revision, limits and explicit refusals.
 **E** in **C/C++** still uses the
 native expression/watch view. In **Lua**, **Python**, **Perl** or **Ruby**, click a named
 binding then **W**, or use **Shift+E** with a local name (`$name` in Perl), to
@@ -222,7 +224,8 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Watch a Lua table field | `xodb --break luaB_print -- lua5.4 examples/lua-path-demo.lua` (debug Lua) | **Space**, **Lua**, select the Lua `print` caller, **Shift+E** `state.player.score` **Return**, then **Space**, **V**. Paths re-resolve replaced tables; metatables refuse. |
 | Watch large Lua tables | `xodb --break luaB_print -- lua5.4 examples/lua-large-path-demo.lua` with debug Lua 5.4.9 | **Space**, **Lua**, select the print caller, **Shift+E** `module.player.score` **Return**, then **Space**, **V**. Lookup follows a bounded collision chain even with thousands of unrelated keys. |
 | Watch Python container paths | `xodb --break builtin_print -- python3 examples/python-path-demo.py` with a supported debug interpreter | **Space**, **Python**, select **main**, **Shift+E** `state["player"]["score"]` **Return**, then **Space**, **V**. Dict/list/tuple paths re-resolve after replacement; no Python callbacks run. |
-| Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
+| Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` or `values[0]` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
+| Inside a Rails model | `XODB_RAILS_GEMS=DIR ./scripts/demo-rails` (activemodel installed in DIR, see [Ruby](RUBY.md#rails-demo)) | **Space**, **Tab** to **Ruby**, click **checkout!**, **E** `attrs` **Return**; click **valid?** for `validations.rb:367`; back on **checkout!**, **Shift+E** `attrs[:line_items][0][:price]` **Return**, then **Space**. |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |

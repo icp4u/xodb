@@ -260,9 +260,9 @@ static int environment(const struct xrb_layout *p, struct xrb_reader *r, const s
     } else if (*slots<stack->stack_lo || ep>=stack->cfp) return fail(r,"RubyEnvironmentBoundsInvalid");
     return !r->error;
 }
-void xrb_locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
+static void locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
                      uint64_t zjit, uint64_t symbols, size_t frame,
-                     size_t start, size_t limit, struct xrb_locals *out) {
+                     size_t start, size_t limit, int preview, struct xrb_locals *out) {
     memset(out,0,sizeof *out);out->start=start;
     if (limit>XRB_LOCAL_ITEMS || start>4096) { out->reason="RubyLocalPageInvalid";return; }
     struct xrb_stack stack;xrb_stack_read(p,r,ec,zjit,&stack);
@@ -285,7 +285,7 @@ void xrb_locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t 
             if (!row->hidden) name(p,r,symbols,id,row->name,sizeof row->name);
             row->reason=r->error;r->error=NULL;
             row->address=add(r,slots,i*8);row->tagged=word(r,row->address,8);
-            xrb_value_read(p,r,row->tagged,&row->value);
+            if (preview) xrb_value_read(p,r,row->tagged,&row->value);
             if (r->error && !strcmp(r->error,"RubyReadBudget")) goto done;
             r->error=NULL;
         }
@@ -299,9 +299,14 @@ void xrb_locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t 
 done:
     out->reason=r->error;out->truncated=out->total>start+out->count || out->reason!=NULL;
 }
-void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
+void xrb_locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
+                     uint64_t zjit, uint64_t symbols, size_t frame,
+                     size_t start, size_t limit, struct xrb_locals *out) {
+    locals_read(p,r,ec,zjit,symbols,frame,start,limit,1,out);
+}
+static void local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
                     uint64_t zjit, uint64_t symbols, size_t frame,
-                    const char *expression, struct xrb_locals *out) {
+                    const char *expression, int preview, struct xrb_locals *out) {
     memset(out,0,sizeof *out);
     size_t length=0;
     if (!expression || !*expression) { out->reason="RubyExpressionUnsupported";return; }
@@ -311,7 +316,7 @@ void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t e
         }
     }
     for (size_t start=0;start<4096;start+=XRB_LOCAL_ITEMS) {
-        struct xrb_locals page;xrb_locals_read(p,r,ec,zjit,symbols,frame,start,XRB_LOCAL_ITEMS,&page);
+        struct xrb_locals page;locals_read(p,r,ec,zjit,symbols,frame,start,XRB_LOCAL_ITEMS,preview,&page);
         for (size_t i=0;i<page.count;++i) {
             struct xrb_local *row=&page.items[i];
             if (row->hidden) continue;
@@ -325,6 +330,12 @@ void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t e
         if (!page.truncated) break;
     }
     out->reason="RubyLocalNotFound";
+}
+
+void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
+                    uint64_t zjit, uint64_t symbols, size_t frame,
+                    const char *expression, struct xrb_locals *out) {
+    local_find(p,r,ec,zjit,symbols,frame,expression,1,out);
 }
 
 /* The exact supported revision's encoding.h defines seven bits starting at
@@ -379,4 +390,290 @@ void xrb_sample_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t 
 done:
     out->reason=r->error;
     if (out->reason) out->size=0;
+}
+
+/* Raw builtin subscriptions. The method/class checks deliberately refuse
+ * subclasses, singleton methods, refinements, prepend and box-specific tables.
+ * They do not execute dispatch or assume that a T_HASH has builtin semantics. */
+enum { XRB_PATH_DEPTH=8, XRB_PATH_ENTRIES=512, XRB_PATH_KEY_BYTES=1024 };
+struct ruby_step { unsigned kind; uint64_t index; char key[129]; size_t length; };
+struct ruby_path { char root[129]; size_t count; struct ruby_step steps[XRB_PATH_DEPTH]; };
+static int path_identifier(unsigned char c, int first) {
+    return c=='_' || (c>='a'&&c<='z') || (c>='A'&&c<='Z') || (!first&&c>='0'&&c<='9');
+}
+static const char *ruby_path_parse(const char *text, struct ruby_path *out) {
+    memset(out,0,sizeof *out);size_t n=0;
+    if(!text) return "RubyExpressionUnsupported";
+    while(n<=128 && text[n])++n;
+    if(!n || n>128 || !path_identifier((unsigned char)text[0],1)) return "RubyExpressionUnsupported";
+    size_t at=1;
+    while(at<n && path_identifier((unsigned char)text[at],0))++at;
+    memcpy(out->root,text,at);
+    while(at<n) {
+        if(out->count==XRB_PATH_DEPTH || text[at++]!='[' || at==n) return "RubyExpressionUnsupported";
+        struct ruby_step *step=&out->steps[out->count++];
+        if(text[at]==':' || text[at]=='\'' || text[at]=='"') {
+            char quote=text[at++];step->kind=quote==':'?2:1;size_t begin=at;
+            if(quote==':') {
+                if(at==n || !path_identifier((unsigned char)text[at],1)) return "RubyExpressionUnsupported";
+                while(at<n && path_identifier((unsigned char)text[at],0))++at;
+            } else {
+                while(at<n && text[at]!=quote) {
+                    unsigned char c=(unsigned char)text[at++];
+                    if(c<32 || c>=127 || c=='\\' || c=='#') return "RubyExpressionUnsupported";
+                }
+                if(at==n) return "RubyExpressionUnsupported";
+            }
+            step->length=at-begin;memcpy(step->key,text+begin,step->length);
+            if(quote!=':')++at;
+        } else {
+            size_t begin=at;
+            while(at<n && text[at]>='0' && text[at]<='9') {
+                unsigned digit=(unsigned)(text[at++]-'0');
+                if(step->index>(INT32_MAX-digit)/10u) return "RubyExpressionUnsupported";
+                step->index=step->index*10+digit;
+            }
+            if(at==begin || (at-begin>1 && text[begin]=='0')) return "RubyExpressionUnsupported";
+        }
+        if(at==n || text[at++]!=']') return "RubyExpressionUnsupported";
+    }
+    return NULL;
+}
+const char *xrb_expression_check(const char *text) {
+    struct ruby_path path;return ruby_path_parse(text,&path);
+}
+struct path_proof { uint64_t classes[5],seed,k0,k1; unsigned checked; };
+static int builtin_method(const struct xrb_layout *p, struct xrb_reader *r,
+                           uint64_t klass, uint64_t id, uint64_t function, int argc) {
+    uint64_t seen[16];size_t depth=0;
+    while(klass && depth<16) {
+        for(size_t i=0;i<depth;++i) if(seen[i]==klass) return fail(r,"RubyPathClassCycle");
+        seen[depth++]=klass;
+        uint64_t f=flags(r,klass);unsigned t=(unsigned)(f&RUBY_T_MASK);
+        if(t!=RUBY_T_CLASS && t!=RUBY_T_MODULE && t!=RUBY_T_ICLASS) return fail(r,"RubyPathClassUnproved");
+        /* RCLASS_BOXABLE is FL_USER4 in this source-pinned revision. */
+        if((f&(UINT64_C(1)<<(RUBY_FL_USHIFT+4))) && field(p,r,klass,XRB_CLASS_BOX_TABLE)) return fail(r,"RubyPathBoxUnsupported");
+        uint64_t origin=field(p,r,klass,XRB_CLASS_ORIGIN);
+        if(t!=RUBY_T_ICLASS && origin!=klass) return fail(r,"RubyPathPrependUnsupported");
+        uint64_t table=field(p,r,klass,XRB_CLASS_METHODS);
+        if(r->error) return 0;
+        if(table) {
+            int32_t cap=(int32_t)field(p,r,table,XRB_METHOD_CAPACITY);
+            int32_t count=(int32_t)field(p,r,table,XRB_METHOD_COUNT);
+            int32_t used_=(int32_t)field(p,r,table,XRB_METHOD_USED);
+            uint64_t buffer=field(p,r,table,XRB_METHOD_BUFFER);
+            if(cap<0 || cap>4096 || (cap && (cap&(cap-1))) || count<0 || count>used_ || used_>cap || (cap && !buffer))
+                return fail(r,"RubyPathMethodTableUnproved");
+            uint8_t data[4096*12];
+            if(!memory(r,buffer,data,(size_t)cap*12)) return 0;
+            uint64_t found=0;unsigned actual=0;
+            uint32_t serial=(uint32_t)(id>tLAST_OP_ID?id>>RUBY_ID_SCOPE_SHIFT:id);
+            for(int32_t i=0;i<cap;++i) {
+                const uint8_t *key=data+(size_t)cap*8+(size_t)i*4;
+                uint32_t k=(uint32_t)key[0]|(uint32_t)key[1]<<8|(uint32_t)key[2]<<16|(uint32_t)key[3]<<24;
+                if(!k) continue;
+                ++actual;uint64_t v=0;
+                for(unsigned j=0;j<8;++j)v|=(uint64_t)data[(size_t)i*8+j]<<(8*j);
+                if(!v) return fail(r,"RubyPathMethodTableUnproved");
+                if(k==serial) {if(found)return fail(r,"RubyPathMethodTableUnproved");found=v;}
+            }
+            if(actual!=(unsigned)count) return fail(r,"RubyPathMethodTableUnproved");
+            if(found) {
+                if(!header(r,found,RUBY_T_IMEMO,imemo_ment) || field(p,r,found,XRB_METHOD_ID)!=id) return fail(r,"RubyPathMethodUnproved");
+                uint64_t def=field(p,r,found,XRB_METHOD_DEF);
+                if((field(p,r,def,XRB_METHOD_TYPE)&15)!=VM_METHOD_TYPE_CFUNC ||
+                   field(p,r,def,XRB_METHOD_FUNC)!=function || field(p,r,def,XRB_METHOD_ORIGINAL_ID)!=id ||
+                   (int32_t)field(p,r,def,XRB_METHOD_ARGC)!=argc) return fail(r,"RubyPathCustomMethodUnsupported");
+                return !r->error;
+            }
+        }
+        klass=field(p,r,klass,XRB_CLASS_SUPER);
+        if(r->error) return 0;
+    }
+    return fail(r,"RubyPathMethodUnproved");
+}
+static int path_methods(const struct xrb_layout *p, struct xrb_reader *r,
+                        const struct xrb_path_context *ctx, struct path_proof *proof, unsigned kind) {
+    if(proof->checked&(1u<<kind)) return 1;
+    uint64_t klass=proof->classes[kind];
+    if(kind<2) {
+        if(!builtin_method(p,r,klass,idAREF,kind?ctx->array_aref:ctx->hash_aref,kind?-1:1)) return 0;
+    } else {
+        uint64_t hash=kind==2?ctx->string_hash:ctx->object_hash;
+        uint64_t eql=kind==2?ctx->string_eql:kind==3?ctx->numeric_eql:ctx->object_eql;
+        if(!builtin_method(p,r,klass,idHash,hash,0) || !builtin_method(p,r,klass,idEqlP,eql,1)) return 0;
+    }
+    proof->checked|=1u<<kind;return 1;
+}
+static uint64_t rotl(uint64_t v,unsigned n) {return (v<<n)|(v>>(64-n));}
+static void sip_round(uint64_t v[4]) {
+    v[0]+=v[1];v[1]=rotl(v[1],13);v[1]^=v[0];v[0]=rotl(v[0],32);
+    v[2]+=v[3];v[3]=rotl(v[3],16);v[3]^=v[2];
+    v[0]+=v[3];v[3]=rotl(v[3],21);v[3]^=v[0];
+    v[2]+=v[1];v[1]=rotl(v[1],17);v[1]^=v[2];v[2]=rotl(v[2],32);
+}
+static uint64_t sip13(const struct path_proof *p,const uint8_t *bytes,size_t n) {
+    uint64_t v[]={UINT64_C(0x736f6d6570736575)^p->k0,UINT64_C(0x646f72616e646f6d)^p->k1,
+                  UINT64_C(0x6c7967656e657261)^p->k0,UINT64_C(0x7465646279746573)^p->k1};
+    size_t at=0;
+    while(n-at>=8) {
+        uint64_t m=0;for(unsigned j=0;j<8;++j)m|=(uint64_t)bytes[at+j]<<(8*j);
+        v[3]^=m;sip_round(v);v[0]^=m;at+=8;
+    }
+    uint64_t last=(uint64_t)n<<56;
+    for(unsigned j=0;at<n;++at,++j)last|=(uint64_t)bytes[at]<<(8*j);
+    v[3]^=last;sip_round(v);v[0]^=last;v[2]^=255;
+    for(unsigned i=0;i<3;++i)sip_round(v);
+    return v[0]^v[1]^v[2]^v[3];
+}
+static uint64_t mul_mix(uint64_t a,uint64_t b) {
+    uint64_t al=(uint32_t)a,ah=a>>32,bl=(uint32_t)b,bh=b>>32;
+    uint64_t low=al*bl,mid=ah*bl+(low>>32),carry=mid>>32;
+    mid=(uint32_t)mid+al*bh;
+    uint64_t high=ah*bh+carry+(mid>>32);
+    return high^(a*b);
+}
+static uint64_t hash_fixnum_range(uint64_t hash) {
+    return hash>>63 ? hash|UINT64_C(0xc000000000000000) : hash&UINT64_C(0x3fffffffffffffff);
+}
+static int raw_ascii_key(const struct xrb_layout *p,struct xrb_reader *r,uint64_t value,
+                          uint8_t bytes[XRB_PATH_KEY_BYTES],size_t *length) {
+    if(!header(r,value,RUBY_T_STRING,-1)) return 0;
+    uint64_t f=field(p,r,value,XRB_STRING_FLAGS),n=field(p,r,value,XRB_STRING_LEN);
+    unsigned encoding=(unsigned)((f>>XRB_ENCODING_SHIFT)&XRB_ENCODING_INLINE_MAX);
+    if(encoding>2 || n>XRB_PATH_KEY_BYTES) return fail(r,"RubyPathKeyUnsupported");
+    uint64_t data=f&RSTRING_NOEMBED?field(p,r,value,XRB_STRING_PTR):add(r,value,p->fields[XRB_STRING_EMBED].offset);
+    if(!memory(r,data,bytes,(size_t)n)) return 0;
+    for(size_t i=0;i<n;++i)if(bytes[i]>=128) return fail(r,"RubyPathKeyUnsupported");
+    *length=(size_t)n;return 1;
+}
+static int path_key(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+                     struct path_proof *proof,uint64_t key,const struct ruby_step *wanted,
+                     uint64_t *hash,int *equal) {
+    *equal=0;
+    if(key&1) {
+        if(!path_methods(p,r,ctx,proof,3)) return 0;
+        *hash=mul_mix(proof->seed+key+UINT64_C(0x830fcab9),UINT64_C(0x2e0bb864e9ea7df5));
+        *equal=wanted->kind==0 && key==(wanted->index*2+1);
+    } else if((key&0xff)==0x0c) {
+        if(!path_methods(p,r,ctx,proof,4)) return 0;
+        char text[256];
+        if(!name(p,r,ctx->symbols,key>>8,text,sizeof text)) return 0;
+        *hash=proof->seed+(key>>(8+RUBY_ID_SCOPE_SHIFT));
+        *equal=wanted->kind==2 && strlen(text)==wanted->length && !memcmp(text,wanted->key,wanted->length);
+    } else {
+        if(key<4096 || key&7) return fail(r,"RubyPathKeyUnsupported");
+        unsigned type=(unsigned)(flags(r,key)&RUBY_T_MASK);
+        uint64_t klass=field(p,r,key,XRB_BASIC_CLASS);
+        if(type!=RUBY_T_STRING && type!=RUBY_T_SYMBOL) return fail(r,"RubyPathKeyUnsupported");
+        unsigned k=type==RUBY_T_STRING?2:4;
+        if(klass!=proof->classes[k] || !path_methods(p,r,ctx,proof,k)) return fail(r,"RubyPathKeyClassUnsupported");
+        uint64_t str=type==RUBY_T_STRING?key:field(p,r,key,XRB_SYMBOL_STRING);
+        uint8_t bytes[XRB_PATH_KEY_BYTES];size_t n;
+        if(!raw_ascii_key(p,r,str,bytes,&n)) return 0;
+        *hash=sip13(proof,bytes,n);
+        if(type==RUBY_T_SYMBOL) {
+            if(field(p,r,key,XRB_SYMBOL_HASH)!=*hash) return fail(r,"RubyPathHashUnproved");
+            *hash>>=1;
+        }
+        *equal=wanted->kind==(type==RUBY_T_STRING?1u:2u) && n==wanted->length && !memcmp(bytes,wanted->key,n);
+    }
+    *hash=hash_fixnum_range(*hash);return !r->error;
+}
+static int path_hash_lookup(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+                             struct path_proof *proof,uint64_t value,const struct ruby_step *step,
+                             struct xrb_path_value *out) {
+    /* A missing key still has a requested key type. Prove its hash/eql?
+     * methods even when the table contains no key of that type. */
+    if(!path_methods(p,r,ctx,proof,step->kind==0?3:step->kind==1?2:4)) return 0;
+    uint64_t f=flags(r,value);
+    if(f&RHASH_COMPARE_BY_IDENTITY) return fail(r,"RubyPathIdentityHashUnsupported");
+    if(f&RHASH_PROC_DEFAULT || field(p,r,value,XRB_HASH_DEFAULT)!=4) return fail(r,"RubyPathDefaultUnsupported");
+    uint64_t table=add(r,value,p->sizes[XRB_T_HASH]);
+    uint64_t entries,start=0,bound,count;int st=(f&RHASH_ST_TABLE_FLAG)!=0;
+    if(st) {
+        uint64_t power=field(p,r,table,XRB_ST_POWER),type=field(p,r,table,XRB_ST_TYPE);
+        start=field(p,r,table,XRB_ST_START);bound=field(p,r,table,XRB_ST_BOUND);count=field(p,r,table,XRB_ST_COUNT);
+        entries=field(p,r,table,XRB_ST_ENTRIES);
+        if(power<2 || power>32 || start>bound || bound>(UINT64_C(1)<<power) || count>bound-start) return fail(r,"RubyPathHashInvalid");
+        if(field(p,r,type,XRB_ST_COMPARE_FN)!=ctx->any_cmp || field(p,r,type,XRB_ST_HASH_FN)!=ctx->any_hash) return fail(r,"RubyPathHashTypeUnsupported");
+    } else {
+        count=(f&RHASH_AR_TABLE_SIZE_MASK)>>RHASH_AR_TABLE_SIZE_SHIFT;
+        bound=(f&RHASH_AR_TABLE_BOUND_MASK)>>RHASH_AR_TABLE_BOUND_SHIFT;
+        entries=add(r,table,p->fields[XRB_AR_PAIRS].offset);
+        if(bound>8 || count>bound) return fail(r,"RubyPathHashInvalid");
+    }
+    if(bound-start>XRB_PATH_ENTRIES) return fail(r,"RubyPathHashLimit");
+    size_t actual=0;int found=0;struct xrb_path_value match={0};
+    for(uint64_t i=start;i<bound;++i) {
+        uint64_t entry=add(r,entries,i*p->sizes[st?XRB_T_ST_ENTRY:XRB_T_AR_PAIR]);
+        uint64_t stored=st?field(p,r,entry,XRB_ST_HASH):word(r,add(r,table,p->fields[XRB_AR_HINTS].offset+i),1);
+        if((st && stored==UINT64_MAX) || (!st && !stored)) continue;
+        ++actual;
+        uint64_t key=field(p,r,entry,st?XRB_ST_KEY:XRB_AR_KEY),hash;int equal;
+        if(!path_key(p,r,ctx,proof,key,step,&hash,&equal)) return 0;
+        if(st) {if(hash==UINT64_MAX)hash=0;}
+        else {hash&=255;if(!hash)hash=1;}
+        if(hash!=stored) return fail(r,"RubyPathHashUnproved");
+        if(equal) {
+            if(found++) return fail(r,"RubyPathDuplicateKey");
+            match.address=add(r,entry,p->fields[st?XRB_ST_VALUE:XRB_AR_VALUE].offset);
+            match.tagged=word(r,match.address,8);
+        }
+    }
+    if(r->error) return 0;
+    if(actual!=count) return fail(r,"RubyPathHashInvalid");
+    if(!found) return fail(r,"RubyPathKeyNotFound");
+    *out=match;return 1;
+}
+static void ruby_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+                            uint64_t root,const struct ruby_path *path,struct xrb_path_value *out) {
+    memset(out,0,sizeof *out);out->tagged=root;
+    struct path_proof proof={0};
+    if(path->count) {
+        const uint64_t globals[]={ctx->hash_class,ctx->array_class,ctx->string_class,ctx->integer_class,ctx->symbol_class};
+        for(size_t i=0;i<5;++i)proof.classes[i]=word(r,globals[i],8);
+        proof.seed=field(p,r,ctx->hash_salt,XRB_HASH_SEED);
+        proof.k0=word(r,add(r,ctx->hash_salt,p->fields[XRB_SIP_SEED].offset),8);
+        proof.k1=word(r,add(r,ctx->hash_salt,p->fields[XRB_SIP_SEED].offset+8),8);
+    }
+    for(size_t i=0;i<path->count && !r->error;++i) {
+        const struct ruby_step *step=&path->steps[i];uint64_t current=out->tagged;
+        if(current<4096 || current&7) {fail(r,"RubyPathContainerRequired");break;}
+        unsigned type=(unsigned)(flags(r,current)&RUBY_T_MASK),k=type==RUBY_T_HASH?0:1;
+        if(type!=RUBY_T_HASH && type!=RUBY_T_ARRAY) {fail(r,"RubyPathContainerRequired");break;}
+        if(field(p,r,current,XRB_BASIC_CLASS)!=proof.classes[k]) {fail(r,"RubyPathContainerClassUnsupported");break;}
+        if(!path_methods(p,r,ctx,&proof,k))break;
+        if(type==RUBY_T_HASH) {
+            if(!path_hash_lookup(p,r,ctx,&proof,current,step,out))break;
+        } else {
+            uint64_t data,n;
+            if(step->kind) {fail(r,"RubyPathArrayIndexRequired");break;}
+            if(!array(p,r,current,&data,&n))break;
+            if(step->index>=n) {fail(r,"RubyPathIndexOutOfRange");break;}
+            out->address=add(r,data,step->index*8);out->tagged=word(r,out->address,8);
+        }
+    }
+    out->reason=r->error;
+    if(out->reason)out->tagged=out->address=0;
+}
+void xrb_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+                   uint64_t root,const char *text,struct xrb_path_value *out) {
+    struct ruby_path path;memset(out,0,sizeof *out);out->reason=ruby_path_parse(text,&path);
+    if(!out->reason)ruby_path_read(p,r,ctx,root,&path,out);
+}
+void xrb_expression_find(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+                         uint64_t ec,uint64_t zjit,size_t frame,const char *text,struct xrb_locals *out) {
+    struct ruby_path path;memset(out,0,sizeof *out);out->reason=ruby_path_parse(text,&path);
+    if(out->reason)return;
+    local_find(p,r,ec,zjit,ctx->symbols,frame,path.root,!path.count,out);
+    if(out->reason || out->count!=1 || !path.count)return;
+    struct xrb_local *row=&out->items[0];struct xrb_path_value value;
+    ruby_path_read(p,r,ctx,row->tagged,&path,&value);
+    row->address=value.address;row->tagged=value.tagged;row->reason=value.reason;
+    snprintf(row->name,sizeof row->name,"%s",text);
+    memset(&row->value,0,sizeof row->value);
+    if(!row->reason)xrb_value_read(p,r,row->tagged,&row->value);
+    /* A path refusal belongs to the row. Preserve no partial value/address. */
+    if(value.reason) { row->value.reason=value.reason; r->error=NULL; }
 }
