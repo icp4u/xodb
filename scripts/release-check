@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None):
     live = tier in ('host', 'all')
     language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
     gui_language_args = [*language_args]
@@ -144,6 +144,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append(('ruby-previews'+suffix, [sys.executable, '-B', 'tests/ruby-previews.py', '--ruby', ruby, '--strace', '--work', '.work/rpr'+suffix, *extra], 300))
                 steps.append(('ruby-watches'+suffix, [sys.executable, '-B', 'tests/ruby-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rw'+suffix, *extra], 300))
                 steps.append(('ruby-language'+suffix, [sys.executable, '-B', 'tests/ruby-language.py', '--ruby', ruby, '--strace', '--work', '.work/ruby'+suffix, *extra], 300))
+        if go:
+            steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('javascript-watches'+suffix, [sys.executable, '-B', 'tests/javascript-watches.py', '--node', node, '--include', node_include, '--strace', '--work', '.work/jw'+suffix, *extra], 300))
@@ -221,6 +223,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('gui-safe-keys'+suffix, [sys.executable, '-B', 'tests/safe-keys-gui.py', '--work', '.work/sk'+suffix, *extra], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-files-selection', [sys.executable, '-B', 'tests/files-selection-gui.py'], 180))
+        steps.append(('gui-fdgraph', [sys.executable, '-B', 'tests/fdgraph-gui.py', '--work-dir', '.work/fg'], 120))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if ruby:
             steps.append(('ruby-previews-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--previews', '--ruby', ruby, '--work', '.work/rprg'], 300))
@@ -228,6 +231,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('ruby-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--ruby', ruby, '--work', '.work/rwg'], 300))
             steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300))
             steps.append(('ruby-expression-gui', [sys.executable, '-B', 'tests/ruby-expression-gui.py', '--ruby', ruby, '--work', '.work/rbe'], 300))
+        if go:
+            steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if node:
             steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 1200))
             steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200))
@@ -429,6 +434,7 @@ def main():
     parser.add_argument('--python', help='Include language-tab and cached-selection checks using this debug CPython runtime')
     parser.add_argument('--ruby', help='Include the exact supported CRuby DWARF runtime and its matching development headers')
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
+    parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -446,13 +452,15 @@ def main():
         parser.error('--python requires the host, gui or all tier')
     if args.ruby and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--ruby requires the host, gui or all tier')
+    if args.go and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
+        parser.error('--go requires the host, gui or all tier')
     if args.node and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--node requires the host, gui or all tier')
     if args.node_refusal and args.tier not in ('gui', 'all'):
         parser.error('--node-refusal requires the gui or all tier')
     if args.lua and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--lua requires the host, gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal)
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
@@ -473,7 +481,7 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -485,6 +493,7 @@ def main():
                     (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)'] if args.tier in ('all', 'gui', 'host') else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
                     (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.ruby else []) +
+                    (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.go else []) +
                     (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.node else []) +
                     (['Node.js frame-proof refusal (use --node-refusal PATH)'] if args.tier in ('gui', 'all') and not args.node_refusal else []) +
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.lua else []) +

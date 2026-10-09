@@ -409,6 +409,18 @@ static enum xrt_status poll(struct xrt_target *t)
             t->threads[i].state = XRT_RUNNING;
             continue;
         }
+        /* Go preempts goroutines with SIGURG many times a second. Like gdb's
+         * default (nostop, noprint, pass), deliver it without a user stop. A
+         * hardware-stepped thread drops it: delivery would step into the
+         * handler, and the Go runtime simply retries the preemption. */
+        const bool step_here = t->stepping && t->step.tid == tid;
+        if (kind == 0 && sig == SIGURG && (step_here ? !t->step.software : t->want_run)) {
+            TRY(xrt_trace(step_here ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, step_here ? 0 : SIGURG));
+            t->threads[i].signal = 0;
+            t->threads[i].reason = XRT_STOP_NONE;
+            t->threads[i].state = XRT_RUNNING;
+            continue;
+        }
         t->threads[i].signal = kind == 0 ? sig : 0;
         t->threads[i].reason = kind == PTRACE_EVENT_EXEC   ? XRT_STOP_EXEC
                                : kind == PTRACE_EVENT_STOP ? XRT_STOP_INTERRUPT

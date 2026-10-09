@@ -279,7 +279,7 @@ if 'looks' in sections or 'layout' in sections:
                     check(f'win9x {size[0]} draws the desktop, title bar and cell colours, the change kinds distinct',
                           all(v > 20 for v in found.values()), found)
                     nav = 236 if size[0] >= 1500 else 196
-                    text = ocr(shot) + ' ' + ocr(shot, (nav, 72, size[0], 108)) + ' ' + ocr(shot, (size[0] // 2, size[1] - 200, size[0], size[1] - 28))
+                    text = ocr(shot) + ' ' + ocr(shot, (nav, 72, size[0], 108)) + ' ' + ocr(shot, (size[0] // 2, size[1] - 200, size[0], size[1] - 28)) + ' ' + ocr(shot, (size[0] // 2, size[1] // 2, size[0], size[1]))
                     want = ['Defragmenting Memory', 'Which process do you', 'Complete', 'Stop', 'Legend', 'Hide Details', 'cost-limited']
                     check(f'win9x {size[0]} chrome text', all(w.lower() in text.lower() for w in want), [w for w in want if w.lower() not in text.lower()] or text[:200])
                 if look == 'dos':
@@ -383,7 +383,7 @@ if 'buttons' in sections:
             d.click(*boxes['Legend'])
             shot = d.shot('legend')
             save(shot, 'win9x-legend.png')
-            text = ocr(shot)
+            text = ocr(shot) + ' ' + ocr(shot, (d.size[0] // 4, d.size[1] // 4, 3 * d.size[0] // 4, 3 * d.size[1] // 4))
             check('Legend opens the legend dialog', 'not observable' in text and 'unknown' in text.lower() and 'split from THP' in text, text[:300])
             d.tap('g')
             d.click(*boxes['Hide'])

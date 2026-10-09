@@ -50,6 +50,7 @@ pub const Collector = struct {
     redact: bool = false,
     fd_collector: ?*c.struct_xrt_fdactivity = null,
     fd_opens: u64 = 0,
+    fd_scope: []const i32 = &.{},
     fd_event_state: FdEventState = .inactive,
     fd_lease: ?@import("../service/lease.zig").Lease = null,
 
@@ -65,7 +66,8 @@ pub const Collector = struct {
 
     pub fn descriptors(self: *Collector) !*c.struct_xrt_fdactivity {
         if (self.fd_collector == null) {
-            if (c.xrt_fdactivity_create(&self.fd_collector) != c.XRT_OK) return error.OutOfMemory;
+            const options = c.struct_xrt_fdactivity_options{ .pids = self.fd_scope.ptr, .pid_count = @intCast(self.fd_scope.len) };
+            if (c.xrt_fdactivity_create_scoped(&options, &self.fd_collector) != c.XRT_OK) return error.OutOfMemory;
             self.fd_opens += 1;
         }
         return self.fd_collector.?;

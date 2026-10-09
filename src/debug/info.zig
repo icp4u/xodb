@@ -86,12 +86,25 @@ fn concreteScopesAt(a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64) ![]c.Dwarf
     };
     return lexical;
 }
+/// Go's linker (and DWARF 2/3 producers) encode exprloc-class attributes as
+/// DW_FORM_block1, which libdw rejects in DWARF 5 units. A block1 length below
+/// 0x80 is byte-identical to exprloc's ULEB128 length, so relabel only that case.
+fn exprloc(attr: *c.Dwarf_Attribute) void {
+    if (attr.form == std.dwarf.FORM.block1 and attr.valp != null and attr.valp[0] < 0x80) attr.form = std.dwarf.FORM.exprloc;
+}
+/// cmd/link's DW_AT_go_kind (reflect.Kind) on Go types; producer-specific.
+fn goKind(die: *c.Dwarf_Die, lang: eval.Language) ?u8 {
+    if (lang != .go) return null;
+    const value = unsigned(die, 0x2900) orelse return null;
+    return std.math.cast(u8, value);
+}
 fn language(die: *c.Dwarf_Die) eval.Language {
     var cu: c.Dwarf_Die = undefined;
     if (c.dwarf_diecu(die, &cu, null, null) == null) return .unknown;
     switch (c.dwarf_srclang(&cu)) {
         std.dwarf.LANG.Rust => return .rust,
         std.dwarf.LANG.Zig => return .zig,
+        std.dwarf.LANG.Go => return .go,
         else => {},
     }
     // Zig 0.16 LLVM emits C99; producer evidence disambiguates it from C.
@@ -139,7 +152,7 @@ pub const Image = struct {
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
     pending_aliases: std.AutoHashMapUnmanaged(*const eval.Type, Alias) = .empty,
     address_table: []const u8,
-    const Alias = struct { target: *const eval.Type, name: []const u8, ruby_value: bool = false };
+    const Alias = struct { target: *const eval.Type, name: []const u8, ruby_value: bool = false, go_kind: u8 = 0 };
     pub fn init(binary: elf.Image, bytes: []u8) !Image {
         return initWithAllocator(binary, bytes, std.heap.page_allocator);
     }
@@ -501,6 +514,7 @@ pub const Image = struct {
         const t = try a.create(eval.Type);
         t.* = .{ .name = name(&die), .kind = .unknown, .size = unsigned(&die, std.dwarf.AT.byte_size) orelse 0, .language = language(&die) };
         try self.types.put(a, key, t);
+        if (goKind(&die, t.language)) |kind| t.go_kind = kind;
         switch (c.dwarf_tag(&die)) {
             std.dwarf.TAG.base_type => {
                 t.kind = switch (unsigned(&die, std.dwarf.AT.encoding) orelse 0) {
@@ -550,7 +564,8 @@ pub const Image = struct {
                     t.* = target.*;
                     const alias = name(&die);
                     if (alias.len > 0) t.name = alias;
-                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias, .ruby_value = c.xrb_dwarf_value(&die) != 0 });
+                    t.go_kind = goKind(&die, t.language) orelse target.go_kind;
+                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias, .ruby_value = c.xrb_dwarf_value(&die) != 0, .go_kind = t.go_kind });
                 }
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
@@ -622,6 +637,7 @@ pub const Image = struct {
             var target = entry.value_ptr.target;
             var alias_name = entry.value_ptr.name;
             var ruby_value = entry.value_ptr.ruby_value;
+            var go_kind = entry.value_ptr.go_kind;
             var hops: usize = 0;
             while (self.pending_aliases.get(target)) |alias| : (hops += 1) {
                 if (hops == 64) {
@@ -630,12 +646,14 @@ pub const Image = struct {
                 }
                 if (alias_name.len == 0) alias_name = alias.name;
                 ruby_value = ruby_value or alias.ruby_value;
+                if (go_kind == 0) go_kind = alias.go_kind;
                 target = alias.target;
             }
             const out = @constCast(entry.key_ptr.*);
             out.* = target.*;
             if (alias_name.len > 0) out.name = alias_name;
             out.ruby_value = out.ruby_value or ruby_value;
+            if (go_kind != 0) out.go_kind = go_kind;
         }
         self.pending_aliases.clearRetainingCapacity();
     }
@@ -649,6 +667,7 @@ pub const Image = struct {
             return error.UnsupportedConstant;
         }
         if (c.dwarf_attr_integrate(die, std.dwarf.AT.location, &attr) == null) return error.OptimizedOut;
+        exprloc(&attr);
         var ops: [2][*c]c.Dwarf_Op = @splat(null);
         var lengths: [2]usize = @splat(0);
         const count = c.dwarf_getlocation_addr(&attr, pc, &ops, &lengths, 2);
@@ -722,6 +741,7 @@ pub const Image = struct {
         for (concrete) |*scope| {
             var attr: c.Dwarf_Attribute = undefined;
             if (c.dwarf_attr_integrate(scope, std.dwarf.AT.frame_base, &attr) != null) {
+                exprloc(&attr);
                 var ops: [*c]c.Dwarf_Op = null;
                 var len: usize = 0;
                 if (c.dwarf_getlocation_addr(&attr, pc, &ops, &len, 1) == 1) {

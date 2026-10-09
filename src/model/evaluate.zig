@@ -1,9 +1,9 @@
 const std = @import("std");
 pub const Kind = enum { signed, unsigned, boolean, float, pointer, array, structure, unknown };
 pub const Field = struct { name: []const u8, offset: u64, type: *const Type };
-pub const Language = enum { unknown, rust, zig };
+pub const Language = enum { unknown, rust, zig, go };
 pub const Enumerator = struct { name: []const u8, bits: u64 };
-pub const Type = struct { name: []const u8, kind: Kind, size: u64, child: ?*const Type = null, count: u64 = 0, fields: []const Field = &.{}, language: Language = .unknown, enumerators: []const Enumerator = &.{}, enumerators_complete: bool = true, javascript_handle: u8 = 0, ruby_value: bool = false };
+pub const Type = struct { name: []const u8, kind: Kind, size: u64, child: ?*const Type = null, count: u64 = 0, fields: []const Field = &.{}, language: Language = .unknown, enumerators: []const Enumerator = &.{}, enumerators_complete: bool = true, javascript_handle: u8 = 0, ruby_value: bool = false, go_kind: u8 = 0 };
 pub fn enumeratorName(value: Value) ?[]const u8 {
     if (value.type.size == 0 or value.type.size > 8) return null;
     const mask: u64 = if (value.type.size == 8) std.math.maxInt(u64) else (@as(u64, 1) << @as(u6, @intCast(value.type.size * 8))) - 1;

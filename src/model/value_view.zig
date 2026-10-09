@@ -4,35 +4,61 @@ const std = @import("std");
 const eval = @import("evaluate.zig");
 pub const max_children = 64;
 pub const max_preview = 64;
-pub const basis = "DWARF types and member offsets; Rust/Zig slice names plus CU language/producer; stopped target memory; no inferior function calls";
+pub const basis = "DWARF types and member offsets; Rust/Zig slice names or Go DW_AT_go_kind plus CU language/producer; stopped target memory; no inferior function calls";
+/// reflect.Kind values cmd/link stores in DW_AT_go_kind.
+pub const go_kind = struct {
+    pub const chan = 18;
+    pub const func = 19;
+    pub const interface = 20;
+    pub const map = 21;
+    pub const slice = 23;
+    pub const string = 24;
+};
 pub const Presentation = enum { scalar, fields, array, slice, bytes };
-const Layout = struct { pointer: eval.Field, length: eval.Field };
+const Layout = struct { pointer: eval.Field, length: eval.Field, capacity: ?eval.Field = null };
 fn layout(t: *const eval.Type) ?Layout {
-    if (t.kind != .structure or t.fields.len != 2) return null;
+    const go_sequence = t.language == .go and (t.go_kind == go_kind.string or t.go_kind == go_kind.slice);
+    if (t.kind != .structure or t.fields.len != @as(usize, if (go_sequence and t.go_kind == go_kind.slice) 3 else 2)) return null;
     const named_slice = switch (t.language) {
         .rust => std.mem.eql(u8, t.name, "&str") or std.mem.eql(u8, t.name, "&mut str") or
             std.mem.startsWith(u8, t.name, "&[") or std.mem.startsWith(u8, t.name, "&mut ["),
         .zig => std.mem.startsWith(u8, t.name, "[]"),
+        .go => go_sequence,
         .unknown => false,
     };
     if (!named_slice) return null;
     var pointer: ?eval.Field = null;
     var length: ?eval.Field = null;
+    const pointer_name = switch (t.language) {
+        .rust => "data_ptr",
+        .go => if (t.go_kind == go_kind.string) "str" else "array",
+        else => "ptr",
+    };
     for (t.fields) |f| {
-        if (std.mem.eql(u8, f.name, if (t.language == .rust) "data_ptr" else "ptr")) pointer = f;
+        if (std.mem.eql(u8, f.name, pointer_name)) pointer = f;
         if (std.mem.eql(u8, f.name, if (t.language == .rust) "length" else "len")) length = f;
         if (f.offset > t.size or f.type.size > t.size - f.offset) return null;
     }
     const p = pointer orelse return null;
     const n = length orelse return null;
-    if (p.type.kind != .pointer or p.type.size != 8 or p.type.child == null or n.type.kind != .unsigned or n.type.size == 0 or n.type.size > 8) return null;
+    var capacity: ?eval.Field = null;
+    if (t.language == .go and t.go_kind == go_kind.slice) {
+        for (t.fields) |f| if (std.mem.eql(u8, f.name, "cap")) {
+            capacity = f;
+        };
+        const k = capacity orelse return null;
+        if (k.type.kind != .signed or k.type.size != 8) return null;
+    }
+    // Go's len is a signed int; a negative length is refused in sequence().
+    const length_kind_ok = n.type.kind == .unsigned or (t.language == .go and n.type.kind == .signed and n.type.size == 8);
+    if (p.type.kind != .pointer or p.type.size != 8 or p.type.child == null or !length_kind_ok or n.type.size == 0 or n.type.size > 8) return null;
     if (p.offset < n.offset + n.type.size and n.offset < p.offset + p.type.size) return null;
-    return .{ .pointer = p, .length = n };
+    return .{ .pointer = p, .length = n, .capacity = capacity };
 }
 fn field(v: eval.Value, f: eval.Field) !eval.Value {
     return eval.subvalue(v, f.type, f.offset);
 }
-pub const Sequence = struct { address: u64, count: u64, element: *const eval.Type, presentation: Presentation };
+pub const Sequence = struct { address: u64, count: u64, element: *const eval.Type, presentation: Presentation, capacity: ?u64 = null };
 pub fn sequence(ctx: eval.Context, v: eval.Value) !?Sequence {
     if (v.availability != .available) return error.ValueUnavailable;
     if (v.type.kind == .array and v.address == null) return null;
@@ -40,16 +66,24 @@ pub fn sequence(ctx: eval.Context, v: eval.Value) !?Sequence {
     const l = layout(v.type) orelse return null;
     const p = try eval.materialize(ctx, try field(v, l.pointer));
     const n = try eval.materialize(ctx, try field(v, l.length));
+    if (l.length.type.kind == .signed and n.bits >> 63 != 0) return error.InvalidLength;
     const child = p.type.child.?;
     const bytes = std.math.mul(u64, n.bits, child.size) catch return error.InvalidAddress;
     _ = std.math.add(u64, p.bits, bytes) catch return error.InvalidAddress;
-    return .{ .address = p.bits, .count = n.bits, .element = child, .presentation = if (child.kind == .unsigned and child.size == 1) .bytes else .slice };
+    var capacity: ?u64 = null;
+    if (l.capacity) |k| {
+        const cap = try eval.materialize(ctx, try field(v, k));
+        if (cap.bits >> 63 != 0 or cap.bits < n.bits) return error.InvalidLength;
+        capacity = cap.bits;
+    }
+    return .{ .address = p.bits, .count = n.bits, .element = child, .presentation = if (child.kind == .unsigned and child.size == 1) .bytes else .slice, .capacity = capacity };
 }
 pub const Preview = struct {
     presentation: Presentation,
     data_address: u64,
     count: u64,
     element_type: []const u8,
+    capacity: ?u64 = null,
     text: ?[]const u8 = null,
     hex: ?[]const u8 = null,
     preview_bytes: usize = 0,
@@ -125,7 +159,7 @@ pub const PythonValue = struct {
 pub fn preview(ctx: eval.Context, v: eval.Value) !?Preview {
     if (layout(v.type) == null) return null;
     const seq = (try sequence(ctx, v)).?;
-    var result = Preview{ .presentation = seq.presentation, .data_address = seq.address, .count = seq.count, .element_type = seq.element.name };
+    var result = Preview{ .presentation = seq.presentation, .data_address = seq.address, .count = seq.count, .element_type = seq.element.name, .capacity = seq.capacity };
     if (seq.presentation != .bytes) return result;
     var buffer: [max_preview]u8 = undefined;
     const wanted: usize = @intCast(@min(seq.count, buffer.len));

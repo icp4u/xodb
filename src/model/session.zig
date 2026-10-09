@@ -1614,6 +1614,22 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
+        if (v.type.language == .go) {
+            const kind: ?[]const u8 = switch (v.type.go_kind) {
+                value_view.go_kind.map => "map",
+                value_view.go_kind.chan => "channel",
+                value_view.go_kind.interface => "interface",
+                else => null,
+            };
+            // Swiss maps, itab/_type dynamic types and hchan state are later
+            // work: say so instead of showing raw words as if they were values.
+            if (kind) |what| {
+                result.display = try std.fmt.allocPrint(a, "partial: M2 (Go {s} preview not implemented)", .{what});
+                result.diagnostic = "GoPreviewNotImplemented";
+                result.partial = true;
+                return result;
+            }
+        }
         const ruby_preview = @import("../language/ruby.zig").preview(self, a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
             break :blk null;
@@ -1682,6 +1698,8 @@ pub const Session = struct {
                 result.display = try std.fmt.allocPrint(a, "{s}{s} [{d} bytes]", .{ quoted, if (shown.truncated) "..." else "", shown.count });
             } else if (shown.hex) |hex| {
                 result.display = try std.fmt.allocPrint(a, "hex {s}{s} [{d} bytes]", .{ hex, if (shown.truncated) "..." else "", shown.count });
+            } else if (shown.capacity) |cap| {
+                result.display = try std.fmt.allocPrint(a, "len {d} cap {d} [{s}] @ 0x{x}{s}", .{ shown.count, cap, shown.element_type, shown.data_address, if (shown.diagnostic != null) " (unreadable)" else "" });
             } else result.display = try std.fmt.allocPrint(a, "[{d} {s}] @ 0x{x}{s}", .{ shown.count, shown.element_type, shown.data_address, if (shown.diagnostic != null) " (unreadable)" else "" });
         }
         return result;

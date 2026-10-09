@@ -109,7 +109,7 @@ different about the slow ones."*
 **Rule of thumb:** profile when you don't know where to look; observe when you
 know which function matters and want to know which calls are slow and why.
 
-## Interpreted languages (Ruby, Python, Perl, JavaScript, Lua)
+## Interpreted languages (Ruby, Python, Perl, JavaScript, Lua) and Go
 
 xodb debugs interpreters as the C programs they are. With a debug build of the
 interpreter you can:
@@ -213,7 +213,7 @@ script level:
   Freed or overwritten objects and inconsistent headers are marked; no
   `__repr__` or other code runs in the target. Needs CPython DWARF types.
 - **The script's stack at a native stop.** Agents ask `get_language_stack`
-  (language `perl`, `python`, `javascript`, `lua` or `ruby`) for sub/function names and file:line, read
+  (language `perl`, `python`, `javascript`, `lua`, `ruby` or `go`) for sub/function names and file:line, read
   straight from the stopped interpreter without running any code in it. Each
   piece is tied to the native interpreter-loop frame it came from, and it says
   `partial` when a boundary can't be proven. For CPython the tie is proved by
@@ -240,6 +240,12 @@ script level:
   **E** `state`, `summary` or `values` shows Symbol, Hash and Array previews.
   The initial exact-revision DWARF profile and refusals are in [Ruby](RUBY.md).
 
+- **Go goroutines.** `scripts/demo-go`, **Space**, choose **Go**: every
+  goroutine with its state (`select`, `sync.Mutex.Lock`, `sleep`…), creation
+  site and stack, read from the stopped runtime (go1.27.1, amd64). Strings,
+  slices and structs preview in **C/C++**; maps, interfaces and channels say
+  `partial: M2`. See [Go](GO.md).
+
 Imported logical frames, including JVM exports, remain separate evidence; see
 [logical frames](LOGICAL_FRAMES.md).
 
@@ -258,6 +264,7 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Watch Python container paths | `xodb --break builtin_print -- python3 examples/python-path-demo.py` with a supported debug interpreter | **Space**, **Python**, select **main**, **Shift+E** `state["player"]["score"]` **Return**, then **Space**, **V**. Dict/list/tuple paths re-resolve after replacement; no Python callbacks run. |
 | Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` or `values[0]` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
 | Inside a Rails model | `XODB_RAILS_GEMS=DIR ./scripts/demo-rails` (activemodel installed in DIR, see [Ruby](RUBY.md#rails-demo)) | **Space**, **Tab** to **Ruby**, click **checkout!**, **E** `attrs` **Return**; click **valid?** for `validations.rb:367`; back on **checkout!**, **Shift+E** `attrs[:line_items][0][:price]` **Return**, then **Space**. |
+| Goroutines in a Go program | `./scripts/demo-go` | **Space**, **Go**, select **main.blocked** for a goroutine parked on a mutex; workers sit in `select`, one goroutine sleeps. **C/C++** shows `label`, `items` (len/cap) and `first` (struct). |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |

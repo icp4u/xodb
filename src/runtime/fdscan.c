@@ -37,6 +37,7 @@ struct snap {
     uint32_t nstrings;
     struct xrt_fd_unseen *unseen;
     uint32_t nunseen;
+    uint32_t procs_cap, fds_cap, strings_cap, unseen_cap;
     struct xrt_fd_snapshot view;
 };
 struct key {
@@ -62,11 +63,45 @@ struct xrt_fdscan {
     char *dents;
     struct key *keys;
     struct xrt_fd_file *files;
-    uint32_t nfiles;
+    uint32_t nfiles, keys_cap, files_cap;
+    int allocation_failed;
     uint64_t files_sequence;
     float totals[METRICS][TOTALS];
     uint32_t ntotals;
 };
+
+/* Limits bound demand, not up-front address-space reservations. Failed growth
+ * keeps the old allocation valid; poll never publishes a half-built sample. */
+static void *reserve(struct xrt_fdscan *s, void *old, uint32_t *capacity,
+                     uint32_t need, uint32_t limit, size_t width)
+{
+    if (need<=*capacity) return old;
+    if (need>limit) return NULL;
+    uint32_t next=*capacity ? *capacity : 64;
+    if (next>limit) next=limit;
+    while (next<need) next=next>limit/2 ? limit : next*2;
+    if (next>SIZE_MAX/width) {s->allocation_failed=1;return NULL;}
+    void *p=realloc(old,(size_t)next*width);
+    if (!p) {s->allocation_failed=1;return NULL;}
+    *capacity=next;return p;
+}
+static int grow_snap(struct xrt_fdscan *s, struct snap *c, uint32_t processes,
+                     uint32_t fds, uint32_t unseen_count, uint32_t strings)
+{
+#define GROW(member, cap, need, limit) do { \
+    if ((need)>c->cap) { \
+        void *p=reserve(s,c->member,&c->cap,(need),(limit),sizeof *c->member); \
+        if (!p) return 0; \
+        c->member=p; \
+    } \
+} while (0)
+    GROW(procs,procs_cap,processes,s->o.max_processes);
+    GROW(fds,fds_cap,fds,s->o.max_fds);
+    GROW(unseen,unseen_cap,unseen_count,s->o.max_processes);
+    GROW(strings,strings_cap,strings,s->o.max_strings);
+#undef GROW
+    return 1;
+}
 
 static uint64_t clock_ns(clockid_t id)
 {
@@ -131,14 +166,8 @@ enum xrt_status xrt_fdscan_create(const struct xrt_fdscan_options *options, stru
         qsort(s->pids, s->o.pid_count, sizeof(*s->pids), by_pid);
     }
     s->o.pids = NULL;
-    /* Large arrays are only touched as far as a scan fills them. */
     for (int i = 0; i < 2; i++) {
-        s->s[i].procs = malloc((size_t)s->o.max_processes * sizeof(struct xrt_fd_process));
-        s->s[i].unseen = malloc((size_t)s->o.max_processes * sizeof(struct xrt_fd_unseen));
-        s->s[i].fds = malloc((size_t)s->o.max_fds * sizeof(struct xrt_fd));
-        s->s[i].strings = malloc(s->o.max_strings);
-        if (!s->s[i].procs || !s->s[i].unseen || !s->s[i].fds || !s->s[i].strings)
-            goto oom;
+        if (!grow_snap(s,&s->s[i],0,0,0,1)) goto oom;
         s->s[i].strings[0] = 0;
         s->s[i].nstrings = 1;
     }
@@ -199,6 +228,11 @@ void xrt_fdscan_budget(struct xrt_fdscan *s, uint32_t ms)
     }
 }
 
+void xrt_fdscan_cgroups(struct xrt_fdscan *s, int enabled)
+{
+    if (s) s->o.cgroups=enabled!=0;
+}
+
 void xrt_fdscan_detail(struct xrt_fdscan *s, int32_t pid)
 {
     if (s)
@@ -227,6 +261,7 @@ static uint32_t put(struct xrt_fdscan *s, struct snap *c, const char *text, size
 {
     if (n >= s->o.max_strings - c->nstrings)
         return 0;
+    if (!grow_snap(s,c,0,0,0,c->nstrings+(uint32_t)n+1)) return 0;
     const uint32_t at = c->nstrings;
     memcpy(c->strings + at, text, n);
     c->strings[at + n] = 0;
@@ -396,6 +431,7 @@ static int unseen(struct xrt_fdscan *s, struct snap *c, int32_t pid, uint32_t ui
         c->view.dropped_processes++;
         return 0;
     }
+    if (!grow_snap(s,c,0,0,c->nunseen+1,0)) return 0;
     struct xrt_fd_unseen *u = &c->unseen[c->nunseen++];
     memset(u, 0, sizeof(*u));
     u->pid = pid;
@@ -406,17 +442,43 @@ static int unseen(struct xrt_fdscan *s, struct snap *c, int32_t pid, uint32_t ui
     return 1;
 }
 
+/* Only the unified hierarchy has a single exact grouping key. Do not guess
+ * a service from command names or silently equate different v1 hierarchies. */
+static void read_cgroup(struct xrt_fdscan *s,struct snap *c,struct xrt_fd_process *p,int proc)
+{
+    char data[4096];ssize_t n=slurp(proc,"cgroup",data,sizeof data);
+    p->cgroup_status=XRT_FD_CGROUP_UNAVAILABLE;
+    if (n<0) {
+        p->cgroup_error=(int32_t)-n;
+        if (n==-EACCES || n==-EPERM) p->cgroup_status=XRT_FD_CGROUP_DENIED;
+        return;
+    }
+    if (n==(ssize_t)sizeof data-1) {p->cgroup_status=XRT_FD_CGROUP_TRUNCATED;return;}
+    if (n<5 || memchr(data,0,(size_t)n)) {p->cgroup_status=XRT_FD_CGROUP_MALFORMED;return;}
+    const char *path=NULL;size_t length=0;
+    for (const char *at=data;at<data+n;) {
+        const char *end=memchr(at,'\n',(size_t)(data+n-at));
+        if (!end) {p->cgroup_status=XRT_FD_CGROUP_MALFORMED;return;}
+        if (end-at>=4 && !memcmp(at,"0::/",4)) {
+            if (path) {p->cgroup_status=XRT_FD_CGROUP_MALFORMED;return;}
+            path=at+3;length=(size_t)(end-path);
+        }
+        at=end+1;
+    }
+    if (!path) {p->cgroup_status=XRT_FD_CGROUP_UNSUPPORTED;return;}
+    p->cgroup=put(s,c,path,length);p->cgroup_length=p->cgroup ? (uint32_t)length : 0;
+    p->cgroup_status=p->cgroup ? XRT_FD_CGROUP_CURRENT : XRT_FD_CGROUP_TRUNCATED;
+}
+
 enum outcome { SCANNED, UNSEEN, GONE, FULL };
 static int carry(struct xrt_fdscan *, struct snap *, const struct snap *, const struct xrt_fd_process *);
 
-static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap *prev,
+static enum outcome scan_process(struct xrt_fdscan *s, struct snap *c, const struct snap *prev,
                          const struct xrt_fd_process *old, const struct xrt_fd_unseen *was_unseen,
-                         int32_t pid, uint64_t now)
+                         int32_t pid, uint64_t now, int proc)
 {
     char name[48], text[1024];
-    const int proc = s->expected_dir >= 0 ? s->expected_dir : s->proc;
-    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "stat");
-    else snprintf(name, sizeof(name), "%d/stat", pid);
+    snprintf(name, sizeof(name), "stat");
     const ssize_t n = slurp(proc, name, text, sizeof(text));
     char *close_paren = n > 0 ? strrchr(text, ')') : NULL;
     char *open_paren = n > 0 ? strchr(text, '(') : NULL;
@@ -450,15 +512,13 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
     }
     struct stat st;
     uint32_t uid = old ? old->uid : was_unseen ? was_unseen->uid : 0;
-    if (s->expected_dir >= 0) snprintf(name, sizeof(name), ".");
-    else snprintf(name, sizeof(name), "%d", pid);
+    snprintf(name, sizeof(name), ".");
     if (recheck) {
         if (fstatat(proc, name, &st, 0))
             return GONE;
         uid = st.st_uid;
     }
-    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "fd");
-    else snprintf(name, sizeof(name), "%d/fd", pid);
+    snprintf(name, sizeof(name), "fd");
     const int fd_dir = openat(proc, name, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
     if (fd_dir < 0) {
         if (errno != EACCES && errno != EPERM)
@@ -470,6 +530,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         close(fd_dir);
         return FULL;
     }
+    if (!grow_snap(s,c,c->nprocs+1,0,0,0)) {close(fd_dir);return FULL;}
     const uint32_t strings_before = c->nstrings;
     struct xrt_fd_process *p = &c->procs[c->nprocs];
     memset(p, 0, offsetof(struct xrt_fd_process, history));
@@ -484,6 +545,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         memcpy(p->comm, open_paren + 1, len);
         p->comm[len] = 0;
     }
+    if (s->o.cgroups) read_cgroup(s,c,p,proc);
     if (old) {
         p->history = old->history;
         p->lifetime_low = old->lifetime_low;
@@ -496,16 +558,14 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         p->cmdline_length = p->cmdline ? old->cmdline_length : 0;
     } else {
         char line[CMDLINE_MAX];
-        if (s->expected_dir >= 0) snprintf(name, sizeof(name), "cmdline");
-    else snprintf(name, sizeof(name), "%d/cmdline", pid);
+        snprintf(name, sizeof(name), "cmdline");
         const ssize_t got = slurp(proc, name, line, sizeof(line));
         if (got > 0) {
             p->cmdline = put(s, c, line, (size_t)got);
             p->cmdline_length = p->cmdline ? (uint32_t)got : 0;
         }
     }
-    if (s->expected_dir >= 0) snprintf(name, sizeof(name), "io");
-    else snprintf(name, sizeof(name), "%d/io", pid);
+    snprintf(name, sizeof(name), "io");
     if (slurp(proc, name, text, sizeof(text)) > 0) {
         p->rchar = field(text, "rchar:");
         p->wchar = field(text, "wchar:");
@@ -532,14 +592,12 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
                 continue;
             if (count == s->numbers_cap) {
                 /* Never hold more numbers than the fd limit could keep. */
-                const uint32_t cap = s->numbers_cap ? s->numbers_cap * 2 : 1024;
-                int32_t *grown = s->numbers_cap <= s->o.max_fds ? realloc(s->numbers, cap * sizeof(*grown)) : NULL;
+                int32_t *grown=reserve(s,s->numbers,&s->numbers_cap,count+1,s->o.max_fds,sizeof *grown);
                 if (!grown) {
                     unlisted++;
                     continue;
                 }
                 s->numbers = grown;
-                s->numbers_cap = cap;
             }
             s->numbers[count++] = (int32_t)strtol(e->name, NULL, 10);
         }
@@ -577,6 +635,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
             c->view.dropped_fds += count - i;
             break;
         }
+        if (!grow_snap(s,c,0,c->nfds+1,0,0)) {close(fd_dir);return FULL;}
         char link[LINK_MAX];
         snprintf(name, sizeof(name), "%d", s->numbers[i]);
         struct xrt_fd *f = &c->fds[c->nfds];
@@ -643,7 +702,7 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
         const int had = same && (was->flags & XRT_FD_INFO);
         f->flags |= XRT_FD_INFO_STALE;
         if (!same) f->info_interval_ns = 0;
-        if (read_info && fdinfo(proc, s->expected_dir >= 0 ? 0 : pid, f->fd, f)) {
+        if (read_info && fdinfo(proc, 0, f->fd, f)) {
             f->flags &= (uint8_t)~XRT_FD_INFO_STALE;
             f->info_sampled_ns = now;
             f->info_interval_ns = had && now > last_at ? now - last_at : 0;
@@ -680,12 +739,30 @@ static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap
     return SCANNED;
 }
 
+static enum outcome scan(struct xrt_fdscan *s, struct snap *c, const struct snap *prev,
+                         const struct xrt_fd_process *old, const struct xrt_fd_unseen *was,
+                         int32_t pid, uint64_t now)
+{
+    if (s->expected_dir>=0) return scan_process(s,c,prev,old,was,pid,now,s->expected_dir);
+    char name[32];snprintf(name,sizeof name,"%d",pid);
+    int proc=openat(s->proc,name,O_RDONLY|O_DIRECTORY|O_CLOEXEC);
+    if (proc<0) {
+        if (errno==EACCES || errno==EPERM) {
+            unseen(s,c,pid,was ? was->uid : 0,was ? was->start : 0,0,0);return UNSEEN;
+        }
+        return GONE;
+    }
+    enum outcome result=scan_process(s,c,prev,old,was,pid,now,proc);
+    close(proc);return result;
+}
+
 /* Carry a process over unscanned when the time budget runs out: its last
  * rates stand, its counts are zero. */
 static int carry(struct xrt_fdscan *s, struct snap *c, const struct snap *prev, const struct xrt_fd_process *old)
 {
     if (c->nprocs == s->o.max_processes || old->count > s->o.max_fds - c->nfds)
         return 0;
+    if (!grow_snap(s,c,c->nprocs+1,c->nfds+old->count,0,0)) return 0;
     struct xrt_fd_process *p = &c->procs[c->nprocs++];
     *p = *old;
     p->flags = (p->flags & ~(uint32_t)(XRT_FDP_NEW | XRT_FDP_QUIET)) | XRT_FDP_STALE | XRT_FDP_OFFSETS_STALE;
@@ -693,6 +770,9 @@ static int carry(struct xrt_fdscan *s, struct snap *c, const struct snap *prev, 
     p->opened = p->closed = 0;
     p->d_count = 0;
     p->interval_ns = 0;
+    p->cgroup=old->cgroup_length ? put(s,c,prev->strings+old->cgroup,old->cgroup_length) : 0;
+    p->cgroup_length=p->cgroup ? old->cgroup_length : 0;
+    if (old->cgroup_length) p->cgroup_status=p->cgroup ? XRT_FD_CGROUP_STALE : XRT_FD_CGROUP_TRUNCATED;
     p->cmdline = old->cmdline_length ? put(s, c, prev->strings + old->cmdline, old->cmdline_length) : 0;
     if (!p->cmdline)
         p->cmdline_length = 0;
@@ -729,6 +809,7 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *s, struct xrt_fd_snapshot *ou
     const struct snap *prev = &s->s[s->cur];
     struct snap *c = &s->s[!s->cur];
     const int first = s->sequence == 0;
+    s->allocation_failed=0;
     c->nprocs = c->nfds = c->nunseen = 0;
     c->nstrings = 1;
     memset(&c->view, 0, sizeof(c->view));
@@ -830,6 +911,7 @@ enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *s, struct xrt_fd_snapshot *ou
         s->resume = next < total ? list[next] : 0;
     }
     free(pids);
+    if (s->allocation_failed) return XRT_OUT_OF_MEMORY;
     const uint64_t ended = clock_ns(CLOCK_MONOTONIC);
     struct xrt_fd_snapshot *v = &c->view;
     v->source = XRT_FD_SOURCE_POLL;
@@ -917,16 +999,15 @@ enum xrt_status xrt_fdscan_files(struct xrt_fdscan *s, const struct xrt_fd_file 
         return XRT_INVALID_ARGUMENT;
     const struct snap *c = &s->s[s->cur];
     if (s->files_sequence != s->sequence) {
-        if (!s->keys) {
-            s->keys = malloc((size_t)s->o.max_fds * sizeof(*s->keys));
-            s->files = malloc((size_t)s->o.max_fds * sizeof(*s->files));
-            if (!s->keys || !s->files) {
-                free(s->keys);
-                free(s->files);
-                s->keys = NULL;
-                s->files = NULL;
-                return XRT_OUT_OF_MEMORY;
-            }
+        if (c->nfds>s->keys_cap) {
+            void *p=reserve(s,s->keys,&s->keys_cap,c->nfds,s->o.max_fds,sizeof *s->keys);
+            if (!p) return XRT_OUT_OF_MEMORY;
+            s->keys=p;
+        }
+        if (c->nfds>s->files_cap) {
+            void *p=reserve(s,s->files,&s->files_cap,c->nfds,s->o.max_fds,sizeof *s->files);
+            if (!p) return XRT_OUT_OF_MEMORY;
+            s->files=p;
         }
         uint32_t n = 0;
         for (uint32_t p = 0; p < c->nprocs; p++)

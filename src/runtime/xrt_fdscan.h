@@ -7,7 +7,7 @@
  * One owner thread polls. Each poll fills a borrowed snapshot that stays valid
  * until the next poll or destroy; xrt_fd_snapshot_copy() makes an owned,
  * immutable copy for other threads. Memory is bounded by the limits given at
- * creation; work per scan is bounded by its time budget. Anything cut by a
+ * creation; arrays grow with observed demand. Work per scan is bounded by its time budget. Anything cut by a
  * limit is counted, never silently dropped.
  *
  * Polling sees only the fd set at each sample: an open and close between two
@@ -88,6 +88,11 @@ struct xrt_fd_history {
     uint16_t kinds[XRT_FD_HISTORY][XRT_FD_KINDS]; /* saturating */
 };
 
+enum xrt_fd_cgroup_status {
+    XRT_FD_CGROUP_UNAVAILABLE, XRT_FD_CGROUP_CURRENT, XRT_FD_CGROUP_STALE,
+    XRT_FD_CGROUP_DENIED, XRT_FD_CGROUP_TRUNCATED, XRT_FD_CGROUP_UNSUPPORTED,
+    XRT_FD_CGROUP_MALFORMED
+};
 struct xrt_fd_process {
     int32_t pid, ppid;
     uint32_t uid, flags;
@@ -95,6 +100,9 @@ struct xrt_fd_process {
     char comm[16];
     uint32_t cmdline;    /* offset into strings: NUL-separated arguments */
     uint32_t cmdline_length;
+    uint32_t cgroup, cgroup_length; /* exact cgroup-v2 path in snapshot strings */
+    enum xrt_fd_cgroup_status cgroup_status;
+    int32_t cgroup_error;
     uint32_t first, count; /* fds[first .. first + count), ascending fd */
     uint32_t kinds[XRT_FD_KINDS];
     uint64_t rchar, wchar, read_bytes, write_bytes; /* cumulative /proc/PID/io */
@@ -169,6 +177,7 @@ struct xrt_fdscan_options {
     uint64_t expected_start; /* nonzero: exactly one pid; pin its proc directory and require this start tick */
     int adaptive; /* opt-in: requested metadata fresh, background metadata explicitly stale */
     int include_self;
+    int cgroups; /* opt-in exact cgroup-v2 paths for graph grouping */
     const char *proc;       /* procfs root; NULL: "/proc" */
 };
 
@@ -179,6 +188,7 @@ void xrt_fdscan_destroy(struct xrt_fdscan *);
 enum xrt_status xrt_fdscan_poll(struct xrt_fdscan *, struct xrt_fd_snapshot *);
 /* Change the scan time budget (0: unbounded) from the next poll. */
 void xrt_fdscan_budget(struct xrt_fdscan *, uint32_t ms);
+void xrt_fdscan_cgroups(struct xrt_fdscan *, int enabled);
 /* Also reread fdinfo for every fd of this process (0: none). */
 void xrt_fdscan_detail(struct xrt_fdscan *, int32_t pid);
 /* Replace the foreground process set; copied, no borrowed pointer. Adaptive

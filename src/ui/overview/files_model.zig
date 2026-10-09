@@ -81,7 +81,10 @@ pub const State = struct {
             const target = if (self.mode == .events and self.event_authorized) self.event_target else null;
             var foreground: [c.XRT_FD_INTEREST_MAX]i32 = undefined;
             var count: usize = 0;
-            if (self.filter) |id| { foreground[0] = id.pid; count = 1; }
+            if (self.filter) |id| {
+                foreground[0] = id.pid;
+                count = 1;
+            }
             for (self.rows.items[@min(self.top, self.rows.items.len)..@min(self.rows.items.len, self.top + self.visible)]) |row| {
                 if (row == .event) continue;
                 const pid = self.identity(row).owner.pid;
@@ -91,8 +94,12 @@ pub const State = struct {
                 }
             }
             const request = c.struct_xrt_fdactivity_request{
-                .poll_pids = &foreground, .poll_pid_count = @intCast(count),
+                .poll_pids = &foreground,
+                .poll_pid_count = @intCast(count),
                 .interval_ms = self.interval_ms,
+                // The cards summarize the whole cache, including quiet rows.
+                // Request real comparisons within the rotating scan budget.
+                .poll_all = 1,
                 .event_pid = if (target) |id| id.pid else 0,
                 .event_start = if (target) |id| id.start else 0,
             };

@@ -12,15 +12,16 @@ const themes = @import("theme.zig");
 const panels = @import("panels.zig");
 pub const files_model = @import("files_model.zig");
 pub const memmap = @import("memmap.zig");
+pub const graph_model = @import("graph_model.zig");
 pub const Ctx = draw.Ctx;
 pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map" };
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -70,6 +71,7 @@ pub const View = struct {
     source_label: []const u8 = "live",
     files: files_model.State = .{},
     memmap: memmap.State = .{},
+    graph: graph_model.State = .{},
     /// The Memory map looks draw period-styled tooltips.
     tooltip_style: enum { overview, win9x, dos } = .overview,
     current: ?*m.Owned = null,
@@ -109,7 +111,7 @@ pub const View = struct {
     status_len: usize = 0,
     status_time: u64 = 0,
     /// Clickable regions recorded while drawing, consumed by the next press.
-    hits: [256]Hit = undefined,
+    hits: [1536]Hit = undefined,
     hit_count: usize = 0,
     action_hook: ?ActionHook = null,
     pending_action: ?actions.Request = null,
@@ -135,7 +137,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click };
+    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -145,6 +147,7 @@ pub const View = struct {
     pub fn deinit(self: *View) void {
         self.files.deinit(self.gpa);
         self.memmap.deinit();
+        self.graph.deinit();
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -417,6 +420,7 @@ pub const View = struct {
             return;
         }
         if (self.panel == .files and self.filesKey(event, now)) return;
+        if ((self.panel == .graph or self.panel == .galaxy) and @import("graph_panel.zig").key(self, event)) return;
         if (self.panel == .memory_map and !self.searching and memmap.key(self, event, now)) return;
         if (self.searching) {
             switch (sym) {
@@ -497,6 +501,8 @@ pub const View = struct {
             },
             'l' => if (self.panel == .processes) self.requestAction(.files, now) else self.show(.files),
             'f' => self.requestAction(.profile, now),
+            'g' => self.show(.graph),
+            'y' => self.show(.galaxy),
             'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
@@ -733,6 +739,10 @@ pub const View = struct {
                 .events => self.requestAction(.events, now),
                 .stop_events => self.files.stopCapture(),
                 .memmap => |what| memmap.click(self, what, now),
+                .graph_star => |index| self.graph.focusStar(index),
+                .graph_resource => |node| @import("graph_panel.zig").openResource(self, node),
+                .graph_all => self.graph.all(),
+                .graph_files => if (self.graph.focus) |id| { self.files.scope(.{ .pid=id.pid, .start=id.start }); self.show(.files); },
             }
             return;
         }
@@ -1134,6 +1144,7 @@ pub const View = struct {
                 .services => .{ .text = if (snapshot.services.len > 0) std.fmt.bufPrint(&vb, "{d} services", .{snapshot.services.len}) catch "" else snapshot.group(.services).reason },
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
+                .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{g.processes, g.member_count}) catch "" else "sampled when shown" },
                 .memory_map => .{ .text = if (self.memmap.map()) |mm| switch (memmap.md.coverage(mm)) {
                     .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (mm.process == null) "free contiguous" else "THP" }) catch "",
                     .none => "nothing eligible",

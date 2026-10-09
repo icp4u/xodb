@@ -25,13 +25,14 @@ pub const usage =
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue or mono (builtin: prefix accepted)
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps, files or memory_map
+    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph or galaxy
+    \\  --graph-pid N   restrict descriptor collection to this PID (repeatable); defaults to galaxy
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
     \\  --files-start-ticks N  require this exact identity with --files-pid
     \\  --look NAME     Memory map look: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern or deep (zoomable)
     \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
-    \\                  at 1 Hz; off Processes, per-process IO and fd counts wait until shown)
+    \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
     \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
     \\  --pause         start paused (replay: show the last frame with full history)
@@ -54,6 +55,8 @@ pub const Options = struct {
     panel: ?vw.Panel = null,
     files_pid: ?i32 = null,
     files_start: u64 = 0,
+    graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
+    graph_count: usize = 0,
     look: ?vw.memmap.Look = null,
     memmap_pid: ?i32 = null,
     memmap_start: u64 = 0,
@@ -83,7 +86,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -100,6 +103,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.theme = value;
         }
         if (std.mem.eql(u8, arg, "--panel")) o.panel = std.meta.stringToEnum(vw.Panel, value) orelse return error.UnknownOverviewPanel;
+        if (std.mem.eql(u8, arg, "--graph-pid")) {
+            const pid = try std.fmt.parseInt(i32, value, 10);
+            if (pid <= 0 or o.graph_count == o.graph_pids.len) return error.InvalidGraphScope;
+            if (std.mem.indexOfScalar(i32, o.graph_pids[0..o.graph_count], pid) == null) {
+                o.graph_pids[o.graph_count] = pid;
+                o.graph_count += 1;
+            }
+        }
         if (std.mem.eql(u8, arg, "--files-pid")) {
             const pid = try std.fmt.parseInt(i32, value, 10);
             if (pid <= 0) return error.InvalidFilesIdentity;
@@ -138,6 +149,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
         if (o.replay != null or (o.panel != null and o.panel.? != .files)) return error.InvalidFilesIdentity;
         o.panel = .files;
     }
+    if (o.graph_count > 0) {
+        if (o.replay != null or (o.panel != null and o.panel.? != .graph and o.panel.? != .galaxy)) return error.InvalidGraphScope;
+        if (o.panel == null) o.panel = .galaxy;
+    }
     return o;
 }
 
@@ -157,7 +172,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
     const gpa = std.heap.c_allocator;
-    var collector: Collector = .{ .redact = o.redact };
+    var collector: Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count] };
     defer collector.deinit();
     const session = try gpa.create(Session);
     defer gpa.destroy(session);
@@ -295,6 +310,18 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
                 if (changed) {
                     window.dirty = true;
                     if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
+                }
+            }
+            if (view.panel == .graph or view.panel == .galaxy) {
+                if (view.graph.refresh(&collector, current, view.paused) catch |err| blk: {
+                    view.setStatus("Graph update failed: {s}", .{@errorName(err)}, current);
+                    break :blk false;
+                }) {
+                    window.dirty = true;
+                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.graph) |graph| {
+                        const projection = view.graph.projection.?;
+                        std.debug.print("xodb: fdgraph sequence={d} processes={d} descriptors={d} peer_edges={d} stars={d} particles={d} scope_count={d}\n", .{ graph.sequence, graph.processes, graph.member_count, graph.peer_edges, projection.star_count, projection.particle_count, o.graph_count });
+                    };
                 }
             }
             if (view.panel == .memory_map) {

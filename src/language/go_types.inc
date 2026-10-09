@@ -1,0 +1,7 @@
+XGO_TYPE(G, "runtime.g")
+XGO_TYPE(M, "runtime.m")
+XGO_TYPE(MODULE, "runtime.moduledata")
+XGO_TYPE(FTAB, "runtime.functab")
+XGO_TYPE(FUNC, "runtime._func")
+XGO_TYPE(STRING, "string")
+XGO_TYPE(GSLICE, "[]*runtime.g")

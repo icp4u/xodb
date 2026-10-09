@@ -29,6 +29,7 @@ pub fn render(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !v
         .services => try services(v, ctx, rect, s),
         .apps => try apps(v, ctx, rect, s),
         .files => try @import("files_panel.zig").render(v, ctx, rect, now),
+        .graph, .galaxy => try @import("graph_panel.zig").render(v, ctx, rect, now),
         .memory_map => try @import("memmap.zig").render(v, ctx, rect, now),
     }
 }

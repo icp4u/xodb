@@ -24,6 +24,8 @@ samples the whole system with the bounded, unprivileged collector
 | System Info | host, kernel, CPU, memory, GPUs, per-group collector state and cost |
 | Users, Services, Installed Apps | utmp sessions, observed daemon processes, package database |
 | Files & IO | Descriptor tables, seekable offset progress, process churn heatmap, fd-growth sparklines, deleted holders and explicit syscall-event counts |
+| FD Graph | Processes and cgroups linked through shared files, pipes and proved UNIX socket peers |
+| FD Galaxy | Descriptor counts orbiting their processes or cgroups, colored by kind, with deleted holders highlighted |
 
 Keys: `1`–`9`, `0`, Tab/Shift+Tab switch panels; arrows, Page Up/Down, Home/End
 move; Left/Right fold the tree; `/` search; `s` next sort, `r` reverse; `v`
@@ -45,8 +47,11 @@ be turned off without a restart); `q` quits. Mouse clicks and the wheel work too
 ## Sampling
 
 Live, the cheap whole-system groups refresh every 500 ms. Process lists are
-sampled once per second (or the slower chosen interval). Off Processes, the
-collector skips per-process IO and fd counts; those fields say "not collected".
+sampled once per second (or the slower chosen interval). Outside Processes, the
+general collector skips its per-process IO and fd counts. Files and the two
+descriptor views request their own IO and fd comparisons from the shared
+descriptor worker, including quiet processes; they do not require a visit to
+Processes first.
 An MCP process request enables full details on the next scheduled tick. Other per-panel groups are sampled only while their
 panel is shown (they read "sampled when shown" until then); connections (an fd
 scan) only while the Connections panel is open. Each group's rates span its own
@@ -64,12 +69,51 @@ work and cap counts remain visible. Initial process rows may wait for their
 turn in the bounded whole-system scan. Positive seekable progress animates at
 up to 15 frames per second while visible; stale, paused or unknown rows do not.
 
-Files prioritizes metadata for visible rows and the selected process. Offscreen
+Files requests comparisons for its whole-cache rate cards. Its rotating scan
+budget still limits which processes are refreshed on each tick. Offscreen
 paths and offsets may be retained; **[stale]** marks those rows, and hovering
 shows which fields are cached and the offset's age. An unchanged descriptor
 count is only a hint: a same-count close/reopen can leave a cached old path
 until refresh. Scroll to a process or select it to request fresh metadata;
 the scan budget still applies. Background metadata receives periodic refresh.
+
+## Descriptor graph and galaxy
+
+These views currently show **polling topology and descriptor counts**. Particle
+size is descriptor count, not measured byte throughput; syscall tracing and
+flow pulses are not connected to these views yet. The Files pane retains its
+separate, explicit event capture.
+
+```sh
+xodb --overview --panel galaxy
+sudo -E xodb --overview --panel graph
+```
+
+The second command uses the access already granted to root and preserves the
+Wayland environment, including `XDG_RUNTIME_DIR`. It opens an ordinary window
+on that display. xodb's overview does not save preferences or history into
+`$HOME`; graphics drivers may write their usual shader caches. An explicit
+`--session-socket` creates the socket requested by the caller.
+
+Press `G` for the graph, `Y` for the galaxy, `C` to fold or expand proved cgroups,
+and `+`/`-` to change detail. Click a process or cgroup to focus; `Esc` returns
+to the whole graph. `L` opens a focused process in Files, and clicking a shared
+resource opens its holders there. For an owned demo process, repeat
+`--graph-pid PID` to restrict the actual descriptor collector; that restriction
+also remains in effect when drilling into Files.
+
+The C collector joins device/inode identities and validated UNIX_DIAG peers,
+not path names. Anonymous or stale identities stay distinct. Denied processes,
+cache age, scan omissions, unproved cgroups and peer-query failures are shown
+explicitly. A peer query covers the collector's network namespace. Cgroup v2
+paths are grouped only when freshly observed; unsupported or stale membership
+does not silently join unrelated processes.
+
+Storage grows with observed demand, up to 16,384 processes and 262,144
+descriptors. The view aggregates these into at most 128 stars and 1,024 particle
+groups; the graph draws at most 128 shared resources and 2,048 links and shows
+omission counts. These are display and collection bounds, not a claim that
+every cached row was refreshed at the same instant.
 
 The collector reuses at most 2,048 read-only process-stat handles, further
 limited to one eighth of the process descriptor limit. Handles are close-on-exec,

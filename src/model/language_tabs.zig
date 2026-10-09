@@ -6,8 +6,8 @@ const Modules = @import("modules.zig").Modules;
 const rt = @import("../target/runtime.zig").c;
 const Text = @import("probes.zig").Text;
 const selection = @import("language_selection.zig");
-pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby };
-pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby };
+pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby, go };
+pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby, .go };
 pub fn title(tab: Tab) []const u8 {
     return switch (tab) {
         .registers => "Regs",
@@ -17,6 +17,7 @@ pub fn title(tab: Tab) []const u8 {
         .lua => "Lua",
         .javascript => "JS",
         .ruby => "Ruby",
+        .go => "Go",
     };
 }
 pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8 };
@@ -41,7 +42,7 @@ pub const State = struct {
     revision: u64 = 0,
     epoch: u64 = std.math.maxInt(u64),
     generation: u64 = std.math.maxInt(u64),
-    entries: [5]Entry = @splat(.{}),
+    entries: [6]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
     pub fn deinit(self: *State) void {
@@ -110,7 +111,10 @@ pub const State = struct {
             }
             self.revision +%= 1;
         }
-        if (self.metadata_revision != session.metadata.revision) {
+        // Consume a metadata change only once the pass is complete: a later
+        // runtime's symbol scan may still be pending when JavaScript metadata
+        // is cancelled or retried, and that change must not be lost.
+        if (self.next == self.entries.len and self.metadata_revision != session.metadata.revision) {
             self.metadata_revision = session.metadata.revision;
             if (self.next == self.entries.len and self.entries[3].found) {
                 self.next = 3;
@@ -125,7 +129,7 @@ pub const State = struct {
         };
         const entry = &self.entries[self.next];
         if (!entry.found) {
-            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version" };
+            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version", "runtime.buildVersion" };
             var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
                 .limit_bytes = 128 * 1024,
                 .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
@@ -158,6 +162,7 @@ pub const State = struct {
             2 => @import("../language/lua.zig").describe(session, a),
             3 => @import("../language/javascript.zig").describe(session, a),
             4 => @import("../language/ruby.zig").describe(session, a),
+            5 => @import("../language/go.zig").describe(session, a),
             else => unreachable,
         };
         const d = description catch |err| {

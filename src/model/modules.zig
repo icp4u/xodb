@@ -22,6 +22,7 @@ pub const Module = struct {
     python_layout: ?c.struct_xpy_layout = null,
     lua_layout: ?c.struct_xl_layout = null,
     ruby_layout: ?c.struct_xrb_layout = null,
+    go_layout: ?c.struct_xgo_layout = null,
     javascript_dwarf: ?c.struct_xjs_dwarf_profile = null,
     debug_file: ?*const @import("../binary/debug_files.zig").File = null,
     debug_allocator: std.mem.Allocator = std.heap.page_allocator,

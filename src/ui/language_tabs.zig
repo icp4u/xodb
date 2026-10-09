@@ -232,7 +232,8 @@ pub const Panel = struct {
             }
             if (@hasField(@TypeOf(segment), "layout_source")) self.stack_basis = try a.dupe(u8, segment.layout_source);
             const anchor_name: ?[]const u8 = if (segment.anchor) |anchor| anchor.symbol else null;
-            try rows.append(a, .{ .name = if (anchor_name) |name| try a.dupe(u8, name) else try std.fmt.allocPrint(a, "Segment {d}", .{segment_index}), .location = if (segment.anchor) |anchor| try std.fmt.allocPrint(a, "segment {d} / native #{d}", .{ segment_index, anchor.frame }) else "native anchor unproved", .reason = if (segment.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = null });
+            const segment_title: ?[]const u8 = if (@hasField(@TypeOf(segment), "title")) segment.title else anchor_name;
+            try rows.append(a, .{ .name = if (segment_title) |name| try a.dupe(u8, name) else try std.fmt.allocPrint(a, "Segment {d}", .{segment_index}), .location = if (segment.anchor) |anchor| try std.fmt.allocPrint(a, "segment {d} / native #{d}", .{ segment_index, anchor.frame }) else "native anchor unproved", .reason = if (segment.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = null });
             for (segment.frames, 0..) |frame, frame_index| {
                 if (count == 64 or rows.items.len == 128) {
                     self.message = "LanguageFrameLimit";
@@ -310,6 +311,12 @@ pub const Panel = struct {
                 self.message = "OutOfMemory";
             },
             .javascript => self.collect(selection.cachedRead(.javascript, session, tid) catch |err| {
+                self.message = @errorName(err);
+                return;
+            }) catch {
+                self.message = "OutOfMemory";
+            },
+            .go => self.collect(selection.cachedRead(.go, session, tid) catch |err| {
                 self.message = @errorName(err);
                 return;
             }) catch {
