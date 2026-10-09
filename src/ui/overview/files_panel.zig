@@ -39,13 +39,14 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         return;
     };
     const s: *const c.struct_xrt_fd_snapshot = snapshot;
-    const status = std.fmt.bufPrint(&buf, "{d} ms · {d} hidden · {d} stale · {d} unscanned · {d} capped · scan {d:.1} ms CPU", .{
+    const status = std.fmt.bufPrint(&buf, "System totals · {d} ms · {d} hidden · {d} stale · {d} unscanned · {d} capped · scan {d:.1} ms CPU", .{
         (now -| s.taken_ns) / 1_000_000,                    s.hidden, s.stale, s.unscanned, s.dropped_processes +| s.dropped_fds,
         @as(f64, @floatFromInt(s.scan_cpu_ns)) / 1_000_000,
     }) catch "";
     try ctx.textFit(rect.x + 8, rect.y + 72, rect.w - 16, status, if (s.hidden +| s.stale +| s.unscanned +| s.dropped_fds > 0) ctx.p.warn else ctx.p.dim);
     const card_w = (rect.w - 24) / 4;
-    const cards = [_][]const u8{ "System visible fds", "System read/s · partial", "System write/s · partial", "System fd changes /s" };
+    // System-wide totals (see the status line); short enough to fit a quarter width.
+    const cards = [_][]const u8{ "Visible fds", "Read/s · partial", "Write/s · partial", "FD changes/s" };
     var known_io = false;
     var known_churn = false;
     for (s.processes[0..s.process_count]) |p| {
@@ -60,7 +61,9 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
             else => if (known_churn) std.fmt.bufPrint(&buf, "{d:.1}", .{s.churn_rate}) catch "" else "not measured",
         };
         const card = Rect{ .x = rect.x + @as(f32, @floatFromInt(i)) * (card_w + 8), .y = rect.y + 100, .w = card_w, .h = 70 };
-        try tile(ctx, card, label, value, if (i == 2) ctx.p.accent2 else ctx.p.accent);
+        // accent2 is the palette's write series; an unmeasured value uses the hatch text colour.
+        const measured = if (i == 1 or i == 2) known_io else if (i == 3) known_churn else true;
+        try tile(ctx, card, label, value, if (!measured) ctx.p.hatch else if (i == 2) ctx.p.accent2 else ctx.p.accent);
         if ((i == 1 or i == 2) and !known_io) v.hover(card, "No comparable readable /proc IO sample yet", .{});
         if (i == 3 and !known_churn) v.hover(card, "No comparable fresh descriptor sample yet", .{});
     }
@@ -84,16 +87,48 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     if (f.rows.items.len == 0) {
         var reason: []const u8 = if (f.mode == .leaks) "No growth candidates in the sampled cache" else if (f.mode == .deleted) "No deleted holders in the sampled cache" else "No matching rows; inspect partial coverage above";
         if (f.mode != .events) if (f.scopeReason()) |scope_reason| { reason = scope_reason; };
-        if (f.mode == .events) reason = if (f.event_status == c.XRT_STALE_SNAPSHOT) (if (f.exact_requested or f.event_authorized) "Event enrollment pending" else "Exact capture is off; E opens its cost and access confirmation") else if (f.failure_len > 0) f.failure[0..f.failure_len] else "Select a process and confirm event capture";
-        try ctx.textFit(table.x + 14, table.y + 56, table.w - 28, reason, ctx.p.warn);
+        var line: [400]u8 = undefined;
+        const failed = f.mode == .events and std.mem.eql(u8, f.captureState(), "failed");
+        if (f.mode == .events) reason = if (f.event_status == c.XRT_STALE_SNAPSHOT) (if (f.exact_requested or f.event_authorized) "Event enrollment pending" else "Exact capture is off; E opens its cost and access confirmation") else if (f.failure_len > 0) (if (failed) std.fmt.bufPrint(&line, "Exact capture failed: {s}", .{f.failure[0..f.failure_len]}) catch "Exact capture failed" else f.failure[0..f.failure_len]) else "Select a process and confirm event capture";
+        if (failed) {
+            // The operation, errno text, path and remedy must all stay readable.
+            const room: usize = @intFromFloat(@max(24, table.h - 62) / 24);
+            const y = try wrap(ctx, table.x + 14, table.y + 56, table.w - 28, reason, ctx.p.crit, @min(3, room));
+            const used: usize = @intFromFloat((y - table.y - 56) / 24);
+            if (f.remedy) |remedy| if (room > used) {
+                _ = try wrap(ctx, table.x + 14, y + 6, table.w - 28, remedy, ctx.p.warn, @min(3, room - used));
+            };
+        } else try ctx.textFit(table.x + 14, table.y + 56, table.w - 28, reason, ctx.p.warn);
     }
-    const loss_state = if (f.event.flags & c.XRT_FDEVENT_LOSS != 0) "incomplete: event loss" else if (f.event.flags & c.XRT_FDEVENT_POSSIBLE_LOSS != 0) "incomplete: possible loss" else if (f.event.flags & c.XRT_FDEVENT_LOSS_UNAVAILABLE != 0) "loss accounting unavailable" else if (f.exact_active) "running" else if (f.exact_requested) "pending" else "stopped; retained counts";
     if (f.mode == .events) {
-        const evidence = std.fmt.bufPrint(&buf, "Capture {d} · lost {d} · unpaired {d} · invalid {d} · {s}", .{ f.event_generation, f.event.lost, f.event.unpaired, f.event.invalid, loss_state }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, evidence, if (f.event.flags != 0) ctx.p.warn else ctx.p.dim);
+        const evidence = std.fmt.bufPrint(&buf, "Capture {d} · lost {d} · unpaired {d} · invalid {d} · {s}", .{ f.event_generation, f.event.lost, f.event.unpaired, f.event.invalid, f.captureState() }) catch "";
+        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, evidence, if (std.mem.eql(u8, f.captureState(), "failed")) ctx.p.crit else if (f.event.flags != 0) ctx.p.warn else ctx.p.dim);
     }
     const note = std.fmt.bufPrint(&buf, "{d} cached rows · {d} ms shared polling · soft budget {d} ms · {s}", .{ f.rows.items.len, f.active_interval_ms, if (f.active_interval_ms == 250) @as(u8, 5) else 10, if (v.paused) "view frozen; peers may continue sampling" else "read-only; no target pause" }) catch "";
     try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (f.exact_active) "exact mode slows all syscalls on this machine by roughly 10 % while active" else note, if (f.exact_active) ctx.p.warn else ctx.p.dim);
+}
+
+/// Up to `lines` lines broken after a space or '/', the last one truncated; returns the next y.
+fn wrap(ctx: Ctx, x: f32, y0: f32, w: f32, text: []const u8, color: draw.Color, lines: usize) !f32 {
+    var rest = text;
+    var y = y0;
+    for (0..lines) |line| {
+        if (rest.len == 0) break;
+        var end = rest.len;
+        if (line + 1 < lines and ctx.measure(rest) > w) {
+            end = 0;
+            for (rest, 0..) |ch, i| {
+                if (ch != ' ' and ch != '/') continue;
+                if (ctx.measure(rest[0 .. i + 1]) > w) break;
+                end = i + 1;
+            }
+            if (end == 0) end = rest.len;
+        }
+        try ctx.textFit(x, y, w, std.mem.trimEnd(u8, rest[0..end], " "), color);
+        rest = rest[end..];
+        y += 24;
+    }
+    return y;
 }
 
 fn heatmap(ctx: Ctx, rect: Rect, s: *const c.struct_xrt_fd_snapshot, redact: bool) !void {
@@ -114,8 +149,15 @@ fn heatmap(ctx: Ctx, rect: Rect, s: *const c.struct_xrt_fd_snapshot, redact: boo
         const index = maybe orelse continue;
         const p: *const c.struct_xrt_fd_process = @ptrCast(&s.processes[index]);
         const x = rect.x + @as(f32, @floatFromInt(tile_index)) * width;
-        var buf: [40]u8 = undefined;
-        const name = if (redact) std.fmt.bufPrint(&buf, "pid {d}", .{p.pid}) catch "" else fm.State.name(p);
+        var buf: [64]u8 = undefined;
+        var name: []const u8 = if (redact) std.fmt.bufPrint(&buf, "pid {d}", .{p.pid}) catch "" else "";
+        if (!redact) {
+            // Keep the pid visible: shorten only the command name.
+            const comm = fm.State.name(p);
+            var keep = comm.len;
+            name = fm.State.churnLabel(&buf, comm, p.pid, keep);
+            while (keep > 0 and ctx.measure(name) > width - 16) : (keep -= 1) name = fm.State.churnLabel(&buf, comm, p.pid, keep - 1);
+        }
         try ctx.textFit(x + 8, rect.y + 24, width - 16, name, if (p.flags & c.XRT_FDP_STALE != 0) ctx.p.dim else ctx.p.text);
         const count = @min(p.history.samples, c.XRT_FD_HISTORY);
         var peak: u32 = 1;

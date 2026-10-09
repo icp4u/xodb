@@ -2,7 +2,8 @@
 //! Rendering never holds the collector's publication lock or scans procfs.
 const std = @import("std");
 const c = @import("../../c.zig").api;
-const Collector = @import("../../model/system.zig").Collector;
+const system = @import("../../model/system.zig");
+const Collector = system.Collector;
 pub const Mode = enum { files, processes, leaks, deleted, events };
 pub const Identity = struct { pid: i32, start: u64 };
 pub const Selection = struct { owner: Identity, fd: i32 = -1 };
@@ -27,8 +28,9 @@ pub const State = struct {
     exact_requested: bool = false,
     event_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
     poll_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
-    failure: [192]u8 = @splat(0),
+    failure: [320]u8 = @splat(0),
     failure_len: usize = 0,
+    remedy: ?[]const u8 = null,
     requested_at: u64 = 0,
     owner_cpu_ns: u64 = 0,
     owner_instances: u64 = 0,
@@ -123,7 +125,7 @@ pub const State = struct {
                     self.event.rows = self.event_rows.items.ptr;
                     self.event_generation = view.event_generation;
                     self.event_sequence = view.event_sequence;
-                    if (view.event.reason != null) self.setFailure(std.mem.span(view.event.reason));
+                    self.noteEvent(view.event_failure, view.event.reason);
                     event_changed = true;
                 }
             }
@@ -134,6 +136,36 @@ pub const State = struct {
         }
         self.dirty = self.dirty or fresh != null or event_changed;
         return fresh != null or event_changed;
+    }
+    /// A failed capture shows its operation, errno text, detail and remedy;
+    /// otherwise the published coverage reason.
+    pub fn noteEvent(self: *State, failure: c.struct_xrt_perf_failure, reason: [*c]const u8) void {
+        self.remedy = null;
+        if (failed(self.event_status) and failure.syscall != null) {
+            var line: [320]u8 = undefined;
+            self.setFailure(system.failureText(&line, failure));
+            self.remedy = system.failureRemedy(failure);
+        } else if (reason != null) self.setFailure(std.mem.span(reason));
+    }
+    fn failed(status: c.enum_xrt_status) bool {
+        return status != c.XRT_OK and status != c.XRT_STALE_SNAPSHOT;
+    }
+    /// Footer state of the exact capture; a failed open is never "pending".
+    pub fn captureState(self: *const State) []const u8 {
+        if (failed(self.event_status)) return "failed";
+        if (self.event.flags & c.XRT_FDEVENT_LOSS != 0) return "incomplete: event loss";
+        if (self.event.flags & c.XRT_FDEVENT_POSSIBLE_LOSS != 0) return "incomplete: possible loss";
+        if (self.event.flags & c.XRT_FDEVENT_LOSS_UNAVAILABLE != 0) return "loss accounting unavailable";
+        if (self.exact_active) return "running";
+        return if (self.exact_requested) "pending" else "stopped; retained counts";
+    }
+    /// A churn tile label, name[pid], with the name shortened to `keep` bytes
+    /// (ending on a UTF-8 boundary) so equal names stay distinguishable.
+    pub fn churnLabel(buf: []u8, process_name: []const u8, pid: i32, keep: usize) []const u8 {
+        var n = @min(keep, process_name.len);
+        while (n > 0 and n < process_name.len and process_name[n] & 0xc0 == 0x80) n -= 1;
+        const more: []const u8 = if (n < process_name.len) "…" else "";
+        return std.fmt.bufPrint(buf, "{s}{s}[{d}]", .{ process_name[0..n], more, pid }) catch "";
     }
     pub fn setFailure(self: *State, value: []const u8) void {
         self.failure_len = @min(value.len, self.failure.len);
@@ -377,4 +409,43 @@ test "descriptor presentation preserves scope, unknown progress and redaction" {
     try state.rebuild(a, true);
     try std.testing.expectEqual(0, state.rows.items.len);
     try std.testing.expectEqualStrings("writer", State.name(&processes[0]));
+}
+
+test "a denied exact capture is shown as failed with its operation, errno text and remedy" {
+    var state: State = .{ .exact_requested = true, .event_authorized = true, .event_status = c.XRT_PERMISSION_DENIED };
+    var f = std.mem.zeroes(c.struct_xrt_perf_failure);
+    f.kind = c.XRT_PERF_PERMISSION;
+    f.syscall = "syscalls.metadata.read";
+    f.detail = "/sys/kernel/tracing/events/raw_syscalls/sys_enter/id";
+    f.@"error" = c.EACCES;
+    f.tid = -1;
+    state.noteEvent(f, f.detail);
+    const shown = state.failure[0..state.failure_len];
+    try std.testing.expect(std.mem.indexOf(u8, shown, "syscalls.metadata.read") != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, std.mem.span(c.strerror(c.EACCES))) != null);
+    try std.testing.expect(std.mem.indexOf(u8, shown, "/sys/kernel/tracing/events/raw_syscalls/sys_enter/id") != null);
+    try std.testing.expect(std.mem.indexOf(u8, state.remedy.?, "tracefs") != null);
+    try std.testing.expectEqualStrings("failed", state.captureState());
+    // Still waiting for enrollment is pending, and a running capture is not failed.
+    state.event_status = c.XRT_STALE_SNAPSHOT;
+    try std.testing.expectEqualStrings("pending", state.captureState());
+    state.event_status = c.XRT_OK;
+    state.noteEvent(std.mem.zeroes(c.struct_xrt_perf_failure), "covered syscalls");
+    try std.testing.expect(state.remedy == null);
+    try std.testing.expectEqualStrings("covered syscalls", state.failure[0..state.failure_len]);
+}
+
+test "churn tiles keep equal command names distinguishable by pid" {
+    var first: [64]u8 = undefined;
+    var second: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("pw-play[12]", State.churnLabel(&first, "pw-play", 12, 64));
+    for ([_]usize{ 64, 3, 0 }) |keep| {
+        const a = State.churnLabel(&first, "pw-play", 1201, keep);
+        const b = State.churnLabel(&second, "pw-play", 1202, keep);
+        try std.testing.expect(!std.mem.eql(u8, a, b));
+        try std.testing.expect(std.mem.endsWith(u8, a, "[1201]") and std.mem.endsWith(u8, b, "[1202]"));
+    }
+    try std.testing.expectEqualStrings("pw-…[7]", State.churnLabel(&first, "pw-play", 7, 3));
+    // A shortened name never splits a UTF-8 sequence.
+    try std.testing.expectEqualStrings("a…[7]", State.churnLabel(&first, "aé", 7, 2));
 }

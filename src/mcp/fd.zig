@@ -266,6 +266,11 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
             try set(a, &out, "started_ns", e.started_ns);
             try set(a, &out, "taken_ns", e.taken_ns);
             try out.object.put(a, "errno", .{ .integer = view.event_failure.@"error" });
+            if (view.event_status != c.XRT_OK and view.event_failure.syscall != null) {
+                var line: [320]u8 = undefined;
+                try text(a, &out, "failure", system.failureText(&line, view.event_failure));
+                if (system.failureRemedy(view.event_failure)) |remedy| try text(a, &out, "remedy", remedy);
+            }
             for (e.rows[0..e.row_count]) |r| {
                 if (matches >= offset and rows.array.items.len < limit) {
                     var row = object();

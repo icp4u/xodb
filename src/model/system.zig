@@ -10,6 +10,29 @@ pub fn bit(id: c_uint) u32 {
 
 pub const FdEventState = enum { inactive, requested, active };
 
+/// One line naming the failed operation, its errno text and the detail
+/// (often the path), e.g. "syscalls.metadata.read: Permission denied
+/// (/sys/...)". Empty when the failure carries no operation.
+pub fn failureText(buf: []u8, f: c.struct_xrt_perf_failure) []const u8 {
+    const op = if (f.syscall != null) std.mem.span(f.syscall) else return "";
+    const detail: []const u8 = if (f.detail != null) std.mem.span(f.detail) else "";
+    if (f.@"error" == 0) return std.fmt.bufPrint(buf, "{s}: {s}", .{ op, detail }) catch op;
+    const why = std.mem.span(c.strerror(f.@"error"));
+    if (detail.len == 0) return std.fmt.bufPrint(buf, "{s}: {s}", .{ op, why }) catch op;
+    return std.fmt.bufPrint(buf, "{s}: {s} ({s})", .{ op, why, detail }) catch op;
+}
+/// What to change when access was denied; null for other failures.
+pub fn failureRemedy(f: c.struct_xrt_perf_failure) ?[]const u8 {
+    if (f.@"error" != c.EACCES and f.@"error" != c.EPERM) return null;
+    const detail: []const u8 = if (f.detail != null) std.mem.span(f.detail) else "";
+    const op: []const u8 = if (f.syscall != null) std.mem.span(f.syscall) else "";
+    if (std.mem.startsWith(u8, detail, "/sys/kernel/tracing/") or std.mem.startsWith(u8, detail, "/sys/kernel/debug/tracing/"))
+        return "needs read access to tracefs: its group (usually `tracing`) must be active in this session (log in again, or start a shell with `newgrp tracing`), or run as root";
+    if (std.mem.eql(u8, op, "perf_event_open"))
+        return "perf_event_open was denied: xodb needs CAP_PERFMON (setcap cap_perfmon=ep), or a lower kernel.perf_event_paranoid";
+    return null;
+}
+
 pub const Collector = struct {
     ctx: ?*c.struct_xrt_sys = null,
     memory_ctx: ?*c.struct_xrt_memobserver = null,
@@ -199,4 +222,25 @@ test "GUI event status does not create a descriptor collector" {
     try std.testing.expectEqual(FdEventState.inactive, owner.fdEventState());
     try std.testing.expectEqual(@as(u64, 0), owner.fd_opens);
     try std.testing.expect(owner.fd_collector == null);
+}
+
+test "denied event capture names the operation, errno text and a remedy" {
+    var buf: [256]u8 = undefined;
+    var f = std.mem.zeroes(c.struct_xrt_perf_failure);
+    try std.testing.expectEqualStrings("", failureText(&buf, f));
+    f.syscall = "syscalls.metadata.read";
+    f.detail = "/sys/kernel/tracing/events/raw_syscalls/sys_enter/id";
+    f.@"error" = c.EACCES;
+    const text = failureText(&buf, f);
+    try std.testing.expect(std.mem.startsWith(u8, text, "syscalls.metadata.read: "));
+    try std.testing.expect(std.mem.indexOf(u8, text, std.mem.span(c.strerror(c.EACCES))) != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "(/sys/kernel/tracing/events/raw_syscalls/sys_enter/id)"));
+    try std.testing.expect(std.mem.indexOf(u8, failureRemedy(f).?, "newgrp tracing") != null);
+    f.syscall = "perf_event_open";
+    f.detail = "thread open failed";
+    f.@"error" = c.EPERM;
+    try std.testing.expect(std.mem.indexOf(u8, failureRemedy(f).?, "CAP_PERFMON") != null);
+    try std.testing.expect(std.mem.indexOf(u8, failureRemedy(f).?, "perf_event_paranoid") != null);
+    f.@"error" = c.ENOMEM;
+    try std.testing.expect(failureRemedy(f) == null);
 }

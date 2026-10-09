@@ -173,7 +173,8 @@ collector CPU percentage does not bound application slowdown.
 Tracepoint files and `perf_event_open` must be accessible under the host's
 existing policy. Tracefs group membership alone does not establish permission
 to capture every task. Permission errors return `needs privilege`, the errno
-and a reason. The tools do not enable global tracefs events, alter kernel policy
+and a reason. A failed capture also returns `failure` (operation, errno text and
+detail, such as the tracefs path) and, when access was denied, a `remedy`. The tools do not enable global tracefs events, alter kernel policy
 or retry as root. Unsupported hosts remain usable through polling.
 
 `redact: true` hides names and paths. Server-level overview redaction also forces
