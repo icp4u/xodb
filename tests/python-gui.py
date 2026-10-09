@@ -111,6 +111,7 @@ finally:
 class Demo(h.Display):
     """The same private compositor, running scripts/demo-python instead."""
     def __init__(self):
+        self.width, self.height = 1280, 800
         Demo.count = getattr(h.Display, 'count', 0) + 1
         h.Display.count = Demo.count
         self.dir = os.path.join(h.WORK, f'run-{Demo.count:02d}')

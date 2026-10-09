@@ -45,9 +45,9 @@ struct xrb_value {
 };
 struct xrb_frame {
     uint64_t cfp, ep, iseq, pc, self;
-    char name[192], file[512], kind[24];
+    char name[192], file[512], kind[24], qualified_name[384];
     uint32_t line;
-    const char *reason, *line_reason;
+    const char *reason, *line_reason, *name_reason;
 };
 struct xrb_stack {
     uint64_t ec, thread, stack_lo, stack_hi, cfp;
@@ -82,6 +82,9 @@ void xrb_value_read(const struct xrb_layout *, struct xrb_reader *, const struct
 /* ec comes only from a proved native rb_vm_exec argument. zjit_entry is the
  * loaded rb_zjit_entry value (not its address). Never call inferior code. */
 void xrb_stack_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec, uint64_t zjit_entry, struct xrb_stack *);
+/* Decorate already-read frames at the same retained stop. Bare iseq names and
+ * frame/source diagnostics remain intact when a method owner cannot be proved. */
+void xrb_stack_names(const struct xrb_layout *, struct xrb_reader *, uint64_t symbols, struct xrb_stack *);
 /* Rebuild canonical frames at this stop before inspecting their environment.
  * Locals and outer block captures expire on resume, GC or fiber switches. */
 void xrb_locals_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec,

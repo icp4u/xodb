@@ -3,7 +3,7 @@
 import argparse,importlib.util,json,os,re,select,subprocess,time
 from pathlib import Path
 from PIL import Image,ImageOps
-from helpers.language_selection import check_native_values
+from helpers.language_selection import check_native_values,check_layout
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--previews',action='store_true');p.add_argument('--ruby',required=True);p.add_argument('--work',type=Path,required=True);a=p.parse_args()
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
 w=(a.work/'.work/input-rby').resolve();w.mkdir(parents=True,mode=0o755)
@@ -38,15 +38,15 @@ try:
  native=check_native_values(d,target.pid,'ruby','ruby')
  args=choose('preview_values' if a.previews else 'plain_slots');generation=d.session()['generation'];regs=d.tool('get_registers',tid=target.pid)
  normalize=lambda t:re.sub(r'[^a-z0-9]','',t.lower())
- def visible(label,wanted):
+ def visible(label,wanted,psm=6):
   deadline=time.monotonic()+30
   while True:
    shot=d.shot(label);crop=shot+'.side.png'
    with Image.open(shot) as image:
     pane=ImageOps.invert(image.crop((1013,130,1272,578)).convert('L'));pane.resize((pane.width*3,pane.height*3)).save(crop)
-   text=subprocess.run(['tesseract',crop,'stdout','--psm','6'],env=dict(d.env,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
+   text=subprocess.run(['tesseract',crop,'stdout','--psm',str(psm)],env=dict(d.env,OMP_THREAD_LIMIT='1'),capture_output=True,text=True,check=True,timeout=30).stdout
    Path(shot+'.side.txt').write_text(text)
-   if all(word in normalize(text) for word in wanted):return text
+   if all(any(word in normalize(text) for word in (item if isinstance(item,tuple) else (item,))) for item in wanted):return text
    assert time.monotonic()<deadline,text
    time.sleep(.05)
  if a.previews:
@@ -67,7 +67,8 @@ try:
   expression=screenshots;recursive=None
   assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
  else:
-  first=visible('ruby-locals',['namedlocals','seed7','plainslots'])
+  # MCP checks the exact name; OCR can mistake the mono-font l for 1.
+  first=visible('ruby-locals',['namedlocals','seed7',('plainslots','p1ainslots')])
   d.keys('tap',18,'tap',31,'tap',18,'tap',18,'tap',32,'tap',28)
   expression=visible('ruby-expression',['eseed7','expressionresultabove'])
   assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
@@ -87,9 +88,22 @@ try:
  locals_=d.tool('get_language_locals',**args);value=d.tool('evaluate_language_expression',expression='symbol' if a.previews else 'depth',**args)
  assert value['rows'][0]['value']['display']==(':ready' if a.previews else '2') and not value['diagnostic'],value
  assert d.session()['generation']==args['generation'] and d.tool('get_registers',tid=target.pid)==regs
- (w/'results.json').write_text(json.dumps(dict(status='pass',native=native,locals=locals_,first=first,expression=expression,recursive=recursive,observer=True),indent=2)+'\n')
+ d.keys('tap',66);assert d.wait(lambda s:s['agent_scope']=='control')
+ observed=stack()
+ si,fi,frame=next((si,fi,f) for si,part in enumerate(observed['segments']) for fi,f in enumerate(part['frames']) if f['qualified_name']=='XodbRuby.probe')
+ assert frame['name']=='<cfunc>' and frame['name_reason'] is None and frame['reason']=='RubyNativeBoundary',frame
+ d.tool('select_language_frame',generation=d.session()['generation'],tid=target.pid,language='ruby',segment=si,frame=fi)
+ # Sparse text mode separates the selected-row outline from its glyphs.
+ qualified=visible('ruby-native-method',['xodbrubyprobe','rubynativeboundary'],psm=11)
+ layout=check_layout(d,'ruby','RubyNativeBoundary')
+ mains=[f for part in stack()['segments'] for f in part['frames'] if f['name']=='<main>']
+ assert mains and all(f['qualified_name']=='<main>' and f['name_reason'] is None for f in mains),mains
+ choose('<main>')
+ main=visible('ruby-main',['main'],psm=11)
+ assert 'mainownerunproved' not in normalize(main),main
+ (w/'results.json').write_text(json.dumps(dict(status='pass',layout=layout,main=main,native=native,locals=locals_,first=first,expression=expression,recursive=recursive,qualified=qualified,observer=True),indent=2)+'\n')
 finally:
  if d:d.close()
  if target.poll() is None:target.kill()
  target.wait(timeout=10)
-print('Ruby GUI: Symbol/Hash/Array expressions and observer reads passed' if a.previews else 'Ruby GUI: named locals, expression label, three recursive frames, native VALUEs and observer reads passed')
+print('Ruby GUI: Symbol/Hash/Array expressions and observer reads passed' if a.previews else 'Ruby GUI: qualified native method, named locals, expression label, three recursive frames, native VALUEs and observer reads passed')

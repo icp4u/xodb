@@ -105,6 +105,12 @@ Set its `WORK` to an owned short path containing `/.work/input-` (for example,
 with `XODB_TEST_PRIVATE_DISPLAY=1` before injecting; this is a guard against
 accidentally using an interactive desktop. Display creates its own Sway session.
 
+Display also enables `XODB_LANGUAGE_LAYOUT=1`: the language pane records clipped
+text boxes and reports overlapping labels. Shared language-selection checks
+require a nonempty report; diagnostic-row tests require the diagnostic to have
+been drawn. Selected frame diagnostics occupy the existing detail line, so they
+cannot spill into the next frame name.
+
 Old prototype patch runners and generated research outputs were removed;
 historical task/research notes may still mention their archived paths.
 

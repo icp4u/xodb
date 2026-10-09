@@ -69,6 +69,8 @@ class Display:
         env["WAYLAND_DISPLAY"] = os.path.basename(sockets[0])
         env["SWAYSOCK"] = ipc[0]
         app_env = dict(env)
+        # Every private language-pane test can inspect actual text-box overlap.
+        app_env["XODB_LANGUAGE_LAYOUT"] = "1"
         if trace:
             app_env["XODB_INPUT_TRACE"] = "1"
         if wayland_debug:

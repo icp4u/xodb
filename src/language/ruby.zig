@@ -125,7 +125,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
 pub const Anchor = struct { frame: usize, pc: []const u8, symbol: []const u8 = "rb_vm_exec", argument: []const u8 = "ec" };
 pub const Runtime = struct { language: []const u8 = "ruby", implementation: []const u8 = "CRuby", version: []const u8 = c.XRB_VERSION ++ "dev", revision: []const u8 = c.XRB_REVISION, build_id: []const u8, layout_source: []const u8 = "same-image DWARF + exact revision" };
 pub const Instance = struct { kind: []const u8 = "address", namespace: []const u8 = "ruby:execution_context", address: []const u8, scope: []const u8 = "this retained stop only; fibers have separate execution contexts" };
-pub const Frame = struct { name: []const u8, file: ?[]const u8, line: ?u32, kind: []const u8, reason: ?[]const u8, line_reason: ?[]const u8, control_frame: []const u8, environment: []const u8, instruction_sequence: []const u8, provenance: []const u8 = "external_read" };
+pub const Frame = struct { name: []const u8, qualified_name: ?[]const u8 = null, name_reason: ?[]const u8 = null, file: ?[]const u8, line: ?u32, kind: []const u8, reason: ?[]const u8, line_reason: ?[]const u8, control_frame: []const u8, environment: []const u8, instruction_sequence: []const u8, provenance: []const u8 = "external_read" };
 pub const Segment = struct { runtime: Runtime, runtime_instance: Instance, anchor: ?Anchor, additional_anchors: []Anchor = &.{}, frames: []Frame, chain_complete: bool = false, state: []const u8 = "partial", reason: ?[]const u8, memory_reads: usize, memory_bytes: usize };
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 pub const Stack = struct { session_id: u64, generation: u64, tid: i32, segments: []Segment, native_stack_incomplete: bool, native_argument_diagnostics: []ArgumentDiagnostic, basis: []const u8 = "CRuby control frames from native rb_vm_exec ec; segment anchor only, logical/native pairing unproved; no target calls" };
@@ -162,9 +162,12 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
         var r = reader(session);
         const raw = try a.create(c.struct_xrb_stack);
         c.xrb_stack_read(layout, &r, ec, zjit, raw);
+        c.xrb_stack_names(layout, &r, globalAddress(module, "ruby_global_symbols") catch 0, raw);
         const frames = try a.alloc(Frame, raw.count);
         for (raw.frames[0..raw.count], frames) |v, *out| out.* = .{
             .name = try a.dupe(u8, std.mem.sliceTo(&v.name, 0)),
+            .qualified_name = if (v.qualified_name[0] == 0) null else try a.dupe(u8, std.mem.sliceTo(&v.qualified_name, 0)),
+            .name_reason = try reason(a, v.name_reason),
             .file = if (v.file[0] == 0) null else try a.dupe(u8, std.mem.sliceTo(&v.file, 0)),
             .line = if (v.line == 0) null else v.line,
             .kind = try a.dupe(u8, std.mem.sliceTo(&v.kind, 0)),

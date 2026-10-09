@@ -144,7 +144,9 @@ static void previews(uint64_t symbols) {
  set(table,XRB_ST_POWER,63);v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyPathHashInvalid"));set(table,XRB_ST_POWER,10);
  set(table,XRB_ST_ENTRIES,UINT64_MAX);v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyAddressInvalid"));
 }
+void ruby_frame_names_test(void);
 int main(void) {
+ ruby_frame_names_test();
  put(BASE,BASE+16,8);put(BASE+8,BASE+32,8);
  const char *valid[]={"root","root[0]","root[2147483647]","root[\"score\"]","root['']","root[:symbol][1][\"name\"]"};
  const char *invalid[]={"","root()","root.x","root[-1]","root[01]","root[2147483648]","root[f()]","root[\"#{x}\"]","root[:'x']","root[1,2]","root[0][0][0][0][0][0][0][0][0]"};

@@ -44,6 +44,21 @@ quit. **W** creates a watch investigation; it does not write the selected value.
 Memory/register writes and continuing all process sessions are explicit MCP
 operations, with no single-letter global GUI shortcut.
 
+Ruby frame labels use the method's stored owner: `Owner#method` for instance
+methods and `Owner.method` for class/module methods, including native calls
+such as `Integer#digits`. Inherited and included methods retain their actual
+owner. Aliases show `Owner#called (alias of original)`; `define_method` bodies
+show `Owner#method (define_method)`. A nested block keeps its `block in` prefix.
+Top-level `<main>` is shown without an owner diagnostic.
+The reader calls no Ruby code to name a class. Anonymous or unreadable owners,
+individual-object singleton methods, boxed class metadata and unsupported
+frames keep the original label with **owner unproved**. MCP retains `name` and
+adds nullable `qualified_name` and `name_reason`; source and frame diagnostics
+remain separate.
+
+Try `xodb --break rb_int_digits -- ruby -e '123.digits'` with a supported debug
+Ruby. **Space**, then the **Ruby** tab: the native boundary is `Integer#digits`.
+
 ## What is an observation?
 
 An observation records **every call to the functions you name** in a running

@@ -392,6 +392,101 @@ static int environment(const struct xrb_layout *p, struct xrb_reader *r, const s
     } else if (*slots<stack->stack_lo || ep>=stack->cfp) return fail(r,"RubyEnvironmentBoundsInvalid");
     return !r->error;
 }
+/* Mirror rb_vm_frame_method_entry's bounded environment walk. The local
+ * environment may wrap its method entry in one vm_svar; a cref is not a method.
+ * Do not infer an owner from self: inherited/included methods belong elsewhere. */
+static uint64_t frame_method(const struct xrb_layout *p, struct xrb_reader *r,
+                             const struct xrb_stack *stack, const struct xrb_frame *f) {
+    uint64_t ep=f->ep,iseq=f->iseq,seen[64];
+    for(size_t depth=0;depth<64;++depth) {
+        for(size_t i=0;i<depth;++i) if(seen[i]==ep) {fail(r,"RubyEnvironmentCycle");return 0;}
+        seen[depth]=ep;
+        uint64_t env,slots;
+        if(!environment(p,r,stack,ep,iseq,0,&env,&slots))return 0;
+        uint64_t me=word(r,ep-16,8);
+        if(me) {
+            if(!header(r,me,RUBY_T_IMEMO,-1))return 0;
+            unsigned type=(unsigned)((flags(r,me)>>RUBY_FL_USHIFT)&15);
+            if(type==imemo_svar && (env&VM_ENV_FLAG_LOCAL)) {
+                me=field(p,r,me,XRB_SVAR_METHOD);
+                if(me && !header(r,me,RUBY_T_IMEMO,-1))return 0;
+                type=me?(unsigned)((flags(r,me)>>RUBY_FL_USHIFT)&15):imemo_cref;
+            }
+            if(type==imemo_ment)return r->error?0:me;
+            if(type!=imemo_cref) {fail(r,"RubyFrameMethodUnproved");return 0;}
+        }
+        if(r->error)return 0;
+        if(env&VM_ENV_FLAG_LOCAL) {fail(r,"RubyFrameMethodUnavailable");return 0;}
+        if(env&VM_ENV_FLAG_ISOLATED) {fail(r,"RubyIsolatedEnvironmentBoundary");return 0;}
+        uint64_t b=body(p,r,iseq);
+        iseq=field(p,r,b,XRB_BODY_PARENT);
+        ep=word(r,ep-8,8)&~UINT64_C(3);
+        if(r->error)return 0;
+    }
+    fail(r,"RubyEnvironmentDepthLimit");return 0;
+}
+static int class_name(const struct xrb_layout *p, struct xrb_reader *r,
+                       uint64_t klass, char *out, size_t cap, char *separator) {
+    uint64_t f=flags(r,klass);unsigned type=(unsigned)(f&RUBY_T_MASK);
+    if(type!=RUBY_T_CLASS && type!=RUBY_T_MODULE)return fail(r,"RubyFrameOwnerUnproved");
+    if((f&(UINT64_C(1)<<(RUBY_FL_USHIFT+4))) && field(p,r,klass,XRB_CLASS_BOX_TABLE))return fail(r,"RubyFrameBoxUnsupported");
+    if(type==RUBY_T_CLASS && (f&RUBY_FL_SINGLETON)) {
+        klass=field(p,r,klass,XRB_CLASS_ATTACHED);
+        f=flags(r,klass);type=(unsigned)(f&RUBY_T_MASK);
+        if((type!=RUBY_T_CLASS && type!=RUBY_T_MODULE) || (type==RUBY_T_CLASS && (f&RUBY_FL_SINGLETON)))
+            return fail(r,"RubyFrameSingletonOwnerUnproved");
+        if((f&(UINT64_C(1)<<(RUBY_FL_USHIFT+4))) && field(p,r,klass,XRB_CLASS_BOX_TABLE))return fail(r,"RubyFrameBoxUnsupported");
+        *separator='.';
+    }
+    uint64_t path=field(p,r,klass,XRB_CLASS_PATH),length;int truncated;
+    if(r->error)return 0;
+    if(!path || path==4)return fail(r,"RubyFrameOwnerUnnamed");
+    if(!string(p,r,path,out,cap,&length,&truncated))return 0;
+    if(!length || truncated)return fail(r,"RubyFrameOwnerTruncated");
+    return 1;
+}
+void xrb_stack_names(const struct xrb_layout *p, struct xrb_reader *r, uint64_t symbols, struct xrb_stack *stack) {
+    const char *prior=r->error;
+    for(size_t i=0;i<stack->count && i<XRB_STACK_FRAMES;++i) {
+        struct xrb_frame *f=&stack->frames[i];f->qualified_name[0]=0;f->name_reason=NULL;r->error=NULL;
+        /* A proved top-level instruction sequence has no method owner. */
+        if(!strcmp(f->name,"<main>") && (!strcmp(f->kind,"top") || !strcmp(f->kind,"eval"))) {
+            uint64_t type=field(p,r,body(p,r,f->iseq),XRB_BODY_TYPE);
+            if(!r->error && (type==ISEQ_TYPE_TOP || type==ISEQ_TYPE_MAIN)) {
+                strcpy(f->qualified_name,"<main>");continue;
+            }
+            if(r->error) {f->name_reason=r->error;continue;}
+        }
+        if(!symbols) {f->name_reason="RubyRuntimeSymbolsUnavailable";continue;}
+        if(!strcmp(f->kind,"jit") || !strcmp(f->kind,"ifunc")) {f->name_reason="RubyFrameMethodUnproved";continue;}
+        uint64_t me=frame_method(p,r,stack,f);
+        char owner[192],method[192],original[192]="",separator='#';
+        if(!r->error) {
+            uint64_t defined=field(p,r,me,XRB_CALLABLE_CLASS);
+            unsigned type=(unsigned)(flags(r,defined)&RUBY_T_MASK);
+            if(type!=RUBY_T_CLASS && type!=RUBY_T_MODULE && type!=RUBY_T_ICLASS)fail(r,"RubyFrameDefinedClassUnproved");
+        }
+        uint64_t def=field(p,r,me,XRB_CALLABLE_DEF),type=field(p,r,def,XRB_METHOD_TYPE)&15;
+        uint64_t called=field(p,r,me,XRB_CALLABLE_ID),original_id=field(p,r,def,XRB_METHOD_ORIGINAL_ID);
+        uint64_t env=word(r,f->ep,8);
+        int bmethod=type==VM_METHOD_TYPE_BMETHOD,body_frame=(env&VM_FRAME_FLAG_BMETHOD)!=0;
+        if(!r->error && ((!strcmp(f->kind,"cfunc") && type!=VM_METHOD_TYPE_CFUNC) || (body_frame && !bmethod)))
+            fail(r,"RubyFrameMethodUnproved");
+        if(!r->error && original_id!=called)name(p,r,symbols,original_id,original,sizeof original);
+        if(!r->error && name(p,r,symbols,called,method,sizeof method) &&
+           class_name(p,r,field(p,r,me,XRB_CALLABLE_OWNER),owner,sizeof owner,&separator)) {
+            const char *prefix="";
+            if(!strcmp(f->kind,"block") && !body_frame)prefix="block in ";
+            else if(!strcmp(f->kind,"rescue"))prefix="rescue in ";
+            int n=snprintf(f->qualified_name,sizeof f->qualified_name,"%s%s%c%s%s%s%s%s",prefix,owner,separator,method,
+                original[0]?" (alias of ":"",original,original[0]?")":"",bmethod?" (define_method)":"");
+            if(n<0 || (size_t)n>=sizeof f->qualified_name)fail(r,"RubyFrameNameTruncated");
+        }
+        f->name_reason=r->error;
+        if(f->name_reason)f->qualified_name[0]=0;
+    }
+    r->error=prior;
+}
 static void locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
                      uint64_t zjit, const struct xrb_context *ctx, size_t frame,
                      size_t start, size_t limit, int preview, struct xrb_locals *out) {

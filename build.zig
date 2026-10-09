@@ -324,7 +324,7 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(&b.addRunArtifact(lua_tests).step);
     const ruby_tests = b.addExecutable(.{ .name = "xodb-ruby-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
-    for ([_][]const u8{ "src/language/ruby.c", "tests/ruby-reader.c" }) |source| {
+    for ([_][]const u8{ "src/language/ruby.c", "tests/ruby-reader.c", "tests/ruby-frame-names.c" }) |source| {
         ruby_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     }
     test_step.dependOn(&b.addRunArtifact(ruby_tests).step);

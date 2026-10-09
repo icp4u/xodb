@@ -134,10 +134,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'perl-path-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-path-watches.py', *sdk, *agent, '--strace', '--work', f'.work/ppw{int(remote)}'], 300))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if ruby:
+            steps.append(('ruby-frame-names-component', [sys.executable, '-B', 'tests/ruby-frame-names-component.py', '--ruby', ruby, '--work', '.work/rfnc'], 120))
             steps.append(('ruby-path-component', [sys.executable, '-B', 'tests/ruby-path-component.py', '--ruby', ruby, '--sanitize', '--work', '.work/rpc'], 180))
             steps.append(('ruby-preview-component', [sys.executable, '-B', 'tests/ruby-preview-component.py', '--ruby', ruby, '--sanitize', '--work', '.work/rprc'], 180))
             steps.append(('ruby-watch-component', [sys.executable, '-B', 'tests/ruby-watch-component.py', '--ruby', ruby, '--work', '.work/rwc'], 120))
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+                steps.append(('ruby-frame-names'+suffix, [sys.executable, '-B', 'tests/ruby-frame-names.py', '--ruby', ruby, '--strace', '--work', '.work/rfn'+suffix, *extra], 180))
                 steps.append(('ruby-path-watches'+suffix, [sys.executable, '-B', 'tests/ruby-path-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rpw'+suffix, *extra], 300))
                 steps.append(('ruby-previews'+suffix, [sys.executable, '-B', 'tests/ruby-previews.py', '--ruby', ruby, '--strace', '--work', '.work/rpr'+suffix, *extra], 300))
                 steps.append(('ruby-watches'+suffix, [sys.executable, '-B', 'tests/ruby-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rw'+suffix, *extra], 300))

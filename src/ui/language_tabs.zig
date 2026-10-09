@@ -1,4 +1,6 @@
 const std = @import("std");
+const c = @import("../c.zig").api;
+const TextLayout = @import("overview/draw.zig").Layout;
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const Session = @import("../model/session.zig").Session;
@@ -33,6 +35,9 @@ fn revealRow(scroll: usize, index: usize, visible: usize) usize {
     return scroll;
 }
 pub const Panel = struct {
+    text_layout: ?*TextLayout = null,
+    layout_signature: ?u64 = null,
+    layout_reason: []const u8 = "none",
     hits: [tabs.order.len]?gpu.Rect = @splat(null),
     content_y: f32 = 135,
     arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
@@ -125,6 +130,7 @@ pub const Panel = struct {
     }
     pub fn deinit(self: *Panel) void {
         self.arena.deinit();
+        if (self.text_layout) |layout| std.heap.page_allocator.destroy(layout);
     }
     pub fn hit(self: *const Panel, x: f32, y: f32) ?tabs.Tab {
         for (self.hits, 0..) |maybe, i| if (maybe) |rect| {
@@ -232,7 +238,11 @@ pub const Panel = struct {
                     self.message = "LanguageFrameLimit";
                     break;
                 }
-                try rows.append(a, .{ .name = try a.dupe(u8, frame.name), .location = if (frame.file) |file|
+                const label = if (@hasField(@TypeOf(frame), "qualified_name"))
+                    if (frame.qualified_name) |text| try a.dupe(u8, text) else try std.fmt.allocPrint(a, "{s} [owner unproved]", .{frame.name})
+                else
+                    try a.dupe(u8, frame.name);
+                try rows.append(a, .{ .name = label, .location = if (frame.file) |file|
                     if (frame.line) |line| try std.fmt.allocPrint(a, "{s}:{d}", .{ std.fs.path.basename(file), line }) else try a.dupe(u8, std.fs.path.basename(file))
                 else
                     "source position unproved", .reason = if (frame.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = frame_index });
@@ -318,7 +328,33 @@ pub const Panel = struct {
             };
         }
     }
-    fn wrapped(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, y: *f32, text: []const u8, color: gpu.Color) !void {
+    fn drawText(self: *Panel, r: *gpu.Renderer, font: *Font, x: f32, y: f32, width: f32, value: []const u8, color: gpu.Color) !void {
+        try r.textFit(font, x, y, width, value, color);
+        if (self.text_layout) |layout| {
+            const left = @max(x, r.clip.x);
+            const top = @max(y + 2, r.clip.y);
+            const right = @min(x + @min(width, r.measure(font, value)), r.clip.x + r.clip.w);
+            const bottom = @min(y + 18, r.clip.y + r.clip.h);
+            if (bottom > top) layout.add(.{ .x = left, .y = top, .w = right - left, .h = bottom - top }, value);
+        }
+    }
+    fn reportLayout(self: *Panel, session: *Session) void {
+        const layout = self.text_layout orelse return;
+        var hash = std.hash.Wyhash.init(session.target.snapshot().generation);
+        hash.update(@tagName(session.language_tabs.selected));
+        hash.update(self.layout_reason);
+        for (0..layout.count) |i| {
+            hash.update(std.mem.asBytes(&layout.boxes[i]));
+            hash.update(layout.labels[i][0..layout.lens[i]]);
+        }
+        const signature = hash.final();
+        if (self.layout_signature == signature) return;
+        self.layout_signature = signature;
+        var first: [6][]const u8 = @splat("");
+        const overlaps = layout.overlaps(&first);
+        std.debug.print("xodb: language layout tab={s} generation={d} boxes={d} selected_reason={s} overlaps={d} first=\"{s}\"/\"{s}\"\n", .{ @tagName(session.language_tabs.selected), session.target.snapshot().generation, layout.count, self.layout_reason, overlaps, first[0], first[1] });
+    }
+    fn wrapped(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, y: *f32, text: []const u8, color: gpu.Color) !void {
         var remaining = text;
         for (0..3) |_| {
             if (remaining.len == 0 or y.* + 20 > rect.y + rect.h - 8) break;
@@ -328,7 +364,7 @@ pub const Panel = struct {
                 end = space;
             }
             if (end == 0) end = remaining.len;
-            try r.textFit(font, rect.x + 12, y.*, rect.w - 24, remaining[0..end], color);
+            try self.drawText(r, font, rect.x + 12, y.*, rect.w - 24, remaining[0..end], color);
             y.* += 23;
             remaining = std.mem.trimStart(u8, remaining[end..], " ");
         }
@@ -364,7 +400,7 @@ pub const Panel = struct {
         var buffer: [256]u8 = undefined;
         self.native_header_hit = .{ .x = rect.x + 1, .y = rect.y, .w = rect.w - 2, .h = 32 };
         const title = try std.fmt.bufPrint(&buffer, "Native frame #{d} {s}", .{ frame, if (self.native_collapsed) "[+]" else "[-]" });
-        try r.textFit(font, rect.x + 12, y, rect.w - 24, title, theme.neutral);
+        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, title, theme.neutral);
         y += 24;
         self.native_count = 0;
         for (values) |value| {
@@ -381,18 +417,25 @@ pub const Panel = struct {
             index += 1;
             if (skip) continue;
             if (y + 42 > end) break;
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, value.name, theme.text);
-            try r.textFit(font, rect.x + 12, y + 21, rect.w - 24, value.value.display, if (value.value.diagnostic != null) theme.warm else theme.weak);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, value.name, theme.text);
+            try self.drawText(r, font, rect.x + 12, y + 21, rect.w - 24, value.value.display, if (value.value.diagnostic != null) theme.warm else theme.weak);
             y += 45;
         }
-        if (!self.native_collapsed and self.native_count == 0 and y + 23 <= end) try r.textFit(font, rect.x + 12, y, rect.w - 24, if (reason) |why| (if (std.mem.eql(u8, why, "BadMapping")) "No mapped native image" else why) else "No decoded native objects", theme.weak);
+        if (!self.native_collapsed and self.native_count == 0 and y + 23 <= end) try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (reason) |why| (if (std.mem.eql(u8, why, "BadMapping")) "No mapped native image" else why) else "No decoded native objects", theme.weak);
         if (!named.supported(tab) and end >= rect.y + 30) {
-            try r.textFit(font, rect.x + 12, end + 3, rect.w - 24, "Variables by name", theme.weak);
+            try self.drawText(r, font, rect.x + 12, end + 3, rect.w - 24, "Variables by name", theme.weak);
             const hint = try std.fmt.bufPrint(&buffer, "Not yet for {s}", .{tabs.title(tab)});
-            try r.textFit(font, rect.x + 12, end + 24, rect.w - 24, hint, theme.weak);
+            try self.drawText(r, font, rect.x + 12, end + 24, rect.w - 24, hint, theme.weak);
         }
     }
     pub fn body(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, session: *Session, tid: i32, frame: usize, native_values: anytype, native_reason: ?[]const u8) !void {
+        if (self.text_layout == null and c.getenv("XODB_LANGUAGE_LAYOUT") != null) {
+            self.text_layout = try std.heap.page_allocator.create(TextLayout);
+            self.text_layout.?.* = .{};
+        }
+        if (self.text_layout) |layout| layout.count = 0;
+        self.layout_reason = "none";
+        defer self.reportLayout(session);
         self.row_hits = @splat(null);
         self.binding_hits = @splat(null);
         const logical = session.language_tabs.logical_selection;
@@ -401,17 +444,17 @@ pub const Panel = struct {
         const state = &session.language_tabs;
         const entry = &state.entries[@intFromEnum(state.selected) - 2];
         var y = self.content_y;
-        try r.textFit(font, rect.x + 12, y, rect.w - 24, entry.version.slice(), theme.neutral);
+        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.version.slice(), theme.neutral);
         y += 23;
-        try wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis.slice()), theme.weak);
+        try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis.slice()), theme.weak);
         if (entry.proof_generation == null or entry.proof_generation.? != session.target.snapshot().generation or entry.reason != null) {
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
             y += 23;
         }
-        try wrapped(r, font, rect, &y, explanation(self.message), theme.weak);
+        try self.wrapped(r, font, rect, &y, explanation(self.message), theme.weak);
         y += 7;
         if (logical) |selected| {
-            if (selected.native_anchor == null) try wrapped(r, font, rect, &y, "Selected logical row has no proved native anchor", theme.warm);
+            if (selected.native_anchor == null) try self.wrapped(r, font, rect, &y, "Selected logical row has no proved native anchor", theme.warm);
         }
         const has_named = named.supported(state.selected);
         const remaining = @max(0, rect.y + rect.h - 8 - y);
@@ -449,10 +492,14 @@ pub const Panel = struct {
                 self.row_hits[hit_count] = .{ .rect = bounds, .segment = row.segment, .frame = frame_index };
                 hit_count += 1;
             }
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, row.name, if (row.frame == null) theme.neutral else theme.text);
-            try r.textFit(font, rect.x + 12, y + 21, rect.w - 24, row.location, theme.weak);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, row.name, if (row.frame == null) theme.neutral else theme.text);
+            // A row has two lines. A selected diagnostic uses its detail
+            // line instead of drawing into the next row's name.
+            const reason = if (selected) row.reason else null;
+            const detail = if (reason) |why| explanation(why) else row.location;
+            try self.drawText(r, font, rect.x + 12, y + 21, rect.w - 24, detail, if (reason != null) theme.warm else theme.weak);
+            if (reason) |why| self.layout_reason = why;
             y += 48;
-            if (selected and row.reason != null and y + 20 < native_top) try r.textFit(font, rect.x + 12, y - 2, rect.w - 24, explanation(row.reason.?), theme.warm);
         }
         try self.nativeValues(r, font, .{ .x = rect.x, .y = native_top, .w = rect.w, .h = binding_top - native_top }, state.selected, frame, native_values, native_reason);
         self.binding_visible = 0;
@@ -465,22 +512,22 @@ pub const Panel = struct {
         if (self.editor.open) {
             try self.editor.draw(r, font, .{ .x = rect.x + 12, .y = y, .w = rect.w - 24, .h = 25 });
             y += 29;
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
             y += 24;
         } else if (self.expression_len != 0) {
             const value = if (self.expression_result) |result| if (result.rows.len != 0) result.rows[0].value.display else result.diagnostic orelse "No binding" else self.expression_reason orelse "Value unavailable";
             var buffer: [2048]u8 = undefined;
             const text = std.fmt.bufPrint(&buffer, "E: {s} = {s}", .{ self.expression[0..self.expression_len], if (std.mem.eql(u8, value, "JavaScriptLexicalUnproved")) "unproved" else value }) catch "Value preview too long";
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, text, theme.text);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, text, theme.text);
             y += 25;
         }
         if (self.bindings) |result| {
             if (result.diagnostic) |why| {
-                try r.textFit(font, rect.x + 12, y, rect.w - 24, if (std.mem.eql(u8, why, "JavaScriptLexicalUnproved")) "Lexical visibility" else why, theme.warm);
+                try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (std.mem.eql(u8, why, "JavaScriptLexicalUnproved")) "Lexical visibility" else why, theme.warm);
                 y += 23;
             }
             if (result.view_kind == .context_storage) {
-                try r.textFit(font, rect.x + 12, y, rect.w - 24, "Unproved; stack hidden", theme.weak);
+                try self.drawText(r, font, rect.x + 12, y, rect.w - 24, "Unproved; stack hidden", theme.weak);
                 y += 21;
             }
             var shown: usize = 0;
@@ -491,25 +538,25 @@ pub const Panel = struct {
                 if (self.binding_selected != null and self.binding_selected.? == result.start + index) try style.focus(r, bounds, 4, 1);
                 var buffer: [2048]u8 = undefined;
                 const text = if (row.name.len == 0) row.value.display else std.fmt.bufPrint(&buffer, "{s} = {s}", .{ row.name, row.value.display }) catch "Value preview too long";
-                try r.textFit(font, rect.x + 12, y, rect.w - 24, text, theme.text);
+                try self.drawText(r, font, rect.x + 12, y, rect.w - 24, text, theme.text);
                 const matching_expression = if (self.expression_result) |expression| expression.rows.len == 1 and expression.rows[0].ordinal == row.ordinal and std.mem.eql(u8, expression.rows[0].name, row.name) else false;
                 var context_label: [80]u8 = undefined;
                 const context_detail = if (row.context_depth) |depth| try std.fmt.bufPrint(&context_label, "context #{d}{s}", .{ depth, if (row.context_parameter orelse false) " / parameter" else "" }) else null;
                 const detail = row.name_diagnostic orelse row.value.diagnostic orelse context_detail orelse if (matching_expression) "expression result above" else if (row.hidden) "hidden compiler local" else if (row.immediate) "immediate integer in frame slot" else if (row.value.advisory) "bounded preview; object lifetime unproved" else @tagName(row.scope);
-                try r.textFit(font, rect.x + 12, y + 20, rect.w - 24, detail, if (row.name_diagnostic != null or row.value.diagnostic != null) theme.warm else theme.weak);
+                try self.drawText(r, font, rect.x + 12, y + 20, rect.w - 24, detail, if (row.name_diagnostic != null or row.value.diagnostic != null) theme.warm else theme.weak);
                 y += 44;
                 shown += 1;
             }
             self.binding_visible = shown;
             more = result.total -| (result.start + shown);
-        } else try r.textFit(font, rect.x + 12, y, rect.w - 24, self.bindings_reason, theme.weak);
+        } else try self.drawText(r, font, rect.x + 12, y, rect.w - 24, self.bindings_reason, theme.weak);
         if (more != 0) {
             var buffer: [48]u8 = undefined;
             const hint = if (state.selected == .javascript) try std.fmt.bufPrint(&buffer, "▼ {d}", .{more}) else try std.fmt.bufPrint(&buffer, "▼ {d} more", .{more});
             const hint_width = r.measure(font, hint);
-            try r.textFit(font, rect.x + 12, heading_y, rect.w - 32 - hint_width, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS", theme.neutral);
-            try r.textFit(font, rect.x + rect.w - 12 - hint_width, heading_y, hint_width, hint, theme.weak);
-        } else try r.textFit(font, rect.x + 12, heading_y, rect.w - 24, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS  /  E name", theme.neutral);
+            try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 32 - hint_width, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS", theme.neutral);
+            try self.drawText(r, font, rect.x + rect.w - 12 - hint_width, heading_y, hint_width, hint, theme.weak);
+        } else try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS  /  E name", theme.neutral);
     }
 };
 

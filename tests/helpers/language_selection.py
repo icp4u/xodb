@@ -8,6 +8,20 @@ from pathlib import Path
 from PIL import Image, ImageOps
 
 
+def check_layout(display, language, reason=None):
+    deadline = time.monotonic() + 20
+    while True:
+        lines = [line for line in Path(display.log).read_text().splitlines() if 'xodb: language layout ' in line]
+        bad = [line for line in lines if ' overlaps=0 ' not in line]
+        assert not bad, ('overlapping language text', bad[:3])
+        seen = [line for line in lines if f'tab={language} ' in line and int(re.search(r'boxes=(\d+)', line)[1]) > 0
+                and (reason is None or f'selected_reason={reason} ' in line)]
+        if seen:
+            return {'reports': len(lines), 'tab': language, 'selected_reason': reason, 'overlaps': 0}
+        assert time.monotonic() < deadline, ('language layout condition not observed', language, reason, lines[-3:])
+        time.sleep(.03)
+
+
 def check_native_values(display, tid, language, label):
     generation = display.session()['generation']
     display.tool('select_native_frame', generation=generation, tid=tid, frame=0)
@@ -35,6 +49,7 @@ def check_native_values(display, tid, language, label):
         assert time.monotonic()<deadline, (values[0], text)
         time.sleep(.1)
     Path(screenshot+'.native-ocr.txt').write_text(text)
+    check_layout(display, language)
     return {'name':values[0]['name'], 'display':values[0]['value']['display'], 'count':len(values)}
 
 def check(display, tid, language, label):
@@ -106,6 +121,7 @@ def check(display, tid, language, label):
                 break
         assert time.monotonic() < deadline, (expected_name, matches, display.tool('get_language_tabs'))
     display.shot(label+'-clicked')
+    layout = check_layout(display, language, segment['frames'][0].get('reason'))
     assert display.tool('get_registers', tid=tid) == registers
     assert display.session()['generation'] == generation
     display.tool('select_language_tab', generation=generation, tab='native')
@@ -120,5 +136,5 @@ def check(display, tid, language, label):
     display.tool('select_language_tab', generation=generation, tab='native')
     display.tool('select_native_frame', generation=generation, tid=tid, frame=anchor['frame'])
     display.shot(label+'-native-offer')
-    return {'native_values':native_values, 'language':language, 'segment':segment_index, 'native_anchor':anchor, 'selected_frame':frame,
+    return {'layout':layout, 'native_values':native_values, 'language':language, 'segment':segment_index, 'native_anchor':anchor, 'selected_frame':frame,
             'clicked_frame':0, 'basis':'reader_segment', 'registers_generation_unchanged':True}

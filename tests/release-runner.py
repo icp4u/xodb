@@ -101,6 +101,14 @@ class RunnerTests(unittest.TestCase):
             names={name for name,_,_ in gate.plan(tier,ruby='/fixture/ruby')}
             self.assertIn('ruby-watches-gui',names)
 
+    def test_ruby_frame_names_cover_components_and_transports(self):
+        for tier in ('host', 'all'):
+            steps={name:argv for name,argv,_ in gate.plan(tier,ruby='/fixture/ruby')}
+            self.assertIn('ruby-frame-names-component',steps)
+            self.assertNotIn('--agent',steps['ruby-frame-names'])
+            self.assertIn('--agent',steps['ruby-frame-names-agent'])
+            self.assertTrue(all('--strace' in steps[name] for name in ('ruby-frame-names','ruby-frame-names-agent')))
+
     def test_javascript_watch_coverage(self):
         for tier in ('host', 'all'):
             names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
