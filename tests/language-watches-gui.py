@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Create and observe runtime watches through an owned private display."""
-import argparse,csv,importlib.util,io,json,os,queue,re,select,shlex,subprocess,threading,time
+import argparse,csv,importlib.util,io,json,os,queue,re,select,shlex,subprocess,sys,threading,time
 from pathlib import Path
 from PIL import Image,ImageOps
 p=argparse.ArgumentParser(description=__doc__)
+p.add_argument('--expect-node-frame-refusal',action='store_true',help='Require the explicit unproved-frame refusal from the selected Node build')
 p.add_argument('--paths',action='store_true');p.add_argument('--node');p.add_argument('--include',default='/usr/include/node');p.add_argument('--ruby');p.add_argument('--perl');p.add_argument('--padwalker',type=Path);p.add_argument('--reuse',action='store_true');p.add_argument('--source');p.add_argument('--library');p.add_argument('--python');p.add_argument('--work',type=Path,required=True)
 a=p.parse_args()
+if a.expect_node_frame_refusal and not a.node:p.error('--expect-node-frame-refusal requires --node')
 if sum((bool(a.node),bool(a.ruby),bool(a.python),bool(a.perl),bool(a.source or a.library)))!=1 or (not (a.node or a.python or a.perl or a.ruby) and not (a.source and a.library)):p.error('choose --node, --ruby, --python, --perl, or both --source and --library')
 if a.perl and not a.padwalker:p.error('--perl requires --padwalker')
 if (a.node or a.python or a.perl or a.ruby) and a.reuse:p.error('--reuse uses the Lua fixture')
@@ -66,15 +68,32 @@ try:
     generation=d.session()['generation'];regs=d.tool('get_registers',tid=target.pid)
     segment,frame=0,0 if a.perl else 1
     if a.node or a.python or a.ruby:
-        deadline=time.monotonic()+60
+        # Large debug Node images need cold metadata indexing before the
+        # watch checks. This is a bounded setup wait, not a latency assertion.
+        metadata_start=time.monotonic();deadline=metadata_start+(900 if a.node else 60)
         while True:
             reply=d.request('tools/call',{'name':'get_language_stack','arguments':{'tid':target.pid,'language':language}})
             if not reply.get('isError'):break
-            assert reply['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,reply
+            assert reply['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,(reply,d.tool('get_debug_metadata'))
             time.sleep(.02)
         stack=reply['structuredContent']
+        result['stack_ready_seconds']=time.monotonic()-metadata_start
         segment,frame=next((s,f) for s,part in enumerate(stack['segments']) for f,row in enumerate(part['frames']) if row['name']==('watched' if (a.node or a.ruby or a.paths) else 'outer.<locals>.watched'))
     args=dict(generation=generation,tid=target.pid,language=language,segment=segment,frame=frame)
+    if a.expect_node_frame_refusal:
+        jobs=d.tool('get_debug_metadata')['jobs']
+        javascript=[job for job in jobs if job['kind']=='javascript']
+        assert len(javascript)==1 and javascript[0]['state']=='ready',jobs
+        result['metadata']=javascript[0];result['refusals']={}
+        for tool,arguments in (('get_language_locals',args),('add_language_watch',dict(args,row=0))):
+            reply=d.request('tools/call',{'name':tool,'arguments':arguments})
+            assert reply.get('isError') and reply['content'][0]['text']=='JavaScriptContextFrameUnproved',(tool,reply)
+            result['refusals'][tool]=reply['content'][0]['text']
+        assert not d.tool('get_language_watches')['watches']
+        assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
+        result['status']='pass';result['case']='explicit-node-frame-refusal'
+        print('Node metadata completed; locals and watch creation refused: JavaScriptContextFrameUnproved')
+        sys.exit(0)
     d.tool('select_language_frame',**args)
     normalize=lambda t:re.sub(r'[^a-z0-9]','',t.lower())
     def visible(label,wanted,box,psm=6):
@@ -92,7 +111,9 @@ try:
     numeric='smi' if a.node else '' if a.ruby else 'int' if a.python else 'IV' if a.perl else 'integer' if '/lua-5.4' in a.library else 'number'
     display=lambda value:str(value) if a.ruby else numeric+' '+str(value)
     if a.node or a.python or a.perl or a.ruby or a.paths:
-        bindings=d.tool('get_language_locals',**args)['rows']
+        reply=d.request('tools/call',{'name':'get_language_locals','arguments':args})
+        assert not reply.get('isError'),reply
+        bindings=reply['structuredContent']['rows']
         visible('named-ready',['contextstorage' if a.node else 'namedlocals',normalize(bindings[0]['name'])],(1013,130,1272,578))
         index=next(i for i,row in enumerate(bindings) if row['name']==binding_name)
         for _ in range(index):d.keys('scroll',1150,540,1)

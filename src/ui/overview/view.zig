@@ -555,7 +555,7 @@ pub const View = struct {
             return true;
         }
         if (event.sym == 0xff0d or event.sym == 0xff8d) {
-            if (event.kind == .press) if (f.selected) |selected| f.scope(selected.owner);
+            if (event.kind == .press) if (f.current()) |selected| f.scope(selected.owner);
             return true;
         }
         switch (event.shortcut) {
@@ -584,7 +584,7 @@ pub const View = struct {
         const f = &self.files;
         f.rebuild(self.gpa, self.redact) catch return;
         const s = f.snapshot orelse return;
-        if (f.selected_row >= f.rows.items.len) return;
+        if (f.current() == null or f.selected_row >= f.rows.items.len) return;
         const row = f.rows.items[f.selected_row];
         if (row != .descriptor or row.descriptor.fd >= s.fd_count) return;
         const fd = s.fds[row.descriptor.fd];
@@ -648,7 +648,7 @@ pub const View = struct {
         };
         const id: Identity = if (self.panel == .files) blk: {
             // A scoped process remains selectable after an empty capture stops.
-            const owner = if (self.files.selected) |selected| selected.owner else self.files.filter orelse {
+            const owner = if (self.files.current()) |selected| selected.owner else self.files.filter orelse {
                 self.setStatus("Select a process or descriptor first", .{}, now);
                 return;
             };

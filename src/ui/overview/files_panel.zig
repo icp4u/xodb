@@ -80,7 +80,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     for (f.top..@min(f.rows.items.len, f.top + f.visible)) |index| {
         const y = table.y + 34 + @as(f32, @floatFromInt(index - f.top)) * 34;
         const row_rect = Rect{ .x = table.x + 4, .y = y, .w = table.w - 8, .h = 32 };
-        if (index == f.selected_row) try ctx.r.shape(row_rect, ctx.p.selection, .{ .radii = @splat(4) });
+        if (index == f.selected_row and !f.selected_gone) try ctx.r.shape(row_rect, ctx.p.selection, .{ .radii = @splat(4) });
         v.hit(row_rect, .{ .files_row = index });
         try row(v, ctx, .{ .x = table.x + 12, .y = y + 4, .w = table.w - 24, .h = 28 }, f.rows.items[index], now);
     }
@@ -105,7 +105,13 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, evidence, if (std.mem.eql(u8, f.captureState(), "failed")) ctx.p.crit else if (f.event.flags != 0) ctx.p.warn else ctx.p.dim);
     }
     const note = std.fmt.bufPrint(&buf, "{d} cached rows · {d} ms shared polling · soft budget {d} ms · {s}", .{ f.rows.items.len, f.active_interval_ms, if (f.active_interval_ms == 250) @as(u8, 5) else 10, if (v.paused) "view frozen; peers may continue sampling" else "read-only; no target pause" }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (f.exact_active) "exact mode slows all syscalls on this machine by roughly 10 % while active" else note, if (f.exact_active) ctx.p.warn else ctx.p.dim);
+    var gone_buf: [128]u8 = undefined;
+    // selected_gone implies a selection: its identity is kept but not listed.
+    const gone: ?[]const u8 = if (!f.selected_gone) null else if (f.selected.?.fd >= 0)
+        std.fmt.bufPrint(&gone_buf, "Selected pid {d} fd {d} is gone; view kept · ↑↓ or click selects another", .{ f.selected.?.owner.pid, f.selected.?.fd }) catch null
+    else
+        std.fmt.bufPrint(&gone_buf, "Selected pid {d} is gone; view kept · ↑↓ or click selects another", .{f.selected.?.owner.pid}) catch null;
+    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (f.exact_active) "exact mode slows all syscalls on this machine by roughly 10 % while active" else gone orelse note, if (f.exact_active or gone != null) ctx.p.warn else ctx.p.dim);
 }
 
 /// Up to `lines` lines broken after a space or '/', the last one truncated; returns the next y.

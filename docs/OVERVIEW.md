@@ -166,6 +166,10 @@ holders of that exact device/inode; **Esc** returns to the system table. **[ ]**
 cycle Files, Processes, Leak watch and Deleted; **/** searches, **S** cycles sort,
 **R** reverses. **A** offers attach and **F** offers a profile, retaining identity
 checks and the existing confirmation. Redacted attach/profile are refused.
+A clicked or keyed row stays selected by PID/start (and fd) while rows re-sort
+each refresh; the list scrolls only when you scroll it or to keep that row on
+screen. A selection whose identity disappears is shown as gone, is not replaced
+and is not an action target. Until a row is picked, the first row is selected.
 
 Polling progress comes from seekable offsets and is not exact IO: pread/pwrite,
 seeks, shared offsets and mmap need different interpretation. Pipes and sockets

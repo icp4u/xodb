@@ -294,7 +294,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
                 view.files.rebuild(gpa, view.redact) catch |err| view.setStatus("Descriptor list failed: {s}", .{@errorName(err)}, current);
                 if (changed) {
                     window.dirty = true;
-                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode) });
+                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
                 }
             }
             if (view.panel == .memory_map) {

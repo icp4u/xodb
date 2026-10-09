@@ -10,6 +10,7 @@ import time
 import re
 from PIL import Image, ImageOps
 from helpers.language_selection import check_native_values
+from helpers.language_editor import check as check_editor
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source',required=True);p.add_argument('--library',required=True)
 p.add_argument('--work',required=True,type=Path);p.add_argument('--binary',type=Path);a=p.parse_args()
@@ -61,16 +62,9 @@ try:
     d.tool('select_language_frame',generation=generation,tid=tid,language='lua',segment=0,frame=2)
     expression=d.tool('evaluate_language_expression',**(args|{'frame':2}),expression='shadow');assert expression['rows'][0]['value']['display']==expression['rows'][0]['value']['type']+' 101',expression
     d.shot('lua-named-caller')
-    # A shared client's tab/frame change must not leave an invisible editor
-    # consuming later keyboard shortcuts in another pane.
-    d.keys('tap',18)
-    d.tool('select_language_tab',generation=generation,tab='native')
-    d.keys('tap',15)
-    assert d.tool('get_language_tabs')['view']['selected']=='lua'
-    d.keys('tap',18)
-    d.tool('select_language_frame',generation=generation,tid=tid,language='lua',segment=0,frame=1)
-    d.keys('tap',15)
-    assert d.tool('get_language_tabs')['view']['selected']=='registers'
+    editor=check_editor(d,tid,'lua',2,1,
+                       [v for key in (31,35,30,32,24,17) for v in ('tap',key)],
+                       'shadow = '+locals_['rows'][0]['value']['type']+' 100')
     assert d.session()['generation']==generation and d.tool('get_registers',tid=tid)==regs
     # Sixth probe has three unnamed arguments, including nil. Scroll the
     # independently paged locals area until its nameless summary is visible.
@@ -97,7 +91,7 @@ try:
         assert time.monotonic()<deadline,text
         time.sleep(.1)
     assert d.session()['generation']==generation and d.tool('get_registers',tid=tid)==regs
-    (w/'results.json').write_text(json.dumps({'status':'pass','native_values':native_values,'locals':locals_,'caller_expression':expression,'varargs':varargs,'generation_registers_unchanged':True,'display_dir':d.dir},indent=2)+'\n')
+    (w/'results.json').write_text(json.dumps({'status':'pass','editor':editor,'native_values':native_values,'locals':locals_,'caller_expression':expression,'varargs':varargs,'generation_registers_unchanged':True,'display_dir':d.dir},indent=2)+'\n')
 finally:
     if d:d.close()
 print('Lua named-local pane, logical-frame selection and expression entry passed')

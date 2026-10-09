@@ -14,6 +14,7 @@ import subprocess
 import time
 from PIL import Image, ImageOps
 from helpers.language_selection import check_native_values
+from helpers.language_editor import check as check_editor
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--perl',required=True);p.add_argument('--padwalker',required=True,type=Path)
 p.add_argument('--work',required=True,type=Path);a=p.parse_args()
@@ -91,12 +92,11 @@ try:
     d.tool('select_language_frame',generation=generation,tid=tid,language='perl',segment=0,frame=1)
     expression=d.tool('evaluate_language_expression',**(args|{'frame':1}),expression='$shadow');assert expression['rows'][0]['value']['display']=='IV 101',expression
     d.shot('perl-named-caller')
-    d.keys('tap',18);d.tool('select_language_tab',generation=generation,tab='native');d.keys('tap',15)
-    assert d.tool('get_language_tabs')['view']['selected']=='perl'
-    d.keys('tap',18);d.tool('select_language_frame',generation=generation,tid=tid,language='perl',segment=0,frame=0);d.keys('tap',15)
-    assert d.tool('get_language_tabs')['view']['selected']=='registers'
+    editor=check_editor(d,tid,'perl',1,0,
+                       ['down',42,'tap',5,'up',42,*[v for key in (31,35,30,32,24,17) for v in ('tap',key)]],
+                       '$shadow = IV 100')
     assert d.session()['generation']==generation and d.tool('get_registers',tid=tid)==regs
-    (w/'results.json').write_text(json.dumps({'status':'pass','toggle_rows':[first_rows,second_rows,restored_rows],'native_values':native_values,'locals':locals_,'caller_expression':expression,'generation_registers_unchanged':True,'display_dir':d.dir},indent=2)+'\n')
+    (w/'results.json').write_text(json.dumps({'status':'pass','editor':editor,'toggle_rows':[first_rows,second_rows,restored_rows],'native_values':native_values,'locals':locals_,'caller_expression':expression,'generation_registers_unchanged':True,'display_dir':d.dir},indent=2)+'\n')
 finally:
     if d:d.close()
     if target.poll() is None:target.kill();target.wait()

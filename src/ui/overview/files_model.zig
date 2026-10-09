@@ -38,6 +38,8 @@ pub const State = struct {
     active_interval_ms: u32 = 1000,
     selected: ?Selection = null,
     selected_row: usize = 0,
+    selected_gone: bool = false,
+    chosen: bool = false,
     top: usize = 0,
     visible: usize = 12,
     query: [128]u8 = undefined,
@@ -173,6 +175,7 @@ pub const State = struct {
     }
     pub fn show(self: *State, mode: Mode) void {
         if (mode != .events and self.event_authorized) self.stopCapture();
+        self.chosen = false;
         self.mode = mode;
         self.top = 0;
         self.dirty = true;
@@ -312,26 +315,44 @@ pub const State = struct {
             }
         }
         std.mem.sortUnstable(Row, self.rows.items, self, less);
-        self.selected_row = @min(self.selected_row, self.rows.items.len -| 1);
-        if (self.selected) |wanted| for (self.rows.items, 0..) |row, i| {
-            if (std.meta.eql(wanted, self.identity(row))) {
-                self.selected_row = i;
-                break;
+        // Until the user picks a row, the first row is selected and the view
+        // stays put. A picked row follows its identity across re-sorts; the
+        // view moves only to keep an on-screen selected row on screen, and a
+        // vanished identity stays selected (shown as gone), never replaced.
+        const shown = !self.selected_gone and self.selected_row >= self.top and self.selected_row < self.top + self.visible;
+        self.selected_gone = false;
+        if (!self.chosen) {
+            self.selected_row = 0;
+            self.selected = if (self.rows.items.len > 0) self.identity(self.rows.items[0]) else null;
+        } else if (self.selected) |wanted| {
+            for (self.rows.items, 0..) |row, i| {
+                if (std.meta.eql(wanted, self.identity(row))) {
+                    self.selected_row = i;
+                    if (shown) self.reveal();
+                    break;
+                }
+            } else {
+                self.selected_gone = true;
+                self.selected_row = @min(self.selected_row, self.rows.items.len -| 1);
             }
-        };
-        self.select(self.selected_row);
+        }
         self.dirty = false;
     }
+    /// The live selection, or null while its identity is not listed.
+    pub fn current(self: *const State) ?Selection {
+        return if (self.selected_gone) null else self.selected;
+    }
     pub fn select(self: *State, index: usize) void {
-        if (index >= self.rows.items.len) {
-            self.selected = null;
-            self.top = 0;
-            return;
-        }
+        if (index >= self.rows.items.len) return;
         self.selected_row = index;
         self.selected = self.identity(self.rows.items[index]);
-        if (index < self.top) self.top = index;
-        if (index >= self.top + self.visible) self.top = index + 1 - self.visible;
+        self.selected_gone = false;
+        self.chosen = true;
+        self.reveal();
+    }
+    fn reveal(self: *State) void {
+        if (self.selected_row < self.top) self.top = self.selected_row;
+        if (self.selected_row >= self.top + self.visible) self.top = self.selected_row + 1 - self.visible;
     }
     pub fn move(self: *State, by: i32) void {
         if (self.rows.items.len == 0) return;
@@ -448,4 +469,92 @@ test "churn tiles keep equal command names distinguishable by pid" {
     try std.testing.expectEqualStrings("pw-…[7]", State.churnLabel(&first, "pw-play", 7, 3));
     // A shortened name never splits a UTF-8 sequence.
     try std.testing.expectEqualStrings("a…[7]", State.churnLabel(&first, "aé", 7, 2));
+}
+
+/// Publishes `n` synthetic processes (pid 1000+i, start 50+i) whose churn
+/// ranks are reshuffled by `round`, skipping pid `missing`.
+fn publishChurn(state: *State, n: usize, round: u32, missing: i32) !void {
+    var processes: [64]c.struct_xrt_fd_process = undefined;
+    var count: usize = 0;
+    for (0..n) |i| {
+        if (@as(i32, @intCast(1000 + i)) == missing) continue;
+        var p = std.mem.zeroes(c.struct_xrt_fd_process);
+        p.pid = @intCast(1000 + i);
+        p.start = 50 + i;
+        p.interval_ns = 1_000_000_000;
+        p.churn_rate = @floatFromInt((i * 7 + round * 13) % 37);
+        processes[count] = p;
+        count += 1;
+    }
+    var snapshot = std.mem.zeroes(c.struct_xrt_fd_snapshot);
+    snapshot.processes = &processes;
+    snapshot.process_count = @intCast(count);
+    snapshot.sequence = round;
+    if (state.snapshot) |old| c.xrt_fd_snapshot_free(old);
+    state.snapshot = c.xrt_fd_snapshot_copy(&snapshot) orelse return error.OutOfMemory;
+    state.dirty = true;
+}
+
+test "selection follows identity and scroll stays put across re-sorting publications" {
+    const a = std.testing.allocator;
+    var state: State = .{ .mode = .processes, .visible = 5 };
+    defer state.deinit(a);
+    try publishChurn(&state, 30, 0, 0);
+    try state.rebuild(a, false);
+    // The user's report: scrolling away from the default selection must
+    // not be undone by the next 1 Hz publication.
+    state.top = 10;
+    for (1..4) |round| {
+        try publishChurn(&state, 30 + round, @intCast(round), 0);
+        try state.rebuild(a, false);
+        try std.testing.expectEqual(@as(usize, 10), state.top);
+        try std.testing.expectEqual(state.identity(state.rows.items[0]), state.selected.?);
+    }
+    // A clicked on-screen row keeps its identity; the view moves only as
+    // far as needed to keep that row visible.
+    state.select(12);
+    const picked = state.selected.?;
+    var moved = false;
+    for (4..12) |round| {
+        const before = state.top;
+        const row = state.selected_row;
+        try publishChurn(&state, 26 + round % 5, @intCast(round), 0);
+        try state.rebuild(a, false);
+        try std.testing.expectEqual(picked, state.selected.?);
+        const at = state.selected_row;
+        try std.testing.expectEqual(picked, state.identity(state.rows.items[at]));
+        moved = moved or at != row;
+        const want = if (at < before) at else if (at >= before + state.visible) at + 1 - state.visible else before;
+        try std.testing.expectEqual(want, state.top);
+    }
+    try std.testing.expect(moved);
+    // A vanished identity is kept (not replaced) and the view does not jump.
+    const top = state.top;
+    try publishChurn(&state, 30, 20, picked.owner.pid);
+    try state.rebuild(a, false);
+    try std.testing.expectEqual(picked, state.selected.?);
+    try std.testing.expectEqual(top, state.top);
+    try publishChurn(&state, 30, 21, 0);
+    try state.rebuild(a, false);
+    try std.testing.expectEqual(picked, state.identity(state.rows.items[state.selected_row]));
+}
+
+test "a vanished selection is shown as gone and is never an action target" {
+    const a = std.testing.allocator;
+    var state: State = .{ .mode = .processes, .visible = 5 };
+    defer state.deinit(a);
+    try publishChurn(&state, 30, 0, 0);
+    try state.rebuild(a, false);
+    state.select(3);
+    const picked = state.selected.?;
+    try publishChurn(&state, 30, 1, picked.owner.pid);
+    try state.rebuild(a, false);
+    try std.testing.expect(state.selected_gone and state.current() == null);
+    try std.testing.expectEqual(picked, state.selected.?);
+    state.move(1);
+    try std.testing.expect(!state.selected_gone and state.current() != null);
+    // Another tab starts at its first row; here Leak watch has none.
+    state.show(.leaks);
+    try state.rebuild(a, false);
+    try std.testing.expect(state.selected == null and state.top == 0);
 }

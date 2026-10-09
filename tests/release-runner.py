@@ -117,6 +117,20 @@ class RunnerTests(unittest.TestCase):
             names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
             self.assertIn('javascript-watches-gui',names)
 
+    def test_node_refusal_is_separate_from_positive_watch_coverage(self):
+        for tier in ('gui', 'all'):
+            steps={name:(argv,seconds) for name,argv,seconds in gate.plan(tier,node='/fixture/supported-node',node_refusal='/fixture/unproved-node')}
+            positive,positive_seconds=steps['javascript-watches-gui']
+            refusal,refusal_seconds=steps['javascript-frame-refusal-gui']
+            self.assertEqual(positive[positive.index('--node')+1],'/fixture/supported-node')
+            self.assertNotIn('--expect-node-frame-refusal',positive)
+            self.assertEqual(refusal[refusal.index('--node')+1],'/fixture/unproved-node')
+            self.assertIn('--expect-node-frame-refusal',refusal)
+            self.assertNotEqual(positive[positive.index('--work')+1],refusal[refusal.index('--work')+1])
+            self.assertGreater(positive_seconds,900)
+            self.assertGreater(refusal_seconds,900)
+            self.assertNotIn('javascript-frame-refusal-gui',{name for name,_,_ in gate.plan(tier,node='/fixture/supported-node')})
+
     def test_shell_preferences_do_not_reach_steps(self):
         poisoned = dict(os.environ, NO_COLOR='1', COLORTERM='truecolor', FORCE_COLOR='3',
                         CLICOLOR='1', CLICOLOR_FORCE='1', TERM='xterm-256color',

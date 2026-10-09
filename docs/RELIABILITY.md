@@ -201,6 +201,16 @@ real runtimes, locally and through the C agent. `--python` includes a syscall
 audit: repeated selections at one retained stop do not reread target memory;
 stepping invalidates that cache. Timing numbers are evidence, not pass criteria.
 
+Node's positive context/watch checks require a build with proved V8 frame
+configuration. A matching version string alone is insufficient. Keep that
+runtime in `--node`; for a separate build whose frame configuration is unproved,
+add `--node-refusal ./debug-node` to the gui/all gate. The separate case requires
+metadata to complete, then checks the exact `JavaScriptContextFrameUnproved`
+refusal from both locals and watch creation, with unchanged registers/generation
+and no watch added. It never substitutes for the positive watch checks. Cold
+metadata setup has the same bounded 900-second ceiling as the other Node GUI
+checks; the actual elapsed time is recorded as evidence.
+
 With a debug Perl and a separately built test-only PadWalker tree, add
 `--perl /path/to/perl --padwalker /path/to/PadWalker` to the host/all gate for
 named-local sanitizer/oracle, local and C-agent MCP, and shared-observer checks.
