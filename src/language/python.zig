@@ -491,6 +491,8 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
     if (row) |index| if (index >= c.XPY_MAX_LOCALS) return error.InvalidArguments;
+    const checked_expression = try a.dupeZ(u8, expression orelse "binding");
+    if (expression != null and c.xpy_expression_valid(checked_expression) == 0) return error.UnsupportedLanguageExpression;
     const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
@@ -508,7 +510,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
         .thread = thread,
         .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, instance.address, 0), instance.interpreter_id, try std.fmt.parseInt(u64, instance.thread_state, 0) },
         .frame = .{ try std.fmt.parseInt(u64, selected.frame_address, 0), try std.fmt.parseInt(u64, selected.code, 0), if (std.mem.eql(u8, selected.owner, "generator")) watch_generator else 0, 0 },
-    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    }, .expression = checked_expression };
     try watchValue(session, a, &capture, row);
     if (row != null and capture.scope.frame[2] & watch_binding == 0) return error.PythonWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);
@@ -626,7 +628,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .diagnostic = (try reason(a, raw.reason)) orelse stack_reason,
         .runtime_version = version,
         .runtime_build_id = id,
-        .basis = "CPython verified build-id, published localsplus/name/kind offsets and cell layout; canonical retained frame/code; normal GIL stackrefs; fast locals only, no mapping lookup, descriptors or inferior calls",
+        .basis = "CPython verified build-id, published localsplus/name/kind offsets and cell layout; canonical retained frame/code; normal GIL stackrefs; fast-local roots and bounded exact builtin dict/list/tuple paths; no mapping locals, descriptors or inferior calls",
         .memory_reads = r.reads,
         .memory_bytes = r.bytes,
     };

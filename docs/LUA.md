@@ -172,7 +172,7 @@ complete strings up to 4096 bytes. Floating-point comparison uses exact bits
 (including signed zero and NaN payloads), not Lua operator semantics. A change
 outside the displayed string prefix still marks the watch changed. Longer
 strings, tables, functions and other objects have explicit unavailability
-reasons. Property/table paths and the other runtime adapters remain future work.
+reasons. A path can select a scalar inside a table as described below.
 Sixteen watches per process allocate storage as needed. Missing observations
 never count as equality; old/new generations identify the last complete baseline.
 These watches report changes **when execution stops**, and do not cause a stop.
@@ -183,3 +183,36 @@ index in `get_language_locals`). `remove_language_watch` takes `generation` and
 `id`. Both require the controller lease in a shared session. Observers can call
 `get_language_watches` without a lease; it reads cached comparison results with
 current/previous generations, state and a reason, and performs no target reads.
+
+### Table paths
+
+With a debug-built Lua 5.4.9 or 5.2.4 on PATH:
+
+```sh
+xodb --break luaB_print -- lua5.4 examples/lua-path-demo.lua
+```
+
+Press **Space**, choose **Lua**, and select the Lua frame at the `print` line.
+**Shift+E**, `state.player.score`, **Return** creates a watch. Press **Space**
+again, then **V**: the score changes even though the program replaced `player`.
+**E** reads the same path once; **Delete** removes a selected watch.
+
+Paths start with an ASCII local/upvalue name and contain at most four selectors:
+`.identifier` or `[signed decimal integer]`, with indices from -2147483648 to
+2147483647 and a total length of 128 bytes. For example, `items[2].name`.
+Each stop resolves the root through current lexical scopes, then reads each
+current table. It retains neither a table pointer nor a value-slot pointer.
+
+These are raw storage reads. Any traversed table with a metatable returns
+`LuaPathMetatableUnsupported`, including keys present in that table. A missing
+final key is nil; missing or non-table intermediate values return
+`LuaPathNotTable`. Hash lookups inspect at most 128 slots, returning
+`LuaPathWorkLimit` before accepting an incomplete scan; array indices within
+proved capacity do not scan the hash. Duplicate hash keys refuse as ambiguous.
+Quoted/arbitrary keys, calls, arithmetic and metamethods are unsupported.
+The ordinary scalar limits and activation-identity caveat still apply.
+
+Syntactically unsupported watch paths refuse at creation with
+`LuaExpressionUnsupported`, leaving the watch count unchanged. A valid path
+whose root is currently absent or whose table cannot be read can still be added
+as an unavailable watch and recover at a later stop.

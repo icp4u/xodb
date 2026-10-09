@@ -665,11 +665,14 @@ static void named_locals(void) {
     assert(!out.reason && out.count == 1 && !strcmp(out.items[0].reason, "PythonUnboundLocal"));
     r = reader(); xpy_local_find(&L, &r, fr, co, "missing", &out);
     assert(!strcmp(out.reason, "PythonNameNotFound") && !out.count);
-    const char *queries[] = {"", "arg()", "arg.attr", "arg[0]", "arg + 1", "1arg"};
+    const char *queries[] = {"", "arg()", "arg.attr", "arg[0:1]", "arg + 1", "1arg"};
     for (size_t i = 0; i < sizeof queries / sizeof *queries; ++i) {
         r = reader(); xpy_local_find(&L, &r, fr, co, queries[i], &out);
         assert(!strcmp(out.reason, "UnsupportedLanguageExpression") && !r.reads);
     }
+    r = reader(); xpy_local_find(&L, &r, fr, co, "arg[0]", &out);
+    assert(!strcmp(out.reason, "PythonPathContainerUnsupported") && !out.count && r.reads);
+    assert(xpy_expression_valid("arg[0]") && !xpy_expression_valid("arg()"));
     r = reader(); xpy_locals_read(&L, &r, fr, co + 16, 0, 32, &out);
     assert(!strcmp(out.reason, "StaleLanguageFrame"));
     put(co + 48, 0, 4);

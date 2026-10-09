@@ -29,8 +29,11 @@ r=run('tests/lua-reader.c','reader')
 assert '23 values, 9 stacks, 32 exact frame positions passed' in r.stdout,r.stdout
 named=run('tests/lua-locals.c','locals')
 assert 'named locals:' in named.stdout and 'callbacks passed' in named.stdout,named.stdout
+paths=run('tests/lua-paths.c','paths')
+assert 'table paths:' in paths.stdout and 'injected reads passed' in paths.stdout,paths.stdout
 inputs={str(p):hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(Path(a.source).glob('*.h'))}
 inputs[str(Path(a.library))]=hashlib.sha256(Path(a.library).read_bytes()).hexdigest()
 (work/'inputs.json').write_text(json.dumps(inputs,indent=2)+'\n')
 print(r.stdout.splitlines()[-1])
 print(named.stdout.splitlines()[-1])
+print(paths.stdout.splitlines()[-1])

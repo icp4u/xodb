@@ -1185,6 +1185,10 @@ static void local_name(const struct xpy_layout *l, struct xpy_reader *r, const s
     else if (!unicode(l, r, name, out->name, sizeof out->name, 511, 0, NULL, &out->name_reason))
         out->name_reason = out->name_reason ? out->name_reason : "PythonLocalNameTruncated";
     isolate(r, &out->name_reason);
+}
+static void local_kind(const struct xpy_layout *l, struct xpy_reader *r, const struct local_frame *f,
+                         size_t i, struct xpy_local *out) {
+    (void)l;
     unsigned kind = (unsigned)number(r, f->kinds + i, 1);
     if (r->error)
         out->reason = r->error;
@@ -1197,7 +1201,7 @@ static void local_name(const struct xpy_layout *l, struct xpy_reader *r, const s
     isolate(r, &out->reason);
 }
 static void local_value(const struct xpy_layout *l, struct xpy_reader *r, const struct local_frame *f,
-                         struct xpy_local *out) {
+                         int preview, struct xpy_local *out) {
     if (out->reason)
         return;
     if (f->stackpointer && out->slot_address >= f->stackpointer) {
@@ -1252,8 +1256,10 @@ static void local_value(const struct xpy_layout *l, struct xpy_reader *r, const 
          * slot can contain its value directly (frameobject.c). */
     }
     out->address = address;
-    xpy_value_read(l, r, address, &out->value);
-    out->reason = out->value.reason;
+    if (preview) {
+        xpy_value_read(l, r, address, &out->value);
+        out->reason = out->value.reason;
+    }
 }
 static int local_query(const char *name) {
     if (!name || !*name)
@@ -1269,7 +1275,7 @@ static int local_query(const char *name) {
     return 0;
 }
 static void locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
-                         size_t start, size_t limit, const char *query, struct xpy_locals *out) {
+                         size_t start, size_t limit, const char *query, int preview, struct xpy_locals *out) {
     memset(out, 0, sizeof *out);
     out->frame = frame;
     out->code = code;
@@ -1286,16 +1292,15 @@ static void locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64
     size_t end = query ? f.count : start + limit;
     if (end > f.count)
         end = f.count;
-    const char *unknown_name = NULL;
     struct xpy_local match;
     int unbound_match = 0;
     for (size_t i = start; i < end; ++i) {
         struct xpy_local row;
         local_name(l, r, &f, i, &row);
-        if (row.name_reason)
-            unknown_name = row.name_reason;
-        if (!query || (!row.name_reason && !strcmp(query, row.name))) {
-            local_value(l, r, &f, &row);
+        if (query && row.name_reason) { out->reason = row.name_reason; return; }
+        if (!query || !strcmp(query, row.name)) {
+            local_kind(l, r, &f, i, &row);
+            local_value(l, r, &f, preview, &row);
             isolate(r, &row.reason);
             if (!query)
                 out->items[out->count++] = row;
@@ -1321,22 +1326,13 @@ static void locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64
             out->start = match.ordinal;
             out->count = 1;
         } else
-            out->reason = unknown_name ? unknown_name : "PythonNameNotFound";
+            out->reason = "PythonNameNotFound";
     } else
         out->truncated = start + out->count < f.count;
 }
 void xpy_locals_read(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
                      size_t start, size_t limit, struct xpy_locals *out) {
-    locals_read(l, r, frame, code, start, limit, NULL, out);
-}
-void xpy_local_find(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
-                    const char *name, struct xpy_locals *out) {
-    if (!name) {
-        memset(out, 0, sizeof *out);
-        out->reason = "UnsupportedLanguageExpression";
-        return;
-    }
-    locals_read(l, r, frame, code, 0, 1, name, out);
+    locals_read(l, r, frame, code, start, limit, NULL, 1, out);
 }
 const char *xpy_local_sample(const struct xpy_layout *l, struct xpy_reader *r, const struct xpy_local *local,
                              void *buffer, size_t capacity, size_t *length, enum xpy_sample_kind *kind) {
@@ -1356,4 +1352,181 @@ const char *xpy_local_sample(const struct xpy_layout *l, struct xpy_reader *r, c
     if (capacity < n) return "PythonWatchSampleLimit";
     memcpy(buffer, raw, n); *length = n; *kind = XPY_SAMPLE_INT;
     return NULL;
+}
+
+struct path_key { char text[129]; int32_t integer; int is_integer; };
+struct path { char root[129]; size_t count; struct path_key keys[XPY_PATH_DEPTH]; };
+static int path_parse(const char *text, struct path *out) {
+    memset(out, 0, sizeof *out);
+    if (!text) return 0;
+    size_t n = 0;
+    while (n <= 128 && text[n]) ++n;
+    if (!n || n > 128) return 0;
+    size_t i = 0;
+    while (i < n && text[i] != '[') ++i;
+    memcpy(out->root, text, i);
+    if (!local_query(out->root)) return 0;
+    while (i < n) {
+        if (out->count == XPY_PATH_DEPTH || text[i++] != '[' || i == n) return 0;
+        struct path_key *key = &out->keys[out->count++];
+        if (text[i] == '\'' || text[i] == '"') {
+            char quote = text[i++]; size_t begin = i;
+            while (i < n && text[i] != quote) {
+                unsigned char c = (unsigned char)text[i++];
+                if (c < 32 || c >= 127 || c == '\\') return 0;
+            }
+            if (i == n) return 0;
+            memcpy(key->text, text + begin, i - begin); ++i;
+        } else {
+            int negative = text[i] == '-';
+            if (negative) ++i;
+            if (i == n || text[i] < '0' || text[i] > '9') return 0;
+            size_t begin = i;
+            uint64_t number = 0, limit = (uint64_t)INT32_MAX + negative;
+            while (i < n && text[i] >= '0' && text[i] <= '9') {
+                unsigned digit = (unsigned)(text[i++] - '0');
+                if (number > (limit - digit) / 10) return 0;
+                number = number * 10 + digit;
+            }
+            if (i - begin > 1 && text[begin] == '0') return 0;
+            key->is_integer = 1; key->integer = (int32_t)(negative ? -(int64_t)number : (int64_t)number);
+        }
+        if (i == n || text[i++] != ']') return 0;
+    }
+    return 1;
+}
+int xpy_expression_valid(const char *text) {
+    struct path path;
+    return path_parse(text, &path);
+}
+static uint64_t path_add(struct xpy_reader *r, uint64_t address, uint64_t offset) {
+    if (!address || address > UINT64_MAX - offset) { r->error = "InvalidAddress"; return 0; }
+    return address + offset;
+}
+static const char *path_key_equal(const struct xpy_layout *l, struct xpy_reader *r,
+                                  uint64_t address, const struct path_key *key, int *equal) {
+    *equal = 0;
+    struct head h;
+    const char *why = object_head(l, r, address, &h, 0);
+    if (why) return why;
+    int string = type_is(l, h.type, XPY_TYPE_UNICODE);
+    int numeric = type_is(l, h.type, XPY_TYPE_LONG) || type_is(l, h.type, XPY_TYPE_BOOL) || type_is(l, h.type, XPY_TYPE_FLOAT);
+    /* Even an exact dict can contain a key whose __eq__ executes Python.
+     * Refuse unknown live key types, including when another key matched. */
+    if (!string && !numeric && !type_is(l, h.type, XPY_TYPE_NONE) && !type_is(l, h.type, XPY_TYPE_BYTES))
+        return "PythonPathKeyUnsupported";
+    if (key->is_integer ? !numeric : !string) return NULL;
+    if (string) {
+        int64_t chars = (int64_t)at(l, r, address, XPY_STR_LENGTH, 8);
+        if (r->error) return r->error;
+        if (chars < 0) return "InconsistentStr";
+        if ((uint64_t)chars != strlen(key->text)) return NULL;
+    }
+    unsigned char bytes[XPY_SAMPLE_BYTES]; size_t size = 0; enum xpy_sample_kind kind;
+    why = xpy_value_sample(l, r, address, bytes, sizeof bytes, &size, &kind);
+    if (why) return why;
+    if (kind == XPY_SAMPLE_STR) {
+        if (size != strlen(key->text) * 4) return "InconsistentStr";
+        *equal = 1;
+        for (size_t i = 0; i < size / 4; ++i)
+            if (le(bytes + i * 4, 4) != (unsigned char)key->text[i]) *equal = 0;
+    } else if (kind == XPY_SAMPLE_BOOL) *equal = key->integer == bytes[0];
+    else if (kind == XPY_SAMPLE_FLOAT) {
+        uint64_t bits = le(bytes, 8); double value; memcpy(&value, &bits, sizeof value);
+        *equal = value == (double)key->integer;
+    } else if (kind == XPY_SAMPLE_INT) {
+        /* The canonical sampler checked every limb and the leading digit.
+         * More than two base-2^30 limbs cannot equal a signed32-bit query. */
+        if (size > 9) return NULL;
+        uint64_t magnitude = 0;
+        for (size_t i = 1; i < size; i += 4) magnitude |= le(bytes + i, 4) << (((i - 1) / 4) * LONG_SHIFT);
+        int64_t value = bytes[0] == 2 ? -(int64_t)magnitude : (int64_t)magnitude;
+        *equal = value == key->integer;
+    } else return "PythonPathKeyUnsupported";
+    return NULL;
+}
+static const char *path_lookup(const struct xpy_layout *l, struct xpy_reader *r, uint64_t address,
+                               const struct path_key *key, uint64_t *value, uint64_t *slot) {
+    *value = *slot = 0;
+    struct head h;
+    const char *why = object_head(l, r, address, &h, 0);
+    if (why) return why;
+    int list = type_is(l, h.type, XPY_TYPE_LIST), tuple = type_is(l, h.type, XPY_TYPE_TUPLE);
+    if (list || tuple) {
+        if (!(h.type_flags & (list ? TPFLAGS_LIST : TPFLAGS_TUPLE))) return "InconsistentTypeFlags";
+        if (!key->is_integer) return "PythonPathIndexRequired";
+        int64_t n = (int64_t)at(l, r, address, list ? XPY_LIST_SIZE : XPY_TUPLE_SIZE, 8);
+        uint64_t items = list ? pointer(l, r, address, XPY_LIST_ITEM) : path_add(r, address, field(l, XPY_TUPLE_ITEM));
+        if (r->error) return r->error;
+        if (n < 0 || n > (int64_t)1 << 40 || (n && !items)) return "PythonPathSequenceInvalid";
+        int64_t index = key->integer < 0 ? n + key->integer : key->integer;
+        if (index < 0 || index >= n) return "PythonPathIndexOutOfRange";
+        *slot = path_add(r, items, (uint64_t)index * 8); *value = number(r, *slot, 8);
+        return r->error ? r->error : !*value ? "PythonPathValueUnavailable" : NULL;
+    }
+    if (!type_is(l, h.type, XPY_TYPE_DICT)) return "PythonPathContainerUnsupported";
+    if (!(h.type_flags & TPFLAGS_DICT)) return "InconsistentTypeFlags";
+    int64_t used = (int64_t)at(l, r, address, XPY_DICT_USED, 8);
+    uint64_t keys = pointer(l, r, address, XPY_DICT_KEYS), values = pointer(l, r, address, XPY_DICT_VALUES);
+    if (r->error) return r->error;
+    if (used < 0 || !keys) return "InconsistentDict";
+    uint8_t kh[40]; size_t need = field(l, XPY_DK_NENTRIES) + 8;
+    if (need > sizeof kh || field(l, XPY_DK_LOG2_SIZE) >= need || field(l, XPY_DK_LOG2_INDEX) >= need ||
+        field(l, XPY_DK_KIND) >= need) return "PythonLayoutUnsupported";
+    if (!read_bytes(r, keys, kh, need)) return r->error;
+    unsigned log2_size = kh[field(l, XPY_DK_LOG2_SIZE)], log2_index = kh[field(l, XPY_DK_LOG2_INDEX)];
+    unsigned kind = kh[field(l, XPY_DK_KIND)];
+    int64_t count = (int64_t)le(kh + field(l, XPY_DK_NENTRIES), 8);
+    if (log2_size == 0 && log2_index == 3 && count == 0 && used == 0 && !values && kind == DICT_UNICODE)
+        return "PythonPathKeyNotFound";
+    if (log2_size < 3 || log2_size > 40 || log2_index < log2_size || log2_index > log2_size + 3 || kind > 2 ||
+        count < 0 || count > (int64_t)((((uint64_t)1 << log2_size) << 1) / 3) || used > count ||
+        (values && kind != DICT_SPLIT) || (!values && kind == DICT_SPLIT)) return "InconsistentDict";
+    if (count > XPY_PATH_ENTRIES) return "PythonPathWorkLimit";
+    size_t stride = kind == DICT_GENERAL ? 24 : 16, key_offset = kind == DICT_GENERAL ? 8 : 0;
+    uint64_t entries = path_add(r, keys, field(l, XPY_DK_INDICES));
+    entries = path_add(r, entries, UINT64_C(1) << log2_index);
+    uint64_t value_base = values ? path_add(r, values, field(l, XPY_DV_VALUES)) : 0;
+    if (r->error) return r->error;
+    uint8_t raw[XPY_PATH_ENTRIES * 24], vals[XPY_PATH_ENTRIES * 8];
+    if (count && !read_bytes(r, entries, raw, (size_t)count * stride)) return r->error;
+    if (count && values && !read_bytes(r, value_base, vals, (size_t)count * 8)) return r->error;
+    int64_t occupied = 0;
+    for (size_t i = 0; i < (size_t)count; ++i) {
+        uint64_t k = le(raw + i * stride + key_offset, 8);
+        uint64_t v = values ? le(vals + i * 8, 8) : le(raw + i * stride + key_offset + 8, 8);
+        if ((!k && v) || (k && !v && !values)) return "InconsistentDict";
+        if (!k || !v) continue;
+        ++occupied;
+        int equal = 0;
+        why = path_key_equal(l, r, k, key, &equal);
+        if (why) return why;
+        if (!equal) continue;
+        if (*value) return "PythonPathKeyAmbiguous";
+        *value = v;
+        *slot = values ? path_add(r, value_base, i * 8) : path_add(r, entries, i * stride + key_offset + 8);
+        if (r->error) return r->error;
+    }
+    if (occupied != used) return "InconsistentDict";
+    return *value ? NULL : "PythonPathKeyNotFound";
+}
+void xpy_local_find(const struct xpy_layout *l, struct xpy_reader *r, uint64_t frame, uint64_t code,
+                    const char *expression, struct xpy_locals *out) {
+    struct path path;
+    if (!path_parse(expression, &path)) {
+        memset(out, 0, sizeof *out); out->reason = "UnsupportedLanguageExpression"; return;
+    }
+    locals_read(l, r, frame, code, 0, 1, path.root, path.count == 0, out);
+    if (!path.count || out->reason || out->count != 1 || out->items[0].reason) return;
+    struct xpy_local *item = &out->items[0];
+    if (item->immediate) { out->reason = "PythonPathContainerUnsupported"; out->count = 0; return; }
+    for (size_t i = 0; i < path.count; ++i) {
+        uint64_t value, slot;
+        out->reason = path_lookup(l, r, item->address, &path.keys[i], &value, &slot);
+        if (out->reason) { out->count = 0; return; }
+        item->address = value; item->slot_address = slot;
+    }
+    bounded_copy(item->name, sizeof item->name, expression);
+    xpy_value_read(l, r, item->address, &item->value);
+    item->reason = item->value.reason;
 }

@@ -69,7 +69,9 @@ an explicit reason. Recursion, active generators, resumed generators and
 coroutines use that frame's slots. Module/class mapping locals report
 `PythonMappingLocalsUnavailable`; globals and arbitrary expressions are not
 looked up. A bare name is matched exactly, including UTF-8 names, without
-normalization, attributes, calls, operators or execution in the target.
+normalization. Bounded builtin container subscripts are also supported (see
+[Container paths](#container-paths)); attributes, calls, operators and execution
+in the target remain unsupported.
 
 Shared observers use the same reader without a controller lease:
 
@@ -81,7 +83,8 @@ Shared observers use the same reader without a controller lease:
 Use the generation, tid and logical segment/frame from your own stopped
 session. `address` is the decoded value's PyObject address, or null for an
 unbound slot or an immediate tagged integer. `slot_address` is its frame
-stack-reference slot, including for a cell; neither is stable after resume.
+stack-reference slot, including for a cell; for a container path it is the
+current leaf slot within the container. Neither is stable after resume.
 `hidden` marks a compiler local and `immediate` marks an integer without an
 object. This is observation, not a hardware watchpoint or interpreter watch.
 
@@ -262,7 +265,7 @@ sign/digits, so boxing alone does not change a value. Floats compare exact bits,
 including signed zero and NaN payloads; this is not Python `==`. Strings compare
 Unicode code points, including lone surrogates. The 4096-byte sample cap allows
 1024 Unicode code points, 4096 bytes, or 1023 base-2^30 integer digits plus sign.
-Subclasses, containers, object paths and oversized values have an explicit reason
+Subclasses, nonscalar results and oversized values have an explicit reason
 and retain the last complete baseline; a preview is never treated as equality.
 
 Matching a frame location and code object does **not** prove continuous activation
@@ -276,10 +279,47 @@ Their close and reuse entirely between observations also cannot be proved.
 
 At most 16 watches share the process's C comparison state, allocated as needed.
 `add_language_watch` accepts `language: "python"`, generation, tid, segment and
-frame, plus either a bare `expression` or an absolute named-local `row` index.
+frame, plus either a bounded `expression` or an absolute named-local `row` index.
 Add/remove require the controller lease. `get_language_watches` returns cached
 results to observers without a lease or target reads. Watches compare only when
 execution stops and do not interrupt it automatically.
+
+## Container paths
+
+With a supported debug-built interpreter:
+
+```sh
+xodb --break builtin_print -- python3 examples/python-path-demo.py
+```
+
+Press **Space**, choose **Python**, select **main**, then **Shift+E**,
+`state["player"]["score"]`, **Return**. **Space** reaches the next print and
+**V** shows the changed score, even though its containing dictionary was
+replaced. **E** reads the path once; **Delete** removes a selected watch.
+
+C resolves the current fast-local/cell/free-variable root and each container
+at every stop. A path is at most 128 UTF-8 bytes and four subscripts. Subscripts
+are signed 32-bit integer literals or quoted printable ASCII strings, with no
+escapes. Exact builtin dict, list and tuple storage is supported. Negative
+sequence indices count from the current end. There is no attribute, descriptor,
+property, method, slice, arithmetic or target-code execution.
+
+Dictionary lookup scans every occupied entry within a 128-entry table cap;
+scans over the cap refuse before accepting an early match. Deleted entry slots
+also count toward this cap. String keys compare complete code points; integer
+queries respect builtin int/bool/float equality. Unknown live key types, including
+subclasses, refuse with `PythonPathKeyUnsupported`, even if another key matched:
+an exact dict can otherwise invoke a custom key's equality method. An oversized
+numeric key may also refuse under the scalar sample cap. Combined and split
+storage use the verified runtime layout; counts and duplicate matches are checked.
+
+A missing dictionary key is `PythonPathKeyNotFound`, never a fabricated `None`.
+Out-of-range sequence access is `PythonPathIndexOutOfRange`. Subclasses or a
+non-container intermediate value produce `PythonPathContainerUnsupported`.
+Unsupported syntax refuses at watch creation without occupying a slot; incomplete
+memory reads leave an unavailable value. These states
+retain the last complete watch baseline and can recover at a later stop. The
+existing activation-continuity caveat still applies.
 
 ## Verification
 

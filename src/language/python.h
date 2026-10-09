@@ -224,6 +224,13 @@ struct xpy_locals {
  * refused. Unbound slots keep their name and reason, without an object address. */
 void xpy_locals_read(const struct xpy_layout *, struct xpy_reader *, uint64_t frame, uint64_t code,
                      size_t start, size_t limit, struct xpy_locals *);
+/* A local/upvalue name followed by at most four [int32] or quoted ASCII-key
+ * selectors (128 bytes total). Exact builtin dict/list/tuple storage only;
+ * no subclasses, attributes, callbacks or implicit globals. */
+#define XPY_PATH_DEPTH 4
+#define XPY_PATH_ENTRIES 128
+/* Pure syntax/bounds check; no target reads. Resolution can still be unavailable. */
+int xpy_expression_valid(const char *);
 void xpy_local_find(const struct xpy_layout *, struct xpy_reader *, uint64_t frame, uint64_t code,
                     const char *name, struct xpy_locals *);
 /* Use a row just resolved in this stopped generation, never a saved slot.

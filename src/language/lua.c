@@ -427,7 +427,7 @@ static void local_name(const struct xl_layout *p, struct xl_reader *r, uint64_t 
 }
 struct local_selector { enum xl_local_kind kind; uint32_t declaration; };
 static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
-                    size_t frame, size_t start, size_t limit, const char *expression, const struct local_selector *selector, struct xl_locals *out) {
+                    size_t frame, size_t start, size_t limit, const char *expression, const struct local_selector *selector, int preview, struct xl_locals *out) {
     memset(out, 0, sizeof *out);
     out->state = state; out->frame = frame; out->start = start;
     if (expression) {
@@ -584,7 +584,7 @@ static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
         if (!item->address || item->address & 7) { item->reason = "LuaLocalSlotInvalid"; out->reason = item->reason; return; }
         local_name(p, r, name, item);
         if (r->error) { out->reason = r->error; return; }
-        value(p, r, item->address, &item->value, 0);
+        if (preview) value(p, r, item->address, &item->value, 0);
         if (r->error) {
             out->reason = r->error;
             if (!strcmp(r->error, "LuaReadBudget")) return;
@@ -596,12 +596,7 @@ static void locals(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
 
 void xl_locals_read(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
                     size_t frame, size_t start, size_t limit, struct xl_locals *out) {
-    locals(p, r, state, frame, start, limit, NULL, NULL, out);
-}
-void xl_local_find(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
-                   size_t frame, const char *expression, struct xl_locals *out) {
-    if (!expression) { memset(out, 0, sizeof *out); out->reason = "LuaExpressionUnsupported"; return; }
-    locals(p, r, state, frame, 0, 1, expression, NULL, out);
+    locals(p, r, state, frame, start, limit, NULL, NULL, 1, out);
 }
 
 /* Canonical comparison reads are separate from the display's 128-byte string
@@ -649,5 +644,179 @@ void xl_local_binding(const struct xl_layout *p, struct xl_reader *r, uint64_t s
         memset(out,0,sizeof *out);out->reason="LuaWatchBindingInvalid";return;
     }
     struct local_selector selector={.kind=kind,.declaration=declaration};
-    locals(p,r,state,frame,0,1,NULL,&selector,out);
+    locals(p,r,state,frame,0,1,NULL,&selector,1,out);
+}
+
+struct path_key { char name[XL_STRING_BYTES + 1]; int32_t integer; int is_integer; };
+struct path { char root[XL_STRING_BYTES + 1]; size_t count; struct path_key keys[XL_PATH_DEPTH]; };
+static int identifier(unsigned c, int first) {
+    return c == '_' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+        (!first && c >= '0' && c <= '9');
+}
+static int path_parse(const char *text, struct path *out) {
+    memset(out, 0, sizeof *out);
+    if (!text) return 0;
+    size_t n = 0;
+    while (n <= XL_STRING_BYTES && text[n]) ++n;
+    if (!n || n > XL_STRING_BYTES || !identifier((unsigned char)text[0], 1)) return 0;
+    size_t i = 1;
+    while (i < n && identifier((unsigned char)text[i], 0)) ++i;
+    memcpy(out->root, text, i);
+    while (i < n) {
+        if (out->count == XL_PATH_DEPTH) return 0;
+        struct path_key *key = &out->keys[out->count++];
+        if (text[i] == '.') {
+            size_t begin = ++i;
+            if (i == n || !identifier((unsigned char)text[i], 1)) return 0;
+            while (++i < n && identifier((unsigned char)text[i], 0)) {}
+            memcpy(key->name, text + begin, i - begin);
+        } else if (text[i] == '[') {
+            ++i; int negative = i < n && text[i] == '-';
+            if (negative) ++i;
+            if (i == n || text[i] < '0' || text[i] > '9') return 0;
+            uint64_t number = 0, limit = (uint64_t)INT32_MAX + negative;
+            while (i < n && text[i] >= '0' && text[i] <= '9') {
+                unsigned digit = (unsigned)(text[i++] - '0');
+                if (number > (limit - digit) / 10) return 0;
+                number = number * 10 + digit;
+            }
+            if (i == n || text[i++] != ']') return 0;
+            key->is_integer = 1; key->integer = (int32_t)(negative ? -(int64_t)number : (int64_t)number);
+        } else return 0;
+    }
+    return 1;
+}
+
+int xl_expression_valid(const char *text) {
+    struct path path;
+    return path_parse(text, &path);
+}
+
+/* Batch only bytes within the proved Node stride; no speculative page reads.
+ * All occupied hash slots are inspected before claiming a key is unique or
+ * absent. A prefix match is not a complete lookup when the scan exceeds a cap. */
+static uint64_t node_word(struct xl_reader *r, const unsigned char *node, size_t stride,
+                          struct xl_field_info f) {
+    if (!f.size || f.size > 8 || f.offset > stride || f.size > stride - f.offset) {
+        fail(r, "LuaLayoutUnsupported"); return 0;
+    }
+    uint64_t result = 0;
+    for (size_t i = 0; i < f.size; ++i) result |= (uint64_t)node[f.offset + i] << (8 * i);
+    return result;
+}
+static int path_key_equal(const struct xl_layout *p, struct xl_reader *r, const struct path_key *key,
+                           unsigned tag, uint64_t bits) {
+    switch (tag) {
+    case 1: case 2: case 3: case 22: case 68: case 84: case 69: case 70: case 102: case 71: case 72: break;
+    case 17: case 19: if (p->version[1] == 4) break; /* fall through */
+    default: return fail(r, "LuaTableKeyInvalid");
+    }
+    if (tag == (p->version[1] == 4 ? 19u : 3u) &&
+        (bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
+        (bits & UINT64_C(0x000fffffffffffff))) return fail(r, "LuaTableKeyInvalid");
+    if (key->is_integer) {
+        if (p->version[1] == 4 && tag == 3) return (int64_t)bits == key->integer;
+        if (tag == (p->version[1] == 4 ? 19u : 3u)) {
+            double number; memcpy(&number, &bits, sizeof number);
+            return number == (double)key->integer;
+        }
+        return 0;
+    }
+    if (tag != 68 && tag != 84) return 0;
+    if (!header(p, r, bits, tag & 63)) return 0;
+    uint64_t length, data;
+    if (!string_extent(p, r, bits, &length, &data)) return 0;
+    size_t wanted = strlen(key->name);
+    if (length != wanted) return 0;
+    unsigned char bytes[XL_STRING_BYTES];
+    return read_bytes(r, data, bytes, wanted) && !memcmp(bytes, key->name, wanted);
+}
+static uint64_t path_lookup(const struct xl_layout *p, struct xl_reader *r, uint64_t slot,
+                            const struct path_key *key) {
+    if (field(p, r, slot, XL_TAG) != 69) { fail(r, "LuaPathNotTable"); return 0; }
+    uint64_t at = field(p, r, slot, XL_BITS);
+    if (!header(p, r, at, 5)) return 0;
+    if (field(p, r, at, XL_TABLE_META)) { fail(r, "LuaPathMetatableUnsupported"); return 0; }
+    uint64_t a = field(p, r, at, XL_TABLE_SIZE), log = field(p, r, at, XL_TABLE_LOG);
+    uint64_t flags = field(p, r, at, XL_TABLE_FLAGS), arr = field(p, r, at, XL_TABLE_ARRAY);
+    uint64_t nodes = field(p, r, at, XL_TABLE_NODE), free_node = field(p, r, at, XL_TABLE_FREE);
+    if (r->error) return 0;
+    if (!p->sizes[XL_T_TVALUE] || a > INT32_MAX || log > 30 || !nodes || (a && !arr) ||
+        (p->version[1] == 4 && !free_node && log)) { fail(r, "LuaTableInvalid"); return 0; }
+    /* Lua 5.4 ltable.c luaH_realasize: BITRAS means alimit is a non-real
+     * boundary within the actual power-of-two allocation. */
+    if (p->version[1] == 4 && (flags & 128) && a) {
+        uint64_t rounded = 1; while (rounded < a) rounded <<= 1;
+        a = rounded;
+    }
+    if (key->is_integer && key->integer > 0 && (uint64_t)key->integer <= a)
+        return add(r, arr, ((uint64_t)key->integer - 1) * p->sizes[XL_T_TVALUE]);
+    uint64_t count = p->version[1] == 4 && !free_node ? 0 : UINT64_C(1) << log;
+    if (count > XL_PATH_HASH_NODES) { fail(r, "LuaPathWorkLimit"); return 0; }
+    size_t stride = p->sizes[XL_T_NODE];
+    if (!stride || stride > 256 || p->fields[XL_NODE_VALUE].offset > stride ||
+        p->sizes[XL_T_TVALUE] > stride - p->fields[XL_NODE_VALUE].offset) {
+        fail(r, "LuaLayoutUnsupported"); return 0;
+    }
+    struct xl_field_info value_tag = p->fields[XL_TAG];
+    if (value_tag.offset > UINT32_MAX - p->fields[XL_NODE_VALUE].offset) {
+        fail(r, "LuaLayoutUnsupported"); return 0;
+    }
+    value_tag.offset += p->fields[XL_NODE_VALUE].offset;
+    unsigned char buffer[16 * 256]; uint64_t found = 0;
+    for (uint64_t start = 0; start < count; start += 16) {
+        size_t n = count - start > 16 ? 16 : (size_t)(count - start);
+        if (!read_bytes(r, add(r, nodes, start * stride), buffer, n * stride)) return 0;
+        for (size_t i = 0; i < n; ++i) {
+            const unsigned char *node = buffer + i * stride;
+            unsigned tag = (unsigned)node_word(r, node, stride, value_tag);
+            if (r->error) return 0;
+            /* Dead keys have no live value. Do not follow their stale bits. */
+            if (nil(tag, p->version[1])) continue;
+            unsigned kt = (unsigned)node_word(r, node, stride, p->fields[XL_NODE_KEY_TAG]);
+            uint64_t kb = node_word(r, node, stride, p->fields[XL_NODE_KEY_BITS]);
+            if (r->error) return 0;
+            int equal = path_key_equal(p, r, key, kt, kb);
+            if (r->error) return 0;
+            if (!equal) continue;
+            if (found) { fail(r, "LuaPathKeyAmbiguous"); return 0; }
+            found = add(r, nodes, (start + i) * stride + p->fields[XL_NODE_VALUE].offset);
+        }
+    }
+    return found;
+}
+
+void xl_local_find(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                   size_t frame, const char *expression, struct xl_locals *out) {
+    struct path path;
+    if (!path_parse(expression, &path)) {
+        memset(out, 0, sizeof *out); out->reason = "LuaExpressionUnsupported"; return;
+    }
+    locals(p, r, state, frame, 0, 1, path.root, NULL, path.count == 0, out);
+    if (!path.count || out->reason || out->count != 1 || out->items[0].reason) return;
+    struct xl_local *item = &out->items[0];
+    for (size_t i = 0; i < path.count; ++i) {
+        uint64_t slot = path_lookup(p, r, item->address, &path.keys[i]);
+        if (r->error) { out->count = 0; out->reason = r->error; return; }
+        if (!slot && i + 1 != path.count) { out->count = 0; out->reason = "LuaPathNotTable"; return; }
+        item->address = slot;
+    }
+    copy(item->name, sizeof item->name, expression);
+    if (item->address) value(p, r, item->address, &item->value, 0);
+    else {
+        item->path_absent = 1;
+        copy(item->value.type, sizeof item->value.type, "nil");
+        copy(item->value.display, sizeof item->value.display, "nil");
+    }
+    if (r->error) { out->count = 0; out->reason = r->error; }
+}
+
+const char *xl_local_sample(const struct xl_layout *p, struct xl_reader *r, const struct xl_local *item,
+                            unsigned char *bytes, size_t cap, size_t *size, enum xl_sample_kind *kind) {
+    if (!item || !bytes || !size || !kind || cap > XL_SAMPLE_BYTES) return "LuaWatchSampleArguments";
+    *size = 0;
+    if (r->error) return r->error;
+    if (item->reason) return item->reason;
+    if (item->path_absent && !item->address) { *kind = XL_SAMPLE_NIL; return NULL; }
+    return xl_value_sample(p, r, item->address, bytes, cap, size, kind);
 }

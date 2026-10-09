@@ -429,7 +429,7 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
         return;
     }
     const item = &raw.items[0];
-    if (item.kind == c.XL_VARARGS or item.address == 0) return error.LuaWatchBindingHasNoStorage;
+    if (item.kind == c.XL_VARARGS or (item.address == 0 and item.path_absent == 0)) return error.LuaWatchBindingHasNoStorage;
     if (item.name_truncated != 0) return error.LuaWatchNameTruncated;
     if (page != null) {
         capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&item.name, 0));
@@ -440,7 +440,7 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
     const bytes = try a.alloc(u8, c.XL_SAMPLE_BYTES);
     var length: usize = 0;
     var kind: c.enum_xl_sample_kind = undefined;
-    if (c.xl_value_sample(layout, &r, item.address, bytes.ptr, bytes.len, &length, &kind)) |message| {
+    if (c.xl_local_sample(layout, &r, item, bytes.ptr, bytes.len, &length, &kind)) |message| {
         capture.diagnostic = try a.dupeZ(u8, std.mem.span(message));
         return;
     }
@@ -451,6 +451,8 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression) |text| if (text.len == 0 or text.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidArguments;
     if (row) |index| if (index >= 4096) return error.InvalidArguments;
+    const checked_expression = try a.dupeZ(u8, expression orelse "binding");
+    if (expression != null and c.xl_expression_valid(checked_expression) == 0) return error.LuaExpressionUnsupported;
     const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
@@ -460,7 +462,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     const stable_thread = for (session.target.threadSlice()) |thread| {
         if (thread.tid == tid) break thread.id;
     } else return error.InvalidThread;
-    var capture = WatchCapture{ .scope = .{ .language = c.XLW_LUA, .session = session.id, .image = session.target.snapshot().image_epoch, .thread = stable_thread, .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 }, .frame = .{ try std.fmt.parseInt(u64, selected.call_info, 0), try std.fmt.parseInt(u64, selected.prototype.?, 0), 0, 0 } }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    var capture = WatchCapture{ .scope = .{ .language = c.XLW_LUA, .session = session.id, .image = session.target.snapshot().image_epoch, .thread = stable_thread, .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 }, .frame = .{ try std.fmt.parseInt(u64, selected.call_info, 0), try std.fmt.parseInt(u64, selected.prototype.?, 0), 0, 0 } }, .expression = checked_expression };
     try watchValue(session, a, &capture, frame, row);
     // A row whose binding cannot be established must not become a name watch.
     if (row != null and capture.scope.frame[2] == 0) return error.LuaWatchBindingUnavailable;

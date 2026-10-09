@@ -4,11 +4,12 @@ import argparse,csv,importlib.util,io,json,os,queue,re,select,shlex,subprocess,t
 from pathlib import Path
 from PIL import Image,ImageOps
 p=argparse.ArgumentParser(description=__doc__)
-p.add_argument('--node');p.add_argument('--include',default='/usr/include/node');p.add_argument('--ruby');p.add_argument('--perl');p.add_argument('--padwalker',type=Path);p.add_argument('--reuse',action='store_true');p.add_argument('--source');p.add_argument('--library');p.add_argument('--python');p.add_argument('--work',type=Path,required=True)
+p.add_argument('--paths',action='store_true');p.add_argument('--node');p.add_argument('--include',default='/usr/include/node');p.add_argument('--ruby');p.add_argument('--perl');p.add_argument('--padwalker',type=Path);p.add_argument('--reuse',action='store_true');p.add_argument('--source');p.add_argument('--library');p.add_argument('--python');p.add_argument('--work',type=Path,required=True)
 a=p.parse_args()
 if sum((bool(a.node),bool(a.ruby),bool(a.python),bool(a.perl),bool(a.source or a.library)))!=1 or (not (a.node or a.python or a.perl or a.ruby) and not (a.source and a.library)):p.error('choose --node, --ruby, --python, --perl, or both --source and --library')
 if a.perl and not a.padwalker:p.error('--perl requires --padwalker')
 if (a.node or a.python or a.perl or a.ruby) and a.reuse:p.error('--reuse uses the Lua fixture')
+if a.paths and (not (a.source or a.python) or a.reuse):p.error('--paths requires Python or Lua without --reuse')
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
 w=(a.work/'.work/input-lwatch').resolve();w.mkdir(parents=True,mode=0o755)
 fixture=w/'host';language='javascript' if a.node else 'ruby' if a.ruby else 'python' if a.python else 'perl' if a.perl else 'lua'
@@ -28,7 +29,7 @@ elif a.ruby:
 elif a.python:
     spec=importlib.util.spec_from_file_location('python_component',root/'tests/python-component.py');component=importlib.util.module_from_spec(spec);spec.loader.exec_module(component)
     component.compile_fixture(a.python,w)
-    target_command=[a.python,str(root/'tests/fixtures/python/watches.py')]
+    target_command=[a.python,str(root/('tests/fixtures/python/path-watches.py' if a.paths else 'tests/fixtures/python/watches.py'))]
     target_env=dict(os.environ,PYTHONPATH=str(w))
 elif a.perl:
     cfg=json.loads(subprocess.check_output([a.perl,'-MConfig','-MJSON::PP','-e','print JSON::PP::encode_json({map {$_=>$Config{$_}} qw(archlib cc ccflags)})'],timeout=30))
@@ -37,7 +38,7 @@ elif a.perl:
     target_command=[a.perl,str(root/'tests/fixtures/perl/watches.pl'),str(shared)]
     target_env=dict(os.environ,PERL5LIB=str(a.padwalker.resolve()/'blib/lib')+':'+str(a.padwalker.resolve()/'blib/arch'))
 else:
-    subprocess.run(['cc','-std=c11','-g','-O0','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I'+a.source,'tests/fixtures/lua/watch-reuse.c' if a.reuse else 'tests/fixtures/lua/watches.c',a.library,'-lm','-ldl','-o',str(fixture)],check=True,timeout=90)
+    subprocess.run(['cc','-std=c11','-g','-O0','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I'+a.source,'tests/fixtures/lua/path-watches.c' if a.paths else 'tests/fixtures/lua/watch-reuse.c' if a.reuse else 'tests/fixtures/lua/watches.c',a.library,'-lm','-ldl','-o',str(fixture)],check=True,timeout=90)
     target_command=[str(fixture)];target_env=os.environ.copy()
 spec=importlib.util.spec_from_file_location('private_input',root/'tests/helpers/input.py');h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h);h.WORK=str(w)
 for name in ('tmp','cache/mesa','cache/nvidia'):(w/name).mkdir(parents=True,exist_ok=True)
@@ -71,7 +72,7 @@ try:
             assert reply['content'][0]['text']=='DebugMetadataPending' and time.monotonic()<deadline,reply
             time.sleep(.02)
         stack=reply['structuredContent']
-        segment,frame=next((s,f) for s,part in enumerate(stack['segments']) for f,row in enumerate(part['frames']) if row['name']==('watched' if (a.node or a.ruby) else 'outer.<locals>.watched'))
+        segment,frame=next((s,f) for s,part in enumerate(stack['segments']) for f,row in enumerate(part['frames']) if row['name']==('watched' if (a.node or a.ruby or a.paths) else 'outer.<locals>.watched'))
     args=dict(generation=generation,tid=target.pid,language=language,segment=segment,frame=frame)
     d.tool('select_language_frame',**args)
     normalize=lambda t:re.sub(r'[^a-z0-9]','',t.lower())
@@ -89,7 +90,7 @@ try:
     initial,changed=(10,20) if a.reuse else (7,8)
     numeric='smi' if a.node else '' if a.ruby else 'int' if a.python else 'IV' if a.perl else 'integer' if '/lua-5.4' in a.library else 'number'
     display=lambda value:str(value) if a.ruby else numeric+' '+str(value)
-    if a.node or a.python or a.perl or a.ruby:
+    if a.node or a.python or a.perl or a.ruby or a.paths:
         bindings=d.tool('get_language_locals',**args)['rows']
         visible('named-ready',['contextstorage' if a.node else 'namedlocals',normalize(bindings[0]['name'])],(1013,130,1272,578))
         index=next(i for i,row in enumerate(bindings) if row['name']==binding_name)
@@ -117,7 +118,12 @@ try:
         before_stack=d.tool('get_language_stack',tid=target.pid,language='lua')
         location=tuple(before_stack['segments'][segment]['frames'][frame][key] for key in ('call_info','prototype'))
     # Shift+E creates a name expression watch; ordinary E stays a stopped read.
-    d.keys('down',42,'tap',18,'up',42,*(['down',42,'tap',5,'up',42] if a.perl else []),'tap',45,'tap',28)
+    if a.paths:
+        # root['player']['score'] or object.a in the actual Shift+E field.
+        keys=(19,24,24,20,26,40,25,38,30,21,18,19,40,27,26,40,31,46,24,19,18,40,27) if a.python else (24,48,36,18,46,20,52,30)
+        d.keys('down',42,'tap',18,'up',42,*[value for key in keys for value in ('tap',key)],'tap',28)
+    else:
+        d.keys('down',42,'tap',18,'up',42,*(['down',42,'tap',5,'up',42] if a.perl else []),'tap',45,'tap',28)
     if a.node:
         visible('name-watch-refused',['jsnameunproved'],(1013,130,1272,578))
         assert len(d.tool('get_language_watches')['watches'])==1
@@ -128,7 +134,10 @@ try:
             rows=d.tool('get_language_watches')['watches']
             if len(rows)==2:break
             assert time.monotonic()<deadline,rows;time.sleep(.02)
-        assert rows[1]['selector']=='expression' and rows[1]['expression']==binding_name,rows
+        assert rows[1]['selector']=='expression' and rows[1]['expression']==(("root['player']['score']" if a.python else 'object.a') if a.paths else binding_name),rows
+    if a.paths:
+        d.keys('click',850,639,'tap',27)
+        visible('watch-path',['rootplayerscore' if a.python else 'objecta','expression'],(600,585,1272,764))
     assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
     d.keys('tap',57);assert d.wait(lambda s:s['generation']>generation and s['state']=='stopped' and any(t['reason']=='breakpoint' for t in s['threads']))
     json.loads(lines.get(timeout=10))

@@ -93,9 +93,13 @@ def main():
                     assert found['diagnostic'] is None and found['rows'] == [row], (found, row)
                     seen.add(row['name']); bindings += 1
                 assert seen == set(expected['bindings']), (seen, expected)
-                for expression, why in [('missing_binding_xyz', 'PythonNameNotFound'), ('depth + 1', 'UnsupportedLanguageExpression'), ('print()', 'UnsupportedLanguageExpression'), ('payload[0]', 'UnsupportedLanguageExpression')]:
+                for expression, why in [('missing_binding_xyz', 'PythonNameNotFound'), ('depth + 1', 'UnsupportedLanguageExpression'), ('print()', 'UnsupportedLanguageExpression'), ('payload[0:1]', 'UnsupportedLanguageExpression')]:
                     found = client.inspect('evaluate_language_expression', **args, expression=expression)
                     assert not found['rows'] and found['diagnostic'] == why, found
+                if 'payload' in expected['bindings']:
+                    found = client.inspect('evaluate_language_expression', **args, expression='payload[0]')
+                    assert found['diagnostic'] is None and found['rows'][0]['name']=='payload[0]', found
+                    assert found['rows'][0]['value']['display']=='int 1', found
                 frames += 1
                 observed.append({'segment': segment, 'frame': frame, 'rows': rows})
             # An explicit mapping-local refusal for the module frame.

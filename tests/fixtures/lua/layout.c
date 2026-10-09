@@ -20,7 +20,7 @@ typedef struct Table { HEAD;
 #ifdef TABLE_PADDING
     unsigned char unrelated_padding[8];
 #endif
-    unsigned char flags, lsizenode; unsigned alimit; TValue *array; void *node, *lastfree; } Table;
+    unsigned char flags, lsizenode; unsigned alimit; TValue *array; void *node, *lastfree; struct Table *metatable; } Table;
 typedef union Node { TValue i_val; struct {Value value_; unsigned char tt_, key_tt; int next; Value key_val;} u; } Node;
 typedef struct LClosure { HEAD; unsigned char nupvalues; void *p; void *upvals[1]; } LClosure;
 typedef struct CClosure { HEAD; unsigned char nupvalues; void *f; TValue upvalue[1]; } CClosure;

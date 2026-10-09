@@ -78,6 +78,7 @@ struct xl_local {
     uint64_t address;
     char name[544]; /* Escaped bytes, with explicit truncation; never evaluated. */
     int name_truncated;
+    int path_absent; /* A proved absent final raw-table key, whose value is nil. */
     const char *reason;
     struct xl_value value;
 };
@@ -94,8 +95,15 @@ struct xl_locals {
  * with no address; they cannot be resolved through named lookup. */
 void xl_locals_read(const struct xl_layout *, struct xl_reader *, uint64_t state,
                     size_t frame, size_t start, size_t limit, struct xl_locals *);
-/* Read-only bare ASCII identifier lookup; innermost active local shadows
- * outer locals and upvalues. Calls, operators and implicit globals are refused. */
+/* ASCII local/upvalue name followed by at most four .identifier or [int32]
+ * raw-table selectors (128 bytes total). Re-resolve every pointer at this stop.
+ * Metatables, calls, operators and implicit globals are refused. Innermost
+ * active locals shadow outer locals and upvalues. An absent final key is nil;
+ * an absent intermediate key is not indexable. Hash scans are bounded. */
+#define XL_PATH_DEPTH 4
+#define XL_PATH_HASH_NODES 128
+/* Pure syntax/bounds check; resolution can still be unavailable. */
+int xl_expression_valid(const char *);
 void xl_local_find(const struct xl_layout *, struct xl_reader *, uint64_t state,
                    size_t frame, const char *expression, struct xl_locals *);
 /* Re-resolve an explicit displayed binding, distinct from lexical lookup.
@@ -110,5 +118,8 @@ void xl_local_binding(const struct xl_layout *, struct xl_reader *, uint64_t sta
 #define XL_SAMPLE_BYTES 4096
 enum xl_sample_kind { XL_SAMPLE_NIL, XL_SAMPLE_BOOLEAN, XL_SAMPLE_INTEGER, XL_SAMPLE_NUMBER, XL_SAMPLE_STRING };
 const char *xl_value_sample(const struct xl_layout *, struct xl_reader *, uint64_t,
+                            unsigned char *, size_t, size_t *, enum xl_sample_kind *);
+/* Samples either freshly resolved storage or a proved absent final path key. */
+const char *xl_local_sample(const struct xl_layout *, struct xl_reader *, const struct xl_local *,
                             unsigned char *, size_t, size_t *, enum xl_sample_kind *);
 #endif

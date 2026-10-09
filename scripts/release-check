@@ -109,10 +109,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         if python:
             sdk = ['--python', python]
             steps.append(('python-component', [sys.executable, '-B', 'tests/python-component.py', *sdk, '--work', '.work/pyc'], 120))
+            steps.append(('python-path-component', [sys.executable, '-B', 'tests/python-paths.py', *sdk, '--sanitize', '--work', '.work/pypc'], 180))
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'python-named-{int(remote)}', [sys.executable, '-B', 'tests/python-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pyn{int(remote)}'], 180))
                 steps.append((f'python-watches-{int(remote)}', [sys.executable, '-B', 'tests/python-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pyw{int(remote)}'], 240))
+                steps.append((f'python-path-watches-{int(remote)}', [sys.executable, '-B', 'tests/python-path-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pypw{int(remote)}'], 240))
                 steps.append((f'python-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/python-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/pys{int(remote)}'], 180))
             if lua:
                 mixed = [*sdk, '--lua-source', lua[0][1]]
@@ -149,6 +151,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'lua-watches-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watches.py', *sdk, *agent, '--strace', '--work', f'.work/lw{index}{int(remote)}'], 180))
+                steps.append((f'lua-path-watches-{index}-{int(remote)}', [sys.executable, '-B', 'tests/lua-path-watches.py', *sdk, *agent, '--strace', '--work', f'.work/lpw{index}{int(remote)}'], 180))
                 steps.append((f'lua-watch-coroutine-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watch-coroutine.py', *sdk, *agent, '--work', f'.work/lwc{index}{int(remote)}'], 120))
                 steps.append((f'lua-watch-reuse-{index}-{int(remote)}', [sys.executable, '-B', 'tests/language-watch-reuse.py', *sdk, *agent, '--work', f'.work/lwr{index}{int(remote)}'], 120))
             steps.append((f'lua-named-{index}', [sys.executable, '-B', 'tests/lua-locals.py', *sdk, '--strace', '--work', f'.work/lua-named-{index}'], 120))
@@ -219,6 +222,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('python-gui', [sys.executable, '-B', 'tests/python-gui.py', '--python', python, '--work', '.'], 240))
             steps.append(('python-named-gui', [sys.executable, '-B', 'tests/python-locals-gui.py', '--python', python, '--work', '.work/pyg'], 180))
             steps.append(('python-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--python', python, '--work', '.work/pywg'], 180))
+            steps.append(('python-path-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--python', python, '--work', '.work/pypg'], 180))
         if perl:
             steps.append(('perl-gui-fixtures', [sys.executable, '-B', 'tests/perl-language.py', '--perl', perl, '--work', '.work/pgf'], 180))
             steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240))
@@ -231,6 +235,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             for index, (_, source, library) in enumerate(lua):
                 steps.append((f'lua-named-gui-{index}', [sys.executable, '-B', 'tests/lua-locals-gui.py', '--source', source, '--library', library, '--work', f'.work/lng{index}'], 120))
                 steps.append((f'lua-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--source', source, '--library', library, '--work', f'.work/lwg{index}'], 180))
+                steps.append((f'lua-path-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--source', source, '--library', library, '--work', f'.work/lpwg{index}'], 180))
                 steps.append((f'lua-watch-reuse-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--reuse', '--source', source, '--library', library, '--work', f'.work/lwrg{index}'], 180))
     return steps
 

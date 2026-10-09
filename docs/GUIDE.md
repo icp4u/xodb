@@ -217,6 +217,8 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Inside Perl | `./scripts/demo-perl` | **Space**, **Shift+E** `val` and `av` (live rows that update every stop), then keep pressing **Space**: `val` undef ↔ not in scope, `av` 3 ↔ 4 slots |
 | Inside CPython | `./scripts/demo-python` | **Space**, **E** `value` (list (8 items)), **E** `key` (str 'answer'), **E** `mp` (dict); in a second terminal `./scripts/demo-python stack` prints `record` ← `tick` ← `<module>` with file:line and the list's items |
 | Compare Lua values at each stop | `./scripts/demo-lua` | **Space**, **Lua**, select the loop frame at `lua-demo.lua:9`, **Shift+E** `value` **Return**, then **Space**. **V** shows changes; table/function values are explicitly unavailable. |
+| Watch a Lua table field | `xodb --break luaB_print -- lua5.4 examples/lua-path-demo.lua` (debug Lua) | **Space**, **Lua**, select the Lua `print` caller, **Shift+E** `state.player.score` **Return**, then **Space**, **V**. Paths re-resolve replaced tables; metatables refuse. |
+| Watch Python container paths | `xodb --break builtin_print -- python3 examples/python-path-demo.py` with a supported debug interpreter | **Space**, **Python**, select **main**, **Shift+E** `state["player"]["score"]` **Return**, then **Space**, **V**. Dict/list/tuple paths re-resolve after replacement; no Python callbacks run. |
 | Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
@@ -312,3 +314,4 @@ For a video: `xodb --break change_value -- ./zig-out/bin/xodb-m1-fixture w`,
 **Space**, **F10** to reach the function body, **Shift+E**, paste `amount` with
 **Ctrl+V**, then **Return**. Use **Space** to reach the next call. Only the final
 Return adds the live display.
+

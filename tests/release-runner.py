@@ -24,6 +24,18 @@ class RunnerTests(unittest.TestCase):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
         (root / '.work').mkdir(exist_ok=True)
 
+    def test_lua_table_paths_have_transport_and_gui_coverage(self):
+        steps = gate.plan('all', False, 'ReleaseSafe', lua=[('lua54','src54','lib54'), ('lua52','src52','lib52')])
+        paths = [(name, cmd) for name, cmd, _ in steps if name.startswith('lua-path-watches-')]
+        self.assertEqual(len(paths), 4)
+        for source in ('src54','src52'):
+            selected = [cmd for _, cmd in paths if source in cmd]
+            self.assertEqual(len(selected), 2)
+            self.assertEqual(sum('--agent' in cmd for cmd in selected), 1)
+        gui = [cmd for name, cmd, _ in steps if name.startswith('lua-path-watch-gui-')]
+        self.assertEqual(len(gui), 2)
+        self.assertTrue(all('--paths' in cmd for cmd in gui))
+
     def test_performance_report_preserves_each_measurement(self):
         paths = ('.work/perf-observers/results.json',
                  '.work/perf-remote-stops/results.json',
@@ -59,6 +71,17 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.get('remaining_pids', []), [])
             result['output'] = (directory / 'owned.log').read_text()
             return result
+
+    def test_python_path_coverage(self):
+        for tier in ('host', 'all'):
+            steps = {name: argv for name, argv, _ in gate.plan(tier, python='/fixture/python')}
+            self.assertTrue({'python-path-component', 'python-path-watches-0', 'python-path-watches-1'} <= steps.keys())
+            self.assertIn('--sanitize', steps['python-path-component'])
+            self.assertNotIn('--agent', steps['python-path-watches-0'])
+            self.assertIn('--agent', steps['python-path-watches-1'])
+        for tier in ('gui', 'all'):
+            steps = {name: argv for name, argv, _ in gate.plan(tier, python='/fixture/python')}
+            self.assertIn('--paths', steps['python-path-watch-gui'])
 
     def test_ruby_watch_coverage(self):
         for tier in ('host', 'all'):
