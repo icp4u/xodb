@@ -30,6 +30,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
               '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
+    steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     steps.append(('source-paths-build', ['cc', '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
@@ -75,11 +76,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
-        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
+        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'static-analysis',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
                      'lsof-top', 'fdactivity'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):

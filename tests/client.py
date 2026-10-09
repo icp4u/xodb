@@ -5,6 +5,7 @@ import select
 import subprocess
 import time
 from pathlib import Path
+from helpers.exact import assert_reply_exact
 
 class Client:
     def __init__(self, scope, executable='./zig-out/bin/xodb-m1-fixture', args=(), options=()):
@@ -42,7 +43,7 @@ class Client:
             return response
         raise AssertionError('Response timeout')
     def tool(self, tool_name, **args):
-        return self.call('tools/call', {'name':tool_name,'arguments':args})
+        return assert_reply_exact(self.call('tools/call', {'name':tool_name,'arguments':args}))
     def inspect(self, tool_name, **args):
         deadline = time.monotonic() + (900 if tool_name == 'get_language_stack' else 15)
         while True:

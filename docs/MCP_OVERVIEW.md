@@ -88,12 +88,98 @@ parallel `registers_hex` array with the same positions and nulls; register rows
 in `get_debug_view` have `value_hex`. Tagged runtime words and watch before/after
 words also have hex siblings; their tags and interpretation remain unchanged.
 `start`, `end` and offset fields used for pagination receive the same additive
-encoding. Ordinary counts, IDs, timestamps and rates keep their existing types.
+encoding. Wall-clock `realtime_ns` also has `realtime_ns_hex`. Any other integer whose
+magnitude is at least 2^53 receives a sibling as well, including imported epoch
+nanoseconds, large counts and sentinel IDs such as UINT64_MAX. Small
+unclassified integers and their duration-summary dictionaries stay compact.
+All original fields keep their types; existing strings remain strings.
 
 `python3 tests/mcp-precision.py` exercises owned synthetic pointer words above
 2^53 and at UINT64_MAX through native, agent and shared-observer sessions. With
 Node.js installed it also proves the original Number rounds while the hex
 field round-trips exactly through BigInt.
+
+If an exact-field projection finds contradictory evidence or an integer outside
+the supported signed/unsigned 64-bit range, the request returns a tool error
+(`ConflictingEvidenceWord` or `InvalidEvidenceWord`). The connection remains
+usable. This is a reply-encoding failure; it does not undo an action that already
+completed.
+
+The common Python test clients check every successful structured result for
+text parity and for wide integers missing their exact companions, independently
+of field names. `tests/mcp-exact-guard.py` plants new unknown fields to verify
+this guard. Coverage depends on exercising a producer with a wide value.
+
+## Paging module maps
+
+`list_modules` returns at most `limit` rows across `regions` and `load_failures`
+(default 128, range 1–512). A byte budget may make a page shorter. Follow `next`
+until it is null; the existing arrays retain their row formats. For example,
+start `xodb --headless --mcp -- ./program`, initialize MCP, then call:
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"list_modules","arguments":{"limit":128}}}
+```
+
+Pass the returned `next` string as `cursor` on the next call, with the same
+`process_id` if one was selected. Page size may change between calls.
+`total_regions` and `total_load_failures` describe the entire retained snapshot.
+The cursor identifies the session, map generation, image epoch, and map/failure
+contents. On `StaleModuleCursor`, discard accumulated rows and restart without a
+cursor; malformed cursors return `InvalidModuleCursor`. A single row too large
+for the byte budget returns `ModuleRowTooLarge` instead of silently dropping it.
+Running targets expose the last retained stopped map; pagination does not stop
+or refresh the running process. Small maps still fit in one reply; clients that
+previously assumed one reply contained every mapping must follow `next`.
+
+`python3 tests/mcp-modules.py` creates over 6,000 mappings in an owned fixture
+and compares the complete paginated result with procfs, locally, through the C
+agent, and from a shared observer.
+
+## Paging native locals and debug files
+
+`list_locals` accepts `start` (default 0), `limit` (default 64, maximum 128),
+and `view_id`. Select the stopped thread with `tid`; optional `frame` and
+`inline_depth` default to zero. A first call can look like:
+
+```json
+{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"list_locals","arguments":{"tid":1234,"limit":64}}}
+```
+
+Substitute a thread ID from `list_threads`. Each reply retains `locals` and the
+frame fields, and adds `total`, `start`, `next`, and `view_id`. For the next page,
+pass `next` as `start`, repeat `view_id` and the same thread/frame selectors, and
+keep the same `process_id` if selected. Stop when `next` is null. Unavailable
+locals remain rows with their original reason. Values are read on each page;
+the view identity binds the stopped generation, frame, metadata and resolved
+local locations. Resuming or changing that context returns `StaleLocalsView`;
+discard accumulated rows and restart at zero. Supplying an old explicit
+`generation` instead returns `StaleSnapshot`.
+
+`get_debug_files` follows the same `start`/`limit`/`view_id` protocol, with a
+default limit of 32 and maximum of 128. Its logical sequence contains `files`
+first, then `source_maps`; the limit applies to their combined row count.
+Existing verification and retention fields remain. `total_files` and
+`total_source_maps` describe the complete view. For example:
+
+```json
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_debug_files","arguments":{"limit":32}}}
+```
+
+Later pages require the returned `view_id`; changes to the selected session,
+companions, source-map rules or retention metadata return `StaleDebugFilesView`.
+Restart from zero on that error. Missing a view ID on a later page returns
+`LocalsViewRequired` or `DebugFilesViewRequired`, respectively.
+
+Both tools measure encoded rows, including exact-value siblings and the escaped
+text copy, so a byte budget may shorten a page below its requested limit. A
+single row that cannot fit returns `McpRowTooLarge`. Clients must follow `next`
+even when a page contains fewer than `limit` rows. Existing clients that assumed
+one reply contained every local or debug file must adopt this loop.
+
+`python3 tests/mcp-list-pages.py` checks 3,000 owned native locals and 32 long,
+escaped source-map rules through native, agent and shared-observer sessions,
+including complete coverage, reply sizes and stale-view rejection.
 
 ## What can a machine ask for?
 

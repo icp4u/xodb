@@ -110,17 +110,31 @@ fn integerHex(a: std.mem.Allocator, value: V) !?V {
     if (n < std.math.minInt(i64) or n > std.math.maxInt(u64)) return error.InvalidEvidenceWord;
     return .{ .string = if (n < 0) try std.fmt.allocPrint(a, "-0x{x}", .{-n}) else try std.fmt.allocPrint(a, "0x{x}", .{n}) };
 }
+// Unclassified IDs, counts and clocks may also exceed a JSON Number's range.
+// Keep ordinary small counters compact; never lose a newly introduced wide word.
+fn wideWord(value: V) !bool {
+    if (value == .array) {
+        for (value.array.items) |item| if (try wideWord(item)) return true;
+        return false;
+    }
+    const n: i128 = switch (value) {
+        .integer => |n| n,
+        .number_string => |text| std.fmt.parseInt(i128, text, 10) catch return error.InvalidEvidenceWord,
+        else => return false,
+    };
+    return n >= (1 << 53) or n <= -(1 << 53);
+}
 fn addressField(key: []const u8) bool {
     for ([_][]const u8{ "address", "pointer", "offset", "pc", "sp", "fp", "ip", "bias" }) |suffix| {
         if (std.mem.eql(u8, key, suffix)) return true;
         if (key.len > suffix.len and std.mem.endsWith(u8, key, suffix) and key[key.len - suffix.len - 1] == '_') return true;
     }
     return for ([_][]const u8{
-        "start",            "end",            "base",         "entry",           "link_entry",     "local_entry",  "target",    "cfa",
-        "bits",             "tagged",         "object",       "body",            "map",            "type_object",  "stackinfo", "root_register",
-        "runtime_location", "frame_location", "prototype",    "unpatched_probe", "offset_advance", "before",       "after",     "previous",
-        "pcs",              "registers",      "running_to",   "main_phdr",       "interpreter",    "displacement", "immediate", "bci",
-        "raw_marker",       "result",         "return_value", "argument_value",  "args",           "arg0",         "arg1",
+        "start",            "end",            "base",       "entry",           "link_entry",     "local_entry",  "target",    "cfa",
+        "bits",             "tagged",         "object",     "body",            "map",            "type_object",  "stackinfo", "root_register",
+        "runtime_location", "frame_location", "prototype",  "unpatched_probe", "offset_advance", "before",       "after",     "previous",
+        "pcs",              "registers",      "running_to", "main_phdr",       "interpreter",    "displacement", "immediate", "bci",
+        "realtime_ns",      "raw_marker",     "result",     "return_value",    "argument_value", "args",         "arg0",      "arg1",
     }) |name| {
         if (std.mem.eql(u8, key, name)) break true;
     } else false;
@@ -168,10 +182,11 @@ fn addressRows(a: std.mem.Allocator, value: *V, parent: []const u8) anyerror!voi
                 try addressRows(a, &object.values()[i], key);
                 const register = std.mem.eql(u8, parent, "registers") and std.mem.eql(u8, key, "value");
                 const js_pointer = js_frame and (std.mem.eql(u8, key, "function") or std.mem.eql(u8, key, "shared") or std.mem.eql(u8, key, "code") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "bytecode"));
-                if (!addressField(key) and !register and !js_pointer) continue;
+                const wide = try wideWord(object.values()[i]);
+                if (!addressField(key) and !register and !js_pointer and !wide) continue;
                 // The coverage summary also has an integer count named
                 // registers. Only register banks get a parallel array.
-                if (std.mem.eql(u8, key, "registers") and object.values()[i] != .array) continue;
+                if (std.mem.eql(u8, key, "registers") and object.values()[i] != .array and !wide) continue;
                 const hex = (try projected(a, object.values()[i])) orelse continue;
                 const sibling = try std.fmt.allocPrint(a, "{s}_hex", .{key});
                 if (object.get(sibling)) |old| {
@@ -279,4 +294,52 @@ test "register coverage counts remain summable numeric objects" {
     const totals = v.object.get("totals").?.object;
     try std.testing.expectEqual(@as(usize, 2), totals.count());
     try std.testing.expectEqual(@as(i64, 2), totals.get("registers").?.integer);
+}
+
+test "wall-clock nanoseconds have exact additive siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a, "{\"realtime_ns\":1800000000000000123}", .{})).value;
+    try addresses(a, &v);
+    try std.testing.expectEqual(@as(i64, 1800000000000000123), v.object.get("realtime_ns").?.integer);
+    try std.testing.expectEqual(@as(u64, 1800000000000000123), try std.fmt.parseInt(u64, v.object.get("realtime_ns_hex").?.string, 0));
+}
+
+// Imported frame clocks can be epoch nanoseconds, not only monotonic clocks.
+test "wide nanosecond fields keep exact epoch clocks and signed offsets" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a,
+        \\{"stack":{"start_ns":1791158400000000000,"end_ns":null,"time_ns":-9223372036854775808,"future_clock_ns":18446744073709551615},"rate_ns":1.5,"declared_ns":"1791158400000000000"}
+    , .{})).value;
+    try addresses(a, &v);
+    const stack = v.object.get("stack").?.object;
+    try std.testing.expectEqual(@as(u64, 1791158400000000000), try std.fmt.parseInt(u64, stack.get("start_ns_hex").?.string, 0));
+    try std.testing.expect(!stack.contains("end_ns_hex"));
+    try std.testing.expect(stack.get("end_ns").? == .null);
+    try std.testing.expectEqualStrings("-0x8000000000000000", stack.get("time_ns_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", stack.get("future_clock_ns_hex").?.string);
+    try std.testing.expect(!v.object.contains("rate_ns_hex"));
+    try std.testing.expect(!v.object.contains("declared_ns_hex"));
+}
+
+test "unknown wide fields and sentinel IDs cannot bypass exact projection" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a,
+        \\{"opening_generation":18446744073709551615,"new_field":9007199254740993,"negative":-9007199254740993,"new_bank":[0,null,18446744073709551615],"counts":{"registers":9007199254740993},"small":9007199254740991}
+    , .{})).value;
+    try addresses(a, &v);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", v.object.get("opening_generation_hex").?.string);
+    try std.testing.expectEqualStrings("0x20000000000001", v.object.get("new_field_hex").?.string);
+    try std.testing.expectEqualStrings("-0x20000000000001", v.object.get("negative_hex").?.string);
+    const bank = v.object.get("new_bank_hex").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), bank.len);
+    try std.testing.expect(bank[1] == .null);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", bank[2].string);
+    try std.testing.expectEqualStrings("0x20000000000001", v.object.get("counts").?.object.get("registers_hex").?.string);
+    try std.testing.expect(!v.object.contains("small_hex"));
 }

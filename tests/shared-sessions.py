@@ -5,6 +5,7 @@ XODB_BIN selects the application; XODB_RUNTIME_AGENT selects its optional local
 C agent. Artifacts use XODB_TEST_TMPDIR, otherwise Python's TMPDIR-aware default.
 No inherited graphical session, privilege change or unrelated process is used.
 """
+import ctypes
 import errno
 import json
 import os
@@ -17,6 +18,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from helpers.exact import assert_reply_exact
 
 
 TIMEOUT = 5
@@ -122,8 +124,8 @@ class Client:
         self.transcript.append({'request': message, 'response': reply})
         return reply
 
-    def raw(self, name, **args):
-        return self.call('tools/call', {'name': name, 'arguments': args})
+    def raw(self, tool_name, **args):
+        return assert_reply_exact(self.call('tools/call', {'name': tool_name, 'arguments': args}))
 
     def tool(self, name, **args):
         reply = self.raw(name, **args)
@@ -150,6 +152,11 @@ class Client:
 
 class Server:
     def __init__(self, root, work, binary, fixture, scope, options=(), fixture_args=('w',)):
+        # Detached owned fixtures can outlive the debugger. Adopt them here so
+        # close() can reap them before the enclosing release runner checks leaks.
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0) != 0:  # PR_SET_CHILD_SUBREAPER, process-local
+            raise OSError(ctypes.get_errno(), 'shared fixture subreaper')
         self.root, self.binary, self.scope = root, binary, scope
         self.work = work / scope
         self.work.mkdir(mode=0o755)
@@ -207,8 +214,18 @@ class Server:
                 self.proc.kill()
                 self.proc.wait()
         # Failure cleanup is restricted to this launched PID and its birth identity.
-        if self.target_pid and self.target_alive():
-            os.kill(self.target_pid, signal.SIGKILL)
+        if self.target_pid:
+            if self.target_alive():
+                os.kill(self.target_pid, signal.SIGKILL)
+            def reaped():
+                try:
+                    if os.waitpid(self.target_pid, os.WNOHANG)[0]:
+                        return True
+                except ChildProcessError:
+                    pass  # The debugger may already have reaped its child.
+                identity = process_identity(self.target_pid)
+                return identity is None or identity[0] != self.target_identity[0]
+            eventually(reaped, bool, 'owned detached target reaped')
         self.log.close()
         (self.work / 'transcript.json').write_text(json.dumps(
             [{'client': c.label, 'messages': c.transcript} for c in self.clients], indent=2) + '\n')

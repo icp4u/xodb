@@ -33,7 +33,7 @@ def exact(reply):
     return v
 
 
-def check(raw, state):
+def check(raw, state, catalog):
     assert state['running_to_hex'] is None if state['running_to'] is None else int(state['running_to_hex'], 16) == state['running_to']
     tid = state['threads'][0]['tid']
     answer = exact(raw('evaluate_expression', tid=tid, expression='wide'))
@@ -82,7 +82,46 @@ def check(raw, state):
         payload = {'wide': raw('evaluate_expression', tid=tid, expression='wide'), 'pointer': raw('evaluate_expression', tid=tid, expression='pointer')}
         node = subprocess.run([a.node, '-e', js], input=json.dumps(payload), text=True, capture_output=True, check=True, timeout=15)
         result['node'] = 'pass'; print(node.stdout.strip())
-    return {'queries': ['evaluate_expression', 'get_stack', 'list_modules', 'get_debug_view', 'query_events', 'get_registers'], 'wide': answer, 'pointer': pointer}
+    # Sweep listed read-only tools with arguments grounded in this owned stop.
+    # Refusals and missing capture/language prerequisites are reported separately;
+    # they are not evidence of successful producer coverage. The common client
+    # checks every successful response independently of the producer's key list.
+    known = dict(tid=tid, generation=state['generation'], pid=state['pid'],
+                 expression='wide', name='precision_stop', frame=0)
+    sweep = dict(succeeded=[], refused={}, missing_arguments={})
+    for definition in catalog:
+        if not definition.get('annotations', {}).get('readOnlyHint'): continue
+        name = definition['name']; schema = definition['inputSchema']
+        required = schema.get('required', [])
+        missing = sorted(set(required) - known.keys())
+        if missing:
+            sweep['missing_arguments'][name] = missing
+            continue
+        args = {key:known[key] for key in required}
+        # Keep optional thread/expression reads on the fixture, and system rows
+        # redacted and scoped where the schema permits it.
+        for key in ('tid', 'pid', 'expression'):
+            if key in schema.get('properties', {}): args[key] = known[key]
+        if 'redact' in schema.get('properties', {}): args['redact'] = True
+        reply = raw(name, **args); body = reply.get('result', {})
+        if 'error' in reply or body.get('isError'):
+            sweep['refused'][name] = reply.get('error', {}).get('message') or body['content'][0]['text']
+        else:
+            exact(reply); sweep['succeeded'].append(name)
+    # Actually see a clock above 2^53; an empty/pending system sample is not proof.
+    deadline = time.monotonic() + 30
+    while True:
+        reply = raw('get_process', pid=state['pid'], redact=True)
+        body = reply.get('result', {})
+        data = body.get('structuredContent', {})
+        clock = data.get('realtime_ns', 0)
+        if clock >= 1 << 53:
+            assert data['realtime_ns_hex'] == hex(clock)
+            sweep['wide_realtime_ns_seen'] = True
+            break
+        assert time.monotonic() < deadline, reply
+        time.sleep(.01)
+    return {'sweep': sweep, 'queries': ['evaluate_expression' , 'get_stack', 'list_modules', 'get_debug_view', 'query_events', 'get_registers'], 'wide': answer, 'pointer': pointer}
 
 try:
     # Owned fixtures only. The synthetic pointer words are never dereferenced.
@@ -96,7 +135,7 @@ try:
             client.action('set_breakpoint', file=str(source), line=line)
             client.action('continue'); state = client.stopped('breakpoint')
             before = usage(client.p.pid)
-            checked = check(client.tool, state)
+            checked = check(client.tool, state, client.call('tools/list')['result']['tools'])
             after = usage(client.p.pid)
             result['transports'].append({'name': 'agent' if agent else 'native', 'check': checked, 'before': before, 'after': after, 'load': os.getloadavg()})
         finally: client.close()
@@ -111,7 +150,7 @@ try:
         server.remember_target(initial)
         owner.action('set_breakpoint', file=str(source), line=line); owner.action('continue')
         state = s.eventually(owner.session, lambda v:v['state']=='stopped' and not v['continue_pending'] and any(t['reason']=='breakpoint' for t in v['threads']), 'precision stop')
-        checked = check(observer.raw, state)
+        checked = check(observer.raw, state, observer.call('tools/list')['result']['tools'])
         result['transports'].append({'name': 'shared observer', 'check': checked})
     finally: server.close()
     result['status'] = 'pass'
