@@ -326,3 +326,57 @@ void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t e
     }
     out->reason="RubyLocalNotFound";
 }
+
+/* The exact supported revision's encoding.h defines seven bits starting at
+ * FL_USHIFT+10. These enum names are absent from the runtime-owned DWARF units;
+ * the public-macro oracle verifies this additional source-pinned contract. */
+enum { XRB_ENCODING_SHIFT = RUBY_FL_USHIFT+10, XRB_ENCODING_INLINE_MAX = 127 };
+static void sample_word(struct xrb_sample *out, uint64_t value) {
+    for (size_t i=0;i<8;++i) out->bytes[out->size++]=(unsigned char)(value>>(8*i));
+}
+void xrb_sample_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t v,
+                     struct xrb_sample *out) {
+    memset(out,0,sizeof *out);
+    if (r->error) goto done;
+    if (v&1) {
+        out->kind=1;
+        /* Arithmetic decoding without an implementation-defined signed shift. */
+        sample_word(out,(v>>1)|(v&(UINT64_C(1)<<63)));
+    } else if (v==4 || v==0 || v==20) {
+        out->kind=v==4?3:v==0?4:5;
+    } else if ((v&3)==2) {
+        uint64_t bits=0;
+        if (v!=UINT64_C(0x8000000000000002)) {
+            bits=(2-(v>>63))|(v&~UINT64_C(3));bits=(bits>>3)|(bits<<61);
+        }
+        out->kind=2;sample_word(out,bits);
+    } else if ((v&0xff)==0x0c) {
+        fail(r,"RubyWatchValueUnsupported");
+    } else {
+        uint64_t f=flags(r,v);
+        if (r->error) goto done;
+        if ((f&RUBY_T_MASK)==RUBY_T_FLOAT) {
+            out->kind=2;sample_word(out,field(p,r,v,XRB_FLOAT_VALUE));
+        } else if ((f&RUBY_T_MASK)==RUBY_T_STRING) {
+            uint64_t encoding=(f>>XRB_ENCODING_SHIFT)&XRB_ENCODING_INLINE_MAX;
+            uint64_t n=field(p,r,v,XRB_STRING_LEN);
+            if (encoding==XRB_ENCODING_INLINE_MAX) { fail(r,"RubyWatchEncodingUnsupported");goto done; }
+            if (n>sizeof out->bytes-1) { fail(r,"RubyWatchSampleLimit");goto done; }
+            uint64_t data=f&RSTRING_NOEMBED?field(p,r,v,XRB_STRING_PTR):add(r,v,p->fields[XRB_STRING_EMBED].offset);
+            out->kind=6;out->bytes[0]=(unsigned char)encoding;
+            if (!memory(r,data,out->bytes+1,(size_t)n)) goto done;
+            out->size=(size_t)n+1;
+        } else fail(r,"RubyWatchValueUnsupported");
+    }
+    if (!r->error) {
+        struct xrb_value preview;xrb_value_read(p,r,v,&preview);
+        if (preview.reason) fail(r,preview.reason);
+        else {
+            snprintf(out->type,sizeof out->type,"%s",preview.type);
+            snprintf(out->display,sizeof out->display,"%s",preview.display);
+        }
+    }
+done:
+    out->reason=r->error;
+    if (out->reason) out->size=0;
+}

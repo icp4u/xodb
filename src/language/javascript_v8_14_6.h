@@ -65,6 +65,9 @@
 #define XJS_V8_SCRIPT_LINE 24
 #define XJS_V8_SCRIPT_COLUMN 32
 #define XJS_V8_SHARED_DATA 8
+/* shared-function-info.tq: unique_id follows flags/function_literal_id; unlike
+ * the heap address, it is retained across moving garbage collections. */
+#define XJS_V8_SHARED_UNIQUE_ID 64
 /* x64/constants-x64.h:18; x64/register-x64.h:318;
  * include/v8-internal.h:953-1046 (uncompressed, unsandboxed),
  * js-function.tq:32-38; globals.h:592-607;

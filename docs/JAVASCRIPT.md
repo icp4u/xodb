@@ -95,6 +95,45 @@ name and script can be displayed: `get_language_locals` returns
 missing proof with `JavaScriptFrameConfigUnavailable`. No target code is executed to recover names or
 values.
 
+## Comparing context values at stops
+
+Run `scripts/demo-node`, press **Space**, select **JS** and the interpreted
+`inspect` frame, then click its `round` row under **CONTEXT STORAGE** and press
+**W**. Continue with **Space**; **V** opens the watches pane. A changed scalar
+shows its previous and current values. **Delete** removes the selected watch.
+**E** and **Shift+E** with a JavaScript name remain refused: selecting an
+explicit context row does not prove that the corresponding source expression
+would resolve to that storage.
+
+MCP uses `add_language_watch` with `language: "javascript"`, the current
+`generation`, `tid`, `segment`, `frame`, and the context row's `ordinal` as `row`.
+`get_language_watches` returns `selector: "context_storage"`. Creating or
+removing watches requires control; observers may read the retained results.
+Both the GUI and MCP keep the lexical-visibility limitation and the
+**activation unproved** caveat, including when a difference is found.
+
+At every stop, C resolves the current interpreted frame, context chain and
+slot again. It retains the native entry/frame locations, isolate, V8's
+GC-stable shared-function id, scope source positions/type and local slot
+index, rather than saving heap pointers. A new inner scope therefore does not
+silently retarget an outer watch. Ambiguous or unsupported scopes refuse.
+When a complete walk to the same V8 entry boundary proves the frame or binding
+absent, the watch becomes `gone` and cannot revive when a location is reused.
+A different or nested entry stays unavailable. These identities do not prove
+that one activation survived between stops; suspended generators and async
+continuations are not followed through heap objects.
+
+Comparisons use complete bounded scalar samples: IEEE-754 binary64 numbers,
+booleans, null, undefined, and up to 2048 UTF-16 string code units. Smi,
+heap-number and context-cell representations of the same number compare
+equally; signed zero and different NaN bit patterns remain distinct. String
+comparison preserves NUL and unpaired surrogates and detects changes beyond
+the displayed preview. Longer strings, objects, functions, arrays, symbols,
+BigInts and unsupported storage report unavailable with a reason. An
+unavailable sample retains the last complete value; recovery compares against
+that value. Watches never execute target code, invoke getters, coerce values
+or interrupt a running program automatically.
+
 ## Values
 
 Locals and expression watches recognize V8 `Local<T>` and internal `Tagged<T>`
@@ -194,3 +233,10 @@ V8's own stack captured at the native call site. It covers a proved TurboFan
 position and a genuinely inlined call whose physical frame must keep a null
 position. It also loads an owned sparse 300 MiB library to check that unrelated
 large files do not disable the reader.
+
+MCP watch results keep storage labels separate from expressions: row-selected
+watches (across the language adapters) return an empty `expression` and their
+display label in `row_name`. Only expression-selected watches populate
+`expression`, with `row_name: null`. The `selector` still distinguishes
+`binding`, `context_storage` and `expression`; a row name never proves lexical
+visibility. The GUI uses `row_name` to label a selected storage watch.

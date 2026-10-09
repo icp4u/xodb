@@ -524,7 +524,8 @@ pub fn watchError(err: anyerror) []const u8 {
     return switch (err) {
         error.SelectNamedBindingForWatch => "Select a named binding before W; native previews have no watch storage",
         error.LuaWatchBindingHasNoStorage => "This summary row has no named watch storage",
-        error.LanguageWatchRuntimeUnsupported => "Runtime watches support Lua, Python and Perl",
+        error.LanguageWatchRuntimeUnsupported => "Select Lua, Python, Perl, Ruby or JavaScript context storage",
+        error.JavaScriptLexicalUnproved => "JS name unproved; use W",
         error.SelectLanguageFrame => "Select a logical frame first",
         else => @errorName(err),
     };

@@ -46,7 +46,19 @@ static void probe(const v8::FunctionCallbackInfo<v8::Value>& args) {
         if (i) out += ',';
         out += "{\"name\":" + quoted(*name) + ",\"file\":" + quoted(*file) + pos;
     }
-    out += "]}\n";
+    out += "]";
+#ifdef XODB_PROBE_HEAP_IDENTITY
+    // Test-only native identity oracle, using the selected SDK's handle
+    // representation rather than the debugger's heap decoder. No V8 call
+    // occurs after this address capture and before the native stop marker.
+    if (args.Length() > 2 && args[2]->IsString()) {
+        auto tagged = v8::internal::ValueHelper::ValueAsAddress(*args[2]);
+        char address[80];
+        snprintf(address, sizeof address, ",\"watch_heap_tagged\":\"0x%llx\"", static_cast<unsigned long long>(tagged));
+        out += address;
+    }
+#endif
+    out += "}\n";
     size_t sent = 0;
     while (sent < out.size()) {
         ssize_t n = write(STDOUT_FILENO, out.data() + sent, out.size() - sent);

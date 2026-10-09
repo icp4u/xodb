@@ -125,7 +125,7 @@ pub const Anchor = struct { frame: usize, pc: []const u8, symbol: []const u8 = "
 pub const Runtime = struct { language: []const u8 = "ruby", implementation: []const u8 = "CRuby", version: []const u8 = c.XRB_VERSION ++ "dev", revision: []const u8 = c.XRB_REVISION, build_id: []const u8, layout_source: []const u8 = "same-image DWARF + exact revision" };
 pub const Instance = struct { kind: []const u8 = "address", namespace: []const u8 = "ruby:execution_context", address: []const u8, scope: []const u8 = "this retained stop only; fibers have separate execution contexts" };
 pub const Frame = struct { name: []const u8, file: ?[]const u8, line: ?u32, kind: []const u8, reason: ?[]const u8, line_reason: ?[]const u8, control_frame: []const u8, environment: []const u8, instruction_sequence: []const u8, provenance: []const u8 = "external_read" };
-pub const Segment = struct { runtime: Runtime, runtime_instance: Instance, anchor: ?Anchor, additional_anchors: []Anchor = &.{}, frames: []Frame, state: []const u8 = "partial", reason: ?[]const u8, memory_reads: usize, memory_bytes: usize };
+pub const Segment = struct { runtime: Runtime, runtime_instance: Instance, anchor: ?Anchor, additional_anchors: []Anchor = &.{}, frames: []Frame, chain_complete: bool = false, state: []const u8 = "partial", reason: ?[]const u8, memory_reads: usize, memory_bytes: usize };
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 pub const Stack = struct { session_id: u64, generation: u64, tid: i32, segments: []Segment, native_stack_incomplete: bool, native_argument_diagnostics: []ArgumentDiagnostic, basis: []const u8 = "CRuby control frames from native rb_vm_exec ec; segment anchor only, logical/native pairing unproved; no target calls" };
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
@@ -173,7 +173,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             .environment = try hex(a, v.ep),
             .instruction_sequence = try hex(a, v.iseq),
         };
-        try segments.append(a, .{ .runtime = .{ .build_id = try buildId(a, layout) }, .runtime_instance = .{ .address = address }, .anchor = .{ .frame = f.index, .pc = try hex(a, f.pc) }, .frames = frames, .reason = (try reason(a, raw.reason)) orelse "RubyNativePairingUnproved", .memory_reads = r.reads, .memory_bytes = r.bytes });
+        try segments.append(a, .{ .runtime = .{ .build_id = try buildId(a, layout) }, .runtime_instance = .{ .address = address }, .anchor = .{ .frame = f.index, .pc = try hex(a, f.pc) }, .frames = frames, .chain_complete = raw.reason == null, .reason = (try reason(a, raw.reason)) orelse "RubyNativePairingUnproved", .memory_reads = r.reads, .memory_bytes = r.bytes });
     }
     if (segments.items.len == 0 and diagnostics.items.len == 0) return error.RubyExecutionContextUnavailable;
     try session.target.expectGeneration(generation);
@@ -224,4 +224,112 @@ fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame
     };
     try session.target.expectGeneration(observed.generation);
     return .{ .generation = observed.generation, .tid = tid, .language = .ruby, .segment = segment_index, .frame = frame, .start = raw.start, .total = raw.total, .truncated = raw.truncated != 0, .rows = rows, .diagnostic = try reason(a, raw.reason), .runtime_version = segment.runtime.version, .runtime_build_id = segment.runtime.build_id, .basis = "same-image DWARF; CRuby local table and validated stack/escaped environment; nearest lexical environment first; no target calls", .memory_reads = r.reads, .memory_bytes = r.bytes };
+}
+
+const WatchCapture = @import("watch.zig").Capture;
+// Runtime words: module/execution context. Frame words: control frame/iseq/
+// binding selector/lexical ordinal. Environment and VALUE addresses are never
+// retained: Binding creation, fiber switches and compacting GC can move them.
+fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, row: ?usize) !void {
+    const module = try runtimeModule(session);
+    if (module.id != capture.scope.runtime[0]) return error.RubyWatchRuntimeChanged;
+    const layout = try profile(session, module);
+    var r = reader(session);
+    defer {
+        capture.reads = r.reads;
+        capture.bytes = r.bytes;
+    }
+    const raw = try a.create(c.struct_xrb_locals);
+    const zjit = try zjitEntry(session, module);
+    const symbols = try globalAddress(module, "ruby_global_symbols");
+    if (row) |ordinal| {
+        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, ordinal, 1, raw);
+    } else if (capture.scope.frame[2] != 0) {
+        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, @intCast(capture.scope.frame[3]), 1, raw);
+    } else c.xrb_local_find(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, capture.expression, raw);
+    if (raw.reason != null or raw.count != 1) {
+        capture.diagnostic = try a.dupeZ(u8, if (raw.reason != null) std.mem.span(raw.reason) else "RubyWatchBindingUnavailable");
+        return;
+    }
+    const item = &raw.items[0];
+    if (item.reason != null or item.hidden != 0 or item.address == 0) {
+        capture.diagnostic = try a.dupeZ(u8, if (item.reason != null) std.mem.span(item.reason) else "RubyWatchBindingUnavailable");
+        return;
+    }
+    if (row != null) {
+        capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&item.name, 0));
+        if (capture.expression.len == 0 or capture.expression.len > c.XLW_EXPRESSION) return error.RubyWatchNameTooLong;
+        capture.scope.frame[2] = 1;
+        capture.scope.frame[3] = item.ordinal;
+    } else if (capture.scope.frame[2] != 0 and !std.mem.eql(u8, std.mem.sliceTo(&item.name, 0), capture.expression)) {
+        capture.diagnostic = try a.dupeZ(u8, "RubyWatchBindingUnavailable");
+        return;
+    }
+    const sample = try a.create(c.struct_xrb_sample);
+    c.xrb_sample_read(layout, &r, item.tagged, sample);
+    if (sample.reason != null) {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(sample.reason));
+        return;
+    }
+    capture.observation = c.XLW_COMPLETE;
+    capture.sample = .{ .kind = sample.kind, .bytes = &sample.bytes, .size = sample.size, .type = &sample.type, .display = &sample.display };
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    if ((expression == null) == (row == null)) return error.InvalidArguments;
+    if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
+    if (row) |index| if (index >= 4096) return error.InvalidArguments;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment = observed.segments[segment_index];
+    if (frame >= segment.frames.len) return error.InvalidLanguageFrame;
+    const selected = segment.frames[frame];
+    if (selected.reason != null) return error.RubyWatchFrameUnproved;
+    const thread = for (session.target.threadSlice()) |entry| {
+        if (entry.tid == tid) break entry.id;
+    } else return error.InvalidThread;
+    var capture = WatchCapture{ .scope = .{
+        .language = c.XLW_RUBY,
+        .session = session.id,
+        .image = session.target.snapshot().image_epoch,
+        .thread = thread,
+        .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 },
+        .frame = .{ try std.fmt.parseInt(u64, selected.control_frame, 0), try std.fmt.parseInt(u64, selected.instruction_sequence, 0), 0, 0 },
+    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    try watchValue(session, a, &capture, frame, row);
+    if (row != null and capture.scope.frame[2] == 0) return error.RubyWatchBindingUnavailable;
+    try session.target.expectGeneration(observed.generation);
+    return capture;
+}
+pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
+    const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
+    const module_id = (try runtimeModule(session)).id;
+    if (module_id != scope.runtime[0]) {
+        capture.scope.runtime[0] = module_id;
+        capture.diagnostic = try a.dupeZ(u8, "RubyWatchRuntimeChanged");
+        return capture;
+    }
+    var saw_runtime = false;
+    var complete = true;
+    for (observed.segments) |segment| {
+        if (try std.fmt.parseInt(u64, segment.runtime_instance.address, 0) != scope.runtime[1]) continue;
+        saw_runtime = true;
+        complete = complete and segment.chain_complete;
+        for (segment.frames, 0..) |frame, index| {
+            if (try std.fmt.parseInt(u64, frame.control_frame, 0) != scope.frame[0] or try std.fmt.parseInt(u64, frame.instruction_sequence, 0) != scope.frame[1]) continue;
+            if (frame.reason) |why| {
+                capture.diagnostic = try a.dupeZ(u8, why);
+                return capture;
+            }
+            try watchValue(session, a, &capture, index, null);
+            try session.target.expectGeneration(observed.generation);
+            return capture;
+        }
+    }
+    if (saw_runtime and complete) {
+        capture.observation = c.XLW_FRAME_GONE;
+        capture.diagnostic = try a.dupeZ(u8, "RubyWatchFrameGone");
+    } else capture.diagnostic = try a.dupeZ(u8, "RubyWatchFrameNotObserved");
+    try session.target.expectGeneration(observed.generation);
+    return capture;
 }

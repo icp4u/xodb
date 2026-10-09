@@ -15,7 +15,7 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: std
     if (add) {
         const language = args.object.get("language") orelse return error.InvalidArguments;
         if (language != .string) return error.InvalidArguments;
-        const tab: Tab = if (std.mem.eql(u8, language.string, "lua")) .lua else if (std.mem.eql(u8, language.string, "python")) .python else if (std.mem.eql(u8, language.string, "perl")) .perl else return error.LanguageWatchRuntimeUnsupported;
+        const tab: Tab = if (std.mem.eql(u8, language.string, "lua")) .lua else if (std.mem.eql(u8, language.string, "python")) .python else if (std.mem.eql(u8, language.string, "perl")) .perl else if (std.mem.eql(u8, language.string, "ruby")) .ruby else if (std.mem.eql(u8, language.string, "javascript")) .javascript else return error.LanguageWatchRuntimeUnsupported;
         const tid = try wire.number(args, "tid", null);
         const segment = try wire.number(args, "segment", null);
         const frame = try wire.number(args, "frame", null);

@@ -4,6 +4,7 @@ import ctypes
 from importlib.machinery import SourceFileLoader
 import importlib.util
 import json
+import itertools
 import os
 from pathlib import Path
 import sys
@@ -23,6 +24,32 @@ class RunnerTests(unittest.TestCase):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
         (root / '.work').mkdir(exist_ok=True)
 
+    def test_performance_report_preserves_each_measurement(self):
+        paths = ('.work/perf-observers/results.json',
+                 '.work/perf-remote-stops/results.json',
+                 '.work/perf-syscalls/results.json')
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='perf-summary-') as name:
+            tree = Path(name); tree.chmod(0o755)
+            for path in paths: (tree / path).parent.mkdir(parents=True)
+            for statuses in itertools.product(('measured', 'not-measurable'), repeat=3):
+                values = [dict(status=statuses[0], sample='observer'),
+                          dict(performance=dict(status=statuses[1]), sample='remote'),
+                          dict(status=statuses[2], sample='syscall')]
+                for path, value in zip(paths, values): (tree / path).write_text(json.dumps(value))
+                result = gate.performance_summary(tree)
+                self.assertEqual(result['status'], 'not-measurable' if 'not-measurable' in statuses else 'passed')
+                self.assertEqual([result[key] for key in ('measurements', 'remote_stop_measurements', 'syscall_measurements')], values)
+            for invalid in ('failed', 'running', 'passed', None):
+                (tree / paths[1]).write_text(json.dumps(dict(performance=dict(status=invalid))))
+                with self.assertRaises(ValueError): gate.performance_summary(tree)
+            (tree / paths[1]).write_text('{}')
+            with self.assertRaises(KeyError): gate.performance_summary(tree)
+            (tree / paths[1]).unlink()
+            with self.assertRaises(FileNotFoundError): gate.performance_summary(tree)
+        steps = {name: argv for name,argv,_ in gate.plan('perf')}
+        command = steps['remote-stop-measurements']
+        self.assertEqual(command[command.index('--work')+1], '.work/perf-remote-stops')
+
     def exercise(self, source, timeout=5, env=None, prefix=()):
         with tempfile.TemporaryDirectory(dir=root / '.work', prefix='gate-test-') as name:
             directory = Path(name)
@@ -32,6 +59,22 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(result.get('remaining_pids', []), [])
             result['output'] = (directory / 'owned.log').read_text()
             return result
+
+    def test_ruby_watch_coverage(self):
+        for tier in ('host', 'all'):
+            names={name for name,_,_ in gate.plan(tier,ruby='/fixture/ruby')}
+            self.assertTrue({'ruby-watch-component','ruby-watches','ruby-watches-agent'} <= names)
+        for tier in ('gui', 'all'):
+            names={name for name,_,_ in gate.plan(tier,ruby='/fixture/ruby')}
+            self.assertIn('ruby-watches-gui',names)
+
+    def test_javascript_watch_coverage(self):
+        for tier in ('host', 'all'):
+            names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
+            self.assertTrue({'javascript-watches','javascript-watches-agent'} <= names)
+        for tier in ('gui', 'all'):
+            names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
+            self.assertIn('javascript-watches-gui',names)
 
     def test_shell_preferences_do_not_reach_steps(self):
         poisoned = dict(os.environ, NO_COLOR='1', COLORTERM='truecolor', FORCE_COLOR='3',
@@ -129,12 +172,22 @@ time.sleep(60)
             self.assertFalse({'m2-preferences', 'm2-preferences-agent'} &
                              {name for name, _, _ in gate.plan(tier)})
 
+    def test_syscall_measurements_keep_the_correctness_lane(self):
+        perf = {name: cmd for name, cmd, _ in gate.plan('perf')}
+        self.assertEqual(perf['syscall-measurements'], [sys.executable, '-B',
+            'tests/syscall-timing.py', '--perf', '--work', '.work/perf-syscalls'])
+        for tier in ('host', 'all'):
+            regular = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            self.assertEqual(regular['syscall-timing'], [sys.executable, '-B', 'tests/syscall-timing.py'])
+        for tier in ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui'):
+            self.assertNotIn('syscall-measurements', {name for name, _, _ in gate.plan(tier)})
+
     def test_measurements_are_explicit_and_separate(self):
         perf = {s[0] for s in gate.plan('perf', headless=True)}
         self.assertIn('observer-measurements', perf)
         self.assertIn('remote-stop-measurements', perf)
         command = next(cmd for name, cmd, _ in gate.plan('perf') if name == 'remote-stop-measurements')
-        self.assertEqual(command[-2:], ['tests/remote-stops.py', '--perf'])
+        self.assertEqual(command[2:4], ['tests/remote-stops.py', '--perf'])
         self.assertFalse(perf & {'mcp', 'vulkan-faults', 'gui-overview'})
         for tier in ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui'):
             self.assertFalse({'observer-measurements', 'remote-stop-measurements'} &

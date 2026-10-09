@@ -12,16 +12,21 @@ def audit(client, pid, log, operation):
     registers=client.inspect('get_registers',tid=pid)
     generation=client.session()['generation']
     before=scheduled()
+    observers={client.p.pid}
+    # Shared-session adapters already supply the collector as p.pid.
+    if getattr(client,'runtime_agent',False):observers.add(client.collector_pid())
     tracer=subprocess.Popen(['strace','-f','-qq','-o',str(log),'-e',
         'trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill',
-        '-p',str(client.p.pid)],stderr=subprocess.PIPE)
+        *[part for pid in sorted(observers) for part in ('-p',str(pid))]],stderr=subprocess.PIPE)
     try:
         deadline = time.monotonic() + 5
         while True:
             assert tracer.poll() is None,tracer.stderr.read().decode()
-            status = Path(f'/proc/{client.p.pid}/status').read_text()
-            attached = next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:'))
-            if attached == tracer.pid: break
+            attached=[]
+            for observer_pid in observers:
+                status=Path(f'/proc/{observer_pid}/status').read_text()
+                attached.append(next(int(line.split()[1]) for line in status.splitlines() if line.startswith('TracerPid:')))
+            if all(pid==tracer.pid for pid in attached):break
             assert time.monotonic() < deadline, 'strace did not attach before the audit deadline'
             time.sleep(.01)
         for _ in range(2):operation()

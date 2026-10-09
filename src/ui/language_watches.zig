@@ -52,7 +52,7 @@ pub const Panel = struct {
         const entries = try session.language_watches.list(a);
         var y = rect.y + 8;
         if (entries.len == 0) {
-            try r.textFit(font, rect.x + 12, y, rect.w - 24, "Click a named Lua/Python binding, then W; Shift+E adds a name watch", theme.weak);
+            try r.textFit(font, rect.x + 12, y, rect.w - 24, "Click a supported named language binding, then W; Shift+E adds a name watch", theme.weak);
             return;
         }
         if (self.reveal and self.selected != null) {
@@ -64,15 +64,21 @@ pub const Panel = struct {
         }
         self.scroll = @min(self.scroll, entries.len - 1);
         for (entries[self.scroll..], self.scroll..) |entry, index| {
-            if (y + 65 > rect.y + rect.h - 6) break;
-            const bounds = gpu.Rect{ .x = rect.x + 4, .y = y - 3, .w = rect.w - 8, .h = 68 };
+            const context_storage = entry.selector == .context_storage;
+            const height: f32 = if (context_storage) 90 else 68;
+            if (y + height - 3 > rect.y + rect.h - 6) break;
+            const bounds = gpu.Rect{ .x = rect.x + 4, .y = y - 3, .w = rect.w - 8, .h = height };
             self.hits[index] = .{ .id = entry.id, .rect = bounds };
             if (self.selected != null and self.selected.? == entry.id) try style.focus(r, bounds, 4, 1);
             // Put the identity caveat before the possibly long expression so
             // textFit cannot truncate it at the moment a difference appears.
-            const title = try std.fmt.allocPrint(a, "{s} {s}: {s} [{s}]", .{ if (entry.comparison == .same_slot_different) "DIFF (activation unproved)" else @tagName(entry.state), @tagName(entry.language), entry.expression, @tagName(entry.selector) });
+            const title = try std.fmt.allocPrint(a, "{s} {s}: {s} [{s}]", .{ if (entry.comparison == .same_slot_different) "DIFF (activation unproved)" else @tagName(entry.state), @tagName(entry.language), entry.row_name orelse entry.expression, @tagName(entry.selector) });
             try r.textFit(font, rect.x + 12, y, rect.w - 24, title, if (entry.changed) theme.warm else theme.neutral);
             y += 22;
+            if (context_storage) {
+                try r.textFit(font, rect.x + 12, y, rect.w - 24, "Context storage; lexical visibility unproved", theme.warm);
+                y += 22;
+            }
             const current = if (entry.current) |v| v.display else "No complete value";
             const first = if (entry.state == .value) try std.fmt.allocPrint(a, "now: {s}", .{current}) else try std.fmt.allocPrint(a, "{s}; last: {s}", .{ entry.diagnostic orelse @tagName(entry.state), current });
             try r.textFit(font, rect.x + 12, y, rect.w - 24, first, theme.text);

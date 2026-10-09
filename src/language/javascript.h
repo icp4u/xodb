@@ -78,6 +78,7 @@ struct xjs_frame {
 };
 struct xjs_stack {
     size_t count;
+    uint64_t entry_fp;
     struct xjs_frame frames[XJS_STACK_FRAMES];
     const char *reason;
     int version_table;
@@ -96,6 +97,7 @@ struct xjs_context_binding {
     const char *name_reason, *reason;
     size_t ordinal, depth;
     uint64_t context, slot_address, tagged;
+    uint64_t number_bits;
     int parameter, immediate;
     struct xjs_value value;
 };
@@ -111,6 +113,32 @@ struct xjs_context_bindings {
  * V8 can move both the contexts and their values during garbage collection. */
 void xjs_context_read(const struct xjs_layout *, struct xjs_reader *, const struct xjs_frame *,
                       size_t start, size_t limit, struct xjs_context_bindings *);
+/* No heap address survives a stop. SharedFunctionInfo's unique id survives GC;
+ * source positions and local index identify storage, not lexical visibility or
+ * continuous activation lifetime. Duplicate scope matches refuse. */
+struct xjs_watch_key {
+    uint64_t fp;
+    uint32_t shared_id, scope_type, slot;
+    int32_t scope_start, scope_end;
+};
+enum xjs_watch_kind { XJS_WATCH_NUMBER = 1, XJS_WATCH_STRING,
+    XJS_WATCH_FALSE, XJS_WATCH_TRUE, XJS_WATCH_NULL, XJS_WATCH_UNDEFINED };
+#define XJS_WATCH_BYTES 4096
+struct xjs_watch_result {
+    struct xjs_watch_key key;
+    char name[128], type[64], display[512];
+    unsigned char bytes[XJS_WATCH_BYTES];
+    size_t size;
+    uint32_t kind;
+    int key_valid, gone;
+    const char *reason;
+};
+/* Create with key/name NULL and an explicit context row. Observe with the
+ * returned key/name and a newly retained canonical frame; row is then ignored.
+ * Complete strings use UTF-16 code units, numbers use IEEE-754 binary64. */
+void xjs_watch_read(const struct xjs_layout *, struct xjs_reader *, const struct xjs_frame *,
+                    size_t row, const struct xjs_watch_key *, const char *name,
+                    struct xjs_watch_result *);
 /* A proved, single-word V8 C++ handle: 1 is a tagged value, 2 an indirect
  * handle slot. Zero means an unrelated or unsupported type. */
 int xjs_dwarf_handle(Dwarf_Die *);

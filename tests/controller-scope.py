@@ -55,7 +55,7 @@ try:
                 name=definition['name']
                 # Missing fields must not reach a hidden handler either.
                 calls=[{}]
-                if name=='add_language_watch':calls.append(dict(generation=state['generation'],language='lua',tid=tid,segment=0,frame=0,expression='x'))
+                if name=='add_language_watch':calls.extend(dict(generation=state['generation'],language=language,tid=tid,segment=0,frame=0,expression='x') for language in ('lua','python','perl','ruby'))
                 elif name=='remove_language_watch':calls.append(dict(generation=state['generation'],id=1))
                 elif name in ('cancel_debug_metadata','retry_debug_metadata'):calls.append(dict(id=1))
                 elif name=='write_memory':calls.append(dict(generation=state['generation'],address='0x0',hex='00'))
@@ -96,9 +96,12 @@ try:
                 listed=shared.listed_tools(observer)
                 for definition in shared_restricted:
                     name=definition['name'];assert name not in listed
-                    reply=observer.raw(name);why=error(reply)
-                    report['calls'].append(dict(transport='shared',scope=scope,phase=phase,name=name,error=why))
-                    if why not in ('AgentScopeDenied','ControlLeaseRequired'):failures.append(('shared',scope,phase,name,why))
+                    arguments=[{}]
+                    if name=='add_language_watch':arguments.extend(dict(generation=state['generation'],language=language,tid=state['pid'],segment=0,frame=0,expression='x') for language in ('lua','python','perl','ruby'))
+                    for params in arguments:
+                        reply=observer.raw(name,**params);why=error(reply)
+                        report['calls'].append(dict(transport='shared',scope=scope,phase=phase,name=name,arguments=params,error=why))
+                        if why not in ('AgentScopeDenied','ControlLeaseRequired'):failures.append(('shared',scope,phase,name,why))
             after=observer.session()
             for key in ('session_id','generation','pid','state'):assert after[key]==state[key],(key,state,after)
             assert observer.tool('get_registers',tid=state['pid'])==before

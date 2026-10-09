@@ -55,6 +55,92 @@ static struct xjs_context_bindings context_decode(const struct xjs_frame *f, siz
     xjs_context_read(&layout, &r, f, start, limit, &out);
     assert(r.reads <= XJS_READ_LIMIT && r.bytes <= XJS_BYTE_LIMIT); return out;
 }
+static struct xjs_watch_result watch_decode(const struct xjs_frame *f, size_t row,
+                                             const struct xjs_watch_result *saved) {
+    struct xjs_reader r = {.read = read_fake}; struct xjs_watch_result out;
+    xjs_watch_read(&layout, &r, f, row, saved ? &saved->key : NULL, saved ? saved->name : NULL, &out);
+    assert(r.reads <= XJS_READ_LIMIT && r.bytes <= XJS_BYTE_LIMIT); return out;
+}
+static void watch_cases(struct xjs_frame f) {
+    put(f.shared + 63, 1234567, 4);
+    const char *names[] = {"x"}; uint64_t values[] = {tagged_int(7)}, scope;
+    f.context = context_fixture(names, values, 1, 0, &scope);
+    put(scope + 31, tagged_int(20), 8); put(scope + 39, tagged_int(80), 8);
+    put(f.fp - 8, f.context, 8);
+    attempts = 0; struct xjs_watch_result saved = watch_decode(&f, 0, NULL); size_t reads = attempts;
+    assert(!saved.reason && saved.key_valid && saved.key.shared_id == 1234567 && !strcmp(saved.name, "x"));
+    assert(saved.kind == XJS_WATCH_NUMBER && saved.size == 8 && saved.bytes[6] == 0x1c && saved.bytes[7] == 0x40);
+    for (size_t i = 1; i <= reads; ++i) {
+        attempts = 0; fail_at = i; struct xjs_watch_result bad = watch_decode(&f, 0, NULL);
+        assert(attempts >= i && bad.reason);
+    }
+    fail_at = 0;
+    uint64_t heap_number = object(layout.fields[XJS_TYPE_NUMBER], 16);
+    put(heap_number + 7, UINT64_C(0x401c000000000000), 8); put(f.context + 31, heap_number, 8);
+    struct xjs_watch_result out = watch_decode(&f, 4095, &saved);
+    assert(!out.reason && out.kind == saved.kind && out.size == saved.size && !memcmp(out.bytes, saved.bytes, out.size));
+    put(heap_number + 7, UINT64_C(0x8000000000000000), 8); out = watch_decode(&f, 0, &saved);
+    assert(!out.reason && out.bytes[7] == 0x80); /* minus zero stays distinct */
+    uint64_t cell = object(layout.fields[XJS_TYPE_CONTEXT_CELL], 40);
+    put(cell + 23, 2, 4); put(cell + 31, 7, 4); put(f.context + 31, cell, 8);
+    out = watch_decode(&f, 0, &saved); assert(!out.reason && !memcmp(out.bytes, saved.bytes, 8));
+    put(cell + 23, 3, 4); put(cell + 31, UINT64_C(0x401c000000000000), 8);
+    out = watch_decode(&f, 0, &saved); assert(!out.reason && !memcmp(out.bytes, saved.bytes, 8));
+    put(cell + 23, 1, 4); put(cell + 7, tagged_int(7), 8);
+    out = watch_decode(&f, 0, &saved); assert(!out.reason && !memcmp(out.bytes, saved.bytes, 8));
+    /* Full strings, not matching truncated displays, determine equality. */
+    uint64_t one = object(40, 16 + 2049), two = object(32, 16 + 4096);
+    put(one + 11, 2048, 4); put(two + 11, 2048, 4);
+    memset(memory + (one + 15 - BASE), 'q', 2049);
+    for (size_t i = 0; i < 2048; ++i) put(two + 15 + i * 2, 'q', 2);
+    put(f.context + 31, one, 8); struct xjs_watch_result string_saved = watch_decode(&f, 0, &saved);
+    assert(!string_saved.reason && string_saved.kind == XJS_WATCH_STRING && string_saved.size == 4096);
+    put(f.context + 31, two, 8); out = watch_decode(&f, 0, &saved);
+    assert(!out.reason && !memcmp(out.bytes, string_saved.bytes, 4096));
+    put(two + 15 + 2047 * 2, 'z', 2); out = watch_decode(&f, 0, &saved);
+    assert(!out.reason && !strcmp(out.display, string_saved.display) && memcmp(out.bytes, string_saved.bytes, 4096));
+    put(two + 15, 0, 2); put(two + 17, 0xdc00, 2); out = watch_decode(&f, 0, &saved);
+    assert(!out.reason && out.bytes[0] == 0 && out.bytes[1] == 0 && out.bytes[2] == 0 && out.bytes[3] == 0xdc);
+    put(one + 11, 2049, 4); put(f.context + 31, one, 8); out = watch_decode(&f, 0, &saved);
+    assert(out.reason && !strcmp(out.reason, "JavaScriptWatchStringLimit"));
+    /* Empty strings and primitive kinds have complete zero-length samples. */
+    put(f.context + 31, str(""), 8); out = watch_decode(&f, 0, &saved);
+    assert(!out.reason && out.kind == XJS_WATCH_STRING && out.size == 0);
+    const enum xjs_field odd[] = {XJS_FALSE, XJS_TRUE, XJS_NULL, XJS_UNDEFINED};
+    for (size_t i = 0; i < sizeof odd / sizeof *odd; ++i) {
+        uint64_t value = object(layout.fields[XJS_TYPE_ODDBALL], 48);
+        put(value + 39, tagged_int(layout.fields[odd[i]]), 8); put(f.context + 31, value, 8);
+        out = watch_decode(&f, 0, &saved); assert(!out.reason && out.kind == XJS_WATCH_FALSE + i && !out.size);
+    }
+    /* Newly entered inner scope changes flattened ordinals but not the key. */
+    uint64_t outer = f.context, inner_scope;
+    f.context = context_fixture(names, values, 1, outer, &inner_scope);
+    put(inner_scope + 31, tagged_int(30), 8); put(inner_scope + 39, tagged_int(60), 8);
+    put(f.fp - 8, f.context, 8); put(outer + 31, tagged_int(9), 8);
+    out = watch_decode(&f, 0, &saved); assert(!out.reason && !strcmp(out.display, "smi 9"));
+    /* Ambiguous scope coordinates refuse on creation and observation. */
+    put(inner_scope + 31, tagged_int(20), 8); put(inner_scope + 39, tagged_int(80), 8);
+    out = watch_decode(&f, 0, &saved); assert(out.reason && !strcmp(out.reason, "JavaScriptWatchScopeAmbiguous"));
+    out = watch_decode(&f, 0, NULL); assert(out.reason && !strcmp(out.reason, "JavaScriptWatchScopeAmbiguous"));
+    out = watch_decode(&f, 1, NULL); assert(out.reason && !strcmp(out.reason, "JavaScriptWatchScopeAmbiguous"));
+    f.context = outer; put(f.fp - 8, outer, 8);
+    /* Relocate both context and SFI. No old tagged pointer is in the key. */
+    uint64_t moved_context = alloc(40), moved_shared = alloc(80);
+    memcpy(memory + (moved_context - BASE), memory + (outer - 1 - BASE), 40);
+    memcpy(memory + (moved_shared - BASE), memory + (f.shared - 1 - BASE), 80);
+    f.context = moved_context + 1; f.shared = moved_shared + 1;
+    put(f.fp - 8, f.context, 8); put(f.function + 31, f.shared, 8);
+    out = watch_decode(&f, 0, &saved); assert(!out.reason && !strcmp(out.display, "smi 9"));
+    put(f.shared + 63, 7654321, 4); out = watch_decode(&f, 0, &saved);
+    assert(out.gone && !strcmp(out.reason, "JavaScriptWatchFrameChanged")); put(f.shared + 63, 1234567, 4);
+    put(scope + 47, str("renamed"), 8); out = watch_decode(&f, 0, &saved);
+    assert(out.gone && !strcmp(out.reason, "JavaScriptWatchBindingChanged")); put(scope + 47, str("x"), 8);
+    put(scope + 31, tagged_int(-1), 8); out = watch_decode(&f, 0, &saved);
+    assert(out.reason && !out.gone && !strcmp(out.reason, "JavaScriptWatchScopeIdentityUnavailable"));
+    put(scope + 31, tagged_int(21), 8); out = watch_decode(&f, 0, &saved);
+    assert(out.gone && !strcmp(out.reason, "JavaScriptWatchBindingGone"));
+    puts("JavaScript watches: full scalar samples, UTF-16, representation equality, tail changes, scope identity, relocation and read failures passed");
+}
 static void context_cases(struct xjs_frame f) {
     uint64_t cells[5];
     for (unsigned i = 0; i < 5; ++i) {
@@ -210,6 +296,7 @@ static void stack_cases(uint64_t function, uint64_t shared) {
     assert(out.frames[0].line == 2 && out.frames[0].column == 3);
     assert(!strcmp(out.reason, "JavaScriptEntryBoundary"));
     context_cases(out.frames[0]);
+    watch_cases(out.frames[0]);
     cache_cases();
     const struct { const char *source; unsigned position; int line, column; } newline_cases[] = {
         {"a\r\nb", 2, 1, 3}, {"a\r\nb", 3, 2, 1}, {"a\rb", 2, 2, 1},

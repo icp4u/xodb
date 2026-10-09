@@ -104,3 +104,32 @@ contract, while `ruby.zig` verifies the loaded runtime and selects the reader.
 
 No interpreter calls, Ruby `inspect`, coercions or getters are needed to add a
 profile. An unproved field, encoding or runtime identity must stay unavailable.
+
+## Stopped value watches
+
+Run `./scripts/demo-cruby`, press **Space**, open **Ruby** and select **tick**.
+Press **Shift+E**, enter `round`, then **Return**. Continue with **Space** and
+open **V** to see the current and previous complete samples. Alternatively click
+a named local and press **W** to retain that declaration; **Delete** removes the
+selected runtime watch. Ordinary **E** reads a name at the current stop.
+
+Ruby watches compare small integers, floats, nil, booleans, and complete strings
+up to 4095 bytes plus their inline encoding index. String tails beyond the
+preview are compared; changing only the encoding also counts as different.
+Floats compare IEEE bytes, so signed zero and NaN payloads retain their bit
+patterns. This is typed storage comparison, not Ruby `==`. Arrays, objects,
+large integers, symbols, extended encodings and larger strings report a reason
+instead of comparing partial previews.
+
+The C reader resolves the control frame, instruction sequence and lexical
+storage again at each stop. It retains no raw VALUE or environment address:
+creating a Binding or running compacting GC may move that storage. A frame
+observed absent in a complete chain retires the watch; an incomplete observation
+stays unavailable. Reuse of the same frame location between stops cannot prove
+continuous activation identity, so the GUI and MCP always retain that caveat,
+including when the value differs. Watches do not interrupt execution or invoke
+Ruby code, getters, coercions or comparison methods.
+
+The exact supported revision supplies the encoding-bit rule; its names are not
+present in the runtime-owned DWARF units. The live component oracle compares
+this rule and scalar samples with the matching Ruby headers' public macros.

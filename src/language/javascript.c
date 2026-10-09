@@ -4,6 +4,7 @@
 #include <inttypes.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 const char *const xjs_field_names[XJS_FIELD_COUNT] = {
@@ -665,6 +666,7 @@ void xjs_stack_read(const struct xjs_layout *l, struct xjs_reader *r, uint64_t f
         if (visited && !(marker & 1)) {
             if (marker == (uint64_t)field(l, r, XJS_FRAME_ENTRY) * 2 ||
                 marker == (uint64_t)field(l, r, XJS_FRAME_CONSTRUCT_ENTRY) * 2) {
+                out->entry_fp = fp;
                 out->reason = "JavaScriptEntryBoundary"; break;
             }
             if (marker != (uint64_t)field(l, r, XJS_FRAME_INTERNAL) * 2 &&
@@ -738,6 +740,7 @@ static void context_value(const struct xjs_layout *l, struct xjs_reader *r,
                 copy_text(row->value.type, sizeof row->value.type, "number");
                 number_text(row->value.display, sizeof row->value.display, number);
                 row->immediate = 1;
+                memcpy(&row->number_bits, &number, sizeof number);
                 return;
             } else {
                 fail(r, "JavaScriptContextCellStateUnsupported"); return;
@@ -747,9 +750,10 @@ static void context_value(const struct xjs_layout *l, struct xjs_reader *r,
     if (!r->error) xjs_value_read(l, r, tagged, &row->value);
 }
 
-void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
+static void context_read(const struct xjs_layout *l, struct xjs_reader *r,
                       const struct xjs_frame *frame, size_t start, size_t limit,
-                      struct xjs_context_bindings *out) {
+                      struct xjs_context_bindings *out, const struct xjs_watch_key *key,
+                      struct xjs_watch_result *watch) {
     memset(out, 0, sizeof *out); out->start = start;
     if (start > XJS_CONTEXT_BINDINGS || !limit || limit > XJS_CONTEXT_PAGE) {
         out->reason = "JavaScriptInvalidContextPage"; return;
@@ -788,6 +792,14 @@ void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
     int64_t offset = smi(r, word(r, frame->fp - 40, 8)) - field(l, r, XJS_BYTECODE_DATA) + 1;
     int64_t length = smi(r, at(l, r, bytecode.address, XJS_BYTECODE_LENGTH, 8));
     if (offset < 0 || offset >= length) { fail(r, "JavaScriptBytecodeOffsetInvalid"); goto done; }
+    if (watch) {
+        watch->key.fp = frame->fp;
+        watch->key.shared_id = (uint32_t)word(r, shared.address + XJS_V8_SHARED_UNIQUE_ID, 4);
+        if (r->error) goto done;
+        if (key && (key->fp != watch->key.fp || key->shared_id != watch->key.shared_id)) {
+            watch->gone = 1; fail(r, "JavaScriptWatchFrameChanged"); goto done;
+        }
+    }
     uint64_t current = frame->context, seen[XJS_CONTEXT_DEPTH];
     for (size_t depth = 0; depth < XJS_CONTEXT_DEPTH && !r->error; ++depth) {
         for (size_t i = 0; i < depth; ++i) if (seen[i] == current) {
@@ -826,10 +838,33 @@ void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
             fail(r, "JavaScriptContextNameTableUnsupported"); goto done;
         }
         size_t first = out->total; out->total += (size_t)count;
+        int32_t scope_start = 0, scope_end = 0;
+        if (watch && count) {
+            int64_t begin = smi(r, word(r, scope.address + XJS_V8_SCOPE_START, 8));
+            int64_t end = smi(r, word(r, scope.address + XJS_V8_SCOPE_END, 8));
+            if (r->error) goto done;
+            if (begin < 0 || end < begin || end > INT32_MAX) {
+                fail(r, "JavaScriptWatchScopeIdentityUnavailable"); goto done;
+            }
+            scope_start = (int32_t)begin; scope_end = (int32_t)end;
+        }
         uint64_t names = scope.address + 8 + (uint64_t)field(l, r, XJS_SCOPE_VARS) * 8;
         for (size_t i = 0; i < (size_t)count && !r->error; ++i) {
             size_t ordinal = first + i;
-            if (ordinal < start || out->count == limit) continue;
+            if (key) {
+                if (scope_start != key->scope_start || scope_end != key->scope_end ||
+                    scope_type != key->scope_type || i != key->slot) continue;
+                if (out->count) { fail(r, "JavaScriptWatchScopeAmbiguous"); goto done; }
+            } else {
+                if (watch && out->count && scope_start == watch->key.scope_start &&
+                    scope_end == watch->key.scope_end && scope_type == watch->key.scope_type &&
+                    i == watch->key.slot) { fail(r, "JavaScriptWatchScopeAmbiguous"); goto done; }
+                if (ordinal < start || out->count == limit) continue;
+            }
+            if (watch) {
+                watch->key.scope_start = scope_start; watch->key.scope_end = scope_end;
+                watch->key.scope_type = scope_type; watch->key.slot = (uint32_t)i;
+            }
             struct xjs_context_binding *row = &out->items[out->count++];
             row->ordinal = ordinal; row->depth = depth; row->context = current;
             row->slot_address = context.address + XJS_V8_CONTEXT_DATA + (header + i) * 8;
@@ -845,7 +880,7 @@ void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
             row->parameter = parameter_number != 65535;
             if (row->parameter && (scope_type != 4 || parameter_number >= (uint64_t)parameters))
                 fail(r, "JavaScriptContextParameterInvalid");
-            if (!r->error) context_value(l, r, flags, row);
+            if (!r->error && (!watch || key)) context_value(l, r, flags, row);
             row->reason = r->error ? r->error : row->value.reason;
             r->error = NULL;  /* Row-local refusals retain neighbouring storage. */
         }
@@ -858,4 +893,88 @@ void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
 done:
     out->reason = r->error;
     out->truncated = out->reason != NULL || out->total > out->start + out->count;
+}
+
+void xjs_context_read(const struct xjs_layout *l, struct xjs_reader *r,
+                      const struct xjs_frame *frame, size_t start, size_t limit,
+                      struct xjs_context_bindings *out) {
+    context_read(l, r, frame, start, limit, out, NULL, NULL);
+}
+
+static void watch_sample(const struct xjs_layout *l, struct xjs_reader *r,
+                          const struct xjs_context_binding *row, struct xjs_watch_result *out) {
+    const struct xjs_value *v = &row->value;
+    copy_text(out->type, sizeof out->type, v->type);
+    copy_text(out->display, sizeof out->display, v->display);
+    if (row->reason && !v->extent_advisory) { fail(r, row->reason); return; }
+    if (row->immediate || !strcmp(v->type, "smi") || !strcmp(v->type, "number")) {
+        uint64_t bits = row->number_bits;
+        if (!row->immediate) {
+            if (!(v->tagged & 1)) {
+                double number = (double)smi(r, v->tagged); memcpy(&bits, &number, 8);
+            } else bits = at(l, r, v->tagged - 1, XJS_NUMBER, 8);
+        }
+        out->kind = XJS_WATCH_NUMBER; out->size = 8;
+        /* Wire-order bytes do not depend on the reader host's byte order. */
+        for (unsigned i = 0; i < 8; ++i) out->bytes[i] = (unsigned char)(bits >> (i * 8));
+        copy_text(out->type, sizeof out->type, "number");
+    } else if (!strcmp(v->type, "string")) {
+        struct head h; uint32_t length;
+        if (!string_head(l, r, v->tagged, &h, &length)) return;
+        if (length > XJS_WATCH_BYTES / 2) { fail(r, "JavaScriptWatchStringLimit"); return; }
+        for (uint32_t start = 0; start < length; ) {
+            uint16_t units[XJS_STRING_UNITS];
+            size_t count = length - start; if (count > XJS_STRING_UNITS) count = XJS_STRING_UNITS;
+            if (!string_units(l, r, v->tagged, start, count, units, 0)) return;
+            for (size_t i = 0; i < count; ++i) {
+                out->bytes[(start + i) * 2] = (unsigned char)units[i];
+                out->bytes[(start + i) * 2 + 1] = (unsigned char)(units[i] >> 8);
+            }
+            start += (uint32_t)count;
+        }
+        out->kind = XJS_WATCH_STRING; out->size = (size_t)length * 2;
+    } else if (!strcmp(v->type, "false")) out->kind = XJS_WATCH_FALSE;
+    else if (!strcmp(v->type, "true")) out->kind = XJS_WATCH_TRUE;
+    else if (!strcmp(v->type, "null")) out->kind = XJS_WATCH_NULL;
+    else if (!strcmp(v->type, "undefined")) out->kind = XJS_WATCH_UNDEFINED;
+    else fail(r, "JavaScriptWatchValueUnsupported");
+}
+
+void xjs_watch_read(const struct xjs_layout *l, struct xjs_reader *r,
+                    const struct xjs_frame *frame, size_t row, const struct xjs_watch_key *key,
+                    const char *name, struct xjs_watch_result *out) {
+    memset(out, 0, sizeof *out);
+    if ((key == NULL) != (name == NULL)) { out->reason = "JavaScriptInvalidWatchSelector"; return; }
+    struct xjs_context_bindings *page = calloc(1, sizeof *page);
+    if (!page) { out->reason = "OutOfMemory"; return; }
+    context_read(l, r, frame, key ? 0 : row, 1, page, key, out);
+    if (!key && !page->reason && page->count &&
+        (page->items[0].name_reason || page->items[0].reason)) {
+        out->reason = page->items[0].name_reason ? page->items[0].name_reason : page->items[0].reason;
+        goto done;
+    }
+    /* A row selected in an outer scope can have an identical key in an inner
+     * scope already visited. Resolve the new key once as well, so creation
+     * applies exactly the same ambiguity rule as later observations. */
+    if (!key && !page->reason && page->count) {
+        struct xjs_watch_key selected = out->key;
+        context_read(l, r, frame, 0, 1, page, &selected, out);
+    }
+    if (page->reason) { out->reason = page->reason; goto done; }
+    if (!page->count) {
+        out->gone = key != NULL;
+        out->reason = key ? "JavaScriptWatchBindingGone" : "JavaScriptInvalidWatchRow"; goto done;
+    }
+    const struct xjs_context_binding *binding = &page->items[0];
+    if (binding->name_reason) { out->reason = binding->name_reason; goto done; }
+    if (!binding->name[0] || strlen(binding->name) >= sizeof out->name) {
+        out->reason = "JavaScriptWatchNameLimit"; goto done;
+    }
+    if (name && strcmp(name, binding->name)) {
+        out->gone = 1; out->reason = "JavaScriptWatchBindingChanged"; goto done;
+    }
+    copy_text(out->name, sizeof out->name, binding->name); out->key_valid = 1;
+    watch_sample(l, r, binding, out); out->reason = r->error;
+done:
+    free(page);
 }

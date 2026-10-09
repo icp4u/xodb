@@ -45,7 +45,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if tier == 'perf':
         steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
                       '--work', '.work/perf-observers'], 180))
-        steps.append(('remote-stop-measurements', [sys.executable, '-B', 'tests/remote-stops.py', '--perf'], 180))
+        steps.append(('remote-stop-measurements', [sys.executable, '-B', 'tests/remote-stops.py', '--perf',
+                      '--work', '.work/perf-remote-stops'], 180))
+        steps.append(('syscall-measurements', [sys.executable, '-B', 'tests/syscall-timing.py',
+                      '--perf', '--work', '.work/perf-syscalls'], 120))
         return steps
     if tier in ('periodic', 'periodic-gui'):
         steps.append(('source-paths-differential', [sys.executable, '-B', 'tests/source-paths-differential.py',
@@ -126,10 +129,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'perl-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pw{int(remote)}'], 300))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if ruby:
+            steps.append(('ruby-watch-component', [sys.executable, '-B', 'tests/ruby-watch-component.py', '--ruby', ruby, '--work', '.work/rwc'], 120))
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+                steps.append(('ruby-watches'+suffix, [sys.executable, '-B', 'tests/ruby-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rw'+suffix, *extra], 300))
                 steps.append(('ruby-language'+suffix, [sys.executable, '-B', 'tests/ruby-language.py', '--ruby', ruby, '--strace', '--work', '.work/ruby'+suffix, *extra], 300))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+                steps.append(('javascript-watches'+suffix, [sys.executable, '-B', 'tests/javascript-watches.py', '--node', node, '--include', node_include, '--strace', '--work', '.work/jw'+suffix, *extra], 300))
                 steps.append(('javascript-context'+suffix, [sys.executable, '-B', 'tests/javascript-context.py', '--node', node, '--include', node_include, '--work', '.work/js-context'+suffix, '--strace', *extra], 1200))
             steps.append(('javascript-language', [sys.executable, '-B', 'tests/javascript-language.py', '--node', node, '--include', node_include, '--strace'], 180))
             steps.append(('javascript-cache', [sys.executable, '-B', 'tests/javascript-cache.py', '--node', node, '--include', node_include, '--work', '.work/js-cache'], 300))
@@ -202,8 +208,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if ruby:
+            steps.append(('ruby-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--ruby', ruby, '--work', '.work/rwg'], 300))
             steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300))
         if node:
+            steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 300))
             steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200))
             steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800))
             steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
@@ -366,6 +374,24 @@ def snapshot(destination):
         shutil.copy2(source, target)
         hashes[name] = hashlib.sha256(target.read_bytes()).hexdigest()
     return hashes
+
+
+def performance_summary(tree):
+    report = {}
+    statuses = []
+    for key, path, nested in (
+        ('measurements', '.work/perf-observers/results.json', None),
+        ('remote_stop_measurements', '.work/perf-remote-stops/results.json', 'performance'),
+        ('syscall_measurements', '.work/perf-syscalls/results.json', None),
+    ):
+        value = json.loads((tree / path).read_text())
+        status = (value[nested] if nested else value)['status']
+        if status not in ('measured', 'not-measurable'):
+            raise ValueError(key + ': measurements did not complete')
+        report[key] = value
+        statuses.append(status)
+    report['status'] = 'not-measurable' if 'not-measurable' in statuses else 'passed'
+    return report
 
 
 def main():
@@ -541,11 +567,7 @@ def main():
                 report.update(status='failed', reason=name + ': ' + result['status'])
                 return 1
         if args.tier == 'perf':
-            measurements = json.loads((tree / '.work/perf-observers/results.json').read_text())
-            if measurements['status'] not in ('measured', 'not-measurable'):
-                raise ValueError('Observer measurements did not complete')
-            report['measurements'] = measurements
-            report['status'] = 'not-measurable' if measurements['status'] == 'not-measurable' else 'passed'
+            report.update(performance_summary(tree))
         else:
             report['status'] = 'passed'
         return 0

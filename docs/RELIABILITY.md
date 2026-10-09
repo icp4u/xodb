@@ -220,3 +220,11 @@ The focused GUI checks retain the existing synchronization and timeout rules.
 They do not claim a new presentation acknowledgement or a timing-flake fix.
 Other expensive suites, including memdefrag and runtime-specific GUIs, still run
 in their original lanes pending separately reviewed coverage changes.
+
+The performance lane also records syscall-capture status-query latency against
+the historical 250 ms reference, with CPU, RSS and host load at the capture
+boundaries. This reference never fails a correctness gate; overloaded runs are
+labelled not measurable. The ordinary syscall check still requires exact
+records, observable overflow/loss, closed perf descriptors and lossless archive
+roundtrips. Run `python3 tests/syscall-timing.py --perf --work .work/syscall-perf`
+for just these measurements on a host with syscall tracing configured.

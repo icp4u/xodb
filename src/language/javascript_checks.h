@@ -26,6 +26,7 @@ static const struct {
     {"Script", "kLineOffsetOffset", 24, 0},
     {"Script", "kColumnOffsetOffset", 32, 0},
     {"SharedFunctionInfo", "kTrustedFunctionDataOffset", 8, 0},
+    {"SharedFunctionInfo", "kUniqueIdOffset", 64, 0},
     {"JSFunction", "kDispatchHandleOffset", 24, 1},
     {"Internals", "kIsolateJSDispatchTableOffset", 616, 1},
     {"JSDispatchEntry", "kObjectPointerShift", 16, 1},

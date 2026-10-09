@@ -80,7 +80,29 @@ static struct xrb_locals locals(uint64_t ec,uint64_t symbols,size_t frame,size_t
  struct xrb_reader r={.read=rd};struct xrb_locals out;xrb_locals_read(&p,&r,ec,0,symbols,frame,start,limit,&out);
  assert(out.count<=XRB_LOCAL_ITEMS&&out.total<=4096&&r.reads<=XRB_READ_LIMIT&&r.bytes<=XRB_BYTE_LIMIT);return out;
 }
+static void samples(void) {
+ struct xrb_sample out;struct xrb_reader r;
+ #define SAMPLE(v) do {r=(struct xrb_reader){.read=rd};xrb_sample_read(&p,&r,(v),&out);}while(0)
+ SAMPLE(UINT64_MAX);assert(!out.reason&&out.kind==1&&out.size==8);for(size_t i=0;i<8;++i)assert(out.bytes[i]==255);
+ SAMPLE(4);assert(!out.reason&&out.kind==3&&!out.size);
+ SAMPLE(0);assert(!out.reason&&out.kind==4&&!out.size);
+ SAMPLE(20);assert(!out.reason&&out.kind==5&&!out.size);
+ SAMPLE(UINT64_C(0x8000000000000002));assert(!out.reason&&out.kind==2&&out.size==8);for(size_t i=0;i<8;++i)assert(!out.bytes[i]);
+ uint64_t heap=alloc(32);set(heap,XRB_FLOAT_FLAGS,4);set(heap,XRB_FLOAT_VALUE,UINT64_C(0x8000000000000000));
+ SAMPLE(heap);assert(!out.reason&&out.kind==2&&out.bytes[7]==128);
+ uint64_t text=alloc(32),data_=alloc(4096);memset(bytes+(data_-BASE),'a',4096);set(text,XRB_STRING_FLAGS,5|8192|(1<<22));set(text,XRB_STRING_PTR,data_);set(text,XRB_STRING_LEN,4095);
+ SAMPLE(text);assert(!out.reason&&out.kind==6&&out.size==4096&&out.bytes[0]==1&&out.bytes[4095]=='a');
+ bytes[data_-BASE+4094]='b';SAMPLE(text);assert(!out.reason&&out.bytes[4095]=='b');
+ set(text,XRB_STRING_LEN,4096);SAMPLE(text);assert(out.reason&&!strcmp(out.reason,"RubyWatchSampleLimit")&&!out.size);
+ set(text,XRB_STRING_LEN,0);set(text,XRB_STRING_FLAGS,5|8192|(127<<22));SAMPLE(text);assert(out.reason&&!strcmp(out.reason,"RubyWatchEncodingUnsupported"));
+ set(text,XRB_STRING_FLAGS,5|8192);SAMPLE(text);assert(!out.reason&&out.size==1&&!out.bytes[0]);
+ set(text,XRB_STRING_LEN,10);set(text,XRB_STRING_PTR,UINT64_MAX);SAMPLE(text);assert(out.reason&&!out.size);
+ SAMPLE(12);assert(out.reason&&!strcmp(out.reason,"RubyWatchValueUnsupported"));
+ set(heap,XRB_FLOAT_FLAGS,10);SAMPLE(heap);assert(out.reason&&!strcmp(out.reason,"RubyWatchValueUnsupported"));
+ #undef SAMPLE
+}
 int main(void) {
+ samples();
  struct xrb_value v=value(15);assert(!v.reason&&!strcmp(v.display,"7"));v=value(UINT64_MAX);assert(!strcmp(v.display,"-1"));
  v=value(4);assert(!strcmp(v.display,"nil"));v=value(0);assert(!strcmp(v.display,"false"));v=value(20);assert(!strcmp(v.display,"true"));
  v=value(UINT64_C(0x8000000000000002));assert(!v.reason&&!strcmp(v.display,"0"));

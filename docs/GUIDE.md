@@ -152,14 +152,18 @@ In **Ruby**, select a logical frame for VM-stack locals and escaped closure
 environments. **E** accepts a bare local/capture name; the closest lexical scope
 wins. See [Ruby](RUBY.md) for the initial supported revision and explicit refusals.
 **E** in **C/C++** still uses the
-native expression/watch view. In **Lua**, **Python** or **Perl**, click a named
+native expression/watch view. In **Lua**, **Python**, **Perl** or **Ruby**, click a named
 binding then **W**, or use **Shift+E** with a local name (`$name` in Perl), to
 compare complete bounded scalar values at each stop.
 **V** opens the runtime watch list; changed rows show old and new values. Storage
 is resolved again after resume/GC. These watches observe stops; they do not
-interrupt a running process. JS and Ruby watch adapters are not yet available.
+interrupt a running process. In **JS**, **W** watches only an explicitly selected
+context-storage row; bare-name **Shift+E** stays refused and lexical visibility
+remains unproved.
 See [Lua watches](LUA.md#runtime-watches), [Python watches](PYTHON.md#runtime-watches)
-and [Perl watches](PERL.md#runtime-watches) for scope and comparison limits.
+[Perl watches](PERL.md#runtime-watches), [Ruby watches](RUBY.md#stopped-value-watches),
+and [JavaScript watches](JAVASCRIPT.md#comparing-context-values-at-stops) for scope
+and comparison limits.
 
 What you see is the interpreter's own C code, plus, for Perl, CPython, CRuby and V8, the
 script level:
@@ -213,7 +217,8 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Inside Perl | `./scripts/demo-perl` | **Space**, **Shift+E** `val` and `av` (live rows that update every stop), then keep pressing **Space**: `val` undef ↔ not in scope, `av` 3 ↔ 4 slots |
 | Inside CPython | `./scripts/demo-python` | **Space**, **E** `value` (list (8 items)), **E** `key` (str 'answer'), **E** `mp` (dict); in a second terminal `./scripts/demo-python stack` prints `record` ← `tick` ← `<module>` with file:line and the list's items |
 | Compare Lua values at each stop | `./scripts/demo-lua` | **Space**, **Lua**, select the loop frame at `lua-demo.lua:9`, **Shift+E** `value` **Return**, then **Space**. **V** shows changes; table/function values are explicitly unavailable. |
-| Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **E** `round` **Return**; continue to watch the next iteration |
+| Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
+| Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |

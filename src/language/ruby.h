@@ -81,5 +81,18 @@ void xrb_locals_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec
 void xrb_local_find(const struct xrb_layout *, struct xrb_reader *, uint64_t ec,
                     uint64_t zjit_entry, uint64_t symbols, size_t frame,
                     const char *expression, struct xrb_locals *);
+/* Complete scalar bytes, separate from the bounded display preview. Strings
+ * include their inline encoding index; extended encodings and object previews
+ * are unavailable, never compared as complete values. */
+#define XRB_SAMPLE_BYTES 4096
+struct xrb_sample {
+    uint32_t kind;
+    size_t size;
+    unsigned char bytes[XRB_SAMPLE_BYTES];
+    char type[24], display[512];
+    const char *reason;
+};
+void xrb_sample_read(const struct xrb_layout *, struct xrb_reader *, uint64_t,
+                     struct xrb_sample *);
 int xrb_dwarf_value(Dwarf_Die *);
 #endif

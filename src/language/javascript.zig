@@ -125,6 +125,8 @@ pub const Segment = struct {
     reason: ?[]const u8,
     layout_source: []const u8,
     dwarf_fields: u64,
+    root_register: u64,
+    entry_frame_pointer: u64,
     frames: []Frame,
     memory_reads: usize,
     memory_bytes: usize,
@@ -155,6 +157,8 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
         .reason = "JavaScriptNativeAnchorUnavailable",
         .layout_source = "postmortem-metadata",
         .dwarf_fields = layout.dwarf_fields,
+        .root_register = 0,
+        .entry_frame_pointer = 0,
         .frames = &.{},
         .memory_reads = 0,
         .memory_bytes = 0,
@@ -189,6 +193,8 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             .reason = try reason(a, f.reason),
         };
         segments[0].anchor = .{ .frame = frame.index, .pc = frame.pc, .symbol = if (frame.symbol) |s| try a.dupe(u8, s) else null };
+        segments[0].root_register = root;
+        segments[0].entry_frame_pointer = raw.entry_fp;
         segments[0].frames = frames;
         segments[0].state = if (raw.reason == null) "complete" else "partial";
         segments[0].reason = try reason(a, raw.reason);
@@ -298,4 +304,105 @@ pub fn evaluateLocal(session: *model.Session, tid: i32, segment: usize, frame: u
     if (segment >= observed.segments.len) return error.InvalidLanguageSegment;
     if (frame >= observed.segments[segment].frames.len) return error.InvalidLanguageFrame;
     return error.JavaScriptLexicalUnproved;
+}
+
+const WatchCapture = @import("watch.zig").Capture;
+// Image epoch + freshly verified main-image metadata guard runtime identity.
+// runtime[0] is the entry boundary; runtime[1] the isolate root;
+// runtime[2:4] hold scope positions/type. Only a complete walk to the same
+// boundary proves absence; a different/nested entry remains unavailable.
+// Frame words hold fp, GC-stable SFI id, selector marker, and context slot.
+// No context, value, function or SharedFunctionInfo heap pointer is retained.
+fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, f: Frame, row: ?usize) !void {
+    const layout = try session.metadata.javascript(session);
+    var expected = std.mem.zeroes(c.struct_xjs_frame);
+    expected.fp = f.frame_pointer;
+    expected.pc = f.pc;
+    expected.function = f.function;
+    expected.shared = f.shared;
+    expected.code = f.code;
+    expected.context = f.context;
+    expected.bytecode = f.bytecode;
+    if (!std.mem.eql(u8, f.kind, "interpreted")) return error.JavaScriptContextFrameUnproved;
+    @memcpy(expected.kind[0..f.kind.len], f.kind);
+    var cache = std.mem.zeroes(c.struct_xjs_read_cache);
+    var r = reader(session, &cache);
+    const raw = try a.create(c.struct_xjs_watch_result);
+    const key = c.struct_xjs_watch_key{
+        .fp = capture.scope.frame[0],
+        .shared_id = @intCast(capture.scope.frame[1]),
+        .scope_type = @intCast(capture.scope.runtime[3]),
+        .slot = @intCast(capture.scope.frame[3]),
+        .scope_start = @bitCast(@as(u32, @truncate(capture.scope.runtime[2]))),
+        .scope_end = @bitCast(@as(u32, @truncate(capture.scope.runtime[2] >> 32))),
+    };
+    c.xjs_watch_read(&layout, &r, &expected, row orelse 0, if (row != null) null else &key, if (row != null) null else capture.expression.ptr, raw);
+    capture.reads = r.reads;
+    capture.bytes = r.bytes;
+    if (row != null and raw.key_valid != 0) {
+        capture.expression = try a.dupeZ(u8, std.mem.sliceTo(&raw.name, 0));
+        capture.scope.runtime[2] = @as(u32, @bitCast(raw.key.scope_start)) | (@as(u64, @as(u32, @bitCast(raw.key.scope_end))) << 32);
+        capture.scope.runtime[3] = raw.key.scope_type;
+        capture.scope.frame[1] = raw.key.shared_id;
+        capture.scope.frame[2] = 1;
+        capture.scope.frame[3] = raw.key.slot;
+    }
+    if (raw.reason != null) {
+        capture.diagnostic = try a.dupeZ(u8, std.mem.span(raw.reason));
+        if (raw.gone != 0) capture.observation = c.XLW_FRAME_GONE;
+        return;
+    }
+    capture.observation = c.XLW_COMPLETE;
+    capture.sample = .{ .kind = raw.kind, .bytes = &raw.bytes, .size = raw.size, .type = &raw.type, .display = &raw.display };
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    if ((expression == null) == (row == null)) return error.InvalidArguments;
+    if (expression != null) return error.JavaScriptLexicalUnproved;
+    if (row.? >= c.XJS_CONTEXT_BINDINGS) return error.InvalidArguments;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
+    if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
+    const segment = observed.segments[segment_index];
+    if (segment.anchor == null or frame >= segment.frames.len) return error.InvalidLanguageFrame;
+    const selected = segment.frames[frame];
+    if (selected.reason != null or segment.root_register == 0 or segment.entry_frame_pointer == 0) return error.JavaScriptContextFrameUnproved;
+    const thread = for (session.target.threadSlice()) |entry| {
+        if (entry.tid == tid) break entry.id;
+    } else return error.InvalidThread;
+    var capture = WatchCapture{ .scope = .{
+        .language = c.XLW_JAVASCRIPT,
+        .session = session.id,
+        .image = session.target.snapshot().image_epoch,
+        .thread = thread,
+        .runtime = .{ segment.entry_frame_pointer, segment.root_register, 0, 0 },
+        .frame = .{ selected.frame_pointer, 0, 0, 0 },
+    }, .expression = try a.dupeZ(u8, "context") };
+    try watchValue(session, a, &capture, selected, row);
+    if (capture.scope.frame[2] == 0) return error.JavaScriptWatchBindingUnavailable;
+    try session.target.expectGeneration(observed.generation);
+    return capture;
+}
+pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
+    const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
+    var saw_runtime = false;
+    for (observed.segments) |segment| {
+        if (segment.root_register != scope.runtime[1] or segment.entry_frame_pointer != scope.runtime[0]) continue;
+        saw_runtime = true;
+        for (segment.frames) |frame| {
+            if (frame.frame_pointer != scope.frame[0]) continue;
+            if (frame.reason) |why| {
+                capture.diagnostic = try a.dupeZ(u8, why);
+                return capture;
+            }
+            try watchValue(session, a, &capture, frame, null);
+            try session.target.expectGeneration(observed.generation);
+            return capture;
+        }
+    }
+    if (saw_runtime) {
+        capture.observation = c.XLW_FRAME_GONE;
+        capture.diagnostic = try a.dupeZ(u8, "JavaScriptWatchFrameGone");
+    } else capture.diagnostic = try a.dupeZ(u8, "JavaScriptWatchFrameNotObserved");
+    try session.target.expectGeneration(observed.generation);
+    return capture;
 }

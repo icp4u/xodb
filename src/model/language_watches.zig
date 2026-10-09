@@ -6,6 +6,8 @@ const Session = @import("session.zig").Session;
 const Tab = @import("language_tabs.zig").Tab;
 const lua = @import("../language/lua.zig");
 const python = @import("../language/python.zig");
+const ruby = @import("../language/ruby.zig");
+const javascript = @import("../language/javascript.zig");
 const perl = @import("../language/perl.zig");
 const Capture = @import("../language/watch.zig").Capture;
 const A = std.mem.Allocator;
@@ -19,7 +21,7 @@ pub const State = struct {
         self.core = null;
     }
     pub fn add(self: *State, session: *Session, language: Tab, tid: i32, segment: usize, frame: usize, expression: ?[]const u8, row: ?usize) !u64 {
-        if (language != .lua and language != .python and language != .perl) return error.LanguageWatchRuntimeUnsupported;
+        if (language != .lua and language != .python and language != .perl and language != .ruby and language != .javascript) return error.LanguageWatchRuntimeUnsupported;
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
         if (segment >= 64 or frame >= 64 or tid <= 0) return error.InvalidArguments;
         if (c.xlw_count(self.core) >= c.XLW_ENTRIES) return error.LanguageWatchLimit;
@@ -28,6 +30,8 @@ pub const State = struct {
         const capture = switch (language) {
             .lua => try lua.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             .python => try python.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .ruby => try ruby.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
+            .javascript => try javascript.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             .perl => try perl.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             else => unreachable,
         };
@@ -83,6 +87,8 @@ pub const State = struct {
             const capture = (switch (scope.language) {
                 c.XLW_LUA => lua.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 c.XLW_PYTHON => python.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_RUBY => ruby.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
+                c.XLW_JAVASCRIPT => javascript.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 c.XLW_PERL => perl.observeWatch(session, arena.allocator(), tid.?, scope, std.mem.span(view.expression)),
                 else => error.LanguageWatchRuntimeUnsupported,
             }) catch |err| {
@@ -103,11 +109,14 @@ pub const State = struct {
         for (entries, 0..) |*entry, ordinal| {
             var view: c.struct_xlw_view = undefined;
             try check(c.xlw_get(self.core, ordinal, &view));
-            entry.* = .{ .semantics = if (view.scope.language == c.XLW_PERL) "stopped complete scalar representations; public IOK/NOK/POK changes count; no coercion or automatic interruption" else sample_semantics, .identity = if (view.scope.language == c.XLW_PERL) "stackinfo/context index and CV match; continuous activation lifetime between stops unproved" else frame_identity, .id = view.id, .language = switch (view.scope.language) {
+            const row_watch = view.scope.language == c.XLW_JAVASCRIPT or binding(view.scope);
+            entry.* = .{ .semantics = if (view.scope.language == c.XLW_JAVASCRIPT) "explicit context storage; lexical visibility unproved; complete UTF-16 strings and IEEE binary64 numbers; no coercion or automatic interruption" else if (view.scope.language == c.XLW_PERL) "stopped complete scalar representations; public IOK/NOK/POK changes count; no coercion or automatic interruption" else sample_semantics, .identity = if (view.scope.language == c.XLW_JAVASCRIPT) "entry/isolate/frame location, GC-stable function id and scope/slot match; continuous activation lifetime between stops unproved" else if (view.scope.language == c.XLW_PERL) "stackinfo/context index and CV match; continuous activation lifetime between stops unproved" else frame_identity, .id = view.id, .language = switch (view.scope.language) {
                 c.XLW_PYTHON => .python,
                 c.XLW_PERL => .perl,
+                c.XLW_RUBY => .ruby,
+                c.XLW_JAVASCRIPT => .javascript,
                 else => .lua,
-            }, .expression = try a.dupe(u8, std.mem.span(view.expression)), .observed_generation = view.observed_generation, .session = view.scope.session, .image_epoch = view.scope.image, .thread_id = view.scope.thread, .runtime_location = view.scope.runtime[1], .frame_location = view.scope.frame[0], .prototype = view.scope.frame[1], .selector = if (binding(view.scope)) .binding else .expression, .declaration = if (binding(view.scope)) view.scope.frame[3] else null, .state = switch (view.state) {
+            }, .expression = if (row_watch) "" else try a.dupe(u8, std.mem.span(view.expression)), .row_name = if (row_watch) try a.dupe(u8, std.mem.span(view.expression)) else null, .observed_generation = view.observed_generation, .session = view.scope.session, .image_epoch = view.scope.image, .thread_id = view.scope.thread, .runtime_location = view.scope.runtime[1], .frame_location = view.scope.frame[0], .prototype = view.scope.frame[1], .selector = if (view.scope.language == c.XLW_JAVASCRIPT) .context_storage else if (binding(view.scope)) .binding else .expression, .declaration = if (binding(view.scope)) view.scope.frame[3] else null, .state = switch (view.state) {
                 c.XLW_PENDING => .pending,
                 c.XLW_VALUE => .value,
                 c.XLW_UNAVAILABLE => .unavailable,
@@ -148,6 +157,7 @@ pub const Entry = struct {
     id: u64,
     language: Tab,
     expression: []const u8,
+    row_name: ?[]const u8 = null,
     observed_generation: u64,
     session: u64,
     image_epoch: u64,
@@ -155,7 +165,7 @@ pub const Entry = struct {
     runtime_location: u64,
     frame_location: u64,
     prototype: u64,
-    selector: enum { expression, binding },
+    selector: enum { expression, binding, context_storage },
     declaration: ?u64,
     state: enum { pending, value, unavailable, running, gone, context_changed },
     diagnostic: ?[]const u8,
