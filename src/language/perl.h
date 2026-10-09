@@ -155,6 +155,8 @@ void xpl_locals_read(const struct xpl_layout *, struct xpl_reader *, uint64_t in
 void xpl_local_find(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
                     size_t frame, const char *name, struct xpl_locals *);
 const char *xpl_expression_check(const char *);
+/* Bare container names remain valid for previews, but not scalar watches. */
+const char *xpl_watch_expression_check(const char *);
 /* Resolve from an already selected lexical SV. Used by the pad reader and by
  * independent runtime-oracle tests. Missing entries are explicit refusals. */
 struct xpl_path_value { uint64_t sv, slot; const char *reason; };

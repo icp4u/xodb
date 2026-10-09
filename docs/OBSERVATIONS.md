@@ -242,7 +242,7 @@ scrolling and selection never start analysis.
   Recomputation uses the same Session operation and busy rule as MCP
   `compare_observation`; a running comparison is not replaced. **Esc** cancels
   a running open or comparison, otherwise it closes the browser like **N**. **N**
-  in the main view reopens it with the same selection. **Q** quits.
+  in the main view reopens it with the same selection. **Shift+Q** quits.
 
 With `--session-socket`, agents read the same immutable capture. An agent's
 `compare_observation` still needs the controller lease; the human GUI does not.

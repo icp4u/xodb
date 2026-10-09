@@ -224,7 +224,7 @@ class Gui:
         return dict(re.findall(r'(\w+)=(\S+)', line.string if hasattr(line, 'string') else line))
 
     def quit(self):
-        self.ctx.inject('tap', '16')
+        self.ctx.inject('down', '42', 'tap', '16', 'up', '42')
         assert self.proc.wait(timeout=10) == 0, self.log.read_text(errors='replace')[-2000:]
 
 

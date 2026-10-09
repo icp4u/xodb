@@ -171,7 +171,7 @@ scalar reference. Each stop starts from the current lexical binding, so replacin
 a reference or growing an array does not leave a watch on the old storage.
 
 For a quick example, run `scripts/demo-perl`, press **Space**, select **Perl**
-and `main::store_answer`, then **Shift+E**, `$list->[3]`, **Return**. Continue
+and `main::store_answer`, then **Shift+E**, `$list->[-1]`, **Return**. Continue
 with **Space** through the store/delete stops to inspect the current element.
 An absent element is explicitly unavailable; inspection never creates it.
 
@@ -179,8 +179,13 @@ Paths allow at most eight subscriptions and 128 bytes total. Hash keys are
 ASCII identifiers or quoted printable ASCII strings (including the empty
 string), excluding backslashes, dollar signs and at signs; escapes,
 interpolation and non-ASCII keys are unsupported. Array
-indices are decimal integers from 0 to 2147483647, without leading zeros.
+indices are decimal integers from -2147483648 to 2147483647, without leading
+zeros. Negative indices count backward from the current last element, so `[-1]`
+follows a new last element after growth or shrinkage; `[-0]` means `[0]`.
 Unsupported syntax is refused at add/evaluate time, before creating a watch.
+Bare array/hash/sub names such as `@array`, `%hash` and `&sub` remain available
+for one-off previews but are refused as scalar watch expressions. Syntax errors
+are reported even when the watch list is full.
 Tied or magical storage, all blessed objects (including overload), restricted
 hashes, SV-backed hash keys, and noncontainers are refused with a typed reason.
 Missing keys, array holes and out-of-range indices are unavailable and may

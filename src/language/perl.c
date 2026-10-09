@@ -518,7 +518,7 @@ static int lexical_name(const char *name) {
     return 0;
 }
 enum { PATH_DEPTH = 8, PATH_BUCKETS = 4096, PATH_ENTRIES = 512 };
-struct path_step { int hash, dereference; uint64_t index; char key[129]; size_t length; };
+struct path_step { int hash, dereference, negative; uint64_t index; char key[129]; size_t length; };
 struct perl_path { char root[129]; size_t count; struct path_step steps[PATH_DEPTH]; };
 static int identifier(unsigned char ch, int first) {
     return ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
@@ -563,10 +563,12 @@ static const char *parse_path(const char *text, struct perl_path *out) {
             if (quote) ++at;
             if (at == n || text[at++] != '}') return "UnsupportedPerlExpression";
         } else {
+            if (at < n && text[at] == '-') { step->negative = 1; ++at; }
             size_t begin = at;
+            uint64_t limit = (uint64_t)INT32_MAX + (unsigned)step->negative;
             while (at < n && text[at] >= '0' && text[at] <= '9') {
                 unsigned digit = (unsigned)(text[at++] - '0');
-                if (step->index > (INT32_MAX - digit) / 10u) return "UnsupportedPerlExpression";
+                if (step->index > (limit - digit) / 10u) return "UnsupportedPerlExpression";
                 step->index = step->index * 10 + digit;
             }
             /* Leading zero integers have different Perl octal semantics. */
@@ -580,6 +582,12 @@ static const char *parse_path(const char *text, struct perl_path *out) {
 const char *xpl_expression_check(const char *expression) {
     struct perl_path path;
     return parse_path(expression, &path);
+}
+const char *xpl_watch_expression_check(const char *expression) {
+    struct perl_path path;
+    const char *why = parse_path(expression, &path);
+    if (why) return why;
+    return !path.count && path.root[0] != '$' ? "UnsupportedPerlExpression" : NULL;
 }
 static const char *path_head(const struct xpl_layout *l, struct xpl_reader *r, uint64_t sv,
                              uint64_t *body, uint32_t *flags) {
@@ -672,11 +680,13 @@ static void path_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t
         else {
             int64_t fill = (int64_t)at(l, r, body, XPL_AVFILL), max = (int64_t)at(l, r, body, XPL_AVMAX);
             uint64_t array = at(l, r, out->sv, XPL_UNION);
+            uint64_t length = fill < 0 ? 0 : (uint64_t)fill + 1;
+            uint64_t index = step->negative && step->index ? length - step->index : step->index;
             if (r->error) out->reason = r->error;
             else if (fill < -1 || max < -1 || fill > max || (fill >= 0 && !array)) out->reason = "PerlPathArrayInvalid";
-            else if (fill < 0 || step->index > (uint64_t)fill) out->reason = "PerlPathIndexOutOfRange";
+            else if (index >= length) out->reason = "PerlPathIndexOutOfRange";
             else {
-                out->slot = pointer_slot(r, array, step->index);
+                out->slot = pointer_slot(r, array, index);
                 out->sv = number(r, out->slot, 8);
                 out->reason = r->error ? r->error : out->sv ? NULL : "PerlPathArrayHole";
             }

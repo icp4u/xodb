@@ -24,6 +24,16 @@ class RunnerTests(unittest.TestCase):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
         (root / '.work').mkdir(exist_ok=True)
 
+    def test_safe_keys_cover_both_live_backends(self):
+        for tier in ('gui', 'all'):
+            steps = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            local = steps['gui-safe-keys']
+            agent = steps['gui-safe-keys-agent']
+            self.assertIn('tests/safe-keys-gui.py', local)
+            self.assertNotIn('--agent', local)
+            self.assertEqual(agent[agent.index('--agent') + 1], 'zig-out/bin/xodb-agent')
+            self.assertNotEqual(local[local.index('--work') + 1], agent[agent.index('--work') + 1])
+
     def test_lua_table_paths_have_transport_and_gui_coverage(self):
         steps = gate.plan('all', False, 'ReleaseSafe', lua=[('lua54','src54','lib54'), ('lua52','src52','lib52')])
         paths = [(name, cmd) for name, cmd, _ in steps if name.startswith('lua-path-watches-')]

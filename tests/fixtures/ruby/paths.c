@@ -5,7 +5,7 @@
 #ifdef XODB_RUBY_PATH_ORACLE
 #include <dlfcn.h>
 #include <gelf.h>
-static struct xrb_path_context path_context;
+static struct xrb_context path_context;
 static uint64_t elf_symbol(const char *wanted) {
     Dl_info image;CHECK(dladdr((void *)rb_hash_aref,&image));
     int fd=open(getenv("XODB_RUBY_ORACLE_IMAGE"),O_RDONLY|O_CLOEXEC);CHECK(fd>=0);
@@ -56,7 +56,7 @@ static VALUE wrong_seed(VALUE self,VALUE root,VALUE expression) {
     uint8_t salt[24];memcpy(salt,(void *)(uintptr_t)path_context.hash_salt,sizeof salt);
     /* Both halves change: integer/static-symbol and SipHash string key paths. */
     salt[0]^=0x40;salt[8]^=0x40;
-    struct xrb_path_context bad=path_context;bad.hash_salt=(uintptr_t)salt;
+    struct xrb_context bad=path_context;bad.hash_salt=(uintptr_t)salt;
     struct xrb_reader r={.read=owned_read};struct xrb_path_value actual;
     xrb_path_read(&layout,&r,&bad,(uintptr_t)root,StringValueCStr(expression),&actual);
     CHECK(actual.reason && !strcmp(actual.reason,"RubyPathHashUnproved") && !actual.address);
@@ -113,7 +113,7 @@ static VALUE corrupt_metadata(VALUE self,VALUE root,VALUE expression) {
     uint64_t table=root+layout.sizes[XRB_T_HASH];
     struct overlay cases[8];size_t count=0;
     cases[count++]=(struct overlay){root,(RBASIC(root)->flags&~RUBY_T_MASK)|T_OBJECT,8,0};
-    cases[count++]=(struct overlay){root+layout.fields[XRB_HASH_DEFAULT].offset,Qtrue,8,0};
+    cases[count++]=(struct overlay){root,RBASIC(root)->flags|RUBY_FL_USER2,8,0};
     if(RB_FL_TEST_RAW(root,RUBY_FL_USER3)) {
         cases[count++]=(struct overlay){table+layout.fields[XRB_ST_POWER].offset,63,1,0};
         cases[count++]=(struct overlay){table+layout.fields[XRB_ST_COUNT].offset,UINT64_MAX,8,0};

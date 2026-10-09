@@ -38,6 +38,7 @@ sub watched {
             ['$root->{player}{score}','$root',$phase==3?undef:\$root->{player}{score},$phase==3?'PerlPathKeyNotFound':''],
             ['$root->{player}{text}','$root',\$root->{player}{text},''],
             ['$root->{list}[1]','$root',$phase==6?undef:\$root->{list}[1],$phase==6?'PerlPathIndexOutOfRange':''],
+            ['$root->{list}[-1]','$root',\$root->{list}[-1],''],
             ['$hash{score}','%hash',\$hash{score},''],
             ['$hash{""}','%hash',\$hash{''},''],
             ['$hash{"a b"}','%hash',\$hash{'a b'},''],

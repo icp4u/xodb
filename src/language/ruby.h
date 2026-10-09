@@ -34,7 +34,7 @@ struct xrb_reader { void *context; xrb_read_fn read; size_t reads, bytes; const 
 #define XRB_STACK_FRAMES 128
 #define XRB_LOCAL_ITEMS 32
 #define XRB_PREVIEW_ITEMS 8
-struct xrb_item { uint64_t tagged; char type[24], display[256]; const char *reason; };
+struct xrb_item { uint64_t tagged; char key[256], type[24], display[256]; const char *reason; };
 struct xrb_value {
     uint64_t tagged, count;
     char type[24], display[512];
@@ -69,31 +69,32 @@ struct xrb_locals {
     const char *reason;
     struct xrb_local items[XRB_LOCAL_ITEMS];
 };
-void xrb_value_read(const struct xrb_layout *, struct xrb_reader *, uint64_t, struct xrb_value *);
+/* Addresses are resolved only in the verified loaded Ruby image. Class entries
+ * are addresses of VALUE globals, not cached object values. */
+struct xrb_context {
+    uint64_t symbols, hash_salt;
+    uint64_t hash_class, array_class, string_class, integer_class, symbol_class;
+    uint64_t hash_aref, array_aref, string_hash, string_eql, object_hash, object_eql, numeric_eql;
+    uint64_t any_hash, any_cmp;
+};
+/* A null context supports primitive scalar previews only. */
+void xrb_value_read(const struct xrb_layout *, struct xrb_reader *, const struct xrb_context *, uint64_t, struct xrb_value *);
 /* ec comes only from a proved native rb_vm_exec argument. zjit_entry is the
  * loaded rb_zjit_entry value (not its address). Never call inferior code. */
 void xrb_stack_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec, uint64_t zjit_entry, struct xrb_stack *);
 /* Rebuild canonical frames at this stop before inspecting their environment.
  * Locals and outer block captures expire on resume, GC or fiber switches. */
 void xrb_locals_read(const struct xrb_layout *, struct xrb_reader *, uint64_t ec,
-                     uint64_t zjit_entry, uint64_t symbols, size_t frame,
+                     uint64_t zjit_entry, const struct xrb_context *, size_t frame,
                      size_t start, size_t limit, struct xrb_locals *);
 void xrb_local_find(const struct xrb_layout *, struct xrb_reader *, uint64_t ec,
-                    uint64_t zjit_entry, uint64_t symbols, size_t frame,
+                    uint64_t zjit_entry, const struct xrb_context *, size_t frame,
                     const char *expression, struct xrb_locals *);
-/* Addresses are resolved only in the verified loaded Ruby image. Class entries
- * are addresses of VALUE globals, not cached object values. */
-struct xrb_path_context {
-    uint64_t symbols, hash_salt;
-    uint64_t hash_class, array_class, string_class, integer_class, symbol_class;
-    uint64_t hash_aref, array_aref, string_hash, string_eql, object_hash, object_eql, numeric_eql;
-    uint64_t any_hash, any_cmp;
-};
 struct xrb_path_value { uint64_t tagged, address; const char *reason; };
 const char *xrb_expression_check(const char *);
-void xrb_path_read(const struct xrb_layout *, struct xrb_reader *, const struct xrb_path_context *,
+void xrb_path_read(const struct xrb_layout *, struct xrb_reader *, const struct xrb_context *,
                    uint64_t root, const char *, struct xrb_path_value *);
-void xrb_expression_find(const struct xrb_layout *, struct xrb_reader *, const struct xrb_path_context *,
+void xrb_expression_find(const struct xrb_layout *, struct xrb_reader *, const struct xrb_context *,
                          uint64_t ec, uint64_t zjit, size_t frame, const char *, struct xrb_locals *);
 /* Complete scalar bytes, separate from the bounded display preview. Strings
  * include their inline encoding index; extended encodings and object previews

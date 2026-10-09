@@ -58,7 +58,7 @@ call. Selecting a pointer local watches the pointer's storage, not its pointee.
 The program makes two calls and exits. The service has a five-minute deadline
 starting at launch; `--seconds N` sets a shorter limit (1–300). The fixture also
 has parent-death protection and its own five-minute alarm once main starts.
-Use Q to finish; Detach is not needed for this demo.
+Use Shift+Q to finish; Detach is not needed for this demo.
 
 ## Transport and cleanup
 

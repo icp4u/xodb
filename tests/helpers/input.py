@@ -35,16 +35,18 @@ def note(name, detail):
 class Display:
     """A private headless Sway and one xodb inside it, with optional MCP on stdio."""
 
-    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True):
+    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True, binary=None, output_size=(1280, 800)):
         Display.count = getattr(Display, "count", 0) + 1
         self.tree = tree
+        self.width, self.height = output_size
+        assert self.width > 0 and self.height > 0
         self.dir = os.path.join(WORK, f"run-{Display.count:02d}")
         self.runtime = os.path.join(WORK, "rt", str(Display.count))  # short: the Sway socket must fit in sun_path
         os.makedirs(self.dir)
         os.makedirs(self.runtime, mode=0o700)
         config = os.path.join(self.dir, "sway.conf")
         with open(config, "w") as f:
-            f.write("xwayland disable\noutput HEADLESS-1 mode 1280x800\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\n" + ("seat seat0 hide_cursor 100\n" if hide_cursor else ""))
+            f.write(f"xwayland disable\noutput HEADLESS-1 mode {self.width}x{self.height}\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\n" + ("seat seat0 hide_cursor 100\n" if hide_cursor else ""))
         env = dict(os.environ)
         for key in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
             env.pop(key, None)
@@ -72,7 +74,7 @@ class Display:
         if wayland_debug:
             app_env["WAYLAND_DEBUG"] = "1"
         self.log = os.path.join(self.dir, "xodb.log")
-        self.app = subprocess.Popen([os.path.join(tree, "zig-out", "bin", "xodb"), *(["--mcp"] if stdio else []), *args], cwd=tree, env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.log, "wb"))
+        self.app = subprocess.Popen([binary or os.path.join(tree, "zig-out", "bin", "xodb"), *(["--mcp"] if stdio else []), *args], cwd=tree, env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.log, "wb"))
         self.procs.append(self.app)
         self.serial = 0
         self.notifications = []
@@ -155,7 +157,7 @@ class Display:
         # Every injected action is logged, so a trace can be told apart from real input.
         with open(os.path.join(self.dir, "injected.jsonl"), "a") as f:
             f.write(json.dumps({"unix_time": round(time.time(), 3), "script": script}) + "\n")
-        helper = subprocess.Popen([HELPER, "1280", "800", *script], env=self.env)
+        helper = subprocess.Popen([HELPER, str(self.width), str(self.height), *script], env=self.env)
         self.procs.append(helper)
         if wait:
             code = helper.wait(timeout=60)
@@ -234,7 +236,7 @@ def differs(a, b, region):
     return float(done.stderr.split()[0]) > 0
 
 def controls(tree):
-    """Space/F5/F6, F10/F11, F8, W, Tab, J/K, D, Q and Escape still do what they did."""
+    """Execution/navigation bindings work; Shift+D/Shift+Q are explicit and Escape only cancels."""
     d = Display(tree, M1)
     try:
         d.stopped()
@@ -257,10 +259,10 @@ def controls(tree):
         before = d.shot("g-before")
         d.keys("tap", KEY["g"])
         check("G opens the control-flow view", differs(before, d.shot("g-after"), "380x450+620+95"))
-        d.keys("tap", KEY["g"], "tap", KEY["d"])
-        check("D detaches", d.wait(lambda s: s["state"] == "idle"))
-        d.keys("tap", KEY["q"])
-        check("Q quits cleanly", d.app.wait(timeout=5) == 0 and "clean shutdown" in d.tail())
+        d.keys("tap", KEY["g"], "down", KEY["shift"], "tap", KEY["d"], "up", KEY["shift"])
+        check("Shift+D detaches", d.wait(lambda s: s["state"] == "idle"))
+        d.keys("down", KEY["shift"], "tap", KEY["q"], "up", KEY["shift"])
+        check("Shift+Q quits cleanly", d.app.wait(timeout=5) == 0 and "clean shutdown" in d.tail())
     finally:
         d.close()
     d = Display(tree, TARGET)
@@ -277,7 +279,9 @@ def controls(tree):
         d.keys("tap", KEY["k"])
         check("K selects the previous thread", not differs(before, d.shot("k-after"), THREADS_PANE))
         d.keys("tap", KEY["esc"])
-        check("Escape quits cleanly", d.app.wait(timeout=5) == 0)
+        check("Escape leaves the debugger open", d.alive())
+        d.keys("down", KEY["shift"], "tap", KEY["q"], "up", KEY["shift"])
+        check("Shift+Q quits cleanly", d.app.wait(timeout=5) == 0)
     finally:
         d.close()
 
@@ -296,8 +300,8 @@ def holding(tree):
         generation = d.session()["generation"]
         d.keys("down", KEY["f8"], "w", 1500, "up", KEY["f8"])
         check("holding F8 toggles agent scope once", d.session()["agent_scope"] == "control" and len([n for n in d.notifications if n["method"] == "notifications/tools/list_changed"]) == 1)
-        d.keys("down", KEY["q"], "w", 300, "up", KEY["q"])
-        check("Q quits on the press", d.app.wait(timeout=5) == 0, f"generation was {generation}")
+        d.keys("down", KEY["shift"], "down", KEY["q"], "w", 300, "up", KEY["q"], "up", KEY["shift"])
+        check("Shift+Q quits on the press", d.app.wait(timeout=5) == 0, f"generation was {generation}")
     finally:
         d.close()
     d = Display(tree, ["--", os.path.join(WORK, "threads")])
@@ -353,8 +357,8 @@ def layouts(tree):
         check("French layout: the key labelled A (QWERTY Q position) does not quit", d.alive() and d.trace()[-1]["shortcut"] in ("a", ""), d.trace()[-2:])
         # A opens the allocation inspector, which owns keys until dismissed.
         d.keys("tap", KEY["esc"])
-        d.keys("layout", "fr", "tap", KEY["a"])
-        check("French layout: the key labelled Q quits", d.app.wait(timeout=5) == 0)
+        d.keys("layout", "fr", "down", KEY["shift"], "tap", KEY["a"], "up", KEY["shift"])
+        check("French layout: Shift plus the key labelled Q quits", d.app.wait(timeout=5) == 0)
     finally:
         d.close()
     d = Display(tree, TARGET)
@@ -379,7 +383,7 @@ def layouts(tree):
         check("Russian layout: the Q position types Cyrillic and is not the Q shortcut", d.alive() and press["shortcut"] == "NoSymbol" and press["text"] == "й", press)
         check("Russian layout: F8 still acts", d.wait(lambda s: s["agent_scope"] == "control"))
         d.keys("layout", "ru", "tap", KEY["esc"])
-        check("Russian layout: Escape still quits", d.app.wait(timeout=5) == 0)
+        check("Russian layout: Escape leaves the debugger open", d.alive())
     finally:
         d.close()
 
@@ -430,7 +434,7 @@ def cursor(tree):
         # Only a capture that changes when the cursor is requested can show what the cursor looks like.
         visible = differs(with_cursor, without_cursor, "96x96+566+252")
         note("cursor appearance", "a cursor image is present in the capture; inspect cursor-divider.png" if visible else "NOT visually verified: the headless compositor's captures contain no cursor image")
-        d.keys("tap", KEY["q"])
+        d.keys("down", KEY["shift"], "tap", KEY["q"], "up", KEY["shift"])
         check("teardown with a cursor device is clean", d.app.wait(timeout=5) == 0 and "clean shutdown" in open(d.log, errors="replace").read())
     finally:
         d.close()

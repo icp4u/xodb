@@ -59,8 +59,8 @@ def active_layout():
         d.keys('layout','fr,ru','group',1,'tap',suite.KEY['a'])
         press = [e for e in d.trace() if e['kind']=='press' and e['code']==suite.KEY['a']][-1]
         suite.check('inactive French layout cannot supply Q while Russian is active',d.alive() and press['shortcut']=='NoSymbol' and press['text']=='ф',press)
-        d.keys('layout','fr,ru','group',0,'tap',suite.KEY['a'])
-        suite.check('selecting French makes the same key Q',d.app.wait(timeout=5)==0)
+        d.keys('layout','fr,ru','group',0,'down',suite.KEY['shift'],'tap',suite.KEY['a'],'up',suite.KEY['shift'])
+        suite.check('selecting French makes Shift plus the same key quit',d.app.wait(timeout=5)==0)
     finally:
         d.close()
 

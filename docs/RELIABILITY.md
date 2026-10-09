@@ -98,6 +98,13 @@ are covered by the ordinary host tier without that helper.
 `tests/fixtures`; shared private-display/input code lives in `tests/helpers`.
 APK, Android-native/app and standalone ARM64/sample-state checks have dedicated
 directories directly under `tests`. Their device opt-ins are unchanged.
+The private GUI `tests/helpers/input.py` Display accepts `binary=PATH` and
+`output_size=(width, height)`; defaults use the checkout binary at 1280×800.
+Set its `WORK` to an owned short path containing `/.work/input-` (for example,
+`WORK_DIR/.work/input-demo`). The virtual-input helper checks that path together
+with `XODB_TEST_PRIVATE_DISPLAY=1` before injecting; this is a guard against
+accidentally using an interactive desktop. Display creates its own Sway session.
+
 Old prototype patch runners and generated research outputs were removed;
 historical task/research notes may still mention their archived paths.
 

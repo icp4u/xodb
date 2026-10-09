@@ -25,8 +25,8 @@ the process panel or choose **Detach family**. It does not mean a kernel failure
   process. Newly admitted children inherit it; existing children keep their
   own setting.
 - **R** retries held admissions after their cause has been corrected.
-- **D in the process panel** detaches the highlighted process, its shared-vfork
-  family and pending children. **D outside the panel** remains ordinary detach
+- **Shift+D in the process panel** detaches the highlighted process, its shared-vfork
+  family and pending children. **Shift+D outside the panel** remains ordinary detach
   and refuses unresolved shared/pending relationships.
 - Closing xodb kills its owned launches/children and attempts to detach
   externally attached processes and their children.

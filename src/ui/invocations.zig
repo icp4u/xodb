@@ -318,7 +318,7 @@ pub const View = struct {
             };
             if (event.kind == .repeat and !navigation) continue;
             switch (event.shortcut) {
-                'q' => {
+                'q' => if (event.kind == .press and event.mods.shift) {
                     w.closing = true;
                     w.close_reason = .quit_key;
                     return;
@@ -400,7 +400,7 @@ pub const View = struct {
         try r.rect(.{ .x = 0, .y = 0, .w = width, .h = 44 }, theme.header);
         try r.rect(.{ .x = 0, .y = 43, .w = width, .h = 1 }, theme.border);
         const footer = height - 28 - reserved;
-        try label(r, font, 18, footer + 4, width - 36, theme.weak, "{s}", .{"J/K PgDn rows  Tab list  E R P C citations  Bksp back  [ ] T threshold  Esc cancel  N close  Q quit"});
+        try label(r, font, 18, footer + 4, width - 36, theme.weak, "{s}", .{"J/K PgDn rows  Tab list  E R P C citations  Bksp back  [ ] T threshold  Esc cancel  N close  Shift+Q quit"});
         const archive = session.observation_archive;
         const path = if (archive) |job_| job_.path else "";
         try label(r, font, 18, 12, width - 36, theme.text, "xodb / Invocations  {s}", .{path});

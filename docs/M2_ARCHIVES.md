@@ -15,7 +15,7 @@ over 60 seconds declare a required feature; old readers reject that feature.
 ~~~
 
 Use **P** to start sampling and **Space** to resume if the target is stopped.
-Use **P** again to stop sampling; **Q** closes xodb and saves the latest capture.
+Use **P** again to stop sampling; **Shift+Q** closes xodb and saves the latest capture.
 An active capture is stopped and drained before saving. Choose a new filename.
 A requested save without a capture, or a failed save, produces a nonzero exit.
 

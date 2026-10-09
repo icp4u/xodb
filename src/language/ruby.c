@@ -50,6 +50,16 @@ static int header(struct xrb_reader *r, uint64_t a, unsigned type, int imemo) {
     if ((f&RUBY_T_MASK)!=type || (imemo>=0 && ((f>>RUBY_FL_USHIFT)&15)!=(unsigned)imemo)) return fail(r,"RubyObjectTypeMismatch");
     return 1;
 }
+/* CRuby's builtin UTF-8 encoding index is 1 (encindex.h).
+ * Preserve valid UTF-8; all other non-ASCII bytes remain explicit escapes. */
+static size_t utf8_width(const uint8_t *s,size_t n) {
+    unsigned c=s[0];size_t width=c>=0xc2&&c<=0xdf?2:c>=0xe0&&c<=0xef?3:c>=0xf0&&c<=0xf4?4:0;
+    if(!width || n<width)return 0;
+    for(size_t i=1;i<width;++i)if((s[i]&0xc0)!=0x80)return 0;
+    if((c==0xe0 && s[1]<0xa0) || (c==0xed && s[1]>=0xa0) ||
+       (c==0xf0 && s[1]<0x90) || (c==0xf4 && s[1]>=0x90))return 0;
+    return width;
+}
 static int string(const struct xrb_layout *p, struct xrb_reader *r, uint64_t a,
                   char *out, size_t cap, uint64_t *length, int *truncated) {
     if (!header(r,a,RUBY_T_STRING,-1)) return 0;
@@ -61,6 +71,14 @@ static int string(const struct xrb_layout *p, struct xrb_reader *r, uint64_t a,
     *length=n; *truncated=count<n;
     for (size_t i=0;i<count;++i) {
         unsigned c=bytes[i]; size_t needed=c>=32&&c<127&&c!='\\'&&c!='"'?1:4;
+        size_t width=((f>>22)&127)==1?utf8_width(bytes+i,count-i):0;
+        if(width) {
+            if(width>=cap-k) { *truncated=1; break; }
+            memcpy(out+k,bytes+i,width);k+=width;i+=width-1;continue;
+        }
+        /* Do not emit a broken codepoint at the raw-byte preview boundary. */
+        size_t leading=c>=0xc2&&c<=0xdf?2:c>=0xe0&&c<=0xef?3:c>=0xf0&&c<=0xf4?4:0;
+        if(((f>>22)&127)==1 && n>count && leading>count-i) { *truncated=1;break; }
         if (needed>=cap-k) { *truncated=1; break; }
         if (needed==1) out[k++]=(char)c;
         else { snprintf(out+k,cap-k,"\\x%02x",c); k+=4; }
@@ -77,7 +95,81 @@ static int array(const struct xrb_layout *p, struct xrb_reader *r, uint64_t a, u
     if (*n>(UINT64_C(1)<<48) || (*n && !add(r,*data,*n*8))) return fail(r,"RubyArrayLengthInvalid");
     return 1;
 }
-static void decode(const struct xrb_layout *p, struct xrb_reader *r, uint64_t v, struct xrb_value *out, unsigned depth) {
+struct hash_storage { uint64_t table,entries,start,bound,count; int st; };
+/* Both paths and previews use the same validated raw entry layout. A preview
+ * does not compute hashes or apply Ruby lookup/default/method semantics. */
+static int hash_storage(const struct xrb_layout *p,struct xrb_reader *r,uint64_t value,
+                         uint64_t f,struct hash_storage *out) {
+    memset(out,0,sizeof *out);out->table=add(r,value,p->sizes[XRB_T_HASH]);
+    out->st=(f&RHASH_ST_TABLE_FLAG)!=0;
+    if(out->st) {
+        uint64_t power=field(p,r,out->table,XRB_ST_POWER);
+        out->start=field(p,r,out->table,XRB_ST_START);out->bound=field(p,r,out->table,XRB_ST_BOUND);
+        out->count=field(p,r,out->table,XRB_ST_COUNT);out->entries=field(p,r,out->table,XRB_ST_ENTRIES);
+        if(power<2 || power>32 || out->start>out->bound || out->bound>(UINT64_C(1)<<power) ||
+           out->count>out->bound-out->start)return fail(r,"RubyPathHashInvalid");
+    } else {
+        out->count=(f&RHASH_AR_TABLE_SIZE_MASK)>>RHASH_AR_TABLE_SIZE_SHIFT;
+        out->bound=(f&RHASH_AR_TABLE_BOUND_MASK)>>RHASH_AR_TABLE_BOUND_SHIFT;
+        out->entries=add(r,out->table,p->fields[XRB_AR_PAIRS].offset);
+        if(out->bound>8 || out->count>out->bound)return fail(r,"RubyPathHashInvalid");
+    }
+    return !r->error;
+}
+static int hash_entry(const struct xrb_layout *p,struct xrb_reader *r,const struct hash_storage *h,
+                       uint64_t i,uint64_t *stored,uint64_t *key,uint64_t *address) {
+    uint64_t entry=add(r,h->entries,i*p->sizes[h->st?XRB_T_ST_ENTRY:XRB_T_AR_PAIR]);
+    *stored=h->st?field(p,r,entry,XRB_ST_HASH):word(r,add(r,h->table,p->fields[XRB_AR_HINTS].offset+i),1);
+    if((h->st && *stored==UINT64_MAX) || (!h->st && !*stored))return 0;
+    *key=field(p,r,entry,h->st?XRB_ST_KEY:XRB_AR_KEY);
+    *address=add(r,entry,p->fields[h->st?XRB_ST_VALUE:XRB_AR_VALUE].offset);
+    return !r->error;
+}
+static void container_display(struct xrb_value *out,int hash) {
+    size_t used=(size_t)snprintf(out->display,sizeof out->display,"%s(%"PRIu64") %c",out->type,out->count,hash?'{':'[');
+    int shortened=0;
+    for(size_t i=0;i<out->item_count;++i) {
+        const struct xrb_item *item=&out->items[i];
+        size_t need=strlen(item->display)+(i?2:0)+(hash?strlen(item->key)+4:0);
+        /* Leave room for an explicit ellipsis, closing delimiter and NUL. */
+        if(need>=sizeof out->display-used-8) {shortened=1;break;}
+        used+=(size_t)snprintf(out->display+used,sizeof out->display-used,
+            hash?"%s%s => %s":"%s%s%s",i?", ":"",hash?item->key:"",item->display);
+    }
+    if(shortened || out->count>out->item_count) {
+        used+=(size_t)snprintf(out->display+used,sizeof out->display-used,"%s...",used && out->display[used-1]!='[' && out->display[used-1]!='{'?", ":"");
+        out->truncated=1;
+    }
+    snprintf(out->display+used,sizeof out->display-used,"%c",hash?'}':']');
+}
+static uint64_t id_string(const struct xrb_layout *,struct xrb_reader *,uint64_t,uint64_t);
+static int preview_class(const struct xrb_layout *p,struct xrb_reader *r,uint64_t value,uint64_t global) {
+    if(!global)return fail(r,"RubyPreviewClassUnproved");
+    uint64_t expected=word(r,global,8),actual=field(p,r,value,XRB_BASIC_CLASS);
+    if(r->error)return 0;
+    if(expected<4096)return fail(r,"RubyPreviewClassUnproved");
+    return actual==expected?1:fail(r,"RubyPreviewContainerClassUnsupported");
+}
+static void symbol_preview(const struct xrb_layout *p,struct xrb_reader *r,uint64_t symbols,
+                            uint64_t v,struct xrb_value *out,unsigned depth) {
+    strcpy(out->type,"Symbol");
+    uint64_t text;
+    if((v&0xff)==0x0c) {
+        if(!symbols) {fail(r,"RubySymbolNamesUnavailable");return;}
+        text=id_string(p,r,symbols,v>>8);
+    } else text=field(p,r,v,XRB_SYMBOL_STRING);
+    char display[480];
+    if(!string(p,r,text,display,depth?220:sizeof display,&out->count,&out->truncated))return;
+    int plain=!out->truncated && display[0] &&
+        ((display[0]>='a'&&display[0]<='z') || (display[0]>='A'&&display[0]<='Z') || display[0]=='_');
+    for(size_t i=1;display[i];++i) {
+        unsigned char c=(unsigned char)display[i];
+        if(!((c>='a'&&c<='z') || (c>='A'&&c<='Z') || (c>='0'&&c<='9') || c=='_'))plain=0;
+    }
+    if(plain)snprintf(out->display,sizeof out->display,":%s",display);
+    else snprintf(out->display,sizeof out->display,":\"%s\"%s",display,out->truncated?"...":"");
+}
+static void decode(const struct xrb_layout *p, struct xrb_reader *r, const struct xrb_context *ctx, uint64_t v, uint64_t root, struct xrb_value *out, unsigned depth) {
     memset(out,0,sizeof *out);out->tagged=v;
     if (r->error) goto done;
     if (v&1) {
@@ -93,32 +185,69 @@ static void decode(const struct xrb_layout *p, struct xrb_reader *r, uint64_t v,
         }
         double d;memcpy(&d,&bits,8);strcpy(out->type,"Float");snprintf(out->display,sizeof out->display,"%.17g",d);
     } else if ((v&0xff)==0x0c) {
-        strcpy(out->type,"Symbol");fail(r,"RubySymbolPreviewUnsupported");
+        symbol_preview(p,r,ctx?ctx->symbols:0,v,out,depth);
     } else {
         unsigned t=(unsigned)(flags(r,v)&RUBY_T_MASK);
         if (r->error) goto done;
         if (t==RUBY_T_STRING) {
             char text[480];
             strcpy(out->type,"String");
-            if (string(p,r,v,text,sizeof text,&out->count,&out->truncated))
+            if (string(p,r,v,text,depth?220:sizeof text,&out->count,&out->truncated))
                 snprintf(out->display,sizeof out->display,"\"%s\"%s",text,out->truncated?"...":"");
         } else if (t==RUBY_T_FLOAT) {
             uint64_t bits=field(p,r,v,XRB_FLOAT_VALUE); double d;memcpy(&d,&bits,8);
             strcpy(out->type,"Float");snprintf(out->display,sizeof out->display,"%.17g",d);
+        } else if (t==RUBY_T_SYMBOL) {
+            symbol_preview(p,r,ctx?ctx->symbols:0,v,out,depth);
+        } else if (t==RUBY_T_HASH) {
+            struct hash_storage h;strcpy(out->type,"Hash");
+            if(!preview_class(p,r,v,ctx?ctx->hash_class:0))goto done;
+            if(!hash_storage(p,r,v,flags(r,v),&h))goto done;
+            out->count=h.count;out->truncated=h.count>(depth?0:XRB_PREVIEW_ITEMS);
+            snprintf(out->display,sizeof out->display,"Hash(%"PRIu64")",h.count);
+            if(depth && v==root)strcpy(out->display,"{...}");
+            if(!depth) {
+                uint64_t i=h.start,actual=0;
+                for(;i<h.bound && i-h.start<512 && out->item_count<XRB_PREVIEW_ITEMS;++i) {
+                    uint64_t stored,key,address;
+                    if(!hash_entry(p,r,&h,i,&stored,&key,&address)) {if(r->error)break;continue;}
+                    ++actual;uint64_t tagged=word(r,address,8);if(r->error)break;
+                    struct xrb_value key_value,child;
+                    decode(p,r,ctx,key,root,&key_value,depth+1);
+                    if(r->error && !strcmp(r->error,"RubyReadBudget"))break;
+                    r->error=NULL;decode(p,r,ctx,tagged,root,&child,depth+1);
+                    struct xrb_item *item=&out->items[out->item_count++];item->tagged=tagged;
+                    snprintf(item->key,sizeof item->key,"%.255s",key_value.display);
+                    snprintf(item->type,sizeof item->type,"%s",child.type);
+                    snprintf(item->display,sizeof item->display,"%.255s",child.display);
+                    item->reason=key_value.reason?key_value.reason:child.reason;
+                    out->truncated|=key_value.truncated|child.truncated;
+                    if(r->error && !strcmp(r->error,"RubyReadBudget"))break;
+                    r->error=NULL;
+                }
+                if(!r->error && (actual>h.count || (i==h.bound && actual!=h.count)))fail(r,"RubyPathHashInvalid");
+                if(!r->error && i<h.bound && out->item_count<XRB_PREVIEW_ITEMS)fail(r,"RubyHashPreviewScanLimit");
+                if(!r->error)container_display(out,1);
+            }
         } else if (t==RUBY_T_ARRAY) {
             uint64_t data,n;strcpy(out->type,"Array");
+            if(!preview_class(p,r,v,ctx?ctx->array_class:0))goto done;
             if (!array(p,r,v,&data,&n)) goto done;
             out->count=n;out->truncated=n>(depth?0:XRB_PREVIEW_ITEMS);
             snprintf(out->display,sizeof out->display,"Array(%"PRIu64")",n);
+            if(depth && v==root)strcpy(out->display,"[...]");
             if (!depth) for (size_t i=0;i<n && i<XRB_PREVIEW_ITEMS;++i) {
                 uint64_t tagged=word(r,add(r,data,i*8),8);struct xrb_value child;
-                decode(p,r,tagged,&child,depth+1);
+                decode(p,r,ctx,tagged,root,&child,depth+1);
                 struct xrb_item *item=&out->items[out->item_count++];item->tagged=tagged;
+                snprintf(item->key,sizeof item->key,"%zu",i);
                 snprintf(item->type,sizeof item->type,"%s",child.type);
                 snprintf(item->display,sizeof item->display,"%.255s",child.display);item->reason=child.reason;
+                out->truncated|=child.truncated;
                 if (r->error && !strcmp(r->error,"RubyReadBudget")) break;
                 r->error=NULL;
             }
+            if(!depth && !r->error)container_display(out,0);
         } else {
             const char *name=t==RUBY_T_HASH?"Hash":t==RUBY_T_OBJECT?"Object":t==RUBY_T_CLASS?"Class":t==RUBY_T_MODULE?"Module":t==RUBY_T_BIGNUM?"Integer":t==RUBY_T_DATA?"Data":"unsupported";
             snprintf(out->type,sizeof out->type,"%s",name);fail(r,"RubyValueKindUnsupported");
@@ -131,8 +260,8 @@ done:
         snprintf(out->display,sizeof out->display,"unavailable (%s)",out->reason);
     }
 }
-void xrb_value_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t v, struct xrb_value *out) {
-    decode(p,r,v,out,0);
+void xrb_value_read(const struct xrb_layout *p, struct xrb_reader *r, const struct xrb_context *ctx, uint64_t v, struct xrb_value *out) {
+    decode(p,r,ctx,v,v,out,0);
 }
 static uint64_t body(const struct xrb_layout *p, struct xrb_reader *r, uint64_t iseq) {
     if (!header(r,iseq,RUBY_T_IMEMO,imemo_iseq)) return 0;
@@ -229,7 +358,7 @@ done:out->reason=r->error;
 static uint64_t typed_data(const struct xrb_layout *p, struct xrb_reader *r, uint64_t v) {
     return header(r,v,RUBY_T_DATA,-1)?field(p,r,v,XRB_DATA_PTR):0;
 }
-static int name(const struct xrb_layout *p, struct xrb_reader *r, uint64_t symbols, uint64_t id, char *out, size_t cap) {
+static uint64_t id_string(const struct xrb_layout *p, struct xrb_reader *r, uint64_t symbols, uint64_t id) {
     uint64_t serial=id>tLAST_OP_ID?id>>RUBY_ID_SCOPE_SHIFT:id;
     if (!serial || serial>=field(p,r,symbols,XRB_SYMBOLS_NEXT)) return fail(r,"RubyLocalIdInvalid");
     uint64_t dir=typed_data(p,r,field(p,r,symbols,XRB_SYMBOLS_IDS));
@@ -240,8 +369,11 @@ static int name(const struct xrb_layout *p, struct xrb_reader *r, uint64_t symbo
     uint64_t size=field(p,r,block,XRB_DARRAY_SIZE),capa=field(p,r,block,XRB_DARRAY_CAPA);
     if (size>capa || capa>512 || pos>=size) return fail(r,"RubySymbolBlockInvalid");
     uint64_t entry=add(r,block,p->sizes[XRB_T_DARRAY]+pos*p->sizes[XRB_T_ID]);
-    uint64_t length;int truncated;
-    if (!string(p,r,field(p,r,entry,XRB_ID_NAME),out,cap,&length,&truncated)) return 0;
+    return field(p,r,entry,XRB_ID_NAME);
+}
+static int name(const struct xrb_layout *p, struct xrb_reader *r, uint64_t symbols, uint64_t id, char *out, size_t cap) {
+    uint64_t value=id_string(p,r,symbols,id),length;int truncated;
+    if (!string(p,r,value,out,cap,&length,&truncated)) return 0;
     if (!length || truncated) return fail(r,"RubyLocalNameTruncated");
     return 1;
 }
@@ -261,7 +393,7 @@ static int environment(const struct xrb_layout *p, struct xrb_reader *r, const s
     return !r->error;
 }
 static void locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
-                     uint64_t zjit, uint64_t symbols, size_t frame,
+                     uint64_t zjit, const struct xrb_context *ctx, size_t frame,
                      size_t start, size_t limit, int preview, struct xrb_locals *out) {
     memset(out,0,sizeof *out);out->start=start;
     if (limit>XRB_LOCAL_ITEMS || start>4096) { out->reason="RubyLocalPageInvalid";return; }
@@ -282,10 +414,10 @@ static void locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64
             struct xrb_local *row=&out->items[out->count++];
             row->ordinal=ordinal;row->depth=depth;row->escaped=(env&VM_ENV_FLAG_ESCAPED)!=0;
             uint64_t id=word(r,add(r,table,i*8),8);row->hidden=!id || (id&RUBY_ID_SCOPE_MASK)==RUBY_ID_INTERNAL;
-            if (!row->hidden) name(p,r,symbols,id,row->name,sizeof row->name);
+            if (!row->hidden) name(p,r,ctx?ctx->symbols:0,id,row->name,sizeof row->name);
             row->reason=r->error;r->error=NULL;
             row->address=add(r,slots,i*8);row->tagged=word(r,row->address,8);
-            if (preview) xrb_value_read(p,r,row->tagged,&row->value);
+            if (preview) xrb_value_read(p,r,ctx,row->tagged,&row->value);
             if (r->error && !strcmp(r->error,"RubyReadBudget")) goto done;
             r->error=NULL;
         }
@@ -300,12 +432,12 @@ done:
     out->reason=r->error;out->truncated=out->total>start+out->count || out->reason!=NULL;
 }
 void xrb_locals_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
-                     uint64_t zjit, uint64_t symbols, size_t frame,
+                     uint64_t zjit, const struct xrb_context *ctx, size_t frame,
                      size_t start, size_t limit, struct xrb_locals *out) {
-    locals_read(p,r,ec,zjit,symbols,frame,start,limit,1,out);
+    locals_read(p,r,ec,zjit,ctx,frame,start,limit,1,out);
 }
 static void local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
-                    uint64_t zjit, uint64_t symbols, size_t frame,
+                    uint64_t zjit, const struct xrb_context *ctx, size_t frame,
                     const char *expression, int preview, struct xrb_locals *out) {
     memset(out,0,sizeof *out);
     size_t length=0;
@@ -316,7 +448,7 @@ static void local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_
         }
     }
     for (size_t start=0;start<4096;start+=XRB_LOCAL_ITEMS) {
-        struct xrb_locals page;locals_read(p,r,ec,zjit,symbols,frame,start,XRB_LOCAL_ITEMS,preview,&page);
+        struct xrb_locals page;locals_read(p,r,ec,zjit,ctx,frame,start,XRB_LOCAL_ITEMS,preview,&page);
         for (size_t i=0;i<page.count;++i) {
             struct xrb_local *row=&page.items[i];
             if (row->hidden) continue;
@@ -333,9 +465,9 @@ static void local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_
 }
 
 void xrb_local_find(const struct xrb_layout *p, struct xrb_reader *r, uint64_t ec,
-                    uint64_t zjit, uint64_t symbols, size_t frame,
+                    uint64_t zjit, const struct xrb_context *ctx, size_t frame,
                     const char *expression, struct xrb_locals *out) {
-    local_find(p,r,ec,zjit,symbols,frame,expression,1,out);
+    local_find(p,r,ec,zjit,ctx,frame,expression,1,out);
 }
 
 /* The exact supported revision's encoding.h defines seven bits starting at
@@ -380,7 +512,7 @@ void xrb_sample_read(const struct xrb_layout *p, struct xrb_reader *r, uint64_t 
         } else fail(r,"RubyWatchValueUnsupported");
     }
     if (!r->error) {
-        struct xrb_value preview;xrb_value_read(p,r,v,&preview);
+        struct xrb_value preview;xrb_value_read(p,r,0,v,&preview);
         if (preview.reason) fail(r,preview.reason);
         else {
             snprintf(out->type,sizeof out->type,"%s",preview.type);
@@ -493,7 +625,7 @@ static int builtin_method(const struct xrb_layout *p, struct xrb_reader *r,
     return fail(r,"RubyPathMethodUnproved");
 }
 static int path_methods(const struct xrb_layout *p, struct xrb_reader *r,
-                        const struct xrb_path_context *ctx, struct path_proof *proof, unsigned kind) {
+                        const struct xrb_context *ctx, struct path_proof *proof, unsigned kind) {
     if(proof->checked&(1u<<kind)) return 1;
     uint64_t klass=proof->classes[kind];
     if(kind<2) {
@@ -547,7 +679,7 @@ static int raw_ascii_key(const struct xrb_layout *p,struct xrb_reader *r,uint64_
     for(size_t i=0;i<n;++i)if(bytes[i]>=128) return fail(r,"RubyPathKeyUnsupported");
     *length=(size_t)n;return 1;
 }
-static int path_key(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+static int path_key(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_context *ctx,
                      struct path_proof *proof,uint64_t key,const struct ruby_step *wanted,
                      uint64_t *hash,int *equal) {
     *equal=0;
@@ -580,7 +712,7 @@ static int path_key(const struct xrb_layout *p,struct xrb_reader *r,const struct
     }
     *hash=hash_fixnum_range(*hash);return !r->error;
 }
-static int path_hash_lookup(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+static int path_hash_lookup(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_context *ctx,
                              struct path_proof *proof,uint64_t value,const struct ruby_step *step,
                              struct xrb_path_value *out) {
     /* A missing key still has a requested key type. Prove its hash/eql?
@@ -588,45 +720,39 @@ static int path_hash_lookup(const struct xrb_layout *p,struct xrb_reader *r,cons
     if(!path_methods(p,r,ctx,proof,step->kind==0?3:step->kind==1?2:4)) return 0;
     uint64_t f=flags(r,value);
     if(f&RHASH_COMPARE_BY_IDENTITY) return fail(r,"RubyPathIdentityHashUnsupported");
-    if(f&RHASH_PROC_DEFAULT || field(p,r,value,XRB_HASH_DEFAULT)!=4) return fail(r,"RubyPathDefaultUnsupported");
-    uint64_t table=add(r,value,p->sizes[XRB_T_HASH]);
-    uint64_t entries,start=0,bound,count;int st=(f&RHASH_ST_TABLE_FLAG)!=0;
+    if(f&RHASH_PROC_DEFAULT) return fail(r,"RubyPathDefaultUnsupported");
+    struct hash_storage h;
+    if(!hash_storage(p,r,value,f,&h))return 0;
+    uint64_t start=h.start,bound=h.bound,count=h.count;int st=h.st;
     if(st) {
-        uint64_t power=field(p,r,table,XRB_ST_POWER),type=field(p,r,table,XRB_ST_TYPE);
-        start=field(p,r,table,XRB_ST_START);bound=field(p,r,table,XRB_ST_BOUND);count=field(p,r,table,XRB_ST_COUNT);
-        entries=field(p,r,table,XRB_ST_ENTRIES);
-        if(power<2 || power>32 || start>bound || bound>(UINT64_C(1)<<power) || count>bound-start) return fail(r,"RubyPathHashInvalid");
+        uint64_t type=field(p,r,h.table,XRB_ST_TYPE);
         if(field(p,r,type,XRB_ST_COMPARE_FN)!=ctx->any_cmp || field(p,r,type,XRB_ST_HASH_FN)!=ctx->any_hash) return fail(r,"RubyPathHashTypeUnsupported");
-    } else {
-        count=(f&RHASH_AR_TABLE_SIZE_MASK)>>RHASH_AR_TABLE_SIZE_SHIFT;
-        bound=(f&RHASH_AR_TABLE_BOUND_MASK)>>RHASH_AR_TABLE_BOUND_SHIFT;
-        entries=add(r,table,p->fields[XRB_AR_PAIRS].offset);
-        if(bound>8 || count>bound) return fail(r,"RubyPathHashInvalid");
     }
     if(bound-start>XRB_PATH_ENTRIES) return fail(r,"RubyPathHashLimit");
     size_t actual=0;int found=0;struct xrb_path_value match={0};
     for(uint64_t i=start;i<bound;++i) {
-        uint64_t entry=add(r,entries,i*p->sizes[st?XRB_T_ST_ENTRY:XRB_T_AR_PAIR]);
-        uint64_t stored=st?field(p,r,entry,XRB_ST_HASH):word(r,add(r,table,p->fields[XRB_AR_HINTS].offset+i),1);
-        if((st && stored==UINT64_MAX) || (!st && !stored)) continue;
+        uint64_t stored,key,address,hash;int equal;
+        if(!hash_entry(p,r,&h,i,&stored,&key,&address)) {if(r->error)return 0;continue;}
         ++actual;
-        uint64_t key=field(p,r,entry,st?XRB_ST_KEY:XRB_AR_KEY),hash;int equal;
         if(!path_key(p,r,ctx,proof,key,step,&hash,&equal)) return 0;
         if(st) {if(hash==UINT64_MAX)hash=0;}
         else {hash&=255;if(!hash)hash=1;}
         if(hash!=stored) return fail(r,"RubyPathHashUnproved");
         if(equal) {
             if(found++) return fail(r,"RubyPathDuplicateKey");
-            match.address=add(r,entry,p->fields[st?XRB_ST_VALUE:XRB_AR_VALUE].offset);
+            match.address=address;
             match.tagged=word(r,match.address,8);
         }
     }
     if(r->error) return 0;
     if(actual!=count) return fail(r,"RubyPathHashInvalid");
-    if(!found) return fail(r,"RubyPathKeyNotFound");
+    if(!found) {
+        if(field(p,r,value,XRB_HASH_DEFAULT)!=4) return fail(r,"RubyPathDefaultUnsupported");
+        return fail(r,"RubyPathKeyNotFound");
+    }
     *out=match;return 1;
 }
-static void ruby_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+static void ruby_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_context *ctx,
                             uint64_t root,const struct ruby_path *path,struct xrb_path_value *out) {
     memset(out,0,sizeof *out);out->tagged=root;
     struct path_proof proof={0};
@@ -657,23 +783,23 @@ static void ruby_path_read(const struct xrb_layout *p,struct xrb_reader *r,const
     out->reason=r->error;
     if(out->reason)out->tagged=out->address=0;
 }
-void xrb_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+void xrb_path_read(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_context *ctx,
                    uint64_t root,const char *text,struct xrb_path_value *out) {
     struct ruby_path path;memset(out,0,sizeof *out);out->reason=ruby_path_parse(text,&path);
     if(!out->reason)ruby_path_read(p,r,ctx,root,&path,out);
 }
-void xrb_expression_find(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_path_context *ctx,
+void xrb_expression_find(const struct xrb_layout *p,struct xrb_reader *r,const struct xrb_context *ctx,
                          uint64_t ec,uint64_t zjit,size_t frame,const char *text,struct xrb_locals *out) {
     struct ruby_path path;memset(out,0,sizeof *out);out->reason=ruby_path_parse(text,&path);
     if(out->reason)return;
-    local_find(p,r,ec,zjit,ctx->symbols,frame,path.root,!path.count,out);
+    local_find(p,r,ec,zjit,ctx,frame,path.root,!path.count,out);
     if(out->reason || out->count!=1 || !path.count)return;
     struct xrb_local *row=&out->items[0];struct xrb_path_value value;
     ruby_path_read(p,r,ctx,row->tagged,&path,&value);
     row->address=value.address;row->tagged=value.tagged;row->reason=value.reason;
     snprintf(row->name,sizeof row->name,"%s",text);
     memset(&row->value,0,sizeof row->value);
-    if(!row->reason)xrb_value_read(p,r,row->tagged,&row->value);
+    if(!row->reason)xrb_value_read(p,r,ctx,row->tagged,&row->value);
     /* A path refusal belongs to the row. Preserve no partial value/address. */
     if(value.reason) { row->value.reason=value.reason; r->error=NULL; }
 }

@@ -42,7 +42,7 @@ cd ~/Work/xodb
 9. For scheduling lanes, open **F → S** and enable **Schedule**, then start a
    new capture with **P**. Setup controls subsequent GUI captures; existing
    captures keep their original settings. Scheduling defaults to off.
-10. **Q** closes xodb and cleans up the owned target.
+10. **Shift+Q** closes xodb and cleans up the owned target.
 
 The initial capture defaults are 99 Hz and a **60-second wall-clock deadline**,
 including time spent stopped. In the profile view, click the **Next** duration
@@ -87,7 +87,7 @@ offline captures. [Workflow, machine interface and limits](M2_SAMPLED_UNWIND.md)
 ```
 
 Attach pauses the process. **P** starts capture, **Space** resumes execution,
-and **P** stops capture. **D** detaches; closing xodb also preserves an attached
+and **P** stops capture. **Shift+D** detaches; closing xodb also preserves an attached
 process. The capture covers threads in that one process. A browser's content,
 GPU and utility processes have separate PIDs; attaching the browser parent does
 not include them. `grep '^Threads:' /proc/PID/status` counts that PID's threads;
@@ -488,7 +488,7 @@ Add `--profile-out NEW_FILE` when launching xodb:
 ```
 
 Capture with **P**, resume with **Space**, stop capture with **P**, and quit with
-**Q**. Shutdown saves the full latest capture; an active capture is stopped and
+**Shift+Q**. Shutdown saves the full latest capture; an active capture is stopped and
 drained first. The stderr message reports the saved sample count and path, or
 an explicit error. No capture means no file. Existing files are never replaced.
 

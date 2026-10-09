@@ -84,7 +84,7 @@ pub const View = struct {
             if ((event.kind == .press or event.kind == .repeat) and event.plain()) {
                 window.dirty = true;
                 switch (event.shortcut) {
-                    'q' => {
+                    'q' => if (event.kind == .press and event.mods.shift) {
                         window.closing = true;
                         window.close_reason = .quit_key;
                     },
@@ -168,7 +168,7 @@ pub const View = struct {
         try r.rect(all, theme.background);
         try r.rect(.{ .x = 0, .y = 0, .w = width, .h = 42 }, theme.header);
         try label(r, font, 16, 10, width - 32, theme.good, "xodb / Imported simpleperf profile", .{});
-        try label(r, font, 16, height - 29, width - 32, theme.weak, "{s}", .{if (self.inspector) "[ ] sample  Up/Down scroll  I close  X all  Q quit" else "Z zoom  Backspace out  I sample  X all  Q quit"});
+        try label(r, font, 16, height - 29, width - 32, theme.weak, "{s}", .{if (self.inspector) "[ ] sample  Up/Down scroll  I close  X all  Shift+Q quit" else "Z zoom  Backspace out  I sample  X all  Shift+Q quit"});
         const profile = state.profile orelse {
             if (state.failure) |err| {
                 try label(r, font, 16, 62, width - 32, theme.warm, "Import failed: {s}", .{@errorName(err)});

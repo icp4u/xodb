@@ -21,7 +21,7 @@ Allocation demo:
   A: allocation inspector. P: start on the selected stopped thread.
   Wait for "Tracing selected threads", then Space to run to allocation_marker phase=1.
   P: stop capture. L: lifetimes. O: outstanding (one 29-byte block).
-  Esc: return to source. Q: close and clean up the owned child.
+  Esc: return to source. Shift+Q: close and clean up the owned child.
 If perf is denied, see docs/ALLOCATIONS.md for the explicit helper option.
 HELP
 exec "$xodb" "$@" --break allocation_marker -- "$demo_dir/fixture" demo

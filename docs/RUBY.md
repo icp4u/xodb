@@ -37,12 +37,33 @@ constants, instance variables and method dispatch are unavailable; no Ruby code,
 `inspect`, coercions or getters run. A missing name is `RubyLocalNotFound`.
 
 Value previews cover tagged small integers, booleans, nil, floating-point values,
-strings and up to eight array elements. Strings retain their bytes with escapes
-for control and non-ASCII bytes. Larger strings/arrays show truncation. Other
-kinds, including hash contents and arbitrary objects, report
-`RubyValueKindUnsupported`. Header consistency does not prove GC liveness or an
+strings, static/dynamic Symbol names, and up to eight Array elements or Hash
+entries. Containers show a one-level inline preview, such as
+`Hash(2) {:state => :ready, "score" => 7}`. Nested containers show their count;
+direct self-references show `{...}` or `[...]` and do not recurse. Hash keys appear in the children's `key` fields in MCP.
+Strings and Symbol names display valid UTF-8 directly. ASCII control bytes,
+invalid UTF-8 and non-ASCII bytes in BINARY or other encodings stay escaped. Names with punctuation are quoted, for example `:"white space"`.
+Only the first 128 string/name bytes are considered; display buffers may shorten
+that further without cutting an escape or UTF-8 codepoint. Ellipses and `truncated` mark omitted
+content, including shortened children. Hash previews scan at most 512 stored
+positions to find the first eight entries; exceeding that bound reports
+`RubyHashPreviewScanLimit`. Unreadable children carry individual diagnostics.
+
+Container previews require the exact builtin Hash or Array class. Subclasses
+and objects with singleton classes refuse with `RubyPreviewContainerClassUnsupported`;
+an unavailable class proof reports `RubyPreviewClassUnproved`. Previews show raw
+storage, including identity hashes and non-nil defaults; they do not invoke `[]`, default procs, `hash`, `eql?` or
+`inspect`. This differs from the stricter path-lookup rules below. A preview is
+advisory, and does not establish complete container equality for watches.
+Arbitrary objects still report `RubyValueKindUnsupported`.
+Header consistency does not prove GC liveness or an
 allocation's complete extent. Native previews require the CRuby public header's
 `VALUE` typedef and representation in DWARF, plus the verified runtime.
+
+Try `./scripts/demo-cruby`: **Space**, choose **Ruby**, select **tick**, then
+**E**, enter `state`, **Return** to see a Symbol; repeat with `summary` or
+`values` for Hash/Array contents. **E** `summary[:state]` reads a Symbol leaf.
+Symbol and whole-container previews are not complete scalar watch samples.
 
 Agents use `get_language_stack` with `language: "ruby"` and a stopped thread ID,
 then `get_language_locals` or `evaluate_language_expression` with that generation,
@@ -161,7 +182,10 @@ and can recover at the next stop; they are never invented nil samples.
 Only exact builtin containers and supported String, Symbol or small Integer
 keys are inspected. Subclasses, singleton overrides, custom `[]`/`hash`/`eql?`,
 refined/prepended methods, unproved box-specific method tables, identity hashes,
-default procs/non-nil defaults and unsupported keys have explicit refusals.
+default procs and unsupported keys have explicit refusals. A non-nil plain
+default, such as `Hash.new(0)`, permits found stored keys; a miss remains
+`RubyPathDefaultUnsupported` rather than becoming a default-value sample.
+Unsupported syntax is still reported when the watch list is full.
 Method pointers and tables are checked in stopped memory; no Ruby methods run.
 The resulting scalar uses the complete-byte watch rules above, and the
 activation-lifetime caveat remains visible.

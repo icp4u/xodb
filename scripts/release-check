@@ -135,9 +135,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if ruby:
             steps.append(('ruby-path-component', [sys.executable, '-B', 'tests/ruby-path-component.py', '--ruby', ruby, '--sanitize', '--work', '.work/rpc'], 180))
+            steps.append(('ruby-preview-component', [sys.executable, '-B', 'tests/ruby-preview-component.py', '--ruby', ruby, '--sanitize', '--work', '.work/rprc'], 180))
             steps.append(('ruby-watch-component', [sys.executable, '-B', 'tests/ruby-watch-component.py', '--ruby', ruby, '--work', '.work/rwc'], 120))
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('ruby-path-watches'+suffix, [sys.executable, '-B', 'tests/ruby-path-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rpw'+suffix, *extra], 300))
+                steps.append(('ruby-previews'+suffix, [sys.executable, '-B', 'tests/ruby-previews.py', '--ruby', ruby, '--strace', '--work', '.work/rpr'+suffix, *extra], 300))
                 steps.append(('ruby-watches'+suffix, [sys.executable, '-B', 'tests/ruby-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rw'+suffix, *extra], 300))
                 steps.append(('ruby-language'+suffix, [sys.executable, '-B', 'tests/ruby-language.py', '--ruby', ruby, '--strace', '--work', '.work/ruby'+suffix, *extra], 300))
         if node:
@@ -213,9 +215,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
+        for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
+            steps.append(('gui-safe-keys'+suffix, [sys.executable, '-B', 'tests/safe-keys-gui.py', '--work', '.work/sk'+suffix, *extra], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if ruby:
+            steps.append(('ruby-previews-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--previews', '--ruby', ruby, '--work', '.work/rprg'], 300))
             steps.append(('ruby-path-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--ruby', ruby, '--work', '.work/rpg'], 300))
             steps.append(('ruby-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--ruby', ruby, '--work', '.work/rwg'], 300))
             steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300))

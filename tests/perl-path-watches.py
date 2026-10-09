@@ -73,7 +73,7 @@ def main():
         records = [json.loads(line) for line in result.stdout.splitlines() if line.startswith('{')]
         assert len(records) == 7 and 'done magic=0' in result.stdout
         count = sum(len(row['values']) for row in records)
-        assert count == 98 and f'verified {count} path samples' in result.stderr
+        assert count == 105 and f'verified {count} path samples' in result.stderr
         bad = work/'paths-negative.so'
         negative_command = [*build_command[:-2], '-DXODB_PERL_PATH_ORACLE_NEGATIVE', '-o', str(bad)]
         negative_build = subprocess.run(negative_command, capture_output=True, text=True, timeout=90)
@@ -85,7 +85,7 @@ def main():
         assert negative.returncode != 0 and 'CHECK failed: got.sv==' in negative.stderr, (
             'wrong element address was not rejected', negative.returncode, negative.stderr)
         (work/'results.json').write_text(json.dumps(dict(status='pass', stops=len(records), oracle_paths=count, sanitized=args.sanitize, negative_control="wrong address rejected", negative_returncode=negative.returncode), indent=2)+'\n')
-        print('Perl paths component: 98 public-API oracle paths, zero magic calls, malformed tables and every-read failures passed')
+        print('Perl paths component: 105 public-API oracle paths, zero magic calls, malformed tables and every-read failures passed')
         return
     client = None; target = subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                               stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -113,14 +113,35 @@ def main():
                 measured = dict(frontend=client.p.pid)
                 if args.agent: measured['agent'] = client.collector_pid()
                 result['resources'].append(dict(phase='metadata ready before watches', processes={k:usage(v) for k,v in measured.items()}, load=os.getloadavg()))
-                for expression in ('$root()', '$root->{f()}', '$root->[01]', '$root->[-1]', '$root->[2147483648]', '$root->{"$x"}', '$root->{x}'*9):
+                for expression in ('$root()', '$root->{f()}', '$root->[01]', '$root->[-01]', '$root->[2147483648]', '$root->{"$x"}', '$root->{x}'*9):
                     for tool in ('add_language_watch', 'evaluate_language_expression'):
                         reply = client.tool(tool, generation=generation, **args_, expression=expression)['result']
                         assert reply.get('isError') and reply['content'][0]['text']=='UnsupportedPerlExpression', (tool,expression,reply)
+                for expression in ('@array', '%hash', '&watched'):
+                    reply = client.tool('add_language_watch', generation=generation, **args_, expression=expression)['result']
+                    assert reply.get('isError') and reply['content'][0]['text']=='UnsupportedPerlExpression', reply
                 assert client.inspect('get_language_watches')['watches'] == []
                 for row in ground['values']:
                     expression = row['expression']
                     ids[expression] = client.action('add_language_watch', **args_, expression=expression)['added']
+                filler = client.action('add_language_watch', **args_, expression='$x')['added']
+                assert len(client.inspect('get_language_watches')['watches']) == 16
+                for language, expression, why in (
+                    ('perl', '@array', 'UnsupportedPerlExpression'),
+                    ('perl', '$x()', 'UnsupportedPerlExpression'),
+                    ('ruby', 'x()', 'UnsupportedRubyExpression'),
+                    ('lua', 'x()', 'LuaExpressionUnsupported'),
+                    ('python', 'x()', 'UnsupportedLanguageExpression'),
+                    ('javascript', 'x', 'JavaScriptLexicalUnproved')):
+                    reply = client.tool('add_language_watch', generation=generation, **(args_|dict(language=language)), expression=expression)['result']
+                    assert reply.get('isError') and reply['content'][0]['text']==why, (language,reply)
+                for language, selector in [('perl',dict(expression='$x')), ('ruby',dict(expression='x')),
+                                            ('lua',dict(expression='x')), ('python',dict(expression='x')),
+                                            ('javascript',dict(row=0))]:
+                    reply = client.tool('add_language_watch', generation=generation, **(args_|dict(language=language)), **selector)['result']
+                    assert reply.get('isError') and reply['content'][0]['text']=='LanguageWatchLimit', (language,reply)
+                client.action('remove_language_watch', id=filler)
+                result['full_watch_syntax_precedence'] = True
                 if args.strace:
                     def observe():
                         client.inspect('evaluate_language_expression', generation=generation, **args_, expression='$root->{player}{score}')

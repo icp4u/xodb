@@ -510,11 +510,15 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
     capture.observation = c.XLW_COMPLETE;
     capture.sample = .{ .kind = sample.kind, .bytes = &sample.bytes, .size = sample.size, .type = &sample.type, .display = &sample.display };
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8 {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
-    if (expression) |query| if (c.xpl_expression_check(try a.dupeZ(u8, query)) != null) return error.UnsupportedPerlExpression;
+    if (expression) |query| if (c.xpl_watch_expression_check(try a.dupeZ(u8, query)) != null) return error.UnsupportedPerlExpression;
     if (row) |index| if (index >= c.XPL_MAX_PAD_NAMES) return error.InvalidArguments;
+    return try a.dupeZ(u8, expression orelse "binding");
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment_ = observed.segments[segment_index];
@@ -533,7 +537,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
         .thread = thread,
         .runtime = .{ (try valueModule(session)).id, try std.fmt.parseInt(u64, instance_.address, 0), selected.stackinfo, 0 },
         .frame = .{ if (selected.stackinfo == 0) 0 else selected.context_index + 1, try std.fmt.parseInt(u64, selected.cv, 0), 0, 0 },
-    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    }, .expression = checked_expression };
     try watchValue(session, a, &capture, frame, try std.fmt.parseInt(u64, selected.context_address, 0), row);
     if (row != null and capture.scope.frame[2] == 0) return error.PerlWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);

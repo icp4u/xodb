@@ -630,10 +630,12 @@ static void paths(void) {
     l.fields[XPL_HEKLEN] = (struct xpl_field_info){4,4};
     l.fields[XPL_HEKKEY] = (struct xpl_field_info){8,1};
     memset(memory, 0, sizeof memory);
-    const char *valid[] = {"$x", "%h", "@a", "$h{k}", "$h{''}", "$h{\"a b\"}", "$a[0]", "$r->{k}->[2]", "$r->[0]{k}"};
-    const char *invalid[] = {NULL,"", "$r->{", "$r->{'x}", "$r->{x", "$r->{x}junk", "$r->[01]", "$r->[-1]", "$r->[2147483648]", "$r->{\"$x\"}", "$r->{'\\n'}", "$r->{\xc3\xa9}", "$r->{a}{a}{a}{a}{a}{a}{a}{a}{a}"};
+    const char *valid[] = {"$x", "%h", "@a", "$h{k}", "$h{''}", "$h{\"a b\"}", "$a[0]", "$a[-0]", "$a[-1]", "$a[-2147483648]", "$r->{k}->[2]", "$r->[0]{k}"};
+    const char *invalid[] = {NULL,"", "$r->{", "$r->{'x}", "$r->{x", "$r->{x}junk", "$r->[01]", "$r->[-01]", "$r->[-2147483649]", "$r->[--1]", "$r->[-]", "$r->[2147483648]", "$r->{\"$x\"}", "$r->{'\\n'}", "$r->{\xc3\xa9}", "$r->{a}{a}{a}{a}{a}{a}{a}{a}{a}"};
     for (size_t i=0;i<sizeof valid/sizeof *valid;++i) assert(!xpl_expression_check(valid[i]));
     for (size_t i=0;i<sizeof invalid/sizeof *invalid;++i) assert(xpl_expression_check(invalid[i]));
+    assert(xpl_watch_expression_check("@a") && xpl_watch_expression_check("%h") && xpl_watch_expression_check("&f"));
+    assert(!xpl_watch_expression_check("$x") && !xpl_watch_expression_check("$a[-1]") && !xpl_watch_expression_check("$h{k}"));
     const uint64_t rv=0x1100,hv=0x1200,body=0x2000,buckets=0x3000,he=0x4000,key=0x5000,av=0x6000,abody=0x7000,slots=0x8000,leaf=0x9000;
     sv(rv,0x801,0,hv);sv(hv,12,body,buckets);field(&l,body,XPL_HVMAX,7);field(&l,body,XPL_HVKEYS,1);
     put(buckets+3*8,he,8);field(&l,he,XPL_HEKEY,key);field(&l,he,XPL_HEVAL,av);
@@ -645,6 +647,16 @@ static void paths(void) {
     size_t total=attempts;
     for(size_t i=1;i<=total;++i) {fail_at=i;r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[2]",&out);assert(out.reason && !out.sv && !out.slot);}
     fail_at=0;
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-1]",&out);assert(!out.reason && out.sv==leaf && out.slot==slots+16);
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-2]",&out);assert(!strcmp(out.reason,"PerlPathArrayHole"));
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-4]",&out);assert(!strcmp(out.reason,"PerlPathIndexOutOfRange"));
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-2147483648]",&out);assert(!strcmp(out.reason,"PerlPathIndexOutOfRange"));
+    put(slots,leaf,8);field(&l,abody,XPL_AVFILL,0);
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-1]",&out);assert(!out.reason && out.slot==slots);
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-0]",&out);assert(!out.reason && out.slot==slots);
+    field(&l,abody,XPL_AVFILL,UINT64_MAX);
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[-1]",&out);assert(!strcmp(out.reason,"PerlPathIndexOutOfRange"));
+    put(slots,0,8);field(&l,abody,XPL_AVFILL,2);
     r=reader();xpl_path_read(&l,&r,hv,"$h{k}",&out);assert(!out.reason && out.sv==av);
     r=reader();xpl_path_read(&l,&r,rv,"$r->{absent}",&out);assert(!strcmp(out.reason,"PerlPathKeyNotFound"));
     r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[0]",&out);assert(!strcmp(out.reason,"PerlPathArrayHole"));

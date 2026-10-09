@@ -27,7 +27,7 @@ Backend cleanup and child-transfer foundations are already checked in.
   processes; human revocation applies immediately to every session.
 - Vfork memory sharing is explicit: the parent cannot continue and software
   byte changes are refused until separation. Instruction stepping works.
-  **Detach family (D inside the panel)** restores traps before releasing shared
+  **Detach family (Shift+D inside the panel)** restores traps before releasing shared
   members and pending children; independently adopted fork children stay attached.
 - CPU profiles remain per process. CLI shutdown exports refer to process 1;
   MCP can save an explicitly selected child's capture. Whole-tree aggregation,

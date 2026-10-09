@@ -23,7 +23,7 @@ const ToolButton = struct { label: []const u8, key: []const u8, code: u32, x: f3
 // One table for drawing and hit-testing. The zones are the ones the smoke tests click.
 const buttons = [_]ToolButton{
     .{ .label = "Continue", .key = "SPACE", .code = 57, .x = 18, .w = 174 },
-    .{ .label = "Detach", .key = "D", .code = 32, .x = 212, .w = 138 },
+    .{ .label = "Detach", .key = "Shift+D", .code = 32, .x = 200, .w = 166 },
     .{ .label = "Step", .key = "F11", .code = 87, .x = 375, .w = 104 },
     .{ .label = "Over", .key = "F10", .code = 68, .x = 485, .w = 110 },
     .{ .label = "Agent", .key = "F8", .code = 66, .x = 605, .w = 200 },
@@ -341,7 +341,7 @@ pub const Workspace = struct {
             keys.sym.down => 108,
             'a' => 30,
             'w' => 17,
-            'd' => 32,
+            'd' => if (event.mods.shift) 32 else 0,
             'g' => 34,
             'p' => 25,
             't' => 20,
@@ -353,7 +353,7 @@ pub const Workspace = struct {
             0xff08 => 14, // BackSpace
             'j' => 36,
             'k' => 37,
-            'q' => 16,
+            'q' => if (event.mods.shift) 16 else 0,
             'b' => 48,
             'm' => 50,
             'r' => 19,
@@ -1327,7 +1327,7 @@ pub const Workspace = struct {
                 }
             }
         }
-        if (code == 16 or code == 1) {
+        if (code == 16) {
             w.closing = true;
             w.close_reason = .quit_key;
         }
@@ -2272,7 +2272,7 @@ test "queued drag preserves release position and quit ends the batch" {
     workspace.input(&w, &session);
     try std.testing.expectApproxEqAbs(@as(f32, 0.55), workspace.split, 0.001);
     try std.testing.expect(!workspace.dragging);
-    w.input.queue[0] = .{ .kind = .press, .shortcut = 'q' };
+    w.input.queue[0] = .{ .kind = .press, .shortcut = 'q', .mods = .{ .shift = true } };
     w.input.queue[1] = .{ .kind = .press, .shortcut = keys.sym.f8 };
     w.input.head = 0;
     w.input.count = 2;

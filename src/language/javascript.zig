@@ -355,10 +355,14 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, f: Frame, r
     capture.observation = c.XLW_COMPLETE;
     capture.sample = .{ .kind = raw.kind, .bytes = &raw.bytes, .size = raw.size, .type = &raw.type, .display = &raw.display };
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8 {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression != null) return error.JavaScriptLexicalUnproved;
     if (row.? >= c.XJS_CONTEXT_BINDINGS) return error.InvalidArguments;
+    return try a.dupeZ(u8, "context");
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
@@ -375,7 +379,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
         .thread = thread,
         .runtime = .{ segment.entry_frame_pointer, segment.root_register, 0, 0 },
         .frame = .{ selected.frame_pointer, 0, 0, 0 },
-    }, .expression = try a.dupeZ(u8, "context") };
+    }, .expression = checked_expression };
     try watchValue(session, a, &capture, selected, row);
     if (capture.scope.frame[2] == 0) return error.JavaScriptWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);

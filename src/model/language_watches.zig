@@ -24,9 +24,21 @@ pub const State = struct {
         if (language != .lua and language != .python and language != .perl and language != .ruby and language != .javascript) return error.LanguageWatchRuntimeUnsupported;
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
         if (segment >= 64 or frame >= 64 or tid <= 0) return error.InvalidArguments;
-        if (c.xlw_count(self.core) >= c.XLW_ENTRIES) return error.LanguageWatchLimit;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
+        if (c.xlw_count(self.core) >= c.XLW_ENTRIES) {
+            // Validate the selector without touching target memory, even when
+            // no new watch fits. Runtime grammar remains owned by the C parsers.
+            _ = try switch (language) {
+                .lua => lua.watchExpression(arena.allocator(), expression, row),
+                .python => python.watchExpression(arena.allocator(), expression, row),
+                .ruby => ruby.watchExpression(arena.allocator(), expression, row),
+                .javascript => javascript.watchExpression(arena.allocator(), expression, row),
+                .perl => perl.watchExpression(arena.allocator(), expression, row),
+                else => unreachable,
+            };
+            return error.LanguageWatchLimit;
+        }
         const capture = switch (language) {
             .lua => try lua.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),
             .python => try python.createWatch(session, arena.allocator(), tid, segment, frame, expression, row),

@@ -27,7 +27,7 @@ In the GUI:
 4. While collection is running, press **P** to stop sampling. The program keeps
    running. If the program exited or the capture stopped automatically, skip
    this step: pressing **P** then would attempt a new capture.
-5. Press **Q** to close xodb and wait for it to return to the terminal.
+5. Press **Shift+Q** to close xodb and wait for it to return to the terminal.
    `before.xoc` is now saved. Closing xodb ends a program it launched.
 
 Rebuild or change the workload, then repeat the same steps with a new filename:
@@ -50,7 +50,7 @@ xodb --capture-out before.xoc --attach PID
 ```
 
 Attach pauses the process: start at step 2 (**P**, **Space**, workload, **P**
-while collecting, **Q**). Closing xodb detaches and preserves an attached
+while collecting, **Shift+Q**). Closing xodb detaches and preserves an attached
 process. If sampling cannot start, check the status line and
 [tracing permissions](../SETUP.md).
 
@@ -64,7 +64,7 @@ Alternatively, disable that breakpoint after reaching the intended phase:
 return to the source workspace with **F** if viewing flames, press **B**, select
 the breakpoint, press **Space** to disable it, then **Esc** to close the manager.
 With no capture running, use **P**, **Space**, a few seconds of work, **P**,
-**Q**. If a capture is already collecting, just resume with **Space**. Skip the
+**Shift+Q**. If a capture is already collecting, just resume with **Space**. Skip the
 stop-collection **P** if collection has already stopped automatically.
 
 ## Open and compare

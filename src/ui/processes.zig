@@ -54,7 +54,7 @@ pub const Panel = struct {
             keys.sym.down, 'j' => self.wheel(tree, 1),
             0xff55 => self.wheel(tree, -@as(i32, @intCast(@max(1, self.visible)))),
             0xff56 => self.wheel(tree, @intCast(@max(1, self.visible))),
-            else => if (event.kind == .press) {
+            else => if (event.kind == .press and (event.shortcut != 'd' or event.mods.shift)) {
                 self.action(tree, event.shortcut) catch |err| {
                     self.message = @errorName(err);
                 };
@@ -92,7 +92,7 @@ pub const Panel = struct {
         const current = tree.entries[self.cursor];
         try style.button(r, font, .{ .x = b.x + 12, .y = b.y + 64, .w = 166, .h = 29 }, if (current.session.target.snapshot().follow_processes) "Follow: on" else "Follow: off", "F", theme.good, 0, 0);
         try style.button(r, font, .{ .x = b.x + 187, .y = b.y + 64, .w = 145, .h = 29 }, "Retry held", "R", theme.text, 0, 0);
-        try style.button(r, font, .{ .x = b.x + 342, .y = b.y + 64, .w = @min(218, b.w - 354), .h = 29 }, "Detach family", "D", theme.warm, 0, 0);
+        try style.button(r, font, .{ .x = b.x + 342, .y = b.y + 64, .w = @min(218, b.w - 354), .h = 29 }, "Detach family", "Shift+D", theme.warm, 0, 0);
         const count: usize = @intFromFloat(@max(1, (b.h - 206) / 28));
         if (self.cursor < self.first) self.first = self.cursor;
         if (self.cursor >= self.first + count) self.first = self.cursor + 1 - count;

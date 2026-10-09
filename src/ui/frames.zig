@@ -86,7 +86,7 @@ pub const View = struct {
             if ((event.kind == .press or event.kind == .repeat) and event.plain()) {
                 w.dirty = true;
                 switch (event.shortcut) {
-                    'q' => {
+                    'q' => if (event.kind == .press and event.mods.shift) {
                         w.closing = true;
                         w.close_reason = .quit_key;
                     },
@@ -144,7 +144,7 @@ pub const View = struct {
         r.clip = all;
         try r.rect(all, theme.background);
         try label(r, font, 16, 18, width - 32, theme.text, "LOGICAL FRAMES  /  separate from native stacks", .{});
-        try label(r, font, 16, height - 28, width - 32, theme.weak, "L native workspace   [ / ] source   J/K select   Enter source   T thread   Esc cancel   Q quit", .{});
+        try label(r, font, 16, height - 28, width - 32, theme.weak, "L native workspace   [ / ] source   J/K select   Enter source   T thread   Esc cancel   Shift+Q quit", .{});
         if (state.attachment.failure) |err| {
             try label(r, font, 16, 50, width - 32, theme.warm, "Archive attachments {s}: {s} (original bytes retained)", .{ @tagName(state.attachment.state), @errorName(err) });
         } else if (state.failure) |err| try label(r, font, 16, 50, width - 32, theme.warm, "Frame job: {s}", .{@errorName(err)});

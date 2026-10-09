@@ -32,7 +32,10 @@ pub const Panel = struct {
             }
             if (!event.plain() or (event.kind != .press and event.kind != .repeat)) continue;
             switch (event.shortcut) {
-                'q' => w.closing = true,
+                'q' => if (event.kind == .press and event.mods.shift) {
+                    w.closing = true;
+                    w.close_reason = .quit_key;
+                },
                 'v' => self.open = false,
                 0xff1b => {
                     if (!job.done.load(.acquire)) job.progress.cancel.store(true, .release);
@@ -70,7 +73,7 @@ pub const Panel = struct {
         self.hit_count = 0;
         try r.rect(all, theme.background);
         try r.rect(.{ .x = 0, .y = 0, .w = width, .h = 44 }, theme.header);
-        try r.textFit(font, 18, 12, width - 36, "CPU COMPARISON   F flames / rankings   V after capture   Backspace reset   Q quit", theme.text);
+        try r.textFit(font, 18, 12, width - 36, "CPU COMPARISON   F flames / rankings   V after capture   Backspace reset   Shift+Q quit", theme.text);
         var buffer: [512]u8 = undefined;
         try r.textFit(font, 18, 56, width - 36, std.fmt.bufPrint(&buffer, "Before: {s}", .{job.paths[0]}) catch "Before", theme.weak);
         try r.textFit(font, 18, 80, width - 36, std.fmt.bufPrint(&buffer, "After:  {s}", .{job.paths[1]}) catch "After", theme.weak);

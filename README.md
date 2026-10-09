@@ -52,7 +52,7 @@ event timeline.*
 
 Keys, in brief: **F10** step over · **G** graph/asm · **P** profile · **F**
 flames · **E** pinned expression · **Shift+E** live display · **Shift+L** convert selected watch · **V** watch/events · **Tab** locals/registers
-· **J/K** threads · **D** detach · **F8** grant or yank agent control.
+· **J/K** threads · **Shift+D** detach · **F8** grant or yank agent control · **Shift+Q** quit.
 Letter shortcuts follow your active keyboard layout. In text fields, **Ctrl+V**
 pastes, **middle-click** pastes the primary selection, and **Ctrl+C** copies.
 See [text editing](docs/GUIDE.md#text-editing-and-clipboard).
@@ -194,7 +194,7 @@ They are development packaging, not published distribution packages.
 ```
 
 **Space** to continue · **F11** steps a source line · click `item->value` in
-Locals, press **W** · **Space** again and watch it catch the store · **Q** saves
+Locals, press **W** · **Space** again and watch it catch the store · **Shift+Q** saves
 the investigation. Full walkthrough and limits: [docs/M1.md](docs/M1.md).
 
 Other things to poke at: `./scripts/demo-cruby` (break on `rb_ary_store`, inspect

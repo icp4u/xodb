@@ -28,6 +28,22 @@ detailed docs. If you just want to try something, jump to
 | Ask which process holds a file, or count one process's descriptor IO | **FD observers over MCP** (`get_fd_activity`, `who_has_open`, `get_fd_leaks`, `get_deleted_open`) | Shared cached polling; exact events require explicit control and slow host-wide syscalls while active. Coverage, age, loss and cost accompany the data ([details](MCP_FD.md)) |
 | Ask "what feeds this value?" or "what controls this call?" | **Static slice** (**S** on an instruction or source line; `slice_value` over MCP) | The parameters, values and branches that can reach it, with instruction and source citations and a trust label. Static possibilities, not an observed run ([details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 
+## Debugger keys that change process state
+
+| Action | Key |
+| --- | --- |
+| Detach and preserve the target (or its shared family in Processes) | **Shift+D** |
+| Quit the debugger; kill owned launches, preserve attached processes | **Shift+Q** |
+| Restart an owned launch | **F4** |
+| Continue or interrupt | **Space**, **F5** or **F6** |
+| Cancel an edit or close the current panel | **Esc** |
+
+Plain **d** and **q**, including Caps Lock, do not detach or quit. Shifted letters
+remain text while an editor has focus. **Esc** in the main workspace does not
+quit. **W** creates a watch investigation; it does not write the selected value.
+Memory/register writes and continuing all process sessions are explicit MCP
+operations, with no single-letter global GUI shortcut.
+
 ## What is an observation?
 
 An observation records **every call to the functions you name** in a running
@@ -206,6 +222,7 @@ script level:
 - **CRuby frames and locals.** `scripts/demo-cruby`, **Space**, choose **Ruby**,
   select **tick**, then **E**, `round`, **Return**. Native `VALUE` previews and
   named stack/escaped-environment bindings are read without target calls.
+  **E** `state`, `summary` or `values` shows Symbol, Hash and Array previews.
   The initial exact-revision DWARF profile and refusals are in [Ruby](RUBY.md).
 
 Imported logical frames, including JVM exports, remain separate evidence; see

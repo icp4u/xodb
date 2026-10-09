@@ -447,12 +447,16 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
     capture.observation = c.XLW_COMPLETE;
     capture.sample = .{ .kind = kind, .bytes = bytes.ptr, .size = length, .type = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.type, 0))).ptr, .display = (try a.dupeZ(u8, std.mem.sliceTo(&item.value.display, 0))).ptr };
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8 {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression) |text| if (text.len == 0 or text.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidArguments;
     if (row) |index| if (index >= 4096) return error.InvalidArguments;
     const checked_expression = try a.dupeZ(u8, expression orelse "binding");
     if (expression != null and c.xl_expression_valid(checked_expression) == 0) return error.LuaExpressionUnsupported;
+    return checked_expression;
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];

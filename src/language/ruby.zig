@@ -101,15 +101,15 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
 }
 fn converted(a: A, v: *const c.struct_xrb_value) !named.Value {
     const children = try a.alloc(named.Child, v.item_count);
-    for (v.items[0..v.item_count], children, 0..) |child, *out, i| out.* = .{
-        .key = try std.fmt.allocPrint(a, "{d}", .{i}),
+    for (v.items[0..v.item_count], children) |child, *out| out.* = .{
+        .key = try a.dupe(u8, std.mem.sliceTo(&child.key, 0)),
         .type = try a.dupe(u8, std.mem.sliceTo(&child.type, 0)),
         .display = try a.dupe(u8, std.mem.sliceTo(&child.display, 0)),
         .address = null,
         .diagnostic = try reason(a, child.reason),
         .advisory = true,
     };
-    return .{ .type = try a.dupe(u8, std.mem.sliceTo(&v.type, 0)), .display = try a.dupe(u8, std.mem.sliceTo(&v.display, 0)), .count = if (std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "String") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Array")) v.count else null, .diagnostic = try reason(a, v.reason), .truncated = v.truncated != 0, .children = children };
+    return .{ .type = try a.dupe(u8, std.mem.sliceTo(&v.type, 0)), .display = try a.dupe(u8, std.mem.sliceTo(&v.display, 0)), .count = if (std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "String") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Array") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Symbol") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Hash")) v.count else null, .diagnostic = try reason(a, v.reason), .truncated = v.truncated != 0, .children = children };
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
     if (value.availability != .available or !value.type.ruby_value or value.type.kind != .unsigned or value.type.size != 8) return null;
@@ -117,7 +117,8 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
     const layout = try profile(session, module);
     var r = reader(session);
     const raw = try a.create(c.struct_xrb_value);
-    c.xrb_value_read(layout, &r, value.bits, raw);
+    const context = try readContext(module, "");
+    c.xrb_value_read(layout, &r, &context, value.bits, raw);
     const v = try converted(a, raw);
     return .{ .presentation = .scalar, .data_address = value.address orelse 0, .count = v.count orelse 0, .element_type = value.type.name, .truncated = v.truncated, .diagnostic = v.diagnostic, .basis = "CRuby public VALUE typedef; loaded identity and same-image DWARF; no inferior calls", .ruby = .{ .value = v, .tagged = value.bits, .runtime_version = c.XRB_VERSION ++ "dev", .runtime_build_id = try buildId(a, layout), .memory_reads = r.reads, .memory_bytes = r.bytes } };
 }
@@ -200,14 +201,14 @@ fn checkedExpression(a: A, text: []const u8) ![:0]const u8 {
     if (c.xrb_expression_check(query) != null) return error.UnsupportedRubyExpression;
     return query;
 }
-fn pathContext(module: *Module, expression: []const u8) !c.struct_xrb_path_context {
-    var context = std.mem.zeroes(c.struct_xrb_path_context);
+fn readContext(module: *Module, expression: []const u8) !c.struct_xrb_context {
+    var context = std.mem.zeroes(c.struct_xrb_context);
     context.symbols = try globalAddress(module, "ruby_global_symbols");
+    context.hash_class = try globalAddress(module, "rb_cHash");
+    context.array_class = try globalAddress(module, "rb_cArray");
     if (std.mem.indexOfScalar(u8, expression, '[') == null) return context;
     inline for (.{
         .{ "hash_salt", "hash_salt" },
-        .{ "hash_class", "rb_cHash" },
-        .{ "array_class", "rb_cArray" },
         .{ "string_class", "rb_cString" },
         .{ "integer_class", "rb_cInteger" },
         .{ "symbol_class", "rb_cSymbol" },
@@ -238,11 +239,10 @@ fn bindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame
     const raw = try a.create(c.struct_xrb_locals);
     const ec = try std.fmt.parseInt(u64, segment.runtime_instance.address, 0);
     const zjit = try zjitEntry(session, module);
-    const symbols = try globalAddress(module, "ruby_global_symbols");
+    const context = try readContext(module, expression orelse "");
     if (expression) |text| {
-        const context = try pathContext(module, text);
         c.xrb_expression_find(layout, &r, &context, ec, zjit, frame, try a.dupeZ(u8, text), raw);
-    } else c.xrb_locals_read(layout, &r, ec, zjit, symbols, frame, start, limit, raw);
+    } else c.xrb_locals_read(layout, &r, ec, zjit, &context, frame, start, limit, raw);
     const rows = try a.alloc(named.Row, raw.count);
     for (raw.items[0..raw.count], rows) |item, *out| out.* = .{
         .name = try a.dupe(u8, std.mem.sliceTo(&item.name, 0)),
@@ -274,13 +274,12 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
     }
     const raw = try a.create(c.struct_xrb_locals);
     const zjit = try zjitEntry(session, module);
-    const symbols = try globalAddress(module, "ruby_global_symbols");
+    const context = try readContext(module, if (row == null and capture.scope.frame[2] == 0) capture.expression else "");
     if (row) |ordinal| {
-        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, ordinal, 1, raw);
+        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, &context, frame, ordinal, 1, raw);
     } else if (capture.scope.frame[2] != 0) {
-        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, symbols, frame, @intCast(capture.scope.frame[3]), 1, raw);
+        c.xrb_locals_read(layout, &r, capture.scope.runtime[1], zjit, &context, frame, @intCast(capture.scope.frame[3]), 1, raw);
     } else {
-        const context = try pathContext(module, capture.expression);
         c.xrb_expression_find(layout, &r, &context, capture.scope.runtime[1], zjit, frame, capture.expression, raw);
     }
     if (raw.reason != null or raw.count != 1) {
@@ -310,12 +309,13 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
     capture.observation = c.XLW_COMPLETE;
     capture.sample = .{ .kind = sample.kind, .bytes = &sample.bytes, .size = sample.size, .type = &sample.type, .display = &sample.display };
 }
-pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8 {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
-    if (expression) |query| {
-        _ = try checkedExpression(a, query);
-    }
     if (row) |index| if (index >= 4096) return error.InvalidArguments;
+    return if (expression) |query| try checkedExpression(a, query) else try a.dupeZ(u8, "binding");
+}
+pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
     const segment = observed.segments[segment_index];
@@ -332,7 +332,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
         .thread = thread,
         .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, segment.runtime_instance.address, 0), 0, 0 },
         .frame = .{ try std.fmt.parseInt(u64, selected.control_frame, 0), try std.fmt.parseInt(u64, selected.instruction_sequence, 0), 0, 0 },
-    }, .expression = try a.dupeZ(u8, expression orelse "binding") };
+    }, .expression = checked_expression };
     try watchValue(session, a, &capture, frame, row);
     if (row != null and capture.scope.frame[2] == 0) return error.RubyWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);

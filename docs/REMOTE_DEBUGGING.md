@@ -23,7 +23,7 @@ then Space again: locals show `amount=5` and `next=12`. Click a stack entry to
 inspect its frame. **F11** steps into the next source line, **F10** steps over,
 **F7** steps one instruction, and **Tab** switches locals/registers. The mouse
 wheel scrolls source, registers/locals, threads or stack under the pointer.
-Space interrupts a running target. **D** detaches; **Q** closes the GUI.
+Space interrupts a running target. **Shift+D** detaches; **Shift+Q** closes the GUI.
 
 Hardware watches: click an addressable scalar local and press **W / Watch**.
 **V / Watches** opens the installed list; select a watch and **W / Remove** to
@@ -105,7 +105,7 @@ The server waits for that connection before launching/attaching the target.
   basenames let that explicitly provided file follow DWARF locations. Automatic
   source fetching, multiple-file mapping and verified source identities follow.
 - Closing the GUI detaches an attached process and kills/reaps a server-launched
-  process. **D / Detach** explicitly preserves either kind of process.
+  process. **Shift+D / Detach** explicitly preserves either kind of process.
 - On connection loss, the GUI retains a labelled stale snapshot, disables target
   controls, and makes no automatic reconnect or action replay. It cannot confirm
   cleanup on an unreachable host. Restart the server/session explicitly.

@@ -26,7 +26,7 @@ xodb attempts ordinary-user perf access and reports the real permission error.
 4. At the second `allocation_marker` stop (phase=1), press **P** to stop/drain.
 5. **L** shows lifetimes; **O** shows one outstanding block requesting **29 bytes**.
    The fixture also includes a failed realloc that preserves its old allocation.
-6. **Esc** returns to source. **Q** closes xodb.
+6. **Esc** returns to source. **Shift+Q** closes xodb.
 
 The record count can exceed twice the user-visible allocator calls: glibc may
 tail-reenter free during initialization. Both entry/return pairs remain in the

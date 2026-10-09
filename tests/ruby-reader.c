@@ -4,9 +4,11 @@
 #include <string.h>
 #include <stdlib.h>
 #define BASE UINT64_C(0x100000)
+static struct xrb_context context={.hash_class=BASE,.array_class=BASE+8};
 static unsigned char bytes[65536], saved[65536];
 static size_t used=4096,attempts,fail_at;
 static struct xrb_layout p={.succinct_lines=1,.fields={
+    [XRB_BASIC_CLASS]={8,8},
     [XRB_CFP_PC]={0,8},
     [XRB_CFP_SP]={8,8},
     [XRB_CFP_ISEQ]={16,8},
@@ -61,14 +63,27 @@ static struct xrb_layout p={.succinct_lines=1,.fields={
     [XRB_ENV_SIZE]={32,4},
     [XRB_FLOAT_FLAGS]={0,8},
     [XRB_FLOAT_VALUE]={16,8},
-},.sizes={[XRB_T_CFP]=56,[XRB_T_INFO]=12,[XRB_T_INDEX]=48,[XRB_T_RANK]=80,[XRB_T_DARRAY]=16,[XRB_T_ID]=16}};
+    [XRB_SYMBOL_STRING]={16,8},
+    [XRB_AR_HINTS]={0,8},
+    [XRB_AR_PAIRS]={8,128},
+    [XRB_AR_KEY]={0,8},
+    [XRB_AR_VALUE]={8,8},
+    [XRB_ST_POWER]={0,1},
+    [XRB_ST_START]={4,4},
+    [XRB_ST_BOUND]={8,4},
+    [XRB_ST_COUNT]={16,8},
+    [XRB_ST_ENTRIES]={24,8},
+    [XRB_ST_HASH]={0,8},
+    [XRB_ST_KEY]={8,8},
+    [XRB_ST_VALUE]={16,8},
+},.sizes={[XRB_T_CFP]=56,[XRB_T_INFO]=12,[XRB_T_INDEX]=48,[XRB_T_RANK]=80,[XRB_T_DARRAY]=16,[XRB_T_ID]=16,[XRB_T_HASH]=40,[XRB_T_AR_PAIR]=16,[XRB_T_ST_ENTRY]=24}};
 
 static uint64_t alloc(size_t n) { uint64_t a=BASE+used;used+=(n+7)&~(size_t)7;assert(used<sizeof bytes);return a; }
 static void put(uint64_t a,uint64_t v,size_t n) { assert(a>=BASE && a-BASE<=sizeof bytes && n<=sizeof bytes-(a-BASE));for(size_t i=0;i<n;++i)bytes[a-BASE+i]=(unsigned char)(v>>(i*8)); }
 static void set(uint64_t a,enum xrb_field f,uint64_t v) { put(a+p.fields[f].offset,v,p.fields[f].size); }
 static uint64_t str(const char *text) { size_t n=strlen(text);uint64_t a=alloc(32+n);set(a,XRB_STRING_FLAGS,5);set(a,XRB_STRING_LEN,n);memcpy(bytes+(a+24-BASE),text,n);return a; }
 static int rd(void *ctx,uint64_t a,void *out,size_t n) { (void)ctx;if(++attempts==fail_at||a<BASE||a-BASE>used||n>used-(a-BASE))return -1;memcpy(out,bytes+(a-BASE),n);return 0; }
-static struct xrb_value value(uint64_t v) { struct xrb_reader r={.read=rd};struct xrb_value out;xrb_value_read(&p,&r,v,&out);assert(r.reads<=XRB_READ_LIMIT&&r.bytes<=XRB_BYTE_LIMIT);return out; }
+static struct xrb_value value(uint64_t v) { struct xrb_reader r={.read=rd};struct xrb_value out;xrb_value_read(&p,&r,&context,v,&out);assert(r.reads<=XRB_READ_LIMIT&&r.bytes<=XRB_BYTE_LIMIT);return out; }
 static uint64_t data(uint64_t address) { uint64_t a=alloc(40);set(a,XRB_DATA_FLAGS,12);set(a,XRB_DATA_PTR,address);return a; }
 static uint64_t iseq(const char *label,uint64_t parent,uint64_t local_id) {
  uint64_t q=alloc(32),b=alloc(304),code=alloc(80),info=alloc(12),table=alloc(8);
@@ -77,7 +92,7 @@ static uint64_t iseq(const char *label,uint64_t parent,uint64_t local_id) {
 }
 static uint64_t get(uint64_t a) { uint64_t v=0;for(size_t i=0;i<8;++i)v|=(uint64_t)bytes[a-BASE+i]<<(i*8);return v; }
 static struct xrb_locals locals(uint64_t ec,uint64_t symbols,size_t frame,size_t start,size_t limit) {
- struct xrb_reader r={.read=rd};struct xrb_locals out;xrb_locals_read(&p,&r,ec,0,symbols,frame,start,limit,&out);
+ struct xrb_reader r={.read=rd};struct xrb_locals out;struct xrb_context ctx=context;ctx.symbols=symbols;xrb_locals_read(&p,&r,ec,0,&ctx,frame,start,limit,&out);
  assert(out.count<=XRB_LOCAL_ITEMS&&out.total<=4096&&r.reads<=XRB_READ_LIMIT&&r.bytes<=XRB_BYTE_LIMIT);return out;
 }
 static void samples(void) {
@@ -101,7 +116,36 @@ static void samples(void) {
  set(heap,XRB_FLOAT_FLAGS,10);SAMPLE(heap);assert(out.reason&&!strcmp(out.reason,"RubyWatchValueUnsupported"));
  #undef SAMPLE
 }
+static void previews(uint64_t symbols) {
+ struct xrb_reader r={.read=rd};struct xrb_value v;
+ struct xrb_context ctx=context;ctx.symbols=symbols;
+ xrb_value_read(&p,&r,&ctx,(UINT64_C(200)<<12)|12,&v);
+ assert(!v.reason&&!strcmp(v.display,":captured")&&v.count==8);
+ v=value((UINT64_C(200)<<12)|12);assert(v.reason&&!strcmp(v.reason,"RubySymbolNamesUnavailable"));
+ uint64_t sym=alloc(32);put(sym,20,8);set(sym,XRB_SYMBOL_STRING,str(""));
+ v=value(sym);assert(!v.reason&&!strcmp(v.display,":\"\"")&&!v.count);
+ set(sym,XRB_SYMBOL_STRING,4);v=value(sym);assert(v.reason);
+ uint64_t ar=alloc(176),table=ar+40;put(ar,8|(2<<16)|(3<<20),8);set(ar,XRB_BASIC_CLASS,BASE+16);
+ put(table,1,1);put(table+2,1,1);put(table+8,15,8);put(table+16,17,8);
+ put(table+40,19,8);put(table+48,21,8);
+ v=value(ar);assert(!v.reason&&v.item_count==2&&!strcmp(v.display,"Hash(2) {7 => 8, 9 => 10}"));
+ set(ar,XRB_BASIC_CLASS,BASE+48);v=value(ar);assert(v.reason&&!strcmp(v.reason,"RubyPreviewContainerClassUnsupported"));set(ar,XRB_BASIC_CLASS,BASE+16);
+ r=(struct xrb_reader){.read=rd};xrb_value_read(&p,&r,NULL,ar,&v);assert(v.reason&&!strcmp(v.reason,"RubyPreviewClassUnproved"));
+ put(ar,8|(1<<16)|(3<<20),8);v=value(ar);assert(v.reason&&!strcmp(v.reason,"RubyPathHashInvalid"));
+ put(ar,8|(2<<16)|(9<<20),8);v=value(ar);assert(v.reason&&!strcmp(v.reason,"RubyPathHashInvalid"));
+ uint64_t st=alloc(80),entries=alloc(514*24);table=st+40;put(st,8|32768,8);set(st,XRB_BASIC_CLASS,BASE+16);
+ set(table,XRB_ST_POWER,10);set(table,XRB_ST_START,0);set(table,XRB_ST_BOUND,514);
+ set(table,XRB_ST_COUNT,1);set(table,XRB_ST_ENTRIES,entries);
+ for(size_t i=0;i<513;++i)set(entries+i*24,XRB_ST_HASH,UINT64_MAX);
+ set(entries+513*24,XRB_ST_HASH,123);set(entries+513*24,XRB_ST_KEY,15);set(entries+513*24,XRB_ST_VALUE,17);
+ v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyHashPreviewScanLimit"));
+ set(table,XRB_ST_START,510);v=value(st);assert(!v.reason&&!strcmp(v.display,"Hash(1) {7 => 8}"));
+ set(table,XRB_ST_COUNT,2);v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyPathHashInvalid"));set(table,XRB_ST_COUNT,1);
+ set(table,XRB_ST_POWER,63);v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyPathHashInvalid"));set(table,XRB_ST_POWER,10);
+ set(table,XRB_ST_ENTRIES,UINT64_MAX);v=value(st);assert(v.reason&&!strcmp(v.reason,"RubyAddressInvalid"));
+}
 int main(void) {
+ put(BASE,BASE+16,8);put(BASE+8,BASE+32,8);
  const char *valid[]={"root","root[0]","root[2147483647]","root[\"score\"]","root['']","root[:symbol][1][\"name\"]"};
  const char *invalid[]={"","root()","root.x","root[-1]","root[01]","root[2147483648]","root[f()]","root[\"#{x}\"]","root[:'x']","root[1,2]","root[0][0][0][0][0][0][0][0][0]"};
  for(size_t i=0;i<sizeof valid/sizeof *valid;++i)assert(!xrb_expression_check(valid[i]));
@@ -116,11 +160,14 @@ int main(void) {
  v=value(4);assert(!strcmp(v.display,"nil"));v=value(0);assert(!strcmp(v.display,"false"));v=value(20);assert(!strcmp(v.display,"true"));
  v=value(UINT64_C(0x8000000000000002));assert(!v.reason&&!strcmp(v.display,"0"));
  uint64_t string=str("hi\n\"");v=value(string);assert(!v.reason&&strstr(v.display,"\\x0a\\x22"));
- uint64_t ar=alloc(40);set(ar,XRB_ARRAY_FLAGS,7|8192|(2<<15));put(ar+16,15,8);put(ar+24,ar,8);v=value(ar);assert(!v.reason&&v.item_count==2&&!strcmp(v.items[0].display,"7")&&!strcmp(v.items[1].type,"Array"));
+ uint64_t utf8=str("é猫😀");set(utf8,XRB_STRING_FLAGS,5|(1<<22));v=value(utf8);assert(!v.reason&&!strcmp(v.display,"\"é猫😀\""));
+ set(utf8,XRB_STRING_FLAGS,5);v=value(utf8);assert(!v.reason&&strstr(v.display,"\\xc3\\xa9"));
+ uint64_t ar=alloc(40);set(ar,XRB_ARRAY_FLAGS,7|8192|(2<<15));set(ar,XRB_BASIC_CLASS,BASE+32);put(ar+16,15,8);put(ar+24,ar,8);v=value(ar);assert(!v.reason&&v.item_count==2&&!strcmp(v.items[0].display,"7")&&!strcmp(v.items[1].type,"Array")&&!strcmp(v.items[1].display,"[...]"));
  set(ar,XRB_ARRAY_FLAGS,7);set(ar,XRB_ARRAY_LEN,UINT64_MAX);v=value(ar);assert(v.reason&&!strcmp(v.reason,"RubyArrayLengthInvalid"));
  uint64_t symbols=alloc(24),dir=alloc(16),entries=alloc(8),block=alloc(16+512*16);
  set(symbols,XRB_SYMBOLS_NEXT,300);set(symbols,XRB_SYMBOLS_IDS,data(dir));set(dir,XRB_DIRECTORY_CAPA,1);set(dir,XRB_DIRECTORY_ENTRIES,entries);put(entries,data(block),8);set(block,XRB_DARRAY_SIZE,512);set(block,XRB_DARRAY_CAPA,512);
  set(block+16+200*16,XRB_ID_NAME,str("captured"));set(block+16+201*16,XRB_ID_NAME,str("captured"));
+ previews(symbols);context.symbols=symbols;
  uint64_t outer=iseq("outer",0,200<<4),inner=iseq("inner",outer,201<<4),ec=alloc(400),thread=alloc(480),stack=alloc(1024),end=stack+1024,cfp=end-3*56,ep=stack+128,outer_ep=stack+256;
  set(ec,XRB_EC_THREAD,thread);set(thread,XRB_THREAD_EC,ec);set(ec,XRB_EC_STACK,stack);set(ec,XRB_EC_STACK_SIZE,128);set(ec,XRB_EC_CFP,cfp);
  set(cfp,XRB_CFP_EP,ep);set(cfp,XRB_CFP_ISEQ,inner);set(cfp,XRB_CFP_PC,get(get(inner+8)+8)+8);
@@ -132,8 +179,8 @@ int main(void) {
  struct xrb_locals out=locals(ec,symbols,0,0,32);assert(!out.reason&&out.count==2&&out.total==2);
  assert(!out.items[0].reason&&!strcmp(out.items[0].name,"captured")&&!strcmp(out.items[0].value.display,"99")&&out.items[0].depth==0);
  assert(!strcmp(out.items[1].value.display,"41")&&out.items[1].depth==1);
- r=(struct xrb_reader){.read=rd};xrb_local_find(&p,&r,ec,0,symbols,0,"captured",&out);assert(!out.reason&&out.count==1&&!strcmp(out.items[0].value.display,"99"));
- r=(struct xrb_reader){.read=rd};xrb_local_find(&p,&r,ec,0,symbols,0,"captured()",&out);assert(out.reason&&!strcmp(out.reason,"RubyExpressionUnsupported")&&!r.reads);
+ r=(struct xrb_reader){.read=rd};xrb_local_find(&p,&r,ec,0,&context,0,"captured",&out);assert(!out.reason&&out.count==1&&!strcmp(out.items[0].value.display,"99"));
+ r=(struct xrb_reader){.read=rd};xrb_local_find(&p,&r,ec,0,&context,0,"captured()",&out);assert(out.reason&&!strcmp(out.reason,"RubyExpressionUnsupported")&&!r.reads);
  out=locals(ec,symbols,0,1,1);assert(!out.reason&&out.total==2&&out.count==1&&out.items[0].depth==1&&!out.truncated);
  out=locals(ec,symbols,0,0,33);assert(out.reason&&!strcmp(out.reason,"RubyLocalPageInvalid"));
  // Escaped environments must prove their own ep, iseq and allocation bounds.

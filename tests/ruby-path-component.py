@@ -66,6 +66,14 @@ test.call(Array.new(80) {|i|i}[20,40],'root[39]',59)
 cycle={};cycle['self']=cycle;cycle['value']=13
 test.call(cycle,'root["self"]["self"]["value"]',13)
 test.call(Hash.new(3),'root["missing"]',nil,'RubyPathDefaultUnsupported')
+[0,3,false,'fallback'].each do |fallback|
+  root=Hash.new(fallback); root['found']=7; root['nil']=nil
+  test.call(root,'root["found"]',7);test.call(root,'root["nil"]',nil)
+  test.call(root,'root["missing"]',nil,'RubyPathDefaultUnsupported')
+  20.times {|i|root[100000+i]=i}
+  test.call(root,'root["found"]',7)
+  test.call(root,'root["missing"]',nil,'RubyPathDefaultUnsupported')
+end
 calls=0; default=Hash.new {calls+=1; 5}
 test.call(default,'root["missing"]',nil,'RubyPathDefaultUnsupported'); raise unless calls==0
 test.call({}.compare_by_identity,'root["missing"]',nil,'RubyPathIdentityHashUnsupported')

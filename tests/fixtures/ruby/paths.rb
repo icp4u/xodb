@@ -10,6 +10,7 @@ def mark_paths(label, b)
   bad = b.local_variable_get(:bad)
   identity = b.local_variable_get(:identity)
   default = b.local_variable_get(:default)
+  fallback = b.local_variable_get(:fallback)
   values = [
     XodbPaths.oracle(root, 'root["player"]["score"]', root['player']['score'], nil),
     XodbPaths.oracle(root, 'root["player"]["text"]', root['player']['text'], nil),
@@ -21,6 +22,8 @@ def mark_paths(label, b)
     XodbPaths.oracle(bad, 'bad["score"]', nil, 'RubyPathContainerClassUnsupported'),
     XodbPaths.oracle(identity, 'identity["score"]', nil, 'RubyPathIdentityHashUnsupported'),
     XodbPaths.oracle(default, 'default["score"]', nil, 'RubyPathDefaultUnsupported'),
+    XodbPaths.oracle(fallback, 'fallback["score"]', fallback['score'], nil),
+    XodbPaths.oracle(fallback, 'fallback["missing"]', nil, 'RubyPathDefaultUnsupported'),
   ]
   puts JSON.generate(label:label, values:values, custom_calls:$custom_calls)
   XodbWatch.stop
@@ -32,11 +35,13 @@ def watched_paths
   bad={'score'=>7}; def bad.[](key); $custom_calls+=1; super; end
   identity={'score'=>7}.compare_by_identity
   default=Hash.new {$custom_calls+=1; 7}
+  fallback=Hash.new(0);fallback['score']=7
   b=binding
   mark_paths('initial', b)
   retained=root
   root={'player'=>{'score'=>9,'text'=>'a'*511+'b'},'list'=>[10,21],'optional'=>nil}
   array=[2,nil,true]; symbol[:score]=9; symbol[2]=true
+  fallback['score']=8
   mark_paths('replaced', b)
   root=Marshal.load(Marshal.dump(root)); GC.start; GC.compact
   mark_paths('equal', b)

@@ -15,10 +15,10 @@ const buttons = [_]Button{
     .{ .name = "Step", .key = "F11", .x = 204, .width = 104 },
     .{ .name = "Over", .key = "F10", .x = 320, .width = 106 },
     .{ .name = "Instruction", .key = "F7", .x = 438, .width = 164 },
-    .{ .name = "Detach", .key = "D", .x = 618, .width = 126 },
-    .{ .name = "Registers", .key = "TAB", .x = 762, .width = 170 },
-    .{ .name = "Watch", .key = "W", .x = 944, .width = 116 },
-    .{ .name = "Watches", .key = "V", .x = 1072, .width = 144 },
+    .{ .name = "Detach", .key = "Shift+D", .x = 618, .width = 166 },
+    .{ .name = "Registers", .key = "TAB", .x = 800, .width = 156 },
+    .{ .name = "Watch", .key = "W", .x = 968, .width = 116 },
+    .{ .name = "Watches", .key = "V", .x = 1096, .width = 144 },
 };
 const Workspace = struct {
     snapshot: ?remote.Snapshot = null,
@@ -172,7 +172,7 @@ const Workspace = struct {
         while (window.input.next()) |event| {
             if (event.kind == .press and event.plain()) {
                 switch (event.shortcut) {
-                    'q' => {
+                    'q' => if (event.mods.shift) {
                         window.closing = true;
                         window.close_reason = .quit_key;
                     },
@@ -180,7 +180,7 @@ const Workspace = struct {
                     keys.sym.f11 => self.invoke(client, 1),
                     keys.sym.f10 => self.invoke(client, 2),
                     0xffc4 => self.invoke(client, 3), // F7
-                    'd' => self.invoke(client, 4),
+                    'd' => if (event.mods.shift) self.invoke(client, 4),
                     keys.sym.tab => self.invoke(client, 5),
                     'w' => self.invoke(client, 6),
                     'v' => self.invoke(client, 7),
@@ -597,4 +597,40 @@ test "remote continue control cancels a queued resume at a stopped target" {
     defer command.deinit();
     try std.testing.expectEqualStrings("interrupt", remote.string(remote.field(command.value, "name")));
     try std.testing.expectEqual(@as(i64, 7), remote.field(remote.field(command.value, "arguments"), "generation").integer);
+}
+
+test "remote letter input cannot detach or close without Shift" {
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    workspace.accept(try testSnapshot(.{ .session_id = 1, .generation = 7, .pid = 100, .architecture = "x86_64", .state = "stopped", .scope = "control", .owned = true }));
+    var client = remote.Client{ .endpoint = .{ .tcp = "127.0.0.1:1" }, .state = .ready, .busy = false };
+    defer client.deinit();
+    var window = Window{ .width = 1280, .height = 800 };
+    for ([_]keys.Mods{ .{}, .{ .caps = true }, .{ .shift = true, .ctrl = true }, .{ .shift = true, .alt = true } }) |mods| {
+        for ("dq") |letter| {
+            window.input.queue[0] = .{ .kind = .press, .shortcut = letter, .mods = mods };
+            window.input.head = 0;
+            window.input.count = 1;
+            workspace.input(&window, &client);
+            try std.testing.expect(!window.closing and client.pending == null);
+        }
+    }
+    window.input.queue[0] = .{ .kind = .repeat, .shortcut = 'd', .mods = .{ .shift = true } };
+    window.input.head = 0;
+    window.input.count = 1;
+    workspace.input(&window, &client);
+    try std.testing.expect(client.pending == null);
+    window.input.queue[0] = .{ .kind = .press, .shortcut = 'd', .mods = .{ .shift = true } };
+    window.input.head = 0;
+    window.input.count = 1;
+    workspace.input(&window, &client);
+    const command = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, client.pending.?, .{});
+    defer command.deinit();
+    try std.testing.expectEqualStrings("detach", remote.string(remote.field(command.value, "name")));
+    try std.testing.expectEqual(@as(i64, 7), remote.field(remote.field(command.value, "arguments"), "generation").integer);
+    window.input.queue[0] = .{ .kind = .press, .shortcut = 'q', .mods = .{ .shift = true } };
+    window.input.head = 0;
+    window.input.count = 1;
+    workspace.input(&window, &client);
+    try std.testing.expect(window.closing and window.close_reason == .quit_key);
 }
