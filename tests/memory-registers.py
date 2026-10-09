@@ -51,11 +51,11 @@ try:
     matches=search(arena,64*1024*1024,'ABA')
     assert matches['state']=='complete' and list(map(lambda x:int(x,16),matches['hits']))==[arena+4093,arena+4095,arena+65534,arena+65536],matches
     capped=search(arena,65536,'\0')
-    assert capped['state']=='match_limit' and capped['total_hits']==1024,capped
-    job=c.action('search_memory',address=hex(arena),length=64*1024*1024,pattern='aabb')
+    assert capped['state']=='match_limit' and capped['total_hits']==4096,capped
+    job=c.action('search_memory',address=hex(arena),length=1<<30,pattern='aabb')
     assert c.inspect('cancel_memory_search',id=job['id'])['state']=='cancelled'
     changed=c.inspect('find_symbol',name='inspect_changed')['address']; c.action('set_breakpoint',address=changed)
-    job=c.action('search_memory',address=hex(arena),length=64*1024*1024,pattern='aabb')
+    job=c.action('search_memory',address=hex(arena),length=1<<30,pattern='aabb')
     c.action('continue'); c.stopped('breakpoint')
     assert c.inspect('get_memory_search',id=job['id'])['state']=='stale'
     now=c.action('capture_memory',address=values,length=32)

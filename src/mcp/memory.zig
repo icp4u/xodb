@@ -14,20 +14,57 @@ pub fn handles(name: []const u8) bool {
     for ([_][]const u8{ "capture_memory", "read_memory_snapshot", "search_memory", "get_memory_search", "cancel_memory_search" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
+/// One range, or up to max_ranges ranges captured during the same stop.
+pub const max_ranges = 16;
+/// Half the retained budget, so one call never has to evict its own ranges
+/// while a pinned observation (at most max_snapshot) is retained.
+pub const max_ranges_bytes = 32 * 1024 * 1024;
+fn capture(a: std.mem.Allocator, session: *Session, args: V) !V {
+    const Range = struct { address: u64, length: usize };
+    var ranges: [max_ranges]Range = undefined;
+    var count: usize = 0;
+    const list = args.object.get("ranges");
+    if (list) |v| {
+        if (args.object.get("address") != null or args.object.get("length") != null) return error.InvalidArguments;
+        if (v != .array or v.array.items.len == 0 or v.array.items.len > max_ranges) return error.InvalidArguments;
+        var total: u64 = 0;
+        for (v.array.items) |item| {
+            try wire.fields(item, &.{ "address", "length" });
+            const length = try wire.number(item, "length", null);
+            if (length == 0 or length > memory.max_snapshot) return error.InvalidArguments;
+            total += length;
+            ranges[count] = .{ .address = try address(item), .length = @intCast(length) };
+            count += 1;
+        }
+        if (total > max_ranges_bytes) return error.InvalidArguments;
+    } else {
+        const length = try wire.number(args, "length", null);
+        if (length > memory.max_snapshot) return error.InvalidArguments;
+        ranges[0] = .{ .address = try address(args), .length = @intCast(length) };
+        count = 1;
+    }
+    const Captured = struct { id: u64, generation: u64, image_epoch: u64, address: []const u8, length: usize, readable: usize };
+    var out: [max_ranges]Captured = undefined;
+    for (ranges[0..count], out[0..count]) |range, *result| {
+        const id = try session.memory.captureOwned(session, range.address, range.length, session.jobRequester());
+        const snapshot = try session.memory.find(id);
+        result.* = .{ .id = id, .generation = snapshot.generation, .image_epoch = snapshot.image_epoch, .address = try std.fmt.allocPrint(a, "0x{x}", .{snapshot.address}), .length = snapshot.bytes.len, .readable = snapshot.readable };
+    }
+    // Other clients' retained captures can leave only this call's own ranges
+    // to evict; report that rather than returning an expired ID.
+    for (out[0..count]) |result| _ = session.memory.find(result.id) catch return error.MemoryBudgetExceeded;
+    return if (list == null) wire.value(a, out[0]) else wire.value(a, .{ .snapshots = out[0..count] });
+}
 pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: V) !V {
     if (std.mem.eql(u8, name, "capture_memory") or std.mem.eql(u8, name, "search_memory")) {
         if (session.offline) return error.OfflineSession;
         const search = std.mem.eql(u8, name, "search_memory");
-        try wire.fields(args, if (search) &.{ "address", "length", "pattern", "encoding", "generation" } else &.{ "address", "length", "generation" });
+        try wire.fields(args, if (search) &.{ "address", "length", "pattern", "encoding", "generation" } else &.{ "address", "length", "ranges", "generation" });
         const generation = try wire.number(args, "generation", null);
         try session.target.expectGeneration(generation);
+        if (!search) return capture(a, session, args);
         const length = try wire.number(args, "length", null);
         if (length > memory.max_search) return error.InvalidArguments;
-        if (!search) {
-            const id = try session.memory.captureOwned(session, try address(args), @intCast(length), session.jobRequester());
-            const snapshot = try session.memory.find(id);
-            return wire.value(a, .{ .id = id, .generation = snapshot.generation, .image_epoch = snapshot.image_epoch, .address = try std.fmt.allocPrint(a, "0x{x}", .{snapshot.address}), .length = snapshot.bytes.len, .readable = snapshot.readable });
-        }
         const pattern = try text(args, "pattern");
         const encoding = if (args.object.get("encoding") != null) try text(args, "encoding") else "hex";
         var bytes: [256]u8 = undefined;

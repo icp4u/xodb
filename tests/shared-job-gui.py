@@ -48,7 +48,7 @@ try:
     before=d.tool('get_registers',tid=state['pid']);generation=state['generation']
     # Maximum bounded range and an unlikely multi-byte pattern keep the job
     # running across the actual cancellation attempt; no sample-rate guess.
-    d.keys('tap',38,'tap',7,'tap',8,'tap',2,'tap',11,'tap',9,'tap',9,'tap',7,'tap',5,'tap',28) # L 67108864 Return
+    d.keys('tap',38,'tap',2,'tap',11,'tap',8,'tap',4,'tap',8,'tap',5,'tap',2,'tap',9,'tap',3,'tap',5,'tap',28) # L 1073741824 Return
     pattern_keys=[part for _ in range(16) for part in ('tap',30,'tap',48)]
     d.keys('tap',53,*pattern_keys,'tap',28) # / ababab... Return
     search=None
@@ -57,7 +57,7 @@ try:
         if not error(reply):search=reply['structuredContent'];break
     assert search is not None,'human GUI search was not observed'
     report['human_search']=search
-    assert search['state']=='running' and search['length']==67108864,search
+    assert search['state']=='running' and search['length']==1073741824,search
     cancellation=call('cancel_memory_search',id=search['id']);report['cancel_reply']=cancellation
     report['search_after']=call('get_memory_search',id=search['id'])
     # Both sides must observe this same job running. A completed or stale

@@ -103,7 +103,7 @@ pub const Panel = struct {
             self.editor.start();
             self.message = switch (self.editing) {
                 .address => "Address (0x...) or native expression, such as &counter",
-                .length => "Search length in bytes (1..67108864); search begins at displayed address",
+                .length => std.fmt.comptimePrint("Search length in bytes (1..{d}); search begins at displayed address", .{memory.max_search}),
                 .pattern => "Pattern: hex:414241 or text:ABA; N next result, C cancel",
             };
         } else if (k == 'p') {

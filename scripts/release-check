@@ -77,13 +77,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
-                     'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
+                     'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
                      'lsof-top', 'fdactivity'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
-        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes'):
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'memory-search-speed'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
