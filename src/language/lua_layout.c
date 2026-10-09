@@ -149,6 +149,12 @@ static int candidate(Dwarf_Die resolved, unsigned t, unsigned version,
         struct xl_field_info got; Dwarf_Die leaf;
         if (!member(resolved, spec->paths[version], &got, &leaf, s)) return 0;
         if (!kind(&leaf, spec->kind) || (spec->widths[version] && spec->widths[version] != got.size)) return 0;
+        if (f == XL_GLOBAL_TMNAME) {
+            Dwarf_Die element; uint64_t element_size;
+            if (!type(&leaf, &element) || !resolve(&element, s) ||
+                !kind(&element, POINTER) || !size(&element, &element_size) ||
+                element_size != 8 || got.size < element_size) return 0;
+        }
         if (f == XL_PROTO_CODE || f == XL_CI_PC) {
             Dwarf_Die instruction; uint64_t instruction_size;
             if (!type(&leaf, &instruction) || !resolve(&instruction, s) ||

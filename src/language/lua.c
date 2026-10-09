@@ -693,8 +693,8 @@ int xl_expression_valid(const char *text) {
 }
 
 /* Batch only bytes within the proved Node stride; no speculative page reads.
- * All occupied hash slots are inspected before claiming a key is unique or
- * absent. A prefix match is not a complete lookup when the scan exceeds a cap. */
+ * The selected collision chain (5.4) or hash scan (5.2) must complete before
+ * claiming a key is unique or absent. A prefix match cannot bypass the cap. */
 static uint64_t node_word(struct xl_reader *r, const unsigned char *node, size_t stride,
                           struct xl_field_info f) {
     if (!f.size || f.size > 8 || f.offset > stride || f.size > stride - f.offset) {
@@ -714,6 +714,13 @@ static int path_key_equal(const struct xl_layout *p, struct xl_reader *r, const 
     if (tag == (p->version[1] == 4 ? 19u : 3u) &&
         (bits & UINT64_C(0x7ff0000000000000)) == UINT64_C(0x7ff0000000000000) &&
         (bits & UINT64_C(0x000fffffffffffff))) return fail(r, "LuaTableKeyInvalid");
+    if (p->version[1] == 4 && tag == 19) {
+        double number; memcpy(&number, &bits, sizeof number);
+        /* Lua normalizes representable integral keys to integer storage.
+         * Accepting a forged float key would disagree with luaH_getint. */
+        if (number >= -0x1p63 && number < 0x1p63 && (double)(int64_t)number == number)
+            return fail(r, "LuaTableKeyInvalid");
+    }
     if (key->is_integer) {
         if (p->version[1] == 4 && tag == 3) return (int64_t)bits == key->integer;
         if (tag == (p->version[1] == 4 ? 19u : 3u)) {
@@ -731,7 +738,89 @@ static int path_key_equal(const struct xl_layout *p, struct xl_reader *r, const 
     unsigned char bytes[XL_STRING_BYTES];
     return read_bytes(r, data, bytes, wanted) && !memcmp(bytes, key->name, wanted);
 }
-static uint64_t path_lookup(const struct xl_layout *p, struct xl_reader *r, uint64_t slot,
+static uint32_t path_string_hash54(const char *text, size_t n, uint32_t seed) {
+    uint32_t hash = seed ^ (uint32_t)n;
+    for (size_t i = n; i; --i)
+        hash ^= (hash << 5) + (hash >> 2) + (unsigned char)text[i - 1];
+    return hash;
+}
+/* A wrong seed can choose an empty bucket, so checking only encountered keys
+ * cannot prove absence. Lua fixes the first tag-method name, "__index", for
+ * the state's lifetime. Verify its bytes and stored short-string hash before
+ * selecting any string bucket. This uses no table scan or target execution. */
+static int path_seed54(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                       uint32_t *seed) {
+    uint64_t global = field(p, r, state, XL_STATE_GLOBAL);
+    if (r->error) return 0;
+    if (!global) return fail(r, "LuaPathHashStateInvalid");
+    *seed = (uint32_t)field(p, r, global, XL_GLOBAL_SEED);
+    uint64_t witness = word(r, add(r, global, p->fields[XL_GLOBAL_TMNAME].offset), 8);
+    if (r->error || !header(p, r, witness, 4)) return 0;
+    uint64_t length, data;
+    if (!string_extent(p, r, witness, &length, &data)) return 0;
+    const char name[] = "__index"; char bytes[sizeof name - 1];
+    if (length != sizeof bytes) return fail(r, "LuaPathHashUnproved");
+    if (!read_bytes(r, data, bytes, sizeof bytes)) return 0;
+    uint32_t stored = (uint32_t)field(p, r, witness, XL_STR_HASH);
+    if (r->error) return 0;
+    if (memcmp(bytes, name, sizeof bytes) || path_string_hash54(bytes, sizeof bytes, *seed) != stored)
+        return fail(r, "LuaPathHashUnproved");
+    return 1;
+}
+/* Lua 5.4's standard hash: string bytes in reverse order with the
+ * owning state's seed; signed integers use unsigned remainder. Hash node
+ * links are signed relative indices, not pointers. Read the full selected
+ * chain before accepting a match, so a prefix cannot hide invalid evidence. */
+static uint64_t path_hash54(const struct xl_layout *p, struct xl_reader *r, uint64_t state,
+                             uint64_t nodes, uint64_t count, size_t stride,
+                             struct xl_field_info value_tag, const struct path_key *key) {
+    if (!count) return 0;
+    uint64_t index; uint32_t hash = 0;
+    if (key->is_integer) index = (uint64_t)(int64_t)key->integer % ((count - 1) | 1);
+    else {
+        uint32_t seed;
+        if (!path_seed54(p, r, state, &seed)) return 0;
+        hash = path_string_hash54(key->name, strlen(key->name), seed);
+        index = hash & (count - 1);
+    }
+    uint64_t visited[XL_PATH_HASH_NODES], found = 0;
+    unsigned char node[256];
+    for (size_t seen = 0; seen < XL_PATH_HASH_NODES; ++seen) {
+        for (size_t i = 0; i < seen; ++i)
+            if (visited[i] == index) { fail(r, "LuaPathHashCycle"); return 0; }
+        visited[seen] = index;
+        uint64_t address = add(r, nodes, index * stride);
+        if (!read_bytes(r, address, node, stride)) return 0;
+        unsigned tag = (unsigned)node_word(r, node, stride, value_tag);
+        int32_t next = (int32_t)node_word(r, node, stride, p->fields[XL_NODE_NEXT]);
+        if (r->error) return 0;
+        if (!nil(tag, p->version[1])) {
+            unsigned kt = (unsigned)node_word(r, node, stride, p->fields[XL_NODE_KEY_TAG]);
+            uint64_t kb = node_word(r, node, stride, p->fields[XL_NODE_KEY_BITS]);
+            if (r->error) return 0;
+            int equal = path_key_equal(p, r, key, kt, kb);
+            if (r->error) return 0;
+            if (equal) {
+                /* Table insertion has materialized even a long key's hash. */
+                if (!key->is_integer) {
+                    uint32_t stored = (uint32_t)field(p, r, kb, XL_STR_HASH);
+                    if (r->error) return 0;
+                    if (stored != hash) { fail(r, "LuaPathHashUnproved"); return 0; }
+                }
+                if (found) { fail(r, "LuaPathKeyAmbiguous"); return 0; }
+                found = add(r, address, p->fields[XL_NODE_VALUE].offset);
+                if (r->error) return 0;
+            }
+        }
+        if (!next) return found;
+        int64_t following = (int64_t)index + next;
+        if (following < 0 || (uint64_t)following >= count) { fail(r, "LuaPathHashLinkInvalid"); return 0; }
+        index = (uint64_t)following;
+    }
+    fail(r, "LuaPathWorkLimit"); return 0;
+}
+
+static uint64_t path_lookup(const struct xl_layout *p, struct xl_reader *r, uint64_t state, uint64_t slot,
                             const struct path_key *key) {
     if (field(p, r, slot, XL_TAG) != 69) { fail(r, "LuaPathNotTable"); return 0; }
     uint64_t at = field(p, r, slot, XL_BITS);
@@ -752,7 +841,7 @@ static uint64_t path_lookup(const struct xl_layout *p, struct xl_reader *r, uint
     if (key->is_integer && key->integer > 0 && (uint64_t)key->integer <= a)
         return add(r, arr, ((uint64_t)key->integer - 1) * p->sizes[XL_T_TVALUE]);
     uint64_t count = p->version[1] == 4 && !free_node ? 0 : UINT64_C(1) << log;
-    if (count > XL_PATH_HASH_NODES) { fail(r, "LuaPathWorkLimit"); return 0; }
+    if (p->version[1] == 2 && count > XL_PATH_HASH_NODES) { fail(r, "LuaPathWorkLimit"); return 0; }
     size_t stride = p->sizes[XL_T_NODE];
     if (!stride || stride > 256 || p->fields[XL_NODE_VALUE].offset > stride ||
         p->sizes[XL_T_TVALUE] > stride - p->fields[XL_NODE_VALUE].offset) {
@@ -763,6 +852,7 @@ static uint64_t path_lookup(const struct xl_layout *p, struct xl_reader *r, uint
         fail(r, "LuaLayoutUnsupported"); return 0;
     }
     value_tag.offset += p->fields[XL_NODE_VALUE].offset;
+    if (p->version[1] == 4) return path_hash54(p, r, state, nodes, count, stride, value_tag, key);
     unsigned char buffer[16 * 256]; uint64_t found = 0;
     for (uint64_t start = 0; start < count; start += 16) {
         size_t n = count - start > 16 ? 16 : (size_t)(count - start);
@@ -796,7 +886,7 @@ void xl_local_find(const struct xl_layout *p, struct xl_reader *r, uint64_t stat
     if (!path.count || out->reason || out->count != 1 || out->items[0].reason) return;
     struct xl_local *item = &out->items[0];
     for (size_t i = 0; i < path.count; ++i) {
-        uint64_t slot = path_lookup(p, r, item->address, &path.keys[i]);
+        uint64_t slot = path_lookup(p, r, state, item->address, &path.keys[i]);
         if (r->error) { out->count = 0; out->reason = r->error; return; }
         if (!slot && i + 1 != path.count) { out->count = 0; out->reason = "LuaPathNotTable"; return; }
         item->address = slot;

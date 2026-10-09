@@ -3,6 +3,7 @@
 #include "named.c"
 #undef main
 #include <stdint.h>
+#include "lobject.h"
 
 static void emit(lua_State *L, const char *expression, int comma) {
     if (comma) putchar(',');
@@ -46,22 +47,23 @@ static int path_probe(lua_State *L) {
     lua_rawgeti(L, 3, 1); emit(L, "object[1]", 1);
     raw_field(L, 3, "missing"); emit(L, "object.missing", 1);
     lua_rawgeti(L, 4, 1); emit(L, "large[1]", 1);
-    puts("]}"); fflush(stdout); xodb_lua_named_stop(L); return 0;
+    raw_field(L, 4, "key1"); emit(L, "large.key1", 1);
+    printf("],\"version\":%d,\"hash_capacity\":%llu}\n", LUA_VERSION_NUM, (unsigned long long)(UINT64_C(1) << ((const Table *)lua_topointer(L, 4))->lsizenode)); fflush(stdout); xodb_lua_named_stop(L); return 0;
 }
 int main(void) {
     lua_State *L = luaL_newstate(); assert(L); luaL_openlibs(L); lua_register(L, "path_probe", path_probe);
     puts("ready"); fflush(stdout); if (!getenv("XODB_LUA_NAMED_AUTO") && getchar() == EOF) return 1;
     const char script[] =
-        "local large={42}; for i=1,200 do large['key'..i]=i end\n"
+        "local large={42}; for i=1,2000 do large['key'..i]=i end\n"
         "local function watched(once)\n"
         " local x=7; local object={a=7,child={value=string.rep('a',300)..'b'},[1]=11}\n"
         " path_probe(0,x,object,large); if once then return end\n"
         " local old=object; object={a=8,child={value=string.rep('a',300)..'c'},[1]=12}; x=8\n"
-        " collectgarbage('collect'); path_probe(1,x,object,large); path_probe(2,x,object,large)\n"
-        " object.a=nil; object.child=nil; object[1]=nil; path_probe(3,x,object,large)\n"
+        " for i=2001,4096 do large['key'..i]=i end; collectgarbage('collect'); path_probe(1,x,object,large); path_probe(2,x,object,large)\n"
+        " object.a=nil; object.child=nil; object[1]=nil; large.key1=nil; path_probe(3,x,object,large)\n"
         " object.a=9; object.child={value='small'}; object[1]=13; local hits=0\n"
         " setmetatable(object,{__index=function() hits=hits+1; return 123 end}); path_probe(4,x,object,large); assert(hits==0)\n"
-        " setmetatable(object,nil); path_probe(5,x,object,large)\n"
+        " setmetatable(object,nil); large.key1=1; path_probe(5,x,object,large)\n"
         " do local object={a=99,child={value='inner'},[1]=14}; path_probe(6,x,object,large) end\n"
         " path_probe(7,x,object,large)\n"
         " local co=coroutine.create(function() local object={a=500,child={value='coroutine'},[1]=15}; path_probe(8,x,object,large) end)\n"

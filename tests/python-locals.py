@@ -93,9 +93,11 @@ def main():
                     assert found['diagnostic'] is None and found['rows'] == [row], (found, row)
                     seen.add(row['name']); bindings += 1
                 assert seen == set(expected['bindings']), (seen, expected)
-                for expression, why in [('missing_binding_xyz', 'PythonNameNotFound'), ('depth + 1', 'UnsupportedLanguageExpression'), ('print()', 'UnsupportedLanguageExpression'), ('payload[0:1]', 'UnsupportedLanguageExpression')]:
-                    found = client.inspect('evaluate_language_expression', **args, expression=expression)
-                    assert not found['rows'] and found['diagnostic'] == why, found
+                found = client.inspect('evaluate_language_expression', **args, expression='missing_binding_xyz')
+                assert not found['rows'] and found['diagnostic'] == 'PythonNameNotFound', found
+                for expression in ('depth + 1', 'print()', 'payload[0:1]', 'o.x'):
+                    refused = client.tool('evaluate_language_expression', **args, expression=expression)['result']
+                    assert refused.get('isError') and refused['content'][0]['text']=='UnsupportedLanguageExpression', refused
                 if 'payload' in expected['bindings']:
                     found = client.inspect('evaluate_language_expression', **args, expression='payload[0]')
                     assert found['diagnostic'] is None and found['rows'][0]['name']=='payload[0]', found

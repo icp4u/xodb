@@ -15,7 +15,13 @@ typedef union Value { TestNumber n; int64_t i; void *gc; } Value;
 typedef struct TValue { Value value_; unsigned char tt_; } TValue;
 typedef union StackValue { TValue val; } StackValue;
 typedef struct GCObject { HEAD; } GCObject;
-typedef struct TString { HEAD; unsigned char shrlen; union {size_t lnglen;} u; char contents[1]; } TString;
+typedef struct TString { HEAD; unsigned char shrlen;
+#ifdef WRONG_HASH
+    unsigned short hash;
+#else
+    unsigned hash;
+#endif
+    union {size_t lnglen;} u; char contents[1]; } TString;
 typedef struct Table { HEAD;
 #ifdef TABLE_PADDING
     unsigned char unrelated_padding[8];
@@ -31,7 +37,14 @@ typedef struct Upvaldesc { void *name; } Upvaldesc;
 typedef struct Udata { HEAD; size_t len; } Udata;
 typedef union StkIdRel { StackValue *p; ptrdiff_t offset; } StkIdRel;
 typedef struct CallInfo { StkIdRel func, top; struct CallInfo *previous, *next; union {struct {const unsigned *savedpc; int nextraargs;} l;} u; unsigned short callstatus; } CallInfo;
-typedef struct lua_State { HEAD; unsigned char status; StkIdRel top, stack, stack_last; void *l_G; CallInfo *ci; CallInfo base_ci; } lua_State;
+typedef struct global_State { unsigned seed;
+#ifdef WRONG_TMNAME
+    unsigned long tmname[25];
+#else
+    TString *tmname[25];
+#endif
+ } global_State;
+typedef struct lua_State { HEAD; unsigned char status; StkIdRel top, stack, stack_last; global_State *l_G; CallInfo *ci; CallInfo base_ci; } lua_State;
 typedef struct AbsLineInfo { int pc, line; } AbsLineInfo;
 #ifndef RUNTIME_ANCHORS
 #define RUNTIME_ANCHORS 3

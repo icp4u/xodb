@@ -38,6 +38,11 @@ int main(int argc, char **argv) {
         subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-DWRONG_NUMBER='+str(wrong),
             'tests/fixtures/lua/layout.c','-o',str(target)],check=True,timeout=30)
         check(target,'LuaLayoutUnsupported' if wrong else 'ok')
+    for name,define in [('wrong-hash','WRONG_HASH'),('wrong-tmname','WRONG_TMNAME')]:
+        target=work/name
+        subprocess.run(['cc','-g','-O0','-fno-eliminate-unused-debug-types','-D'+define,
+            'tests/fixtures/lua/layout.c','-o',str(target)],check=True,timeout=30)
+        check(target,'LuaLayoutUnsupported')
     # A larger embedded C++ host reuses common names. These incomplete
     # candidates must not override or conflict with the actual Lua layouts.
     host=work/'host.o'

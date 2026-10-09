@@ -316,9 +316,10 @@ storage use the verified runtime layout; counts and duplicate matches are checke
 A missing dictionary key is `PythonPathKeyNotFound`, never a fabricated `None`.
 Out-of-range sequence access is `PythonPathIndexOutOfRange`. Subclasses or a
 non-container intermediate value produce `PythonPathContainerUnsupported`.
-Unsupported syntax refuses at watch creation without occupying a slot; incomplete
-memory reads leave an unavailable value. These states
-retain the last complete watch baseline and can recover at a later stop. The
+Unsupported syntax returns `UnsupportedLanguageExpression` for both one-off
+reads and watch creation, without occupying a watch slot. Incomplete memory
+reads leave an unavailable value; an existing watch retains its last complete
+baseline and can recover at a later stop. The
 existing activation-continuity caveat still applies.
 
 ## Verification

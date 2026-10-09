@@ -62,14 +62,16 @@ def main():
                 result['resources'].append(dict(phase='metadata ready before watches', processes={k:usage(v) for k,v in measured.items()}, load=os.getloadavg()))
                 invalid = ('root()', 'root.a', 'root[0:1]', 'root[2147483648]', 'root[0][0][0][0][0]')
                 for expression in invalid:
-                    refused = client.tool('add_language_watch', **call_args, expression=expression)['result']
-                    assert refused.get('isError') and refused['content'][0]['text']=='UnsupportedLanguageExpression', refused
+                    for operation in ('evaluate_language_expression', 'add_language_watch'):
+                        refused = client.tool(operation, **call_args, expression=expression)['result']
+                        assert refused.get('isError') and refused['content'][0]['text']=='UnsupportedLanguageExpression', (operation, refused)
                 assert client.inspect('get_language_watches')['watches']==[]
                 temporary = client.inspect('add_language_watch', **call_args, expression='root["absent"]')['added']
                 missing = client.inspect('get_language_watches')['watches'][0]
                 assert missing['state']=='unavailable' and missing['diagnostic']=='PythonPathKeyNotFound', missing
                 client.inspect('remove_language_watch', generation=generation, id=temporary)
                 result['syntax_refused_before_add'] = list(invalid)
+                result['syntax_refused_at_evaluate'] = list(invalid)
                 for expression in ground['values']:
                     ids[expression] = client.inspect('add_language_watch', **call_args, expression=expression)['added']
                 evaluated = client.inspect('evaluate_language_expression', **call_args, expression='root["player"]["score"]')

@@ -206,9 +206,14 @@ current table. It retains neither a table pointer nor a value-slot pointer.
 These are raw storage reads. Any traversed table with a metatable returns
 `LuaPathMetatableUnsupported`, including keys present in that table. A missing
 final key is nil; missing or non-table intermediate values return
-`LuaPathNotTable`. Hash lookups inspect at most 128 slots, returning
-`LuaPathWorkLimit` before accepting an incomplete scan; array indices within
-proved capacity do not scan the hash. Duplicate hash keys refuse as ambiguous.
+`LuaPathNotTable`. On Lua 5.4.9, hash lookup reads the actual bucket and at
+most 128 nodes in its collision chain, so a large table can still be watched.
+The whole selected chain must validate before a match is accepted: duplicate
+matches, cycles, invalid links and unreadable tails refuse. A longer chain
+returns `LuaPathWorkLimit`, including when a matching prefix was found.
+Lua 5.2.4 retains the bounded full scan and refuses hash parts over 128 slots;
+its configurable hash variants are not assumed. Array indices within proved
+capacity do not scan the hash on either version.
 Quoted/arbitrary keys, calls, arithmetic and metamethods are unsupported.
 The ordinary scalar limits and activation-identity caveat still apply.
 
@@ -216,3 +221,19 @@ Syntactically unsupported watch paths refuse at creation with
 `LuaExpressionUnsupported`, leaving the watch count unchanged. A valid path
 whose root is currently absent or whose table cannot be read can still be added
 as an unavailable watch and recover at a later stop.
+
+For a larger-table demo with debug-built Lua 5.4.9:
+
+```sh
+xodb --break luaB_print -- lua5.4 examples/lua-large-path-demo.lua
+```
+
+Space → Lua → select the Lua print caller → Shift+E `module.player.score`
+Return → Space → V. The module has thousands of keys; unrelated insertions
+rehash it while the score remains watchable. Lookup uses the same-image DWARF
+seed and relative-link fields with the standard PUC Lua 5.4 hash algorithm.
+Before selecting a string bucket, the reader checks that seed and algorithm
+against the runtime's stored hash for its fixed `__index` name. A matching table
+key must also have the expected stored hash. A disagreement returns
+`LuaPathHashUnproved`, including when the wrong seed would select an empty
+bucket; it never becomes a false missing-key result.

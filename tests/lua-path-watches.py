@@ -48,7 +48,7 @@ try:
             assert missing['state']=='unavailable' and missing['diagnostic']=='LuaNameNotFound',missing
             client.inspect('remove_language_watch',generation=generation,id=temporary)
             result['syntax_refused_before_add']=list(invalid)
-            for expression in (*oracle,'large.key1'):
+            for expression in oracle:
                 ids[expression]=client.inspect('add_language_watch',**args,expression=expression)['added']
             evaluated=client.inspect('evaluate_language_expression',**args,expression='object.a')
             assert evaluated['diagnostic'] is None and evaluated['rows'][0]['name']=='object.a' and evaluated['rows'][0]['value']['display']==oracle['object.a']['display'],evaluated
@@ -71,7 +71,7 @@ try:
                 if phase==8 and v['state']=='unavailable' and v['diagnostic']=='LuaWatchCoroutineNotObserved':
                     assert not v['changed'];continue
                 expected=last.get(expression) if phase==8 else oracle.get(expression)
-                error='LuaPathWorkLimit' if expression=='large.key1' else 'LuaPathMetatableUnsupported' if phase==4 and expression.startswith('object') else 'LuaPathNotTable' if phase==3 and expression=='object.child.value' else None
+                error='LuaPathWorkLimit' if expression=='large.key1' and ground['version']==502 else 'LuaPathMetatableUnsupported' if phase==4 and expression.startswith('object') else 'LuaPathNotTable' if phase==3 and expression=='object.child.value' else None
                 if error:
                     assert v['state']=='unavailable' and v['diagnostic']==error and not v['changed'],(stop,expression,v,error)
                     continue
@@ -84,6 +84,9 @@ try:
                 last[expression]=expected
         if stop==1:
             assert ground['root']!=result['stops'][0]['ground']['root'];result['root_replacement_observed']=True
+            assert ground['hash_capacity']>result['stops'][0]['ground']['hash_capacity']>128
+            result['rehash_observed']=True
+            result['large_table_hash_lookup']=ground['version']==504
         assert client.inspect('get_language_watches')['watches']==rows and client.session()['generation']==generation
         assert client.inspect('get_registers',tid=target.pid)==regs
         result['stops'].append({'ground':ground,'watches':rows})

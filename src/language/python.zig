@@ -438,6 +438,7 @@ pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame
     return readBindings(session, a, tid, segment, frame, start, limit, null);
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    if (c.xpy_expression_valid(try a.dupeZ(u8, expression)) == 0) return error.UnsupportedLanguageExpression;
     return readBindings(session, a, tid, segment, frame, 0, 1, expression);
 }
 
