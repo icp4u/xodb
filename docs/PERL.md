@@ -161,7 +161,39 @@ Click a named row and press **W** to retain that pad declaration. An inner
 unavailable when its lexical scope ends. **Shift+E** with `$x` instead resolves
 the currently visible ASCII sigil/identifier in the retained logical frame at
 every stop. W also accepts Unicode names because it retains a declaration
-identity rather than parsing an expression. Arbitrary Perl expressions, package variables and object paths are unsupported.
+identity rather than parsing an expression. Arbitrary Perl expressions and
+package variables are unsupported.
+
+Builtin container paths work with **E** and **Shift+E**, for example
+`$hash{score}`, `$array[2]`, and `$root->{player}{scores}[0]`. The first two
+resolve the lexical `%hash` and `@array`; an explicit first `->` resolves a
+scalar reference. Each stop starts from the current lexical binding, so replacing
+a reference or growing an array does not leave a watch on the old storage.
+
+For a quick example, run `scripts/demo-perl`, press **Space**, select **Perl**
+and `main::store_answer`, then **Shift+E**, `$list->[3]`, **Return**. Continue
+with **Space** through the store/delete stops to inspect the current element.
+An absent element is explicitly unavailable; inspection never creates it.
+
+Paths allow at most eight subscriptions and 128 bytes total. Hash keys are
+ASCII identifiers or quoted printable ASCII strings (including the empty
+string), excluding backslashes, dollar signs and at signs; escapes,
+interpolation and non-ASCII keys are unsupported. Array
+indices are decimal integers from 0 to 2147483647, without leading zeros.
+Unsupported syntax is refused at add/evaluate time, before creating a watch.
+Tied or magical storage, all blessed objects (including overload), restricted
+hashes, SV-backed hash keys, and noncontainers are refused with a typed reason.
+Missing keys, array holes and out-of-range indices are unavailable and may
+recover at later stops. Even a missing intermediate reference is never
+autovivified.
+
+Hash lookup scans at most 4096 buckets and 512 entries, within the reader's
+existing read/byte budget. It compares raw key bytes, checks each stored HEK
+hash against its physical bucket, and verifies the complete entry count before
+returning a match or absence. It does not calculate Perl's seeded hash. A
+mismatched stored hash produces `PerlPathHashUnproved`; larger tables return
+`PerlPathHashLimit`. Array lookup reads only the selected slot. Neither lookup
+calls Perl or changes the hash iterator.
 
 Comparison uses complete stored scalar representations, not Perl `eq` or `==`.
 All public IOK/NOK/POK representations participate, so dualvars include both
@@ -205,7 +237,10 @@ python3 tests/perl-locals.py --perl /path/to/debug/perl --padwalker /path/to/Pad
 python3 tests/perl-locals-shared.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-shared --strace
 python3 tests/perl-locals-gui.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-gui
 python3 tests/perl-watches.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-watches --strace
+python3 tests/perl-path-watches.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --component --sanitize --work out/perl-path-component
+python3 tests/perl-path-watches.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --strace --work out/perl-path-watches
 python3 tests/language-watches-gui.py --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-watch-gui
+python3 tests/language-watches-gui.py --paths --perl /path/to/debug/perl --padwalker /path/to/PadWalker --work out/perl-path-gui
 ```
 
 Add `--agent zig-out/bin/xodb-agent` to named-local and shared tests for C-agent

@@ -386,6 +386,7 @@ pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize,
     return readBindings(session, a, tid, segment_index, frame, start, limit, null);
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    if (c.xpl_expression_check(try a.dupeZ(u8, expression)) != null) return error.UnsupportedPerlExpression;
     return readBindings(session, a, tid, segment_index, frame, 0, 1, expression);
 }
 fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
@@ -459,7 +460,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .diagnostic = (try reason(a, raw.reason)) orelse stack_reason,
         .runtime_version = version,
         .runtime_build_id = id,
-        .basis = "Perl 5.44.0 threaded DWARF layout and verified build-id; canonical context CV/depth/COP lexical scope; retained pad bindings only; no magic, globals, uncaptured outer traversal or inferior calls",
+        .basis = "Perl 5.44.0 threaded DWARF layout and verified build-id; canonical context CV/depth/COP lexical scope; retained pad bindings and bounded raw HV/AV paths; no magic, globals, uncaptured outer traversal or inferior calls",
         .memory_reads = r.reads,
         .memory_bytes = r.bytes,
     };
@@ -512,6 +513,7 @@ fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usiz
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
     if ((expression == null) == (row == null)) return error.InvalidArguments;
     if (expression) |query| if (query.len == 0 or query.len > c.XLW_EXPRESSION or std.mem.indexOfScalar(u8, query, 0) != null) return error.InvalidArguments;
+    if (expression) |query| if (c.xpl_expression_check(try a.dupeZ(u8, query)) != null) return error.UnsupportedPerlExpression;
     if (row) |index| if (index >= c.XPL_MAX_PAD_NAMES) return error.InvalidArguments;
     const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;

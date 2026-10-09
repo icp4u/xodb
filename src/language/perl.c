@@ -517,6 +517,185 @@ static int lexical_name(const char *name) {
     }
     return 0;
 }
+enum { PATH_DEPTH = 8, PATH_BUCKETS = 4096, PATH_ENTRIES = 512 };
+struct path_step { int hash, dereference; uint64_t index; char key[129]; size_t length; };
+struct perl_path { char root[129]; size_t count; struct path_step steps[PATH_DEPTH]; };
+static int identifier(unsigned char ch, int first) {
+    return ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+           (!first && ch >= '0' && ch <= '9');
+}
+static const char *parse_path(const char *text, struct perl_path *out) {
+    memset(out, 0, sizeof *out);
+    if (!text) return "UnsupportedPerlExpression";
+    size_t n = 0;
+    while (n <= 128 && text[n]) ++n;
+    if (n < 2 || n > 128 || !strchr("$@%&", text[0]) || !identifier((unsigned char)text[1], 1))
+        return "UnsupportedPerlExpression";
+    size_t at = 2;
+    while (at < n && identifier((unsigned char)text[at], 0)) ++at;
+    memcpy(out->root, text, at);
+    while (at < n) {
+        if (text[0] != '$' || out->count == PATH_DEPTH) return "UnsupportedPerlExpression";
+        struct path_step *step = &out->steps[out->count];
+        if (at + 1 < n && text[at] == '-' && text[at + 1] == '>') {
+            at += 2; step->dereference = 1;
+        } else step->dereference = out->count != 0;
+        if (at == n || (text[at] != '{' && text[at] != '[')) return "UnsupportedPerlExpression";
+        step->hash = text[at++] == '{';
+        if (out->count == 0 && !step->dereference) out->root[0] = step->hash ? '%' : '@';
+        if (step->hash) {
+            if (at == n) return "UnsupportedPerlExpression";
+            char quote = text[at] == '\'' || text[at] == '"' ? text[at++] : 0;
+            size_t begin = at;
+            if (quote) {
+                while (at < n && text[at] != quote) {
+                    unsigned char ch = (unsigned char)text[at++];
+                    if (ch < 32 || ch >= 127 || ch == '\\' || ch == '$' || ch == '@')
+                        return "UnsupportedPerlExpression";
+                }
+                if (at == n) return "UnsupportedPerlExpression";
+            } else {
+                if (!identifier((unsigned char)text[at], 1)) return "UnsupportedPerlExpression";
+                while (at < n && identifier((unsigned char)text[at], 0)) ++at;
+            }
+            step->length = at - begin;
+            memcpy(step->key, text + begin, step->length);
+            if (quote) ++at;
+            if (at == n || text[at++] != '}') return "UnsupportedPerlExpression";
+        } else {
+            size_t begin = at;
+            while (at < n && text[at] >= '0' && text[at] <= '9') {
+                unsigned digit = (unsigned)(text[at++] - '0');
+                if (step->index > (INT32_MAX - digit) / 10u) return "UnsupportedPerlExpression";
+                step->index = step->index * 10 + digit;
+            }
+            /* Leading zero integers have different Perl octal semantics. */
+            if (at == begin || (at - begin > 1 && text[begin] == '0') || at == n || text[at++] != ']')
+                return "UnsupportedPerlExpression";
+        }
+        ++out->count;
+    }
+    return NULL;
+}
+const char *xpl_expression_check(const char *expression) {
+    struct perl_path path;
+    return parse_path(expression, &path);
+}
+static const char *path_head(const struct xpl_layout *l, struct xpl_reader *r, uint64_t sv,
+                             uint64_t *body, uint32_t *flags) {
+    uint32_t refs;
+    if (!head(l, r, sv, body, flags, &refs)) return r->error ? r->error : "PerlPathInvalidSv";
+    /* Refuse all blessed objects, including overload, and all three magic
+     * flags. Looking at an RV must not bypass magic on its referent. */
+    if (*flags & (0x00e00000u | OBJECT)) return "PerlPathMagicOrObjectUnsupported";
+    return NULL;
+}
+static const char *path_hash(const struct xpl_layout *l, struct xpl_reader *r, uint64_t sv,
+                             uint64_t body, uint32_t flags, const struct path_step *step,
+                             struct xpl_path_value *out) {
+    /* Restricted hashes can throw on absent keys or contain placeholders. */
+    if (flags & 0x08000000u) return "PerlPathRestrictedHashUnsupported";
+    uint64_t count = at(l, r, body, XPL_HVKEYS), max = at(l, r, body, XPL_HVMAX);
+    uint64_t array = at(l, r, sv, XPL_UNION);
+    if (r->error) return r->error;
+    if (max == UINT64_MAX || ((max + 1) & max) || (count && !array)) return "PerlPathHashInvalid";
+    if (max >= PATH_BUCKETS || count > PATH_ENTRIES) return "PerlPathHashLimit";
+    if (!array) return "PerlPathKeyNotFound";
+    uint8_t buckets[PATH_BUCKETS * 8];
+    if (!read_bytes(r, array, buckets, (size_t)(max + 1) * 8)) return r->error;
+    uint64_t seen[PATH_ENTRIES]; size_t used = 0;
+    struct xpl_path_value found = {0};
+    /* Scan the whole bounded table: no seed-dependent hash is computed. Each
+     * stored HEK hash must corroborate the physical bucket. A partial scan,
+     * invalid chain or inconsistent count never becomes a false absence. */
+    for (uint64_t bucket = 0; bucket <= max; ++bucket) {
+        uint64_t he = 0;
+        for (unsigned b = 0; b < 8; ++b) he |= (uint64_t)buckets[bucket * 8 + b] << (b * 8);
+        while (he) {
+            for (size_t i = 0; i < used; ++i) if (seen[i] == he) return "HashEntryCycle";
+            if (used == PATH_ENTRIES || used >= count) return "PerlPathHashInvalid";
+            seen[used++] = he;
+            uint64_t key = at(l, r, he, XPL_HEKEY), value_ = at(l, r, he, XPL_HEVAL);
+            uint64_t hash = at(l, r, key, XPL_HEKHASH);
+            int32_t len = (int32_t)at(l, r, key, XPL_HEKLEN);
+            if (r->error) return r->error;
+            if ((hash & max) != bucket) return "PerlPathHashUnproved";
+            if (len < 0) return "PerlPathSvKeyUnsupported";
+            if (len > 1048576 || key > UINT64_MAX - l->fields[XPL_HEKKEY].offset)
+                return "PerlPathHashInvalid";
+            uint64_t bytes = key + l->fields[XPL_HEKKEY].offset;
+            if (bytes > UINT64_MAX - (uint64_t)len - 1) return "PerlPathHashInvalid";
+            unsigned key_flags = (unsigned)number(r, bytes + (uint64_t)len + 1, 1);
+            if (r->error) return r->error;
+            if (key_flags & ~7u) return "PerlPathKeyFlagsUnsupported";
+            if ((size_t)len == step->length) {
+                char key_text[129];
+                if (!read_bytes(r, bytes, key_text, (size_t)len + 1)) return r->error;
+                if (key_text[len]) return "PerlPathHashInvalid";
+                /* ASCII has the same bytes in both byte and UTF-8 keys. */
+                if (!memcmp(key_text, step->key, (size_t)len)) {
+                    if (found.sv || !value_) return "PerlPathHashInvalid";
+                    found.sv = value_;
+                    if (he > UINT64_MAX - l->fields[XPL_HEVAL].offset) return "PerlPathHashInvalid";
+                    found.slot = he + l->fields[XPL_HEVAL].offset;
+                }
+            }
+            he = at(l, r, he, XPL_HENEXT);
+            if (r->error) return r->error;
+        }
+    }
+    if (used != count) return "PerlPathHashInvalid";
+    if (!found.sv) return "PerlPathKeyNotFound";
+    *out = found;
+    return NULL;
+}
+static void path_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t root,
+                       const struct perl_path *path, struct xpl_path_value *out) {
+    memset(out, 0, sizeof *out); out->sv = root;
+    for (size_t i = 0; i < path->count; ++i) {
+        const struct path_step *step = &path->steps[i];
+        uint64_t body; uint32_t flags;
+        out->reason = path_head(l, r, out->sv, &body, &flags);
+        if (out->reason) break;
+        if (step->dereference) {
+            if (!(flags & ROK) || (flags & 255) == 0 || (flags & 255) >= SV_AV || (flags & (IOK | NOK | POK))) {
+                out->reason = "PerlPathReferenceRequired"; break;
+            }
+            out->sv = at(l, r, out->sv, XPL_UNION);
+            out->reason = path_head(l, r, out->sv, &body, &flags);
+            if (out->reason) break;
+        }
+        if (!body || (flags & ROK) || (flags & 255) != (step->hash ? SV_HV : SV_AV)) {
+            out->reason = "PerlPathContainerRequired"; break;
+        }
+        if (step->hash) out->reason = path_hash(l, r, out->sv, body, flags, step, out);
+        else {
+            int64_t fill = (int64_t)at(l, r, body, XPL_AVFILL), max = (int64_t)at(l, r, body, XPL_AVMAX);
+            uint64_t array = at(l, r, out->sv, XPL_UNION);
+            if (r->error) out->reason = r->error;
+            else if (fill < -1 || max < -1 || fill > max || (fill >= 0 && !array)) out->reason = "PerlPathArrayInvalid";
+            else if (fill < 0 || step->index > (uint64_t)fill) out->reason = "PerlPathIndexOutOfRange";
+            else {
+                out->slot = pointer_slot(r, array, step->index);
+                out->sv = number(r, out->slot, 8);
+                out->reason = r->error ? r->error : out->sv ? NULL : "PerlPathArrayHole";
+            }
+        }
+        if (out->reason) break;
+    }
+    if (!out->reason && path->count) {
+        uint64_t body; uint32_t flags;
+        out->reason = path_head(l, r, out->sv, &body, &flags);
+    }
+    if (out->reason) out->sv = out->slot = 0;
+}
+void xpl_path_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t root,
+                   const char *expression, struct xpl_path_value *out) {
+    struct perl_path path;
+    memset(out, 0, sizeof *out);
+    out->reason = parse_path(expression, &path);
+    if (!out->reason) path_read(l, r, root, &path, out);
+}
 static int pad_frame(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                      size_t index, struct xpl_locals *out, uint64_t *names, uint64_t *slots,
                      int64_t *last) {
@@ -577,7 +756,8 @@ static int pad_frame(const struct xpl_layout *l, struct xpl_reader *r, uint64_t 
     return !r->error;
 }
 static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
-                       size_t frame, size_t start, size_t limit, const char *find, const uint64_t *ordinal, struct xpl_locals *out) {
+                       size_t frame, size_t start, size_t limit, const char *find, const uint64_t *ordinal,
+                       int preview, struct xpl_locals *out) {
     memset(out, 0, sizeof *out);
     out->interpreter = interpreter; out->frame = frame; out->start = start;
     if (find && !ordinal && !lexical_name(find)) { out->reason = "UnsupportedPerlExpression"; return; }
@@ -647,8 +827,10 @@ static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_
             entry->reason = r->error ? r->error : "PadValueUnavailable";
             continue;
         }
-        xpl_value_read(l, r, entry->sv, &entry->value);
-        entry->reason = entry->value.reason;
+        if (preview) {
+            xpl_value_read(l, r, entry->sv, &entry->value);
+            entry->reason = entry->value.reason;
+        }
     }
     if (r->error) out->reason = r->error;
     else if (find && !out->count && !out->reason) {
@@ -661,17 +843,31 @@ static void pad_locals(const struct xpl_layout *l, struct xpl_reader *r, uint64_
 }
 void xpl_locals_read(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                      size_t frame, size_t start, size_t limit, struct xpl_locals *out) {
-    pad_locals(l, r, interpreter, frame, start, limit, NULL, NULL, out);
+    pad_locals(l, r, interpreter, frame, start, limit, NULL, NULL, 1, out);
 }
 void xpl_local_find(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                     size_t frame, const char *name, struct xpl_locals *out) {
-    /* NULL must not silently become an enumeration request. */
-    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", NULL, out);
+    struct perl_path path;
+    const char *why = parse_path(name, &path);
+    if (why) { memset(out, 0, sizeof *out); out->reason = why; return; }
+    pad_locals(l, r, interpreter, frame, 0, 1, path.root, NULL, !path.count, out);
+    if (!path.count || out->reason || out->count != 1) return;
+    struct xpl_local *entry = &out->items[0];
+    if (entry->reason) return;
+    struct xpl_path_value resolved;
+    path_read(l, r, entry->sv, &path, &resolved);
+    entry->sv = resolved.sv; entry->slot_address = resolved.slot;
+    entry->reason = resolved.reason; memset(&entry->value, 0, sizeof entry->value);
+    snprintf(entry->name, sizeof entry->name, "%s", name);
+    if (!entry->reason) {
+        xpl_value_read(l, r, entry->sv, &entry->value);
+        entry->reason = entry->value.reason;
+    }
 }
 
 void xpl_local_binding(const struct xpl_layout *l, struct xpl_reader *r, uint64_t interpreter,
                        size_t frame, uint64_t ordinal, const char *name, struct xpl_locals *out) {
-    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", &ordinal, out);
+    pad_locals(l, r, interpreter, frame, 0, 1, name ? name : "", &ordinal, 1, out);
 }
 
 static int sample_number(struct xpl_sample *out, uint64_t n, size_t bytes) {

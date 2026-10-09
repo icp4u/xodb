@@ -8,7 +8,7 @@
 #include <string.h>
 #ifdef XODB_PERL_WATCH_ORACLE
 #include "../../../src/language/perl.h"
-#include <assert.h>
+#include "../../check.h"
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -79,8 +79,11 @@ static XS(snapshot) {
             struct xpl_sample observed;
             struct xpl_reader reader = {.read = owned_read};
             xpl_sample_read(&layout, &reader, (uintptr_t)value, &observed);
-            assert((observed.reason == NULL) == complete);
-            if (complete) assert(observed.kind == kind && observed.size == used && !memcmp(observed.bytes, bytes, used));
+#ifdef XODB_PERL_ORACLE_NEGATIVE
+            observed.kind ^= 1; /* The harness must reject this wrong sample. */
+#endif
+            CHECK((observed.reason == NULL) == complete);
+            if (complete) CHECK(observed.kind == kind && observed.size == used && !memcmp(observed.bytes, bytes, used));
             ++verified_samples;
 #endif
             if (!first) putchar(',');
@@ -104,8 +107,8 @@ static XS(snapshot) {
 EXTERN_C void boot_XodbWatch(pTHX_ CV *cv) {
     (void)cv;
 #ifdef XODB_PERL_WATCH_ORACLE
-    int fd = open(getenv("XODB_PERL_ORACLE_IMAGE"), O_RDONLY | O_CLOEXEC); assert(fd >= 0);
-    Dwarf *dw = dwarf_begin(fd, DWARF_C_READ); assert(dw);
+    int fd = open(getenv("XODB_PERL_ORACLE_IMAGE"), O_RDONLY | O_CLOEXEC); CHECK(fd >= 0);
+    Dwarf *dw = dwarf_begin(fd, DWARF_C_READ); CHECK(dw);
     uint8_t id[] = {1}, version[] = {5,44,0};
     const char *why = xpl_layout_build(dw, id, sizeof id, version, &layout);
     if (why) { fprintf(stderr, "%s\n", why); abort(); }

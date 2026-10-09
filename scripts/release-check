@@ -126,10 +126,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         if perl and padwalker:
             sdk = ['--perl', perl, '--padwalker', padwalker]
             steps.append(('perl-component', [sys.executable, '-B', 'tests/perl-component.py', *sdk, '--work', '.work/pc', '--sanitize'], 120))
+            steps.append(('perl-path-component', [sys.executable, '-B', 'tests/perl-path-watches.py', *sdk, '--component', '--sanitize', '--work', '.work/ppc'], 180))
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'perl-named-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pn{int(remote)}'], 180))
                 steps.append((f'perl-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pw{int(remote)}'], 300))
+                steps.append((f'perl-path-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-path-watches.py', *sdk, *agent, '--strace', '--work', f'.work/ppw{int(remote)}'], 300))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
         if ruby:
             steps.append(('ruby-watch-component', [sys.executable, '-B', 'tests/ruby-watch-component.py', '--ruby', ruby, '--work', '.work/rwc'], 120))
@@ -230,6 +232,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         if perl and padwalker:
             steps.append(('perl-named-gui', [sys.executable, '-B', 'tests/perl-locals-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/png'], 180))
             steps.append(('perl-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/pwg'], 180))
+            steps.append(('perl-path-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--perl', perl, '--padwalker', padwalker, '--work', '.work/ppg'], 180))
         if lua:
             selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
             steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))

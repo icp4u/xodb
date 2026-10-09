@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import resource
 from pathlib import Path
 import shlex
 import subprocess
@@ -17,6 +18,7 @@ p.add_argument('--padwalker', required=True, type=Path, help='built PadWalker tr
 p.add_argument('--work', required=True, type=Path)
 p.add_argument('--sanitize', action='store_true')
 a = p.parse_args()
+resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 os.umask(0o022)
@@ -43,7 +45,7 @@ run('reader-build', [*cc, '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Werror'
 r = run('reader', [exe])
 assert '2000 corrupt objects passed' in r.stdout
 shared = a.work/'named.so'
-run('oracle-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE', '-shared', '-fPIC',
+run('oracle-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE', '-DNDEBUG', '-shared', '-fPIC',
     '-g3', '-O0', *sanitize, '-DXODB_PERL_ORACLE', '-I'+config['archlib']+'/CORE',
     'tests/fixtures/perl/named.c', *source, '-ldw', '-lelf', '-o', shared])
 image = Path(config['archlib'])/'CORE/libperl.so'
@@ -60,7 +62,7 @@ r = run('oracle', [a.perl, 'tests/fixtures/perl/named.pl', shared], env)
 assert '81 bindings, 20 frames, 9 snapshots passed' in r.stdout, r.stdout
 named_result = r.stdout.splitlines()[-1]
 watch = a.work/'watches.so'
-run('watch-oracle-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE', '-shared', '-fPIC',
+run('watch-oracle-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE', '-DNDEBUG', '-shared', '-fPIC',
     '-g3', '-O0', *sanitize, '-DXODB_PERL_WATCH_ORACLE', '-I'+config['archlib']+'/CORE',
     'tests/fixtures/perl/watches.c', *source, '-ldw', '-lelf', '-o', watch])
 # The cooperating program's own macros produce expected bytes; its separately
@@ -77,11 +79,28 @@ assert first['label'] == 'initial'
 assert any(row['name'] == '$élan' for frame in first['frames'] for row in frame), 'Unicode oracle binding missing'
 deep = next(row for row in oracles if row['label'] == 'deep')
 assert first['context_array'] != deep['context_array'], 'oracle must observe actual context-array relocation'
+# Deliberate mismatches must fail even when the SDK or command defines NDEBUG.
+negative_controls = {}
+for name, define, condition in [
+    ('named', 'XODB_PERL_ORACLE', 'locals->total == HvTOTALKEYS(bindings)'),
+    ('watches', 'XODB_PERL_WATCH_ORACLE', 'observed.kind == kind'),
+]:
+    bad = a.work/(name+'-negative.so')
+    run(name+'-negative-build', [*cc, *shlex.split(config['ccflags']), '-U_FORTIFY_SOURCE',
+        '-DNDEBUG', '-shared', '-fPIC', '-g3', '-O0', *sanitize, '-D'+define,
+        '-DXODB_PERL_ORACLE_NEGATIVE', '-I'+config['archlib']+'/CORE',
+        'tests/fixtures/perl/'+name+'.c', *source, '-ldw', '-lelf', '-o', bad])
+    control = subprocess.run([a.perl, 'tests/fixtures/perl/'+name+'.pl', str(bad)],
+        input='go\n', env=env, capture_output=True, text=True, timeout=90)
+    (a.work/(name+'-negative.log')).write_text(control.stdout+control.stderr)
+    assert control.returncode != 0 and 'CHECK failed: '+condition in control.stderr, (
+        'wrong oracle result was not rejected', name, control.returncode, control.stderr)
+    negative_controls[name] = {'status':'rejected', 'returncode':control.returncode, 'condition':condition}
 inputs = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
     for path in [image, a.padwalker/'blib/lib/PadWalker.pm', a.padwalker/'blib/arch/auto/PadWalker/PadWalker.so',
                  *sorted((image.parent).glob('*.h'))]}
 (a.work/'inputs.json').write_text(json.dumps(inputs, indent=2)+'\n')
 (a.work/'results.json').write_text(json.dumps({'reader': 'pass', 'padwalker_oracle': 'pass',
-    'bindings': 81, 'frames': 20, 'snapshots': 9, 'malformed_cases': 2000, 'sanitizers': a.sanitize, 'scalar_oracle_samples':samples, 'context_array_relocated':True}, indent=2)+'\n')
+    'bindings': 81, 'frames': 20, 'snapshots': 9, 'malformed_cases': 2000, 'sanitizers': a.sanitize, 'scalar_oracle_samples':samples, 'context_array_relocated':True, 'negative_controls':negative_controls}, indent=2)+'\n')
 print(named_result)
 print(f'Perl stopped scalar bytes: {samples} public-macro oracle samples and context relocation passed')

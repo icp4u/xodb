@@ -66,6 +66,7 @@ static const struct field_spec specs[XPL_FIELD_COUNT] = {
     {"PADNAME", "xpadn_ourstash", 8},
     {"PADNAME", "xpadn_low", 4},
     {"PADNAME", "xpadn_high", 4},
+    {"HEK", "hek_hash", 4},
 };
 static int type_of(Dwarf_Die *die, Dwarf_Die *out) {
     Dwarf_Attribute attr;

@@ -9,7 +9,7 @@ a=p.parse_args()
 if sum((bool(a.node),bool(a.ruby),bool(a.python),bool(a.perl),bool(a.source or a.library)))!=1 or (not (a.node or a.python or a.perl or a.ruby) and not (a.source and a.library)):p.error('choose --node, --ruby, --python, --perl, or both --source and --library')
 if a.perl and not a.padwalker:p.error('--perl requires --padwalker')
 if (a.node or a.python or a.perl or a.ruby) and a.reuse:p.error('--reuse uses the Lua fixture')
-if a.paths and (not (a.source or a.python) or a.reuse):p.error('--paths requires Python or Lua without --reuse')
+if a.paths and (not (a.source or a.python or a.perl) or a.reuse):p.error('--paths requires Perl, Python or Lua without --reuse')
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022)
 w=(a.work/'.work/input-lwatch').resolve();w.mkdir(parents=True,mode=0o755)
 fixture=w/'host';language='javascript' if a.node else 'ruby' if a.ruby else 'python' if a.python else 'perl' if a.perl else 'lua'
@@ -34,8 +34,9 @@ elif a.python:
 elif a.perl:
     cfg=json.loads(subprocess.check_output([a.perl,'-MConfig','-MJSON::PP','-e','print JSON::PP::encode_json({map {$_=>$Config{$_}} qw(archlib cc ccflags)})'],timeout=30))
     shared=w/'watches.so'
-    subprocess.run([*shlex.split(cfg['cc']),*shlex.split(cfg['ccflags']),'-U_FORTIFY_SOURCE','-shared','-fPIC','-g3','-O0','-fno-omit-frame-pointer','-I'+cfg['archlib']+'/CORE',str(source),'-o',str(shared)],check=True,timeout=90)
-    target_command=[a.perl,str(root/'tests/fixtures/perl/watches.pl'),str(shared)]
+    compiled_source=root/'tests/fixtures/perl/paths.c' if a.paths else source
+    subprocess.run([*shlex.split(cfg['cc']),*shlex.split(cfg['ccflags']),'-U_FORTIFY_SOURCE','-shared','-fPIC','-g3','-O0','-fno-omit-frame-pointer','-I'+cfg['archlib']+'/CORE',str(compiled_source),'-o',str(shared)],check=True,timeout=90)
+    target_command=[a.perl,str(root/('tests/fixtures/perl/paths.pl' if a.paths else 'tests/fixtures/perl/watches.pl')),str(shared)]
     target_env=dict(os.environ,PERL5LIB=str(a.padwalker.resolve()/'blib/lib')+':'+str(a.padwalker.resolve()/'blib/arch'))
 else:
     subprocess.run(['cc','-std=c11','-g','-O0','-fno-omit-frame-pointer','-Wall','-Wextra','-Werror','-I'+a.source,'tests/fixtures/lua/path-watches.c' if a.paths else 'tests/fixtures/lua/watch-reuse.c' if a.reuse else 'tests/fixtures/lua/watches.c',a.library,'-lm','-ldl','-o',str(fixture)],check=True,timeout=90)
@@ -119,9 +120,14 @@ try:
         location=tuple(before_stack['segments'][segment]['frames'][frame][key] for key in ('call_info','prototype'))
     # Shift+E creates a name expression watch; ordinary E stays a stopped read.
     if a.paths:
-        # root['player']['score'] or object.a in the actual Shift+E field.
-        keys=(19,24,24,20,26,40,25,38,30,21,18,19,40,27,26,40,31,46,24,19,18,40,27) if a.python else (24,48,36,18,46,20,52,30)
-        d.keys('down',42,'tap',18,'up',42,*[value for key in keys for value in ('tap',key)],'tap',28)
+        # Enter the path through the actual Shift+E field.
+        if a.perl:
+            d.keys('down',42,'tap',18,'up',42,'down',42,'tap',5,'up',42,
+                   'tap',35,'tap',30,'tap',31,'tap',35,'down',42,'tap',26,'up',42,
+                   'tap',31,'tap',46,'tap',24,'tap',19,'tap',18,'down',42,'tap',27,'up',42,'tap',28)
+        else:
+            keys=(19,24,24,20,26,40,25,38,30,21,18,19,40,27,26,40,31,46,24,19,18,40,27) if a.python else (24,48,36,18,46,20,52,30)
+            d.keys('down',42,'tap',18,'up',42,*[value for key in keys for value in ('tap',key)],'tap',28)
     else:
         d.keys('down',42,'tap',18,'up',42,*(['down',42,'tap',5,'up',42] if a.perl else []),'tap',45,'tap',28)
     if a.node:
@@ -134,10 +140,10 @@ try:
             rows=d.tool('get_language_watches')['watches']
             if len(rows)==2:break
             assert time.monotonic()<deadline,rows;time.sleep(.02)
-        assert rows[1]['selector']=='expression' and rows[1]['expression']==(("root['player']['score']" if a.python else 'object.a') if a.paths else binding_name),rows
+        assert rows[1]['selector']=='expression' and rows[1]['expression']==(("$hash{score}" if a.perl else "root['player']['score']" if a.python else 'object.a') if a.paths else binding_name),rows
     if a.paths:
         d.keys('click',850,639,'tap',27)
-        visible('watch-path',['rootplayerscore' if a.python else 'objecta','expression'],(600,585,1272,764))
+        visible('watch-path',['hashscore' if a.perl else 'rootplayerscore' if a.python else 'objecta','expression'],(600,585,1272,764))
     assert d.session()['generation']==generation and d.tool('get_registers',tid=target.pid)==regs
     d.keys('tap',57);assert d.wait(lambda s:s['generation']>generation and s['state']=='stopped' and any(t['reason']=='breakpoint' for t in s['threads']))
     json.loads(lines.get(timeout=10))

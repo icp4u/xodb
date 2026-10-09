@@ -8,7 +8,7 @@
 #include <string.h>
 #ifdef XODB_RUBY_WATCH_ORACLE
 #include "../../../src/language/ruby.h"
-#include <assert.h>
+#include "../../check.h"
 #include <fcntl.h>
 #include <sys/uio.h>
 #include <unistd.h>
@@ -42,8 +42,11 @@ static VALUE sample(VALUE self,VALUE v) {
 #ifdef XODB_RUBY_WATCH_ORACLE
     struct xrb_reader reader={.read=owned_read};struct xrb_sample got;
     xrb_sample_read(&layout,&reader,(uintptr_t)v,&got);
-    assert((got.reason==NULL)==complete);
-    if(complete)assert(got.kind==kind&&got.size==n&&!memcmp(got.bytes,bytes,n));
+#ifdef XODB_RUBY_ORACLE_NEGATIVE
+    got.kind ^= 1; /* The harness must reject this deliberately wrong sample. */
+#endif
+    CHECK((got.reason==NULL)==complete);
+    if(complete)CHECK(got.kind==kind&&got.size==n&&!memcmp(got.bytes,bytes,n));
     ++verified;
 #endif
     VALUE out=rb_hash_new();
@@ -65,8 +68,8 @@ static VALUE stop(VALUE self) {
 void Init_xodb_watches(void) {
     (void)prctl(PR_SET_PTRACER,PR_SET_PTRACER_ANY,0,0,0);
 #ifdef XODB_RUBY_WATCH_ORACLE
-    int fd=open(getenv("XODB_RUBY_ORACLE_IMAGE"),O_RDONLY|O_CLOEXEC);assert(fd>=0);
-    Dwarf *dw=dwarf_begin(fd,DWARF_C_READ);assert(dw);uint8_t id[]={1};
+    int fd=open(getenv("XODB_RUBY_ORACLE_IMAGE"),O_RDONLY|O_CLOEXEC);CHECK(fd>=0);
+    Dwarf *dw=dwarf_begin(fd,DWARF_C_READ);CHECK(dw);uint8_t id[]={1};
     const char *why=xrb_layout_build(dw,id,sizeof id,XRB_VERSION,XRB_REVISION,&layout);
     if(why){fprintf(stderr,"%s\n",why);abort();}dwarf_end(dw);close(fd);
 #endif

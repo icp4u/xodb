@@ -37,6 +37,7 @@ Try: Space (stop in Perl_av_store) · Shift+E val Return (a new, undefined eleme
      Live rows update each stop; val is out of scope in delete, then undef at store
      Shift+L converts a selected row to/from a pinned watch; click frames to change context
      Tab to Perl; click main::store_answer; E $value Return reads its named binding
+     Shift+E $list->[3] Return watches that current element; missing slots are unavailable
      In Perl, select main::tick; Shift+E $round Return follows its stopped scalar value
      Space through delete/store: differences keep the activation-unproved caveat
      Click Native frame [-] to give the logical stack more room

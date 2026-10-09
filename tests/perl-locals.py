@@ -69,9 +69,12 @@ try:
                 found=client.inspect('evaluate_language_expression',**arguments,expression=row['name'])
                 assert found['diagnostic'] is None and found['rows']==[row],(found,row)
                 bindings+=1
-            for expression,why in [('$absent_binding_xyz','PerlOuterScopeUnread'),('$n+1','UnsupportedPerlExpression'),('system()','UnsupportedPerlExpression'),('$n[0]','UnsupportedPerlExpression')]:
+            for expression,why in [('$absent_binding_xyz','PerlOuterScopeUnread'),('$n[0]','PerlOuterScopeUnread')]:
                 found=client.inspect('evaluate_language_expression',**arguments,expression=expression)
                 assert not found['rows'] and found['diagnostic']==why,found
+            for expression in ('$n+1','system()','$n[f()]'):
+                found=client.tool('evaluate_language_expression',**arguments,expression=expression)['result']
+                assert found.get('isError') and found['content'][0]['text']=='UnsupportedPerlExpression',found
             if stop==3 and frame==0:
                 package=client.inspect('evaluate_language_expression',**arguments,expression='$masked')
                 assert package['diagnostic']=='PerlPackageVariableUnread' and not package['rows'],package

@@ -135,7 +135,9 @@ extra arguments have a `(vararg) ×N` row; it has no expression name or address.
 
 In **Perl**, click a subroutine logical frame to read its active `my`/`state`
 bindings and captured outer pad entries. **E** accepts a sigil-name such as
-`$value`, `@array` or `%hash`. In `scripts/demo-perl`, press **Space**, **Tab** to
+`$value`, `@array` or `%hash`, and builtin paths such as `$hash{score}` or
+`$list->[3]`. **Shift+E** retains a path watch that resolves fresh storage at
+each stop; tied/magical or blessed storage is refused. In `scripts/demo-perl`, press **Space**, **Tab** to
 Perl, select `main::store_answer`, then **E**, `$value`, **Return** to read `IV 42`.
 Recursion uses the selected activation's pad. Eval/try/format/XS frames, fields,
 missing names and unproved storage show a reason. No magic or Perl code runs.
@@ -315,4 +317,3 @@ For a video: `xodb --break change_value -- ./zig-out/bin/xodb-m1-fixture w`,
 **Space**, **F10** to reach the function body, **Shift+E**, paste `amount` with
 **Ctrl+V**, then **Return**. Use **Space** to reach the next call. Only the final
 Return adds the live display.
-

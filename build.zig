@@ -174,7 +174,7 @@ pub fn build(b: *std.Build) void {
     for (runtime_sources) |source| {
         perf_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
-    perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const fdscan_tests = b.addExecutable(.{ .name = "xodb-runtime-fdscan-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdscan_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdscan.c" }) |source| {
@@ -229,7 +229,7 @@ pub fn build(b: *std.Build) void {
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     wire_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
-        wire_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+        wire_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     const agent = b.addExecutable(.{ .name = "xodb-agent", .root_module = b.createModule(.{ .target = portable_target, .optimize = optimize, .link_libc = true }) });
     const snapshot_tests = b.addExecutable(.{ .name = "xodb-runtime-snapshot-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -238,7 +238,7 @@ pub fn build(b: *std.Build) void {
         for (runtime_sources) |source| artifact.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     agent.root_module.addCSourceFile(.{ .file = b.path("src/runtime/agent_main.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
-    snapshot_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-snapshot.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    snapshot_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-snapshot.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     const sysstat_tests = b.addExecutable(.{ .name = "xodb-runtime-sysstat-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     sysstat_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/sysstat.c", "src/runtime/sysstat_nvml.c", "tests/runtime-sysstat.c" }) |source| {
@@ -379,7 +379,7 @@ pub fn build(b: *std.Build) void {
         remote_tests.pie = false;
         remote_tests.root_module.addIncludePath(b.path("src/runtime"));
         for (runtime_sources) |source| remote_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
-        remote_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-remote.c"), .flags = &.{ "-std=c11", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });
+        remote_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-remote.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-fno-pie", "-Wall", "-Wextra", "-Werror" } });
         const remote_run = b.addRunArtifact(remote_tests);
         remote_run.addArtifactArg(agent);
         test_step.dependOn(&remote_run.step);

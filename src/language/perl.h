@@ -65,6 +65,7 @@ enum xpl_field {
     XPL_NAMEOUR,
     XPL_NAMELOW,
     XPL_NAMEHIGH,
+    XPL_HEKHASH,
     XPL_FIELD_COUNT
 };
 struct xpl_field_info {
@@ -147,11 +148,18 @@ struct xpl_locals {
     struct xpl_local items[XPL_MAX_LOCALS];
 };
 /* Select by a canonical retained context ordinal, never by a caller-provided
- * CV/pad address. Lexical lookup accepts only a sigil and ASCII identifier. */
+ * CV/pad address. Expressions support ASCII lexical names and bounded raw
+ * builtin hash/array paths; no target calls or implicit autovivification. */
 void xpl_locals_read(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
                      size_t frame, size_t start, size_t limit, struct xpl_locals *);
 void xpl_local_find(const struct xpl_layout *, struct xpl_reader *, uint64_t interpreter,
                     size_t frame, const char *name, struct xpl_locals *);
+const char *xpl_expression_check(const char *);
+/* Resolve from an already selected lexical SV. Used by the pad reader and by
+ * independent runtime-oracle tests. Missing entries are explicit refusals. */
+struct xpl_path_value { uint64_t sv, slot; const char *reason; };
+void xpl_path_read(const struct xpl_layout *, struct xpl_reader *, uint64_t root,
+                   const char *expression, struct xpl_path_value *);
 /* A retained declaration remains that ordinal even while a same-named inner
  * declaration is visible. Its name is exact declared bytes, not an expression;
  * Unicode names are allowed. Inactive or mismatched declarations are refused. */

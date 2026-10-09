@@ -466,7 +466,7 @@ static void named_locals(struct xpl_layout *l) {
         r=reader();xpl_local_find(l,&r,0x1100,0,missing[i],out);
         assert(out->reason && !strcmp(out->reason, !strcmp(missing[i], "$masked") ? "PerlPackageVariableUnread" : "PerlOuterScopeUnread") && !out->count);
     }
-    const char *invalid[]={NULL,"","$","x","$x+1","$x[0]","$x->foo","@a()","$::x"," $x","$x ","$9x","$$x"};
+    const char *invalid[]={NULL,"","$","x","$x+1","$x[f()]","$x->foo","@a()","$::x"," $x","$x ","$9x","$$x"};
     for(unsigned i=0;i<sizeof invalid/sizeof *invalid;++i) {
         r=reader();xpl_local_find(l,&r,0x1100,0,invalid[i],out);
         assert(!strcmp(out->reason,"UnsupportedPerlExpression") && attempts==0);
@@ -624,6 +624,47 @@ static void watch_bindings(struct xpl_layout *l) {
     puts("Perl watch bindings: relocatable context identity, structural completion, retained shadowed declaration, inactive/package refusal and every-read failure passed");
 }
 
+static void paths(void) {
+    struct xpl_layout l = layout();
+    l.fields[XPL_HEKHASH] = (struct xpl_field_info){0,4};
+    l.fields[XPL_HEKLEN] = (struct xpl_field_info){4,4};
+    l.fields[XPL_HEKKEY] = (struct xpl_field_info){8,1};
+    memset(memory, 0, sizeof memory);
+    const char *valid[] = {"$x", "%h", "@a", "$h{k}", "$h{''}", "$h{\"a b\"}", "$a[0]", "$r->{k}->[2]", "$r->[0]{k}"};
+    const char *invalid[] = {NULL,"", "$r->{", "$r->{'x}", "$r->{x", "$r->{x}junk", "$r->[01]", "$r->[-1]", "$r->[2147483648]", "$r->{\"$x\"}", "$r->{'\\n'}", "$r->{\xc3\xa9}", "$r->{a}{a}{a}{a}{a}{a}{a}{a}{a}"};
+    for (size_t i=0;i<sizeof valid/sizeof *valid;++i) assert(!xpl_expression_check(valid[i]));
+    for (size_t i=0;i<sizeof invalid/sizeof *invalid;++i) assert(xpl_expression_check(invalid[i]));
+    const uint64_t rv=0x1100,hv=0x1200,body=0x2000,buckets=0x3000,he=0x4000,key=0x5000,av=0x6000,abody=0x7000,slots=0x8000,leaf=0x9000;
+    sv(rv,0x801,0,hv);sv(hv,12,body,buckets);field(&l,body,XPL_HVMAX,7);field(&l,body,XPL_HVKEYS,1);
+    put(buckets+3*8,he,8);field(&l,he,XPL_HEKEY,key);field(&l,he,XPL_HEVAL,av);
+    field(&l,key,XPL_HEKHASH,11);field(&l,key,XPL_HEKLEN,1);str(key+8,"k");
+    sv(av,0x801,0,av+64);sv(av+64,11,abody,slots);field(&l,abody,XPL_AVFILL,2);field(&l,abody,XPL_AVMAX,3);
+    put(slots+2*8,leaf,8);sv(leaf,0x101,0,7);
+    struct xpl_reader r=reader();struct xpl_path_value out;
+    xpl_path_read(&l,&r,rv,"$r->{k}[2]",&out);assert(!out.reason && out.sv==leaf && out.slot==slots+16);
+    size_t total=attempts;
+    for(size_t i=1;i<=total;++i) {fail_at=i;r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[2]",&out);assert(out.reason && !out.sv && !out.slot);}
+    fail_at=0;
+    r=reader();xpl_path_read(&l,&r,hv,"$h{k}",&out);assert(!out.reason && out.sv==av);
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{absent}",&out);assert(!strcmp(out.reason,"PerlPathKeyNotFound"));
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[0]",&out);assert(!strcmp(out.reason,"PerlPathArrayHole"));
+    r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[3]",&out);assert(!strcmp(out.reason,"PerlPathIndexOutOfRange"));
+    for(unsigned bit=0x00100000;bit<=0x00800000;bit<<=1) {
+        field(&l,hv,XPL_FLAGS,12|bit);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathMagicOrObjectUnsupported"));
+        field(&l,hv,XPL_FLAGS,12);field(&l,rv,XPL_FLAGS,0x801|bit);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathMagicOrObjectUnsupported"));
+        field(&l,rv,XPL_FLAGS,0x801);
+    }
+    field(&l,hv,XPL_FLAGS,12|0x08000000);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathRestrictedHashUnsupported"));field(&l,hv,XPL_FLAGS,12);
+    field(&l,leaf,XPL_FLAGS,0x00200101);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[2]",&out);assert(!strcmp(out.reason,"PerlPathMagicOrObjectUnsupported"));field(&l,leaf,XPL_FLAGS,0x101);
+    field(&l,key,XPL_HEKHASH,12);r=reader();xpl_path_read(&l,&r,rv,"$r->{absent}",&out);assert(!strcmp(out.reason,"PerlPathHashUnproved"));field(&l,key,XPL_HEKHASH,11);
+    field(&l,he,XPL_HENEXT,he);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"HashEntryCycle"));field(&l,he,XPL_HENEXT,0);
+    field(&l,body,XPL_HVKEYS,2);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathHashInvalid"));field(&l,body,XPL_HVKEYS,1);
+    field(&l,key,XPL_HEKLEN,UINT32_MAX);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathSvKeyUnsupported"));field(&l,key,XPL_HEKLEN,1);
+    field(&l,body,XPL_HVMAX,8191);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}",&out);assert(!strcmp(out.reason,"PerlPathHashLimit"));field(&l,body,XPL_HVMAX,7);
+    field(&l,abody,XPL_AVFILL,5);r=reader();xpl_path_read(&l,&r,rv,"$r->{k}[2]",&out);assert(!strcmp(out.reason,"PerlPathArrayInvalid"));
+    puts("Perl paths: syntax, nested raw storage, holes, missing keys, magic/object/restricted refusal, stored-hash mismatch, corrupt chains and every-read failure passed");
+}
+
 int main(void) {
     struct xpl_layout l = layout();
     assert(!xpl_layout_check(&l, l.build_id, l.build_id_len, l.version));
@@ -640,6 +681,7 @@ int main(void) {
     named_locals(&l);
     watch_samples(&l);
     watch_bindings(&l);
+    paths();
     puts("Perl memory reader: values, stale undef bits, bounded previews, identity refusal, corrupt contexts and "
          "every-read failure passed");
     return 0;
