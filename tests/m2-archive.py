@@ -73,14 +73,67 @@ class Offline(Client):
         self.p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         ready(self)
 
+def capture_evidence(c, capture, symbol):
+    """Wait for this archive's coverage, without warming a flamegraph cache.
+
+    The existing >20 assertion exercises more than one raw-sample page. It is
+    a required corpus size, not a sample-rate or wall-time assumption. Also
+    observe hot_hash and a nontrivial time filter before stopping the fixture.
+    """
+    begin, end = int(symbol['address'], 16), int(symbol['address'], 16) + symbol['size']
+    assert end > begin, symbol
+    samples, stale, paused = [], 0, False
+    deadline = time.monotonic() + 30
+    while True:
+        state = c.inspect('get_profile')
+        cap = state['capture']
+        assert cap['id'] == capture['id'] and cap['status'] == 'collecting', cap
+        assert state['recorded_view_job'] is None, state
+        assert time.monotonic() < deadline, (cap, len(samples), 'archive corpus did not become ready')
+        if not paused:
+            if cap['stored_samples'] <= max(20, len(samples)):
+                time.sleep(.005)
+                continue
+            # Raw pages require an exact current revision. Stop the owned
+            # fixture so collection cannot invalidate every page request.
+            c.action('interrupt'); c.stopped()
+            paused = True
+            continue
+        if len(samples) < cap['stored_samples']:
+            response = c.tool('get_profile_samples', capture_id=cap['id'], revision=cap['revision'], start=len(samples), limit=16)
+            if response['result']['isError']:
+                error(response, 'StaleProfile'); stale += 1
+                continue
+            page = response['result']['structuredContent']
+            for row in page['samples']:
+                assert row['ordinal'] == len(samples), row
+                samples.append(row['sample'])
+        if len(samples) > 20 and any(s['ip'] is not None and begin <= s['ip'] < end for s in samples):
+            tid = samples[0]['tid']
+            times = sorted({s['time_ns'] for s in samples if s['tid'] == tid and s['time_ns'] is not None})
+            if len(times) > 1:
+                upper = times[0] + (times[-1] - times[0]) // 2 + 1
+                filters = dict(tid=tid, from_ns=0, to_ns=upper - cap['started_ns'])
+                assert filters['to_ns'] > 0 and times[0] < upper <= times[-1]
+                return filters, dict(samples=len(samples), stale_retries=stale, hot_hash=True)
+        if len(samples) == cap['stored_samples']:
+            c.action('continue'); paused = False
+        time.sleep(.005)
+
 original = run / 'original.xcap'
-c = Client('control', str(fixture), args=['2', 'threads'])
+stop_file = run / 'finish-profile'
+c = Client('control', str(fixture), args=['60', 'threads', str(stop_file)])
 try:
     bp = c.action('set_breakpoint', symbol='profile_ready')['id']
     c.action('continue'); c.stopped('breakpoint'); c.action('remove_breakpoint', id=bp)
-    cap = c.action('start_profile', frequency_hz=199, context_switch=True)['capture']
-    c.action('continue'); time.sleep(.6)
+    symbol = c.inspect('find_symbol', name='hot_hash')
+    cap = c.action('start_profile', frequency_hz=199, context_switch=True, duration_ms=0)['capture']
+    c.action('continue')
+    filters, evidence = capture_evidence(c, cap, symbol)
+    (run / 'capture-evidence.json').write_text(json.dumps(evidence, indent=2) + '\n')
     cap = c.action('stop_profile', capture_id=cap['id'])['capture']
+    stop_file.touch()
+    c.action('continue')
     # Saving must not rely on any graph query having warmed the cache.
     published = save(c, original)
     assert published['state'] == 'published' and not published['cleanup_error'], published
@@ -91,13 +144,14 @@ try:
     assert expected['samples'] > 20 and any(n['name'] == 'hot_hash' for n in expected['nodes'])
     cap = c.inspect('get_profile')['capture']
     first_samples = c.inspect('get_profile_samples', capture_id=cap['id'], revision=cap['revision'], limit=16)['samples']
-    filters = dict(tid=cap['threads'][0]['perf']['tid'], from_ns=0, to_ns=300000000)
     expected_filtered = graph(c, **filters)
+    assert 0 < expected_filtered['samples'] < expected['samples'], (expected_filtered, expected)
     deadline = time.monotonic() + 5
     while c.session()['state'] != 'exited':
         assert time.monotonic() < deadline
         time.sleep(.02)
 finally:
+    stop_file.touch()
     (run / 'live-rpc.json').write_text(json.dumps(c.transcript, indent=2) + '\n')
     c.close()
 # Back up before removing the original fixture build path.

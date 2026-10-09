@@ -575,9 +575,14 @@ pub const Server = struct {
                 try self.reply(a, id, .{ .isError = true, .content = .{.{ .type = "text", .text = @errorName(err) }} });
                 return;
             };
-            const text = try std.json.Stringify.valueAlloc(a, result, .{});
-            try self.reply(a, id, .{ .structuredContent = result, .isError = false, .content = .{.{ .type = "text", .text = text }} });
+            try self.toolReply(a, id, result);
         } else try self.failure(a, id, -32601, "Method not found");
+    }
+    fn toolReply(self: *Server, a: Allocator, id: Value, result: Value) !void {
+        var exact_result = result;
+        try @import("exact.zig").addresses(a, &exact_result);
+        const text = try std.json.Stringify.valueAlloc(a, exact_result, .{});
+        try self.reply(a, id, .{ .structuredContent = exact_result, .isError = false, .content = .{.{ .type = "text", .text = text }} });
     }
     pub fn pump(self: *Server, session: *Session) !void {
         // A request executes exactly once, only when its full reply has room.
@@ -690,4 +695,46 @@ test "tool policy cache is mode-specific and does not cache authorization" {
     try std.testing.expectError(error.UnknownTool, server.toolPolicy(overview.definitions, "add_language_watch"));
     try std.testing.expectError(error.UnknownTool, server.toolPolicy(@import("imported.zig").definitions, "write_memory"));
     try std.testing.expectEqual(shared_context.Access.mutator, (try server.toolPolicy(tool_definitions, "write_memory")).required);
+}
+
+test "tool replies preserve numeric fields and share exact structured and text results" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const server = try a.create(Server);
+    server.* = .{};
+    const result = try asValue(a, .{ .rows = .{.{ .address = @as(u64, 9007199254740993), .slot_address = std.math.maxInt(u64), .offset = std.math.minInt(i64) }} });
+    try server.toolReply(a, .{ .integer = 1 }, result);
+    const reply = (try std.json.parseFromSlice(Value, a, server.output[0 .. server.queued - 1], .{})).value.object.get("result").?;
+    const structured = reply.object.get("structuredContent").?;
+    const text = reply.object.get("content").?.array.items[0].object.get("text").?.string;
+    try std.testing.expectEqualStrings(text, try std.json.Stringify.valueAlloc(a, structured, .{}));
+    const row = structured.object.get("rows").?.array.items[0];
+    try std.testing.expectEqual(@as(i64, 9007199254740993), row.object.get("address").?.integer);
+    try std.testing.expectEqualStrings("0x20000000000001", row.object.get("address_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", row.object.get("slot_address_hex").?.string);
+    try std.testing.expectEqualStrings("-0x8000000000000000", row.object.get("offset_hex").?.string);
+}
+
+test "hex expansion obeys the reply cap and leaves the next request usable" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const server = try a.create(Server);
+    server.* = .{};
+    const Row = struct { address: u64 };
+    const rows = try a.alloc(Row, 10000);
+    for (rows) |*row| row.* = .{ .address = std.math.maxInt(u64) };
+    const value = try asValue(a, rows);
+    const old_text = try std.json.Stringify.valueAlloc(a, value, .{});
+    const old_reply = try std.json.Stringify.valueAlloc(a, .{ .structuredContent = value, .isError = false, .content = .{.{ .type = "text", .text = old_text }} }, .{});
+    try std.testing.expect(old_reply.len < server.output.len);
+    try server.toolReply(a, .{ .integer = 1 }, value);
+    const reply = (try std.json.parseFromSlice(Value, a, server.output[0 .. server.queued - 1], .{})).value;
+    try std.testing.expectEqual(-32000, reply.object.get("error").?.object.get("code").?.integer);
+    try std.testing.expect(!server.closed);
+    server.queued = 0; // Previous reply drained by the peer.
+    try server.toolReply(a, .{ .integer = 2 }, try asValue(a, .{ .address = @as(u64, 9007199254740993) }));
+    const next = (try std.json.parseFromSlice(Value, a, server.output[0 .. server.queued - 1], .{})).value;
+    try std.testing.expectEqualStrings("0x20000000000001", next.object.get("result").?.object.get("structuredContent").?.object.get("address_hex").?.string);
 }

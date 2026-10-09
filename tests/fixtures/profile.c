@@ -60,6 +60,9 @@ int main(int argc, char **argv) {
     (void)now_ns(); // resolve lazy loader paths before the capture checkpoint
     puts("profile demo ready: P, then Space; P stops capture, F toggles flames");
     int threaded = argc > 2 && !strcmp(argv[2], "threads");
+    /* Tests may finish a threaded run after observing the needed samples.
+     * The seconds argument remains a fail-safe if the harness disappears. */
+    const char *stop_file = threaded && argc > 3 ? argv[3] : NULL;
     pthread_t worker;
     if (threaded && pthread_create(&worker, NULL, profile_worker, NULL)) return 2;
     int kernel = argc > 2 && !strcmp(argv[2], "kernel");
@@ -87,6 +90,7 @@ int main(int argc, char **argv) {
     uint64_t begin = now_ns(), iterations = 0;
     void *late_map = NULL;
     while (now_ns() - begin < (uint64_t)seconds * 1000000000ULL) {
+        if (stop_file && access(stop_file, F_OK) == 0) break;
         if (kernel) {
             if (read(zero, kernel_buffer, sizeof(kernel_buffer)) <= 0) return 2;
         } else if (sleeping) usleep(10000);

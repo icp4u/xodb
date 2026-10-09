@@ -97,3 +97,186 @@ test "raw words and duration totals stay exact through JSON projection" {
     try std.testing.expectEqualStrings("12", value.object.get("fast").?.object.get("total_ns").?.string);
     try std.testing.expectEqualStrings("0xffffffffffffffff", value.object.get("result").?.object.get("value").?.string);
 }
+
+// Compatibility fields remain untouched. Only integer tokens are projected:
+// converting through f64 here would already have lost the low bits.
+fn integerHex(a: std.mem.Allocator, value: V) !?V {
+    const n: i128 = switch (value) {
+        .integer => |n| n,
+        .number_string => |s| std.fmt.parseInt(i128, s, 10) catch return error.InvalidEvidenceWord,
+        .null => return .null,
+        else => return null,
+    };
+    if (n < std.math.minInt(i64) or n > std.math.maxInt(u64)) return error.InvalidEvidenceWord;
+    return .{ .string = if (n < 0) try std.fmt.allocPrint(a, "-0x{x}", .{-n}) else try std.fmt.allocPrint(a, "0x{x}", .{n}) };
+}
+fn addressField(key: []const u8) bool {
+    for ([_][]const u8{ "address", "pointer", "offset", "pc", "sp", "fp", "ip", "bias" }) |suffix| {
+        if (std.mem.eql(u8, key, suffix)) return true;
+        if (key.len > suffix.len and std.mem.endsWith(u8, key, suffix) and key[key.len - suffix.len - 1] == '_') return true;
+    }
+    return for ([_][]const u8{
+        "start",            "end",            "base",         "entry",           "link_entry",     "local_entry",  "target",    "cfa",
+        "bits",             "tagged",         "object",       "body",            "map",            "type_object",  "stackinfo", "root_register",
+        "runtime_location", "frame_location", "prototype",    "unpatched_probe", "offset_advance", "before",       "after",     "previous",
+        "pcs",              "registers",      "running_to",   "main_phdr",       "interpreter",    "displacement", "immediate", "bci",
+        "raw_marker",       "result",         "return_value", "argument_value",  "args",           "arg0",         "arg1",
+    }) |name| {
+        if (std.mem.eql(u8, key, name)) break true;
+    } else false;
+}
+fn projected(a: std.mem.Allocator, value: V) !?V {
+    if (value != .array) return integerHex(a, value);
+    // Saved register banks and address arrays retain positional nulls. Object
+    // rows (get_debug_view registers) instead receive their own value_hex.
+    for (value.array.items) |item| switch (item) {
+        .integer, .number_string, .null => {},
+        else => return null,
+    };
+    var out: std.array_list.Managed(V) = .init(a);
+    for (value.array.items) |item| try out.append((try integerHex(a, item)).?);
+    return .{ .array = out };
+}
+fn hexEqual(left: V, right: V) bool {
+    if (std.meta.activeTag(left) != std.meta.activeTag(right)) return false;
+    return switch (left) {
+        .null => true,
+        .string => |s| std.mem.eql(u8, s, right.string),
+        .array => |items| blk: {
+            if (items.items.len != right.array.items.len) break :blk false;
+            for (items.items, right.array.items) |x, y| if (!hexEqual(x, y)) break :blk false;
+            break :blk true;
+        },
+        else => false,
+    };
+}
+/// One projection for every successful MCP tool result, including nested rows.
+/// Existing hex strings remain strings; numeric fields gain *_hex siblings.
+pub fn addresses(a: std.mem.Allocator, value: *V) !void {
+    try addressRows(a, value, "");
+}
+fn addressRows(a: std.mem.Allocator, value: *V, parent: []const u8) anyerror!void {
+    switch (value.*) {
+        .array => |*array| for (array.items) |*item| try addressRows(a, item, parent),
+        .object => |*object| {
+            const original_count = object.count();
+            const js_frame = object.contains("frame_pointer");
+            // Index the original entries afresh after each insertion: put may
+            // relocate this map. Never hold an iterator or value pointer then.
+            for (0..original_count) |i| {
+                const key = object.keys()[i];
+                try addressRows(a, &object.values()[i], key);
+                const register = std.mem.eql(u8, parent, "registers") and std.mem.eql(u8, key, "value");
+                const js_pointer = js_frame and (std.mem.eql(u8, key, "function") or std.mem.eql(u8, key, "shared") or std.mem.eql(u8, key, "code") or std.mem.eql(u8, key, "context") or std.mem.eql(u8, key, "bytecode"));
+                if (!addressField(key) and !register and !js_pointer) continue;
+                // The coverage summary also has an integer count named
+                // registers. Only register banks get a parallel array.
+                if (std.mem.eql(u8, key, "registers") and object.values()[i] != .array) continue;
+                const hex = (try projected(a, object.values()[i])) orelse continue;
+                const sibling = try std.fmt.allocPrint(a, "{s}_hex", .{key});
+                if (object.get(sibling)) |old| {
+                    // Idempotent, but never silently retain contradictory data.
+                    if (!hexEqual(old, hex)) return error.ConflictingEvidenceWord;
+                } else try object.put(a, sibling, hex);
+            }
+        },
+        else => {},
+    }
+}
+test "additive addresses preserve integer tokens and exact signed magnitudes" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a,
+        \\{"address":9007199254740993,"offset":-9223372036854775808,"pc":18446744073709551615,"pointer":null,"data_address":"0xffffffffffffffff","rate":1.25,"generation":7,"rows":[{"registers":[0,null,18446744073709551615]},{"registers":[{"name":"rax","value":9007199254740993}]}]}
+    , .{})).value;
+    try addresses(a, &v);
+    try std.testing.expectEqual(@as(i64, 9007199254740993), v.object.get("address").?.integer);
+    try std.testing.expectEqualStrings("18446744073709551615", v.object.get("pc").?.number_string);
+    try std.testing.expectEqualStrings("0x20000000000001", v.object.get("address_hex").?.string);
+    try std.testing.expectEqualStrings("-0x8000000000000000", v.object.get("offset_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", v.object.get("pc_hex").?.string);
+    try std.testing.expect(v.object.get("pointer_hex").? == .null);
+    try std.testing.expect(!v.object.contains("data_address_hex"));
+    try std.testing.expect(!v.object.contains("generation_hex"));
+    try std.testing.expect(!v.object.contains("rate_hex"));
+    const rows = v.object.get("rows").?.array.items;
+    const bank = rows[0].object.get("registers_hex").?.array.items;
+    try std.testing.expect(bank[1] == .null);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", bank[2].string);
+    const reg = rows[1].object.get("registers").?.array.items[0];
+    try std.testing.expectEqualStrings("0x20000000000001", reg.object.get("value_hex").?.string);
+    const before = try std.json.Stringify.valueAlloc(a, v, .{});
+    try addresses(a, &v);
+    try std.testing.expectEqualStrings(before, try std.json.Stringify.valueAlloc(a, v, .{}));
+    try v.object.put(a, "address_hex", .{ .string = "0x0" });
+    try std.testing.expectError(error.ConflictingEvidenceWord, addresses(a, &v));
+}
+
+test "integer projection covers every u64 bit without a float intermediary" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for (0..64) |bit| {
+        const n = (@as(u64, 1) << @intCast(bit)) | 1;
+        const json = try std.fmt.allocPrint(a, "{{\"slot_address\":{d}}}", .{n});
+        var v = (try std.json.parseFromSlice(V, a, json, .{})).value;
+        try addresses(a, &v);
+        const hex = v.object.get("slot_address_hex").?.string;
+        try std.testing.expectEqual(n, try std.fmt.parseInt(u64, hex, 0));
+        // Serialization must preserve the legacy integer token byte for byte.
+        try std.testing.expectEqualStrings(try std.fmt.allocPrint(a, "{d}", .{n}), try std.json.Stringify.valueAlloc(a, v.object.get("slot_address").?, .{}));
+    }
+    try std.testing.expectError(error.InvalidEvidenceWord, integerHex(a, .{ .number_string = "18446744073709551616" }));
+    try std.testing.expectError(error.InvalidEvidenceWord, integerHex(a, .{ .number_string = "-9223372036854775809" }));
+    try std.testing.expect((try integerHex(a, .{ .float = 9007199254740992.0 })) == null);
+}
+
+test "runtime pointer names and storage locations retain exact siblings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a,
+        \\{"frames":[{"frame_pointer":1,"function":2,"shared":3,"code":4,"context":5,"bytecode":6,"pc":7}],"scope":{"runtime_location":8,"frame_location":9,"prototype":10},"value":{"tagged":11,"map":12,"body":13,"type_object":14,"object":15,"data_address":16},"stackinfo":17,"trap_address":18,"root_register":19,"entry_frame_pointer":20}
+    , .{})).value;
+    try addresses(a, &v);
+    const frame = v.object.get("frames").?.array.items[0].object;
+    for ([_][]const u8{ "frame_pointer", "function", "shared", "code", "context", "bytecode", "pc" }, 1..) |field, expected| {
+        const name = try std.fmt.allocPrint(a, "{s}_hex", .{field});
+        try std.testing.expectEqual(expected, try std.fmt.parseInt(u64, frame.get(name).?.string, 0));
+    }
+    try std.testing.expectEqualStrings("0x8", v.object.get("scope").?.object.get("runtime_location_hex").?.string);
+    try std.testing.expectEqualStrings("0xe", v.object.get("value").?.object.get("type_object_hex").?.string);
+    try std.testing.expectEqualStrings("0x11", v.object.get("stackinfo_hex").?.string);
+    try std.testing.expectEqualStrings("0x14", v.object.get("entry_frame_pointer_hex").?.string);
+}
+
+test "nonstandard address and displacement names retain exact words" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a,
+        \\{"running_to":9007199254740993,"sample":{"ip":18446744073709551615,"raw_marker":18446744073709551614},"syscall":{"result":9007199254740993},"loader_reads":{"main_phdr":18446744073709551615,"interpreter":9007199254740993},"memory":{"displacement":-9223372036854775808},"immediate":-1,"bci":-1,"previous":18446744073709551615}
+    , .{})).value;
+    try addresses(a, &v);
+    try std.testing.expectEqualStrings("0x20000000000001", v.object.get("running_to_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", v.object.get("loader_reads").?.object.get("main_phdr_hex").?.string);
+    try std.testing.expectEqualStrings("-0x8000000000000000", v.object.get("memory").?.object.get("displacement_hex").?.string);
+    try std.testing.expectEqualStrings("-0x1", v.object.get("immediate_hex").?.string);
+    try std.testing.expectEqualStrings("-0x1", v.object.get("bci_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", v.object.get("previous_hex").?.string);
+    try std.testing.expectEqualStrings("0xffffffffffffffff", v.object.get("sample").?.object.get("ip_hex").?.string);
+    try std.testing.expectEqualStrings("0xfffffffffffffffe", v.object.get("sample").?.object.get("raw_marker_hex").?.string);
+    try std.testing.expectEqualStrings("0x20000000000001", v.object.get("syscall").?.object.get("result_hex").?.string);
+}
+
+test "register coverage counts remain summable numeric objects" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var v = (try std.json.parseFromSlice(V, a, "{\"totals\":{\"samples\":3,\"registers\":2}}", .{})).value;
+    try addresses(a, &v);
+    const totals = v.object.get("totals").?.object;
+    try std.testing.expectEqual(@as(usize, 2), totals.count());
+    try std.testing.expectEqual(@as(i64, 2), totals.get("registers").?.integer);
+}

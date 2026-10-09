@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 from client import Client
+from helpers.exact import legacy
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -165,7 +166,7 @@ def evidence():
     finally:
         finish(client, 'evidence')
     saved = json.loads(export.read_text())['investigations'][0]
-    assert saved['initial'] == initial['initial'] and saved['observations'] == recorded['observations'], saved
+    assert saved['initial'] == legacy(initial['initial']) and saved['observations'] == legacy(recorded['observations']), saved
 
 def sigpipe():
     assert subprocess.run([str(exe), 'signal']).returncode == -signal.SIGPIPE

@@ -75,7 +75,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
-        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
+        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',

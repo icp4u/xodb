@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 from client import Client
+from helpers.worker_gate import WorkerGate
 
 MAGIC = b'XODBINVOC\x01\r\n'
 
@@ -37,14 +38,16 @@ def observation(client):
         time.sleep(.01)
 
 
-def expect_error(client, tool, error, **args):
+def expect_error(client, tool, error, gate=None, **args):
+    if gate: gate.assert_held()
     start = time.monotonic()
     value = client.tool(tool, **args)
     elapsed = time.monotonic() - start
     assert value['result']['isError'], value
     assert value['result']['content'][0]['text'] == error, value
-    # A denial must not wait for the archive worker to finish.
-    assert elapsed < 1, elapsed
+    # The owner replied while its worker callback was still held. Elapsed
+    # time is diagnostic only; it cannot prove this ordering on a loaded host.
+    if gate: gate.assert_held()
     return elapsed
 
 
@@ -57,6 +60,7 @@ def main():
     work = Path(tempfile.mkdtemp(prefix='association-lifecycle-', dir=os.environ.get('XODB_TEST_TMPDIR'))).resolve()
     work.chmod(0o755)
     binary = os.environ.get('XODB_BIN', './zig-out/bin/xodb')
+    gate = WorkerGate(Path(__file__).resolve().parents[1], work)
     client = Client('control', None, options=['--open-observation', str(args.large_fixture)])
     try:
         observed = observation(client)
@@ -66,18 +70,31 @@ def main():
         assert original['analysis_origin'] == 'restored' and original['payload_version'] == 2
         assert original['rows_truncated'] and original['omitted_rows'] > 0
         assert original['association_algorithm'] == 'xodb-temporal-association-v1'
+        gate.arm('save')
         saved = client.action('save_observation', **key, path=str(work / 'pinned.xoi'))
-        busy_save = expect_error(client, 'associate_observation', 'ObservationArchiveBusy', **key, threshold_ns=11)
+        gate.held()
+        assert client.inspect('get_observation_archive', id=saved['id'])['state'] == 'running'
+        busy_save = expect_error(client, 'associate_observation', 'ObservationArchiveBusy', gate=gate, **key, threshold_ns=11)
         assert client.inspect('get_observation_associations', id=first_id, stream_id=2, limit=1)['source_records']['total'] == 262144
+        gate.release()
         assert wait(client, 'get_observation_archive', id=saved['id'])['associations_saved']
+        gate.arm('analysis')
         second = client.inspect('associate_observation', **key, threshold_ns=12)
-        busy_analysis = expect_error(client, 'save_observation', 'ObservationAssociationsBusy', generation=client.session()['generation'], **key, path=str(work / 'refused.xoi'))
+        gate.held()
+        assert client.inspect('get_observation_associations', id=second['id'])['state'] == 'running'
+        busy_analysis = expect_error(client, 'save_observation', 'ObservationAssociationsBusy', gate=gate, generation=client.session()['generation'], **key, path=str(work / 'refused.xoi'))
         assert not (work / 'refused.xoi').exists()
+        gate.release()
         assert wait(client, 'get_observation_associations', id=second['id'])['analysis_origin'] == 'reanalysed'
         for paging in ({}, {'stream_id': 2}):
             expect_error(client, 'get_observation_associations', 'StaleObservationAssociations', id=first_id, **paging)
+        gate.arm('cancel')
         third = client.inspect('associate_observation', **key, threshold_ns=13)
+        gate.held()
+        assert client.inspect('get_observation_associations', id=third['id'])['state'] == 'running'
         client.inspect('cancel_observation_associations', id=third['id'])
+        gate.assert_held()
+        gate.release()
         assert wait(client, 'get_observation_associations', id=third['id'])['state'] == 'cancelled'
         cancelled_path = work / 'after-cancel.xoi'
         saved = client.action('save_observation', **key, path=str(cancelled_path))
@@ -94,6 +111,7 @@ def main():
             assert proc.returncode == 0, proc.stderr
             assert json.loads(proc.stdout)['observation']['offline']
     finally:
+        gate.close()
         client.close()
     # The same raw evidence under an unknown algorithm opens without accepting
     # old classifications. Reanalysis is explicit and gets a fresh job ID.
@@ -148,7 +166,7 @@ def main():
         assert proc.returncode == 0, proc.stderr
         assert json.loads(proc.stdout)['observation']['offline']
     print(json.dumps({'status': 'pass', 'work': str(work), 'busy_save_seconds': busy_save,
-                      'busy_analysis_seconds': busy_analysis, 'parent_reader': bool(args.parent_bin),
+                      'busy_analysis_seconds': busy_analysis, 'held_workers': gate.history, 'parent_reader': bool(args.parent_bin),
                       'cases': ['save pins source', 'running analysis denies save', 'stale IDs',
                                 'cancel then retain saved v2 evidence', 'unknown algorithm opens', 'explicit reanalysis', 'invocation-only v1 readers']}))
 

@@ -56,6 +56,45 @@ output goes to stderr; stdout carries
 MCP messages. Disconnecting stdio ends xodb; launched targets are cleaned up and
 attached targets are detached.
 
+## Exact addresses and offsets
+
+Numeric address, pointer and offset fields now have a lossless hexadecimal
+sibling in every MCP tool result: `address_hex`, `pc_hex`, `slot_address_hex`,
+`offset_hex`, and so on. Existing numeric fields remain for compatibility.
+This applies recursively to nested rows, both `structuredContent` and the JSON
+inside `content[].text`, and both stdio and shared sessions.
+
+Use the hex field when doing address arithmetic. JavaScript's `JSON.parse`
+rounds integers above 2^53; converting the resulting Number to BigInt cannot
+recover the lost bits:
+
+```javascript
+const value = reply.result.structuredContent.value;
+const pointer = BigInt(value.bits_hex); // e.g. 0xffffffffffffffffn
+```
+
+Hex strings use lowercase digits and `0x`, with no fixed padding. Zero is
+`"0x0"`; unavailable nullable fields have a null sibling. Negative signed
+offsets use `"-0x..."` (parse the magnitude with BigInt and then negate).
+Existing fields that already return hex strings keep their original contract
+and do not need an additional sibling. Neither floats nor formatted displays
+are converted into supposedly exact values.
+
+Coverage includes native stack/register words, module/core ranges and offsets,
+breakpoint/watchpoint/event addresses, object and local storage, language stack
+pointers, language-watch scope locations, loader pointers, run-to destinations,
+sampled IPs, syscall return words, and signed operand displacements. Saved register arrays have a
+parallel `registers_hex` array with the same positions and nulls; register rows
+in `get_debug_view` have `value_hex`. Tagged runtime words and watch before/after
+words also have hex siblings; their tags and interpretation remain unchanged.
+`start`, `end` and offset fields used for pagination receive the same additive
+encoding. Ordinary counts, IDs, timestamps and rates keep their existing types.
+
+`python3 tests/mcp-precision.py` exercises owned synthetic pointer words above
+2^53 and at UINT64_MAX through native, agent and shared-observer sessions. With
+Node.js installed it also proves the original Number rounds while the hex
+field round-trips exactly through BigInt.
+
 ## What can a machine ask for?
 
 Examples, rather than an exhaustive tool catalog:

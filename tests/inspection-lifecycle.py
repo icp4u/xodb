@@ -8,6 +8,7 @@ import select
 import subprocess
 import time
 from client import Client
+from helpers.exact import legacy
 
 
 class CountedIO:
@@ -181,7 +182,7 @@ int main(int argc, char **argv) {
         assert len(saved) == 16, saved
         assert saved[0]['data']['values'] == registers
         for index, value in enumerate(expected):
-            assert saved[index+2]['data']['value'] == exact_inspection_value(value['value']), (saved[index+2], value)
+            assert legacy(saved[index+2]['data']['value']) == exact_inspection_value(legacy(value['value'])), (saved[index+2], value)
         for item in saved[-4:]:
             assert item['data']['hex'] == '11' * 64 and item['data']['readable'] == 64
         identity = complete['identity']
