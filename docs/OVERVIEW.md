@@ -245,9 +245,25 @@ unavailable. No descriptor recording format is implied.
 ## Themes
 
 `dark`, `light`, `green`, `amber`, `blue` (phosphor: glow, faint scanlines,
-vignette, ghosted VFD segments) and `mono`. `--theme` accepts these names with
+vignette, ghosted VFD segments), `mono`, and `win95`. `--theme` accepts these names with
 or without `builtin:`; `t` cycles them. The overview's palettes are its own and
 do not change the debugger's startup theme.
+
+`xodb --overview --look win95` (or `--theme win95`) selects the complete classic
+skin: teal desktop, beveled controls, title/menu bars, property tabs, sunken
+list views and black/green history graphs. The taskbar opens common panels and
+shows measured CPU/memory utilization and a clock labelled UTC. File, View,
+Panels and Help menus work with the mouse; F10 opens the menu, arrows select,
+Enter activates, and Escape dismisses. Caption buttons ask the compositor to
+minimize or maximize/restore, or close the overview.
+
+The skin embeds the BSD-licensed Spleen 8x16 bitmap font; see
+[DEPENDENCIES.md](DEPENDENCIES.md). Cycling away restores the usual `--font`
+face. The Win95 skin uses its bundled font even when `--font` is supplied.
+Memory Map retains its separate `t` binding for its map look; use View > Next
+theme to cycle the outer skin there. Redaction is still one-way, confirmations
+still require a fresh activation, and unavailable data retains its reason.
+
 
 ## Replay
 

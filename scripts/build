@@ -4,6 +4,8 @@ umask 022
 cd "$(dirname "$0")/.."
 mkdir -p .work/tmp
 export TMPDIR="$PWD/.work/tmp"
-export ZIG_GLOBAL_CACHE_DIR="$PWD/.cache/zig-global"
+# Zig's global cache is content-addressed and locked, so callers may share one
+# across checkouts. packaging/build pins the in-tree cache.
+export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$PWD/.cache/zig-global}"
 export ZIG_LOCAL_CACHE_DIR="$PWD/.zig-cache"
 exec zig build "$@"

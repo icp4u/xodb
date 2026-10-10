@@ -11,7 +11,7 @@ const fade = draw.fade;
 const titles = [_][]const u8{ "Files", "Processes", "Leak watch", "Deleted", "Exact events" };
 
 fn button(v: *vw.View, ctx: Ctx, rect: Rect, label: []const u8, selected: bool, action: vw.View.Action) !void {
-    try ctx.r.shape(rect, if (selected) ctx.p.selection else ctx.p.raised, .{ .radii = @splat(5) });
+    try ctx.button(rect, selected);
     try ctx.textFit(rect.x + 10, rect.y + 5, rect.w - 20, label, if (selected) ctx.p.accent else ctx.p.dim);
     v.hit(rect, action);
 }
@@ -68,8 +68,18 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         if (i == 3 and !known_churn) v.hover(card, "No comparable fresh descriptor sample yet", .{});
     }
     try heatmap(ctx, .{ .x = rect.x, .y = rect.y + 184, .w = rect.w, .h = 88 }, s, v.redact);
-    const table = Rect{ .x = rect.x, .y = rect.y + 280, .w = rect.w, .h = @max(90, rect.h - (if (f.mode == .events) @as(f32, 338) else 314)) };
-    try ctx.panel(table);
+    const table_outer = Rect{ .x = rect.x, .y = rect.y + 280, .w = rect.w, .h = @max(90, rect.h - (if (f.mode == .events) @as(f32, 338) else 314)) };
+    var table = table_outer;
+    if (ctx.p.win95) table.w = @max(0, table.w - 18);
+    try ctx.list(table_outer);
+    if (ctx.p.win95) {
+        const widths = [_]f32{ 158, @max(0, table.w - 454), 154, 134 };
+        var hx = table.x + 4;
+        for (widths) |width| {
+            try ctx.bevel(.{ .x = hx, .y = table.y + 4, .w = width, .h = 26 }, false);
+            hx += width;
+        }
+    }
     const proc = f.mode == .processes or f.mode == .leaks;
     try ctx.text(table.x + 12, table.y + 8, "PID / FD", ctx.p.dim);
     try ctx.textFit(table.x + 170, table.y + 8, table.w - 470, if (f.searching or f.query_len > 0) std.fmt.bufPrint(&buf, "/ {s}_", .{f.text()}) catch "" else if (proc) "Process · fd history" else if (f.mode == .events) "FD-number history · spans reuse" else "Path · [stale] = cached metadata", ctx.p.dim);
@@ -84,6 +94,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         v.hit(row_rect, .{ .files_row = index });
         try row(v, ctx, .{ .x = table.x + 12, .y = y + 4, .w = table.w - 24, .h = 28 }, f.rows.items[index], now);
     }
+    if (ctx.p.win95) try @import("win95.zig").scrollbar(v, ctx, .{ .x = table_outer.x + table_outer.w - 18, .y = table.y + 32, .w = 16, .h = table.h - 36 }, f.top, f.rows.items.len, f.visible);
     if (f.rows.items.len == 0) {
         var reason: []const u8 = if (f.mode == .leaks) "No growth candidates in the sampled cache" else if (f.mode == .deleted) "No deleted holders in the sampled cache" else "No matching rows; inspect partial coverage above";
         if (f.mode != .events) if (f.scopeReason()) |scope_reason| { reason = scope_reason; };

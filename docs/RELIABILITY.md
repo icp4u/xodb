@@ -35,9 +35,19 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check periodic-gui         # Full graphics and delayed-discovery matrices
 ./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution
+./scripts/release-check gui --keep-going     # Run every step, then list all failures
+./scripts/release-check gui --only gui-files,gui-themes # Rerun chosen steps (always rebuilds first)
+./scripts/release-check gui --from gui-files # Resume at a step
 ./scripts/release-check periodic --headless  # Portable checks plus readelf source-path differential
 ./scripts/release-check perf --headless      # Owned observer RPC measurements; no speed thresholds
 ```
+
+GUI steps that fail are retried once by default in `gui`, `all` and
+`periodic-gui` (`--retry-flaky N`; `0` turns it off). A step that passes only on
+retry is recorded as `flaky` in the summary line and `results.json`, never as
+passed. `scripts/build` uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
+snapshots can share one warm cache; `packaging/build` always uses the in-tree
+cache.
 
 The explicit `periodic` tier starts the periodic correctness lane. It includes
 portable checks and 1,500 deterministic malformed/valid DWARF 2–4 file tables,

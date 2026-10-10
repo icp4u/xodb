@@ -17,19 +17,19 @@ const Session = @import("../../model/session.zig").Session;
 
 pub const usage =
     \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
-    \\               [--look win9x|dos|modern|deep] [--memmap-pid N [--memmap-start-ticks N]]
+    \\               [--look win95|win9x|dos|modern|deep] [--memmap-pid N [--memmap-start-ticks N]]
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
     \\  show their reason; nothing unmeasured is drawn as zero.
     \\  --replay FILE   collector JSON (one snapshot, or one per line) instead of the live system
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
-    \\  --theme NAME    dark, light, green, amber, blue or mono (builtin: prefix accepted)
+    \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
     \\                  network, connections, power, system, users, services, apps, files, memory_map, graph or galaxy
     \\  --graph-pid N   restrict descriptor collection to this PID (repeatable); defaults to galaxy
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
     \\  --files-start-ticks N  require this exact identity with --files-pid
-    \\  --look NAME     Memory map look: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern or deep (zoomable)
+    \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern or deep (zoomable)
     \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
     \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)
@@ -120,7 +120,9 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.files_start = try std.fmt.parseInt(u64, value, 10);
             if (o.files_start == 0) return error.InvalidFilesIdentity;
         }
-        if (std.mem.eql(u8, arg, "--look")) o.look = std.meta.stringToEnum(vw.memmap.Look, value) orelse return error.UnknownMemoryMapLook;
+        if (std.mem.eql(u8, arg, "--look")) {
+            if (std.mem.eql(u8, value, "win95")) o.theme = "win95" else o.look = std.meta.stringToEnum(vw.memmap.Look, value) orelse return error.UnknownMemoryMapLook;
+        }
         if (std.mem.eql(u8, arg, "--memmap-pid")) {
             const pid = try std.fmt.parseInt(i32, value, 10);
             if (pid <= 0) return error.InvalidMemoryMapIdentity;
@@ -221,6 +223,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         view.action_hook = launchAction;
         view.action_context = &launcher;
     }
+    view.font_path = o.font;
     view.redact = o.redact;
     view.paused = o.paused;
     if (o.theme) |t| view.palette = themes.find(t).?;
@@ -254,7 +257,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     const font = try gpa.create(Font);
     defer gpa.destroy(font);
     font.* = .{};
-    try font.initMode(o.font, false);
+    if (view.pal().win95) try font.initRetro() else try font.initMode(o.font, false);
     defer font.deinit();
 
     const interval = (o.interval_ms orelse if (source == .live) @as(u64, 500) else 1000) * 1_000_000;
@@ -413,6 +416,9 @@ fn readFile(gpa: std.mem.Allocator, path: [:0]const u8) ![]u8 {
 
 test "overview options reject debugger targets and bad values" {
     const ok = try parse(&.{ "xodb", "--overview", "--redact", "--theme", "builtin:green", "--panel", "disk_space", "--interval-ms", "250" });
+    const classic = try parse(&.{ "xodb", "--overview", "--look", "win95", "--look", "deep" });
+    try std.testing.expectEqualStrings("win95", classic.theme.?);
+    try std.testing.expectEqual(vw.memmap.Look.deep, classic.look.?);
     try std.testing.expect(ok.redact);
     try std.testing.expectEqual(vw.Panel.disk_space, ok.panel.?);
     try std.testing.expectEqual(@as(?u64, 250), ok.interval_ms);

@@ -412,6 +412,64 @@ def run_step(name, argv, timeout, cwd, env, logs):
     return outcome
 
 
+def gui_step(name, argv):
+    return 'gui' in name.split('-') or any(str(arg).endswith('-gui.py') for arg in argv)
+
+
+# A failed prerequisite makes every later step meaningless, even with --keep-going.
+PREREQUISITES = ('probe-build', 'capabilities', 'build-tests')
+
+
+def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0):
+    failures = []
+    for name, argv, timeout in steps:
+        result = run_step(name, argv, timeout, tree, env, logs)
+        earlier = []
+        # GUI steps may get recorded retries. A pass after a failure is
+        # reported as flaky, never as passed.
+        while result['status'] in ('failed', 'timeout') and len(earlier) < retries and gui_step(name, argv):
+            earlier.append(result)
+            result = run_step(f'{name}.retry{len(earlier)}', argv, timeout, tree, env, logs)
+            result['name'] = name
+        if earlier:
+            result['earlier_attempts'] = earlier
+            if result['status'] == 'passed':
+                result['status'] = 'flaky'
+                print(f"{'flaky':16} {name} (passed on retry {len(earlier)})", flush=True)
+        report['steps'].append(result)
+        if name == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
+            report.update(status='blocked', reason='Owned ptrace/perf probe denied; see capabilities.log and SETUP.md')
+            return 2
+        if result['status'] not in ('passed', 'flaky'):
+            failures.append(result)
+            if not keep_going or name in PREREQUISITES or result['status'] == 'interrupted':
+                break
+    done = report['steps']
+    flaky = [step['name'] for step in done if step['status'] == 'flaky']
+    report['flaky'] = flaky
+    report['failures'] = [dict(name=step['name'], status=step['status'], log=step['log']) for step in failures]
+    report['summary'] = dict(planned=len(steps), passed=sum(step['status'] == 'passed' for step in done),
+                             flaky=len(flaky), failed=len(failures), not_run=len(steps) - len(done))
+    if failures:
+        report.update(status='failed', reason=', '.join(step['name'] + ': ' + step['status'] for step in failures))
+        return 1
+    return 0
+
+
+def select(steps, only=None, start=None):
+    # Each run builds a fresh snapshot, so keep build-tests and any NAME-build
+    # step that the selected NAME* steps rely on.
+    names = [name for name, _, _ in steps]
+    unknown = [name for name in [*(only or ()), *([start] if start else [])] if name not in names]
+    if unknown:
+        raise ValueError('unknown step: ' + ', '.join(unknown))
+    wanted = set(names[names.index(start):]) if start else set(only or names)
+    def keep(name):
+        return (name in wanted or name == 'build-tests' or
+                name.endswith('-build') and any(other.startswith(name[:-len('-build')]) for other in wanted))
+    return [step for step in steps if keep(step[0])]
+
+
 def snapshot(destination):
     # Copy tracked *working* contents, including local edits, but no ignored
     # caches, captures or untracked prototypes that could hide missing inputs.
@@ -468,7 +526,15 @@ def main():
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
+    parser.add_argument('--keep-going', action='store_true', help='Run every step after a failure (not after a failed build or probe), then summarise all failures')
+    parser.add_argument('--retry-flaky', type=int, metavar='N', help='Retry a failed GUI step up to N times; a later pass is recorded as flaky (default 1 for gui, all and periodic-gui, else 0)')
+    chosen = parser.add_mutually_exclusive_group()
+    chosen.add_argument('--only', metavar='STEP[,STEP]', help='Run only these steps (plus build-tests and their build steps)')
+    chosen.add_argument('--from', dest='start', metavar='STEP', help='Run this step and every later step (plus build-tests)')
     args = parser.parse_args()
+    retries = args.retry_flaky if args.retry_flaky is not None else 1 if args.tier in ('gui', 'all', 'periodic-gui') else 0
+    if retries < 0:
+        parser.error('--retry-flaky must be 0 or more')
     if args.wine and args.tier not in ('periodic', 'periodic-gui'):
         parser.error('--wine requires periodic or periodic-gui')
     if args.headless and args.tier not in ('portable', 'periodic', 'perf'):
@@ -494,6 +560,11 @@ def main():
     steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
+    try:
+        if args.only or args.start:
+            steps = select(steps, args.only.split(',') if args.only else None, args.start)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.list:
         print(json.dumps(steps, indent=2))
         return 0
@@ -512,7 +583,7 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, keep_going=args.keep_going, retry_flaky=retries, only=args.only, start=args.start, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -627,15 +698,9 @@ def main():
                          ('capabilities', ['.work/release-probe'], 10)]
         else:
             preflight = []
-        for name, argv, timeout in [*preflight, *steps]:
-            result = run_step(name, argv, timeout, tree, env, logs)
-            report['steps'].append(result)
-            if name == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
-                report.update(status='blocked', reason='Owned ptrace/perf probe denied; see capabilities.log and SETUP.md')
-                return 2
-            if result['status'] != 'passed':
-                report.update(status='failed', reason=name + ': ' + result['status'])
-                return 1
+        code = run_steps([*preflight, *steps], tree, env, logs, report, args.keep_going, retries)
+        if code:
+            return code
         if args.tier == 'perf':
             report.update(performance_summary(tree))
         else:
@@ -651,6 +716,12 @@ def main():
         report['load_end'] = os.getloadavg()
         report['finished'] = datetime.now(timezone.utc).isoformat()
         (run / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
+        summary = report.get('summary')
+        for failure in report.get('failures', []):
+            print(f"{'failed':16} {failure['name']} ({failure['status']}): {failure['log']}", flush=True)
+        if summary:
+            print(f"Summary: {summary['passed']} passed, {summary['flaky']} flaky, {summary['failed']} failed, {summary['not_run']} not run"
+                  + (': flaky ' + ', '.join(report['flaky']) if report['flaky'] else ''), flush=True)
         print(f"{report['status'].upper()}: {report.get('reason', args.tier + ' checks completed')}", flush=True)
         print(f'Results: {run / "results.json"}', flush=True)
 

@@ -110,6 +110,63 @@ class RunnerTests(unittest.TestCase):
             result['output'] = (directory / 'owned.log').read_text()
             return result
 
+    def sequence(self, steps, keep_going=False, retries=0):
+        with tempfile.TemporaryDirectory(dir=root / '.work', prefix='gate-test-') as name:
+            directory = Path(name)
+            directory.chmod(0o755)
+            report = dict(steps=[])
+            planned = [(step, [sys.executable, '-c', source], .5 if 'sleep' in source else 5) for step, source in steps]
+            code = gate.run_steps(planned, directory, dict(os.environ), directory, report, keep_going, retries)
+            report['logs'] = sorted(path.name for path in directory.glob('*.log'))
+            return code, report
+
+    # Fails on the first attempt in a run directory, then passes.
+    once = 'import os,sys\nif os.path.exists("m"): sys.exit(0)\nopen("m","w").close(); sys.exit(1)'
+
+    def test_keep_going_runs_every_step_and_summarises(self):
+        steps = [('one', 'raise SystemExit(3)'), ('two', 'pass'), ('three', 'import time; time.sleep(9)')]
+        code, report = self.sequence(steps)
+        self.assertEqual((code, [s['name'] for s in report['steps']]), (1, ['one']))
+        self.assertEqual(report['summary'], dict(planned=3, passed=0, flaky=0, failed=1, not_run=2))
+        code, report = self.sequence(steps, keep_going=True)
+        self.assertEqual((code, [s['name'] for s in report['steps']]), (1, ['one', 'two', 'three']))
+        self.assertEqual([(f['name'], f['status']) for f in report['failures']], [('one', 'failed'), ('three', 'timeout')])
+        self.assertEqual(report['summary'], dict(planned=3, passed=1, flaky=0, failed=2, not_run=0))
+        self.assertEqual(report['reason'], 'one: failed, three: timeout')
+        code, report = self.sequence([('build-tests', 'raise SystemExit(1)'), ('two', 'pass')], keep_going=True)
+        self.assertEqual((code, report['summary']['not_run']), (1, 1))
+
+    def test_gui_retry_is_recorded_as_flaky(self):
+        code, report = self.sequence([('gui-once', self.once), ('two', 'pass')], retries=1)
+        self.assertEqual(code, 0)
+        step = report['steps'][0]
+        self.assertEqual((step['name'], step['status']), ('gui-once', 'flaky'))
+        self.assertEqual([s['status'] for s in step['earlier_attempts']], ['failed'])
+        self.assertEqual(report['flaky'], ['gui-once'])
+        self.assertEqual(report['summary'], dict(planned=2, passed=1, flaky=1, failed=0, not_run=0))
+        self.assertEqual(report['logs'], ['gui-once.log', 'gui-once.retry1.log', 'two.log'])
+        code, report = self.sequence([('gui-broken', 'raise SystemExit(1)')], retries=1)
+        self.assertEqual((code, report['steps'][0]['status'], report['summary']['flaky']), (1, 'failed', 0))
+        self.assertEqual(len(report['steps'][0]['earlier_attempts']), 1)
+        for name, retries in (('plain', 1), ('gui-once', 0)):
+            code, report = self.sequence([(name, self.once)], retries=retries)
+            self.assertEqual((code, report['steps'][0]['status']), (1, 'failed'))
+            self.assertNotIn('earlier_attempts', report['steps'][0])
+        self.assertTrue(gate.gui_step('remote-panes', ['python', 'tests/remote-gui.py']))
+        self.assertTrue(gate.gui_step('lua-watch-gui-0', []))
+        self.assertFalse(gate.gui_step('source-paths', ['python', 'tests/source-paths.py']))
+
+    def test_only_and_from_keep_their_builds(self):
+        steps = gate.plan('gui')
+        names = [name for name, _, _ in steps]
+        picked = [name for name, _, _ in gate.select(steps, ['gui-files', 'source-paths'])]
+        self.assertEqual(picked, [n for n in names if n in ('build-tests', 'source-paths-build', 'source-paths', 'gui-files')])
+        later = [name for name, _, _ in gate.select(steps, start='gui-files')]
+        self.assertEqual(later, ['build-tests', *names[names.index('gui-files'):]])
+        self.assertEqual([name for name, _, _ in gate.select(steps, start='build-tests')], names)
+        with self.assertRaises(ValueError): gate.select(steps, ['gui-files', 'no-such-step'])
+        with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
+
     def test_python_path_coverage(self):
         for tier in ('host', 'all'):
             steps = {name: argv for name, argv, _ in gate.plan(tier, python='/fixture/python')}

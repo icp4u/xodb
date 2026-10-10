@@ -22,6 +22,7 @@ protocol-generated files are bundled for distribution.
 | elfutils libdw/libelf | Headers: LGPL-3.0-or-later OR GPL-2.0-or-later | M1 DWARF and CFI decoding; dynamically linked |
 | Capstone | BSD-3-Clause | x86-64, AArch64, m68k, and ppc64le instruction decoding. LoongArch64 decoding uses the optional private Capstone 6 prefix |
 | DejaVu fonts | custom | Default installed font; not bundled |
+| Spleen 8x16 | BSD-2-Clause | Bundled bitmap face for the Win95 overview skin |
 | wlr-protocols | MIT | Private pointer protocol used only by GUI tests |
 
 Build tools: Zig, `pkg-config`, `wayland-scanner`, `glslc`, and a C compiler.
@@ -194,3 +195,14 @@ bounded ZIP32 metadata reader using PKWARE field definitions; it adds no library
 or decompressor. `src/binary/debug_files.zig` pairs explicit GNU-build-ID-matched
 ELFs with the existing libdw adapter. Runtime CFI remains tied to the actual
 mapped ELF. [Usage](DEBUG_SYMBOLS.md) and [provenance](research/android-symbols.md).
+
+## Spleen bitmap font
+
+`src/render/assets/spleen-8x16.bdf` is from
+[Spleen](https://github.com/fcambus/spleen), commit
+`57f9219328c9f5873085320fe8bc8f7dd34b8791`, unchanged. Its SHA-256 is
+`b38b32a66920068965a3101f98071d310c5c74659fe86e55d346140770f8f6e8`.
+The full copyright and BSD-2-Clause notice are in
+[licenses/SPLEEN.txt](licenses/SPLEEN.txt). The overview embeds the face;
+FreeType rasterizes its monochrome bitmap strikes. Bevels and application icons
+are drawn procedurally; no Microsoft font, logo, or icon is included.

@@ -259,7 +259,7 @@ pub const State = struct {
         if (self.mode != .files) return false;
         const s = self.snapshot orelse return false;
         if (now -| s.taken_ns > 2_000_000_000) return false;
-        for (self.rows.items[self.top..@min(self.rows.items.len, self.top + self.visible)]) |row| {
+        for (self.rows.items[@min(self.top, self.rows.items.len)..@min(self.rows.items.len, self.top + self.visible)]) |row| {
             if (row != .descriptor) continue;
             const p = s.processes[row.descriptor.process];
             if (p.flags & c.XRT_FDP_STALE != 0) continue;
@@ -564,4 +564,14 @@ test "a vanished selection is shown as gone and is never an action target" {
     state.show(.leaks);
     try state.rebuild(a, false);
     try std.testing.expect(state.selected == null and state.top == 0);
+}
+
+test "flowing survives a scroll position past a shrunken list" {
+    const a = std.testing.allocator;
+    var state: State = .{ .mode = .files, .visible = 5 };
+    defer state.deinit(a);
+    try publishChurn(&state, 3, 0, 0);
+    try state.rebuild(a, false);
+    state.top = 40; // a wheel step left top here before the list shrank
+    _ = state.flowing(state.snapshot.?.taken_ns);
 }

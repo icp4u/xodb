@@ -44,7 +44,7 @@ def run(name, image, remote=False, mode='plain', delay=0):
 
 for variant in ('exec', 'pie'):
     for remote in (False, True):
-        for mode in ('plain', 'cancel', 'mutation'):
+        for mode in (('plain', 'cancel', 'mutation') if remote else ('plain', 'cancel', 'mutation', 'immediate')):
             run(variant + ('-agent-' if remote else '-local-') + mode,
                 a.fixtures.resolve() / variant, remote, mode)
 for delay in (.05, .1):

@@ -164,6 +164,10 @@ pub fn build(b: *std.Build) void {
         process_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     const target_tests = b.addExecutable(.{ .name = "xodb-runtime-target-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    const file_path_tests = b.addExecutable(.{ .name = "xodb-runtime-file-path-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    file_path_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/mapped_file.c", "tests/runtime-file-paths.c" }) |source|
+        file_path_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     target_tests.root_module.addIncludePath(b.path("src/runtime"));
     for (runtime_sources) |source| {
         target_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -483,6 +487,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(register_tests).step);
     test_step.dependOn(&b.addRunArtifact(process_tests).step);
     test_step.dependOn(&b.addRunArtifact(target_tests).step);
+    test_step.dependOn(&b.addRunArtifact(file_path_tests).step);
     test_step.dependOn(&b.addRunArtifact(perf_tests).step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);

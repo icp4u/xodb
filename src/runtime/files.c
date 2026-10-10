@@ -19,7 +19,8 @@ static int matching(const char *path, int32_t pid, const struct xrt_mapping *m)
     close(fd);
     return -1;
 }
-static enum xrt_status mapped(int32_t pid, const struct xrt_mapping *m, int *out)
+static enum xrt_status mapped(int32_t pid, const struct xrt_mapping *m, int *out,
+                              enum xrt_file_source *source)
 {
     if (!m->inode || !m->path || m->path[0] != '/' || m->start >= m->end)
         return XRT_FILE_UNAVAILABLE;
@@ -30,33 +31,45 @@ static enum xrt_status mapped(int32_t pid, const struct xrt_mapping *m, int *out
     if (!path)
         return XRT_OUT_OF_MEMORY;
     int fd = -1;
+    enum xrt_file_source selected = XRT_FILE_SOURCE_MAP_FILES;
     if (pid > 0) {
         snprintf(path, length + 96, "/proc/%d/map_files/%llx-%llx", pid,
                  (unsigned long long)m->start, (unsigned long long)m->end);
         fd = matching(path, pid, m);
         if (fd < 0) {
+            selected = XRT_FILE_SOURCE_EXE;
             snprintf(path, length + 96, "/proc/%d/exe", pid);
             fd = matching(path, pid, m);
         }
         if (fd < 0) {
+            selected = XRT_FILE_SOURCE_ROOT;
             snprintf(path, length + 96, "/proc/%d/root%s", pid, m->path);
             fd = matching(path, pid, m);
         }
     }
-    if (fd < 0)
+    if (fd < 0) {
+        selected = XRT_FILE_SOURCE_HOST;
         fd = matching(m->path, pid, m);
+    }
     free(path);
     if (fd < 0)
         return XRT_FILE_UNAVAILABLE;
     *out = fd;
+    if (source)
+        *source = selected;
     return XRT_OK;
 }
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *r, int *out)
 {
+    return xrt_process_file_resolved(pid, r, out, NULL);
+}
+enum xrt_status xrt_process_file_resolved(int32_t pid, const struct xrt_file_request *r,
+                                          int *out, enum xrt_file_source *source)
+{
     if (!r || !out)
         return XRT_INVALID_ARGUMENT;
     if (r->kind == XRT_FILE_MAPPED)
-        return mapped(pid, &r->mapping, out);
+        return mapped(pid, &r->mapping, out, source);
     char path[96];
     switch (r->kind) {
     case XRT_FILE_MAPS:
@@ -85,6 +98,8 @@ enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *r, 
     if (fd < 0)
         return XRT_FILE_UNAVAILABLE;
     *out = fd;
+    if (source)
+        *source = XRT_FILE_SOURCE_UNKNOWN;
     return XRT_OK;
 }
 enum xrt_status xrt_target_file(const struct xrt_target *t, const struct xrt_file_request *r,
@@ -95,10 +110,19 @@ enum xrt_status xrt_target_file(const struct xrt_target *t, const struct xrt_fil
 enum xrt_status xrt_target_file_open(const struct xrt_target *t, const struct xrt_file_request *r,
                                      int *fd, struct xrt_file_identity *identity)
 {
+    return xrt_target_file_resolved(t, r, fd, identity, NULL);
+}
+enum xrt_status xrt_target_file_resolved(const struct xrt_target *t, const struct xrt_file_request *r,
+        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source)
+{
     if (!t || !r || !fd)
         return XRT_INVALID_ARGUMENT;
-    if (t->connection)
-        return xrt_remote_file(t, r, fd, identity);
+    if (t->connection) {
+        enum xrt_status status = xrt_remote_file(t, r, fd, identity);
+        if (status == XRT_OK && source)
+            *source = XRT_FILE_SOURCE_REMOTE;
+        return status;
+    }
     if (t->core)
         return XRT_READ_ONLY_CORE;
     /* /proc/<leader>/maps and exe disappear when the leader exits before
@@ -110,7 +134,8 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *t, const struct xr
             break;
         }
     int opened = -1;
-    enum xrt_status status = xrt_process_file(pid, r, &opened);
+    enum xrt_file_source selected;
+    enum xrt_status status = xrt_process_file_resolved(pid, r, &opened, &selected);
     if (status != XRT_OK)
         return status;
     if (identity) {
@@ -123,6 +148,8 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *t, const struct xr
         return status;
     }
     *fd = opened;
+    if (source)
+        *source = selected;
     return XRT_OK;
 }
 enum xrt_status xrt_file_identity(int fd, struct xrt_file_identity *out)

@@ -1,6 +1,6 @@
 #define _GNU_SOURCE 1
 #include "elf_symbols.h"
-#include <assert.h>
+#include "check.h"
 #include <elf.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -19,7 +19,7 @@ static void put(unsigned char *p, uint64_t value, unsigned n, bool little)
 {
     for (unsigned i = 0; i < n; ++i) { p[little ? i : n-i-1] = (unsigned char)value; value >>= 8; }
 }
-static void one(bool wide)
+static void one(bool wide, bool wrong_index)
 {
     const uint64_t size = UINT64_C(512) * 1024 * 1024, shoff = size-4096, symoff = size-8192;
     const unsigned hs = wide ? 64 : 52, ss = wide ? 64 : 40, syms = wide ? 24 : 16;
@@ -42,33 +42,35 @@ static void one(bool wide)
     put(symbols+syms, 1, 4, wide);
     put(symbols+syms+(wide ? 6 : 14), 3, 2, wide);
     int input=memfd_create("symbol-input",0), output=memfd_create("symbol-output",0);
-    assert(input>=0 && output>=0 && !ftruncate(input,(off_t)size) && !ftruncate(output,(off_t)size));
-    assert(pwrite(input,header,hs,0)==(ssize_t)hs);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
-    assert(pwrite(input,symbols,2*syms,(off_t)symoff)==(ssize_t)(2*syms));
-    assert(pwrite(input,"\0named_function\0",16,(off_t)(symoff+128))==16);
-    assert(pwrite(input,"NOT SYMBOL DATA!",16,4096)==16);
+    CHECK(input>=0 && output>=0 && !ftruncate(input,(off_t)size) && !ftruncate(output,(off_t)size));
+    CHECK(pwrite(input,header,hs,0)==(ssize_t)hs);
+    CHECK(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
+    CHECK(pwrite(input,symbols,2*syms,(off_t)symoff)==(ssize_t)(2*syms));
+    CHECK(pwrite(input,"\0named_function\0",16,(off_t)(symoff+128))==16);
+    CHECK(pwrite(input,"NOT SYMBOL DATA!",16,4096)==16);
     struct input in={input,0,false};
-    assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_OK);
-    assert(in.bytes<1024);
+    CHECK(xrt_elf_symbols(read_at,&in,output,size)==XRT_OK);
+    CHECK(in.bytes<1024);
     unsigned char got[16];
-    assert(pread(output,got,16,(off_t)(symoff+128))==16 && !memcmp(got,"\0named_function\0",16));
-    assert(pread(output,got,16,4096)==16);
-    for (unsigned i=0;i<16;++i) assert(got[i]==0);
-    assert(pread(output,got,2,wide ? 62 : 50)==2 && !got[0] && !got[1]);
-    in.refuse=true; assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_DISCOVERY_PENDING); in.refuse=false;
+    CHECK(pread(output,got,16,(off_t)(symoff+128))==16 && !memcmp(got,"\0named_function\0",16));
+    CHECK(pread(output,got,16,4096)==16);
+    for (unsigned i=0;i<16;++i) CHECK(got[i]==0);
+    if (wrong_index) put(header+(wide ? 62 : 50), 3, 2, wide);
+    CHECK(pread(output,got,2,wide ? 62 : 50)==2 && !memcmp(got,header+(wide ? 62 : 50),2));
+    in.refuse=true; CHECK(xrt_elf_symbols(read_at,&in,output,size)==XRT_DISCOVERY_PENDING); in.refuse=false;
     put(sections+ss+(wide ? 40 : 24), 4, 4, wide);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
-    assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
+    CHECK(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
+    CHECK(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
     put(sections+ss+(wide ? 40 : 24), 2, 4, wide);
     put(sections+2*ss+(wide ? 32 : 20), size, wide ? 8 : 4, wide);
-    assert(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
-    assert(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
+    CHECK(pwrite(input,sections,4*ss,(off_t)shoff)==(ssize_t)(4*ss));
+    CHECK(xrt_elf_symbols(read_at,&in,output,size)==XRT_INVALID_ARGUMENT);
     close(input);close(output);
 }
-int main(void)
+int main(int argc, char **argv)
 {
-    one(true);one(false);
+    const bool wrong_index=argc==2 && !strcmp(argv[1], "--wrong-result");
+    one(true,wrong_index);one(false,wrong_index);
     puts("C sparse symbols: 512 MiB ELF64/ELF32, byte order, omitted code, bad links/ranges and policy refusal passed");
     return 0;
 }

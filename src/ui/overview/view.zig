@@ -9,6 +9,7 @@ const m = @import("model.zig");
 const h = @import("history.zig");
 const draw = @import("draw.zig");
 const themes = @import("theme.zig");
+const win95 = @import("win95.zig");
 const panels = @import("panels.zig");
 pub const files_model = @import("files_model.zig");
 pub const memmap = @import("memmap.zig");
@@ -65,6 +66,14 @@ pub const ScaleId = enum { disk_total, net_total, mem_psi, disk_card, net_card }
 pub const View = struct {
     gpa: std.mem.Allocator,
     palette: usize = 0,
+    font_path: [:0]const u8 = @import("build_options").font_path ++ "",
+    classic_menu: ?win95.Menu = null,
+    classic_cursor: usize = 0,
+    classic_scroll: ?win95.Scroll = null,
+    classic_about: bool = false,
+    minimize_requested: bool = false,
+    maximize_requested: bool = false,
+    maximized: bool = false,
     panel: Panel = .summary,
     redact: bool = false,
     paused: bool = false,
@@ -137,7 +146,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files };
+    pub const Action = union(enum) { classic: win95.Action, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -354,13 +363,14 @@ pub const View = struct {
     // --- Input -----------------------------------------------------------
 
     pub fn input(self: *View, w: *Window, now: u64) void {
+        defer self.windowActions(w);
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };
             w.dirty = true;
-            if (self.deepMap()) memmap.deepmap.motion(self);
+            if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self);
         }
         if (w.scroll != 0) {
-            self.wheel(w.scroll);
+            if (self.classic_menu == null and !self.classic_about and self.pending_action == null) self.wheel(w.scroll);
             w.scroll = 0;
             w.dirty = true;
         }
@@ -378,11 +388,18 @@ pub const View = struct {
                 .button_press => {
                     w.dirty = true;
                     // The deep map's field and minimap take presses (drag, select, jump).
-                    if (event.code == 272 and !(self.deepMap() and self.pending_action == null and memmap.deepmap.press(self, event.x, event.y))) self.click(event.x, event.y, now);
+                    if (event.code == 272 and !(self.deepMap() and self.pending_action == null and self.classic_menu == null and !self.classic_about and memmap.deepmap.press(self, event.x, event.y))) self.click(event.x, event.y, now);
                 },
-                .button_release => if (event.code == 272 and self.deepMap()) {
-                    w.dirty = true;
-                    memmap.deepmap.release(self, event.x, event.y);
+                .button_release => if (event.code == 272) {
+                    if (self.classic_scroll != null) {
+                        self.pointer = .{ event.x, event.y };
+                        win95.drag(self);
+                    }
+                    self.classic_scroll = null;
+                    if (self.deepMap()) {
+                        w.dirty = true;
+                        memmap.deepmap.release(self, event.x, event.y);
+                    }
                 },
             }
             if (self.quit) {
@@ -391,6 +408,19 @@ pub const View = struct {
                 return;
             }
         }
+    }
+
+    fn windowActions(self: *View, w: *Window) void {
+        const c = @import("../../c.zig").api;
+        if (w.top) |top| {
+            if (self.minimize_requested) c.xdg_toplevel_set_minimized(top);
+            if (self.maximize_requested) {
+                self.maximized = !self.maximized;
+                if (self.maximized) c.xdg_toplevel_set_maximized(top) else c.xdg_toplevel_unset_maximized(top);
+            }
+        }
+        self.minimize_requested = false;
+        self.maximize_requested = false;
     }
 
     fn deepMap(self: *const View) bool {
@@ -415,6 +445,7 @@ pub const View = struct {
             if (sym == 0xff0d or sym == 0xff8d) self.confirmAction(now);
             return;
         }
+        if (self.pal().win95 and win95.key(self, event, now)) return;
         if (event.kind == .press and event.plain() and event.shortcut == 'e' and self.files.exact_active) {
             self.files.stopCapture();
             return;
@@ -522,6 +553,8 @@ pub const View = struct {
         }
     }
     pub fn show(self: *View, panel: Panel) void {
+        self.classic_menu = null;
+        self.classic_scroll = null;
         self.panel = panel;
         self.searching = false;
         self.files.searching = false;
@@ -710,41 +743,77 @@ pub const View = struct {
             i -= 1;
             const target = self.hits[i];
             if (!draw.inside(target.rect, x, y)) continue;
-            switch (target.action) {
-                .panel => |p| self.show(p),
-                .sort => |s| {
-                    if (self.sort == s) self.descending = !self.descending else {
-                        self.sort = s;
-                        self.descending = s != .name and s != .pid;
-                    }
-                    self.rows_dirty = true;
-                },
-                .row => |r| self.selectRow(r),
-                .attach => self.requestAttach(now),
-                .files => self.requestAction(.files, now),
-                .profile => self.requestAction(.profile, now),
-                .confirm => self.confirmAction(now),
-                .cancel => self.pending_action = null,
-                .tree => {
-                    self.tree = !self.tree;
-                    self.rows_dirty = true;
-                },
-                .theme => self.palette = (self.palette + 1) % themes.all.len,
-                .pause => self.paused = !self.paused,
-                .search => self.searching = true,
-                .files_mode => |mode| if (mode == .events) self.requestAction(.events, now) else self.files.show(mode),
-                .files_row => |row| self.files.select(row),
-                .files_all => self.files.all(),
-                .file_holders => self.fileHolders(),
-                .events => self.requestAction(.events, now),
-                .stop_events => self.files.stopCapture(),
-                .memmap => |what| memmap.click(self, what, now),
-                .graph_star => |index| self.graph.focusStar(index),
-                .graph_resource => |node| @import("graph_panel.zig").openResource(self, node),
-                .graph_all => self.graph.all(),
-                .graph_files => if (self.graph.focus) |id| { self.files.scope(.{ .pid=id.pid, .start=id.start }); self.show(.files); },
-            }
+            const action = target.action;
+            self.pointer = .{ x, y };
+            self.classic_menu = null;
+            self.activate(action, now);
             return;
+        }
+    }
+
+    pub fn activate(self: *View, action: Action, now: u64) void {
+        switch (action) {
+            .classic_scroll => |scroll| {
+                self.classic_scroll = scroll;
+                self.classic_scroll.?.grab = self.pointer[1] - scroll.thumb_y;
+            },
+            .classic => |which| switch (which) {
+                .file, .view, .panels, .help, .start => {
+                    const menu: win95.Menu = @enumFromInt(@intFromEnum(which));
+                    self.classic_menu = menu;
+                    self.classic_cursor = 0;
+                },
+                .close_menu => self.classic_menu = null,
+                .quit => self.quit = true,
+                .minimize => self.minimize_requested = true,
+                .maximize => self.maximize_requested = true,
+                .redact => {
+                    self.redact = true;
+                    self.rows_dirty = true;
+                    self.files.dirty = true;
+                },
+                .about => self.classic_about = true,
+                .dismiss => self.classic_about = false,
+                .scroll_up => self.wheel(-1),
+                .scroll_down => self.wheel(1),
+                .page_up => self.wheel(-@as(i32, @intCast(@min(if (self.panel == .files) self.files.visible else self.visible_rows, 1024)))),
+                .page_down => self.wheel(@intCast(@min(if (self.panel == .files) self.files.visible else self.visible_rows, 1024))),
+            },
+            .panel => |p| self.show(p),
+            .sort => |s| {
+                if (self.sort == s) self.descending = !self.descending else {
+                    self.sort = s;
+                    self.descending = s != .name and s != .pid;
+                }
+                self.rows_dirty = true;
+            },
+            .row => |r| self.selectRow(r),
+            .attach => self.requestAttach(now),
+            .files => self.requestAction(.files, now),
+            .profile => self.requestAction(.profile, now),
+            .confirm => self.confirmAction(now),
+            .cancel => self.pending_action = null,
+            .tree => {
+                self.tree = !self.tree;
+                self.rows_dirty = true;
+            },
+            .theme => self.palette = (self.palette + 1) % themes.all.len,
+            .pause => self.paused = !self.paused,
+            .search => self.searching = true,
+            .files_mode => |mode| if (mode == .events) self.requestAction(.events, now) else self.files.show(mode),
+            .files_row => |row| self.files.select(row),
+            .files_all => self.files.all(),
+            .file_holders => self.fileHolders(),
+            .events => self.requestAction(.events, now),
+            .stop_events => self.files.stopCapture(),
+            .memmap => |what| memmap.click(self, what, now),
+            .graph_star => |index| self.graph.focusStar(index),
+            .graph_resource => |node| @import("graph_panel.zig").openResource(self, node),
+            .graph_all => self.graph.all(),
+            .graph_files => if (self.graph.focus) |id| {
+                self.files.scope(.{ .pid = id.pid, .start = id.start });
+                self.show(.files);
+            },
         }
     }
 
@@ -940,7 +1009,10 @@ pub const View = struct {
         const query_pid = std.fmt.parseInt(i32, self.searchText(), 10) catch 0;
         var query_row: i64 = -1;
         if (self.snap()) |snapshot| for (self.rows.items, 0..) |row, i| {
-            if (snapshot.processes[row.index].pid == query_pid) { query_row = @intCast(i); break; }
+            if (snapshot.processes[row.index].pid == query_pid) {
+                query_row = @intCast(i);
+                break;
+            }
         };
         std.debug.print("xodb: process selection query_pid={d} query_row={d} rows={d} selected_pid={d} start={d}\n", .{
             query_pid, query_row, self.rows.items.len, if (self.selected) |id| id.pid else 0, if (self.selected) |id| id.start else 0,
@@ -966,6 +1038,12 @@ pub const View = struct {
         self.hit_count = 0;
         self.tooltip_style = .overview;
         const p = self.pal();
+        try font.selectOverview(self.gpa, self.font_path, p.win95);
+        if (!p.win95) {
+            self.classic_menu = null;
+            self.classic_about = false;
+        }
+        if (p.win95) self.tooltip_style = .win9x;
         if (self.layout) |l| l.count = 0;
         var ctx = Ctx{ .r = r, .font = font, .p = p, .layout = self.layout };
         try r.rect(.{ .x = 0, .y = 0, .w = self.width, .h = self.height }, p.background);
@@ -974,13 +1052,15 @@ pub const View = struct {
         const header_h: f32 = 52;
         const footer_h: f32 = 28;
         const nav_w: f32 = if (compact) 196 else 236;
-        try self.header(ctx, .{ .x = 0, .y = 0, .w = self.width, .h = header_h }, now);
-        try self.nav(ctx, .{ .x = 0, .y = header_h, .w = nav_w, .h = self.height - header_h - footer_h });
-        const content = Rect{ .x = nav_w + 10, .y = header_h + 8, .w = self.width - nav_w - 20, .h = self.height - header_h - footer_h - 14 };
+        const content = if (p.win95) try win95.chrome(self, ctx) else blk: {
+            try self.header(ctx, .{ .x = 0, .y = 0, .w = self.width, .h = header_h }, now);
+            try self.nav(ctx, .{ .x = 0, .y = header_h, .w = nav_w, .h = self.height - header_h - footer_h });
+            break :blk Rect{ .x = nav_w + 10, .y = header_h + 8, .w = self.width - nav_w - 20, .h = self.height - header_h - footer_h - 14 };
+        };
         const saved = r.clip;
         r.clip = draw.intersect(saved, content);
         if (self.snap()) |s| {
-            panels.render(self, ctx, content, s, now) catch |err| {
+            if (content.w > 0 and content.h > 0) panels.render(self, ctx, content, s, now) catch |err| {
                 r.clip = saved;
                 if (err != error.VertexBufferFull) return err;
                 try ctx.text(content.x + 12, content.y + 12, "This panel exceeded the frame's geometry budget; enlarge rows or narrow the window", p.crit);
@@ -989,7 +1069,9 @@ pub const View = struct {
             try ctx.glowText(content.x + 24, content.y + 24, "Waiting for the first sample…", p.dim);
         }
         r.clip = saved;
-        try self.footer(ctx, .{ .x = 0, .y = self.height - footer_h, .w = self.width, .h = footer_h }, now);
+        if (p.win95) {
+            if (self.width >= 640 and self.height >= 120) try self.footer(ctx, .{ .x = 8, .y = self.height - 72, .w = self.width - 16, .h = footer_h }, now);
+        } else try self.footer(ctx, .{ .x = 0, .y = self.height - footer_h, .w = self.width, .h = footer_h }, now);
         if (self.layout) |l| {
             var first: [6][]const u8 = @splat("");
             const n = l.overlaps(&first);
@@ -1001,7 +1083,12 @@ pub const View = struct {
             }
         }
         ctx.layout = null;
-        try self.tooltip(ctx);
+        if (p.win95) {
+            self.tooltip_style = .win9x;
+            try win95.popup(self, ctx);
+            try win95.about(self, ctx);
+        }
+        if (self.pending_action == null and !self.classic_about) try self.tooltip(ctx);
         try self.overlay(ctx);
         try self.actionDialog(ctx);
     }
@@ -1144,7 +1231,7 @@ pub const View = struct {
                 .services => .{ .text = if (snapshot.services.len > 0) std.fmt.bufPrint(&vb, "{d} services", .{snapshot.services.len}) catch "" else snapshot.group(.services).reason },
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
-                .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{g.processes, g.member_count}) catch "" else "sampled when shown" },
+                .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
                 .memory_map => .{ .text = if (self.memmap.map()) |mm| switch (memmap.md.coverage(mm)) {
                     .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (mm.process == null) "free contiguous" else "THP" }) catch "",
                     .none => "nothing eligible",
@@ -1175,7 +1262,7 @@ pub const View = struct {
         const overhead = if (self.view_pct) |v| std.fmt.bufPrint(&buf, "overhead (4 s)  draw {d:.1}%  {s} {d:.1}%  total {d:.1}% of a core", .{ v, if (live) "collector" else "replay", self.collector_pct orelse 0, self.total_pct orelse v + (self.collector_pct orelse 0) }) catch "" else "overhead  measuring (first second)";
         const ow = ctx.measure(overhead) + 20;
         const orect = Rect{ .x = rect.w - ow - 8, .y = rect.y + 3, .w = ow, .h = rect.h - 6 };
-        try ctx.r.shape(orect, fade(p.accent, 0.10), .{ .radii = @splat(5) });
+        if (p.win95) try ctx.bevel(orect, true) else try ctx.r.shape(orect, fade(p.accent, 0.10), .{ .radii = @splat(5) });
         try ctx.text(orect.x + 10, rect.y + 4, overhead, p.dim);
         self.hover(orect, "Overhead over the last second, % of one core: drawing, sampling, and total for the whole process (all threads)", .{});
         // Left: hover reason, status, or key hints.
@@ -1233,9 +1320,18 @@ pub const View = struct {
         try ctx.r.rect(.{ .x = 0, .y = 0, .w = self.width, .h = self.height }, .{ 0, 0, 0, 0.7 });
         const w = @min(900, self.width - 60);
         const box = Rect{ .x = (self.width - w) / 2, .y = (self.height - 280) / 2, .w = w, .h = 280 };
-        try ctx.r.shape(box, p.panel, .{ .radii = @splat(10) });
+        if (p.win95) {
+            try ctx.bevel(box, false);
+            try win95.title(ctx, .{ .x = box.x + 4, .y = box.y + 4, .w = box.w - 8, .h = 28 }, "Confirm action");
+        } else try ctx.r.shape(box, p.panel, .{ .radii = @splat(10) });
         var buf: [128]u8 = undefined;
-        try ctx.textFit(box.x + 20, box.y + 16, w - 40, std.fmt.bufPrint(&buf, "Open {s}: pid {d}, start {d}", .{ @tagName(request.kind), request.id.pid, request.id.start }) catch "", p.text);
+        if (p.win95) {
+            const ix = box.x + 22;
+            const iy = box.y + 41;
+            try ctx.r.rect(.{ .x = ix, .y = iy, .w = 16, .h = 16 }, p.accent);
+            try ctx.text(ix + 4, iy - 1, "!", .{ 1, 1, 1, 1 });
+        }
+        try ctx.textFit(box.x + (if (p.win95) @as(f32, 46) else 20), box.y + (if (p.win95) @as(f32, 34) else 16), w - 40, std.fmt.bufPrint(&buf, "Open {s}: pid {d}, start {d}", .{ @tagName(request.kind), request.id.pid, request.id.start }) catch "", p.text);
         const lines: [4][]const u8 = switch (request.kind) {
             .files => .{ "Read-only descriptors in this window's Files & IO pane.", "Cost: shared scan once per second, 10 ms soft budget; no target pause.", "Access: your account's /proc permissions; denied fields stay unavailable.", "The view pins the sampled process identity. No privilege escalation." },
             .profile => .{ "Attach, start a 99 Hz CPU capture for 10 seconds, then resume.", "Cost: briefly stops all threads; perf buffers up to 64 MiB, plus symbols.", "Access: ptrace and perf_event permissions; denial is reported.", "The target is checked before and after attach. No privilege escalation." },
@@ -1245,10 +1341,15 @@ pub const View = struct {
         for (lines, 0..) |line, i| try ctx.textFit(box.x + 20, box.y + 58 + @as(f32, @floatFromInt(i)) * 30, w - 40, line, p.dim);
         const cancel = Rect{ .x = box.x + 20, .y = box.y + 222, .w = 190, .h = 36 };
         const confirm = Rect{ .x = box.x + w - 240, .y = box.y + 222, .w = 220, .h = 36 };
-        try ctx.r.shape(cancel, fade(p.accent, 0.15), .{ .radii = @splat(6) });
-        try ctx.r.shape(confirm, fade(p.accent, 0.3), .{ .radii = @splat(6) });
+        if (p.win95) {
+            try ctx.bevel(cancel, false);
+            try ctx.bevel(confirm, false);
+        } else {
+            try ctx.r.shape(cancel, fade(p.accent, 0.15), .{ .radii = @splat(6) });
+            try ctx.r.shape(confirm, fade(p.accent, 0.3), .{ .radii = @splat(6) });
+        }
         try ctx.text(cancel.x + 12, cancel.y + 8, "Cancel  Esc", p.text);
-        try ctx.text(confirm.x + 12, confirm.y + 8, "Confirm  Enter again", p.text);
+        try ctx.text(confirm.x + 12, confirm.y + 8, if (p.win95) "OK  Enter again" else "Confirm  Enter again", p.text);
         self.hit(cancel, .cancel);
         self.hit(confirm, .confirm);
     }
@@ -1503,16 +1604,21 @@ test "queued search and actions cannot use a filtered-out process identity" {
     v.tree = false;
     try v.buildRows();
     try std.testing.expectEqual(123, v.selected.?.pid);
-    const Hook = struct { fn launch(_: ?*anyopaque, _: actions.Request) !void {} };
+    const Hook = struct {
+        fn launch(_: ?*anyopaque, _: actions.Request) !void {}
+    };
     v.action_hook = Hook.launch;
     // No intervening draw: the next arrow and L must use the new filter.
-    @memcpy(v.search[0..3], "456"); v.search_len = 3; v.rows_dirty = true;
+    @memcpy(v.search[0..3], "456");
+    v.search_len = 3;
+    v.rows_dirty = true;
     v.key(.{ .kind = .press, .code = 108, .sym = 0xff54 }, 2);
     try std.testing.expectEqual(456, v.selected.?.pid);
     v.requestAction(.files, 3);
     try std.testing.expectEqual(456, v.pending_action.?.id.pid);
     v.pending_action = null;
-    @memcpy(v.search[0..3], "999"); v.rows_dirty = true;
+    @memcpy(v.search[0..3], "999");
+    v.rows_dirty = true;
     v.requestAction(.files, 4);
     try std.testing.expect(v.pending_action == null and v.selected == null);
     try std.testing.expectEqual(0, v.rows.items.len);
@@ -1549,20 +1655,84 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
     var w = Window{};
     const sizes = [_][2]u32{ .{ 0, 0 }, .{ 1, 1 }, .{ 40, 20 }, .{ 120, 60 }, .{ 300, 200 }, .{ 480, 540 }, .{ 700, 300 }, .{ 960, 1080 }, .{ 3000, 30 }, .{ 30, 2000 }, .{ 1, 1 } };
     const pointers = [_][2]f32{ .{ -1, -1 }, .{ 0, 0 }, .{ 5, 5 }, .{ 300, 200 }, .{ 1e6, 1e6 }, .{ -1e6, 5 } };
-    for (std.enums.values(Panel)) |panel| {
-        v.panel = panel;
-        for (std.enums.values(memmap.Look)) |look| for ([_]bool{ false, true }) |compact| {
-            if (panel != .memory_map and (look != .win9x or compact)) continue;
-            v.memmap.look = look;
-            v.memmap.compact = compact;
-            for (sizes) |size| for (pointers) |pointer| {
-                w.width = size[0];
-                w.height = size[1];
-                v.pointer = pointer;
-                r.vertices = 0;
-                r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(size[0]), .h = @floatFromInt(size[1]) };
-                v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
+    // Fast component lane: both chrome paths share the original resize oracle.
+    for ([_]usize{ 0, themes.find("win95").? }) |palette| {
+        v.palette = palette;
+        for (std.enums.values(Panel)) |panel| {
+            v.panel = panel;
+            for (std.enums.values(memmap.Look)) |look| for ([_]bool{ false, true }) |compact| {
+                if (panel != .memory_map and (look != .win9x or compact)) continue;
+                v.memmap.look = look;
+                v.memmap.compact = compact;
+                for (sizes) |size| for (pointers) |pointer| {
+                    w.width = size[0];
+                    w.height = size[1];
+                    v.pointer = pointer;
+                    r.vertices = 0;
+                    r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(size[0]), .h = @floatFromInt(size[1]) };
+                    v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
+                    if (palette == themes.find("win95").? and panel == .summary) {
+                        for (0..3) |overlay| {
+                            v.classic_menu = if (overlay == 0) .start else null;
+                            v.classic_about = overlay == 1;
+                            v.pending_action = if (overlay == 2) .{ .kind = .files, .id = .{ .pid = 7, .start = 1 } } else null;
+                            r.vertices = 0;
+                            v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
+                        }
+                        v.classic_menu = null;
+                        v.classic_about = false;
+                        v.pending_action = null;
+                    }
+                };
             };
-        };
+        }
     }
+}
+
+// Fast component lane: keyboard capture and modal ordering are state properties.
+test "classic menus consume shortcuts and preserve text-entry and confirmations" {
+    var v = try View.init(std.testing.allocator);
+    defer v.deinit();
+    v.palette = themes.find("win95").?;
+    const f10 = @import("../../platform/input.zig").Event{ .kind = .press, .sym = 0xffc7 };
+    v.key(f10, 1);
+    try std.testing.expectEqual(win95.Menu.file, v.classic_menu.?);
+    v.key(.{ .kind = .press, .sym = 'q', .shortcut = 'q' }, 2);
+    try std.testing.expect(!v.quit);
+    v.key(.{ .kind = .press, .sym = 0xff54 }, 3);
+    v.key(.{ .kind = .press, .sym = 0xff0d }, 4);
+    try std.testing.expectEqual(Panel.processes, v.panel);
+    try std.testing.expect(v.classic_menu == null);
+    v.searching = true;
+    v.key(f10, 5);
+    try std.testing.expect(v.classic_menu == null);
+    v.searching = false;
+    v.pending_action = .{ .kind = .attach, .id = .{ .pid = 123, .start = 456 } };
+    v.key(f10, 6);
+    try std.testing.expect(v.classic_menu == null);
+    v.key(.{ .kind = .press, .sym = 0xff1b }, 7);
+    try std.testing.expect(v.pending_action == null);
+    v.activate(.{ .classic = .redact }, 8);
+    v.activate(.{ .classic = .redact }, 9);
+    try std.testing.expect(v.redact);
+}
+
+// Fast component lane: dragging reaches both ends and remains bounded.
+test "classic scrollbar clamps dragging and routes files separately" {
+    var v = try View.init(std.testing.allocator);
+    defer v.deinit();
+    v.panel = .processes;
+    v.classic_scroll = .{ .track = .{ .x = 10, .y = 100, .w = 16, .h = 200 }, .thumb_h = 20, .thumb_y = 100, .grab = 5, .max = 90 };
+    v.pointer = .{ 10, 195 };
+    win95.drag(&v);
+    try std.testing.expectEqual(@as(usize, 45), v.scroll[@intFromEnum(Panel.processes)]);
+    v.pointer[1] = -1e6;
+    win95.drag(&v);
+    try std.testing.expectEqual(@as(usize, 0), v.scroll[@intFromEnum(Panel.processes)]);
+    v.pointer[1] = 1e6;
+    win95.drag(&v);
+    try std.testing.expectEqual(@as(usize, 90), v.scroll[@intFromEnum(Panel.processes)]);
+    v.panel = .files;
+    win95.drag(&v);
+    try std.testing.expectEqual(@as(usize, 90), v.files.top);
 }

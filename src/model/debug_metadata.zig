@@ -8,6 +8,9 @@ const info = @import("../debug/info.zig");
 const loc = @import("../debug/location.zig");
 const A = std.heap.page_allocator;
 const Kind = enum { javascript, unwind };
+const max_unwind_jobs = 64;
+const max_jobs = max_unwind_jobs + 2;
+const unwind_budget: u64 = 128 * 1024 * 1024;
 const Entry = struct {
     id: u64,
     kind: Kind,
@@ -16,6 +19,8 @@ const Entry = struct {
     path: [:0]u8,
     job: *c.struct_xmd_job,
     retired: bool = false,
+    local: bool = false,
+    touched_query: u64 = 0,
     last_state: c_uint = c.XMD_PREPARING,
     cfi: ?info.Cfi = null,
     checked_query: u64 = 0,
@@ -35,6 +40,7 @@ pub const JobStatus = struct {
     id: u64,
     kind: Kind,
     image: []const u8,
+    image_truncated: bool,
     state: []const u8,
     reason: ?[]const u8,
     source_bytes: u64,
@@ -49,14 +55,14 @@ pub const JobStatus = struct {
     accelerator_hits: u64,
 };
 pub const Snapshot = struct {
-    items: [6]JobStatus = undefined,
+    items: [max_jobs]JobStatus = undefined,
     count: usize = 0,
     pub fn jsonStringify(self: Snapshot, writer: anytype) !void {
         try writer.write(self.items[0..self.count]);
     }
 };
 pub const State = struct {
-    entries: [6]?Entry = @splat(null),
+    entries: [max_jobs]?Entry = @splat(null),
     epoch: u64 = 0,
     kernel: ?runtime.c.struct_xrt_auxv = null,
     revision: u64 = 0,
@@ -111,13 +117,20 @@ pub const State = struct {
             if (!entry.retired and entry.kind == kind and entry.epoch == self.epoch and
                 old.start == region.start and old.end == region.end and old.offset == region.offset and
                 old.inode == region.inode and old.device_major == region.device_major and old.device_minor == region.device_minor)
+            {
+                entry.touched_query = self.query;
                 return entry;
+            }
         };
-        var unwind_count: usize = 0;
-        for (self.entries) |slot| if (slot) |entry| {
-            if (!entry.retired and entry.kind == .unwind) unwind_count += 1;
-        };
-        if (kind == .unwind and unwind_count == 4) return error.DebugMetadataJobLimit;
+        if (kind == .unwind) {
+            try self.reserveUnwind(runtime.c.xrt_target_is_remote(session.target.handle));
+        } else {
+            var count: usize = 0;
+            for (self.entries) |slot| if (slot) |entry| {
+                if (entry.kind == .javascript) count += 1;
+            };
+            if (count >= 2) return error.DebugMetadataJobLimit;
+        }
         const slot = for (&self.entries) |*item| {
             if (item.* == null) break item;
         } else return error.DebugMetadataJobLimit;
@@ -127,14 +140,62 @@ pub const State = struct {
         var view: ?*c.struct_xrt_file_view = null;
         try runtime.check(@intCast(c.xrt_target_file_view_open(@ptrCast(session.target.handle), &request, &view)));
         errdefer _ = c.xrt_file_view_close(view);
+        const local = c.xrt_file_view_remote(view) == 0;
+        const identity = c.xrt_file_view_identity(view).*;
+        if (local) try session.modules.rememberMetadataIdentity(region, @bitCast(identity));
         var job: ?*c.struct_xmd_job = null;
-        const status = if (kind == .javascript) c.xmd_start_javascript_cached(view, &job) else c.xmd_start_cfi(view, &job);
+        const status = if (kind == .javascript)
+            c.xmd_start_javascript_cached(view, &job)
+        else if (local and identity.size > 0 and identity.size <= c.XMD_LOCAL_CFI_LIMIT)
+            c.xmd_start_cfi_local(view, &job)
+        else
+            c.xmd_start_cfi(view, &job);
         try check(status, null);
-        slot.* = .{ .id = self.next_id, .kind = kind, .epoch = self.epoch, .region = region, .path = path, .job = job.? };
+        slot.* = .{ .id = self.next_id, .kind = kind, .epoch = self.epoch, .region = region, .path = path, .job = job.?, .local = local, .touched_query = self.query };
         slot.*.?.region.path = path;
         self.next_id +|= 1;
         self.revision +%= 1;
         return &slot.*.?;
+    }
+    fn reserveUnwind(self: *State, remote: bool) !void {
+        while (true) {
+            var used: u64 = 0;
+            var count: usize = 0;
+            var active: usize = 0;
+            var free = false;
+            var waiting = false;
+            for (self.entries) |slot| {
+                const entry = slot orelse {
+                    free = true;
+                    continue;
+                };
+                if (entry.kind != .unwind) continue;
+                count += 1;
+                if (!entry.retired) active += 1;
+                if (c.xmd_join(entry.job) == c.XBO_OK) {
+                    var progress: c.struct_xmd_snapshot = undefined;
+                    c.xmd_poll(entry.job, &progress);
+                    used +|= progress.unwind.retained_bytes;
+                } else {
+                    // Reserve the maximum while a worker can still allocate.
+                    used +|= c.XCF_MAX_BYTES;
+                    waiting = true;
+                }
+            }
+            if (remote and active >= 4) return error.DebugMetadataJobLimit;
+            if (free and count < max_unwind_jobs and used <= unwind_budget - c.XCF_MAX_BYTES) return;
+            var oldest: ?usize = null;
+            for (self.entries, 0..) |slot, i| if (slot) |entry| {
+                if (entry.kind != .unwind or !entry.local or entry.touched_query == self.query or c.xmd_join(entry.job) != c.XBO_OK) continue;
+                if (oldest == null or entry.touched_query < self.entries[oldest.?].?.touched_query) oldest = i;
+            };
+            const victim = oldest orelse return if (waiting) error.DebugMetadataPending else error.DebugMetadataBudgetLimit;
+            // Unwind results contain owned register values, never decoder
+            // pointers. Destroy libdw before the backing job bytes.
+            self.entries[victim].?.deinit();
+            self.entries[victim] = null;
+            self.revision +%= 1;
+        }
     }
     fn mapped(session: *Session, address: u64) !Region {
         try session.refreshMaps();
@@ -159,6 +220,7 @@ pub const State = struct {
         if (self.query == 0) {
             for (&self.entries) |*slot| if (slot.*) |*entry| {
                 entry.checked_query = 0;
+                entry.touched_query = 0;
             };
             self.query = 1;
         }
@@ -289,7 +351,11 @@ pub const State = struct {
                 c.XMD_CANCELLED => "cancelled",
                 else => "failed",
             };
-            out.items[out.count] = .{ .id = entry.id, .kind = entry.kind, .image = entry.path, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits };
+            // Up to 66 rows fit the bounded MCP reply even with escaped paths.
+            // Full mapping paths remain available through paged list_modules.
+            var path_end = @min(entry.path.len, 512);
+            while (path_end < entry.path.len and path_end > 0 and entry.path[path_end] & 0xc0 == 0x80) path_end -= 1;
+            out.items[out.count] = .{ .id = entry.id, .kind = entry.kind, .image = entry.path[0..path_end], .image_truncated = path_end != entry.path.len, .state = state, .reason = entry.verify_error orelse if (progress.reason) |why| std.mem.span(why) else null, .source_bytes = progress.source_bytes, .source_reads = progress.source_reads, .source_size = progress.object.source_size, .units = if (progress.state == c.XMD_INDEXING) progress.index.units else progress.scan.dwarf.units, .dies = if (progress.state == c.XMD_INDEXING) progress.index.dies else progress.scan.dwarf.dies, .retained_unwind_bytes = progress.unwind.retained_bytes, .cached_bytes = progress.cache_bytes, .index_file_bytes = progress.index.file_bytes, .candidate_units = progress.candidate_units, .accelerator_hits = progress.accelerator_hits };
             out.count += 1;
         };
         return out;

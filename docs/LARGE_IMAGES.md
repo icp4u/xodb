@@ -2,9 +2,49 @@
 
 The C components in `src/binary/object*` and `src/debug/dwarf_*` provide ranged
 reads and reusable name indexes for large ELF debug images. The live JavaScript reader uses these components through a background metadata
-job. Native stacks that exceed the full-image cap can also request a bounded
-CFI-only view. Other full-image consumers retain their existing snapshot limits;
+job. Native stripped-library stacks use bounded CFI-only views directly;
+images with DWARF, `.debug_frame`, or a verified companion retain the full
+source/inline path.
+Native stacks that exceed the full-image cap can also request a CFI-only view. Other full-image consumers retain their existing snapshot limits;
 these paths do not imply complete large-image source or type support.
+
+Ordinary local name lookups also use a symbols-only ELF projection. Headers,
+symbol tables and their strings/indexes, notes, section names, dynamic metadata
+and `.gnu_debuglink` are retained; code and DWARF contents are omitted. Files up
+to 256 MiB use an immediate bounded local read. Larger files use the cancellable
+worker. Both validate the pinned source and seal the result before publication.
+Full code, source and type inspection retain their separate snapshot limits.
+
+Local symbol projections use a 128 MiB LRU budget, charged by the greater of
+copied bytes and allocated backing pages, excluding sparse holes. Published
+names and mapped-instance IDs survive eviction. Reloading an evicted image, or
+promoting it to a full snapshot, must match the original source device/inode,
+size and modification/change timestamps. Remote projections remain pinned
+within the same cap because that API does not expose their original file
+identity. Up to 1,024 image identities and 65,536 published names (16 MiB of name
+text) are retained per module set; these are limits, not initial allocations.
+A worker's in-progress projection has its separate 64 MiB copied-byte limit.
+
+Local CFI jobs keep only `.eh_frame` and `.eh_frame_hdr` in a compact ELF.
+Images up to 16 MiB use an immediate local read; larger images and remote files
+use workers and report `DebugMetadataPending` until ready. The local cache
+admits at most 64 jobs and 128 MiB of unwind containers, reserving each worker's
+32 MiB maximum while it can still allocate. Completed local jobs are evicted by
+last stack query; jobs used by the current walk stay pinned. A walk that cannot
+fit reports a budget refusal. Original file versions survive eviction in the
+symbol identity ledger, so reload cannot silently mix file versions. Remote jobs
+keep their existing four-active-job limit and are not LRU victims. JavaScript
+jobs retain their separate two-slot bound. Job, object and decoder overhead,
+symbol projections, and full DWARF snapshots are separate from the CFI cap.
+Metadata status paths have a 512-byte preview with `image_truncated`; full paths
+remain available through paged `list_modules`.
+
+Full-image refusals produce one changed-count summary after a scan or session
+poll: `module budget: N full images loaded, M mapped files deferred`. Repeated
+VMAs count as one deferred file. Each affected `list_modules` region carries
+`full_image_deferred`, even when the 64-entry detailed `load_failures` list is
+full. Successful symbols or CFI do not mean full code/DWARF was loaded. Counts
+are retained over unchanged mappings and repeated queries do not repeat notices.
 
 `xbo_object` borrows a pinned source and validates its device/inode, length and
 modification/change timestamps before and after reads. It reads ELF placement,
@@ -206,3 +246,20 @@ automatic stack decoration. Selecting a caller for explicit locals inspection
 can still load its full debug image; later stack walks reuse that image. The top
 frame and explicit source/locals operations retain their existing synchronous
 small-image path.
+
+Native cache checks: the default and debug-frame cases are fast; eviction and
+budget variants are periodic.
+
+```sh
+python3 tests/module-unwind.py --work .work/unwind-chain
+python3 tests/module-unwind.py --work .work/unwind-debug-frame --debug-frame
+python3 tests/module-unwind.py --work .work/unwind-lru --eviction
+python3 tests/module-unwind.py --work .work/unwind-budget --budget
+```
+
+The first uses 12 stripped, optimized libraries padded to 64 MiB and compares
+unwound PCs with compiler return addresses recorded by the inferior. The second
+visits 66 small libraries, proves eviction and cold reload, then changes an
+evicted source timestamp and requires refusal. The budget variant requires an
+explicit refusal for a working set with 24 MiB of CFI per image. `--wrong-result` plants a wrong
+caller PC and must fail. RSS and CPU readings accompany both runs.

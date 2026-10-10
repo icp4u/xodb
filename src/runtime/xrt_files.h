@@ -26,6 +26,16 @@ struct xrt_file_request {
     int32_t tid;
     struct xrt_mapping mapping; /* used only for MAPPED */
 };
+/* How a successful mapped-file open was resolved. REMOTE means the local
+ * snapshot came from the agent; its namespace path is not in the wire ABI. */
+enum xrt_file_source {
+    XRT_FILE_SOURCE_UNKNOWN,
+    XRT_FILE_SOURCE_MAP_FILES,
+    XRT_FILE_SOURCE_EXE,
+    XRT_FILE_SOURCE_ROOT,
+    XRT_FILE_SOURCE_HOST,
+    XRT_FILE_SOURCE_REMOTE
+};
 /* Returned descriptors belong to the caller. Remote results are immutable
  * local snapshots of target files, so analysis never opens host /proc/PID. */
 enum xrt_status xrt_target_file_open(const struct xrt_target *, const struct xrt_file_request *,
@@ -33,6 +43,12 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *, const struct xrt
 enum xrt_status xrt_target_file(const struct xrt_target *, const struct xrt_file_request *,
                                 int *fd);
 enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *, int *fd);
+/* Optional source output is set only on success. Identity checks and lookup
+ * order are identical to the ordinary open calls. */
+enum xrt_status xrt_target_file_resolved(const struct xrt_target *, const struct xrt_file_request *,
+        int *, struct xrt_file_identity *, enum xrt_file_source *);
+enum xrt_status xrt_process_file_resolved(int32_t, const struct xrt_file_request *,
+        int *, enum xrt_file_source *);
 enum xrt_status xrt_file_identity(int fd, struct xrt_file_identity *);
 enum xrt_status xrt_file_unchanged(int fd, const struct xrt_file_identity *);
 /* Pinned regular file, without a whole-image snapshot. Open on the target's
@@ -49,6 +65,7 @@ const struct xrt_file_identity *xrt_file_view_identity(const struct xrt_file_vie
  * foreground RPC owns or awaits the transport. No wire request was sent. */
 void xrt_file_view_background(struct xrt_file_view *);
 int xrt_file_view_remote(const struct xrt_file_view *);
+enum xrt_file_source xrt_file_view_source(const struct xrt_file_view *);
 enum xrt_status xrt_file_view_validate(struct xrt_file_view *);
 enum xrt_status xrt_file_view_read(struct xrt_file_view *, uint64_t, void *, size_t);
 enum xrt_status xrt_file_view_close(struct xrt_file_view *);
@@ -73,6 +90,10 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *, const struct x
  * Poll is owner-thread only, returning PENDING or a sealed fd exactly once.
  * A completed poll revalidates the original file before transferring the fd. */
 struct xrt_symbol_job;
+/* Synchronous projection for ordinary local files up to 256 MiB. Borrows the
+ * view; copies at most 64 MiB of symbol metadata, never whole code or DWARF.
+ * Larger/remote inputs return UNSUPPORTED_MODE and use the worker instead. */
+enum xrt_status xrt_local_symbol_file(struct xrt_file_view *, int *, uint64_t *resident);
 enum xrt_status xrt_symbol_job_start(struct xrt_file_view *, struct xrt_symbol_job **);
 enum xrt_status xrt_symbol_job_poll(struct xrt_symbol_job *, int *, uint64_t *resident);
 void xrt_symbol_job_cancel(struct xrt_symbol_job *);

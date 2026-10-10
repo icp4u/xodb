@@ -60,6 +60,7 @@ static enum xrt_status tables(struct image *im, unsigned char *header)
     uint64_t phoff = word(im, header, 32, 28), shoff = word(im, header, 40, 32);
     uint64_t phnum = number(im, header + (im->wide ? 56 : 44), 2);
     uint64_t shnum = number(im, header + (im->wide ? 60 : 48), 2);
+    uint64_t names_index = number(im, header + (im->wide ? 62 : 50), 2);
     if (shoff) {
         if (number(im, header + (im->wide ? 58 : 46), 2) != shsize)
             return XRT_INVALID_ARGUMENT;
@@ -67,6 +68,7 @@ static enum xrt_status tables(struct image *im, unsigned char *header)
         TRY(copy(im, shoff, shsize, zero));
         if (!shnum) shnum = word(im, zero, 32, 20);
         if (phnum == PN_XNUM) phnum = number(im, zero + (im->wide ? 44 : 28), 4);
+        if (names_index == SHN_XINDEX) names_index = number(im, zero + (im->wide ? 40 : 24), 4);
     } else {
         if (phnum == PN_XNUM) return XRT_INVALID_ARGUMENT;
         shnum = 0;
@@ -91,14 +93,37 @@ static enum xrt_status tables(struct image *im, unsigned char *header)
     if (!shnum) return XRT_OK;
     size_t n = (size_t)shnum * shsize;
     unsigned char *sections = malloc(n);
+    unsigned char *names = NULL;
+    uint64_t names_size = 0;
     bool *selected = calloc((size_t)shnum, sizeof(*selected));
     if (!sections || !selected) { free(sections); free(selected); return XRT_OUT_OF_MEMORY; }
     enum xrt_status result = copy(im, shoff, n, sections);
     if (result != XRT_OK) goto done;
+    if (names_index) {
+        if (names_index >= shnum) { result = XRT_INVALID_ARGUMENT; goto done; }
+        const unsigned char *s = sections + names_index * shsize;
+        if (number(im, s + 4, 4) != SHT_STRTAB) { result = XRT_INVALID_ARGUMENT; goto done; }
+        names_size = word(im, s, 32, 20);
+        uint64_t names_offset = word(im, s, 24, 16);
+        if (names_offset > im->size || names_size > im->size - names_offset) { result = XRT_INVALID_ARGUMENT; goto done; }
+        if (names_size > UINT64_C(64) * 1024 * 1024 - im->copied) { result = XRT_FILE_LIMIT; goto done; }
+        if (names_size) {
+            names = malloc((size_t)names_size);
+            if (!names) { result = XRT_OUT_OF_MEMORY; goto done; }
+            result = copy(im, names_offset, names_size, names);
+            if (result != XRT_OK) goto done;
+        }
+    }
     for (uint64_t i = 1; i < shnum; ++i) {
         const unsigned char *s = sections + i * shsize;
         uint64_t type = number(im, s + 4, 4);
         if (type == SHT_NOTE) { selected[i] = true; continue; }
+        uint64_t name = number(im, s, 4);
+        if (type == SHT_PROGBITS && name < names_size &&
+            sizeof(".gnu_debuglink") <= names_size - name &&
+            !memcmp(names + name, ".gnu_debuglink", sizeof(".gnu_debuglink"))) {
+            selected[i] = true; continue;
+        }
         if (type != SHT_SYMTAB && type != SHT_DYNSYM && type != SHT_SYMTAB_SHNDX) continue;
         uint64_t link = number(im, s + (im->wide ? 40 : 24), 4);
         if (link >= shnum) { result = XRT_INVALID_ARGUMENT; goto done; }
@@ -111,13 +136,13 @@ static enum xrt_status tables(struct image *im, unsigned char *header)
         selected[link] = true;
     }
     for (uint64_t i = 1; i < shnum; ++i) {
-        if (!selected[i]) continue;
+        if (!selected[i] || i == names_index) continue;
         const unsigned char *s = sections + i * shsize;
         result = copy(im, word(im, s, 24, 16), word(im, s, 32, 20), NULL);
         if (result != XRT_OK) goto done;
     }
 done:
-    free(sections); free(selected);
+    free(sections); free(selected); free(names);
     return result;
 }
 enum xrt_status xrt_elf_symbols(xrt_elf_read read, void *context, int fd, uint64_t size)
@@ -139,9 +164,7 @@ enum xrt_status xrt_elf_symbols(xrt_elf_read read, void *context, int fd, uint64
     if ((type != ET_EXEC && type != ET_DYN) || number(&im, header + 20, 4) != EV_CURRENT ||
         number(&im, header + (im.wide ? 52 : 40), 2) != hsize) return XRT_INVALID_ARGUMENT;
     TRY(tables(&im, header));
-    /* No section-name strings or debug/code contents are fetched. Consumers
-     * are deliberately restricted to symbol iteration and load placement. */
-    header[im.wide ? 62 : 50] = 0;
-    header[im.wide ? 63 : 51] = 0;
+    /* Names and .gnu_debuglink allow verified companion discovery. DWARF,
+     * unwind and code contents remain absent; this is only a symbol view. */
     return store(fd, 0, header, hsize);
 }

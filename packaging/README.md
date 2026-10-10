@@ -11,7 +11,7 @@ a release, update `packaging/debian/changelog`, `packaging/rpm/xodb.spec` and
 Install the [application build dependencies](../README.md#build-and-run) first.
 Package builders need the additional tools below. No build command installs
 system packages or changes tracing policy. Run builds as an ordinary user in
-an external directory; `scripts/build` keeps its caches inside its source tree.
+an external directory; `packaging/build` keeps its caches inside its source tree.
 
 ## Make a source snapshot
 

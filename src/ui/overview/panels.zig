@@ -120,7 +120,22 @@ pub const GraphOpts = struct {
 
 /// History graph: anti-aliased traces over a gradient fill, adaptive
 /// ceiling with a decaying peak, and hatching wherever a sample is missing.
-pub fn graph(v: *View, ctx: Ctx, rect: Rect, series: []const Series, o: GraphOpts, now: u64) !void {
+pub fn graph(v: *View, base_ctx: Ctx, outer: Rect, series: []const Series, o: GraphOpts, now: u64) !void {
+    var ctx = base_ctx;
+    var palette = ctx.p.*;
+    const classic = palette.win95;
+    if (classic) {
+        try ctx.bevel(outer, true);
+        const rgb = @import("../../appearance.zig").rgb;
+        palette.panel = rgb(0x000000);
+        palette.raised = rgb(0x000000);
+        palette.grid = rgb(0x004000);
+        palette.dim = rgb(0x80c080);
+        palette.text = rgb(0x80ff80);
+        palette.hatch = rgb(0x426642);
+        ctx.p = &palette;
+    }
+    const rect = if (classic) draw.inset(outer, 2) else outer;
     const p = ctx.p;
     try ctx.r.shape(rect, fade(p.raised, 0.85), .{ .radii = @splat(4) });
     const n = @min(o.samples, h.capacity);
@@ -173,7 +188,9 @@ pub fn graph(v: *View, ctx: Ctx, rect: Rect, series: []const Series, o: GraphOpt
     }
     var raw: [h.capacity + 2]?[2]f32 = undefined;
     var smooth: [(h.capacity + 2) * 4]?[2]f32 = undefined;
-    for (series) |sr| {
+    for (series, 0..) |original, index| {
+        var sr = original;
+        if (classic) sr.color = taskColor(index);
         for (0..n + 1) |i| {
             const val = sr.ring.back(i);
             raw[n - i] = if (val) |x| .{ rect.x + rect.w - @as(f32, @floatFromInt(i)) * dx + shift, zero - sr.sign * std.math.clamp((x - o.floor) / @max(ceiling - o.floor, 0.0001), 0, 1) * span } else null;
@@ -199,7 +216,8 @@ pub fn graph(v: *View, ctx: Ctx, rect: Rect, series: []const Series, o: GraphOpt
     var i = series.len;
     while (i > 0) {
         i -= 1;
-        const sr = series[i];
+        var sr = series[i];
+        if (classic) sr.color = taskColor(i);
         if (sr.label.len == 0) continue;
         var lb: [64]u8 = undefined;
         const label = std.fmt.bufPrint(&lb, "{s} {s}", .{ sr.label, format(&b, o.kind, sr.ring.last()) }) catch sr.label;
@@ -211,6 +229,11 @@ pub fn graph(v: *View, ctx: Ctx, rect: Rect, series: []const Series, o: GraphOpt
         try ctx.text(x + 18, rect.y + 2, label, p.text);
         x -= 6;
     }
+}
+
+fn taskColor(index: usize) Color {
+    const rgb = @import("../../appearance.zig").rgb;
+    return ([_]Color{ rgb(0x00ff00), rgb(0x70b870), rgb(0xd0ffd0), rgb(0x00b880) })[index % 4];
 }
 
 fn areaDown(ctx: Ctx, points: []const ?[2]f32, zero: f32, bottom: f32, color: Color, strength: f32) !void {
@@ -521,12 +544,13 @@ fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !
     const left_w: f32 = 300;
     {
         const inner = try card(ctx, .{ .x = rect.x, .y = rect.y, .w = left_w, .h = top_h }, "Total CPU", if (s.cpu_model.ok()) "" else s.cpu_model.why);
+        const digit_h: f32 = if (p.win95) @min(64, @max(20, inner.h - 3 * line_h - 12)) else 64;
         var b: [32]u8 = undefined;
         if (s.cpu_total.get()) |x| {
             const t = std.fmt.bufPrint(&b, "{d:.1}%", .{x}) catch "";
-            _ = try ctx.vfd(inner.x, inner.y + 4, 64, t, p.accent);
+            _ = try ctx.vfd(inner.x, inner.y + 4, digit_h, t, p.accent);
         } else try missing(v, ctx, inner.x, inner.y + 20, inner.w, s.cpu_total.reason);
-        var y = inner.y + 84;
+        var y = inner.y + digit_h + (if (p.win95) @as(f32, 12) else 20);
         var mhz: f64 = 0;
         var n: f64 = 0;
         var max_mhz: f64 = 0;
@@ -694,7 +718,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     try ctx.r.shape(.{ .x = rect.x, .y = rect.y, .w = rect.w, .h = bar_h }, p.panel, .{ .radii = @splat(6) });
     const narrow = rect.w < 1400;
     const search = Rect{ .x = rect.x + 8, .y = rect.y + 5, .w = if (narrow) rect.w * 0.2 else @min(360, rect.w * 0.3), .h = 24 };
-    try ctx.r.shape(search, p.raised, .{ .radii = @splat(5) });
+    if (p.win95) try ctx.list(search) else try ctx.r.shape(search, p.raised, .{ .radii = @splat(5) });
     try ctx.r.shape(search, if (v.searching) p.accent else p.border, .{ .radii = @splat(5), .border = 1 });
     v.hit(search, .search);
     const q = v.searchText();
@@ -714,8 +738,8 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
         const label = if (on) std.fmt.bufPrint(&nb, "{s} {s}", .{ name, if (v.descending) "▼" else "▲" }) catch name else name;
         const w = ctx.measure(label) + 16;
         const chip = Rect{ .x = x, .y = rect.y + 6, .w = w, .h = 22 };
-        try ctx.r.shape(chip, if (on) fade(p.accent, 0.18) else fade(p.raised, 1), .{ .radii = @splat(11) });
-        if (on) try ctx.r.shape(chip, fade(p.accent, 0.7), .{ .radii = @splat(11), .border = 1 });
+        if (p.win95) try ctx.button(chip, on) else try ctx.r.shape(chip, if (on) fade(p.accent, 0.18) else fade(p.raised, 1), .{ .radii = @splat(11) });
+        if (on and !p.win95) try ctx.r.shape(chip, fade(p.accent, 0.7), .{ .radii = @splat(11), .border = 1 });
         try ctx.text(x + 8, rect.y + 7, label, if (on) p.accent else p.dim);
         v.hit(chip, .{ .sort = sort });
         x += w + 4;
@@ -724,7 +748,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
         const label = if (v.tree) "tree ✓" else "tree";
         const w = ctx.measure(label) + 16;
         const chip = Rect{ .x = x + 8, .y = rect.y + 6, .w = w, .h = 22 };
-        try ctx.r.shape(chip, if (v.tree) fade(p.accent3, 0.18) else p.raised, .{ .radii = @splat(11) });
+        if (p.win95) try ctx.button(chip, v.tree) else try ctx.r.shape(chip, if (v.tree) fade(p.accent3, 0.18) else p.raised, .{ .radii = @splat(11) });
         try ctx.text(chip.x + 8, rect.y + 7, label, if (v.tree) p.accent3 else p.dim);
         v.hit(chip, .tree);
         x = chip.x + chip.w;
@@ -739,7 +763,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     // Detail strip for the selection.
     const detail_h: f32 = 92;
     const table = Rect{ .x = rect.x, .y = rect.y + bar_h + 8, .w = rect.w, .h = rect.h - bar_h - 8 - detail_h - 8 };
-    try ctx.panel(table);
+    try ctx.list(table);
     const wide = rect.w > 1300;
     const cols_all = [_]Column{
         .{ .label = "Name", .width = 0, .sort = .name, .right = false },
@@ -757,12 +781,13 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     const cols: []const Column = if (wide) &cols_all else cols_all[0..10];
     var fixed: f32 = 0;
     for (cols[1..]) |c| fixed += c.width + 10;
-    const name_w = @max(140, table.w - 24 - fixed);
+    const name_w = @max(140, table.w - 24 - fixed - (if (p.win95) @as(f32, 18) else 0));
     // Header.
     var cx = table.x + 12;
     const hy = table.y + 6;
     for (cols, 0..) |c, i| {
         const w = if (i == 0) name_w else c.width;
+        if (p.win95) try ctx.bevel(.{ .x = cx - 4, .y = hy - 3, .w = w + 9, .h = 26 }, false);
         const on = c.sort != null and c.sort.? == v.sort;
         var lb: [24]u8 = undefined;
         const label = if (on) std.fmt.bufPrint(&lb, "{s}{s}", .{ c.label, if (v.descending) " ▼" else " ▲" }) catch c.label else c.label;
@@ -900,7 +925,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     if (v.rows.items.len > v.visible_rows) {
         const frac = @as(f32, @floatFromInt(v.visible_rows)) / @as(f32, @floatFromInt(v.rows.items.len));
         const pos = @as(f32, @floatFromInt(top.*)) / @as(f32, @floatFromInt(v.rows.items.len));
-        try ctx.r.shape(.{ .x = table.x + table.w - 6, .y = body.y + body.h * pos, .w = 3, .h = @max(20, body.h * frac) }, fade(p.dim, 0.5), .{ .radii = @splat(1.5) });
+        if (p.win95) try @import("win95.zig").scrollbar(v, ctx, .{ .x = table.x + table.w - 18, .y = body.y, .w = 16, .h = body.h - 22 }, top.*, v.rows.items.len, v.visible_rows) else try ctx.r.shape(.{ .x = table.x + table.w - 6, .y = body.y + body.h * pos, .w = 3, .h = @max(20, body.h * frac) }, fade(p.dim, 0.5), .{ .radii = @splat(1.5) });
     }
     try processDetail(v, ctx, .{ .x = rect.x, .y = rect.y + rect.h - detail_h, .w = rect.w, .h = detail_h }, now);
 }
@@ -954,7 +979,7 @@ fn processDetail(v: *View, ctx: Ctx, rect: Rect, now: u64) !void {
     for ([_][]const u8{ "Files  L", "Profile  F", button_label }, [_]View.Action{ .files, .profile, .attach }, 0..) |label, action, i| {
         const button = Rect{ .x = rect.x + rect.w - bw - 14, .y = rect.y + 4 + @as(f32, @floatFromInt(i)) * 27, .w = bw, .h = 25 };
         const hot = draw.inside(button, v.pointer[0], v.pointer[1]);
-        try ctx.r.shape(button, fade(p.accent, if (hot) 0.32 else 0.2), .{ .radii = @splat(5) });
+        if (p.win95) try ctx.button(button, hot) else try ctx.r.shape(button, fade(p.accent, if (hot) 0.32 else 0.2), .{ .radii = @splat(5) });
         try ctx.text(button.x + 12, button.y + 2, label, p.text);
         v.hit(button, action);
     }
@@ -1260,7 +1285,9 @@ fn connections(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     const cols = [_]struct { label: []const u8, w: f32 }{ .{ .label = "Proto", .w = 60 }, .{ .label = "State", .w = 120 }, .{ .label = "Local", .w = inner.w * 0.27 }, .{ .label = "Remote", .w = inner.w * 0.27 }, .{ .label = "PID", .w = 80 }, .{ .label = "Process", .w = 0 } };
     var x = inner.x;
     const hy = inner.y + 6;
+    if (p.win95) try ctx.list(.{ .x = inner.x - 4, .y = hy - 4, .w = inner.w + 8, .h = inner.h - 2 });
     for (cols) |c| {
+        if (p.win95) try ctx.bevel(.{ .x = x - 2, .y = hy - 2, .w = if (c.w > 0) c.w + 12 else @max(0, inner.x + inner.w - x), .h = 26 }, false);
         try ctx.text(x, hy, c.label, p.dim);
         x += c.w + 12;
     }
@@ -1542,7 +1569,11 @@ fn users(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     if (try groupBanner(v, ctx, inner, s, .users)) y += 66;
     const cols = [_]f32{ 0, 0.25, 0.42, 0.7, 0.85 };
     const labels = [_][]const u8{ "User", "Line", "From", "Login", "PID" };
-    for (labels, cols) |l, c| try ctx.text(inner.x + inner.w * c, y, l, p.dim);
+    if (p.win95) try ctx.list(.{ .x = inner.x - 4, .y = y - 4, .w = inner.w + 8, .h = inner.y + inner.h - y + 4 });
+    for (labels, cols, 0..) |label, fraction, i| {
+        if (p.win95) try ctx.bevel(.{ .x = inner.x + inner.w * fraction - 2, .y = y - 2, .w = inner.w * ((if (i + 1 < cols.len) cols[i + 1] else 1) - fraction), .h = 26 }, false);
+        try ctx.text(inner.x + inner.w * fraction, y, label, p.dim);
+    }
     y += line_h + 4;
     for (s.users, 0..) |u, i| {
         if (y + line_h > inner.y + inner.h) break;
@@ -1577,7 +1608,11 @@ fn services(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     y += line_h + 6;
     const fractions = [_]f32{ 0, 0.26, 0.38, 0.54, 0.62, 0.77, 0.88, 1 };
     const labels = [_][]const u8{ "Name", "PID", "User (UID)", "State", "Uptime", "CPU %", "RSS" };
-    for (labels, 0..) |label, i| try ctx.textFit(inner.x + inner.w * fractions[i], y, inner.w * (fractions[i + 1] - fractions[i]) - 8, label, p.dim);
+    if (p.win95) try ctx.list(.{ .x = inner.x - 4, .y = y - 4, .w = inner.w + 8, .h = inner.y + inner.h - y + 4 });
+    for (labels, 0..) |label, i| {
+        if (p.win95) try ctx.bevel(.{ .x = inner.x + inner.w * fractions[i] - 2, .y = y - 2, .w = inner.w * (fractions[i + 1] - fractions[i]), .h = 26 }, false);
+        try ctx.textFit(inner.x + inner.w * fractions[i], y, inner.w * (fractions[i + 1] - fractions[i]) - 8, label, p.dim);
+    }
     y += line_h + 4;
     if (s.services.len == 0) {
         if (s.group(.services).status == .ok) try ctx.textFit(inner.x, y, inner.w, "No matching daemon processes observed", p.dim);

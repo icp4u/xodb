@@ -18,6 +18,37 @@ struct xrt_symbol_job {
     uint64_t bytes;
     enum xrt_status status;
 };
+struct local_symbols { struct xrt_file_view *view; uint64_t bytes; };
+static enum xrt_status read_local_symbols(void *context, uint64_t offset, void *out, size_t size)
+{
+    struct local_symbols *local = context;
+    enum xrt_status status = xrt_file_view_read(local->view, offset, out, size);
+    if (status == XRT_OK) local->bytes += size;
+    return status;
+}
+enum xrt_status xrt_local_symbol_file(struct xrt_file_view *view, int *out, uint64_t *resident)
+{
+    if (!view || !out || !resident) return XRT_INVALID_ARGUMENT;
+    *out = -1;
+    *resident = 0;
+    const struct xrt_file_identity *id = xrt_file_view_identity(view);
+    if (!id || id->size <= 0) return XRT_INVALID_ARGUMENT;
+    if (xrt_file_view_remote(view) || id->size > INT64_C(256) * 1024 * 1024)
+        return XRT_UNSUPPORTED_MODE;
+    int fd = memfd_create("xodb-symbols", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (fd < 0) return XRT_FILE_UNAVAILABLE;
+    struct local_symbols local = {.view = view};
+    enum xrt_status status = ftruncate(fd, id->size) ? XRT_FILE_UNAVAILABLE :
+        xrt_elf_symbols(read_local_symbols, &local, fd, (uint64_t)id->size);
+    if (status == XRT_OK) status = xrt_file_view_validate(view);
+    if (status == XRT_OK && fcntl(fd, F_ADD_SEALS,
+            F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0)
+        status = XRT_FILE_UNAVAILABLE;
+    if (status != XRT_OK) { close(fd); return status; }
+    *out = fd;
+    *resident = local.bytes;
+    return XRT_OK;
+}
 static enum xrt_status read_symbols(void *context, uint64_t offset, void *out, size_t size)
 {
     struct xrt_symbol_job *job = context;

@@ -32,6 +32,7 @@ pub const Palette = struct {
     ghost: f32 = 0.07,
     /// True when hue carries no meaning: series differ by brightness and fill.
     monochrome: bool = false,
+    win95: bool = false,
 };
 
 fn shade(hex: u24, alpha: f32) Color {
@@ -168,6 +169,25 @@ pub const all = [_]Palette{
         .selection = shade(0xffffff, 0.12),
         .ghost = 0.06,
         .monochrome = true,
+    },
+    .{
+        .name = "win95",
+        .background = rgb(0xc0c0c0),
+        .panel = rgb(0xc0c0c0),
+        .raised = rgb(0xdfdfdf),
+        .grid = rgb(0x909090),
+        .border = rgb(0x808080),
+        .text = rgb(0x000000),
+        .dim = rgb(0x383838),
+        .accent = rgb(0x000080),
+        .accent2 = rgb(0x005000),
+        .accent3 = rgb(0x600060),
+        .ok = rgb(0x005000),
+        .warn = rgb(0x704000),
+        .crit = rgb(0x800000),
+        .hatch = rgb(0x606060),
+        .selection = rgb(0xa8b4cc),
+        .win95 = true,
     },
 };
 

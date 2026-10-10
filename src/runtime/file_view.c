@@ -10,6 +10,7 @@ struct xrt_file_view {
     struct xrt_file_identity identity;
     uint64_t remote_id;
     int fd, background;
+    enum xrt_file_source source;
     enum xrt_status failure;
     unsigned char bytes[XRT_FILE_VIEW_MAX_READ];
 };
@@ -30,7 +31,7 @@ enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
     v->fd = -1;
     enum xrt_status status;
     if (!t->connection) {
-        status = xrt_target_file_open(t, request, &v->fd, &v->identity);
+        status = xrt_target_file_resolved(t, request, &v->fd, &v->identity, &v->source);
     } else {
         struct xrt_file_request copy = *request;
         struct xrt_codec wire = xrt_codec(v->bytes, sizeof(v->bytes), false);
@@ -52,6 +53,7 @@ enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
                 status = xrt_remote_fail(t, XRT_PROTOCOL_ERROR);
             else {
                 v->target = t;
+                v->source = XRT_FILE_SOURCE_REMOTE;
                 __atomic_add_fetch(&((struct xrt_target *)t)->remote_files, 1, __ATOMIC_SEQ_CST);
             }
         }
@@ -71,6 +73,10 @@ const struct xrt_file_identity *xrt_file_view_identity(const struct xrt_file_vie
 int xrt_file_view_remote(const struct xrt_file_view *v)
 {
     return v && v->target != NULL;
+}
+enum xrt_file_source xrt_file_view_source(const struct xrt_file_view *v)
+{
+    return v ? v->source : XRT_FILE_SOURCE_UNKNOWN;
 }
 void xrt_file_view_background(struct xrt_file_view *v)
 {

@@ -1179,6 +1179,7 @@ pub const Session = struct {
         return true;
     }
     pub fn poll(self: *Session) !void {
+        defer self.modules.reportBudget();
         defer self.language_watches.poll(self);
         defer self.language_tabs.poll(self);
         defer self.metadata.poll(self);
@@ -1474,6 +1475,7 @@ pub const Session = struct {
         return ids;
     }
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
+        defer self.modules.reportBudget();
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         try self.refreshMaps();
         const raw_registers = try self.target.registers(tid);
@@ -1494,14 +1496,18 @@ pub const Session = struct {
             if (pc == 0) break;
             var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
             const remote_caller = frames.items.len != 0 and @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
-            if (if (remote_caller) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| frame.symbol = symbol.name else |_| {}
+            const metadata_only = self.modules.prefersUnwindMetadata(frame.lookup_pc) catch false;
+            if (if (remote_caller or metadata_only) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| {
+                frame.symbol = symbol.name;
+                frame.module_id = symbol.module_id;
+            } else |_| {}
             const step: info.Unwind = step: {
                 // Decorating an unloaded remote caller must not download its
                 // whole library on the event loop. CFI uses the C range worker;
                 // explicit locals/source inspection can still load full DWARF.
-                const module = (if (remote_caller) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
+                const module = (if (remote_caller or metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
                     if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
-                        frame.inline_diagnostic = @errorName(err);
+                        frame.inline_diagnostic = if (metadata_only) "NoDebugInfo" else @errorName(err);
                         break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
                             frame.diagnostic = @errorName(metadata_error);
                             try frames.append(a, frame);

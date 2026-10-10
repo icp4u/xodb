@@ -17,6 +17,7 @@ pub const Font = struct {
     dirty: bool = true,
     degraded: bool = false,
     pixel: bool = false,
+    retro: bool = false,
     pub fn init(self: *Font, path: [:0]const u8) !void {
         return self.initMode(path, false);
     }
@@ -35,10 +36,34 @@ pub const Font = struct {
         errdefer _ = c.FT_Done_FreeType(self.library);
         if (c.FT_New_Face(self.library, path.ptr, 0, &self.face) != 0) return error.FontNotFound;
         errdefer _ = c.FT_Done_Face(self.face);
+        try self.prepare();
+    }
+    /// Embedded, freely redistributable bitmap face; independent of host fonts.
+    pub fn initRetro(self: *Font) !void {
+        const data = @embedFile("assets/spleen-8x16.bdf");
+        self.pixel = true;
+        self.retro = true;
+        if (c.FT_Init_FreeType(&self.library) != 0) return error.FontLibraryFailed;
+        errdefer _ = c.FT_Done_FreeType(self.library);
+        if (c.FT_New_Memory_Face(self.library, data.ptr, data.len, 0, &self.face) != 0) return error.FontNotFound;
+        errdefer _ = c.FT_Done_Face(self.face);
+        try self.prepare();
+    }
+    /// Build the replacement before releasing the active atlas. Call between frames.
+    pub fn selectOverview(self: *Font, gpa: std.mem.Allocator, path: [:0]const u8, retro: bool) !void {
+        if (self.retro == retro) return;
+        const next = try gpa.create(Font);
+        defer gpa.destroy(next);
+        next.* = .{};
+        if (retro) try next.initRetro() else try next.initMode(path, false);
+        self.deinit();
+        self.* = next.*;
+    }
+    fn prepare(self: *Font) !void {
         if (c.FT_Set_Pixel_Sizes(self.face, 0, 16) != 0) return error.FontSizeFailed;
         self.hb = c.hb_ft_font_create_referenced(self.face) orelse return error.FontShapeFailed;
         errdefer c.hb_font_destroy(self.hb);
-        if (pixel) c.hb_ft_font_set_load_flags(self.hb, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME);
+        if (self.pixel) c.hb_ft_font_set_load_flags(self.hb, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME);
         self.buffer = c.hb_buffer_create() orelse return error.FontShapeFailed;
         errdefer c.hb_buffer_destroy(self.buffer);
         self.pixels[0] = 255;
@@ -101,4 +126,32 @@ test "pixel glyph atlas has binary nonempty coverage" {
         if (value == 255) ink += 1;
     }
     try std.testing.expect(ink > 1);
+}
+
+// Fast component lane: bundled glyphs and transactional switching.
+test "bundled bitmap font switches atomically and restores the overview font" {
+    const a = std.testing.allocator;
+    const font = try a.create(Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.initRetro();
+    defer font.deinit();
+    for ("xodb 0123456789CPU") |ch| {
+        const id = c.FT_Get_Char_Index(font.face, ch);
+        try std.testing.expect(id != 0);
+        _ = try font.glyph(id);
+    }
+    var ink: usize = 0;
+    for (font.pixels) |value| {
+        try std.testing.expect(value == 0 or value == 255);
+        if (value == 255) ink += 1;
+    }
+    try std.testing.expect(ink > 100);
+    const face = font.face;
+    try std.testing.expectError(error.FontNotFound, font.selectOverview(a, "missing-overview-font", false));
+    try std.testing.expect(font.face == face and font.retro);
+    try font.selectOverview(a, @import("build_options").font_path ++ "", false);
+    try std.testing.expect(!font.retro and !font.pixel);
+    try font.selectOverview(a, "missing-overview-font", true);
+    try std.testing.expect(font.retro and font.pixel and font.dirty);
 }

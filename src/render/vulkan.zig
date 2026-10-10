@@ -650,7 +650,7 @@ pub const Renderer = struct {
         var count: u32 = 0;
         const glyphs = c.hb_buffer_get_glyph_infos(font.buffer, &count);
         const positions = c.hb_buffer_get_glyph_positions(font.buffer, null);
-        if (font.pixel) for (positions[0..count]) |*position| {
+        if (font.pixel and count != 0) for (positions[0..count]) |*position| {
             position.x_advance = @intFromFloat(@round(@as(f64, @floatFromInt(position.x_advance)) / 64) * 64);
             position.x_offset = @intFromFloat(@round(@as(f64, @floatFromInt(position.x_offset)) / 64) * 64);
             position.y_offset = @intFromFloat(@round(@as(f64, @floatFromInt(position.y_offset)) / 64) * 64);
@@ -850,4 +850,18 @@ const Wait = struct {
 fn reportSlowCall(name: []const u8, started: u64) void {
     const elapsed = Wait.now() -| started;
     if (elapsed >= 250_000_000) std.debug.print("xodb: slow Vulkan {s}: {d} ms\n", .{ name, elapsed / 1_000_000 });
+}
+
+// Fast component lane: HarfBuzz returns null positions for an empty buffer.
+test "empty text is safe with the bitmap font" {
+    const a = std.testing.allocator;
+    const font = try a.create(fonts.Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.initRetro();
+    defer font.deinit();
+    var renderer = Renderer{};
+    try std.testing.expectEqual(@as(f32, 0), renderer.measure(font, ""));
+    try renderer.text(font, 0, 0, "", .{ 1, 1, 1, 1 });
+    try std.testing.expectEqual(@as(f32, 32), renderer.measure(font, "xodb"));
 }

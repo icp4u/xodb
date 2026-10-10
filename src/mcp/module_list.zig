@@ -43,6 +43,8 @@ fn identity(snapshot: Snapshot) [64]u8 {
         hashNumber(&hash, r.device_minor);
         hash.update(&r.permissions);
         hashText(&hash, r.path);
+        hashText(&hash, @tagName(r.file_source));
+        hashNumber(&hash, @intFromBool(r.full_image_deferred));
     }
     hashNumber(&hash, snapshot.failures.len);
     for (snapshot.failures) |f| {
@@ -197,6 +199,14 @@ test "module cursors refuse other sessions generations mappings and malformed in
     regions[0].offset = 4096;
     try std.testing.expectError(error.StaleModuleCursor, page(a, snapshot, args));
     regions[0].offset = 0;
+    regions[0].file_source = .target_root;
+    try std.testing.expectError(error.StaleModuleCursor, page(a, snapshot, args));
+    const resolved = try page(a, snapshot, try wire.value(a, .{ .limit = 1 }));
+    try std.testing.expectEqualStrings("target_root", resolved.object.get("regions").?.array.items[0].object.get("file_source").?.string);
+    regions[0].file_source = .unopened;
+    regions[0].full_image_deferred = true;
+    try std.testing.expectError(error.StaleModuleCursor, page(a, snapshot, args));
+    regions[0].full_image_deferred = false;
     failures[0].diagnostic = "Second";
     try std.testing.expectError(error.StaleModuleCursor, page(a, snapshot, args));
     failures[0].diagnostic = "First";

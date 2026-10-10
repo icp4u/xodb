@@ -49,6 +49,10 @@ enum xbo_status xmd_mapping_bias(struct xmd_job *, uint64_t start, uint64_t end,
         uint64_t offset, uint64_t page_size, unsigned write_execute, uint64_t *bias);
 /* CFI-only worker. The caller owns the view until successful start. */
 enum xbo_status xmd_start_cfi(struct xrt_file_view *, struct xmd_job **);
+/* Ordinary local ELF files can finish before returning, without a worker
+ * round trip. Larger or remote files keep the asynchronous entry point. */
+#define XMD_LOCAL_CFI_LIMIT (UINT64_C(16) * 1024 * 1024)
+enum xbo_status xmd_start_cfi_local(struct xrt_file_view *, struct xmd_job **);
 /* Joins nonblockingly and revalidates before lending the CFI-only ELF bytes.
  * Close all libelf/libdw handles borrowing these bytes before destroying job. */
 enum xbo_status xmd_cfi_result(struct xmd_job *, unsigned char **, size_t *);

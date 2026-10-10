@@ -361,7 +361,7 @@ static void *worker(void *context) {
     }
 }
 static enum xbo_status start(struct xrt_file_view *view, int cache_fd,
-                                    uint64_t cache_limit, enum job_kind kind, int managed, struct xmd_job **out) {
+                                    uint64_t cache_limit, enum job_kind kind, int managed, int immediate, struct xmd_job **out) {
     if (!view || !out || (cache_fd >= 0 && !cache_limit)) return XBO_MALFORMED;
     *out = NULL;
     struct xmd_job *job = calloc(1, sizeof *job);
@@ -379,6 +379,12 @@ static enum xbo_status start(struct xrt_file_view *view, int cache_fd,
     job->snapshot.status = job->working.status = XBO_AGAIN;
     int error = pthread_mutex_init(&job->mutex, NULL);
     if (error) { if (job->cache_fd >= 0) close(job->cache_fd); free(job); return XBO_NOMEM; }
+    if (immediate) {
+        job->joined = 1;
+        worker(job);
+        *out = job;
+        return XBO_OK;
+    }
     pthread_attr_t attr;
     error = pthread_attr_init(&attr);
     if (!error) {
@@ -395,17 +401,25 @@ static enum xbo_status start(struct xrt_file_view *view, int cache_fd,
 }
 enum xbo_status xmd_start_javascript(struct xrt_file_view *view, int cache_fd,
                                     uint64_t cache_limit, struct xmd_job **out) {
-    return start(view, cache_fd, cache_limit, JOB_JAVASCRIPT, 0, out);
+    return start(view, cache_fd, cache_limit, JOB_JAVASCRIPT, 0, 0, out);
 }
 enum xbo_status xmd_start_javascript_cached(struct xrt_file_view *view, struct xmd_job **out) {
-    return start(view, -1, 0, JOB_JAVASCRIPT, 1, out);
+    return start(view, -1, 0, JOB_JAVASCRIPT, 1, 0, out);
 }
 enum xbo_status xmd_start_javascript_dwarf(struct xrt_file_view *view, int cache_fd,
                                           uint64_t cache_limit, struct xmd_job **out) {
-    return start(view, cache_fd, cache_limit, JOB_DWARF, 0, out);
+    return start(view, cache_fd, cache_limit, JOB_DWARF, 0, 0, out);
 }
 enum xbo_status xmd_start_cfi(struct xrt_file_view *view, struct xmd_job **out) {
-    return start(view, -1, 0, JOB_CFI, 0, out);
+    return start(view, -1, 0, JOB_CFI, 0, 0, out);
+}
+enum xbo_status xmd_start_cfi_local(struct xrt_file_view *view, struct xmd_job **out) {
+    if (!view || !out) return XBO_MALFORMED;
+    *out = NULL;
+    const struct xrt_file_identity *identity = xrt_file_view_identity(view);
+    if (!identity || identity->size <= 0) return XBO_MALFORMED;
+    if (xrt_file_view_remote(view) || (uint64_t)identity->size > XMD_LOCAL_CFI_LIMIT) return XBO_LIMIT;
+    return start(view, -1, 0, JOB_CFI, 0, 1, out);
 }
 enum xbo_status xmd_cfi_result(struct xmd_job *job, unsigned char **out, size_t *size) {
     if (!out || !size) return XBO_MALFORMED;

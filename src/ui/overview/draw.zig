@@ -267,13 +267,57 @@ pub const Ctx = struct {
     }
 
     pub fn panel(self: Ctx, rect: Rect) !void {
+        if (self.p.win95) return self.bevel(rect, true);
         try self.r.shape(rect, self.p.panel, .{ .radii = @splat(6) });
         try self.r.shape(rect, self.p.border, .{ .radii = @splat(6), .border = 1 });
+    }
+
+    /// Four-color, two-pixel system-control edge. Small rectangles stay empty.
+    pub fn bevel(self: Ctx, rect: Rect, sunken: bool) !void {
+        if (rect.w < 4 or rect.h < 4) return;
+        const rgb = @import("../../appearance.zig").rgb;
+        const light = rgb(0xffffff);
+        const gray = rgb(0xdfdfdf);
+        const dark = rgb(0x808080);
+        const black = rgb(0x000000);
+        try self.r.rect(rect, rgb(0xc0c0c0));
+        const upper = [2]Color{ if (sunken) dark else light, if (sunken) black else gray };
+        const lower = [2]Color{ if (sunken) light else black, if (sunken) gray else dark };
+        for (0..2) |i| {
+            const q = inset(rect, @floatFromInt(i));
+            try self.r.rect(.{ .x = q.x, .y = q.y, .w = q.w, .h = 1 }, upper[i]);
+            try self.r.rect(.{ .x = q.x, .y = q.y, .w = 1, .h = q.h }, upper[i]);
+            try self.r.rect(.{ .x = q.x, .y = q.y + q.h - 1, .w = q.w, .h = 1 }, lower[i]);
+            try self.r.rect(.{ .x = q.x + q.w - 1, .y = q.y, .w = 1, .h = q.h }, lower[i]);
+        }
+    }
+    pub fn button(self: Ctx, rect: Rect, selected: bool) !void {
+        if (self.p.win95) {
+            try self.bevel(rect, selected);
+            if (selected) try self.r.rect(inset(rect, 2), self.p.raised);
+        } else try self.r.shape(rect, if (selected) self.p.selection else self.p.raised, .{ .radii = @splat(5) });
+    }
+    pub fn list(self: Ctx, rect: Rect) !void {
+        try self.panel(rect);
+        if (self.p.win95) try self.r.rect(inset(rect, 2), .{ 1, 1, 1, 1 });
+    }
+
+    fn progress(self: Ctx, rect: Rect, value: ?f64) !void {
+        if (rect.w < 4 or rect.h <= 0) return;
+        const inset_by: f32 = if (rect.h >= 8) 2 else 0;
+        if (inset_by > 0) try self.bevel(rect, true);
+        const inner = inset(rect, inset_by);
+        try self.r.rect(inner, self.p.raised);
+        const v = value orelse return self.hatch(inner);
+        const end = inner.w * @as(f32, @floatCast(std.math.clamp(v, 0, 1)));
+        var x: f32 = 0;
+        while (x < end) : (x += 8) try self.r.rect(.{ .x = inner.x + x, .y = inner.y, .w = @min(6, end - x), .h = inner.h }, self.p.accent);
     }
 
     /// Segmented VFD bar: `cells` discrete cells, lit up to `value` (0..1),
     /// unlit cells shown as ghosts. Null draws hatching.
     pub fn segments(self: Ctx, rect: Rect, value: ?f64, color: Color) !void {
+        if (self.p.win95) return self.progress(rect, value);
         const v = value orelse return self.hatch(rect);
         const cell_w: f32 = if (rect.h >= 14) 5 else 4;
         const gap: f32 = 2;
@@ -294,6 +338,7 @@ pub const Ctx = struct {
 
     /// Smooth thin bar with rounded ends (dense tables).
     pub fn bar(self: Ctx, rect: Rect, value: ?f64, color: Color) !void {
+        if (self.p.win95) return self.progress(rect, value);
         const v = value orelse return self.hatch(rect);
         try self.r.shape(rect, fade(self.p.grid, 1.4), .{ .radii = @splat(rect.h / 2) });
         const w = rect.w * @as(f32, @floatCast(std.math.clamp(v, 0, 1)));

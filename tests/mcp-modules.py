@@ -59,6 +59,11 @@ def check(raw, state, frontend):
         cursor=data['next']; first_cursor=first_cursor or cursor
         if cursor is None:break
         assert isinstance(cursor,str) and len(cursor)<=128 and len(pages)<200
+    sources=[row.pop('file_source') for row in rows]
+    for row in rows:
+        assert row.pop('full_image_deferred') is False, row
+    assert set(sources)<= {'unopened','map_files','target_exe','target_root','host_path','remote_snapshot','core_path'},set(sources)
+    assert any(source!='unopened' for source in sources), 'resolved breakpoint retained no module provenance'
     assert rows==expected,(len(rows),len(expected),next(((x,y) for x,y in zip(rows,expected) if x!=y),None))
     assert len(failures)==data['total_load_failures'] and first_cursor
     expect_error(raw('list_modules',cursor='invalid'),'InvalidModuleCursor')

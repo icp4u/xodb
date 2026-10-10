@@ -124,6 +124,13 @@ start `xodb --headless --mcp -- ./program`, initialize MCP, then call:
 Pass the returned `next` string as `cursor` on the next call, with the same
 `process_id` if one was selected. Page size may change between calls.
 `total_regions` and `total_load_failures` describe the entire retained snapshot.
+Each region's `file_source` describes the retained module bytes: `map_files`
+(`/proc/PID/map_files`), `target_exe` (`/proc/PID/exe`), `target_root`
+(`/proc/PID/root`), or `host_path`. These fallbacks all verify the mapped
+device and inode. `remote_snapshot` means the agent supplied the bytes; it
+does not claim which path the agent used. `core_path` is a build-ID-checked
+file for a core. `unopened` means no module bytes have been retained yet.
+Listing modules never opens binaries just to populate this field.
 The cursor identifies the session, map generation, image epoch, and map/failure
 contents. On `StaleModuleCursor`, discard accumulated rows and restart without a
 cursor; malformed cursors return `InvalidModuleCursor`. A single row too large

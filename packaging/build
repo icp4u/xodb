@@ -7,6 +7,8 @@ if [ "$#" -ne 1 ]; then
 fi
 zig version
 pkg-config --atleast-version=1.36 wayland-protocols
+# Package builds keep every cache inside the source tree.
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.cache/zig-global"
 # Package binaries must run on other CPUs of the same architecture.
 exec ./scripts/build app -Doptimize=ReleaseSafe -Dcpu=baseline --build-id=sha1 \
     -Dfont-path="$1" --prefix .work/package
