@@ -83,6 +83,9 @@ pub const Modules = struct {
         retained: u64,
         last_used: u64 = 0,
     };
+    /// `unexamined` is the first image whose symbols could not be read.
+    pub const Definers = struct { modules: []const *Module, unexamined: ?anyerror };
+    const DefinerScan = struct { name: []const u8 = "", revision: u64 = 0, cursor: SymbolCursor = .{}, done: bool = false, count: usize = 0, modules: [4]*Module = undefined };
     pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
     target: ?*const rt.struct_xrt_target = null,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
@@ -118,6 +121,7 @@ pub const Modules = struct {
     // mapped-instance IDs independent of evictable section bytes.
     symbol_names: std.StringHashMapUnmanaged(void) = .empty,
     symbol_name_bytes: usize = 0,
+    definer_scans: [2]DefinerScan = @splat(.{}),
     symbol_pending: ?struct { region: Region, job: *rt.struct_xrt_symbol_job, identity: rt.struct_xrt_file_identity } = null,
     pub fn init(a: std.mem.Allocator) Modules {
         return .{ .allocator = a };
@@ -624,6 +628,32 @@ pub const Modules = struct {
             return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
         }
         return failure orelse error.SymbolNotFound;
+    }
+    /// The mapped images defining `name`, each loaded in full. Images without
+    /// it are read through the bounded symbol views, so a runtime search does
+    /// not spend the full-image budget on every library. The scan is kept for
+    /// the current map snapshot: a repeated lookup neither reopens every file
+    /// nor restarts a pending large-file read. `name` must outlive the session.
+    pub fn definers(self: *Modules, name: []const u8) !Definers {
+        defer self.reportBudget();
+        const scan = for (&self.definer_scans) |*item| {
+            if (item.name.len == 0 or std.mem.eql(u8, item.name, name)) break item;
+        } else return error.SymbolDefinerLimit;
+        if (scan.name.len == 0 or scan.revision != self.maps_revision) scan.* = .{ .name = name, .revision = self.maps_revision };
+        scanning: while (!scan.done) {
+            const symbol = self.symbolLookup(name, false, &scan.cursor) catch |err| {
+                if (scan.cursor.next < self.regions.items.len) return err;
+                scan.done = true;
+                break;
+            };
+            const module = try self.at(symbol.address);
+            scan.cursor.next += 1;
+            for (scan.modules[0..scan.count]) |old| if (old.id == module.id) continue :scanning;
+            if (scan.count == scan.modules.len) return error.SymbolDefinerLimit;
+            scan.modules[scan.count] = module;
+            scan.count += 1;
+        }
+        return .{ .modules = scan.modules[0..scan.count], .unexamined = scan.cursor.failure };
     }
     fn symbolImage(self: *Modules, region: Region) !*const elf.Image {
         for (self.symbol_images.items) |*item| if (sameFile(item.region, region)) {

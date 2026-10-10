@@ -3,6 +3,7 @@
 import contextlib
 import ctypes
 from importlib.machinery import SourceFileLoader
+import fnmatch
 import importlib.util
 import io
 import json
@@ -40,6 +41,11 @@ UNREGISTERED = {
 }
 
 
+def lane(tier, *args, **flags):
+    # A tier's steps together with the ones PERIODIC moved out of it.
+    return [*gate.plan(tier, *args, **flags), *gate.plan(tier, *args, **flags, moved=True)]
+
+
 class RunnerTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -48,7 +54,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_go_native_value_lanes(self):
         for tier in ('quick', 'host', 'gui', 'all', 'periodic'):
-            steps = {name: cmd for name, cmd, _ in gate.plan(tier, go='/fixture/go')}
+            steps = {name: cmd for name, cmd, _ in lane(tier, go='/fixture/go')}
             self.assertIn('go-type-index', steps)
             if tier in ('host', 'all'):
                 for remote in (0, 1):
@@ -130,12 +136,12 @@ class RunnerTests(unittest.TestCase):
 
     def test_jai_write_gui_backends(self):
         for tier in ('gui','all'):
-            steps={name:cmd for name,cmd,_ in gate.plan(tier)}
+            steps={name:cmd for name,cmd,_ in lane(tier)}
             self.assertNotIn('--agent',steps['gui-jai-writes'])
             self.assertIn('--agent',steps['gui-jai-writes-agent'])
 
     def test_elisp_has_local_agent_and_gui_oracles(self):
-        steps = {name: cmd for name, cmd, _ in gate.plan('all', emacs='chosen-emacs')}
+        steps = {name: cmd for name, cmd, _ in lane('all', emacs='chosen-emacs')}
         for name in ('elisp-reader-live', 'elisp-language', 'elisp-language-agent', 'elisp-gui', 'elisp-values', 'elisp-values-language', 'elisp-values-agent-language', 'elisp-bindings'):
             self.assertEqual(steps[name][steps[name].index('--emacs') + 1], 'chosen-emacs')
         self.assertNotIn('--agent', steps['elisp-language'])
@@ -170,7 +176,7 @@ class RunnerTests(unittest.TestCase):
 
     def test_safe_keys_cover_both_live_backends(self):
         for tier in ('gui', 'all'):
-            steps = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            steps = {name: cmd for name, cmd, _ in lane(tier)}
             local = steps['gui-safe-keys']
             agent = steps['gui-safe-keys-agent']
             self.assertIn('tests/safe-keys-gui.py', local)
@@ -179,7 +185,7 @@ class RunnerTests(unittest.TestCase):
             self.assertNotEqual(local[local.index('--work') + 1], agent[agent.index('--work') + 1])
 
     def test_lua_table_paths_have_transport_and_gui_coverage(self):
-        steps = gate.plan('all', False, 'ReleaseSafe', lua=[('lua54','src54','lib54'), ('lua52','src52','lib52')])
+        steps = lane('all', False, 'ReleaseSafe', lua=[('lua54','src54','lib54'), ('lua52','src52','lib52')])
         paths = [(name, cmd) for name, cmd, _ in steps if name.startswith('lua-path-watches-')]
         self.assertEqual(len(paths), 4)
         for source in ('src54','src52'):
@@ -304,12 +310,12 @@ class RunnerTests(unittest.TestCase):
     def test_only_and_from_keep_their_builds(self):
         steps = gate.plan('gui')
         names = [name for name, _, _ in steps]
-        picked = [name for name, _, _ in gate.select(steps, ['gui-files', 'source-paths'])]
-        self.assertEqual(picked, [n for n in names if n in ('build-tests', 'source-paths-build', 'source-paths', 'gui-files')])
-        later = [name for name, _, _ in gate.select(steps, start='gui-files')]
-        self.assertEqual(later, ['build-tests', *names[names.index('gui-files'):]])
+        picked = [name for name, _, _ in gate.select(steps, ['gui-fdgraph', 'source-paths'])]
+        self.assertEqual(picked, [n for n in names if n in ('build-tests', 'source-paths-build', 'source-paths', 'gui-fdgraph')])
+        later = [name for name, _, _ in gate.select(steps, start='gui-fdgraph')]
+        self.assertEqual(later, ['build-tests', *names[names.index('gui-fdgraph'):]])
         self.assertEqual([name for name, _, _ in gate.select(steps, start='build-tests')], names)
-        with self.assertRaises(ValueError): gate.select(steps, ['gui-files', 'no-such-step'])
+        with self.assertRaises(ValueError): gate.select(steps, ['gui-fdgraph', 'no-such-step'])
         with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
@@ -364,16 +370,58 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(step.kind == 'gui' and step.name not in gate.NO_RETRY, before, step.name)
         self.assertEqual(kinds['source-paths'].needs, ('build-tests', 'source-paths-build'))
         self.assertEqual(kinds['perl-gui'].needs, ('build-tests', 'perl-gui-fixtures'))
-        self.assertTrue(kinds['gui-memdefrag'].serial and not kinds['gui-files'].serial)
-        self.assertEqual({step.name for step in gate.plan('periodic-gui') if step.kind == 'gui'},
-                         {'vulkan-faults', 'gui-overview', 'gui-win95-all-panels', 'gui-clipboard'})
+        self.assertTrue(kinds['gui-memdefrag-smoke'].serial and not kinds['gui-fdgraph'].serial)
+        self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-win95-all-panels', 'gui-clipboard', 'gui-memdefrag', 'gui-files'}
+                        <= {step.name for step in gate.plan('periodic-gui') if step.kind == 'gui'})
         records = self.listed('gui', '--records')
         self.assertEqual(records['schema'], 2)
         self.assertEqual(records['steps'][0], dict(name='build-tests', argv=gate.plan('gui')[0].argv, timeout=600, kind='build',
                                                    needs=[], paths=[], serial=False, work=[]))
-        vendored = self.listed('gui', '--capstone', 'vendored', '--only', 'gui-files')
-        self.assertEqual([name for name, _, _ in vendored], ['build-tests', 'gui-files'])
+        vendored = self.listed('gui', '--capstone', 'vendored', '--only', 'gui-fdgraph')
+        self.assertEqual([name for name, _, _ in vendored], ['build-tests', 'gui-fdgraph'])
         self.assertEqual(vendored[0][1][-1], '-Dcapstone=vendored')
+
+    def test_moved_steps_run_unchanged_in_the_periodic_tiers(self):
+        flags = {**self.EVERYTHING, 'uprobes': False}
+        batch = {step.name: step for step in gate.plan('all', **flags)}
+        moved = gate.plan('all', **flags, moved=True)
+        live, gui = ({step.name: step for step in gate.plan(tier, **flags)} for tier in ('periodic', 'periodic-gui'))
+        for pattern in gate.PERIODIC:
+            self.assertTrue(any(fnmatch.fnmatchcase(step.name, pattern) for step in moved), pattern + ' names no step')
+        for step in moved:
+            self.assertNotIn(step.name, batch)
+            self.assertIn(step.kind, ('live', 'gui'), step.name)  # never a build or unit step
+            there = (gui if step.kind == 'gui' else live)[step.name]
+            self.assertNotIn(step.name, live if step.kind == 'gui' else gui)
+            self.assertEqual(there.record(), step.record(), step.name)
+        # Never moved: the runner's own test, device selection, and checks of scope, refusal, redaction and limits on untrusted input.
+        for name in ('release-runner', 'mcp-exact-guard', 'review-boundaries', 'controller-scope-0', 'controller-scope-1', 'vulkan-device',
+                     'vulkan-enumeration', 'vulkan-faults', 'lua-refusals-0', 'lua-refusals-1', 'gui-fdflow-denied',
+                     'gui-overview', 'gui-clipboard', 'gui-memdefrag-smoke', 'elisp-limits', 'elisp-limits-agent', 'mcp-list-pages'):
+            self.assertIn(name, batch)
+        self.assertIn('redact', batch['gui-memdefrag-smoke'].argv[-1])
+        # Each runtime and area keeps a live and a GUI step in the batch gate, and one GUI step drives the C agent.
+        for names in (('lua-named-0', 'lua-named-shared-agent-0', 'lua-named-gui-0'), ('python-named-0', 'python-named-1', 'python-lua-named-0', 'python-gui'),
+                      ('perl-named-0', 'perl-named-shared-1', 'perl-gui'), ('ruby-language', 'ruby-language-agent', 'ruby-watches-gui', 'ruby-gui'),
+                      ('javascript-language', 'javascript-watches-agent', 'javascript-gui'), ('go-language', 'go-language-agent', 'go-gui'),
+                      ('elisp-language', 'elisp-values-agent-language', 'elisp-bindings-1-1', 'elisp-gui'), ('jai-writes-0-0', 'jai-writes-1-0', 'gui-jai-runtime'),
+                      ('sysstat-sensors', 'gui-overview', 'gui-win95', 'gui-themes'), ('fdactivity', 'gui-fdactivity', 'gui-fdgraph'),
+                      ('memory-registers', 'memory-search-ranges', 'memdefrag-tui', 'gui-vga'), ('m2-profile', 'gui-profile', 'gui-flame-status'),
+                      ('remote', 'remote-stops', 'remote-panes', 'gui-shared-jobs-agent'), ('module-symbols', 'debug-discovery', 'gui-symbol-discovery'),
+                      ('breakpoint-policy', 'run-control', 'gui-breakpoints', 'gui-restart', 'gui-debug'), ('hidden-window', 'wayland-read-race')):
+            self.assertTrue(set(names) <= batch.keys(), sorted(set(names) - batch.keys()))
+        # periodic --headless stays the portable lane; the runtime flags that all takes are accepted by both.
+        self.assertFalse({step.name for step in moved} & {step.name for step in gate.plan('periodic', headless=True)})
+        every = ['--perl', 'P', '--padwalker', 'W', '--python', 'Y', '--emacs', 'E', '--ruby', 'R', '--node', 'N', '--node-refusal', 'NR', '--go', 'G', '--lua', 'l', 's', 'b']
+        for tier in ('periodic', 'periodic-gui'):
+            self.assertIsNotNone(self.listed(tier, *every), tier)
+        # affected reaches a moved step through the test script it runs, and only that way.
+        steps = [*batch.values(), *moved]
+        picked = lambda *changed: [step.name for step in gate.affected(steps, changed, [])[0]]
+        self.assertEqual(picked('tests/memdefrag-gui.py'), ['build-tests', 'release-runner', 'gui-memdefrag-smoke', 'gui-memdefrag'])
+        self.assertEqual(picked('tests/m2-limits.py'), ['build-tests', 'release-runner', 'm2-limits'])
+        self.assertEqual(picked('tests/client.py'), list(batch))
+        self.assertFalse({step.name for step in moved} & set(picked('src/memdefrag/map.zig', 'src/language/lua_layout.c', 'src/profile/flame.zig')))
 
     def test_parallel_gui_steps_never_share_a_work_directory(self):
         # Fixed .work names come from argv or from the step's declaration.
@@ -424,18 +472,18 @@ class RunnerTests(unittest.TestCase):
         for required in ('build-tests', 'release-runner', 'memory-registers', 'memory-search-speed', 'memory-search-speed-agent',
                          'memory-search-ranges', 'memory-search-ranges-agent', 'mcp', 'mcp-precision', 'controller-scope-1'):
             self.assertIn(required, names)
-        self.assertFalse({'gui-files', 'lua-gui', 'm2-archive', 'vulkan-faults'} & set(names))
+        self.assertFalse({'gui-fdgraph', 'lua-gui', 'lua-named-gui-0', 'm2-archive', 'vulkan-faults'} & set(names))
         self.assertIn('src/mcp/memory.zig: ', lines[0])
         self.assertNotIn('not mapped', lines[0])
         for changed, required, absent in (
-                ('src/language/lua_layout.c', ('lua-component-0', 'lua-watches-1-1', 'lua-gui', 'python-lua-named-1', 'gui-language-tabs'), 'ruby-gui'),
+                ('src/language/lua_layout.c', ('lua-component-0', 'lua-watches-0-1', 'lua-named-gui-0', 'python-lua-named-0', 'gui-language-tabs'), 'ruby-gui'),
                 ('src/language/go_map.c', ('go-maps-component', 'go-maps', 'go-native-values-1-1', 'go-gui'), 'lua-gui'),
-                ('src/ui/overview/treemap_panel.zig', ('gui-overview', 'gui-fdtreemap', 'gui-files', 'gui-memdefrag', 'sysstat-sensors'), 'mcp'),
-                ('src/runtime/fdflow.c', ('fdactivity', 'lsof-top', 'gui-fdflow-denied', 'gui-fdgraph'), 'gui-overview'),
-                ('src/debug/source_paths.c', ('source-paths-build', 'source-paths', 'debug-discovery', 'gui-inline'), 'lua-gui'),
-                ('src/binary/object.c', ('mapping-identity', 'apk-symbols', 'gui-symbol-discovery'), 'gui-files'),
-                ('src/frames/model.zig', ('frame-host', 'frame-jvm', 'frame-archive', 'gui-frames'), 'gui-files'),
-                ('src/profile/flame.zig', ('m2-profile', 'm2-archive', 'gui-profile', 'gui-flame-status'), 'lua-gui'),
+                ('src/ui/overview/treemap_panel.zig', ('gui-overview', 'gui-fdgraph', 'gui-win95', 'gui-memdefrag-smoke', 'sysstat-sensors'), 'mcp'),
+                ('src/runtime/fdflow.c', ('fdactivity', 'gui-fdflow-denied', 'gui-fdgraph'), 'gui-overview'),
+                ('src/debug/source_paths.c', ('source-paths-build', 'source-paths', 'debug-discovery', 'gui-inline'), 'lua-named-gui-0'),
+                ('src/binary/object.c', ('mapping-identity', 'apk-symbols', 'gui-symbol-discovery'), 'gui-fdgraph'),
+                ('src/frames/model.zig', ('frame-host', 'frame-jvm', 'frame-archive'), 'gui-fdgraph'),
+                ('src/profile/flame.zig', ('m2-profile', 'm2-archive', 'gui-profile', 'gui-flame-status'), 'lua-named-gui-0'),
                 ('tests/perl-gui.py', ('perl-gui-fixtures', 'perl-gui'), 'perl-named-gui'),
                 ('tests/memory-search-speed.py', ('memory-search-speed', 'memory-search-speed-agent'), 'mcp'),
                 ('docs/GUIDE.md', ('package-source',), 'mcp')):
@@ -567,21 +615,21 @@ open(f'.work/{name}.out', 'w').close()
 
     def test_python_path_coverage(self):
         for tier in ('host', 'all'):
-            steps = {name: argv for name, argv, _ in gate.plan(tier, python='/fixture/python')}
+            steps = {name: argv for name, argv, _ in lane(tier, python='/fixture/python')}
             self.assertTrue({'python-path-component', 'python-path-watches-0', 'python-path-watches-1'} <= steps.keys())
             self.assertIn('--sanitize', steps['python-path-component'])
             self.assertNotIn('--agent', steps['python-path-watches-0'])
             self.assertIn('--agent', steps['python-path-watches-1'])
         for tier in ('gui', 'all'):
-            steps = {name: argv for name, argv, _ in gate.plan(tier, python='/fixture/python')}
+            steps = {name: argv for name, argv, _ in lane(tier, python='/fixture/python')}
             self.assertIn('--paths', steps['python-path-watch-gui'])
 
     def test_ruby_watch_coverage(self):
         for tier in ('host', 'all'):
-            names={name for name,_,_ in gate.plan(tier,ruby='/fixture/ruby')}
+            names={name for name,_,_ in lane(tier,ruby='/fixture/ruby')}
             self.assertTrue({'ruby-watch-component','ruby-watches','ruby-watches-agent'} <= names)
         for tier in ('gui', 'all'):
-            names={name for name,_,_ in gate.plan(tier,ruby='/fixture/ruby')}
+            names={name for name,_,_ in lane(tier,ruby='/fixture/ruby')}
             self.assertIn('ruby-watches-gui',names)
 
     def test_ruby_frame_names_cover_components_and_transports(self):
@@ -594,15 +642,15 @@ open(f'.work/{name}.out', 'w').close()
 
     def test_javascript_watch_coverage(self):
         for tier in ('host', 'all'):
-            names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
+            names={name for name,_,_ in lane(tier,node='/fixture/node')}
             self.assertTrue({'javascript-watches','javascript-watches-agent'} <= names)
         for tier in ('gui', 'all'):
-            names={name for name,_,_ in gate.plan(tier,node='/fixture/node')}
+            names={name for name,_,_ in lane(tier,node='/fixture/node')}
             self.assertIn('javascript-watches-gui',names)
 
     def test_node_refusal_is_separate_from_positive_watch_coverage(self):
         for tier in ('gui', 'all'):
-            steps={name:(argv,seconds) for name,argv,seconds in gate.plan(tier,node='/fixture/supported-node',node_refusal='/fixture/unproved-node')}
+            steps={name:(argv,seconds) for name,argv,seconds in lane(tier,node='/fixture/supported-node',node_refusal='/fixture/unproved-node')}
             positive,positive_seconds=steps['javascript-watches-gui']
             refusal,refusal_seconds=steps['javascript-frame-refusal-gui']
             self.assertEqual(positive[positive.index('--node')+1],'/fixture/supported-node')
@@ -692,7 +740,7 @@ time.sleep(60)
         self.assertTrue({'build-tests', 'release-runner', 'package-source', 'mapping-identity'} <= portable)
         self.assertFalse(portable & {'remote', 'mcp', 'shared-sessions', 'gui-overview', 'vulkan-faults', 'observations-live'})
         names = [s[0] for s in gate.plan('all')]
-        for required in ('remote', 'm2-limits', 'm2-archive', 'hidden-window', 'wayland-read-race', 'vulkan-faults'):
+        for required in ('remote', 'm2-archive', 'hidden-window', 'wayland-read-race', 'vulkan-faults'):
             self.assertIn(required, names)
         self.assertNotIn('observations-live', names)
         observed = [s[0] for s in gate.plan('host', uprobes=True)]
@@ -701,24 +749,24 @@ time.sleep(60)
 
     def test_preferences_cover_both_live_backends(self):
         for tier in ('host', 'all'):
-            commands = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            commands = {name: cmd for name, cmd, _ in lane(tier)}
             self.assertEqual(commands['m2-preferences'][-1], 'tests/m2-preferences.py')
             self.assertEqual(commands['m2-preferences-agent'][:2],
                              ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent'])
             self.assertEqual(commands['m2-preferences-agent'][-1], 'tests/m2-preferences.py')
-        for tier in ('portable', 'periodic', 'gui', 'perf'):
+        for tier in ('portable', 'gui', 'perf'):
             self.assertFalse({'m2-preferences', 'm2-preferences-agent'} &
-                             {name for name, _, _ in gate.plan(tier)})
+                             {name for name, _, _ in lane(tier)})
 
     def test_syscall_measurements_keep_the_correctness_lane(self):
         perf = {name: cmd for name, cmd, _ in gate.plan('perf')}
         self.assertEqual(perf['syscall-measurements'], [sys.executable, '-B',
             'tests/syscall-timing.py', '--perf', '--work', '.work/perf-syscalls'])
         for tier in ('host', 'all'):
-            regular = {name: cmd for name, cmd, _ in gate.plan(tier)}
+            regular = {name: cmd for name, cmd, _ in lane(tier)}
             self.assertEqual(regular['syscall-timing'], [sys.executable, '-B', 'tests/syscall-timing.py'])
         for tier in ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui'):
-            self.assertNotIn('syscall-measurements', {name for name, _, _ in gate.plan(tier)})
+            self.assertNotIn('syscall-measurements', {name for name, _, _ in lane(tier)})
 
     def test_measurements_are_explicit_and_separate(self):
         perf = {s[0] for s in gate.plan('perf', headless=True)}
@@ -761,9 +809,9 @@ time.sleep(60)
                 'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
                 '--read-delay-ms', '0', '--rate', '10000000000', '--timeout', '70',
                 '--cases', 'complete', 'interrupt'])
-        self.assertTrue({'symbol-discovery', 'symbol-discovery-install',
-            'm2-limits', 'm2-archive', 'hidden-window', 'acquire-timeout',
-            'fence-timeout', 'wayland-read-race', 'gui-overview-live'} <= regular.keys())
+        self.assertTrue({'m2-archive', 'hidden-window', 'wayland-read-race', 'gui-symbol-discovery'} <= regular.keys())
+        self.assertTrue({'acquire-timeout', 'fence-timeout', 'gui-overview-live'} <= periodic.keys())
+        self.assertTrue({'symbol-discovery', 'symbol-discovery-install', 'm2-limits'} <= {name for name, _, _ in gate.plan('periodic')})
         headless = {name for name, _, _ in gate.plan('periodic', headless=True)}
         self.assertTrue({'source-paths-differential', 'symbol-discovery-latency-25',
             'symbol-discovery-latency-50', 'symbol-discovery-latency-100'} <= headless)

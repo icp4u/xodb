@@ -342,22 +342,22 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 // Type aliases carry no owning image id. Refuse ambiguous runtimes rather
 // than choosing the first CPython image found in the mappings.
 fn runtimeModule(session: *model.Session) !*Module {
-    var chosen: ?*Module = null;
     if (session.modules.regions.items.len > 4096) return error.PythonModuleLimit;
-    for (session.modules.regions.items) |r| {
-        if ((r.offset != 0 and r.permissions[2] != 'x') or r.path.len == 0 or r.path[0] != '/') continue;
-        const module = session.modules.load(r) catch |err| {
-            if (err == error.NotElf or err == error.NoBinaryImage) continue;
-            return error.PythonModuleIdentityUnavailable;
-        };
-        const symbol = module.symbols().findSymbol("_PyRuntime") orelse continue;
-        if (!symbol.hasAddress()) continue;
-        if (chosen) |previous| {
-            if (previous.id == module.id) continue;
-            return error.PythonRuntimeAmbiguous;
-        } else chosen = module;
-    }
-    return chosen orelse error.PythonRuntimeUnavailable;
+    const found = session.modules.definers("_PyRuntime") catch |err| return moduleError(err);
+    if (found.modules.len > 1) return error.PythonRuntimeAmbiguous;
+    // An image too large to examine does not hide a runtime that was found.
+    if (found.unexamined) |err| if (found.modules.len == 0 or !overBudget(err)) return moduleError(err);
+    return if (found.modules.len == 1) found.modules[0] else error.PythonRuntimeUnavailable;
+}
+fn overBudget(err: anyerror) bool {
+    return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
+}
+fn moduleError(err: anyerror) error{ PythonImageBudgetExceeded, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, PythonModuleIdentityUnavailable } {
+    if (overBudget(err)) return error.PythonImageBudgetExceeded;
+    if (err == error.SymbolDiscoveryPending) return error.SymbolDiscoveryPending;
+    if (err == error.SymbolDiscoveryCancelled) return error.SymbolDiscoveryCancelled;
+    if (err == error.SymbolDiscoveryBudgetExceeded) return error.SymbolDiscoveryBudgetExceeded;
+    return error.PythonModuleIdentityUnavailable;
 }
 /// A DWARF struct that begins with a CPython object head: `ob_type` at 8,
 /// or `ob_base` at 0 leading (recursively) to one.

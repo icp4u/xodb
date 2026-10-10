@@ -8,6 +8,7 @@ pub const api = @cImport({
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
+    @cInclude("string.h");
     @cInclude("fcntl.h");
     @cInclude("errno.h");
     @cInclude("signal.h");

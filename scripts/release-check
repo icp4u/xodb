@@ -42,11 +42,11 @@ COVERS = (
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
       'src/runtime/registers.c', 'src/runtime/xrt_memory.h'), ('memory-registers', 'memory-search-*')),
     (('src/mcp/memstat*', 'src/runtime/memstat*', 'src/runtime/memobserver.c', 'src/runtime/xrt_mem*', 'src/memdefrag/*'),
-     ('memory-observer', 'memdefrag-tui', 'gui-memdefrag', 'gui-vga')),
+     ('memory-observer', 'memdefrag-tui', 'gui-memdefrag*', 'gui-vga')),
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
       'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h'),
-     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-files*', 'gui-fd*', 'gui-memdefrag', 'gui-safe-keys*', 'gui-themes')),
+     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-safe-keys*', 'gui-themes')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
@@ -73,7 +73,7 @@ COVERS = (
       'gui-symbol-discovery', 'gui-debug', 'm2-recovery')),
     (('src/binary/*', 'src/model/modules.zig'),
      ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
-      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery')),
+      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget')),
     (('src/target/*', 'src/runtime/target*', 'src/runtime/process.c', 'src/runtime/watchpoints.c', 'src/runtime/arch.c',
       'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
       'src/runtime/xrt_arch.h', 'src/runtime/xrt_xstate.h', 'src/runtime/xrt_loader.h', 'src/ui/stop.zig', 'src/ui/watch*'),
@@ -92,17 +92,46 @@ COVERS = (
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
-    'gui-memdefrag', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
+    'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
 }
 
 # GUI steps that are never retried: they inject faults or race the renderer,
 # so one failure in several runs is the defect they exist to catch.
 NO_RETRY = {'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
 
+# Host and gui steps (name globs) that run in `periodic` (live) or
+# `periodic-gui` (gui) instead, with the same commands: soaks, stress and
+# timing-sensitive checks, install/fetch steps, injected timeouts, the
+# second copy of a matrix (second Lua runtime, C-agent twin) and the slowest
+# of the rest. host/gui/all keep a quicker check of each area. `affected`
+# still selects one of these when a test script it runs changes.
+PERIODIC = (
+    'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
+    'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
+    'symbol-discovery', 'symbol-discovery-install', 'source-fetch', 'lsof-top', 'memory-observer', 'sysstat-nvml',
+    'metadata-session-agent', 'm2-preferences-agent', 'python-lua-named-1',
+    'perl-named-1', 'perl-watches-1', 'perl-path-watches-1', 'ruby-watches-agent', 'ruby-path-watches-agent', 'ruby-previews-agent',
+    'javascript-context-agent', 'javascript-cache-agent', 'elisp-language-agent', 'elisp-reader-live', 'elisp-bindings-1-0',
+    'language-selection-1-*', 'lua-component-1', 'lua-watches-1-*', 'lua-path-watches-1-*', 'lua-watch-coroutine-1-*',
+    'lua-watch-reuse-1-*', 'lua-named-1', 'lua-named-agent-*', 'lua-named-shared-1', 'lua-named-shared-agent-1',
+    'lua-embedded-1', 'lua-interpreter-1', 'lua-runtime-identity-1', 'lua-mixed-runtime-1', 'lua-cpp-1', 'lua-context-1-*',
+    'gui-safe-keys*', 'gui-jai-writes*', 'gui-jai-browser*', 'gui-shared-jobs',
+    'gui-files*', 'gui-fdtreemap', 'gui-overview-live', 'gui-live-display', 'gui-frames', 'gui-invocations',
+    'gui-repeated-break', 'gui-remote-caller',
+    'elisp-bindings-gui-*', 'go-native-values-gui', 'ruby-previews-gui', 'ruby-path-watches-gui', 'ruby-expression-gui',
+    'javascript-watches-gui', 'javascript-context-gui', 'javascript-advisory-gui', 'javascript-frame-refusal-gui',
+    'python-named-gui', 'python-watch-gui', 'python-path-watch-gui', 'perl-named-gui', 'perl-watch-gui', 'perl-path-watch-gui',
+    'lua-gui', 'lua-path-watch-gui-*', 'lua-watch-reuse-gui-*', 'lua-named-gui-1', 'lua-watch-gui-1',
+)
+
+
+def periodic(name):
+    return any(fnmatch.fnmatchcase(name, pattern) for pattern in PERIODIC)
+
 
 def covered(name, argv):
     paths = [arg for arg in argv if isinstance(arg, str) and arg.startswith(('tests/', 'scripts/')) and arg != 'scripts/build']
-    for sources, names in COVERS:
+    for sources, names in () if periodic(name) else COVERS:
         if any(fnmatch.fnmatchcase(name, pattern) for pattern in names):
             paths += sources
     return tuple(dict.fromkeys(paths))
@@ -134,6 +163,8 @@ class Steps(list):
     kind = 'unit'
 
     def append(self, step):
+        if isinstance(step, Step):
+            return super().append(step)
         name, argv, timeout = step[:3]
         fields = dict(step[3]) if len(step) > 3 else {}
         fields.setdefault('kind', self.kind)
@@ -153,7 +184,9 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False):
+    # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
+    runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
     language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
     gui_language_args = [*language_args]
@@ -247,6 +280,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 ('gui-win95-all-panels', [sys.executable, '-B', 'tests/overview-win95-gui.py', '--all-panels'], 300),
                 ('gui-clipboard', [sys.executable, '-B', 'tests/clipboard-gui.py'], 90),
             ]
+            steps += plan('gui', *runtimes, moved=True)
+        elif not headless:
+            steps += plan('host', *runtimes, moved=True)
         return steps
     if live:
         steps.kind = 'live'
@@ -318,6 +354,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             sdk = ['--python', python]
             steps.append(('python-component', [sys.executable, '-B', 'tests/python-component.py', *sdk, '--work', '.work/pyc'], 120))
             steps.append(('python-path-component', [sys.executable, '-B', 'tests/python-paths.py', *sdk, '--sanitize', '--work', '.work/pypc'], 180))
+            steps.append(('python-image-budget', [sys.executable, '-B', 'tests/python-image-budget.py', *sdk, '--work', '.work/pyib'], 120))
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
                 steps.append((f'python-named-{int(remote)}', [sys.executable, '-B', 'tests/python-locals.py', *sdk, *agent, '--strace', '--work', f'.work/pyn{int(remote)}'], 180))
@@ -470,6 +507,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
         steps.append(('gui-fdflow-denied', [sys.executable, '-B', 'tests/fdflow-gui.py', '--work-dir', '.work/ff', '--expect-denied'], 120))
         steps.append(('gui-win95', [sys.executable, '-B', 'tests/overview-win95-gui.py'], 120))
+        steps.append(('gui-memdefrag-smoke', [sys.executable, '-B', 'tests/memdefrag-gui.py', '--only', 'redact'], 180))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if emacs:
             steps.append(('elisp-gui', [sys.executable, '-B', 'tests/elisp-gui.py', '--emacs', emacs, '--work', '.'], 300, dict(work=['input-eli'])))
@@ -513,7 +551,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'lua-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--source', source, '--library', library, '--work', f'.work/lwg{index}'], 180))
                 steps.append((f'lua-path-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--source', source, '--library', library, '--work', f'.work/lpwg{index}'], 180))
                 steps.append((f'lua-watch-reuse-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--reuse', '--source', source, '--library', library, '--work', f'.work/lwrg{index}'], 180))
-    return steps
+    return Steps(step for step in steps if periodic(step.name) == moved)
 
 
 def group_members(group):
@@ -832,8 +870,8 @@ def affected(steps, changed, fallback, registered=()):
     """The steps that cover the changed files, and a line per decision.
 
     A file that no planned step covers selects every step named in fallback.
-    An uncovered file under tests/ or scripts/ selects every planned step: a
-    helper may be loaded by any step of either lane. registered names the
+    An uncovered file under tests/ or scripts/ selects every planned step
+    outside PERIODIC: a helper may be loaded by any step of either lane. registered names the
     steps whose registration changed, for scripts/release-check itself.
     """
     wanted, lines = {'release-runner'}, []
@@ -848,7 +886,7 @@ def affected(steps, changed, fallback, registered=()):
         elif names:
             lines.append(f'affected: {path}: {len(names)} steps: ' + ' '.join(names))
         elif path.startswith(('tests/', 'scripts/')):
-            names = [step.name for step in steps]
+            names = [step.name for step in steps if not periodic(step.name)]
             lines.append(f'affected: {path}: not mapped, so every planned step ({len(names)} steps)')
         else:
             names = fallback
@@ -911,7 +949,8 @@ def performance_summary(tree):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf', 'affected'],
-                        help='affected: the host and gui steps that cover the files changed against --base')
+                        help='affected: the host and gui steps that cover the files changed against --base; '
+                             'periodic, periodic-gui: the full matrices and the slow host/gui steps that all leaves out')
     parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
@@ -956,24 +995,24 @@ def main(argv=None):
         parser.error('--headless is for the portable, periodic or perf tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
         parser.error('--uprobes requires the host or all tier')
-    if args.perl and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--perl requires the host, gui or all tier')
+    if args.perl and args.tier in ('portable', 'perf'):
+        parser.error('--perl is not for the portable or perf tier')
     if args.padwalker and not args.perl:
         parser.error('--padwalker requires --perl')
-    if args.python and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--python requires the host, gui or all tier')
-    if args.emacs and args.tier in ('portable', 'periodic-gui', 'perf'):
-        parser.error('--emacs requires the host, gui, all or periodic tier')
-    if args.ruby and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--ruby requires the host, gui or all tier')
-    if args.go and args.tier in ('portable', 'periodic-gui', 'perf'):
-        parser.error('--go requires the host, gui, all or periodic tier')
-    if args.node and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--node requires the host, gui or all tier')
-    if args.node_refusal and args.tier not in ('gui', 'all'):
-        parser.error('--node-refusal requires the gui or all tier')
-    if args.lua and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--lua requires the host, gui or all tier')
+    if args.python and args.tier in ('portable', 'perf'):
+        parser.error('--python is not for the portable or perf tier')
+    if args.emacs and args.tier in ('portable', 'perf'):
+        parser.error('--emacs is not for the portable or perf tier')
+    if args.ruby and args.tier in ('portable', 'perf'):
+        parser.error('--ruby is not for the portable or perf tier')
+    if args.go and args.tier in ('portable', 'perf'):
+        parser.error('--go is not for the portable or perf tier')
+    if args.node and args.tier in ('portable', 'perf'):
+        parser.error('--node is not for the portable or perf tier')
+    if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
+        parser.error('--node-refusal requires the gui or all tier, or a periodic tier')
+    if args.lua and args.tier in ('portable', 'perf'):
+        parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
     steps = plan(args.tier, *runtimes)
     decisions, missing = [], []
@@ -986,6 +1025,7 @@ def main(argv=None):
         if not changed:
             parser.error(f'no tracked file differs from {base}; nothing is affected (pass --base REV, or run a tier)')
         registered = registered_since(base, runtimes) if 'scripts/release-check' in changed else ()
+        steps += plan('all', *runtimes, moved=True)  # selected only by their own test scripts
         everything = steps
         steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes)], registered)
         # A runtime that was not passed has no steps to select. Say what the change lost.
@@ -1032,27 +1072,29 @@ def main(argv=None):
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
                      ['full host integration suite', 'GUI execution'] if args.tier == 'periodic' else
-                     ['full host integration suite', 'runtime-specific GUI checks'] if args.tier == 'periodic-gui' else
+                     ['full host integration suite', 'focused GUI checks'] if args.tier == 'periodic-gui' else
                      ['GUI execution'] if args.tier == 'host' else
                      ['full host integration suite'] if args.tier == 'gui' else
                      ['full host integration suite', 'GUI execution'] if args.tier == 'perf' else []) +
-                    (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)'] if args.tier in ('all', 'gui', 'host') else []) +
+                    (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)',
+                      'slow, stress and second-matrix steps (PERIODIC; use periodic and periodic-gui with the same runtime flags)'] if args.tier in ('all', 'gui', 'host') else []) +
                     (['owned PE/Jai checks (use periodic --wine PATH)'] if not args.wine else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
-                    (['Elisp stack checks (use --emacs PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.emacs else []) +
-                    (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.ruby else []) +
-                    (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.go else []) +
-                    (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.node else []) +
+                    (['Elisp stack checks (use --emacs PATH)'] if args.tier not in ('portable', 'perf') and not args.emacs else []) +
+                    (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'perf') and not args.ruby else []) +
+                    (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'perf') and not args.go else []) +
+                    (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'perf') and not args.node else []) +
                     (['Node.js frame-proof refusal (use --node-refusal PATH)'] if args.tier in ('gui', 'all') and not args.node_refusal else []) +
-                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.lua else []) +
-                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.padwalker else []))
+                    (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'perf') and not args.lua else []) +
+                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'perf') and not args.padwalker else []))
     print(f'Release evidence: {run}', flush=True)
     began = time.monotonic()
-    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
-               XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
+    # periodic runs the live steps that host leaves out, unless it is headless.
+    live = args.tier in ('host', 'all') or args.tier == 'periodic' and not args.headless
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1', XODB_TEST_NO_LIVE='0' if live else '1')
     # C live tests use presence of this opt-out, while Zig tests inspect its
     # value. Remove it completely so host/all really exercise both runtimes.
-    if args.tier in ('host', 'all'):
+    if live:
         env.pop('XODB_TEST_NO_LIVE', None)
     for key in ('DISPLAY', 'WAYLAND_DISPLAY', 'SWAYSOCK', 'DBUS_SESSION_BUS_ADDRESS'):
         env.pop(key, None)

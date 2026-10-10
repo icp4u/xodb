@@ -277,25 +277,29 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 // Type aliases currently carry no owning image id. Refuse ambiguous layouts
 // rather than choosing the first interpreter library found in the mappings.
 fn valueModule(session: *model.Session) !*Module {
-    var chosen: ?*Module = null;
     if (session.modules.regions.items.len > 4096) return error.PerlModuleLimit;
-    for (session.modules.regions.items) |r| {
-        if ((r.offset != 0 and r.permissions[2] != 'x') or r.path.len == 0 or r.path[0] != '/') continue;
-        const module = session.modules.load(r) catch |err| {
-            if (err == error.NotElf or err == error.NoBinaryImage) continue;
-            return error.PerlModuleIdentityUnavailable;
-        };
-        const symbol = module.symbols().findSymbol("Perl_runops_standard") orelse continue;
-        if (!symbol.hasAddress()) continue;
-        if (chosen) |previous| {
-            if (previous.id == module.id) continue;
-            const a_id = previous.image.buildId() orelse return error.PerlBuildIdUnavailable;
-            const b_id = module.image.buildId() orelse return error.PerlBuildIdUnavailable;
-            if (!std.mem.eql(u8, a_id, b_id)) return error.PerlValueRuntimeAmbiguous;
-            _ = try profile(session, module);
-        } else chosen = module;
+    const found = session.modules.definers("Perl_runops_standard") catch |err| return moduleError(err);
+    // An image too large to examine does not hide a runtime that was found.
+    if (found.unexamined) |err| if (found.modules.len == 0 or !overBudget(err)) return moduleError(err);
+    if (found.modules.len == 0) return error.PerlRuntimeUnavailable;
+    const chosen = found.modules[0];
+    for (found.modules[1..]) |module| {
+        const a_id = chosen.image.buildId() orelse return error.PerlBuildIdUnavailable;
+        const b_id = module.image.buildId() orelse return error.PerlBuildIdUnavailable;
+        if (!std.mem.eql(u8, a_id, b_id)) return error.PerlValueRuntimeAmbiguous;
+        _ = try profile(session, module);
     }
-    return chosen orelse error.PerlRuntimeUnavailable;
+    return chosen;
+}
+fn overBudget(err: anyerror) bool {
+    return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
+}
+fn moduleError(err: anyerror) error{ PerlImageBudgetExceeded, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, PerlModuleIdentityUnavailable } {
+    if (overBudget(err)) return error.PerlImageBudgetExceeded;
+    if (err == error.SymbolDiscoveryPending) return error.SymbolDiscoveryPending;
+    if (err == error.SymbolDiscoveryCancelled) return error.SymbolDiscoveryCancelled;
+    if (err == error.SymbolDiscoveryBudgetExceeded) return error.SymbolDiscoveryBudgetExceeded;
+    return error.PerlModuleIdentityUnavailable;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;

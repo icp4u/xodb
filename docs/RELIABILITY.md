@@ -32,12 +32,13 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check gui                  # Private Sway/Vulkan regressions
 ./scripts/release-check gui --perl /path/to/debug/perl # Also the Perl live-row demo (5.44 + DWARF)
 ./scripts/release-check all                  # Host plus focused GUI, one build
-./scripts/release-check periodic-gui         # Full graphics and delayed-discovery matrices
+./scripts/release-check periodic             # Full matrices plus the slow live steps that all leaves out
+./scripts/release-check periodic-gui         # Full graphics and delayed-discovery matrices, and the slow GUI steps
 ./scripts/release-check all --uprobes        # Also native/C-agent function investigations; explicit sudo helper opt-in
 ./scripts/release-check all --list           # Exact commands; no execution
 ./scripts/release-check gui --keep-going     # Run every step, then list all failures
-./scripts/release-check gui --only gui-files,gui-themes # Rerun chosen steps (always rebuilds first)
-./scripts/release-check gui --from gui-files # Resume at a step
+./scripts/release-check gui --only gui-fdgraph,gui-themes # Rerun chosen steps (always rebuilds first)
+./scripts/release-check gui --from gui-fdgraph # Resume at a step
 ./scripts/release-check affected             # Only the host and GUI steps that cover your uncommitted changes
 ./scripts/release-check affected --base REV  # ... or every change since REV
 ./scripts/release-check gui --jobs 4         # Up to four GUI steps at once, each on its own compositor
@@ -77,8 +78,9 @@ to `scripts/release-check` selects the steps whose registration differs from
 printed and recorded in `results.json`. Pass the same runtime flags as for
 `all`: steps for a runtime that was not passed cannot be selected, so each
 missing flag that costs the change coverage is printed as a `WARNING` line and
-named in the final verdict line. If nothing differs, it stops with an error
-instead of passing. It is a per-change check, not a replacement for the
+named in the final verdict line. A step that was moved to a periodic tier
+(`PERIODIC`, below) is selected only when a test script it runs changed. If
+nothing differs, it stops with an error instead of passing. It is a per-change check, not a replacement for the
 `gui` and `all` tiers.
 
 `--jobs N` runs up to N `gui` steps at once (default 1). Each has its own
@@ -94,12 +96,13 @@ The explicit `periodic` tier starts the periodic correctness lane. It includes
 portable checks and 1,500 deterministic malformed/valid DWARF 2–4 file tables,
 compared with GNU readelf: every authorized path must appear in readelf's table.
 Stricter refusals are counted separately. It is excluded from `all`; run it in a
-scheduled job or when changing the source-path parser. This tier performs no
-live target or GUI checks and rejects live-runtime options. Reports record the
-host load and available CPU count; correctness still fails on a counterexample
-under load. This is not a performance benchmark or a replacement for `all`.
-Other slow matrices remain in their existing tiers until focused replacements
-preserve their lifecycle and fault assertions.
+scheduled job or when changing the source-path parser. Without `--headless` it
+also runs the live steps that `PERIODIC` moves out of `host` and `all`, so it
+needs the same ptrace/perf access and takes the same runtime flags; with
+`--headless` it performs no live target checks. It never runs GUI checks.
+Reports record the host load and available CPU count; correctness still fails
+on a counterexample under load. This is not a performance benchmark or a
+replacement for `all`.
 
 The separate `perf` tier is excluded from `all`. Its first benchmark measures
 cached `get_session` RPCs on an owned stopped fixture, locally and through the
@@ -119,7 +122,7 @@ tiers to validate language adapters.
 
 Use `--optimize Debug` for a second build mode; the default is ReleaseSafe.
 For a release candidate, require portable CI plus `all` on the configured
-workstation, plus `periodic-gui` for the full graphics and delayed-discovery matrices. An `all` pass deliberately excludes those matrices; its result records that exclusion. A portable pass alone does not certify tracing, graphics or ARM64.
+workstation, plus `periodic` and `periodic-gui` (with the same runtime flags) for the full graphics and delayed-discovery matrices and the steps moved out of `all`. An `all` pass deliberately excludes those; its result records that exclusion. A portable pass alone does not certify tracing, graphics or ARM64.
 
 The newer source-block, comparison, process-tree and allocation suites are
 separate from `all`. After building the default target, also run:
@@ -271,7 +274,7 @@ collapsible native-object section on a private display. Nothing is installed.
 ## Focused checks and periodic matrices
 
 Run `scripts/release-check all` for ordinary changes and
-`scripts/release-check periodic-gui` periodically and before release. Scheduling
+`scripts/release-check periodic` and `periodic-gui` periodically and before release. Scheduling
 changes do not change a test failure into a skip. The full existing commands
 and their assertions remain in the periodic lane; this runner does not install
 a scheduler. Use `--list` to see the exact commands.
@@ -285,15 +288,34 @@ a scheduler. Use `--list` to see the exact commands.
 
 `periodic --headless` includes the source-path differential and delayed-discovery
 matrix without graphics. `periodic-gui` includes those plus the three full GUI
-matrices. Runtime SDK flags are rejected in both because these lanes do not
-schedule runtime-specific checks; run the ordinary lane with those flags too.
-Neither periodic lane is the performance lane: its correctness failures remain
-failures under load. `perf` reports measurements separately.
+matrices. Neither periodic lane is the performance lane: its correctness
+failures remain failures under load. `perf` reports measurements separately.
+
+### Steps moved to the periodic tiers
+
+To keep `all` short enough to run for every batch, the `PERIODIC` list in
+`scripts/release-check` names host and GUI steps that `host`, `gui` and `all`
+leave out. The same commands, with the same timeouts and runtime flags, run in
+`periodic` (live steps) and `periodic-gui` (GUI steps). Nothing is deleted, and
+a failure there is still a failure. Pass both periodic tiers the runtime flags
+you pass `all` (`--node-refusal` is accepted and unused), or the steps of that
+runtime are not planned.
+
+| Moved | Examples | What stays in `all` |
+| --- | --- | --- |
+| Long soak | Full `gui-memdefrag` | `gui-memdefrag-smoke`: the redaction section |
+| Stress and timing-sensitive | `m2-limits`, `m2-sampled`, `m2-recorded-views`, `syscall-timing`, `gui-files-selection`, `javascript-advisory-gui`, `acquire-timeout`, `fence-timeout` | `m2-profile`, `m2-archive`, `m2-robustness`, focused `vulkan-faults`, `hidden-window`, `wayland-read-race` |
+| Install and fetch | `symbol-discovery`, `symbol-discovery-install`, `source-fetch` | `gui-symbol-discovery`, `debug-discovery`, `module-symbols` |
+| Second copy of a matrix | Every step of the second `--lua` runtime except its refusals, the slower C-agent twins (`perl-watches-1`, `ruby-watches-agent`, `metadata-session-agent`, ...) | The first Lua runtime, one local and one C-agent step for each language, `gui-shared-jobs-agent`, `remote-panes` |
+| Slowest of the rest | `gui-safe-keys` and its agent twin, `gui-jai-writes` and its agent twin, `lsof-top`, `gui-files`, `gui-overview-live`, `gui-live-display`, `gui-frames`, `gui-invocations`, `gui-run-control`, the watch, path and preview GUI checks of each language | One live and one GUI step for each runtime and area: `python-gui`, `perl-gui`, `ruby-gui`, `javascript-gui`, `go-gui`, `elisp-gui`, `lua-named-gui-0`, `gui-overview`, `gui-fdactivity`, `gui-debug`, ... |
+
+Build and unit steps, the runner's own test, Vulkan device selection and
+faults, and the scope, refusal, redaction and input-limit checks are never
+moved; `tests/release-runner.py` asserts this, and that every moved step is
+planned unchanged in its periodic tier. `--list` shows the exact split.
 
 The focused GUI checks retain the existing synchronization and timeout rules.
 They do not claim a new presentation acknowledgement or a timing-flake fix.
-Other expensive suites, including memdefrag and runtime-specific GUIs, still run
-in their original lanes pending separately reviewed coverage changes.
 
 The performance lane also records syscall-capture status-query latency against
 the historical 250 ms reference, with CPU, RSS and host load at the capture
