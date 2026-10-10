@@ -314,6 +314,20 @@ static void stack_cases(uint64_t function, uint64_t shared) {
     xjs_stack_read(&layout, &r, api_fp, 0x800010, root, stack, stack + 320, &out);
     assert(out.count == 1 && !out.frames[0].line && !strcmp(out.frames[0].reason, "JavaScriptFrameConfigUnavailable"));
     layout.build_id[0] ^= 1;
+    /* The second verified stock image is accepted exactly; one changed byte
+     * or a truncated id refuses. */
+    const uint8_t stock_2610[] = {0x83,0xdb,0x74,0x69,0x59,0xb3,0x36,0xee,0x59,0xd2,
+        0xf5,0x17,0xb4,0x83,0x78,0xda,0x2b,0xbe,0xfa,0x4f};
+    memcpy(layout.build_id, stock_2610, sizeof stock_2610); r = (struct xjs_reader){.read = read_fake};
+    xjs_stack_read(&layout, &r, api_fp, 0x800010, root, stack, stack + 320, &out);
+    assert(out.count == 1 && !out.frames[0].reason && out.frames[0].line == 3 && out.frames[0].column == 1);
+    layout.build_id[19] ^= 1; r = (struct xjs_reader){.read = read_fake};
+    xjs_stack_read(&layout, &r, api_fp, 0x800010, root, stack, stack + 320, &out);
+    assert(out.count == 1 && !out.frames[0].line && !strcmp(out.frames[0].reason, "JavaScriptFrameConfigUnavailable"));
+    layout.build_id[19] ^= 1; layout.build_id_len = 19; r = (struct xjs_reader){.read = read_fake};
+    xjs_stack_read(&layout, &r, api_fp, 0x800010, root, stack, stack + 320, &out);
+    assert(out.count == 1 && !out.frames[0].line && !strcmp(out.frames[0].reason, "JavaScriptFrameConfigUnavailable"));
+    layout.build_id_len = sizeof stock_id; memcpy(layout.build_id, stock_id, sizeof stock_id);
     put(table + 15, 0x80, 1); put(table + 16, 0x80, 1); r = (struct xjs_reader){.read = read_fake};
     xjs_stack_read(&layout, &r, api_fp, 0x800010, root, stack, stack + 320, &out);
     assert(out.count == 1 && !out.frames[0].line && !strcmp(out.frames[0].reason, "JavaScriptSourceTableMalformed"));
@@ -391,6 +405,18 @@ int main(void) {
     put(elements + 23, b, 8);
     layout.version_string[0] = '2'; v = decode(array);
     assert(v.reason && !strcmp(v.reason, "JavaScriptSupplementVersionUnsupported")); layout.version_string[0] = '1';
+    /* Only the listed embedder patch levels are accepted: no prefix, range
+     * or nearest match. */
+    strcpy(layout.version_string, "14.6.202.34-node.34"); v = decode(array);
+    assert(!v.reason && v.version_table);
+    const char *const unlisted[] = {"14.6.202.34-node.29", "14.6.202.34-node.33", "14.6.202.34-node.35",
+        "14.6.202.34-node.3", "14.6.202.34-node.340", "14.6.202.34-node.2", "14.6.202.34-node.288",
+        "14.6.202.34", "14.6.202.34-node.", ""};
+    for (size_t i = 0; i < sizeof unlisted / sizeof *unlisted; ++i) {
+        strcpy(layout.version_string, unlisted[i]); v = decode(array);
+        assert(v.reason && !strcmp(v.reason, "JavaScriptSupplementVersionUnsupported"));
+    }
+    strcpy(layout.version_string, "14.6.202.34-node.28");
     layout.fields[XJS_CODE_WRAPPER] += 8; v = decode(array);
     assert(v.reason && !strcmp(v.reason, "JavaScriptSupplementMetadataMismatch")); layout.fields[XJS_CODE_WRAPPER] -= 8;
     put(array + 23, UINT64_C(4) << 32, 8); v = decode(array);

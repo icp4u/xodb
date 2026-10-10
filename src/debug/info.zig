@@ -9,7 +9,7 @@ pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, l
 pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, diagnostic: ?[]const u8 = null };
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
-pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame }, outermost: bool = false };
+pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog }, outermost: bool = false };
 const Unit = struct { die: c.Dwarf_Die, kind: u8, split: ?c.Dwarf_Die = null, split_error: ?anyerror = null };
 pub const Inline = struct { name: []const u8, depth: usize, die_offset: u64, call_path: ?[]const u8 = null, call_line: ?u32 = null, call_column: ?u32 = null, decl_path: ?[]const u8 = null, decl_line: ?u32 = null };
 const unknown = eval.Type{ .name = "unknown", .kind = .unknown, .size = 0 };
@@ -92,12 +92,6 @@ fn concreteScopesAt(a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64) ![]c.Dwarf
 fn exprloc(attr: *c.Dwarf_Attribute) void {
     if (attr.form == std.dwarf.FORM.block1 and attr.valp != null and attr.valp[0] < 0x80) attr.form = std.dwarf.FORM.exprloc;
 }
-/// cmd/link's DW_AT_go_kind (reflect.Kind) on Go types; producer-specific.
-fn goKind(die: *c.Dwarf_Die, lang: eval.Language) ?u8 {
-    if (lang != .go) return null;
-    const value = unsigned(die, 0x2900) orelse return null;
-    return std.math.cast(u8, value);
-}
 fn language(die: *c.Dwarf_Die) eval.Language {
     var cu: c.Dwarf_Die = undefined;
     if (c.dwarf_diecu(die, &cu, null, null) == null) return .unknown;
@@ -150,9 +144,11 @@ pub const Image = struct {
     split_bytes: usize = 0,
     units_error: ?anyerror = null,
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
+    go_type_index: ?*c.struct_xgo_type_index = null,
+    go_type_index_error: ?anyerror = null,
     pending_aliases: std.AutoHashMapUnmanaged(*const eval.Type, Alias) = .empty,
     address_table: []const u8,
-    const Alias = struct { target: *const eval.Type, name: []const u8, ruby_value: bool = false, go_kind: u8 = 0 };
+    const Alias = struct { target: *const eval.Type, name: []const u8, ruby_value: bool = false, go_kind: u8 = 0, go_runtime_offset: ?u64 = null, go_interface_nonempty: ?bool = null, go_key: ?*const eval.Type = null, go_element: ?*const eval.Type = null, elisp_object: bool = false };
     pub fn init(binary: elf.Image, bytes: []u8) !Image {
         return initWithAllocator(binary, bytes, std.heap.page_allocator);
     }
@@ -197,6 +193,7 @@ pub const Image = struct {
         return bytes;
     }
     pub fn deinit(self: *Image) void {
+        c.xgo_type_index_free(self.go_type_index);
         if (self.eh) |cache| _ = c.dwarf_cfi_end(cache);
         if (self.dwarf) |d| _ = c.dwarf_end(d);
         if (self.debug_object != self.object) _ = c.elf_end(self.debug_object);
@@ -497,6 +494,25 @@ pub const Image = struct {
         if (self.architecture == .aarch64) caller[self.architecture.pc()] = caller[self.architecture.ra()];
         return .{ .cfa = cfa, .caller = caller, .method = method, .outermost = outermost };
     }
+    pub fn goRuntimeType(self: *Image, offset: u64) !*const eval.Type {
+        if (self.go_type_index_error) |err| return err;
+        if (self.go_type_index == null) {
+            if (c.xgo_type_index_create(self.dwarf, &self.go_type_index)) |why| {
+                const err = goTypeError(std.mem.span(why));
+                self.go_type_index_error = err;
+                return err;
+            }
+        }
+        var die: c.Dwarf_Die = undefined;
+        if (c.xgo_type_index_find(self.go_type_index, offset, &die)) |why| return goTypeError(std.mem.span(why));
+        return self.typeOf(die, 0);
+    }
+    fn goTypeError(why: []const u8) anyerror {
+        inline for (.{ error.GoDwarfUnavailable, error.GoDwarfMalformed, error.GoDwarfWorkLimit, error.GoDwarfUnitLimit, error.GoDwarfRuntimeTypeLimit, error.GoDwarfOutOfMemory, error.GoDwarfTypeDepthLimit, error.GoDwarfTypeMetadataInvalid, error.GoRuntimeTypeMetadataUnavailable, error.GoRuntimeTypeMetadataAmbiguous }) |err| {
+            if (std.mem.eql(u8, why, @errorName(err))) return err;
+        }
+        return error.GoDwarfTypeMetadataInvalid;
+    }
     fn typeOf(self: *Image, die_: c.Dwarf_Die, depth: usize) anyerror!*const eval.Type {
         // Recursive aliases can observe a structure before its fields exist.
         // Finish their copies only after the complete outer graph is built.
@@ -514,7 +530,12 @@ pub const Image = struct {
         const t = try a.create(eval.Type);
         t.* = .{ .name = name(&die), .kind = .unknown, .size = unsigned(&die, std.dwarf.AT.byte_size) orelse 0, .language = language(&die) };
         try self.types.put(a, key, t);
-        if (goKind(&die, t.language)) |kind| t.go_kind = kind;
+        var go_meta = std.mem.zeroes(c.struct_xgo_type_metadata);
+        if (t.language == .go) {
+            t.go_dwarf = if (self.dwarf) |dw| @ptrCast(dw) else null;
+            if (c.xgo_type_metadata(&die, &go_meta)) |why| return goTypeError(std.mem.span(why));
+            t.go_kind = @intCast(go_meta.kind);
+        }
         switch (c.dwarf_tag(&die)) {
             std.dwarf.TAG.base_type => {
                 t.kind = switch (unsigned(&die, std.dwarf.AT.encoding) orelse 0) {
@@ -564,8 +585,8 @@ pub const Image = struct {
                     t.* = target.*;
                     const alias = name(&die);
                     if (alias.len > 0) t.name = alias;
-                    t.go_kind = goKind(&die, t.language) orelse target.go_kind;
-                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias, .ruby_value = c.xrb_dwarf_value(&die) != 0, .go_kind = t.go_kind });
+                    t.go_kind = if (go_meta.present & c.XGO_META_KIND != 0) @intCast(go_meta.kind) else target.go_kind;
+                    try self.pending_aliases.put(a, t, .{ .target = target, .name = alias, .ruby_value = c.xrb_dwarf_value(&die) != 0, .go_kind = t.go_kind, .elisp_object = c.xel_dwarf_object(&die) != 0 });
                 }
             },
             std.dwarf.TAG.pointer_type, std.dwarf.TAG.reference_type, std.dwarf.TAG.rvalue_reference_type => {
@@ -629,6 +650,16 @@ pub const Image = struct {
             },
             else => {},
         }
+        if (go_meta.present & c.XGO_META_RUNTIME != 0) t.go_runtime_offset = go_meta.runtime_offset;
+        if (go_meta.present & c.XGO_META_IFACE != 0) t.go_interface_nonempty = go_meta.interface_nonempty != 0;
+        if (go_meta.present & c.XGO_META_KEY != 0) t.go_key = try self.typeOf(go_meta.key, depth + 1);
+        if (go_meta.present & c.XGO_META_ELEM != 0) t.go_element = try self.typeOf(go_meta.element, depth + 1);
+        if (self.pending_aliases.getPtr(t)) |alias| {
+            alias.go_runtime_offset = t.go_runtime_offset;
+            alias.go_interface_nonempty = t.go_interface_nonempty;
+            alias.go_key = t.go_key;
+            alias.go_element = t.go_element;
+        }
         return t;
     }
     fn finishAliases(self: *Image) void {
@@ -638,6 +669,11 @@ pub const Image = struct {
             var alias_name = entry.value_ptr.name;
             var ruby_value = entry.value_ptr.ruby_value;
             var go_kind = entry.value_ptr.go_kind;
+            var go_runtime_offset = entry.value_ptr.go_runtime_offset;
+            var go_interface_nonempty = entry.value_ptr.go_interface_nonempty;
+            var go_key = entry.value_ptr.go_key;
+            var go_element = entry.value_ptr.go_element;
+            var elisp_object = entry.value_ptr.elisp_object;
             var hops: usize = 0;
             while (self.pending_aliases.get(target)) |alias| : (hops += 1) {
                 if (hops == 64) {
@@ -647,6 +683,11 @@ pub const Image = struct {
                 if (alias_name.len == 0) alias_name = alias.name;
                 ruby_value = ruby_value or alias.ruby_value;
                 if (go_kind == 0) go_kind = alias.go_kind;
+                if (go_runtime_offset == null) go_runtime_offset = alias.go_runtime_offset;
+                if (go_interface_nonempty == null) go_interface_nonempty = alias.go_interface_nonempty;
+                if (go_key == null) go_key = alias.go_key;
+                if (go_element == null) go_element = alias.go_element;
+                elisp_object = elisp_object or alias.elisp_object;
                 target = alias.target;
             }
             const out = @constCast(entry.key_ptr.*);
@@ -654,6 +695,11 @@ pub const Image = struct {
             if (alias_name.len > 0) out.name = alias_name;
             out.ruby_value = out.ruby_value or ruby_value;
             if (go_kind != 0) out.go_kind = go_kind;
+            if (go_runtime_offset) |offset| out.go_runtime_offset = offset;
+            if (go_interface_nonempty) |nonempty| out.go_interface_nonempty = nonempty;
+            if (go_key) |key| out.go_key = key;
+            if (go_element) |element| out.go_element = element;
+            out.elisp_object = out.elisp_object or elisp_object;
         }
         self.pending_aliases.clearRetainingCapacity();
     }

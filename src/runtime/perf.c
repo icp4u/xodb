@@ -206,17 +206,20 @@ static void start_time(struct xrt_perf_thread *t)
                 xrt_perf_unsigned(begin, (size_t)(at - begin), &t->start_time_ticks);
     }
 }
-bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *attrs, size_t events,
-                  xrt_perf_opener opener, void *context, struct xrt_perf_failure *f)
+static bool add(struct xrt_perf *p, int32_t tid, int32_t cpu, const struct xrt_perf_attr *attrs,
+                size_t events, xrt_perf_opener opener, void *context, const char *filter,
+                struct xrt_perf_failure *f)
 {
-    if (tid <= 0 || !attrs || !events || events > XRT_PERF_MAX_EVENTS) {
-        xrt_perf_fail(f, "enroll", EINVAL, tid, "invalid thread or event count");
+    if (!p || p->remote_target || !((tid > 0 && cpu == -1) || (tid == -1 && cpu >= 0)) ||
+        !attrs || !events || events > XRT_PERF_MAX_EVENTS ||
+        (filter && (!*filter || strlen(filter) > 8192))) {
+        xrt_perf_fail(f, "enroll", EINVAL, tid, "invalid local scope, filter or event count");
         return false;
     }
     for (size_t i = 0; i < p->count; ++i)
-        if (p->slots[i].thread.tid == tid) {
+        if (p->slots[i].thread.tid == tid && p->slots[i].cpu == cpu) {
             xrt_perf_fail(f, "enroll", EINVAL, tid,
-                          "thread id already recorded; reuse requires a new capture");
+                          "scope already recorded; reuse requires a new capture");
             return false;
         }
     if (p->count == p->max_threads) {
@@ -233,6 +236,7 @@ bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *a
     struct xrt_perf_slot *s = &p->slots[p->count];
     memset(s, 0, sizeof(*s));
     s->thread.tid = tid;
+    s->cpu = cpu;
     for (size_t i = 0; i < XRT_PERF_MAX_EVENTS; ++i)
         s->fds[i] = -1;
     const char *call = "perf_event_open", *detail = "thread open failed";
@@ -244,7 +248,7 @@ bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *a
             goto fail;
         }
         int fd = opener ? opener(context, tid, s->fds[0], i, &attr)
-                        : (int)syscall(SYS_perf_event_open, &attr, tid, -1, s->fds[0],
+                        : (int)syscall(SYS_perf_event_open, &attr, tid, cpu, s->fds[0],
                                        PERF_FLAG_FD_CLOEXEC);
         if (fd < 0) {
             call = "perf_event_open";
@@ -252,6 +256,11 @@ bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *a
             goto fail;
         }
         s->fds[s->thread.event_count++] = fd;
+        if (filter) {
+            call = "ioctl";
+            detail = "PERF_EVENT_IOC_SET_FILTER";
+            if (ioctl(fd, PERF_EVENT_IOC_SET_FILTER, filter)) goto fail;
+        }
         if (attr.read_format == PERF_FORMAT_LOST) s->lost_read_mask |= UINT32_C(1) << i;
         call = "ioctl";
         detail = "PERF_EVENT_IOC_ID";
@@ -274,7 +283,7 @@ bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *a
             goto fail;
         }
     }
-    start_time(&s->thread);
+    if (tid > 0) start_time(&s->thread);
     if (p->running && ioctl(s->fds[0], PERF_EVENT_IOC_ENABLE, PERF_IOC_FLAG_GROUP)) {
         call = "ioctl";
         detail = "PERF_EVENT_IOC_ENABLE";
@@ -291,6 +300,16 @@ fail:;
     if (f)
         f->opened_then_closed = opened;
     return false;
+}
+bool xrt_perf_add(struct xrt_perf *p, int32_t tid, const struct xrt_perf_attr *attrs, size_t events,
+                  xrt_perf_opener opener, void *context, struct xrt_perf_failure *f)
+{
+    return add(p, tid, -1, attrs, events, opener, context, NULL, f);
+}
+bool xrt_perf_add_cpu(struct xrt_perf *p, int32_t cpu, const struct xrt_perf_attr *attrs,
+                      size_t events, const char *filter, struct xrt_perf_failure *f)
+{
+    return add(p, -1, cpu, attrs, events, NULL, NULL, filter, f);
 }
 /* PERF_FORMAT_LOST counts failed ring reservations even before a later event
  * can emit PERF_RECORD_LOST. Each FD has its own cumulative counter. */

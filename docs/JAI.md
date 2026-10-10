@@ -27,16 +27,16 @@ stride instead of assigning the observed 64-byte values to every image.
 
 | Seed record | Bytes / offsets | Corroboration |
 | --- | --- | --- |
-| Common header | tag u32 at0; runtime size s64 at8; extent16 | Type_Info's named members and their type widths/signedness |
-| Struct/enum name | string at16 | Struct's own `name` member; enum is a seed encoding |
-| string / view | count s64 at0; pointer at8 | string's stored runtime size16; member-list bounds and self-description |
-| Member prefix | name string at0; type pointer at16; instance offset s64 at24 | Type_Info_Struct_Member's named members |
-| Array type | element type pointer at16; kind at24 (low16 bootstrap bits) | members' array points to Type_Info_Struct_Member with the recovered stride; kind1 is the view seed; the graph reader checks Array_Type and uses its stored width |
-| Enum type | underlying type pointer at32; names view at40; values view at56 | unsigned u32 underlying type, equal counts, all expected stored tag/flag values |
-| Enum entries | names are16-byte strings; values are64-bit slots | two independent enum tables: tags and member flags |
-| Integer type | signed bool at16 | metadata instance offsets and runtime sizes require signed64; enum bases require unsigned32 |
+| Common header | tag u32 at 0; runtime size s64 at 8; extent 16 | Type_Info's named members and their type widths/signedness |
+| Struct/enum name | string at 16 | Struct's own `name` member; enum is a seed encoding |
+| string / view | count s64 at 0; pointer at 8 | string's stored runtime size 16; member-list bounds and self-description |
+| Member prefix | name string at 0; type pointer at 16; instance offset s64 at 24 | Type_Info_Struct_Member's named members |
+| Array type | element type pointer at 16; kind at 24 (low 16 bootstrap bits) | members' array points to Type_Info_Struct_Member with the recovered stride; kind 1 is the view seed; the graph reader checks Array_Type and uses its stored width |
+| Enum type | underlying type pointer at 32; names view at 40; values view at 56 | unsigned u32 underlying type, equal counts, all expected stored tag/flag values |
+| Enum entries | names are 16-byte strings; values are 64-bit slots | two independent enum tables: tags and member flags |
+| Integer type | signed bool at 16 | metadata instance offsets and runtime sizes require signed 64; enum bases require unsigned 32 |
 
-The four bytes at header offset4 are **uninterpreted**. They are not a proved
+The four bytes at header offset 4 are **uninterpreted**. They are not a proved
 identifier, version or hash. They are deliberately varied in the fixture.
 
 The required stored Type_Info_Tag mapping is:
@@ -50,25 +50,25 @@ actual enum value table, not just a nearby string pool.
 
 These are the observed offsets, not unconditional parser constants. The detector
 returns the offsets and record sizes recovered from that image. A synthetic
-variant moves `members` to72 and increases the member stride to72; it must still
+variant moves `members` to 72 and increases the member stride to 72; it must still
 work and have a different schema fingerprint.
 
 | Type_Info_Struct member | Observed byte offset | Stored type |
 | --- | --- | --- |
-| info | 0 | Type_Info, size16 |
-| name | 16 | string, size16 |
-| parameters | 32 | array view, size16 |
-| specified_parameters | 48 | array view, size16 |
+| info | 0 | Type_Info, size 16 |
+| name | 16 | string, size 16 |
+| parameters | 32 | array view, size 16 |
+| specified_parameters | 48 | array view, size 16 |
 | members | 64 | array view of Type_Info_Struct_Member |
-| tagged_union_bindings | 80 | array view, size16 |
-| status_flags | 96 | enum, size4 |
-| nontextual_flags | 100 | enum, size4 |
-| textual_flags | 104 | enum, size4 |
-| alignment | 108 | integer, size4 |
-| polymorph_source_struct | 112 | pointer, size8 |
-| initializer | 120 | procedure, size8 |
-| constant_storage | 128 | array view, size16 |
-| notes | 144 | array view, size16 |
+| tagged_union_bindings | 80 | array view, size 16 |
+| status_flags | 96 | enum, size 4 |
+| nontextual_flags | 100 | enum, size 4 |
+| textual_flags | 104 | enum, size 4 |
+| alignment | 108 | integer, size 4 |
+| polymorph_source_struct | 112 | pointer, size 8 |
+| initializer | 120 | procedure, size 8 |
+| constant_storage | 128 | array view, size 16 |
+| notes | 144 | array view, size 16 |
 
 Observed struct runtime size:160. Every required field must have its stated
 category and width, fit the record and not overlap another required field.
@@ -77,12 +77,12 @@ signatures. The graph reader validates each referenced type separately.
 
 | Type_Info_Struct_Member member | Observed byte offset | Stored type |
 | --- | --- | --- |
-| name | 0 | string, size16 |
-| type | 16 | pointer to Type_Info, size8 |
-| offset_in_bytes | 24 | signed integer, size8 |
-| flags | 32 | enum, size4 |
-| notes | 40 | array view, size16 |
-| offset_into_constant_storage | 56 | signed integer, size8 |
+| name | 0 | string, size 16 |
+| type | 16 | pointer to Type_Info, size 8 |
+| offset_in_bytes | 24 | signed integer, size 8 |
+| flags | 32 | enum, size 4 |
+| notes | 40 | array view, size 16 |
+| offset_into_constant_storage | 56 | signed integer, size 8 |
 
 Observed member runtime size:64. The member schema also contains a **constant**
 named Flags. Its instance offset is -1; it is not an instance field and must not
@@ -97,14 +97,14 @@ storage address for each proved constant.
 
 ## Detection and identity
 
-1. Validate sorted, nonoverlapping read-only ranges: at most128 ranges and64MiB
+1. Validate sorted, nonoverlapping read-only ranges: at most 128 ranges and 64 MiB
    total. Addresses and lengths must not wrap. The caller supplies relocated
    virtual addresses and immutable bytes; the detector does no file or target IO.
 2. Scan aligned candidate headers for exact Type_Info_Struct and Type_Info_Tag
    names. Exactly one of each is required. Pool strings alone are insufficient.
 3. Check the tag enum's actual name/value pairs and underlying integer type.
-4. Search members-array offsets32..496 and member strides32..256, in steps of8.
-   Lists are capped at64 members during bootstrap. Require a unique solution
+4. Search members-array offsets 32..496 and member strides 32..256, in steps of 8.
+   Lists are capped at 64 members during bootstrap. Require a unique solution
    consistent with the self-descriptions of the struct, member and common header.
 5. Check member flags against their own enum, constant-vs-instance placement,
    pointer backreferences, data-field bounds and the required scalar widths.
@@ -144,13 +144,13 @@ share a name. Resolve by type-record address until a later interface explicitly
 checks name ambiguity.
 
 Array_Type's stored enum values must prove FIXED=0, VIEW=1 and RESIZABLE=2. Its
-underlying integer can be unsigned16 or unsigned32; the reader uses that width
-at the array record's offset24 and ignores adjacent padding. Fixed counts are
-checked against element size and total runtime size. Views require size16;
-resizable arrays require size40 in this profile. The latter proves metadata
+underlying integer can be unsigned 16 or unsigned 32; the reader uses that width
+at the array record's offset 24 and ignores adjacent padding. Fixed counts are
+checked against element size and total runtime size. Views require size 16;
+resizable arrays require size 40 in this profile. The latter proves metadata
 shape only, not the live allocator/header interpretation for container walking.
 The struct `alignment` field may be -1 (unspecified); otherwise this reader
-requires a power of two up to4096, consistent with the runtime size. It never
+requires a power of two up to 4096, consistent with the runtime size. It never
 turns the unspecified sentinel into an inferred alignment.
 
 A tag/name match alone is not a root. Root recognition requires bounded metadata
@@ -165,22 +165,22 @@ also remains explicit, preserving the other members of the struct.
 `xjai_fields_flatten` expands USING struct members, including AS bases, by adding
 stored offsets. It skips constants and compiler-imported duplicates. Every row
 retains its member path: two equal leaf names are not collapsed. Recursive using
-cycles, depth16, output capacity and a65536-member work limit return typed
+cycles, depth 16, output capacity and a 65536-member work limit return typed
 reasons along with any already validated prefix. Procedure/variant metadata and
 other unimplemented categories remain explicit `JaiTypeCategoryUnsupported`
 records; a pointer to an unsupported target still preserves its own pointer shape.
 
-Hard caps are16384 types,65536 members,65536 enum values and8MiB copied text,
-with smaller caller limits supported. Individual struct tables allow4096 members,
-parameter tables256 and names1024 bytes. Beyond the initial64MiB image scan, the
-graph reader allows at most1048576 bounded reads/128MiB cumulative read bytes.
+Hard caps are 16384 types, 65536 members, 65536 enum values and 8 MiB copied text,
+with smaller caller limits supported. Individual struct tables allow 4096 members,
+parameter tables 256 and names 1024 bytes. Beyond the initial 64 MiB image scan, the
+graph reader allows at most 1048576 bounded reads/128 MiB cumulative read bytes.
 Budget exhaustion is `JaiReadBudget`, never a complete result. All collections
 grow as needed. Fatal argument/bootstrap/allocation failures return no graph;
 capacity limits or damaged records return a partial graph with reasons.
 
 The fast reader fixture checks C sizeof/offsetof, recursive pointers, negative
 enum values, three array kinds, polymorph parameters, constant offsets, nested
-base fields, same-name distinct types,300-type storage growth, string-pool decoys,
+base fields, same-name distinct types, 300-type storage growth, string-pool decoys,
 corrupt references/offsets and smaller caps. Its wrong-value oracle must abort
 with NDEBUG. `tests/jai-reader-fuzz.c` mutates only synthetic metadata and belongs
 to the periodic lane.
@@ -194,15 +194,15 @@ or transport of its own. It executes no target code and performs no writes.
 
 Scalar rows carry exact integer/float/pointer bits and an explicit `has_bits`;
 unreadable rows never present an invented zero. Narrow signed values are extended
-to64 bits. Enums retain numeric bits plus a matching enumerator name when present.
+to 64 bits. Enums retain numeric bits plus a matching enumerator name when present.
 A Type field reports the referenced type-record index. String previews retain
 byte length, including embedded NUL or invalid UTF-8, for the presentation layer
 to escape correctly; the bytes are not assumed to be C strings.
 
 Struct fields and fixed/view arrays expand into parent-indexed rows. Constants
 and compiler-imported duplicate members are omitted from instance previews.
-Root aggregates page with start/limit; nested aggregates start at0. The depth
-limit, paging and128-byte string preview mark truncation. A damaged member gets
+Root aggregates page with start/limit; nested aggregates start at 0. The depth
+limit, paging and 128-byte string preview mark truncation. A damaged member gets
 its own reason and no invented field address. Recursive pointer traversal is
 opt-in and detects repeated type/address pairs. Resizable headers use the
 profile documented below. Any payloads remain unsupported; their static types
@@ -210,13 +210,13 @@ are still available.
 
 `xjai_self_type` follows an explicitly selected member whose type is Type. It is
 not a heuristic based on names such as entity_type. The referenced type must be
-a validated struct equal to the declared type, or contain it at offset0 through
+a validated struct equal to the declared type, or contain it at offset 0 through
 USING fields. Unknown pointers, incompatible types and bounded traversal failures
 are distinct refusals. The call shares the caller's read budget.
 
-Per read: at most512 exact callbacks,64KiB cumulative bytes,256 rows, depth8 and
+Per read: at most 512 exact callbacks, 64 KiB cumulative bytes, 256 rows, depth 8 and
 64 children per aggregate page. Address/count/size arithmetic is checked before
-calling the backend. Rows grow from16 as needed. Fatal argument/allocation errors
+calling the backend. Rows grow from 16 as needed. Fatal argument/allocation errors
 return no result; unreadable/unsupported/cyclic values return partial rows and
 reasons. The session adapter checks the captured session, image epoch and stopped
 generation before live reads and checks the stop again afterward.
@@ -258,7 +258,7 @@ The following are MCP tool argument examples; replace the example generation,
 snapshot ID, context ID and address with those returned by your session:
 
 ```json
-{"provider":"jai","generation":42,"snapshot_ids":[1,2]}
+{"provider":"jai","generation":42,"snapshot_ids":[1, 2]}
 ```
 
 Pass that to `load_runtime_types`, then poll `list_runtime_types` with
@@ -391,7 +391,10 @@ addresses and exact total/capacity hex strings. Read any returned element with
 watch. An unavailable container has null counts and a reason, never a false zero.
 
 Start a search with `search_runtime_instances`. The range is explicit and capped
-at 1 GiB; it uses the same incremental search job as `search_memory`, so normal
+at 1 GiB, or given as `ranges` or a `regions` selector (optionally clipped by
+`address`/`length`) exactly as for `search_memory` (see
+[MEMORY_REGISTERS.md](MEMORY_REGISTERS.md)); `get_memory_search` pages its
+per-range coverage. It uses the same incremental search job as `search_memory`, so normal
 ownership, replacement and `cancel_memory_search` apply. This job requires the
 controller. Choose the declared struct with `type_name` or `type_address`, and
 name a direct `self_type_field` of type `Type`. Optionally provide an exact
@@ -507,13 +510,13 @@ python3 tests/jai-demo.py --kind pe --wine wine --work .work/jai-demo-pe
 python3 tests/jai-demo.py --kind pe --wine wine --work .work/jai-demo-pe-agent --agent zig-out/bin/xodb-agent
 ```
 
-Each run builds a fixture, checks metadata offsets and enum names, reads health77,
+Each run builds a fixture, checks metadata offsets and enum names, reads health 77,
 pages a resizable array, walks occupied Bucket slots and finds three Type-pointer
 candidates (including an unrelated word). A breakpoint uses the fixture's emitted
-code address, without symbols. Continue changes health to78; the old metadata
+code address, without symbols. Continue changes health to 78; the old metadata
 context refuses live reads, and a new capture recovers the new value. Registers
 and generation must remain unchanged during the inspection phase.
-`--wrong-oracle` expects78 before execution and must fail at the actual77.
+`--wrong-oracle` expects 78 before execution and must fail at the actual 77.
 
 ELF checks are in the fast host/all lane. PE checks require Zig's Windows C
 target support plus Wine and use the periodic lane because prefix initialization
@@ -548,8 +551,8 @@ unresolved metadata are never writable through this planner.
 
 Pointers, Type fields, strings and array headers require explicit raw mode:
 exactly two hex characters per byte in target byte order. This also permits a
-raw representation of another resolved leaf. A leaf is limited to64 bytes;
-paths to256 bytes and16 components; all field/enum visits share a4096-work bound.
+raw representation of another resolved leaf. A leaf is limited to 64 bytes;
+paths to 256 bytes and 16 components; all field/enum visits share a 4096-work bound.
 Name comparisons inspect only the requested token length. Invalid inputs clear
 the complete output plan. The planner makes no explicit heap allocation and
 uses the existing live-read budget for array headers.
@@ -559,12 +562,12 @@ through guarded IO callbacks; the session adapter must bind those callbacks to
 the current stopped target and mutation authority. The live bindings below use the same C implementation for MCP and the browser. `scripts/build test-jai-write
 -Doptimize=ReleaseSafe` checks native offsets, values, boundaries, raw headers and
 that planning leaves all owned target bytes unchanged. Its wrong-value control
-expects78 for a planned77 and must fail even with NDEBUG.
+expects 78 for a planned 77 and must fail even with NDEBUG.
 
 
 ## Guarded writes and undo in C
 
-`xjai_write_destination` checks every mapping crossed by a plan (at most64 bytes).
+`xjai_write_destination` checks every mapping crossed by a plan (at most 64 bytes).
 Every byte must be readable and writable, no mapping may be executable or shared (a write must not reach a file, /dev/shm or a device buffer), and no
 byte may overlap any retained runtime-metadata capture. Invalid mappings or
 metadata spans fail closed. Explicit raw writes and raw undo use these same
@@ -585,9 +588,14 @@ change record for the session audit: per-operation before/requested/observed
 bytes, validity flags, generations and write outcome. The caller stamp supplies
 actor/client identity.
 Those audit bytes must be copied, not retained as a pointer into the journal.
-The journal starts at24 bytes on this host, grows lazily from4 entries and caps
-at1024 entries (about632 KiB here). It never evicts recovery data; at capacity,
-new writes refuse and existing undo remains available.
+The journal starts at 32 bytes on this host, grows lazily from 4 entries and caps
+at 1024 entries (about 632 KiB here). It retains every record for the current
+target/image: at capacity, new writes refuse and existing undo remains available.
+After restart or exec, the first write that passes preflight releases the old
+incarnation's recovery records and starts again with four slots. Record IDs never
+repeat; an evicted ID reports `JaiWriteUnknown`, never a different operation.
+Before eviction, an old incarnation's ID reports `JaiWriteTargetChanged`.
+Failed preflight preserves the existing history. The copied audit ring is separate.
 
 `xjai_write_undo` requires the same session, target incarnation and executable
 image. A restart must change the incarnation even if a PID or image number is
@@ -603,7 +611,7 @@ not atomic, and do not prove that an allocation still has the same lifetime.
 `scripts/build test-jai-journal -Doptimize=ReleaseSafe` is a fast component test
 using owned synthetic storage. It checks overlapping writes, partial effects,
 readback failures, scope/destination/identity refusals, changed bytes, raw
-recovery, and undo at full capacity. `--wrong-oracle` expects78 after writing77
+recovery, and undo at full capacity. `--wrong-oracle` expects 78 after writing 77
 and must fail with NDEBUG too. `tests/jai-journal-fuzz.c` belongs to the periodic
 lane; it varies failure modes and overlapping ranges and requires reverse-order
 recovery to restore every owned byte, while protected bytes never change.
@@ -629,7 +637,7 @@ xodb --break discovery_ready --break discovery_changed -- .work/jai-write-demo/f
 
 Continue to the first breakpoint. In `manual.json`, use `base` and `size` for
 `Y`, `L ADDRESS LENGTH`; filter `/ FixtureTypedChild`, then `G` the first
-`candidates` address. `W health 123` changes22 to123; `Shift+U` restores22. This
+`candidates` address. `W health 123` changes 22 to 123; `Shift+U` restores 22. This
 fixture is synthetic C emitting the documented RTTI, not a real Jai compiler.
 
 MCP names are provider-neutral:
@@ -637,7 +645,7 @@ MCP names are provider-neutral:
 - `write_runtime_field(id, generation, type_name|type_address, address, path, value,
   raw=false)` uses the retained context and an explicit string value. Addresses
   are hex strings. A raw value is exactly two hex digits per target byte.
-- `list_runtime_writes(start=0, limit=32)` pages at most128 journal entries. It
+- `list_runtime_writes(start=0, limit=32)` pages at most 128 journal entries. It
   includes original before/requested bytes, latest observed bytes/outcome,
   original/latest actor and client, undone state and current-target applicability.
 - `undo_runtime_write(write_id, generation, raw=false)` restores original bytes.
@@ -659,11 +667,36 @@ error remains visible even if `verified` proves that the requested bytes are now
 present. `generation_after` in the change is the readback generation, before the
 session's audit event; use the reply's outer generation for the next request.
 `get_audit` includes the same copied change on each accepted write/undo attempt.
-The256-entry audit ring may rotate; the1024-entry write journal never evicts
-original recovery bytes during the session.
+The 256-entry audit ring may rotate; the 1024-entry write journal retains
+original recovery bytes for its current target/image, until the first valid write
+against a new incarnation releases the old records.
 
 Fast owned tests: `tests/jai-writes-live.py` covers local/agent and stdio/shared
 paths; `tests/jai-writes-gui.py` runs on a private display. `tests/jai-demo.py
 --writes` checks the stripped native oracle; add `--kind pe --wine wine` for the
 periodic Wine lane. The fixture itself checks that undo restored its original
 health before continuing.
+
+
+## Periodic checks and shared presentation
+
+`python3 -B tests/jai-fuzz.py --work .work/jai-fuzz --cases 2000` compiles the
+six synthetic harnesses (layout, graph reader, values, containers, write plans
+and journal) with Clang/libFuzzer, ASan and UBSan. Each has a fixed case count,
+512-byte input cap, per-input timeout and process deadline. This is registered
+only in `scripts/release-check periodic`; failures remain failures and their
+logs/corpus/reproduction inputs stay in the work directory. No private image
+is used as a seed.
+
+The shared watch pane uses compact rows below 960 pixels of content width,
+with selected type/context information on separate lines. This applies to all
+languages because the expression, frame provenance, value and failure reason
+compete for the same limited space. Reserving up to 220 pixels for the frame tag
+and 320 for the expression leaves the remaining width for the value; selecting
+a row gives its diagnostic a separate detail line. The runtime type work
+uses this existing shared layout rather than introducing a Jai-only watch style.
+
+Typed write paths currently name direct members: use `base.health` for a field
+inside a `using base` member, even when reads display the flattened `health`.
+An MCP value retained before a write becomes stale; cast it again at the reply's
+current generation. GUI watches re-evaluate automatically.

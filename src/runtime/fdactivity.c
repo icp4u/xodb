@@ -11,10 +11,11 @@
 #define DEMAND_NS UINT64_C(3000000000)
 struct xrt_fdactivity {
     pthread_t thread;
+    struct xrt_fdflow_owner *flow;
     pthread_mutex_t lock;
     pthread_cond_t wake;
     atomic_bool stop;
-    uint64_t wanted_until, fast_until, event_until, poll_all_until, graph_until;
+    uint64_t wanted_until, fast_until, event_until, poll_all_until, graph_until, fdinfo_until, flow_until;
     int32_t scope_pids[XRT_FD_INTEREST_MAX];
     uint32_t scope_count;
     struct { int32_t pid; uint64_t until; } poll_interest[XRT_FD_INTEREST_MAX];
@@ -62,6 +63,8 @@ static int inode_compare(const void *left, const void *right)
 }
 static enum xrt_status scoped_peers(const struct xrt_fd_snapshot *s, struct xrt_unix_peers *out)
 {
+    out->started_ns=now_ns(CLOCK_MONOTONIC);
+    const uint64_t deadline=out->started_ns+250000000u;
     uint32_t inodes[256], count=0;
     uint32_t process=0;
     for (uint32_t i=0;i<s->fd_count;++i) {
@@ -80,18 +83,17 @@ static enum xrt_status scoped_peers(const struct xrt_fd_snapshot *s, struct xrt_
     out->capacity=count;
     for (uint32_t i=0;i<count;++i) {
         struct xrt_unix_peers one={0};
-        enum xrt_status status=xrt_unix_peers_read(inodes[i],1,&one);
+        enum xrt_status status=xrt_unix_peers_read_until(inodes[i],1,deadline,&one);
+        out->taken_ns=one.taken_ns;out->bytes+=one.bytes;
         if (status!=XRT_OK) {
             /* TCP/UDP descriptors have no AF_UNIX record. */
             if (one.error==ENOENT) {xrt_unix_peers_free(&one);continue;}
             out->reason=one.reason;out->error=one.error;out->count=0;
             xrt_unix_peers_free(&one);return status;
         }
-        if (!out->started_ns) out->started_ns=one.started_ns;
-        out->taken_ns=one.taken_ns;out->bytes+=one.bytes;
         out->rows[out->count++]=one.rows[0];xrt_unix_peers_free(&one);
     }
-    out->complete=1;return XRT_OK;
+    out->taken_ns=now_ns(CLOCK_MONOTONIC);out->complete=1;return XRT_OK;
 }
 static void *owner(void *opaque)
 {
@@ -108,6 +110,8 @@ static void *owner(void *opaque)
         pthread_mutex_lock(&a->lock);
         const int wanted = now < a->wanted_until, event_wanted = now < a->event_until;
         const int graph_wanted = now < a->graph_until;
+        const int flow_wanted = now < a->flow_until;
+        const int fdinfo_wanted = now < a->fdinfo_until;
         const uint32_t interval = now < a->fast_until ? 250 : 1000;
         const uint64_t generation = a->requested_generation, start = a->requested_start;
         const int32_t pid = a->requested_pid;
@@ -175,6 +179,7 @@ static void *owner(void *opaque)
             if (poller) {
                 xrt_fdscan_budget(poller, interval == 250 ? 5 : 10);
                 xrt_fdscan_cgroups(poller, graph_wanted);
+                xrt_fdscan_fdinfo(poller, fdinfo_wanted);
                 (void)xrt_fdscan_interest(poller, foreground, nforeground, all_foreground);
                 struct xrt_fd_snapshot snapshot;
                 poll_status = xrt_fdscan_poll(poller, &snapshot);
@@ -182,6 +187,12 @@ static void *owner(void *opaque)
                     copy = xrt_fd_snapshot_copy(&snapshot);
                     if (!copy)
                         poll_status = XRT_OUT_OF_MEMORY;
+                    if (copy && (graph_wanted || flow_wanted)) {
+                        struct xrt_fdflow_bindings *bindings = NULL;
+                        if (xrt_fdflow_bindings_create(copy, &bindings) == XRT_OK &&
+                            xrt_fdflow_owner_bind(a->flow, bindings) != XRT_OK)
+                            xrt_fdflow_bindings_free(bindings);
+                    }
                     if (copy && graph_wanted) {
                         peer_status = a->scope_count ? scoped_peers(copy, &peers) : xrt_unix_peers_read(0, 262144, &peers);
                         graph_status = xrt_fdgraph_build(copy, peer_status == XRT_OK ? peers.rows : NULL,
@@ -234,6 +245,7 @@ static void *owner(void *opaque)
     pthread_mutex_lock(&a->lock);
     pthread_mutex_unlock(&a->lock);
     xrt_fdevent_close(events);
+    xrt_fdflow_owner_destroy(a->flow);
     xrt_fdscan_destroy(poller);
     xrt_fd_snapshot_free((struct xrt_fd_snapshot *)a->view.poll);
     xrt_fdgraph_free((struct xrt_fdgraph *)a->view.graph);
@@ -283,6 +295,14 @@ enum xrt_status xrt_fdactivity_create_scoped(const struct xrt_fdactivity_options
         free(a);
         return XRT_OUT_OF_MEMORY;
     }
+    enum xrt_status flow_status = xrt_fdflow_owner_create(
+        a->scope_count ? a->scope_pids : NULL, a->scope_count, &a->flow);
+    if (flow_status != XRT_OK) {
+        pthread_cond_destroy(&a->wake);
+        pthread_mutex_destroy(&a->lock);
+        free(a);
+        return flow_status;
+    }
     pthread_attr_t thread_attr;
     error = pthread_attr_init(&thread_attr);
     if (!error) {
@@ -292,6 +312,7 @@ enum xrt_status xrt_fdactivity_create_scoped(const struct xrt_fdactivity_options
         pthread_attr_destroy(&thread_attr);
     }
     if (error) {
+        xrt_fdflow_owner_destroy(a->flow);
         pthread_cond_destroy(&a->wake);
         pthread_mutex_destroy(&a->lock);
         free(a);
@@ -316,7 +337,9 @@ enum xrt_status xrt_fdactivity_request(struct xrt_fdactivity *a,
 {
     if (!a || !r || (r->interval_ms != 250 && r->interval_ms != 1000) || r->event_pid < 0 ||
         r->poll_pid_count > XRT_FD_INTEREST_MAX || (r->poll_pid_count && !r->poll_pids) ||
-        ((r->event_pid == 0) != (r->event_start == 0)) || (r->stop_events && r->event_pid))
+        ((r->event_pid == 0) != (r->event_start == 0)) || (r->stop_events && r->event_pid) ||
+        (r->fdinfo_all != 0 && r->fdinfo_all != 1) ||
+        (r->flow != 0 && r->flow != 1) || (r->stop_flow != 0 && r->stop_flow != 1) || (r->flow && r->stop_flow))
         return XRT_INVALID_ARGUMENT;
     for (uint32_t i = 0; i < r->poll_pid_count; ++i)
         if (r->poll_pids[i] <= 0) return XRT_INVALID_ARGUMENT;
@@ -328,10 +351,20 @@ enum xrt_status xrt_fdactivity_request(struct xrt_fdactivity *a,
         pthread_mutex_unlock(&a->lock);
         return XRT_INVALID_STATE;
     }
+    if (r->flow || r->stop_flow) {
+        enum xrt_status status = xrt_fdflow_owner_request(a->flow, r->flow);
+        if (status != XRT_OK) {
+            pthread_mutex_unlock(&a->lock);
+            return status;
+        }
+    }
+    if (r->flow) a->flow_until = now + DEMAND_NS;
+    if (r->stop_flow) a->flow_until = 0;
     if (r->stop_events)
         a->event_until = 0;
     a->wanted_until = now + DEMAND_NS;
     if (r->graph) a->graph_until = now + DEMAND_NS;
+    if (r->fdinfo_all) a->fdinfo_until = now + DEMAND_NS;
     if (r->poll_all) a->poll_all_until = now + DEMAND_NS;
     for (uint32_t i = 0; i < r->poll_pid_count; ++i) {
         uint32_t slot = 0;
@@ -362,12 +395,18 @@ int xrt_fdactivity_acquire(struct xrt_fdactivity *a, struct xrt_fdactivity_view 
     if (!a || !view || pthread_mutex_trylock(&a->lock))
         return 0;
     *view = a->view;
+    if (!xrt_fdflow_owner_acquire(a->flow, &view->flow)) {
+        pthread_mutex_unlock(&a->lock);
+        return 0;
+    }
     view->requested_event_generation = a->requested_generation;
     view->event_requested = now_ns(CLOCK_MONOTONIC) < a->event_until;
     return 1;
 }
 void xrt_fdactivity_release(struct xrt_fdactivity *a)
 {
-    if (a)
+    if (a) {
+        xrt_fdflow_owner_release(a->flow);
         pthread_mutex_unlock(&a->lock);
+    }
 }

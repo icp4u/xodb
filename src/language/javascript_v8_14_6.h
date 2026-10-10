@@ -1,13 +1,22 @@
 #ifndef XODB_JAVASCRIPT_V8_14_6_H
 #define XODB_JAVASCRIPT_V8_14_6_H
-/* Supplemental fields for exactly V8 14.6.202.34-node.28, x86-64,
- * TaggedSize=SystemPointerSize=8, pointer compression and sandbox disabled.
+/* Supplemental fields for exactly V8 14.6.202.34 at the embedder patch levels
+ * listed below, x86-64, TaggedSize=SystemPointerSize=8, pointer compression
+ * and sandbox disabled.
  * These are independently transcribed layout facts, not copied reader code.
  * Every source below is in the exact Node v26.8.2 tag:
  * https://github.com/nodejs/node/tree/v26.8.2/deps/v8
  * Related exported constants are checked before any supplemented read.
- */
-#define XJS_V8_VERSION "14.6.202.34-node.28"
+ *
+ * A version string is listed only after its own tag was compared: every file
+ * cited here is byte-identical in v26.10.0 (-node.34) except string.h and
+ * string-inl.h, whose only change is an #include path. No object .tq layout
+ * read here changed (call-site-info.tq gained a flag bit and debug-objects.tq
+ * renamed a field; neither is read), and the stock executables of both
+ * releases export identical v8dbg_* values. Unlisted strings refuse; there
+ * is no prefix or range match. */
+#define XJS_V8_VERSIONS "14.6.202.34-node.28", /* Node 26.8.2 */ \
+                        "14.6.202.34-node.34"  /* Node 26.10.0 */
 /* src/objects/js-array.tq:61-66: JSObject header followed by Number length. */
 #define XJS_V8_ARRAY_LENGTH 24
 /* src/common/globals.h:2108-2118, x86-64 signalling-NaN hole encoding. */

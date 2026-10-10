@@ -5,22 +5,6 @@ const c = @import("../c.zig").api;
 const Session = @import("session.zig").Session;
 const cache = @import("runtime_types.zig");
 pub const max_page = 64;
-pub const Reader = struct {
-    session: *Session,
-    failure: ?anyerror = null,
-    pub fn reader(self: *Reader) c.struct_xjai_live_reader {
-        return .{ .context = self, .read = read, .reads = 0, .bytes = 0 };
-    }
-    fn read(context: ?*anyopaque, address: u64, out: ?*anyopaque, size: usize) callconv(.c) c_int {
-        const self: *Reader = @ptrCast(@alignCast(context.?));
-        const bytes: [*]u8 = @ptrCast(out.?);
-        const got = self.session.target.readMemory(address, bytes[0..size]) catch |err| {
-            self.failure = err;
-            return 0;
-        };
-        return @intFromBool(got == size);
-    }
-};
 pub fn selfField(g: *const c.struct_xjai_graph, index: u32, name: []const u8) !u32 {
     if (index >= g.type_count or name.len == 0 or name.len > 1024) return error.InvalidArguments;
     const t = g.types[index];
@@ -47,15 +31,16 @@ pub const Page = struct {
 pub const State = struct {
     query: ?Query = null,
     pub fn begin(self: *State, session: *Session, entry: cache.Entry, declared: u32, needle: u32, member: u32, address: u64, length: usize) !u64 {
-        return self.beginOwned(session, entry, declared, needle, member, address, length, session.jobRequester());
+        if (length > @import("memory.zig").max_search) return error.InvalidMemoryRange;
+        return self.beginOwned(session, entry, declared, needle, member, &.{.{ .address = address, .length = length }}, session.jobRequester());
     }
-    pub fn beginOwned(self: *State, session: *Session, entry: cache.Entry, declared: u32, needle: u32, member: u32, address: u64, length: usize, requester: @import("../service/job_owner.zig").Requester) !u64 {
+    pub fn beginOwned(self: *State, session: *Session, entry: cache.Entry, declared: u32, needle: u32, member: u32, ranges: []const @import("memory.zig").Range, requester: @import("../service/job_owner.zig").Requester) !u64 {
         try entry.requireStop(session);
         const g = try entry.graph();
         if (needle >= g.type_count or g.types[needle].reason != null or g.types[needle].tag != 7) return error.RuntimeTypeUnproved;
         var pattern: [8]u8 = undefined;
         std.mem.writeInt(u64, &pattern, g.types[needle].address, .little);
-        const id = try session.memory.startSearchOwned(session, address, length, &pattern, requester);
+        const id = try session.memory.startSearchRanges(session, ranges, &pattern, requester);
         self.query = .{ .id = id, .context_id = entry.id, .declared = declared, .needle = needle, .member = member };
         return id;
     }
@@ -74,7 +59,7 @@ pub const State = struct {
         const search = &session.memory.search.?;
         if (search.generation != entry.generation or search.image_epoch != entry.image_epoch) return error.RuntimeTypesStale;
         if (start > search.count or limit == 0 or limit > max_page) return error.InvalidArguments;
-        var context = Reader{ .session = session };
+        var context = cache.LiveReader{ .session = session };
         var reader = context.reader();
         var result = Page{};
         const end = @min(search.count, start + limit);

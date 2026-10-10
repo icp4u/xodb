@@ -137,7 +137,8 @@ offline sessions, irrespective of agent scope.
 | Encoder temporary / retained decoded Zig allocations | 512 MiB each |
 | New offline filtered graph working allocations | 64 MiB |
 | Live recorded snapshot/graph worker | 96 MiB |
-| Owned ELF snapshot | 256 MiB per image; 512 MiB total |
+| Owned ELF/PE snapshots | 256 MiB per image; 512 MiB total, shared |
+| Retained PE parser metadata | 64 MiB total, separate from file snapshots |
 | Mapping path strings | 16 MiB aggregate; 4096 bytes per path |
 | Annotations / graph nodes | 8192 each |
 | Raw evidence | Configured 1–65,536 samples (default 16,384; 32 MiB sample-store budget), 1024 threads, 256 images and mapping/scheduling/interval caps |
@@ -148,7 +149,7 @@ memory outside the retained decoder counter. libdw's own allocations are not
 governed by the Zig budget. A hostile ELF is not isolated in a helper process.
 
 Archive read/hash/decode/annotations and offline graph rebuilds run on the worker.
-Live capture ELF snapshot acquisition is still synchronous during capture opening
+Live capture ELF/PE snapshot acquisition is still synchronous during capture opening
 or observed mapping changes; a large image can add latency, and files over the
 limits remain unresolved. This does not establish large-game/server overhead.
 The debugger's ordinary live-module loading is unchanged.

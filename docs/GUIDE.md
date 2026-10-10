@@ -11,9 +11,10 @@ detailed docs. If you just want to try something, jump to
 | See what is using the machine | **System overview** (`--overview`) | Live CPU, memory, disk, network and processes; unknown values show reasons. **L** opens files, **F** profiles, **Enter** attaches after a cost/access confirmation. `--session-socket PATH` shares the same cache with observer-only MCP clients. |
 | Watch a process's memory get defragmented (THP) | **Memory map** (`xodb --overview --panel memory_map`, **M**; **m** on a Processes row) and the terminal twin `xodb --memdefrag` | A Windows 9x Disk Defragmenter, an MS-DOS DEFRAG screen or a modern grid of 2 MiB cells: THP, 4 KiB, file, swapped, unknown (hatched); collapses, splits and page-state changes stay distinct; coverage, buddy fragmentation and system-wide THP/compaction activity, with the real refresh period ([details](MEMDEFRAG.md)) |
 | Zoom into one process's pages, down to single 4 KiB pages | **Memory map, deep look** (**t** to cycle, or `--look deep`) | Up to 65,536 cells from 2 MiB down to 4 KiB: wheel zoom at the pointer, drag to pan, **0** fit, **[ ]** VMA to VMA, a minimap of the whole address space; pending, unknown and the three change kinds stay distinct; hover shows range, VMA, state bits and the VMA's NUMA totals ([details](OVERVIEW.md#deep-map)) |
+| Find a value anywhere in a stopped process (a score, a name, a pointer) | **Memory** (**M**, **W** all writable, **/** `text:` or `hex:`; MCP `search_memory` with `regions` or `ranges`) | One search over every writable mapping (or a list of ranges), exact hits and readable/unreadable bytes per range ([details](MEMORY_REGISTERS.md)) |
 | Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
-| Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
+| Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS / Ruby / Elisp** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a native value | **Watchpoint investigation** (**W** on a C/C++ field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
@@ -25,6 +26,9 @@ detailed docs. If you just want to try something, jump to
 | Let an AI agent help | **MCP** (`--mcp` or `--session-socket`) | The same tools for an agent; you keep **F8** to take back control |
 | See which files are being read, written, leaked or held after deletion, right now | **lsof-top** (`xodb --lsof-top`, a terminal view) | Top files by bytes/s, processes by fd churn and growth, leak watch, deleted-but-open files and live per-process fd tables, from unprivileged `/proc` polling ([details](LSOF_TOP.md)) |
 | Explore open files visually | **Files & IO** (`xodb --overview --panel files`) | Churn heatmap, seekable progress, fd-growth sparklines and deleted holders. **L** drills in from Processes; exact events require explicit host-cost confirmation ([details](OVERVIEW.md#files-and-exact-events)) |
+| Find paths holding open handles and sampled IO | **FD Treemap** (`xodb --overview --panel treemap`) | **B** opens; click zooms, **Backspace** goes up, **L** opens a sampled holder. **E** stops default live tracing (~11% host cost). Area is handle count ([details](FD_TREEMAP.md)). |
+| Compare parent and child descriptors | **Parent/Child FDs** (`xodb --overview --panel inheritance`) | **I** opens the polling comparison; inspect child CLOEXEC flags, click for its Files table. A sampled match does not prove inheritance. |
+| See shared files and IPC pulse across processes | **FD Graph / Galaxy** (`sudo -E xodb --overview --panel galaxy`) | Default live syscall tracing (~11% host cost); **E** switches to polling, **G/Y** switch graph/galaxy, click to focus, **L** opens Files. Inode joins are sampled; unknown bytes and loss stay visible ([details](OVERVIEW.md#descriptor-graph-and-galaxy)) |
 | Ask which process holds a file, or count one process's descriptor IO | **FD observers over MCP** (`get_fd_activity`, `who_has_open`, `get_fd_leaks`, `get_deleted_open`) | Shared cached polling; exact events require explicit control and slow host-wide syscalls while active. Coverage, age, loss and cost accompany the data ([details](MCP_FD.md)) |
 | Ask "what feeds this value?" or "what controls this call?" | **Static slice** (**S** on an instruction or source line; `slice_value` over MCP) | The parameters, values and branches that can reach it, with instruction and source citations and a trust label. Static possibilities, not an observed run ([details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 
@@ -265,6 +269,7 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` or `values[0]` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
 | Inside a Rails model | `XODB_RAILS_GEMS=DIR ./scripts/demo-rails` (activemodel installed in DIR, see [Ruby](RUBY.md#rails-demo)) | **Space**, **Tab** to **Ruby**, click **checkout!**, **E** `attrs` **Return**; click **valid?** for `validations.rb:367`; back on **checkout!**, **Shift+E** `attrs[:line_items][0][:price]` **Return**, then **Space**. |
 | Goroutines in a Go program | `./scripts/demo-go` | **Space**, **Go**, select **main.blocked** for a goroutine parked on a mutex; workers sit in `select`, one goroutine sleeps. **C/C++** shows `label`, `items` (len/cap) and `first` (struct). |
+| Inside Emacs Lisp | `./scripts/demo-emacs` | **Space**, **Elisp**, select **xodb-demo-checkpoint** for its label; nearby **let** rows show task titles, points and dynamic stage. **Space** visits two items, rendering, then a handled error. [Walkthrough](ELISP.md#try-the-demo). |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
@@ -277,6 +282,34 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Debug a LoongArch64 program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a LoongArch64 Linux host or QEMU loongarch64 | **Space** runs to the breakpoint. Assembly is shown when xodb was built with `-Dcapstone=vendored` after `scripts/build-capstone`; with the default system Capstone, MCP `disassemble` reports `DisassemblerUnavailable` and the assembly pane stays empty. Instruction step and hardware watches report unsupported. Remove the breakpoint before continuing |
 | Debug a ppc64le program from x86 | `xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program` against a little-endian ELFv2 POWER host or QEMU ppc64le | **Space** runs to the breakpoint. A function breakpoint stops at the ELFv2 local entry when the symbol has one. Assembly is shown with the system Capstone. Instruction step works where `PTRACE_SINGLESTEP` stops. Hardware watches report unsupported. Remove the breakpoint before continuing |
 | Debug through gdbserver or QEMU | `xodb --gdb-remote 127.0.0.1:2345` after preparing the stub | Inspect raw registers/memory and use address breakpoints; see [GDB_REMOTE.md](GDB_REMOTE.md) for supported targets and QEMU interrupt limits |
+
+## The window is blank
+
+A window that opens but stays empty is almost always a GPU mix-up, and xodb says so on stderr in
+one line that starts with `xodb: vulkan:`. Run it from a terminal and look for that line.
+
+| What stderr says | What happened | What to do |
+|---|---|---|
+| `driver libGLX_nvidia.so.0 failed to load (driver/library mismatch ...)` | A GPU driver was updated without a reboot, so its library and kernel module disagree. Vulkan dropped that GPU and xodb drew on another one | Reboot, or reinstall the driver. Until then pick a device that reaches your screen with `--vk-device` |
+| `rendering on X, which is not the display GPU (drm 226:1, Y)` | The compositor draws with Y, but xodb is on X. Some pairs can hand frames across, some show nothing | `--vk-device Y`, or drop a `--vk-device` / `XODB_VK_DEVICE` you set earlier |
+| `no Vulkan device matches "..."` | `--vk-device` or `XODB_VK_DEVICE` names nothing in the list printed below it | Use an index or a name from that list |
+| nothing | xodb is on the display GPU, or the compositor did not say which GPU it uses | `--vk-list`, then try each device |
+
+Three controls:
+
+- `xodb --vk-list` prints every Vulkan device with its kind, DRM node, whether it can present to a
+  window here, which one is the display GPU, and a `*` on the one xodb uses. It needs no target.
+- `--vk-device INDEX|NAME` picks a device by its `--vk-list` index or by any part of its name
+  (`--vk-device nvidia`, `--vk-device llvmpipe`). It works with `--overview` too.
+- `XODB_VK_DEVICE=INDEX|NAME` does the same from the environment; the flag wins.
+
+Without a request xodb uses the device behind the compositor's GPU (from the compositor's
+linux-dmabuf feedback, matched to the device's DRM node). If the compositor does not say, or no
+Vulkan device matches, it takes the first discrete GPU, then an integrated one, then anything
+that can present. Indexes follow the driver's order, which can differ between sessions; names do not.
+
+`llvmpipe` draws on the CPU and reaches any display, so `--vk-device llvmpipe` is a slow but safe
+way to get a picture while a driver is broken.
 
 ## Where to go next
 
@@ -374,3 +407,12 @@ and open a typed address with `G` or Return on a candidate. `W` accepts
 `Shift+U` restores the latest original value; plain `U` does nothing. After `F8`,
 a human can also undo an agent write. See [JAI.md](JAI.md#live-field-editing-and-recovery)
 for a runnable owned fixture, MCP mutate-scope commands and conflict semantics.
+
+### Emacs Lisp stack
+
+A supported GNU Emacs 31.1 debug build exposes an **Elisp** tab at a stopped
+main thread. See [ELISP.md](ELISP.md) for an owned batch example, layout
+requirements, argument counts and control records. Proved interpreted/bytecode
+frames link to live C argument storage; other boundaries remain explicitly
+unknown. Bounded Lisp values are available from native Lisp_Object expressions;
+per-frame dynamic and saved lexical bindings appear in the Elisp pane.

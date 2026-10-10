@@ -2,7 +2,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-struct xjai_write_journal { struct xjai_write_record *records;size_t count,capacity; };
+struct xjai_write_journal {
+    struct xjai_write_record *records;
+    size_t count,capacity;
+    uint64_t last_id;
+};
 static int range_valid(uint64_t at,size_t n) {return at && n && n<=XJAI_WRITE_BYTES && at<=UINT64_MAX-n;}
 const char *xjai_write_destination(xjai_mapping_fn query,void *ctx,
     const struct xjai_write_range *protected_ranges,size_t count,uint64_t at,size_t n)
@@ -29,9 +33,14 @@ struct xjai_write_journal *xjai_write_journal_create(void) {return calloc(1,size
 void xjai_write_journal_free(struct xjai_write_journal *j) {if (j) {free(j->records);free(j);}}
 size_t xjai_write_journal_count(const struct xjai_write_journal *j) {return j?j->count:0;}
 size_t xjai_write_journal_bytes(const struct xjai_write_journal *j) {return j?sizeof *j+j->capacity*sizeof *j->records:0;}
+const struct xjai_write_record *xjai_write_journal_at(const struct xjai_write_journal *j,size_t index)
+{
+    return j && index<j->count?&j->records[index]:NULL;
+}
 const struct xjai_write_record *xjai_write_journal_get(const struct xjai_write_journal *j,uint64_t id)
 {
-    return j && id && id<=j->count?&j->records[id-1]:NULL;
+    if (!j || !id || id>j->last_id || j->last_id-id>=j->count) return NULL;
+    return &j->records[j->count-1-(size_t)(j->last_id-id)];
 }
 static int same_target(const struct xjai_write_stamp *a,const struct xjai_write_stamp *b)
 {
@@ -103,14 +112,22 @@ const char *xjai_write_apply(struct xjai_write_journal *j,const struct xjai_writ
     memset(change,0,sizeof *change);const char *why=arguments(s,io,raw);
     if (why) return change->reason=why;
     if (!j || !plan || !range_valid(plan->address,plan->size) || !path || !pn || pn>XJAI_WRITE_PATH || memchr(path,0,pn)) return change->reason="JaiWriteInvalidArguments";
-    if (j->count==XJAI_WRITE_RECORDS) return change->reason="JaiWriteJournalFull";
+    /* A session has one current target/image. Retain every recovery record for
+       it, but release the previous incarnation on the first valid new write.
+       IDs remain monotonic so a retained old ID can never refer to new bytes. */
+    int changed=j->count && !same_target(&j->records[0].initial,s);
+    if (!changed && j->count==XJAI_WRITE_RECORDS) return change->reason="JaiWriteJournalFull";
+    if (j->last_id==UINT64_MAX) return change->reason="JaiWriteIdLimit";
     change->address=plan->address;change->size=plan->size;change->raw=raw;change->before_generation=s->generation;
     memcpy(change->requested,plan->bytes,plan->size);
     if ((why=preflight(io,s,change))) return change->reason=why;
+    if (changed) {
+        free(j->records);j->records=NULL;j->count=0;j->capacity=0;
+    }
     if ((why=reserve(j))) return change->reason=why;
     if ((why=before_write(io,s,change))) return change->reason=why;
     struct xjai_write_record *r=&j->records[j->count];memset(r,0,sizeof *r);
-    r->id=++j->count;r->initial=*s;r->plan=*plan;r->raw=raw;
+    r->id=++j->last_id;++j->count;r->initial=*s;r->plan=*plan;r->raw=raw;
     memcpy(r->path,path,pn);memcpy(r->before,change->before,plan->size);
     return perform(r,s,io,change);
 }
@@ -120,8 +137,8 @@ const char *xjai_write_undo(struct xjai_write_journal *j,uint64_t id,int raw,
     if (!change) return "JaiWriteInvalidArguments";
     memset(change,0,sizeof *change);const char *why=arguments(s,io,raw);
     if (why) return change->reason=why;
-    if (!j || !id || id>j->count) return change->reason="JaiWriteUnknown";
-    struct xjai_write_record *r=&j->records[id-1];
+    if (!xjai_write_journal_get(j,id)) return change->reason="JaiWriteUnknown";
+    struct xjai_write_record *r=&j->records[j->count-1-(size_t)(j->last_id-id)];
     if (!same_target(&r->initial,s)) return change->reason="JaiWriteTargetChanged";
     if (r->undone) return change->reason="JaiWriteAlreadyUndone";
     change->address=r->plan.address;change->size=r->plan.size;change->raw=raw;change->undo=1;change->before_generation=s->generation;

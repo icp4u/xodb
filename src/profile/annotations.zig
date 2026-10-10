@@ -8,5 +8,5 @@ pub const Record = struct {
     site: ?info.Site = null,
     source_error: []const u8 = "",
 };
-pub const resolver = "xodb-elf-symbols-libdw-lines-v1";
-pub const basis = "derived at archive finalization from retained immutable ELF snapshots; source text not archived";
+pub const resolver = "xodb-elf-pe-symbols-libdw-lines-v2";
+pub const basis = "derived at archive finalization from retained immutable ELF/PE snapshots; source text not archived";

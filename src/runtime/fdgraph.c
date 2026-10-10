@@ -89,10 +89,15 @@ static int graph_groups(const struct xrt_fd_snapshot *s,struct xrt_fdgraph *g)
         g->groups[i]=(UINT64_C(1)<<63)|((uint64_t)i+1);
         if (i>=s->process_count) continue;
         const struct xrt_fd_process *p=&s->processes[i];
-        if ((p->flags&XRT_FDP_STALE) || p->cgroup_status!=XRT_FD_CGROUP_CURRENT || !p->cgroup_length ||
+        if ((p->cgroup_status!=XRT_FD_CGROUP_CURRENT && p->cgroup_status!=XRT_FD_CGROUP_STALE) || !p->cgroup_length ||
             !s->strings || p->cgroup>=s->strings_length || p->cgroup_length>=s->strings_length-p->cgroup) continue;
         const char *path=s->strings+p->cgroup;
         if (path[0]!='/' || path[p->cgroup_length] || memchr(path,0,p->cgroup_length)) continue;
+        /* A carried path remains useful for grouping, but never becomes fresh
+         * merely because another process still reports the same path. */
+        if (p->cgroup_status==XRT_FD_CGROUP_STALE || (p->flags&XRT_FDP_STALE)) {
+            ++g->cgroup_stale_processes;g->nodes[i].flags|=XRT_FDG_CGROUP_STALE;
+        } else ++g->cgroup_processes;
         keys[count++]=(struct cgroup_key){path,i};
     }
     qsort(keys,count,sizeof *keys,cgroup_compare);
@@ -100,7 +105,7 @@ static int graph_groups(const struct xrt_fd_snapshot *s,struct xrt_fdgraph *g)
         if (!i || strcmp(keys[i-1].path,keys[i].path)) ++g->cgroup_count;
         g->groups[keys[i].process]=g->cgroup_count;
     }
-    g->cgroup_processes=count;free(keys);return 1;
+    free(keys);return 1;
 }
 enum xrt_status xrt_fdgraph_build(const struct xrt_fd_snapshot *s,
                                  const struct xrt_unix_peer *peers,uint32_t peer_count,
@@ -288,6 +293,7 @@ enum xrt_status xrt_fdgraph_project(const struct xrt_fdgraph *g,
         ++s->processes;s->descriptors+=g->nodes[process].descriptors;
         if (g->nodes[process].flags&XRT_FDG_DENIED) ++s->denied;
         if (g->nodes[process].flags&XRT_FDG_STALE) ++s->stale;
+        if (g->nodes[process].flags&XRT_FDG_CGROUP_STALE) ++s->cgroup_stale;
     }
     v->star_count=count ? at+1 : 0;v->represented_processes=count;
     uint32_t base=v->star_count*XRT_FD_KINDS;

@@ -97,6 +97,17 @@ try:
  restart_id=field(value='222')['id'];c.action('restart');c.stopped()
  changed=undo(restart_id,raw=True);assert changed['reason']=='JaiWriteTargetChanged' and not changed['write_attempted'],changed
  assert all(not r['same_target'] for r in journal()),journal()
+ # The first write in the new incarnation evicts old recovery data while IDs
+ # remain monotonic. Pagination uses row positions, never an assumed ID+1.
+ c.action('continue');restarted=c.stopped('breakpoint')
+ if server:server.remember_target(restarted)
+ truth=json.loads(oracle.read_text());ident=load();assert health()==22
+ fresh=field(value='333');assert fresh['verified'] and fresh['id']>restart_id and health()==333,fresh
+ rows=journal();assert len(rows)==1 and rows[0]['id']==fresh['id'] and rows[0]['same_target'],rows
+ page=c.inspect('list_runtime_writes',start=0,limit=1);assert page['total']==1 and page['next'] is None and page['rows']==rows,page
+ assert c.inspect('list_runtime_writes',start=1,limit=1)['rows']==[]
+ unknown=undo(restart_id,raw=True);assert unknown['reason']=='JaiWriteUnknown' and not unknown['write_attempted'],unknown
+ assert undo(fresh['id'])['verified'] and health()==22
  report['after']=usage();report['records']=len(journal());report['status']='pass'
 finally:
  if server:server.close()

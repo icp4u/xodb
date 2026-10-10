@@ -55,9 +55,15 @@ def former_theme_hotkey(d):
 
 
 def pixel(d, name, expected):
-    shot = d.shot(name)
-    with Image.open(shot) as image:
-        actual = image.convert('RGB').getpixel((2, 82))
+    # A mapped, focused window may not be composited yet: wait for the colour, bounded.
+    deadline = time.monotonic() + 5
+    while True:
+        shot = d.shot(name)
+        with Image.open(shot) as image:
+            actual = image.convert('RGB').getpixel((2, 82))
+        if max(abs(a-b) for a, b in zip(actual, expected)) <= 2 or time.monotonic() > deadline:
+            break
+        time.sleep(.025)  # condition polling only
     assert max(abs(a-b) for a, b in zip(actual, expected)) <= 2, (name, actual, expected, shot)
     return shot
 

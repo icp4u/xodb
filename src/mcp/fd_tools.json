@@ -243,6 +243,58 @@
     }
   },
   {
+    "name": "get_fd_inheritance",
+    "description": "Compare cached parent/child descriptors at the same fd number and kind/device/inode. A match does not prove inheritance, a shared open file description, or survival across exec. Requests fresh fdinfo flags within the existing scan budget; never starts tracing. pid filters by child, counts describe the whole cache. No paths or process names are returned.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 50
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Filtered row offset; nonzero requires sequence from the preceding page."
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Require this exact cached snapshot for pagination; live updates invalidate an earlier sequence."
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        },
+        "interval_ms": {
+          "type": "integer",
+          "enum": [
+            250,
+            1000
+          ],
+          "default": 1000,
+          "description": "Request a shared polling interval for three seconds. Fast mode uses a 5 ms scan budget; normal mode 10 ms. Partial and stale coverage is explicit."
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
     "name": "start_fd_events",
     "description": "Start or renew one explicit 3-second capture; requires control (and the shared-session lease). exact mode slows all syscalls on this machine by roughly 10 % while active. Syscall-heavy targets may slow much more. Explicit cost acknowledgement required every renewal.",
     "inputSchema": {
@@ -285,6 +337,39 @@
     "annotations": {
       "readOnlyHint": false,
       "xodbSessionAccess": "controller"
+    }
+  },
+  {
+    "name": "get_fd_treemap",
+    "description": "Read the bounded path treemap of cached descriptors. Area is handle count, not bytes; equal paths do not prove equal inodes. Never starts or renews tracing. Non-root node IDs require the sequence returned by the previous call. At most 4096 nodes, 1 MiB names and 32 output tiles; capped paths remain counted as unexpanded. Read system_flow for coverage and host tracing cost.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "node": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 32,
+          "default": 16
+        },
+        "redact": {
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
     }
   }
 ]

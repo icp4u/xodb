@@ -40,7 +40,7 @@ pub const Font = struct {
     }
     /// Embedded, freely redistributable bitmap face; independent of host fonts.
     pub fn initRetro(self: *Font) !void {
-        const data = @embedFile("assets/spleen-8x16.bdf");
+        const data = retro_bdf;
         self.pixel = true;
         self.retro = true;
         if (c.FT_Init_FreeType(&self.library) != 0) return error.FontLibraryFailed;
@@ -113,6 +113,92 @@ pub const Font = struct {
     }
 };
 
+/// Marks the overview draws that the upstream face lacks (tree twisties and the
+/// check mark), in the same 8x16 cell. They are appended to the embedded BDF at
+/// compile time, so shaping and the atlas treat them like any other glyph.
+const retro_extra =
+    \\STARTCHAR BLACK RIGHT-POINTING SMALL TRIANGLE
+    \\ENCODING 9656
+    \\SWIDTH 500 0
+    \\DWIDTH 8 0
+    \\BBX 8 16 0 -4
+    \\BITMAP
+    \\00
+    \\00
+    \\00
+    \\00
+    \\00
+    \\20
+    \\30
+    \\38
+    \\3C
+    \\38
+    \\30
+    \\20
+    \\00
+    \\00
+    \\00
+    \\00
+    \\ENDCHAR
+    \\STARTCHAR BLACK DOWN-POINTING SMALL TRIANGLE
+    \\ENCODING 9662
+    \\SWIDTH 500 0
+    \\DWIDTH 8 0
+    \\BBX 8 16 0 -4
+    \\BITMAP
+    \\00
+    \\00
+    \\00
+    \\00
+    \\00
+    \\00
+    \\7C
+    \\7C
+    \\38
+    \\38
+    \\10
+    \\00
+    \\00
+    \\00
+    \\00
+    \\00
+    \\ENDCHAR
+    \\STARTCHAR CHECK MARK
+    \\ENCODING 10003
+    \\SWIDTH 500 0
+    \\DWIDTH 8 0
+    \\BBX 8 16 0 -4
+    \\BITMAP
+    \\00
+    \\00
+    \\00
+    \\00
+    \\03
+    \\06
+    \\06
+    \\0C
+    \\CC
+    \\78
+    \\78
+    \\30
+    \\00
+    \\00
+    \\00
+    \\00
+    \\ENDCHAR
+;
+const retro_extra_count = 3;
+const retro_bdf = blk: {
+    @setEvalBranchQuota(200_000);
+    const base = @embedFile("assets/spleen-8x16.bdf");
+    const key = "\nCHARS ";
+    const at = std.mem.indexOf(u8, base[0..4096], key).? + key.len;
+    const eol = std.mem.indexOfScalarPos(u8, base, at, '\n').?;
+    const end = std.mem.lastIndexOf(u8, base[base.len - 64 ..], "ENDFONT").? + base.len - 64;
+    const total = (std.fmt.parseInt(u32, base[at..eol], 10) catch unreachable) + retro_extra_count;
+    break :blk base[0..at] ++ std.fmt.comptimePrint("{d}", .{total}) ++ base[eol..end] ++ retro_extra ++ "\nENDFONT\n";
+};
+
 test "pixel glyph atlas has binary nonempty coverage" {
     const font = try std.testing.allocator.create(Font);
     defer std.testing.allocator.destroy(font);
@@ -154,4 +240,49 @@ test "bundled bitmap font switches atomically and restores the overview font" {
     try std.testing.expect(!font.retro and !font.pixel);
     try font.selectOverview(a, "missing-overview-font", true);
     try std.testing.expect(font.retro and font.pixel and font.dirty);
+}
+
+// Non-ASCII marks in overview source that the bundled face must cover, so the
+// classic skin never shows a missing-glyph box for its own labels.
+test "bundled bitmap font covers every mark the overview source draws" {
+    const a = std.testing.allocator;
+    const font = try a.create(Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.initRetro();
+    defer font.deinit();
+    const sources = [_][]const u8{
+        @embedFile("../ui/overview/actions.zig"),     @embedFile("../ui/overview/deepmap.zig"),
+        @embedFile("../ui/overview/draw.zig"),        @embedFile("../ui/overview/files_model.zig"),
+        @embedFile("../ui/overview/files_panel.zig"), @embedFile("../ui/overview/graph_model.zig"),
+        @embedFile("../ui/overview/graph_panel.zig"), @embedFile("../ui/overview/history.zig"),
+        @embedFile("../ui/overview/inheritance_panel.zig"), @embedFile("../ui/overview/memmap.zig"),
+        @embedFile("../ui/overview/model.zig"),       @embedFile("../ui/overview/panels.zig"),
+        @embedFile("../ui/overview/sysstat.zig"),     @embedFile("../ui/overview/theme.zig"),
+        @embedFile("../ui/overview/treemap_model.zig"), @embedFile("../ui/overview/treemap_panel.zig"),
+        @embedFile("../ui/overview/view.zig"),        @embedFile("../ui/overview/win95.zig"),
+    };
+    var seen: usize = 0;
+    for (sources) |source| {
+        var lines = std.mem.splitScalar(u8, source, '\n');
+        while (lines.next()) |line| {
+            // Comments are not drawn; a trailing one ends the scanned text.
+            const code = line[0 .. std.mem.indexOf(u8, line, "//") orelse line.len];
+            var it = std.unicode.Utf8View.initUnchecked(code).iterator();
+            while (it.nextCodepoint()) |cp| {
+                if (cp < 0x80) continue;
+                seen += 1;
+                if (c.FT_Get_Char_Index(font.face, cp) == 0) {
+                    std.debug.print("bundled font lacks U+{X:0>4} in: {s}\n", .{ cp, std.mem.trim(u8, line, " ") });
+                    return error.MissingGlyph;
+                }
+            }
+        }
+    }
+    try std.testing.expect(seen > 50);
+    // The added marks have ink and stay inside the 8x16 cell.
+    for ([_]u21{ 0x25B8, 0x25BE, 0x2713 }) |cp| {
+        const g = try font.glyph(c.FT_Get_Char_Index(font.face, cp));
+        try std.testing.expect(g.w > 0 and g.w <= 8 and g.h > 0 and g.h <= 16);
+    }
 }

@@ -25,8 +25,9 @@ pub const usage =
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph or galaxy
-    \\  --graph-pid N   restrict descriptor collection to this PID (repeatable); defaults to galaxy
+    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance or treemap
+    \\  Graph/galaxy/treemap starts LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
+    \\  --graph-pid N   restrict descriptor collection and captured threads to these PIDs (repeatable)
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
     \\  --files-start-ticks N  require this exact identity with --files-pid
     \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern or deep (zoomable)
@@ -36,8 +37,9 @@ pub const usage =
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
     \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
     \\  --pause         start paused (replay: show the last frame with full history)
+    \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
-    \\      t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
+    \\      B treemap, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
     \\
 ;
 
@@ -86,7 +88,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--vk-device" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -152,7 +154,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
         o.panel = .files;
     }
     if (o.graph_count > 0) {
-        if (o.replay != null or (o.panel != null and o.panel.? != .graph and o.panel.? != .galaxy)) return error.InvalidGraphScope;
+        if (o.replay != null or (o.panel != null and o.panel.? != .graph and o.panel.? != .galaxy and o.panel.? != .inheritance and o.panel.? != .treemap)) return error.InvalidGraphScope;
         if (o.panel == null) o.panel = .galaxy;
     }
     return o;
@@ -302,6 +304,8 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         if (source == .live) {
             const started = vw.threadNs();
             collector.redact = view.redact;
+            if (view.graph.flow_demand and ((view.panel != .graph and view.panel != .galaxy) or view.paused)) view.graph.stopCapture();
+            if (view.treemap.flow_demand and (view.panel != .treemap or view.paused)) view.treemap.stopCapture();
             if (view.files.event_authorized and (view.panel != .files or view.paused)) view.files.stopCapture();
             if (view.files.refreshStatus(&collector)) window.dirty = true;
             if (view.panel == .files) {
@@ -315,8 +319,8 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
                     if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
                 }
             }
-            if (view.panel == .graph or view.panel == .galaxy) {
-                if (view.graph.refresh(&collector, current, view.paused) catch |err| blk: {
+            if (view.panel == .graph or view.panel == .galaxy or view.panel == .inheritance) {
+                if (view.graph.refresh(&collector, current, view.paused, view.panel != .inheritance) catch |err| blk: {
                     view.setStatus("Graph update failed: {s}", .{@errorName(err)}, current);
                     break :blk false;
                 }) {
@@ -324,8 +328,28 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
                     if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.graph) |graph| {
                         const projection = view.graph.projection.?;
                         std.debug.print("xodb: fdgraph sequence={d} processes={d} descriptors={d} peer_edges={d} stars={d} particles={d} scope_count={d}\n", .{ graph.sequence, graph.processes, graph.member_count, graph.peer_edges, projection.star_count, projection.particle_count, o.graph_count });
+                        var rate: f64 = 0;
+                        if (view.graph.metrics) |metrics| for (metrics.stars[0..metrics.star_count]) |metric| {
+                            rate += metric.read_rate + metric.write_rate;
+                        };
+                        std.debug.print("xodb: fdgraph-flow running={d} requested={d} sequence={d} matched={d} bytes={d} unknown={d} rate={d:.0} lost={d} cpus={d}/{d} status={d}\n", .{ @intFromBool(view.graph.flow_running), @intFromBool(view.graph.flow_requested), view.graph.flow_sequence, if (view.graph.metrics) |metrics| metrics.matched_rows else 0, view.graph.flow_bytes, view.graph.flow_unknown, rate, view.graph.flow_lost, view.graph.flow_active_cpus, view.graph.flow_online_cpus, view.graph.flow_status });
                     };
                 }
+            }
+            if (view.panel == .treemap) {
+                if (view.treemap.refresh(&collector, current, view.paused) catch |err| blk: {
+                    view.setStatus("Treemap update failed: {s}", .{@errorName(err)}, current);
+                    break :blk false;
+                }) {
+                    window.dirty = true;
+                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.treemap.tree) |tree|
+                        std.debug.print("xodb: fdtreemap sequence={d} flow={d} fds={d} nodes={d} focus={d} scope_count={d} running={d} measured={d} read={d} write={d}\n", .{ tree.sequence, tree.flow_sequence, tree.fd_count, tree.count, view.treemap.focus, o.graph_count, @intFromBool(view.treemap.flow_running), tree.nodes[0].total.flow_measured, tree.nodes[0].total.read_bytes, tree.nodes[0].total.write_bytes });
+                }
+            }
+            if (view.panel == .inheritance and view.graph.refreshInheritance()) {
+                window.dirty = true;
+                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.inheritance) |rows|
+                    std.debug.print("xodb: fdinherit sequence={d} matched={d} shown={d} cloexec={d} no_cloexec={d} unknown={d} scope_count={d}\n", .{ rows.sequence, rows.matched, rows.count, rows.cloexec, rows.no_cloexec, rows.flags_unknown, o.graph_count });
             }
             if (view.panel == .memory_map) {
                 if (view.memmap.refresh(gpa, &collector, current, view.paused, view.redact)) window.dirty = true;
@@ -361,6 +385,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         if (current < retry) continue;
         if (!ready) {
             renderer.init(&window) catch |err| {
+                if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
                 std.debug.print("xodb: overview renderer failed: {s}; retrying\n", .{@errorName(err)});
                 retry = current + 1_000_000_000;
                 continue;

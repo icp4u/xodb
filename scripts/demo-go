@@ -25,8 +25,10 @@ a sync.Mutex and one sleeping; main stops at main.marker.
   Space        run to main.marker
   Go tab       (click it, or Tab to cycle) lists goroutines with their state;
                select main.blocked for its parked stack (inlined Mutex.Lock)
-  C/C++ tab    native locals: label (string), items (slice len/cap), first
-               (struct); maps, interfaces and channels say "partial: M2"
+  F10, C/C++   native locals: strings, slices, structs and Go containers
+  E counts Enter, Enter   expand the map entries in a watch
+  E err Enter             concrete interface type/value
+  E results Enter         channel length, capacity and wait queues
   F10 / F11    step over / step in; Space continues to exit
   Shift+Q      quits
 TIPS

@@ -144,8 +144,28 @@ int xjai_journal_fixture_main(int argc,char **argv)
     size_t peak=xjai_write_journal_bytes(j);unsigned long after_rss=rss();s=stamp(&t);unsigned calls=t.writes;
     why(xjai_write_apply(j,&p,"byte",4,0,&s,&io,&c),"JaiWriteJournalFull");CHECK(!c.id && t.writes==calls && xjai_write_journal_count(j)==XJAI_WRITE_RECORDS);
     for (unsigned i=XJAI_WRITE_RECORDS;i>0;--i) {clean_mode(&t);s=stamp(&t);CHECK(!xjai_write_undo(j,i,0,&s,&io,&c));}
-    CHECK(!memcmp(t.bytes,original,sizeof original) && !xjai_write_journal_last(j,&s));CHECK(!clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&end));
-    printf("{\"cpu_ns\":%llu,\"rss_before\":%lu,\"rss_at_capacity\":%lu,\"empty_bytes\":%zu,\"first_write_bytes\":%zu,\"capacity_bytes\":%zu,\"records\":%u}\n",(unsigned long long)((end.tv_sec-start.tv_sec)*1000000000LL+end.tv_nsec-start.tv_nsec),before_rss,after_rss,empty_bytes,first_bytes,peak,XJAI_WRITE_RECORDS);
+    CHECK(!memcmp(t.bytes,original,sizeof original) && !xjai_write_journal_last(j,&s));
+    /* Failed new-target preflight preserves history. A valid new incarnation
+       releases the full old journal; no old ID is ever reused for new bytes. */
+    clean_mode(&t);s=stamp(&t);++s.target_id;t.denied=1;
+    why(xjai_write_apply(j,&p,"byte",4,0,&s,&io,&c),"AgentScopeDenied");
+    CHECK(xjai_write_journal_count(j)==XJAI_WRITE_RECORDS && xjai_write_journal_get(j,1));
+    clean_mode(&t);CHECK(!xjai_write_apply(j,&p,"byte",4,0,&s,&io,&c));
+    id=c.id;CHECK(id==XJAI_WRITE_RECORDS+1 && xjai_write_journal_count(j)==1);
+    CHECK(!xjai_write_journal_get(j,1) && !xjai_write_journal_get(j,XJAI_WRITE_RECORDS));
+    CHECK(xjai_write_journal_get(j,id)->id==id && xjai_write_journal_last(j,&s)==id);
+    CHECK(xjai_write_journal_at(j,0)->id==id && !xjai_write_journal_at(j,1));
+    CHECK(!xjai_write_journal_at(NULL,0) && !xjai_write_journal_at(j,SIZE_MAX));
+    size_t recycled=xjai_write_journal_bytes(j);CHECK(recycled==first_bytes && recycled<peak);
+    unsigned long recycled_rss=rss();
+    s.generation=t.generation;why(xjai_write_undo(j,1,1,&s,&io,&c),"JaiWriteUnknown");
+    CHECK(!xjai_write_undo(j,id,0,&s,&io,&c) && !memcmp(t.bytes,original,sizeof original));
+    s.generation=t.generation;++s.image_epoch;CHECK(!xjai_write_apply(j,&p,"byte",4,0,&s,&io,&c));
+    CHECK(c.id==id+1 && xjai_write_journal_count(j)==1 && !xjai_write_journal_get(j,id));id=c.id;
+    s.generation=t.generation;++s.session_id;CHECK(!xjai_write_apply(j,&p,"byte",4,0,&s,&io,&c));
+    CHECK(c.id==id+1 && xjai_write_journal_count(j)==1 && !xjai_write_journal_get(j,id));
+    CHECK(!clock_gettime(CLOCK_PROCESS_CPUTIME_ID,&end));
+    printf("{\"cpu_ns\":%llu,\"rss_before\":%lu,\"rss_at_capacity\":%lu,\"rss_recycled\":%lu,\"empty_bytes\":%zu,\"first_write_bytes\":%zu,\"capacity_bytes\":%zu,\"recycled_bytes\":%zu,\"records\":%u}\n",(unsigned long long)((end.tv_sec-start.tv_sec)*1000000000LL+end.tv_nsec-start.tv_nsec),before_rss,after_rss,recycled_rss,empty_bytes,first_bytes,peak,recycled,XJAI_WRITE_RECORDS);
     xjai_write_journal_free(j);puts("Jai journal: guarded writes/readback, retained partial effects, identity/conflicts, raw recovery and full-capacity undo PASS");return 0;
 }
 #ifndef JAI_JOURNAL_NO_MAIN

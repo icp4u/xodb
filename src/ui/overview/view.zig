@@ -19,10 +19,10 @@ pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy" };
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -73,7 +73,6 @@ pub const View = struct {
     classic_about: bool = false,
     minimize_requested: bool = false,
     maximize_requested: bool = false,
-    maximized: bool = false,
     panel: Panel = .summary,
     redact: bool = false,
     paused: bool = false,
@@ -81,6 +80,7 @@ pub const View = struct {
     files: files_model.State = .{},
     memmap: memmap.State = .{},
     graph: graph_model.State = .{},
+    treemap: @import("treemap_model.zig").State = .{},
     /// The Memory map looks draw period-styled tooltips.
     tooltip_style: enum { overview, win9x, dos } = .overview,
     current: ?*m.Owned = null,
@@ -146,7 +146,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { classic: win95.Action, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files };
+    pub const Action = union(enum) { classic: win95.Action, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -157,6 +157,7 @@ pub const View = struct {
         self.files.deinit(self.gpa);
         self.memmap.deinit();
         self.graph.deinit();
+        self.treemap.deinit();
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -340,7 +341,7 @@ pub const View = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const View, now: u64) bool {
-        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now));
+        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now));
     }
 
     pub fn setStatus(self: *View, comptime fmt: []const u8, args: anytype, now: u64) void {
@@ -414,9 +415,9 @@ pub const View = struct {
         const c = @import("../../c.zig").api;
         if (w.top) |top| {
             if (self.minimize_requested) c.xdg_toplevel_set_minimized(top);
+            // The compositor owns this state: it may maximize or restore by other means.
             if (self.maximize_requested) {
-                self.maximized = !self.maximized;
-                if (self.maximized) c.xdg_toplevel_set_maximized(top) else c.xdg_toplevel_unset_maximized(top);
+                if (w.maximized) c.xdg_toplevel_unset_maximized(top) else c.xdg_toplevel_set_maximized(top);
             }
         }
         self.minimize_requested = false;
@@ -450,6 +451,8 @@ pub const View = struct {
             self.files.stopCapture();
             return;
         }
+        if (self.panel == .inheritance and (sym == 0xff0d or sym == 0xff8d)) return;
+        if (self.panel == .treemap and @import("treemap_panel.zig").key(self, event)) return;
         if (self.panel == .files and self.filesKey(event, now)) return;
         if ((self.panel == .graph or self.panel == .galaxy) and @import("graph_panel.zig").key(self, event)) return;
         if (self.panel == .memory_map and !self.searching and memmap.key(self, event, now)) return;
@@ -534,6 +537,8 @@ pub const View = struct {
             'f' => self.requestAction(.profile, now),
             'g' => self.show(.graph),
             'y' => self.show(.galaxy),
+            'i' => self.show(.inheritance),
+            'b' => self.show(.treemap),
             'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
@@ -807,6 +812,13 @@ pub const View = struct {
             .events => self.requestAction(.events, now),
             .stop_events => self.files.stopCapture(),
             .memmap => |what| memmap.click(self, what, now),
+            .inheritance_files => |id| {
+                self.files.scope(.{ .pid = id.pid, .start = id.start });
+                self.show(.files);
+            },
+            .treemap_node => |node| self.treemap.select(node),
+            .treemap_up => self.treemap.up(),
+            .treemap_holder => @import("treemap_panel.zig").holder(self),
             .graph_star => |index| self.graph.focusStar(index),
             .graph_resource => |node| @import("graph_panel.zig").openResource(self, node),
             .graph_all => self.graph.all(),
@@ -1231,6 +1243,8 @@ pub const View = struct {
                 .services => .{ .text = if (snapshot.services.len > 0) std.fmt.bufPrint(&vb, "{d} services", .{snapshot.services.len}) catch "" else snapshot.group(.services).reason },
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
+                .treemap => .{ .text = if (self.treemap.tree) |tree| std.fmt.bufPrint(&vb, "{d} handles", .{tree.fd_count}) catch "" else "sampled when shown" },
+                .inheritance => .{ .text = if (self.graph.inheritance) |rows| std.fmt.bufPrint(&vb, "{d} sampled matches", .{rows.matched}) catch "" else "sampled when shown" },
                 .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
                 .memory_map => .{ .text = if (self.memmap.map()) |mm| switch (memmap.md.coverage(mm)) {
                     .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (mm.process == null) "free contiguous" else "THP" }) catch "",
@@ -1672,10 +1686,11 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
                     r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(size[0]), .h = @floatFromInt(size[1]) };
                     v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
                     if (palette == themes.find("win95").? and panel == .summary) {
-                        for (0..3) |overlay| {
-                            v.classic_menu = if (overlay == 0) .start else null;
-                            v.classic_about = overlay == 1;
-                            v.pending_action = if (overlay == 2) .{ .kind = .files, .id = .{ .pid = 7, .start = 1 } } else null;
+                        const menus = comptime std.enums.values(win95.Menu);
+                        for (0..menus.len + 2) |overlay| {
+                            v.classic_menu = if (overlay < menus.len) menus[overlay] else null;
+                            v.classic_about = overlay == menus.len;
+                            v.pending_action = if (overlay == menus.len + 1) .{ .kind = .files, .id = .{ .pid = 7, .start = 1 } } else null;
                             r.vertices = 0;
                             v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
                         }
@@ -1735,4 +1750,56 @@ test "classic scrollbar clamps dragging and routes files separately" {
     v.panel = .files;
     win95.drag(&v);
     try std.testing.expectEqual(@as(usize, 90), v.files.top);
+}
+
+// Fast component lane: geometry properties, no renderer.
+test "classic pull-downs stay inside the window at every size" {
+    for (std.enums.values(win95.Menu)) |menu| {
+        var width: f32 = 80;
+        while (width <= 4000) : (width += if (width < 400) 1 else 37) {
+            for ([_]f32{ 100, 101, 180, 274, 300, 480, 720, 1080, 2160 }) |height| {
+                const place = win95.popupRect(menu, width, height);
+                const q = place.rect;
+                try std.testing.expect(q.x >= 0 and q.y >= 0);
+                try std.testing.expect(q.x + q.w <= width and q.y + q.h <= height + 0.01);
+                try std.testing.expect(q.w == @min(258, width) and place.row > 0);
+                // Roomy windows keep the period position under the menu title.
+                if (width >= 600 and height >= 720 and menu != .start) try std.testing.expectEqual(@as(f32, 12 + @as(f32, @floatFromInt(@intFromEnum(menu))) * 72), q.x);
+            }
+        }
+    }
+}
+
+test "classic scrollbar geometry does not grow with the trough height" {
+    const a = std.testing.allocator;
+    const font = try a.create(Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.initRetro();
+    defer font.deinit();
+    const buffer = try a.alignedAlloc(u8, .@"16", 1024 * 1024);
+    defer a.free(buffer);
+    var r = gpu.Renderer{};
+    r.mapped = buffer.ptr;
+    var v = try View.init(a);
+    defer v.deinit();
+    v.palette = themes.find("win95").?;
+    var used: [2]usize = undefined;
+    for ([_]f32{ 200, 4000 }, &used) |height, *n| {
+        r.vertices = 0;
+        r.clip = .{ .x = 0, .y = 0, .w = 100, .h = height };
+        v.hit_count = 0;
+        try win95.scrollbar(&v, .{ .r = &r, .font = font, .p = v.pal() }, .{ .x = 10, .y = 0, .w = 16, .h = height }, 5, 1000, 20);
+        n.* = r.vertices;
+    }
+    try std.testing.expect(used[0] > 0);
+    try std.testing.expectEqual(used[0], used[1]);
+}
+
+test "maximize state follows the compositor's configure states" {
+    const state = @import("../../platform/wayland.zig").hasState;
+    const none = [_]u32{};
+    try std.testing.expect(!state(&none, 1));
+    try std.testing.expect(!state(&[_]u32{ 4, 5, 6 }, 1)); // activated and tiled edges only
+    try std.testing.expect(state(&[_]u32{ 4, 1 }, 1));
 }

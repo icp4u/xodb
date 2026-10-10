@@ -28,7 +28,7 @@ for line in sys.stdin:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text('#!'+sys.executable+'\n'+fixture.replace('LANGUAGES',repr(languages)))
         path.chmod(0o755)
-    langs = ['python','perl','lua','javascript']
+    langs = ['python','perl','lua','javascript','elisp']
     local, installed, explicit, stale = [work/n for n in ['zig-out/bin/xodb','path/xodb','chosen','old']]
     for path in [local, installed, explicit]:binary(path, langs)
     binary(stale, [])

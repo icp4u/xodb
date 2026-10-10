@@ -10,7 +10,7 @@ const style = @import("style.zig");
 const theme = style.theme;
 const named = @import("../model/language_locals.zig");
 const Editor = @import("watch.zig").Editor;
-const Row = struct { name: []const u8, location: []const u8, reason: ?[]const u8, segment: usize, frame: ?usize };
+const Row = struct { following: usize = 0, name: []const u8, location: []const u8, reason: ?[]const u8, segment: usize, frame: ?usize };
 const Hit = struct { rect: gpu.Rect, segment: usize, frame: usize };
 const SelectedKey = struct { generation: u64, tid: i32, language: tabs.Tab, segment: usize, frame: usize };
 const Key = struct { session: u64, generation: u64, revision: u64, metadata: u64, tid: i32, frame: usize, tab: tabs.Tab };
@@ -77,7 +77,7 @@ pub const Panel = struct {
     pub fn syncEditor(self: *Panel, session: *Session) void {
         if (!self.editor.open) return;
         const selected = selectedKey(session);
-        if (!named.supported(session.language_tabs.selected)) {
+        if (@intFromEnum(session.language_tabs.selected) < 2) {
             self.editor.open = false;
         } else if (self.editor_key == null) {
             // E before a frame is chosen (or after a stop dropped it) still
@@ -85,18 +85,19 @@ pub const Panel = struct {
             // The first frame the user then selects binds the field.
             if (selected != null) {
                 self.editor_key = selected;
-                self.editor.message = "";
+                self.editor.message = if (named.supported(session.language_tabs.selected)) "" else "Elisp expressions unavailable; Esc cancels";
             }
         } else if (selected == null or !std.meta.eql(selected.?, self.editor_key.?)) self.editor.open = false;
     }
     pub fn beginExpression(self: *Panel, session: *Session) !void {
-        if (!named.supported(session.language_tabs.selected)) return error.LanguageLocalsUnavailable;
+        if (@intFromEnum(session.language_tabs.selected) < 2) return error.LanguageLocalsUnavailable;
         self.editor_key = selectedKey(session);
         self.editor_watch = false;
         self.editor.start();
-        if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
+        if (session.language_tabs.selected == .elisp) self.editor.message = "Elisp expressions unavailable; Esc cancels" else if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
     }
     pub fn submitExpression(self: *Panel, session: *Session, text: []const u8) !void {
+        if (session.language_tabs.selected == .elisp) return error.ElispExpressionsUnavailable;
         const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
         if (self.editor_key == null or !std.meta.eql(self.editor_key.?, selected)) return error.StaleLanguageFrame;
         if (text.len == 0 or text.len > self.expression.len) return error.InvalidArguments;
@@ -113,6 +114,7 @@ pub const Panel = struct {
         self.editor.open = false;
     }
     pub fn watchBinding(self: *Panel, session: *Session) !u64 {
+        if (session.language_tabs.selected == .elisp) return error.ElispWatchesUnavailable;
         const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
         if (self.bindings_key == null or !std.meta.eql(self.bindings_key.?, selected)) return error.StaleLanguageFrame;
         const index = self.binding_selected orelse return error.SelectNamedBindingForWatch;
@@ -239,15 +241,39 @@ pub const Panel = struct {
                     self.message = "LanguageFrameLimit";
                     break;
                 }
+                if (@hasField(@TypeOf(frame), "native_binding")) self.message = "C argument links; other links partial";
                 const label = if (@hasField(@TypeOf(frame), "qualified_name"))
                     if (frame.qualified_name) |text| try a.dupe(u8, text) else try std.fmt.allocPrint(a, "{s} [owner unproved]", .{frame.name})
                 else
                     try a.dupe(u8, frame.name);
-                try rows.append(a, .{ .name = label, .location = if (frame.file) |file|
+                const location = if (@hasField(@TypeOf(frame), "argument_count"))
+                    if (frame.argument_count) |n| try std.fmt.allocPrint(a, "{s} / {d} args", .{ frame.kind, n }) else try std.fmt.allocPrint(a, "{s} / unevaluated", .{frame.kind})
+                else if (frame.file) |file|
                     if (frame.line) |line| try std.fmt.allocPrint(a, "{s}:{d}", .{ std.fs.path.basename(file), line }) else try a.dupe(u8, std.fs.path.basename(file))
                 else
-                    "source position unproved", .reason = if (frame.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = frame_index });
+                    "source position unproved";
+                try rows.append(a, .{ .name = label, .location = location, .reason = if (frame.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = frame_index });
                 count += 1;
+                if (@hasField(@TypeOf(frame), "native_binding")) {
+                    if (frame.native_binding) |anchor| {
+                        if (rows.items.len < 128) {
+                            rows.items[rows.items.len - 1].following = 1;
+                            try rows.append(a, .{
+                                .name = try std.fmt.allocPrint(a, "C: {s}", .{anchor.symbol}),
+                                .location = try std.fmt.allocPrint(a, "arguments / native #{d}", .{anchor.frame}),
+                                .reason = null,
+                                .segment = segment_index,
+                                .frame = null,
+                            });
+                        }
+                    }
+                }
+                if (@hasField(@TypeOf(segment), "controls")) {
+                    for (segment.controls) |control| {
+                        if (control.frame == null or control.frame.? != frame_index or rows.items.len == 128) continue;
+                        try rows.append(a, .{ .name = try a.dupe(u8, control.kind), .location = "control record; callback not evaluated", .reason = null, .segment = segment_index, .frame = null });
+                    }
+                }
             }
         }
         if (@hasField(@TypeOf(stack), "native_argument_diagnostics")) {
@@ -299,6 +325,12 @@ pub const Panel = struct {
                 self.message = "OutOfMemory";
             },
             .lua => self.collect(selection.cachedRead(.lua, session, tid) catch |err| {
+                self.message = @errorName(err);
+                return;
+            }) catch {
+                self.message = "OutOfMemory";
+            },
+            .elisp => self.collect(selection.cachedRead(.elisp, session, tid) catch |err| {
                 self.message = @errorName(err);
                 return;
             }) catch {
@@ -396,6 +428,7 @@ pub const Panel = struct {
             .lua => preview.lua != null,
             .javascript => preview.javascript != null,
             .ruby => preview.ruby != null,
+            .elisp => preview.elisp != null,
             else => false,
         };
     }
@@ -463,7 +496,7 @@ pub const Panel = struct {
         if (logical) |selected| {
             if (selected.native_anchor == null) try self.wrapped(r, font, rect, &y, "Selected logical row has no proved native anchor", theme.warm);
         }
-        const has_named = named.supported(state.selected);
+        const has_named = named.supported(state.selected) or self.editor.open;
         const remaining = @max(0, rect.y + rect.h - 8 - y);
         var native_count: usize = 0;
         for (native_values) |value| if (nativeMatches(state.selected, value.value)) {
@@ -482,7 +515,7 @@ pub const Panel = struct {
                 const visible: usize = @intFromFloat(@max(1, @floor((native_top - y) / 48)));
                 for (self.rows, 0..) |row, index| {
                     if (row.segment != current.segment or row.frame == null or row.frame.? != current.frame) continue;
-                    self.scroll = revealRow(self.scroll, index, visible);
+                    self.scroll = revealRow(self.scroll, index, visible -| @min(row.following, visible -| 1));
                     break;
                 }
                 self.revealed = key;
@@ -519,7 +552,7 @@ pub const Panel = struct {
         if (self.editor.open) {
             try self.editor.draw(r, font, .{ .x = rect.x + 12, .y = y, .w = rect.w - 24, .h = 25 });
             y += 29;
-            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (state.selected == .elisp) "Unavailable; Esc cancels" else if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
             y += 24;
         } else if (self.expression_len != 0) {
             const value = if (self.expression_result) |result| if (result.rows.len != 0) result.rows[0].value.display else result.diagnostic orelse "No binding" else self.expression_reason orelse "Value unavailable";
@@ -527,6 +560,10 @@ pub const Panel = struct {
             const text = std.fmt.bufPrint(&buffer, "E: {s} = {s}", .{ self.expression[0..self.expression_len], if (std.mem.eql(u8, value, "JavaScriptLexicalUnproved")) "unproved" else value }) catch "Value preview too long";
             try self.drawText(r, font, rect.x + 12, y, rect.w - 24, text, theme.text);
             y += 25;
+        }
+        if (!named.supported(state.selected)) {
+            try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, "ELISP EXPRESSION", theme.neutral);
+            return;
         }
         if (self.bindings) |result| {
             if (result.diagnostic) |why| {
@@ -563,7 +600,7 @@ pub const Panel = struct {
             const hint_width = r.measure(font, hint);
             try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 32 - hint_width, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS", theme.neutral);
             try self.drawText(r, font, rect.x + rect.w - 12 - hint_width, heading_y, hint_width, hint, theme.weak);
-        } else try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, if (state.selected == .javascript) "CONTEXT STORAGE" else "NAMED LOCALS  /  E name", theme.neutral);
+        } else try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, if (state.selected == .javascript) "CONTEXT STORAGE" else if (state.selected == .elisp) "FRAME BINDINGS" else "NAMED LOCALS  /  E name", theme.neutral);
     }
 };
 

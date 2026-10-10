@@ -100,6 +100,9 @@ pub const Capture = struct {
     cpu_before: [perf.max_threads]?activity.Ticks = @splat(null),
     cpu_activity: ?activity.Summary = null,
     images: modules.Modules,
+    pe_assets: @import("pe_assets.zig").Assets = .{},
+    pe_assets_failed: usize = 0,
+    pe_assets_pending: bool = false,
     history: mappings.History = .{},
     mapping_revision: u64 = 0,
     samples: sample_store.Store = .{ .max_samples = max_samples },
@@ -150,7 +153,7 @@ pub const Capture = struct {
         errdefer history.deinit(a);
         var missing: u64 = 0;
         for (images.regions.items) |region| {
-            const entry = prepareMapping(&images, region);
+            const entry = prepareMapping(&images, region, 0);
             if (entry.reason == .image_unavailable or entry.reason == .image_limit) missing += 1;
             try history.opening(a, entry);
         }
@@ -277,6 +280,7 @@ pub const Capture = struct {
         self.recorded.deinit(self.allocator);
         self.cache.deinit(self.allocator);
         self.history.deinit(self.allocator);
+        self.pe_assets.deinit(self.allocator);
         self.images.deinit();
         self.arena.deinit();
         self.allocator.destroy(self);
@@ -328,7 +332,7 @@ pub const Capture = struct {
         return null;
     }
     pub fn summary(self: *const Capture) Summary {
-        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len, .snapshot_bytes = self.images.snapshot_bytes } };
+        return .{ .producer = self.producer, .follow_threads = self.config.follow_threads, .ring_budget_bytes = if (self.config.ring_budget_bytes == 0) null else self.config.ring_budget_bytes, .ring_allocated_bytes = (if (self.collector) |collector| collector.allocatedRingBytes() else 0) + (if (self.syscall_collector != null) syscall_perf.ringBytes(self.thread_count) else 0), .opening_threads = self.openingThreads(), .scope = if (self.config.follow_threads) "all threads in this process, including held newborns; user CPU only; child processes remain outside scope" else "fixed selected threads, user CPU only; new tasks stop collection; a subset leaves mappings unverified", .id = self.id, .session_id = self.session_id, .opening_generation = self.generation, .image_epoch = self.image_epoch, .pid = self.pid, .revision = self.revision, .status = self.status, .stop_reasons = self.stop_reasons[0..self.stop_reason_count], .started_ns = self.started_ns, .ended_ns = self.ended_ns, .duration_ms = self.config.duration_ms, .accepted = self.accepted, .threads = self.threads[0..self.thread_count], .sampled_state = .{ .requested_bytes = self.config.user_stack_bytes, .budget_bytes = self.config.user_stack_budget_bytes, .retained_bytes = self.user_state.used, .records = self.user_state.count, .skipped_stacks = self.user_state.skipped, .first_skipped_sample = self.firstSkippedSample(), .allocated_bytes = self.user_state.allocationBytes() }, .stored_samples = self.samples.len(), .sample_limit = self.config.sample_limit, .discarded_samples = self.discarded_samples, .lost_records = self.lost_records, .lost_samples = self.lost_samples, .throttles = self.throttles, .unthrottles = self.unthrottles, .mapping_events = self.mapping_events, .exec_events = self.exec_events, .exit_events = self.exit_events, .fork_events = self.fork_events, .scope_change = self.scope_change, .unknown_records = self.unknown_records, .unselected_threads = self.unselected_threads, .missing_images = self.missing_images, .trusted_before_ns = if (self.trusted_before_ns == std.math.maxInt(u64)) null else self.trusted_before_ns, .failure = self.failure, .diagnostic = self.diagnostic, .cpu_activity = self.cpu_activity, .scheduling = self.schedulingSummary(), .syscalls = self.syscallSummary(), .application_intervals = self.application_intervals.items.items.len, .mapping_revision = self.mapping_revision, .mapping_history = .{ .opening_regions = self.history.opening_count, .recorded_changes = self.history.changes.items.len, .unresolved_executable_mappings = self.unresolvedMappings(), .opened_images = self.images.loaded.items.len + self.pe_assets.entries.items.len, .pe_images = self.pe_assets.entries.items.len, .pe_metadata_bytes = self.pe_assets.metadata_bytes, .pe_failed = self.pe_assets_failed, .pe_pending = self.pe_assets_pending, .snapshot_bytes = self.images.snapshot_bytes } };
     }
     pub fn poll(self: *Capture, now: u64) void {
         if (self.collector == null) return;
@@ -643,13 +647,62 @@ pub const Capture = struct {
         for (self.threads[0..self.thread_count]) |thread| if (thread.perf.tid == tid) return true;
         return false;
     }
-    fn prepareMapping(images: *modules.Modules, region: modules.Region) mappings.Mapping {
+    /// Add already discovered native PE images while the opening process is
+    /// still stopped. Later mapping events never borrow current live placement.
+    pub fn retainPe(self: *Capture, live: *modules.Modules) !void {
+        const rt = @import("../target/runtime.zig").c;
+        const target = live.target orelse return;
+        if (rt.xrt_target_is_remote(target)) return;
+        var view: rt.struct_xrt_target_view = undefined;
+        rt.xrt_target_view(target, &view);
+        if (view.state != rt.XRT_STOPPED or view.pid != self.pid or view.generation != self.generation or view.image_epoch != self.image_epoch) return error.PeImageChanged;
+        if (self.history.changes.items.len != 0 or self.samples.len() != 0 or self.pe_assets.entries.items.len != 0) return error.ProfileAlreadyRunning;
+        if (self.images.regions.items.len != live.regions.items.len) return error.PeImagePlacementMismatch;
+        for (self.images.regions.items, live.regions.items) |a, b| {
+            if (a.start != b.start or a.end != b.end or a.offset != b.offset or a.inode != b.inode or a.device_major != b.device_major or a.device_minor != b.device_minor or !std.mem.eql(u8, &a.permissions, &b.permissions) or !std.mem.eql(u8, a.path, b.path)) return error.PeImagePlacementMismatch;
+        }
+        self.pe_assets_pending = live.peDiscoveryPending();
+        for (live.pe_images.entries.items) |entry| {
+            if (entry.id == 0 or entry.verified_revision != live.maps_revision or entry.image() == null) continue;
+            const present = for (live.regions.items) |region| {
+                if (region.permissions[2] == 'x' and region.pe_image != null and region.pe_image.?.id == entry.id) break true;
+            } else false;
+            if (!present) continue;
+            const id = self.images.next_id;
+            const asset = asset: {
+                if (self.images.loaded.items.len + self.pe_assets.entries.items.len >= 256) break :asset null;
+                const held = @import("pe_assets.zig").retain(self.allocator, target, entry, id, @import("../binary/snapshot.zig").total_limit - self.images.snapshot_bytes) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    break :asset null;
+                };
+                self.pe_assets.append(self.allocator, held) catch |err| {
+                    held.deinit(self.allocator);
+                    if (err == error.OutOfMemory) return err;
+                    break :asset null;
+                };
+                self.images.next_id += 1;
+                self.images.snapshot_bytes += held.mapping.len;
+                break :asset held;
+            };
+            if (asset == null) self.pe_assets_failed += 1;
+            for (self.history.entries.items[0..self.history.opening_count], live.regions.items) |*mapping, region| {
+                if (!mapping.executable or region.pe_image == null or region.pe_image.?.id != entry.id) continue;
+                mapping.image_id = if (asset != null) id else 0;
+                mapping.reason = if (asset != null) .pe else .image_unavailable;
+            }
+        }
+        self.missing_images = 0;
+        for (self.history.entries.items) |mapping| if (mapping.reason == .image_unavailable or mapping.reason == .image_limit) {
+            self.missing_images += 1;
+        };
+    }
+    fn prepareMapping(images: *modules.Modules, region: modules.Region, pe_count: usize) mappings.Mapping {
         var entry = mappings.Mapping{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = region.path, .executable = region.permissions[2] == 'x' };
         if (!entry.executable) {
             entry.reason = .non_executable;
         } else if (region.inode == 0 or region.path.len == 0 or region.path[0] != '/') {
             entry.reason = .anonymous;
-        } else if (images.loaded.items.len == 256) {
+        } else if (images.loaded.items.len + pe_count >= 256) {
             entry.reason = .image_limit;
         } else if (images.loadObserved(region)) |image| {
             entry.image_id = image.id;
@@ -671,7 +724,7 @@ pub const Capture = struct {
         var entry: mappings.Mapping = undefined;
         if (event.raw_type != records.Type.mmap2 or event.build_id or event.path_truncated) {
             entry = .{ .start = region.start, .end = region.end, .offset = region.offset, .path = path, .executable = event.prot & 4 != 0 or event.raw_type == records.Type.mmap, .reason = if (event.path_truncated) .truncated_path else .unsupported_record };
-        } else entry = prepareMapping(&self.images, region);
+        } else entry = prepareMapping(&self.images, region, self.pe_assets.entries.items.len);
         const before = self.history.changes.items.len;
         _ = try self.history.add(self.allocator, event.time_ns, entry);
         if (self.history.changes.items.len != before) {
@@ -711,6 +764,16 @@ pub const Capture = struct {
                     result.kind = .code;
                     result.address = try image.runtimeAddress(symbol.symbol.value);
                     result.name = symbol.symbol.name[0..@min(256, symbol.symbol.name.len)];
+                }
+            };
+            if (match.mapping.executable) if (self.pe_assets.byId(match.mapping.image_id)) |image| {
+                result.module_id = image.id;
+                result.module = image.path;
+                var buffer: [256]u8 = undefined;
+                if (image.symbol(address, &buffer)) |symbol| {
+                    result.kind = .code;
+                    result.address = symbol.address;
+                    result.name = try a.dupe(u8, symbol.name);
                 }
             };
         };
@@ -934,7 +997,7 @@ pub const Summary = struct {
     syscalls: Capture.SyscallSummary,
     application_intervals: usize,
     mapping_revision: u64,
-    mapping_history: struct { opening_regions: usize, recorded_changes: usize, unresolved_executable_mappings: usize, opened_images: usize, snapshot_bytes: usize, per_image_bytes_limit: usize = @import("../binary/snapshot.zig").per_image_limit, total_image_bytes_limit: usize = @import("../binary/snapshot.zig").total_limit, change_limit: usize = mappings.max_changes, coverage: []const u8 = mappings.coverage },
+    mapping_history: struct { opening_regions: usize, recorded_changes: usize, unresolved_executable_mappings: usize, opened_images: usize, pe_images: usize = 0, pe_metadata_bytes: usize = 0, pe_failed: usize = 0, pe_pending: bool = false, snapshot_bytes: usize, per_image_bytes_limit: usize = @import("../binary/snapshot.zig").per_image_limit, total_image_bytes_limit: usize = @import("../binary/snapshot.zig").total_limit, change_limit: usize = mappings.max_changes, coverage: []const u8 = mappings.coverage },
     units: []const u8 = "samples (not elapsed time)",
     clock: []const u8 = "CLOCK_MONOTONIC",
     callchain: []const u8 = "kernel user callchain, frame-pointer dependent; missing callers and sample skid possible; recorded ancestry stops at an unmapped caller; sampled DWARF inspection is a separate derived result",

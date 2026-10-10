@@ -1,4 +1,4 @@
-# Experimental native capture format 2.6
+# Experimental native capture format 2.8
 
 This extends the integrated formats 2.0/2.1/2.2/2.3/2.4/2.5, which superseded T11's unshipped prototype 1.
 The canonical field order and validation are in src/profile/archive.zig.
@@ -45,7 +45,7 @@ reader rejects bit 1 explicitly. Bit 2 declares USTA schema 1 (sampled user stat
 requires minor >= 2 and a non-ignorable USTA section. Bit 3 declares thread scope
 and enrollment evidence (TSCP), requires minor >= 3 and that non-ignorable section.
 Bit 4 declares a configured sample ceiling (LIMT), requires minor >= 4 and that
-non-ignorable section. Bit 5 declares syscall evidence (SYSC), requires minor >= 5 and that non-ignorable section. Other required bits are unsupported. Unknown required sections/features fail
+non-ignorable section. Bit 5 declares syscall evidence (SYSC), requires minor >= 5 and that non-ignorable section. Bit 6 declares typed ELF/PE image rows in IMGS and requires minor >= 8. Other required bits are unsupported. Unknown required sections/features fail
 explicitly; an unknown optional section is checksum/length checked, reported and
 retained inside the original bytes. Copying an opened artifact preserves its
 complete bytes and SHA-256. Re-encoding the runtime offline capture is refused.
@@ -79,7 +79,18 @@ raw SMPL and MAPS evidence are not replaced with derived frames.
 
 Source paths/lines are annotations, not embedded source contents. Image manifests
 identify held file snapshots, not arbitrary future files found at the same path.
-Neither ELF assets nor source files are embedded in this version.
+Neither ELF/PE assets nor source files are embedded in this version.
+
+With required feature bit 6, each IMGS row has an additional u8 kind immediately
+after its u64 image ID: 0 is ELF, 1 is PE. Remaining fields retain their order.
+Every row, including ELF rows in a mixed capture, carries this byte. Without the
+feature the original layout implies ELF. PE build IDs must be absent, start must
+equal the load bias, and end is the image extent. On verified file resolution,
+the parsed PE image size must reproduce that extent. The combined image count
+remains at most 256. MAPS appends reason code 7 (PE), which requires a nonzero
+PE image reference and executable mapping; cross-kind references are rejected.
+An older reader rejects the unknown required bit before reading changed rows.
+ELF-only writers keep their previous minor number and IMGS layout.
 
 ## Sampled user state: USTA schema 1
 

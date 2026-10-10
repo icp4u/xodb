@@ -5,7 +5,7 @@ const Allocator = std.mem.Allocator;
 pub const max_opening = 16384;
 pub const max_changes = 4096;
 pub const coverage = "opening snapshot plus observed perf MMAP2 events; munmap/mremap and in-place code changes are not fully observed and can invalidate attribution";
-pub const Reason = enum { elf, anonymous, image_unavailable, image_limit, non_executable, unsupported_record, truncated_path };
+pub const Reason = enum { elf, anonymous, image_unavailable, image_limit, non_executable, unsupported_record, truncated_path, pe };
 pub const Mapping = struct {
     id: u32 = 0,
     start: u64,

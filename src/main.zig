@@ -34,6 +34,15 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--memdefrag")) std.process.exit(@import("memdefrag/tui.zig").main(args));
     }
+    // Vulkan device choice applies to every window; the list needs no target.
+    if (comptime build_options.gui) for (args[1..], 1..) |arg, k| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--vk-device") and k + 1 < args.len) @import("render/vulkan.zig").device_request = args[k + 1];
+    };
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--vk-list")) return vkList();
+    }
     // The overview is its own window and session with no debug target.
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -144,8 +153,12 @@ pub fn main(init: std.process.Init) !void {
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
                 \\Owned targets are killed on close. Attached targets are detached and preserved.
                 \\--frames N exits after N rendered frames for graphical smoke testing.
+                \\--vk-list prints the Vulkan devices and marks the one xodb uses; --vk-device INDEX|NAME picks
+                \\  another (XODB_VK_DEVICE does the same). A blank window usually means the wrong GPU or a
+                \\  driver that did not load: stderr names it in one "xodb: vulkan:" line (docs/GUIDE.md).
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
+                \\Graph/galaxy default: LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
@@ -155,7 +168,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -521,6 +534,8 @@ pub fn main(init: std.process.Init) !void {
                 if (!renderer_ready) {
                     phase_started = linux.now();
                     renderer.init(&window) catch |err| {
+                        // A device request that names nothing will not start matching.
+                        if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
                         workspace.status = @errorName(err);
                         std.debug.print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
                         render_retry = current + 1_000_000_000;
@@ -602,6 +617,14 @@ fn reportSlow(phase: []const u8, started: u64) void {
     const elapsed = linux.now() -| started;
     if (elapsed >= 250_000_000) std.debug.print("xodb: slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
 }
+/// With a compositor the list also says which devices present and which is the display's.
+fn vkList() !void {
+    if (comptime !build_options.gui) return error.GuiNotBuilt;
+    var window = Window{};
+    const connected = if (window.init()) true else |_| false;
+    defer if (connected) window.deinit();
+    try Renderer.list(if (connected) &window else null);
+}
 fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, session: *Session) !bool {
     var started = linux.now();
     if (!try renderer.begin(window.width, window.height)) return false;
@@ -654,11 +677,13 @@ test {
     _ = @import("profile/recorded_view_test.zig");
     _ = @import("profile/user_state_test.zig");
     _ = @import("profile/sampled_test.zig");
+    _ = @import("profile/pe_test.zig");
     _ = @import("profile/derived_test.zig");
     std.testing.refAllDecls(@import("profile/sample_state.zig"));
     std.testing.refAllDecls(@import("profile/unwind.zig"));
     if (build_options.gui) {
         std.testing.refAllDecls(@import("render/font.zig"));
+        _ = @import("render/vk_select.zig");
         std.testing.refAllDecls(@import("platform/input.zig"));
         std.testing.refAllDecls(@import("ui/workspace.zig"));
         std.testing.refAllDecls(@import("ui/allocations.zig"));

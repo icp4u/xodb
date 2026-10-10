@@ -288,3 +288,9 @@ open to revision as we test real workflows.
 For implementation details, see [external-agent setup](../README.md#external-agents),
 [profiling](PROFILING.md), [value views](M2_VALUES.md), and the
 [current server](../src/mcp/server.zig).
+
+`get_fd_treemap` returns a bounded C path projection with descriptor-count area,
+sampled syscall/offset metrics and explicit omissions. It is an observer read
+and never renews tracing. Non-root nodes require the returned poll sequence;
+redaction suppresses readable and hex path bytes. See [FD treemap](FD_TREEMAP.md)
+for the query shape and coverage limits.

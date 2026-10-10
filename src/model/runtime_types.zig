@@ -4,6 +4,85 @@ const std = @import("std");
 const c = @import("../c.zig").api;
 const jobs = @import("../service/job_owner.zig");
 pub const max_contexts = 4;
+
+/// One IO adapter for runtime values, containers and candidate reads. C owns
+/// cumulative read limits. Writes add their identity checks around readInto.
+pub const LiveReader = struct {
+    session: *@import("session.zig").Session,
+    failure: ?anyerror = null,
+    pub fn reader(self: *LiveReader) c.struct_xjai_live_reader {
+        return .{ .context = self, .read = read, .reads = 0, .bytes = 0 };
+    }
+    pub fn readInto(self: *LiveReader, address: u64, out: ?*anyopaque, size: usize) c_int {
+        const bytes: [*]u8 = @ptrCast(out.?);
+        const got = self.session.target.readMemory(address, bytes[0..size]) catch |err| {
+            self.failure = err;
+            return 0;
+        };
+        return @intFromBool(got == size);
+    }
+    fn read(context: ?*anyopaque, address: u64, out: ?*anyopaque, size: usize) callconv(.c) c_int {
+        const self: *LiveReader = @ptrCast(@alignCast(context.?));
+        return self.readInto(address, out, size);
+    }
+};
+
+pub const Selector = union(enum) {
+    name: []const u8,
+    address: u64,
+    pub fn find(self: Selector, g: *const c.struct_xjai_graph) !u32 {
+        if (self == .address) {
+            const index = c.xjai_type_at(g, self.address);
+            return if (index == c.XJAI_NONE) error.RuntimeTypeNotFound else index;
+        }
+        var found: ?u32 = null;
+        for (g.types[0..g.type_count], 0..) |t, i| {
+            if (!std.mem.eql(u8, std.mem.span(g.text + t.name), self.name)) continue;
+            if (found != null) return error.RuntimeTypeAmbiguous;
+            found = @intCast(i);
+        }
+        return found orelse error.RuntimeTypeNotFound;
+    }
+};
+pub const Selection = struct { entry: Entry, graph: *const c.struct_xjai_graph, index: u32 };
+pub fn select(session: *@import("session.zig").Session, selector: Selector) !Selection {
+    var found: ?Selection = null;
+    var pending = false;
+    var stale = false;
+    var failed = false;
+    for (session.runtime_types.entries) |maybe| if (maybe) |entry| {
+        if (entry.stale(session)) {
+            stale = true;
+            continue;
+        }
+        const status = entry.poll();
+        if (status.state == c.XJAI_JOB_PENDING) {
+            pending = true;
+            continue;
+        }
+        if (status.state == c.XJAI_JOB_FAILED) {
+            failed = true;
+            continue;
+        }
+        const g = try entry.graph();
+        const index = selector.find(g) catch |err| switch (err) {
+            error.RuntimeTypeNotFound => continue,
+            else => return err,
+        };
+        if (found) |previous| {
+            if (previous.graph.types[previous.index].address != g.types[index].address) return error.RuntimeTypeAmbiguous;
+            if (previous.entry.id > entry.id) continue;
+        }
+        found = .{ .entry = entry, .graph = g, .index = index };
+    };
+    // A pending discovery can still change whether the selected name is unique.
+    if (pending) return error.RuntimeTypesPending;
+    if (found) |f| return f;
+    if (stale) return error.RuntimeTypesStale;
+    if (failed) return error.RuntimeTypesFailed;
+    return error.RuntimeTypeNotFound;
+}
+
 pub const Entry = struct {
     id: u64,
     owner: jobs.Owner,

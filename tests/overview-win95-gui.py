@@ -71,8 +71,38 @@ def pixel(name, xy, expected):
     with Image.open(d.shot(name)) as im:
         return im.convert('RGB').getpixel(xy) == expected
 
+# Marks the bundled bitmap face gained, as its 8x16 cell rows (see src/render/font.zig).
+CHECK = [0] * 4 + [0x03, 0x06, 0x06, 0x0C, 0xCC, 0x78, 0x78, 0x30] + [0] * 4
+DOWN = [0] * 6 + [0x7C, 0x7C, 0x38, 0x38, 0x10] + [0] * 5
+
+def glyph(name, rows, box):
+    """True when one text cell in `box` shows exactly this bitmap in a single ink colour."""
+    ink = [(x, y) for y, row in enumerate(rows) for x in range(8) if row & (0x80 >> x)]
+    blank = [(x, y) for y in range(16) for x in range(8) if (x, y) not in set(ink)]
+    with Image.open(d.shot(name)) as im:
+        px = im.convert('RGB').load()
+    for top in range(box[1], box[3] - 16):
+        for left in range(box[0], box[2] - 8):
+            colour = px[left + ink[0][0], top + ink[0][1]]
+            if all(px[left + x, top + y] == colour for x, y in ink) and all(px[left + x, top + y] != colour for x, y in blank):
+                return True
+    return False
+
+def resize(width, height):
+    subprocess.run(['swaymsg', 'output', 'HEADLESS-1', 'mode', f'{width}x{height}'], env=d.env, check=True, capture_output=True, timeout=5)
+    d.width, d.height = width, height  # the pointer helper scales to the output
+    def settled():
+        with Image.open(d.shot('resize')) as im:
+            return im.size == (width, height) and im.convert('RGB').getpixel((2, height - 60)) == (0, 128, 128)
+    until(settled, f'window follows the {width}x{height} output')
+
+def near(name, xy, expected, slack=4):
+    """A gradient pixel: each channel within `slack` of `expected`."""
+    with Image.open(d.shot(name)) as im:
+        return all(abs(a - b) <= slack for a, b in zip(im.convert('RGB').getpixel(xy), expected))
+
 panels = ['summary', 'performance', 'processes', 'memory', 'disk', 'disk_space', 'network',
-          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy']
+          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy', 'inheritance', 'treemap']
 sizes = [(1280, 720), (1920, 1080)] if args.all_panels else [(1280, 720)]
 try:
     for width, height in sizes:
@@ -87,6 +117,11 @@ try:
             send('tap', 68, 'tap', 16, 'tap', 108, 'tap', 28)  # F10 q Down Enter
             until(lambda: 'panel=processes' in log(), 'menu selects Processes')
             check('menu consumes quit shortcut and opens Processes', d.alive())
+            # Processes opens in tree mode. Its marks come from the bundled face;
+            # a missing glyph would be a box.
+            until(lambda: glyph('tree-chip', CHECK, (200, 90, width - 8, 260)), 'tree chip check mark')
+            check('tree chip shows a check mark, not a missing-glyph box', True)
+            check('tree rows show expander triangles', glyph('tree-rows', DOWN, (200, 130, width - 40, height - 60)))
             def first_row():
                 with Image.open(d.shot('scroll-row')) as im:
                     return im.crop((230, 177, 700, 210)).tobytes()
@@ -94,6 +129,17 @@ try:
             send('fastdrag', width - 32, 200, width - 32, 440, 'm', 2, 100)
             until(lambda: first_row() != before_scroll, 'scrollbar moves process rows')
             check('dragging the scrollbar scrolls actual process rows', True)
+            # A narrow window slides the Help pull-down left; its row stays clickable.
+            resize(262, 400)
+            send('click', 244, 49, 'click', 120, 79)
+            until(lambda: near('narrow-about', (5, 90), (0, 0, 128)), 'Help row opens About in a 262 px window')
+            check('Help pull-down stays on-screen and usable in a narrow window', d.alive())
+            send('tap', 1)
+            resize(width, height)
+            # The compositor owns maximize; one that declines it must leave the window as it was.
+            send('click', width - 51, 23)
+            until(lambda: pixel('maximize', (2, 100), (0, 128, 128)) and pixel('maximize', (width - 3, height - 60), (0, 128, 128)), 'window intact after maximize request')
+            check('caption maximize follows the compositor', d.alive())
             # Return via taskbar and cycle the embedded atlas out and back in.
             send('click', 150, height - 20, 'tap', 20)
             until(lambda: not pixel('smooth-font', (2, 100), (0, 128, 128)), 'leave classic theme')
@@ -115,7 +161,8 @@ try:
                     with Image.open(shot) as im:
                         check(f'{width} {panel} captured', im.size == (width, height))
             if args.all_panels:
-                layout = [line for line in log().splitlines() if 'overview layout' in line]
+                # Only this output size: the narrow-window step above is not a layout target.
+                layout = [line for line in log().splitlines() if f'overview layout {width}x{height} ' in line]
                 # The layout probe also records unavailable-data panels; no hidden live reads.
                 bad = [line for line in layout if 'overlaps=0 ' not in line]
                 (Path(d.dir) / 'layout-findings.json').write_text(json.dumps(bad, indent=2))
@@ -159,7 +206,26 @@ for child in children:
             check('galaxy collects only the two owned processes', 'scope_count=2' in log())
             send('click', 80, 84 + 15 * 29, 'm', 2, 100)
             until(lambda: 'panel=graph' in log(), 'owned graph')
-            d.shot('owned-graph')
+            def star_label_clear():
+                """The row above the label text is plate-coloured: no link or dot runs through it."""
+                shot = d.shot('owned-graph')
+                stars = re.findall(r'fdgraph-star panel=graph star=0 pid=\d+ x=([\d.]+) y=([\d.]+)', log())
+                if not stars:
+                    return False
+                x, y = (round(float(value)) for value in stars[-1])
+                with Image.open(shot) as im:
+                    px = im.convert('RGB').load()
+                return all(px[i, y + 17] == (192, 192, 192) for i in range(x - 60, x + 60))
+            until(star_label_clear, 'graph star label plate')
+            check('classic graph star label is clear of the links under it', True)
+            send('click', 80, 84 + 17 * 29, 'm', 2, 100)
+            until(lambda: bool(re.search(r'fdinherit sequence=[1-9].*scope_count=2', log())), 'owned inheritance')
+            d.shot('owned-inheritance')
+            check('classic Parent/Child samples the owned scope', True)
+            send('click', 80, 84 + 18 * 29, 'm', 2, 100)
+            until(lambda: bool(re.search(r'fdtreemap sequence=[1-9]\d* .*fds=[1-9].*scope_count=2', log())), 'owned treemap')
+            d.shot('owned-treemap')
+            check('classic Treemap shows owned descriptors', True)
             d.close()
             d = h.Display(str(root), ['--overview', '--look', 'win95', '--redact', '--files-pid', str(pids[0])], stdio=False, trace=False, output_size=(1280, 720))
             until(lambda: bool(re.search(r'files collector .*filter_pid=' + str(pids[0]) + r' .*rows=[1-9]', log())), 'owned Files')

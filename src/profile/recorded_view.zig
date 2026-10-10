@@ -1,5 +1,5 @@
 //! An immutable input and a cancellable worker for recorded callchain views.
-//! The source capture pins immutable ELF bytes until this job is joined. Mutable
+//! The source capture pins immutable ELF/PE bytes until this job is joined. Mutable
 //! arrays, labels and caches belong to the input; published labels are detached.
 const std = @import("std");
 const model = @import("capture.zig");
@@ -143,7 +143,7 @@ fn frameCopy(allocator: std.mem.Allocator, frame: flame.Frame) !flame.Frame {
     out.mapping_note = try allocator.dupe(u8, frame.mapping_note);
     return out;
 }
-/// Read only on the event loop. ELF bytes remain borrowed, never lazy debug
+/// Read only on the event loop. ELF/PE bytes remain borrowed, never lazy debug
 /// handles. The caller must pin source until snapshot destruction.
 pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture {
     const copy = try allocator.create(Capture);
@@ -169,6 +169,11 @@ pub fn snapshot(allocator: std.mem.Allocator, source: *const Capture) !*Capture 
         private.* = .{ .id = image.id, .inode = image.inode, .device_major = image.device_major, .device_minor = image.device_minor, .path = path, .image = image.image, .bias = image.bias, .start = image.start, .end = image.end, .mapping = image.mapping, .file_offset = image.file_offset, .owns_mapping = false, .immutable = true, .debug_allocator = allocator };
         copy.images.loaded.appendAssumeCapacity(private);
     }
+    copy.pe_assets.owns_assets = false;
+    try copy.pe_assets.entries.appendSlice(allocator, source.pe_assets.entries.items);
+    copy.pe_assets.metadata_bytes = source.pe_assets.metadata_bytes;
+    copy.pe_assets_failed = source.pe_assets_failed;
+    copy.pe_assets_pending = source.pe_assets_pending;
     var records = source.recorded.iterator();
     while (records.next()) |entry| try copy.recorded.put(allocator, entry.key_ptr.*, .{ .frame = try frameCopy(strings, entry.value_ptr.frame) });
     return copy;

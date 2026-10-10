@@ -467,6 +467,8 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         if (now < retry or (!window.dirty and now -| last_frame < 250_000_000)) continue;
         if (!ready) {
             renderer.init(&window) catch |err| {
+                // A device request that names nothing will not start matching.
+                if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
                 std.debug.print("xodb: remote GUI renderer failed: {s}\n", .{@errorName(err)});
                 retry = now + 1_000_000_000;
                 continue;

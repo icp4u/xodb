@@ -106,7 +106,7 @@ const WatchSource = struct {
         const frame = self.frames[i][index];
         const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame), text) catch |err| return .{ .failed = err };
         const summary = self.session.summarize(a, value) catch |err| return .{ .failed = err };
-        const expandable = value.type.kind == .structure or value.type.kind == .array;
+        const expandable = value.type.kind == .structure or value.type.kind == .array or (value.type.language == .go and value.type.go_kind == @import("../model/value_view.zig").go_kind.map);
         const extent_advisory = if (summary.visualization) |v| v.extent_advisory else false;
         var result = watch_ui.Result{ .value = .{ .display = summary.display, .type_name = summary.type, .available = summary.availability == .available, .extent_advisory = extent_advisory, .expandable = expandable } };
         if (page) |start| if (expandable) {
@@ -1648,6 +1648,9 @@ pub const Workspace = struct {
         for (variables) |v| {
             const summary = session.summarize(a, v.value) catch continue;
             rows.append(a, .{ .name = v.name, .value = summary }) catch {};
+            // Semantic Go containers expand through the value view/watch page;
+            // implementation pointers are only shown by an explicit raw view.
+            if (@import("../language/go_values.zig").supported(v.value.type)) continue;
             const is_pointer = v.value.type.kind == .pointer;
             const structure = if (is_pointer) v.value.type.child orelse continue else v.value.type;
             if (structure.kind != .structure or summary.availability != .available) continue;

@@ -5,6 +5,7 @@ const Session = @import("../model/session.zig").Session;
 const cache = @import("../model/runtime_types.zig");
 const instances = @import("../model/runtime_instances.zig");
 const memory = @import("../model/memory.zig");
+const memory_tools = @import("memory.zig");
 const wire = @import("profile.zig");
 const V = std.json.Value;
 pub const definitions = std.mem.trim(u8, @embedFile("runtime_type_tools.json"), " \r\n\t");
@@ -55,17 +56,11 @@ fn selected(g: *const c.struct_xjai_graph, args: V) !u32 {
     if ((args.object.get("type_address") != null) == (args.object.get("type_name") != null)) return error.InvalidArguments;
     if (args.object.get("type_address") != null) {
         const at = std.fmt.parseInt(u64, try text(args, "type_address"), 0) catch return error.InvalidArguments;
-        const index = c.xjai_type_at(g, at);
-        return if (index == c.XJAI_NONE) error.RuntimeTypeNotFound else index;
+        return (cache.Selector{ .address = at }).find(g);
     }
     const name = try text(args, "type_name");
     if (name.len == 0 or name.len > 1024) return error.InvalidArguments;
-    var found: ?u32 = null;
-    for (g.types[0..g.type_count], 0..) |t, i| if (std.mem.eql(u8, str(g, t.name), name)) {
-        if (found != null) return error.RuntimeTypeAmbiguous;
-        found = @intCast(i);
-    };
-    return found orelse error.RuntimeTypeNotFound;
+    return (cache.Selector{ .name = name }).find(g);
 }
 const Type = struct { address_hex: []const u8, name: []const u8, category: []const u8, size_hex: []const u8, reason: ?[]const u8, member_count: u32, enum_count: u32, parameter_count: u32, signed: bool, element_hex: ?[]const u8, polymorph_source_hex: ?[]const u8, array_kind: ?[]const u8, array_count_hex: ?[]const u8 };
 fn describe(a: std.mem.Allocator, g: *const c.struct_xjai_graph, t: c.struct_xjai_type) !Type {
@@ -86,16 +81,6 @@ fn members(a: std.mem.Allocator, g: *const c.struct_xjai_graph, first: u32, coun
     }
     return out;
 }
-const ReadContext = struct { session: *Session, failure: ?anyerror = null };
-fn read(context: ?*anyopaque, at: u64, out: ?*anyopaque, size: usize) callconv(.c) c_int {
-    const ctx: *ReadContext = @ptrCast(@alignCast(context.?));
-    const bytes: [*]u8 = @ptrCast(out.?);
-    const got = ctx.session.target.readMemory(at, bytes[0..size]) catch |err| {
-        ctx.failure = err;
-        return 0;
-    };
-    return @intFromBool(got == size);
-}
 fn readValue(a: std.mem.Allocator, session: *Session, entry: cache.Entry, g: *const c.struct_xjai_graph, args: V) !V {
     try session.target.expectGeneration(try wire.number(args, "generation", null));
     try entry.requireStop(session);
@@ -105,8 +90,8 @@ fn readValue(a: std.mem.Allocator, session: *Session, entry: cache.Entry, g: *co
     const limit = try wire.number(args, "limit", 32);
     if (depth > 8 or limit == 0 or limit > 64) return error.InvalidArguments;
     const options = c.struct_xjai_value_options{ .depth = @intCast(depth), .limit = @intCast(limit), .start = try wire.number(args, "start", 0), .follow_pointers = @intFromBool(try flag(args, "follow_pointers")) };
-    var ctx = ReadContext{ .session = session };
-    var reader = c.struct_xjai_live_reader{ .context = &ctx, .read = read, .reads = 0, .bytes = 0 };
+    var ctx = cache.LiveReader{ .session = session };
+    var reader = ctx.reader();
     if (args.object.get("self_type_field") != null) {
         const name = try text(args, "self_type_field");
         const t = g.types[index];
@@ -148,7 +133,7 @@ fn container(a: std.mem.Allocator, session: *Session, entry: cache.Entry, g: *co
     const start = try wire.number(args, "start", 0);
     const limit = try wire.number(args, "limit", 32);
     if (limit == 0 or limit > instances.max_page) return error.InvalidArguments;
-    var context = instances.Reader{ .session = session };
+    var context = cache.LiveReader{ .session = session };
     var reader = context.reader();
     var rows: [instances.max_page]c.struct_xjai_container_row = undefined;
     var page: c.struct_xjai_container_page = undefined;
@@ -160,7 +145,7 @@ fn container(a: std.mem.Allocator, session: *Session, entry: cache.Entry, g: *co
     return wire.value(a, .{ .id = entry.id, .provider = "jai", .generation = entry.generation, .image_epoch = entry.image_epoch, .state = if (why != null) "unavailable" else if (page.truncated != 0) "truncated" else "complete", .reason = reason(why), .rows = out, .total_count_hex = if (why == null) try hex(a, page.total_count) else null, .capacity_hex = if (why == null) try hex(a, page.capacity) else null, .start = start, .next = if (why == null and start + page.count < page.total_count) @as(?u64, start + page.count) else null, .memory_reads = reader.reads, .memory_bytes = reader.bytes, .backend_error = if (context.failure) |err| @errorName(err) else null, .lifetime_proved = false, .basis = "occupied container storage at the retained stop; allocation identity and concurrent mutation unproved" });
 }
 fn searchInstances(a: std.mem.Allocator, session: *Session, args: V) !V {
-    try wire.fields(args, &.{ "id", "generation", "type_address", "type_name", "dynamic_type_address", "self_type_field", "address", "length" });
+    try wire.fields(args, &([_][]const u8{ "id", "generation", "type_address", "type_name", "dynamic_type_address", "self_type_field" } ++ memory_tools.range_keys));
     if (session.offline) return error.OfflineSession;
     try session.target.expectGeneration(try wire.number(args, "generation", null));
     const entry = try session.runtime_types.find(try wire.number(args, "id", null));
@@ -173,11 +158,9 @@ fn searchInstances(a: std.mem.Allocator, session: *Session, args: V) !V {
         const at = std.fmt.parseInt(u64, try text(args, "dynamic_type_address"), 0) catch return error.InvalidArguments;
         needle = c.xjai_type_at(g, at);
     }
-    const address = std.fmt.parseInt(u64, try text(args, "address"), 0) catch return error.InvalidArguments;
-    const length = try wire.number(args, "length", null);
-    if (length == 0 or length > memory.max_search) return error.InvalidArguments;
-    const id = try session.runtime_instances.begin(session, entry, declared, needle, member, address, @intCast(length));
-    return wire.value(a, .{ .id = id, .context_id = entry.id, .state = "running", .candidate_kind = "type_pointer_match", .lifetime_proved = false, .cancel_tool = "cancel_memory_search" });
+    const ranges = try memory_tools.searchRanges(a, session, args);
+    const id = try session.runtime_instances.beginOwned(session, entry, declared, needle, member, ranges, session.jobRequester());
+    return wire.value(a, .{ .id = id, .context_id = entry.id, .state = "running", .range_count = ranges.len, .range_bytes = session.memory.search.?.length, .candidate_kind = "type_pointer_match", .lifetime_proved = false, .cancel_tool = "cancel_memory_search" });
 }
 fn instancePage(a: std.mem.Allocator, session: *Session, args: V) !V {
     try wire.fields(args, &.{ "id", "generation", "start", "limit" });
@@ -282,7 +265,7 @@ fn listWrites(a: std.mem.Allocator, session: *Session, args: V) !V {
     const out = try a.alloc(V, @intCast(end - start));
     const current = session.runtime_writes.stamp(session, .human);
     for (out, @as(usize, @intCast(start))..) |*row, i| {
-        const r = c.xjai_write_journal_get(journal, i + 1).*;
+        const r = c.xjai_write_journal_at(journal, i).*;
         var old: [128]u8 = undefined;
         var wanted: [128]u8 = undefined;
         var observed: [128]u8 = undefined;

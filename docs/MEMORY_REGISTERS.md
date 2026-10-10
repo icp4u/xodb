@@ -9,6 +9,8 @@
   blue bytes became readable. **U** clears the baseline. `??` means unreadable.
 - **/** searches from the displayed address: `hex:414241` or `text:ABA`.
   **L** changes range length, **N** visits matches, **C** cancels.
+  **W** toggles searching every writable private mapping at this stop instead
+  (the `writable` selector below); the footer shows `scan all writable`.
 - **R** opens floating-point/SIMD registers for the selected thread.
   **V** cycles float32, float64, int32, uint32, uint64 and hex lane formats;
   **W** cycles available 128/256/512-bit widths. Scroll to x87 and mask registers.
@@ -30,6 +32,29 @@ of the selected stack frame. It does not reconstruct caller-saved SIMD state.
   per-byte comparison. Hex uses memory byte order and `??` for unreadable bytes.
 - `search_memory(address, length, pattern, encoding?, generation)` starts a job;
   `get_memory_search(id, start?, limit?)` reports coverage and pages hit addresses.
+- `search_memory(ranges=[{address, length}, ...], pattern, ...)` searches up to
+  1,024 ascending, non-overlapping ranges as one job with one hit list.
+  `search_memory(regions="writable", pattern, ...)` builds the ranges from the
+  process map at this stop, so a client need not fetch maps first; add
+  `address`/`length` to clip the selected mappings to a window. Selectors:
+
+  | `regions` | Includes |
+  | --- | --- |
+  | `writable` | readable and writable private mappings (`rw-p`): heap, stacks, anonymous memory and file-backed private data such as `.data`/`.bss` |
+  | `anon-writable` | the same, only mappings without a file path: no name or a bracketed name such as `[heap]`, `[stack]`, `[anon:…]` |
+  | `all-readable` | every readable private mapping (`r--p`, `r-xp`, `rw-p`, …), including code and read-only file mappings |
+
+  Shared mappings (`rw-s`, `r--s`) are added only with `include_shared: true`:
+  another process can change them, and device mappings can be slow or refuse
+  reads. Selected mappings that touch merge into one range.
+  `get_memory_search` adds `range_count`, `ranges_done`,
+  `ranges_with_unreadable`, `ranges_unreadable` and a page of per-range rows
+  (`address`, `length`, `scanned`, `unreadable`, `hits`) selected with
+  `range_start`/`range_limit` (default 16, at most 256; `range_next` continues).
+
+  ```json
+  {"generation":42,"regions":"writable","pattern":"Player One","encoding":"utf8"}
+  ```
 - `cancel_memory_search(id)` cancels analysis without resuming the target.
 - `get_extended_registers(tid, generation?, width?, format?)` returns vectors,
   x87 values/tags/control/status, MXCSR and available AVX-512 mask registers.
@@ -49,8 +74,17 @@ remote servers; the separate remote GUI does not yet expose these panels.
   snapshots or the GUI's pinned baseline: such a capture fails with `JobNotOwned`,
   and a multi-range call that would have to evict its own ranges fails with
   `MemoryBudgetExceeded`. The GUI retains 1 KiB and may pin one baseline.
-- One search, at most 1 GiB, 256 pattern bytes, 4,096 matches. Results explicitly
-  distinguish complete, cancelled, stale and match-limit termination.
+- One search, at most 256 pattern bytes and 4,096 matches. A single range is at
+  most 1 GiB; a multi-range or region search at most 4 GiB in total and 1,024
+  explicit ranges (one MCP request line is 64 KiB) or 4,096 merged region ranges.
+  The larger total stays bounded: it uses the same fixed 1 MiB buffer, the same
+  per-turn time budget and cancellation, and gaps between ranges cost no reads,
+  so it only keeps the stopped target stopped for a few seconds. A selector that
+  exceeds a limit fails with `MemorySearchTooLarge` or `MemorySearchTooManyRanges`
+  (clip it with `address`/`length`); one that selects nothing fails with
+  `NoMatchingRegions`. A hit never spans two ranges: partial matches reset at
+  each range boundary, as at an unreadable page. Results explicitly distinguish
+  complete, cancelled, stale and match-limit termination.
 - Searches read 1 MiB at a time (64 KiB per request to a remote agent) and scan
   for at most about 4 ms per owner-loop turn, so the debugger stays responsive.
   A local search scans several GB/s; a remote agent a few hundred MB/s. After a

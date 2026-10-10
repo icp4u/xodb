@@ -49,7 +49,7 @@ static void synthetic(int wrong)
     CHECK(layout->star_count==1 && layout->resource_count==3 && layout->link_count==4);
     CHECK(layout->links[0].descriptors+layout->links[1].descriptors+layout->links[2].descriptors==4);
     xrt_fdgraph_layout_free(layout);
-    CHECK(xrt_fdgraph_layout(g,v,1,1,&layout)==XRT_OK && layout->omitted_resources==2 && layout->link_count==1);
+    CHECK(xrt_fdgraph_layout(g,v,1,1,&layout)==XRT_OK && layout->omitted_resources==2 && layout->link_count==1 && layout->omitted_links==3);
     xrt_fdgraph_layout_free(layout);
     xrt_fdgraph_projection_free(v);project.max_particles=16;project.focus_process=0;
     CHECK(xrt_fdgraph_project(g,&project,&v)==XRT_OK && v->star_count==1 && v->particle_count==3 && !v->grouped_particles);
@@ -79,7 +79,7 @@ static void synthetic(int wrong)
     peers[1].inode=20;CHECK(xrt_fdgraph_build(&s,peers,2,&g)==XRT_INVALID_ARGUMENT && !g);
     s=(struct xrt_fd_snapshot){0};CHECK(xrt_fdgraph_build(&s,NULL,0,&g)==XRT_OK && !g->node_count);xrt_fdgraph_free(g);
 }
-static void cgroup_projection(void)
+static void cgroup_projection(int wrong)
 {
     const char names[]="\0/demo.service\0/other.service\0";
     struct xrt_fd_process process[3]={
@@ -95,9 +95,25 @@ static void cgroup_projection(void)
     xrt_fdgraph_projection_free(v);options.focus_group=g->groups[0];options.collapse_cgroups=0;
     CHECK(xrt_fdgraph_project(g,&options,&v)==XRT_OK && v->star_count==2 && v->represented_processes==2 && v->process_to_star[2]==UINT32_MAX);
     xrt_fdgraph_projection_free(v);xrt_fdgraph_free(g);
-    process[1].cgroup_status=XRT_FD_CGROUP_STALE;process[2].cgroup_length=sizeof names;
+    process[1].cgroup_status=XRT_FD_CGROUP_STALE;process[1].flags=XRT_FDP_STALE;
+    process[2].cgroup_length=sizeof names;
     CHECK(xrt_fdgraph_build(&snapshot,NULL,0,&g)==XRT_OK && g->cgroup_processes==1);
-    CHECK(g->groups[0]!=g->groups[1] && g->groups[1]!=g->groups[2]);xrt_fdgraph_free(g);
+    CHECK(g->groups[0]==g->groups[1] && g->groups[1]!=g->groups[2]);
+    CHECK(g->cgroup_stale_processes==(unsigned)(wrong ? 2 : 1) && g->cgroup_count==1);
+    CHECK(!(g->nodes[0].flags&XRT_FDG_CGROUP_STALE) && (g->nodes[1].flags&XRT_FDG_CGROUP_STALE));
+    options.focus_group=0;options.collapse_cgroups=1;
+    CHECK(xrt_fdgraph_project(g,&options,&v)==XRT_OK);
+    CHECK(v->star_count==2 && v->stars[0].processes==2 && v->stars[0].cgroup_stale==1 && v->stars[0].stale==1);
+    xrt_fdgraph_projection_free(v);
+    options.focus_group=g->groups[0];options.collapse_cgroups=0;
+    CHECK(xrt_fdgraph_project(g,&options,&v)==XRT_OK && v->represented_processes==2);
+    xrt_fdgraph_projection_free(v);xrt_fdgraph_free(g);
+    process[0].flags=XRT_FDP_STALE; /* Conservative even for an inconsistent caller. */
+    CHECK(xrt_fdgraph_build(&snapshot,NULL,0,&g)==XRT_OK && !g->cgroup_processes && g->cgroup_stale_processes==2);
+    CHECK(g->groups[0]==g->groups[1]);xrt_fdgraph_free(g);
+    process[1].cgroup_status=XRT_FD_CGROUP_UNAVAILABLE;
+    CHECK(xrt_fdgraph_build(&snapshot,NULL,0,&g)==XRT_OK && g->cgroup_stale_processes==1);
+    CHECK(g->groups[0]!=g->groups[1]);xrt_fdgraph_free(g);
 }
 static size_t message(unsigned char *data,uint32_t inode,uint32_t peer,int duplicate)
 {
@@ -142,6 +158,11 @@ static void live(void)
     struct stat sa,sb,sp;CHECK(!fstat(sock[0],&sa) && !fstat(sock[1],&sb) && !fstat(pipefds[0],&sp));
     CHECK(sa.st_ino<=UINT32_MAX && sb.st_ino<=UINT32_MAX);
     struct xrt_unix_peers a,b;
+    /* An expired shared budget sends nothing, even for a valid owned socket. */
+    struct xrt_unix_peers expired={0};
+    CHECK(xrt_unix_peers_read_until((uint32_t)sa.st_ino,4,1,&expired)==XRT_FILE_UNAVAILABLE);
+    CHECK(expired.error==ETIMEDOUT && !expired.complete && !expired.count && !expired.rows && !expired.bytes);
+    xrt_unix_peers_free(&expired);
     enum xrt_status ar=xrt_unix_peers_read((uint32_t)sa.st_ino,4,&a);
     enum xrt_status br=xrt_unix_peers_read((uint32_t)sb.st_ino,4,&b);
     int32_t pids[2]={getpid(),child};if (pids[0]>pids[1]) {int32_t swap=pids[0];pids[0]=pids[1];pids[1]=swap;}
@@ -201,7 +222,9 @@ static void stress(void)
 }
 int main(int argc,char **argv)
 {
-    synthetic(argc>1 && !strcmp(argv[1],"--wrong-oracle"));parser();cgroup_projection();
+    /* Fast: pure cases plus owned-socket live checks stay below five seconds. */
+    cgroup_projection(argc>1 && !strcmp(argv[1],"--wrong-cgroup"));
+    synthetic(argc>1 && !strcmp(argv[1],"--wrong-oracle"));parser();
     if (argc>1 && !strcmp(argv[1],"--live")) live();
     if (argc>1 && !strcmp(argv[1],"--stress")) stress();
     puts("descriptor graph: shared inode, anonymous isolation, stale/denied rows and UNIX peer parser PASS");return 0;

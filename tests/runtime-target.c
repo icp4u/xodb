@@ -341,6 +341,58 @@ static void mapping_identity(void)
     CHECK(xodb_mapped_file_matches(fd, 0, start, end, ma, mi, ino, 0) == 1);
     CHECK(close(fd) == 0);
 }
+/* Mapped-file views opened during one stop share a single maps read; a new
+ * generation or a running target reads again and sees a mapping that left. */
+static void maps_snapshot(void)
+{
+    const long page = sysconf(_SC_PAGESIZE);
+    struct xrt_target *t = xrt_target_create();
+    CHECK(t && page > 0);
+    t->pid = getpid();
+    t->state = XRT_STOPPED;
+    void *address[2];
+    char path[2][64];
+    struct xrt_file_request request[2];
+    for (int i = 0; i < 2; ++i) {
+        const int fd = memfd_create("maps-snapshot-fixture", MFD_CLOEXEC);
+        struct stat st;
+        CHECK(fd >= 0 && ftruncate(fd, page) == 0 && fstat(fd, &st) == 0);
+        address[i] = mmap(NULL, (size_t)page, PROT_NONE, MAP_PRIVATE, fd, 0);
+        CHECK(address[i] != MAP_FAILED);
+        snprintf(path[i], sizeof path[i], "/proc/%d/fd/%d", getpid(), fd);
+        request[i] = (struct xrt_file_request){.kind = XRT_FILE_MAPPED, .mapping = {
+            .start = (uintptr_t)address[i], .end = (uintptr_t)address[i] + (uint64_t)page,
+            .device_major = major(st.st_dev), .device_minor = minor(st.st_dev),
+            .inode = st.st_ino, .path = path[i]}};
+    }
+    struct xrt_file_view *view = NULL;
+    uint64_t before = xodb_maps_reads();
+    for (int i = 0; i < 64; ++i) {
+        OK(xrt_target_file_view_open(t, &request[i & 1], &view));
+        OK(xrt_file_view_close(view));
+    }
+    CHECK(xodb_maps_reads() - before == (getenv("XODB_TEST_WRONG_MAPS_READS") ? 2 : 1));
+    /* Another stop: one more read, and the departed mapping is refused. */
+    CHECK(munmap(address[1], (size_t)page) == 0);
+    ++t->generation;
+    OK(xrt_target_file_view_open(t, &request[0], &view));
+    OK(xrt_file_view_close(view));
+    CHECK(xrt_target_file_view_open(t, &request[1], &view) == XRT_FILE_UNAVAILABLE);
+    CHECK(xodb_maps_reads() - before == 2);
+    /* A running target can drop a mapping at any time: no snapshot. */
+    t->state = XRT_RUNNING;
+    before = xodb_maps_reads();
+    for (int i = 0; i < 3; ++i) {
+        OK(xrt_target_file_view_open(t, &request[0], &view));
+        OK(xrt_file_view_close(view));
+    }
+    CHECK(xodb_maps_reads() - before == 3);
+    CHECK(munmap(address[0], (size_t)page) == 0);
+    CHECK(xrt_target_file_view_open(t, &request[0], &view) == XRT_FILE_UNAVAILABLE);
+    t->state = XRT_IDLE;
+    t->pid = 0;
+    OK(xrt_target_destroy(t));
+}
 struct patch_script {
     int calls;
     size_t accept[4];
@@ -1009,6 +1061,7 @@ int main(int argc, char **argv)
     CHECK(atexit(cleanup) == 0);
     alarm(30);
     mapping_identity();
+    maps_snapshot();
     core_snapshot();
     legacy_vectors();
     if (getenv("XODB_TEST_NO_LIVE") || !xrt_arch_native()) {

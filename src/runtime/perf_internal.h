@@ -3,6 +3,7 @@
 #include "xrt_perf.h"
 struct xrt_perf_slot {
     struct xrt_perf_thread thread;
+    int32_t cpu; /* -1 for an explicit thread; otherwise a system-wide CPU */
     int fds[XRT_PERF_MAX_EVENTS];
     uint8_t *map;
     size_t map_size;

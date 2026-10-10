@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+# Binary order: XODB, ./zig-out/bin/xodb, then xodb on PATH.
+set -euo pipefail
+umask 022
+demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$demo_root"
+emacs=${EMACS:-/opt/debug/bin/emacs}
+if ! command -v "$emacs" >/dev/null; then
+    printf '%s\n' 'Set EMACS to a GNU Emacs 31.1 debug build (default /opt/debug/bin/emacs).' >&2
+    exit 1
+fi
+xodb=$(python3 scripts/helpers/demo-binary.py elisp)
+printf 'Using Emacs: %s\n' "$emacs" >&2
+cat >&2 <<'TIPS'
+Emacs demo: JSON tasks become an Org-style outline, then a bad estimate is caught.
+  Space        reach the next checkpoint: item, item, render, error, then exit
+  Elisp tab    select xodb-demo-checkpoint: lexical label names the stop
+               select the nearby let rows and scroll the bindings pane for title,
+               points, count, total and the dynamic demo-stage
+  C stack      the Lisp frame's C argument link selects its native caller;
+               unproved bytecode/native locals remain labelled unavailable
+  E / Esc      Elisp expressions are unavailable; Esc closes the captured input
+  Shift+Q      quit
+TIPS
+exec "$xodb" "$@" --break Fdebugger_trap -- "$emacs" -Q --batch -l examples/emacs-demo.el

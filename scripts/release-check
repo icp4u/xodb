@@ -3,23 +3,157 @@
 import argparse
 import ctypes
 from datetime import datetime, timezone
+import fnmatch
 import hashlib
 import json
 import os
 from pathlib import Path
 import platform
+import queue
 import shutil
 import signal
 import secrets
 import socket
 import subprocess
 import sys
+import threading
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
 
+# Coarse map from sources to the steps that cover them: (source globs, step
+# name globs). `release-check affected` runs the steps of every row that a
+# changed file matches. A step also covers the test scripts in its own argv.
+# A file that matches nothing selects the full gui tier.
+LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
+COVERS = (
+    (('src/language/lua*', 'tests/fixtures/lua/*'), ('lua-*', 'python-lua-*', *LANGUAGE_PANES)),
+    (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', *LANGUAGE_PANES)),
+    (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', *LANGUAGE_PANES)),
+    (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
+    (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
+    (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
+    (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
+    (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
+    (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
+     ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', *LANGUAGE_PANES)),
+    (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
+     ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
+    (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
+      'src/runtime/registers.c', 'src/runtime/xrt_memory.h'), ('memory-registers', 'memory-search-*')),
+    (('src/mcp/memstat*', 'src/runtime/memstat*', 'src/runtime/memobserver.c', 'src/runtime/xrt_mem*', 'src/memdefrag/*'),
+     ('memory-observer', 'memdefrag-tui', 'gui-memdefrag', 'gui-vga')),
+    (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
+      'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
+    (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h'),
+     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-files*', 'gui-fd*', 'gui-memdefrag', 'gui-safe-keys*', 'gui-themes')),
+    (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
+     ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
+    (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
+    (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig'),
+     ('static-analysis', 'gui-static-analysis')),
+    (('src/mcp/observation.zig', 'src/mcp/associations.zig', 'src/mcp/probes.zig', 'src/model/probes.zig',
+      'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
+    (('src/profile/*', 'src/mcp/profile.zig', 'src/mcp/sampled_stack.zig', 'src/mcp/archive.zig', 'src/mcp/comparison.zig',
+      'src/mcp/imported*', 'src/mcp/allocation*', 'src/runtime/perf*', 'src/runtime/xrt_perf.h', 'src/runtime/xrt_allocations.h',
+      'src/ui/flame.zig', 'src/ui/timeline.zig', 'src/ui/capture_*', 'src/ui/sample_inspector.zig', 'src/ui/syscalls.zig',
+      'src/ui/flow.zig', 'src/ui/imported.zig', 'src/ui/comparison.zig', 'src/ui/allocations.zig'),
+     ('m2-*', 'syscall-timing', 'frame-*', 'allocation-helper', 'comparison', 'scheduling-decode', 'gui-profile', 'gui-flame-status', 'gui-frames',
+      'gui-overview-live', 'gui-capture-setup')),
+    (('src/frames/*', 'src/import/*', 'src/mcp/frames.zig', 'src/ui/frames.zig'), ('frame-*', 'gui-frames')),
+    (('src/remote/*', 'src/mcp/remote.zig', 'src/ui/remote.zig', 'src/runtime/remote*', 'src/runtime/agent*',
+      'src/runtime/wire*', 'src/runtime/rpc.h', 'src/runtime/xrt_remote.h', 'src/runtime/xrt_wire.h', 'src/model/remote_*'),
+     ('remote', 'remote-stops', 'agent-startup', 'runtime-agent', 'runtime-host', 'remote-panes', 'gui-remote-caller', '*-agent',
+      'controller-scope-1')),
+    (('src/mcp/*',), ('mcp', 'mcp-*', 'review-boundaries', 'controller-scope-*', 'client-control', 'shared-readiness')),
+    (('src/debug/*', 'src/model/debug_metadata.zig', 'src/model/source_maps.zig', 'src/ui/inline.zig', 'src/runtime/source*',
+      'src/runtime/symbol_job.c', 'src/runtime/xrt_source.h'),
+     ('source-paths*', 'dwarf-*', 'debug-discovery', 'optimized-info', 'composite-values', 'm1-source', 'javascript-dwarf', 'lua-dwarf',
+      'go-type-index', 'symbol-discovery*', 'local-large-symbols', 'metadata-session*', 'source-fetch', 'gui-inline',
+      'gui-symbol-discovery', 'gui-debug', 'm2-recovery')),
+    (('src/binary/*', 'src/model/modules.zig'),
+     ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
+      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery')),
+    (('src/target/*', 'src/runtime/target*', 'src/runtime/process.c', 'src/runtime/watchpoints.c', 'src/runtime/arch.c',
+      'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
+      'src/runtime/xrt_arch.h', 'src/runtime/xrt_xstate.h', 'src/runtime/xrt_loader.h', 'src/ui/stop.zig', 'src/ui/watch*'),
+     ('m1-*', 'breakpoint-policy', 'run-control', 'repeated-break', 'restart-pending', 'core-debugging', 'memory-registers',
+      'source-blocks', 'stale-interrupt',
+      'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
+    (('src/render/*', 'src/platform/*'),
+     ('vulkan-*', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'hidden-window', 'acquire-timeout',
+      'fence-timeout', 'wayland-read-race')),
+    (('scripts/release-check',), ('release-runner',)),
+    (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
+)
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None):
+# GUI steps that must run alone under --jobs: they assert frame time, CPU or
+# RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
+# OCR passes with bounded waits, or read a pixel from the first frame.
+SERIAL = {
+    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
+    'gui-memdefrag', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
+}
+
+# GUI steps that are never retried: they inject faults or race the renderer,
+# so one failure in several runs is the defect they exist to catch.
+NO_RETRY = {'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+
+
+def covered(name, argv):
+    paths = [arg for arg in argv if isinstance(arg, str) and arg.startswith(('tests/', 'scripts/')) and arg != 'scripts/build']
+    for sources, names in COVERS:
+        if any(fnmatch.fnmatchcase(name, pattern) for pattern in names):
+            paths += sources
+    return tuple(dict.fromkeys(paths))
+
+
+class Step(tuple):
+    """One planned command. It is still the (name, argv, timeout) triple.
+
+    kind:   build, unit, live, gui or periodic.
+    needs:  names of the steps that must pass first.
+    paths:  source globs this step covers (see COVERS).
+    serial: a gui step that must run alone under --jobs.
+    work:   entries this step creates directly in .work under fixed names.
+    """
+    def __new__(cls, name, argv, timeout, kind='unit', needs=(), paths=(), serial=False, work=()):
+        self = super().__new__(cls, (name, argv, timeout))
+        self.name, self.argv, self.timeout = name, argv, timeout
+        self.kind, self.needs, self.paths, self.serial, self.work = kind, tuple(needs), tuple(paths), serial, tuple(work)
+        return self
+
+    def record(self):
+        return dict(name=self.name, argv=self.argv, timeout=self.timeout, kind=self.kind, needs=list(self.needs),
+                    paths=list(self.paths), serial=self.serial, work=list(self.work))
+
+
+class Steps(list):
+    """plan()'s list. append() takes (name, argv, timeout[, fields]) and fills
+    in the section's kind, the build prerequisite and the covered paths."""
+    kind = 'unit'
+
+    def append(self, step):
+        name, argv, timeout = step[:3]
+        fields = dict(step[3]) if len(step) > 3 else {}
+        fields.setdefault('kind', self.kind)
+        needs = [*fields.get('needs', ())]
+        if fields['kind'] != 'build' and 'build-tests' not in needs:
+            needs.insert(0, 'build-tests')
+        fields['needs'] = needs
+        fields.setdefault('paths', covered(name, argv))
+        fields.setdefault('serial', fields['kind'] == 'gui' and name in SERIAL)
+        named = [arg.split('/')[1] for arg in argv if isinstance(arg, str) and arg.startswith('.work/')]
+        fields['work'] = tuple(dict.fromkeys([*fields.get('work', ()), *named]))
+        super().append(Step(name, argv, timeout, **fields))
+
+    def __iadd__(self, more):
+        for step in more:
+            self.append(step)
+        return self
+
+
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None):
     live = tier in ('host', 'all')
     language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
     gui_language_args = [*language_args]
@@ -27,23 +161,37 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         language_args += ['--lua', executable]
     if lua:
         gui_language_args += ['--lua', lua[0][0]]
-    steps = [('build-tests', ['scripts/build', 'test', '--summary', 'all',
-              '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600)]
+    steps = Steps()
+    steps.append(('build-tests', ['scripts/build', 'test', '--summary', 'all',
+                  '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600, dict(kind='build')))
+    if tier == 'periodic' and go:
+        steps.append(('go-maps-interleaved', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--experiment', 'nomapsplitgroup', '--strace', '--work', '.work/go-maps-interleaved'], 180))
+    steps.append(('go-type-index', [sys.executable, '-B', 'tests/go-type-index.py', '--work', '.work/go-type-index'], 60))
+    steps.append(('go-maps-component', [sys.executable, '-B', 'tests/go-maps-component.py', '--work', '.work/go-maps-component'], 60))
+    steps.append(('go-values-component', [sys.executable, '-B', 'tests/go-values-component.py', '--work', '.work/go-values-component'], 60))
+    for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'javascript-ranged', 'javascript-image'):
+        steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     steps.append(('source-paths-build', ['cc', '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
                   'tests/source-paths.c', 'src/debug/source_paths.c', 'src/debug/dwarf_cursor.c',
-                  'src/binary/object.c', '-o', '.work/source-paths-check'], 60))
+                  'src/binary/object.c', '-o', '.work/source-paths-check'], 60, dict(kind='build')))
     steps.append(('source-paths', [sys.executable, '-B', 'tests/source-paths.py',
-                  '--check', '.work/source-paths-check', '--work', '.work/source-paths'], 120))
+                  '--check', '.work/source-paths-check', '--work', '.work/source-paths'], 120, dict(needs=['source-paths-build'])))
     steps.append(('shared-readiness', [sys.executable, '-B', 'tests/shared-readiness.py'], 30))
     steps.append(('javascript-dwarf', [sys.executable, '-B', 'tests/javascript-dwarf.py'], 60))
     steps.append(('lua-dwarf', [sys.executable, '-B', 'tests/lua-dwarf.py'], 90))
     steps.append(('demo-binary', [sys.executable, '-B', 'tests/demo-binary.py'], 30))
     steps.append(('client-control', [sys.executable, '-B', 'tests/client-control.py'], 30))
+    if tier != 'perf':
+        steps.append(('pe-image', [sys.executable, '-B', 'tests/pe-image.py',
+                      '--work', '.work/pe-image'], 30))
+        steps.append(('pe-unwind', [sys.executable, '-B', 'tests/pe-unwind.py',
+                      '--work', '.work/pe-unwind'], 30))
     if tier == 'perf':
+        steps.kind = 'periodic'
         steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
                       '--work', '.work/perf-observers'], 180))
         steps.append(('remote-stop-measurements', [sys.executable, '-B', 'tests/remote-stops.py', '--perf',
@@ -52,27 +200,60 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--perf', '--work', '.work/perf-syscalls'], 120))
         return steps
     if tier in ('periodic', 'periodic-gui'):
+        steps.kind = 'periodic'
+        if tier == 'periodic':
+            steps.append(('jai-fuzz', [sys.executable, '-B', 'tests/jai-fuzz.py',
+                          '--work', '.work/jai-fuzz', '--cases', '2000'], 900))
+            if emacs:
+                steps.append(('elisp-preview-stress-agent', [sys.executable, '-B', 'tests/elisp-limits.py',
+                              '--emacs', emacs, '--work', '.work/elisp-preview-stress-agent',
+                              '--case', 'budget', '--agent', 'zig-out/bin/xodb-agent'], 180))
+        steps.append(('pe-unwind-fuzz', [sys.executable, '-B', 'tests/pe-unwind.py',
+                      '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
+        steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',
+                      '--work', '.work/pe-job', '--image', '.work/pe-image/owned-pe.dll', '--sanitize'], 240, dict(needs=['pe-image'])))
+        steps.append(('pe-image-fuzz', [sys.executable, '-B', 'tests/pe-image.py',
+                      '--work', '.work/pe-image-fuzz', '--fuzz'], 90))
+        for variant in ('eviction', 'budget', 'full-dwarf', 'large-companions'):
+            label = 'module-unwind-' + variant
+            steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', '--'+variant, '--work', '.work/'+label], 120))
+        steps.append(('cfi-job', [sys.executable, '-B', 'tests/cfi-job.py', '--work', '.work/cfi-job', '--agent', 'zig-out/bin/xodb-agent'], 420))
         if wine:
+            steps.append(('pe-unwind-runtime', [sys.executable, '-B', 'tests/pe-unwind-runtime.py',
+                          '--wine', wine, '--work', '.work/pe-unwind-runtime'], 180))
+            steps.append(('pe-corpus', [sys.executable, '-B', 'tests/pe-corpus.py',
+                          '--wine', wine, '--work', '.work/pe-corpus'], 300))
+            for variant in ('native', 'eviction', 'unwind', 'profile'):
+                label = 'pe-wine-' + variant
+                steps.append((label, [sys.executable, '-B', 'tests/pe-wine.py', '--wine', wine,
+                              '--work', '.work/'+label, *(['--'+variant] if variant != 'native' else [])], 240))
             for remote in (False, True):
                 label = f'jai-pe-demo-{int(remote)}'
                 steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--kind', 'pe', '--wine', wine, '--work', '.work/' + label,
                               *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 420))
         steps.append(('source-paths-differential', [sys.executable, '-B', 'tests/source-paths-differential.py',
-                      '--check', '.work/source-paths-check', '--work', '.work/source-differential', '--cases', '1500'], 300))
+                      '--check', '.work/source-paths-check', '--work', '.work/source-differential', '--cases', '1500'], 300, dict(needs=['source-paths-build'])))
         for delay in (25, 50, 100):
             steps.append((f'symbol-discovery-latency-{delay}', [sys.executable, '-B',
                           'tests/symbol-discovery-install.py', '--reply-delay-ms', str(delay),
                           '--read-delay-ms', '0', '--rate', '10000000000',
                           '--timeout', '70', '--cases', 'complete', 'interrupt'], 150))
         if tier == 'periodic-gui':
+            steps.kind = 'gui'
             steps += [
                 ('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                  'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600),
                 ('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900),
+                ('gui-win95-all-panels', [sys.executable, '-B', 'tests/overview-win95-gui.py', '--all-panels'], 300),
                 ('gui-clipboard', [sys.executable, '-B', 'tests/clipboard-gui.py'], 90),
             ]
         return steps
     if live:
+        steps.kind = 'live'
+        steps.append(('module-symbols', [sys.executable, '-B', 'tests/module-symbols.py', '--work', '.work/module-symbols'], 60))
+        for variant in ('chain', 'debug-frame', 'companions'):
+            label = 'module-unwind-' + variant
+            steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', *([] if variant == 'chain' else ['--'+variant]), '--work', '.work/'+label], 60))
         for remote in (False, True):
             label = f'jai-elf-demo-{int(remote)}'
             steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--work', '.work/' + label,
@@ -100,13 +281,16 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
-                     'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
+                     'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
-                     'lsof-top', 'fdactivity'):
+                     'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt',
+                     'comparison', 'scheduling-decode', 'observation-experiments',
+                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
-        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'memory-search-speed'):
+        steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
@@ -156,6 +340,25 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'perl-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-watches.py', *sdk, *agent, '--strace', '--work', f'.work/pw{int(remote)}'], 300))
                 steps.append((f'perl-path-watches-{int(remote)}', [sys.executable, '-B', 'tests/perl-path-watches.py', *sdk, *agent, '--strace', '--work', f'.work/ppw{int(remote)}'], 300))
                 steps.append((f'perl-named-shared-{int(remote)}', [sys.executable, '-B', 'tests/perl-locals-shared.py', *sdk, *agent, '--strace', '--work', f'.work/ps{int(remote)}'], 180))
+        if emacs:
+            for remote in (False, True):
+                label = 'elisp-limits' + ('-agent' if remote else '')
+                extra = ['--agent', 'zig-out/bin/xodb-agent', '--case', 'deep'] if remote else []
+                steps.append((label, [sys.executable, '-B', 'tests/elisp-limits.py', '--emacs', emacs,
+                              '--work', '.work/'+label, *extra], 180))
+            steps.append(('emacs-demo', [sys.executable, '-B', 'tests/emacs-demo.py', '--emacs', emacs, '--work', '.work/emacs-demo'], 180))
+            steps.append(('emacs-demo-agent', [sys.executable, '-B', 'tests/emacs-demo.py', '--emacs', emacs, '--work', '.work/emacs-demo-agent', '--agent', 'zig-out/bin/xodb-agent'], 180))
+            steps.append(('elisp-bindings', [sys.executable, '-B', 'tests/elisp-bindings.py', '--emacs', emacs, '--work', '.work/elisp-bindings'], 180))
+            for remote in (False, True):
+                for shared in (False, True):
+                    label = f'elisp-bindings-{int(remote)}-{int(shared)}'
+                    extra = (['--agent', 'zig-out/bin/xodb-agent'] if remote else []) + (['--shared'] if shared else [])
+                    steps.append((label, [sys.executable, '-B', 'tests/elisp-bindings-language.py', '--emacs', emacs, '--work', '.work/'+label, '--strace', *extra], 180))
+            steps.append(('elisp-values', [sys.executable, '-B', 'tests/elisp-values.py', '--emacs', emacs, '--work', '.work/elisp-values'], 180))
+            steps.append(('elisp-reader-live', [sys.executable, '-B', 'tests/elisp-runtime.py', '--emacs', emacs, '--scratch', '.work/elisp-reader'], 300))
+            for suffix, extra in [('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])]:
+                steps.append(('elisp-values'+suffix+'-language', [sys.executable, '-B', 'tests/elisp-values-language.py', '--emacs', emacs, '--strace', '--work', '.work/ev'+suffix, *extra], 300))
+                steps.append(('elisp-language'+suffix, [sys.executable, '-B', 'tests/elisp-language.py', '--emacs', emacs, '--strace', '--work', '.work/eli'+suffix, *extra], 300))
         if ruby:
             steps.append(('ruby-frame-names-component', [sys.executable, '-B', 'tests/ruby-frame-names-component.py', '--ruby', ruby, '--work', '.work/rfnc'], 120))
             steps.append(('ruby-path-component', [sys.executable, '-B', 'tests/ruby-path-component.py', '--ruby', ruby, '--sanitize', '--work', '.work/rpc'], 180))
@@ -168,7 +371,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append(('ruby-watches'+suffix, [sys.executable, '-B', 'tests/ruby-watches.py', '--ruby', ruby, '--strace', '--work', '.work/rw'+suffix, *extra], 300))
                 steps.append(('ruby-language'+suffix, [sys.executable, '-B', 'tests/ruby-language.py', '--ruby', ruby, '--strace', '--work', '.work/ruby'+suffix, *extra], 300))
         if go:
+            for remote in (False, True):
+                for shared in (False, True):
+                    label = f'go-native-values-{int(remote)}-{int(shared)}'
+                    steps.append((label, [sys.executable, '-B', 'tests/go-native-values.py', '--go', go, '--strace', '--work', '.work/' + label,
+                                  *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []), *(['--shared'] if shared else [])], 180))
+            steps.append(('go-maps', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--strace', '--work', '.work/go-maps'], 180))
+            steps.append(('go-values', [sys.executable, '-B', 'tests/go-values.py', '--go', go, '--strace', '--work', '.work/go-values'], 180))
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
+            steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('javascript-watches'+suffix, [sys.executable, '-B', 'tests/javascript-watches.py', '--node', node, '--include', node_include, '--strace', '--work', '.work/jw'+suffix, *extra], 300))
@@ -203,12 +414,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             for companion in (False, True):
                 steps.append((f'lua-context-{index}-{int(companion)}', [sys.executable, '-B', 'tests/lua-context.py', *sdk, '--strace', *(['--companion'] if companion else []), '--work', f'.work/lua-context-{index}-{int(companion)}'], 120))
     if tier in ('gui', 'all'):
+        steps.kind = 'gui'
         steps.append(('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                       'zig-out/bin/xodb', '.work/vulkan-faults.json',
                       'baseline', 'partial-vkCreateFramebuffer', 'poison-vkCreateSwapchainKHR',
                       'frame-vkQueuePresentKHR-lost', 'repeat-init-fails-late', 'resize-real-output'], 600))
         for name, args in (
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
+            ('vulkan-device', ['tests/vulkan-device.py']),
             ('gui-themes', ['tests/themes.py']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-frames', ['tests/frames-gui.py']),
@@ -237,6 +450,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
+            ('gui-capture-setup', ['tests/m2-capture-setup.py']),
             ('remote-panes', ['tests/remote-gui.py', '--bin', 'zig-out/bin', '--running-panes']),
             ('hidden-window', ['tests/vulkan-stall.py', 'trace', '--attach-fixture']),
             ('acquire-timeout', ['tests/vulkan-stall.py', 'acquire', '--keep-hidden', '--quit', 'signal', '--attach-fixture']),
@@ -252,37 +466,48 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-files-selection', [sys.executable, '-B', 'tests/files-selection-gui.py'], 180))
         steps.append(('gui-fdgraph', [sys.executable, '-B', 'tests/fdgraph-gui.py', '--work-dir', '.work/fg'], 120))
+        steps.append(('gui-fdinherit', [sys.executable, '-B', 'tests/fdinherit-gui.py', '--work-dir', '.work/fi'], 120))
+        steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
+        steps.append(('gui-fdflow-denied', [sys.executable, '-B', 'tests/fdflow-gui.py', '--work-dir', '.work/ff', '--expect-denied'], 120))
+        steps.append(('gui-win95', [sys.executable, '-B', 'tests/overview-win95-gui.py'], 120))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
+        if emacs:
+            steps.append(('elisp-gui', [sys.executable, '-B', 'tests/elisp-gui.py', '--emacs', emacs, '--work', '.'], 300, dict(work=['input-eli'])))
+            for remote in (False, True):
+                label = f'elisp-bindings-gui-{int(remote)}'
+                extra = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append((label, [sys.executable, '-B', 'tests/elisp-bindings-gui.py', '--emacs', emacs, '--work', f'.work/eb{int(remote)}', *extra], 180))
         if ruby:
             steps.append(('ruby-previews-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--previews', '--ruby', ruby, '--work', '.work/rprg'], 300))
             steps.append(('ruby-path-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--ruby', ruby, '--work', '.work/rpg'], 300))
             steps.append(('ruby-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--ruby', ruby, '--work', '.work/rwg'], 300))
-            steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300))
+            steps.append(('ruby-gui', [sys.executable, '-B', 'tests/ruby-gui.py', '--ruby', ruby, '--work', '.'], 300, dict(work=['input-rby'])))
             steps.append(('ruby-expression-gui', [sys.executable, '-B', 'tests/ruby-expression-gui.py', '--ruby', ruby, '--work', '.work/rbe'], 300))
         if go:
+            steps.append(('go-native-values-gui', [sys.executable, '-B', 'tests/go-native-values-gui.py', '--go', go, '--work', '.work/input-gnv'], 180))
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if node:
             steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 1200))
-            steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200))
-            steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800))
-            steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180))
+            steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200, dict(work=['input-jsc'])))
+            steps.append(('javascript-gui', [sys.executable, '-B', 'tests/javascript-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1800, dict(work=['input-node'])))
+            steps.append(('javascript-advisory-gui', [sys.executable, '-B', 'tests/javascript-advisory-gui.py', '--node', node, '--include', node_include, '--work', '.'], 180, dict(work=['input-js-advisory'])))
         if node_refusal:
             steps.append(('javascript-frame-refusal-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node_refusal, '--include', node_include, '--expect-node-frame-refusal', '--work', '.work/jfrg'], 1200))
         if python:
-            steps.append(('python-gui', [sys.executable, '-B', 'tests/python-gui.py', '--python', python, '--work', '.'], 240))
+            steps.append(('python-gui', [sys.executable, '-B', 'tests/python-gui.py', '--python', python, '--work', '.'], 240, dict(work=['input-python'])))
             steps.append(('python-named-gui', [sys.executable, '-B', 'tests/python-locals-gui.py', '--python', python, '--work', '.work/pyg'], 180))
             steps.append(('python-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--python', python, '--work', '.work/pywg'], 180))
             steps.append(('python-path-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--python', python, '--work', '.work/pypg'], 180))
         if perl:
             steps.append(('perl-gui-fixtures', [sys.executable, '-B', 'tests/perl-language.py', '--perl', perl, '--work', '.work/pgf'], 180))
-            steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240))
+            steps.append(('perl-gui', [sys.executable, '-B', 'tests/perl-gui.py', '--perl', perl, '--fixtures', '.work/pgf', '--work', '.'], 240, dict(needs=['perl-gui-fixtures'], work=['input-perl'])))
         if perl and padwalker:
             steps.append(('perl-named-gui', [sys.executable, '-B', 'tests/perl-locals-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/png'], 180))
             steps.append(('perl-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--perl', perl, '--padwalker', padwalker, '--work', '.work/pwg'], 180))
             steps.append(('perl-path-watch-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--perl', perl, '--padwalker', padwalker, '--work', '.work/ppg'], 180))
         if lua:
             selected = [arg for executable, _, _ in lua for arg in ('--lua', executable)]
-            steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240))
+            steps.append(('lua-gui', [sys.executable, '-B', 'tests/lua-gui.py', *selected, '--work', '.'], 240, dict(work=['input-lua'])))
             for index, (_, source, library) in enumerate(lua):
                 steps.append((f'lua-named-gui-{index}', [sys.executable, '-B', 'tests/lua-locals-gui.py', '--source', source, '--library', library, '--work', f'.work/lng{index}'], 120))
                 steps.append((f'lua-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--source', source, '--library', library, '--work', f'.work/lwg{index}'], 180))
@@ -328,29 +553,50 @@ def stop_group(group):
 
 
 def children():
-    path = Path(f'/proc/self/task/{os.getpid()}/children')
-    return set(map(int, path.read_text().split()))
+    # Every thread's children: a step started by a worker thread is listed
+    # under that thread, an adopted orphan under any live one.
+    found = set()
+    for task in Path('/proc/self/task').iterdir():
+        try:
+            found.update(map(int, (task / 'children').read_text().split()))
+        except (FileNotFoundError, ProcessLookupError):
+            pass
+    return found
 
 
-def stop_adopted(baseline):
+def session_of(pid):
+    try:
+        return int(Path(f'/proc/{pid}/stat').read_text().rsplit(') ', 1)[1].split()[3])
+    except (FileNotFoundError, ProcessLookupError, PermissionError):
+        return None
+
+
+def adopted_since(baseline, session=None):
+    # While other steps run, only children still in this step's session are
+    # certainly its own. run_steps checks the rest once nothing is running.
+    found = children() - baseline
+    return found if session is None else {pid for pid in found if session_of(pid) == session}
+
+
+def stop_adopted(baseline, session=None):
     # GDB/inferiors may change process groups. As a subreaper, the runner owns
     # those orphaned children too. Preserve any children predating this step.
     for sig, seconds in ((signal.SIGTERM, 1), (signal.SIGKILL, 2)):
         until = time.monotonic() + seconds
         while time.monotonic() < until:
-            adopted = children() - baseline
+            adopted = adopted_since(baseline, session)
             if not adopted:
                 return []
             for pid in adopted:
                 try:
                     # A live unreaped child cannot have its PID reused between
-                    # this check and kill; no other thread here calls waitpid.
+                    # this check and kill; nothing else waits for these PIDs.
                     if os.waitpid(pid, os.WNOHANG)[0] == 0:
                         os.kill(pid, sig)
                 except (ChildProcessError, ProcessLookupError):
                     pass
             time.sleep(.02)
-    return sorted(children() - baseline)
+    return sorted(adopted_since(baseline, session))
 
 
 def child_environment(inherited):
@@ -366,7 +612,8 @@ def child_environment(inherited):
     return env
 
 
-def run_step(name, argv, timeout, cwd, env, logs):
+def run_step(name, argv, timeout, cwd, env, logs, halt=None):
+    # halt is set for a step that runs beside others: an Event that interrupts it.
     log = logs / (name + '.log')
     started = time.monotonic()
     outcome = dict(name=name, argv=argv, timeout_seconds=timeout, log=str(log), status='failed')
@@ -377,10 +624,19 @@ def run_step(name, argv, timeout, cwd, env, logs):
             child = subprocess.Popen(argv, cwd=cwd, env=child_environment(env), stdout=stream,
                                      stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, start_new_session=True)
             try:
-                outcome['exit_code'] = child.wait(timeout=timeout)
-                outcome['status'] = 'passed' if child.returncode == 0 else 'failed'
-            except subprocess.TimeoutExpired:
-                outcome['status'] = 'timeout'
+                while True:
+                    left = started + timeout - time.monotonic()
+                    try:
+                        outcome['exit_code'] = child.wait(timeout=min(left, .1) if halt else timeout)
+                        outcome['status'] = 'passed' if child.returncode == 0 else 'failed'
+                    except subprocess.TimeoutExpired:
+                        if halt and halt.is_set():
+                            outcome['status'] = 'interrupted'
+                        elif halt and left > .1:
+                            continue
+                        else:
+                            outcome['status'] = 'timeout'
+                    break
             except KeyboardInterrupt:
                 outcome['status'] = 'interrupted'
         except OSError as exc:
@@ -398,10 +654,11 @@ def run_step(name, argv, timeout, cwd, env, logs):
                 except subprocess.TimeoutExpired:
                     outcome['status'] = 'cleanup_failed'
                     outcome['remaining_pids'] = group_members(child.pid)
-    adopted = children() - baseline
+    session = (child.pid if child else 0) if halt else None
+    adopted = adopted_since(baseline, session)
     if adopted:
         outcome['adopted_pids'] = sorted(adopted)
-        remaining = stop_adopted(baseline)
+        remaining = stop_adopted(baseline, session)
         outcome['remaining_pids'] = sorted(set(outcome.get('remaining_pids', [])) | set(remaining))
         if outcome['status'] == 'passed':
             outcome['status'] = 'leaked_processes'
@@ -412,44 +669,146 @@ def run_step(name, argv, timeout, cwd, env, logs):
     return outcome
 
 
-def gui_step(name, argv):
-    return 'gui' in name.split('-') or any(str(arg).endswith('-gui.py') for arg in argv)
+def work_entries(tree):
+    try:
+        return set(os.listdir(Path(tree) / '.work'))
+    except FileNotFoundError:
+        return set()
+
+
+def set_aside(tree, before, attempt, only=None):
+    """Rename what a failed attempt created directly in .work to NAME.attemptN.
+
+    Tests create their work directories with a plain mkdir, under names fixed
+    by their argv or by the test itself. A retry with the same argv would stop
+    at that mkdir. Renaming keeps the failed attempt's files as evidence.
+    Beside other steps, only the step's declared entries (only) are its own.
+    """
+    moved = []
+    for entry in sorted(work_entries(tree) - before):
+        if only is not None and entry not in only:
+            continue
+        target = f'{entry}.attempt{attempt}'
+        try:
+            os.rename(Path(tree) / '.work' / entry, Path(tree) / '.work' / target)
+        except OSError:
+            continue
+        before.add(target)
+        moved.append(entry)
+    return moved
 
 
 # A failed prerequisite makes every later step meaningless, even with --keep-going.
 PREREQUISITES = ('probe-build', 'capabilities', 'build-tests')
 
 
-def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0):
-    failures = []
-    for name, argv, timeout in steps:
-        result = run_step(name, argv, timeout, tree, env, logs)
+def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0, jobs=1):
+    steps = [step if isinstance(step, Step) else Step(*step) for step in steps]
+    order = {step.name: index for index, step in enumerate(steps)}
+    halt, finished = threading.Event(), queue.Queue()
+
+    def attempts(step, beside):
+        before = work_entries(tree)
+        result = run_step(step.name, step.argv, step.timeout, tree, env, logs, halt if beside else None)
         earlier = []
         # GUI steps may get recorded retries. A pass after a failure is
         # reported as flaky, never as passed.
-        while result['status'] in ('failed', 'timeout') and len(earlier) < retries and gui_step(name, argv):
+        while result['status'] in ('failed', 'timeout') and len(earlier) < retries and step.kind == 'gui' and step.name not in NO_RETRY:
             earlier.append(result)
-            result = run_step(f'{name}.retry{len(earlier)}', argv, timeout, tree, env, logs)
-            result['name'] = name
+            result['set_aside'] = set_aside(tree, before, len(earlier), step.work if beside else None)
+            result = run_step(f'{step.name}.retry{len(earlier)}', step.argv, step.timeout, tree, env, logs, halt if beside else None)
+            result['name'] = step.name
         if earlier:
             result['earlier_attempts'] = earlier
             if result['status'] == 'passed':
                 result['status'] = 'flaky'
-                print(f"{'flaky':16} {name} (passed on retry {len(earlier)})", flush=True)
-        report['steps'].append(result)
-        if name == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
-            report.update(status='blocked', reason='Owned ptrace/perf probe denied; see capabilities.log and SETUP.md')
-            return 2
-        if result['status'] not in ('passed', 'flaky'):
-            failures.append(result)
-            if not keep_going or name in PREREQUISITES or result['status'] == 'interrupted':
+                print(f"{'flaky':16} {step.name} (passed on retry {len(earlier)})", flush=True)
+        if beside:
+            result['beside'] = True
+        return result
+
+    def worker(step):
+        try:
+            result = attempts(step, True)
+        except Exception as exc:
+            result = dict(name=step.name, argv=step.argv, status='failed', error=repr(exc), log=str(logs / (step.name + '.log')))
+        finished.put(result)
+
+    failures, good, bad, skipped = [], set(), set(), []
+    pending, running, batch = list(steps), set(), []
+    start, stop, blocked = children(), False, False
+    try:
+        while True:
+            for step in [] if stop else list(pending):
+                if any(need in bad for need in step.needs):
+                    bad.add(step.name)  # stays "not run": its prerequisite did not pass
+                    skipped.append(dict(name=step.name, needs=[need for need in step.needs if need in bad]))
+                    pending.remove(step)
+                elif any(need in order and need not in good for need in step.needs):
+                    continue
+                elif jobs > 1 and step.kind == 'gui' and not step.serial:
+                    if len(running) < jobs:
+                        pending.remove(step)
+                        running.add(step.name)
+                        batch.append(step.name)
+                        threading.Thread(target=worker, args=(step,), daemon=True).start()
+                elif not running:
+                    pending.remove(step)
+                    finished.put(attempts(step, False))
+                    break
+            if finished.empty() and not running:
                 break
+            result = finished.get()
+            running.discard(result['name'])
+            report['steps'].append(result)
+            if result['name'] == 'capabilities' and result.get('exit_code') == 2 and not result.get('leftover_pids'):
+                blocked = True
+                break
+            if result['status'] in ('passed', 'flaky'):
+                good.add(result['name'])
+            else:
+                bad.add(result['name'])
+                failures.append(result)
+                if not keep_going or result['name'] in PREREQUISITES or result['status'] == 'interrupted':
+                    stop = True
+            if batch and not running:
+                # Children that left their step's session could not be
+                # attributed while other steps ran. None may outlive the batch.
+                strays = sorted(children() - start)
+                if strays:
+                    left = stop_adopted(start)
+                    failures.append(dict(name='parallel-strays', status='cleanup_failed' if left else 'leaked_processes',
+                                         adopted_pids=strays, remaining_pids=left, among=batch, log=str(logs)))
+                    report['steps'].append(failures[-1])
+                    stop = stop or not keep_going
+                batch = []
+    except KeyboardInterrupt:
+        halt.set()
+        while running:
+            try:
+                result = finished.get()
+            except KeyboardInterrupt:  # a second interrupt must not abandon the steps being stopped
+                continue
+            running.discard(result['name'])
+            report['steps'].append(result)
+            failures.append(result)
+        failures.append(dict(name='runner', status='interrupted', log=str(logs)))
+    if blocked:
+        report.update(status='blocked', reason='Owned ptrace/perf probe denied; see capabilities.log and SETUP.md')
+        return 2
     done = report['steps']
+    done.sort(key=lambda step: order.get(step['name'], len(order)))
+    ran = {step['name'] for step in done}
+    report['skipped'] = skipped
+    report['not_run'] = [step.name for step in steps if step.name not in ran]
+    if report['not_run'] and not failures:
+        # Nothing failed, yet planned steps never started (needs that cannot be met). Never a pass.
+        failures.append(dict(name='runner', status='unscheduled', log=str(logs)))
     flaky = [step['name'] for step in done if step['status'] == 'flaky']
     report['flaky'] = flaky
     report['failures'] = [dict(name=step['name'], status=step['status'], log=step['log']) for step in failures]
     report['summary'] = dict(planned=len(steps), passed=sum(step['status'] == 'passed' for step in done),
-                             flaky=len(flaky), failed=len(failures), not_run=len(steps) - len(done))
+                             flaky=len(flaky), failed=len(failures), not_run=len(report['not_run']))
     if failures:
         report.update(status='failed', reason=', '.join(step['name'] + ': ' + step['status'] for step in failures))
         return 1
@@ -457,17 +816,58 @@ def run_steps(steps, tree, env, logs, report, keep_going=False, retries=0):
 
 
 def select(steps, only=None, start=None):
-    # Each run builds a fresh snapshot, so keep build-tests and any NAME-build
-    # step that the selected NAME* steps rely on.
-    names = [name for name, _, _ in steps]
-    unknown = [name for name in [*(only or ()), *([start] if start else [])] if name not in names]
+    # Each run builds a fresh snapshot, so keep what the chosen steps need.
+    by = {step.name: step for step in steps}
+    names = list(by)
+    unknown = [name for name in [*(only or ()), *([start] if start else [])] if name not in by]
     if unknown:
         raise ValueError('unknown step: ' + ', '.join(unknown))
-    wanted = set(names[names.index(start):]) if start else set(only or names)
-    def keep(name):
-        return (name in wanted or name == 'build-tests' or
-                name.endswith('-build') and any(other.startswith(name[:-len('-build')]) for other in wanted))
-    return [step for step in steps if keep(step[0])]
+    wanted = names[names.index(start):] if start else list(only or names)
+    for name in wanted:
+        wanted += [need for need in by[name].needs if need in by and need not in wanted]
+    return [step for step in steps if step.name in wanted]
+
+
+def affected(steps, changed, fallback, registered=()):
+    """The steps that cover the changed files, and a line per decision.
+
+    A file that no planned step covers selects every step named in fallback.
+    An uncovered file under tests/ or scripts/ selects every planned step: a
+    helper may be loaded by any step of either lane. registered names the
+    steps whose registration changed, for scripts/release-check itself.
+    """
+    wanted, lines = {'release-runner'}, []
+    for path in changed:
+        names = [step.name for step in steps if any(fnmatch.fnmatchcase(path, glob) for glob in step.paths)]
+        if path == 'scripts/release-check' and registered:
+            names = [step.name for step in steps if step.name in registered or step.name in names]
+            lines.append(f'affected: {path}: {len(names)} steps, those whose registration changed: ' + ' '.join(names))
+        elif path == 'scripts/release-check':
+            names = fallback
+            lines.append(f'affected: {path}: no registration changed, so the full gui tier ({len(names)} steps)')
+        elif names:
+            lines.append(f'affected: {path}: {len(names)} steps: ' + ' '.join(names))
+        elif path.startswith(('tests/', 'scripts/')):
+            names = [step.name for step in steps]
+            lines.append(f'affected: {path}: not mapped, so every planned step ({len(names)} steps)')
+        else:
+            names = fallback
+            lines.append(f'affected: {path}: not mapped, so the full gui tier ({len(names)} steps)')
+        wanted.update(names)
+    return select(steps, [step.name for step in steps if step.name in wanted]), lines
+
+
+def registered_since(base, runtimes):
+    """Names of the steps that base's scripts/release-check plans differently
+    or not at all. Empty when that plan cannot be made."""
+    old = subprocess.run(['git', 'show', base + ':scripts/release-check'], cwd=ROOT, capture_output=True, text=True)
+    scope = {'__name__': 'base', '__file__': __file__}
+    try:
+        exec(compile(old.stdout, 'base', 'exec'), scope)
+        before = {step[0]: list(step) for step in scope['plan']('all', *runtimes)}
+    except Exception:
+        return []
+    return [step.name for step in plan('all', *runtimes) if before.get(step.name) != list(step)]
 
 
 def snapshot(destination):
@@ -508,16 +908,22 @@ def performance_summary(tree):
     return report
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf'])
+    parser.add_argument('tier', choices=['portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf', 'affected'],
+                        help='affected: the host and gui steps that cover the files changed against --base')
     parser.add_argument('--headless', action='store_true', help='Portable CI without GUI build dependencies')
     parser.add_argument('--optimize', choices=['Debug', 'ReleaseSafe'], default='ReleaseSafe')
     parser.add_argument('--list', action='store_true', help='Print planned commands without running or writing files')
+    parser.add_argument('--records', action='store_true', help='With --list, print whole step records (schema 2: kind, needs, paths, serial, work)')
+    parser.add_argument('--base', metavar='REV', help='affected: compare the index and working tree with this revision (default HEAD)')
+    parser.add_argument('--jobs', type=int, default=1, metavar='N', help='Run up to N GUI steps at once, each on its own private compositor; steps marked serial still run alone (default 1)')
+    parser.add_argument('--slowest', type=int, default=0, metavar='N', help='Also print the N slowest steps')
     parser.add_argument('--uprobes', action='store_true', help='Also test function capture; explicitly permits the built helper to use sudo -n for owned fixtures')
     parser.add_argument('--perl', help='Include the Perl live-display GUI scenario using this debug Perl 5.44 executable')
     parser.add_argument('--padwalker', help='Built test-only PadWalker tree for Perl named-local oracle checks; requires --perl')
     parser.add_argument('--python', help='Include language-tab and cached-selection checks using this debug CPython runtime')
+    parser.add_argument('--emacs', help='Include GNU Emacs 31.1 stack checks using its same-image DWARF')
     parser.add_argument('--ruby', help='Include the exact supported CRuby DWARF runtime and its matching development headers')
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
     parser.add_argument('--wine', help='Include owned stripped PE/Jai checks with this Wine executable (periodic tiers; private prefix)')
@@ -531,7 +937,16 @@ def main():
     chosen = parser.add_mutually_exclusive_group()
     chosen.add_argument('--only', metavar='STEP[,STEP]', help='Run only these steps (plus build-tests and their build steps)')
     chosen.add_argument('--from', dest='start', metavar='STEP', help='Run this step and every later step (plus build-tests)')
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
+    tier = args.tier
+    if args.base and tier != 'affected':
+        parser.error('--base requires the affected tier')
+    if args.records and not args.list:
+        parser.error('--records requires --list')
+    if args.jobs < 1 or args.slowest < 0:
+        parser.error('--jobs must be 1 or more, and --slowest 0 or more')
+    if tier == 'affected':
+        args.tier = 'all'  # plan both lanes, then keep the steps that cover the change
     retries = args.retry_flaky if args.retry_flaky is not None else 1 if args.tier in ('gui', 'all', 'periodic-gui') else 0
     if retries < 0:
         parser.error('--retry-flaky must be 0 or more')
@@ -547,26 +962,55 @@ def main():
         parser.error('--padwalker requires --perl')
     if args.python and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--python requires the host, gui or all tier')
+    if args.emacs and args.tier in ('portable', 'periodic-gui', 'perf'):
+        parser.error('--emacs requires the host, gui, all or periodic tier')
     if args.ruby and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--ruby requires the host, gui or all tier')
-    if args.go and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
-        parser.error('--go requires the host, gui or all tier')
+    if args.go and args.tier in ('portable', 'periodic-gui', 'perf'):
+        parser.error('--go requires the host, gui, all or periodic tier')
     if args.node and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--node requires the host, gui or all tier')
     if args.node_refusal and args.tier not in ('gui', 'all'):
         parser.error('--node-refusal requires the gui or all tier')
     if args.lua and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--lua requires the host, gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine)
+    runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
+    steps = plan(args.tier, *runtimes)
+    decisions, missing = [], []
+    if tier == 'affected':
+        base = args.base or 'HEAD'
+        diff = subprocess.run(['git', 'diff', '--name-only', '-z', base, '--'], cwd=ROOT, capture_output=True, text=True)
+        changed = sorted(filter(None, diff.stdout.split('\0')))
+        if diff.returncode:
+            parser.error('git diff failed: ' + diff.stderr.strip())
+        if not changed:
+            parser.error(f'no tracked file differs from {base}; nothing is affected (pass --base REV, or run a tier)')
+        registered = registered_since(base, runtimes) if 'scripts/release-check' in changed else ()
+        everything = steps
+        steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes)], registered)
+        # A runtime that was not passed has no steps to select. Say what the change lost.
+        chosen = {step.name for step in steps}
+        for flag, more in (('perl', dict(perl='PERL')), ('padwalker', dict(perl=args.perl or 'PERL', padwalker='PADWALKER')), ('python', dict(python='PYTHON')),
+                           ('emacs', dict(emacs='EMACS')), ('ruby', dict(ruby='RUBY')), ('node', dict(node='NODE')), ('go', dict(go='GO')),
+                           ('lua', dict(lua=[('LUA', 'SOURCE', 'LIBRARY')]))):
+            if getattr(args, flag):
+                continue
+            named = dict(zip(('headless', 'optimize', 'uprobes', 'perl', 'node', 'node_include', 'lua', 'python', 'padwalker', 'ruby', 'node_refusal', 'go', 'wine', 'emacs'), runtimes), **more)
+            lost = [step.name for step in affected(plan('all', **named), changed, [step.name for step in plan('gui', **named)], registered)[0] if step.name not in chosen]
+            if lost:
+                missing.append('--' + flag)
+                decisions.append(f'affected: WARNING: without --{flag}, {len(lost)} steps that cover this change cannot run: ' + ' '.join(lost))
+        decisions.append(f'affected: {len(changed)} changed files against {base} select {len(steps)} of {len(everything)} steps')
+        print('\n'.join(decisions), file=sys.stderr if args.list else sys.stdout, flush=True)
     if args.capstone == 'vendored':
-        steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
+        next(step for step in steps if step.name == 'build-tests').argv.append('-Dcapstone=vendored')
     try:
         if args.only or args.start:
             steps = select(steps, args.only.split(',') if args.only else None, args.start)
     except ValueError as exc:
         parser.error(str(exc))
     if args.list:
-        print(json.dumps(steps, indent=2))
+        print(json.dumps(dict(schema=2, steps=[step.record() for step in steps]) if args.records else steps, indent=2))
         return 0
     # Gate currently certifies the x86-64 Linux build. ARM/device evidence is
     # separate; do not run x86-only probes on another architecture accidentally.
@@ -582,8 +1026,8 @@ def main():
             continue
     logs = run / 'logs'
     logs.mkdir()
-    report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, keep_going=args.keep_going, retry_flaky=retries, only=args.only, start=args.start, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+    report = dict(schema=1, tier=tier, jobs=args.jobs, affected=decisions, affected_missing_runtimes=missing, gui_build=not args.headless, capstone=args.capstone,
+                  optimize=args.optimize, elisp_language=bool(args.emacs), keep_going=args.keep_going, retry_flaky=retries, only=args.only, start=args.start, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -595,6 +1039,7 @@ def main():
                     (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)'] if args.tier in ('all', 'gui', 'host') else []) +
                     (['owned PE/Jai checks (use periodic --wine PATH)'] if not args.wine else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
+                    (['Elisp stack checks (use --emacs PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.emacs else []) +
                     (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.ruby else []) +
                     (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.go else []) +
                     (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.node else []) +
@@ -602,6 +1047,7 @@ def main():
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.lua else []) +
                     (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.padwalker else []))
     print(f'Release evidence: {run}', flush=True)
+    began = time.monotonic()
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1',
                XODB_TEST_NO_LIVE='0' if args.tier in ('host', 'all') else '1')
     # C live tests use presence of this opt-out, while Zig tests inspect its
@@ -693,12 +1139,14 @@ def main():
         (tree / '.work/tmp').mkdir(parents=True)
         env['TMPDIR'] = str(tree / '.work/tmp')
         if args.tier != 'portable':
-            preflight = [('probe-build', ['cc', '-Wall', '-Wextra', '-Werror',
-                         'tests/release-probe.c', '-o', '.work/release-probe'], 30),
-                         ('capabilities', ['.work/release-probe'], 10)]
+            preflight = [Step('probe-build', ['cc', '-Wall', '-Wextra', '-Werror',
+                         'tests/release-probe.c', '-o', '.work/release-probe'], 30, 'build'),
+                         Step('capabilities', ['.work/release-probe'], 10, 'build', ['probe-build'])]
         else:
             preflight = []
-        code = run_steps([*preflight, *steps], tree, env, logs, report, args.keep_going, retries)
+        for number in (signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, signal.default_int_handler)  # stop the steps, as for an interrupt
+        code = run_steps([*preflight, *steps], tree, env, logs, report, args.keep_going, retries, args.jobs)
         if code:
             return code
         if args.tier == 'perf':
@@ -715,14 +1163,23 @@ def main():
     finally:
         report['load_end'] = os.getloadavg()
         report['finished'] = datetime.now(timezone.utc).isoformat()
+        report['wall_seconds'] = round(time.monotonic() - began, 3)
+        timed = sorted((step for step in report['steps'] if 'seconds' in step), key=lambda step: -step['seconds'])
+        report['step_seconds'] = round(sum(step['seconds'] for step in timed), 3)
         (run / 'results.json').write_text(json.dumps(report, indent=2) + '\n')
         summary = report.get('summary')
         for failure in report.get('failures', []):
             print(f"{'failed':16} {failure['name']} ({failure['status']}): {failure['log']}", flush=True)
+        for step in report.get('skipped', []):
+            print(f"{'not run':16} {step['name']} (needs {', '.join(step['needs'])})", flush=True)
         if summary:
             print(f"Summary: {summary['passed']} passed, {summary['flaky']} flaky, {summary['failed']} failed, {summary['not_run']} not run"
                   + (': flaky ' + ', '.join(report['flaky']) if report['flaky'] else ''), flush=True)
-        print(f"{report['status'].upper()}: {report.get('reason', args.tier + ' checks completed')}", flush=True)
+        if args.slowest:
+            print(f"Slowest: " + ', '.join(f"{step['name']} {step['seconds']:.1f}s" for step in timed[:args.slowest])
+                  + f" (steps {report['step_seconds']:.0f}s, wall {report['wall_seconds']:.0f}s, jobs {args.jobs})", flush=True)
+        print(f"{report['status'].upper()}: {report.get('reason', tier + ' checks completed')}"
+              + (f"; NOT COVERED: steps for {' '.join(missing)} (not passed)" if missing else ''), flush=True)
         print(f'Results: {run / "results.json"}', flush=True)
 
 

@@ -2,6 +2,11 @@ const std = @import("std");
 const c = @import("../c.zig").api;
 const Window = @import("../platform/wayland.zig").Window;
 const fonts = @import("font.zig");
+const select = @import("vk_select.zig");
+const display_gpu = @import("../platform/display_gpu.zig");
+/// `--vk-device`: an index from `--vk-list` or part of a device name. It wins
+/// over XODB_VK_DEVICE.
+pub var device_request: ?[]const u8 = null;
 pub const Color = [4]f32;
 pub const Rect = struct { x: f32, y: f32, w: f32, h: f32 };
 const Vertex = extern struct { position: [2]f32, uv: [2]f32, color: Color, local: [2]f32 = .{ 0, 0 }, half: [2]f32 = .{ 0, 0 }, shape: [3]f32 = .{ 0, 0, 0 } };
@@ -117,60 +122,29 @@ pub const Renderer = struct {
     batch_count: usize = 0,
     clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     gpu_name: [256]u8 = @splat(0),
+    /// Instance has VK_KHR_get_physical_device_properties2 for DRM nodes.
+    device_nodes: bool = false,
+    /// A driver library the loader reported as failing to load, if any.
+    failed_driver: [96]u8 = undefined,
+    failed_driver_len: usize = 0,
 
     pub fn init(self: *Renderer, window: *Window) !void {
         self.window = window;
         errdefer self.deinit();
-        var app = info(c.VkApplicationInfo, c.VK_STRUCTURE_TYPE_APPLICATION_INFO);
-        app.pApplicationName = "xodb";
-        app.apiVersion = c.VK_API_VERSION_1_0;
-        const extensions = [_][*c]const u8{ "VK_KHR_surface", "VK_KHR_wayland_surface" };
-        var instance_info = info(c.VkInstanceCreateInfo, c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
-        instance_info.pApplicationInfo = &app;
-        instance_info.enabledExtensionCount = extensions.len;
-        instance_info.ppEnabledExtensionNames = &extensions;
-        try created(c.vkCreateInstance(&instance_info, null, &self.instance), &self.instance);
+        try self.createInstance();
         var surface_info = info(c.VkWaylandSurfaceCreateInfoKHR, c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
         surface_info.display = window.display;
         surface_info.surface = window.surface;
         try created(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface), &self.surface);
-        var devices = try enumerate(c.VkPhysicalDevice, c.vkEnumeratePhysicalDevices, .{self.instance}, "vkEnumeratePhysicalDevices");
-        defer devices.deinit(std.heap.page_allocator);
-        var best: i32 = -1;
-        for (devices.items) |physical| {
-            var props: c.VkPhysicalDeviceProperties = undefined;
-            c.vkGetPhysicalDeviceProperties(physical, &props);
-            // One unusable device must not hide another that can present.
-            if (!hasSwapchain(physical)) {
-                std.debug.print("xodb: Vulkan device {s} lacks VK_KHR_swapchain; skipped\n", .{std.mem.sliceTo(@as([]const u8, &props.deviceName), 0)});
-                continue;
-            }
-            var n: u32 = 0;
-            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, null);
-            if (n > 4096) return error.VulkanEnumerationLimit;
-            const families = try std.heap.page_allocator.alloc(c.VkQueueFamilyProperties, n);
-            defer std.heap.page_allocator.free(families);
-            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, families.ptr);
-            if (n > families.len) return error.VulkanEnumerationUnstable;
-            for (families[0..n], 0..) |family, i| {
-                var present: c.VkBool32 = 0;
-                const queried = c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present);
-                if (queried != c.VK_SUCCESS) {
-                    std.debug.print("xodb: Vulkan device {s} queue family {d} surface support query failed: {d}; skipped\n", .{ std.mem.sliceTo(@as([]const u8, &props.deviceName), 0), i, queried });
-                    continue;
-                }
-                if (present == 0 or family.queueFlags & c.VK_QUEUE_GRAPHICS_BIT == 0) continue;
-                const score: i32 = if (props.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU) 3 else if (props.deviceType == c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU) 2 else 1;
-                if (score > best) {
-                    self.physical = physical;
-                    self.family = @intCast(i);
-                    self.gpu_name = props.deviceName;
-                    best = score;
-                }
-            }
-        }
-        if (self.physical == null) return error.NoPresentDevice;
+        var found = try self.probe();
+        defer found.deinit(std.heap.page_allocator);
+        const display = display_gpu.query(window.display);
+        const choice = try pick(found.items, display);
+        self.physical = found.items[choice.index].physical;
+        self.family = found.items[choice.index].family;
+        self.gpu_name = found.items[choice.index].name;
         std.debug.print("Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
+        self.warn(found.items, choice, display);
         const priority: f32 = 1;
         var queue_info = info(c.VkDeviceQueueCreateInfo, c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
         queue_info.queueFamilyIndex = self.family;
@@ -203,11 +177,202 @@ pub const Renderer = struct {
         try self.createDescriptors();
         try self.createSwap(window.width, window.height);
     }
-    fn hasSwapchain(physical: c.VkPhysicalDevice) bool {
+    /// The instance, with two optional extensions when the loader has them:
+    /// device DRM nodes (to find the display GPU) and loader messages (to hear
+    /// about a driver that did not load). The messenger lives for this call only.
+    fn createInstance(self: *Renderer) !void {
+        var app = info(c.VkApplicationInfo, c.VK_STRUCTURE_TYPE_APPLICATION_INFO);
+        app.pApplicationName = "xodb";
+        app.apiVersion = c.VK_API_VERSION_1_0;
+        const extensions = [_][*c]const u8{ "VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_get_physical_device_properties2", "VK_EXT_debug_utils" };
+        var messenger = info(c.VkDebugUtilsMessengerCreateInfoEXT, c.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT);
+        messenger.messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
+        messenger.messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
+        messenger.pfnUserCallback = loaderMessage;
+        messenger.pUserData = self;
+        var instance_info = info(c.VkInstanceCreateInfo, c.VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO);
+        instance_info.pApplicationInfo = &app;
+        instance_info.ppEnabledExtensionNames = &extensions;
+        instance_info.enabledExtensionCount = extensions.len;
+        instance_info.pNext = &messenger;
+        self.failed_driver_len = 0;
+        // Drop the optional extensions from the end until the loader accepts the rest.
+        var result: c.VkResult = c.VK_ERROR_EXTENSION_NOT_PRESENT;
+        var count: u32 = extensions.len;
+        while (result == c.VK_ERROR_EXTENSION_NOT_PRESENT and count >= 2) : (count -= 1) {
+            instance_info.enabledExtensionCount = count;
+            instance_info.pNext = if (count == extensions.len) &messenger else null;
+            self.device_nodes = count >= 3;
+            result = c.vkCreateInstance(&instance_info, null, &self.instance);
+        }
+        try created(result, &self.instance);
+    }
+    fn loaderMessage(_: c.VkDebugUtilsMessageSeverityFlagBitsEXT, _: c.VkDebugUtilsMessageTypeFlagsEXT, data: [*c]const c.VkDebugUtilsMessengerCallbackDataEXT, user: ?*anyopaque) callconv(.c) c.VkBool32 {
+        const self: *Renderer = @ptrCast(@alignCast(user orelse return c.VK_FALSE));
+        if (data == null or data.*.pMessage == null or self.failed_driver_len != 0) return c.VK_FALSE;
+        const driver = select.failedDriver(std.mem.span(data.*.pMessage)) orelse return c.VK_FALSE;
+        self.failed_driver_len = @min(driver.len, self.failed_driver.len);
+        @memcpy(self.failed_driver[0..self.failed_driver_len], driver[0..self.failed_driver_len]);
+        return c.VK_FALSE;
+    }
+    const Found = struct {
+        physical: c.VkPhysicalDevice,
+        family: u32 = 0,
+        name: [256]u8,
+        kind: select.Kind,
+        usable: bool = false,
+        primary: ?select.Node = null,
+        render: ?select.Node = null,
+        fn describe(self: *const Found) select.Device {
+            return .{ .name = std.mem.sliceTo(@as([]const u8, &self.name), 0), .kind = self.kind, .usable = self.usable, .primary = self.primary, .render = self.render };
+        }
+    };
+    /// Every physical device, with the first graphics queue family that can
+    /// present to the surface (any graphics family when there is no surface).
+    fn probe(self: *Renderer) !std.ArrayList(Found) {
+        const a = std.heap.page_allocator;
+        var devices = try enumerate(c.VkPhysicalDevice, c.vkEnumeratePhysicalDevices, .{self.instance}, "vkEnumeratePhysicalDevices");
+        defer devices.deinit(a);
+        var found: std.ArrayList(Found) = .empty;
+        errdefer found.deinit(a);
+        // The loader exports only the core name; the extension entry point is looked up.
+        const properties2: c.PFN_vkGetPhysicalDeviceProperties2 = if (self.device_nodes) @ptrCast(c.vkGetInstanceProcAddr(self.instance, "vkGetPhysicalDeviceProperties2KHR")) else null;
+        for (devices.items) |physical| {
+            var props: c.VkPhysicalDeviceProperties = undefined;
+            c.vkGetPhysicalDeviceProperties(physical, &props);
+            var device = Found{ .physical = physical, .name = props.deviceName, .kind = switch (props.deviceType) {
+                c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => .discrete,
+                c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => .integrated,
+                c.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => .virtual,
+                c.VK_PHYSICAL_DEVICE_TYPE_CPU => .cpu,
+                else => .other,
+            } };
+            const name = std.mem.sliceTo(@as([]const u8, &props.deviceName), 0);
+            if (properties2 != null and hasExtension(physical, "VK_EXT_physical_device_drm")) {
+                var drm = info(c.VkPhysicalDeviceDrmPropertiesEXT, c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT);
+                var props2 = info(c.VkPhysicalDeviceProperties2, c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
+                props2.pNext = &drm;
+                properties2.?(physical, &props2);
+                if (drm.hasPrimary != 0) device.primary = .{ .major = @intCast(drm.primaryMajor), .minor = @intCast(drm.primaryMinor) };
+                if (drm.hasRender != 0) device.render = .{ .major = @intCast(drm.renderMajor), .minor = @intCast(drm.renderMinor) };
+            }
+            // One unusable device must not hide another that can present.
+            if (!hasExtension(physical, "VK_KHR_swapchain")) {
+                std.debug.print("xodb: Vulkan device {s} lacks VK_KHR_swapchain; skipped\n", .{name});
+                try found.append(a, device);
+                continue;
+            }
+            var n: u32 = 0;
+            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, null);
+            if (n > 4096) return error.VulkanEnumerationLimit;
+            const families = try a.alloc(c.VkQueueFamilyProperties, n);
+            defer a.free(families);
+            c.vkGetPhysicalDeviceQueueFamilyProperties(physical, &n, families.ptr);
+            if (n > families.len) return error.VulkanEnumerationUnstable;
+            for (families[0..n], 0..) |family, i| {
+                var present: c.VkBool32 = 1;
+                if (self.surface != null) {
+                    const queried = c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present);
+                    if (queried != c.VK_SUCCESS) {
+                        std.debug.print("xodb: Vulkan device {s} queue family {d} surface support query failed: {d}; skipped\n", .{ name, i, queried });
+                        continue;
+                    }
+                }
+                if (present == 0 or family.queueFlags & c.VK_QUEUE_GRAPHICS_BIT == 0) continue;
+                device.family = @intCast(i);
+                device.usable = true;
+                break;
+            }
+            try found.append(a, device);
+        }
+        return found;
+    }
+    fn describeAll(found: []const Found, out: []select.Device) []select.Device {
+        const n = @min(found.len, out.len);
+        for (found[0..n], out[0..n]) |*from, *to| to.* = from.describe();
+        return out[0..n];
+    }
+    /// Applies the request (flag, then environment) and the display GPU rule.
+    /// A request that cannot be honoured is an error with the list, never a
+    /// silent fallback.
+    fn pick(found: []const Found, display: ?select.Node) !select.Choice {
+        var described: [64]select.Device = undefined;
+        const devices = describeAll(found, &described);
+        const request: ?[]const u8 = device_request orelse if (c.getenv("XODB_VK_DEVICE")) |value| std.mem.span(value) else null;
+        return select.choose(devices, request, display) catch |err| {
+            switch (err) {
+                error.NoPresentDevice => return err,
+                error.VulkanDeviceNotFound => std.debug.print("xodb: no Vulkan device matches \"{s}\"; the devices are:\n", .{request.?}),
+                error.VulkanDeviceCannotPresent => std.debug.print("xodb: the Vulkan device requested with \"{s}\" cannot present to this window; the devices are:\n", .{request.?}),
+            }
+            for (devices, 0..) |device, i| std.debug.print("  {d}  {s}{s}\n", .{ i, device.name, if (device.usable) "" else "  (cannot present)" });
+            return err;
+        };
+    }
+    fn failedDriver(self: *const Renderer) ?[]const u8 {
+        return if (self.failed_driver_len == 0) null else self.failed_driver[0..self.failed_driver_len];
+    }
+    /// At most one line per process: a retried initialization does not repeat it.
+    fn warn(self: *const Renderer, found: []const Found, choice: select.Choice, display: ?select.Node) void {
+        const Once = struct {
+            var said = false;
+        };
+        var described: [64]select.Device = undefined;
+        var buf: [768]u8 = undefined;
+        const line = select.warning(&buf, describeAll(found, &described), choice, display, self.failedDriver()) orelse return;
+        if (Once.said) return;
+        Once.said = true;
+        std.debug.print("{s}\n", .{line});
+    }
+    /// `--vk-list`: every device on stdout, with the one xodb would use. Only
+    /// with a window can it check presentation and name the display's device.
+    pub fn list(window: ?*Window) !void {
+        var self = Renderer{};
+        defer self.deinit();
+        try self.createInstance();
+        if (window) |w| {
+            var surface_info = info(c.VkWaylandSurfaceCreateInfoKHR, c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
+            surface_info.display = w.display;
+            surface_info.surface = w.surface;
+            try created(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface), &self.surface);
+        }
+        var found = try self.probe();
+        defer found.deinit(std.heap.page_allocator);
+        const display = if (window) |w| display_gpu.query(w.display) else null;
+        var described: [64]select.Device = undefined;
+        const devices = describeAll(found.items, &described);
+        const choice: ?select.Choice = pick(found.items, display) catch null;
+        var listing: [16384]u8 = undefined;
+        var out = std.Io.Writer.fixed(&listing);
+        if (display) |d| out.print("Vulkan devices (display GPU: drm {d}:{d})\n", .{ d.major, d.minor }) catch {} else out.writeAll("Vulkan devices (display GPU: unknown)\n") catch {};
+        var widest: usize = 0;
+        for (devices) |device| widest = @max(widest, device.name.len);
+        for (devices, 0..) |device, i| {
+            out.print("{s} {d:>2}  {s}", .{ if (choice != null and choice.?.index == i) "*" else " ", i, device.name }) catch {};
+            out.splatByteAll(' ', widest - device.name.len + 2) catch {};
+            out.print("{s:<10} ", .{@tagName(device.kind)}) catch {};
+            var nodes: [48]u8 = undefined;
+            var node = std.Io.Writer.fixed(&nodes);
+            if (device.primary) |n| node.print("drm {d}:{d}", .{ n.major, n.minor }) catch {};
+            if (device.render) |n| node.print("{s}{d}:{d}", .{ if (device.primary == null) "drm " else "/", n.major, n.minor }) catch {};
+            if (node.end == 0) node.writeAll("no drm node") catch {};
+            out.print("{s:<20} {s}{s}\n", .{ node.buffered(), if (window == null) "unchecked" else if (device.usable) "presents" else "cannot present", if (device.drives(display)) "  display" else "" }) catch {};
+        }
+        out.writeAll("* = the device xodb uses here; --vk-device <index|name> or XODB_VK_DEVICE picks another\n") catch {};
+        const bytes = out.buffered();
+        var sent: usize = 0;
+        while (sent < bytes.len) {
+            const n = c.write(1, bytes.ptr + sent, bytes.len - sent);
+            if (n <= 0) break;
+            sent += @intCast(n);
+        }
+        if (choice) |ch| self.warn(found.items, ch, display) else if (self.failedDriver()) |driver| std.debug.print("xodb: vulkan: driver {s} failed to load (driver/library mismatch after an update? a reboot usually fixes it)\n", .{driver});
+    }
+    fn hasExtension(physical: c.VkPhysicalDevice, comptime wanted: []const u8) bool {
         var extensions = enumerate(c.VkExtensionProperties, c.vkEnumerateDeviceExtensionProperties, .{ physical, @as([*c]const u8, null) }, "vkEnumerateDeviceExtensionProperties") catch return false;
         defer extensions.deinit(std.heap.page_allocator);
         for (extensions.items) |extension| {
-            if (std.mem.eql(u8, std.mem.sliceTo(@as([]const u8, &extension.extensionName), 0), "VK_KHR_swapchain")) return true;
+            if (std.mem.eql(u8, std.mem.sliceTo(@as([]const u8, &extension.extensionName), 0), wanted)) return true;
         }
         return false;
     }

@@ -48,7 +48,7 @@ pub const State = struct {
         try entry.requireStop(session);
         const g = try entry.graph();
         try session.refreshMaps();
-        var ctx = Context{ .session = session, .actor = actor, .stamp = self.stamp(session, actor), .expected = expected };
+        var ctx = Context{ .session = session, .live = .{ .session = session }, .actor = actor, .stamp = self.stamp(session, actor), .expected = expected };
         var reader = c.struct_xjai_live_reader{ .context = &ctx, .read = Context.read, .reads = 0, .bytes = 0 };
         var plan: c.struct_xjai_write_plan = undefined;
         var change = Change{};
@@ -65,7 +65,7 @@ pub const State = struct {
     pub fn undo(self: *State, session: *model.Session, actor: model.Actor, expected: u64, id: u64, raw: bool) !Change {
         try authority(session, actor, expected);
         try session.refreshMaps();
-        var ctx = Context{ .session = session, .actor = actor, .stamp = self.stamp(session, actor), .expected = expected };
+        var ctx = Context{ .session = session, .live = .{ .session = session }, .actor = actor, .stamp = self.stamp(session, actor), .expected = expected };
         const io = ctx.io();
         var change = Change{};
         _ = c.xjai_write_undo(self.journal, id, @intFromBool(raw), &ctx.stamp, &io, &change.value);
@@ -88,6 +88,7 @@ fn authority(session: *model.Session, actor: model.Actor, expected: u64) !void {
 }
 const Context = struct {
     session: *model.Session,
+    live: cache.LiveReader,
     actor: model.Actor,
     stamp: c.struct_xjai_write_stamp,
     expected: u64,
@@ -106,10 +107,9 @@ const Context = struct {
     fn read(p: ?*anyopaque, address: u64, output: ?*anyopaque, size: usize) callconv(.c) c_int {
         const self = from(p);
         self.current() catch return 0;
-        const bytes: [*]u8 = @ptrCast(output.?);
-        const got = self.session.target.readMemory(address, bytes[0..size]) catch return 0;
+        const got = self.live.readInto(address, output, size);
         self.current() catch return 0;
-        return @intFromBool(got == size);
+        return got;
     }
     fn write(p: ?*anyopaque, address: u64, input: ?*const anyopaque, size: usize) callconv(.c) [*c]const u8 {
         const self = from(p);

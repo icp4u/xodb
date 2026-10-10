@@ -126,7 +126,7 @@ try:
     definitions = d.request('tools/list')['tools']
     names = {x['name'] for x in definitions}
     expected = {'get_overview','get_process','list_processes','get_connections','get_sensors','get_memory_map','get_thp_state','get_fragmentation',
-                'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open'}
+                'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open','get_fd_inheritance','get_fd_treemap'}
     check('overview exposes only observer tools', names == expected and all(x['annotations']['readOnlyHint'] for x in definitions))
     shared_names = {x['name'] for x in peers[0].call('tools/list')['result']['tools']}
     check('socket peers expose only observation and membership tools', shared_names == names | {'get_session_clients','get_session_events'})

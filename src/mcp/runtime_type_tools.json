@@ -268,7 +268,7 @@
   },
   {
     "name": "search_runtime_instances",
-    "description": "Start an incremental search for a runtime type pointer in an explicit bounded range. Declare the direct self Type field; dynamic_type_address optionally selects a derived record. Reuses the owned memory-search job and cancel_memory_search. Hits are candidates, never proved live allocations.",
+    "description": "Start an incremental search for a runtime type pointer in an explicit bounded range (address+length), explicit ranges, or a regions selector, exactly as search_memory takes them. Declare the direct self Type field; dynamic_type_address optionally selects a derived record. Reuses the owned memory-search job, get_memory_search per-range coverage and cancel_memory_search. Hits are candidates, never proved live allocations.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -303,19 +303,49 @@
         },
         "length": {
           "type": "integer",
-          "minimum": 1,
-          "maximum": 1073741824
+          "minimum": 1
         },
         "dynamic_type_address": {
           "type": "string"
+        },
+        "ranges": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {
+            "type": "object",
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "length": {
+                "type": "integer",
+                "minimum": 1
+              }
+            },
+            "required": [
+              "address",
+              "length"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "regions": {
+          "type": "string",
+          "enum": [
+            "writable",
+            "anon-writable",
+            "all-readable"
+          ]
+        },
+        "include_shared": {
+          "type": "boolean"
         }
       },
       "required": [
         "id",
         "generation",
-        "self_type_field",
-        "address",
-        "length"
+        "self_type_field"
       ],
       "additionalProperties": false
     },

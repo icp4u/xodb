@@ -2,6 +2,7 @@
 #include "mapped_file.h"
 #include <fcntl.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -44,37 +45,85 @@ static int mapping_identity(int fd, uint64_t ma, uint64_t mi, uint64_t ino)
     return match;
 }
 
-/* The candidate descriptor is already open and pins its inode while maps is
- * read. A matching live VMA therefore cannot refer to a freed inode whose
- * number the candidate later reused. This is an identity check at observation
- * time, not a promise that a running target keeps the mapping afterwards. */
-static int mapping_present(int pid, uint64_t start, uint64_t end, uint64_t ma, uint64_t mi,
-                           uint64_t ino)
+static uint64_t maps_reads;
+uint64_t xodb_maps_reads(void) { return __atomic_load_n(&maps_reads, __ATOMIC_RELAXED); }
+void xodb_maps_free(struct xodb_maps *maps)
 {
-    if (start >= end)
-        return 0;
+    if (!maps)
+        return;
+    free(maps->rows);
+    *maps = (struct xodb_maps){0};
+}
+int xodb_maps_read(int pid, struct xodb_maps *out)
+{
+    *out = (struct xodb_maps){0};
     char path[64];
     snprintf(path, sizeof path, "/proc/%d/maps", pid);
     FILE *maps = fopen(path, "re");
     if (!maps)
         return 0;
-    int match = 0;
+    __atomic_add_fetch(&maps_reads, 1, __ATOMIC_RELAXED);
+    size_t capacity = 0;
+    int ok = 1;
     char line[8192];
-    for (unsigned i = 0; i < 65536 && !match && fgets(line, sizeof line, maps); ++i) {
+    for (unsigned i = 0; i < 65536 && ok && fgets(line, sizeof line, maps); ++i) {
         unsigned long long s, e, offset, inode;
         unsigned major_number, minor_number;
         char permissions[5];
         if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &s, &e, permissions, &offset,
-                   &major_number, &minor_number, &inode) == 7)
-            match = s < end && start < e && major_number == ma && minor_number == mi &&
-                    inode == ino;
+                   &major_number, &minor_number, &inode) != 7 || !inode)
+            continue;
+        if (out->count == capacity) {
+            capacity = capacity ? capacity * 2 : 256;
+            struct xodb_maps_row *rows = realloc(out->rows, capacity * sizeof *rows);
+            if (!rows) {
+                ok = 0;
+                break;
+            }
+            out->rows = rows;
+        }
+        out->rows[out->count++] = (struct xodb_maps_row){s, e, major_number, minor_number, inode};
     }
+    if (ferror(maps))
+        ok = 0;
     fclose(maps);
+    if (!ok)
+        xodb_maps_free(out);
+    return ok;
+}
+/* The candidate descriptor is already open and pins its inode while maps is
+ * read. A matching live VMA therefore cannot refer to a freed inode whose
+ * number the candidate later reused. This is an identity check at observation
+ * time, not a promise that a running target keeps the mapping afterwards.
+ * A caller's snapshot was read earlier; see xodb_maps for when that holds. */
+static int mapping_present(int pid, const struct xodb_maps *known, uint64_t start, uint64_t end,
+                           uint64_t ma, uint64_t mi, uint64_t ino)
+{
+    if (start >= end || !ino)
+        return 0;
+    struct xodb_maps fresh = {0};
+    if (!known) {
+        if (!xodb_maps_read(pid, &fresh))
+            return 0;
+        known = &fresh;
+    }
+    int match = 0;
+    for (size_t i = 0; i < known->count && !match; ++i) {
+        const struct xodb_maps_row *r = &known->rows[i];
+        match = r->start < end && start < r->end && r->device_major == ma &&
+                r->device_minor == mi && r->inode == ino;
+    }
+    xodb_maps_free(&fresh);
     return match;
 }
 
 int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end, uint64_t ma,
                              uint64_t mi, uint64_t inode, int strict)
+{
+    return xodb_mapped_file_matches_in(fd, pid, NULL, start, end, ma, mi, inode, strict);
+}
+int xodb_mapped_file_matches_in(int fd, int pid, const struct xodb_maps *maps, uint64_t start,
+                                uint64_t end, uint64_t ma, uint64_t mi, uint64_t inode, int strict)
 {
     struct stat candidate;
     if (fstat(fd, &candidate) || !S_ISREG(candidate.st_mode) || candidate.st_ino != inode)
@@ -84,7 +133,7 @@ int xodb_mapped_file_matches(int fd, int pid, uint64_t start, uint64_t end, uint
         return 0;
     if ((unsigned long)fs.f_type != XODB_BTRFS_SUPER_MAGIC)
         return major(candidate.st_dev) == ma && minor(candidate.st_dev) == mi &&
-               (pid <= 0 || mapping_present(pid, start, end, ma, mi, inode));
+               (pid <= 0 || mapping_present(pid, maps, start, end, ma, mi, inode));
     if (pid <= 0 || start >= end || !mapping_identity(fd, ma, mi, inode))
         return 0;
 

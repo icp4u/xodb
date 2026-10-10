@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdgraph.c", "fdgraph_layout.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pe_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -88,6 +88,12 @@ pub fn build(b: *std.Build) void {
             const code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", xml });
             module.addCSourceFile(.{ .file = code.addOutputFileArg(b.fmt("{s}.c", .{std.fs.path.stem(xml)})), .flags = &.{} });
         }
+        // linux-dmabuf feedback names the compositor's GPU for Vulkan device choice.
+        const dmabuf_xml = "/usr/share/wayland-protocols/stable/linux-dmabuf/linux-dmabuf-v1.xml";
+        const dmabuf_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", dmabuf_xml });
+        module.addIncludePath(dmabuf_header.addOutputFileArg("linux-dmabuf-v1-client-protocol.h").dirname());
+        const dmabuf_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", dmabuf_xml });
+        module.addCSourceFile(.{ .file = dmabuf_code.addOutputFileArg("linux-dmabuf-v1.c"), .flags = &.{} });
         for ([_][]const u8{ "wayland-client", "xkbcommon", "vulkan", "freetype2", "harfbuzz" }) |lib| module.linkSystemLibrary(lib, .{});
         for ([_][]const u8{ "ui", "cell" }) |name| for ([_][]const u8{ "vert", "frag" }) |stage| {
             const shader = b.addSystemCommand(&.{"glslc"});
@@ -163,11 +169,11 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/process.c", "tests/runtime-process.c" }) |source| {
         process_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
-    const target_tests = b.addExecutable(.{ .name = "xodb-runtime-target-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     const file_path_tests = b.addExecutable(.{ .name = "xodb-runtime-file-path-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     file_path_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/mapped_file.c", "tests/runtime-file-paths.c" }) |source|
-        file_path_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+        file_path_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const target_tests = b.addExecutable(.{ .name = "xodb-runtime-target-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     target_tests.root_module.addIncludePath(b.path("src/runtime"));
     for (runtime_sources) |source| {
         target_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -179,11 +185,89 @@ pub fn build(b: *std.Build) void {
         perf_tests.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     perf_tests.root_module.addCSourceFile(.{ .file = b.path("tests/runtime-perf.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const perf_run = b.addRunArtifact(perf_tests);
+    b.step("test-perf", "Test C perf ownership, decoding and owned-thread capture").dependOn(&perf_run.step);
+    const fdflow_tests = b.addExecutable(.{ .name = "xodb-fdflow-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_tests.root_module.addIncludePath(b.path("src/runtime"));
+    const fdflow_sources = [_][]const u8{ "src/runtime/perf.c", "src/runtime/perf_syscalls.c", "src/runtime/fdflow.c", "src/runtime/fdflow_decode.c", "tests/fdflow-perf-stubs.c" };
+    for (fdflow_sources ++ [_][]const u8{"tests/runtime-fdflow.c"}) |source|
+        fdflow_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdflow_run = b.addRunArtifact(fdflow_tests);
+    b.step("test-fdflow", "Fast pure system IO stream protocol and explicit-scope checks").dependOn(&fdflow_run.step);
+    const fdflow_order = b.addExecutable(.{ .name = "xodb-fdflow-order-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_order.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/perf.c", "src/runtime/perf_syscalls.c", "src/runtime/fdflow_decode.c", "tests/fdflow-perf-stubs.c", "tests/runtime-fdflow-order.c" }) |source|
+        fdflow_order.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdflow_order_run = b.addRunArtifact(fdflow_order);
+    b.step("test-fdflow-order", "Test timestamp merge across capped CPU drains").dependOn(&fdflow_order_run.step);
+    const fdflow_live = b.addExecutable(.{ .name = "xodb-fdflow-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_live.root_module.addIncludePath(b.path("src/runtime"));
+    for (fdflow_sources ++ [_][]const u8{"tests/fdflow-live.c"}) |source|
+        fdflow_live.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const install_fdflow_live = b.addInstallArtifact(fdflow_live, .{});
+    b.step("fdflow-fixture", "Build the explicitly scoped owned IO stream fixture (manual/periodic)").dependOn(&install_fdflow_live.step);
+    const fdflow_count = b.addExecutable(.{ .name = "xodb-fdflow-count-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_count.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdflow_count.c", "src/runtime/fdgraph.c", "tests/runtime-fdflow-count.c" }) |source|
+        fdflow_count.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdflow_count_run = b.addRunArtifact(fdflow_count);
+    b.step("test-fdflow-count", "Fast sampled IO identity, mutation, reuse and loss checks").dependOn(&fdflow_count_run.step);
+    const fdflow_churn = b.addExecutable(.{ .name = "xodb-fdflow-churn-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_churn.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdflow_count.c", "src/runtime/fdgraph.c", "tests/runtime-fdflow-churn.c" }) |source|
+        fdflow_churn.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdflow_churn_run = b.addRunArtifact(fdflow_churn);
+    b.step("test-fdflow-churn", "Accelerated pid and connection churn through the flow counter").dependOn(&fdflow_churn_run.step);
+    const fdflow_identity = b.addExecutable(.{ .name = "xodb-fdflow-identity-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_identity.root_module.addIncludePath(b.path("src/runtime"));
+    for (fdflow_sources ++ [_][]const u8{ "src/runtime/fdflow_count.c", "src/runtime/fdgraph.c", "src/runtime/fdscan.c", "tests/fdflow-identity-live.c" }) |source|
+        fdflow_identity.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const install_fdflow_identity = b.addInstallArtifact(fdflow_identity, .{});
+    b.step("fdflow-identity-fixture", "Build the owned live descriptor reuse fixture (manual/periodic)").dependOn(&install_fdflow_identity.step);
+    const fdflow_churn_live = b.addExecutable(.{ .name = "xodb-fdflow-churn-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdflow_churn_live.root_module.addIncludePath(b.path("src/runtime"));
+    for (fdflow_sources ++ [_][]const u8{ "src/runtime/fdflow_count.c", "src/runtime/fdgraph.c", "src/runtime/fdscan.c", "tests/fdflow-churn-live.c" }) |source|
+        fdflow_churn_live.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.step("fdflow-churn-fixture", "Build the owned live 25k-process churn fixture (manual/periodic; needs CAP_PERFMON)").dependOn(&b.addInstallArtifact(fdflow_churn_live, .{}).step);
+    const flow_owner_test = b.addExecutable(.{ .name = "xodb-flow-owner-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    flow_owner_test.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdflow_owner.c", "src/runtime/fdflow_count.c", "src/runtime/fdgraph.c", "src/runtime/fdscan.c", "src/runtime/unix_peer.c", "tests/runtime-fdflow-owner.c" }) |source|
+        flow_owner_test.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const flow_owner_run = b.addRunArtifact(flow_owner_test);
+    const flow_owner_step = b.step("test-fdflow-owner", "Test independent stream drain, stop, publication and passive polling");
+    flow_owner_step.dependOn(&flow_owner_run.step);
+    const flow_graph_test = b.addExecutable(.{ .name = "xodb-flow-graph-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    flow_graph_test.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdflow_graph.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "tests/runtime-fdflow-graph.c" }) |source|
+        flow_graph_test.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const flow_graph_run = b.addRunArtifact(flow_graph_test);
+    flow_owner_step.dependOn(&flow_graph_run.step);
+    b.step("test-fdflow-graph", "Test sampled graph IO identity and aggregation").dependOn(&flow_graph_run.step);
+    const fdtreemap_test = b.addExecutable(.{ .name = "xodb-fdtreemap-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdtreemap_test.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdtreemap.c", "src/runtime/fdgraph.c", "tests/runtime-fdtreemap.c" }) |source|
+        fdtreemap_test.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdtreemap_run = b.addRunArtifact(fdtreemap_test);
+    b.step("test-fdtreemap", "Test bounded path grouping, sampled IO and treemap geometry").dependOn(&fdtreemap_run.step);
+    const fdtreemap_owner = b.addExecutable(.{ .name = "xodb-fdtreemap-owner-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdtreemap_owner.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "tests/runtime-fdtreemap-owner.c", "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdflow_count.c", "src/runtime/unix_peer.c" }) |source|
+        fdtreemap_owner.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdtreemap_owner_run = b.addRunArtifact(fdtreemap_owner);
+    b.step("test-fdtreemap-owner", "Test flow bindings without topology demand on an owned fixture").dependOn(&fdtreemap_owner_run.step);
     const fdscan_tests = b.addExecutable(.{ .name = "xodb-runtime-fdscan-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdscan_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/fdscan.c", "tests/runtime-fdscan.c" }) |source| {
         fdscan_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
+    const fdinherit_tests = b.addExecutable(.{ .name = "xodb-fdinherit-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    fdinherit_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdinherit.c", "tests/runtime-fdinherit.c" }) |source|
+        fdinherit_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const fdinherit_run = b.addRunArtifact(fdinherit_tests);
+    fdinherit_run.addArg("--live");
+    const fdinherit_step = b.step("test-fdinherit", "Test sampled parent/child descriptors and close-on-exec flags");
+    fdinherit_step.dependOn(&fdinherit_run.step);
     const fdgraph_tests = b.addExecutable(.{ .name = "xodb-fdgraph-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdgraph_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "src/runtime/unix_peer.c", "tests/runtime-fdgraph.c" }) |source|
@@ -193,7 +277,7 @@ pub fn build(b: *std.Build) void {
     fdgraph_step.dependOn(&fdgraph_run.step);
     const fdgraph_owner = b.addExecutable(.{ .name = "xodb-fdgraph-owner-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdgraph_owner.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "src/runtime/unix_peer.c", "tests/runtime-fdgraph-owner.c" }) |source|
+    for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "src/runtime/unix_peer.c", "src/runtime/fdflow_owner.c", "src/runtime/fdflow_count.c", "tests/fdflow-capture-stubs.c", "tests/runtime-fdgraph-owner.c" }) |source|
         fdgraph_owner.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     const fdscan_growth = b.addExecutable(.{ .name = "xodb-fdscan-growth-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdscan_growth.root_module.addIncludePath(b.path("src/runtime"));
@@ -214,8 +298,9 @@ pub fn build(b: *std.Build) void {
         fdcount_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     const fdactivity_tests = b.addExecutable(.{ .name = "xodb-fdactivity-demand-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdactivity_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "src/runtime/unix_peer.c", "tests/runtime-fdactivity.c" }) |source|
+    for ([_][]const u8{ "src/runtime/fdscan.c", "src/runtime/fdgraph.c", "src/runtime/fdgraph_layout.c", "src/runtime/unix_peer.c", "src/runtime/fdflow_owner.c", "src/runtime/fdflow_count.c", "tests/fdflow-capture-stubs.c", "tests/runtime-fdactivity.c" }) |source|
         fdactivity_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    flow_owner_step.dependOn(&b.addRunArtifact(fdactivity_tests).step);
     const fdactivity_live = b.addExecutable(.{ .name = "xodb-fdactivity-live", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fdactivity_live.root_module.addIncludePath(b.path("src/runtime"));
     for (runtime_sources) |source|
@@ -302,6 +387,9 @@ pub fn build(b: *std.Build) void {
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
     test_step.dependOn(&fdgraph_run.step);
+    test_step.dependOn(&fdinherit_run.step);
+    test_step.dependOn(&fdtreemap_run.step);
+    test_step.dependOn(&fdtreemap_owner_run.step);
     test_step.dependOn(&fdscan_growth_run.step);
     test_step.dependOn(&fdgraph_owner_run.step);
     test_step.dependOn(&b.addRunArtifact(gdb_packet_tests).step);
@@ -358,10 +446,12 @@ pub fn build(b: *std.Build) void {
     }
     test_step.dependOn(&b.addRunArtifact(ruby_tests).step);
     const go_tests = b.addExecutable(.{ .name = "xodb-go-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
-    for ([_][]const u8{ "src/language/go.c", "tests/go-reader.c" }) |source| {
+    for ([_][]const u8{ "src/language/go.c", "src/language/go_value.c", "src/language/go_map.c", "tests/go-reader.c", "tests/go-values.c", "tests/go-maps.c" }) |source| {
         go_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     }
-    test_step.dependOn(&b.addRunArtifact(go_tests).step);
+    const go_run = b.addRunArtifact(go_tests);
+    b.step("test-go", "Check Go goroutine and value readers").dependOn(&go_run.step);
+    test_step.dependOn(&go_run.step);
     const jai_tests = b.addExecutable(.{ .name = "xodb-jai-layout-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     for ([_][]const u8{ "src/language/jai_layout.c", "tests/jai-layout.c" }) |source| {
         jai_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror" } });
@@ -412,6 +502,13 @@ pub fn build(b: *std.Build) void {
     const jai_job_run = b.addRunArtifact(jai_job_tests);
     b.step("test-jai-job", "Check copied input, worker ownership and nonblocking release").dependOn(&jai_job_run.step);
     test_step.dependOn(&jai_job_run.step);
+    const elisp_tests = b.addExecutable(.{ .name = "xodb-elisp-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/elisp.c", "tests/elisp-reader.c" }) |source| {
+        elisp_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const elisp_run = b.addRunArtifact(elisp_tests);
+    test_step.dependOn(&elisp_run.step);
+    b.step("test-elisp", "Test the bounded Emacs Lisp memory reader").dependOn(&elisp_run.step);
     const javascript_tests = b.addExecutable(.{ .name = "xodb-javascript-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     for ([_][]const u8{ "src/language/javascript.c", "src/language/javascript_layout.c", "tests/javascript-reader.c" }) |source| {
         javascript_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
@@ -473,7 +570,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;
@@ -488,7 +585,13 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(process_tests).step);
     test_step.dependOn(&b.addRunArtifact(target_tests).step);
     test_step.dependOn(&b.addRunArtifact(file_path_tests).step);
-    test_step.dependOn(&b.addRunArtifact(perf_tests).step);
+    test_step.dependOn(&perf_run.step);
+    test_step.dependOn(&fdflow_run.step);
+    test_step.dependOn(&fdflow_order_run.step);
+    test_step.dependOn(&fdflow_count_run.step);
+    test_step.dependOn(&fdflow_churn_run.step);
+    test_step.dependOn(&flow_owner_run.step);
+    test_step.dependOn(&flow_graph_run.step);
     test_step.dependOn(&b.addRunArtifact(wire_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdscan_tests).step);
     test_step.dependOn(&b.addRunArtifact(fdactivity_tests).step);

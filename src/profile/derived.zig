@@ -60,6 +60,13 @@ pub fn assetSet(capture: *const Capture) u64 {
         h.update(std.mem.asBytes(&image.mapping.len));
         h.update(std.mem.asBytes(&@intFromPtr(image.mapping.ptr)));
     }
+    for (capture.pe_assets.entries.items) |image| {
+        h.update("PE");
+        h.update(std.mem.asBytes(&image.id));
+        h.update(std.mem.asBytes(&image.bias));
+        h.update(std.mem.asBytes(&image.mapping.len));
+        h.update(std.mem.asBytes(&@intFromPtr(image.mapping.ptr)));
+    }
     return h.final();
 }
 pub const Counts = struct {

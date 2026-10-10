@@ -86,8 +86,18 @@ void xrt_unix_peers_free(struct xrt_unix_peers *out)
 }
 enum xrt_status xrt_unix_peers_read(uint32_t inode,uint32_t capacity,struct xrt_unix_peers *out)
 {
+    return xrt_unix_peers_read_until(inode,capacity,0,out);
+}
+enum xrt_status xrt_unix_peers_read_until(uint32_t inode,uint32_t capacity,uint64_t deadline,struct xrt_unix_peers *out)
+{
     if (!out || !capacity || capacity>262144) return XRT_INVALID_ARGUMENT;
     memset(out,0,sizeof *out);out->capacity=capacity<256 ? capacity : 256;out->started_ns=peer_now();
+    uint64_t limit=out->started_ns+250000000u;
+    if (!deadline || deadline>limit) deadline=limit;
+    if (!out->started_ns || out->started_ns>=deadline) {
+        peer_error(out,ETIMEDOUT,"UNIX_DIAG deadline");out->taken_ns=out->started_ns;
+        return XRT_FILE_UNAVAILABLE;
+    }
     out->rows=calloc(out->capacity,sizeof *out->rows);
     if (!out->rows) return XRT_OUT_OF_MEMORY;
     int fd=socket(AF_NETLINK,SOCK_RAW|SOCK_CLOEXEC|SOCK_NONBLOCK,NETLINK_SOCK_DIAG);
@@ -103,7 +113,7 @@ enum xrt_status xrt_unix_peers_read(uint32_t inode,uint32_t capacity,struct xrt_
     struct sockaddr_nl kernel={.nl_family=AF_NETLINK};
     if (sendto(fd,&request,request.h.nlmsg_len,0,(struct sockaddr *)&kernel,sizeof kernel)!=(ssize_t)request.h.nlmsg_len)
         peer_error(out,errno ? errno : EIO,"UNIX_DIAG send failed");
-    unsigned datagrams=0;uint64_t deadline=out->started_ns+250000000u;
+    unsigned datagrams=0;
     while (!out->error && !out->complete) {
         uint64_t now=peer_now();
         if (!now || now>=deadline) {peer_error(out,ETIMEDOUT,"UNIX_DIAG deadline");break;}

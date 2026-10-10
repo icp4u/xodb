@@ -275,11 +275,12 @@ if 'looks' in sections or 'layout' in sections:
                 save(shot, f'{look}-{size[0]}x{size[1]}.png')
                 check(f'{look} {size[0]}x{size[1]} renders', colorful(shot) > 30 and 'Draw failed' not in d.text(), d.text()[-300:])
                 if look == 'win9x':
+                    # The title strip alone as well: on the whole row its gradient reads differently per GPU.
                     found = {k: count_rgb(shot, c, 6) for k, c in WIN9X.items()}
                     check(f'win9x {size[0]} draws the desktop, title bar and cell colours, the change kinds distinct',
                           all(v > 20 for v in found.values()), found)
                     nav = 236 if size[0] >= 1500 else 196
-                    text = ocr(shot) + ' ' + ocr(shot, (nav, 72, size[0], 108)) + ' ' + ocr(shot, (size[0] // 2, size[1] - 200, size[0], size[1] - 28)) + ' ' + ocr(shot, (size[0] // 2, size[1] // 2, size[0], size[1]))
+                    text = ocr(shot) + ' ' + ocr(shot, (nav, 72, size[0], 108)) + ' ' + ocr(shot, (size[0] * 3 // 8, 72, size[0] - 80, 108)) + ' ' + ocr(shot, (size[0] // 2, size[1] - 200, size[0], size[1] - 28)) + ' ' + ocr(shot, (size[0] // 2, size[1] // 2, size[0], size[1])) + ' ' + ocr(shot, (nav, size[1] - 200, size[0], size[1] - 28))
                     want = ['Defragmenting Memory', 'Which process do you', 'Complete', 'Stop', 'Legend', 'Hide Details', 'cost-limited']
                     check(f'win9x {size[0]} chrome text', all(w.lower() in text.lower() for w in want), [w for w in want if w.lower() not in text.lower()] or text[:200])
                 if look == 'dos':

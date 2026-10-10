@@ -14,6 +14,12 @@ pub const max_snapshots = 64;
 /// Bulk search reads at roughly a gigabyte per second, so this bounds one
 /// stopped search to about a second. Memory use does not grow with length.
 pub const max_search = 1024 * 1024 * 1024;
+/// A multi-range search (explicit ranges or a region selector) may cover
+/// more: it is incremental, tick-budgeted and cancellable like one range, uses
+/// the same fixed buffer, and skips the gaps between ranges without reads, so
+/// the extra cost is only the target staying stopped for a few seconds.
+pub const max_search_total: u64 = 4 * 1024 * 1024 * 1024;
+pub const max_search_ranges = 4096;
 pub const max_hits = 4096;
 /// Largest single local or core read. Remote targets use the agent protocol's
 /// read limit (XRT_RPC_DATA_MAX) instead.
@@ -38,15 +44,23 @@ pub const Snapshot = struct {
         A.free(self.valid);
     }
 };
+/// One searched range; `unreadable` is filled in as the search runs.
+pub const Range = struct { address: u64, length: u64, unreadable: u64 = 0 };
 pub const Search = struct {
     owner: jobs.Owner = .{},
     id: u64,
     generation: u64,
     image_epoch: u64,
+    /// First range's address and the total bytes of all ranges.
     address: u64,
-    length: usize,
-    scanned: usize = 0,
-    unreadable: usize = 0,
+    length: u64,
+    scanned: u64 = 0,
+    unreadable: u64 = 0,
+    /// Ascending, non-overlapping; owned by Memory. A hit never spans two
+    /// ranges: partial matches reset at each range boundary.
+    ranges: []Range,
+    range: usize = 0,
+    offset: u64 = 0,
     state: enum { running, complete, cancelled, stale, match_limit } = .running,
     pattern: [256]u8 = undefined,
     pattern_len: usize,
@@ -75,6 +89,51 @@ fn readSpan(target: anytype, address: u64, dest: []u8, page_mode: *bool) Span {
     if (n == count) page_mode.* = false;
     return if (n > 0) .{ .readable = n } else .{ .unreadable = count };
 }
+/// Region selectors for a search over the current memory map:
+///   writable: readable and writable private mappings, file-backed or not
+///     (heap, stacks, anonymous memory, a module's .data/.bss);
+///   anon-writable: the same, only without a file path (no name, or a
+///     bracketed pseudo name such as [heap], [stack] or [anon:...]);
+///   all-readable: every readable private mapping.
+/// Shared mappings ('s') are added only with `shared`: another process can
+/// change them, and device mappings can be slow or refuse reads. Selected
+/// mappings that touch merge into one range; all are clipped to the window.
+pub const Selector = enum { writable, @"anon-writable", @"all-readable" };
+pub const RegionError = error{ NoMatchingRegions, MemorySearchTooManyRanges, MemorySearchTooLarge, OutOfMemory };
+pub fn selected(selector: Selector, shared: bool, region: anytype) bool {
+    const p = region.permissions;
+    if (p[0] != 'r' or (p[3] == 's' and !shared)) return false;
+    const file = region.path.len > 0 and region.path[0] != '[';
+    return switch (selector) {
+        .@"all-readable" => true,
+        .writable => p[1] == 'w',
+        .@"anon-writable" => p[1] == 'w' and !file,
+    };
+}
+pub fn regionRanges(a: std.mem.Allocator, regions: anytype, selector: Selector, shared: bool, window_start: u64, window_end: u64) RegionError![]Range {
+    var out: std.ArrayList(Range) = .empty;
+    errdefer out.deinit(a);
+    var total: u64 = 0;
+    for (regions) |region| {
+        if (!selected(selector, shared, region)) continue;
+        const start = @max(region.start, window_start, 1);
+        const end = @min(region.end, window_end);
+        if (start >= end) continue;
+        total += end - start;
+        if (total > max_search_total) return error.MemorySearchTooLarge;
+        if (out.items.len > 0) {
+            const last = &out.items[out.items.len - 1];
+            if (last.address + last.length == start) {
+                last.length += end - start;
+                continue;
+            }
+        }
+        if (out.items.len == max_search_ranges) return error.MemorySearchTooManyRanges;
+        try out.append(a, .{ .address = start, .length = end - start });
+    }
+    if (out.items.len == 0) return error.NoMatchingRegions;
+    return out.toOwnedSlice(a);
+}
 fn readLimit(target: anytype) usize {
     const T = @TypeOf(target.*);
     if (@hasDecl(T, "isRemote") and target.isRemote()) return remote_read;
@@ -95,6 +154,8 @@ pub const Memory = struct {
         self.retained = 0;
         if (self.buffer.len > 0) A.free(self.buffer);
         self.buffer = &.{};
+        if (self.search) |search| A.free(search.ranges);
+        self.search = null;
     }
     pub fn find(self: *const Memory, id: u64) !*const Snapshot {
         for (&self.snapshots) |*snapshot| if (snapshot.*) |*s| {
@@ -172,15 +233,30 @@ pub const Memory = struct {
         return self.startSearchOwned(session, address, length, pattern, .{});
     }
     pub fn startSearchOwned(self: *Memory, session: anytype, address: u64, length: usize, pattern: []const u8, requester: jobs.Requester) !u64 {
+        if (length > max_search) return error.InvalidMemoryRange;
+        return self.startSearchRanges(session, &.{.{ .address = address, .length = length }}, pattern, requester);
+    }
+    /// One job over ascending, non-overlapping ranges with one hit list.
+    pub fn startSearchRanges(self: *Memory, session: anytype, ranges: []const Range, pattern: []const u8, requester: jobs.Requester) !u64 {
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
-        if (length == 0 or length > max_search or address == 0 or address > std.math.maxInt(u64) - length) return error.InvalidMemoryRange;
+        if (ranges.len == 0 or ranges.len > max_search_ranges) return error.InvalidMemoryRange;
+        var total: u64 = 0;
+        var end: u64 = 0;
+        for (ranges) |r| {
+            if (r.length == 0 or r.address == 0 or r.address < end or r.address > std.math.maxInt(u64) - r.length) return error.InvalidMemoryRange;
+            end = r.address + r.length;
+            total += r.length;
+            if (total > max_search_total) return error.InvalidMemoryRange;
+        }
         if (pattern.len == 0 or pattern.len > 256) return error.InvalidMemoryPattern;
         if (self.search) |search| {
             try search.owner.require(requester);
             if (search.state == .running) return error.MemorySearchBusy;
         }
-        var search = Search{ .owner = requester.owner, .id = self.next_id, .generation = session.target.snapshot().generation, .image_epoch = session.target.snapshot().image_epoch, .address = address, .length = length, .pattern_len = pattern.len };
         if (self.buffer.len == 0) self.buffer = try A.alloc(u8, bulk_read);
+        const owned = try A.alloc(Range, ranges.len);
+        for (owned, ranges) |*o, r| o.* = .{ .address = r.address, .length = r.length };
+        var search = Search{ .owner = requester.owner, .id = self.next_id, .generation = session.target.snapshot().generation, .image_epoch = session.target.snapshot().image_epoch, .address = ranges[0].address, .length = total, .ranges = owned, .pattern_len = pattern.len };
         @memcpy(search.pattern[0..pattern.len], pattern);
         search.prefix[0] = 0;
         var matched: usize = 0;
@@ -189,6 +265,7 @@ pub const Memory = struct {
             if (pattern[matched] == byte) matched += 1;
             search.prefix[i] = matched;
         }
+        if (self.search) |old| A.free(old.ranges);
         self.search = search;
         self.next_id += 1;
         return search.id;
@@ -213,17 +290,27 @@ pub const Memory = struct {
         }
         const limit = @min(self.read_size, self.buffer.len, readLimit(&session.target));
         const started = now();
-        while (search.scanned < search.length) {
-            const address = search.address + search.scanned;
-            const span = readSpan(&session.target, address, self.buffer[0..@min(search.length - search.scanned, limit)], &search.page_mode);
+        while (search.range < search.ranges.len) {
+            const range = &search.ranges[search.range];
+            if (search.offset == range.length) {
+                search.range += 1;
+                search.offset = 0;
+                search.matched = 0;
+                search.page_mode = false;
+                continue;
+            }
+            const address = range.address + search.offset;
+            const span = readSpan(&session.target, address, self.buffer[0..@intCast(@min(range.length - search.offset, limit))], &search.page_mode);
             if (span.unreadable > 0) {
+                range.unreadable += span.unreadable;
                 search.unreadable += span.unreadable;
                 search.matched = 0;
                 search.scanned += span.unreadable;
+                search.offset += span.unreadable;
             } else if (!scan(search, address, self.buffer[0..span.readable])) return;
             if (now() -% started >= budget_ns) break;
         }
-        if (search.scanned == search.length) search.state = .complete;
+        if (search.range == search.ranges.len) search.state = .complete;
     }
     /// KMP over one readable run; the partial match carries into the next
     /// run. While nothing is matched, memchr-style skipping finds the first
@@ -242,12 +329,14 @@ pub const Memory = struct {
                 search.matched = search.prefix[search.matched - 1];
                 if (search.count == search.hits.len) {
                     search.scanned += i + 1;
+                    search.offset += i + 1;
                     search.state = .match_limit;
                     return false;
                 }
             }
         }
         search.scanned += bytes.len;
+        search.offset += bytes.len;
         return true;
     }
 };
@@ -455,4 +544,103 @@ test "large captures are exact across holes and the retained budget evicts oldes
     const observer = jobs.Requester{ .owner = jobs.Owner.agent(9) };
     try std.testing.expectError(error.JobNotOwned, memory.captureOwned(&session, 0x100000, max_snapshot, observer));
     _ = try memory.find(ids[1]);
+}
+
+test "multi-range search keeps one hit list, per-range accounting and resets at range ends" {
+    const holes = [_]u64{0x41000};
+    const plants = [_]Space.Plant{
+        .{ .at = 0x10000, .text = "ABABAC" }, // first byte of range 0
+        .{ .at = 0x20000 - 3, .text = "ABA" }, // range 0 ends mid-match:
+        .{ .at = 0x20000, .text = "BAC" }, //     this half is in the gap, never read
+        .{ .at = 0x30000 - 3, .text = "ABABAC" }, // straddles adjacent ranges 1|2: no hit
+        .{ .at = 0x40ffa, .text = "ABABAC" }, // ends at the hole inside range 2
+        .{ .at = 0x60000 - 6, .text = "ABABAC" }, // ends range 3
+    };
+    const ranges = [_]Range{
+        .{ .address = 0x10000, .length = 0x10000 },
+        .{ .address = 0x28000, .length = 0x8000 },
+        .{ .address = 0x30000, .length = 0x12000 },
+        .{ .address = 0x50000, .length = 0x10000 },
+    };
+    inline for (.{ false, true }) |whole| {
+        for ([_]usize{ 7, 4096, bulk_read }) |read_size| {
+            var session = struct { id: u64 = 1, target: Space = .{} }{};
+            session.target = .{ .holes = &holes, .plants = &plants, .whole = whole };
+            var memory = Memory{ .read_size = read_size };
+            defer memory.deinit();
+            _ = try memory.startSearchRanges(&session, &ranges, "ABABAC", .{});
+            while (memory.search.?.state == .running) memory.pollBudget(&session, 0);
+            const search = &memory.search.?;
+            try std.testing.expectEqual(.complete, search.state);
+            try std.testing.expectEqualSlices(u64, &.{ 0x10000, 0x40ffa, 0x60000 - 6 }, search.hits[0..search.count]);
+            try std.testing.expectEqual(@as(u64, 0x10000 + 0x8000 + 0x12000 + 0x10000), search.scanned);
+            try std.testing.expectEqual(search.length, search.scanned);
+            try std.testing.expectEqual(@as(u64, page), search.unreadable);
+            for (search.ranges, [_]u64{ 0, 0, page, 0 }) |r, u| try std.testing.expectEqual(u, r.unreadable);
+            // Every range was visited in order.
+            try std.testing.expectEqual(ranges.len, search.range);
+        }
+    }
+    // Hit cap stops mid-range with exact progress; cancellation still works.
+    var session = struct { id: u64 = 1, target: Space = .{ .fill = 'A' } }{};
+    var memory = Memory{};
+    defer memory.deinit();
+    _ = try memory.startSearchRanges(&session, &.{ .{ .address = 0x1000, .length = 100 }, .{ .address = 0x100000, .length = 3 * max_hits } }, "AA", .{});
+    while (memory.search.?.state == .running) memory.pollBudget(&session, 0);
+    try std.testing.expectEqual(.match_limit, memory.search.?.state);
+    try std.testing.expectEqual(@as(usize, 1), memory.search.?.range);
+    try std.testing.expectEqual(@as(u64, 100 + max_hits - 99 + 1), memory.search.?.scanned);
+    const id = try memory.startSearchRanges(&session, &.{ .{ .address = 0x1000, .length = bulk_read }, .{ .address = 0x10000000, .length = bulk_read } }, "needle", .{});
+    try memory.cancelSearch(id, .{});
+    memory.pollBudget(&session, 0);
+    try std.testing.expectEqual(.cancelled, memory.search.?.state);
+    // Unsorted, overlapping, empty, oversized and too many ranges are refused.
+    const bad = [_][]const Range{
+        &.{ .{ .address = 0x2000, .length = 16 }, .{ .address = 0x1000, .length = 16 } },
+        &.{ .{ .address = 0x1000, .length = 32 }, .{ .address = 0x1010, .length = 16 } },
+        &.{.{ .address = 0x1000, .length = 0 }},
+        &.{ .{ .address = 0x1000, .length = max_search_total }, .{ .address = 0x1000 + max_search_total, .length = 1 } },
+        &.{},
+    };
+    for (bad) |list| try std.testing.expectError(error.InvalidMemoryRange, memory.startSearchRanges(&session, list, "x", .{}));
+    var many: [max_search_ranges + 1]Range = undefined;
+    for (&many, 0..) |*r, i| r.* = .{ .address = 0x1000 + i * 0x2000, .length = 16 };
+    try std.testing.expectError(error.InvalidMemoryRange, memory.startSearchRanges(&session, &many, "x", .{}));
+    _ = try memory.startSearchRanges(&session, many[0..max_search_ranges], "x", .{});
+}
+
+test "region selectors pick documented mappings, merge neighbours and clip to a window" {
+    const R = struct { start: u64, end: u64, permissions: [4]u8, path: []const u8 };
+    const maps = [_]R{
+        .{ .start = 0x400000, .end = 0x401000, .permissions = "r-xp".*, .path = "/bin/x" },
+        .{ .start = 0x401000, .end = 0x402000, .permissions = "rw-p".*, .path = "/bin/x" }, // .data
+        .{ .start = 0x402000, .end = 0x404000, .permissions = "rw-p".*, .path = "" }, // .bss tail
+        .{ .start = 0x500000, .end = 0x501000, .permissions = "rw-p".*, .path = "[heap]" },
+        .{ .start = 0x600000, .end = 0x601000, .permissions = "---p".*, .path = "" },
+        .{ .start = 0x601000, .end = 0x602000, .permissions = "rw-s".*, .path = "/dev/shm/x" },
+        .{ .start = 0x700000, .end = 0x701000, .permissions = "r--p".*, .path = "/lib/y" },
+        .{ .start = 0x800000, .end = 0x810000, .permissions = "rw-p".*, .path = "[anon:pool]" },
+    };
+    const a = std.testing.allocator;
+    const Case = struct { selector: Selector, shared: bool, expect: []const Range };
+    const cases = [_]Case{
+        .{ .selector = .writable, .shared = false, .expect = &.{ .{ .address = 0x401000, .length = 0x3000 }, .{ .address = 0x500000, .length = 0x1000 }, .{ .address = 0x800000, .length = 0x10000 } } },
+        .{ .selector = .writable, .shared = true, .expect = &.{ .{ .address = 0x401000, .length = 0x3000 }, .{ .address = 0x500000, .length = 0x1000 }, .{ .address = 0x601000, .length = 0x1000 }, .{ .address = 0x800000, .length = 0x10000 } } },
+        .{ .selector = .@"anon-writable", .shared = false, .expect = &.{ .{ .address = 0x402000, .length = 0x2000 }, .{ .address = 0x500000, .length = 0x1000 }, .{ .address = 0x800000, .length = 0x10000 } } },
+        .{ .selector = .@"all-readable", .shared = false, .expect = &.{ .{ .address = 0x400000, .length = 0x4000 }, .{ .address = 0x500000, .length = 0x1000 }, .{ .address = 0x700000, .length = 0x1000 }, .{ .address = 0x800000, .length = 0x10000 } } },
+    };
+    for (cases) |case| {
+        const got = try regionRanges(a, &maps, case.selector, case.shared, 0, std.math.maxInt(u64));
+        defer a.free(got);
+        try std.testing.expectEqualSlices(Range, case.expect, got);
+    }
+    const clipped = try regionRanges(a, &maps, .writable, false, 0x403000, 0x500800);
+    defer a.free(clipped);
+    try std.testing.expectEqualSlices(Range, &.{ .{ .address = 0x403000, .length = 0x1000 }, .{ .address = 0x500000, .length = 0x800 } }, clipped);
+    try std.testing.expectError(error.NoMatchingRegions, regionRanges(a, &maps, .writable, false, 0x600000, 0x601000));
+    var lots: [max_search_ranges + 1]R = undefined;
+    for (&lots, 0..) |*r, i| r.* = .{ .start = 0x10000 + i * 0x2000, .end = 0x11000 + i * 0x2000, .permissions = "rw-p".*, .path = "" };
+    try std.testing.expectError(error.MemorySearchTooManyRanges, regionRanges(a, &lots, .writable, false, 0, std.math.maxInt(u64)));
+    const big = [_]R{ .{ .start = 0x10000, .end = 0x10000 + max_search_total, .permissions = "rw-p".*, .path = "" }, .{ .start = 0x20000 + max_search_total, .end = 0x21000 + max_search_total, .permissions = "rw-p".*, .path = "" } };
+    try std.testing.expectError(error.MemorySearchTooLarge, regionRanges(a, &big, .writable, false, 0, std.math.maxInt(u64)));
 }

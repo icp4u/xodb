@@ -24,6 +24,8 @@ pub const Panel = struct {
     tid: i32 = 0,
     refresh: bool = true,
     search_length: usize = 64 * 1024,
+    /// Search every writable private mapping instead of the displayed range.
+    all_writable: bool = false,
     hit: usize = 0,
     vector: ?xstate.State = null,
     previous: ?xstate.State = null,
@@ -121,6 +123,9 @@ pub const Panel = struct {
             if (session.memory.search) |*search| if (search.state == .running) {
                 search.state = .cancelled;
             };
+        } else if (k == 'w') {
+            self.all_writable = !self.all_writable;
+            self.message = if (self.all_writable) "/ now searches all writable private mappings at this stop" else "/ now searches the displayed address and length";
         } else if (k == 'u') {
             self.baseline = null;
             session.memory.pinned = null;
@@ -160,7 +165,13 @@ pub const Panel = struct {
                     for (0..hex.len / 2) |i| bytes[i] = std.fmt.parseInt(u8, hex[2 * i ..][0..2], 16) catch return error.InvalidMemoryPattern;
                     break :blk bytes[0 .. hex.len / 2];
                 };
-                _ = try session.memory.startSearch(session, self.address, self.search_length, data);
+                if (self.all_writable) {
+                    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer arena.deinit();
+                    try session.refreshMaps();
+                    const ranges = try memory.regionRanges(arena.allocator(), session.modules.regions.items, .writable, false, 0, std.math.maxInt(u64));
+                    _ = try session.memory.startSearchRanges(session, ranges, data, .{});
+                } else _ = try session.memory.startSearch(session, self.address, self.search_length, data);
                 self.hit = 0;
                 self.message = "Searching; N jumps to next result, C cancels";
             },
@@ -200,11 +211,11 @@ pub const Panel = struct {
         var buffer: [1024]u8 = undefined;
         const title = try std.fmt.bufPrint(&buffer, "{s}   {s} / Esc close   tid {d}   stop {d}{s}", .{ if (self.kind == .memory) "MEMORY" else "FP / SIMD", if (self.kind == .memory) "M" else "R", tid, self.generation, if (session.target.snapshot().state != .stopped) " (historical: target running)" else "" });
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, title, theme.text);
-        try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, if (self.kind == .memory) "G address  P pin  U unpin  / find  L length  N next  C cancel  PgUp/Down" else "V format  W width  Up/Down scroll  Orange = changed since previous stop", theme.weak);
+        try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, if (self.kind == .memory) "G address  P pin  U unpin  / find  L length  W all writable  N next  C cancel  PgUp/Down" else "V format  W width  Up/Down scroll  Orange = changed since previous stop", theme.weak);
         if (self.kind == .memory) try self.drawMemory(r, font, b, session) else try self.drawVectors(r, font, b);
         const y = b.y + b.h - 76;
         if (self.kind == .memory) if (session.memory.search) |search| {
-            const progress = try std.fmt.bufPrint(&buffer, "Search {s}: {d}/{d} bytes, {d} unreadable, {d} hits", .{ @tagName(search.state), search.scanned, search.length, search.unreadable, search.count });
+            const progress = try std.fmt.bufPrint(&buffer, "Search {s}: {d}/{d} bytes in {d} ranges, {d} unreadable, {d} hits", .{ @tagName(search.state), search.scanned, search.length, search.ranges.len, search.unreadable, search.count });
             try r.textFit(font, b.x + 14, y - 24, b.w - 28, progress, theme.weak);
         };
         try r.textFit(font, b.x + 14, y, b.w - 28, self.message, theme.text);
@@ -212,7 +223,10 @@ pub const Panel = struct {
             try style.box(r, .{ .x = b.x + 10, .y = y + 24, .w = b.w - 20, .h = 27 }, theme.background, theme.focus, @splat(3));
             try self.editor.draw(r, font, .{ .x = b.x + 16, .y = y + 28, .w = b.w - 32, .h = 22 });
         } else if (self.kind == .memory) {
-            const label = try std.fmt.bufPrint(&buffer, "0x{x}   scan {d} bytes   baseline {d}   ?? unreadable", .{ self.address, self.search_length, self.baseline orelse 0 });
+            const label = if (self.all_writable)
+                try std.fmt.bufPrint(&buffer, "0x{x}   scan all writable   baseline {d}   ?? unreadable", .{ self.address, self.baseline orelse 0 })
+            else
+                try std.fmt.bufPrint(&buffer, "0x{x}   scan {d} bytes   baseline {d}   ?? unreadable", .{ self.address, self.search_length, self.baseline orelse 0 });
             try r.textFit(font, b.x + 14, y + 28, b.w - 28, label, theme.weak);
         }
     }

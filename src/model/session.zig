@@ -699,6 +699,7 @@ pub const Session = struct {
         var config = request;
         config.follow_threads = request.follow_threads and request.tids.len == 0;
         config.tids = tids[0..count];
+        try self.refreshMaps();
         const opened = try profile.Capture.openTarget(self.target.handle, std.heap.page_allocator, self.next_profile_id, self.id, self.target.snapshot().generation, self.target.snapshot().image_epoch, self.target.snapshot().pid, try self.target.stoppedTid(), config, identities[0..count], linux.now());
         switch (opened) {
             .failed => |failure| {
@@ -706,6 +707,8 @@ pub const Session = struct {
                 return error.PerfOpenFailed;
             },
             .capture => |capture| {
+                errdefer capture.deinit();
+                try capture.retainPe(&self.modules);
                 self.dropDerived();
                 if (self.profile) |old| self.recorded_views.retire(old);
                 self.profile = capture;
@@ -897,6 +900,7 @@ pub const Session = struct {
             }
             self.modules.debug_files = self.symbolFiles();
             self.modules.target = self.target.handle;
+            self.modules.beginStop(self.target.snapshot().generation);
             try self.modules.refresh(try self.target.stoppedTid());
             self.maps_generation = self.target.snapshot().generation;
         }
@@ -1178,7 +1182,14 @@ pub const Session = struct {
         self.source_step_batched += boundary;
         return true;
     }
+    fn pollPeImages(self: *Session) void {
+        self.modules.pe_images.poll();
+        if (self.target.snapshot().state != .stopped or self.target.core != null) return;
+        self.refreshMaps() catch return;
+        self.modules.discoverPe();
+    }
     pub fn poll(self: *Session) !void {
+        defer self.pollPeImages();
         defer self.modules.reportBudget();
         defer self.language_watches.poll(self);
         defer self.language_tabs.poll(self);
@@ -1506,6 +1517,20 @@ pub const Session = struct {
                 // whole library on the event loop. CFI uses the C range worker;
                 // explicit locals/source inspection can still load full DWARF.
                 const module = (if (remote_caller or metadata_only) self.modules.cachedAt(frame.lookup_pc) else self.modules.at(frame.lookup_pc)) catch |err| {
+                    if (err == error.PeDebugInfoUnavailable and arch_ == .x86_64) {
+                        frame.inline_diagnostic = "PeDebugInfoUnavailable";
+                        const image = self.modules.peAt(pc) catch |pe_error| {
+                            frame.diagnostic = @errorName(pe_error);
+                            try frames.append(a, frame);
+                            break :stack_walk;
+                        };
+                        frame.module_id = image.id;
+                        break :step image.unwind(self.target.handle.?, pc, registers) catch |pe_error| {
+                            frame.diagnostic = @errorName(pe_error);
+                            try frames.append(a, frame);
+                            break :stack_walk;
+                        };
+                    }
                     if ((err == error.BinarySnapshotLimit or err == error.DebugMetadataNotLoaded) and self.target.core == null) {
                         frame.inline_diagnostic = if (metadata_only) "NoDebugInfo" else @errorName(err);
                         break :step self.metadata.unwind(self, a, frame.lookup_pc, registers) catch |metadata_error| {
@@ -1626,21 +1651,16 @@ pub const Session = struct {
             result.enumerator = label;
             result.display = try std.fmt.allocPrint(a, "{s} ({s})", .{ label, result.display });
         }
-        if (v.type.language == .go) {
-            const kind: ?[]const u8 = switch (v.type.go_kind) {
-                value_view.go_kind.map => "map",
-                value_view.go_kind.chan => "channel",
-                value_view.go_kind.interface => "interface",
-                else => null,
-            };
-            // Swiss maps, itab/_type dynamic types and hchan state are later
-            // work: say so instead of showing raw words as if they were values.
-            if (kind) |what| {
-                result.display = try std.fmt.allocPrint(a, "partial: M2 (Go {s} preview not implemented)", .{what});
-                result.diagnostic = "GoPreviewNotImplemented";
-                result.partial = true;
-                return result;
-            }
+        if (try @import("../language/go_values.zig").summarize(self, a, v, &result)) return result;
+        const elisp_preview = @import("../language/elisp.zig").preview(self, a, v) catch |err| blk: {
+            result.diagnostic = @errorName(err);
+            break :blk null;
+        };
+        if (elisp_preview) |shown| {
+            result.visualization = shown;
+            result.display = shown.elisp.?.display;
+            result.diagnostic = shown.diagnostic;
+            return result;
         }
         const ruby_preview = @import("../language/ruby.zig").preview(self, a, v) catch |err| blk: {
             result.diagnostic = @errorName(err);
@@ -1728,6 +1748,7 @@ pub const Session = struct {
     pub const ValuePage = struct { value: ValueSummary, presentation: value_view.Presentation, total: u64, start: u64, next: ?u64, children: []ValueChild, basis: []const u8 = value_view.basis };
     pub fn valueChildren(self: *Session, a: std.mem.Allocator, v: eval.Value, start: u64, limit: usize, raw: bool) !ValuePage {
         if (v.runtime_type != null) return @import("runtime_values.zig").children(self, a, v, start, limit);
+        if (!raw and @import("../language/go_values.zig").supported(v.type)) return @import("../language/go_values.zig").children(self, a, v, start, limit);
         const page = try value_view.children(self.valueContext(a), v, start, limit, raw);
         const children = try a.alloc(ValueChild, page.children.len);
         for (page.children, children) |child, *item| item.* = .{ .index = child.index, .name = child.name, .value = try self.summarize(a, child.value) };
@@ -1819,7 +1840,7 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
         self.language_watches.deinit();
@@ -1856,7 +1877,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

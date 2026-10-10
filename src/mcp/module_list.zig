@@ -17,6 +17,7 @@ const Snapshot = struct {
     epoch: u64,
     regions: []const model.Region,
     failures: []const model.Modules.LoadFailure,
+    pe_pending: bool = false,
 };
 fn hashNumber(hash: *Hash, n: u64) void {
     var bytes: [8]u8 = undefined;
@@ -45,6 +46,12 @@ fn identity(snapshot: Snapshot) [64]u8 {
         hashText(&hash, r.path);
         hashText(&hash, @tagName(r.file_source));
         hashNumber(&hash, @intFromBool(r.full_image_deferred));
+        hashNumber(&hash, @intFromBool(r.pe_image != null));
+        if (r.pe_image) |pe_image| {
+            hashNumber(&hash, pe_image.id);
+            hashNumber(&hash, pe_image.base);
+            hashText(&hash, pe_image.path);
+        }
     }
     hashNumber(&hash, snapshot.failures.len);
     for (snapshot.failures) |f| {
@@ -92,7 +99,7 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
     var used: usize = 0;
     var rows: usize = 0;
     while (end < snapshot.regions.len and rows < limit) {
-        const bytes = rowBytes(snapshot.regions[end].path, "");
+        const bytes = rowBytes(snapshot.regions[end].path, if (snapshot.regions[end].pe_image) |pe_image| pe_image.path else "");
         if (bytes > page_bytes - used) break;
         used += bytes;
         rows += 1;
@@ -116,6 +123,7 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
         .total_load_failures = snapshot.failures.len,
         .map_generation = snapshot.generation,
         .image_epoch = snapshot.epoch,
+        .pe_metadata_pending = snapshot.pe_pending,
         .next = next,
     });
 }
@@ -127,6 +135,7 @@ pub fn call(a: Allocator, session: *Session, args: Value) !Value {
         .epoch = session.maps_epoch,
         .regions = session.modules.regions.items,
         .failures = session.modules.load_failures.items,
+        .pe_pending = session.modules.peDiscoveryPending(),
     }, args);
 }
 

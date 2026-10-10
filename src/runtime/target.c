@@ -40,6 +40,7 @@ enum xrt_status xrt_target_destroy(struct xrt_target *t)
     if (!t)
         return XRT_OK;
     TRY(xrt_target_close(t));
+    xodb_maps_free(&t->maps);
     free(t);
     return XRT_OK;
 }

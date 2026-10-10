@@ -32,19 +32,32 @@ admits at most 64 jobs and 128 MiB of unwind containers, reserving each worker's
 32 MiB maximum while it can still allocate. Completed local jobs are evicted by
 last stack query; jobs used by the current walk stay pinned. A walk that cannot
 fit reports a budget refusal. Original file versions survive eviction in the
-symbol identity ledger, so reload cannot silently mix file versions. Remote jobs
+shared file-identity ledger, so reload cannot silently mix file versions. Remote jobs
 keep their existing four-active-job limit and are not LRU victims. JavaScript
 jobs retain their separate two-slot bound. Job, object and decoder overhead,
 symbol projections, and full DWARF snapshots are separate from the CFI cap.
 Metadata status paths have a 512-byte preview with `image_truncated`; full paths
 remain available through paged `list_modules`.
 
-Full-image refusals produce one changed-count summary after a scan or session
-poll: `module budget: N full images loaded, M mapped files deferred`. Repeated
+Full-image refusals produce at most one summary per stopped generation: `module budget: N full images loaded, M mapped files deferred`. Repeated
 VMAs count as one deferred file. Each affected `list_modules` region carries
 `full_image_deferred`, even when the 64-entry detailed `load_failures` list is
-full. Successful symbols or CFI do not mean full code/DWARF was loaded. Counts
-are retained over unchanged mappings and repeated queries do not repeat notices.
+full. Successful symbols or CFI do not mean full code/DWARF was loaded. The summary describes the first refusal batch at that stop; subsequent deferred
+files remain visible through `list_modules`. Unchanged polls do not recount
+regions, and further queries at the same stop do not repeat the notice.
+
+The shared identity ledger also caches companion discovery and the choice of
+metadata-only unwinding. Rejected and missing companions are tried once per
+mapped file identity. Adding an explicit debug file or search root, or changing
+automatic discovery, invalidates those decisions. Automatically retained
+companions do not invalidate decisions for other images.
+
+File identity includes size, modification time and change time. Touching a
+mapped library can therefore make metadata stack frames or an evicted-image
+reload refuse with `BinaryChangedDuringRead` or `DebugMetadataFileChanged`, even
+when its bytes are unchanged. Exec or restarting the target establishes a new
+module set. Existing immutable full snapshots remain usable; the debugger never
+mixes newly read metadata with an older pinned file version.
 
 `xbo_object` borrows a pinned source and validates its device/inode, length and
 modification/change timestamps before and after reads. It reads ELF placement,
@@ -255,11 +268,18 @@ python3 tests/module-unwind.py --work .work/unwind-chain
 python3 tests/module-unwind.py --work .work/unwind-debug-frame --debug-frame
 python3 tests/module-unwind.py --work .work/unwind-lru --eviction
 python3 tests/module-unwind.py --work .work/unwind-budget --budget
+python3 tests/module-unwind.py --work .work/unwind-companions --companions
+python3 tests/module-unwind.py --work .work/unwind-large-companions --large-companions
+python3 tests/module-unwind.py --work .work/unwind-full-dwarf --full-dwarf
 ```
 
 The first uses 12 stripped, optimized libraries padded to 64 MiB and compares
-unwound PCs with compiler return addresses recorded by the inferior. The second
+unwound PCs with compiler return addresses recorded by the inferior. The eviction variant
 visits 66 small libraries, proves eviction and cold reload, then changes an
 evicted source timestamp and requires refusal. The budget variant requires an
 explicit refusal for a working set with 24 MiB of CFI per image. `--wrong-result` plants a wrong
 caller PC and must fail. RSS and CPU readings accompany both runs.
+
+The companion variants repeat stacks through four libraries with wrong-CRC debug
+files and require one rejection per file. The full-DWARF variant exceeds the
+full-image budget progressively and requires one summary for the stop.

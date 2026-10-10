@@ -1,0 +1,7 @@
+XGV_TYPE(TYPE, "internal/abi.Type")
+XGV_TYPE(ITAB, "internal/abi.ITab")
+XGV_TYPE(EFACE, "runtime.eface")
+XGV_TYPE(IFACE, "runtime.iface")
+XGV_TYPE(CHAN, "runtime.hchan")
+XGV_TYPE(SUDOG, "runtime.sudog")
+XGV_TYPE(MODULE, "runtime.moduledata")

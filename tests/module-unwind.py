@@ -2,6 +2,8 @@
 """Native CFI: exact compiler return PCs, sparse images and cache eviction.
 
 Fast default: 12 stripped 64 MiB DSOs in one optimized, frame-pointer-less callchain.
+Fast --companions: repeated wrong-CRC companion lookups share one decision.
+Periodic --large-companions and --full-dwarf exercise companion I/O and summary budgets.
 Periodic --eviction: 66 small DSOs in successive stacks, cold reload, changed-file refusal.
 CPU and RSS are evidence, not performance gates. --wrong-result plants a bad PC.
 """
@@ -19,9 +21,13 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work', type=Path, required=True)
 p.add_argument('--binary', type=Path, default=Path('zig-out/bin/xodb'))
 p.add_argument('--baseline', action='store_true')
-p.add_argument('--eviction', action='store_true')
-p.add_argument('--debug-frame', action='store_true', help='fast: preserve debug_frame without debug_info')
-p.add_argument('--budget', action='store_true', help='periodic: oversized CFI working set must refuse honestly')
+variants = p.add_mutually_exclusive_group()
+variants.add_argument('--eviction', action='store_true')
+variants.add_argument('--debug-frame', action='store_true', help='fast: preserve debug_frame without debug_info')
+variants.add_argument('--budget', action='store_true', help='periodic: oversized CFI working set must refuse honestly')
+variants.add_argument('--companions', action='store_true')
+variants.add_argument('--large-companions', action='store_true')
+variants.add_argument('--full-dwarf', action='store_true')
 p.add_argument('--wrong-result', action='store_true')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -40,7 +46,8 @@ __attribute__((noinline)) void walk(void **functions, unsigned i, unsigned count
     __asm__ volatile("" ::: "memory");
 }
 ''')
-flags = ['-O2', '-fomit-frame-pointer', '-fno-optimize-sibling-calls', '-fasynchronous-unwind-tables']
+companions = a.companions or a.large_companions
+flags = [*(['-g'] if a.full_dwarf or companions else []), '-O2', '-fomit-frame-pointer', '-fno-optimize-sibling-calls', '-fasynchronous-unwind-tables']
 subprocess.run(['cc', *flags, '-shared', '-fPIC', '-Wl,--build-id=none', str(w/'library.c'), '-o', str(w/'library.so')], check=True, timeout=30)
 if a.debug_frame:
     subprocess.run(['cc', '-O2', '-g', '-fomit-frame-pointer', '-fno-optimize-sibling-calls',
@@ -51,10 +58,19 @@ if a.debug_frame:
                     '--remove-section=.debug_str', '--remove-section=.debug_line_str',
                     '--remove-section=.debug_loclists', '--remove-section=.debug_rnglists',
                     str(w/'library.so')], check=True, timeout=30)
-count = 66 if a.eviction else 4 if a.debug_frame else 12
+count = 66 if a.eviction else 4 if a.debug_frame or companions else 12
 for i in range(count):
     path = w/f'lib{i:02}.so'
     shutil.copyfile(w/'library.so', path)
+    if companions:
+        debug = path.with_suffix('.debug')
+        subprocess.run(['objcopy', '--only-keep-debug', str(path), str(debug)], check=True, timeout=30)
+        subprocess.run(['objcopy', '--strip-debug', '--add-gnu-debuglink='+str(debug), str(path)], check=True, timeout=30)
+        # Change the companion after storing its CRC in the mapped library.
+        with debug.open('ab') as f:
+            f.write(b'wrong-crc')
+            if a.large_companions:
+                f.truncate(60*1024*1024)
     if a.budget:
         # Preserve real compiler CFI and append zero terminators in a larger
         # non-loadable file extent. The loader still maps the original segments.
@@ -70,7 +86,7 @@ for i in range(count):
         struct.pack_into('<IIQQQQIIQQ', data, shoff+index*width, *h)
         with path.open('wb') as f:
             f.write(data); f.seek(h[4]); f.write(payload); f.truncate(h[4]+h[5])
-    elif not a.eviction and not a.debug_frame:
+    elif not a.eviction and not a.debug_frame and not companions:
         with path.open('r+b') as f:
             f.truncate(64*1024*1024)
 fixture = w/'fixture'
@@ -97,7 +113,7 @@ def action(client, name, **arguments):
 
 
 c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction else 'chain'])
-report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, stacks=[])
+report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, companions=companions, full_dwarf=a.full_dwarf, stacks=[])
 try:
     c.stopped()
     action(c, 'set_breakpoint', symbol='unwind_stop')
@@ -105,7 +121,7 @@ try:
     stopped = c.stopped('breakpoint')
     report['before'] = usage(c.p.pid)
     original_id = None
-    for index in range(count+2 if a.eviction else 1):
+    for index in range(count+2 if a.eviction else 20 if companions else 3 if a.full_dwarf else 1):
         expected = [int(pc,16) for pc in (w/'oracle').read_text().splitlines()]
         if a.wrong_result:
             expected[0] += 1
@@ -133,7 +149,7 @@ try:
             if a.debug_frame:
                 assert all(f['unwind_method']=='debug_frame' for f in frames[2:2+count]), stack
                 assert not any(j['image'].endswith('lib00.so') for j in metadata), metadata
-            if index == 0 and not a.budget and not a.debug_frame:
+            if index == 0 and not a.budget and not a.debug_frame and not a.full_dwarf:
                 assert any(j['image'].endswith('lib00.so') and j['state']=='ready' for j in metadata), metadata
                 original_id = next(j['id'] for j in metadata if j['image'].endswith('lib00.so'))
             if a.eviction and index == count-1:
@@ -144,10 +160,21 @@ try:
                 changed = w/'lib01.so'
                 stat = changed.stat()
                 os.utime(changed, ns=(stat.st_atime_ns, stat.st_mtime_ns+1_000_000_000))
-        report['stacks'].append(dict(index=index, expected=expected, stack=stack, jobs=metadata))
+        report['stacks'].append(dict(index=index, expected=expected, stack=stack, jobs=metadata, usage=usage(c.p.pid)))
         if a.eviction and index < count+1:
             action(c, 'continue')
             stopped = c.stopped('breakpoint')
+    if a.full_dwarf:
+        regions, cursor = [], None
+        while True:
+            page = c.inspect('list_modules', **({'cursor':cursor} if cursor else {}))
+            regions.extend(page['regions'])
+            cursor = page['next']
+            if cursor is None:
+                break
+        deferred = sorted({r['path'] for r in regions if r['full_image_deferred']})
+        assert len(deferred) > 1, deferred
+        report['deferred'] = deferred
     report.update(after=usage(c.p.pid), load=os.getloadavg(), status='pass')
 finally:
     if report['status'] != 'pass':
@@ -157,7 +184,19 @@ finally:
     c.close()
     report['diagnostics'] = c.p.stderr.read().decode(errors='replace')
     report['elapsed_seconds'] = time.monotonic()-started
-    (w/'results.json').write_text(json.dumps(report, indent=2)+'\n')
-if not a.baseline:
-    assert 'BinarySnapshotLimit' not in report['diagnostics'], report['diagnostics']
+    try:
+        if report['status'] == 'pass' and not a.baseline:
+            assert 'BinarySnapshotLimit' not in report['diagnostics'], report['diagnostics']
+            if companions:
+                rejections = [line for line in report['diagnostics'].splitlines() if 'debug companion rejected' in line and str(w) in line]
+                assert len(rejections) == count, rejections
+                for i in range(count):
+                    assert sum(f'lib{i:02}.debug' in line for line in rejections) == 1, rejections
+            if a.full_dwarf:
+                assert report['diagnostics'].count('module budget:') == 1, report['diagnostics']
+    except BaseException:
+        report['status'] = 'fail'
+        raise
+    finally:
+        (w/'results.json').write_text(json.dumps(report, indent=2)+'\n')
 print(json.dumps({key:report[key] for key in ('status','baseline','eviction','before','after','elapsed_seconds')}))

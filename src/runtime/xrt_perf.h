@@ -49,7 +49,8 @@ struct xrt_perf_info {
     bool failed;
     struct xrt_perf_failure failure;
 };
-/* Explicit positive TIDs only. Handles and their mmap/fd ownership remain in C.
+/* Thread APIs take explicit positive TIDs; CPU enrollment is separate below.
+ * Handles and their mmap/fd ownership remain in C.
  * Callbacks may decode borrowed bytes, but never retain them or reenter handle
  * operations. They return a validated consumed prefix; C publishes the tail. */
 struct xrt_perf_ring {
@@ -78,6 +79,12 @@ void xrt_perf_info(const struct xrt_perf *, struct xrt_perf_info *);
 bool xrt_perf_thread(const struct xrt_perf *, size_t index, struct xrt_perf_thread *);
 bool xrt_perf_add(struct xrt_perf *, int32_t tid, const struct xrt_perf_attr *, size_t events,
                   xrt_perf_opener, void *context, struct xrt_perf_failure *);
+/* Local system-wide CPU enrollment. A non-NULL tracepoint filter is installed
+ * on every event while disabled, before any record can be collected. This is
+ * also the owned-TID scope used by live tests. No remote enrollment or inherit.
+ * The ring's thread.tid is -1; the caller retains its CPU-to-ring-index map. */
+bool xrt_perf_add_cpu(struct xrt_perf *, int32_t cpu, const struct xrt_perf_attr *, size_t events,
+                      const char *tracepoint_filter, struct xrt_perf_failure *);
 bool xrt_perf_enable(struct xrt_perf *, struct xrt_perf_failure *);
 bool xrt_perf_stop(struct xrt_perf *, struct xrt_perf_failure *);
 bool xrt_perf_retire(struct xrt_perf *, size_t index, struct xrt_perf_failure *);

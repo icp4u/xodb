@@ -31,7 +31,7 @@ enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
     v->fd = -1;
     enum xrt_status status;
     if (!t->connection) {
-        status = xrt_target_file_resolved(t, request, &v->fd, &v->identity, &v->source);
+        status = xrt_target_file_owner(t, request, &v->fd, &v->identity, &v->source, 1);
     } else {
         struct xrt_file_request copy = *request;
         struct xrt_codec wire = xrt_codec(v->bytes, sizeof(v->bytes), false);

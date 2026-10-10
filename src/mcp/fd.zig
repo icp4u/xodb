@@ -13,7 +13,7 @@ pub fn isControl(name: []const u8) bool {
 }
 pub fn handles(name: []const u8) bool {
     if (isControl(name)) return true;
-    inline for (.{ "get_fd_activity", "who_has_open", "get_fd_leaks", "get_deleted_open" }) |known|
+    inline for (.{ "get_fd_activity", "who_has_open", "get_fd_leaks", "get_deleted_open", "get_fd_inheritance", "get_fd_treemap" }) |known|
         if (std.mem.eql(u8, name, known)) return true;
     return false;
 }
@@ -179,18 +179,60 @@ pub fn control(a: Allocator, owner: *system.Collector, name: []const u8, args: V
     try set(a, &out, "demand_ms", if (start) 3000 else 0);
     return out;
 }
+fn appendInheritance(a: Allocator, s: *const c.struct_xrt_fd_snapshot, pid: u64, offset: u64, limit: u64, rows: *Value, out: *Value) !u64 {
+    var comparisons: ?*c.struct_xrt_fdinherit = null;
+    if (c.xrt_fdinherit_build(s, 262144, &comparisons) != c.XRT_OK) return error.FdComparisonUnavailable;
+    defer c.xrt_fdinherit_free(comparisons);
+    const view = comparisons.?;
+    try text(a, out, "evidence", "sampled same-number, kind, device/inode match; inheritance and exec history unproved");
+    try text(a, out, "fdinfo_demand", "fresh flags for reached rows; existing scan budget, no tracing");
+    var counts = object();
+    inline for (.{ "matched", "dropped", "stale", "cloexec", "no_cloexec", "flags_unknown", "parent_pairs", "parent_unavailable", "parent_unavailable_fds", "parent_denied", "parent_absent", "parent_reused", "no_parent_fd", "different_object", "identity_unknown" }) |field| try set(a, &counts, field, @field(view.*, field));
+    try text(a, &counts, "parent_reasons", "parent_denied: fd table needs privilege; parent_absent: exited or hidden by hidepid; parent_reused: pid reused after the child");
+    try out.object.put(a, "comparison_coverage", counts);
+    var matches: u64 = 0;
+    for (view.rows[0..view.count]) |r| {
+        const child = s.processes[r.child];
+        const parent = s.processes[r.parent];
+        const fd = s.fds[r.child_fd];
+        if (pid != 0 and child.pid != @as(i32, @intCast(pid))) continue;
+        defer matches += 1;
+        if (matches < offset or rows.array.items.len >= limit) continue;
+        var row = object();
+        var parent_id = object();
+        var child_id = object();
+        try set(a, &parent_id, "pid", @intCast(parent.pid));
+        try set(a, &parent_id, "start_ticks", parent.start);
+        try set(a, &child_id, "pid", @intCast(child.pid));
+        try set(a, &child_id, "start_ticks", child.start);
+        try row.object.put(a, "parent", parent_id);
+        try row.object.put(a, "child", child_id);
+        try set(a, &row, "fd", @intCast(fd.fd));
+        try text(a, &row, "kind", std.mem.span(c.xrt_fd_kind_name(fd.kind)));
+        try row.object.put(a, "device", .{ .string = try std.fmt.allocPrint(a, "{d}", .{fd.device}) });
+        try row.object.put(a, "inode", .{ .string = try std.fmt.allocPrint(a, "{d}", .{fd.inode}) });
+        try set(a, &row, "flags", r.flags);
+        try row.object.put(a, "child_cloexec", if (r.flags & c.XRT_FDINH_CHILD_FLAGS_KNOWN != 0) .{ .bool = r.flags & c.XRT_FDINH_CHILD_CLOEXEC != 0 } else .null);
+        try row.object.put(a, "parent_cloexec", if (r.flags & c.XRT_FDINH_PARENT_FLAGS_KNOWN != 0) .{ .bool = r.flags & c.XRT_FDINH_PARENT_CLOEXEC != 0 } else .null);
+        try flag(a, &row, "stale", r.flags & (c.XRT_FDINH_PARENT_STALE | c.XRT_FDINH_CHILD_STALE | c.XRT_FDINH_IDENTITY_STALE) != 0);
+        try rows.array.append(row);
+    }
+    return matches;
+}
 pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Value) !Value {
+    if (std.mem.eql(u8, name, "get_fd_treemap")) return treemap(a, owner, args);
     const activity = std.mem.eql(u8, name, "get_fd_activity");
     const lookup = std.mem.eql(u8, name, "who_has_open");
     const leaks = std.mem.eql(u8, name, "get_fd_leaks");
-    if (!activity and !lookup and !leaks and !std.mem.eql(u8, name, "get_deleted_open")) return error.UnknownTool;
+    const inheritance = std.mem.eql(u8, name, "get_fd_inheritance");
+    if (!activity and !lookup and !leaks and !inheritance and !std.mem.eql(u8, name, "get_deleted_open")) return error.UnknownTool;
     try wire.fields(args, if (activity) &.{ "limit", "offset", "sequence", "redact", "interval_ms", "pid", "mode", "start_ticks", "sort" } else if (lookup) &.{ "limit", "offset", "sequence", "redact", "interval_ms", "pid", "path", "device", "inode" } else &.{ "limit", "offset", "sequence", "redact", "interval_ms", "pid" });
     const limit = try wire.number(args, "limit", 50);
     const offset = try wire.number(args, "offset", 0);
     const sequence = try wire.number(args, "sequence", 0);
     const pid = try wire.number(args, "pid", 0);
     const interval = try wire.number(args, "interval_ms", 1000);
-    if (limit == 0 or limit > 500 or offset > 65536 or (offset != 0 and sequence == 0) or (args.object.contains("sequence") and sequence == 0) or (args.object.contains("pid") and pid == 0) or pid > std.math.maxInt(i32) or (interval != 250 and interval != 1000)) return error.InvalidArguments;
+    if (limit == 0 or limit > 500 or offset > (if (inheritance) @as(u64, 262144) else 65536) or (offset != 0 and sequence == 0) or (args.object.contains("sequence") and sequence == 0) or (args.object.contains("pid") and pid == 0) or pid > std.math.maxInt(i32) or (interval != 250 and interval != 1000)) return error.InvalidArguments;
     const redact = try boolean(args, "redact") or owner.redact;
     var events = false;
     var sort: Sort = .io;
@@ -216,8 +258,11 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
     const ctx = try owner.descriptors();
     const poll_pid: i32 = @intCast(pid);
     const request = c.struct_xrt_fdactivity_request{
-        .interval_ms = @intCast(interval), .poll_pids = if (pid != 0) &poll_pid else null,
-        .poll_pid_count = if (pid != 0) 1 else 0, .poll_all = if (pid == 0) 1 else 0,
+        .interval_ms = @intCast(interval),
+        .poll_pids = if (pid != 0) &poll_pid else null,
+        .poll_pid_count = if (pid != 0) 1 else 0,
+        .poll_all = if (pid == 0) 1 else 0,
+        .fdinfo_all = @intFromBool(inheritance),
     };
     // Observer event reads neither start capture nor extend its lifetime.
     const requested: c.enum_xrt_status = if (events) c.XRT_OK else c.xrt_fdactivity_request(ctx, &request);
@@ -236,6 +281,9 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
     try set(a, &out, "owner_cpu_ns", view.owner_cpu_ns);
     try set(a, &out, "interval_ms", view.interval_ms);
     try set(a, &out, "collector_instances", owner.fd_opens);
+    // Status only: observer polling never requests or renews graph tracing.
+    const flow = try flowStatus(a, view.flow);
+    try out.object.put(a, "system_flow", flow);
     var rows = Value{ .array = std.json.Array.init(a) };
     var matches: u64 = 0;
     const now = @import("../target/linux.zig").now();
@@ -310,27 +358,31 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
             };
             try out.object.put(a, "scope", scope);
         }
-        const indices = try a.alloc(u32, s.process_count);
-        for (indices, 0..) |*index, i| index.* = @intCast(i);
-        std.mem.sortUnstable(u32, indices, Order{ .snapshot = s, .sort = sort }, Order.less);
-        for (indices) |index| {
-            const p = s.processes[index];
-            if (pid != 0 and p.pid != @as(i32, @intCast(pid))) continue;
-            if (leaks or (activity and pid == 0)) {
-                if (leaks and p.flags & c.XRT_FDP_LEAKING == 0) continue;
-                if (matches >= offset and rows.array.items.len < limit) try rows.array.append(try process(a, p, redact, now));
-                matches += 1;
-                continue;
-            }
-            for (s.fds[p.first..][0..p.count]) |fd| {
-                if (!activity and !lookup and fd.flags & c.XRT_FD_DELETED == 0) continue;
-                if (lookup) {
-                    if (wanted_path) |wanted| {
-                        if (fd.flags & c.XRT_FD_LINK_CUT != 0 or !std.mem.eql(u8, path(s, fd), wanted)) continue;
-                    } else if (fd.flags & c.XRT_FD_STAT == 0 or fd.device != device.? or fd.inode != inode.?) continue;
+        if (inheritance) {
+            matches = try appendInheritance(a, s, pid, offset, limit, &rows, &out);
+        } else {
+            const indices = try a.alloc(u32, s.process_count);
+            for (indices, 0..) |*index, i| index.* = @intCast(i);
+            std.mem.sortUnstable(u32, indices, Order{ .snapshot = s, .sort = sort }, Order.less);
+            for (indices) |index| {
+                const p = s.processes[index];
+                if (pid != 0 and p.pid != @as(i32, @intCast(pid))) continue;
+                if (leaks or (activity and pid == 0)) {
+                    if (leaks and p.flags & c.XRT_FDP_LEAKING == 0) continue;
+                    if (matches >= offset and rows.array.items.len < limit) try rows.array.append(try process(a, p, redact, now));
+                    matches += 1;
+                    continue;
                 }
-                if (matches >= offset and rows.array.items.len < limit) try rows.array.append(try descriptor(a, s, p, fd, redact, now));
-                matches += 1;
+                for (s.fds[p.first..][0..p.count]) |fd| {
+                    if (!activity and !lookup and fd.flags & c.XRT_FD_DELETED == 0) continue;
+                    if (lookup) {
+                        if (wanted_path) |wanted| {
+                            if (fd.flags & c.XRT_FD_LINK_CUT != 0 or !std.mem.eql(u8, path(s, fd), wanted)) continue;
+                        } else if (fd.flags & c.XRT_FD_STAT == 0 or fd.device != device.? or fd.inode != inode.?) continue;
+                    }
+                    if (matches >= offset and rows.array.items.len < limit) try rows.array.append(try descriptor(a, s, p, fd, redact, now));
+                    matches += 1;
+                }
             }
         }
     } else {
@@ -348,7 +400,7 @@ pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Valu
 test "fd reads are observer tools and capture controls require a lease" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(6, parsed.value.array.items.len);
+    try std.testing.expectEqual(8, parsed.value.array.items.len);
     for (parsed.value.array.items) |tool| {
         try std.testing.expect(handles(tool.object.get("name").?.string));
         const annotations = tool.object.get("annotations").?.object;
@@ -447,4 +499,150 @@ test "path guesses refused under request or owner redaction before collection" {
         try std.testing.expectError(error.FdPathLookupRedacted, call(a, &owner, "who_has_open", args.value));
         try std.testing.expectEqual(0, owner.fd_opens);
     }
+}
+
+fn flowStatus(a: Allocator, sample: c.struct_xrt_fdflow_live) !Value {
+    var flow = object();
+    try flag(a, &flow, "running", sample.stream.running != 0);
+    try flag(a, &flow, "requested", sample.requested != 0);
+    try text(a, &flow, "state", status(sample.status));
+    try text(a, &flow, "host_cost", system.graph_cost);
+    try text(a, &flow, "identity", "sampled inode correlation; uncertain bytes remain unattributed");
+    try text(a, &flow, "scope", if (sample.stream.scoped != 0) "explicit process thread scope at capture start" else "all processes on enrolled CPUs");
+    try set(a, &flow, "active_cpus", if (sample.stream.running != 0) sample.stream.active_cpus else 0);
+    try set(a, &flow, "enrolled_cpus", sample.stream.active_cpus);
+    try set(a, &flow, "online_cpus", sample.stream.online_cpus);
+    try set(a, &flow, "generation", sample.generation);
+    try set(a, &flow, "sequence", sample.sequence);
+    try set(a, &flow, "flags", sample.stream.flags);
+    try set(a, &flow, "counter_flags", sample.counts.flags);
+    try set(a, &flow, "lost", sample.stream.lost);
+    try set(a, &flow, "read_bytes", sample.counts.read_bytes);
+    try set(a, &flow, "write_bytes", sample.counts.write_bytes);
+    try set(a, &flow, "unknown_read", sample.counts.unknown_read);
+    try set(a, &flow, "unknown_write", sample.counts.unknown_write);
+    if (sample.failure.detail != null) {
+        var failure_line: [320]u8 = undefined;
+        try text(a, &flow, "failure", system.failureText(&failure_line, sample.failure));
+    }
+    return flow;
+}
+fn treeMetric(a: Allocator, m: c.struct_xrt_fdtreemap_metric) !Value {
+    var out = object();
+    inline for (.{ "descriptors", "stale", "deleted", "unknown_paths", "stale_paths", "offset_measured", "flow_measured", "unexpanded", "flags", "read_bytes", "write_bytes", "last_ns" }) |field| try set(a, &out, field, @field(m, field));
+    try out.object.put(a, "read_bytes_per_second", if (m.flow_measured > 0) real(m.read_rate) else .null);
+    try out.object.put(a, "write_bytes_per_second", if (m.flow_measured > 0) real(m.write_rate) else .null);
+    try out.object.put(a, "offset_progress_per_second", if (m.offset_measured > 0) real(m.offset_rate) else .null);
+    return out;
+}
+fn treePath(a: Allocator, out: *Value, t: *const c.struct_xrt_fdtreemap, node: u32, redact: bool) !void {
+    if (node >= t.count) {
+        try out.object.put(a, "namespace_kind", .null);
+        try out.object.put(a, "path", .null);
+        try out.object.put(a, "path_hex", .null);
+        try text(a, out, "path_state", "combined omitted entries; no single path");
+        return;
+    }
+    try set(a, out, "namespace_kind", t.nodes[node].kind);
+    var buffer: [4098]u8 = undefined;
+    var needed: usize = 0;
+    const valid = !redact and c.xrt_fdtreemap_path(t, node, &buffer, buffer.len, &needed) == c.XRT_OK;
+    const bytes = if (valid) buffer[0 .. needed - 1] else "";
+    try out.object.put(a, "path", if (valid and bytes.len <= 512 and std.unicode.utf8ValidateSlice(bytes)) try string(a, bytes) else .null);
+    if (valid) {
+        const hex = try a.alloc(u8, bytes.len * 2);
+        const digits = "0123456789abcdef";
+        for (bytes, 0..) |byte, i| {
+            hex[i * 2] = digits[byte >> 4];
+            hex[i * 2 + 1] = digits[byte & 15];
+        }
+        try out.object.put(a, "path_hex", .{ .string = hex });
+    } else try out.object.put(a, "path_hex", .null);
+    try text(a, out, "path_state", if (redact) "redacted" else if (!valid) "unavailable" else if (bytes.len > 512) "long path; exact bytes in path_hex" else if (!std.unicode.utf8ValidateSlice(bytes)) "non-UTF-8; exact bytes in path_hex" else if (t.nodes[node].kind != 0) "synthetic kind bucket; not a filesystem path" else "literal sampled spelling");
+}
+fn treemap(a: Allocator, owner: *system.Collector, args: Value) !Value {
+    try wire.fields(args, &.{ "node", "sequence", "limit", "redact" });
+    const node = try wire.number(args, "node", 0);
+    const sequence = try wire.number(args, "sequence", 0);
+    const limit = try wire.number(args, "limit", 16);
+    if (node >= 4096 or limit == 0 or limit > 32 or (node != 0 and sequence == 0) or (args.object.contains("sequence") and sequence == 0)) return error.InvalidArguments;
+    const redact = try boolean(args, "redact") or owner.redact;
+    const ctx = try owner.descriptors();
+    // Poll demand only: observing live metrics must not renew capture.
+    // poll_all already refreshes seekable offsets each scan; no fdinfo_all.
+    const request = c.struct_xrt_fdactivity_request{ .interval_ms = 1000, .poll_all = 1 };
+    const requested = c.xrt_fdactivity_request(ctx, &request);
+    if (requested != c.XRT_OK and requested != c.XRT_STALE_SNAPSHOT) return error.FdCollectorUnavailable;
+    var view: c.struct_xrt_fdactivity_view = undefined;
+    if (c.xrt_fdactivity_acquire(ctx, &view) == 0) return error.FdCacheBusy;
+    var tree: ?*c.struct_xrt_fdtreemap = null;
+    defer c.xrt_fdtreemap_free(tree);
+    var holder: c.struct_xrt_fdtreemap_holder = std.mem.zeroes(c.struct_xrt_fdtreemap_holder);
+    var snapshot: ?*c.struct_xrt_fd_snapshot = null;
+    var flow: ?*c.struct_xrt_fdflow_live = null;
+    {
+        // Copy under the lock, build after release: the flow drain waits on it.
+        defer c.xrt_fdactivity_release(ctx);
+        const poll: *const c.struct_xrt_fd_snapshot = if (view.poll != null) @ptrCast(view.poll) else return error.FdSnapshotPending;
+        if (sequence != 0 and sequence != poll.sequence) return error.FdSnapshotChanged;
+        snapshot = c.xrt_fd_snapshot_copy(poll) orelse return error.OutOfMemory;
+        flow = c.xrt_fdflow_live_copy(&view.flow) orelse {
+            c.xrt_fd_snapshot_free(snapshot);
+            return error.OutOfMemory;
+        };
+    }
+    {
+        defer c.xrt_fd_snapshot_free(snapshot);
+        defer c.xrt_fdflow_live_free(flow);
+        const options = c.struct_xrt_fdtreemap_options{ .max_nodes = 4096, .max_text = 1024 * 1024, .max_depth = 32 };
+        if (c.xrt_fdtreemap_build(snapshot, flow, &options, &tree) != c.XRT_OK) return error.FdTreemapUnavailable;
+        if (node >= tree.?.count) return error.InvalidArguments;
+        _ = c.xrt_fdtreemap_holder(tree, @intCast(node), &holder);
+    }
+    // Only owned tree data and by-value publication status are used below.
+    const t = tree.?;
+    var layout: ?*c.struct_xrt_fdtreemap_layout = null;
+    if (c.xrt_fdtreemap_layout(t, @intCast(node), @intCast(limit), 1.6, &layout) != c.XRT_OK) return error.FdTreemapUnavailable;
+    defer c.xrt_fdtreemap_layout_free(layout);
+    var out = object();
+    try text(a, &out, "state", status(view.poll_status));
+    try text(a, &out, "evidence", "area is descriptor count; literal path aggregation can combine different inodes/namespaces; sampled syscall identity, not exact file IO");
+    try text(a, &out, "limits", "4096 nodes, 1 MiB names, 32 components; capped descriptors remain unexpanded at the nearest represented ancestor");
+    try flag(a, &out, "redacted", redact);
+    try set(a, &out, "sequence", t.sequence);
+    try set(a, &out, "taken_ns", t.taken_ns);
+    try set(a, &out, "node", node);
+    try out.object.put(a, "parent", if (node != 0) try integer(a, t.nodes[node].parent) else .null);
+    try treePath(a, &out, t, @intCast(node), redact);
+    try out.object.put(a, "metric", try treeMetric(a, t.nodes[node].total));
+    try out.object.put(a, "system_flow", try flowStatus(a, view.flow));
+    var counts = object();
+    inline for (.{ "fd_count", "count", "text_length", "matched_rows", "unmatched_rows", "dropped_processes", "dropped_fds", "unscanned", "gone", "denied", "flow_flags", "count_flags", "allocated_bytes" }) |field| try set(a, &counts, field, @field(t.*, field));
+    try out.object.put(a, "coverage", counts);
+    var sample = object();
+    if (holder.pid > 0) {
+        try set(a, &sample, "pid", @intCast(holder.pid));
+        try set(a, &sample, "start_ticks", holder.start);
+        try set(a, &sample, "fd", @intCast(holder.fd));
+        try text(a, &sample, "evidence", "one sampled holder of this subtree; use its process Files table");
+    }
+    try out.object.put(a, "sample_holder", if (holder.pid > 0) sample else .null);
+    var tiles = Value{ .array = std.json.Array.init(a) };
+    for (layout.?.tiles[0..layout.?.count]) |tile| {
+        var row = object();
+        try row.object.put(a, "node", if (tile.node < t.count) try integer(a, tile.node) else .null);
+        try text(a, &row, "kind", switch (tile.kind) {
+            c.XRT_FDT_CHILD => "child",
+            c.XRT_FDT_DIRECT => "direct",
+            c.XRT_FDT_OVERFLOW => "unexpanded",
+            else => "other",
+        });
+        try set(a, &row, "hidden_items", tile.hidden_items);
+        try treePath(a, &row, t, tile.node, redact);
+        try row.object.put(a, "metric", try treeMetric(a, tile.metric));
+        inline for (.{ "x", "y", "w", "h" }) |field| try row.object.put(a, field, real(@field(tile, field)));
+        try tiles.array.append(row);
+    }
+    try out.object.put(a, "tiles", tiles);
+    return out;
 }

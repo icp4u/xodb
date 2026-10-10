@@ -1,0 +1,7 @@
+LIBRARY owned-pe
+EXPORTS
+    pe_inner @7
+    pe_outer @11
+    exported_counter DATA
+    forwarded_pid=KERNEL32.GetCurrentProcessId
+    ordinal_only=pe_inner @23 NONAME

@@ -16,6 +16,7 @@ pub const Files = struct {
     items: std.ArrayList(*File) = .empty,
     retained: usize = 0,
     automatic: bool = true,
+    lookup_revision: u64 = 0,
     auto_file_limit: usize = 64 * 1024 * 1024,
     auto_total_limit: usize = 128 * 1024 * 1024,
     auto_retained: usize = 0,
@@ -37,6 +38,7 @@ pub const Files = struct {
         const copy = try self.allocator.dupeZ(u8, path);
         errdefer self.allocator.free(copy);
         try self.roots.append(self.allocator, copy);
+        self.lookup_revision +|= 1;
     }
     fn read(self: *Files, path: [:0]const u8, limit: usize) !*File {
         if (self.items.items.len >= 64) return error.DebugFileLimit;
@@ -63,6 +65,7 @@ pub const Files = struct {
         if (file.build_id.len == 0) return error.DebugFileMissingBuildId;
         for (self.items.items) |existing| if (std.mem.eql(u8, existing.build_id, file.build_id)) return error.DuplicateDebugBuildId;
         try self.retain(file);
+        self.lookup_revision +|= 1;
     }
     pub fn matching(self: *const Files, image: *const elf.Image) !?*const File {
         const id = image.buildId() orelse return null;

@@ -14,6 +14,13 @@ ptrace, stops a target or changes privilege.
 | `get_fd_leaks` | Sustained fd-growth candidates with up to 32 history samples; growth alone does not establish a leak |
 | `get_deleted_open` | Descriptors holding unlinked files, with file size and allocated disk bytes |
 
+Every FD reply also includes passive `system_flow` status for the overview's
+graph/galaxy capture: running/requested state, generation, sampled and
+unattributed bytes, CPU coverage, loss and failure. `active_cpus` becomes zero
+when tracing stops; `enrolled_cpus` retains the last capture's coverage. The
+`host_cost` field repeats **LIVE SYSCALL TRACING · ~11% host syscall overhead · E
+to stop**. These observer reads never start, restart or renew graph tracing.
+
 ## Polling and lookup
 
 Start a server with `xodb --headless --session-socket session.sock
@@ -125,7 +132,7 @@ not storage traffic. A capture starting inside a call reports an unpaired exit.
 | close, dup/dup2/dup3, fcntl duplication | Successful explicit close/dup counts; dup2 replacement's implicit close is not inferred |
 | pipe/pipe2/socketpair | Global creation count; returned fd arrays are not read from target memory, so per-fd attribution is marked incomplete |
 | close_range, recvmmsg/sendmmsg, io_uring operations | Unsupported evidence is flagged when the relevant successful syscall is observed |
-| mmap IO, ABI-switching assembly, unlisted descriptor-producing syscalls | Outside the documented coverage; native executable identity cannot rule out hand-written compatibility calls |
+| mmap IO, ABI-switching assembly, unlisted descriptor-producing syscalls | Outside the documented coverage; native executable identity cannot rule out hand-written compatibility calls. Raw records carry no ABI, so a compat close/dup2 of a sampled fd is not treated as a mutation, and a later native IO on that fd can be joined to the old inode |
 
 Loss is checked on every drain through `PERF_FORMAT_LOST`, so a burst followed
 by an idle target cannot hide overflow until the next syscall. Per-thread loss
@@ -196,3 +203,29 @@ A polling MCP call with a `pid` requests fresh detail for that process. Omitting
 `pid` requests a full refresh of the shared cache, so whole-system polling calls
 do not benefit from the background adaptive-scan speedup. Both respect the scan
 budget and publish asynchronously; repeated calls do not sample synchronously.
+
+### Parent/child descriptor comparison
+
+`get_fd_inheritance` returns sampled same-number, kind, device/inode matches
+between a child and its sampled parent. It is an observer tool; it requests fresh
+fdinfo flags within the existing polling budget and never starts tracing.
+`pid` filters the child. Use `limit`, `offset` and `sequence` as with the other fd
+tools; nonzero offsets require the preceding snapshot sequence. At most 500 rows
+are returned per page, up to the 262144-row collector bound.
+
+Each row carries parent/child PID and start ticks, fd, kind, device/inode strings,
+`child_cloexec` and `parent_cloexec` (null when flags are unavailable or stale),
+and `stale`. No paths or names are returned. `comparison_coverage` describes the
+whole cache, including unknown identities, missing parents, different objects
+and caps. Missing parents carry a reason: `parent_denied` (the parent's fd table
+needs privilege), `parent_absent` (not listed: exited, or hidden by `hidepid`) and
+`parent_reused` (the pid now names a process born after the child). Rows for fds
+0-2 are listed after all others, so shared standard streams fill the row cap last. `matches_in_cache` and pagination apply to the child filter.
+
+The evidence is explicitly **unproved inheritance**. Independently reopening the
+same file can produce a match; no shared open file description or fork/exec
+history is inferred. A descriptor moved to another number is outside this view.
+
+```json
+{"name":"get_fd_inheritance","arguments":{"limit":50,"redact":true}}
+```

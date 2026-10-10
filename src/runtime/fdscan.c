@@ -52,7 +52,7 @@ struct xrt_fdscan {
     int32_t self, detail;
     int32_t interest[XRT_FD_INTEREST_MAX];
     uint32_t ninterest;
-    int all_interest;
+    int all_interest, all_fdinfo;
     struct snap s[2];
     int cur;
     uint64_t epoch, sequence;
@@ -231,6 +231,11 @@ void xrt_fdscan_budget(struct xrt_fdscan *s, uint32_t ms)
 void xrt_fdscan_cgroups(struct xrt_fdscan *s, int enabled)
 {
     if (s) s->o.cgroups=enabled!=0;
+}
+
+void xrt_fdscan_fdinfo(struct xrt_fdscan *s, int all)
+{
+    if (s) s->all_fdinfo=all!=0;
 }
 
 void xrt_fdscan_detail(struct xrt_fdscan *s, int32_t pid)
@@ -610,14 +615,14 @@ static enum outcome scan_process(struct xrt_fdscan *s, struct snap *c, const str
         qsort(s->numbers, count, sizeof(*s->numbers), by_pid);
     const struct xrt_fd *before = old ? prev->fds + old->first : NULL;
     const uint32_t before_count = old ? old->count : 0;
-    const int whole = s->detail == pid;
+    const int whole = s->detail == pid || s->all_fdinfo;
     const int foreground = interested(s, pid);
     const int full = !s->o.adaptive || !old || foreground ||
                      s->sequence + 1 - old->full_sequence >= 8;
     p->full_sequence = full ? s->sequence + 1 : old->full_sequence;
     /* The count and process IO are only a hint. A close/reopen or rename can
      * leave both unchanged, so retaining anything marks the whole row stale. */
-    if (!full && !unlisted && !(old->flags & (XRT_FDP_TRUNCATED | XRT_FDP_NO_IO)) &&
+    if (!full && !whole && !unlisted && !(old->flags & (XRT_FDP_TRUNCATED | XRT_FDP_NO_IO)) &&
         !(p->flags & XRT_FDP_NO_IO) && count == old->count &&
         p->rchar == old->rchar && p->wchar == old->wchar &&
         p->read_bytes == old->read_bytes && p->write_bytes == old->write_bytes) {

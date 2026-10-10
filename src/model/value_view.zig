@@ -97,6 +97,21 @@ pub const Preview = struct {
     javascript: ?JavaScriptValue = null,
     lua: ?LuaValue = null,
     ruby: ?RubyValue = null,
+    elisp: ?ElispValue = null,
+};
+pub const ElispItem = struct { tagged: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
+pub const ElispValue = struct {
+    type: []const u8,
+    display: []const u8,
+    tagged: u64,
+    object: u64,
+    runtime_version: []const u8,
+    runtime_build_id: []const u8,
+    layout_source: []const u8 = "same-image DWARF",
+    memory_reads: usize,
+    memory_bytes: usize,
+    liveness: []const u8 = "unproved; consistent headers do not prove GC liveness or allocation extents",
+    items: []ElispItem,
 };
 pub const RubyValue = struct { value: @import("language_locals.zig").Value, tagged: u64, runtime_version: []const u8, runtime_build_id: []const u8, memory_reads: usize, memory_bytes: usize, liveness: []const u8 = "unproved; consistent tags do not prove GC liveness" };
 pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, advisory: bool = false };

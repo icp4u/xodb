@@ -64,7 +64,11 @@ static unsigned shift(const struct xjs_layout *l, struct xjs_reader *r, enum xjs
     return (unsigned)n;
 }
 static int supplement(const struct xjs_layout *l, struct xjs_reader *r) {
-    if (memcmp(l->version_string, XJS_V8_VERSION, sizeof XJS_V8_VERSION))
+    static const char *const versions[] = {XJS_V8_VERSIONS};
+    size_t known = 0;
+    while (known < sizeof versions / sizeof *versions && (strlen(versions[known]) >= sizeof l->version_string ||
+           memcmp(l->version_string, versions[known], strlen(versions[known]) + 1))) ++known;
+    if (known == sizeof versions / sizeof *versions)
         return fail(r, "JavaScriptSupplementVersionUnsupported");
     /* Code's raw instruction pointer is absent under the sandbox: the
      * wrapper/stream/start/flags offsets prove the unsandboxed layout. */
@@ -504,15 +508,23 @@ void xjs_value_read(const struct xjs_layout *l, struct xjs_reader *r, uint64_t t
     out->version_table = r->version_table;
 }
 
-/* The stock Node 26.8.2 image whose build configuration was independently
- * checked with its public headers and cooperating fixtures. Version alone
+/* The stock Node images whose build configuration was independently
+ * checked with their public headers and cooperating fixtures. Version alone
  * cannot select TSAN/WASM-dependent builtin ids or dispatch-table limits.
  * Other builds can still use metadata-backed values; frame positions refuse
  * until their same-image layout/configuration has been established. */
 static int frame_config(const struct xjs_layout *l) {
-    static const uint8_t id[] = {0x93,0xf8,0x2a,0xf1,0xea,0xc2,0x4f,0xf5,0x12,0x35,
-        0x95,0xe6,0x66,0x95,0x72,0xc9,0x34,0x21,0xc4,0x36};
-    return l->dwarf_frame_config || (l->build_id_len == sizeof id && !memcmp(l->build_id, id, sizeof id));
+    static const uint8_t ids[][20] = {
+        /* Node 26.8.2 */
+        {0x93,0xf8,0x2a,0xf1,0xea,0xc2,0x4f,0xf5,0x12,0x35,0x95,0xe6,0x66,0x95,0x72,0xc9,0x34,0x21,0xc4,0x36},
+        /* Node 26.10.0: same V8 options and public headers, and the same
+         * builtin table index for InterpreterEntryTrampoline in the image. */
+        {0x83,0xdb,0x74,0x69,0x59,0xb3,0x36,0xee,0x59,0xd2,0xf5,0x17,0xb4,0x83,0x78,0xda,0x2b,0xbe,0xfa,0x4f},
+    };
+    if (l->dwarf_frame_config) return 1;
+    for (size_t i = 0; i < sizeof ids / sizeof *ids; ++i)
+        if (l->build_id_len == sizeof *ids && !memcmp(l->build_id, ids[i], sizeof *ids)) return 1;
+    return 0;
 }
 static int leb(const uint8_t *bytes, size_t length, size_t *at, uint64_t *out) {
     *out = 0;

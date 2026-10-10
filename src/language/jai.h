@@ -222,8 +222,11 @@ struct xjai_write_journal *xjai_write_journal_create(void);
 void xjai_write_journal_free(struct xjai_write_journal *);
 size_t xjai_write_journal_count(const struct xjai_write_journal *);
 size_t xjai_write_journal_bytes(const struct xjai_write_journal *);
-/* Borrowed until next apply/free. No entry is silently evicted. */
+/* Borrowed until next apply/free. Current-target entries are never evicted;
+ * the first valid write for a new target/image releases the old incarnation.
+ * IDs remain unique. Page indices refer only to the currently retained rows. */
 const struct xjai_write_record *xjai_write_journal_get(const struct xjai_write_journal *,uint64_t id);
+const struct xjai_write_record *xjai_write_journal_at(const struct xjai_write_journal *,size_t index);
 uint64_t xjai_write_journal_last(const struct xjai_write_journal *,const struct xjai_write_stamp *);
 /* Single-owner calls. target_id must change on every new target incarnation.
  * All IO callbacks must refuse a replaced/resumed target; guards alone cannot

@@ -24,7 +24,9 @@ samples the whole system with the bounded, unprivileged collector
 | System Info | host, kernel, CPU, memory, GPUs, per-group collector state and cost |
 | Users, Services, Installed Apps | utmp sessions, observed daemon processes, package database |
 | Files & IO | Descriptor tables, seekable offset progress, process churn heatmap, fd-growth sparklines, deleted holders and explicit syscall-event counts |
+| FD Treemap | Literal sampled paths; area counts open handles, colour shows sampled IO, capped/unknown paths remain explicit |
 | FD Graph | Processes and cgroups linked through shared files, pipes and proved UNIX socket peers |
+| Parent/Child FDs | Sampled matching descriptors and close-on-exec flags; origin stays unproved |
 | FD Galaxy | Descriptor counts orbiting their processes or cgroups, colored by kind, with deleted holders highlighted |
 
 Keys: `1`–`9`, `0`, Tab/Shift+Tab switch panels; arrows, Page Up/Down, Home/End
@@ -79,10 +81,14 @@ the scan budget still applies. Background metadata receives periodic refresh.
 
 ## Descriptor graph and galaxy
 
-These views currently show **polling topology and descriptor counts**. Particle
-size is descriptor count, not measured byte throughput; syscall tracing and
-flow pulses are not connected to these views yet. The Files pane retains its
-separate, explicit event capture.
+**LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop**
+
+Graph and galaxy start syscall tracing by default, without an acknowledgement.
+The banner remains visible while capture is active. Press `E` to switch to
+polling or start a new capture. Pause and leaving these panes stop tracing;
+passive MCP reads never start or renew it. Files retains its separate explicit
+acknowledgement. If tracefs/perf access is denied, topology remains available
+with the actual tracing failure shown.
 
 ```sh
 xodb --overview --panel galaxy
@@ -95,22 +101,78 @@ on that display. xodb's overview does not save preferences or history into
 `$HOME`; graphics drivers may write their usual shader caches. An explicit
 `--session-socket` creates the socket requested by the caller.
 
-Press `G` for the graph, `Y` for the galaxy, `C` to fold or expand proved cgroups,
+Press `G` for the graph, `Y` for the galaxy, `C` to fold or expand observed cgroups,
 and `+`/`-` to change detail. Click a process or cgroup to focus; `Esc` returns
 to the whole graph. `L` opens a focused process in Files, and clicking a shared
 resource opens its holders there. For an owned demo process, repeat
 `--graph-pid PID` to restrict the actual descriptor collector; that restriction
-also remains in effect when drilling into Files.
+also remains in effect when drilling into Files. It also filters every tracepoint
+to that scope's threads at capture start; threads created later need a new
+capture. An invalid or empty explicit scope refuses instead of capturing
+unrelated processes.
+
+Cgroup grouping retains the last observed membership when a scan carries an
+older process row forward. Groups with cached members are dimmed; the summary
+separates fresh, cached and unknown memberships. A cached path does not prove
+that a process still belongs to that cgroup. Unscanned, gone, capped and unmatched
+counts remain visible; a failed rebuild keeps the previous graph with its age
+and a reason. UNIX peer discovery has one 250 ms deadline for the whole polling
+batch, including scoped queries, and incomplete results add no peer edges.
+
+Press `I`, or start `xodb --overview --panel inheritance`, for **Parent/Child
+FDs**. It compares the same descriptor number, kind, device and inode in sampled
+parent/child rows. Child `CLOEXEC`, `no CLOEXEC` and unknown flags have separate
+counts; cached matches are dimmed. Click a row to open that child's Files table.
+`P` pauses, arrows/wheel scroll, and `G`/`Y` return to graph/galaxy. The same
+`--graph-pid PID` scope applies. This comparison view uses polling and stops
+live graph tracing when entered. It requests fresh fdinfo flags for every row
+the existing scan budget reaches, including pipes and sockets; skipped rows
+remain stale. This extra metadata demand expires after leaving the view.
+
+A match is **not proof of inheritance**: an independent reopen of the same path
+can have the same fd and inode but a different open file description. No fork
+or exec history is inferred, no process is paused, and no target code is called.
+A current `no CLOEXEC` value tells you the descriptor flag is unset; it does
+not prove a leak or that the program will leave it open. Linux reports the
+current close-on-exec flag in [fdinfo's flags field](https://man7.org/linux/man-pages/man5/proc_pid_fdinfo.5.html).
+Missing parents, unreadable identities, carried rows and row/scan caps stay
+visible. Reparenting may change which process is compared. This first view
+covers same-number matches; descriptors moved to a different number are outside
+its comparison. Event-backed fork/exec history remains a later slice.
 
 The C collector joins device/inode identities and validated UNIX_DIAG peers,
-not path names. Anonymous or stale identities stay distinct. Denied processes,
+not path names. Anonymous or unknown identities stay distinct. Cached stale
+identities may share a dim resource link by their last observed device/inode;
+these are not current sharing proofs and never establish UNIX peer joins. Denied processes,
 cache age, scan omissions, unproved cgroups and peer-query failures are shown
-explicitly. A peer query covers the collector's network namespace. Cgroup v2
-paths are grouped only when freshly observed; unsupported or stale membership
-does not silently join unrelated processes.
+explicitly. A peer query covers the collector's network namespace.
+
+Live byte rates enlarge stars and particles and pulse graph links. The C worker
+drains events independently of descriptor polling. Read/write counts cover
+native Linux x86-64 `read`, `write`, `pread64`, `pwrite64`, `readv`, `writev`,
+`preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendto`, `recvfrom`, `sendmsg` and
+`recvmsg`. Compatibility calls, mmap, io_uring, splice and sendfile byte
+transfers are not covered. No target buffers are read.
+
+**Inode attribution is a sampled correlation.** Fresh descriptor tables supply
+the identity; mutations, reuse, stale samples, missing pairs, loss and partial
+CPU coverage leave uncertain bytes unattributed. Old identities never donate
+their totals to a replacement fd. Even a matching sample cannot prove which
+kernel file a concurrent syscall selected. UNIX-peer glow shows activity at
+either endpoint, not proof that those bytes traversed that peer link.
+
+Capture enrolls CPUs online at startup, with at most 1,024 CPU rings and 64 MiB
+of ring storage. New CPUs require a new capture. Missing CPUs and event loss
+remain visible. MCP FD replies expose passive `system_flow` status, the same
+cost notice, sampled/unknown byte totals, CPU coverage and loss. Stopping capture
+closes its perf handles; another `E` starts fresh counters.
 
 Storage grows with observed demand, up to 16,384 processes and 262,144
-descriptors. The view aggregates these into at most 128 stars and 1,024 particle
+descriptors. The flow counter tracks the live set, not history: each poll drops
+rows for closed descriptors and forgets exited or idle processes and threads, so
+fork-heavy builds and connection churn neither fill its tables nor slow its drain.
+Only native x86-64 calls that change the descriptor table (open, close, dup, fork,
+exec and the like) withdraw a process's attribution until the next poll. The view aggregates these into at most 128 stars and 1,024 particle
 groups; the graph draws at most 128 shared resources and 2,048 links and shows
 omission counts. These are display and collection bounds, not a claim that
 every cached row was refreshed at the same instant.
@@ -205,7 +267,7 @@ The example identity is synthetic. Omitting `--files-start-ticks` binds to the
 first sampled birth identity and never follows a replacement with that PID.
 From Processes, **L** opens Files for the selected PID/start pair after a cost
 and access explanation. From other panels **L** switches to Files directly.
-**Enter** scopes the selected descriptor/process row to its process; **H** shows
+**Enter** scopes the selected descriptor/process row to its process; **B** shows
 holders of that exact device/inode; **Esc** returns to the system table. **[ ]**
 cycle Files, Processes, Leak watch and Deleted; **/** searches, **S** cycles sort,
 **R** reverses. **A** offers attach and **F** offers a profile, retaining identity
@@ -548,3 +610,11 @@ References: Linux
 [page table metadata](https://docs.kernel.org/admin-guide/mm/pagemap.html),
 [proc memory fields](https://www.kernel.org/doc/html/next/filesystems/proc.html),
 and [THP statistics](https://docs.kernel.org/admin-guide/mm/transhuge.html).
+
+## Descriptor path treemap
+
+`xodb --overview --panel treemap` (or **B**) opens the path heat map. It starts
+live syscall tracing by default (~11% host cost); **E** stops it. Click to zoom,
+**Backspace** to go up, **Esc** for root and **L** for one sampled holder's Files.
+Area represents open handles, including duplicates, rather than file size.
+See [controls, bounds and passive MCP queries](FD_TREEMAP.md).

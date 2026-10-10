@@ -6,7 +6,7 @@ const records = @import("records.zig");
 const mappings = @import("mappings.zig");
 const loc = @import("../debug/location.zig");
 const info = @import("../debug/info.zig");
-pub const algorithm = "xodb-sampled-dwarf-x86_64-v2";
+pub const algorithm = "xodb-sampled-x86_64-v3";
 pub const max_frames = 32;
 pub const Reason = enum {
     complete,
@@ -26,6 +26,7 @@ pub const Reason = enum {
     cfi_missing,
     signal_frame,
     unsupported_cfi,
+    unsupported_windows_unwind,
     stack_window,
     cycle,
     depth_limit,
@@ -39,7 +40,7 @@ pub const Frame = struct {
     name: [256]u8 = @splat(0),
     name_len: usize = 0,
     name_truncated: bool = false,
-    /// Runtime address of the containing ELF symbol, when one was found.
+    /// Runtime address of the containing ELF/PE symbol, when one was found.
     symbol_address: ?u64 = null,
     method: ?[]const u8 = null,
 };
@@ -75,7 +76,7 @@ fn hashInt(hash: *std.crypto.hash.sha2.Sha256, value: u64) void {
 }
 /// Shared state for unwinding many samples of one completed capture: a mapping
 /// cursor that advances with sample time (rebuilt if time goes backwards),
-/// one SHA-256 fingerprint per consulted ELF, and a small cache of private
+/// one SHA-256 fingerprint per consulted ELF/PE, and a small cache of private
 /// libdw handles. Results and analysis IDs equal per-sample `walk`.
 pub const Batch = struct {
     allocator: std.mem.Allocator,
@@ -86,7 +87,7 @@ pub const Batch = struct {
     fingerprints: std.AutoHashMapUnmanaged(u64, [32]u8) = .empty,
     debug: [max_debug]?Debug = @splat(null),
     debug_next: usize = 0,
-    /// Bytes hashed for fingerprints; each ELF at most once per batch.
+    /// Bytes hashed for fingerprints; each asset at most once per batch.
     hashed_bytes: u64 = 0,
     /// Symbol lookups by module and link address; profiles repeat PCs, and
     /// an ELF symbol lookup is a linear scan. Bounded; misses past the bound
@@ -193,6 +194,17 @@ fn nameLeaf(batch: *Batch, frame: *Frame, time_ns: u64, hash: *std.crypto.hash.s
     const cursor = try batch.cursorAt(time_ns);
     const found = cursor.at(frame.lookup_pc) orelse return;
     if (found.ambiguous or !found.mapping.executable) return;
+    if (batch.capture.pe_assets.byId(found.mapping.image_id)) |asset| {
+        hashInt(hash, found.mapping.start);
+        hashInt(hash, found.mapping.end);
+        hashInt(hash, found.mapping.offset);
+        hash.update(&(try batch.fingerprint(asset)));
+        hashInt(hash, asset.bias);
+        frame.mapping_id = found.mapping.id;
+        frame.module_id = asset.id;
+        namePe(frame, asset);
+        return;
+    }
     const module = for (batch.capture.images.loaded.items) |image| {
         if (image.id == found.mapping.image_id) break image;
     } else return;
@@ -209,6 +221,13 @@ fn nameLeaf(batch: *Batch, frame: *Frame, time_ns: u64, hash: *std.crypto.hash.s
     @memcpy(frame.name[0..frame.name_len], symbol.symbol.name[0..frame.name_len]);
     frame.name_truncated = frame.name_len < symbol.symbol.name.len;
     frame.symbol_address = module.runtimeAddress(symbol.symbol.value) catch null;
+}
+fn namePe(frame: *Frame, asset: *const @import("pe_assets.zig").Asset) void {
+    if (asset.symbol(frame.lookup_pc, &frame.name)) |symbol| {
+        frame.name_len = symbol.name.len;
+        frame.name_truncated = symbol.truncated;
+        frame.symbol_address = symbol.address;
+    }
 }
 fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.Sha256) !Result {
     const capture = batch.capture;
@@ -273,45 +292,79 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
             result.reason = .non_executable;
             return result;
         }
-        const module = blk: {
-            for (capture.images.loaded.items) |image| if (image.id == mapping.image_id) break :blk image;
-            result.reason = .asset_missing;
-            return result;
-        };
-        const link = module.linkAddress(frame.lookup_pc) catch {
-            result.reason = .mapping_missing;
-            return result;
-        };
-        if (std.mem.indexOfScalar(u64, seen_images[0..seen_count], module.id) == null) {
-            seen_images[seen_count] = module.id;
-            seen_count += 1;
-            // The same per-sample identity, with each ELF hashed once per batch.
-            const digest = try batch.fingerprint(module);
-            hash.update(&digest);
-            hashInt(hash, module.bias);
-        }
-        if (try batch.symbolAt(module, link)) |symbol| {
-            frame.name_len = @min(frame.name.len, symbol.symbol.name.len);
-            @memcpy(frame.name[0..frame.name_len], symbol.symbol.name[0..frame.name_len]);
-            frame.name_truncated = frame.name_len < symbol.symbol.name.len;
-            frame.symbol_address = module.runtimeAddress(symbol.symbol.value) catch null;
-        }
-        const debug = batch.debugImage(module) catch |err| {
-            result.reason = .unsupported_cfi;
-            result.detail = @errorName(err);
-            return result;
-        };
-        var scratch: [64 * 1024]u8 = undefined;
-        var scratch_allocator = std.heap.FixedBufferAllocator.init(&scratch);
         window.failed = false;
-        const step = debug.unwind(scratch_allocator.allocator(), link, .{ .registers = registers, .load_bias = module.bias, .user = &window, .read = Window.read }) catch |err| {
-            result.reason = switch (err) {
-                error.NoUnwindInfo => .cfi_missing,
-                error.SignalFrameUnsupported => .signal_frame,
-                else => if (window.failed) .stack_window else .unsupported_cfi,
+        const step: info.Unwind = step: {
+            if (capture.pe_assets.byId(mapping.image_id)) |asset| {
+                // PE lookup and epilogue inspection use the actual PC. Confirm
+                // its ownership at this sample time as well as the PC-1 label.
+                const actual = cursor.at(frame.pc) orelse {
+                    result.reason = .mapping_missing;
+                    return result;
+                };
+                if (actual.ambiguous) {
+                    result.reason = .mapping_ambiguous;
+                    return result;
+                }
+                if (!actual.mapping.executable) {
+                    result.reason = .non_executable;
+                    return result;
+                }
+                if (actual.mapping.image_id != asset.id) {
+                    result.reason = .mapping_missing;
+                    return result;
+                }
+                if (std.mem.indexOfScalar(u64, seen_images[0..seen_count], asset.id) == null) {
+                    seen_images[seen_count] = asset.id;
+                    seen_count += 1;
+                    hash.update(&(try batch.fingerprint(asset)));
+                    hashInt(hash, asset.bias);
+                }
+                namePe(frame, asset);
+                break :step @import("../debug/windows.zig").unwind(asset.image, asset.bias, frame.pc, registers, .{ .user = &window, .read = Window.read }, null) catch |err| {
+                    result.reason = if (window.failed) .stack_window else .unsupported_windows_unwind;
+                    result.detail = @errorName(err);
+                    return result;
+                };
+            }
+            const module = blk: {
+                for (capture.images.loaded.items) |image| if (image.id == mapping.image_id) break :blk image;
+                result.reason = .asset_missing;
+                return result;
             };
-            result.detail = @errorName(err);
-            return result;
+            const link = module.linkAddress(frame.lookup_pc) catch {
+                result.reason = .mapping_missing;
+                return result;
+            };
+            if (std.mem.indexOfScalar(u64, seen_images[0..seen_count], module.id) == null) {
+                seen_images[seen_count] = module.id;
+                seen_count += 1;
+                // The same per-sample identity, with each ELF hashed once per batch.
+                const digest = try batch.fingerprint(module);
+                hash.update(&digest);
+                hashInt(hash, module.bias);
+            }
+            if (try batch.symbolAt(module, link)) |symbol| {
+                frame.name_len = @min(frame.name.len, symbol.symbol.name.len);
+                @memcpy(frame.name[0..frame.name_len], symbol.symbol.name[0..frame.name_len]);
+                frame.name_truncated = frame.name_len < symbol.symbol.name.len;
+                frame.symbol_address = module.runtimeAddress(symbol.symbol.value) catch null;
+            }
+            const debug = batch.debugImage(module) catch |err| {
+                result.reason = .unsupported_cfi;
+                result.detail = @errorName(err);
+                return result;
+            };
+            var scratch: [64 * 1024]u8 = undefined;
+            var scratch_allocator = std.heap.FixedBufferAllocator.init(&scratch);
+            break :step debug.unwind(scratch_allocator.allocator(), link, .{ .registers = registers, .load_bias = module.bias, .user = &window, .read = Window.read }) catch |err| {
+                result.reason = switch (err) {
+                    error.NoUnwindInfo => .cfi_missing,
+                    error.SignalFrameUnsupported => .signal_frame,
+                    else => if (window.failed) .stack_window else .unsupported_cfi,
+                };
+                result.detail = @errorName(err);
+                return result;
+            };
         };
         frame.method = @tagName(step.method);
         const pc = step.caller[16] orelse {

@@ -6,6 +6,7 @@
 #include "xrt_fdevent.h"
 #include "xrt_fdscan.h"
 #include "xrt_fdgraph.h"
+#include "xrt_fdflow_owner.h"
 struct xrt_fdactivity;
 struct xrt_fdactivity_request {
     uint32_t interval_ms; /* 250 or 1000; active faster requests win for 3s */
@@ -14,7 +15,10 @@ struct xrt_fdactivity_request {
     const int32_t *poll_pids; /* copied during request; no retained pointer */
     uint32_t poll_pid_count;  /* at most XRT_FD_INTEREST_MAX */
     int poll_all; /* explicit whole-snapshot demand; otherwise visible/requested pids */
+    int fdinfo_all; /* renew full fdinfo sampling for flags/offsets; same scan bounds */
     int graph; /* renew graph publication; this alone never requests tracing */
+    int flow; /* explicit graph tracing demand; passive readers leave zero */
+    int stop_flow; /* GUI stop/pause/pane exit */
     int stop_events; /* explicit authorized stop; observers leave this zero */
 };
 struct xrt_fdactivity_view {
@@ -23,6 +27,7 @@ struct xrt_fdactivity_view {
     const char *peer_reason; /* static string */
     const struct xrt_fd_snapshot *poll; /* NULL until the first successful poll */
     struct xrt_fdevent_snapshot event;
+    struct xrt_fdflow_live flow;
     enum xrt_status poll_status, event_status;
     struct xrt_perf_failure event_failure;
     uint64_t generation, event_generation, event_sequence, requested_event_generation, updated_ns, owner_cpu_ns;

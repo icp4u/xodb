@@ -129,22 +129,30 @@ half-open `from_ns`/`to_ns` relative-time filter. It reports totals and paged TI
 counts for registers, retained stacks, budget gaps, kernel-absent stacks, missing
 state and disabled capture. Unfilterable records are counted separately.
 
-The x86-64 DWARF walker is bounded to 32 frames. It reads only the saved stack
+The x86-64 walker is bounded to 32 frames. Its DWARF path reads only the saved stack
 window through the existing debug-info adapter, using a private libdw handle on
 the worker. No target memory, current stack, source file or executable code is
 fetched to fill gaps. The leaf uses its exact sampled PC; callers use PC-1 for
 mapping and CFI lookup. Recorded mappings are replayed at the sample timestamp.
 Ambiguous mappings and metadata-loss cutoffs terminate explicitly.
 
+Algorithm v3 also handles retained PE Windows x64 metadata. It uses the actual
+control PC for function and epilogue decoding, while names use PC-1 for callers.
+Both must have matching executable PE placement. PE metadata and instruction
+bytes come from an immutable file snapshot; stack reads stay within the saved
+window. Supported records and opening-time verification are described in
+[PE stacks and recorded profiles](PE.md). Unsupported Windows records produce
+`unsupported_windows_unwind` with a specific detail.
+
 Terminal reasons include missing registers/assets/CFI, unsupported ABI or CFI,
 signal frames, inaccessible saved bytes, a cycle, depth limit and retention gaps.
-In sampled-unwind algorithm v2, `complete` means CFI reached a zero return PC
+In sampled-unwind algorithms v2/v3, `complete` means unwinding reached a zero return PC
 or an explicitly undefined return-address rule. Unavailable terminal registers
 remain a separate reason. A partial result is not proof that further callers did not
 exist. libdw's internal allocations/call duration are not governed by Zig's
 64 MiB worker budget; cancellation is checked between frames and hash chunks.
 
-Analysis IDs hash the algorithm, sampled inputs, consulted mappings/ELF contents
+Analysis IDs hash the algorithm, sampled inputs, consulted mappings/ELF or PE contents
 and result. Archive replies additionally identify the artifact SHA-256. Reopening
 with identical verified assets reproduces the result independently of session IDs.
 
@@ -153,7 +161,7 @@ with identical verified assets reproduces the result independently of session ID
 Format 2.2 uses required feature bit 2 and a USTA section for raw sampled evidence.
 Registers and retained bytes, including budget gaps, survive reopening without
 assets and byte-identical copying. Reconstruct offline only after explicitly
-loading matching ELF assets (`--resolve-capture-symbols` or `--symbols ROOT`).
+loading matching ELF/PE assets (`--resolve-capture-symbols` or `--symbols ROOT`).
 Absent assets remain explicit. Derived results are not written into the archive.
 Old 2.0/2.1 archives remain readable; earlier readers reject the required extension.
 See [format](M2_ARCHIVE_FORMAT.md) and [archive workflow](M2_ARCHIVES.md).

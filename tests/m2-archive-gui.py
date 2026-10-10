@@ -36,7 +36,8 @@ try:
     cap = app.tool('get_profile')['capture']; snap = app.session()
     assert snap['pid'] == 0
     d.shot('recorded-profile')
-    d.pointer('drag', 450, 630, 850, 630, 20); time.sleep(.4)
+    # The overview exists even when this capture has only one thread lane.
+    d.pointer('drag', 450, 565, 850, 565, 20); time.sleep(.4)
     displayed = app.tool('get_profile')['displayed_view']
     assert displayed and displayed['filter']['from_ns'] > 0 and displayed['filter']['to_ns'] is not None, displayed
     filters = {k:v for k,v in displayed['filter'].items() if v is not None}

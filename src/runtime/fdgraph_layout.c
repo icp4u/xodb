@@ -69,10 +69,12 @@ enum xrt_status xrt_fdgraph_layout(const struct xrt_fdgraph *g, const struct xrt
         l->vertices[i] = (struct xrt_fdgraph_vertex){p->stars[i].source_node, (float)(.5 + .43 * cos(angle)),
                                                      (float)(.5 + .43 * sin(angle))};
     }
-    for (uint32_t i = 0; i < kept; ++i) {
+    /* Map even capped candidates so omissions count projected links, after
+     * merging owners in the same star, rather than silently dropping edges. */
+    for (uint32_t i = 0; i < count; ++i) {
         uint32_t at = p->star_count + i;
         map[c[i].node] = at;
-        l->vertices[at] = (struct xrt_fdgraph_vertex){c[i].node, 0, 0};
+        if (i < kept) l->vertices[at] = (struct xrt_fdgraph_vertex){c[i].node, 0, 0};
     }
     uint32_t used = 0;
     for (uint32_t i = 0; i < g->edge_count; ++i) {
@@ -92,19 +94,20 @@ enum xrt_status xrt_fdgraph_layout(const struct xrt_fdgraph *g, const struct xrt
         } else
             links[n++] = links[i];
     }
-    l->link_count = n < max_links ? n : max_links;
-    l->omitted_links = n - l->link_count;
-    l->links = calloc(l->link_count ? l->link_count : 1, sizeof *l->links);
+    uint32_t capacity = n < max_links ? n : max_links;
+    l->links = calloc(capacity ? capacity : 1, sizeof *l->links);
     if (!l->links)
         goto oom;
-    if (l->link_count)
-        memcpy(l->links, links, l->link_count * sizeof *links);
+    for (uint32_t i = 0; i < n; ++i)
+        if (links[i].from < l->vertex_count && links[i].to < l->vertex_count && l->link_count < capacity)
+            l->links[l->link_count++] = links[i];
+    l->omitted_links = n - l->link_count;
     /* Resource positions are centroids of all represented owners, independent
      * of the drawing-edge cap. Tiny deterministic separation avoids coincidence. */
     for (uint32_t i = 0; i < kept; ++i)
         c[i].holders = 0;
     for (uint32_t j = 0; j < n; ++j)
-        if (links[j].kind == XRT_FDG_HOLDS) {
+        if (links[j].kind == XRT_FDG_HOLDS && links[j].to < l->vertex_count) {
             uint32_t at = links[j].to;
             l->vertices[at].x += l->vertices[links[j].from].x;
             l->vertices[at].y += l->vertices[links[j].from].y;

@@ -8,19 +8,20 @@
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <unistd.h>
-static int matching(const char *path, int32_t pid, const struct xrt_mapping *m)
+static int matching(const char *path, int32_t pid, const struct xrt_mapping *m,
+                    const struct xodb_maps *maps)
 {
     int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0)
         return -1;
-    if (xodb_mapped_file_matches(fd, pid, m->start, m->end, m->device_major, m->device_minor,
-                                 m->inode, 0) == 1)
+    if (xodb_mapped_file_matches_in(fd, pid, maps, m->start, m->end, m->device_major,
+                                    m->device_minor, m->inode, 0) == 1)
         return fd;
     close(fd);
     return -1;
 }
 static enum xrt_status mapped(int32_t pid, const struct xrt_mapping *m, int *out,
-                              enum xrt_file_source *source)
+                              enum xrt_file_source *source, const struct xodb_maps *maps)
 {
     if (!m->inode || !m->path || m->path[0] != '/' || m->start >= m->end)
         return XRT_FILE_UNAVAILABLE;
@@ -35,21 +36,21 @@ static enum xrt_status mapped(int32_t pid, const struct xrt_mapping *m, int *out
     if (pid > 0) {
         snprintf(path, length + 96, "/proc/%d/map_files/%llx-%llx", pid,
                  (unsigned long long)m->start, (unsigned long long)m->end);
-        fd = matching(path, pid, m);
+        fd = matching(path, pid, m, maps);
         if (fd < 0) {
             selected = XRT_FILE_SOURCE_EXE;
             snprintf(path, length + 96, "/proc/%d/exe", pid);
-            fd = matching(path, pid, m);
+            fd = matching(path, pid, m, maps);
         }
         if (fd < 0) {
             selected = XRT_FILE_SOURCE_ROOT;
             snprintf(path, length + 96, "/proc/%d/root%s", pid, m->path);
-            fd = matching(path, pid, m);
+            fd = matching(path, pid, m, maps);
         }
     }
     if (fd < 0) {
         selected = XRT_FILE_SOURCE_HOST;
-        fd = matching(m->path, pid, m);
+        fd = matching(m->path, pid, m, maps);
     }
     free(path);
     if (fd < 0)
@@ -63,13 +64,13 @@ enum xrt_status xrt_process_file(int32_t pid, const struct xrt_file_request *r, 
 {
     return xrt_process_file_resolved(pid, r, out, NULL);
 }
-enum xrt_status xrt_process_file_resolved(int32_t pid, const struct xrt_file_request *r,
-                                          int *out, enum xrt_file_source *source)
+static enum xrt_status process_file(int32_t pid, const struct xrt_file_request *r, int *out,
+                                    enum xrt_file_source *source, const struct xodb_maps *maps)
 {
     if (!r || !out)
         return XRT_INVALID_ARGUMENT;
     if (r->kind == XRT_FILE_MAPPED)
-        return mapped(pid, &r->mapping, out, source);
+        return mapped(pid, &r->mapping, out, source, maps);
     char path[96];
     switch (r->kind) {
     case XRT_FILE_MAPS:
@@ -102,6 +103,11 @@ enum xrt_status xrt_process_file_resolved(int32_t pid, const struct xrt_file_req
         *source = XRT_FILE_SOURCE_UNKNOWN;
     return XRT_OK;
 }
+enum xrt_status xrt_process_file_resolved(int32_t pid, const struct xrt_file_request *r,
+                                          int *out, enum xrt_file_source *source)
+{
+    return process_file(pid, r, out, source, NULL);
+}
 enum xrt_status xrt_target_file(const struct xrt_target *t, const struct xrt_file_request *r,
                                 int *fd)
 {
@@ -112,8 +118,35 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *t, const struct xr
 {
     return xrt_target_file_resolved(t, r, fd, identity, NULL);
 }
+/* One maps read serves every mapped-file open of a stop. Each event, resume
+ * and mutation advances the generation, and a stopped address space that no
+ * vfork relative shares cannot drop a mapping in between. Owner thread only. */
+static const struct xodb_maps *stopped_maps(const struct xrt_target *target, int32_t pid)
+{
+    struct xrt_target *t = (struct xrt_target *)target;
+    if (t->state != XRT_STOPPED || t->vfork_parent)
+        return NULL;
+    for (size_t i = 0; i < XRT_MAX_THREADS; ++i)
+        if (t->vfork_children[i])
+            return NULL;
+    for (size_t i = 0; i < t->thread_count; ++i)
+        if (t->threads[i].state != XRT_STOPPED && t->threads[i].state != XRT_EXITED)
+            return NULL;
+    if (!t->maps_valid || t->maps_generation != t->generation || t->maps_pid != pid) {
+        xodb_maps_free(&t->maps);
+        t->maps_valid = xodb_maps_read(pid, &t->maps) == 1;
+        t->maps_generation = t->generation;
+        t->maps_pid = pid;
+    }
+    return t->maps_valid ? &t->maps : NULL;
+}
 enum xrt_status xrt_target_file_resolved(const struct xrt_target *t, const struct xrt_file_request *r,
         int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source)
+{
+    return xrt_target_file_owner(t, r, fd, identity, source, 0);
+}
+enum xrt_status xrt_target_file_owner(const struct xrt_target *t, const struct xrt_file_request *r,
+        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source, int owner)
 {
     if (!t || !r || !fd)
         return XRT_INVALID_ARGUMENT;
@@ -135,7 +168,9 @@ enum xrt_status xrt_target_file_resolved(const struct xrt_target *t, const struc
         }
     int opened = -1;
     enum xrt_file_source selected;
-    enum xrt_status status = xrt_process_file_resolved(pid, r, &opened, &selected);
+    const struct xodb_maps *maps =
+        owner && r->kind == XRT_FILE_MAPPED ? stopped_maps(t, pid) : NULL;
+    enum xrt_status status = process_file(pid, r, &opened, &selected, maps);
     if (status != XRT_OK)
         return status;
     if (identity) {

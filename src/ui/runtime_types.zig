@@ -22,17 +22,13 @@ fn number(s: []const u8) !u64 {
     return std.fmt.parseInt(u64, s, 0) catch error.ExpectedNumber;
 }
 fn typeSelector(g: *const c.struct_xjai_graph, name: []const u8) !u32 {
-    if (std.mem.startsWith(u8, name, "0x")) {
-        const index = c.xjai_type_at(g, try number(name));
-        return if (index == c.XJAI_NONE) error.RuntimeTypeNotFound else index;
-    }
-    var found: ?u32 = null;
-    for (g.types[0..g.type_count], 0..) |t, i| if (std.mem.eql(u8, text(g, t.name), name)) {
-        if (found != null) return error.RuntimeTypeAmbiguous;
-        found = @intCast(i);
-    };
-    return found orelse error.RuntimeTypeNotFound;
+    const selector: cache.Selector = if (std.mem.startsWith(u8, name, "0x"))
+        .{ .address = try number(name) }
+    else
+        .{ .name = name };
+    return selector.find(g);
 }
+
 const hint = "L load   / filter   G address   S search   O container   W write   Shift+U undo   T context   Tab focus";
 pub const Panel = struct {
     open: bool = false,
@@ -291,7 +287,7 @@ pub const Panel = struct {
             const member = try instances.selfField(g, self.selected_type, tokens.next() orelse return error.ExpectedTypeField);
             const needle = if (tokens.next()) |t| try typeSelector(g, t) else self.selected_type;
             if (tokens.next() != null) return error.TooManyArguments;
-            _ = try session.runtime_instances.beginOwned(session, e, self.selected_type, needle, member, address, @intCast(length), .{});
+            _ = try session.runtime_instances.beginOwned(session, e, self.selected_type, needle, member, &.{.{ .address = address, .length = length }}, .{});
             self.item_kind = .search;
             self.items_reason = null;
             self.item_start = 0;
@@ -329,7 +325,7 @@ pub const Panel = struct {
         const e = try self.entry(session);
         try e.requireStop(session);
         const g = try e.graph();
-        var context = instances.Reader{ .session = session };
+        var context = cache.LiveReader{ .session = session };
         var reader = context.reader();
         const options = c.struct_xjai_value_options{ .depth = 3, .limit = 16, .start = start, .follow_pointers = 0 };
         var result: ?*c.struct_xjai_values = null;
@@ -363,7 +359,7 @@ pub const Panel = struct {
         const e = try self.entry(session);
         try e.requireStop(session);
         const g = try e.graph();
-        var context = instances.Reader{ .session = session };
+        var context = cache.LiveReader{ .session = session };
         var reader = context.reader();
         var rows: [64]c.struct_xjai_container_row = undefined;
         var page: c.struct_xjai_container_page = undefined;

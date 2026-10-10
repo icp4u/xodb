@@ -8,8 +8,10 @@ from pathlib import Path
 from helpers.exact import assert_reply_exact
 
 class Client:
-    def __init__(self, scope, executable='./zig-out/bin/xodb-m1-fixture', args=(), options=()):
+    reply_seconds = 5  # subclasses that build their own process skip __init__
+    def __init__(self, scope, executable='./zig-out/bin/xodb-m1-fixture', args=(), options=(), reply_seconds=5):
         self.transcript = []
+        self.reply_seconds = reply_seconds
         agent = os.environ.get('XODB_RUNTIME_AGENT') if executable is not None else None
         if agent and '--runtime-agent' not in options:
             options = ['--runtime-agent', agent, *options]
@@ -29,7 +31,7 @@ class Client:
         self.id += 1
         self.p.stdin.write((json.dumps({'jsonrpc':'2.0','id':self.id,'method':method,'params':params or {}})+'\n').encode())
         self.p.stdin.flush()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + self.reply_seconds
         while time.monotonic() < deadline:
             assert select.select([self.p.stdout],[],[],max(0, deadline-time.monotonic()))[0], 'Response timeout'
             data = self.p.stdout.readline()

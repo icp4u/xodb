@@ -62,6 +62,7 @@ def check(raw, state, frontend):
     sources=[row.pop('file_source') for row in rows]
     for row in rows:
         assert row.pop('full_image_deferred') is False, row
+        assert row.pop('pe_image') is None, row
     assert set(sources)<= {'unopened','map_files','target_exe','target_root','host_path','remote_snapshot','core_path'},set(sources)
     assert any(source!='unopened' for source in sources), 'resolved breakpoint retained no module provenance'
     assert rows==expected,(len(rows),len(expected),next(((x,y) for x,y in zip(rows,expected) if x!=y),None))

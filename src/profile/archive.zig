@@ -1,4 +1,4 @@
-//! Native capture artifact, experimental format 2.7. Adapted from T11's codec.
+//! Native capture artifact, experimental format 2.8. Adapted from T11's codec.
 //! Own original bytes for lossless copying; origin and recorded labels are never
 //! reconstructed from runtime session IDs or the set of available asset files.
 const std = @import("std");
@@ -27,7 +27,10 @@ const Allocator = std.mem.Allocator;
 
 pub const magic = "XODBCAPT";
 pub const format_major: u16 = 2;
-pub const format_minor: u16 = 7;
+pub const format_minor: u16 = 8;
+/// Attaching FRAM stamps at least this minor. Minor 8 means typed (PE)
+/// images and is set only by a capture that has them.
+const frames_minor: u16 = 7;
 pub const frames_tag: u32 = 0x4d415246; // FRAM: optional evidence bundle
 pub const header_bytes = 64;
 pub const entry_bytes = 24;
@@ -107,7 +110,7 @@ fn Codes(comptime E: type, comptime names: []const []const u8) type {
 const StopCode = Codes(capture_model.Stop, &.{ "collecting", "manual", "duration", "capacity", "mapping_limit", "mappings_changed", "metadata_lost", "thread_scope_changed", "decode_error", "target_ended", "image_changed", "drain_limit", "collector_error", "scheduling_limit", "scheduling_error", "syscall_limit", "syscall_error" });
 const EventCode = Codes(perf.EventKind, &.{ "task_clock", "cpu_clock", "cpu_cycles" });
 const FailureCode = Codes(perf.FailureKind, &.{ "unavailable", "permission", "configuration", "thread_gone", "resource", "other" });
-const ReasonCode = Codes(mappings.Reason, &.{ "elf", "anonymous", "image_unavailable", "image_limit", "non_executable", "unsupported_record", "truncated_path" });
+const ReasonCode = Codes(mappings.Reason, &.{ "elf", "anonymous", "image_unavailable", "image_limit", "non_executable", "unsupported_record", "truncated_path", "pe" });
 const ModeCode = Codes(records.CpuMode, &.{ "unknown", "kernel", "user", "hypervisor", "guest_kernel", "guest_user", "other" });
 const ContextCode = Codes(records.Context, &.{ "unknown", "kernel", "user", "hypervisor", "guest", "guest_kernel", "guest_user", "user_deferred", "other" });
 const ChainCode = Codes(records.Callchain, &.{ "absent", "complete", "truncated" });
@@ -125,6 +128,8 @@ pub const Environment = struct {
 };
 /// Identity of one ELF file as it was mapped during capture.
 pub const ImageIdentity = struct { file_bytes: u64, sha256: [32]u8, build_id: ?[]const u8 };
+pub const ImageKind = enum { elf, pe };
+const ImageKindCode = Codes(ImageKind, &.{ "elf", "pe" });
 
 // ---------------------------------------------------------------- encoding
 
@@ -157,7 +162,7 @@ const Writer = struct {
 };
 
 /// Encodes a completed capture. Image identities are hashed from the mapped
-/// ELF bytes the capture already holds; the result is deterministic for a
+/// ELF/PE bytes the capture already holds; the result is deterministic for a
 /// given capture and environment.
 pub fn encode(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.offline) return error.ArchiveUseOriginalBytes;
@@ -171,6 +176,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.collector != null) return error.ArchiveStillCollecting;
     try validateSyscalls(capture);
     const sampled = capture.config.user_stack_bytes != 0;
+    const typed_images = capture.pe_assets.entries.items.len != 0;
     const custom_limit = capture.config.sample_limit != capture_model.max_samples;
     if (capture.config.sample_limit == 0 or capture.config.sample_limit > capture_model.max_sample_limit) return error.ArchiveLimit;
     try validateUserState(capture);
@@ -197,7 +203,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         selected_count += 1;
     }
     const selected = selected_storage[0..selected_count];
-    if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len > max_images) return error.ArchiveLimit;
+    if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len + capture.pe_assets.entries.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
     var bodies: [section_order.len + 5]std.ArrayList(u8) = @splat(.empty);
@@ -230,7 +236,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..8], magic);
     std.mem.writeInt(u16, out[8..10], format_major, .little);
-    std.mem.writeInt(u16, out[10..12], if (capture.producer != null) @as(u16, 6) else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
+    std.mem.writeInt(u16, out[10..12], if (typed_images) @as(u16, 8) else if (capture.producer != null) 6 else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
     std.mem.writeInt(u32, out[12..16], header_bytes, .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], @intCast(selected.len), .little);
@@ -238,7 +244,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     out[33] = 64; // address bits
     std.mem.writeInt(u16, out[34..36], machine_x86_64, .little);
     std.mem.writeInt(u32, out[36..40], clock_monotonic, .little);
-    std.mem.writeInt(u64, out[40..48], (@as(u64, if (capture.config.duration_ms == 0 or capture.config.duration_ms > 60000) 3 else 1) | @as(u64, if (sampled) 4 else 0) | 8 | @as(u64, if (custom_limit) 16 else 0) | @as(u64, if (capture.syscalls.enabled) 32 else 0)), .little); // annotations, duration, sampled state, thread scope
+    std.mem.writeInt(u64, out[40..48], (@as(u64, if (capture.config.duration_ms == 0 or capture.config.duration_ms > 60000) 3 else 1) | @as(u64, if (sampled) 4 else 0) | 8 | @as(u64, if (custom_limit) 16 else 0) | @as(u64, if (capture.syscalls.enabled) 32 else 0) | @as(u64, if (typed_images) 64 else 0)), .little); // bit 6: typed ELF/PE assets
     std.mem.writeInt(u32, out[56..60], std.hash.Crc32.hash(out[0..56]), .little);
     var offset: usize = header_bytes + entry_bytes * selected.len;
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
@@ -280,7 +286,7 @@ pub fn attachFrames(a: Allocator, bytes: []const u8, bundle: ?[]const u8) ![]u8 
     if (total > max_file_bytes) return error.ArchiveTooLarge;
     const out = try a.alloc(u8, total);
     @memcpy(out[0..header_bytes], bytes[0..header_bytes]);
-    std.mem.writeInt(u16, out[10..12], @max(format_minor, std.mem.readInt(u16, bytes[10..12], .little)), .little);
+    std.mem.writeInt(u16, out[10..12], @max(frames_minor, std.mem.readInt(u16, bytes[10..12], .little)), .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], new_count, .little);
     std.mem.writeInt(u32, out[56..60], std.hash.Crc32.hash(out[0..56]), .little);
@@ -436,17 +442,29 @@ fn buildId(bytes: []const u8) ?[]const u8 {
     return note[desc_at..][0..desc_size];
 }
 fn encodeImages(w: Writer, capture: *const Capture) !void {
-    try w.count(capture.images.loaded.items.len);
+    const typed = capture.pe_assets.entries.items.len != 0;
+    try w.count(capture.images.loaded.items.len + capture.pe_assets.entries.items.len);
     for (capture.images.loaded.items) |image| {
         if (!image.immutable) return error.ArchiveMutableImage;
         if (@intFromEnum(image.image.header.machine) != machine_x86_64) return error.ArchiveUnsupportedArchitecture;
         const identity = identify(image.mapping);
         try w.int(u64, image.id);
+        if (typed) try w.code(ImageKindCode.encode(.elf));
         try w.text(image.path, max_path);
         for ([_]u64{ image.device_major, image.device_minor, image.inode, image.bias, image.start, image.end, identity.file_bytes }) |value| try w.int(u64, value);
         try w.out.appendSlice(w.a, &identity.sha256);
         try w.flag(identity.build_id != null);
         if (identity.build_id) |id| try w.text(id, max_build_id);
+    }
+    for (capture.pe_assets.entries.items) |image| {
+        const identity = identify(image.mapping);
+        const p = image.placement;
+        try w.int(u64, image.id);
+        try w.code(ImageKindCode.encode(.pe));
+        try w.text(image.path, max_path);
+        for ([_]u64{ p.device_major, p.device_minor, p.inode, p.bias, p.start, p.end, identity.file_bytes }) |value| try w.int(u64, value);
+        try w.out.appendSlice(w.a, &identity.sha256);
+        try w.flag(false);
     }
 }
 fn encodeMappings(w: Writer, capture: *const Capture) !void {
@@ -574,10 +592,10 @@ const Reader = struct {
     }
 };
 
-pub const ImageStatus = enum { verified, not_requested, missing, size_mismatch, content_mismatch, unreadable, invalid_elf, limit };
+pub const ImageStatus = enum { verified, not_requested, missing, size_mismatch, content_mismatch, unreadable, invalid_elf, invalid_pe, limit };
 /// Capture-time placement of an image: device/inode as observed, load bias and range.
-pub const Placement = struct { device_major: u64, device_minor: u64, inode: u64, bias: u64, start: u64, end: u64 };
-pub const ImageReport = struct { id: u64, path: []const u8, opened_path: []const u8, status: ImageStatus, identity: ImageIdentity, placement: Placement };
+pub const Placement = @import("pe_assets.zig").Placement;
+pub const ImageReport = struct { id: u64, kind: ImageKind = .elf, path: []const u8, opened_path: []const u8, status: ImageStatus, identity: ImageIdentity, placement: Placement };
 /// Explicit asset loading only. A symbol directory holds SHA-256-named files;
 /// without a root, an explicitly enabled resolver tries the recorded path.
 pub const Resolver = struct {
@@ -674,7 +692,8 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (major != format_major) return error.ArchiveVersionUnsupported;
     if (std.mem.readInt(u32, bytes[12..16], .little) != header_bytes or bytes[32] != 1 or bytes[33] != 64 or std.mem.readInt(u16, bytes[34..36], .little) != machine_x86_64 or std.mem.readInt(u32, bytes[36..40], .little) != clock_monotonic or std.mem.readInt(u32, bytes[28..32], .little) != 0) return error.ArchiveHeaderInvalid;
     const required_features = std.mem.readInt(u64, bytes[40..48], .little);
-    if (required_features & ~@as(u64, 63) != 0) return error.ArchiveFeatureUnsupported;
+    if (required_features & ~@as(u64, 127) != 0) return error.ArchiveFeatureUnsupported;
+    if (required_features & 64 != 0 and minor < 8) return error.ArchiveHeaderInvalid;
     if (required_features & 1 == 0) return error.ArchiveHeaderInvalid;
     for (bytes[60..64]) |b| if (b != 0) return error.ArchiveHeaderInvalid;
     const file_bytes = std.mem.readInt(u64, bytes[16..24], .little);
@@ -785,7 +804,7 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
         try decodeThreadScope(&r, self);
     }
     r = .{ .bytes = header.sections[2], .cancel = if (options.progress) |p| &p.cancel else null };
-    const reports = try decodeImages(&r, arena.allocator());
+    const reports = try decodeImages(&r, arena.allocator(), header.required_features & 64 != 0);
     r = .{ .bytes = header.sections[3], .cancel = if (options.progress) |p| &p.cancel else null };
     try decodeMappings(&r, self, reports);
     r = .{ .bytes = header.sections[4], .cancel = if (options.progress) |p| &p.cancel else null };
@@ -975,11 +994,12 @@ fn decodeThreads(r: *Reader, self: *Capture) !void {
     }
     try r.end();
 }
-fn decodeImages(r: *Reader, a: Allocator) ![]ImageReport {
+fn decodeImages(r: *Reader, a: Allocator, typed: bool) ![]ImageReport {
     const n = try r.count(max_images, 101);
     const reports = try a.alloc(ImageReport, n);
     for (reports, 0..) |*report, i| {
         const id = try r.int(u64);
+        const kind = if (typed) try ImageKindCode.decode(try r.code()) else .elf;
         if (id == 0) return error.ArchiveInvalidValue;
         for (reports[0..i]) |prior| if (prior.id == id) return error.ArchiveInconsistent;
         const path = try a.dupe(u8, try r.text(max_path));
@@ -993,7 +1013,8 @@ fn decodeImages(r: *Reader, a: Allocator) ![]ImageReport {
             identity.build_id = try a.dupe(u8, id_bytes);
         }
         if (fields[4] >= fields[5] or path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.ArchiveInvalidValue;
-        report.* = .{ .id = id, .path = path, .opened_path = "", .status = .not_requested, .identity = identity, .placement = .{ .device_major = fields[0], .device_minor = fields[1], .inode = fields[2], .bias = fields[3], .start = fields[4], .end = fields[5] } };
+        if (kind == .pe and (identity.build_id != null or fields[3] != fields[4] or fields[5] - fields[4] > std.math.maxInt(u32))) return error.ArchiveInvalidValue;
+        report.* = .{ .id = id, .kind = kind, .path = path, .opened_path = "", .status = .not_requested, .identity = identity, .placement = .{ .device_major = fields[0], .device_minor = fields[1], .inode = fields[2], .bias = fields[3], .start = fields[4], .end = fields[5] } };
     }
     try r.end();
     return reports;
@@ -1015,9 +1036,13 @@ fn decodeMappings(r: *Reader, self: *Capture, reports: []const ImageReport) !voi
         if (path_bytes > max_path_bytes) return error.ArchiveLimit;
         if (fields[3] != 0) {
             for (reports) |report| {
-                if (report.id == fields[3]) break;
+                if (report.id == fields[3]) {
+                    if ((reason == .pe) != (report.kind == .pe)) return error.ArchiveInconsistent;
+                    break;
+                }
             } else return error.ArchiveInconsistent;
         }
+        if (reason == .pe and (fields[3] == 0 or !executable)) return error.ArchiveInconsistent;
         entry.* = .{ .start = fields[0], .end = fields[1], .offset = fields[2], .image_id = fields[3], .device_major = fields[4], .device_minor = fields[5], .inode = fields[6], .executable = executable, .reason = reason, .path = try self.arena.allocator().dupe(u8, path) };
     }
     // Rebuild through the shared history so its invariants are re-checked;
@@ -1180,6 +1205,23 @@ fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, a: Alloca
         report.status = .content_mismatch;
         return;
     }
+    if (report.kind == .pe) {
+        const asset = @import("pe_assets.zig").Asset.fromBytes(self.allocator, report.id, report.path, report.placement, bytes) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            report.status = .invalid_pe;
+            return;
+        };
+        keep = true;
+        self.pe_assets.append(self.allocator, asset) catch |err| {
+            asset.deinit(self.allocator);
+            if (err == error.OutOfMemory) return err;
+            report.status = .limit;
+            return;
+        };
+        self.images.snapshot_bytes += bytes.len;
+        report.status = .verified;
+        return;
+    }
     const image = elf.Image.parse(bytes) catch {
         report.status = .invalid_elf;
         return;
@@ -1298,6 +1340,9 @@ fn encodeAnnotations(w: Writer, original: *const Capture, state: ?*progress.Prog
         .history = original.history,
         .trusted_before_ns = original.trusted_before_ns,
         .images = modules.Modules.init(w.a),
+        // Immutable PE readers have no mutable libdw handle or source counter.
+        // The temporary annotation view borrows them, like history/samples.
+        .pe_assets = original.pe_assets,
     };
     defer view.arena.deinit();
     view.cache = .empty;
@@ -1367,6 +1412,10 @@ fn encodeAnnotations(w: Writer, original: *const Capture, state: ?*progress.Prog
             if (image.image.symbolAt(try image.linkAddress(frame.lookup_address))) |symbol| size = symbol.symbol.size;
             break;
         };
+        if (view.pe_assets.byId(frame.module_id)) |image| {
+            var buffer: [256]u8 = undefined;
+            if (image.symbol(frame.lookup_address, &buffer)) |symbol| size = symbol.size;
+        }
         try w.opt(u64, size);
         var detail_arena = std.heap.ArenaAllocator.init(w.a);
         defer detail_arena.deinit();
@@ -1405,7 +1454,10 @@ fn decodeAnnotations(r: *Reader, self: *Capture, reports: []const ImageReport) !
         if (key.mapping_id > 0 and key.trusted and !key.ambiguous) frame.module = self.history.entries.items[key.mapping_id - 1].path;
         if (frame.module_id != 0) {
             for (reports) |report| {
-                if (report.id == frame.module_id) break;
+                if (report.id == frame.module_id) {
+                    if (report.kind == .pe) frame.module = report.path;
+                    break;
+                }
             } else return error.ArchiveInconsistent;
         }
         if (kind == .code) {

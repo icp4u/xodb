@@ -10,7 +10,7 @@ fn read(ctx: ?*anyopaque, at: u64, out: ?*anyopaque, n: usize) callconv(.c) c_in
     const bytes: [*]u8 = @ptrCast(out.?);
     return if ((session.target.readMemory(at, bytes[0..n]) catch return -1) == n) 0 else -1;
 }
-fn reader(session: *model.Session) c.struct_xgo_reader {
+pub fn reader(session: *model.Session) c.struct_xgo_reader {
     return .{ .context = session, .read = read, .reads = 0, .bytes = 0, .@"error" = null };
 }
 fn hex(a: A, value: u64) ![]const u8 {
@@ -39,7 +39,7 @@ fn runtimeModule(session: *model.Session) !*Module {
     if (module.symbols().findSymbol("runtime.buildVersion") == null or module.symbols().findSymbol("runtime.allgs") == null) return error.GoRuntimeUnavailable;
     return module;
 }
-fn globalAddress(module: *Module, name: []const u8) !u64 {
+pub fn globalAddress(module: *Module, name: []const u8) !u64 {
     const sym = module.symbols().findSymbol(name) orelse return error.GoRuntimeSymbolsUnavailable;
     if (!sym.hasAddress()) return error.GoRuntimeSymbolsUnavailable;
     return module.runtimeAddress(sym.value);
@@ -58,7 +58,7 @@ fn loadedVersion(session: *model.Session, module: *Module, out: *[64]u8) ![]cons
     if (try session.target.readMemory(ptr, out[0..@intCast(len)]) != len) return error.GoVersionUnavailable;
     return out[0..@intCast(len)];
 }
-fn profile(session: *model.Session, module: *Module) !*const c.struct_xgo_layout {
+fn verify(session: *model.Session, module: *Module) ![]const u8 {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (session.target.arch() != .x86_64) return error.GoArchitectureUnsupported;
     const id = module.image.buildId() orelse return error.GoBuildIdUnavailable;
@@ -70,6 +70,15 @@ fn profile(session: *model.Session, module: *Module) !*const c.struct_xgo_layout
     if (try session.target.readMemory(try module.runtimeAddress(note.addr), actual[0..expected.len]) != expected.len or !std.mem.eql(u8, expected, actual[0..expected.len])) return error.GoBuildIdMismatch;
     var version: [64]u8 = undefined;
     if (!std.mem.eql(u8, try loadedVersion(session, module, &version), c.XGO_VERSION)) return error.GoVersionUnsupported;
+    return id;
+}
+pub fn verifiedModule(session: *model.Session) !*Module {
+    const module = try runtimeModule(session);
+    _ = try verify(session, module);
+    return module;
+}
+fn profile(session: *model.Session, module: *Module) !*const c.struct_xgo_layout {
+    const id = try verify(session, module);
     if (module.go_layout == null) {
         const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GoDwarfUnavailable;
         var layout: c.struct_xgo_layout = undefined;

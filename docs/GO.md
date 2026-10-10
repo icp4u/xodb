@@ -43,11 +43,16 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
   read as unavailable (`PrologueNotComplete`) until the function's prologue
   has run.
 
-## Not yet (M2) and explicit refusals
+- **Maps, interfaces and channels:** map length and bounded entry pages;
+  concrete interface types and values, including typed nils; channel
+  len/cap/closed and physical wait-queue counts. After the demo's **F10**, press
+  **E**, type `counts`, **Return**, then **Return** again to expand the map.
+  Add `err` and `results` to inspect the interface and channel. These native
+  previews also work through the runtime agent and shared observer tools.
+  [Go values](GO_VALUES.md) documents limits, reasons and MCP pagination.
 
-- **Maps, interfaces and channels** display `partial: M2 (Go … preview not
-  implemented)`. Swiss-table maps, dynamic interface types (itab/_type) and
-  channel state are later work; raw words are never shown as values.
+## Remaining work and explicit refusals
+
 - No named Go locals inside the Go tab yet (use the C/C++ tab).
 - Not shown: which M/P a goroutine is on, CGO and signal frames (a running
   goroutine on a system stack reports `GoRunningOnSystemStack`), plugins or

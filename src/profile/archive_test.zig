@@ -89,7 +89,7 @@ test "archive optional sections survive copying and required features fail expli
     defer opened.deinit();
     try std.testing.expectEqual(@as(usize, 1), opened.source.ignored_sections);
     try std.testing.expectEqualSlices(u8, bytes, opened.bytes);
-    std.mem.writeInt(u64, bytes[40..48], 65, .little);
+    std.mem.writeInt(u64, bytes[40..48], 129, .little);
     std.mem.writeInt(u32, bytes[56..60], std.hash.Crc32.hash(bytes[0..56]), .little);
     try std.testing.expectError(error.ArchiveFeatureUnsupported, archive.decode(a, bytes, .{ .local_id = 3 }));
 }

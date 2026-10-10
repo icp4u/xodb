@@ -2,6 +2,8 @@
 #define XODB_RUNTIME_TARGET_INTERNAL_H
 #include "xrt_target.h"
 #include "remote_internal.h"
+#include "mapped_file.h"
+#include "xrt_files.h"
 #include "xrt_memory.h"
 #include <assert.h>
 #include <errno.h>
@@ -87,6 +89,11 @@ struct xrt_target {
     struct xrt_event events[XRT_MAX_EVENTS];
     size_t event_count;
     uint64_t sequence, generation, image_epoch;
+    /* Mapped-file identity evidence for the stop at maps_generation. */
+    struct xodb_maps maps;
+    uint64_t maps_generation;
+    int32_t maps_pid;
+    bool maps_valid;
     struct xrt_breakpoint breakpoints[XRT_MAX_BREAKPOINTS];
     size_t breakpoint_count;
     struct xrt_watchpoint watchpoints[4];
@@ -100,6 +107,10 @@ struct xrt_target {
 
 enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uintptr_t data);
 int xrt_thread_index(const struct xrt_target *t, int32_t tid);
+/* xrt_target_file_resolved; owner != 0 is the target's owner thread and may
+ * reuse this stop's maps snapshot. */
+enum xrt_status xrt_target_file_owner(const struct xrt_target *, const struct xrt_file_request *,
+        int *, struct xrt_file_identity *, enum xrt_file_source *, int owner);
 int xrt_breakpoint_index(const struct xrt_target *t, uint64_t id);
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address);
 enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn);

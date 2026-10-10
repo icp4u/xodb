@@ -96,6 +96,20 @@ try:
     assert hole_result['state']=='complete' and hole_result['unreadable_bytes']==4096 and hole_result['candidate_hit_count']==2,hole_result
     assert [r['candidate_address_hex'] for r in hole_result['rows']]==[truth['holes'],hex(int(truth['holes'],16)+8192)],hole_result
     report['holes']={k:hole_result[k] for k in ('state','candidate_hit_count','unreadable_bytes','scanned_bytes')}
+    # One job over several ranges, and over a region selector clipped to a window.
+    ranges=sorted([{'address':truth['area'],'length':truth['area_size']},{'address':truth['holes'],'length':3*4096}],key=lambda r:int(r['address'],16))
+    multi=c.action('search_runtime_instances',**({k:v for k,v in search_args.items() if k not in ('address','length')}|{'ranges':ranges}))
+    assert multi['range_count']==2,multi
+    multi_result=wait(lambda:c.action('get_runtime_instances',id=multi['id']),lambda r:r['state']!='running')
+    assert multi_result['state']=='complete' and multi_result['candidate_hit_count']==5 and multi_result['unreadable_bytes']==4096,multi_result
+    assert sorted(r['candidate_address_hex'] for r in multi_result['rows'])==sorted(truth['candidates']+[truth['holes'],hex(int(truth['holes'],16)+8192)]),multi_result
+    coverage=c.inspect('get_memory_search',id=multi['id'])
+    assert [r['unreadable'] for r in coverage['ranges']]==[4096 if r['address']==truth['holes'] else 0 for r in ranges] and coverage['ranges_with_unreadable']==1,coverage
+    selected=c.action('search_runtime_instances',**(search_args|{'address':truth['holes'],'length':3*4096,'regions':'anon-writable'}))
+    assert selected['range_count']==2,selected
+    sel=wait(lambda:c.action('get_runtime_instances',id=selected['id']),lambda r:r['state']!='running')
+    assert sel['candidate_hit_count']==2 and sel['unreadable_bytes']==0 and sel['range_bytes']==8192,sel
+    report['multi_range']={k:multi_result[k] for k in ('state','candidate_hit_count','unreadable_bytes','scanned_bytes')}
     replacement=c.action('search_memory',address=truth['area'],length=truth['area_size'],pattern='ee',encoding='hex')
     wait(lambda:c.inspect('get_memory_search',id=replacement['id']),lambda r:r['state']!='running')
     refuse(c.tool('get_runtime_instances',id=search['id'],generation=gen),'StaleRuntimeInstanceSearch')

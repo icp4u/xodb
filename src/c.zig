@@ -27,6 +27,9 @@ pub const api = @cImport({
     @cInclude("../lsoftop/lsoftop.h");
     @cInclude("../runtime/xrt_sysstat.h");
     @cInclude("../runtime/xrt_fdactivity.h");
+    @cInclude("../runtime/xrt_fdflow_graph.h");
+    @cInclude("../runtime/xrt_fdinherit.h");
+    @cInclude("../runtime/xrt_fdtreemap.h");
     @cInclude("../runtime/xrt_memobserver.h");
     @cInclude("../text.h");
     if (gui) {
@@ -34,6 +37,7 @@ pub const api = @cImport({
         @cInclude("../platform/clipboard.h");
         @cInclude("xdg-shell-client-protocol.h");
         @cInclude("cursor-shape-v1-client-protocol.h");
+        @cInclude("linux-dmabuf-v1-client-protocol.h");
         @cInclude("vulkan/vulkan.h");
         @cInclude("freetype/freetype.h");
         @cInclude("hb.h");
@@ -45,10 +49,15 @@ pub const api = @cImport({
     @cInclude("../language/python.h");
     @cInclude("../language/javascript.h");
     @cInclude("../debug/metadata_job.h");
+    @cInclude("../binary/pe_job.h");
+    @cInclude("../debug/pe_unwind.h");
     @cInclude("../language/lua.h");
     @cInclude("../language/watch.h");
     @cInclude("../language/ruby.h");
     @cInclude("../language/go.h");
+    @cInclude("../language/go_map.h");
+    @cInclude("../language/go_type_index.h");
     @cInclude("../language/jai_job.h");
+    @cInclude("../language/elisp.h");
     @cInclude("dwarf.h");
 });

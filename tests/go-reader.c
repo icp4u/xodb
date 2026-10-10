@@ -86,7 +86,11 @@ static void run(unsigned count, uint64_t allglen) {
     xgo_goroutines_read(&l, &r, &gl, &snap);
     CHECK(r.reads == reads);
 }
+void go_value_tests(void);
+void go_map_tests(void);
 int main(void) {
+    go_value_tests();
+    go_map_tests();
     image();
     uint64_t s0 = goroutine(0, 7, 4, TEXT + 0x10, STACK + 0x100); chain(s0);
     goroutine(1, 8, 4, UINT64_C(0xdead0000), STACK + 0x400 + 0x100);              /* corrupted sched.pc */

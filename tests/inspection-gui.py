@@ -43,6 +43,19 @@ try:
         if not response.get('isError',True):search=response['structuredContent'];break
     assert search and search['total_hits']>=1,search
     d.keys('tap',49);d.shot('03-search-result')
+    # W: the same search over every writable private mapping, as one job.
+    single=search
+    d.keys('tap',17,'tap',53,'tap',35,'tap',18,'tap',45,'down',42,'tap',39,'up',42,'tap',2,'tap',2,'tap',10,'tap',10,'tap',28)
+    deadline=time.monotonic()+10;search=None
+    while time.monotonic()<deadline:
+        for ident in range(1,40):
+            response=d.request('tools/call',{'name':'get_memory_search','arguments':{'id':ident}})
+            if not response.get('isError',True):search=response['structuredContent'];break
+        if search and search['id']!=single['id'] and search['state']!='running':break
+        time.sleep(.02)
+    assert search and search['id']!=single['id'] and search['state']=='complete' and search['range_count']>1,search
+    assert search['total_hits']>=single['total_hits'] and search['length']>single['length'],(search,single)
+    d.shot('03b-search-writable')
     d.keys('tap',1,'tap',19);d.shot('04-vectors')
     d.keys('tap',47,'tap',17);d.shot('05-vector-formats')
     subprocess.run(['swaymsg','output','HEADLESS-1','mode','720x480'],env=d.env,check=True,capture_output=True)

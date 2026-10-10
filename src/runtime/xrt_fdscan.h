@@ -191,6 +191,9 @@ void xrt_fdscan_budget(struct xrt_fdscan *, uint32_t ms);
 void xrt_fdscan_cgroups(struct xrt_fdscan *, int enabled);
 /* Also reread fdinfo for every fd of this process (0: none). */
 void xrt_fdscan_detail(struct xrt_fdscan *, int32_t pid);
+/* Demand current fdinfo flags for every reached row, including pipes/sockets.
+ * This keeps the existing time/row bounds; processes not reached stay stale. */
+void xrt_fdscan_fdinfo(struct xrt_fdscan *, int all);
 /* Replace the foreground process set; copied, no borrowed pointer. Adaptive
  * scans refresh their paths and seekable offsets. Nonseekable fdinfo stays
  * stale unless detail() requests it. Background entries use one identity

@@ -154,15 +154,27 @@ pub fn chrome(v: *View, ctx: Ctx) !Rect {
     return .{ .x = x + 8, .y = 100, .w = @max(0, w - x - 30), .h = @max(0, h - 182) };
 }
 
+/// Where a pull-down opens and its row height. The box always lies inside the
+/// window: narrow windows slide it left and short ones squeeze the rows.
+pub fn popupRect(menu: Menu, width: f32, height: f32) struct { rect: Rect, row: f32 } {
+    const n: f32 = @floatFromInt(count(menu));
+    var rh = @min(26, @max(14, (height - 100) / n));
+    if (n * rh + 8 > height) rh = @max(0, (height - 8) / n);
+    const h = n * rh + 8;
+    const w = @min(258, width);
+    const x: f32 = if (menu == .start) 5 else 12 + @as(f32, @floatFromInt(@intFromEnum(menu))) * 72;
+    const y: f32 = if (menu == .start) height - 40 - h else 62;
+    return .{ .rect = .{ .x = @max(0, @min(x, width - w)), .y = @max(0, @min(y, height - h)), .w = w, .h = h }, .row = rh };
+}
 pub fn popup(v: *View, ctx: Ctx) !void {
     const menu = v.classic_menu orelse return;
     if (v.width < 80 or v.height < 100) return;
     const n = count(menu);
-    const rh = @min(26, @max(14, (v.height - 100) / @as(f32, @floatFromInt(n))));
-    const height = @as(f32, @floatFromInt(n)) * rh + 8;
-    const x = if (menu == .start) 5 else 12 + @as(f32, @floatFromInt(@intFromEnum(menu))) * 72;
-    const y = if (menu == .start) @max(0, v.height - 40 - height) else 62;
-    const rect = Rect{ .x = x, .y = y, .w = @min(258, v.width - x), .h = height };
+    const place = popupRect(menu, v.width, v.height);
+    const rect = place.rect;
+    const rh = place.row;
+    const x = rect.x;
+    const y = rect.y;
     v.hit_count = 0;
     v.hover_len = 0;
     v.hit(.{ .x = 0, .y = 0, .w = v.width, .h = v.height }, .{ .classic = .close_menu });
@@ -222,13 +234,8 @@ pub fn scrollbar(v: *View, ctx: Ctx, rect: Rect, top: usize, total: usize, visib
     if (rect.h < 48 or total <= visible) return;
     const arrow_h: f32 = 16;
     const track = Rect{ .x = rect.x, .y = rect.y + arrow_h, .w = rect.w, .h = rect.h - 2 * arrow_h };
+    // Flat trough in the dither's average tone: one quad at any height.
     try ctx.r.rect(track, rgb(0xdfdfdf));
-    // Dither without a texture or an unbounded tessellation.
-    var y: f32 = track.y;
-    while (y < track.y + track.h) : (y += 2) {
-        var x = track.x + @mod(y - track.y, 4);
-        while (x < track.x + track.w) : (x += 4) try ctx.r.rect(.{ .x = x, .y = y, .w = 1, .h = 1 }, rgb(0xffffff));
-    }
     const thumb_h = @min(track.h, @max(18, track.h * @as(f32, @floatFromInt(visible)) / @as(f32, @floatFromInt(total))));
     const offset = (track.h - thumb_h) * @as(f32, @floatFromInt(@min(top, total - visible))) / @as(f32, @floatFromInt(total - visible));
     const thumb = Rect{ .x = track.x, .y = track.y + offset, .w = track.w, .h = thumb_h };

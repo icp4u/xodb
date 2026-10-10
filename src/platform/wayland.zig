@@ -29,6 +29,8 @@ pub const Window = struct {
     width: u32 = 1280,
     height: u32 = 800,
     configured: bool = false,
+    /// From the latest xdg_toplevel configure; the compositor decides it.
+    maximized: bool = false,
     closing: bool = false,
     close_reason: enum { none, compositor_close, quit_key } = .none,
     dirty: bool = true,
@@ -212,8 +214,13 @@ fn configured(data: ?*anyopaque, surface: ?*c.xdg_surface, serial: u32) callconv
     window(data).configured = true;
     window(data).dirty = true;
 }
-fn resized(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, _: ?*c.wl_array) callconv(.c) void {
+pub fn hasState(states: []const u32, state: u32) bool {
+    return std.mem.indexOfScalar(u32, states, state) != null;
+}
+fn resized(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, states: ?*c.wl_array) callconv(.c) void {
     const w = window(data);
+    const list: []const u32 = if (states) |s| (if (s.data) |p| @as([*]const u32, @ptrCast(@alignCast(p)))[0 .. s.size / 4] else &.{}) else &.{};
+    w.maximized = hasState(list, c.XDG_TOPLEVEL_STATE_MAXIMIZED);
     if (width > 0) w.width = @intCast(width);
     if (height > 0) w.height = @intCast(height);
     w.dirty = true;

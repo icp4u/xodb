@@ -12,6 +12,7 @@
 #define XRT_FDG_TRUNCATED 16u
 #define XRT_FDG_KERNEL 32u
 #define XRT_FDG_IDENTITY_STALE 64u
+#define XRT_FDG_CGROUP_STALE 128u
 #define XRT_FDG_PROCESS 0u
 #define XRT_FDG_RESOURCE 1u
 #define XRT_FDG_HOLDS 0u
@@ -42,6 +43,9 @@ struct xrt_unix_peers {
  * that owned socket (also used by tests). Limits are explicit and partial
  * results never masquerade as a complete peer set. No setns or target calls. */
 enum xrt_status xrt_unix_peers_read(uint32_t inode, uint32_t capacity, struct xrt_unix_peers *);
+/* A nonzero absolute CLOCK_MONOTONIC deadline bounds a batch of queries; each
+ * query also keeps its own 250 ms cap. An expired deadline sends no request. */
+enum xrt_status xrt_unix_peers_read_until(uint32_t inode, uint32_t capacity, uint64_t deadline_ns, struct xrt_unix_peers *);
 void xrt_unix_peers_free(struct xrt_unix_peers *);
 /* Pure parser: caller authenticates a kernel sender and rejects MSG_TRUNC. */
 int xrt_unix_peers_decode(const void *, size_t, uint32_t sequence, struct xrt_unix_peers *);
@@ -52,7 +56,7 @@ struct xrt_fdgraph {
     struct xrt_fdgraph_edge *edges;
     struct xrt_fdgraph_member *members;
     uint64_t *groups; /* exact interned cgroup IDs; unknowns get unique IDs */
-    uint32_t cgroup_processes, cgroup_count;
+    uint32_t cgroup_processes, cgroup_stale_processes, cgroup_count; /* fresh / cached memberships */
     uint32_t member_count;
     uint32_t node_count, edge_count, processes, resources, peer_edges;
     uint32_t unknown_descriptors, stale_descriptors, denied_processes;
@@ -76,7 +80,7 @@ struct xrt_fdgraph *xrt_fdgraph_copy(const struct xrt_fdgraph *);
  * overflow remains in explicit kind buckets. No descriptor disappears. */
 struct xrt_fdgraph_star {
     uint64_t group;
-    uint32_t source_node, sample_node, processes, descriptors, denied, stale, mixed_groups;
+    uint32_t source_node, sample_node, processes, descriptors, denied, stale, mixed_groups, cgroup_stale;
 };
 struct xrt_fdgraph_particle {
     uint32_t star, kind, descriptors, deleted, stale, source_node, source_fd;

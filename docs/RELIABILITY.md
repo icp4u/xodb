@@ -38,6 +38,11 @@ below when those capabilities are intentionally unavailable.
 ./scripts/release-check gui --keep-going     # Run every step, then list all failures
 ./scripts/release-check gui --only gui-files,gui-themes # Rerun chosen steps (always rebuilds first)
 ./scripts/release-check gui --from gui-files # Resume at a step
+./scripts/release-check affected             # Only the host and GUI steps that cover your uncommitted changes
+./scripts/release-check affected --base REV  # ... or every change since REV
+./scripts/release-check gui --jobs 4         # Up to four GUI steps at once, each on its own compositor
+./scripts/release-check gui --slowest 10     # Also print the ten slowest steps
+./scripts/release-check all --list --records # Whole step records: kind, needs, paths, serial, work
 ./scripts/release-check periodic --headless  # Portable checks plus readelf source-path differential
 ./scripts/release-check perf --headless      # Owned observer RPC measurements; no speed thresholds
 ```
@@ -48,6 +53,42 @@ retry is recorded as `flaky` in the summary line and `results.json`, never as
 passed. `scripts/build` uses an existing `ZIG_GLOBAL_CACHE_DIR`, so gate
 snapshots can share one warm cache; `packaging/build` always uses the in-tree
 cache.
+
+Each step is a record: its command and timeout, a `kind` (`build`, `unit`,
+`live`, `gui` or `periodic`), the steps it `needs`, and the source `paths` it
+covers. `--list` still prints the `[name, argv, timeout]` triples; add
+`--records` for the whole records. `--only` and `--from` keep what the chosen
+steps need, and a step whose prerequisite failed is listed as `not run` with
+the step it needed. A run that leaves planned steps unstarted without a
+failure fails as `runner: unscheduled`. Fault-injection and race steps
+(`NO_RETRY`) are never retried.
+
+`affected` plans the host and GUI lanes together, then keeps the steps whose
+`paths` match a file that differs from `--base` (default `HEAD`; the index and
+working tree are both compared), plus what those steps need and the runner's
+own tests. A step covers the test scripts it runs and the sources named for it
+in the `COVERS` table in `scripts/release-check`: for example
+`src/mcp/memory.zig` selects the memory checks, locally and through the C agent.
+The table is coarse on purpose. A changed file that no step covers selects the
+whole `gui` tier; an uncovered file under `tests/` or `scripts/` selects every
+planned step, because a helper may be loaded by steps of either lane. A change
+to `scripts/release-check` selects the steps whose registration differs from
+`--base`, or the `gui` tier when none does. The decision for every file is
+printed and recorded in `results.json`. Pass the same runtime flags as for
+`all`: steps for a runtime that was not passed cannot be selected, so each
+missing flag that costs the change coverage is printed as a `WARNING` line and
+named in the final verdict line. If nothing differs, it stops with an error
+instead of passing. It is a per-change check, not a replacement for the
+`gui` and `all` tiers.
+
+`--jobs N` runs up to N `gui` steps at once (default 1). Each has its own
+compositor, runtime directory and work directory. Build, unit and live steps,
+and GUI steps marked `serial` (frame-time, CPU, RSS and injected-timeout
+checks, and the long OCR sweeps), still run alone, once the others have
+finished. A retry beside other steps sets aside only the directories the step
+declares in `work`. A process that left its step's session cannot be charged
+to one step while others run; it fails the run as `parallel-strays` when the
+batch ends. `results.json` records `jobs`, `wall_seconds` and `step_seconds`.
 
 The explicit `periodic` tier starts the periodic correctness lane. It includes
 portable checks and 1,500 deterministic malformed/valid DWARF 2–4 file tables,

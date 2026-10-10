@@ -124,7 +124,7 @@ pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) 
 test "overview reads and explicit fd capture controls are advertised" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(14, parsed.value.array.items.len);
+    try std.testing.expectEqual(16, parsed.value.array.items.len);
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
         try std.testing.expectEqual(!fd.isControl(definition.object.get("name").?.string), definition.object.get("annotations").?.object.get("readOnlyHint").?.bool);

@@ -8,9 +8,9 @@ import shutil
 import subprocess
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work', type=Path, required=True)
-p.add_argument('--library', type=Path, required=True)
+p.add_argument('--library', type=Path, help='existing runtime archive; built privately if omitted')
 p.add_argument('--agent', type=Path, required=True)
-p.add_argument('--fixtures', type=Path, required=True)
+p.add_argument('--fixtures', type=Path, help='directory containing exec/pie; compiled privately if omitted')
 p.add_argument('--sanitize', action='store_true')
 p.add_argument('--node', type=Path)
 a = p.parse_args()
@@ -18,6 +18,16 @@ os.umask(0o022)
 r = Path(__file__).resolve().parents[1]
 w = a.work.resolve()
 w.mkdir(parents=True, exist_ok=True, mode=0o755)
+if a.library is None:
+    a.library = w/'runtime/libxrt.a'
+    subprocess.run(['make', '-C', str(r/'src/runtime'), 'BUILD='+str(a.library.parent), '-j2', str(a.library)], check=True, timeout=120)
+if a.fixtures is None:
+    a.fixtures = w/'fixtures'
+    a.fixtures.mkdir(mode=0o755)
+    fixture = a.fixtures/'entry.c'
+    fixture.write_text('int main(void) { return 0; }\n')
+    for variant, flags in (('exec', ['-fno-pie', '-no-pie']), ('pie', ['-fPIE', '-pie'])):
+        subprocess.run(['cc', '-O2', '-g', '-fomit-frame-pointer', *flags, str(fixture), '-o', str(a.fixtures/variant)], check=True, timeout=30)
 exe = w / 'check'
 flags = ['-O1', '-fsanitize=address,undefined', '-fno-omit-frame-pointer'] if a.sanitize else ['-O2']
 subprocess.run(['clang' if a.sanitize else 'cc', '-g', '-std=c11', '-Wall', '-Wextra', '-Werror',

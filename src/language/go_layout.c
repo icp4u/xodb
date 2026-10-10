@@ -1,21 +1,20 @@
-#include "go.h"
+#include "go_dwarf.h"
 #include <dwarf.h>
 #include <gelf.h>
 #include <string.h>
 /* Go runtime layout from the image's own DWARF (cmd/link output). Every
  * offset the reader uses is proved here; nothing is hand-written. */
-enum kind { SIGNED, UNSIGNED, POINTER };
 static const char *const types[] = {
 #define XGO_TYPE(key, name) name,
 #include "go_types.inc"
 #undef XGO_TYPE
 };
-static const struct { unsigned owner; const char *path; enum kind kind; unsigned width; } fields[] = {
-#define XGO_FIELD(key, owner, path, kind, width) {XGO_T_##owner, path, kind, width},
+static const struct xgo_dwarf_field fields[] = {
+#define XGO_FIELD(key, owner, path, kind, width) {XGO_T_##owner, path, XGO_D_##kind, width},
 #include "go_fields.inc"
 #undef XGO_FIELD
 };
-static const struct { const char *name; uint64_t value; } constants[] = {
+static const struct xgo_dwarf_constant constants[] = {
 #define XGO_CONSTANT(key, name, value) {name, value},
 #include "go_constants.inc"
 #undef XGO_CONSTANT
@@ -53,11 +52,18 @@ static int size(Dwarf_Die *d, uint64_t *out) {
     if (dwarf_aggregate_size(d, &n) || !n || n > 1 << 20) return 0;
     *out = n; return 1;
 }
-static int kind(Dwarf_Die *d, enum kind want) {
+static int kind(Dwarf_Die *d, enum xgo_dwarf_kind want) {
     uint64_t encoding;
-    if (want == POINTER) return dwarf_tag(d) == DW_TAG_pointer_type;
+    if (want == XGO_D_POINTER) return dwarf_tag(d) == DW_TAG_pointer_type;
+    if (want == XGO_D_WORD_ARRAY) {
+        Dwarf_Die element; uint64_t bytes;
+        struct scan s = {0};
+        return dwarf_tag(d) == DW_TAG_array_type && type(d, &element) && resolve(&element, &s) &&
+            kind(&element, XGO_D_UNSIGNED) && size(&element, &bytes) && bytes == 8;
+    }
     if (dwarf_tag(d) != DW_TAG_base_type || !ud(d, DW_AT_encoding, &encoding)) return 0;
-    return want == SIGNED ? encoding == DW_ATE_signed : encoding == DW_ATE_unsigned;
+    if (want == XGO_D_BOOLEAN) return encoding == DW_ATE_boolean;
+    return want == XGO_D_SIGNED ? encoding == DW_ATE_signed : encoding == DW_ATE_unsigned;
 }
 static int member(Dwarf_Die parent, const char *path, struct xgo_field_info *out, Dwarf_Die *leaf, struct scan *s) {
     uint64_t offset = 0;
@@ -92,19 +98,21 @@ static int member(Dwarf_Die parent, const char *path, struct xgo_field_info *out
     if (!s->error) s->error = "GoDwarfTypeDepthLimit";
     return 0;
 }
-static int candidate(Dwarf_Die die, unsigned t, struct xgo_layout *out, struct scan *s) {
+static int candidate(Dwarf_Die die, unsigned t, const struct xgo_dwarf_schema *schema,
+                     struct xgo_field_info *out_fields, uint32_t *out_sizes, struct scan *s) {
     uint64_t bytes;
     if (!resolve(&die, s) || dwarf_tag(&die) != DW_TAG_structure_type || !size(&die, &bytes)) return 0;
-    out->sizes[t] = (uint32_t)bytes;
-    for (unsigned f = 0; f < XGO_FIELD_COUNT; ++f) {
-        if (fields[f].owner != t) continue;
+    out_sizes[t] = (uint32_t)bytes;
+    for (unsigned f = 0; f < schema->field_count; ++f) {
+        const struct xgo_dwarf_field *field = &schema->fields[f];
+        if (field->owner != t) continue;
         struct xgo_field_info got; Dwarf_Die leaf;
-        if (!member(die, fields[f].path, &got, &leaf, s) || !kind(&leaf, fields[f].kind) || got.size != fields[f].width) return 0;
-        out->fields[f] = got;
+        if (!member(die, field->path, &got, &leaf, s) || !kind(&leaf, field->kind) || got.size != field->width) return 0;
+        out_fields[f] = got;
     }
     return 1;
 }
-static int info_size(Dwarf *dwarf, uint64_t *out) {
+int xgo_dwarf_info_size(Dwarf *dwarf, uint64_t *out) {
     Elf *elf = dwarf_getelf(dwarf); size_t names;
     if (!elf || elf_getshdrstrndx(elf, &names)) return 0;
     Elf_Scn *scn = NULL;
@@ -120,14 +128,17 @@ static int info_size(Dwarf *dwarf, uint64_t *out) {
     }
     return 0;
 }
-const char *xgo_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, struct xgo_layout *out) {
-    memset(out, 0, sizeof *out);
-    if (!id || !n || n > sizeof out->build_id) return "GoBuildIdUnavailable";
+const char *xgo_dwarf_layout_build(Dwarf *dwarf, const struct xgo_dwarf_schema *schema,
+                                 struct xgo_field_info *out_fields, uint32_t *out_sizes, uint64_t *out_constants) {
+    if (schema->type_count > 32 || schema->field_count > 128 || schema->constant_count > 64) return "GoDwarfSchemaLimit";
+    memset(out_fields, 0, schema->field_count * sizeof *out_fields);
+    memset(out_sizes, 0, schema->type_count * sizeof *out_sizes);
+    memset(out_constants, 0, schema->constant_count * sizeof *out_constants);
     if (!dwarf) return "GoDwarfUnavailable";
     uint64_t length;
-    if (!info_size(dwarf, &length)) return "GoDwarfMalformed";
+    if (!xgo_dwarf_info_size(dwarf, &length)) return "GoDwarfMalformed";
     struct scan s = {0};
-    uint8_t have[XGO_TYPE_COUNT] = {0}, known[XGO_CONSTANT_COUNT] = {0};
+    uint8_t have[32] = {0}, known[64] = {0};
     Dwarf_Off off = 0, next; size_t header;
     for (unsigned cu = 0; off < length; off = next, ++cu) {
         uint8_t width;
@@ -144,36 +155,45 @@ const char *xgo_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, struct x
             int tag = dwarf_tag(&d); const char *name = dwarf_diename(&d);
             if (!name) continue;
             if (tag == DW_TAG_constant) {
-                for (unsigned i = 0; i < XGO_CONSTANT_COUNT; ++i) {
-                    if (strcmp(name, constants[i].name)) continue;
+                for (unsigned i = 0; i < schema->constant_count; ++i) {
+                    if (strcmp(name, schema->constants[i].name)) continue;
                     uint64_t got;
-                    if (!ud(&d, DW_AT_const_value, &got) || got != constants[i].value) return "GoConstantMismatch";
-                    out->constants[i] = got; known[i] = 1;
+                    if (!ud(&d, DW_AT_const_value, &got) || got != schema->constants[i].value) return "GoConstantMismatch";
+                    out_constants[i] = got; known[i] = 1;
                 }
                 continue;
             }
             if (tag != DW_TAG_structure_type) continue;
-            for (unsigned t = 0; t < XGO_TYPE_COUNT; ++t) {
-                if (strcmp(name, types[t])) continue;
-                struct xgo_layout got = {0};
-                if (!candidate(d, t, &got, &s)) {
+            for (unsigned t = 0; t < schema->type_count; ++t) {
+                if (strcmp(name, schema->types[t])) continue;
+                struct xgo_field_info got_fields[128] = {0}; uint32_t got_sizes[32] = {0};
+                if (!candidate(d, t, schema, got_fields, got_sizes, &s)) {
                     if (s.error) return s.error;
                     return "GoDwarfTypesUnsupported";
                 }
-                if (have[t] && (out->sizes[t] != got.sizes[t])) return "GoDwarfAmbiguous";
-                out->sizes[t] = got.sizes[t];
-                for (unsigned f = 0; f < XGO_FIELD_COUNT; ++f) {
-                    if (fields[f].owner != t) continue;
-                    if (have[t] && memcmp(&out->fields[f], &got.fields[f], sizeof got.fields[f])) return "GoDwarfAmbiguous";
-                    out->fields[f] = got.fields[f];
+                if (have[t] && (out_sizes[t] != got_sizes[t])) return "GoDwarfAmbiguous";
+                out_sizes[t] = got_sizes[t];
+                for (unsigned f = 0; f < schema->field_count; ++f) {
+                    if (schema->fields[f].owner != t) continue;
+                    if (have[t] && memcmp(&out_fields[f], &got_fields[f], sizeof got_fields[f])) return "GoDwarfAmbiguous";
+                    out_fields[f] = got_fields[f];
                 }
                 have[t] = 1;
             }
         } while ((rc = dwarf_siblingof(&d, &d)) == 0);
         if (rc < 0) return "GoDwarfMalformed";
     }
-    for (unsigned t = 0; t < XGO_TYPE_COUNT; ++t) if (!have[t]) return "GoDwarfTypesUnavailable";
-    for (unsigned i = 0; i < XGO_CONSTANT_COUNT; ++i) if (!known[i]) return "GoDwarfConstantsUnavailable";
+    for (unsigned t = 0; t < schema->type_count; ++t) if (!have[t]) return "GoDwarfTypesUnavailable";
+    for (unsigned i = 0; i < schema->constant_count; ++i) if (!known[i]) return "GoDwarfConstantsUnavailable";
+    return NULL;
+}
+
+const char *xgo_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n, struct xgo_layout *out) {
+    memset(out, 0, sizeof *out);
+    if (!id || !n || n > sizeof out->build_id) return "GoBuildIdUnavailable";
+    const struct xgo_dwarf_schema schema = {types, fields, constants, XGO_TYPE_COUNT, XGO_FIELD_COUNT, XGO_CONSTANT_COUNT};
+    const char *why = xgo_dwarf_layout_build(dwarf, &schema, out->fields, out->sizes, out->constants);
+    if (why) return why;
     if (out->sizes[XGO_T_FTAB] != 8) return "GoDwarfTypesUnsupported";
     memcpy(out->build_id, id, n); out->build_id_len = (uint8_t)n;
     return NULL;

@@ -77,7 +77,9 @@ try:
     assert select.select([churn.stdout], [], [], 5)[0] and churn.stdout.readline().strip() == 'ready'
     d = h.Display(str(root), ['--overview', '--files-pid', str(churn.pid), '--files-start-ticks', str(ticks(churn.pid)), '--interval-ms', '1000'], trace=False, output_size=(1280, 900))
     # Offsets need a few samples before progress is measured and rows re-rank.
-    first = until(lambda value: len(value) >= 7 and value[-1][1] >= 40, 'measured churn rows')[-1]
+    # Wait for the first rate ranking (the idle stdin row leaves the top), so
+    # the Up taps below cannot race the re-rank that moves the picked row.
+    first = until(lambda value: len(value) >= 7 and value[-1][1] >= 40 and value[-1][3] != 0, 'measured churn rows')[-1]
     rows, visible = first[1], first[6]
     check('owned churn workload fills more rows than fit', rows >= 40 and visible < rows)
     # Nothing is picked yet: re-ranking must not move the view by itself.

@@ -101,7 +101,7 @@ try:
     else:
         raise SystemExit('FAIL: planted wrong frame was accepted')
     # Native Go values at main.marker: scalars, string, slice (len/cap +
-    # bounded elements), struct fields; map/interface/channel are M2.
+    # bounded elements), struct fields and Go containers.
     # Step one source line so stack-passed arguments are past the prologue.
     client.action('step_over', tid=tid)
     stepped = client.stopped(seconds=30)
@@ -113,8 +113,11 @@ try:
     check(shown['label'] == '"ready" [5 bytes]', shown)
     check(re.fullmatch(r'len 3 cap 3 \[main\.Item\] @ 0x[0-9a-f]+', shown['items']), shown)
     check(rows['p']['value']['kind'] == 'pointer' and rows['p']['value']['bits'] != 0, rows['p'])
-    for name, kind in (('counts', 'map'), ('err', 'interface'), ('results', 'channel')):
-        check(shown[name] == f'partial: M2 (Go {kind} preview not implemented)' and rows[name]['value']['partial'], rows[name])
+    check(shown['counts'] == 'map[string]int len 2' and not rows['counts']['value']['partial'], rows['counts'])
+    check(re.fullmatch(r'\*errors\.errorString\(0x[0-9a-f]+\)', shown['err']) and not rows['err']['value']['partial'], rows['err'])
+    check(shown['results'] == 'chan int len 0 cap 16 open; queue entries send 0, recv 0, select 0' and not rows['results']['value']['partial'], rows['results'])
+    entries = client.inspect('get_value_children', tid=tid, frame=0, expression='counts')['view']
+    check({c['name']: c['value']['display'] for c in entries['children']} == {'["alpha" [5 bytes]]': '1', '["beta" [4 bytes]]': '2'}, entries)
     page = client.inspect('get_value_children', tid=tid, frame=0, expression='items', start=0, limit=2)
     page = page['view']
     check(page['total'] == 3 and page['next'] == 2 and [c['name'] for c in page['children']] == ['[0]', '[1]'], page)

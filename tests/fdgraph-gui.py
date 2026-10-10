@@ -63,7 +63,10 @@ try:
     last=tuple(map(int,rows[-1]));check('actual collector scope excludes all other processes',last[1]==2 and last[6]==2)
     check('two complete snapshots preserve every fixture descriptor',last[2]==expected)
     check('UNIX socketpair link is present after metadata cache refresh',last[3]==1)
-    check('redacted galaxy has a visible title', 'descriptor galaxy' in h.ocr_until(d,'galaxy',lambda t:'descriptor galaxy' in t))
+    galaxy=h.ocr_until(d,'galaxy',lambda t:'descriptor galaxy' in t)
+    check('redacted galaxy has a visible title','descriptor galaxy' in galaxy)
+    check('scan omissions are visible',all(word in galaxy for word in ('unscanned','gone','capped','unmatched')))
+    check('membership freshness is visible',all(word in galaxy for word in ('fresh','cached','unknown')))
     d.keys('tap',46) # C: expand cgroup groups to process stars
     time.sleep(.1)
     d.keys('tap',34) # G: shared topology

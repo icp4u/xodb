@@ -20,7 +20,18 @@ on exit. It does not install anything or modify Node.
 ## Verified layouts
 
 The initial reader supports Linux x86-64, uncompressed pointers, sandbox off,
-and V8 **14.6.202.34-node.28** (Node **26.8.2**). It compares the loaded build-id,
+and V8 **14.6.202.34** at two verified embedder patch levels:
+
+| V8 version string | Node | Stock build-id with proved frame configuration |
+|---|---|---|
+| `14.6.202.34-node.28` | 26.8.2 | `93f82af1eac24ff5123595e6669572c93421c436` |
+| `14.6.202.34-node.34` | 26.10.0 | `83db746959b336ee59d2f517b48378da2bbefa4f` |
+
+The version string is matched exactly against this list; there is no prefix or
+range match, and any other string gets `JavaScriptSupplementVersionUnsupported`.
+Node 26.10.0 was added after comparing its V8 tree with 26.8.2: the layout
+sources cited by the version table are unchanged, and both stock executables
+export identical `v8dbg_*` constants. The reader compares the loaded build-id,
 version string and published `v8dbg_*` constants with the identified ELF image.
 It selects the main executable using the kernel's program-header address;
 the supported Node build embeds V8 there. An unrelated addon that exceeds
@@ -42,8 +53,8 @@ malformed-data reason; it is not reported as a layout mismatch.
 
 Frame code identity also needs configuration-dependent builtin and dispatch
 facts. These are currently established by either the required same-image DWARF
-constants or the tested stock build-id
-`93f82af1eac24ff5123595e6669572c93421c436`. Another build can show independently
+constants or one of the tested stock build-ids in the table above.
+Another build of a listed version can show independently
 verified names and scripts but gets `JavaScriptFrameConfigUnavailable` and null
 positions until its configuration is proved. The Node executable does not need
 DWARF for the tested stock profile; the native variable's owning addon does

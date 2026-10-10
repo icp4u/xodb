@@ -8,6 +8,8 @@ pub fn bit(id: c_uint) u32 {
     return @as(u32, 1) << @intCast(id);
 }
 
+pub const graph_cost = "LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop";
+
 pub const FdEventState = enum { inactive, requested, active };
 
 /// One line naming the failed operation, its errno text and the detail
