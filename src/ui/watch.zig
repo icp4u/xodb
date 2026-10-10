@@ -330,6 +330,13 @@ pub const WatchList = struct {
 /// Plain words for evaluator and target errors. A typo must never look like a value.
 pub fn explain(err: anyerror) []const u8 {
     return switch (err) {
+        error.RuntimeTypesPending => "runtime types loading",
+        error.RuntimeTypesStale => "runtime types stale; capture and load at this stop",
+        error.RuntimeTypesExpired => "runtime type context released",
+        error.RuntimeTypesFailed => "runtime type discovery failed",
+        error.RuntimeTypeNotFound => "runtime type not found; load its read-only capture",
+        error.RuntimeTypeAmbiguous => "runtime type name is ambiguous; use its record address",
+        error.InvalidRuntimeTypeExpression => "use address as TypeName (one trailing cast)",
         error.UnknownVariable => "unknown name here",
         error.UnknownRegister => "unknown register; use a name from the Registers pane",
         error.RegisterUnavailable => "register not recovered in this frame",
@@ -726,6 +733,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
     var y = rect.y + 8;
     const x = rect.x + 12;
     const w = rect.w - 24;
+    const compact = w < 960;
     for (hits) |*h| h.* = null;
     if (editor.open) {
         try r.shape(.{ .x = rect.x + 6, .y = y - 3, .w = rect.w - 12, .h = row_h + 2 }, style.fade(theme.focus, 0.18), .{ .radii = @splat(5) });
@@ -742,10 +750,10 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
     }
     // Small panes give the selected entry dedicated type/context lines rather
     // than squeezing the value between three truncated columns.
-    if (w <= 560) if (list.selected) |selected| {
+    if (compact) if (list.selected) |selected| {
         const entry = &list.entries[selected];
         var detail: [240]u8 = undefined;
-        const label = if (entry.type_name.len == 0) @tagName(entry.state) else std.fmt.bufPrint(&detail, "{s} / {s}", .{ entry.type_name.slice(), if (entry.state != .value) @tagName(entry.state) else if (entry.available) "available" else "unavailable" }) catch "";
+        const label = if (entry.state == .failed) std.fmt.bufPrint(&detail, "{s}: {s}", .{ entry.expression(), explain(entry.failure.?) }) catch "" else if (entry.type_name.len == 0) @tagName(entry.state) else std.fmt.bufPrint(&detail, "{s} / {s}", .{ entry.type_name.slice(), if (entry.state != .value) @tagName(entry.state) else if (entry.available) "available" else "unavailable" }) catch "";
         try r.textFit(font, x, y, w, label, theme.weak);
         y += row_h;
         var context: [240]u8 = undefined;
@@ -786,7 +794,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
         if (k >= visible or k >= hits.len) break;
         hits[k] = row.entry;
         const entry = &list.entries[row.entry];
-        const type_w: f32 = if (w > 560 and entry.state == .value) 150 else 0;
+        const type_w: f32 = if (!compact and entry.state == .value) 150 else 0;
         const ry = y + @as(f32, @floatFromInt(k)) * row_h;
         if (row.child) |c| {
             var buffer: [320]u8 = undefined;
@@ -801,11 +809,11 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
         }
         if (list.selected != null and list.selected.? == row.entry) try style.focus(r, .{ .x = rect.x + 4, .y = ry - 3, .w = rect.w - 8, .h = row_h }, 6, 1);
         var tag_buffer: [160]u8 = undefined;
-        const tag = frameTag(&tag_buffer, entry, w > 560);
-        const tag_w = if (w > 560) @min(r.measure(font, tag), w * 0.35) else 0;
+        const tag = frameTag(&tag_buffer, entry, !compact);
+        const tag_w = if (!compact) @min(r.measure(font, tag), 220) else 0;
         var expression_buffer: [max_text + 8]u8 = undefined;
         const expr = if (entry.mode == .live) std.fmt.bufPrint(&expression_buffer, "~ {s}", .{entry.expression()}) catch entry.expression() else entry.expression();
-        const expr_w = @min(r.measure(font, expr), w * 0.4);
+        const expr_w = @min(r.measure(font, expr), if (compact) w * 0.4 else @min(w * 0.4, 320));
         try r.textFit(font, x, ry, expr_w, expr, theme.neutral);
         const value_x = x + expr_w + 10;
         const value_w = w - expr_w - 10 - tag_w - 12 - type_w;

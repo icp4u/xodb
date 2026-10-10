@@ -359,3 +359,18 @@ For a video: `xodb --break change_value -- ./zig-out/bin/xodb-m1-fixture w`,
 **Space**, **F10** to reach the function body, **Shift+E**, paste `amount` with
 **Ctrl+V**, then **Return**. Use **Space** to reach the next call. Only the final
 Return adds the live display.
+
+
+For stripped Jai programs with supported read-only runtime metadata, **Y** opens
+the runtime type browser. **L** loads a range, **/** filters types, **G** reads a
+typed address, **S** searches type-pointer candidates and **O** lists container
+storage. See [Jai runtime browser](JAI.md#runtime-browser) for an owned example,
+keyboard walkthrough and the limits of candidate counts.
+
+
+Runtime field editing: open the runtime browser with `Y`, load metadata with `L`,
+and open a typed address with `G` or Return on a candidate. `W` accepts
+`FIELD_PATH VALUE` (for example `health 123`); Return writes and verifies readback.
+`Shift+U` restores the latest original value; plain `U` does nothing. After `F8`,
+a human can also undo an agent write. See [JAI.md](JAI.md#live-field-editing-and-recovery)
+for a runnable owned fixture, MCP mutate-scope commands and conflict semantics.

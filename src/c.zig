@@ -49,5 +49,6 @@ pub const api = @cImport({
     @cInclude("../language/watch.h");
     @cInclude("../language/ruby.h");
     @cInclude("../language/go.h");
+    @cInclude("../language/jai_job.h");
     @cInclude("dwarf.h");
 });

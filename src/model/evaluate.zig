@@ -11,7 +11,8 @@ pub fn enumeratorName(value: Value) ?[]const u8 {
     return null;
 }
 pub const Availability = enum { available, optimized_out, unavailable, unsupported };
-pub const Value = struct { type: *const Type, address: ?u64 = null, bits: u64 = 0, availability: Availability = .available, data: ?[]const u8 = null, valid: ?[]const u8 = null };
+pub const RuntimeType = struct { context_id: u64, type_address: u64, generation: u64 };
+pub const Value = struct { runtime_type: ?RuntimeType = null, type: *const Type, address: ?u64 = null, bits: u64 = 0, availability: Availability = .available, data: ?[]const u8 = null, valid: ?[]const u8 = null };
 pub const Context = struct {
     endian: std.builtin.Endian = .little,
     user: *anyopaque,

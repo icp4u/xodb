@@ -101,7 +101,7 @@ pub fn main(init: std.process.Init) !void {
                 \\       xodb [--font FILE] [--frames N]
                 \\GUI keys: SPACE / F5 / F6 continue or interrupt, F11 source step, F10 source step over (instruction fallback),
                 \\          F4 restart owned launch, F9 run to source cursor, F12 finish selected frame, B breakpoint manager,
-                \\          M memory/search, R floating-point/SIMD, I inline scopes, C stop/crash details, F8 agent control toggle, TAB locals/registers, W watch, G flow,
+                \\          M memory/search, Y runtime types, R floating-point/SIMD, I inline scopes, C stop/crash details, F8 agent control toggle, TAB locals/registers, W watch, G flow,
                 \\          P start/stop CPU capture, F flame graph, Z zoom frame, Backspace zoom out, Enter browse,
                 \\          click source gutter for breakpoint, D detach, J/K thread, arrows scroll, Q quit; Esc cancels archive work.
                 \\--connect ADDRESS:PORT opens the remote GUI (numeric IPv4 or [IPv6]).

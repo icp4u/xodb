@@ -1,0 +1,488 @@
+[
+  {
+    "name": "load_runtime_types",
+    "description": "Build a stop-pinned runtime type graph on a bounded worker from complete read-only captures. Jai is the first provider. Own derived cache only; no target code or writes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "provider": {
+          "enum": [
+            "jai"
+          ]
+        },
+        "snapshot_ids": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 1,
+          "maxItems": 16
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "provider",
+        "snapshot_ids",
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "list_runtime_types",
+    "description": "Poll or page a retained runtime type graph. Partial metadata, rejected candidates and stale identity remain explicit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "get_runtime_type",
+    "description": "Read one runtime type by exact record address or unique name, with paged members, enum values and parameters.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "type_address": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "parameter_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "read_runtime_value",
+    "description": "Read an explicit typed address at the captured stopped generation. Exact hex bits; bounded rows, raw byte previews, paging and optional pointer traversal. No target execution.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "type_address": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "address": {
+          "type": "string"
+        },
+        "depth": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 8
+        },
+        "follow_pointers": {
+          "type": "boolean"
+        },
+        "self_type_field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "address"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "release_runtime_types",
+    "description": "Release your retained type context; a controller may reclaim another client\u2019s context. A pending worker finishes without blocking the session.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "read_runtime_container",
+    "description": "Page occupied container storage using C RTTI offsets/count validation. Arrays and Bucket supported; unproved containers refuse. Addresses do not prove object lifetime.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "type_address": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "address": {
+          "type": "string"
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "address"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "search_runtime_instances",
+    "description": "Start an incremental search for a runtime type pointer in an explicit bounded range. Declare the direct self Type field; dynamic_type_address optionally selects a derived record. Reuses the owned memory-search job and cancel_memory_search. Hits are candidates, never proved live allocations.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "type_address": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "self_type_field": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "address": {
+          "type": "string"
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        },
+        "length": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1073741824
+        },
+        "dynamic_type_address": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "self_type_field",
+        "address",
+        "length"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "controller"
+    }
+  },
+  {
+    "name": "get_runtime_instances",
+    "description": "Page a runtime instance search at its retained stop, with C self-type corroboration and per-hit refusal. Candidate count is raw hits, not proven live objects.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id",
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "write_runtime_field",
+    "description": "Write one RTTI-checked field at a retained stop; C guards data destinations, verifies readback and retains original bytes for undo. Raw mode is explicit exact hex. No target code runs.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "type_address": {
+          "type": "string"
+        },
+        "type_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "address": {
+          "type": "string"
+        },
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "value": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "raw": {
+          "type": "boolean"
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "id",
+        "generation",
+        "address",
+        "path",
+        "value"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "mutator"
+    }
+  },
+  {
+    "name": "list_runtime_writes",
+    "description": "Page retained before/requested/observed bytes and outcome for runtime writes, including partial effects and undo. Does not mutate or grant authority.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 128
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "undo_runtime_write",
+    "description": "Restore original bytes for a retained write in the same target incarnation/image. Checked undo refuses conflicting bytes. Explicit raw bypasses only the byte conflict, never identity/authority/destination checks.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "write_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw": {
+          "type": "boolean"
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "write_id",
+        "generation"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "mutator"
+    }
+  }
+]

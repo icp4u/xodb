@@ -24,6 +24,34 @@ class RunnerTests(unittest.TestCase):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
         (root / '.work').mkdir(exist_ok=True)
 
+    def test_jai_demo_lanes(self):
+        for tier in ('host', 'all'):
+            steps={name:cmd for name,cmd,_ in gate.plan(tier)}
+            self.assertNotIn('--agent',steps['jai-elf-demo-0'])
+            self.assertIn('--writes',steps['jai-elf-demo-0'])
+            for remote in (False,True):
+                for shared in (False,True):
+                    cmd=steps[f'jai-writes-{int(remote)}-{int(shared)}']
+                    self.assertEqual('--agent' in cmd,remote)
+                    self.assertEqual('--shared' in cmd,shared)
+            self.assertIn('--agent',steps['jai-elf-demo-1'])
+            self.assertFalse(any(name.startswith('jai-pe-demo-') for name in steps))
+        for tier in ('periodic','periodic-gui'):
+            self.assertFalse(any(name.startswith('jai-pe-demo-') for name,_,_ in gate.plan(tier)))
+            steps={name:cmd for name,cmd,_ in gate.plan(tier,wine='/fixture/wine')}
+            for remote in (False,True):
+                cmd=steps[f'jai-pe-demo-{int(remote)}']
+                self.assertEqual(cmd[cmd.index('--wine')+1],'/fixture/wine')
+                self.assertEqual(cmd[cmd.index('--kind')+1],'pe')
+                self.assertIn('--writes',cmd)
+                self.assertEqual('--agent' in cmd,remote)
+
+    def test_jai_write_gui_backends(self):
+        for tier in ('gui','all'):
+            steps={name:cmd for name,cmd,_ in gate.plan(tier)}
+            self.assertNotIn('--agent',steps['gui-jai-writes'])
+            self.assertIn('--agent',steps['gui-jai-writes-agent'])
+
     def test_safe_keys_cover_both_live_backends(self):
         for tier in ('gui', 'all'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier)}

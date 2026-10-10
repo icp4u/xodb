@@ -13,7 +13,7 @@ pub const FunctionGraph = struct { generation: u64, image_epoch: u64, module_id:
 pub const AgentScope = enum { observe, control, mutate };
 pub const Actor = enum { human, agent };
 pub const Effect = enum { execution, mutation };
-pub const Audit = struct { sequence: u64, actor: Actor, client_id: ?u64 = null, action: []const u8, generation: u64 };
+pub const Audit = struct { sequence: u64, actor: Actor, client_id: ?u64 = null, action: []const u8, generation: u64, runtime_write: ?@import("runtime_writes.zig").Change = null };
 pub const Frame = struct {
     architecture: @import("../target/arch.zig").Arch = .x86_64,
     tid: i32 = 0,
@@ -34,7 +34,7 @@ pub const Frame = struct {
     }
 };
 const value_view = @import("value_view.zig");
-pub const ValueSummary = struct { type: []const u8, kind: eval.Kind, size: u64, address: ?u64, bits: ?u64, display: []const u8, availability: eval.Availability, diagnostic: ?[]const u8 = null, language: eval.Language = .unknown, enumerator: ?[]const u8 = null, visualization: ?value_view.Preview = null, composite: bool = false, partial: bool = false };
+pub const ValueSummary = struct { provider: ?[]const u8 = null, runtime_type: ?eval.RuntimeType = null, type: []const u8, kind: eval.Kind, size: u64, address: ?u64, bits: ?u64, display: []const u8, availability: eval.Availability, diagnostic: ?[]const u8 = null, language: eval.Language = .unknown, enumerator: ?[]const u8 = null, visualization: ?value_view.Preview = null, composite: bool = false, partial: bool = false };
 /// Inspection borrows module strings. Evidence must own the entire value,
 /// including optional preview metadata and inline/source names, across exec.
 fn retainEvidence(a: std.mem.Allocator, value: anytype) std.mem.Allocator.Error!@TypeOf(value) {
@@ -122,6 +122,9 @@ pub const Session = struct {
     run_to: ?RunTo = null,
     probes: @import("probes.zig").Manager = .{},
     memory: @import("memory.zig").Memory = .{},
+    runtime_types: @import("runtime_types.zig").Cache = .{},
+    runtime_instances: @import("runtime_instances.zig").State = .{},
+    runtime_writes: @import("runtime_writes.zig").State = .{},
     inspections: @import("../observe/context.zig").Manager = .{},
     persistent: @import("persistent.zig").Manager = .{},
     launch_argv: []const [:0]const u8 = &.{},
@@ -850,7 +853,9 @@ pub const Session = struct {
         self.run_to = null;
         self.source_step = null;
         self.metadata.invalidate();
+        if (self.runtime_writes.target_id == std.math.maxInt(u64)) return error.RuntimeWriteTargetIdLimit;
         try self.target.reset();
+        self.runtime_writes.target_id += 1;
         try self.target.launch(self.launch_argv);
         // Relocation happens before another event-loop policy pass can prune IDs.
         for (self.persistent.entries.items, 0..) |item, i| {
@@ -1583,6 +1588,7 @@ pub const Session = struct {
         }
     };
     pub fn summarize(self: *Session, a: std.mem.Allocator, value: eval.Value) !ValueSummary {
+        if (value.runtime_type != null) return @import("runtime_values.zig").preview(self, a, value);
         var result = ValueSummary{ .type = value.type.name, .kind = value.type.kind, .size = value.type.size, .address = value.address, .bits = null, .display = @tagName(value.availability), .availability = value.availability, .language = value.type.language };
         result.composite = value.data != null;
         result.partial = eval.hasMissingBits(value);
@@ -1715,6 +1721,7 @@ pub const Session = struct {
     pub const ValueChild = struct { index: u64, name: []const u8, value: ValueSummary };
     pub const ValuePage = struct { value: ValueSummary, presentation: value_view.Presentation, total: u64, start: u64, next: ?u64, children: []ValueChild, basis: []const u8 = value_view.basis };
     pub fn valueChildren(self: *Session, a: std.mem.Allocator, v: eval.Value, start: u64, limit: usize, raw: bool) !ValuePage {
+        if (v.runtime_type != null) return @import("runtime_values.zig").children(self, a, v, start, limit);
         const page = try value_view.children(self.valueContext(a), v, start, limit, raw);
         const children = try a.alloc(ValueChild, page.children.len);
         for (page.children, children) |child, *item| item.* = .{ .index = child.index, .name = child.name, .value = try self.summarize(a, child.value) };
@@ -1753,7 +1760,14 @@ pub const Session = struct {
             }
         };
         var adapter = Adapter{ .session = self, .registers = frame.registers, .values = values };
-        return eval.evaluate(.{ .endian = self.target.arch().endian(), .user = &adapter, .lookup = Adapter.lookup, .read = Adapter.read, .allocator = a }, text);
+        const context = eval.Context{ .endian = self.target.arch().endian(), .user = &adapter, .lookup = Adapter.lookup, .read = Adapter.read, .allocator = a };
+        if (std.mem.indexOf(u8, text, " as ")) |split| {
+            const operand = std.mem.trim(u8, text[0..split], " \t");
+            const type_name = std.mem.trim(u8, text[split + 4 ..], " \t");
+            if (operand.len == 0 or std.mem.indexOf(u8, type_name, " as ") != null) return error.InvalidRuntimeTypeExpression;
+            return @import("runtime_values.zig").cast(self, a, try eval.evaluate(context, operand), type_name);
+        }
+        return eval.evaluate(context, text);
     }
     pub fn authorize(self: *Session, actor: Actor, effect: Effect, generation: ?u64) !void {
         if (self.target.core != null) return error.ReadOnlyCore;
@@ -1817,6 +1831,8 @@ pub const Session = struct {
         self.allocations.deinit();
         self.observations.deinit();
         self.inspections.deinit();
+        self.runtime_types.deinit();
+        self.runtime_writes.deinit();
         self.memory.deinit();
         self.persistent.deinit();
         for (self.launch_argv) |arg| std.heap.page_allocator.free(arg);

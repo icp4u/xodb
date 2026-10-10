@@ -125,6 +125,7 @@ const WatchSource = struct {
 };
 
 pub const Workspace = struct {
+    runtime_type_signature: ?u64 = null,
     shared_clients: ?usize = null,
     shared_controller: ?u64 = null,
     /// Owner loop consumes this even when several toggles restore the old scope.
@@ -158,6 +159,7 @@ pub const Workspace = struct {
     static_traced: u64 = 0,
     assembly_rows: struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, count: usize = 0 } = .{},
     inspection_panel: @import("inspection.zig").Panel = .{},
+    runtime_type_panel: @import("runtime_types.zig").Panel = .{},
     selected_frame: usize = 0,
     last_frame: usize = std.math.maxInt(usize),
     frames: []model.Frame = &.{},
@@ -229,6 +231,7 @@ pub const Workspace = struct {
     const LocalRow = struct { name: []const u8, value: model.ValueSummary };
     pub fn deinit(self: *Workspace) void {
         self.language_panel.deinit();
+        self.runtime_type_panel.deinit();
         self.logical_frames.deinit();
         self.flow.deinit();
         self.flame.deinit();
@@ -356,6 +359,7 @@ pub const Workspace = struct {
             'q' => if (event.mods.shift) 16 else 0,
             'b' => 48,
             'm' => 50,
+            'y' => 21,
             'r' => 19,
             'i' => 23,
             'c' => 46,
@@ -401,6 +405,7 @@ pub const Workspace = struct {
         if (self.allocation_save_editor.open) return &self.allocation_save_editor;
         if (self.allocation_panel.open or self.syscall_panel.open or self.stop_panel.open or self.static_panel.open) return null;
         if (self.inline_panel.open) return if (self.inline_panel.editor.open) &self.inline_panel.editor else null;
+        if (self.runtime_type_panel.open) return if (self.runtime_type_panel.editor.open) &self.runtime_type_panel.editor else null;
         if (self.inspection_panel.open) return if (self.inspection_panel.editor.open) &self.inspection_panel.editor else null;
         if (self.probes_panel.open) return if (self.probes_panel.editor.open) &self.probes_panel.editor else null;
         if (self.language_panel.editor.open) return &self.language_panel.editor;
@@ -466,6 +471,11 @@ pub const Workspace = struct {
         }
         if (self.inline_panel.open and scroll != 0) {
             self.inline_panel.wheel(scroll);
+            scroll = 0;
+            w.dirty = true;
+        }
+        if (self.runtime_type_panel.open and scroll != 0) {
+            self.runtime_type_panel.wheel(session, scroll);
             scroll = 0;
             w.dirty = true;
         }
@@ -555,6 +565,10 @@ pub const Workspace = struct {
                         continue;
                     }
                     if (self.inline_panel.key(session, inspect_tid, self.selected_frame, event)) {
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.runtime_type_panel.key(session, event)) {
                         w.dirty = true;
                         continue;
                     }
@@ -651,6 +665,11 @@ pub const Workspace = struct {
                     }
                     if (self.inline_panel.open) {
                         if (event.kind == .button_press) self.inline_panel.press(event.x, event.y);
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.runtime_type_panel.open) {
+                        if (event.kind == .button_press) self.runtime_type_panel.press(session, event.x, event.y);
                         w.dirty = true;
                         continue;
                     }
@@ -881,6 +900,18 @@ pub const Workspace = struct {
             self.status = "Restarted owned launch; watches cleared, breakpoints relocated";
             self.selected = 0;
             self.selected_frame = 0;
+            w.dirty = true;
+            return;
+        }
+        if (code == 21 and !self.show_profile) {
+            self.probes_panel.open = false;
+            self.inspection_panel.open = false;
+            self.inline_panel.open = false;
+            self.stop_panel.open = false;
+            self.allocation_panel.open = false;
+            self.syscall_panel.open = false;
+            self.static_panel.open = false;
+            self.runtime_type_panel.show();
             w.dirty = true;
             return;
         }
@@ -1475,6 +1506,9 @@ pub const Workspace = struct {
     }
     fn refreshWatch(self: *Workspace, session: *Session) void {
         if (self.watch.count == 0) return;
+        const signature = session.runtime_types.signature();
+        if (self.runtime_type_signature == null or self.runtime_type_signature.? != signature) self.watch.dirty = true;
+        self.runtime_type_signature = signature;
         self.watch.setDisplayFrame(if (self.selected < session.target.snapshot().thread_count) .{ .tid = session.target.threadSlice()[self.selected].tid, .index = self.selected_frame } else null);
         var source = WatchSource{ .session = session };
         defer source.scratch.deinit();
@@ -1694,7 +1728,7 @@ pub const Workspace = struct {
         for (&self.bar, target) |*channel, goal| {
             if (style.approach(channel, goal, 30, dt)) moving = true;
         }
-        self.animating = moving or self.inspection_panel.busy(session);
+        self.animating = moving or self.inspection_panel.busy(session) or self.runtime_type_panel.busy(session);
     }
     fn drawSharedOwnership(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
         const count = self.shared_clients orelse return;
@@ -1973,6 +2007,7 @@ pub const Workspace = struct {
         try self.probes_panel.draw(r, font, width, height, session);
         const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
         try self.inspection_panel.draw(r, font, width, height, session, inspect_tid);
+        try self.runtime_type_panel.draw(r, font, width, height, session);
         try self.inline_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
         try self.static_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
         if (self.static_panel.open and self.static_panel.running) self.animating = true;

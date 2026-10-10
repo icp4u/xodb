@@ -85,8 +85,8 @@ try:
     # The user's report: pick a row near the top, scroll the list away from
     # it, and the next 1 Hz publications must not pull the view back up.
     d.keys(*['tap', 103] * 48) # Up to the first row
-    leader = after(1, 'publication after Up')[0]
-    check('keys pick the first row', leader[4] == 0 and leader[5] == 0)
+    # 48 taps can straddle a 1 Hz publication, so wait for one that has them all.
+    leader = until(lambda value: value and value[-1][4] == 0 and value[-1][5] == 0, 'keys pick the first row')[-1]
     d.keys('scroll', 640, 760, 6)
     scrolled = after(1, 'publication after scroll')[0]
     check('wheel scroll is still in place after the next refresh', scrolled[5] > 0)
@@ -99,8 +99,8 @@ try:
         picked = after(1, 'publication after click')[0]
         if picked[2:4] != leader[2:4]: break
     check('click selects an on-screen descriptor', picked[2:4] != leader[2:4] and picked[5] <= picked[4] < picked[5] + picked[6])
-    held = after(4, 'publications after click')
-    check('clicked identity stays selected across 4 refreshes', all(s[2:4] == picked[2:4] for s in held))
+    held = after(8, 'publications after click')  # 8 so the churn reliably re-ranks under the pick
+    check('clicked identity stays selected across 8 refreshes', all(s[2:4] == picked[2:4] for s in held))
     prior = picked
     minimal = True
     for s in held:

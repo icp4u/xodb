@@ -19,7 +19,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None):
     live = tier in ('host', 'all')
     language_args = (['--python', python] if python else []) + (['--perl', perl] if perl else []) + (['--node', node] if node else [])
     gui_language_args = [*language_args]
@@ -52,6 +52,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--perf', '--work', '.work/perf-syscalls'], 120))
         return steps
     if tier in ('periodic', 'periodic-gui'):
+        if wine:
+            for remote in (False, True):
+                label = f'jai-pe-demo-{int(remote)}'
+                steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--kind', 'pe', '--wine', wine, '--work', '.work/' + label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 420))
         steps.append(('source-paths-differential', [sys.executable, '-B', 'tests/source-paths-differential.py',
                       '--check', '.work/source-paths-check', '--work', '.work/source-differential', '--cases', '1500'], 300))
         for delay in (25, 50, 100):
@@ -68,6 +73,24 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ]
         return steps
     if live:
+        for remote in (False, True):
+            label = f'jai-elf-demo-{int(remote)}'
+            steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 60))
+        for remote in (False, True):
+            for shared in (False, True):
+                label = f'jai-runtime-{int(remote)}-{int(shared)}'
+                steps.append((label, [sys.executable, '-B', 'tests/jai-runtime.py', '--work', '.work/' + label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []),
+                              *(['--shared'] if shared else [])], 60))
+                writes = f'jai-writes-{int(remote)}-{int(shared)}'
+                steps.append((writes, [sys.executable, '-B', 'tests/jai-writes-live.py', '--work', '.work/' + writes,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []),
+                              *(['--shared'] if shared else [])], 60))
+                discovery = f'jai-discovery-{int(remote)}-{int(shared)}'
+                steps.append((discovery, [sys.executable, '-B', 'tests/jai-discovery.py', '--work', '.work/' + discovery,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []),
+                              *(['--shared'] if shared else [])], 60))
         for remote in (False, True):
             steps.append((f'controller-scope-{int(remote)}', [sys.executable, '-B', 'tests/controller-scope.py',
                           '--work', f'.work/scope{int(remote)}', *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
@@ -191,6 +214,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
+            ('gui-jai-runtime', ['tests/jai-runtime-gui.py']),
+            ('gui-jai-browser', ['tests/jai-browser-gui.py']),
+            ('gui-jai-writes', ['tests/jai-writes-gui.py']),
+            ('gui-jai-writes-agent', ['tests/jai-writes-gui.py', '--agent', 'zig-out/bin/xodb-agent']),
+            ('gui-jai-browser-pages', ['tests/jai-browser-gui.py', '--pagination']),
             ('gui-clipboard', ['tests/clipboard-gui.py', '--focused']),
             ('gui-repeated-break', ['tests/repeated-break-gui.py']),
             ('gui-symbol-discovery', ['tests/symbol-discovery-gui.py']),
@@ -434,12 +462,15 @@ def main():
     parser.add_argument('--python', help='Include language-tab and cached-selection checks using this debug CPython runtime')
     parser.add_argument('--ruby', help='Include the exact supported CRuby DWARF runtime and its matching development headers')
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
+    parser.add_argument('--wine', help='Include owned stripped PE/Jai checks with this Wine executable (periodic tiers; private prefix)')
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
     args = parser.parse_args()
+    if args.wine and args.tier not in ('periodic', 'periodic-gui'):
+        parser.error('--wine requires periodic or periodic-gui')
     if args.headless and args.tier not in ('portable', 'periodic', 'perf'):
         parser.error('--headless is for the portable, periodic or perf tier; release host/GUI coverage builds the GUI')
     if args.uprobes and args.tier not in ('host', 'all'):
@@ -460,7 +491,7 @@ def main():
         parser.error('--node-refusal requires the gui or all tier')
     if args.lua and args.tier in ('portable', 'periodic', 'periodic-gui', 'perf'):
         parser.error('--lua requires the host, gui or all tier')
-    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go)
+    steps = plan(args.tier, args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine)
     if args.capstone == 'vendored':
         steps = [(name, [*argv, '-Dcapstone=vendored'], timeout) if name == 'build-tests' else (name, argv, timeout) for name, argv, timeout in steps]
     if args.list:
@@ -481,7 +512,7 @@ def main():
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=args.tier, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -491,6 +522,7 @@ def main():
                      ['full host integration suite'] if args.tier == 'gui' else
                      ['full host integration suite', 'GUI execution'] if args.tier == 'perf' else []) +
                     (['full overview/clipboard/Vulkan and delayed-discovery matrices (use periodic-gui)'] if args.tier in ('all', 'gui', 'host') else []) +
+                    (['owned PE/Jai checks (use periodic --wine PATH)'] if not args.wine else []) +
                     (['Perl live display (use --perl PATH)'] if args.tier in ('gui', 'all') and not args.perl else []) +
                     (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.ruby else []) +
                     (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'periodic', 'periodic-gui', 'perf') and not args.go else []) +
@@ -519,6 +551,8 @@ def main():
             required += ['wayland-scanner', 'glslc']
         if args.tier in ('gui', 'all', 'periodic-gui'):
             required += ['sway', 'swaymsg', 'grim']
+        if args.wine:
+            required.append(args.wine)
         missing = [tool for tool in required if not shutil.which(tool)]
         if args.tier in ('gui', 'all', 'periodic-gui'):
             try:

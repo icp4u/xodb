@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/go.c", "src/language/go_layout.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -358,6 +358,56 @@ pub fn build(b: *std.Build) void {
         go_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     }
     test_step.dependOn(&b.addRunArtifact(go_tests).step);
+    const jai_tests = b.addExecutable(.{ .name = "xodb-jai-layout-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "tests/jai-layout.c" }) |source| {
+        jai_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const jai_run = b.addRunArtifact(jai_tests);
+    b.step("test-jai-layout", "Check bounded Jai self-description detection").dependOn(&jai_run.step);
+    test_step.dependOn(&jai_run.step);
+    const jai_reader_tests = b.addExecutable(.{ .name = "xodb-jai-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "src/language/jai_reader.c", "tests/jai-reader.c" }) |source| {
+        jai_reader_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const jai_reader_run = b.addRunArtifact(jai_reader_tests);
+    b.step("test-jai-reader", "Check bounded Jai type graph and member flattening").dependOn(&jai_reader_run.step);
+    test_step.dependOn(&jai_reader_run.step);
+    const jai_value_tests = b.addExecutable(.{ .name = "xodb-jai-value-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "tests/jai-value.c" }) |source| {
+        jai_value_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const jai_value_run = b.addRunArtifact(jai_value_tests);
+    b.step("test-jai-value", "Check Jai typed values in an owned stopped child").dependOn(&jai_value_run.step);
+    test_step.dependOn(&jai_value_run.step);
+    const jai_container_tests = b.addExecutable(.{ .name = "xodb-jai-container-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "tests/jai-container.c" }) |source| {
+        jai_container_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DNDEBUG" } });
+    }
+    const jai_write_tests = b.addExecutable(.{ .name = "xodb-jai-write-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "tests/jai-write.c" }) |source| {
+        jai_write_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DNDEBUG" } });
+    }
+    const jai_journal_tests = b.addExecutable(.{ .name = "xodb-jai-journal-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_journal.c", "tests/jai-journal.c" }) |source| {
+        jai_journal_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-DNDEBUG" } });
+    }
+    const jai_journal_run = b.addRunArtifact(jai_journal_tests);
+    b.step("test-jai-journal", "Check guarded Jai write/readback and undo journal").dependOn(&jai_journal_run.step);
+    test_step.dependOn(&jai_journal_run.step);
+    const jai_write_run = b.addRunArtifact(jai_write_tests);
+    b.step("test-jai-write", "Check Jai typed field resolution and write byte plans").dependOn(&jai_write_run.step);
+    test_step.dependOn(&jai_write_run.step);
+    const jai_container_run = b.addRunArtifact(jai_container_tests);
+    b.step("test-jai-container", "Check bounded Jai occupied containers and candidates").dependOn(&jai_container_run.step);
+    test_step.dependOn(&jai_container_run.step);
+
+    const jai_job_tests = b.addExecutable(.{ .name = "xodb-jai-job-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    for ([_][]const u8{ "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_job.c", "tests/jai-job.c" }) |source| {
+        jai_job_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-DNDEBUG", "-DXJAI_JOB_TEST", "-Wall", "-Wextra", "-Werror" } });
+    }
+    const jai_job_run = b.addRunArtifact(jai_job_tests);
+    b.step("test-jai-job", "Check copied input, worker ownership and nonblocking release").dependOn(&jai_job_run.step);
+    test_step.dependOn(&jai_job_run.step);
     const javascript_tests = b.addExecutable(.{ .name = "xodb-javascript-reader-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     for ([_][]const u8{ "src/language/javascript.c", "src/language/javascript_layout.c", "tests/javascript-reader.c" }) |source| {
         javascript_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
