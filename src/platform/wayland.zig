@@ -12,6 +12,7 @@ pub const Window = struct {
     last_input_serial: u32 = 0,
     compositor: ?*c.wl_compositor = null,
     wm: ?*c.xdg_wm_base = null,
+    decoration_manager: ?*c.zxdg_decoration_manager_v1 = null,
     seat: ?*c.wl_seat = null,
     seat_name: u32 = 0,
     cursor_shapes: ?*c.wp_cursor_shape_manager_v1 = null,
@@ -26,6 +27,7 @@ pub const Window = struct {
     surface: *c.wl_surface = undefined,
     xdg: ?*c.xdg_surface = null,
     top: ?*c.xdg_toplevel = null,
+    decoration: ?*c.zxdg_toplevel_decoration_v1 = null,
     width: u32 = 1280,
     height: u32 = 800,
     configured: bool = false,
@@ -64,6 +66,13 @@ pub const Window = struct {
         c.xdg_toplevel_set_title(self.top, "xodb — hugs and kisses debugger");
         c.xdg_toplevel_set_app_id(self.top, "xodb");
         c.xdg_toplevel_set_min_size(self.top, 720, 480);
+        // Negotiate before the first commit: the compositor owns the native
+        // title bar, including move, resize, minimize, maximize and close.
+        if (self.decoration_manager) |manager| {
+            self.decoration = c.zxdg_decoration_manager_v1_get_toplevel_decoration(manager, self.top);
+            _ = c.zxdg_toplevel_decoration_v1_add_listener(self.decoration, &decoration_listener, self);
+            c.zxdg_toplevel_decoration_v1_set_mode(self.decoration, c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+        }
         c.wl_surface_commit(self.surface);
         while (!self.configured) if (c.wl_display_dispatch(self.display) < 0) return error.WaylandDisconnected;
     }
@@ -71,10 +80,12 @@ pub const Window = struct {
         self.cancelFrame();
         self.dropSeat();
         if (self.cursor_shapes) |v| c.wp_cursor_shape_manager_v1_destroy(v);
+        if (self.decoration) |v| c.zxdg_toplevel_decoration_v1_destroy(v);
         if (self.top) |v| c.xdg_toplevel_destroy(v);
         if (self.xdg) |v| c.xdg_surface_destroy(v);
         c.wl_surface_destroy(self.surface);
         if (self.wm) |v| c.xdg_wm_base_destroy(v);
+        if (self.decoration_manager) |v| c.zxdg_decoration_manager_v1_destroy(v);
         if (self.compositor) |v| c.wl_compositor_destroy(v);
         if (self.registry) |v| c.wl_registry_destroy(v);
         c.xclip_destroy(self.clipboard);
@@ -191,6 +202,9 @@ fn global(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*
     if (std.mem.eql(u8, s, "xdg_wm_base")) {
         w.wm = @ptrCast(c.wl_registry_bind(registry, name, &c.xdg_wm_base_interface, 1));
         _ = c.xdg_wm_base_add_listener(w.wm, &wm_listener, w);
+    }
+    if (std.mem.eql(u8, s, "zxdg_decoration_manager_v1")) {
+        w.decoration_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.zxdg_decoration_manager_v1_interface, 1));
     }
     if (std.mem.eql(u8, s, "wl_seat") and w.seat == null) {
         w.seat = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_seat_interface, @min(version, 5)));
@@ -312,6 +326,10 @@ fn axisDiscrete(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: i32) callconv(.c) 
 const registry_listener = c.wl_registry_listener{ .global = global, .global_remove = removed };
 const wm_listener = c.xdg_wm_base_listener{ .ping = ping };
 const surface_listener = c.xdg_surface_listener{ .configure = configured };
+// The existing content has no client-side window frame to toggle. The following
+// xdg_surface.configure acknowledges this mode along with the surface state.
+fn decorationConfigured(_: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, _: u32) callconv(.c) void {}
+const decoration_listener = c.zxdg_toplevel_decoration_v1_listener{ .configure = decorationConfigured };
 const top_listener = c.xdg_toplevel_listener{ .configure = resized, .close = closed, .configure_bounds = null, .wm_capabilities = null };
 const seat_listener = c.wl_seat_listener{ .capabilities = seatCapabilities, .name = seatName };
 const keyboard_listener = c.wl_keyboard_listener{ .keymap = keymap, .enter = enter, .leave = leave, .key = key, .modifiers = modifiers, .repeat_info = repeat };

@@ -37,6 +37,7 @@ pub const api = @cImport({
         @cInclude("wayland-client.h");
         @cInclude("../platform/clipboard.h");
         @cInclude("xdg-shell-client-protocol.h");
+        @cInclude("xdg-decoration-unstable-v1-client-protocol.h");
         @cInclude("cursor-shape-v1-client-protocol.h");
         @cInclude("linux-dmabuf-v1-client-protocol.h");
         @cInclude("vulkan/vulkan.h");

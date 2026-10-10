@@ -57,6 +57,10 @@ Letter shortcuts follow your active keyboard layout. In text fields, **Ctrl+V**
 pastes, **middle-click** pastes the primary selection, and **Ctrl+C** copies.
 See [text editing](docs/GUIDE.md#text-editing-and-clipboard).
 
+On compositors supporting `xdg-decoration` (including KDE Plasma), the GUI
+requests the desktop's native title bar for dragging, minimizing, maximizing
+and closing the window.
+
 ## What actually works today
 
 New here? [Which tool do I reach for?](docs/GUIDE.md) is the plain-language map

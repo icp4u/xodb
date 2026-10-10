@@ -74,6 +74,12 @@ pub fn build(b: *std.Build) void {
         const xdg_code = protocol.addOutputFileArg("xdg-shell-protocol.c");
         module.addIncludePath(xdg_header.dirname());
         module.addCSourceFile(.{ .file = xdg_code, .flags = &.{} });
+        // Ask supporting compositors for their native title bar and window controls.
+        const decoration_xml = "/usr/share/wayland-protocols/unstable/xdg-decoration/xdg-decoration-unstable-v1.xml";
+        const decoration_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", decoration_xml });
+        module.addIncludePath(decoration_header.addOutputFileArg("xdg-decoration-unstable-v1-client-protocol.h").dirname());
+        const decoration_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", decoration_xml });
+        module.addCSourceFile(.{ .file = decoration_code.addOutputFileArg("xdg-decoration-unstable-v1.c"), .flags = &.{} });
         const primary_xml = "/usr/share/wayland-protocols/unstable/primary-selection/primary-selection-unstable-v1.xml";
         const primary_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", primary_xml });
         module.addIncludePath(primary_header.addOutputFileArg("primary-selection-unstable-v1-client-protocol.h").dirname());
