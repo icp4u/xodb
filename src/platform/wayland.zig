@@ -28,6 +28,12 @@ pub const Window = struct {
     xdg: ?*c.xdg_surface = null,
     top: ?*c.xdg_toplevel = null,
     decoration: ?*c.zxdg_toplevel_decoration_v1 = null,
+    /// Set before `init` when the content draws its own title bar and window
+    /// buttons; later changes go through `setOwnFrame`.
+    own_frame: bool = false,
+    /// The mode in the compositor's latest decoration configure, which need
+    /// not be the one requested; 0 until one arrives.
+    decoration_mode: u32 = 0,
     width: u32 = 1280,
     height: u32 = 800,
     configured: bool = false,
@@ -67,14 +73,24 @@ pub const Window = struct {
         c.xdg_toplevel_set_app_id(self.top, "xodb");
         c.xdg_toplevel_set_min_size(self.top, 720, 480);
         // Negotiate before the first commit: the compositor owns the native
-        // title bar, including move, resize, minimize, maximize and close.
+        // title bar, including move, resize, minimize, maximize and close,
+        // unless the content draws a frame of its own.
         if (self.decoration_manager) |manager| {
             self.decoration = c.zxdg_decoration_manager_v1_get_toplevel_decoration(manager, self.top);
             _ = c.zxdg_toplevel_decoration_v1_add_listener(self.decoration, &decoration_listener, self);
-            c.zxdg_toplevel_decoration_v1_set_mode(self.decoration, c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+            self.requestDecoration();
         }
         c.wl_surface_commit(self.surface);
         while (!self.configured) if (c.wl_display_dispatch(self.display) < 0) return error.WaylandDisconnected;
+    }
+    fn requestDecoration(self: *Window) void {
+        if (self.decoration) |v| c.zxdg_toplevel_decoration_v1_set_mode(v, if (self.own_frame) c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE else c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
+    }
+    /// For looks that change while the window is open.
+    pub fn setOwnFrame(self: *Window, own: bool) void {
+        if (self.own_frame == own) return;
+        self.own_frame = own;
+        self.requestDecoration();
     }
     pub fn deinit(self: *Window) void {
         self.cancelFrame();
@@ -326,9 +342,20 @@ fn axisDiscrete(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: i32) callconv(.c) 
 const registry_listener = c.wl_registry_listener{ .global = global, .global_remove = removed };
 const wm_listener = c.xdg_wm_base_listener{ .ping = ping };
 const surface_listener = c.xdg_surface_listener{ .configure = configured };
-// The existing content has no client-side window frame to toggle. The following
-// xdg_surface.configure acknowledges this mode along with the surface state.
-fn decorationConfigured(_: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, _: u32) callconv(.c) void {}
+// The compositor has the last word and the content does not adapt to it. The
+// following xdg_surface.configure acknowledges this mode along with the surface state.
+fn decorationConfigured(data: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, mode: u32) callconv(.c) void {
+    const w = window(data);
+    w.decoration_mode = mode;
+    if (w.input.trace) std.debug.print("decoration own_frame={} granted={s}\n", .{ w.own_frame, decorationName(mode) });
+}
+fn decorationName(mode: u32) []const u8 {
+    return switch (mode) {
+        c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE => "client",
+        c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE => "server",
+        else => "none",
+    };
+}
 const decoration_listener = c.zxdg_toplevel_decoration_v1_listener{ .configure = decorationConfigured };
 const top_listener = c.xdg_toplevel_listener{ .configure = resized, .close = closed, .configure_bounds = null, .wm_capabilities = null };
 const seat_listener = c.wl_seat_listener{ .capabilities = seatCapabilities, .name = seatName };

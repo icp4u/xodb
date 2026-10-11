@@ -46,7 +46,7 @@ COVERS = (
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
       'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h'),
-     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-safe-keys*', 'gui-themes')),
+     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-safe-keys*', 'gui-themes')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
@@ -81,7 +81,7 @@ COVERS = (
       'source-blocks', 'stale-interrupt',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*'),
-     ('vulkan-*', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('scripts/release-check',), ('release-runner',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
@@ -507,6 +507,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
         steps.append(('gui-fdflow-denied', [sys.executable, '-B', 'tests/fdflow-gui.py', '--work-dir', '.work/ff', '--expect-denied'], 120))
         steps.append(('gui-win95', [sys.executable, '-B', 'tests/overview-win95-gui.py'], 120))
+        steps.append(('gui-decoration', [sys.executable, '-B', 'tests/window-decoration-gui.py'], 60))
         steps.append(('gui-memdefrag-smoke', [sys.executable, '-B', 'tests/memdefrag-gui.py', '--only', 'redact'], 180))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
         if emacs:

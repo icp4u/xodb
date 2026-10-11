@@ -191,7 +191,8 @@ fn appendInheritance(a: Allocator, s: *const c.struct_xrt_fd_snapshot, pid: u64,
     try text(a, &counts, "parent_reasons", "parent_denied: fd table needs privilege; parent_absent: exited or hidden by hidepid; parent_reused: pid reused after the child");
     try out.object.put(a, "comparison_coverage", counts);
     var matches: u64 = 0;
-    for (view.rows[0..view.count]) |r| {
+    // rows is null while count is 0.
+    if (view.count != 0) for (view.rows[0..view.count]) |r| {
         const child = s.processes[r.child];
         const parent = s.processes[r.parent];
         const fd = s.fds[r.child_fd];
@@ -216,7 +217,7 @@ fn appendInheritance(a: Allocator, s: *const c.struct_xrt_fd_snapshot, pid: u64,
         try row.object.put(a, "parent_cloexec", if (r.flags & c.XRT_FDINH_PARENT_FLAGS_KNOWN != 0) .{ .bool = r.flags & c.XRT_FDINH_PARENT_CLOEXEC != 0 } else .null);
         try flag(a, &row, "stale", r.flags & (c.XRT_FDINH_PARENT_STALE | c.XRT_FDINH_CHILD_STALE | c.XRT_FDINH_IDENTITY_STALE) != 0);
         try rows.array.append(row);
-    }
+    };
     return matches;
 }
 pub fn call(a: Allocator, owner: *system.Collector, name: []const u8, args: Value) !Value {

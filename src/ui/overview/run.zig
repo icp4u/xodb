@@ -247,7 +247,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     view.source_label = if (source == .replay) "REPLAY" else "live";
     view.owns_samples = source == .live;
 
-    var window = Window{};
+    var window = Window{ .own_frame = view.pal().win95 };
     try window.init();
     defer window.deinit();
     if (window.top) |top| {

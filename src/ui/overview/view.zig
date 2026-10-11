@@ -413,6 +413,8 @@ pub const View = struct {
 
     fn windowActions(self: *View, w: *Window) void {
         const c = @import("../../c.zig").api;
+        // The theme key may have switched to or from the look with its own title bar.
+        w.setOwnFrame(self.pal().win95);
         if (w.top) |top| {
             if (self.minimize_requested) c.xdg_toplevel_set_minimized(top);
             // The compositor owns this state: it may maximize or restore by other means.

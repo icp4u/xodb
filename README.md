@@ -59,7 +59,9 @@ See [text editing](docs/GUIDE.md#text-editing-and-clipboard).
 
 On compositors supporting `xdg-decoration` (including KDE Plasma), the GUI
 requests the desktop's native title bar for dragging, minimizing, maximizing
-and closing the window.
+and closing the window. A look that draws its own title bar and window buttons
+(`--overview --look win95`) asks the compositor to leave the frame off instead.
+Compositors without the protocol (including GNOME) are unchanged.
 
 ## What actually works today
 
