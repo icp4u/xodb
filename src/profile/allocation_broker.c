@@ -50,7 +50,10 @@ static int receive_packet(int socket, void *data, size_t size, int fds[2], size_
     do n = recvmsg(socket, &msg, MSG_CMSG_CLOEXEC); while (n < 0 && errno == EINTR);
     if (n < 0) return -1;
     int bad = !!(msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC));
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wsign-compare" /* musl CMSG_NXTHDR */
     for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+#pragma GCC diagnostic pop
         if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS || cmsg->cmsg_len < CMSG_LEN(0)) { bad = 1; continue; }
         size_t bytes = cmsg->cmsg_len - CMSG_LEN(0);
         if (bytes % sizeof(int)) bad = 1;
