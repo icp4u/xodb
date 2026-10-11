@@ -434,8 +434,7 @@ pub fn main(init: std.process.Init) !void {
         defer window.deinit();
         var renderer = Renderer{};
         defer renderer.deinit();
-        var renderer_ready = false;
-        var render_retry: u64 = 0;
+        var recovery = @import("render/recovery.zig").Recovery{};
         const font = try a.create(Font);
         font.* = .{};
         try font.initSelected(font_path, @import("build_options").font_path ++ "");
@@ -550,19 +549,14 @@ pub fn main(init: std.process.Init) !void {
                 (if (active.allocations.capture) |capture| capture.revision != last_allocation_revision and current -| last_frame >= 250_000_000 else false);
             const profile_changed = if (active.profile) |capture| (capture.id != last_profile_id or capture.revision != last_profile_revision) and current -| last_frame >= 250_000_000 else false;
             if ((if (active.imported) |state| state.serial != last_import_serial else false) or active.recorded_views.serial != last_view_serial or allocations_changed or profile_changed or window.dirty or workspace.animating or active.target.snapshot().generation != last_generation or frames > 0 or current - last_frame > 1_000_000_000) {
-                if (current < render_retry) continue;
-                if (!renderer_ready) {
+                if (current < recovery.retry_at) continue;
+                if (!recovery.ready) {
                     phase_started = linux.now();
-                    renderer.init(&window) catch |err| {
-                        // A device request that names nothing will not start matching.
-                        if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
-                        workspace.status = @errorName(err);
-                        std.debug.print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
-                        render_retry = current + 1_000_000_000;
+                    if (!try recovery.init(&renderer, &window, current)) {
+                        if (recovery.last_error) |err| workspace.status = @errorName(err);
                         continue;
-                    };
+                    }
                     reportSlow("Vulkan initialization", phase_started);
-                    renderer_ready = true;
                     font.dirty = true;
                 }
                 const presented = renderFrame(&renderer, font, workspace, &window, active) catch |err| {
@@ -570,9 +564,7 @@ pub fn main(init: std.process.Init) !void {
                     std.debug.print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
                     // A failed submit may leave the frame fence unsignalled. Recreate
                     // the renderer instead of waiting on that fence next frame.
-                    renderer.deinit();
-                    renderer_ready = false;
-                    render_retry = current + 1_000_000_000;
+                    recovery.lost(&renderer, current);
                     continue;
                 };
                 window.dirty = !presented;

@@ -12,6 +12,10 @@ pub const Context = struct {
     registers: RegisterSet,
     register_data: ?*const fn (*anyopaque, u64) ?[]const u8 = null,
     cfa: ?u64 = null,
+    /// libdw seeds CFI register expressions with the CFA. An independent
+    /// expression can leave that prefix unused; its result is the stack top.
+    /// Ordinary location queries retain their single-result validation.
+    allow_stack_prefix: bool = false,
     frame_base: ?u64 = null,
     load_bias: u64 = 0,
     user: *anyopaque,
@@ -178,8 +182,8 @@ pub fn evaluate(ctx: Context, ops: []const Op) !Place {
             else => return error.UnsupportedLocation,
         }
     }
-    if (count != 1) return error.MalformedExpression;
-    return .{ .kind = kind, .bits = stack[0], .register = register };
+    if (count == 0 or (count != 1 and !ctx.allow_stack_prefix)) return error.MalformedExpression;
+    return .{ .kind = kind, .bits = stack[count - 1], .register = register };
 }
 test "frame-relative locations and stack values keep runtime addresses distinct" {
     const Mock = struct {
@@ -328,4 +332,33 @@ test "big endian 32 bit register pieces preserve the low bytes in target order" 
     const piece = try composite(arena.allocator(), ctx, &.{ .{ .atom = OP.reg0 }, .{ .atom = OP.piece, .number = 2 }, .{ .atom = OP.reg0 }, .{ .atom = OP.piece, .number = 4 } });
     try std.testing.expectEqualSlices(u8, &.{ 0x56, 0x78, 0x12, 0x34, 0x56, 0x78 }, piece.data.?);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 255, 255 }, piece.valid.?);
+}
+
+// Fast component lane: libdw's initial CFA is not necessarily consumed by a
+// register expression. Permitting that prefix never relaxes resource limits.
+test "CFI expression returns its stack top and keeps the evaluator bounds" {
+    const Mock = struct {
+        fn read(_: *anyopaque, _: u64, _: []u8) !usize {
+            return error.MemoryUnreadable;
+        }
+    };
+    var token: u8 = 0;
+    var regs: RegisterSet = @splat(null);
+    regs[6] = 0x2000;
+    var ctx = Context{ .registers = regs, .cfa = 0x5000, .user = &token, .read = Mock.read };
+    const ops = [_]Op{ .{ .atom = OP.call_frame_cfa }, .{ .atom = OP.breg6, .number = @bitCast(@as(i64, -24)) } };
+    try std.testing.expectError(error.MalformedExpression, evaluate(ctx, &ops));
+    ctx.allow_stack_prefix = true;
+    const where = try evaluate(ctx, &ops);
+    try std.testing.expectEqual(@as(u64, 0x1fe8), where.bits);
+    try std.testing.expectEqual(@FieldType(Place, "kind").address, where.kind);
+    const value = try evaluate(ctx, &.{ .{ .atom = OP.call_frame_cfa }, .{ .atom = OP.lit7 }, .{ .atom = OP.stack_value } });
+    try std.testing.expectEqual(@as(u64, 7), value.bits);
+    try std.testing.expectEqual(@FieldType(Place, "kind").value, value.kind);
+    try std.testing.expectError(error.MalformedExpression, evaluate(ctx, &.{ .{ .atom = OP.lit1 }, .{ .atom = OP.drop } }));
+    try std.testing.expectError(error.MemoryUnreadable, evaluate(ctx, &.{ .{ .atom = OP.call_frame_cfa }, .{ .atom = OP.breg6 }, .{ .atom = OP.deref } }));
+    const deep = [_]Op{.{ .atom = OP.lit0 }} ** 129;
+    try std.testing.expectError(error.ExpressionTooDeep, evaluate(ctx, &deep));
+    const long = [_]Op{.{ .atom = OP.nop }} ** 4097;
+    try std.testing.expectError(error.ExpressionTooLarge, evaluate(ctx, &long));
 }

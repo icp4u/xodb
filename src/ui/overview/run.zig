@@ -277,8 +277,7 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         view.sample_time = 0;
         next_sample = now() + interval;
     }
-    var ready = false;
-    var retry: u64 = 0;
+    var recovery = @import("../../render/recovery.zig").Recovery{};
     var rendered: u64 = 0;
     var last_frame: u64 = 0;
     while (!window.closing and quitting == 0) {
@@ -382,22 +381,14 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         if (view.panel == .memory_map and view.memmap.tick(current)) window.dirty = true;
         const eased = view.animating(current) and current -| last_frame >= frame_gap;
         if (!(window.dirty or eased or o.frames > 0 or current -| last_frame > 1_000_000_000)) continue;
-        if (current < retry) continue;
-        if (!ready) {
-            renderer.init(&window) catch |err| {
-                if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
-                std.debug.print("xodb: overview renderer failed: {s}; retrying\n", .{@errorName(err)});
-                retry = current + 1_000_000_000;
-                continue;
-            };
-            ready = true;
+        if (current < recovery.retry_at) continue;
+        if (!recovery.ready) {
+            if (!try recovery.init(&renderer, &window, current)) continue;
             font.dirty = true;
         }
         const presented = frame(&renderer, font, &view, &window, current) catch |err| {
             std.debug.print("xodb: overview frame failed: {s}; recreating renderer\n", .{@errorName(err)});
-            renderer.deinit();
-            ready = false;
-            retry = current + 1_000_000_000;
+            recovery.lost(&renderer, current);
             continue;
         };
         window.dirty = !presented;

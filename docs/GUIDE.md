@@ -286,15 +286,15 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 
 ## The window is blank
 
-A window that opens but stays empty is almost always a GPU mix-up, and xodb says so on stderr in
-one line that starts with `xodb: vulkan:`. Run it from a terminal and look for that line.
+GPU selection or driver loading can leave a window blank. xodb reports detected problems on stderr
+in one line that starts with `xodb: vulkan:`. Run it from a terminal and look for that line.
 
 | What stderr says | What happened | What to do |
 |---|---|---|
-| `driver libGLX_nvidia.so.0 failed to load (driver/library mismatch ...)` | A GPU driver was updated without a reboot, so its library and kernel module disagree. Vulkan dropped that GPU and xodb drew on another one | Reboot, or reinstall the driver. Until then pick a device that reaches your screen with `--vk-device` |
+| `driver ... failed to load` | A driver manifest names a library that Vulkan could not load; it may be stale or have a driver/library mismatch | Check the driver installation. A reboot hint appears only when the display GPU is also absent; if that followed a driver update, rebooting may help |
 | `rendering on X, which is not the display GPU (drm 226:1, Y)` | The compositor draws with Y, but xodb is on X. Some pairs can hand frames across, some show nothing | `--vk-device Y`, or drop a `--vk-device` / `XODB_VK_DEVICE` you set earlier |
 | `no Vulkan device matches "..."` | `--vk-device` or `XODB_VK_DEVICE` names nothing in the list printed below it | Use an index or a name from that list |
-| nothing | xodb is on the display GPU, or the compositor did not say which GPU it uses | `--vk-list`, then try each device |
+| nothing | No confirmed device mismatch or driver loading failure was detected; automatically selected software and devices without DRM nodes do not imply a mismatch | `--vk-list`, then try each device |
 
 Three controls:
 
@@ -308,6 +308,10 @@ Without a request xodb uses the device behind the compositor's GPU (from the com
 linux-dmabuf feedback, matched to the device's DRM node). If the compositor does not say, or no
 Vulkan device matches, it takes the first discrete GPU, then an integrated one, then anything
 that can present. Indexes follow the driver's order, which can differ between sessions; names do not.
+
+A device request that cannot be satisfied at startup exits with an error. After the renderer has
+initialized successfully, a device that temporarily disappears causes retries while the debugger
+retains its session and owned targets.
 
 `llvmpipe` draws on the CPU and reaches any display, so `--vk-device llvmpipe` is a slow but safe
 way to get a picture while a driver is broken.

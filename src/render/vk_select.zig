@@ -82,12 +82,21 @@ pub fn failedDriver(message: []const u8) ?[]const u8 {
 /// One line for stderr when the picture may never reach the screen: the chosen
 /// device is not the compositor's, or a driver failed to load. Null otherwise.
 pub fn warning(buf: []u8, devices: []const Device, choice: Choice, display: ?Node, failed_driver: ?[]const u8) ?[]const u8 {
-    const name = devices[choice.index].name;
-    const off_display = display != null and !devices[choice.index].drives(display);
+    const chosen = devices[choice.index];
+    const name = chosen.name;
+    const known_device = chosen.kind != .cpu and (chosen.primary != null or chosen.render != null);
+    const off_display = display != null and !chosen.drives(display) and (known_device or choice.why == .requested);
+    const display_listed = for (devices) |device| {
+        if (device.drives(display)) break true;
+    } else false;
     if (!off_display and failed_driver == null) return null;
     var w = std.Io.Writer.fixed(buf);
     w.writeAll("xodb: vulkan: ") catch {};
-    if (failed_driver) |driver| w.print("driver {s} failed to load (driver/library mismatch after an update? a reboot usually fixes it); ", .{driver}) catch {};
+    if (failed_driver) |driver| {
+        w.print("driver {s} failed to load", .{driver}) catch {};
+        if (display != null and !display_listed) w.writeAll(" (display GPU unavailable; driver/library mismatch after an update? a reboot may help)") catch {};
+        w.writeAll("; ") catch {};
+    }
     w.print("rendering on {s}", .{name}) catch {};
     if (off_display) {
         const d = display.?;
@@ -101,6 +110,27 @@ pub fn warning(buf: []u8, devices: []const Device, choice: Choice, display: ?Nod
     }
     w.writeAll("; --vk-list shows the devices, --vk-device or XODB_VK_DEVICE picks one") catch {};
     return w.buffered();
+}
+
+/// Render the listing from the same descriptions used for selection and warnings.
+pub fn listing(buf: []u8, devices: []const Device, choice: ?Choice, display: ?Node, presentation_checked: bool) []const u8 {
+    var out = std.Io.Writer.fixed(buf);
+    if (display) |d| out.print("Vulkan devices (display GPU: drm {d}:{d})\n", .{ d.major, d.minor }) catch {} else out.writeAll("Vulkan devices (display GPU: unknown)\n") catch {};
+    var widest: usize = 0;
+    for (devices) |device| widest = @max(widest, device.name.len);
+    for (devices, 0..) |device, i| {
+        out.print("{s} {d:>2}  {s}", .{ if (choice != null and choice.?.index == i) "*" else " ", i, device.name }) catch {};
+        out.splatByteAll(' ', widest - device.name.len + 2) catch {};
+        out.print("{s:<10} ", .{@tagName(device.kind)}) catch {};
+        var nodes: [48]u8 = undefined;
+        var node = std.Io.Writer.fixed(&nodes);
+        if (device.primary) |n| node.print("drm {d}:{d}", .{ n.major, n.minor }) catch {};
+        if (device.render) |n| node.print("{s}{d}:{d}", .{ if (device.primary == null) "drm " else "/", n.major, n.minor }) catch {};
+        if (node.end == 0) node.writeAll("no drm node") catch {};
+        out.print("{s:<20} {s}{s}\n", .{ node.buffered(), if (!presentation_checked) "unchecked" else if (device.usable) "presents" else "cannot present", if (device.drives(display)) "  display" else "" }) catch {};
+    }
+    out.writeAll("* = the device xodb uses here; --vk-device <index|name> or XODB_VK_DEVICE picks another\n") catch {};
+    return out.buffered();
 }
 
 const stub = [_]Device{
@@ -150,7 +180,7 @@ test "the warning names the device, the display GPU and a failed driver, once" {
     const driver = failedDriver("loader_icd_scan: Failed loading library associated with ICD JSON libGLX_example.so.0. Ignoring this JSON").?;
     try std.testing.expectEqualStrings("libGLX_example.so.0", driver);
     const missing = warning(&buf, stub[1..3], try choose(stub[1..3], null, .{ .major = 226, .minor = 128 }), .{ .major = 226, .minor = 128 }, driver).?;
-    try std.testing.expectEqualStrings("xodb: vulkan: driver libGLX_example.so.0 failed to load (driver/library mismatch after an update? a reboot usually fixes it); rendering on Small Integrated (OPEN DRIVER), which is not the display GPU (drm 226:128) and may leave the window blank; --vk-list shows the devices, --vk-device or XODB_VK_DEVICE picks one", missing);
+    try std.testing.expectEqualStrings("xodb: vulkan: driver libGLX_example.so.0 failed to load (display GPU unavailable; driver/library mismatch after an update? a reboot may help); rendering on Small Integrated (OPEN DRIVER), which is not the display GPU (drm 226:128) and may leave the window blank; --vk-list shows the devices, --vk-device or XODB_VK_DEVICE picks one", missing);
     try std.testing.expect(std.mem.indexOfScalar(u8, missing, '\n') == null);
     // A failed driver is reported even when the display GPU is unknown.
     try std.testing.expect(std.mem.indexOf(u8, warning(&buf, &stub, try choose(&stub, null, null), null, driver).?, "failed to load") != null);
@@ -164,4 +194,32 @@ test "the warning names the device, the display GPU and a failed driver, once" {
 test "dev_t decoding matches the Linux layout" {
     try std.testing.expectEqual(Node{ .major = 226, .minor = 129 }, Node.fromDev((226 << 8) | 129));
     try std.testing.expectEqual(Node{ .major = 226, .minor = 0x12345 }, Node.fromDev((226 << 8) | 0x45 | (0x123 << 20)));
+}
+
+test "ranked software and unknown-node devices do not imply a display mismatch" {
+    const display = Node{ .major = 226, .minor = 129 };
+    var buf: [768]u8 = undefined;
+    try std.testing.expect(warning(&buf, stub[2..3], try choose(stub[2..3], null, display), display, null) == null);
+    const unknown = [_]Device{.{ .name = "Hardware without node extension", .kind = .discrete }};
+    try std.testing.expect(warning(&buf, &unknown, try choose(&unknown, null, display), display, null) == null);
+    const stale = warning(&buf, &stub, try choose(&stub, null, display), display, "stale_driver.so").?;
+    try std.testing.expect(std.mem.indexOf(u8, stale, "failed to load") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "reboot") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stale, "not the display GPU") == null);
+    const uncertain = warning(&buf, &stub, try choose(&stub, null, null), null, "stale_driver.so").?;
+    try std.testing.expect(std.mem.indexOf(u8, uncertain, "reboot") == null);
+}
+
+test "device listing preserves names nodes selection and presentation status" {
+    var buf: [2048]u8 = undefined;
+    const display = Node{ .major = 226, .minor = 129 };
+    const text = listing(&buf, &stub, try choose(&stub, null, display), display, true);
+    try std.testing.expect(std.mem.indexOf(u8, text, "*  1  Small Integrated (OPEN DRIVER)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "drm 226:0/226:129") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "presents  display") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "cannot present") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "no drm node") != null);
+    const headless = listing(&buf, stub[2..3], null, null, false);
+    try std.testing.expect(std.mem.indexOf(u8, headless, "unknown") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headless, "unchecked") != null);
 }

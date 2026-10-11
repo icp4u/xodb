@@ -22,6 +22,8 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
+    // Allocation-free C++ parser; no C++ standard-library runtime is used.
+    module.addCSourceFile(.{ .file = b.path("src/debug/demangle.cc"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror" } });
     for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pe_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }

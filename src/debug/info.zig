@@ -523,8 +523,9 @@ pub const Image = struct {
         var ops: [*c]c.Dwarf_Op = null;
         var count: usize = 0;
         if (c.dwarf_frame_cfa(frame, &ops, &count) != 0 or count == 0) return error.CfaUnavailable;
-        const cfa = try loc.scalar(try self.expression(a, null, ops, count, ctx), ctx.address_bytes);
         var context = ctx;
+        context.allow_stack_prefix = true;
+        const cfa = try loc.scalar(try self.expression(a, null, ops, count, context), ctx.address_bytes);
         context.cfa = cfa;
         var caller: loc.RegisterSet = @splat(null);
         var outermost = false;
@@ -545,6 +546,9 @@ pub const Image = struct {
                 if (n == width) value.* = loc.lowBits(bytes[0..width], self.architecture.endian());
             } else value.* = loc.scalar(where, ctx.address_bytes) catch continue;
         }
+        // Only an explicit undefined rule declares the outermost frame. Failed
+        // evaluation or an unreadable saved address must remain a partial walk.
+        if (!outermost and caller[self.architecture.ra()] == null) return error.ReturnAddressUnavailable;
         caller[self.architecture.sp()] = cfa;
         if (self.architecture == .aarch64) caller[self.architecture.pc()] = caller[self.architecture.ra()];
         return .{ .cfa = cfa, .caller = caller, .method = method, .outermost = outermost };

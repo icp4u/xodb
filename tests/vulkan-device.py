@@ -98,13 +98,71 @@ try:
     code, out, err = run('--vk-device', str(len(listed)), '--frames', '3')
     check('an out-of-range --vk-device index fails', code != 0 and 'no Vulkan device matches' in err, err)
 
+    for mode in (['--overview', '--pause'], ['--connect', '127.0.0.1:9']):
+        code, out, err = run(*mode, '--vk-device', 'no-such-device-name', '--frames', '3')
+        check('bad startup device exits in ' + mode[0], code != 0 and 'no Vulkan device matches' in err, err)
+
+    # A device can disappear or lose presentation support during recreation.
+    # Prove the owned target survives and the same GUI returns to rendering.
+    from client import Client
+    shim = Path(private.dir) / 'recovery.so'
+    subprocess.run(['cc', '-shared', '-fPIC', '-Wall', '-Wextra', '-Werror',
+                    'tests/vulkan-fault.c', '-ldl', '-lpthread', '-o', str(shim)], check=True)
+    for rule, failure in (('devices=missing-once', 'VulkanDeviceNotFound'),
+                          ('support=blocked-once', 'VulkanDeviceCannotPresent')):
+        log = Path(private.dir) / (failure + '.log')
+        with log.open('wb') as stream:
+            env = dict(private.env, LD_PRELOAD=str(shim),
+                       XODB_VKFAULT='fail=vkQueuePresentKHR@5:lost;' + rule)
+            client = Client.__new__(Client)
+            client.id, client.transcript = 0, []
+            client.reply_seconds, client.runtime_agent = 5, False
+            client.p = subprocess.Popen([binary, '--mcp', '--agent-scope', 'control',
+                '--vk-device', str(chosen[0]['index']), '--frames', '100000', '--break', 'main',
+                '--', str(root / 'zig-out/bin/xodb-fixture')], env=env,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stream, bufsize=0)
+            try:
+                client.call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {},
+                    'clientInfo': {'name': 'renderer-recovery-test', 'version': '1'}})
+                client.p.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+                client.p.stdin.flush()
+                before = client.session()
+                target_stat = Path(f"/proc/{before['pid']}/stat").read_text().split()
+                check(failure + ' fixture is the GUI process child', int(target_stat[3]) == client.p.pid)
+                target_start = target_stat[21]
+                deadline = time.monotonic() + 10
+                while True:
+                    if client.p.poll() is not None:
+                        raise AssertionError('GUI exited during recovery: ' + log.read_text(errors='replace'))
+                    text = log.read_text(errors='replace')
+                    if failure in text and text.count('Vulkan device: ') >= 2:
+                        break
+                    if time.monotonic() >= deadline:
+                        raise AssertionError('renderer did not recover: ' + text)
+                    time.sleep(.01)  # wait for the injected failure and successful reinit
+                after = client.session()
+                check(failure + ' occurs only after a rendered frame and then recovers',
+                      'Frame failed:' in text and 'vkfault: recreated renderer' in text)
+                check(failure + ' retains the same owned target',
+                      before['pid'] == after['pid'] and after['state'] != 'exited' and client.p.poll() is None and
+                      Path(f"/proc/{after['pid']}/stat").read_text().split()[21] == target_start)
+                client.p.stdin.close()
+                check(failure + ' shuts down cleanly after recovery', client.p.wait(timeout=5) == 0)
+            finally:
+                if client.p.poll() is None:
+                    client.p.terminate()
+                    try:
+                        client.p.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        client.p.kill(); client.p.wait()
+
     # A driver manifest whose library cannot load, as after a mismatched driver update.
     manifest = Path(private.dir) / 'missing-driver.json'
     manifest.write_text(json.dumps({'file_format_version': '1.0.1', 'ICD': {'library_path': 'libxodb_missing_driver.so.0', 'api_version': '1.3.0'}}))
     code, out, err = run('--frames', '3', VK_ADD_DRIVER_FILES=str(manifest))
     lines = warnings(err)
     check('a driver that fails to load is reported in one line and rendering continues',
-          code == 0 and len(lines) == 1 and 'driver libxodb_missing_driver.so.0 failed to load' in lines[0] and 'rendering on ' + chosen[0]['name'] in lines[0], err)
+          code == 0 and len(lines) == 1 and 'driver libxodb_missing_driver.so.0 failed to load' in lines[0] and 'rendering on ' + chosen[0]['name'] in lines[0] and (not chosen[0]['display'] or 'reboot' not in lines[0]), err)
     code, out, err = run('--vk-list', VK_ADD_DRIVER_FILES=str(manifest))
     check('--vk-list reports the failed driver too', code == 0 and len(warnings(err)) == 1 and len(devices(out)) == len(listed), out + err)
 finally:

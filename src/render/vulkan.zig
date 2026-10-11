@@ -219,12 +219,11 @@ pub const Renderer = struct {
         physical: c.VkPhysicalDevice,
         family: u32 = 0,
         name: [256]u8,
-        kind: select.Kind,
-        usable: bool = false,
-        primary: ?select.Node = null,
-        render: ?select.Node = null,
+        device: select.Device,
         fn describe(self: *const Found) select.Device {
-            return .{ .name = std.mem.sliceTo(@as([]const u8, &self.name), 0), .kind = self.kind, .usable = self.usable, .primary = self.primary, .render = self.render };
+            var result = self.device;
+            result.name = std.mem.sliceTo(@as([]const u8, &self.name), 0);
+            return result;
         }
     };
     /// Every physical device, with the first graphics queue family that can
@@ -240,21 +239,21 @@ pub const Renderer = struct {
         for (devices.items) |physical| {
             var props: c.VkPhysicalDeviceProperties = undefined;
             c.vkGetPhysicalDeviceProperties(physical, &props);
-            var device = Found{ .physical = physical, .name = props.deviceName, .kind = switch (props.deviceType) {
+            var device = Found{ .physical = physical, .name = props.deviceName, .device = .{ .name = "", .usable = false, .kind = switch (props.deviceType) {
                 c.VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU => .discrete,
                 c.VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU => .integrated,
                 c.VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU => .virtual,
                 c.VK_PHYSICAL_DEVICE_TYPE_CPU => .cpu,
                 else => .other,
-            } };
+            } } };
             const name = std.mem.sliceTo(@as([]const u8, &props.deviceName), 0);
             if (properties2 != null and hasExtension(physical, "VK_EXT_physical_device_drm")) {
                 var drm = info(c.VkPhysicalDeviceDrmPropertiesEXT, c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRM_PROPERTIES_EXT);
                 var props2 = info(c.VkPhysicalDeviceProperties2, c.VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2);
                 props2.pNext = &drm;
                 properties2.?(physical, &props2);
-                if (drm.hasPrimary != 0) device.primary = .{ .major = @intCast(drm.primaryMajor), .minor = @intCast(drm.primaryMinor) };
-                if (drm.hasRender != 0) device.render = .{ .major = @intCast(drm.renderMajor), .minor = @intCast(drm.renderMinor) };
+                if (drm.hasPrimary != 0) device.device.primary = .{ .major = @intCast(drm.primaryMajor), .minor = @intCast(drm.primaryMinor) };
+                if (drm.hasRender != 0) device.device.render = .{ .major = @intCast(drm.renderMajor), .minor = @intCast(drm.renderMinor) };
             }
             // One unusable device must not hide another that can present.
             if (!hasExtension(physical, "VK_KHR_swapchain")) {
@@ -280,7 +279,7 @@ pub const Renderer = struct {
                 }
                 if (present == 0 or family.queueFlags & c.VK_QUEUE_GRAPHICS_BIT == 0) continue;
                 device.family = @intCast(i);
-                device.usable = true;
+                device.device.usable = true;
                 break;
             }
             try found.append(a, device);
@@ -342,31 +341,15 @@ pub const Renderer = struct {
         var described: [64]select.Device = undefined;
         const devices = describeAll(found.items, &described);
         const choice: ?select.Choice = pick(found.items, display) catch null;
-        var listing: [16384]u8 = undefined;
-        var out = std.Io.Writer.fixed(&listing);
-        if (display) |d| out.print("Vulkan devices (display GPU: drm {d}:{d})\n", .{ d.major, d.minor }) catch {} else out.writeAll("Vulkan devices (display GPU: unknown)\n") catch {};
-        var widest: usize = 0;
-        for (devices) |device| widest = @max(widest, device.name.len);
-        for (devices, 0..) |device, i| {
-            out.print("{s} {d:>2}  {s}", .{ if (choice != null and choice.?.index == i) "*" else " ", i, device.name }) catch {};
-            out.splatByteAll(' ', widest - device.name.len + 2) catch {};
-            out.print("{s:<10} ", .{@tagName(device.kind)}) catch {};
-            var nodes: [48]u8 = undefined;
-            var node = std.Io.Writer.fixed(&nodes);
-            if (device.primary) |n| node.print("drm {d}:{d}", .{ n.major, n.minor }) catch {};
-            if (device.render) |n| node.print("{s}{d}:{d}", .{ if (device.primary == null) "drm " else "/", n.major, n.minor }) catch {};
-            if (node.end == 0) node.writeAll("no drm node") catch {};
-            out.print("{s:<20} {s}{s}\n", .{ node.buffered(), if (window == null) "unchecked" else if (device.usable) "presents" else "cannot present", if (device.drives(display)) "  display" else "" }) catch {};
-        }
-        out.writeAll("* = the device xodb uses here; --vk-device <index|name> or XODB_VK_DEVICE picks another\n") catch {};
-        const bytes = out.buffered();
+        var buffer: [16384]u8 = undefined;
+        const bytes = select.listing(&buffer, devices, choice, display, window != null);
         var sent: usize = 0;
         while (sent < bytes.len) {
             const n = c.write(1, bytes.ptr + sent, bytes.len - sent);
             if (n <= 0) break;
             sent += @intCast(n);
         }
-        if (choice) |ch| self.warn(found.items, ch, display) else if (self.failedDriver()) |driver| std.debug.print("xodb: vulkan: driver {s} failed to load (driver/library mismatch after an update? a reboot usually fixes it)\n", .{driver});
+        if (choice) |ch| self.warn(found.items, ch, display) else if (self.failedDriver()) |driver| std.debug.print("xodb: vulkan: driver {s} failed to load\n", .{driver});
     }
     fn hasExtension(physical: c.VkPhysicalDevice, comptime wanted: []const u8) bool {
         var extensions = enumerate(c.VkExtensionProperties, c.vkEnumerateDeviceExtensionProperties, .{ physical, @as([*c]const u8, null) }, "vkEnumerateDeviceExtensionProperties") catch return false;

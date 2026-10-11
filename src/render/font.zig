@@ -187,7 +187,10 @@ const retro_extra =
     \\00
     \\ENDCHAR
 ;
-const retro_extra_count = 3;
+const retro_extra_count = blk: {
+    @setEvalBranchQuota(10000);
+    break :blk std.mem.count(u8, retro_extra, "STARTCHAR ");
+};
 const retro_bdf = blk: {
     @setEvalBranchQuota(200_000);
     const base = @embedFile("assets/spleen-8x16.bdf");
@@ -251,29 +254,32 @@ test "bundled bitmap font covers every mark the overview source draws" {
     font.* = .{};
     try font.initRetro();
     defer font.deinit();
-    const sources = [_][]const u8{
-        @embedFile("../ui/overview/actions.zig"),     @embedFile("../ui/overview/deepmap.zig"),
-        @embedFile("../ui/overview/draw.zig"),        @embedFile("../ui/overview/files_model.zig"),
-        @embedFile("../ui/overview/files_panel.zig"), @embedFile("../ui/overview/graph_model.zig"),
-        @embedFile("../ui/overview/graph_panel.zig"), @embedFile("../ui/overview/history.zig"),
-        @embedFile("../ui/overview/inheritance_panel.zig"), @embedFile("../ui/overview/memmap.zig"),
-        @embedFile("../ui/overview/model.zig"),       @embedFile("../ui/overview/panels.zig"),
-        @embedFile("../ui/overview/sysstat.zig"),     @embedFile("../ui/overview/theme.zig"),
-        @embedFile("../ui/overview/treemap_model.zig"), @embedFile("../ui/overview/treemap_panel.zig"),
-        @embedFile("../ui/overview/view.zig"),        @embedFile("../ui/overview/win95.zig"),
-    };
+    const io = std.testing.io;
+    var dir = try std.Io.Dir.cwd().openDir(io, "src/ui/overview", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
     var seen: usize = 0;
-    for (sources) |source| {
-        var lines = std.mem.splitScalar(u8, source, '\n');
-        while (lines.next()) |line| {
-            // Comments are not drawn; a trailing one ends the scanned text.
-            const code = line[0 .. std.mem.indexOf(u8, line, "//") orelse line.len];
-            var it = std.unicode.Utf8View.initUnchecked(code).iterator();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+        const source = try entry.dir.readFileAllocOptions(io, entry.basename, a, .limited(4 * 1024 * 1024), .of(u8), 0);
+        defer a.free(source);
+        // Zig's tokenizer skips comments while preserving // inside strings.
+        var tokens = std.zig.Tokenizer.init(source);
+        while (true) {
+            const token = tokens.next();
+            switch (token.tag) {
+                .eof => break,
+                .string_literal, .multiline_string_literal_line, .char_literal => {},
+                else => continue,
+            }
+            const literal = source[token.loc.start..token.loc.end];
+            var it = (try std.unicode.Utf8View.init(literal)).iterator();
             while (it.nextCodepoint()) |cp| {
                 if (cp < 0x80) continue;
                 seen += 1;
                 if (c.FT_Get_Char_Index(font.face, cp) == 0) {
-                    std.debug.print("bundled font lacks U+{X:0>4} in: {s}\n", .{ cp, std.mem.trim(u8, line, " ") });
+                    std.debug.print("bundled font lacks U+{X:0>4} in {s}: {s}\n", .{ cp, entry.path, literal });
                     return error.MissingGlyph;
                 }
             }

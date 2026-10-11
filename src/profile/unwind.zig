@@ -6,7 +6,8 @@ const records = @import("records.zig");
 const mappings = @import("mappings.zig");
 const loc = @import("../debug/location.zig");
 const info = @import("../debug/info.zig");
-pub const algorithm = "xodb-sampled-x86_64-v3";
+// v5 preserves a typed boundary when the return-address rule cannot be read.
+pub const algorithm = "xodb-sampled-x86_64-v5";
 pub const max_frames = 32;
 pub const Reason = enum {
     complete,
@@ -360,6 +361,7 @@ fn walkInner(batch: *Batch, sample: records.Sample, hash: *std.crypto.hash.sha2.
                 result.reason = switch (err) {
                     error.NoUnwindInfo => .cfi_missing,
                     error.SignalFrameUnsupported => .signal_frame,
+                    error.ReturnAddressUnavailable => if (window.failed) .stack_window else .registers_unavailable,
                     else => if (window.failed) .stack_window else .unsupported_cfi,
                 };
                 result.detail = @errorName(err);

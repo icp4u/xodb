@@ -154,17 +154,25 @@ pub fn chrome(v: *View, ctx: Ctx) !Rect {
     return .{ .x = x + 8, .y = 100, .w = @max(0, w - x - 30), .h = @max(0, h - 182) };
 }
 
-/// Where a pull-down opens and its row height. The box always lies inside the
-/// window: narrow windows slide it left and short ones squeeze the rows.
-pub fn popupRect(menu: Menu, width: f32, height: f32) struct { rect: Rect, row: f32 } {
-    const n: f32 = @floatFromInt(count(menu));
-    var rh = @min(26, @max(14, (height - 100) / n));
-    if (n * rh + 8 > height) rh = @max(0, (height - 8) / n);
-    const h = n * rh + 8;
-    const w = @min(258, width);
+/// Short pull-downs keep full-height text and page the items, with visible
+/// earlier/later controls. Width and height are clamped before integer conversion.
+pub fn popupRect(menu: Menu, width: f32, height: f32) struct { rect: Rect, row: f32, visible: usize } {
+    const n = count(menu);
+    const slots: usize = @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(n + 2)), @floor((height - 8) / 26))));
+    const visible = if (slots >= n) n else slots -| 2;
+    const rows = if (visible == n) n else visible + 2;
+    const h = @min(@max(0, height), @as(f32, @floatFromInt(rows)) * 26 + 8);
+    const w = @max(0, @min(258, width));
     const x: f32 = if (menu == .start) 5 else 12 + @as(f32, @floatFromInt(@intFromEnum(menu))) * 72;
     const y: f32 = if (menu == .start) height - 40 - h else 62;
-    return .{ .rect = .{ .x = @max(0, @min(x, width - w)), .y = @max(0, @min(y, height - h)), .w = w, .h = h }, .row = rh };
+    return .{ .rect = .{ .x = @max(0, @min(x, width - w)), .y = @max(0, @min(y, height - h)), .w = w, .h = h }, .row = 26, .visible = visible };
+}
+pub fn firstVisible(cursor: usize, visible: usize, total: usize) usize {
+    return @min(cursor -| (visible -| 1), total -| visible);
+}
+pub fn scrollMenu(v: *View, lines: i32) void {
+    const menu = v.classic_menu orelse return;
+    v.classic_cursor = @intCast(std.math.clamp(@as(i64, @intCast(v.classic_cursor)) + lines, 0, @as(i64, @intCast(count(menu) - 1))));
 }
 pub fn popup(v: *View, ctx: Ctx) !void {
     const menu = v.classic_menu orelse return;
@@ -173,15 +181,21 @@ pub fn popup(v: *View, ctx: Ctx) !void {
     const place = popupRect(menu, v.width, v.height);
     const rect = place.rect;
     const rh = place.row;
-    const x = rect.x;
-    const y = rect.y;
+    const first = firstVisible(v.classic_cursor, place.visible, n);
+    const paged = place.visible < n;
     v.hit_count = 0;
     v.hover_len = 0;
     v.hit(.{ .x = 0, .y = 0, .w = v.width, .h = v.height }, .{ .classic = .close_menu });
     try menuBar(v, ctx);
     try ctx.bevel(rect, false);
-    for (0..n) |i| {
-        const row = Rect{ .x = x + 4, .y = y + 4 + @as(f32, @floatFromInt(i)) * rh, .w = rect.w - 8, .h = rh };
+    if (paged) for (0..2) |direction| {
+        const row = Rect{ .x = rect.x + 4, .y = rect.y + 4 + (if (direction == 0) @as(f32, 0) else @as(f32, @floatFromInt(place.visible + 1)) * rh), .w = rect.w - 8, .h = rh };
+        const enabled = if (direction == 0) first > 0 else first + place.visible < n;
+        try ctx.textFit(row.x + 10, row.y + 3, row.w - 20, if (direction == 0) "^ Earlier" else "v Later", if (enabled) ctx.p.text else ctx.p.dim);
+        if (enabled) v.hit(row, .{ .classic_page = @as(i32, @intCast(place.visible)) * (if (direction == 0) @as(i32, -1) else 1) });
+    };
+    for (first..first + place.visible) |i| {
+        const row = Rect{ .x = rect.x + 4, .y = rect.y + 4 + @as(f32, @floatFromInt(i - first + @intFromBool(paged))) * rh, .w = rect.w - 8, .h = rh };
         const selected = i == v.classic_cursor or draw.inside(row, v.pointer[0], v.pointer[1]);
         if (selected) try ctx.r.rect(row, ctx.p.accent);
         const entry = item(menu, i, v);

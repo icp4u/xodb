@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Lossless MCP pointer words, numeric compatibility, and both reply forms."""
-import argparse, importlib.util, json, os, re, shutil, subprocess, time
+import argparse, importlib.util, json, os, re, shutil, subprocess, sys, time
 from pathlib import Path
 from client import Client
 from helpers.exact import legacy
@@ -39,6 +39,30 @@ def check(raw, state, catalog):
     answer = exact(raw('evaluate_expression', tid=tid, expression='wide'))
     assert answer['value']['bits'] == 0x20000000000001 and answer['value']['bits_hex'] == '0x20000000000001', answer
     assert legacy(answer)['value']['bits'] == 0x20000000000001
+    # The owned variable's bytes are an independent oracle for both address
+    # forms. Raw symbol/address fields retain their existing exact encodings.
+    address = answer['value']['address']
+    assert 0 <= address <= (1 << 53) - 1, address
+    expected_bytes = (0x20000000000001).to_bytes(8, sys.byteorder).hex()
+    for encoded in (address, hex(address), hex(address)[2:]):
+        read = exact(raw('read_memory', address=encoded, length=8))
+        assert read['address'] == hex(address) and read['bytes_read'] == 8, read
+        assert read['hex'] == expected_bytes, read
+    for encoded, diagnostic in (
+            (-1, 'AddressIntegerOutOfSafeRangeUseHexString'),
+            (1 << 53, 'AddressIntegerOutOfSafeRangeUseHexString'),
+            ((1 << 53) + 1, 'AddressIntegerOutOfSafeRangeUseHexString'),
+            (1.25, 'AddressMustBeHexStringOrSafeInteger'),
+            (True, 'AddressMustBeHexStringOrSafeInteger'),
+            (None, 'AddressMustBeHexStringOrSafeInteger'),
+            ('xyz', 'InvalidHexAddress'),
+            ('0x', 'InvalidHexAddress'),
+            ('0x10000000000000000', 'InvalidHexAddress')):
+        reply = raw('read_memory', address=encoded, length=8)
+        body = reply.get('result', {})
+        assert body.get('isError') and body['content'][0]['text'] == diagnostic, reply
+    schema = next(t for t in catalog if t['name'] == 'read_memory')['inputSchema']['properties']['address']
+    assert schema['anyOf'] == [dict(type='string'), dict(type='integer', minimum=0, maximum=(1 << 53) - 1)], schema
     pointer = exact(raw('evaluate_expression', tid=tid, expression='pointer'))
     assert pointer['value']['bits'] == 0xffffffffffffffff and pointer['value']['bits_hex'] == '0xffffffffffffffff', pointer
     stack = exact(raw('get_stack', tid=tid))

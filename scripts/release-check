@@ -27,6 +27,9 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
+    (('tests/fixtures/unwind-realigned.c',), ('unwind-realigned*',)),
+    (('src/debug/demangle.*', 'tests/demangle-names.*', 'tests/fixtures/stack-symbol-names.cc'), ('demangle-names', 'stack-symbol-names*')),
     (('src/language/lua*', 'tests/fixtures/lua/*'), ('lua-*', 'python-lua-*', *LANGUAGE_PANES)),
     (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', *LANGUAGE_PANES)),
     (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', *LANGUAGE_PANES)),
@@ -70,7 +73,7 @@ COVERS = (
       'src/runtime/symbol_job.c', 'src/runtime/xrt_source.h'),
      ('source-paths*', 'dwarf-*', 'debug-discovery', 'optimized-info', 'composite-values', 'm1-source', 'javascript-dwarf', 'lua-dwarf',
       'go-type-index', 'symbol-discovery*', 'local-large-symbols', 'metadata-session*', 'source-fetch', 'gui-inline',
-      'gui-symbol-discovery', 'gui-debug', 'm2-recovery')),
+      'gui-symbol-discovery', 'gui-debug', 'm2-recovery', 'unwind-realigned*', 'unwind-return-address*', 'module-unwind*')),
     (('src/binary/*', 'src/model/modules.zig'),
      ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
       'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget', 'image-budget', 'image-budget-hostile', 'gui-image-budget')),
@@ -206,6 +209,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
+    if tier in ('portable', 'quick', 'host', 'gui', 'all'):
+        steps.append(('demangle-names', [sys.executable, '-B', 'tests/demangle-names.py'], 30))
     steps.append(('package-source', [sys.executable, '-B', 'tests/package-source.py'], 30))
     steps.append(('mapping-identity', [sys.executable, '-B', 'tests/mapping-identity.py'], 30))
     steps.append(('source-paths-build', ['cc', '-std=c11', '-O2', '-g', '-Wall', '-Wextra', '-Werror',
@@ -286,6 +291,17 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         return steps
     if live:
         steps.kind = 'live'
+        for remote in (False, True):
+            label = 'unwind-return-address' + ('-agent' if remote else '')
+            steps.append((label, [sys.executable, '-B', 'tests/unwind-return-address.py', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 60))
+        for remote in (False, True):
+            label = 'unwind-realigned' + ('-agent' if remote else '')
+            steps.append((label, [sys.executable, '-B', 'tests/unwind-realigned.py', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 60))
+        for variant, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent']), ('-shared', ['--shared'])):
+            label = 'stack-symbol-names' + variant
+            steps.append((label, [sys.executable, '-B', 'tests/stack-symbol-names.py', '--work', '.work/' + label, *extra], 30))
         steps.append(('module-symbols', [sys.executable, '-B', 'tests/module-symbols.py', '--work', '.work/module-symbols'], 60))
         for variant in ('chain', 'debug-frame', 'companions'):
             label = 'module-unwind-' + variant

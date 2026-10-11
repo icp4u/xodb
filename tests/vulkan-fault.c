@@ -6,9 +6,10 @@
  * same gate as tests/vulkan-stall.c); otherwise every call passes through.
  *
  * XODB_VKFAULT is a ';'-separated rule list:
- *   devices=N|err|incomplete   physical device count (N>real repeats real devices)
+ *   devices=N|err|incomplete|missing-once   physical device count (N>real repeats real devices)
  *   families=N                 queue family count (N>real repeats family 0)
- *   support=err:SUB|false:SUB  surface support query for devices named *SUB*
+ *   support=err:SUB|false:SUB|blocked-once  surface support query
+ *   missing-once / blocked-once affect only the first renderer recreation
  *   noswap=SUB                 hide VK_KHR_swapchain on devices named *SUB*
  *   formats=0|err              surface formats
  *   alpha=0                    supportedCompositeAlpha
@@ -477,6 +478,11 @@ VKAPI_ATTR VkResult VKAPI_CALL vkEnumeratePhysicalDevices(VkInstance n, uint32_t
     REAL(vkEnumeratePhysicalDevices); VkResult r; char v[32];
     if (scheduled("vkEnumeratePhysicalDevices", &r)) return r;
     if (!active() || !rule("devices", v, sizeof v)) return real(n, count, out);
+    if (!strcmp(v, "missing-once")) {
+        if (retired_instances != 1) return real(n, count, out);
+        fprintf(stderr, "vkfault: recreated renderer has no devices\n");
+        *count = 0; return VK_SUCCESS;
+    }
     if (!strcmp(v, "err")) return VK_ERROR_INITIALIZATION_FAILED;
     uint32_t actual = 0;
     if ((r = real(n, &actual, NULL)) != VK_SUCCESS) return r;
@@ -529,6 +535,10 @@ VKAPI_ATTR VkResult VKAPI_CALL vkGetPhysicalDeviceSurfaceSupportKHR(VkPhysicalDe
     REAL(vkGetPhysicalDeviceSurfaceSupportKHR); VkResult r; char v[160];
     if (scheduled("vkGetPhysicalDeviceSurfaceSupportKHR", &r)) return r;
     if (active() && rule("support", v, sizeof v)) {
+        if (!strcmp(v, "blocked-once") && retired_instances == 1) {
+            fprintf(stderr, "vkfault: recreated renderer cannot present\n");
+            *out = VK_FALSE; return VK_SUCCESS;
+        }
         char *colon = strchr(v, ':');
         if (colon && device_named(p, colon + 1)) {
             if (!strncmp(v, "err", 3)) { fprintf(stderr, "vkfault: surface support query fails on %s\n", colon + 1); return VK_ERROR_SURFACE_LOST_KHR; }

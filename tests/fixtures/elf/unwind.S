@@ -45,4 +45,25 @@ saved_nocfi:
 nop
 ret
 .size saved_nocfi,.-saved_nocfi
+.globl saved_bad_return
+.type saved_bad_return,@function
+saved_bad_return:
+.cfi_startproc
+.cfi_def_cfa %rsp,8
+/* DW_CFA_expression rip: drop the seeded CFA, leaving no return address. */
+.cfi_escape 0x10,16,1,0x13
+nop
+ret
+.cfi_endproc
+.size saved_bad_return,.-saved_bad_return
+.globl saved_outermost
+.type saved_outermost,@function
+saved_outermost:
+.cfi_startproc
+.cfi_def_cfa %rsp,8
+.cfi_undefined %rip
+nop
+ret
+.cfi_endproc
+.size saved_outermost,.-saved_outermost
 .section .note.GNU-stack,"",@progbits

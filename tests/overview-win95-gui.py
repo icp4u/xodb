@@ -135,6 +135,16 @@ try:
             until(lambda: near('narrow-about', (5, 90), (0, 0, 128)), 'Help row opens About in a 262 px window')
             check('Help pull-down stays on-screen and usable in a narrow window', d.alive())
             send('tap', 1)
+            # Short menus page at full glyph height. A page click keeps the
+            # modal open, then keyboard navigation reaches the last panel.
+            resize(262, 210)
+            send('click', 175, 49)
+            until(lambda: pixel('short-menu', (250, 60), (0, 0, 128)), 'short menu first row is drawn')
+            send('click', 200, 190)
+            until(lambda: pixel('short-page', (250, 165), (0, 0, 128)), 'page control keeps the menu open')
+            send(*[x for _ in range(13) for x in ('tap', 108)], 'tap', 28)
+            until(lambda: 'panel=treemap' in log(), 'short Panels menu reaches its last item')
+            check('short Panels menu pages without losing modal input', d.alive())
             resize(width, height)
             # The compositor owns maximize; one that declines it must leave the window as it was.
             send('click', width - 51, 23)

@@ -47,6 +47,25 @@ bit-field type layout and scalar values larger than eight bytes remain limited
 or explicitly unsupported. FP/SIMD register inspection itself has the separate
 [typed register panel](MEMORY_REGISTERS.md).
 
+## Realigned stack frames
+
+Native unwinding evaluates CFA and saved-register DWARF expressions, including
+compiler-generated stack realignment. libdw can prefix a saved-register
+expression with the CFA; an independent expression may leave that prefix
+unused. CFI evaluation takes the top result while ordinary value expressions
+retain their single-result check. Evaluation is bounded to 4,096 operations and
+128 stack entries, and failed memory reads remain errors. If a return-address
+rule cannot produce a value, the last frame reports `ReturnAddressUnavailable`.
+Only an explicitly undefined return-address rule declares an outermost frame;
+failed rules for other registers leave those registers unavailable while the
+walk continues when possible.
+
+Live host and agent stacks share this evaluator with captured-stack analysis.
+Captured analysis reads only the saved stack window. Its algorithm identifier
+is `xodb-sampled-x86_64-v5`, so recomputed stacks cannot reuse an older analysis
+identity after this correction. Captured failures retain the `stack_window` or
+`registers_unavailable` reason and add `ReturnAddressUnavailable` as their detail.
+
 ## Split DWARF
 
 Live modules resolve DWARF 4 GNU and DWARF 5 skeletons to matching `.dwo` units

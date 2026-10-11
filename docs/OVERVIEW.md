@@ -316,7 +316,8 @@ skin: teal desktop, beveled controls, title/menu bars, property tabs, sunken
 list views and black/green history graphs. The taskbar opens common panels and
 shows measured CPU/memory utilization and a clock labelled UTC. File, View,
 Panels and Help menus work with the mouse; F10 opens the menu, arrows select,
-Enter activates, and Escape dismisses. Caption buttons ask the compositor to
+Enter activates, and Escape dismisses. In short windows, menus keep readable row heights and show
+Earlier/Later controls; the wheel and arrow keys also move through every item. Caption buttons ask the compositor to
 minimize or maximize/restore, or close the overview.
 
 The skin embeds the BSD-licensed Spleen 8x16 bitmap font; see

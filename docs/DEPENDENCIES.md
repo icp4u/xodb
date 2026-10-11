@@ -206,3 +206,20 @@ The full copyright and BSD-2-Clause notice are in
 [licenses/SPLEEN.txt](licenses/SPLEEN.txt). The overview embeds the face;
 FreeType rasterizes its monochrome bitmap strikes. Bevels and application icons
 are drawn procedurally; no Microsoft font, logo, or icon is included.
+
+## Compact C++ symbol display
+
+`src/debug/demangle.cc` adapts the allocation-free Itanium parser from
+[Abseil 20240116.2](https://github.com/abseil/abseil-cpp/blob/20240116.2/absl/debugging/internal/demangle.cc),
+under [Apache 2.0](licenses/ABSEIL-DEMANGLE.txt). Upstream source SHA-256:
+`d29918d9c240bd4f6d270d6cff8eea76b1c0b36b6c6b69f02b9cc969b1abe757`.
+The compact parser omits parameter and template-argument types. It retains
+upstream's 256-level recursion and 131,072-parse-step limits; the C wrapper also
+limits input to 4,096 bytes and output to 1,024 including the terminator.
+
+Local adaptation removes Abseil configuration/namespaces, unused C++ headers
+and the allocating `DemangleString`/`__cxa_demangle` wrapper; replaces two
+`numeric_limits<int>::max()` expressions with `INT_MAX`; and adds the bounded,
+length-delimited C interface. The remaining C++17 code uses only libc symbols,
+no allocation, exceptions, RTTI or C++ standard-library runtime. Zig's existing
+C++ frontend builds it with the host application; it is not part of the C agent.

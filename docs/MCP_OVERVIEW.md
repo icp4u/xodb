@@ -58,6 +58,12 @@ attached targets are detached.
 
 ## Exact addresses and offsets
 
+`read_memory.address` accepts a hexadecimal string (with optional `0x`) or a
+nonnegative JSON integer up to 9,007,199,254,740,991. Prefer hex strings when
+passing addresses between tools; they preserve all 64 bits. Larger integers,
+fractional numbers and malformed strings produce an address-specific error.
+The returned address remains a hexadecimal string.
+
 Numeric address, pointer and offset fields now have a lossless hexadecimal
 sibling in every MCP tool result: `address_hex`, `pc_hex`, `slot_address_hex`,
 `offset_hex`, and so on. Existing numeric fields remain for compatibility.
@@ -109,6 +115,19 @@ The common Python test clients check every successful structured result for
 text parity and for wide integers missing their exact companions, independently
 of field names. `tests/mcp-exact-guard.py` plants new unknown fields to verify
 this guard. Coverage depends on exercising a producer with a wide value.
+
+## Native stack names
+
+`get_stack` adds `symbol_display` to each physical frame. Supported Itanium C++
+names become compact readable names, such as `demo::Engine::run()` or
+`demo::leaf<>()`. Parameter types and template-argument types are omitted, so
+this display cannot distinguish overloads. The original `symbol` remains the
+exact linkage name for lookup, breakpoints and identity.
+
+Unrecognised, malformed or oversized names retain their original display.
+Parsing has fixed input, output, recursion and work limits and does not call an
+allocating full demangler. Microsoft C++ and Rust encodings are not decoded by
+this display path. Inline frames and other symbol-producing tools are unchanged.
 
 ## Paging module maps
 

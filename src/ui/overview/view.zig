@@ -146,7 +146,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { classic: win95.Action, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
+    pub const Action = union(enum) { classic: win95.Action, classic_page: i32, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -371,7 +371,7 @@ pub const View = struct {
             if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self);
         }
         if (w.scroll != 0) {
-            if (self.classic_menu == null and !self.classic_about and self.pending_action == null) self.wheel(w.scroll);
+            if (self.classic_menu != null) win95.scrollMenu(self, w.scroll) else if (!self.classic_about and self.pending_action == null) self.wheel(w.scroll);
             w.scroll = 0;
             w.dirty = true;
         }
@@ -419,7 +419,7 @@ pub const View = struct {
             if (self.minimize_requested) c.xdg_toplevel_set_minimized(top);
             // The compositor owns this state: it may maximize or restore by other means.
             if (self.maximize_requested) {
-                if (w.maximized) c.xdg_toplevel_unset_maximized(top) else c.xdg_toplevel_set_maximized(top);
+                toggleMaximize(c, top, w.maximized);
             }
         }
         self.minimize_requested = false;
@@ -752,7 +752,7 @@ pub const View = struct {
             if (!draw.inside(target.rect, x, y)) continue;
             const action = target.action;
             self.pointer = .{ x, y };
-            self.classic_menu = null;
+            if (action != .classic_page) self.classic_menu = null;
             self.activate(action, now);
             return;
         }
@@ -760,6 +760,7 @@ pub const View = struct {
 
     pub fn activate(self: *View, action: Action, now: u64) void {
         switch (action) {
+            .classic_page => |lines| win95.scrollMenu(self, lines),
             .classic_scroll => |scroll| {
                 self.classic_scroll = scroll;
                 self.classic_scroll.?.grab = self.pointer[1] - scroll.thumb_y;
@@ -1071,6 +1072,7 @@ pub const View = struct {
             try self.nav(ctx, .{ .x = 0, .y = header_h, .w = nav_w, .h = self.height - header_h - footer_h });
             break :blk Rect{ .x = nav_w + 10, .y = header_h + 8, .w = self.width - nav_w - 20, .h = self.height - header_h - footer_h - 14 };
         };
+        const chrome_hits = self.hit_count;
         const saved = r.clip;
         r.clip = draw.intersect(saved, content);
         if (self.snap()) |s| {
@@ -1098,6 +1100,9 @@ pub const View = struct {
         }
         ctx.layout = null;
         if (p.win95) {
+            // Clipped panel controls can extend beyond a very short content
+            // area. The visible caption, menus and taskbar keep input priority.
+            std.mem.rotate(Hit, self.hits[0..self.hit_count], chrome_hits);
             self.tooltip_style = .win9x;
             try win95.popup(self, ctx);
             try win95.about(self, ctx);
@@ -1764,7 +1769,7 @@ test "classic pull-downs stay inside the window at every size" {
                 const q = place.rect;
                 try std.testing.expect(q.x >= 0 and q.y >= 0);
                 try std.testing.expect(q.x + q.w <= width and q.y + q.h <= height + 0.01);
-                try std.testing.expect(q.w == @min(258, width) and place.row > 0);
+                try std.testing.expect(q.w == @min(258, width) and place.row >= 20 and place.visible > 0);
                 // Roomy windows keep the period position under the menu title.
                 if (width >= 600 and height >= 720 and menu != .start) try std.testing.expectEqual(@as(f32, 12 + @as(f32, @floatFromInt(@intFromEnum(menu))) * 72), q.x);
             }
@@ -1798,10 +1803,62 @@ test "classic scrollbar geometry does not grow with the trough height" {
     try std.testing.expectEqual(used[0], used[1]);
 }
 
+fn toggleMaximize(comptime protocol: type, top: anytype, maximized: bool) void {
+    if (maximized) protocol.xdg_toplevel_unset_maximized(top) else protocol.xdg_toplevel_set_maximized(top);
+}
+
+test "maximize toggle requests the opposite compositor state" {
+    const Protocol = struct {
+        fn xdg_toplevel_set_maximized(out: *bool) void {
+            out.* = true;
+        }
+        fn xdg_toplevel_unset_maximized(out: *bool) void {
+            out.* = false;
+        }
+    };
+    var requested = false;
+    toggleMaximize(Protocol, &requested, false);
+    try std.testing.expect(requested);
+    toggleMaximize(Protocol, &requested, true);
+    try std.testing.expect(!requested);
+    // An external restore, not the previous request, determines the next action.
+    toggleMaximize(Protocol, &requested, false);
+    try std.testing.expect(requested);
+}
+
 test "maximize state follows the compositor's configure states" {
     const state = @import("../../platform/wayland.zig").hasState;
     const none = [_]u32{};
     try std.testing.expect(!state(&none, 1));
     try std.testing.expect(!state(&[_]u32{ 4, 5, 6 }, 1)); // activated and tiled edges only
     try std.testing.expect(state(&[_]u32{ 4, 1 }, 1));
+}
+
+test "short classic menus expose every full-height item by keyboard and paging" {
+    var v = try View.init(std.testing.allocator);
+    defer v.deinit();
+    v.palette = themes.find("win95").?;
+    for ([_]win95.Menu{ .panels, .start }) |menu| {
+        v.classic_menu = menu;
+        v.classic_cursor = 0;
+        const layout = win95.popupRect(menu, 160, 100);
+        try std.testing.expectEqual(@as(usize, 1), layout.visible);
+        for (0..panel_count) |i| {
+            const first = win95.firstVisible(v.classic_cursor, layout.visible, panel_count);
+            try std.testing.expectEqual(i, v.classic_cursor);
+            try std.testing.expect(i >= first and i < first + layout.visible);
+            v.key(.{ .kind = .press, .sym = 0xff54 }, 1);
+        }
+        // Page controls use the click path and must leave the menu open.
+        v.hit_count = 0;
+        v.hit(.{ .x = 0, .y = 0, .w = 100, .h = 26 }, .{ .classic_page = 3 });
+        v.click(10, 10, 1);
+        try std.testing.expectEqual(menu, v.classic_menu.?);
+        try std.testing.expectEqual(@as(usize, 3), v.classic_cursor);
+        win95.scrollMenu(&v, 1000);
+        try std.testing.expectEqual(panel_count - 1, v.classic_cursor);
+        v.key(.{ .kind = .press, .sym = 0xff0d }, 1);
+        try std.testing.expectEqual(Panel.treemap, v.panel);
+        try std.testing.expect(v.classic_menu == null);
+    }
 }

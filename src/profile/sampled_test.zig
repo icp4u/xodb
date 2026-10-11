@@ -71,6 +71,7 @@ test "saved unwind labels absent budget ABI short CFI signal and cycle boundarie
     const short = try unwind.walk(a, capture, 0, null);
     try std.testing.expectEqual(unwind.Reason.stack_window, short.reason);
     try std.testing.expectEqual(@as(usize, 2), short.count);
+    try std.testing.expectEqualStrings("ReturnAddressUnavailable", short.detail.?);
     entry.* = original;
     entry.state.abi = records.regs_abi_32;
     try std.testing.expectEqual(unwind.Reason.unsupported_abi, (try unwind.walk(a, capture, 0, null)).reason);
@@ -84,6 +85,18 @@ test "saved unwind labels absent budget ABI short CFI signal and cycle boundarie
         entry.state.regs[8] = pc;
         capture.samples.coreMut(0).ip = pc;
         try std.testing.expectEqual(case.reason, (try unwind.walk(a, capture, 0, null)).reason);
+    }
+    for ([_]struct { name: []const u8, reason: unwind.Reason, detail: ?[]const u8 }{
+        .{ .name = "saved_bad_return", .reason = .registers_unavailable, .detail = "ReturnAddressUnavailable" },
+        .{ .name = "saved_outermost", .reason = .complete, .detail = null },
+    }) |case| {
+        const pc = image.image.findSymbol(case.name).?.value + image.bias;
+        entry.state.regs[8] = pc;
+        capture.samples.coreMut(0).ip = pc;
+        const result = try unwind.walk(a, capture, 0, null);
+        try std.testing.expectEqual(case.reason, result.reason);
+        try std.testing.expectEqual(@as(usize, 1), result.count);
+        if (case.detail) |detail| try std.testing.expectEqualStrings(detail, result.detail.?) else try std.testing.expect(result.detail == null);
     }
 }
 test "sampled archive retains raw evidence and budget gaps with matching asset reanalysis" {

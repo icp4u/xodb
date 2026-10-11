@@ -446,8 +446,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     defer font.deinit();
     var workspace = Workspace{};
     defer workspace.deinit();
-    var ready = false;
-    var retry: u64 = 0;
+    var recovery = @import("../render/recovery.zig").Recovery{};
     var rendered: u64 = 0;
     var last_frame: u64 = 0;
     var old_state: remote.State = .connecting;
@@ -464,23 +463,14 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         old_state = facts.state;
         old_busy = facts.busy;
         const now = transport.now();
-        if (now < retry or (!window.dirty and now -| last_frame < 250_000_000)) continue;
-        if (!ready) {
-            renderer.init(&window) catch |err| {
-                // A device request that names nothing will not start matching.
-                if (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent) return err;
-                std.debug.print("xodb: remote GUI renderer failed: {s}\n", .{@errorName(err)});
-                retry = now + 1_000_000_000;
-                continue;
-            };
-            ready = true;
+        if (now < recovery.retry_at or (!window.dirty and now -| last_frame < 250_000_000)) continue;
+        if (!recovery.ready) {
+            if (!try recovery.init(&renderer, &window, now)) continue;
             font.dirty = true;
         }
         const presented = drawFrame(&renderer, font, &workspace, &window, client, label) catch |err| {
             std.debug.print("xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
-            renderer.deinit();
-            ready = false;
-            retry = now + 1_000_000_000;
+            recovery.lost(&renderer, now);
             continue;
         };
         window.dirty = !presented;
