@@ -6,6 +6,7 @@ import subprocess
 import time
 from pathlib import Path
 from helpers.exact import assert_reply_exact
+from helpers.tasks import children as task_children
 
 class Client:
     reply_seconds = 5  # subclasses that build their own process skip __init__
@@ -24,9 +25,9 @@ class Client:
     def collector_pid(self):
         """Kernel perf descriptors belong to the local C agent when selected."""
         if not self.runtime_agent: return self.p.pid
-        children = Path(f'/proc/{self.p.pid}/task/{self.p.pid}/children').read_text().split()
+        children = task_children(self.p.pid)
         assert len(children) == 1, children
-        return int(children[0])
+        return children[0]
     def call(self, method, params=None):
         self.id += 1
         self.p.stdin.write((json.dumps({'jsonrpc':'2.0','id':self.id,'method':method,'params':params or {}})+'\n').encode())

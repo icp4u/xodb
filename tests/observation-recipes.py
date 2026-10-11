@@ -36,13 +36,21 @@ def descendants(pid):
     while pending:
         current = pending.pop()
         try:
-            children = Path(f"/proc/{current}/task/{current}/children").read_text().split()
+            tasks = list(Path(f"/proc/{current}/task").iterdir())
         except (FileNotFoundError, ProcessLookupError):
             continue
-        for child in children:
-            child = int(child)
-            result.append(child)
-            pending.append(child)
+        # Remote startup belongs to the owner thread. Linux lists a child
+        # under the task that spawned it, not necessarily the process leader.
+        for task in tasks:
+            try:
+                children = (task / "children").read_text().split()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            for child in children:
+                child = int(child)
+                if child not in result:
+                    result.append(child)
+                    pending.append(child)
     return result
 
 

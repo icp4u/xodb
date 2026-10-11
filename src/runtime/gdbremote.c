@@ -1255,9 +1255,10 @@ enum xrt_status xrt_gdb_images(struct xrt_gdb *g, struct xrt_target *t,
     if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
     g->link.operation_deadline_ns = xrt_now() + XRT_GDB_OPERATION_NS;
     bool cut;
-    /* Addresses and paths only: load commands would multiply the reply. */
+    /* UUIDs and segments bind local symbols and label shared-cache addresses.
+     * The complete list remains bounded by the packet and image limits. */
     enum xrt_status status = query_prefix(g,
-        "jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true,\"report_load_commands\":false}", &cut);
+        "jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true}", &cut);
     if (status != XRT_OK) return status;
     if (cut) return problem(g, XRT_BUFFER_TOO_SMALL, "GDB loaded-image list exceeds the packet limit");
     if (!g->length || g->reply[0] != '{') {

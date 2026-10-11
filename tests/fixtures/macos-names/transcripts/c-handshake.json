@@ -1,0 +1,1657 @@
+{
+"comment": "Packets recorded from Apple debugserver with a raw RSP client through the relay and scrub() of tests/macos-debugserver.py; process and thread identities are synthetic, paths are mapped to /xodb-corpus.",
+"description": "Launch, stopped before the first instruction: every capability and description query (host, process, register info, target XML, shared cache, dyld state), then kill.",
+"program": "out/c/arm64-O0/cprog",
+"mode": "launch",
+"status": "pass",
+"static": {
+"symbols": {
+"tick": 4294969048,
+"inner": 4294969068,
+"middle": 4294969176,
+"outer": 4294969196,
+"after_dlopen": 4294969216,
+"after_dlclose": 4294969220,
+"after_fork": 4294969224,
+"threads_ready": 4294969228,
+"worker_spin": 4294969232,
+"main": 4294969248,
+"on_signal": 4294970580,
+"worker": 4294970612,
+"queue_work": 4294970720,
+"requests": 4294970768,
+"util_mix": 4294971480,
+"rotate": 4294971616,
+"util_sum": 4294971672,
+"types_touch": 4294971792,
+"types_vla": 4294972096,
+"types_square": 4294972348,
+"types_table": 4294973232,
+"marker": 4295000064,
+"halves": 4295000072,
+"child_status": 4295000080,
+"types_global": 4295000096,
+"types_long_double": 4295000184,
+"types_wide": 4295000192,
+"types_tls": 4295000208,
+"types_tls$tlv$init": 4295000232,
+"saved_argv": 4295000240,
+"util_mix.calls": 4295000248,
+"types_touch.calls": 4295000256,
+"got_signal": 4295000264,
+"pages": 4295000272,
+"pagesize": 4295000280,
+"plug_handle": 4295000288,
+"plug_result": 4295000296,
+"read_sink": 4295000304,
+"wait_interrupted": 4295000308,
+"want_crash": 4295000312,
+"want_dlopen": 4295000316,
+"want_exec": 4295000320,
+"want_exit": 4295000324,
+"want_fork": 4295000328,
+"want_read": 4295000332,
+"want_signal": 4295000336,
+"want_watch": 4295000340,
+"workers_up": 4295000344,
+"types_complex": 4295000348
+}
+},
+"notes": {
+"register_infos": 217,
+"QThreadSuffixSupported": "OK",
+"g_with_suffix_length": 0
+},
+"exchanges": [
+[
+"qSupported:multiprocess+;qXfer:features:read+;swbreak+;hwbreak+;vContSupported+",
+[
+"qXfer:features:read+;PacketSize=20000;qEcho+;native-signals+;SupportedWatchpointTypes=aarch64-mask,aarch64-bas;MultiMemRead+;jMultiBreakpoint+;"
+]
+],
+[
+"QEnableErrorStrings",
+[
+"OK"
+]
+],
+[
+"qGDBServerVersion",
+[
+"name:debugserver;version:2103;"
+]
+],
+[
+"qHostInfo",
+[
+"cputype:16777228;cpusubtype:2;addressing_bits:47;ostype:macosx;watchpoint_exceptions_received:before;vendor:apple;os_version:26.6.0;maccatalyst_version:26.6;endian:little;ptrsize:8;vm-page-size:16384;"
+]
+],
+[
+"qProcessInfo",
+[
+"pid:4d2;parent-pid:4d1;real-uid:3e8;real-gid:3e8;effective-uid:3e8;effective-gid:3e8;cputype:100000c;cpusubtype:0;ptrsize:8;ostype:macosx;vendor:apple;endian:little;"
+]
+],
+[
+"vCont?",
+[
+"vCont;c;C;s;S"
+]
+],
+[
+"qVAttachOrWaitSupported",
+[
+"OK"
+]
+],
+[
+"qEcho:abc",
+[
+"qEcho:abc"
+]
+],
+[
+"qC",
+[
+"QC1001"
+]
+],
+[
+"?",
+[
+"T11thread:1001;00:0000000000000000;01:0000000000000000;02:0000000000000000;03:0000000000000000;04:0000000000000000;05:0000000000000000;06:0000000000000000;07:0000000000000000;08:0000000000000000;09:0000000000000000;0a:0000000000000000;0b:0000000000000000;0c:0000000000000000;0d:0000000000000000;0e:0000000000000000;0f:0000000000000000;10:0000000000000000;11:0000000000000000;12:0000000000000000;13:0000000000000000;14:0000000000000000;15:0000000000000000;16:0000000000000000;17:0000000000000000;18:0000000000000000;19:0000000000000000;1a:0000000000000000;1b:0000000000000000;1c:0000000000000000;1d:0000000000000000;1e:0000000000000000;1f:307d176b01000000;20:c089f60401000000;21:00000000;a1:0000000000000000;a2:00000000;a3:00000000;metype:5;mecount:2;medata:10003;medata:11;"
+]
+],
+[
+"qfThreadInfo",
+[
+"m1001"
+]
+],
+[
+"qsThreadInfo",
+[
+"l"
+]
+],
+[
+"qOffsets",
+[
+""
+]
+],
+[
+"qSymbol::",
+[
+"qSymbol:64697370617463685f71756575655f6f666673657473"
+]
+],
+[
+"qShlibInfoAddr",
+[
+"105028000"
+]
+],
+[
+"qWatchpointSupportInfo:",
+[
+"num:4;"
+]
+],
+[
+"qStructuredDataPlugins",
+[
+""
+]
+],
+[
+"qGetWorkingDir",
+[
+""
+]
+],
+[
+"jGetSharedCacheInfo",
+[
+"OK"
+]
+],
+[
+"jGetDyldProcessState",
+[
+"{\"process_state_value\":0,\"process_state string\":\"dyld_process_state_not_started\"}"
+]
+],
+[
+"jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true}",
+[
+"{\"images\":[{\"load_address\":4375216128,\"mod_date\":0,\"pathname\":\"/xodb-corpus/out/c/arm64-O0/cprog\",\"uuid\":\"300187C7-FCAA-3973-8D80-D277103DF964\",\"min_version_os_name\":\"macosx\",\"min_version_os_sdk\":\"26.0\",\"mach_header\":{\"magic\":4277009103,\"cputype\":16777228,\"cpusubtype\":0,\"filetype\":2,\"flags\":10485893,\"sizeof_mh_and_loadcmds\":1720},\"segments\":[{\"name\":\"__PAGEZERO\",\"vmaddr\":0,\"vmsize\":4294967296,\"fileoff\":0,\"filesize\":0,\"maxprot\":0},{\"name\":\"__TEXT\",\"vmaddr\":4294967296,\"vmsize\":16384,\"fileoff\":0,\"filesize\":16384,\"maxprot\":5},{\"name\":\"__DATA_CONST\",\"vmaddr\":4294983680,\"vmsize\":16384,\"fileoff\":16384,\"filesize\":16384,\"maxprot\":3},{\"name\":\"__DATA\",\"vmaddr\":4295000064,\"vmsize\":16384,\"fileoff\":32768,\"filesize\":16384,\"maxprot\":3},{\"name\":\"__LINKEDIT\",\"vmaddr\":4295016448,\"vmsize\":16384,\"fileoff\":49152,\"filesize\":6600,\"maxprot\":1}]},{\"load_address\":4378214400,\"mod_date\":0,\"pathname\":\"/usr/lib/dyld\",\"uuid\":\"DF42DD9D-AD11-33A7-8849-9AD5DF30A274\",\"min_version_os_name\":\"macosx\",\"min_version_os_sdk\":\"26.6\",\"mach_header\":{\"magic\":4277009103,\"cputype\":16777228,\"cpusubtype\":2,\"filetype\":7,\"flags\":133,\"sizeof_mh_and_loadcmds\":2568},\"segments\":[{\"name\":\"__TEXT\",\"vmaddr\":0,\"vmsize\":737280,\"fileoff\":0,\"filesize\":737280,\"maxprot\":5},{\"name\":\"__DATA_CONST\",\"vmaddr\":737280,\"vmsize\":16384,\"fileoff\":737280,\"filesize\":16384,\"maxprot\":3},{\"name\":\"__AUTH_CONST\",\"vmaddr\":753664,\"vmsize\":32768,\"fileoff\":753664,\"filesize\":32768,\"maxprot\":3},{\"name\":\"__DATA\",\"vmaddr\":786432,\"vmsize\":16384,\"fileoff\":786432,\"filesize\":16384,\"maxprot\":3},{\"name\":\"__DATA_DIRTY\",\"vmaddr\":802816,\"vmsize\":16384,\"fileoff\":802816,\"filesize\":16384,\"maxprot\":3},{\"name\":\"__TPRO_CONST\",\"vmaddr\":819200,\"vmsize\":147456,\"fileoff\":819200,\"filesize\":147456,\"maxprot\":3},{\"name\":\"__LINKEDIT\",\"vmaddr\":966656,\"vmsize\":442368,\"fileoff\":966656,\"filesize\":432080,\"maxprot\":1}]}]}"
+]
+],
+[
+"jThreadsInfo",
+[
+"[{\"tid\":4097,\"metype\":5,\"medata\":[65539,17],\"reason\":\"exception\",\"registers\":{\"0\":\"0000000000000000\",\"1\":\"0000000000000000\",\"2\":\"0000000000000000\",\"3\":\"0000000000000000\",\"4\":\"0000000000000000\",\"5\":\"0000000000000000\",\"6\":\"0000000000000000\",\"7\":\"0000000000000000\",\"8\":\"0000000000000000\",\"9\":\"0000000000000000\",\"10\":\"0000000000000000\",\"11\":\"0000000000000000\",\"12\":\"0000000000000000\",\"13\":\"0000000000000000\",\"14\":\"0000000000000000\",\"15\":\"0000000000000000\",\"16\":\"0000000000000000\",\"17\":\"0000000000000000\",\"18\":\"0000000000000000\",\"19\":\"0000000000000000\",\"20\":\"0000000000000000\",\"21\":\"0000000000000000\",\"22\":\"0000000000000000\",\"23\":\"0000000000000000\",\"24\":\"0000000000000000\",\"25\":\"0000000000000000\",\"26\":\"0000000000000000\",\"27\":\"0000000000000000\",\"28\":\"0000000000000000\",\"29\":\"0000000000000000\",\"30\":\"0000000000000000\",\"31\":\"307d176b01000000\",\"32\":\"c089f60401000000\",\"33\":\"00000000\"}}]"
+]
+],
+[
+"qXodbUnknownPacket",
+[
+""
+]
+],
+[
+"qRegisterInfo0",
+[
+"name:x0;alt-name:arg1;bitsize:64;offset:0;encoding:uint;format:hex;set:General Purpose Registers;ehframe:0;dwarf:0;generic:arg1;invalidate-regs:0,22;"
+]
+],
+[
+"qRegisterInfo1",
+[
+"name:x1;alt-name:arg2;bitsize:64;offset:8;encoding:uint;format:hex;set:General Purpose Registers;ehframe:1;dwarf:1;generic:arg2;invalidate-regs:1,23;"
+]
+],
+[
+"qRegisterInfo2",
+[
+"name:x2;alt-name:arg3;bitsize:64;offset:16;encoding:uint;format:hex;set:General Purpose Registers;ehframe:2;dwarf:2;generic:arg3;invalidate-regs:2,24;"
+]
+],
+[
+"qRegisterInfo3",
+[
+"name:x3;alt-name:arg4;bitsize:64;offset:24;encoding:uint;format:hex;set:General Purpose Registers;ehframe:3;dwarf:3;generic:arg4;invalidate-regs:3,25;"
+]
+],
+[
+"qRegisterInfo4",
+[
+"name:x4;alt-name:arg5;bitsize:64;offset:32;encoding:uint;format:hex;set:General Purpose Registers;ehframe:4;dwarf:4;generic:arg5;invalidate-regs:4,26;"
+]
+],
+[
+"qRegisterInfo5",
+[
+"name:x5;alt-name:arg6;bitsize:64;offset:40;encoding:uint;format:hex;set:General Purpose Registers;ehframe:5;dwarf:5;generic:arg6;invalidate-regs:5,27;"
+]
+],
+[
+"qRegisterInfo6",
+[
+"name:x6;alt-name:arg7;bitsize:64;offset:48;encoding:uint;format:hex;set:General Purpose Registers;ehframe:6;dwarf:6;generic:arg7;invalidate-regs:6,28;"
+]
+],
+[
+"qRegisterInfo7",
+[
+"name:x7;alt-name:arg8;bitsize:64;offset:56;encoding:uint;format:hex;set:General Purpose Registers;ehframe:7;dwarf:7;generic:arg8;invalidate-regs:7,29;"
+]
+],
+[
+"qRegisterInfo8",
+[
+"name:x8;bitsize:64;offset:64;encoding:uint;format:hex;set:General Purpose Registers;ehframe:8;dwarf:8;invalidate-regs:8,2a;"
+]
+],
+[
+"qRegisterInfo9",
+[
+"name:x9;bitsize:64;offset:72;encoding:uint;format:hex;set:General Purpose Registers;ehframe:9;dwarf:9;invalidate-regs:9,2b;"
+]
+],
+[
+"qRegisterInfoa",
+[
+"name:x10;bitsize:64;offset:80;encoding:uint;format:hex;set:General Purpose Registers;ehframe:10;dwarf:10;invalidate-regs:a,2c;"
+]
+],
+[
+"qRegisterInfob",
+[
+"name:x11;bitsize:64;offset:88;encoding:uint;format:hex;set:General Purpose Registers;ehframe:11;dwarf:11;invalidate-regs:b,2d;"
+]
+],
+[
+"qRegisterInfoc",
+[
+"name:x12;bitsize:64;offset:96;encoding:uint;format:hex;set:General Purpose Registers;ehframe:12;dwarf:12;invalidate-regs:c,2e;"
+]
+],
+[
+"qRegisterInfod",
+[
+"name:x13;bitsize:64;offset:104;encoding:uint;format:hex;set:General Purpose Registers;ehframe:13;dwarf:13;invalidate-regs:d,2f;"
+]
+],
+[
+"qRegisterInfoe",
+[
+"name:x14;bitsize:64;offset:112;encoding:uint;format:hex;set:General Purpose Registers;ehframe:14;dwarf:14;invalidate-regs:e,30;"
+]
+],
+[
+"qRegisterInfof",
+[
+"name:x15;bitsize:64;offset:120;encoding:uint;format:hex;set:General Purpose Registers;ehframe:15;dwarf:15;invalidate-regs:f,31;"
+]
+],
+[
+"qRegisterInfo10",
+[
+"name:x16;bitsize:64;offset:128;encoding:uint;format:hex;set:General Purpose Registers;ehframe:16;dwarf:16;invalidate-regs:10,32;"
+]
+],
+[
+"qRegisterInfo11",
+[
+"name:x17;bitsize:64;offset:136;encoding:uint;format:hex;set:General Purpose Registers;ehframe:17;dwarf:17;invalidate-regs:11,33;"
+]
+],
+[
+"qRegisterInfo12",
+[
+"name:x18;bitsize:64;offset:144;encoding:uint;format:hex;set:General Purpose Registers;ehframe:18;dwarf:18;invalidate-regs:12,34;"
+]
+],
+[
+"qRegisterInfo13",
+[
+"name:x19;bitsize:64;offset:152;encoding:uint;format:hex;set:General Purpose Registers;ehframe:19;dwarf:19;invalidate-regs:13,35;"
+]
+],
+[
+"qRegisterInfo14",
+[
+"name:x20;bitsize:64;offset:160;encoding:uint;format:hex;set:General Purpose Registers;ehframe:20;dwarf:20;invalidate-regs:14,36;"
+]
+],
+[
+"qRegisterInfo15",
+[
+"name:x21;bitsize:64;offset:168;encoding:uint;format:hex;set:General Purpose Registers;ehframe:21;dwarf:21;invalidate-regs:15,37;"
+]
+],
+[
+"qRegisterInfo16",
+[
+"name:x22;bitsize:64;offset:176;encoding:uint;format:hex;set:General Purpose Registers;ehframe:22;dwarf:22;invalidate-regs:16,38;"
+]
+],
+[
+"qRegisterInfo17",
+[
+"name:x23;bitsize:64;offset:184;encoding:uint;format:hex;set:General Purpose Registers;ehframe:23;dwarf:23;invalidate-regs:17,39;"
+]
+],
+[
+"qRegisterInfo18",
+[
+"name:x24;bitsize:64;offset:192;encoding:uint;format:hex;set:General Purpose Registers;ehframe:24;dwarf:24;invalidate-regs:18,3a;"
+]
+],
+[
+"qRegisterInfo19",
+[
+"name:x25;bitsize:64;offset:200;encoding:uint;format:hex;set:General Purpose Registers;ehframe:25;dwarf:25;invalidate-regs:19,3b;"
+]
+],
+[
+"qRegisterInfo1a",
+[
+"name:x26;bitsize:64;offset:208;encoding:uint;format:hex;set:General Purpose Registers;ehframe:26;dwarf:26;invalidate-regs:1a,3c;"
+]
+],
+[
+"qRegisterInfo1b",
+[
+"name:x27;bitsize:64;offset:216;encoding:uint;format:hex;set:General Purpose Registers;ehframe:27;dwarf:27;invalidate-regs:1b,3d;"
+]
+],
+[
+"qRegisterInfo1c",
+[
+"name:x28;bitsize:64;offset:224;encoding:uint;format:hex;set:General Purpose Registers;ehframe:28;dwarf:28;invalidate-regs:1c,3e;"
+]
+],
+[
+"qRegisterInfo1d",
+[
+"name:fp;alt-name:x29;bitsize:64;offset:232;encoding:uint;format:hex;set:General Purpose Registers;ehframe:29;dwarf:29;generic:fp;"
+]
+],
+[
+"qRegisterInfo1e",
+[
+"name:lr;alt-name:x30;bitsize:64;offset:240;encoding:uint;format:hex;set:General Purpose Registers;ehframe:30;dwarf:30;generic:ra;"
+]
+],
+[
+"qRegisterInfo1f",
+[
+"name:sp;alt-name:xsp;bitsize:64;offset:248;encoding:uint;format:hex;set:General Purpose Registers;ehframe:31;dwarf:31;generic:sp;"
+]
+],
+[
+"qRegisterInfo20",
+[
+"name:pc;bitsize:64;offset:256;encoding:uint;format:hex;set:General Purpose Registers;ehframe:32;dwarf:32;generic:pc;"
+]
+],
+[
+"qRegisterInfo21",
+[
+"name:cpsr;alt-name:flags;bitsize:32;offset:264;encoding:uint;format:hex;set:General Purpose Registers;ehframe:33;dwarf:33;generic:flags;"
+]
+],
+[
+"qRegisterInfo22",
+[
+"name:w0;bitsize:32;offset:0;encoding:uint;format:hex;set:General Purpose Registers;container-regs:0;invalidate-regs:0,22;"
+]
+],
+[
+"qRegisterInfo23",
+[
+"name:w1;bitsize:32;offset:8;encoding:uint;format:hex;set:General Purpose Registers;container-regs:1;invalidate-regs:1,23;"
+]
+],
+[
+"qRegisterInfo24",
+[
+"name:w2;bitsize:32;offset:16;encoding:uint;format:hex;set:General Purpose Registers;container-regs:2;invalidate-regs:2,24;"
+]
+],
+[
+"qRegisterInfo25",
+[
+"name:w3;bitsize:32;offset:24;encoding:uint;format:hex;set:General Purpose Registers;container-regs:3;invalidate-regs:3,25;"
+]
+],
+[
+"qRegisterInfo26",
+[
+"name:w4;bitsize:32;offset:32;encoding:uint;format:hex;set:General Purpose Registers;container-regs:4;invalidate-regs:4,26;"
+]
+],
+[
+"qRegisterInfo27",
+[
+"name:w5;bitsize:32;offset:40;encoding:uint;format:hex;set:General Purpose Registers;container-regs:5;invalidate-regs:5,27;"
+]
+],
+[
+"qRegisterInfo28",
+[
+"name:w6;bitsize:32;offset:48;encoding:uint;format:hex;set:General Purpose Registers;container-regs:6;invalidate-regs:6,28;"
+]
+],
+[
+"qRegisterInfo29",
+[
+"name:w7;bitsize:32;offset:56;encoding:uint;format:hex;set:General Purpose Registers;container-regs:7;invalidate-regs:7,29;"
+]
+],
+[
+"qRegisterInfo2a",
+[
+"name:w8;bitsize:32;offset:64;encoding:uint;format:hex;set:General Purpose Registers;container-regs:8;invalidate-regs:8,2a;"
+]
+],
+[
+"qRegisterInfo2b",
+[
+"name:w9;bitsize:32;offset:72;encoding:uint;format:hex;set:General Purpose Registers;container-regs:9;invalidate-regs:9,2b;"
+]
+],
+[
+"qRegisterInfo2c",
+[
+"name:w10;bitsize:32;offset:80;encoding:uint;format:hex;set:General Purpose Registers;container-regs:a;invalidate-regs:a,2c;"
+]
+],
+[
+"qRegisterInfo2d",
+[
+"name:w11;bitsize:32;offset:88;encoding:uint;format:hex;set:General Purpose Registers;container-regs:b;invalidate-regs:b,2d;"
+]
+],
+[
+"qRegisterInfo2e",
+[
+"name:w12;bitsize:32;offset:96;encoding:uint;format:hex;set:General Purpose Registers;container-regs:c;invalidate-regs:c,2e;"
+]
+],
+[
+"qRegisterInfo2f",
+[
+"name:w13;bitsize:32;offset:104;encoding:uint;format:hex;set:General Purpose Registers;container-regs:d;invalidate-regs:d,2f;"
+]
+],
+[
+"qRegisterInfo30",
+[
+"name:w14;bitsize:32;offset:112;encoding:uint;format:hex;set:General Purpose Registers;container-regs:e;invalidate-regs:e,30;"
+]
+],
+[
+"qRegisterInfo31",
+[
+"name:w15;bitsize:32;offset:120;encoding:uint;format:hex;set:General Purpose Registers;container-regs:f;invalidate-regs:f,31;"
+]
+],
+[
+"qRegisterInfo32",
+[
+"name:w16;bitsize:32;offset:128;encoding:uint;format:hex;set:General Purpose Registers;container-regs:10;invalidate-regs:10,32;"
+]
+],
+[
+"qRegisterInfo33",
+[
+"name:w17;bitsize:32;offset:136;encoding:uint;format:hex;set:General Purpose Registers;container-regs:11;invalidate-regs:11,33;"
+]
+],
+[
+"qRegisterInfo34",
+[
+"name:w18;bitsize:32;offset:144;encoding:uint;format:hex;set:General Purpose Registers;container-regs:12;invalidate-regs:12,34;"
+]
+],
+[
+"qRegisterInfo35",
+[
+"name:w19;bitsize:32;offset:152;encoding:uint;format:hex;set:General Purpose Registers;container-regs:13;invalidate-regs:13,35;"
+]
+],
+[
+"qRegisterInfo36",
+[
+"name:w20;bitsize:32;offset:160;encoding:uint;format:hex;set:General Purpose Registers;container-regs:14;invalidate-regs:14,36;"
+]
+],
+[
+"qRegisterInfo37",
+[
+"name:w21;bitsize:32;offset:168;encoding:uint;format:hex;set:General Purpose Registers;container-regs:15;invalidate-regs:15,37;"
+]
+],
+[
+"qRegisterInfo38",
+[
+"name:w22;bitsize:32;offset:176;encoding:uint;format:hex;set:General Purpose Registers;container-regs:16;invalidate-regs:16,38;"
+]
+],
+[
+"qRegisterInfo39",
+[
+"name:w23;bitsize:32;offset:184;encoding:uint;format:hex;set:General Purpose Registers;container-regs:17;invalidate-regs:17,39;"
+]
+],
+[
+"qRegisterInfo3a",
+[
+"name:w24;bitsize:32;offset:192;encoding:uint;format:hex;set:General Purpose Registers;container-regs:18;invalidate-regs:18,3a;"
+]
+],
+[
+"qRegisterInfo3b",
+[
+"name:w25;bitsize:32;offset:200;encoding:uint;format:hex;set:General Purpose Registers;container-regs:19;invalidate-regs:19,3b;"
+]
+],
+[
+"qRegisterInfo3c",
+[
+"name:w26;bitsize:32;offset:208;encoding:uint;format:hex;set:General Purpose Registers;container-regs:1a;invalidate-regs:1a,3c;"
+]
+],
+[
+"qRegisterInfo3d",
+[
+"name:w27;bitsize:32;offset:216;encoding:uint;format:hex;set:General Purpose Registers;container-regs:1b;invalidate-regs:1b,3d;"
+]
+],
+[
+"qRegisterInfo3e",
+[
+"name:w28;bitsize:32;offset:224;encoding:uint;format:hex;set:General Purpose Registers;container-regs:1c;invalidate-regs:1c,3e;"
+]
+],
+[
+"qRegisterInfo3f",
+[
+"name:v0;alt-name:q0;bitsize:128;offset:268;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:64;invalidate-regs:a4,3f,61,81;"
+]
+],
+[
+"qRegisterInfo40",
+[
+"name:v1;alt-name:q1;bitsize:128;offset:284;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:65;invalidate-regs:a5,40,62,82;"
+]
+],
+[
+"qRegisterInfo41",
+[
+"name:v2;alt-name:q2;bitsize:128;offset:300;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:66;invalidate-regs:a6,41,63,83;"
+]
+],
+[
+"qRegisterInfo42",
+[
+"name:v3;alt-name:q3;bitsize:128;offset:316;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:67;invalidate-regs:a7,42,64,84;"
+]
+],
+[
+"qRegisterInfo43",
+[
+"name:v4;alt-name:q4;bitsize:128;offset:332;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:68;invalidate-regs:a8,43,65,85;"
+]
+],
+[
+"qRegisterInfo44",
+[
+"name:v5;alt-name:q5;bitsize:128;offset:348;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:69;invalidate-regs:a9,44,66,86;"
+]
+],
+[
+"qRegisterInfo45",
+[
+"name:v6;alt-name:q6;bitsize:128;offset:364;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:70;invalidate-regs:aa,45,67,87;"
+]
+],
+[
+"qRegisterInfo46",
+[
+"name:v7;alt-name:q7;bitsize:128;offset:380;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:71;invalidate-regs:ab,46,68,88;"
+]
+],
+[
+"qRegisterInfo47",
+[
+"name:v8;alt-name:q8;bitsize:128;offset:396;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:72;invalidate-regs:ac,47,69,89;"
+]
+],
+[
+"qRegisterInfo48",
+[
+"name:v9;alt-name:q9;bitsize:128;offset:412;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:73;invalidate-regs:ad,48,6a,8a;"
+]
+],
+[
+"qRegisterInfo49",
+[
+"name:v10;alt-name:q10;bitsize:128;offset:428;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:74;invalidate-regs:ae,49,6b,8b;"
+]
+],
+[
+"qRegisterInfo4a",
+[
+"name:v11;alt-name:q11;bitsize:128;offset:444;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:75;invalidate-regs:af,4a,6c,8c;"
+]
+],
+[
+"qRegisterInfo4b",
+[
+"name:v12;alt-name:q12;bitsize:128;offset:460;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:76;invalidate-regs:b0,4b,6d,8d;"
+]
+],
+[
+"qRegisterInfo4c",
+[
+"name:v13;alt-name:q13;bitsize:128;offset:476;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:77;invalidate-regs:b1,4c,6e,8e;"
+]
+],
+[
+"qRegisterInfo4d",
+[
+"name:v14;alt-name:q14;bitsize:128;offset:492;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:78;invalidate-regs:b2,4d,6f,8f;"
+]
+],
+[
+"qRegisterInfo4e",
+[
+"name:v15;alt-name:q15;bitsize:128;offset:508;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:79;invalidate-regs:b3,4e,70,90;"
+]
+],
+[
+"qRegisterInfo4f",
+[
+"name:v16;alt-name:q16;bitsize:128;offset:524;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:80;invalidate-regs:b4,4f,71,91;"
+]
+],
+[
+"qRegisterInfo50",
+[
+"name:v17;alt-name:q17;bitsize:128;offset:540;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:81;invalidate-regs:b5,50,72,92;"
+]
+],
+[
+"qRegisterInfo51",
+[
+"name:v18;alt-name:q18;bitsize:128;offset:556;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:82;invalidate-regs:b6,51,73,93;"
+]
+],
+[
+"qRegisterInfo52",
+[
+"name:v19;alt-name:q19;bitsize:128;offset:572;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:83;invalidate-regs:b7,52,74,94;"
+]
+],
+[
+"qRegisterInfo53",
+[
+"name:v20;alt-name:q20;bitsize:128;offset:588;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:84;invalidate-regs:b8,53,75,95;"
+]
+],
+[
+"qRegisterInfo54",
+[
+"name:v21;alt-name:q21;bitsize:128;offset:604;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:85;invalidate-regs:b9,54,76,96;"
+]
+],
+[
+"qRegisterInfo55",
+[
+"name:v22;alt-name:q22;bitsize:128;offset:620;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:86;invalidate-regs:ba,55,77,97;"
+]
+],
+[
+"qRegisterInfo56",
+[
+"name:v23;alt-name:q23;bitsize:128;offset:636;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:87;invalidate-regs:bb,56,78,98;"
+]
+],
+[
+"qRegisterInfo57",
+[
+"name:v24;alt-name:q24;bitsize:128;offset:652;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:88;invalidate-regs:bc,57,79,99;"
+]
+],
+[
+"qRegisterInfo58",
+[
+"name:v25;alt-name:q25;bitsize:128;offset:668;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:89;invalidate-regs:bd,58,7a,9a;"
+]
+],
+[
+"qRegisterInfo59",
+[
+"name:v26;alt-name:q26;bitsize:128;offset:684;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:90;invalidate-regs:be,59,7b,9b;"
+]
+],
+[
+"qRegisterInfo5a",
+[
+"name:v27;alt-name:q27;bitsize:128;offset:700;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:91;invalidate-regs:bf,5a,7c,9c;"
+]
+],
+[
+"qRegisterInfo5b",
+[
+"name:v28;alt-name:q28;bitsize:128;offset:716;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:92;invalidate-regs:c0,5b,7d,9d;"
+]
+],
+[
+"qRegisterInfo5c",
+[
+"name:v29;alt-name:q29;bitsize:128;offset:732;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:93;invalidate-regs:c1,5c,7e,9e;"
+]
+],
+[
+"qRegisterInfo5d",
+[
+"name:v30;alt-name:q30;bitsize:128;offset:748;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:94;invalidate-regs:c2,5d,7f,9f;"
+]
+],
+[
+"qRegisterInfo5e",
+[
+"name:v31;alt-name:q31;bitsize:128;offset:764;encoding:vector;format:vector-uint8;set:Floating Point Registers;dwarf:95;invalidate-regs:c3,5e,80,a0;"
+]
+],
+[
+"qRegisterInfo5f",
+[
+"name:fpsr;bitsize:32;offset:780;encoding:uint;format:hex;set:Floating Point Registers;"
+]
+],
+[
+"qRegisterInfo60",
+[
+"name:fpcr;bitsize:32;offset:784;encoding:uint;format:hex;set:Floating Point Registers;"
+]
+],
+[
+"qRegisterInfo61",
+[
+"name:d0;bitsize:64;offset:788;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a4,3f,61,81;"
+]
+],
+[
+"qRegisterInfo62",
+[
+"name:d1;bitsize:64;offset:796;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a5,40,62,82;"
+]
+],
+[
+"qRegisterInfo63",
+[
+"name:d2;bitsize:64;offset:804;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a6,41,63,83;"
+]
+],
+[
+"qRegisterInfo64",
+[
+"name:d3;bitsize:64;offset:812;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a7,42,64,84;"
+]
+],
+[
+"qRegisterInfo65",
+[
+"name:d4;bitsize:64;offset:820;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a8,43,65,85;"
+]
+],
+[
+"qRegisterInfo66",
+[
+"name:d5;bitsize:64;offset:828;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a9,44,66,86;"
+]
+],
+[
+"qRegisterInfo67",
+[
+"name:d6;bitsize:64;offset:836;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:aa,45,67,87;"
+]
+],
+[
+"qRegisterInfo68",
+[
+"name:d7;bitsize:64;offset:844;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ab,46,68,88;"
+]
+],
+[
+"qRegisterInfo69",
+[
+"name:d8;bitsize:64;offset:852;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ac,47,69,89;"
+]
+],
+[
+"qRegisterInfo6a",
+[
+"name:d9;bitsize:64;offset:860;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ad,48,6a,8a;"
+]
+],
+[
+"qRegisterInfo6b",
+[
+"name:d10;bitsize:64;offset:868;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ae,49,6b,8b;"
+]
+],
+[
+"qRegisterInfo6c",
+[
+"name:d11;bitsize:64;offset:876;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:af,4a,6c,8c;"
+]
+],
+[
+"qRegisterInfo6d",
+[
+"name:d12;bitsize:64;offset:884;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b0,4b,6d,8d;"
+]
+],
+[
+"qRegisterInfo6e",
+[
+"name:d13;bitsize:64;offset:892;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b1,4c,6e,8e;"
+]
+],
+[
+"qRegisterInfo6f",
+[
+"name:d14;bitsize:64;offset:900;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b2,4d,6f,8f;"
+]
+],
+[
+"qRegisterInfo70",
+[
+"name:d15;bitsize:64;offset:908;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b3,4e,70,90;"
+]
+],
+[
+"qRegisterInfo71",
+[
+"name:d16;bitsize:64;offset:916;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b4,4f,71,91;"
+]
+],
+[
+"qRegisterInfo72",
+[
+"name:d17;bitsize:64;offset:924;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b5,50,72,92;"
+]
+],
+[
+"qRegisterInfo73",
+[
+"name:d18;bitsize:64;offset:932;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b6,51,73,93;"
+]
+],
+[
+"qRegisterInfo74",
+[
+"name:d19;bitsize:64;offset:940;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b7,52,74,94;"
+]
+],
+[
+"qRegisterInfo75",
+[
+"name:d20;bitsize:64;offset:948;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b8,53,75,95;"
+]
+],
+[
+"qRegisterInfo76",
+[
+"name:d21;bitsize:64;offset:956;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b9,54,76,96;"
+]
+],
+[
+"qRegisterInfo77",
+[
+"name:d22;bitsize:64;offset:964;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ba,55,77,97;"
+]
+],
+[
+"qRegisterInfo78",
+[
+"name:d23;bitsize:64;offset:972;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bb,56,78,98;"
+]
+],
+[
+"qRegisterInfo79",
+[
+"name:d24;bitsize:64;offset:980;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bc,57,79,99;"
+]
+],
+[
+"qRegisterInfo7a",
+[
+"name:d25;bitsize:64;offset:988;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bd,58,7a,9a;"
+]
+],
+[
+"qRegisterInfo7b",
+[
+"name:d26;bitsize:64;offset:996;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:be,59,7b,9b;"
+]
+],
+[
+"qRegisterInfo7c",
+[
+"name:d27;bitsize:64;offset:1004;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bf,5a,7c,9c;"
+]
+],
+[
+"qRegisterInfo7d",
+[
+"name:d28;bitsize:64;offset:1012;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c0,5b,7d,9d;"
+]
+],
+[
+"qRegisterInfo7e",
+[
+"name:d29;bitsize:64;offset:1020;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c1,5c,7e,9e;"
+]
+],
+[
+"qRegisterInfo7f",
+[
+"name:d30;bitsize:64;offset:1028;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c2,5d,7f,9f;"
+]
+],
+[
+"qRegisterInfo80",
+[
+"name:d31;bitsize:64;offset:1036;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c3,5e,80,a0;"
+]
+],
+[
+"qRegisterInfo81",
+[
+"name:s0;bitsize:32;offset:1044;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a4,3f,61,81;"
+]
+],
+[
+"qRegisterInfo82",
+[
+"name:s1;bitsize:32;offset:1048;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a5,40,62,82;"
+]
+],
+[
+"qRegisterInfo83",
+[
+"name:s2;bitsize:32;offset:1052;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a6,41,63,83;"
+]
+],
+[
+"qRegisterInfo84",
+[
+"name:s3;bitsize:32;offset:1056;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a7,42,64,84;"
+]
+],
+[
+"qRegisterInfo85",
+[
+"name:s4;bitsize:32;offset:1060;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a8,43,65,85;"
+]
+],
+[
+"qRegisterInfo86",
+[
+"name:s5;bitsize:32;offset:1064;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:a9,44,66,86;"
+]
+],
+[
+"qRegisterInfo87",
+[
+"name:s6;bitsize:32;offset:1068;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:aa,45,67,87;"
+]
+],
+[
+"qRegisterInfo88",
+[
+"name:s7;bitsize:32;offset:1072;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ab,46,68,88;"
+]
+],
+[
+"qRegisterInfo89",
+[
+"name:s8;bitsize:32;offset:1076;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ac,47,69,89;"
+]
+],
+[
+"qRegisterInfo8a",
+[
+"name:s9;bitsize:32;offset:1080;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ad,48,6a,8a;"
+]
+],
+[
+"qRegisterInfo8b",
+[
+"name:s10;bitsize:32;offset:1084;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ae,49,6b,8b;"
+]
+],
+[
+"qRegisterInfo8c",
+[
+"name:s11;bitsize:32;offset:1088;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:af,4a,6c,8c;"
+]
+],
+[
+"qRegisterInfo8d",
+[
+"name:s12;bitsize:32;offset:1092;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b0,4b,6d,8d;"
+]
+],
+[
+"qRegisterInfo8e",
+[
+"name:s13;bitsize:32;offset:1096;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b1,4c,6e,8e;"
+]
+],
+[
+"qRegisterInfo8f",
+[
+"name:s14;bitsize:32;offset:1100;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b2,4d,6f,8f;"
+]
+],
+[
+"qRegisterInfo90",
+[
+"name:s15;bitsize:32;offset:1104;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b3,4e,70,90;"
+]
+],
+[
+"qRegisterInfo91",
+[
+"name:s16;bitsize:32;offset:1108;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b4,4f,71,91;"
+]
+],
+[
+"qRegisterInfo92",
+[
+"name:s17;bitsize:32;offset:1112;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b5,50,72,92;"
+]
+],
+[
+"qRegisterInfo93",
+[
+"name:s18;bitsize:32;offset:1116;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b6,51,73,93;"
+]
+],
+[
+"qRegisterInfo94",
+[
+"name:s19;bitsize:32;offset:1120;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b7,52,74,94;"
+]
+],
+[
+"qRegisterInfo95",
+[
+"name:s20;bitsize:32;offset:1124;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b8,53,75,95;"
+]
+],
+[
+"qRegisterInfo96",
+[
+"name:s21;bitsize:32;offset:1128;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:b9,54,76,96;"
+]
+],
+[
+"qRegisterInfo97",
+[
+"name:s22;bitsize:32;offset:1132;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:ba,55,77,97;"
+]
+],
+[
+"qRegisterInfo98",
+[
+"name:s23;bitsize:32;offset:1136;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bb,56,78,98;"
+]
+],
+[
+"qRegisterInfo99",
+[
+"name:s24;bitsize:32;offset:1140;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bc,57,79,99;"
+]
+],
+[
+"qRegisterInfo9a",
+[
+"name:s25;bitsize:32;offset:1144;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bd,58,7a,9a;"
+]
+],
+[
+"qRegisterInfo9b",
+[
+"name:s26;bitsize:32;offset:1148;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:be,59,7b,9b;"
+]
+],
+[
+"qRegisterInfo9c",
+[
+"name:s27;bitsize:32;offset:1152;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:bf,5a,7c,9c;"
+]
+],
+[
+"qRegisterInfo9d",
+[
+"name:s28;bitsize:32;offset:1156;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c0,5b,7d,9d;"
+]
+],
+[
+"qRegisterInfo9e",
+[
+"name:s29;bitsize:32;offset:1160;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c1,5c,7e,9e;"
+]
+],
+[
+"qRegisterInfo9f",
+[
+"name:s30;bitsize:32;offset:1164;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c2,5d,7f,9f;"
+]
+],
+[
+"qRegisterInfoa0",
+[
+"name:s31;bitsize:32;offset:1168;encoding:ieee754;format:float;set:Floating Point Registers;invalidate-regs:c3,5e,80,a0;"
+]
+],
+[
+"qRegisterInfoa1",
+[
+"name:far;bitsize:64;offset:1172;encoding:uint;format:hex;set:Exception State Registers;"
+]
+],
+[
+"qRegisterInfoa2",
+[
+"name:esr;bitsize:32;offset:1180;encoding:uint;format:hex;set:Exception State Registers;"
+]
+],
+[
+"qRegisterInfoa3",
+[
+"name:exception;bitsize:32;offset:1184;encoding:uint;format:hex;set:Exception State Registers;"
+]
+],
+[
+"qRegisterInfoa4",
+[
+"name:z0;bitsize:512;offset:1188;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a4,3f,61,81;"
+]
+],
+[
+"qRegisterInfoa5",
+[
+"name:z1;bitsize:512;offset:1252;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a5,40,62,82;"
+]
+],
+[
+"qRegisterInfoa6",
+[
+"name:z2;bitsize:512;offset:1316;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a6,41,63,83;"
+]
+],
+[
+"qRegisterInfoa7",
+[
+"name:z3;bitsize:512;offset:1380;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a7,42,64,84;"
+]
+],
+[
+"qRegisterInfoa8",
+[
+"name:z4;bitsize:512;offset:1444;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a8,43,65,85;"
+]
+],
+[
+"qRegisterInfoa9",
+[
+"name:z5;bitsize:512;offset:1508;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:a9,44,66,86;"
+]
+],
+[
+"qRegisterInfoaa",
+[
+"name:z6;bitsize:512;offset:1572;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:aa,45,67,87;"
+]
+],
+[
+"qRegisterInfoab",
+[
+"name:z7;bitsize:512;offset:1636;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:ab,46,68,88;"
+]
+],
+[
+"qRegisterInfoac",
+[
+"name:z8;bitsize:512;offset:1700;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:ac,47,69,89;"
+]
+],
+[
+"qRegisterInfoad",
+[
+"name:z9;bitsize:512;offset:1764;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:ad,48,6a,8a;"
+]
+],
+[
+"qRegisterInfoae",
+[
+"name:z10;bitsize:512;offset:1828;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:ae,49,6b,8b;"
+]
+],
+[
+"qRegisterInfoaf",
+[
+"name:z11;bitsize:512;offset:1892;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:af,4a,6c,8c;"
+]
+],
+[
+"qRegisterInfob0",
+[
+"name:z12;bitsize:512;offset:1956;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b0,4b,6d,8d;"
+]
+],
+[
+"qRegisterInfob1",
+[
+"name:z13;bitsize:512;offset:2020;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b1,4c,6e,8e;"
+]
+],
+[
+"qRegisterInfob2",
+[
+"name:z14;bitsize:512;offset:2084;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b2,4d,6f,8f;"
+]
+],
+[
+"qRegisterInfob3",
+[
+"name:z15;bitsize:512;offset:2148;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b3,4e,70,90;"
+]
+],
+[
+"qRegisterInfob4",
+[
+"name:z16;bitsize:512;offset:2212;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b4,4f,71,91;"
+]
+],
+[
+"qRegisterInfob5",
+[
+"name:z17;bitsize:512;offset:2276;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b5,50,72,92;"
+]
+],
+[
+"qRegisterInfob6",
+[
+"name:z18;bitsize:512;offset:2340;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b6,51,73,93;"
+]
+],
+[
+"qRegisterInfob7",
+[
+"name:z19;bitsize:512;offset:2404;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b7,52,74,94;"
+]
+],
+[
+"qRegisterInfob8",
+[
+"name:z20;bitsize:512;offset:2468;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b8,53,75,95;"
+]
+],
+[
+"qRegisterInfob9",
+[
+"name:z21;bitsize:512;offset:2532;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:b9,54,76,96;"
+]
+],
+[
+"qRegisterInfoba",
+[
+"name:z22;bitsize:512;offset:2596;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:ba,55,77,97;"
+]
+],
+[
+"qRegisterInfobb",
+[
+"name:z23;bitsize:512;offset:2660;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:bb,56,78,98;"
+]
+],
+[
+"qRegisterInfobc",
+[
+"name:z24;bitsize:512;offset:2724;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:bc,57,79,99;"
+]
+],
+[
+"qRegisterInfobd",
+[
+"name:z25;bitsize:512;offset:2788;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:bd,58,7a,9a;"
+]
+],
+[
+"qRegisterInfobe",
+[
+"name:z26;bitsize:512;offset:2852;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:be,59,7b,9b;"
+]
+],
+[
+"qRegisterInfobf",
+[
+"name:z27;bitsize:512;offset:2916;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:bf,5a,7c,9c;"
+]
+],
+[
+"qRegisterInfoc0",
+[
+"name:z28;bitsize:512;offset:2980;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:c0,5b,7d,9d;"
+]
+],
+[
+"qRegisterInfoc1",
+[
+"name:z29;bitsize:512;offset:3044;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:c1,5c,7e,9e;"
+]
+],
+[
+"qRegisterInfoc2",
+[
+"name:z30;bitsize:512;offset:3108;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:c2,5d,7f,9f;"
+]
+],
+[
+"qRegisterInfoc3",
+[
+"name:z31;bitsize:512;offset:3172;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;invalidate-regs:c3,5e,80,a0;"
+]
+],
+[
+"qRegisterInfoc4",
+[
+"name:p0;bitsize:64;offset:3236;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoc5",
+[
+"name:p1;bitsize:64;offset:3244;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoc6",
+[
+"name:p2;bitsize:64;offset:3252;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoc7",
+[
+"name:p3;bitsize:64;offset:3260;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoc8",
+[
+"name:p4;bitsize:64;offset:3268;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoc9",
+[
+"name:p5;bitsize:64;offset:3276;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoca",
+[
+"name:p6;bitsize:64;offset:3284;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfocb",
+[
+"name:p7;bitsize:64;offset:3292;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfocc",
+[
+"name:p8;bitsize:64;offset:3300;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfocd",
+[
+"name:p9;bitsize:64;offset:3308;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfoce",
+[
+"name:p10;bitsize:64;offset:3316;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfocf",
+[
+"name:p11;bitsize:64;offset:3324;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfod0",
+[
+"name:p12;bitsize:64;offset:3332;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfod1",
+[
+"name:p13;bitsize:64;offset:3340;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfod2",
+[
+"name:p14;bitsize:64;offset:3348;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfod3",
+[
+"name:p15;bitsize:64;offset:3356;encoding:vector;format:vector-uint8;set:Scalable Vector Extension Registers;"
+]
+],
+[
+"qRegisterInfod4",
+[
+"name:svcr;bitsize:64;offset:3364;encoding:uint;format:hex;set:Scalable Matrix Extension Registers;"
+]
+],
+[
+"qRegisterInfod5",
+[
+"name:tpidr2;bitsize:64;offset:3372;encoding:uint;format:hex;set:Scalable Matrix Extension Registers;"
+]
+],
+[
+"qRegisterInfod6",
+[
+"name:svl;bitsize:16;offset:3380;encoding:uint;format:hex;set:Scalable Matrix Extension Registers;"
+]
+],
+[
+"qRegisterInfod7",
+[
+"name:za;bitsize:32768;offset:3382;encoding:vector;format:vector-uint8;set:Scalable Matrix Extension Registers;"
+]
+],
+[
+"qRegisterInfod8",
+[
+"name:zt0;bitsize:512;offset:7478;encoding:vector;format:vector-uint8;set:Scalable Matrix Extension Registers;"
+]
+],
+[
+"qRegisterInfod9",
+[
+"E45"
+]
+],
+[
+"qXfer:features:read:target.xml:0,3fff",
+[
+"m<?xml version=\"1.0\"?>\n<target version=\"1.0\">\n<feature name=\"com.apple.debugserver.arm64\">\n  <reg name=\"x0\" regnum=\"0\" offset=\"0\" bitsize=\"64\" group=\"general\" altname=\"arg1\" group_id=\"1\" ehframe_regnum=\"0\" dwarf_regnum=\"0\" generic=\"arg1\" invalidate_regnums=\"0,34\"/>\n  <reg name=\"x1\" regnum=\"1\" offset=\"8\" bitsize=\"64\" group=\"general\" altname=\"arg2\" group_id=\"1\" ehframe_regnum=\"1\" dwarf_regnum=\"1\" generic=\"arg2\" invalidate_regnums=\"1,35\"/>\n  <reg name=\"x2\" regnum=\"2\" offset=\"16\" bitsize=\"64\" group=\"general\" altname=\"arg3\" group_id=\"1\" ehframe_regnum=\"2\" dwarf_regnum=\"2\" generic=\"arg3\" invalidate_regnums=\"2,36\"/>\n  <reg name=\"x3\" regnum=\"3\" offset=\"24\" bitsize=\"64\" group=\"general\" altname=\"arg4\" group_id=\"1\" ehframe_regnum=\"3\" dwarf_regnum=\"3\" generic=\"arg4\" invalidate_regnums=\"3,37\"/>\n  <reg name=\"x4\" regnum=\"4\" offset=\"32\" bitsize=\"64\" group=\"general\" altname=\"arg5\" group_id=\"1\" ehframe_regnum=\"4\" dwarf_regnum=\"4\" generic=\"arg5\" invalidate_regnums=\"4,38\"/>\n  <reg name=\"x5\" regnum=\"5\" offset=\"40\" bitsize=\"64\" group=\"general\" altname=\"arg6\" group_id=\"1\" ehframe_regnum=\"5\" dwarf_regnum=\"5\" generic=\"arg6\" invalidate_regnums=\"5,39\"/>\n  <reg name=\"x6\" regnum=\"6\" offset=\"48\" bitsize=\"64\" group=\"general\" altname=\"arg7\" group_id=\"1\" ehframe_regnum=\"6\" dwarf_regnum=\"6\" generic=\"arg7\" invalidate_regnums=\"6,40\"/>\n  <reg name=\"x7\" regnum=\"7\" offset=\"56\" bitsize=\"64\" group=\"general\" altname=\"arg8\" group_id=\"1\" ehframe_regnum=\"7\" dwarf_regnum=\"7\" generic=\"arg8\" invalidate_regnums=\"7,41\"/>\n  <reg name=\"x8\" regnum=\"8\" offset=\"64\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"8\" dwarf_regnum=\"8\" invalidate_regnums=\"8,42\"/>\n  <reg name=\"x9\" regnum=\"9\" offset=\"72\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"9\" dwarf_regnum=\"9\" invalidate_regnums=\"9,43\"/>\n  <reg name=\"x10\" regnum=\"10\" offset=\"80\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"10\" dwarf_regnum=\"10\" invalidate_regnums=\"10,44\"/>\n  <reg name=\"x11\" regnum=\"11\" offset=\"88\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"11\" dwarf_regnum=\"11\" invalidate_regnums=\"11,45\"/>\n  <reg name=\"x12\" regnum=\"12\" offset=\"96\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"12\" dwarf_regnum=\"12\" invalidate_regnums=\"12,46\"/>\n  <reg name=\"x13\" regnum=\"13\" offset=\"104\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"13\" dwarf_regnum=\"13\" invalidate_regnums=\"13,47\"/>\n  <reg name=\"x14\" regnum=\"14\" offset=\"112\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"14\" dwarf_regnum=\"14\" invalidate_regnums=\"14,48\"/>\n  <reg name=\"x15\" regnum=\"15\" offset=\"120\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"15\" dwarf_regnum=\"15\" invalidate_regnums=\"15,49\"/>\n  <reg name=\"x16\" regnum=\"16\" offset=\"128\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"16\" dwarf_regnum=\"16\" invalidate_regnums=\"16,50\"/>\n  <reg name=\"x17\" regnum=\"17\" offset=\"136\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"17\" dwarf_regnum=\"17\" invalidate_regnums=\"17,51\"/>\n  <reg name=\"x18\" regnum=\"18\" offset=\"144\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"18\" dwarf_regnum=\"18\" invalidate_regnums=\"18,52\"/>\n  <reg name=\"x19\" regnum=\"19\" offset=\"152\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"19\" dwarf_regnum=\"19\" invalidate_regnums=\"19,53\"/>\n  <reg name=\"x20\" regnum=\"20\" offset=\"160\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"20\" dwarf_regnum=\"20\" invalidate_regnums=\"20,54\"/>\n  <reg name=\"x21\" regnum=\"21\" offset=\"168\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"21\" dwarf_regnum=\"21\" invalidate_regnums=\"21,55\"/>\n  <reg name=\"x22\" regnum=\"22\" offset=\"176\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"22\" dwarf_regnum=\"22\" invalidate_regnums=\"22,56\"/>\n  <reg name=\"x23\" regnum=\"23\" offset=\"184\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"23\" dwarf_regnum=\"23\" invalidate_regnums=\"23,57\"/>\n  <reg name=\"x24\" regnum=\"24\" offset=\"192\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"24\" dwarf_regnum=\"24\" invalidate_regnums=\"24,58\"/>\n  <reg name=\"x25\" regnum=\"25\" offset=\"200\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"25\" dwarf_regnum=\"25\" invalidate_regnums=\"25,59\"/>\n  <reg name=\"x26\" regnum=\"26\" offset=\"208\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"26\" dwarf_regnum=\"26\" invalidate_regnums=\"26,60\"/>\n  <reg name=\"x27\" regnum=\"27\" offset=\"216\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"27\" dwarf_regnum=\"27\" invalidate_regnums=\"27,61\"/>\n  <reg name=\"x28\" regnum=\"28\" offset=\"224\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"28\" dwarf_regnum=\"28\" invalidate_regnums=\"28,62\"/>\n  <reg name=\"fp\" regnum=\"29\" offset=\"232\" bitsize=\"64\" group=\"general\" altname=\"x29\" group_id=\"1\" ehframe_regnum=\"29\" dwarf_regnum=\"29\" generic=\"fp\"/>\n  <reg name=\"lr\" regnum=\"30\" offset=\"240\" bitsize=\"64\" group=\"general\" altname=\"x30\" group_id=\"1\" ehframe_regnum=\"30\" dwarf_regnum=\"30\" generic=\"ra\"/>\n  <reg name=\"sp\" regnum=\"31\" offset=\"248\" bitsize=\"64\" group=\"general\" altname=\"xsp\" group_id=\"1\" ehframe_regnum=\"31\" dwarf_regnum=\"31\" generic=\"sp\"/>\n  <reg name=\"pc\" regnum=\"32\" offset=\"256\" bitsize=\"64\" group=\"general\" group_id=\"1\" ehframe_regnum=\"32\" dwarf_regnum=\"32\" generic=\"pc\"/>\n  <reg name=\"cpsr\" regnum=\"33\" offset=\"264\" bitsize=\"32\" group=\"general\" altname=\"flags\" group_id=\"1\" ehframe_regnum=\"33\" dwarf_regnum=\"33\" generic=\"flags\"/>\n  <reg name=\"w0\" regnum=\"34\" offset=\"0\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"0\" invalidate_regnums=\"0,34\"/>\n  <reg name=\"w1\" regnum=\"35\" offset=\"8\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"1\" invalidate_regnums=\"1,35\"/>\n  <reg name=\"w2\" regnum=\"36\" offset=\"16\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"2\" invalidate_regnums=\"2,36\"/>\n  <reg name=\"w3\" regnum=\"37\" offset=\"24\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"3\" invalidate_regnums=\"3,37\"/>\n  <reg name=\"w4\" regnum=\"38\" offset=\"32\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"4\" invalidate_regnums=\"4,38\"/>\n  <reg name=\"w5\" regnum=\"39\" offset=\"40\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"5\" invalidate_regnums=\"5,39\"/>\n  <reg name=\"w6\" regnum=\"40\" offset=\"48\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"6\" invalidate_regnums=\"6,40\"/>\n  <reg name=\"w7\" regnum=\"41\" offset=\"56\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"7\" invalidate_regnums=\"7,41\"/>\n  <reg name=\"w8\" regnum=\"42\" offset=\"64\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"8\" invalidate_regnums=\"8,42\"/>\n  <reg name=\"w9\" regnum=\"43\" offset=\"72\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"9\" invalidate_regnums=\"9,43\"/>\n  <reg name=\"w10\" regnum=\"44\" offset=\"80\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"10\" invalidate_regnums=\"10,44\"/>\n  <reg name=\"w11\" regnum=\"45\" offset=\"88\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"11\" invalidate_regnums=\"11,45\"/>\n  <reg name=\"w12\" regnum=\"46\" offset=\"96\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"12\" invalidate_regnums=\"12,46\"/>\n  <reg name=\"w13\" regnum=\"47\" offset=\"104\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"13\" invalidate_regnums=\"13,47\"/>\n  <reg name=\"w14\" regnum=\"48\" offset=\"112\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"14\" invalidate_regnums=\"14,48\"/>\n  <reg name=\"w15\" regnum=\"49\" offset=\"120\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"15\" invalidate_regnums=\"15,49\"/>\n  <reg name=\"w16\" regnum=\"50\" offset=\"128\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"16\" invalidate_regnums=\"16,50\"/>\n  <reg name=\"w17\" regnum=\"51\" offset=\"136\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"17\" invalidate_regnums=\"17,51\"/>\n  <reg name=\"w18\" regnum=\"52\" offset=\"144\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"18\" invalidate_regnums=\"18,52\"/>\n  <reg name=\"w19\" regnum=\"53\" offset=\"152\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"19\" invalidate_regnums=\"19,53\"/>\n  <reg name=\"w20\" regnum=\"54\" offset=\"160\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"20\" invalidate_regnums=\"20,54\"/>\n  <reg name=\"w21\" regnum=\"55\" offset=\"168\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"21\" invalidate_regnums=\"21,55\"/>\n  <reg name=\"w22\" regnum=\"56\" offset=\"176\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"22\" invalidate_regnums=\"22,56\"/>\n  <reg name=\"w23\" regnum=\"57\" offset=\"184\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"23\" invalidate_regnums=\"23,57\"/>\n  <reg name=\"w24\" regnum=\"58\" offset=\"192\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"24\" invalidate_regnums=\"24,58\"/>\n  <reg name=\"w25\" regnum=\"59\" offset=\"200\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"25\" invalidate_regnums=\"25,59\"/>\n  <reg name=\"w26\" regnum=\"60\" offset=\"208\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"26\" invalidate_regnums=\"26,60\"/>\n  <reg name=\"w27\" regnum=\"61\" offset=\"216\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"27\" invalidate_regnums=\"27,61\"/>\n  <reg name=\"w28\" regnum=\"62\" offset=\"224\" bitsize=\"32\" group=\"general\" group_id=\"1\" value_regnums=\"28\" invalidate_regnums=\"28,62\"/>\n  <reg name=\"v0\" regnum=\"63\" offset=\"268\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q0\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"64\" invalidate_regnums=\"164,63,97,129\"/>\n  <reg name=\"v1\" regnum=\"64\" offset=\"284\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q1\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"65\" invalidate_regnums=\"165,64,98,130\"/>\n  <reg name=\"v2\" regnum=\"65\" offset=\"300\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q2\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"66\" invalidate_regnums=\"166,65,99,131\"/>\n  <reg name=\"v3\" regnum=\"66\" offset=\"316\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q3\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"67\" invalidate_regnums=\"167,66,100,132\"/>\n  <reg name=\"v4\" regnum=\"67\" offset=\"332\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q4\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"68\" invalidate_regnums=\"168,67,101,133\"/>\n  <reg name=\"v5\" regnum=\"68\" offset=\"348\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q5\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"69\" invalidate_regnums=\"169,68,102,134\"/>\n  <reg name=\"v6\" regnum=\"69\" offset=\"364\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q6\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"70\" invalidate_regnums=\"170,69,103,135\"/>\n  <reg name=\"v7\" regnum=\"70\" offset=\"380\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q7\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"71\" invalidate_regnums=\"171,70,104,136\"/>\n  <reg name=\"v8\" regnum=\"71\" offset=\"396\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q8\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"72\" invalidate_regnums=\"172,71,105,137\"/>\n  <reg name=\"v9\" regnum=\"72\" offset=\"412\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q9\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"73\" invalidate_regnums=\"173,72,106,138\"/>\n  <reg name=\"v10\" regnum=\"73\" offset=\"428\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q10\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"74\" invalidate_regnums=\"174,73,107,139\"/>\n  <reg name=\"v11\" regnum=\"74\" offset=\"444\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q11\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"75\" invalidate_regnums=\"175,74,108,140\"/>\n  <reg name=\"v12\" regnum=\"75\" offset=\"460\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q12\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"76\" invalidate_regnums=\"176,75,109,141\"/>\n  <reg name=\"v13\" regnum=\"76\" offset=\"476\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q13\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"77\" invalidate_regnums=\"177,76,110,142\"/>\n  <reg name=\"v14\" regnum=\"77\" offset=\"492\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q14\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"78\" invalidate_regnums=\"178,77,111,143\"/>\n  <reg name=\"v15\" regnum=\"78\" offset=\"508\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q15\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"79\" invalidate_regnums=\"179,78,112,144\"/>\n  <reg name=\"v16\" regnum=\"79\" offset=\"524\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q16\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"80\" invalidate_regnums=\"180,79,113,145\"/>\n  <reg name=\"v17\" regnum=\"80\" offset=\"540\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q17\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"81\" invalidate_regnums=\"181,80,114,146\"/>\n  <reg name=\"v18\" regnum=\"81\" offset=\"556\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q18\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"82\" invalidate_regnums=\"182,81,115,147\"/>\n  <reg name=\"v19\" regnum=\"82\" offset=\"572\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q19\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"83\" invalidate_regnums=\"183,82,116,148\"/>\n  <reg name=\"v20\" regnum=\"83\" offset=\"588\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q20\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"84\" invalidate_regnums=\"184,83,117,149\"/>\n  <reg name=\"v21\" regnum=\"84\" offset=\"604\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q21\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"85\" invalidate_regnums=\"185,84,118,150\"/>\n  <reg name=\"v22\" regnum=\"85\" offset=\"620\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q22\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"86\" invalidate_regnums=\"186,85,119,151\"/>\n  <reg name=\"v23\" regnum=\"86\" offset=\"636\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q23\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"87\" invalidate_regnums=\"187,86,120,152\"/>\n  <reg name=\"v24\" regnum=\"87\" offset=\"652\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q24\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"88\" invalidate_regnums=\"188,87,121,153\"/>\n  <reg name=\"v25\" regnum=\"88\" offset=\"668\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q25\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"89\" invalidate_regnums=\"189,88,122,154\"/>\n  <reg name=\"v26\" regnum=\"89\" offset=\"684\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q26\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"90\" invalidate_regnums=\"190,89,123,155\"/>\n  <reg name=\"v27\" regnum=\"90\" offset=\"700\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q27\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"91\" invalidate_regnums=\"191,90,124,156\"/>\n  <reg name=\"v28\" regnum=\"91\" offset=\"716\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q28\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"92\" invalidate_regnums=\"192,91,125,157\"/>\n  <reg name=\"v29\" regnum=\"92\" offset=\"732\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q29\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"93\" invalidate_regnums=\"193,92,126,158\"/>\n  <reg name=\"v30\" regnum=\"93\" offset=\"748\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q30\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"94\" invalidate_regnums=\"194,93,127,159\"/>\n  <reg name=\"v31\" regnum=\"94\" offset=\"764\" bitsize=\"128\" group=\"vector\" type=\"float\" altname=\"q31\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"2\" dwarf_regnum=\"95\" invalidate_regnums=\"195,94,128,160\"/>\n  <reg name=\"fpsr\" regnum=\"95\" offset=\"780\" bitsize=\"32\" group=\"general\" group_id=\"2\"/>\n  <reg name=\"fpcr\" regnum=\"96\" offset=\"784\" bitsize=\"32\" group=\"general\" group_id=\"2\"/>\n  <reg name=\"d0\" regnum=\"97\" offset=\"788\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"164,63,97,129\"/>\n  <reg name=\"d1\" regnum=\"98\" offset=\"796\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"165,64,98,130\"/>\n  <reg na"
+]
+],
+[
+"qXfer:features:read:target.xml:3fff,3fff",
+[
+"mme=\"d2\" regnum=\"99\" offset=\"804\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"166,65,99,131\"/>\n  <reg name=\"d3\" regnum=\"100\" offset=\"812\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"167,66,100,132\"/>\n  <reg name=\"d4\" regnum=\"101\" offset=\"820\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"168,67,101,133\"/>\n  <reg name=\"d5\" regnum=\"102\" offset=\"828\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"169,68,102,134\"/>\n  <reg name=\"d6\" regnum=\"103\" offset=\"836\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"170,69,103,135\"/>\n  <reg name=\"d7\" regnum=\"104\" offset=\"844\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"171,70,104,136\"/>\n  <reg name=\"d8\" regnum=\"105\" offset=\"852\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"172,71,105,137\"/>\n  <reg name=\"d9\" regnum=\"106\" offset=\"860\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"173,72,106,138\"/>\n  <reg name=\"d10\" regnum=\"107\" offset=\"868\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"174,73,107,139\"/>\n  <reg name=\"d11\" regnum=\"108\" offset=\"876\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"175,74,108,140\"/>\n  <reg name=\"d12\" regnum=\"109\" offset=\"884\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"176,75,109,141\"/>\n  <reg name=\"d13\" regnum=\"110\" offset=\"892\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"177,76,110,142\"/>\n  <reg name=\"d14\" regnum=\"111\" offset=\"900\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"178,77,111,143\"/>\n  <reg name=\"d15\" regnum=\"112\" offset=\"908\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"179,78,112,144\"/>\n  <reg name=\"d16\" regnum=\"113\" offset=\"916\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"180,79,113,145\"/>\n  <reg name=\"d17\" regnum=\"114\" offset=\"924\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"181,80,114,146\"/>\n  <reg name=\"d18\" regnum=\"115\" offset=\"932\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"182,81,115,147\"/>\n  <reg name=\"d19\" regnum=\"116\" offset=\"940\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"183,82,116,148\"/>\n  <reg name=\"d20\" regnum=\"117\" offset=\"948\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"184,83,117,149\"/>\n  <reg name=\"d21\" regnum=\"118\" offset=\"956\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"185,84,118,150\"/>\n  <reg name=\"d22\" regnum=\"119\" offset=\"964\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"186,85,119,151\"/>\n  <reg name=\"d23\" regnum=\"120\" offset=\"972\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"187,86,120,152\"/>\n  <reg name=\"d24\" regnum=\"121\" offset=\"980\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"188,87,121,153\"/>\n  <reg name=\"d25\" regnum=\"122\" offset=\"988\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"189,88,122,154\"/>\n  <reg name=\"d26\" regnum=\"123\" offset=\"996\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"190,89,123,155\"/>\n  <reg name=\"d27\" regnum=\"124\" offset=\"1004\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"191,90,124,156\"/>\n  <reg name=\"d28\" regnum=\"125\" offset=\"1012\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"192,91,125,157\"/>\n  <reg name=\"d29\" regnum=\"126\" offset=\"1020\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"193,92,126,158\"/>\n  <reg name=\"d30\" regnum=\"127\" offset=\"1028\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"194,93,127,159\"/>\n  <reg name=\"d31\" regnum=\"128\" offset=\"1036\" bitsize=\"64\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"195,94,128,160\"/>\n  <reg name=\"s0\" regnum=\"129\" offset=\"1044\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"164,63,97,129\"/>\n  <reg name=\"s1\" regnum=\"130\" offset=\"1048\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"165,64,98,130\"/>\n  <reg name=\"s2\" regnum=\"131\" offset=\"1052\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"166,65,99,131\"/>\n  <reg name=\"s3\" regnum=\"132\" offset=\"1056\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"167,66,100,132\"/>\n  <reg name=\"s4\" regnum=\"133\" offset=\"1060\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"168,67,101,133\"/>\n  <reg name=\"s5\" regnum=\"134\" offset=\"1064\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"169,68,102,134\"/>\n  <reg name=\"s6\" regnum=\"135\" offset=\"1068\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"170,69,103,135\"/>\n  <reg name=\"s7\" regnum=\"136\" offset=\"1072\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"171,70,104,136\"/>\n  <reg name=\"s8\" regnum=\"137\" offset=\"1076\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"172,71,105,137\"/>\n  <reg name=\"s9\" regnum=\"138\" offset=\"1080\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"173,72,106,138\"/>\n  <reg name=\"s10\" regnum=\"139\" offset=\"1084\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"174,73,107,139\"/>\n  <reg name=\"s11\" regnum=\"140\" offset=\"1088\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"175,74,108,140\"/>\n  <reg name=\"s12\" regnum=\"141\" offset=\"1092\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"176,75,109,141\"/>\n  <reg name=\"s13\" regnum=\"142\" offset=\"1096\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"177,76,110,142\"/>\n  <reg name=\"s14\" regnum=\"143\" offset=\"1100\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"178,77,111,143\"/>\n  <reg name=\"s15\" regnum=\"144\" offset=\"1104\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"179,78,112,144\"/>\n  <reg name=\"s16\" regnum=\"145\" offset=\"1108\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"180,79,113,145\"/>\n  <reg name=\"s17\" regnum=\"146\" offset=\"1112\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"181,80,114,146\"/>\n  <reg name=\"s18\" regnum=\"147\" offset=\"1116\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"182,81,115,147\"/>\n  <reg name=\"s19\" regnum=\"148\" offset=\"1120\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"183,82,116,148\"/>\n  <reg name=\"s20\" regnum=\"149\" offset=\"1124\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"184,83,117,149\"/>\n  <reg name=\"s21\" regnum=\"150\" offset=\"1128\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"185,84,118,150\"/>\n  <reg name=\"s22\" regnum=\"151\" offset=\"1132\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"186,85,119,151\"/>\n  <reg name=\"s23\" regnum=\"152\" offset=\"1136\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"187,86,120,152\"/>\n  <reg name=\"s24\" regnum=\"153\" offset=\"1140\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"188,87,121,153\"/>\n  <reg name=\"s25\" regnum=\"154\" offset=\"1144\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"189,88,122,154\"/>\n  <reg name=\"s26\" regnum=\"155\" offset=\"1148\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"190,89,123,155\"/>\n  <reg name=\"s27\" regnum=\"156\" offset=\"1152\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"191,90,124,156\"/>\n  <reg name=\"s28\" regnum=\"157\" offset=\"1156\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"192,91,125,157\"/>\n  <reg name=\"s29\" regnum=\"158\" offset=\"1160\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"193,92,126,158\"/>\n  <reg name=\"s30\" regnum=\"159\" offset=\"1164\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"194,93,127,159\"/>\n  <reg name=\"s31\" regnum=\"160\" offset=\"1168\" bitsize=\"32\" group=\"float\" type=\"float\" encoding=\"ieee754\" format=\"float\" group_id=\"2\" invalidate_regnums=\"195,94,128,160\"/>\n  <reg name=\"far\" regnum=\"161\" offset=\"1172\" bitsize=\"64\" group=\"general\" group_id=\"3\"/>\n  <reg name=\"esr\" regnum=\"162\" offset=\"1180\" bitsize=\"32\" group=\"general\" group_id=\"3\"/>\n  <reg name=\"exception\" regnum=\"163\" offset=\"1184\" bitsize=\"32\" group=\"general\" group_id=\"3\"/>\n  <reg name=\"z0\" regnum=\"164\" offset=\"1188\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"164,63,97,129\"/>\n  <reg name=\"z1\" regnum=\"165\" offset=\"1252\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"165,64,98,130\"/>\n  <reg name=\"z2\" regnum=\"166\" offset=\"1316\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"166,65,99,131\"/>\n  <reg name=\"z3\" regnum=\"167\" offset=\"1380\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"167,66,100,132\"/>\n  <reg name=\"z4\" regnum=\"168\" offset=\"1444\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"168,67,101,133\"/>\n  <reg name=\"z5\" regnum=\"169\" offset=\"1508\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"169,68,102,134\"/>\n  <reg name=\"z6\" regnum=\"170\" offset=\"1572\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"170,69,103,135\"/>\n  <reg name=\"z7\" regnum=\"171\" offset=\"1636\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"171,70,104,136\"/>\n  <reg name=\"z8\" regnum=\"172\" offset=\"1700\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"172,71,105,137\"/>\n  <reg name=\"z9\" regnum=\"173\" offset=\"1764\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"173,72,106,138\"/>\n  <reg name=\"z10\" regnum=\"174\" offset=\"1828\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"174,73,107,139\"/>\n  <reg name=\"z11\" regnum=\"175\" offset=\"1892\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"175,74,108,140\"/>\n  <reg name=\"z12\" regnum=\"176\" offset=\"1956\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"176,75,109,141\"/>\n  <reg name=\"z13\" regnum=\"177\" offset=\"2020\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"177,76,110,142\"/>\n  <reg name=\"z14\" regnum=\"178\" offset=\"2084\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"178,77,111,143\"/>\n  <reg name=\"z15\" regnum=\"179\" offset=\"2148\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"179,78,112,144\"/>\n  <reg name=\"z16\" regnum=\"180\" offset=\"2212\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"180,79,113,145\"/>\n  <reg name=\"z17\" regnum=\"181\" offset=\"2276\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"181,80,114,146\"/>\n  <reg name=\"z18\" regnum=\"182\" offset=\"2340\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"182,81,115,147\"/>\n  <reg name=\"z19\" regnum=\"183\" offset=\"2404\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"183,82,116,148\"/>\n  <reg name=\"z20\" regnum=\"184\" offset=\"2468\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"184,83,117,149\"/>\n  <reg name=\"z21\" regnum=\"185\" offset=\"2532\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"185,84,118,150\"/>\n  <reg name=\"z22\" regnum=\"186\" offset=\"2596\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"186,85,119,151\"/>\n  <reg name=\"z23\" regnum=\"187\" offset=\"2660\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"187,86,120,152\"/>\n  <reg name=\"z24\" regnum=\"188\" offset=\"2724\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"188,87,121,153\"/>\n  <reg name=\"z25\" regnum=\"189\" offset=\"2788\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"189,88,122,154\"/>\n  <reg name=\"z26\" regnum=\"190\" offset=\"2852\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"190,89,123,155\"/>\n  <reg name=\"z27\" regnum=\"191\" offset=\"2916\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"191,90,124,156\"/>\n  <reg name=\"z28\" regnum=\"192\" offset=\"2980\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"192,91,125,157\"/>\n  <reg name=\"z29\" regnum=\"193\" offset=\"3044\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"193,92,126,158\"/>\n  <reg name=\"z30\" regnum=\"194\" offset=\"3108\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\" invalidate_regnums=\"194,93,127,159\"/>\n  <reg name=\"z31\" regnum=\"195\" offset=\"3172\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-ui"
+]
+],
+[
+"qXfer:features:read:target.xml:7ffe,3fff",
+[
+"lnt8\" group_id=\"4\" invalidate_regnums=\"195,94,128,160\"/>\n  <reg name=\"p0\" regnum=\"196\" offset=\"3236\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p1\" regnum=\"197\" offset=\"3244\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p2\" regnum=\"198\" offset=\"3252\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p3\" regnum=\"199\" offset=\"3260\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p4\" regnum=\"200\" offset=\"3268\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p5\" regnum=\"201\" offset=\"3276\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p6\" regnum=\"202\" offset=\"3284\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p7\" regnum=\"203\" offset=\"3292\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p8\" regnum=\"204\" offset=\"3300\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p9\" regnum=\"205\" offset=\"3308\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p10\" regnum=\"206\" offset=\"3316\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p11\" regnum=\"207\" offset=\"3324\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p12\" regnum=\"208\" offset=\"3332\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p13\" regnum=\"209\" offset=\"3340\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p14\" regnum=\"210\" offset=\"3348\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"p15\" regnum=\"211\" offset=\"3356\" bitsize=\"64\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"4\"/>\n  <reg name=\"svcr\" regnum=\"212\" offset=\"3364\" bitsize=\"64\" group=\"general\" group_id=\"5\"/>\n  <reg name=\"tpidr2\" regnum=\"213\" offset=\"3372\" bitsize=\"64\" group=\"general\" group_id=\"5\"/>\n  <reg name=\"svl\" regnum=\"214\" offset=\"3380\" bitsize=\"16\" group=\"general\" group_id=\"5\"/>\n  <reg name=\"za\" regnum=\"215\" offset=\"3382\" bitsize=\"32768\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"5\"/>\n  <reg name=\"zt0\" regnum=\"216\" offset=\"7478\" bitsize=\"512\" group=\"vector\" type=\"float\" encoding=\"vector\" format=\"vector-uint8\" group_id=\"5\"/>\n</feature>\n<groups>\n  <group id=\"1\" name=\"General Purpose Registers\"/>\n  <group id=\"2\" name=\"Floating Point Registers\"/>\n  <group id=\"3\" name=\"Exception State Registers\"/>\n  <group id=\"4\" name=\"Scalable Vector Extension Registers\"/>\n  <group id=\"5\" name=\"Scalable Matrix Extension Registers\"/>\n</groups>\n</target>\n"
+]
+],
+[
+"g",
+[
+""
+]
+],
+[
+"p0",
+[
+"0000000000000000"
+]
+],
+[
+"p1d",
+[
+"0000000000000000"
+]
+],
+[
+"p1e",
+[
+"0000000000000000"
+]
+],
+[
+"p1f",
+[
+"307d176b01000000"
+]
+],
+[
+"p20",
+[
+"c089f60401000000"
+]
+],
+[
+"p21",
+[
+"00000000"
+]
+],
+[
+"p22",
+[
+"E97"
+]
+],
+[
+"p42",
+[
+"00000000000000000000000000000000"
+]
+],
+[
+"p62",
+[
+"0000000000000000"
+]
+],
+[
+"p63",
+[
+"0000000000000000"
+]
+],
+[
+"p64",
+[
+"0000000000000000"
+]
+],
+[
+"pa1",
+[
+"0000000000000000"
+]
+],
+[
+"pa2",
+[
+"00000000"
+]
+],
+[
+"pa4",
+[
+"E97"
+]
+],
+[
+"qfThreadInfo",
+[
+"m1001"
+]
+],
+[
+"qsThreadInfo",
+[
+"l"
+]
+],
+[
+"QThreadSuffixSupported",
+[
+"OK"
+]
+],
+[
+"g;thread:1001;",
+[
+""
+]
+],
+[
+"p20;thread:1001;",
+[
+"c089f60401000000"
+]
+],
+[
+"k",
+[
+"X09"
+]
+]
+]
+}

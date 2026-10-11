@@ -1223,6 +1223,9 @@ pub const Session = struct {
         self.modules.discoverPe();
     }
     pub fn poll(self: *Session) !void {
+        defer if (self.gdb_map.symbols.poll()) {
+            self.metadata.revision +|= 1;
+        };
         defer self.compatibility.poll(self);
         defer self.pollPeImages();
         defer self.modules.reportBudget();
@@ -1580,7 +1583,8 @@ pub const Session = struct {
     }
     /// Mach-O unwind data is not read by this build. AArch64 Darwin code keeps
     /// frame records, so walk them: [fp] holds the caller's fp and [fp+8] its
-    /// return address. Frames are unsymbolised and name how they were found.
+    /// return address. UUID-matched Mach-O files may supply frame labels;
+    /// source and unwind metadata still require separate debug-info support.
     /// A leaf function, or one stopped in its prologue, has not pushed its
     /// record yet: there x30 is the caller, and is reported as such only when
     /// no frame setup precedes the PC in the same function.
@@ -1593,7 +1597,7 @@ pub const Session = struct {
         var frames: std.ArrayList(Frame) = .empty;
         const pc = start[arch_.pc()] orelse return error.RegisterUnavailable;
         try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = 0, .pc = pc, .lookup_pc = pc, .registers = start, .unwind_method = "registers", .inline_diagnostic = reason });
-        var fp = start[29] orelse return frames.toOwnedSlice(a);
+        var fp = start[29] orelse 0;
         var sp = start[arch_.sp()] orelse fp;
         const max = @min(64, limit);
         if (start[30]) |raw| link: {
@@ -1631,6 +1635,22 @@ pub const Session = struct {
             if (frames.items.len != 2 or frames.items[1].pc != ret or !std.mem.eql(u8, frames.items[1].unwind_method.?, "link_register"))
                 try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = frames.items.len, .pc = ret, .lookup_pc = arch_.callerLookup(ret) orelse break, .registers = caller, .cfa = sp, .unwind_method = "frame_pointer", .inline_diagnostic = reason });
             fp = next; // The loop condition requires the chain to move up the stack.
+        }
+        self.gdb_map.refreshImages(&self.target) catch |err| {
+            for (frames.items) |*frame| frame.diagnostic = @errorName(err);
+            return frames.toOwnedSlice(a);
+        };
+        for (frames.items) |*frame| {
+            const label = self.gdb_map.label(a, frame.pc, frame.lookup_pc, self.debug_files.roots.items) catch |err| {
+                frame.diagnostic = @errorName(err);
+                continue;
+            };
+            if (label) |name| {
+                frame.symbol = name.name;
+                frame.module_id = name.module;
+                frame.diagnostic = name.diagnostic;
+                frame.inline_diagnostic = "MachODebugInfoUnavailable";
+            }
         }
         return frames.toOwnedSlice(a);
     }

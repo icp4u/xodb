@@ -732,10 +732,12 @@ enum xrt_status xrt_remote_destroy(struct xrt_target *t)
         return XRT_OK;
     }
     if (status != XRT_OK && !xrt_cancel_requested(c->cancel)) {
-        /* A broken stream forces agent cleanup. Exit bit 2 means its detach
-         * failed; keep the handle in that case, as the local API does. */
+        /* A reaped signal death has no live transport on which a retained
+         * handle could retry. Release local storage without claiming remote
+         * detach. Exit bit 2 still means a reported detach failure. */
         const bool unconfirmed = c->fd >= 0 || !reap(c) || !c->exit_status_known ||
-                                 !WIFEXITED(c->exit_status) || (WEXITSTATUS(c->exit_status) & 2);
+                                 (!WIFSIGNALED(c->exit_status) &&
+                                  (!WIFEXITED(c->exit_status) || (WEXITSTATUS(c->exit_status) & 2)));
         /* Cancelled while waiting: abandon below, so the transport child is
          * terminated and reaped instead of outliving a retained handle. */
         if (unconfirmed && !xrt_cancel_requested(c->cancel))

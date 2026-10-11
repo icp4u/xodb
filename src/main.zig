@@ -262,7 +262,7 @@ pub fn main(init: std.process.Init) !void {
     if (compare_capture != null and (open_capture == null or symbols != null or reanalyze)) return error.ComparisonRequiresRecordedCpuArchives;
     if (process_limit == 0 or process_limit > @import("model/process_tree.zig").maximum) return error.InvalidProcessLimit;
     if ((follow_forks or process_limit != 32) and (core_file != null or open_capture != null or open_profile != null or connect != null or ssh != null)) return error.ProcessOptionsRequireLocalLiveTarget;
-    if (core_executable != null and core_file == null) return error.ExecutableRequiresCore;
+    if (core_executable != null and core_file == null and gdb_remote == null) return error.ExecutableRequiresCoreOrGdbRemote;
     if (core_file != null and (attach != null or launch.len > 0 or open_profile != null or open_capture != null or connect != null or ssh != null or initial_breakpoint_count != 0 or profile_out != null or capture_out != null or record_path != null or symbols != null or reanalyze)) return error.CoreOptionConflict;
     if (open_frames != null and (open_profile != null or connect != null or ssh != null or observation_recipe != null or open_observation != null or browse_observation != null)) return error.FrameOptionConflict;
     if (open_profile != null and (open_capture != null or attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null or symbols != null or reanalyze or connect != null or ssh != null or capture_out != null or profile_out != null or record_path != null)) return error.ImportOptionConflict;
@@ -344,6 +344,7 @@ pub fn main(init: std.process.Init) !void {
     session.languages = languages;
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
+    if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
     session.static_analysis.toolchain_dir = static_analysis;
     if (static_analysis != null) {
         const swept = @import("semq/host.zig").sweepStale();
@@ -354,7 +355,7 @@ pub fn main(init: std.process.Init) !void {
     // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
     var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
-    const async_remote_start = runtime_remote and !headless;
+    const async_remote_start = runtime_remote;
     var remote_transport: std.ArrayList([:0]const u8) = .empty;
     if (!async_remote_start) if (gdb_remote) |endpoint| try session.target.connectGdbRemote(endpoint);
     if (runtime_agent != null or runtime_ssh != null) {
@@ -417,10 +418,10 @@ pub fn main(init: std.process.Init) !void {
             _ = try session.persistent.addSymbol(session, name);
         }
     }
-    if (observation_recipe) |path| {
+    if (!async_remote_start) if (observation_recipe) |path| {
         try @import("observe/cli.zig").run(a, session, path, observation_out.?, observation_threshold, &quitting);
         return;
-    }
+    };
     // The GUI browser never waits here: the view reports the open worker.
     if (browse_observation) |path| try session.openObservation(path);
     if (open_observation) |path| {
@@ -436,10 +437,13 @@ pub fn main(init: std.process.Init) !void {
     if (mcp) try server.init();
     defer if (mcp) server.deinit();
     if (headless) {
-        if (session.target.isRemote()) {
-            var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = capture_out, .profile_out = profile_out, .record_path = record_path };
+        if (runtime_remote) {
+            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .observation = if (observation_recipe) |path| .{ .allocator = a, .path = path, .output = observation_out.?, .threshold = observation_threshold } else null, .report_attach = true };
+            var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = capture_out, .profile_out = profile_out, .record_path = record_path, .startup = &startup };
             const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
                 .connection = 1,
+                .bootstrap = .{ .context = &startup, .run = RemoteStartup.run },
+                .run_once = if (observation_recipe != null) .{ .context = &startup, .run = RemoteStartup.observe } else null,
                 .shutdown = .{ .context = &shutdown, .run = RemoteShutdown.run },
                 .test_directory = @import("model/remote_test.zig").Probes.environment(),
                 .server = if (mcp) server else null,
@@ -447,8 +451,20 @@ pub fn main(init: std.process.Init) !void {
                 .source = source,
             });
             defer owner.destroy();
-            while (quitting == 0 and !owner.done.load(.acquire) and !owner.stopping.load(.acquire)) _ = c.usleep(20000);
+            var startup_input_closed = false;
+            while (quitting == 0 and !owner.done.load(.acquire) and !owner.stopping.load(.acquire)) {
+                if (owner.startup_error.load(.acquire) != 0) break;
+                // Inspect closure only; buffered MCP requests still belong to
+                // the owner. Once connected, its normal EOF/drain path applies.
+                if (mcp and !owner.connected.load(.acquire) and startupInputClosed(server.input_fd)) {
+                    startup_input_closed = true;
+                    break;
+                }
+                _ = c.usleep(20000);
+            }
             owner.join();
+            const startup_error = owner.startup_error.load(.acquire);
+            if (quitting == 0 and !startup_input_closed and startup_error != 0) return @errorFromInt(startup_error);
             if (owner.failure) |err| return err;
             return;
         }
@@ -561,6 +577,7 @@ pub fn main(init: std.process.Init) !void {
                 session.profile_defaults = preferences.profile.config();
                 session.allocation_defaults = preferences.allocations;
                 session.allocation_helper = allocation_helper;
+                if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
                 session.static_analysis.toolchain_dir = static_analysis;
                 session.debug_files.automatic = preferences.symbols.automatic;
                 session.debug_files.auto_file_limit = preferences.symbols.auto_file_bytes;
@@ -841,6 +858,21 @@ fn finishRemoteOwner(owner: *@import("model/remote_worker.zig").Worker, window: 
     }
     owner.joinCompleted();
 }
+fn startupInputClosed(fd: c_int) bool {
+    var poll = c.pollfd{ .fd = fd, .events = c.POLLIN | c.POLLRDHUP, .revents = 0 };
+    if (c.poll(&poll, 1, 0) > 0 and poll.revents & (c.POLLHUP | c.POLLRDHUP | c.POLLNVAL) != 0) {
+        // A client may write its whole batch and close before startup ends.
+        // Those requests are still owed an answer once the session connects.
+        var unread: c_int = 0;
+        return std.posix.errno(std.os.linux.ioctl(fd, std.os.linux.T.FIONREAD, @intFromPtr(&unread))) != .SUCCESS or unread <= 0;
+    }
+    // Empty redirected files have EOF without a pipe/socket hangup event.
+    // lseek(SEEK_CUR) observes the position without consuming protocol bytes.
+    var stat: c.struct_stat = undefined;
+    if (c.fstat(fd, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return false;
+    const position = c.lseek(fd, 0, c.SEEK_CUR);
+    return position >= 0 and position >= stat.st_size;
+}
 const RemoteStartup = struct {
     session: *Session,
     gdb: ?[:0]const u8,
@@ -850,6 +882,9 @@ const RemoteStartup = struct {
     follow: bool,
     breakpoints: []const []const u8,
     initial_actions: bool = true,
+    observation: ?struct { allocator: std.mem.Allocator, path: [:0]const u8, output: [:0]const u8, threshold: ?u64 } = null,
+    report_attach: bool = false, // headless prints the same attach lines as a local attach
+    completed: bool = false, // owner thread only: written here, read by RemoteShutdown
     fn run(context: *anyopaque, cancel: *@import("target/runtime.zig").c.struct_xrt_cancel) !void {
         const self: *RemoteStartup = @ptrCast(@alignCast(context));
         if (self.gdb) |endpoint| {
@@ -857,14 +892,31 @@ const RemoteStartup = struct {
         } else try self.session.target.connectRemoteCancel(self.transport, cancel);
         // A reconnect establishes a new transport only. Never replay attach,
         // launch, breakpoints, resume, or the old session's controller grant.
-        if (!self.initial_actions) return;
-        if (self.attach) |pid| try self.session.target.attach(pid);
+        if (!self.initial_actions) {
+            self.completed = true;
+            return;
+        }
+        if (self.attach) |pid| {
+            const started = linux.now();
+            if (self.report_attach) std.debug.print("xodb: attaching to pid={d}\n", .{pid});
+            self.session.target.attach(pid) catch |err| {
+                if (self.report_attach) std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
+                return err;
+            };
+            if (self.report_attach) std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
+        }
         if (self.launch.len > 0) try self.session.launch(self.launch);
         if (self.follow) try self.session.target.setFollowProcesses(true);
         for (self.breakpoints) |name| {
             try self.session.refreshMaps();
             _ = try self.session.persistent.addSymbol(self.session, name);
         }
+        self.completed = true;
+    }
+    fn observe(context: *anyopaque) !void {
+        const self: *RemoteStartup = @ptrCast(@alignCast(context));
+        const recipe = self.observation.?;
+        try @import("observe/cli.zig").run(recipe.allocator, self.session, recipe.path, recipe.output, recipe.threshold, &quitting);
     }
 };
 const RemoteShutdown = struct {
@@ -874,6 +926,7 @@ const RemoteShutdown = struct {
     capture_out: ?[:0]const u8,
     profile_out: ?[:0]const u8,
     record_path: ?[:0]const u8,
+    startup: ?*const RemoteStartup = null,
     fn run(context: *anyopaque) !void {
         const self: *RemoteShutdown = @ptrCast(@alignCast(context));
         defer self.destroyed.* = true;
@@ -881,7 +934,10 @@ const RemoteShutdown = struct {
         defer self.tree.deinitRemote();
         defer if (self.record_path) |path| self.session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
         defer exportProfileOnExit(self.session, self.profile_out);
-        try finishRequestedArchive(self.session, self.capture_out);
+        // A startup that failed or was cancelled has nothing to archive: the
+        // startup error, not a missing capture, is the result to report.
+        const started = if (self.startup) |startup| startup.completed else true;
+        try finishRequestedArchive(self.session, if (started) self.capture_out else null);
     }
 };
 fn exportProfileOnExit(session: *Session, profile_out: ?[:0]const u8) void {

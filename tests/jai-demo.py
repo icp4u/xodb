@@ -29,6 +29,7 @@ if a.kind=='pe':
  argv=[shutil.which(a.wine) or a.wine,str(exe),'Z:'+str(oracle)]
 else:argv=[str(exe),str(oracle)]
 from client import Client
+from helpers.tasks import children as task_children
 c=None;target=None;log=(w/'target.log').open('wb')
 def allow_parent():
  if libc.prctl(0x59616d61,os.getppid(),0,0,0)!=0:os._exit(127) # PR_SET_PTRACER
@@ -41,8 +42,7 @@ def descendants():
  out={};pending=[os.getpid()]
  while pending:
   parent=pending.pop()
-  try:children=Path(f'/proc/{parent}/task/{parent}/children').read_text().split()
-  except (FileNotFoundError,ProcessLookupError):continue
+  children=task_children(parent)
   for token in children:
    pid=int(token)
    if pid not in out:

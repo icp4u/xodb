@@ -369,7 +369,14 @@ An ordinary quit, primary stdio EOF, or reconnect closes admission immediately
 and gives the owner two seconds to finish its active operation and shutdown
 exports on the live connection. Queued commands are cancelled without dispatch.
 The deadline starts with the first stop request; repeated requests cannot extend
-it. Startup cancels immediately because no connected session exists to export.
+it. Both GUI and headless remote sessions connect, launch/attach, and install
+initial breakpoints on the owner. Startup cancels immediately because no
+connected session exists to export. The headless main thread observes signals
+and input hangup during startup without consuming MCP requests. A hangup with
+nothing left to read cancels that startup, as does an empty redirected input
+file. A client that wrote its requests and then closed is still answered: the
+unread requests are served once the session connects. After connection, observation-recipe
+CLI work uses the connected owner's normal graceful stop and archive cleanup.
 The owner also cancels an already-failed link before shutdown exports; releasing
 local handles does not claim that remote detach succeeded.
 The joining thread requests transport cancellation if the owner is still
@@ -377,7 +384,7 @@ working when the grace expires. Internal owner failures may cancel immediately.
 The grace bounds when cancellation is requested, not local disk writes or the
 final wait for an owned transport child to be reaped.
 
-Primary stdio EOF starts this grace only when the owner observes it. If the
+After connection, primary stdio EOF starts this grace only when the owner observes it. If the
 owner is inside a silent peer's request, the transport's absolute 10-second
 request timeout can elapse first. SIGINT/SIGTERM and GUI close are observed by
 the presentation/main thread and start the stop independently of that request.
@@ -391,7 +398,9 @@ again after acquisition. Cancellation cannot make a partially used stream reusab
 A sent mutation whose reply is lost returns `RemoteOutcomeUnknown`. It is not
 safe to repeat it automatically. Queued commands that were never dispatched
 finish cancelled. Local teardown cannot prove that the remote target detached,
-stopped, or cleaned up breakpoints.
+stopped, or cleaned up breakpoints. A transport child that has already been
+reaped after signal death has no live connection to retry; its local handles
+are released without claiming remote cleanup succeeded.
 
 `--profile-out`, `--capture-out`, and investigation export run before connection
 cancellation on a normal close. A stalled or already-broken connection still

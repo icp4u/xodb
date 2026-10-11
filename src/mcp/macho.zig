@@ -131,7 +131,23 @@ pub fn call(a: A, session: *Session, args: V) !V {
     try wire.fields(args, &.{ "address", "arch", "symbol", "symbol_address", "sections" });
     if (session.offline) return error.OfflineSession;
     const address = try hexArgument(args, "address") orelse return error.InvalidArguments;
-    var options = c.struct_xmo_options{ .cputype = 0, .max_read_bytes = read_budget };
+    if (session.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+        // The stub's address map and UUID-matched local symbols are available
+        // without opening a remote pathname or claiming local debug info.
+        for ([_][]const u8{ "arch", "symbol", "symbol_address", "sections" }) |field| if (args.object.contains(field)) return error.MachORemoteLabelOptions;
+        try session.gdb_map.refreshImages(&session.target);
+        const label = try session.gdb_map.label(a, address, address, session.debug_files.roots.items) orelse return error.MachOAddressUnavailable;
+        return wire.value(a, .{
+            .source = "gdb_remote_images",
+            .address = try hex(a, address),
+            .module_id = label.module,
+            .label = label.name,
+            .diagnostic = label.diagnostic,
+            .status = if (label.diagnostic) |reason| (if (std.mem.eql(u8, reason, "MachOSymbolsPending")) "pending" else "image_only") else "ready",
+        });
+    };
+    var options: c.struct_xmo_options = std.mem.zeroes(c.struct_xmo_options);
+    options.max_read_bytes = read_budget;
     if (args.object.get("arch")) |v| {
         if (v != .string) return error.InvalidArguments;
         options.cputype = if (std.mem.eql(u8, v.string, "arm64")) c.XMO_CPU_ARM64 else if (std.mem.eql(u8, v.string, "x86_64")) c.XMO_CPU_X86_64 else return error.InvalidArguments;

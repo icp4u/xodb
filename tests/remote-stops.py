@@ -64,9 +64,15 @@ try:
     server.remember_target(first)
     measured_pids = {'frontend': server.proc.pid}
     if not args.ssh_host:
-        children = Path(f'/proc/{server.proc.pid}/task/{server.proc.pid}/children').read_text().split()
+        # The remote owner now spawns the agent: inspect every frontend task.
+        children = set()
+        for task in Path(f'/proc/{server.proc.pid}/task').iterdir():
+            try:
+                children.update((task / 'children').read_text().split())
+            except (FileNotFoundError, ProcessLookupError):
+                pass
         assert len(children) == 1, children
-        measured_pids['agent'] = int(children[0])
+        measured_pids['agent'] = int(next(iter(children)))
     results['resources_before'] = resource_sample(measured_pids)
     one.tool('claim_session_control')
     ready_symbol = one.call('tools/call', {'name': 'find_symbol', 'arguments': {'name': 'remote_ready'}})['result']['structuredContent']

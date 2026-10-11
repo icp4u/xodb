@@ -4,6 +4,7 @@ import argparse, importlib.util, json, os, re, resource, signal, subprocess, tim
 from pathlib import Path
 from types import SimpleNamespace
 from client import Client
+from helpers.tasks import children as task_children
 p=argparse.ArgumentParser(description=__doc__);p.add_argument('--emacs',type=Path,required=True);p.add_argument('--work',type=Path,required=True)
 p.add_argument('--agent',type=Path);p.add_argument('--shared',action='store_true');p.add_argument('--strace',action='store_true');p.add_argument('--wrong-oracle',action='store_true')
 a=p.parse_args();os.umask(0o022);resource.setrlimit(resource.RLIMIT_CORE,(0,0))
@@ -82,7 +83,7 @@ try:
     if a.strace:
         observer=pid_host
         if a.agent:
-            children=Path(f'/proc/{observer}/task/{observer}/children').read_text().split();assert len(children)==1;observer=int(children[0])
+            children=task_children(observer);assert len(children)==1;observer=int(children[0])
         def ticks():return {q.name:(q/'schedstat').read_text().split()[0] for q in Path(f'/proc/{pid}/task').iterdir()}
         before_ticks=ticks();trace=w/'readonly.strace'
         tracer=subprocess.Popen(['strace','-f','-qq','-o',str(trace),'-e','trace=ptrace,process_vm_readv,process_vm_writev,pread64,pwrite64,pwritev,pwritev2,kill,tgkill,tkill','-p',str(observer)],stderr=subprocess.PIPE)

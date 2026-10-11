@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 from helpers.readonly import audit
+from helpers.tasks import children as task_children
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--source',required=True);p.add_argument('--library',required=True)
 p.add_argument('--work',required=True,type=Path);p.add_argument('--agent',type=Path);p.add_argument('--strace',action='store_true');a=p.parse_args()
@@ -46,7 +47,7 @@ try:
     if a.strace:
         collector=server.proc.pid
         if a.agent:
-            children=Path(f'/proc/{collector}/task/{collector}/children').read_text().split();assert len(children)==1;collector=int(children[0])
+            children=task_children(collector);assert len(children)==1;collector=int(children[0])
         adapter=SimpleNamespace(p=SimpleNamespace(pid=collector),inspect=observer.tool,session=observer.session)
         report['readonly']=audit(adapter,tid,w/'named.strace',lambda:(observer.tool('get_language_locals',**args),observer.tool('evaluate_language_expression',**args,expression='shadow')))
     s.expect_error(observer.raw('evaluate_language_expression',**(args|{'generation':generation+1}),expression='shadow'),'StaleSnapshot')

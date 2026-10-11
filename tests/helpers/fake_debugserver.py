@@ -26,6 +26,13 @@ class Fake(threading.Thread):
 
     def lookup(self, request):
         ex, at = self.exchanges, self.at
+        # Suppressing load commands changes the requested fields, not the
+        # image snapshot. Older recordings can still answer the new query with
+        # their recorded reduced fields; consumers explicitly handle absence.
+        if request == 'jGetLoadedDynamicLibrariesInfos:{"fetch_all_solibs":true}':
+            reduced = request[:-1] + ',"report_load_commands":false}'
+            if any(q == reduced for q, _ in self.exchanges):
+                request = reduced
         if at < len(ex) and ex[at][0] == request:
             self.at = at + 1; return ex[at][1]
         after = next((i for i in range(at, len(ex)) if run_control(ex[i][0])), len(ex))
@@ -38,7 +45,14 @@ class Fake(threading.Thread):
         if later:
             self.at = later[0] + 1; return ex[later[0]][1]
         earlier = [i for i in range(before, at) if ex[i][0] == request]
-        return ex[earlier[-1]][1] if earlier else None
+        if earlier: return ex[earlier[-1]][1]
+        # Older launch recordings do not query images at every stop. For a
+        # supplementary image read, replay the last recorded list, never a
+        # future list. Dynamic-image tests supply each stop's own snapshot.
+        if request.startswith('jGetLoadedDynamicLibrariesInfos:'):
+            previous = [i for i in range(at) if ex[i][0] == request]
+            if previous: return ex[previous[-1]][1]
+        return None
 
     def run(self):
         try:

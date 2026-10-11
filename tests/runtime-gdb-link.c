@@ -81,7 +81,7 @@ enum { BIG_GOOD, BIG_MEDIUM, BIG_PLAIN, BIG_CHECKSUM, BIG_DOLLAR, BIG_ENDLESS, B
 static void oversized(int kind)
 {
     int pair[2]; assert(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
-    const size_t body = kind == BIG_MEDIUM ? 70000 : 300000;
+    const size_t body = kind == BIG_MEDIUM ? XRT_GDB_PAYLOAD_MAX + 10000 : 2 * XRT_GDB_PAYLOAD_MAX + 4096;
     pid_t child = fork(); assert(child >= 0);
     if (!child) {
         close(pair[0]);

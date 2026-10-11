@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
-    (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit')),
-    (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown',)),
+    (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
+    (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
     (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
       'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
     (('src/runtime/remote_perf.c', 'src/runtime/perf_internal.h', 'src/runtime/xrt_perf.h', 'src/profile/linux_*.zig', 'src/profile/capture.zig'), ('gui-remote-profile-close', 'gui-remote-profile-ack-close')),
@@ -38,7 +38,8 @@ COVERS = (
     (('tests/metadata-ready-validation.c', 'src/runtime/file_view.c', 'src/runtime/xrt_files.h', 'src/debug/metadata_job.c'), ('metadata-ready-validation', 'javascript-watches*', 'metadata-session*')),
     (('src/binary/pe*', 'src/binary/pdb*', 'src/debug/pe_unwind.c', 'src/model/pe_images.zig',
       'tests/pe-*', 'tests/pdb-*', 'tests/fixtures/pe/*'), ('pe-*', 'pdb-*', 'jai-pe-demo-*')),
-    (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*',)),
+    (('src/model/macho_images.zig', 'src/model/gdb_images.zig', 'src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'tests/macos-names*.py', 'tests/fixtures/macos-names/*'), ('macos-names*', 'gui-macos-names', 'gdb-debugserver*')),
+    (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*', 'macos-names*', 'gui-macos-names')),
     (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
      ('runtime-host', 'runtime-agent', 'shared-processes', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
@@ -132,11 +133,11 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
-    'remote-unknown-matrix',
+    'remote-unknown-matrix', 'remote-startup-matrix',
     'gui-remote-publication', 'gui-owner-*',
     'image-budget-lifecycle*', 'image-budget-regressions*', 'image-budget-torch',
     'gui-scene3d-evidence', 'gui-gibson-evidence',
-    'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout', 'gdb-debugserver-deadline',
+    'macos-names-matrix', 'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout', 'gdb-debugserver-deadline',
     'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
     'symbol-discovery', 'symbol-discovery-install', 'source-fetch', 'lsof-top', 'memory-observer', 'sysstat-nvml',
     'metadata-session-agent', 'm2-preferences-agent', 'python-lua-named-1',
@@ -354,10 +355,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('remote-exit-export', [sys.executable, '-B', 'tests/remote-exit-export.py', '--work', '.work/rexit'], 60))
         steps.append(('remote-exit-export-stdio', [sys.executable, '-B', 'tests/remote-exit-export.py', '--stdio', '--work', '.work/rexit-stdio'], 60))
         steps.append(('remote-broken-exit', [sys.executable, '-B', 'tests/remote-broken-exit.py', '--work', '.work/rbroken'], 60))
+        steps.append(('remote-startup', [sys.executable, '-B', 'tests/remote-startup.py', '--work', '.work/rstartup'], 120))
+        steps.append(('remote-startup-matrix', [sys.executable, '-B', 'tests/remote-startup.py', '--matrix', '--work', '.work/rstartup-matrix'], 180))
         steps.append(('remote-unknown', [sys.executable, '-B', 'tests/remote-unknown.py', '--work', '.work/runknown'], 60))
         steps.append(('remote-unknown-matrix', [sys.executable, '-B', 'tests/remote-unknown.py', '--matrix', '--work', '.work/runknown-matrix'], 120))
         # A recorded Apple debugserver session replayed by a loopback stub, then hostile replies.
         # The one case that waits out the five-second request deadline runs in periodic.
+        steps.append(('macos-names', [sys.executable, '-B', 'tests/macos-names.py', '--work', '.work/macos-names'], 120))
+        steps.append(('macos-names-matrix', [sys.executable, '-B', 'tests/macos-names.py', '--matrix', '--only', 'large-index', '--work', '.work/macos-names-matrix'], 120))
         steps.append(('gdb-debugserver', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver',
                       '--skip', 'truncated-packet'], 60))
         steps.append(('gdb-debugserver-deadline', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver-deadline',
@@ -580,6 +585,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-gdb-close', ['tests/remote-gdb-close-gui.py']),
             ('gui-remote-startup', ['tests/remote-reconnect-gui.py', '--startup']),
             ('gui-remote-reconnect', ['tests/remote-reconnect-gui.py']),
+            ('gui-macos-names', ['tests/macos-names-gui.py']),
             ('gui-remote-publication', ['tests/remote-publication-gui.py']),
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),

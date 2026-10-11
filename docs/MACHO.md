@@ -137,18 +137,66 @@ Memory use follows the retained counter: 16 bytes per symbol, 4 more for the
 address index and 8 for the name index, 8 per function start, 24 per debug-map
 function. An image at the symbol cap retains about 56 MiB.
 
+## Names on a Darwin GDB target
+
+For a target behind Apple debugserver, stopped image lists provide UUIDs,
+architecture and executable segment ranges. Stack frames use `image!symbol+offset`
+when a configured local binary matches, and `image+offset` otherwise, including
+shared-cache frames. Return addresses are stripped to the stub's reported
+address width before lookup (47 bits on the recorded arm64e target).
+
+```sh
+xodb --gdb-remote 127.0.0.1:2345 --exe ./program --debug-dir /opt/corpus/bin
+```
+
+`--exe` is an explicit local executable. Each `--debug-dir` is searched for an
+image's basename only; the target's directory names are never opened here.
+Files must be regular, without a final symlink, and their LC_UUID, CPU and
+subtype must match the stopped image. Universal binaries select the recorded
+subtype, including arm64e; capability bits do not change subtype matching.
+The pinned file's identity is checked during indexing and before each cached
+lookup. A mismatch or changed file produces a typed diagnostic and an image
+offset, never a name from the wrong file.
+
+One background worker at a time loads the address index and bounded string
+table. Frame queries do no table reads. `MachOSymbolsPending` becomes ready on
+a later query; the GUI refreshes when the metadata revision changes. Up to
+32 cached images share 256 MiB and the process-wide image budget. Each worker
+may retain at most 96 MiB of parser data plus a conservative 128 KiB overhead
+reservation, released down to retained size when it joins. Reads across all
+candidate directories share a 128 MiB / 262,144-read cap and a ten-second
+construction deadline checked at reads. Sorting is bounded by the existing
+2,097,152-symbol cap. The stopped image list has at most 4,096 images, 64
+segments per image and 16,384 executable intervals; overlapping code intervals
+refuse ambiguous labels. These map records and the bounded GDB packet buffers
+are separate from the symbol cache's retained-byte figure.
+
+On a Darwin GDB target, `get_macho_image` with only `address` labels a runtime
+code address through the same map and local cache. It returns `pending`,
+`ready`, or `image_only`, with the label, module ID and diagnostic. Other
+options belong to the existing mapped-file inspection mode and refuse on
+this path. The background path supports indexed images above 131,072 symbols;
+the synchronous mapped-file tool retains its smaller lookup limit.
+
+Image lists are refreshed at each stopped generation. Unloaded images lose
+their mappings, and completed metadata for departed UUIDs is released; a
+pending worker is cancelled before it can be reused. IDs remain stable for
+an unchanged UUID at the same address. The map is not a shared-cache symbol
+extractor: source lines, locals, compact unwind and system symbol names still
+require further metadata. A labelled link-register address is not proof that
+it is an additional stack frame.
+
 ## Not read yet
 
 | Missing | Effect | Where it belongs |
 | --- | --- | --- |
-| Live module discovery on a macOS target | no Mach-O image appears in the module list or in stacks | with the macOS target's image list (dyld's image infos), feeding this reader in the memory layout |
 | Debug info | no source lines, locals or types | debug map (`N_OSO` to the `.o` files) and `.dSYM` by `LC_UUID`, into the DWARF readers |
 | Compact unwind and `__eh_frame` | no Mach-O stack unwinding | a `__unwind_info` decoder that hands DWARF-mode entries to the existing CFI code |
 | The dyld shared cache as a file | `unsupported`; cache libraries are read from memory instead | a cache-file reader, with the `.symbols` file for stripped locals |
 | Exports trie, chained fixups, bind and rebase opcodes | exported-only names of stripped images are not found; pointers in a file are not resolved | with symbolication of stripped system libraries |
 | 32-bit, big-endian, arm64_32 | `unsupported` | not planned |
 | More than 2,097,152 symbols | `limit` | raise the cap with the retained budget when a real image needs it |
-| Symbol lookup over MCP in a file with more than 131,072 symbols | `symbol` and `symbol_at` report `limit` | with images that are kept between calls and indexed by a background job, as PE images are |
+| Synchronous mapped-file MCP lookup above 131,072 symbols | `symbol` and `symbol_at` report `limit` | use the background Darwin image path for indexed frame labels |
 
 ## Tests
 
@@ -164,3 +212,8 @@ those are installed. `tests/macho-image.py --fuzz` adds the cap-sized cases
 and a 30-second libFuzzer run of `tests/macho-fuzz.c`. `tests/macho-mcp.py`
 checks `get_macho_image` on the native runtime, through the runtime agent and
 as a shared observer.
+
+`tests/macos-names.py` replays owned Apple-linked C/C++/Objective-C/Swift,
+stripped, universal and arm64e recordings, the abort address example, and
+dlopen/dlclose. Hostile UUIDs, ranges and local files must refuse. Its periodic
+matrix exercises an index above 131,072 symbols and a small image budget.

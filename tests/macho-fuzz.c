@@ -14,10 +14,17 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
     if (!size) return 0;
     struct input in = { data+1, size-1 };
     struct xmo_source source = { &in, in.size, (data[0]&1) ? XMO_MEMORY : XMO_FILE, bytes };
-    struct xmo_options options = { (data[0]&2) ? XMO_CPU_X86_64 : (data[0]&4) ? XMO_CPU_ARM64 : 0, (data[0]&8) ? 4096 : 0 };
+    struct xmo_options options = {
+        .cputype = (data[0]&2) ? XMO_CPU_X86_64 : (data[0]&4) ? XMO_CPU_ARM64 : 0,
+        .max_read_bytes = (data[0]&8) ? 4096 : 0,
+        .cpusubtype = (data[0]&16) ? XMO_CPU_SUBTYPE_ARM64E : 0,
+        .match_subtype = (data[0]&64) != 0,
+        .max_retained_bytes = (data[0]&128) ? 4*1024*1024 : 0,
+    };
     struct xmo_image *p = NULL;
     if (xmo_load(&source, &options, &p) != XMO_OK) return 0;
     const struct xmo_info *info = xmo_info(p);
+    if (data[0]&32) (void)xmo_prepare_labels(p);
     const struct xmo_symbol *found;
     struct xmo_debug_map map;
     const uint64_t *starts;
@@ -50,6 +57,7 @@ int LLVMFuzzerTestOneInput(const unsigned char *data, size_t size) {
         for (uint32_t i=0; i<map.function_count; ++i) if (map.functions[i].object != UINT32_MAX && map.functions[i].object >= map.object_count) __builtin_trap();
     }
     if (info->retained_bytes > XMO_MAX_RETAINED_BYTES || info->source_bytes > XMO_MAX_READ_BYTES) __builtin_trap();
+    if (options.max_retained_bytes && info->retained_bytes > options.max_retained_bytes) __builtin_trap();
     xmo_destroy(p);
     return 0;
 }

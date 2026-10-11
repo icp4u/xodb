@@ -8,7 +8,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define XRT_GDB_PAYLOAD_MAX 65536u
+#define XRT_GDB_PAYLOAD_MAX 524288u
 #define XRT_GDB_WIRE_MAX (2u * XRT_GDB_PAYLOAD_MAX + 4u)
 /* One complete frame is consumed on decode errors. NEED_MORE consumes none.
  * A malformed prefix consumes at least one byte so a stream can recover.

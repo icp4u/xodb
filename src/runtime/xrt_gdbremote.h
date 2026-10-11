@@ -14,6 +14,7 @@
 #define XRT_GDB_CAP_IMAGES (UINT64_C(1) << 9)
 #define XRT_GDB_REGIONS_MAX 4096
 #define XRT_GDB_IMAGES_MAX 4096
+#define XRT_GDB_IMAGE_SEGMENTS_MAX 64
 /* The target's operating system selects its signal numbering. Unknown keeps
  * the GDB protocol numbers and their Linux display mapping. */
 enum xrt_gdb_os { XRT_GDB_OS_UNKNOWN, XRT_GDB_OS_LINUX, XRT_GDB_OS_DARWIN };
@@ -31,10 +32,19 @@ struct xrt_gdb_region {
     bool mapped, read, write, execute;
     char type[32], name[128];
 };
+struct xrt_gdb_image_segment {
+    uint64_t vmaddr, vmsize;
+    uint32_t maxprot;
+    char name[17];
+};
 struct xrt_gdb_image {
     uint64_t load_address;
     bool path_truncated;
     char path[256];
+    bool has_uuid, has_header;
+    unsigned char uuid[16];
+    uint32_t cputype, cpusubtype, filetype, segment_count;
+    struct xrt_gdb_image_segment segments[XRT_GDB_IMAGE_SEGMENTS_MAX];
 };
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out);
 enum xrt_status xrt_target_gdb_remote_cancel(const char *endpoint, struct xrt_target **out, struct xrt_cancel *);

@@ -91,11 +91,14 @@ static void image_lists(void)
     rows[1].load_address = 7;
     assert(parse_images(images, rows, 1, &total) == XRT_OK && total == 2 && rows[1].load_address == 7);
     assert(parse_images(images, NULL, 0, &total) == XRT_OK && total == 2);
-    /* Load commands and unknown members are skipped, whatever their shape. */
-    const char *full = " { \"other\" : [1,2.5e-3,true,null,{\"a\":\"b\\\"c\"}] , \"images\" : [ {\"mach_header\":{\"magic\":4277009103},"
-        "\"segments\":[{\"name\":\"__TEXT\",\"vmaddr\":0}],\"pathname\":\"a\\/b\\u00e9\\n\",\"load_address\":16 } ] } ";
+    /* UUID/header/segments are retained; unknown members remain skippable. */
+    const char *full = " { \"other\" : [1,2.5e-3,true,null,{\"a\":\"b\\\"c\"}] , \"images\" : [ {\"mach_header\":{\"magic\":4277009103,\"cputype\":16777228,\"cpusubtype\":2,\"filetype\":2},"
+        "\"uuid\":\"01234567-89AB-CDEF-0123-456789ABCDEF\","
+        "\"segments\":[{\"name\":\"__TEXT\",\"vmaddr\":0,\"vmsize\":4096,\"maxprot\":5}],\"pathname\":\"a\\/b\\u00e9\\n\",\"load_address\":16 } ] } ";
     assert(parse_images(full, rows, 4, &total) == XRT_OK && total == 1);
     assert(rows[0].load_address == 16 && !strcmp(rows[0].path, "a/b??"));
+    assert(rows[0].has_uuid && rows[0].uuid[15] == 0xef && rows[0].has_header && rows[0].cpusubtype == 2);
+    assert(rows[0].segment_count == 1 && rows[0].segments[0].vmsize == 4096 && rows[0].segments[0].maxprot == 5);
     assert(parse_images("{\"images\":[]}", rows, 4, &total) == XRT_OK && !total);
     char longpath[900]; int n = snprintf(longpath, sizeof(longpath), "{\"images\":[{\"load_address\":1,\"pathname\":\"");
     memset(longpath + n, 'p', 600); strcpy(longpath + n + 600, "\"}]}");
@@ -111,7 +114,10 @@ static void image_lists(void)
         "{\"images\":[{\"load_address\":1}]}x", "{\"images\":[{\"load_address\":1}]", "{\"images\":[{\"load_address\":1,\"pathname\":\"a",
         "{\"images\":[{\"load_address\":1,\"pathname\":\"a\\q\"}]}", "{\"images\":[{\"load_address\":1,\"pathname\":\"a\\u00g0\"}]}",
         "{\"images\":[{\"load_address\":1,\"pathname\":\"a\tb\"}]}", "{\"images\":[{\"load_address\":1,\"x\":tru}]}",
-        "{\"images\":[{\"load_address\":1 \"x\":1}]}", "{images:[]}"};
+        "{\"images\":[{\"load_address\":1 \"x\":1}]}", "{images:[]}",
+        "{\"images\":[{\"load_address\":1,\"uuid\":\"bad\"}]}",
+        "{\"images\":[{\"load_address\":1,\"mach_header\":{\"cputype\":1}}]}",
+        "{\"images\":[{\"load_address\":1,\"segments\":[{\"name\":\"__TEXT\",\"vmaddr\":18446744073709551615,\"vmsize\":1,\"maxprot\":5}]}]}"};
     for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
         assert(parse_images(bad[i], rows, 4, &total) == XRT_PROTOCOL_ERROR);
     /* Nesting is bounded: depth 12 inside an image is accepted, depth 40 is not. */

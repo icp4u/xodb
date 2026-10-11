@@ -30,6 +30,9 @@ struct xmo_source {
 struct xmo_options {
     uint32_t cputype;        /* FAT: wanted slice; 0 takes the first supported one */
     uint64_t max_read_bytes; /* 0 or above the hard cap: XMO_MAX_READ_BYTES */
+    uint32_t cpusubtype;     /* Match the low 24 bits when match_subtype is set. */
+    unsigned match_subtype;
+    uint64_t max_retained_bytes; /* 0 or above the hard cap: XMO_MAX_RETAINED_BYTES */
 };
 
 #define XMO_MAX_CHUNK 65536u
@@ -167,6 +170,10 @@ enum xmo_status xmo_symbol_find(struct xmo_image *, const char *name, const stru
  * size runs to the next symbol, the next function start or the section end,
  * whichever is first. External symbols win ties. */
 enum xmo_status xmo_symbol_at(struct xmo_image *, uint64_t address, const struct xmo_symbol **, uint64_t *size);
+/* Background preparation for address labels: builds the address index and
+ * retains the bounded string table. Later symbol_at/string calls do no I/O.
+ * Missing tables are allowed and retain their ordinary unavailable status. */
+enum xmo_status xmo_prepare_labels(struct xmo_image *);
 /* Ascending link addresses from LC_FUNCTION_STARTS. */
 enum xmo_status xmo_function_starts(struct xmo_image *, const uint64_t **addresses, uint32_t *count);
 enum xmo_status xmo_debug_map(struct xmo_image *, struct xmo_debug_map *);

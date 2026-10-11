@@ -68,8 +68,8 @@ def replay(exchanges, static, log):
 
 def images_too_large(exchanges, static, log):
     row = '{"load_address":4294967296,"mod_date":0,"pathname":"/tmp/xodb-fixture/' + 'a' * 200 + '"},'
-    huge = '{"images":[' + row * 1500 + row[:-1] + ']}'
-    assert len(huge) > 300000
+    huge = '{"images":[' + row * 4000 + row[:-1] + ']}'
+    assert len(huge) > 524288
     hostile = Replace(lambda request, replies: request.startswith(IMAGES), lambda request, replies: huge)
     fake, client = session(exchanges, hostile)
     regions, images = scenario.modules(client)

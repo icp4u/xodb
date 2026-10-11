@@ -243,9 +243,78 @@ static bool skip(struct json *j, unsigned depth)
     uint64_t value; bool integer;
     return numeral(j, &value, &integer);
 }
+static bool unsigned_number(struct json *j, uint64_t *out)
+{
+    bool integer;
+    return numeral(j, out, &integer) && integer;
+}
+static bool image_uuid(struct json *j, unsigned char out[16])
+{
+    char value[37]; bool cut;
+    if (!text(j, value, sizeof value, &cut) || cut || strlen(value) != 36) return false;
+    size_t at = 0;
+    for (unsigned i = 0; i < 16; ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10) if (value[at++] != '-') return false;
+        int a = hex((unsigned char)value[at++]), b = hex((unsigned char)value[at++]);
+        if (a < 0 || b < 0) return false;
+        out[i] = (unsigned char)(a * 16 + b);
+    }
+    return true;
+}
+static bool image_header(struct json *j, struct xrt_gdb_image *out)
+{
+    unsigned seen = 0; char key[32];
+    if (!take(j, '{') || take(j, '}')) return false;
+    do {
+        if (!text(j, key, sizeof key, NULL) || !take(j, ':')) return false;
+        unsigned bit = !strcmp(key, "cputype") ? 1 : !strcmp(key, "cpusubtype") ? 2 : !strcmp(key, "filetype") ? 4 : 0;
+        if (!bit) { if (!skip(j, 4)) return false; continue; }
+        uint64_t n;
+        if ((seen & bit) || !unsigned_number(j, &n) || n > UINT32_MAX) return false;
+        seen |= bit;
+        if (bit == 1) out->cputype = (uint32_t)n;
+        else if (bit == 2) out->cpusubtype = (uint32_t)n;
+        else out->filetype = (uint32_t)n;
+    } while (take(j, ','));
+    return take(j, '}') && seen == 7;
+}
+static bool image_segment(struct json *j, struct xrt_gdb_image_segment *out)
+{
+    unsigned seen = 0; char key[32];
+    *out = (struct xrt_gdb_image_segment){0};
+    if (!take(j, '{') || take(j, '}')) return false;
+    do {
+        if (!text(j, key, sizeof key, NULL) || !take(j, ':')) return false;
+        unsigned bit = !strcmp(key, "name") ? 1 : !strcmp(key, "vmaddr") ? 2 : !strcmp(key, "vmsize") ? 4 : !strcmp(key, "maxprot") ? 8 : 0;
+        if (!bit) { if (!skip(j, 5)) return false; continue; }
+        if (seen & bit) return false;
+        seen |= bit;
+        if (bit == 1) {
+            bool cut;
+            if (!text(j, out->name, sizeof out->name, &cut) || cut) return false;
+        } else {
+            uint64_t n;
+            if (!unsigned_number(j, &n)) return false;
+            if (bit == 2) out->vmaddr = n;
+            else if (bit == 4) out->vmsize = n;
+            else { if (n > 7) return false; out->maxprot = (uint32_t)n; }
+        }
+    } while (take(j, ','));
+    return take(j, '}') && seen == 15 && out->vmsize <= UINT64_MAX-out->vmaddr;
+}
+static bool image_segments(struct json *j, struct xrt_gdb_image *out)
+{
+    if (!take(j, '[')) return false;
+    if (take(j, ']')) return true;
+    do {
+        if (out->segment_count == XRT_GDB_IMAGE_SEGMENTS_MAX || !image_segment(j, &out->segments[out->segment_count])) return false;
+        ++out->segment_count;
+    } while (take(j, ','));
+    return take(j, ']');
+}
 static bool image(struct json *j, struct xrt_gdb_image *out)
 {
-    bool has_address = false, has_path = false;
+    bool has_address = false, has_path = false, has_segments = false;
     char key[32];
     *out = (struct xrt_gdb_image){0};
     if (!take(j, '{')) return false;
@@ -259,6 +328,15 @@ static bool image(struct json *j, struct xrt_gdb_image *out)
         } else if (!strcmp(key, "pathname")) {
             if (has_path || !text(j, out->path, sizeof(out->path), &out->path_truncated)) return false;
             has_path = true;
+        } else if (!strcmp(key, "uuid")) {
+            if (out->has_uuid || !image_uuid(j, out->uuid)) return false;
+            out->has_uuid = true;
+        } else if (!strcmp(key, "mach_header")) {
+            if (out->has_header || !image_header(j, out)) return false;
+            out->has_header = true;
+        } else if (!strcmp(key, "segments")) {
+            if (has_segments || !image_segments(j, out)) return false;
+            has_segments = true;
         } else if (!skip(j, 3)) return false;
     } while (take(j, ','));
     return take(j, '}') && has_address;

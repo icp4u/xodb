@@ -32,7 +32,7 @@ struct lazy { unsigned done; enum xmo_status status; };
 struct xmo_image {
     struct xmo_source source;
     struct xmo_info info;
-    uint64_t base, limit, read_limit; /* base/limit: the slice inside a FILE source */
+    uint64_t base, limit, read_limit, retained_limit; /* base/limit: the slice inside a FILE source */
     struct xmo_fat_arch fat[XMO_MAX_FAT_ARCH];
     unsigned char *commands;
     struct xmo_segment *segments;
@@ -45,6 +45,7 @@ struct xmo_image {
     struct xmo_symbol *symbols;
     uint32_t symbol_count;
     uint64_t strings_at;
+    unsigned char *strings;
     uint32_t *by_address, address_count; /* (value, external first, index) order */
     uint32_t *hashes, *by_name, name_count; /* (hash, index) order */
     uint64_t *starts;
@@ -110,7 +111,7 @@ static enum xmo_status fetch(struct xmo_image *p, uint64_t at, void *out, uint64
     return XMO_OK;
 }
 static enum xmo_status retain(struct xmo_image *p, uint64_t count, size_t each, void *out) {
-    if (!count || count > (XMO_MAX_RETAINED_BYTES-p->info.retained_bytes)/each) return XMO_LIMIT;
+    if (!count || count > (p->retained_limit-p->info.retained_bytes)/each) return XMO_LIMIT;
     void *result = calloc((size_t)count, each);
     if (!result) return XMO_NOMEM;
     p->info.retained_bytes += count*each;
@@ -336,7 +337,8 @@ static enum xmo_status fat(struct xmo_image *p, const struct xmo_options *option
         if (!a->size || a->offset < table_end || !span(a->offset, a->size, p->source.size)) return XMO_MALFORMED;
         for (uint32_t j=0; j<i; ++j) if (overlap(a->offset, a->size, p->fat[j].offset, p->fat[j].size)) return XMO_MALFORMED;
         int supported = a->cputype == XMO_CPU_ARM64 || a->cputype == XMO_CPU_X86_64;
-        if (!chosen && (options && options->cputype ? a->cputype == options->cputype : supported)) chosen = a;
+        if (!chosen && (options && options->cputype ? a->cputype == options->cputype : supported) &&
+            (!options || !options->match_subtype || (a->cpusubtype & XMO_CPU_SUBTYPE_MASK) == (options->cpusubtype & XMO_CPU_SUBTYPE_MASK))) chosen = a;
     }
     p->info.fat_count = count; p->info.fat_64 = wide != 0;
     if (!chosen) return options && options->cputype ? XMO_NOT_FOUND : XMO_UNSUPPORTED;
@@ -349,7 +351,7 @@ static enum xmo_status fat(struct xmo_image *p, const struct xmo_options *option
     if (!memcmp(raw, "!<arch>\n", 8)) return XMO_UNSUPPORTED;
     status = thin(p);
     if (status == XMO_NOT_MACHO) return XMO_MALFORMED;
-    if (status == XMO_OK && p->info.cputype != chosen->cputype) return XMO_MALFORMED;
+    if (status == XMO_OK && (p->info.cputype != chosen->cputype || p->info.cpusubtype != chosen->cpusubtype)) return XMO_MALFORMED;
     return status;
 }
 enum xmo_status xmo_load(const struct xmo_source *source, const struct xmo_options *options, struct xmo_image **out) {
@@ -362,6 +364,7 @@ enum xmo_status xmo_load(const struct xmo_source *source, const struct xmo_optio
     if (!p) return XMO_NOMEM;
     p->source = *source; p->limit = source->size;
     p->read_limit = options && options->max_read_bytes && options->max_read_bytes < XMO_MAX_READ_BYTES ? options->max_read_bytes : XMO_MAX_READ_BYTES;
+    p->retained_limit = options && options->max_retained_bytes && options->max_retained_bytes < XMO_MAX_RETAINED_BYTES ? options->max_retained_bytes : XMO_MAX_RETAINED_BYTES;
     enum xmo_status status = fetch(p, 0, magic, sizeof magic);
     if (status == XMO_OK) {
         uint32_t stored = be32(magic);
@@ -374,7 +377,7 @@ enum xmo_status xmo_load(const struct xmo_source *source, const struct xmo_optio
 }
 void xmo_destroy(struct xmo_image *p) {
     if (!p) return;
-    free(p->commands); free(p->segments); free(p->sections); free(p->dylibs); free(p->symbols);
+    free(p->commands); free(p->segments); free(p->sections); free(p->dylibs); free(p->symbols); free(p->strings);
     free(p->by_address); free(p->hashes); free(p->by_name); free(p->starts); free(p->objects); free(p->functions);
     free(p);
 }
@@ -477,6 +480,15 @@ static enum xmo_status name_at(struct xmo_image *p, uint32_t strx, char *out, si
     uint64_t size = p->info.string_size, at = strx;
     size_t done = 0;
     *defect = XMO_OK;
+    if (p->strings) {
+        if (at >= size) { *defect = XMO_MALFORMED; return XMO_OK; }
+        size_t available = size-at < capacity ? (size_t)(size-at) : capacity;
+        const unsigned char *end = memchr(p->strings+at, 0, available);
+        if (!end) { *defect = available == capacity ? XMO_LIMIT : XMO_MALFORMED; return XMO_OK; }
+        *length = (size_t)(end-(p->strings+at));
+        memcpy(out, p->strings+at, *length+1);
+        return XMO_OK;
+    }
     for (;;) {
         if (at >= size) { *defect = XMO_MALFORMED; return XMO_OK; }
         uint64_t start = at&~(uint64_t)(PAGE-1);
@@ -694,7 +706,7 @@ static enum xmo_status load_starts(struct xmo_image *p) {
                 if (p->start_count == XMO_MAX_FUNCTION_STARTS) return XMO_LIMIT;
                 if (wider > XMO_MAX_FUNCTION_STARTS) wider = XMO_MAX_FUNCTION_STARTS;
                 uint64_t more = (uint64_t)(wider-p->start_capacity)*sizeof *p->starts;
-                if (more > XMO_MAX_RETAINED_BYTES-p->info.retained_bytes) return XMO_LIMIT;
+                if (more > p->retained_limit-p->info.retained_bytes) return XMO_LIMIT;
                 uint64_t *grown = realloc(p->starts, (size_t)wider*sizeof *p->starts);
                 if (!grown) return XMO_NOMEM;
                 p->starts = grown; p->start_capacity = wider; p->info.retained_bytes += more;
@@ -717,6 +729,21 @@ enum xmo_status xmo_function_starts(struct xmo_image *p, const uint64_t **addres
     if (addresses) *addresses = status == XMO_OK ? p->starts : NULL;
     if (count) *count = status == XMO_OK ? p->start_count : 0;
     return status;
+}
+enum xmo_status xmo_prepare_labels(struct xmo_image *p) {
+    if (!p) return XMO_MALFORMED;
+    enum xmo_status status = once_loaded(p, &p->address_state, load_addresses);
+    if (status != XMO_OK && status != XMO_UNAVAILABLE) return status;
+    if (status == XMO_OK && p->info.string_size && !p->strings) {
+        unsigned char *strings = NULL;
+        status = retain(p, p->info.string_size, 1, &strings);
+        if (status != XMO_OK) return status;
+        status = fetch(p, p->strings_at, strings, p->info.string_size);
+        if (status != XMO_OK) { release(p, strings, p->info.string_size, 1); return status; }
+        p->strings = strings;
+    }
+    status = xmo_function_starts(p, NULL, NULL);
+    return status == XMO_UNAVAILABLE ? XMO_OK : status;
 }
 
 /* ld's debug map, in table order: N_SO directory, N_SO file, N_OSO object

@@ -117,7 +117,7 @@ not read local `/proc` files using those IDs for target memory or registers.
 
 ## Bounds and validation
 
-Packets are limited to 64 KiB decoded, with a bounded escaped frame, checksum
+Packets are limited to 512 KiB decoded, with a bounded escaped frame, checksum
 validation, at most three retransmissions, and at most 128 frames per receive.
 TCP connect and individual request waits have five-second deadlines. All
 exchanges in one target call share a ten-second operation deadline; opening

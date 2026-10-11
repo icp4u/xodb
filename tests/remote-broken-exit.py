@@ -37,7 +37,13 @@ def proxy(directory, agent):
         if children and not (directory/'agent.json').exists():
             (directory/'agent.json').write_text(json.dumps(identity(int(children[0]))))
         only = (directory/'arm').read_text() if (directory/'arm').exists() else None
-        if only is not None and (not only or row['op'] == int(only)):
+        kill = only is not None and only.startswith('kill:')
+        selected = only.removeprefix('kill:') if only is not None else None
+        if selected is not None and (not selected or row['op'] == int(selected)):
+            if kill:
+                (directory/'fault.pending').write_text(json.dumps(dict(phase='killed', op=row['op'])))
+                (directory/'fault.pending').replace(directory/'fault.json')
+                os.kill(os.getpid(), signal.SIGKILL)
             # Lose the stream, but keep its direct child alive until teardown.
             os.close(1)
             os.close(0)
@@ -75,7 +81,7 @@ def run(args):
     result = dict(status='running', rows=rows, load=os.getloadavg())
     started = time.monotonic()
     try:
-        for mode, stop in [('close', 'sigint'), ('dead', 'sigint'), ('close', 'eof'), ('dead', 'eof'), ('late', 'sigint')]:
+        for mode, stop in [('close', 'sigint'), ('dead', 'sigint'), ('close', 'eof'), ('dead', 'eof'), ('late', 'sigint'), ('late-dead', 'sigint')]:
             if args.only and mode != args.only:
                 continue
             directory = work/(mode+'-'+stop)
@@ -120,10 +126,10 @@ def run(args):
                         fault = wait(lambda: json.loads((directory/'fault.json').read_text()) if (directory/'fault.json').exists() and (directory/'fault.json').stat().st_size else None, 'proxy did not close an active RPC')
                         assert fault['phase'] == 'closed' and same(transport)['state'] != 'Z', fault
                         row['fault'] = fault
-                    elif mode == 'late':
+                    elif mode in ('late', 'late-dead'):
                         # Healthy at the quit; the stream is lost on the owner's
                         # own teardown request, after its health check passed.
-                        (directory/'arm.pending').write_text(str(destroy))
+                        (directory/'arm.pending').write_text(('kill:' if mode == 'late-dead' else '')+str(destroy))
                         (directory/'arm.pending').replace(directory/'arm')
                     else:
                         os.kill(transport['pid'], signal.SIGKILL)
@@ -140,9 +146,9 @@ def run(args):
                     code = process.wait(timeout=20*max(1, os.getloadavg()[0]/len(os.sched_getaffinity(0))))
                     row['exit_seconds'] = time.monotonic()-at
                     row['exit_code'] = code
-                    if mode == 'late':
+                    if mode in ('late', 'late-dead'):
                         row['fault'] = json.loads((directory/'fault.json').read_text()) if (directory/'fault.json').exists() else None
-                        assert row['fault'] and row['fault']['phase'] == 'closed' and row['fault']['op'] == destroy, row
+                        assert row['fault'] and row['fault']['phase'] == ('killed' if mode == 'late-dead' else 'closed') and row['fault']['op'] == destroy, row
                     row['transport_gone'] = same(transport) is None
                     if args.wrong_result:
                         row['transport_gone'] = False
@@ -186,6 +192,6 @@ if __name__ == '__main__':
         p = argparse.ArgumentParser(description=__doc__)
         p.add_argument('--work', type=Path, required=True)
         p.add_argument('--binary', type=Path)
-        p.add_argument('--only', choices=('close', 'dead', 'late'))
+        p.add_argument('--only', choices=('close', 'dead', 'late', 'late-dead'))
         p.add_argument('--wrong-result', action='store_true')
         run(p.parse_args())

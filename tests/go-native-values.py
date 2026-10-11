@@ -17,6 +17,7 @@ exe=w/'values';truth_file=w/'truth.json';began=time.monotonic()
 subprocess.run([a.go,'build','-p','2','-o',str(exe),'tests/fixtures/go/native-values.go'],env=env,check=True,timeout=120)
 built=time.monotonic()
 from client import Client
+from helpers.tasks import children as task_children
 
 def wait(probe,predicate):
  deadline=time.monotonic()+30
@@ -59,7 +60,7 @@ try:
   pid=server.proc.pid if server else c.p.pid
   trace_pids=[pid]
   if a.agent:
-   children=Path(f'/proc/{pid}/task/{pid}/children').read_text().split()
+   children=task_children(pid)
    assert len(children)==1,children
    trace_pids.append(int(children[0]))
   before=resource(pid);started=time.monotonic()

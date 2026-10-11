@@ -65,6 +65,9 @@ pub const Options = struct {
     // Empty remote sessions can establish their first connection here. The
     // cancellation capability exists before any startup transport operation.
     bootstrap: ?struct { context: *anyopaque, run: *const fn (*anyopaque, *rt.struct_xrt_cancel) anyerror!void } = null,
+    // One-shot CLI work runs after connection, with the same graceful stop
+    // and shutdown hook as commands served by the normal owner loop.
+    run_once: ?struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void } = null,
     // Called after every admitted command is completed/disposed, before done.
     // The caller keeps context and all borrowed model storage alive until then.
     shutdown: ?struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void } = null,
@@ -234,7 +237,11 @@ pub const Worker = struct {
         };
         if (self.startup_error.load(.acquire) == 0) {
             self.connected.store(true, .release);
-            self.loop();
+            if (self.options.run_once) |task| {
+                task.run(task.context) catch |err| {
+                    self.failure = err;
+                };
+            } else self.loop();
         } else {
             // Keep the lifecycle available to close/reconnect while displaying
             // the startup refusal. Never poll a missing target as native.
