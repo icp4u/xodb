@@ -125,6 +125,7 @@ pub const Renderer = struct {
     batch_count: usize = 0,
     scene_gpu: ?scene3d.Gpu = null,
     scene_requested: bool = false,
+    scene_retry: @import("scene3d/retry.zig").Retry = .{},
     scene_at: usize = 0,
     scene_after_batches: usize = 0,
     clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
@@ -727,7 +728,7 @@ pub const Renderer = struct {
         return true;
     }
     /// Record one clipped scene at the current UI layer. Call only after begin
-    /// returns true; returned instance slices remain valid until the next reserve.
+    /// returns true; returned instance writers remain valid until the next reserve.
     pub fn scene(self: *Renderer, bounds: Rect, view_projection: scene3d.math.Mat4) !?*scene3d.Gpu {
         if (self.scene_requested) return error.SceneAlreadyRecorded;
         for ([_]f32{ bounds.x, bounds.y, bounds.w, bounds.h, bounds.x + bounds.w, bounds.y + bounds.h }) |v| if (!std.math.isFinite(v)) return error.InvalidSceneBounds;
@@ -737,15 +738,22 @@ pub const Renderer = struct {
         const x1 = @min(@as(f32, @floatFromInt(self.extent.width)), @min(self.clip.x + self.clip.w, bounds.x + bounds.w));
         const y1 = @min(@as(f32, @floatFromInt(self.extent.height)), @min(self.clip.y + self.clip.h, bounds.y + bounds.h));
         if (x1 <= x0 or y1 <= y0) return null;
+        const now = Wait.now();
+        if (self.scene_retry.waiting(now)) |err| return err;
         if (self.scene_gpu == null) {
             self.scene_gpu = .{ .ctx = .{ .device = self.device, .physical = self.physical, .font_layout = self.descriptor_layout, .font_descriptor = self.descriptor, .family = self.family } };
             self.scene_gpu.?.init() catch |err| {
                 self.scene_gpu = null;
+                self.scene_retry.failed(now, err);
                 return err;
             };
         }
         const out = &self.scene_gpu.?;
-        try out.extent(self.extent.width, self.extent.height, self.pass);
+        out.extent(self.extent.width, self.extent.height, self.pass) catch |err| {
+            self.scene_retry.failed(now, err);
+            return err;
+        };
+        self.scene_retry = .{};
         out.stats = .{ .gpu_ns = out.stats.gpu_ns };
         out.bounds = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
         out.push.view_projection = view_projection;
@@ -767,12 +775,12 @@ pub const Renderer = struct {
         for (0..run.count) |i| {
             const pos = run.positions[i];
             const g = font.glyph(run.glyphs[i].codepoint) catch try font.glyph(0);
-            glyphs[first + i] = .{
+            glyphs.set(first + i, .{
                 .anchor = .{ anchor[0], anchor[1], anchor[2], 1 },
                 .rect = .{ @round(pen + @as(f32, @floatFromInt(pos.x_offset)) / 64 + @as(f32, @floatFromInt(g.left))), @round(offset[1] + 16 - @as(f32, @floatFromInt(g.top)) - @as(f32, @floatFromInt(pos.y_offset)) / 64), @floatFromInt(g.w), @floatFromInt(g.h) },
                 .uv = .{ @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, @as(f32, @floatFromInt(g.h)) / fonts.atlas_size },
                 .color = color,
-            };
+            });
             pen += @as(f32, @floatFromInt(pos.x_advance)) / 64;
         }
     }

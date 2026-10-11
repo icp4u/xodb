@@ -34,6 +34,12 @@ try:
             assert expected=='InvalidArguments' and reply['error']=={'code':-32602,'message':expected},reply
         else:
             reply=reply['result'];assert reply.get('isError') and reply['content'][0]['text']==expected,reply
+    if a.shared:
+        # The owner can still be resolving the startup breakpoint when both
+        # shared clients connect. Match the settled initial-stop phase.
+        shared.eventually(owner.session, lambda s: s['state']=='stopped' and
+                          not s['symbol_discovery_pending'] and not s['continue_pending'],
+                          'startup breakpoint resolution')
     advance();deadline=time.monotonic()+180
     while True:
         state=c.session()

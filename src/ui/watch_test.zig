@@ -1,7 +1,8 @@
 //! T19 watch-list model: bounds, per-generation re-evaluation, frame identity,
 //! change marking, stale-while-running without reads, and the text field.
 const std = @import("std");
-const watch = @import("watch.zig");
+const watch = @import("../model/native_watches.zig");
+const Editor = @import("watch.zig").Editor;
 const keys = @import("../platform/input.zig");
 
 const Fake = struct {
@@ -52,6 +53,59 @@ const f_main = watch.Frame{ .cfa = 0x7000, .symbol = "main", .module = 1, .funct
 const f_work = watch.Frame{ .cfa = 0x6f00, .symbol = "work", .module = 1, .function = 200, .pc = 200 };
 const f_work_again = watch.Frame{ .cfa = 0x6e00, .symbol = "work", .module = 1, .function = 200, .pc = 200 };
 const f_nocfa = watch.Frame{ .cfa = null, .symbol = "start", .module = 2, .function = 300, .pc = 300 };
+
+test "native watch publication retains children and rejects compacted row tokens" {
+    const Session = @import("../model/session.zig").Session;
+    const boundary = @import("../model/remote_owner.zig");
+    var session = Session.init();
+    defer session.deinit();
+    var list = watch.WatchList{};
+    defer list.deinit();
+    var fake = Fake{ .frames = &.{f_main} };
+    const frame = watch.FrameId.of(10, 0, f_main, fake.ident, fake.gen);
+    _ = try list.add("first", frame);
+    _ = try list.add("second", frame);
+    list.refresh(&fake);
+    const children = try list.arena.allocator().alloc(watch.Child, 1);
+    children[0] = .{ .name = try list.arena.allocator().dupe(u8, "member"), .display = try list.arena.allocator().dupe(u8, "old child") };
+    list.entries[0].children = children;
+    const publication = try boundary.Publication.create(std.testing.allocator, .{
+        .stamp = @import("../model/remote_dispatch.zig").stamp(1, &session),
+        .revision = 1,
+        .taken_ns = 1,
+        .status = .ready,
+        .native_watches = watch.snapshot(&list, &session),
+    });
+    defer publication.destroy();
+    const published = publication.value.native_watches.?;
+    const rt = @import("../target/runtime.zig").c;
+    rt.xrt_remote_io_guard(true);
+    defer rt.xrt_remote_io_guard(false);
+    var panel: @import("watch.zig").Panel = .{ .selected = 0 };
+    try std.testing.expect(panel.keyView(published, 27) == .local);
+    const remove = panel.keyView(published, 111).owner;
+    try std.testing.expectEqual(@as(usize, 2), list.count);
+    _ = try watch.apply(&list, &session, .human, remove);
+    try std.testing.expectError(error.StaleWatchList, watch.apply(&list, &session, .human, .{ .remove = .{ .revision = published.revision, .index = 0 } }));
+    try std.testing.expectEqualStrings("second", list.entries[0].expression());
+    fake.gen += 1;
+    list.refresh(&fake); // Resets and reuses the owner's child arena.
+    try std.testing.expectEqualStrings("first", published.entries[0].expression());
+    try std.testing.expectEqualStrings("member", published.entries[0].children[0].name);
+    try std.testing.expectEqualStrings("old child", published.entries[0].children[0].display);
+}
+
+test "native watch binding refuses stale metadata before evaluation" {
+    var session = @import("../model/session.zig").Session.init();
+    defer session.deinit();
+    var list: watch.WatchList = .{};
+    defer list.deinit();
+    const metadata = session.metadata.revision;
+    session.metadata.revision += 1;
+    try std.testing.expectError(error.StaleSnapshot, watch.apply(&list, &session, .human, .{ .add = .{ .binding = .{ .selection = .{ .tid = 1, .index = 0 }, .metadata = metadata }, .text = "1", .mode = .pinned } }));
+    try std.testing.expectEqual(@as(usize, 0), list.count);
+    try std.testing.expectEqual(@as(usize, 0), session.audit_count);
+}
 
 test "bounds: count, length, empty text" {
     var list = watch.WatchList{};
@@ -165,7 +219,7 @@ test "changes are marked against the previous stop only" {
     fake.fail = error.UnknownVariable;
     list.refresh(&fake);
     try std.testing.expect(!list.entries[0].changed);
-    try std.testing.expectEqualStrings("unknown name here", watch.explain(list.entries[0].failure.?));
+    try std.testing.expectEqualStrings("unknown name here", list.entries[0].failure.?);
     fake.gen = 5;
     fake.fail = null;
     fake.value = "9";
@@ -206,7 +260,7 @@ fn press(shortcut: u32, text: []const u8, ctrl: bool) keys.Event {
 }
 
 test "editor: typing, editing keys, history and cancel" {
-    var editor = watch.Editor{};
+    var editor = Editor{};
     try std.testing.expect(editor.key(press('a', "a", false)) == null); // closed
     editor.start();
     for ("p->x") |ch| _ = editor.key(press(ch, &.{ch}, false));
@@ -361,7 +415,7 @@ test "live displays follow selected frames, retain scope failures and never eval
     list.refresh(&fake);
     try std.testing.expectEqual(watch.State.not_in_scope, list.entries[0].state);
     try std.testing.expectEqual(watch.State.failed, list.entries[unknown].state);
-    try std.testing.expectEqual(error.UnknownVariable, list.entries[unknown].failure.?);
+    try std.testing.expectEqualStrings("unknown name here", list.entries[unknown].failure.?);
     fake.gen += 1;
     list.refresh(&fake);
     try std.testing.expectEqual(watch.State.not_in_scope, list.entries[0].state);
@@ -392,7 +446,7 @@ test "live displays follow selected frames, retain scope failures and never eval
 }
 
 test "editor paste replaces selection without submitting and respects UTF-8 boundaries" {
-    var editor = watch.Editor{};
+    var editor = Editor{};
     editor.start();
     const epoch = editor.epoch;
     editor.insert("aéλz", false);
@@ -425,7 +479,7 @@ test "editor paste replaces selection without submitting and respects UTF-8 boun
 }
 
 test "pasted format characters cannot hide text or erase a selection" {
-    var editor = watch.Editor{};
+    var editor = Editor{};
     editor.start();
     editor.insert("é\u{ad}\u{61c}\u{200b}\u{202e}\u{2066}\u{feff}\u{e0061}λ", false);
     try std.testing.expectEqualStrings("éλ", editor.text.slice());
@@ -438,4 +492,20 @@ test "pasted format characters cannot hide text or erase a selection" {
     try std.testing.expectEqualStrings("éλ", editor.text.slice());
     try std.testing.expectEqualStrings("λ", editor.selectedText());
     try std.testing.expect(editor.open);
+}
+
+test "watch add completion waits for its row publication before selecting" {
+    var panel: @import("watch.zig").Panel = .{};
+    panel.addedAt(0, 7);
+    panel.present(.{ .revision = 6 });
+    try std.testing.expect(panel.selected == null);
+    try std.testing.expect(panel.pending_add != null);
+    const entries: [1]watch.Entry = undefined; // present reads only the count.
+    panel.present(.{ .revision = 7, .entries = &entries });
+    try std.testing.expectEqual(@as(?usize, 0), panel.selected);
+    try std.testing.expect(panel.pending_add == null);
+    panel.present(.{ .revision = 8, .entries = &entries });
+    try std.testing.expectEqual(@as(?usize, 0), panel.selected);
+    panel.present(.{ .revision = 9 });
+    try std.testing.expect(panel.selected == null);
 }

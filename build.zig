@@ -19,12 +19,16 @@ pub fn build(b: *std.Build) void {
     options.addOption(bool, "capstone_vendored", capstone_link == .vendored);
     options.addOption([]const u8, "font_path", font_path);
     module.addOptions("build_options", options);
+    if (gui) module.addOptions("overview_font_sources", fontCoverageSources(b) catch |err| {
+        std.debug.print("overview font coverage inputs: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    });
     module.addIncludePath(b.path("src/profile"));
     module.addIncludePath(b.path("src/runtime"));
     module.addIncludePath(b.path("src/service"));
     // Allocation-free C++ parser; no C++ standard-library runtime is used.
     module.addCSourceFile(.{ .file = b.path("src/debug/demangle.cc"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror" } });
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pdb.c", "src/binary/pe_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/debug/dwarf_types.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pdb.c", "src/binary/pe_job.c", "src/binary/macho.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/debug/dwarf_types.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -402,6 +406,20 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    if (gui) {
+        const coverage = b.addTest(.{ .root_module = module, .filters = &.{"bundled bitmap font covers every mark"} });
+        if (capstone_link == .vendored) {
+            coverage.use_llvm = true;
+            coverage.each_lib_rpath = false;
+        }
+        const empty = b.addWriteFiles();
+        _ = empty.add(".keep", "");
+        const run_coverage = b.addRunArtifact(coverage);
+        run_coverage.setCwd(empty.getDirectory());
+        b.step("test-font-coverage", "Check embedded overview glyph coverage from an empty working directory").dependOn(&run_coverage.step);
+        test_step.dependOn(&run_coverage.step);
+    }
+
     const scene_math = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/render/scene3d/math.zig"), .target = target, .optimize = optimize }) });
     test_step.dependOn(&b.addRunArtifact(scene_math).step);
     test_step.dependOn(&fdgraph_run.step);
@@ -622,4 +640,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(memstat_cells_tests).step);
     test_step.dependOn(&b.addRunArtifact(memstat_process_tests).step);
     test_step.dependOn(&b.addRunArtifact(memstat_system_tests).step);
+}
+
+// Capture every overview source for the test binary. Sorting makes generated
+// inputs stable; discovering the directory keeps new panels covered automatically.
+fn fontCoverageSources(b: *std.Build) !*std.Build.Step.Options {
+    const a = b.allocator;
+    const io = b.graph.io;
+    var dir = try b.build_root.handle.openDir(io, "src/ui/overview", .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(a);
+    defer walker.deinit();
+    var paths: std.ArrayList([]const u8) = .empty;
+    while (try walker.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.basename, ".zig")) try paths.append(a, try a.dupe(u8, entry.path));
+    }
+    std.mem.sort([]const u8, paths.items, {}, struct {
+        fn less(_: void, left: []const u8, right: []const u8) bool {
+            return std.mem.lessThan(u8, left, right);
+        }
+    }.less);
+    const sources = try a.alloc([]const u8, paths.items.len);
+    for (paths.items, sources) |path, *source| source.* = try dir.readFileAlloc(io, path, a, .limited(4 * 1024 * 1024));
+    const options = b.addOptions();
+    options.addOption([]const []const u8, "paths", paths.items);
+    options.addOption([]const []const u8, "sources", sources);
+    return options;
 }

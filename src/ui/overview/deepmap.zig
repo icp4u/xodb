@@ -67,6 +67,8 @@ pub const Deep = struct {
     hover: ?u64 = null,
     pulse: u8 = 0,
     counts: Counts = .{},
+    /// Layout-audit evidence survives a scan completing between trace polls.
+    partial: struct { frames: u64 = 0, origin: u64 = 0, cell: u64 = 0, pending: usize = 0, count: usize = 0 } = .{},
     perf: Perf = .{},
     modern: bool = false,
     nav: Navigation = .{},
@@ -671,7 +673,7 @@ fn drawMini(ctx: Ctx, d: *const Deep, vmas: []const md.Vma, pt: *const Paint) !v
 var cache: [md.max_cells]gpu.Cell = undefined;
 var cache_key: u64 = 0;
 var swatches: [24]gpu.Cell = undefined;
-var audited: [14]u64 = @splat(0);
+var audited: [15]u64 = @splat(0);
 var audited_detail: u64 = 0;
 
 fn sizeText(bytes: u64) []const u8 {
@@ -1002,14 +1004,21 @@ fn legend(v: *vw.View, ctx: Ctx, r: Rect, pt: *const Paint) !void {
 }
 
 /// With the layout audit on, tests learn the field geometry and what it shows.
-fn audit(d: *const Deep) void {
+fn audit(d: *Deep) void {
     const k = d.counts;
-    const now_ = [14]u64{ @intFromFloat(d.field.x * 10), @intFromFloat(d.field.y * 10), @intFromFloat(d.pitch * 1000), d.cols, d.rows, d.origin, d.cell(), k.pending, k.unknown, k.split + k.collapsed * 7 + k.changed * 131, @intFromFloat(miniX(d.origin) * 10), k.zero, @intFromBool(d.nav.active), d.pulse / 32 };
+    if (k.pending > 0 and k.pending < d.count()) {
+        d.partial = .{ .frames = d.partial.frames +| 1, .origin = d.origin, .cell = d.cell(), .pending = k.pending, .count = d.count() };
+    }
+    const now_ = [15]u64{ @intFromFloat(d.field.x * 10), @intFromFloat(d.field.y * 10), @intFromFloat(d.pitch * 1000), d.cols, d.rows, d.origin, d.cell(), k.pending, k.unknown, k.split + k.collapsed * 7 + k.changed * 131, @intFromFloat(miniX(d.origin) * 10), k.zero, @intFromBool(d.nav.active), d.pulse / 32, d.partial.frames };
     if (std.mem.eql(u64, &now_, &audited)) return;
     audited = now_;
-    std.debug.print("xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1} nav={d} pulse={d}\n", .{
+    var partial_buf: [256]u8 = undefined;
+    const partial = std.fmt.bufPrint(&partial_buf, "partial_frames={d} partial_origin=0x{x} partial_cell={d} partial_pending={d} partial_count={d}", .{
+        d.partial.frames, d.partial.origin, d.partial.cell, d.partial.pending, d.partial.count,
+    }) catch unreachable;
+    std.debug.print("xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1} nav={d} pulse={d} {s}\n", .{
         d.field.x, d.field.y, d.pitch,  d.cols,   d.rows,          d.origin,                   d.cell(),                   d.count(), k.pending, k.unknown, k.gap, k.thp, k.mixed, k.anon, k.file, k.zero, k.other, k.changed, k.collapsed, k.split,
-        d.mini.x,  d.mini.y,  d.mini.w, d.mini.h, miniX(d.origin), miniX(d.origin + d.span()), @intFromBool(d.nav.active), d.pulse,
+        d.mini.x,  d.mini.y,  d.mini.w, d.mini.h, miniX(d.origin), miniX(d.origin + d.span()), @intFromBool(d.nav.active), d.pulse,   partial,
     });
 }
 /// Called for every look: the deep look reports its cell count, the others 0.

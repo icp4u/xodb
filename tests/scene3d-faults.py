@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Periodic private GPU lane: partial scene creates release every owned handle."""
+"""Batch private GPU lane: partial scene creates release every owned handle."""
 import importlib.util
 import json
 import os
@@ -8,6 +8,9 @@ import re
 import signal
 import subprocess
 import time
+
+def load_scale():
+    return max(1.0, os.getloadavg()[0] / len(os.sched_getaffinity(0)))
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -24,7 +27,7 @@ subprocess.run(['cc', '-shared', '-fPIC', '-std=c11', '-Wall', '-Wextra', '-Werr
 component = work / 'accounting'
 subprocess.run(['cc', '-std=c11', '-Wall', '-Wextra', '-Werror', 'tests/vulkan-fault-accounting.c',
                 '-ldl', '-pthread', '-o', str(component)], check=True)
-subprocess.run([str(component)], check=True, timeout=5)
+subprocess.run([str(component)], check=True, timeout=5 * load_scale())
 d = None
 rows = []
 
@@ -41,21 +44,21 @@ def cwd_check(proc):
     if Path(cwd) != root:
         raise AssertionError('owned-process cwd changed before cleanup')
 
-def run(name, rule):
+def run(name, rule, retry=False):
     env = dict(d.env, LD_PRELOAD=str(shim), XODB_VKFAULT=rule)
     log = work / (name + '.log')
     started = time.monotonic()
     with log.open('wb') as stream:
-        proc = subprocess.Popen([str(root/'zig-out/bin/xodb'), '--scene3d-probe', '--instances', '4000', '--frames', '3'],
+        proc = subprocess.Popen([str(root/'zig-out/bin/xodb'), '--scene3d-probe', '--instances', '4000', '--frames', '30' if retry else '3', *(['--retry-scene'] if retry else [])],
                                 cwd=root, env=env, stdout=stream, stderr=stream)
         try:
-            proc.wait(timeout=15)
+            proc.wait(timeout=15 * load_scale())
         finally:
             if proc.poll() is None:
                 cwd_check(proc)
                 proc.terminate()
                 try:
-                    proc.wait(timeout=5)
+                    proc.wait(timeout=5 * load_scale())
                 except subprocess.TimeoutExpired:
                     cwd_check(proc)
                     proc.kill()
@@ -68,7 +71,14 @@ def run(name, rule):
     failures = [line for line in text.splitlines() if line.startswith(('vkfault: leak', 'vkfault: violation'))]
     if failures or any(result[k] for k in ('live_at_exit', 'leaks', 'violations', 'dirty_retirements')) or result['allocations']['live_bytes']:
         raise AssertionError(name + ': resources leaked or retired in flight\n' + text)
-    if rule:
+    if retry:
+        refusals = re.findall(r'scene3d refused=(\w+) now=(\d+) retry=(\d+)', text)
+        injections = text.count('vkfault: inject vkCreateRenderPass ')
+        deadlines = {int(row[2]) for row in refusals}
+        if proc.returncode != 0 or len(refusals) != 30 or injections != len(deadlines) or injections >= len(refusals):
+            raise AssertionError(name + ': repeated scene allocation did not back off\n' + text)
+        result['retry_evidence'] = dict(frames=len(refusals), actual_allocations=injections, retry_deadlines=sorted(deadlines))
+    elif rule:
         function = rule.split('fail=', 1)[1].split('@', 1)[0]
         if f'vkfault: inject {function} ' not in text or proc.returncode != 1 or 'error: SceneVulkanFailed' not in text:
             raise AssertionError(name + ': did not observe requested scene failure\n' + text)
@@ -95,6 +105,7 @@ try:
         cases.append(('vkCreateQueryPool', 1))
     for function, call in cases:
         run(function + '-' + str(call), f'poison=1;fail={function}@{call}:oodm')
+    run('persistent-scene-failure', 'poison=1;fail=vkCreateRenderPass@2x*:oodm', retry=True)
     (work/'results.json').write_text(json.dumps(dict(cases=rows, query_supported=bool(baseline['created'].get('query_pool', 0))), indent=2)+'\n')
     print(f'{len(rows)} passed; evidence {work}', flush=True)
 finally:

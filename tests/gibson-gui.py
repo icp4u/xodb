@@ -52,7 +52,7 @@ def latest():
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1])) if rows else {}
 
 def until(fn, name):
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 10 * h.load_scale()
     while time.monotonic() < deadline:
         if not d.alive():
             raise AssertionError(d.tail())
@@ -64,15 +64,28 @@ def until(fn, name):
 
 def capture(name):
     frame = int(latest().get('frame', '0'))
+    # A manual, settled camera is idle. Request two real pointer repaints.
+    send('m', 2, 2, 'm', 3, 3)
     until(lambda r: int(r['frame']) >= frame + 2, 'present next two frames')
     with Image.open(d.shot(name)) as im:
         return im.convert('RGB')
 
 def key(code, predicate, name):
     helper = d.keys('tap', code, wait=False)
-    if helper.wait(timeout=10):
+    if helper.wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
     return until(predicate, name)
+
+def display(*args, **kwargs):
+    view = h.Display(*args, **kwargs)
+    # Keep a keyboard seat present between short-lived injection clients.
+    keeper = subprocess.Popen([h.HELPER, str(view.width), str(view.height), 'layout', 'us', 'barrier'],
+                              env=view.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    view.procs.append(keeper)
+    if not select.select([keeper.stdout], [], [], 10 * h.load_scale())[0] or keeper.stdout.readline() != b'ready\n':
+        view.close()
+        raise AssertionError('persistent private keyboard did not initialize')
+    return view
 
 def close():
     global d
@@ -109,7 +122,7 @@ visible = [c for c in expected['cells'] if not c.get('gap', 0) and (c.get('mappe
 evidence = {}
 
 def send(*cmd):
-    if d.keys(*cmd, wait=False).wait(timeout=10):
+    if d.keys(*cmd, wait=False).wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
 
 def has_city(im):
@@ -127,7 +140,7 @@ def snapshot(pid):
 
 def periodic():
     global d
-    d = h.Display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map', '--redact',
+    d = display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map', '--redact',
                   '--pause', '--interval-ms', '2000', '--replay', str(replay)], stdio=False, trace=False,
                   binary=a.binary, output_size=(1280, 720))
     until(lambda r: int(r['collapsed']) > 0 and float(r['ease']) == 1, 'replay ready')
@@ -168,7 +181,7 @@ def periodic():
         perf = []
         os.environ['XODB_MEMMAP_PERF'] = '1'
         for size in ((1920,1080), (3840,2160)):
-            d = h.Display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map', '--redact',
+            d = display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map', '--redact',
                           '--memmap-pid', str(target.pid)], stdio=False, trace=False, binary=a.binary, output_size=size)
             until(lambda r: int(r['towers']) >= 256 and int(r['unknown']) < int(r['towers']), 'owned Node sampled')
             before = snapshot(d.app.pid)
@@ -199,13 +212,13 @@ def periodic():
         if target.poll() is None:
             if Path(os.readlink(f'/proc/{target.pid}/cwd')) != root: raise AssertionError('owned Node cwd changed')
             target.terminate()
-        try: target.wait(timeout=5)
+        try: target.wait(timeout=5 * h.load_scale())
         except subprocess.TimeoutExpired:
             target.kill()
-            target.wait(timeout=5)
+            target.wait(timeout=5 * h.load_scale())
 
 try:
-    d = h.Display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map',
+    d = display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map',
                   '--pause', '--frames', '100000', '--replay', str(replay)], stdio=False, trace=False, binary=a.binary, output_size=(1280, 720))
     row = until(lambda r: int(r['towers']) > 0 and float(r['ease']) == 1, 'city populated')
     check('one tower per measured or unmeasured mapped cell; compressed gaps omitted', int(row['towers']) == len(visible))
@@ -279,7 +292,7 @@ try:
     check('city labels do not overlap', bool(overlaps) and all(int(n) == 0 for n in overlaps))
     for width, height in ((800,600), (240,160), (1920,1080), (1280,720)):
         subprocess.run(['swaymsg', '-t', 'command', f'output HEADLESS-1 mode {width}x{height}'], env=d.env,
-                       check=True, stdout=subprocess.DEVNULL, timeout=10)
+                       check=True, stdout=subprocess.DEVNULL, timeout=10 * h.load_scale())
         until(lambda r: f'layout {width}x{height} panel=memory_map ' in Path(d.log).read_text(), 'resize repaint')
     until(lambda r: float(r['h']) > 0, 'restored GPU field')
     capture('resized')

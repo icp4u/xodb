@@ -13,357 +13,80 @@ const keys = @import("../platform/input.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 
-pub const max_entries = 16;
-pub const max_text = 256;
+const watches = @import("../model/native_watches.zig");
+const max_entries = watches.max_entries;
+const max_children = watches.max_children;
+const max_display = watches.max_display;
+pub const max_text = watches.max_text;
 pub const max_history = 32;
-pub const max_children = 16;
-const max_display = 160;
-const max_type = 64;
-const max_symbol = 96;
+const Text = watches.Text;
+const Mode = watches.Mode;
+const Entry = watches.Entry;
 
-fn Text(comptime n: usize) type {
-    return struct {
-        bytes: [n]u8 = undefined,
-        len: usize = 0,
-        fn set(self: *@This(), value: []const u8) void {
-            self.len = @min(n, value.len);
-            @memcpy(self.bytes[0..self.len], value[0..self.len]);
-        }
-        pub fn slice(self: *const @This()) []const u8 {
-            return self.bytes[0..self.len];
-        }
-    };
-}
-
-/// Stable target/thread identity; a reused numeric TID is a different thread.
-pub const Identity = struct { session: u64, image: u64, thread: u64 };
-pub const Frame = struct { cfa: ?u64, symbol: ?[]const u8, module: ?u64, function: ?u64, pc: u64 };
-pub const Stack = union(enum) { unavailable, frames: struct { items: []const Frame, complete: bool } };
-/// CFA and function address are a matching heuristic, not proof of a call's
-/// lifetime. Calls may return and reuse an address entirely between stops.
-/// Once observed gone, an entry never rebinds; the user must add it again.
-pub const FrameId = struct {
-    tid: i32,
-    identity: Identity,
-    generation: u64,
-    index: usize,
-    cfa: ?u64,
-    module: ?u64,
-    function: ?u64,
-    pc: u64,
-    symbol: Text(max_symbol) = .{},
-    pub fn of(tid: i32, index: usize, frame: Frame, identity: Identity, generation: u64) FrameId {
-        var id = FrameId{ .tid = tid, .identity = identity, .generation = generation, .index = index, .cfa = frame.cfa, .module = frame.module, .function = frame.function, .pc = frame.pc };
-        id.symbol.set(frame.symbol orelse "");
-        return id;
-    }
-    fn persistent(self: *const FrameId) bool {
-        return self.cfa != null and self.module != null and self.function != null;
-    }
-    fn matches(self: *const FrameId, frame: Frame, index: usize, generation: u64) bool {
-        if (generation == self.generation) return index == self.index and frame.pc == self.pc;
-        return self.persistent() and self.cfa == frame.cfa and self.module == frame.module and self.function == frame.function;
-    }
-};
-pub const Mode = enum { pinned, live };
-pub const State = enum { pending, value, failed, frame_gone, thread_gone, context_changed, stack_unavailable, stale, not_in_scope };
-pub const Child = struct { name: []const u8, display: []const u8, extent_advisory: bool = false };
-/// One evaluation, filled by the context. Slices live until the next refresh.
-pub const Result = union(enum) {
-    value: struct { display: []const u8, type_name: []const u8, available: bool, extent_advisory: bool = false, expandable: bool = false, children: []const Child = &.{}, total: ?u64 = null, next: ?u64 = null },
-    failed: anyerror,
-};
-
-pub const Entry = struct {
-    text: Text(max_text) = .{},
-    frame: FrameId,
-    mode: Mode = .pinned,
-    state: State = .pending,
-    display: Text(max_display) = .{},
-    type_name: Text(max_type) = .{},
-    available: bool = false,
-    extent_advisory: bool = false,
-    /// `display` holds a value from a successful evaluation.
-    has_value: bool = false,
-    ever_resolved: bool = false,
-    failure: ?anyerror = null,
-    /// Value at the previous stop, for change marking.
-    previous: u64 = 0,
-    fingerprint: u64 = 0,
-    has_previous: bool = false,
-    changed: bool = false,
-    resolved_index: ?usize = null,
-    unverified: bool = false,
-    expandable: bool = false,
-    expanded: bool = false,
-    page: u64 = 0,
-    children: []const Child = &.{},
-    total: ?u64 = null,
-    next: ?u64 = null,
-    seen_generation: u64 = 0,
-    pub fn expression(self: *const Entry) []const u8 {
-        return self.text.slice();
-    }
-    fn unavailableDisplay(self: *Entry, state: State) void {
-        self.state = state;
-        self.has_value = false;
-        self.available = false;
-        self.extent_advisory = false;
-        self.display.len = 0;
-        self.type_name.len = 0;
-        self.changed = false;
-        self.resolved_index = null;
-        self.expandable = false;
-        self.children = &.{};
-    }
-};
-
-pub const WatchList = struct {
-    pub const Selection = struct { tid: i32, index: usize };
-    entries: [max_entries]Entry = undefined,
-    count: usize = 0,
+/// Frontend-only row selection, scrolling and hit geometry.
+pub const Panel = struct {
     selected: ?usize = null,
     first_row: usize = 0,
     reveal_selection: bool = true,
-    /// Generation of the last evaluation; null forces the next one.
-    generation: ?u64 = null,
-    dirty: bool = true,
-    display_frame: ?Selection = null,
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    /// Evaluations performed, for tests and measurements.
-    evaluations: u64 = 0,
-    /// Top of the first drawn row, for hit testing.
     rows_top: f32 = 0,
-    pub fn rowAt(self: *const WatchList, y: f32, hits: *const [64]?usize) ?usize {
+    pending_add: ?struct { index: usize, revision: u64 } = null,
+    pub fn present(self: *Panel, view: watches.View) void {
+        if (self.pending_add) |pending| if (view.revision >= pending.revision) {
+            self.pending_add = null;
+            if (pending.index < view.entries.len) self.added(pending.index);
+        };
+        if (self.selected) |i| if (i >= view.entries.len) {
+            self.selected = if (view.entries.len == 0) null else view.entries.len - 1;
+        };
+    }
+    /// A completion can arrive before the publication containing its new row.
+    pub fn addedAt(self: *Panel, index: usize, revision: u64) void {
+        self.pending_add = .{ .index = index, .revision = revision };
+    }
+    pub fn added(self: *Panel, index: usize) void {
+        self.pending_add = null;
+        self.selected = index;
+        self.reveal_selection = true;
+    }
+    pub fn removed(self: *Panel, index: usize, count: usize) void {
+        self.selected = if (count == 0) null else @min(index, count - 1);
+        self.reveal_selection = true;
+    }
+    pub fn scrollBy(self: *Panel, amount: i32) void {
+        self.first_row = @intCast(@max(0, @as(i64, @intCast(self.first_row)) + amount));
+        self.reveal_selection = false;
+    }
+    pub fn rowAt(self: *const Panel, y: f32, hits: *const [64]?usize) ?usize {
         if (y < self.rows_top) return null;
         const k: usize = @intFromFloat((y - self.rows_top) / 23);
         return if (k < hits.len) hits[k] else null;
     }
-
-    pub fn deinit(self: *WatchList) void {
-        self.arena.deinit();
-    }
-    pub fn add(self: *WatchList, text: []const u8, frame: FrameId) !usize {
-        return self.addMode(text, frame, .pinned);
-    }
-    pub fn addMode(self: *WatchList, text: []const u8, frame: FrameId, mode: Mode) !usize {
-        const trimmed = std.mem.trim(u8, text, " \t");
-        if (trimmed.len == 0) return error.EmptyExpression;
-        if (trimmed.len > max_text) return error.ExpressionTooLong;
-        if (self.count == max_entries) return error.WatchListFull;
-        var entry = Entry{ .frame = frame, .mode = mode };
-        entry.text.set(trimmed);
-        self.entries[self.count] = entry;
-        self.count += 1;
-        self.selected = self.count - 1;
-        self.reveal_selection = true;
-        self.dirty = true;
-        return self.count - 1;
-    }
-    pub fn setDisplayFrame(self: *WatchList, selection: ?Selection) void {
-        if (std.meta.eql(self.display_frame, selection)) return;
-        self.display_frame = selection;
-        for (self.items()) |entry| if (entry.mode == .live) {
-            self.dirty = true;
-            break;
-        };
-    }
-    pub fn toggleMode(self: *WatchList, index: usize, frame: FrameId) void {
-        if (index >= self.count) return;
-        const old = self.entries[index];
-        self.entries[index] = .{ .text = old.text, .frame = frame, .mode = if (old.mode == .pinned) .live else .pinned };
-        self.dirty = true;
-    }
-    pub fn remove(self: *WatchList, index: usize) void {
-        if (index >= self.count) return;
-        std.mem.copyForwards(Entry, self.entries[index .. self.count - 1], self.entries[index + 1 .. self.count]);
-        self.count -= 1;
-        self.selected = if (self.count == 0) null else @min(index, self.count - 1);
-        self.reveal_selection = true;
-    }
-    pub fn scrollBy(self: *WatchList, amount: i32) void {
-        self.first_row = @intCast(@max(0, @as(i64, @intCast(self.first_row)) + amount));
-        self.reveal_selection = false;
-    }
-    pub fn items(self: *WatchList) []Entry {
-        return self.entries[0..self.count];
-    }
-    pub fn toggleExpanded(self: *WatchList, index: usize) void {
-        if (index >= self.count or !self.entries[index].expandable) return;
-        self.entries[index].expanded = !self.entries[index].expanded;
-        self.entries[index].page = 0;
-        self.reveal_selection = true;
-        self.dirty = true;
-    }
-    pub fn pageChildren(self: *WatchList, index: usize, forward: bool) void {
-        if (index >= self.count or !self.entries[index].expanded) return;
-        const entry = &self.entries[index];
-        self.reveal_selection = true;
-        if (forward) {
-            entry.page = entry.next orelse return;
-        } else entry.page -|= max_children;
-        self.dirty = true;
-    }
-
-    /// Re-evaluates when the generation changed or entries did. `ctx` provides:
-    ///   stopped() bool, ended() bool, generation() u64,
-    ///   identity(tid) ?Identity, stack(tid) Stack,
-    ///   evaluate(a, tid, frame_index, text, children: ?u64 page) Result.
-    /// Nothing is evaluated (and no memory read) unless `stopped()`.
-    pub fn refresh(self: *WatchList, ctx: anytype) void {
-        if (ctx.ended()) {
-            for (self.items()) |*entry| {
-                entry.state = .thread_gone;
-                entry.resolved_index = null;
-            }
-            self.generation = null;
-            return;
+    pub const KeyAction = union(enum) { ignored, local, owner: watches.Action };
+    pub fn keyView(self: *Panel, view: watches.View, code: u32) KeyAction {
+        self.present(view);
+        if (code == 26 or code == 27) {
+            self.scrollBy(if (code == 26) -1 else 1);
+            return .local;
         }
-        if (!ctx.stopped()) {
-            // Only current results go stale; "frame gone" and "thread gone"
-            // already describe an older observation and stay as they are.
-            for (self.items()) |*entry| if (entry.state == .value or entry.state == .failed or entry.state == .not_in_scope) {
-                entry.state = .stale;
-            };
-            self.generation = null;
-            return;
+        const index = self.selected orelse return .ignored;
+        const token = watches.Token{ .revision = view.revision, .index = index };
+        if (code == 103 or code == 108) {
+            self.added(if (code == 103) index -| 1 else @min(index + 1, view.entries.len - 1));
+            return .local;
         }
-        const generation = ctx.generation();
-        if (!self.dirty and self.generation != null and self.generation.? == generation) return;
-        self.generation = generation;
-        self.dirty = false;
-        _ = self.arena.reset(.retain_capacity);
-        const a = self.arena.allocator();
-        for (self.items()) |*entry| {
-            entry.children = &.{};
-            entry.resolved_index = null;
-            if (entry.mode == .live) {
-                const selected = self.display_frame orelse {
-                    entry.unavailableDisplay(.not_in_scope);
-                    continue;
-                };
-                const identity = ctx.identity(selected.tid) orelse {
-                    entry.unavailableDisplay(.not_in_scope);
-                    continue;
-                };
-                const stack = switch (ctx.stack(selected.tid)) {
-                    .unavailable => {
-                        entry.unavailableDisplay(.stack_unavailable);
-                        continue;
-                    },
-                    .frames => |frames| frames.items,
-                };
-                if (selected.index >= stack.len) {
-                    entry.unavailableDisplay(.not_in_scope);
-                    continue;
-                }
-                entry.frame = FrameId.of(selected.tid, selected.index, stack[selected.index], identity, generation);
-                entry.state = .pending;
-            }
-            // Terminal observations cannot be resurrected by CFA/TID reuse.
-            if (entry.state == .frame_gone or entry.state == .thread_gone or entry.state == .context_changed) continue;
-            const identity = ctx.identity(entry.frame.tid) orelse {
-                entry.state = .thread_gone;
-                continue;
-            };
-            if (!std.meta.eql(identity, entry.frame.identity) or
-                (generation != entry.frame.generation and !entry.frame.persistent()))
-            {
-                entry.state = .context_changed;
-                continue;
-            }
-            const stack = switch (ctx.stack(entry.frame.tid)) {
-                .unavailable => {
-                    entry.state = .stack_unavailable;
-                    continue;
-                },
-                .frames => |frames| frames,
-            };
-            const index = for (stack.items, 0..) |frame, i| {
-                if (entry.frame.matches(frame, i, generation)) break i;
-            } else {
-                entry.state = if (stack.complete) .frame_gone else .stack_unavailable;
-                continue;
-            };
-            entry.resolved_index = index;
-            entry.unverified = generation != entry.frame.generation;
-            // Change marking compares with the value at this entry's previous
-            // stop; re-evaluating within one stop (expand, page) keeps it.
-            if (entry.seen_generation != generation) {
-                entry.has_previous = entry.has_value;
-                if (entry.has_previous) entry.previous = entry.fingerprint;
-                entry.seen_generation = generation;
-            }
-            self.evaluations += 1;
-            switch (ctx.evaluate(a, entry.frame.tid, index, entry.expression(), if (entry.expanded) entry.page else null)) {
-                .value => |v| {
-                    entry.state = .value;
-                    entry.has_value = true;
-                    entry.ever_resolved = true;
-                    entry.failure = null;
-                    entry.display.set(v.display);
-                    entry.type_name.set(v.type_name);
-                    entry.fingerprint = std.hash.Wyhash.hash(std.hash.Wyhash.hash(@intFromBool(v.available), v.type_name), v.display);
-                    entry.available = v.available;
-                    entry.extent_advisory = v.extent_advisory;
-                    entry.expandable = v.expandable;
-                    if (!v.expandable) entry.expanded = false;
-                    entry.children = v.children;
-                    entry.total = v.total;
-                    entry.next = v.next;
-                },
-                .failed => |err| {
-                    entry.state = if (entry.mode == .live and entry.ever_resolved and err == error.UnknownVariable) .not_in_scope else .failed;
-                    entry.has_value = false;
-                    entry.extent_advisory = false;
-                    entry.failure = err;
-                    entry.display.len = 0;
-                    entry.expandable = false;
-                    entry.expanded = false;
-                },
-            }
-            entry.changed = entry.has_previous and entry.has_value and entry.previous != entry.fingerprint;
+        if (code == 111 or code == 14) return .{ .owner = .{ .remove = token } };
+        if (code == 28) {
+            self.reveal_selection = true;
+            return .{ .owner = .{ .expand = token } };
         }
+        if (code == 104 or code == 109) {
+            self.reveal_selection = true;
+            return .{ .owner = .{ .page = .{ .entry = token, .forward = code == 109 } } };
+        }
+        if (code == 17) return .{ .owner = .{ .investigate_write = token } };
+        return .ignored;
     }
 };
-
-/// Plain words for evaluator and target errors. A typo must never look like a value.
-pub fn explain(err: anyerror) []const u8 {
-    return switch (err) {
-        error.RuntimeTypesPending => "runtime types loading",
-        error.RuntimeTypesStale => "runtime types stale; capture and load at this stop",
-        error.RuntimeTypesExpired => "runtime type context released",
-        error.RuntimeTypesFailed => "runtime type discovery failed",
-        error.RuntimeTypeNotFound => "runtime type not found; load its read-only capture",
-        error.RuntimeTypeAmbiguous => "runtime type name is ambiguous; use its record address",
-        error.InvalidRuntimeTypeExpression => "use address as TypeName (one trailing cast)",
-        error.UnknownVariable => "unknown name here",
-        error.UnknownRegister => "unknown register; use a name from the Registers pane",
-        error.RegisterUnavailable => "register not recovered in this frame",
-        error.UnknownField => "no field with that name",
-        error.ExpectedStructure => "not a struct; . and -> need a struct",
-        error.ExpectedPointer => "not a pointer or array",
-        error.ExpectedIdentifier, error.InvalidExpression, error.InvalidCharacter, error.InvalidOperator => "cannot parse the expression",
-        error.MissingParenthesis => "unbalanced ( )",
-        error.MissingBracket => "unbalanced [ ]",
-        error.NotAddressable => "has no address (& and fields need memory)",
-        error.ValueUnavailable => "optimized out or unavailable here",
-        error.IndexOutOfBounds => "index outside the array bounds",
-        error.MemoryUnreadable, error.InvalidAddress, error.MemoryReadFailed, error.ShortRead => "memory at that address cannot be read",
-        error.ShortCircuitNotSupported => "&& and || are not supported yet",
-        error.ExpressionTooDeep => "expression nested too deeply",
-        error.DivisionByZero => "division by zero",
-        error.IntegerOverflow, error.Overflow => "integer overflow",
-        error.InvalidShift => "shift amount out of range",
-        error.InvalidPointerOperation => "invalid pointer arithmetic",
-        error.InvalidFloatOperation => "operator not valid for floating point",
-        error.ExpectedInteger => "needs an integer",
-        error.UnsupportedType => "type not supported by the evaluator",
-        error.NotStopped => "target is not stopped",
-        error.InvalidFrame => "frame no longer exists",
-        else => @errorName(err),
-    };
-}
 
 /// Shared single-line editing. Clipboard bytes enter through insert(), never
 /// through the key queue; only a physical Return can submit a field.
@@ -728,7 +451,8 @@ fn frameTag(buffer: []u8, entry: *const Entry, with_tid: bool) []const u8 {
 
 /// Rows: the open editor, then entries and expanded children. Keeps the
 /// selected entry in view. Returns per-row entry indices for hit testing.
-pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, hits: *[64]?usize) !void {
+pub fn draw(panel: *Panel, view: watches.View, editor: *Editor, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, hits: *[64]?usize) !void {
+    panel.present(view);
     const row_h: f32 = 23;
     var y = rect.y + 8;
     const x = rect.x + 12;
@@ -744,16 +468,16 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
             y += row_h;
         }
     }
-    if (list.count == 0) {
+    if (view.entries.len == 0) {
         try r.textFit(font, x, y, w, if (editor.open) "Return adds to the watch list; Esc cancels; Up/Down recall" else "E evaluates an expression in the selected frame", theme.weak);
         return;
     }
     // Small panes give the selected entry dedicated type/context lines rather
     // than squeezing the value between three truncated columns.
-    if (compact) if (list.selected) |selected| {
-        const entry = &list.entries[selected];
+    if (compact) if (panel.selected) |selected| {
+        const entry = &view.entries[selected];
         var detail: [240]u8 = undefined;
-        const label = if (entry.state == .failed) std.fmt.bufPrint(&detail, "{s}: {s}", .{ entry.expression(), explain(entry.failure.?) }) catch "" else if (entry.type_name.len == 0) @tagName(entry.state) else std.fmt.bufPrint(&detail, "{s} / {s}", .{ entry.type_name.slice(), if (entry.state != .value) @tagName(entry.state) else if (entry.available) "available" else "unavailable" }) catch "";
+        const label = if (entry.state == .failed) std.fmt.bufPrint(&detail, "{s}: {s}", .{ entry.expression(), entry.failure.? }) catch "" else if (entry.type_name.len == 0) @tagName(entry.state) else std.fmt.bufPrint(&detail, "{s} / {s}", .{ entry.type_name.slice(), if (entry.state != .value) @tagName(entry.state) else if (entry.available) "available" else "unavailable" }) catch "";
         try r.textFit(font, x, y, w, label, theme.weak);
         y += row_h;
         var context: [240]u8 = undefined;
@@ -762,7 +486,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
         try r.textFit(font, x, y, w, label_context, theme.weak);
         y += row_h;
     };
-    if (list.selected) |selected| if (list.entries[selected].extent_advisory and list.entries[selected].has_value) {
+    if (panel.selected) |selected| if (view.entries[selected].extent_advisory and view.entries[selected].has_value) {
         try r.textFit(font, x, y, w, "Extent unproved / dimmed preview", theme.weak);
         y += row_h;
     };
@@ -771,8 +495,8 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
     var rows: [max_entries * (max_children + 2)]Row = undefined;
     var n: usize = 0;
     var selected_row: usize = 0;
-    for (list.items(), 0..) |*entry, i| {
-        if (list.selected != null and list.selected.? == i) selected_row = n;
+    for (view.entries, 0..) |*entry, i| {
+        if (panel.selected != null and panel.selected.? == i) selected_row = n;
         rows[n] = .{ .entry = i, .child = null };
         n += 1;
         if (entry.expanded and entry.state == .value) {
@@ -782,18 +506,18 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
             }
         }
     }
-    list.rows_top = y - 3;
+    panel.rows_top = y - 3;
     const visible: usize = @intFromFloat(@max(1, @floor((rect.y + rect.h - y) / row_h)));
-    if (list.reveal_selection) {
-        if (selected_row < list.first_row) list.first_row = selected_row;
-        if (selected_row >= list.first_row + visible) list.first_row = selected_row + 1 - visible;
-        list.reveal_selection = false;
+    if (panel.reveal_selection) {
+        if (selected_row < panel.first_row) panel.first_row = selected_row;
+        if (selected_row >= panel.first_row + visible) panel.first_row = selected_row + 1 - visible;
+        panel.reveal_selection = false;
     }
-    list.first_row = @min(list.first_row, n -| visible);
-    for (rows[list.first_row..n], 0..) |row, k| {
+    panel.first_row = @min(panel.first_row, n -| visible);
+    for (rows[panel.first_row..n], 0..) |row, k| {
         if (k >= visible or k >= hits.len) break;
         hits[k] = row.entry;
-        const entry = &list.entries[row.entry];
+        const entry = &view.entries[row.entry];
         const type_w: f32 = if (!compact and entry.state == .value) 150 else 0;
         const ry = y + @as(f32, @floatFromInt(k)) * row_h;
         if (row.child) |c| {
@@ -807,7 +531,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
             try r.textFit(font, x, ry, w, text, if (c < entry.children.len and !entry.children[c].extent_advisory) theme.text else theme.weak);
             continue;
         }
-        if (list.selected != null and list.selected.? == row.entry) try style.focus(r, .{ .x = rect.x + 4, .y = ry - 3, .w = rect.w - 8, .h = row_h }, 6, 1);
+        if (panel.selected != null and panel.selected.? == row.entry) try style.focus(r, .{ .x = rect.x + 4, .y = ry - 3, .w = rect.w - 8, .h = row_h }, 6, 1);
         var tag_buffer: [160]u8 = undefined;
         const tag = frameTag(&tag_buffer, entry, !compact);
         const tag_w = if (!compact) @min(r.measure(font, tag), 220) else 0;
@@ -821,7 +545,7 @@ pub fn draw(list: *WatchList, editor: *Editor, r: *gpu.Renderer, font: *Font, re
         const marker = if (entry.expandable) (if (entry.expanded) "- " else "+ ") else "";
         const value: []const u8, const color: gpu.Color = switch (entry.state) {
             .value => .{ std.fmt.bufPrint(&value_buffer, "= {s}{s}", .{ marker, entry.display.slice() }) catch "", if (entry.available) theme.text else theme.weak },
-            .failed => .{ std.fmt.bufPrint(&value_buffer, "error: {s}", .{explain(entry.failure.?)}) catch "", theme.warm },
+            .failed => .{ std.fmt.bufPrint(&value_buffer, "error: {s}", .{entry.failure.?}) catch "", theme.warm },
             .pending => .{ "not evaluated yet", theme.weak },
             .not_in_scope => .{ "not in scope here", theme.weak },
             .stale => .{ if (!entry.has_value) "stale: running" else std.fmt.bufPrint(&value_buffer, "stale: running / {s}", .{entry.display.slice()}) catch "stale: running", theme.weak },

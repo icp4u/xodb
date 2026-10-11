@@ -289,12 +289,15 @@ The reusable `src/render/scene3d` layer supplies one optional GPU scene per
 frame: instanced boxes, additive wire edges and translucent faces, point sprites,
 lines, shared-atlas billboard glyphs, depth, and a downsample/blur bloom pass.
 Call `Renderer.scene()` after a successful `begin()` at the desired 2D layer,
-fill each returned instance slice, then record UI overlays normally. Bounds are
+fill each returned instance writer with `set()` or `copy()`, then record UI
+overlays normally. Writers provide no read operation on mapped GPU memory. Bounds are
 intersected with the active clip and framebuffer before setting the scene camera
 viewport. Geometry projection and depth testing stay on the GPU; camera matrices
 and ray picking live in `scene3d/math.zig`.
 
-Resources are created on demand and retired after the frame fence when the scene
+Failed scene creation backs off from 250 ms to four seconds while retaining the
+typed diagnostic; successful creation clears the delay. Resources are created
+on demand and retired after the frame fence when the scene
 is hidden, resized, or the renderer is destroyed. Zero extent creates no images.
 Each primitive buffer grows to at most 262,144 instances (16,384 glyphs); the
 color/depth target is capped at 16,777,216 pixels. Opaque faces write depth;
@@ -309,5 +312,5 @@ pixel/lifecycle regression; its `--evidence` mode measures 4k/65k/250k instances
 at 1080p and 4K. It reports process CPU and RSS alongside frame throughput,
 submission wall time and optional GPU timestamps. The GPU interval includes
 command execution and synchronization through the final render pass, not
-presentation latency. `tests/scene3d-faults.py` is the periodic allocation-failure
-matrix, with handle and mapped-memory accounting.
+presentation latency. `tests/scene3d-faults.py` is the batch allocation-failure
+matrix, with handle and mapped-memory accounting and persistent-failure backoff.

@@ -47,7 +47,7 @@ d = None
 evidence = {}
 
 def until(fn, name):
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 10 * h.load_scale()
     while time.monotonic() < deadline:
         if not d.alive():
             raise AssertionError(d.tail())
@@ -63,7 +63,7 @@ def shot(name):
         return im.convert('RGB')
 
 def send(*cmd):
-    if d.keys(*cmd, wait=False).wait(timeout=10):
+    if d.keys(*cmd, wait=False).wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
 
 def field():
@@ -184,7 +184,7 @@ def periodic():
         if target.poll() is None:
             target.terminate()
         try:
-            target.wait(timeout=5)
+            target.wait(timeout=5 * h.load_scale())
         except subprocess.TimeoutExpired:
             target.kill()
             target.wait()

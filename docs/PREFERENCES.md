@@ -33,6 +33,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 
 | Setting | Initial default | Meaning |
 | --- | --- | --- |
+| wine.hide_internal_threads | false | Hide advisory Wine internal thread names in the GUI; selected and faulting threads stay visible, and MCP still lists every thread |
 | appearance.theme | builtin:dark | GUI theme preset or file relative to these preferences; CLI --theme wins |
 | profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |

@@ -104,7 +104,9 @@ pub const Tree = struct {
         for (self.entries[0..end]) |*entry| {
             entry.session.poll() catch |err| {
                 entry.session.cancelStep();
-                entry.session.step_diagnostic = @errorName(err);
+                const diagnostic = @errorName(err);
+                if (entry.session.step_diagnostic == null or !std.mem.eql(u8, entry.session.step_diagnostic.?, diagnostic)) self.revision += 1;
+                entry.session.step_diagnostic = diagnostic;
                 if (entry.last_generation != entry.session.target.snapshot().generation)
                     std.debug.print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.snapshot().pid, @errorName(err) });
             };

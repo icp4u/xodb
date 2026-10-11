@@ -7,6 +7,7 @@ const model = @import("../model/session.zig");
 const Session = model.Session;
 const linux = @import("../target/linux.zig");
 const disasm = @import("../model/disassembly.zig");
+const debugger_view = @import("../model/debugger_view.zig");
 const keys = @import("../platform/input.zig");
 const style = @import("style.zig");
 const theme = style.theme;
@@ -17,6 +18,7 @@ const capture_setup = @import("capture_setup.zig");
 const sample_inspector = @import("sample_inspector.zig");
 const capture_panel = @import("capture_panel.zig");
 const watch_ui = @import("watch.zig");
+const native_watches = @import("../model/native_watches.zig");
 const info = @import("../debug/info.zig");
 const profile = @import("../profile/capture.zig");
 const ToolButton = struct { label: []const u8, key: []const u8, code: u32, x: f32, w: f32 };
@@ -35,95 +37,6 @@ const tab_width = 4;
 /// and the timeline the row below it.
 const profile_split = 0.64;
 
-/// Watch-list evaluation through the same Session paths as MCP
-/// `evaluate_expression`: one unwind per thread and one locals lookup per
-/// frame for each refresh, shared by all entries.
-const WatchSource = struct {
-    session: *Session,
-    scratch: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    tids: [watch_ui.max_entries]i32 = undefined,
-    frames: [watch_ui.max_entries][]const model.Frame = undefined,
-    views: [watch_ui.max_entries][]watch_ui.Frame = undefined,
-    stacks: usize = 0,
-    local_keys: [watch_ui.max_entries]struct { tid: i32, index: usize } = undefined,
-    locals: [watch_ui.max_entries][]const info.Local = undefined,
-    local_count: usize = 0,
-    pub fn stopped(self: *WatchSource) bool {
-        return self.session.target.snapshot().state == .stopped;
-    }
-    pub fn ended(self: *WatchSource) bool {
-        return self.session.target.snapshot().state == .exited or self.session.target.snapshot().state == .idle;
-    }
-    pub fn generation(self: *WatchSource) u64 {
-        return self.session.target.snapshot().generation;
-    }
-    fn slot(self: *WatchSource, tid: i32) ?usize {
-        for (self.tids[0..self.stacks], 0..) |t, i| if (t == tid) return i;
-        return null;
-    }
-    pub fn identity(self: *WatchSource, tid: i32) ?watch_ui.Identity {
-        for (self.session.target.threadSlice()) |thread| {
-            if (thread.tid == tid and thread.state != .exited) return .{ .session = self.session.id, .image = self.session.target.snapshot().image_epoch, .thread = thread.id };
-        }
-        return null;
-    }
-    fn frameView(session: *Session, frame: model.Frame) watch_ui.Frame {
-        // Frame decoration must not fetch an unloaded remote caller's library.
-        const found = if (session.target.isRemote()) session.modules.cachedSymbolAt(frame.lookup_pc) else session.modules.symbolAt(frame.lookup_pc);
-        const function = if (found) |symbol| symbol.address else |_| null;
-        return .{ .cfa = frame.cfa, .symbol = frame.symbol, .module = frame.module_id, .function = function, .pc = frame.pc };
-    }
-    pub fn stack(self: *WatchSource, tid: i32) watch_ui.Stack {
-        const i = self.slot(tid) orelse blk: {
-            if (self.stacks == watch_ui.max_entries) return .unavailable;
-            const a = self.scratch.allocator();
-            const frames = self.session.stack(a, tid, 64) catch return .unavailable;
-            const views = a.alloc(watch_ui.Frame, frames.len) catch return .unavailable;
-            for (frames, views) |frame, *view| view.* = frameView(self.session, frame);
-            const i = self.stacks;
-            self.tids[i] = tid;
-            self.frames[i] = frames;
-            self.views[i] = views;
-            self.stacks += 1;
-            break :blk i;
-        };
-        const frames = self.frames[i];
-        return .{ .frames = .{ .items = self.views[i], .complete = frames.len > 0 and frames.len < 64 and frames[frames.len - 1].diagnostic == null } };
-    }
-    fn frameLocals(self: *WatchSource, tid: i32, index: usize, frame: model.Frame) []const info.Local {
-        for (self.local_keys[0..self.local_count], 0..) |key, i| if (key.tid == tid and key.index == index) return self.locals[i];
-        const values = self.session.frameLocals(self.scratch.allocator(), frame) catch &.{};
-        if (self.local_count < watch_ui.max_entries) {
-            self.local_keys[self.local_count] = .{ .tid = tid, .index = index };
-            self.locals[self.local_count] = values;
-            self.local_count += 1;
-        }
-        return values;
-    }
-    pub fn evaluate(self: *WatchSource, a: std.mem.Allocator, tid: i32, index: usize, text: []const u8, page: ?u64) watch_ui.Result {
-        const i = self.slot(tid) orelse return .{ .failed = error.InvalidFrame };
-        if (index >= self.frames[i].len) return .{ .failed = error.InvalidFrame };
-        const frame = self.frames[i][index];
-        const value = self.session.evaluateInFrame(self.scratch.allocator(), frame, self.frameLocals(tid, index, frame), text) catch |err| return .{ .failed = err };
-        const summary = self.session.summarize(a, value) catch |err| return .{ .failed = err };
-        const expandable = value.type.kind == .structure or value.type.kind == .array or (value.type.language == .go and value.type.go_kind == @import("../model/value_view.zig").go_kind.map);
-        const extent_advisory = if (summary.visualization) |v| v.extent_advisory else false;
-        var result = watch_ui.Result{ .value = .{ .display = summary.display, .type_name = summary.type, .available = summary.availability == .available, .extent_advisory = extent_advisory, .expandable = expandable } };
-        if (page) |start| if (expandable) {
-            const view = self.session.valueChildren(a, value, start, watch_ui.max_children, false) catch |err| return .{ .failed = err };
-            const children = a.alloc(watch_ui.Child, view.children.len) catch return result;
-            for (view.children, children) |child, *out| {
-                const advisory = if (child.value.visualization) |v| v.extent_advisory else false;
-                out.* = .{ .name = child.name, .display = if (advisory) std.fmt.allocPrint(a, "unproved extent: {s}", .{child.value.display}) catch child.value.display else child.value.display, .extent_advisory = advisory };
-            }
-            result.value.children = children;
-            result.value.total = view.total;
-            result.value.next = view.next;
-        };
-        return result;
-    }
-};
-
 /// A source line that was not found is only as good as the search: say so
 /// when images were left unread for a budget.
 fn lineStatus(session: *const Session, err: anyerror) []const u8 {
@@ -131,14 +44,12 @@ fn lineStatus(session: *const Session, err: anyerror) []const u8 {
     return @errorName(err);
 }
 pub const Workspace = struct {
-    runtime_type_signature: ?u64 = null,
     shared_clients: ?usize = null,
     shared_controller: ?u64 = null,
     /// Owner loop consumes this even when several toggles restore the old scope.
     shared_scope_changed: bool = false,
     imported: @import("imported.zig").View = .{},
     logical_frames: @import("frames.zig").View = .{},
-    jit_requested: ?struct { capture: u64, revision: u64, evidence: u64, ordinal: usize } = null,
     source: []const u8 = "",
     source_path: []const u8 = "No source file selected",
     source_line: i32 = 0,
@@ -149,13 +60,21 @@ pub const Workspace = struct {
     cursor_line: ?u32 = null,
     was_running_to: bool = false,
     probes_panel: @import("probes.zig").Panel = .{},
+    probe_capture: @import("../model/probe_view.zig").Capture = .{},
     stop_panel: @import("stop.zig").Panel = .{},
+    stop_capture: @import("../model/stop_view.zig").Capture = .{},
+    stop_view: @import("../model/stop_view.zig").View = .{},
     process_panel: @import("processes.zig").Panel = .{},
+    process_capture: @import("../model/process_view.zig").Capture = .{},
     allocation_panel: @import("allocations.zig").Panel = .{},
+    allocation_capture: @import("../model/allocation_view.zig").Capture = .{},
+    allocation_save_key: ?@import("../profile/allocation_capture.zig").Key = null,
     allocation_save_editor: watch_ui.Editor = .{},
     allocation_archive_seen: bool = false,
     syscall_panel: @import("syscalls.zig").Panel = .{},
+    syscall_capture: @import("../model/syscall_view.zig").Capture = .{},
     inline_panel: @import("inline.zig").Panel = .{},
+    inline_capture: @import("../model/inline_view.zig").Capture = .{},
     /// Static slice/control answers (S); see src/semq/host.zig.
     static_panel: @import("static_analysis.zig").Panel = .{},
     /// The assembly row last clicked, and whether S should use the source
@@ -166,24 +85,31 @@ pub const Workspace = struct {
     assembly_rows: struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, count: usize = 0 } = .{},
     inspection_panel: @import("inspection.zig").Panel = .{},
     runtime_type_panel: @import("runtime_types.zig").Panel = .{},
+    thread_list: @import("thread_list.zig").Panel = .{},
+    compatibility_info: @import("../model/compatibility.zig").Info = .{ .kind = .unavailable },
+    thread_labels: []const @import("../model/compatibility.zig").Label = &.{},
+    inspection_capture: @import("../model/inspection_view.zig").Capture = .{},
     selected_frame: usize = 0,
     last_frame: usize = std.math.maxInt(usize),
-    frames: []model.Frame = &.{},
-    locals: []LocalRow = &.{},
+    frames: []const model.Frame = &.{},
+    locals: []const LocalRow = &.{},
     local_diagnostic: ?[]const u8 = null,
-    breakpoint_lines: []u32 = &.{},
+    breakpoint_lines: []const u32 = &.{},
     language_panel: @import("language_tabs.zig").Panel = .{},
     show_flow: bool = false,
     show_profile: bool = false,
     flame: FlameView = .{},
+    profile_capture: @import("../model/profile_view.zig").Capture = .{},
     inspector: sample_inspector.Inspector = .{},
+    sample_capture: @import("../model/sample_view.zig").Capture = .{},
     /// Next-capture setup (S): the session defaults plus this thread choice.
     /// The selection is GUI state for the next capture and is never saved.
     setup: capture_panel.Panel = .{},
     thread_selection: capture_setup.Selection = .{},
-    thread_rows: ThreadRows = .{},
+    capture_control: @import("../model/capture_view.zig").Capture = .{},
+    capture_view: @import("../model/capture_view.zig").View = .{},
     timeline: timeline.TimelineView = .{},
-    timeline_source: TimelineSource = .{},
+    timeline_capture: @import("../model/profile_timeline.zig").Capture = .{},
     last_show_flow: bool = false,
     flow: FlowView = .{},
     browse_address: ?u64 = null,
@@ -192,23 +118,27 @@ pub const Workspace = struct {
     selected_local: usize = 0,
     /// Expression field (E) and watch list, shown in place of EVENTS (V).
     editor: watch_ui.Editor = .{},
-    watch: watch_ui.WatchList = .{},
+    watch: native_watches.WatchList = .{},
+    watch_panel: watch_ui.Panel = .{},
+    watch_view: native_watches.View = .{},
     runtime_watch_panel: @import("language_watches.zig").Panel = .{},
+    runtime_watch_capture: @import("../model/runtime_watch_view.zig").Capture = .{},
+    runtime_watch_view: @import("../model/runtime_watch_view.zig").View = .{},
     show_watch: bool = false,
     /// Up/Down, Delete, Return, PgUp/PgDn and W act on the watch list.
     watch_focus: bool = false,
     watch_rect: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     watch_hits: [64]?usize = @splat(null),
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    source_buffer: ?[]u8 = null,
-    source_name: ?[:0]u8 = null,
+    prepared: debugger_view.Capture = .{},
+    source_revision: u64 = 0,
+    presented: ?struct { generation: u64, tid: i32, frame: usize, browse: ?u64, source_revision: u64 } = null,
+    presentation_status: [256]u8 = undefined,
     selected: usize = 0,
     split: f32 = 0.48,
     dragging: bool = false,
     reported_dropped: u64 = 0,
     reported_keymap_errors: u64 = 0,
     status: []const u8 = "Ready",
-    budget_status: [128 + 288 + 32]u8 = undefined,
     fd_event_state: @import("../model/system.zig").FdEventState = .inactive,
     allocation_busy: bool = false,
     allocation_collecting: bool = false,
@@ -235,104 +165,46 @@ pub const Workspace = struct {
     comparison: @import("comparison.zig").Panel = .{},
     invocations: @import("invocations.zig").View = .{},
 
-    const LocalRow = struct { name: []const u8, value: model.ValueSummary };
+    const LocalRow = debugger_view.LocalRow;
     pub fn deinit(self: *Workspace) void {
         self.language_panel.deinit();
         self.runtime_type_panel.deinit();
         self.logical_frames.deinit();
-        self.flow.deinit();
         self.flame.deinit();
-        self.timeline_source.deinit();
-        self.syscall_panel.deinit();
+        self.profile_capture.deinit();
+        self.timeline_capture.deinit();
+        self.syscall_capture.deinit();
+        self.sample_capture.deinit();
         self.allocation_panel.deinit();
+        self.allocation_capture.deinit();
         self.invocations.deinit();
         self.watch.deinit();
-        self.arena.deinit();
-        if (self.source_buffer) |bytes| std.heap.page_allocator.free(bytes);
-        if (self.source_name) |name| std.heap.page_allocator.free(name);
+        self.stop_capture.deinit();
+        self.inline_capture.deinit();
+        self.process_capture.deinit();
+        self.probe_capture.deinit();
+        self.inspection_capture.deinit();
+        self.runtime_watch_capture.deinit();
+        self.prepared.deinit();
+        self.static_panel.deinit();
     }
     pub fn loadSource(self: *Workspace, path: []const u8) !void {
-        if (!self.source_remote and std.mem.eql(u8, path, self.source_path) and self.source.len > 0) return;
-        const a = std.heap.page_allocator;
-        const name = try a.dupeZ(u8, path);
-        errdefer a.free(name);
-        const fd = c.open(name, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
-        if (fd < 0) return error.SourceFileUnavailable;
-        defer _ = c.close(fd);
-        var stat: c.struct_stat = undefined;
-        if (c.fstat(fd, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.SourceFileUnavailable;
-        const bytes = try a.alloc(u8, 1024 * 1024);
-        errdefer a.free(bytes);
-        var n: usize = 0;
-        while (n < bytes.len) {
-            const count = c.read(fd, bytes.ptr + n, bytes.len - n);
-            if (count < 0 and c.__errno_location().* == c.EINTR) continue;
-            if (count < 0) return error.SourceReadFailed;
-            if (count == 0) break;
-            n += @intCast(count);
-        }
-        self.cursor_line = null;
-        if (self.source_buffer) |old| a.free(old);
-        if (self.source_name) |old| a.free(old);
-        self.source_buffer = bytes;
-        self.source_name = name;
-        self.source = bytes[0..n];
-        self.source_lines = @intCast(std.mem.count(u8, self.source, "\n") + @intFromBool(n > 0 and bytes[n - 1] != '\n'));
-        self.source_truncated = stat.st_size > bytes.len;
-        self.source_remote = false;
-        self.source_path = name;
+        try self.prepared.source.load(path);
+        self.presentSource(self.prepared.source.value);
     }
-    fn loadSite(self: *Workspace, session: *Session, site: @import("../debug/info.zig").Site) !void {
-        self.loadSource(site.path) catch |err| {
-            if (!session.fetch_source or site.original_path != null or !session.target.isRemote()) return err;
-            const a = std.heap.page_allocator;
-            const bytes = session.remoteSource(a, site) catch |remote_err| {
-                // Do not display an old remote copy as this stop's source.
-                if (self.source_remote) {
-                    self.source = "";
-                    self.source_lines = 0;
-                    self.source_remote = false;
-                    self.source_path = "";
-                    self.source_truncated = false;
-                    self.cursor_line = null;
-                }
-                return remote_err;
-            };
-            errdefer a.free(bytes);
-            const name = try a.dupeZ(u8, site.path);
-            if (self.source_buffer) |old| a.free(old);
-            if (self.source_name) |old| a.free(old);
-            self.source_buffer = bytes;
-            self.source_name = name;
-            self.source_path = name;
-            self.source = bytes;
-            self.source_lines = @intCast(std.mem.count(u8, bytes, "\n") + @intFromBool(bytes.len > 0 and bytes[bytes.len - 1] != '\n'));
-            self.source_truncated = false;
-            self.source_remote = true;
-            self.cursor_line = null;
-        };
+    fn presentSource(self: *Workspace, source: debugger_view.Source) void {
+        if (self.source_revision != source.revision) self.cursor_line = null;
+        self.source_revision = source.revision;
+        self.source = source.bytes;
+        self.source_path = source.path;
+        self.source_lines = source.lines;
+        self.source_truncated = source.truncated;
+        self.source_remote = source.remote;
     }
     /// The key bindings, as the evdev codes `step` tests for. A key is matched by
     /// its logical identity, and never with Ctrl, Alt, or Logo held. Only
     /// navigation repeats while a key is held; execution control, detach, watch,
     /// graph, agent scope, and quit act once per press.
-    /// The selected sample's per-sample reconstruction, on the existing stack
-    /// job. Waits behind other worker jobs; never unwinds on this thread.
-    fn inspectorStack(session: *Session, ordinal: usize) sample_inspector.Stack {
-        const capture = session.profile.?;
-        if (capture.collector != null) return .{ .not_available = "Stop collection to reconstruct" };
-        if (capture.config.user_stack_bytes == 0) return .{ .not_available = "Stack capture was off (S, Stacks)" };
-        if (session.archive_job) |job| {
-            if (job.kind == .stack and job.capture_id == capture.id and job.capture_revision == capture.revision and job.sample_ordinal == ordinal) {
-                if (!job.done.load(.acquire)) return .pending;
-                if (job.stack_result) |*result| return .{ .ready = result };
-                return .{ .failed = if (job.failure) |err| @errorName(err) else "no result" };
-            }
-            if (!job.done.load(.acquire)) return .{ .waiting = if (job.kind == .derived) "reconstructed flame view" else "archive job" };
-        }
-        _ = session.requestProfileStack(ordinal) catch |err| return .{ .failed = @errorName(err) };
-        return .pending;
-    }
     fn binding(event: keys.Event) u32 {
         if (!event.plain()) return 0;
         const code: u32 = switch (event.shortcut) {
@@ -353,6 +225,7 @@ pub const Workspace = struct {
             'w' => 17,
             'd' => if (event.mods.shift) 32 else 0,
             'g' => 34,
+            'h' => 35,
             'p' => 25,
             't' => 20,
             's' => 31,
@@ -404,11 +277,13 @@ pub const Workspace = struct {
             event.* = .{ .kind = .release };
         }
     }
-    fn activeEditor(self: *Workspace, session: *Session) ?*watch_ui.Editor {
-        self.language_panel.syncEditor(session);
-        if (self.logical_frames.open or (session.comparison != null and self.comparison.open) or session.imported != null) return null;
+    pub fn activeEditor(self: *Workspace, context: anytype) ?*watch_ui.Editor {
+        const remote = @TypeOf(context) != *Session;
+        const session = if (remote) {} else context;
+        if (remote) self.language_panel.syncEditorView(context.language) else self.language_panel.syncEditor(session);
+        if (self.logical_frames.open or (if (remote) false else (session.comparison != null and self.comparison.open) or session.imported != null)) return null;
         if (self.invocations.open) return if (self.invocations.editor.open) &self.invocations.editor else null;
-        if (session.process_tree != null and self.process_panel.open) return null;
+        if ((if (remote) true else session.process_tree != null) and self.process_panel.open) return null;
         if (self.allocation_save_editor.open) return &self.allocation_save_editor;
         if (self.allocation_panel.open or self.syscall_panel.open or self.stop_panel.open or self.static_panel.open) return null;
         if (self.inline_panel.open) return if (self.inline_panel.editor.open) &self.inline_panel.editor else null;
@@ -420,34 +295,34 @@ pub const Workspace = struct {
         if (self.show_profile and self.setup.open and self.setup.editor.open) return &self.setup.editor;
         return null;
     }
-    fn clipboardFocus(self: *Workspace, w: *Window, session: *Session) void {
-        watch_ui.Editor.focus(w, self.activeEditor(session));
+    pub fn clipboardFocus(self: *Workspace, w: *Window, context: anytype) void {
+        watch_ui.Editor.focus(w, self.activeEditor(context));
         self.setup.syncEditor();
     }
     /// Applies the queued key and button events one at a time, in order, then the
     /// pointer state. A click is handled at the position where it happened.
-    pub fn input(self: *Workspace, w: *Window, session: *Session) void {
-        self.sharedScopeInput(w, session);
-        self.clipboardFocus(w, session);
-        defer self.clipboardFocus(w, session);
-        if (self.show_profile and self.inspector.open and session.frames.hasJit()) if (session.profile) |capture| {
-            const key: @typeInfo(@FieldType(Workspace, "jit_requested")).optional.child = .{ .capture = capture.id, .revision = capture.revision, .evidence = session.frames.evidence_revision, .ordinal = self.inspector.ordinal };
-            if (capture.collector == null and !capture.archive_busy and !session.frames.busy() and (self.jit_requested == null or !std.meta.eql(self.jit_requested.?, key))) {
-                session.frames.prepareJit(capture, if (session.artifact) |artifact| artifact.source else null, self.inspector.ordinal, 1) catch |err| {
-                    self.status = @errorName(err);
-                };
-                self.jit_requested = key;
-            }
-        };
-
-        if (self.logical_frames.open) return self.logical_frames.input(w, &session.frames);
-        if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
+    pub fn input(self: *Workspace, w: *Window, context: anytype) void {
+        const remote = @TypeOf(context) != *Session;
+        const session = if (remote) {} else context;
+        const language = if (remote) context.language else @import("../model/language_view.zig").header(session);
+        if (remote) context.scopeInput(self, w) else self.sharedScopeInput(w, session);
+        self.clipboardFocus(w, context);
+        defer self.clipboardFocus(w, context);
+        if (self.logical_frames.open) {
+            if (remote) {
+                if (self.logical_frames.inputPrepared(w)) |action| context.send(self, .{ .logical_frames = action });
+            } else self.logical_frames.input(w, &session.frames);
+            return;
+        }
+        if (!remote) if (session.comparison) |job| if (self.comparison.open) return self.comparison.input(w, job);
         if (self.invocations.open) {
-            self.invocations.input(w, session);
+            if (remote) {
+                if (self.invocations.inputPrepared(w)) |action| context.send(self, .{ .invocation = action });
+            } else self.invocations.input(w, session);
             if (!self.invocations.open) self.status = "Invocation browser closed; N reopens it";
             return;
         }
-        if (session.imported) |*state| return self.imported.input(w, state);
+        if (!remote) if (session.imported) |*state| return self.imported.input(w, state);
         const pointer = [2]f32{ w.pointer_x, w.pointer_y };
         const down = w.mouse_down;
         defer {
@@ -456,11 +331,11 @@ pub const Workspace = struct {
             w.mouse_down = down;
         }
         var scroll = w.scroll;
-        if (self.process_panel.open and scroll != 0) if (session.process_tree) |tree| {
-            self.process_panel.wheel(tree, scroll);
+        if (self.process_panel.open and scroll != 0 and (if (remote) true else session.process_tree != null)) {
+            self.process_panel.wheel(scroll);
             scroll = 0;
             w.dirty = true;
-        };
+        }
         if (self.allocation_panel.open and scroll != 0) {
             self.allocation_panel.wheel(scroll);
             scroll = 0;
@@ -482,7 +357,7 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (self.runtime_type_panel.open and scroll != 0) {
-            self.runtime_type_panel.wheel(session, scroll);
+            if (remote) context.runtimeTypeInput(self, self.runtime_type_panel.wheelPrepared(scroll)) else self.runtime_type_panel.wheel(session, scroll);
             scroll = 0;
             w.dirty = true;
         }
@@ -492,7 +367,7 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (self.probes_panel.open and scroll != 0) {
-            self.probes_panel.wheel(scroll, session.target.snapshot().breakpoint_count);
+            self.probes_panel.wheel(scroll);
             scroll = 0;
             w.dirty = true;
         }
@@ -506,22 +381,27 @@ pub const Workspace = struct {
         w.mouse_down = self.dragging or down; // replay a pending drag release in order
         while (w.input.next()) |event| {
             if (w.closing) break;
-            self.clipboardFocus(w, session);
-            if (self.activeEditor(session)) |editor| if (editor.clipboard(w, event)) continue;
+            self.clipboardFocus(w, context);
+            if (self.activeEditor(context)) |editor| if (editor.clipboard(w, event)) continue;
             switch (event.kind) {
                 .press, .repeat => {
-                    if (self.activeEditor(session) == null and session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
+                    if (!remote and self.activeEditor(context) == null and session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
                         self.comparison.open = true;
                         w.dirty = true;
                         continue;
                     }
-                    if (self.activeEditor(session) == null and (session.observations.capture != null or session.observation_archive != null) and event.plain() and event.kind == .press and event.shortcut == 'n') {
+                    if (self.activeEditor(context) == null and (if (remote) context.header.observation_available else session.observations.capture != null or session.observation_archive != null) and event.plain() and event.kind == .press and event.shortcut == 'n') {
                         self.invocations.open = true;
                         w.dirty = true;
                         // Later queued input belongs to the browser.
-                        return self.input(w, session);
+                        return self.input(w, context);
                     }
-                    if (session.process_tree) |tree| if (self.process_panel.key(tree, event)) {
+                    if (remote) {
+                        if (context.processInput(self, self.process_panel.keyView(event))) {
+                            w.dirty = true;
+                            continue;
+                        }
+                    } else if (session.process_tree) |tree| if (self.process_panel.key(tree, event)) {
                         w.dirty = true;
                         if (tree.active() != session) return;
                         continue;
@@ -529,12 +409,19 @@ pub const Workspace = struct {
                     if (self.allocation_save_editor.open) {
                         if (self.allocation_save_editor.key(event)) |action| switch (action) {
                             .submit => |path| {
-                                _ = session.saveAllocationArchive(path) catch |err| {
+                                const identity = self.allocation_save_key orelse {
+                                    self.allocation_save_editor.message = "NoAllocationCapture";
+                                    continue;
+                                };
+                                if (remote) {
+                                    context.send(self, .{ .allocation = .{ .save = .{ .key = identity, .path = path } } });
+                                    continue;
+                                }
+                                @import("../model/allocation_view.zig").apply(session, .{ .save = .{ .key = identity, .path = path } }, .human) catch |err| {
                                     self.allocation_save_editor.message = @errorName(err);
                                     w.dirty = true;
                                     continue;
                                 };
-                                session.record(.human, "save_allocation_archive");
                                 self.allocation_save_editor.open = false;
                             },
                             else => {},
@@ -543,17 +430,25 @@ pub const Workspace = struct {
                         continue;
                     }
                     if (self.allocation_panel.open and event.plain() and event.kind == .press and event.shortcut == 's') {
+                        self.allocation_save_key = self.allocation_panel.key_;
                         self.allocation_save_editor.start();
                         w.dirty = true;
                         continue;
                     }
-                    const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
+                    const threads = if (remote) context.display.threads else session.target.threadSlice();
+                    const inspect_tid = if (threads.len > 0) threads[@min(self.selected, threads.len - 1)].tid else 0;
                     if (self.allocation_panel.open and event.plain() and event.kind == .press and event.shortcut == 'p') {
-                        self.toggleAllocations(session);
+                        self.toggleAllocations(context, @floatFromInt(w.height));
                         w.dirty = true;
                         continue;
                     }
-                    if (self.allocation_panel.key(session.allocations.capture, event)) {
+                    const allocation_input = self.allocation_panel.key(event);
+                    if (allocation_input != .unhandled) {
+                        if (remote) {
+                            if (allocation_input == .owner) context.send(self, .{ .allocation = allocation_input.owner });
+                        } else if (allocation_input == .owner) @import("../model/allocation_view.zig").apply(session, allocation_input.owner, .human) catch |err| {
+                            self.allocation_panel.message = @errorName(err);
+                        };
                         w.dirty = true;
                         continue;
                     }
@@ -565,57 +460,64 @@ pub const Workspace = struct {
                         w.dirty = true;
                         continue;
                     }
-                    if (self.static_panel.key(session, event)) {
-                        self.traceStatic(w);
-                        self.followStatic(w);
-                        w.dirty = true;
-                        continue;
-                    }
-                    if (self.inline_panel.key(session, inspect_tid, self.selected_frame, event)) {
-                        w.dirty = true;
-                        continue;
-                    }
-                    if (self.runtime_type_panel.key(session, event)) {
-                        w.dirty = true;
-                        continue;
-                    }
-                    if (self.inspection_panel.key(session, inspect_tid, self.selected_frame, event)) {
-                        w.dirty = true;
-                        continue;
-                    }
-                    if (self.probes_panel.key(session, event)) {
-                        w.dirty = true;
-                        continue;
-                    }
-                    if (self.editor.open) {
-                        if (self.editor.key(event)) |action| {
-                            self.applyEditor(session, action);
+                    if (remote) {
+                        if (context.paneKey(self, inspect_tid, event, w)) {
+                            w.dirty = true;
+                            continue;
+                        }
+                    } else {
+                        if (self.static_panel.key(session, event)) {
+                            self.traceStatic(w);
+                            self.followStatic(w);
+                            w.dirty = true;
+                            continue;
+                        }
+                        if (self.inline_panel.key(session, inspect_tid, self.selected_frame, event)) {
+                            w.dirty = true;
+                            continue;
+                        }
+                        if (self.runtime_type_panel.key(session, event)) {
+                            w.dirty = true;
+                            continue;
+                        }
+                        if (self.inspection_panel.key(session, inspect_tid, self.selected_frame, event)) {
+                            w.dirty = true;
+                            continue;
+                        }
+                        if (self.probes_panel.key(session, event)) {
                             w.dirty = true;
                             continue;
                         }
                     }
-                    if (@intFromEnum(session.language_tabs.selected) < 2 and !self.show_profile and self.show_watch and self.watch_focus and event.kind == .press and event.plain() and event.mods.shift and event.shortcut == 'l') {
-                        self.toggleWatchMode(session);
+                    if (self.editor.open) {
+                        if (self.editor.key(event)) |action| {
+                            self.applyEditor(context, action);
+                            w.dirty = true;
+                            continue;
+                        }
+                    }
+                    if (@intFromEnum(language.selected) < 2 and !self.show_profile and self.show_watch and self.watch_focus and event.kind == .press and event.plain() and event.mods.shift and event.shortcut == 'l') {
+                        self.toggleWatchMode(context);
                         w.dirty = true;
                         continue;
                     }
                     if (self.show_profile and self.setup.open) {
-                        const snapshot = self.thread_rows.snapshot(session);
-                        if (self.setup.key(event, &snapshot, .{})) |action| {
-                            self.applySetup(w, session, action);
+                        const capture_snapshot = if (remote) self.capture_view.snapshot else self.capture_control.rows.snapshot(session);
+                        if (self.setup.key(event, &capture_snapshot, .{})) |action| {
+                            self.applySetup(w, context, action);
                             continue;
                         }
                     }
-                    if (event.kind == .press and event.plain() and event.shortcut == 'l' and (session.frames.count > 0 or session.frames.job != null or session.frames.attachment.failure != null)) {
+                    if (event.kind == .press and event.plain() and event.shortcut == 'l' and (if (remote) context.header.logical_frames_available else session.frames.count > 0 or session.frames.job != null or session.frames.attachment.failure != null)) {
                         self.logical_frames.open = true;
                         w.dirty = true;
-                        return self.logical_frames.input(w, &session.frames);
+                        return self.input(w, context);
                     }
                     if (self.language_panel.editor.open) {
                         if (self.language_panel.editor.key(event)) |action| switch (action) {
                             .submit => |text| {
                                 const watching = self.language_panel.editor_watch;
-                                self.language_panel.submitExpression(session, text) catch |err| {
+                                (if (remote) context.submitLanguage(self, text) else self.language_panel.submitExpression(session, text)) catch |err| {
                                     self.language_panel.editor.message = @import("language_tabs.zig").watchError(err);
                                     continue;
                                 };
@@ -632,13 +534,18 @@ pub const Workspace = struct {
                     }
                     const code = binding(event);
                     if (code == 0) continue;
-                    self.step(w, session, false, code);
+                    self.step(w, context, false, code);
                     if (code == 18 and self.language_panel.editor.open) self.language_panel.editor_watch = event.mods.shift;
                     if (code == 18 and self.editor.open) self.editor.mode = if (event.mods.shift) .live else .pinned;
                 },
                 .button_press, .button_release => {
                     if (event.code != 272) continue;
-                    if (self.process_panel.open) if (session.process_tree) |tree| {
+                    if (remote and self.process_panel.open) {
+                        if (event.kind == .button_press) if (self.process_panel.pressView(event.x, event.y)) |intent| context.sendAt(self, intent.stamp, .{ .process = intent.operation });
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (!remote and self.process_panel.open) if (session.process_tree) |tree| {
                         if (event.kind == .button_press) self.process_panel.press(tree, event.x, event.y);
                         w.dirty = true;
                         if (tree.active() != session) return;
@@ -646,7 +553,7 @@ pub const Workspace = struct {
                     };
                     if (self.allocation_panel.open) {
                         if (event.kind == .button_press) {
-                            if (@import("allocations.zig").Panel.liveHit(@floatFromInt(w.width), event.x, event.y)) self.toggleAllocations(session) else self.allocation_panel.press(session.allocations.capture, event.x, event.y);
+                            if (@import("allocations.zig").Panel.liveHit(@floatFromInt(w.width), event.x, event.y)) self.toggleAllocations(context, @floatFromInt(w.height)) else self.allocation_panel.press(event.x, event.y);
                         }
                         w.dirty = true;
                         continue;
@@ -663,7 +570,7 @@ pub const Workspace = struct {
                     }
                     if (self.static_panel.open) {
                         if (event.kind == .button_press) {
-                            self.static_panel.press(session, event.x, event.y);
+                            if (remote) self.static_panel.pressPrepared(event.x, event.y) else self.static_panel.press(session, event.x, event.y);
                             self.traceStatic(w);
                             self.followStatic(w);
                         }
@@ -676,7 +583,9 @@ pub const Workspace = struct {
                         continue;
                     }
                     if (self.runtime_type_panel.open) {
-                        if (event.kind == .button_press) self.runtime_type_panel.press(session, event.x, event.y);
+                        if (event.kind == .button_press) {
+                            if (remote) context.runtimeTypeInput(self, self.runtime_type_panel.pressPrepared(event.x, event.y)) else self.runtime_type_panel.press(session, event.x, event.y);
+                        }
                         w.dirty = true;
                         continue;
                     }
@@ -686,7 +595,7 @@ pub const Workspace = struct {
                         continue;
                     }
                     if (self.probes_panel.open) {
-                        if (event.kind == .button_press) self.probes_panel.press(event.x, event.y, session.target.snapshot().breakpoint_count);
+                        if (event.kind == .button_press) self.probes_panel.press(event.x, event.y);
                         w.dirty = true;
                         continue;
                     }
@@ -701,19 +610,19 @@ pub const Workspace = struct {
                     }
                     // A timeline drag commits on release; motion only previews it.
                     if (event.kind == .button_release and self.show_profile and self.timeline.drag != null) {
-                        if (self.timeline.release(event.x, event.y)) self.applyTimeline(session);
+                        if (self.timeline.release(event.x, event.y)) self.applyTimeline(context);
                         w.dirty = true;
                         continue;
                     }
                     // A complete drag may arrive between two display frames.
                     if (!w.mouse_down and self.dragging) self.split = std.math.clamp(event.x / @as(f32, @floatFromInt(w.width)), 0.30, 0.62);
-                    self.step(w, session, w.mouse_down, 0);
+                    self.step(w, context, w.mouse_down, 0);
                 },
                 else => continue,
             }
             // Later actions in the batch must use a newly selected frame/thread.
             // The first action still observes the normal stale-snapshot guard.
-            if (!w.closing) self.refresh(session);
+            if (!remote and !w.closing) self.refresh(session);
         }
         w.pointer_x = pointer[0];
         w.pointer_y = pointer[1];
@@ -721,7 +630,7 @@ pub const Workspace = struct {
         w.scroll = scroll;
         if (w.closing) return;
         if (self.show_profile and self.timeline.motion(w.pointer_x, w.pointer_y)) w.dirty = true;
-        self.step(w, session, false, 0);
+        self.step(w, context, false, 0);
         if (w.input.dropped != self.reported_dropped) {
             std.debug.print("Input queue dropped {d} events ({d} total)\n", .{ w.input.dropped - self.reported_dropped, w.input.dropped });
             self.reported_dropped = w.input.dropped;
@@ -739,44 +648,61 @@ pub const Workspace = struct {
     /// S: the most recent selection (source line or assembly row), else the PC.
     /// A line keeps all its line-table rows and every function they fall in;
     /// the panel asks which function when there is more than one.
-    fn openStatic(self: *Workspace, w: *Window, session: *Session) void {
-        if (self.static_from_line) if (self.cursor_line) |line| {
-            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer scratch.deinit();
-            const a = scratch.allocator();
-            const addresses = session.sourceAddresses(a, self.source_path, line) catch &.{};
-            if (addresses.len == 0) {
-                self.status = if (session.modules.skipped().count != 0) "No code at the selected line in the images searched; some are over the image budget (Modules lists them)" else "No code at the selected line for static analysis";
+    fn openStatic(self: *Workspace, w: *Window, context: anytype) void {
+        if (@TypeOf(context) != *Session) {
+            if (self.static_from_line) if (self.cursor_line) |line| {
+                const origin = @import("../model/static_view.zig").Origin.source(self.source_path, line) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                };
+                self.static_panel.showOrigin(origin);
                 return;
-            }
-            var functions: std.ArrayList(@import("static_analysis.zig").Choice) = .empty;
-            for (addresses) |address| {
-                const f = session.static_analysis.resolve(a, session, address) catch continue;
-                const entry = f.runtime(f.key.entry);
-                for (functions.items) |known| {
-                    if (known.entry == entry) break;
-                } else functions.append(a, .{ .name = f.name, .entry = entry }) catch {};
-            }
-            if (functions.items.len == 0) {
-                self.status = "The selected line has no function bounds in the session's symbols";
+            };
+            const pc = self.assembly_cursor orelse (if (self.regs) |regs| linux.programCounter(regs) catch null else null) orelse {
+                self.status = "Pause, or select an instruction or source line, for static analysis";
                 return;
-            }
-            if (w.input.trace) {
-                std.debug.print("static functions:", .{});
-                for (functions.items) |f| std.debug.print(" {s}", .{f.name});
-                std.debug.print("\n", .{});
-            }
-            self.static_panel.show(.{ .line = .{ .path = self.source_path, .line = line, .addresses = addresses, .functions = functions.items } });
-            return;
-        };
-        const pc = self.assembly_cursor orelse (if (self.regs) |regs| linux.programCounter(regs) catch null else null) orelse {
-            self.status = "Pause, or select an instruction or source line, for static analysis";
-            return;
-        };
-        self.static_panel.show(.{ .pc = pc });
+            };
+            self.static_panel.showOrigin(.{ .pc = pc });
+        } else {
+            const session = context;
+            if (self.static_from_line) if (self.cursor_line) |line| {
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const a = scratch.allocator();
+                const addresses = session.sourceAddresses(a, self.source_path, line) catch &.{};
+                if (addresses.len == 0) {
+                    self.status = if (session.modules.skipped().count != 0) "No code at the selected line in the images searched; some are over the image budget (Modules lists them)" else "No code at the selected line for static analysis";
+                    return;
+                }
+                var functions: std.ArrayList(@import("static_analysis.zig").Choice) = .empty;
+                for (addresses) |address| {
+                    const f = session.static_analysis.resolve(a, session, address) catch continue;
+                    const entry = f.runtime(f.key.entry);
+                    for (functions.items) |known| {
+                        if (known.entry == entry) break;
+                    } else functions.append(a, .{ .name = f.name, .entry = entry }) catch {};
+                }
+                if (functions.items.len == 0) {
+                    self.status = "The selected line has no function bounds in the session's symbols";
+                    return;
+                }
+                if (w.input.trace) {
+                    std.debug.print("static functions:", .{});
+                    for (functions.items) |f| std.debug.print(" {s}", .{f.name});
+                    std.debug.print("\n", .{});
+                }
+                self.static_panel.show(.{ .line = .{ .path = self.source_path, .line = line, .addresses = addresses, .functions = functions.items } });
+                return;
+            };
+            const pc = self.assembly_cursor orelse (if (self.regs) |regs| linux.programCounter(regs) catch null else null) orelse {
+                self.status = "Pause, or select an instruction or source line, for static analysis";
+                return;
+            };
+            self.static_panel.show(.{ .pc = pc });
+        }
     }
     /// With XODB_INPUT_TRACE, each static answer is logged once for GUI tests.
-    fn traceStatic(self: *Workspace, w: *Window) void {
+    pub fn traceStatic(self: *Workspace, w: *Window) void {
         const panel = &self.static_panel;
         if (!w.input.trace or panel.answers == self.static_traced) return;
         self.static_traced = panel.answers;
@@ -784,7 +710,7 @@ pub const Workspace = struct {
         for (panel.rows) |row| std.debug.print("static row: {s} 0x{x} {s}\n", .{ row.certainty, row.address orelse 0, row.label });
     }
     /// A chosen static citation browses the assembly and source to it.
-    fn followStatic(self: *Workspace, w: *Window) void {
+    pub fn followStatic(self: *Workspace, w: *Window) void {
         const address = self.static_panel.navigate orelse return;
         if (w.input.trace) std.debug.print("static navigate: 0x{x}\n", .{address});
         self.static_panel.navigate = null;
@@ -794,26 +720,47 @@ pub const Workspace = struct {
         self.static_from_line = false;
         self.status = "Static citation; S returns to the answer";
     }
-    fn toggleAllocations(self: *Workspace, session: *Session) void {
-        if (session.allocations.preparing() or session.allocations.collecting()) {
-            session.allocations.stop(.manual);
-            session.record(.human, "stop_allocations");
-            self.status = "Allocation capture stopping";
-            return;
+    pub fn toggleAllocations(self: *Workspace, context: anytype, height: f32) void {
+        if (@TypeOf(context) != *Session) {
+            const view = self.allocation_panel.view;
+            const stopping = view.preparing or view.collecting;
+            if (!stopping and self.selected >= context.display.threads.len) {
+                self.status = "Select a stopped thread before allocation capture";
+                return;
+            }
+            const action: @import("../model/allocation_view.zig").Action = if (stopping) .{ .stop = .{ .identity = if (view.key) |key| key.identity else null, .serial = view.serial } } else .{ .start = .{ .tid = context.display.threads[self.selected].tid, .serial = view.serial } };
+            context.send(self, .{ .allocation = action });
+        } else {
+            const session = context;
+            const threads = session.target.threadSlice();
+            const tid = if (threads.len > 0) threads[@min(self.selected, threads.len - 1)].tid else 0;
+            self.allocation_capture.refresh(&session.allocations, self.allocation_panel.request(height), tid);
+            self.allocation_panel.present(self.allocation_capture.value);
+            const view = self.allocation_panel.view;
+            const stopping = view.preparing or view.collecting;
+            if (!stopping and self.selected >= session.target.snapshot().thread_count) {
+                self.status = "Select a stopped thread before allocation capture";
+                return;
+            }
+            const action: @import("../model/allocation_view.zig").Action = if (stopping)
+                .{ .stop = .{ .identity = if (view.key) |key| key.identity else null, .serial = view.serial } }
+            else
+                .{ .start = .{ .tid = session.target.threadSlice()[self.selected].tid, .serial = view.serial } };
+            @import("../model/allocation_view.zig").apply(session, action, .human) catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
+            if (!stopping) self.allocation_busy = true;
+            self.status = if (stopping) "Allocation capture stopping" else "Preparing allocation capture; keep target paused";
         }
-        if (self.selected >= session.target.snapshot().thread_count) {
-            self.status = "Select a stopped thread before allocation capture";
-            return;
-        }
-        const tids = [_]i32{session.target.threadSlice()[self.selected].tid};
-        session.startAllocations(.human, &tids, session.allocation_defaults, null, &Session.allocation_hooks) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        self.allocation_busy = true;
-        self.status = "Preparing allocation capture; keep target paused";
     }
-    fn step(self: *Workspace, w: *Window, session: *Session, press: bool, key: u32) void {
+    pub fn step(self: *Workspace, w: *Window, context: anytype, press: bool, key: u32) void {
+        const remote = @TypeOf(context) != *Session;
+        const session = if (remote) {} else context;
+        const snapshot = if (remote) context.display.snapshot else session.target.snapshot();
+        const threads = if (remote) context.display.threads else session.target.threadSlice();
+        const language = if (remote) context.language else @import("../model/language_view.zig").header(session);
+        const offline = if (remote) false else session.offline;
         var click = press;
         if (key == 30) {
             self.syscall_panel.open = false;
@@ -839,7 +786,7 @@ pub const Workspace = struct {
                 return;
             }
             if (key == 26 or key == 27) {
-                if (session.profile) |capture| self.inspector.step(capture, self.flame.selection.filter, if (key == 26) -1 else 1);
+                self.inspector.step(self.flame.selection.filter, if (key == 26) -1 else 1);
                 w.dirty = true;
                 return;
             }
@@ -855,7 +802,7 @@ pub const Workspace = struct {
         if (self.show_profile and self.setup.open and click) {
             click = false;
             w.dirty = true;
-            if (self.setup.press(w.pointer_x, w.pointer_y, w.input.mods().shift)) |action| return self.applySetup(w, session, action);
+            if (self.setup.press(w.pointer_x, w.pointer_y, w.input.mods().shift)) |action| return self.applySetup(w, context, action);
             if (!self.setup.containsPoint(w.pointer_x, w.pointer_y)) self.setup.open = false;
         }
         if (self.show_profile and (key == 31 or (click and self.flame.setupHit(w.pointer_x, w.pointer_y)))) {
@@ -864,9 +811,15 @@ pub const Workspace = struct {
             w.dirty = true;
             click = false;
         }
-        if (self.show_profile and !session.offline and (key == 20 or (click and self.flame.durationHit(w.pointer_x, w.pointer_y)))) {
-            @import("flame.zig").FlameView.cycleDuration(&session.profile_defaults);
-            self.status = if (session.profile_defaults.duration_ms == 0) "Next capture: until stopped; resource and scope limits still apply" else "Next capture duration changed";
+        if (self.show_profile and !offline and (key == 20 or (click and self.flame.durationHit(w.pointer_x, w.pointer_y)))) {
+            if (remote) {
+                var defaults = self.capture_view.defaults;
+                @import("flame.zig").FlameView.cycleDuration(&defaults);
+                context.send(self, .{ .capture_control = .{ .defaults = defaults } });
+            } else {
+                @import("flame.zig").FlameView.cycleDuration(&session.profile_defaults);
+                self.status = if (session.profile_defaults.duration_ms == 0) "Next capture: until stopped; resource and scope limits still apply" else "Next capture duration changed";
+            }
             w.dirty = true;
             click = false;
         }
@@ -898,12 +851,14 @@ pub const Workspace = struct {
         const flame_w: f32 = if (w.width < 900) 110 else 178;
         if (click and w.pointer_x >= flame_x and w.pointer_x < flame_x + flame_w and w.pointer_y >= 8 and w.pointer_y < 37) code = 33;
         if (code == 62 and !self.show_profile) {
-            session.restart() catch |err| {
-                self.status = @errorName(err);
-                w.dirty = true;
-                return;
-            };
-            session.record(.human, "restart");
+            if (remote) context.send(self, .{ .control = .restart }) else {
+                session.restart() catch |err| {
+                    self.status = @errorName(err);
+                    w.dirty = true;
+                    return;
+                };
+                session.record(.human, "restart");
+            }
             self.status = "Restarted owned launch; watches cleared, breakpoints relocated";
             self.selected = 0;
             self.selected_frame = 0;
@@ -936,7 +891,7 @@ pub const Workspace = struct {
             self.probes_panel.open = false;
             self.inspection_panel.open = false;
             self.inline_panel.open = false;
-            self.openStatic(w, session);
+            self.openStatic(w, context);
             w.dirty = true;
             return;
         }
@@ -957,12 +912,16 @@ pub const Workspace = struct {
             } else 0;
             const address = if (self.selected_local < self.locals.len) self.locals[self.selected_local].value.address orelse fallback_sp else fallback_sp;
             self.probes_panel.open = false;
-            self.inspection_panel.show(session, code == 19, address);
+            self.inspection_panel.show(code == 19, address);
             w.dirty = true;
             return;
         }
         if (code == 48 and !self.show_profile) {
             self.probes_panel.open = !self.probes_panel.open;
+            if (!remote) {
+                self.probe_capture.refresh(session, self.probes_panel.open);
+                self.probes_panel.present(self.probe_capture.value);
+            }
             w.dirty = true;
             return;
         }
@@ -982,40 +941,18 @@ pub const Workspace = struct {
             self.show_profile = true;
             self.dragging = false;
             w.dirty = true;
-            if (session.profile != null and session.profile.?.collector != null) {
-                session.stopProfile() catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
-                session.record(.human, "stop_profile");
-                self.status = "Capture stopped; target execution unchanged";
+            const control = @import("../model/capture_view.zig");
+            if (if (remote) self.capture_view.snapshot.collecting else session.profile != null and session.profile.?.collector != null) {
+                self.applyCapture(context, .{ .stop = if (remote) self.capture_view.capture_id orelse return else session.profile.?.id });
             } else {
-                // Revalidate the thread choice against the current target, then
-                // let Session apply its own checks.
-                const snapshot = self.thread_rows.snapshot(session);
-                if (self.thread_selection.sync(&snapshot) == .cleared_replaced) {
+                const capture_snapshot = if (remote) self.capture_view.snapshot else self.capture_control.rows.snapshot(session);
+                if (self.thread_selection.sync(&capture_snapshot) == .cleared_replaced) {
                     self.setup.message = "The target changed; review the capture thread selection";
                     self.setup.open = true;
                     self.status = self.setup.message;
                     return;
                 }
-                var tids: [@import("../profile/linux_perf.zig").max_threads]i32 = undefined;
-                switch (capture_setup.prepareStart(&snapshot, session.profile_defaults, &self.thread_selection, .{}, &tids)) {
-                    .rejected => |rejected| {
-                        self.status = capture_setup.problemText(rejected.problem);
-                        if (rejected.problem == .empty_subset or rejected.problem == .missing_threads or rejected.problem == .too_many_threads) self.setup.open = true;
-                        return;
-                    },
-                    .ready => |config| {
-                        _ = session.startProfile(config) catch |err| {
-                            self.status = @errorName(err);
-                            return;
-                        };
-                    },
-                }
-                session.record(.human, "start_profile");
-                self.setup.open = false;
-                self.status = "Capturing CPU samples; Space runs the target";
+                self.applyCapture(context, .{ .start = control.Start.from(&self.thread_selection) });
             }
         }
         if (self.show_profile) {
@@ -1027,7 +964,7 @@ pub const Workspace = struct {
             if (code == 48) {
                 if (self.flame.basis == .recorded) {
                     // Choosing the basis again is the explicit retry of a failure.
-                    session.retryDerived();
+                    self.applyCapture(context, .retry_derived);
                     self.flame.setBasis(.reconstructed);
                     self.status = "Reconstructed stacks from saved registers and stack bytes; B returns to recorded callchains";
                 } else {
@@ -1036,47 +973,33 @@ pub const Workspace = struct {
                 }
                 w.dirty = true;
             }
-            if (session.profile) |capture| {
+            if (self.flame.capture_key != null) {
                 if (code == 23) {
                     self.inspector.open = !self.inspector.open;
                     if (self.inspector.open) self.inspector.scroll = 0;
-                    if (self.inspector.open) self.inspector.ordinal = self.flame.selectedExample() orelse sample_inspector.Inspector.first(capture, self.flame.selection.filter) orelse capture.samples.len();
+                    if (self.inspector.open) self.inspector.ordinal = if (self.flame.selectedExample()) |ordinal| ordinal else std.math.maxInt(usize);
                     w.dirty = true;
                 }
                 if (self.inspector.open and (code == 26 or code == 27)) {
-                    self.inspector.step(capture, self.flame.selection.filter, if (code == 26) -1 else 1);
+                    self.inspector.step(self.flame.selection.filter, if (code == 26) -1 else 1);
                     w.dirty = true;
                 }
             }
             if (code == 44) self.flame.zoomSelected();
             if (code == 14) self.flame.zoomOut();
-            if (click) if (session.profile) |capture| {
-                // Hit rectangles describe the displayed revision; frame identity
-                // remains valid within this capture until new mapping evidence.
-                if (capture.id == self.flame.capture_id and capture.mapping_revision == self.flame.mapping_revision and (capture.trusted_before_ns == std.math.maxInt(u64) or capture.revision == self.flame.revision)) {
-                    if (self.flame.hit(w.pointer_x, w.pointer_y)) |node| self.flame.select(capture, node);
-                }
-            };
-            if (code == 28) if (session.profile) |capture| {
-                if (self.flame.capture_id == capture.id and capture.mapping_revision == self.flame.mapping_revision and (capture.trusted_before_ns == std.math.maxInt(u64) or capture.revision == self.flame.revision)) if (self.flame.selectedFrame()) |frame| {
-                    if (capture.offline) {
-                        self.status = "Offline capture: recorded source location shown below; historical source text is not bundled";
-                    } else if (session.target.snapshot().state != .stopped or session.target.snapshot().image_epoch != capture.image_epoch or session.target.snapshot().pid != capture.pid) {
-                        self.status = "Pause in the captured image to browse; frozen assembly remains below";
-                    } else {
-                        session.refreshMaps() catch |err| {
-                            self.status = @errorName(err);
-                            return;
-                        };
-                        if (capture.matchesLive(&session.modules, frame)) {
-                            self.browse_address = frame.lookup_address;
-                            self.browse_assembly = frame.address; // start decoding at a known instruction boundary
-                            self.show_flow = false;
-                            self.show_profile = false;
-                            self.status = "Browsing sampled function; execution unchanged";
-                        } else self.status = "Captured frame has no matching live image";
+            if (remote) {
+                if (click) if (self.flame.hit(w.pointer_x, w.pointer_y)) |node| self.flame.select(node);
+            } else {
+                if (click) if (session.profile) |capture| {
+                    // Hit rectangles describe the displayed revision; frame identity
+                    // remains valid within this capture until new mapping evidence.
+                    if (capture.id == self.flame.capture_id and capture.mapping_revision == self.flame.mapping_revision and (capture.trusted_before_ns == std.math.maxInt(u64) or capture.revision == self.flame.revision)) {
+                        if (self.flame.hit(w.pointer_x, w.pointer_y)) |node| self.flame.select(node);
                     }
                 };
+            }
+            if (code == 28) if (self.flame.view.key) |capture_key| if (self.flame.selectedFrame()) |frame| {
+                self.applyCapture(context, .{ .browse = .{ .key = capture_key, .frame = frame } });
             };
             if (w.scroll != 0 and self.timeline.wheel(w.pointer_x, w.pointer_y, w.scroll)) {
                 w.scroll = 0;
@@ -1089,7 +1012,14 @@ pub const Workspace = struct {
             if (w.pointer_y >= 90 and w.pointer_y < @as(f32, @floatFromInt(w.height)) * 0.73) click = false;
         }
         if (code == 24 or (click and w.pointer_y >= 8 and w.pointer_y < 37 and w.pointer_x >= 91 and w.pointer_x < 262)) {
-            if (session.process_tree) |tree| self.process_panel.show(tree);
+            if (remote) {
+                self.process_panel.show(context.processes);
+            } else if (session.process_tree) |tree| {
+                self.process_capture.refresh(tree, 0, true) catch |err| {
+                    self.status = @errorName(err);
+                };
+                self.process_panel.show(self.process_capture.value);
+            }
             w.dirty = true;
             return;
         }
@@ -1098,7 +1028,7 @@ pub const Workspace = struct {
             self.show_flow = !self.show_flow;
             w.dirty = true;
         }
-        if (!self.show_profile and self.show_flow and session.target.snapshot().state == .stopped and self.flow.generation == session.target.snapshot().generation) {
+        if (!self.show_profile and self.show_flow and snapshot.state == .stopped and self.flow.generation == snapshot.generation) {
             if (click) if (self.flow.hit(w.pointer_x, w.pointer_y)) |address| {
                 self.browse_address = address;
                 self.browse_assembly = null;
@@ -1112,8 +1042,8 @@ pub const Workspace = struct {
             }
         }
         if (!self.show_profile) {
-            if (code == 18 and @intFromEnum(session.language_tabs.selected) >= 2) {
-                self.language_panel.beginExpression(session) catch |err| {
+            if (code == 18 and @intFromEnum(language.selected) >= 2) {
+                (if (remote) self.language_panel.beginExpressionView(language) else self.language_panel.beginExpression(session)) catch |err| {
                     self.status = @errorName(err);
                 };
                 w.dirty = true;
@@ -1131,7 +1061,7 @@ pub const Workspace = struct {
             if (self.show_watch and w.scroll != 0) {
                 const r = self.watch_rect;
                 if (w.pointer_x >= r.x and w.pointer_x < r.x + r.w and w.pointer_y >= r.y and w.pointer_y < r.y + r.h) {
-                    if (@intFromEnum(session.language_tabs.selected) >= 2) self.runtime_watch_panel.scrollBy(w.scroll) else self.watch.scrollBy(w.scroll);
+                    if (@intFromEnum(language.selected) >= 2) self.runtime_watch_panel.scrollBy(w.scroll) else self.watch_panel.scrollBy(w.scroll);
                     w.scroll = 0;
                     w.dirty = true;
                 }
@@ -1140,70 +1070,91 @@ pub const Workspace = struct {
                 const r = self.watch_rect;
                 self.watch_focus = w.pointer_x >= r.x and w.pointer_x < r.x + r.w and w.pointer_y >= r.y and w.pointer_y < r.y + r.h;
                 if (self.watch_focus) {
-                    if (@intFromEnum(session.language_tabs.selected) >= 2) {
+                    if (@intFromEnum(language.selected) >= 2) {
                         self.runtime_watch_panel.click(w.pointer_x, w.pointer_y);
-                    } else if (self.watch.rowAt(w.pointer_y, &self.watch_hits)) |i| self.watch.selected = i;
+                    } else if (self.watch_panel.rowAt(w.pointer_y, &self.watch_hits)) |i| self.watch_panel.selected = i;
                     click = false;
                     w.dirty = true;
                 }
             }
-            if (self.show_watch and self.watch_focus and @intFromEnum(session.language_tabs.selected) >= 2) {
-                if (self.runtime_watch_panel.key(session, code) catch |err| failed: {
-                    self.status = @errorName(err);
-                    break :failed false;
-                }) {
-                    code = 0;
-                    w.dirty = true;
+            if (self.show_watch and self.watch_focus and @intFromEnum(language.selected) >= 2) {
+                if (remote) {
+                    switch (self.runtime_watch_panel.keyView(self.runtime_watch_view, code)) {
+                        .ignored => {},
+                        .local => {
+                            code = 0;
+                            w.dirty = true;
+                        },
+                        .remove => |id| {
+                            context.send(self, .{ .runtime_watch = .{ .remove = id } });
+                            code = 0;
+                            w.dirty = true;
+                        },
+                    }
+                } else {
+                    if (self.runtime_watch_panel.key(session, code) catch |err| failed: {
+                        self.status = @errorName(err);
+                        break :failed false;
+                    }) {
+                        code = 0;
+                        w.dirty = true;
+                    }
                 }
             }
-            if (self.show_watch and self.watch_focus and @intFromEnum(session.language_tabs.selected) < 2) if (self.watch.selected) |i| {
-                if (code == 103 or code == 108) {
-                    self.watch.reveal_selection = true;
-                    self.watch.selected = if (code == 103) i -| 1 else @min(i + 1, self.watch.count - 1);
-                    code = 0;
-                    w.dirty = true;
+            if (self.show_watch and self.watch_focus and @intFromEnum(language.selected) < 2) {
+                switch (self.watch_panel.keyView(self.watch_view, code)) {
+                    .ignored => {},
+                    .local => {
+                        code = 0;
+                        w.dirty = true;
+                    },
+                    .owner => |action| {
+                        if (action == .investigate_write) {
+                            self.watchWrite(context, action.investigate_write.index);
+                        } else if (self.applyWatch(context, action)) {
+                            if (action == .remove) self.watch_panel.removed(action.remove.index, self.watch_view.entries.len);
+                        }
+                        code = 0;
+                        w.dirty = true;
+                    },
                 }
-                if (code == 26 or code == 27) {
-                    self.watch.scrollBy(if (code == 26) -1 else 1);
-                    code = 0;
-                    w.dirty = true;
-                }
-                // Delete or BackSpace: compact keyboards (e.g. HHKB) have no
-                // dedicated Delete key.
-                if (code == 111 or code == 14) {
-                    self.watch.remove(i);
-                    code = 0;
-                    w.dirty = true;
-                }
-                if (code == 28) {
-                    self.watch.toggleExpanded(i);
-                    self.refreshWatch(session);
-                    w.dirty = true;
-                }
-                if (code == 104 or code == 109) {
-                    self.watch.pageChildren(i, code == 109);
-                    self.refreshWatch(session);
-                    w.dirty = true;
-                }
-                if (code == 17) return self.watchWrite(session, i);
-            };
+            }
         }
         if (!self.show_profile and click) {
             if (self.language_panel.hit(w.pointer_x, w.pointer_y)) |tab| {
-                session.language_tabs.select(tab) catch {};
+                if (remote) context.send(self, .{ .language = .{ .tab = tab } }) else session.language_tabs.select(tab) catch {};
                 click = false;
                 w.dirty = true;
             }
         }
-        if (!self.show_profile and @intFromEnum(session.language_tabs.selected) >= 2) {
+        if (!self.show_profile and @intFromEnum(language.selected) >= 2) {
             if (click) {
-                const handled = self.language_panel.click(session, w.pointer_x, w.pointer_y) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
-                if (handled) {
-                    click = false;
-                    w.dirty = true;
+                if (remote) {
+                    const result = self.language_panel.clickView(language, w.pointer_x, w.pointer_y) catch |err| {
+                        self.status = @errorName(err);
+                        return;
+                    };
+                    switch (result) {
+                        .ignored => {},
+                        .local => {
+                            click = false;
+                            w.dirty = true;
+                        },
+                        .select => |action| {
+                            context.send(self, .{ .language = action });
+                            click = false;
+                            w.dirty = true;
+                        },
+                    }
+                } else {
+                    const handled = self.language_panel.click(session, w.pointer_x, w.pointer_y) catch |err| {
+                        self.status = @errorName(err);
+                        return;
+                    };
+                    if (handled) {
+                        click = false;
+                        w.dirty = true;
+                    }
                 }
             }
             if (w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.scroll != 0) {
@@ -1213,28 +1164,45 @@ pub const Workspace = struct {
             }
         }
         if (code == 15) {
-            session.language_tabs.cycle();
+            if (remote) {
+                const tabs = @import("../model/language_tabs.zig");
+                for (1..tabs.order.len + 1) |offset| {
+                    const tab = tabs.order[(@intFromEnum(language.selected) + offset) % tabs.order.len];
+                    if (language.visible(tab)) {
+                        context.send(self, .{ .language = .{ .tab = tab } });
+                        break;
+                    }
+                }
+            } else session.language_tabs.cycle();
             w.dirty = true;
         }
-        if (click and session.language_tabs.selected == .native and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
+        if (click and language.selected == .native and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.selected_local = @intFromFloat((w.pointer_y - self.language_panel.content_y) / 48);
             w.dirty = true;
         }
-        if (code == 17 and @intFromEnum(session.language_tabs.selected) >= 2) {
-            const id = self.language_panel.watchBinding(session) catch |err| {
-                self.status = @import("language_tabs.zig").watchError(err);
-                return;
-            };
-            self.runtime_watch_panel.selected = id;
-            self.runtime_watch_panel.reveal = true;
+        if (code == 17 and @intFromEnum(language.selected) >= 2) {
+            if (remote) {
+                const action = self.language_panel.watchBindingView(language) catch |err| {
+                    self.status = @import("language_tabs.zig").watchError(err);
+                    return;
+                };
+                context.send(self, .{ .runtime_watch = action });
+            } else {
+                const id = self.language_panel.watchBinding(session) catch |err| {
+                    self.status = @import("language_tabs.zig").watchError(err);
+                    return;
+                };
+                self.runtime_watch_panel.selected = id;
+                self.runtime_watch_panel.reveal = true;
+            }
             self.show_watch = true;
             self.watch_focus = false;
             self.status = "Runtime binding watch added; compares when the process stops";
             w.dirty = true;
             return;
         }
-        if (code == 17 and session.language_tabs.selected == .native and session.target.snapshot().state == .stopped and self.selected_local < self.locals.len and session.target.snapshot().thread_count > 0) {
-            if (self.last_generation != session.target.snapshot().generation) {
+        if (code == 17 and language.selected == .native and snapshot.state == .stopped and self.selected_local < self.locals.len and snapshot.thread_count > 0) {
+            if (self.last_generation != snapshot.generation) {
                 self.status = "StaleSnapshot";
                 return;
             }
@@ -1243,48 +1211,57 @@ pub const Workspace = struct {
                 self.status = "NotAddressable";
                 return;
             };
-            for (session.target.watchpointSlice()) |watch| if (watch != null and watch.?.address == address) {
-                session.target.removeWatchpoint(watch.?.id) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
-                session.record(.human, "remove_watchpoint");
-                self.status = "Watchpoint removed";
-                return;
-            };
-            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
-            _ = session.investigateWrite(tid, self.selected_frame, "Why did the selected value change?", local.name) catch |err| {
-                self.status = @errorName(err);
-                return;
-            };
-            session.record(.human, "investigate_write");
-            self.status = "Write investigation started";
-        }
-        if (click and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and session.target.snapshot().state == .stopped) {
-            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-            defer scratch.deinit();
-            const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
-            const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, number) catch |err| {
-                self.status = lineStatus(session, err);
-                return;
-            };
-            var removed = false;
-            for (addresses) |address| {
-                for (session.target.breakpointSlice()) |probe| if (probe.address == address) {
-                    session.target.removeBreakpoint(probe.id) catch |err| {
+            if (remote) {
+                context.send(self, .{ .workspace = .{ .watch_local = .{ .tid = threads[self.selected % threads.len].tid, .frame = self.selected_frame, .metadata = self.last_metadata_revision, .name = local.name, .address = address } } });
+            } else {
+                for (session.target.watchpointSlice()) |watch| if (watch != null and watch.?.address == address) {
+                    session.target.removeWatchpoint(watch.?.id) catch |err| {
                         self.status = @errorName(err);
                         return;
                     };
-                    removed = true;
-                    break;
+                    session.record(.human, "remove_watchpoint");
+                    self.status = "Watchpoint removed";
+                    return;
                 };
+                const tid = threads[self.selected % snapshot.thread_count].tid;
+                _ = session.investigateWrite(tid, self.selected_frame, "Why did the selected value change?", local.name) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                };
+                session.record(.human, "investigate_write");
+                self.status = "Write investigation started";
             }
-            if (!removed) _ = session.setSourceBreakpoint(scratch.allocator(), self.source_path, number) catch |err| {
-                self.status = @errorName(err);
-                return;
-            };
-            session.record(.human, "toggle_source_breakpoint");
-            if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
+        }
+        if (click and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
+            if (remote) {
+                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
+                context.send(self, .{ .workspace = .{ .toggle_source = .{ .path = self.source_path, .line = number } } });
+            } else {
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
+                const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, number) catch |err| {
+                    self.status = lineStatus(session, err);
+                    return;
+                };
+                var removed = false;
+                for (addresses) |address| {
+                    for (session.target.breakpointSlice()) |probe| if (probe.address == address) {
+                        session.target.removeBreakpoint(probe.id) catch |err| {
+                            self.status = @errorName(err);
+                            return;
+                        };
+                        removed = true;
+                        break;
+                    };
+                }
+                if (!removed) _ = session.setSourceBreakpoint(scratch.allocator(), self.source_path, number) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                };
+                session.record(.human, "toggle_source_breakpoint");
+                if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
+            }
         }
         if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
@@ -1302,32 +1279,42 @@ pub const Workspace = struct {
                 w.dirty = true;
             }
         }
-        if ((code == 67 or code == 88) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
-            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
-            if (code == 88) session.finishFrame(tid, self.selected_frame, .human) catch |err| {
-                self.status = @errorName(err);
-                return;
-            } else {
-                const line_number = self.cursor_line orelse {
-                    self.status = "Click a source line first";
-                    return;
-                };
-                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                defer scratch.deinit();
-                const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, line_number) catch |err| {
-                    self.status = lineStatus(session, err);
-                    return;
-                };
-                if (addresses.len == 0) {
-                    self.status = "No code at selected line";
-                    return;
+        if ((code == 67 or code == 88) and snapshot.state == .stopped and snapshot.thread_count > 0) {
+            const tid = threads[self.selected % snapshot.thread_count].tid;
+            if (remote) {
+                if (code == 88) context.send(self, .{ .control = .{ .finish_frame = .{ .tid = tid, .frame = self.selected_frame } } }) else {
+                    const line = self.cursor_line orelse {
+                        self.status = "Click a source line first";
+                        return;
+                    };
+                    context.send(self, .{ .workspace = .{ .run_to_source = .{ .tid = tid, .path = self.source_path, .line = line } } });
                 }
-                session.runTo(tid, addresses[0], null, .human) catch |err| {
+            } else {
+                if (code == 88) session.finishFrame(tid, self.selected_frame, .human) catch |err| {
                     self.status = @errorName(err);
                     return;
-                };
+                } else {
+                    const line_number = self.cursor_line orelse {
+                        self.status = "Click a source line first";
+                        return;
+                    };
+                    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                    defer scratch.deinit();
+                    const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, line_number) catch |err| {
+                        self.status = lineStatus(session, err);
+                        return;
+                    };
+                    if (addresses.len == 0) {
+                        self.status = "No code at selected line";
+                        return;
+                    }
+                    session.runTo(tid, addresses[0], null, .human) catch |err| {
+                        self.status = @errorName(err);
+                        return;
+                    };
+                }
+                session.record(.human, if (code == 88) "finish" else "run_to");
             }
-            session.record(.human, if (code == 88) "finish" else "run_to");
             self.status = if (code == 88) "Running until selected frame returns" else "Running to selected source line";
             self.browse_address = null;
         }
@@ -1336,64 +1323,97 @@ pub const Workspace = struct {
         if (click and !self.show_profile and w.pointer_x >= stack_x and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= stack_y and self.frames.len > 0) {
             self.browse_address = null;
             self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / 25)));
-            self.selectNative(session);
+            self.selectNative(context);
             w.dirty = true;
         }
-        if (code == 66) self.toggleAgentScope(session); // F8 or the Agent button.
+        if (code == 66) {
+            if (remote) context.send(self, .toggle_scope) else self.toggleAgentScope(session);
+        } // F8 or the Agent button.
         if (code == 87 or code == 68 or code == 57 or code == 63 or code == 64 or code == 36 or code == 37) self.browse_address = null;
-        if ((code == 87 or code == 68) and session.target.snapshot().state == .stopped and session.target.snapshot().thread_count > 0) {
-            const tid = session.target.threadSlice()[self.selected % session.target.snapshot().thread_count].tid;
-            session.probe_resume_actor = .human;
-            if (self.current_line != null) session.startSourceStep(tid, code == 68) catch |err| {
-                self.status = @errorName(err);
-                return;
-            } else if (code == 87) session.stepInstruction(tid) catch |err| {
-                self.status = @errorName(err);
-                return;
-            } else session.stepOverInstruction(tid) catch |err| {
-                self.status = @errorName(err);
+        if ((code == 87 or code == 68) and snapshot.state == .stopped and snapshot.thread_count > 0) {
+            const tid = threads[self.selected % snapshot.thread_count].tid;
+            if (remote) {
+                const action: @import("../model/remote_owner.zig").Control = if (self.current_line != null) .{ .step_source = .{ .tid = tid, .over = code == 68 } } else if (code == 87) .{ .step_instruction = tid } else .{ .step_over_instruction = tid };
+                context.send(self, .{ .control = action });
+                self.selected_frame = 0;
+            } else {
+                session.probe_resume_actor = .human;
+                if (self.current_line != null) session.startSourceStep(tid, code == 68) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                } else if (code == 87) session.stepInstruction(tid) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                } else session.stepOverInstruction(tid) catch |err| {
+                    self.status = @errorName(err);
+                    return;
+                };
+                self.selected_frame = 0;
+                session.record(.human, if (code == 87) "step" else "step_over");
+            }
+        }
+        if (remote) {
+            if (code == 1) if (self.capture_view.archive_job) |job| if (!job.done) {
+                self.applyCapture(context, .{ .cancel_archive = job.id });
                 return;
             };
-            self.selected_frame = 0;
-            session.record(.human, if (code == 87) "step" else "step_over");
-        }
-        if (code == 1) {
-            if (session.archive_job) |job| {
+        } else {
+            if (code == 1) if (session.archive_job) |job| {
                 if (!job.done.load(.acquire)) {
-                    job.progress.cancel.store(true, .release);
-                    self.status = "Archive cancellation requested";
+                    self.applyCapture(context, .{ .cancel_archive = job.id });
                     return;
                 }
-            }
+            };
         }
         if (code == 16) {
             w.closing = true;
             w.close_reason = .quit_key;
         }
-        if (code == 57 or code == 63 or code == 64) {
-            if (session.pending_continue != null) {
-                session.cancelStep();
-                self.status = "Pending continue cancelled";
-            } else if (session.target.snapshot().state == .stopped) {
-                session.continueExecution(.human) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
-                if (session.pending_continue != null) self.status = "Resolving symbols; Space cancels the queued continue";
-            } else if (session.target.snapshot().state == .running) {
-                session.cancelStep();
-                session.target.interrupt() catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
+        if (remote) {
+            if (code == 57 or code == 63 or code == 64) {
+                if (context.header.pending_continue) context.send(self, .{ .workspace = .cancel_continue }) else if (snapshot.state == .stopped) context.send(self, .{ .control = .continue_execution }) else if (snapshot.state == .running) context.send(self, .{ .control = .interrupt });
+                self.selected_frame = 0;
             }
-            self.selected_frame = 0;
+            if (code == 32 and snapshot.pid != 0) context.send(self, .{ .control = .detach });
+        } else {
+            if (code == 57 or code == 63 or code == 64) {
+                if (session.pending_continue != null) {
+                    session.cancelStep();
+                    self.status = "Pending continue cancelled";
+                } else if (snapshot.state == .stopped) {
+                    session.continueExecution(.human) catch |err| {
+                        self.status = @errorName(err);
+                        return;
+                    };
+                    if (session.pending_continue != null) self.status = "Resolving symbols; Space cancels the queued continue";
+                } else if (snapshot.state == .running) {
+                    session.cancelStep();
+                    session.target.interrupt() catch |err| {
+                        self.status = @errorName(err);
+                        return;
+                    };
+                }
+                self.selected_frame = 0;
+            }
+            if (code == 57 or code == 63 or code == 64) session.record(.human, "continue_or_interrupt");
+            if (code == 32 and snapshot.pid != 0) session.detach() catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
         }
-        if (code == 57 or code == 63 or code == 64) session.record(.human, "continue_or_interrupt");
-        if (code == 32 and session.target.snapshot().pid != 0) session.detach() catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
+        if (!remote) {
+            if (code == 35 and session.compatibility.info.kind == .wine) {
+                self.thread_list.hide_internal = !self.thread_list.hide_internal;
+                self.status = if (self.thread_list.hide_internal) "Wine internal names hidden; selected/faulting threads remain visible; capture keeps all threads" else "All threads shown; Wine internal names grouped below application threads";
+            }
+            if (code == 36 or code == 37) if (session.compatibility.info.kind == .wine) {
+                self.thread_list.prepare(threads, session.compatibility.labels.items, self.selected);
+                self.selected = self.thread_list.move(self.selected, code == 36);
+                self.selected_frame = 0;
+                self.selectNative(context);
+                return;
+            };
+        }
         if (code == 36) {
             self.selected += 1;
             self.selected_frame = 0;
@@ -1406,106 +1426,196 @@ pub const Workspace = struct {
         if (code == 103) self.source_line = @max(0, self.source_line - 3);
         self.source_line = std.math.clamp(self.source_line + w.scroll, 0, @max(0, self.source_lines - 1));
         w.scroll = 0;
-        if (session.target.snapshot().thread_count > 0) self.selected %= session.target.snapshot().thread_count else self.selected = 0;
-        if (code == 36 or code == 37) self.selectNative(session);
+        if (snapshot.thread_count > 0) self.selected %= snapshot.thread_count else self.selected = 0;
+        if (code == 36 or code == 37) self.selectNative(context);
     }
-    /// Performs a setup-panel action. Start goes through the same path as P.
-    fn applySetup(self: *Workspace, w: *Window, session: *Session, action: capture_panel.Action) void {
-        w.dirty = true;
-        const snapshot = self.thread_rows.snapshot(session);
-        // Offline sessions show recorded settings only.
-        if (session.offline) switch (action) {
-            .close, .page, .edit => {},
-            else => return,
-        };
-        const effect = self.setup.apply(action, &snapshot, &session.profile_defaults, &self.thread_selection) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        if (effect == .start_requested) self.step(w, session, false, 25);
-        switch (action) {
-            .set_duration, .set_frequency, .toggle_scheduling, .toggle_syscalls => self.status = "Next capture settings changed; a running capture keeps its own",
-            else => {},
-        }
-    }
-    /// Hands the committed timeline selection to the flames.
-    fn applyTimeline(self: *Workspace, session: *Session) void {
-        const capture = session.profile orelse return;
-        if (capture.id != self.timeline.capture_id) return;
-        self.flame.setFilter(capture, self.timeline.filter()) catch |err| {
-            self.status = @errorName(err);
-        };
-    }
-    /// Starts a write investigation on a watch entry, in the frame the entry
-    /// resolved to at this stop. Same authority as W on a local.
-    fn watchWrite(self: *Workspace, session: *Session, index: usize) void {
-        const entry = &self.watch.entries[index];
-        if (session.target.snapshot().state != .stopped or self.watch.generation == null or self.watch.generation.? != session.target.snapshot().generation) {
-            self.status = "StaleSnapshot";
-            return;
-        }
-        const frame = entry.resolved_index orelse {
-            self.status = "The watch entry's frame is gone";
-            return;
-        };
-        if (entry.state != .value) {
-            self.status = "The watch entry has no current value";
-            return;
-        }
-        _ = session.investigateWrite(entry.frame.tid, frame, "Why did the watched expression change?", entry.expression()) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        session.record(.human, "investigate_write");
-        self.status = "Write investigation started";
-    }
-    fn applyEditor(self: *Workspace, session: *Session, action: watch_ui.Editor.Action) void {
-        switch (action) {
-            .edited => {},
-            .cancel => self.status = "Expression cancelled",
-            .submit => |text| {
-                if (session.target.snapshot().state != .stopped or session.target.snapshot().thread_count == 0) {
-                    self.editor.message = "Pause the target to evaluate";
-                    return;
-                }
-                self.refresh(session);
-                if (self.frames.len == 0 or self.last_generation != session.target.snapshot().generation) {
-                    self.editor.message = "No frame to evaluate in";
-                    return;
-                }
-                const frame = self.frames[self.selected_frame];
-                const tid = session.target.threadSlice()[self.selected].tid;
-                _ = self.watch.addMode(text, watch_ui.FrameId.of(tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = session.target.threadSlice()[self.selected].id }, session.target.snapshot().generation), self.editor.mode) catch |err| {
-                    self.editor.message = switch (err) {
-                        error.WatchListFull => "The watch list is full (16); Delete one first",
-                        error.ExpressionTooLong => "Expressions are limited to 256 characters",
-                        else => "Type an expression",
-                    };
-                    return;
+    fn applyCapture(self: *Workspace, context: anytype, action: @import("../model/capture_view.zig").Action) void {
+        if (@TypeOf(context) != *Session) {
+            context.send(self, .{ .capture_control = action });
+        } else {
+            const session = context;
+            const outcome = @import("../model/capture_view.zig").apply(&self.capture_control.rows, session, .human, action) catch |err| {
+                self.status = switch (err) {
+                    error.ProfileSourceNotRecorded => "Offline capture: recorded source location shown below; historical source text is not bundled",
+                    error.ProfileImageNotStopped => "Pause in the captured image to browse; frozen assembly remains below",
+                    error.ProfileImageMismatch => "Captured frame has no matching live image",
+                    else => @errorName(err),
                 };
-                self.status = if (self.editor.mode == .live) "Live display added; updates in the selected frame at each stop / Shift+L pins it" else "Watch added; later CFA matches cannot prove call lifetime between stops / Shift+L makes it live";
-                self.editor.open = false;
-                self.watch_focus = true;
-                self.refreshWatch(session);
+                return;
+            };
+            self.captureOutcome(outcome);
+        }
+    }
+    pub fn captureOutcome(self: *Workspace, outcome: @import("../model/capture_view.zig").Outcome) void {
+        switch (outcome) {
+            .configured => self.status = "Next capture settings changed; a running capture keeps its own",
+            .started => {
+                self.setup.open = false;
+                self.status = "Capturing CPU samples; Space runs the target";
+            },
+            .stopped => self.status = "Capture stopped; target execution unchanged",
+            .rejected => |reason| {
+                self.status = capture_setup.problemText(reason);
+                if (reason == .empty_subset or reason == .missing_threads or reason == .too_many_threads) self.setup.open = true;
+            },
+            .retrying => {},
+            .cancelled => self.status = "Archive cancellation requested",
+            .browse => |addresses| {
+                self.browse_address = addresses.source;
+                self.browse_assembly = addresses.assembly;
+                self.show_flow = false;
+                self.show_profile = false;
+                self.status = "Browsing sampled function; execution unchanged";
             },
         }
     }
-    fn toggleWatchMode(self: *Workspace, session: *Session) void {
-        const index = self.watch.selected orelse return;
-        if (session.target.snapshot().state != .stopped) {
-            self.status = "Pause in the desired frame to change the watch mode";
-            return;
+    /// Performs a setup-panel action. Start goes through the same path as P.
+    pub fn applySetup(self: *Workspace, w: *Window, context: anytype, action: capture_panel.Action) void {
+        if (@TypeOf(context) != *Session) {
+            w.dirty = true;
+            const snapshot = self.capture_view.snapshot;
+            var defaults = self.capture_view.defaults;
+            const effect = self.setup.apply(action, &snapshot, &defaults, &self.thread_selection) catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
+            if (!std.meta.eql(defaults, self.capture_view.defaults)) context.send(self, .{ .capture_control = .{ .defaults = defaults } });
+            if (effect == .start_requested) self.step(w, context, false, 25);
+        } else {
+            const session = context;
+            w.dirty = true;
+            const snapshot = self.capture_control.rows.snapshot(session);
+            // Offline sessions show recorded settings only.
+            if (session.offline) switch (action) {
+                .close, .page, .edit => {},
+                else => return,
+            };
+            const effect = self.setup.apply(action, &snapshot, &session.profile_defaults, &self.thread_selection) catch |err| {
+                self.status = @errorName(err);
+                return;
+            };
+            if (effect == .start_requested) self.step(w, session, false, 25);
+            switch (action) {
+                .set_duration, .set_frequency, .toggle_scheduling, .toggle_syscalls => self.status = "Next capture settings changed; a running capture keeps its own",
+                else => {},
+            }
         }
-        self.refresh(session);
-        if (self.frames.len == 0 or session.target.snapshot().thread_count == 0) {
-            self.status = "No selected frame to bind the watch";
-            return;
+    }
+    /// Hands the committed timeline selection to the flames.
+    pub fn applyTimeline(self: *Workspace, context: anytype) void {
+        if (@TypeOf(context) != *Session) {
+            if (self.flame.capture_id != self.timeline.capture_id) return;
+            self.flame.setFilter(self.timeline.filter()) catch |err| {
+                self.status = @errorName(err);
+            };
+        } else {
+            const session = context;
+            const capture = session.profile orelse return;
+            if (capture.id != self.timeline.capture_id) return;
+            self.flame.setFilter(self.timeline.filter()) catch |err| {
+                self.status = @errorName(err);
+            };
         }
-        const thread = session.target.threadSlice()[self.selected];
-        const frame = self.frames[self.selected_frame];
-        self.watch.toggleMode(index, watch_ui.FrameId.of(thread.tid, self.selected_frame, WatchSource.frameView(session, frame), .{ .session = session.id, .image = session.target.snapshot().image_epoch, .thread = thread.id }, session.target.snapshot().generation));
-        self.status = if (self.watch.entries[index].mode == .live) "Live display: follows the selected frame / Shift+L pins it" else "Watch pinned to the selected frame / Shift+L makes it live";
-        self.refreshWatch(session);
+    }
+    /// Starts a write investigation on a watch entry, in the frame the entry
+    /// resolved to at this stop. Same authority as W on a local.
+    fn watchWrite(self: *Workspace, context: anytype, index: usize) void {
+        if (@TypeOf(context) != *Session) {
+            context.send(self, .{ .native_watch = .{ .investigate_write = self.watchToken(index) } });
+        } else {
+            const session = context;
+            if (self.applyWatch(session, .{ .investigate_write = self.watchToken(index) })) self.status = "Write investigation started";
+        }
+    }
+    fn watchToken(self: *const Workspace, index: usize) native_watches.Token {
+        return .{ .revision = self.watch_view.revision, .index = index };
+    }
+    fn applyWatch(self: *Workspace, context: anytype, action: native_watches.Action) bool {
+        if (@TypeOf(context) != *Session) {
+            context.send(self, .{ .native_watch = action });
+            return false; // Completion, not admission, confirms an edit.
+        } else {
+            const session = context;
+            _ = native_watches.apply(&self.watch, session, .human, action) catch |err| {
+                self.status = @errorName(err);
+                return false;
+            };
+            self.refreshWatch(session);
+            return true;
+        }
+    }
+    fn applyEditor(self: *Workspace, context: anytype, action: watch_ui.Editor.Action) void {
+        if (@TypeOf(context) != *Session) {
+            switch (action) {
+                .edited => {},
+                .cancel => self.status = "Expression cancelled",
+                .submit => |text| {
+                    if (context.display.snapshot.state != .stopped or self.selected >= context.display.threads.len or self.frames.len == 0) {
+                        self.editor.message = "Pause and select a frame to evaluate";
+                        return;
+                    }
+                    context.send(self, .{ .native_watch = .{ .add = .{ .binding = .{ .selection = .{ .tid = context.display.threads[self.selected].tid, .index = self.selected_frame }, .metadata = context.language.metadata }, .text = text, .mode = self.editor.mode } } });
+                },
+            }
+        } else {
+            const session = context;
+            switch (action) {
+                .edited => {},
+                .cancel => self.status = "Expression cancelled",
+                .submit => |text| {
+                    if (session.target.snapshot().state != .stopped or session.target.snapshot().thread_count == 0) {
+                        self.editor.message = "Pause the target to evaluate";
+                        return;
+                    }
+                    self.refresh(session);
+                    if (self.frames.len == 0 or self.last_generation != session.target.snapshot().generation) {
+                        self.editor.message = "No frame to evaluate in";
+                        return;
+                    }
+                    const tid = session.target.threadSlice()[self.selected].tid;
+                    const added = native_watches.apply(&self.watch, session, .human, .{ .add = .{ .binding = .{ .selection = .{ .tid = tid, .index = self.selected_frame }, .metadata = session.metadata.revision }, .text = text, .mode = self.editor.mode } }) catch |err| {
+                        self.editor.message = switch (err) {
+                            error.WatchListFull => "The watch list is full (16); Delete one first",
+                            error.ExpressionTooLong => "Expressions are limited to 256 characters",
+                            error.EmptyExpression => "Type an expression",
+                            else => @errorName(err),
+                        };
+                        return;
+                    };
+                    self.watch_panel.added(@intCast(added.?));
+                    self.status = if (self.editor.mode == .live) "Live display added; updates in the selected frame at each stop / Shift+L pins it" else "Watch added; later CFA matches cannot prove call lifetime between stops / Shift+L makes it live";
+                    self.editor.open = false;
+                    self.watch_focus = true;
+                    self.refreshWatch(session);
+                },
+            }
+        }
+    }
+    fn toggleWatchMode(self: *Workspace, context: anytype) void {
+        if (@TypeOf(context) != *Session) {
+            const index = self.watch_panel.selected orelse return;
+            if (context.display.snapshot.state != .stopped or self.selected >= context.display.threads.len or self.frames.len == 0) {
+                self.status = "Pause and select a frame to change the watch mode";
+                return;
+            }
+            context.send(self, .{ .native_watch = .{ .toggle_mode = .{ .entry = self.watchToken(index), .binding = .{ .selection = .{ .tid = context.display.threads[self.selected].tid, .index = self.selected_frame }, .metadata = context.language.metadata } } } });
+        } else {
+            const session = context;
+            const index = self.watch_panel.selected orelse return;
+            if (session.target.snapshot().state != .stopped) {
+                self.status = "Pause in the desired frame to change the watch mode";
+                return;
+            }
+            self.refresh(session);
+            if (self.frames.len == 0 or session.target.snapshot().thread_count == 0) {
+                self.status = "No selected frame to bind the watch";
+                return;
+            }
+            const thread = session.target.threadSlice()[self.selected];
+            if (!self.applyWatch(session, .{ .toggle_mode = .{ .entry = self.watchToken(index), .binding = .{ .selection = .{ .tid = thread.tid, .index = self.selected_frame }, .metadata = session.metadata.revision } } })) return;
+            self.status = if (self.watch_view.entries[index].mode == .live) "Live display: follows the selected frame / Shift+L pins it" else "Watch pinned to the selected frame / Shift+L makes it live";
+            self.refreshWatch(session);
+        }
     }
     /// Top of the bottom row (threads, stack, events/watch). Short windows give
     /// the watch view more rows; the source and assembly panes shrink instead.
@@ -1513,23 +1623,49 @@ pub const Workspace = struct {
         return @round(height * @as(f32, if (self.show_watch and height < 640) 0.56 else 0.73));
     }
     fn refreshWatch(self: *Workspace, session: *Session) void {
-        if (self.watch.count == 0) return;
-        const signature = session.runtime_types.signature();
-        if (self.runtime_type_signature == null or self.runtime_type_signature.? != signature) self.watch.dirty = true;
-        self.runtime_type_signature = signature;
-        self.watch.setDisplayFrame(if (self.selected < session.target.snapshot().thread_count) .{ .tid = session.target.threadSlice()[self.selected].tid, .index = self.selected_frame } else null);
-        var source = WatchSource{ .session = session };
-        defer source.scratch.deinit();
-        self.watch.refresh(&source);
+        self.presentNativeWatches(native_watches.refresh(&self.watch, session, if (self.selected < session.target.snapshot().thread_count) .{ .tid = session.target.threadSlice()[self.selected].tid, .index = self.selected_frame } else null));
     }
-    fn selectNative(self: *Workspace, session: *Session) void {
-        if (self.selected >= session.target.snapshot().thread_count or session.target.snapshot().state != .stopped) return;
-        const tid = session.target.threadSlice()[self.selected].tid;
-        @import("../model/language_selection.zig").selectNative(session, tid, self.selected_frame) catch |err| {
-            self.status = @errorName(err);
-        };
+    pub fn presentStop(self: *Workspace, view: @import("../model/stop_view.zig").View) void {
+        self.stop_view = view;
+    }
+    pub fn presentNativeWatches(self: *Workspace, view: native_watches.View) void {
+        self.watch_view = view;
+        self.watch_panel.present(view);
+    }
+    fn selectNative(self: *Workspace, context: anytype) void {
+        if (@TypeOf(context) != *Session) {
+            if (self.selected >= context.display.threads.len or context.display.snapshot.state != .stopped) return;
+            context.send(self, .{ .language = .{ .native = .{ .tid = context.display.threads[self.selected].tid, .frame = self.selected_frame } } });
+        } else {
+            const session = context;
+            if (self.selected >= session.target.snapshot().thread_count or session.target.snapshot().state != .stopped) return;
+            const tid = session.target.threadSlice()[self.selected].tid;
+            @import("../model/language_selection.zig").selectNative(session, tid, self.selected_frame) catch |err| {
+                self.status = @errorName(err);
+            };
+        }
     }
     fn refresh(self: *Workspace, session: *Session) void {
+        defer {
+            const threads = session.target.threadSlice();
+            const tid = if (threads.len > 0) threads[@min(self.selected, threads.len - 1)].tid else 0;
+            if (session.process_tree) |tree| {
+                self.process_capture.refresh(tree, 0, self.process_panel.open) catch |err| {
+                    self.status = @errorName(err);
+                };
+            } else self.process_capture.clear();
+            self.process_panel.present(self.process_capture.value);
+            self.probe_capture.refresh(session, self.probes_panel.open);
+            self.probes_panel.present(self.probe_capture.value);
+            self.inline_capture.refresh(session, self.inline_panel.request(tid, self.selected_frame, session.target.snapshot().generation));
+            self.inline_panel.present(self.inline_capture.value);
+            self.inspection_capture.refresh(session, self.inspection_panel.request(tid));
+            self.inspection_panel.present(self.inspection_capture.value);
+            self.stop_capture.refresh(session, tid, self.stop_panel.open);
+            self.presentStop(self.stop_capture.value);
+            self.runtime_watch_capture.refresh(session);
+            self.presentRuntimeWatches(self.runtime_watch_capture.value);
+        }
         session.language_tabs.enabled = true;
         session.language_tabs.syncSelection(session.target.snapshot().generation);
         if (self.last_language_revision != session.language_tabs.revision) {
@@ -1576,123 +1712,40 @@ pub const Workspace = struct {
         self.last_metadata_revision = session.metadata.revision;
         self.last_tid = tid;
         self.last_frame = self.selected_frame;
-        _ = self.arena.reset(.retain_capacity);
-        self.frames = &.{};
-        self.locals = &.{};
-        self.current_line = null;
-        self.breakpoint_lines = &.{};
-        self.local_diagnostic = null;
-        self.regs = null;
-        self.instruction_count = 0;
-        self.assembly_error = null;
-        if (tid == 0 or session.target.snapshot().state != .stopped) {
-            self.flow.refresh(session, 0);
-            return;
+        self.prepared.refresh(session, .{ .tid = tid, .frame = self.selected_frame, .browse_address = self.browse_address, .browse_assembly = self.browse_assembly, .flow = self.show_flow });
+        self.presentDebugger(self.prepared.value);
+        self.last_language_revision = session.language_tabs.revision;
+    }
+    pub fn presentRuntimeWatches(self: *Workspace, view: @import("../model/runtime_watch_view.zig").View) void {
+        if (self.runtime_watch_view.session != view.session) self.runtime_watch_panel = .{};
+        self.runtime_watch_view = view;
+    }
+    /// Bind prepared pane values without target reads or ownership changes.
+    /// The caller keeps the source preparation/publication alive while drawn.
+    pub fn presentDebugger(self: *Workspace, view: debugger_view.Presentation) void {
+        self.frames = view.frames;
+        self.locals = view.locals;
+        self.local_diagnostic = view.local_diagnostic;
+        self.regs = view.regs;
+        self.instruction_count = view.instructions.len;
+        std.debug.assert(self.instruction_count <= self.instructions.len);
+        @memcpy(self.instructions[0..self.instruction_count], view.instructions);
+        self.assembly_error = view.assembly_error;
+        self.current_line = view.current_line;
+        self.selected_frame = view.selected_frame;
+        self.breakpoint_lines = view.breakpoint_lines;
+        self.presentSource(view.source);
+        const key: @typeInfo(@FieldType(Workspace, "presented")).optional.child = .{ .generation = view.snapshot.generation, .tid = view.request.tid, .frame = view.selected_frame, .browse = view.request.browse_address, .source_revision = view.source.revision };
+        if (self.presented == null or !std.meta.eql(self.presented.?, key)) {
+            if (view.current_line) |line| self.source_line = @intCast(line -| 6);
         }
-        self.regs = session.target.registers(tid) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        var bytes: [256]u8 = undefined;
-        const assembly_address = if (self.browse_address) |address| self.browse_assembly orelse address else linux.programCounter(self.regs.?) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        const n = session.target.readMemory(assembly_address, &bytes) catch |err| {
-            self.status = @errorName(err);
-            return;
-        };
-        self.instruction_count = disasm.decodeFor(session.target.arch(), bytes[0..n], assembly_address, &self.instructions) catch |err| blk: {
-            self.assembly_error = @errorName(err);
-            break :blk 0;
-        };
-        const a = self.arena.allocator();
-        self.frames = session.stack(a, tid, 64) catch &.{};
-        // Unnamed frames of an image refused in full: say which and why.
-        for (self.frames) |frame| {
-            if (frame.inline_diagnostic) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit")) if (session.modules.budgetFailure(frame.lookup_pc)) |failure| {
-                // The line is narrow and formatted into a fixed buffer with
-                // the rest of the status: the file name, cut to fit.
-                var name: [128]u8 = undefined;
-                var text: [@import("../binary/snapshot.zig").refusal_text]u8 = undefined;
-                const budget = failure.budget orelse continue;
-                self.status = std.fmt.bufPrint(&self.budget_status, "Over budget: {s}", .{budget.write(&text, @import("../binary/snapshot.zig").printable(&name, std.fs.path.basename(failure.path), name.len))}) catch "Image over budget";
-                break;
-            };
+        self.presented = key;
+        self.flow.present(view.flow);
+        if (view.status) |message| {
+            const n = @min(message.len, self.presentation_status.len);
+            @memcpy(self.presentation_status[0..n], message[0..n]);
+            self.status = self.presentation_status[0..n];
         }
-        if (self.frames.len > 0) {
-            self.selected_frame = @min(self.selected_frame, self.frames.len - 1);
-            // Publish the freshly displayed default frame too; its index does
-            // not inherit a logical activation's identity from the old stop.
-            if (session.language_tabs.native_selection == null and session.language_tabs.logical_selection == null) {
-                session.language_tabs.native_selection = .{ .generation = session.target.snapshot().generation, .tid = tid, .frame = self.selected_frame };
-                session.language_tabs.revision +%= 1;
-                self.last_language_revision = session.language_tabs.revision;
-            }
-            if (self.frames[self.selected_frame].source) |site| {
-                self.loadSite(session, site) catch |err| {
-                    self.status = if (err == error.SourceAgentNeedsUpdating) "Source: agent needs updating" else @errorName(err);
-                };
-                if (std.mem.eql(u8, self.source_path, site.path)) {
-                    self.current_line = site.line;
-                    self.source_line = @intCast(site.line -| 6);
-                }
-            }
-        }
-        if (self.show_flow) {
-            const anchor = if (self.frames.len > 0) self.frames[self.selected_frame].lookup_pc else linux.programCounter(self.regs.?) catch |err| {
-                self.status = @errorName(err);
-                return;
-            };
-            self.flow.refresh(session, anchor);
-        }
-        if (self.browse_address) |address| {
-            self.current_line = null;
-            if (session.sourceAt(a, address)) |site| {
-                self.loadSite(session, site) catch |err| {
-                    self.status = if (err == error.SourceAgentNeedsUpdating) "Source: agent needs updating" else @errorName(err);
-                };
-                if (std.mem.eql(u8, self.source_path, site.path)) {
-                    self.current_line = site.line;
-                    self.source_line = @intCast(site.line -| 6);
-                }
-            } else |_| {
-                self.current_line = null;
-            }
-        }
-        const variables = session.locals(a, tid, self.selected_frame) catch |err| {
-            self.local_diagnostic = @errorName(err);
-            return;
-        };
-        var rows: std.ArrayList(LocalRow) = .empty;
-        for (variables) |v| {
-            const summary = session.summarize(a, v.value) catch continue;
-            rows.append(a, .{ .name = v.name, .value = summary }) catch {};
-            // Semantic Go containers expand through the value view/watch page;
-            // implementation pointers are only shown by an explicit raw view.
-            if (@import("../language/go_values.zig").supported(v.value.type)) continue;
-            const is_pointer = v.value.type.kind == .pointer;
-            const structure = if (is_pointer) v.value.type.child orelse continue else v.value.type;
-            if (structure.kind != .structure or summary.availability != .available) continue;
-            const base = if (is_pointer) summary.bits orelse continue else summary.address orelse continue;
-            for (structure.fields[0..@min(8, structure.fields.len)]) |field| {
-                const expression = std.fmt.allocPrint(a, "{s}{s}{s}", .{ v.name, if (is_pointer) "->" else ".", field.name }) catch continue;
-                const address = std.math.add(u64, base, field.offset) catch continue;
-                var value = session.summarize(a, .{ .type = field.type, .address = address }) catch continue;
-                if (summary.visualization) |shown| {
-                    if (shown.perl != null and std.mem.eql(u8, field.name, "sv_u"))
-                        value.display = std.fmt.allocPrint(a, "raw union (not a value): {s}", .{value.display}) catch continue;
-                }
-                rows.append(a, .{ .name = expression, .value = value }) catch {};
-            }
-        }
-        self.locals = rows.toOwnedSlice(a) catch &.{};
-        var lines: std.ArrayList(u32) = .empty;
-        for (session.target.breakpointSlice()) |probe| {
-            const site = session.sourceAt(a, probe.address) catch continue;
-            if (std.mem.eql(u8, site.path, self.source_path)) lines.append(a, site.line) catch {};
-        }
-        self.breakpoint_lines = lines.toOwnedSlice(a) catch &.{};
     }
     fn expandTabs(buffer: []u8, source: []const u8) []const u8 {
         var n: usize = 0;
@@ -1727,7 +1780,7 @@ pub const Workspace = struct {
         r.clip = .{ .x = rect.x + 1, .y = rect.y + 35, .w = rect.w - 2, .h = rect.h - 37 };
     }
     /// Advances every eased value by the time since the last frame.
-    fn animate(self: *Workspace, session: *Session) void {
+    fn animate(self: *Workspace, state: linux.State, threads: []const linux.Thread) void {
         const now = linux.now();
         const dt: f32 = if (self.last_draw == 0) 0 else @min(0.05, @as(f32, @floatFromInt(now - self.last_draw)) / 1e9);
         self.last_draw = now;
@@ -1739,10 +1792,10 @@ pub const Workspace = struct {
         if (style.approach(&self.alive, 1, 9, dt)) moving = true;
         // The status bar takes the color of the run state, as RAD Debugger's does.
         var target = theme.header;
-        switch (session.target.snapshot().state) {
+        switch (state) {
             .running => target = theme.pop,
             .exited => target = theme.good_pop,
-            .stopped => for (session.target.threadSlice()) |thread| switch (thread.reason) {
+            .stopped => for (threads) |thread| switch (thread.reason) {
                 .breakpoint, .watchpoint, .signal => target = theme.bad_pop,
                 else => {},
             },
@@ -1751,9 +1804,9 @@ pub const Workspace = struct {
         for (&self.bar, target) |*channel, goal| {
             if (style.approach(channel, goal, 30, dt)) moving = true;
         }
-        self.animating = moving or self.inspection_panel.busy(session) or self.runtime_type_panel.busy(session);
+        self.animating = moving or self.inspection_panel.busy() or self.runtime_type_panel.busyPrepared();
     }
-    fn drawSharedOwnership(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+    pub fn drawSharedOwnership(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, scope: model.AgentScope) !void {
         const count = self.shared_clients orelse return;
         const width: f32 = @floatFromInt(w.width);
         const height: f32 = @floatFromInt(w.height);
@@ -1762,34 +1815,36 @@ pub const Workspace = struct {
         try r.rect(.{ .x = 0, .y = top, .w = width, .h = height - top }, theme.header);
         try r.rect(.{ .x = 0, .y = top, .w = width, .h = 1 }, theme.status_border);
         if (self.shared_controller) |owner| {
-            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / controller #{d} / {d} clients", .{ @tagName(session.agent_scope), owner, count });
+            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / controller #{d} / {d} clients", .{ @tagName(scope), owner, count });
         } else {
-            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / no controller / {d} clients", .{ @tagName(session.agent_scope), count });
+            try fit(r, font, 12, top + 5, @max(0, width - 24), theme.text, "F8 agent {s} / no controller / {d} clients", .{ @tagName(scope), count });
         }
     }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+        self.compatibility_info = session.compatibility.info;
+        self.thread_labels = session.compatibility.labels.items;
         if (self.logical_frames.open) {
             session.profile_view_visible = false;
             self.animating = session.frames.busy();
             try self.logical_frames.draw(r, font, w, &session.frames);
-            return self.drawSharedOwnership(r, font, w, session);
+            return self.drawSharedOwnership(r, font, w, session.agent_scope);
         }
 
         if (session.comparison) |job| if (self.comparison.open) {
             session.profile_view_visible = false;
             self.animating = !job.done.load(.acquire);
             try self.comparison.draw(r, font, w, job);
-            return self.drawSharedOwnership(r, font, w, session);
+            return self.drawSharedOwnership(r, font, w, session.agent_scope);
         };
         if (self.invocations.open) {
             session.profile_view_visible = false;
             self.animating = @import("invocations.zig").View.busy(session);
             try self.invocations.draw(r, font, w, session, if (self.shared_clients != null) 30 else 0);
-            return self.drawSharedOwnership(r, font, w, session);
+            return self.drawSharedOwnership(r, font, w, session.agent_scope);
         }
         if (session.imported) |*state| {
             try self.imported.draw(r, font, w, state);
-            return self.drawSharedOwnership(r, font, w, session);
+            return self.drawSharedOwnership(r, font, w, session.agent_scope);
         }
         if (session.allocations.capture) |capture| if (capture.archived and !self.allocation_archive_seen) {
             self.allocation_archive_seen = true;
@@ -1798,12 +1853,40 @@ pub const Workspace = struct {
             self.allocation_panel.setMode(.heap);
         };
         self.refresh(session);
-        self.animate(session);
-        const state = session.target.snapshot().state;
+        const height: f32 = @floatFromInt(w.height);
+        const tid = if (session.target.threadSlice().len > 0) session.target.threadSlice()[self.selected].tid else 0;
+        self.allocation_capture.refresh(&session.allocations, self.allocation_panel.request(height), tid);
+        self.allocation_panel.present(self.allocation_capture.value);
+        session.profile_view_visible = self.show_profile;
+        const bounds = self.timelineBounds(w);
+        self.timeline_capture.refresh(session, if (self.show_profile) self.timeline.request(bounds) else null);
+        if (self.timeline.present(self.timeline_capture.value, bounds)) self.applyTimeline(session);
+        self.profile_capture.refresh(session, self.flame.request(self.show_profile));
+        self.flame.present(self.profile_capture.value);
+        if (!self.show_profile) self.language_panel.refresh(session, if (session.language_tabs.logical_selection) |selected| selected.tid else tid, self.selected_frame);
+        self.sample_capture.refresh(session, if (self.show_profile) self.inspector.request(self.flame.selection.filter) else null);
+        self.inspector.present(self.sample_capture.value, self.flame.selection.filter);
+        self.syscall_capture.refresh(session, if (self.show_profile) self.syscall_panel.request(height, self.flame.selection.filter) else null);
+        self.syscall_panel.present(self.syscall_capture.value, height, self.flame.selection.filter);
+        self.capture_control.refresh(session, self.show_profile and self.setup.open);
+        self.capture_view = self.capture_control.value;
+        try self.runtime_type_panel.prepare(session, height);
+        try self.static_panel.prepare(session, tid, self.selected_frame);
+        try self.drawPrepared(r, font, w, self.prepared.value, @import("../model/workspace_view.zig").capture(session), @import("../model/language_view.zig").header(session), session.target.core != null);
+    }
+    pub fn timelineBounds(self: *const Workspace, w: *const Window) gpu.Rect {
+        const height: f32 = @floatFromInt(w.height);
+        const bottom = if (self.show_profile) @round(height * profile_split) else self.bottomY(height);
+        return .{ .x = 8, .y = bottom, .w = @as(f32, @floatFromInt(w.width)) - 16, .h = height - bottom - 37 };
+    }
+    /// Rendering uses only copied pane values; callers prepare or publish them.
+    pub fn drawPrepared(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, display: debugger_view.Presentation, header: @import("../model/workspace_view.zig").Header, language: @import("../model/language_view.zig").Header, core: bool) !void {
+        self.animate(display.snapshot.state, display.threads);
+        const state = display.snapshot.state;
         const width: f32 = @floatFromInt(w.width);
         const height: f32 = @floatFromInt(w.height);
         const all = gpu.Rect{ .x = 0, .y = 0, .w = width, .h = height };
-        const selected_thread: ?linux.Thread = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected] else null;
+        const selected_thread: ?linux.Thread = if (display.threads.len > 0) display.threads[@min(self.selected, display.threads.len - 1)] else null;
         const thread_color = if (selected_thread) |thread| style.threadColor(thread.id) else theme.good;
         r.clip = all;
         try r.rect(all, theme.background);
@@ -1812,12 +1895,17 @@ pub const Workspace = struct {
         try r.text(font, 18, 12, "xo", theme.good);
         try r.text(font, 41, 12, "db", theme.text);
         r.clip = .{ .x = 0, .y = 0, .w = width - 322, .h = 44 };
-        if (session.target.core != null) try r.text(font, 91, 12, "/  core dump (read-only)", theme.weak) else try style.button(r, font, .{ .x = 91, .y = 8, .w = 171, .h = 29 }, "Processes", "O", theme.text, 0, 0);
+        if (core) try r.text(font, 91, 12, "/  core dump (read-only)", theme.weak) else try style.button(r, font, .{ .x = 91, .y = 8, .w = 171, .h = 29 }, "Processes", "O", theme.text, 0, 0);
+        if (self.compatibility_info.kind == .wine) {
+            var title: [192]u8 = undefined;
+            const title_x: f32 = if (width < 900) 405 else 575;
+            try r.textFit(font, title_x, 12, @max(0, width - title_x - 322), self.compatibility_info.title(&title), theme.weak);
+        }
         r.clip = all;
         {
             // Run state as a pill: tinted fill and border in the state's color.
             var buffer: [64]u8 = undefined;
-            const label_text = std.fmt.bufPrint(&buffer, "#{d} {s}  PID {d}", .{ session.process_id, if (session.target.core != null) "core" else @tagName(state), session.target.snapshot().pid }) catch "";
+            const label_text = std.fmt.bufPrint(&buffer, "#{d} {s}  PID {d}", .{ header.process, if (core) "core" else @tagName(state), display.snapshot.pid }) catch "";
             const color = switch (state) {
                 .stopped => theme.warm,
                 .running => theme.good,
@@ -1830,17 +1918,17 @@ pub const Workspace = struct {
         try style.button(r, font, .{ .x = if (width < 900) 280 else 380, .y = 8, .w = if (width < 900) 110 else 178, .h = 29 }, if (self.show_profile) "Source" else "Flames", "F", theme.warm, 0, 0);
         for (buttons, 0..) |b, i| {
             const label_text: []const u8 = switch (b.code) {
-                57 => if (session.target.core != null) "Read-only" else switch (state) {
+                57 => if (core) "Read-only" else switch (state) {
                     .running => "Pause",
-                    .stopped => if (session.pending_continue != null) "Cancel" else "Continue",
+                    .stopped => if (header.pending_continue) "Cancel" else "Continue",
                     .exited => "Exited",
                     .idle => "No target",
                 },
-                66 => if (session.agent_scope == .observe) "Agent: observe" else "Agent: control",
+                66 => if (header.scope == .observe) "Agent: observe" else "Agent: control",
                 else => b.label,
             };
-            const live = (session.target.core == null or b.code == 34) and (state == .stopped or (state == .running and (b.code == 57 or b.code == 32 or b.code == 66)));
-            const color = if (!live) theme.weak else if (b.code == 57) theme.good else if (b.code == 66 and session.agent_scope != .observe) theme.warm else theme.text;
+            const live = (!core or b.code == 34) and (state == .stopped or (state == .running and (b.code == 57 or b.code == 32 or b.code == 66)));
+            const color = if (!live) theme.weak else if (b.code == 57) theme.good else if (b.code == 66 and header.scope != .observe) theme.warm else theme.text;
             try style.button(r, font, .{ .x = b.x, .y = 50, .w = b.w, .h = 29 }, label_text, b.key, color, if (live) self.hot[i] else 0, self.pressed[i]);
         }
         _ = try style.chip(r, font, 822, 54, "TAB", theme.weak);
@@ -1849,194 +1937,63 @@ pub const Workspace = struct {
         const right = @round(width * 0.79);
         const bottom = if (self.show_profile) @round(height * profile_split) else self.bottomY(height);
         const body_y: f32 = 91;
-        session.profile_view_visible = self.show_profile;
-        const timeline_data = if (self.show_profile) self.timeline_source.refresh(session.profile) else null;
+        const timeline_bounds = gpu.Rect{ .x = 8, .y = bottom, .w = width - 16, .h = height - bottom - 37 };
         if (self.show_profile) {
-            // Capture replacement or shrinkage can change the selection.
-            if (timeline_data) |data| if (self.timeline.sync(data)) self.applyTimeline(session);
-            if (self.flame.basis == .recorded) if (session.profile) |capture| if (capture.offline and (self.flame.capture_id != capture.id or self.flame.revision != capture.revision or !std.meta.eql(self.flame.selection.filter, self.flame.built_filter))) session.ensureArchiveView(self.flame.selection.filter) catch {};
-            const reconstructed: @import("flame.zig").Derived = if (self.flame.basis == .recorded) .none else switch (session.requestDerivedOwned(self.flame.selection.filter, .gui)) {
-                .ready => |view| .{ .ready = view },
-                .pending => |p| .{ .pending = .{ .done = p.done, .total = p.total } },
-                .failed => |err| .{ .failed = @errorName(err) },
-                .unavailable => |err| .{ .unavailable = @errorName(err) },
-            };
-            try self.flame.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = bottom - body_y - 5 }, session.profile, &session.recorded_views, session.profile_failure, session.profile_error, session.profile_requested_threads, session.profile_defaults, reconstructed);
-            session.profile_view = if (self.flame.graph != null and (self.flame.basis == .recorded or reconstructed == .ready)) .{ .capture_id = self.flame.capture_id, .revision = self.flame.revision, .filter = self.flame.built_filter, .view_id = self.flame.view_id, .sample_count = self.flame.sample_count, .basis = @enumFromInt(@intFromEnum(self.flame.basis)) } else null;
+            try self.flame.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = bottom - body_y - 5 });
         } else {
-            const source_rect = gpu.Rect{ .x = 8, .y = body_y, .w = left - 12, .h = bottom - body_y - 5 };
-            try pane(r, font, source_rect, if (self.source_remote) "SOURCE / remote copy" else if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
-            if (self.source.len == 0) {
-                try r.text(font, 24, body_y + 58, "Open a file with --source <path>", theme.weak);
-                try r.text(font, 24, body_y + 86, "Stop in code with DWARF to follow source.", theme.weak);
-            } else {
-                var lines = std.mem.splitScalar(u8, self.source, '\n');
-                var number: i32 = 0;
-                var y = body_y + 44;
-                var more = false;
-                while (lines.next()) |source| : (number += 1) {
-                    if (number < self.source_line) continue;
-                    if (y + 20 > bottom - 10) {
-                        more = source.len != 0 or lines.rest().len != 0;
-                        break;
-                    }
-                    const line_number: u32 = @intCast(number + 1);
-                    const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = 23 };
-                    const current = self.current_line != null and self.current_line.? == line_number;
-                    const has_breakpoint = std.mem.indexOfScalar(u32, self.breakpoint_lines, line_number) != null;
-                    if (has_breakpoint) {
-                        const red = style.fade(theme.breakpoint, 0.13);
-                        try r.shape(row, red, .{ .colors = .{ red, style.fade(red, 0), red, style.fade(red, 0) } });
-                    }
-                    if (self.cursor_line == line_number) {
-                        if (@import("../appearance.zig").active.block_selection) try style.focus(r, row, 0, 1) else try r.rect(row, style.fade(theme.focus, 0.08));
-                    }
-                    if (current) {
-                        try style.threadLine(r, row, if (self.browse_address != null) theme.focus else thread_color, self.alive, 16);
-                        try r.text(font, 24, y, if (self.browse_address != null) "\u{25c6}" else "\u{25b6}", if (self.browse_address != null) theme.focus else thread_color);
-                    }
-                    if (has_breakpoint) {
-                        try style.disc(r, 16, y + 9.5, 5, theme.breakpoint);
-                    } else if (self.hover_line == line_number and state == .stopped) {
-                        try style.disc(r, 16, y + 9.5, 5, style.fade(theme.breakpoint, 0.3));
-                    }
-                    try label(r, font, 36, y, if (current) (if (self.browse_address != null) theme.focus else thread_color) else theme.weak, "{d: >4}", .{line_number});
-                    const trimmed = std.mem.trimStart(u8, source, " \t");
-                    const color = if (std.mem.startsWith(u8, trimmed, "#")) theme.neutral else if (std.mem.startsWith(u8, trimmed, "//")) theme.weak else theme.text;
-                    var expanded: [1024]u8 = undefined;
-                    try r.textFit(font, 88, y, left - 14 - 88, expandTabs(&expanded, source[0..@min(source.len, 512)]), color);
-                    y += 23;
-                }
-                if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
-            }
-            if (self.show_flow) {
-                try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
-                try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) catch null else null);
-            } else {
-                var arch_subtitle: [64]u8 = undefined;
-                const assembly_detail = if (self.browse_address != null)
-                    "browsing / G flow"
-                else
-                    std.fmt.bufPrint(&arch_subtitle, "{s} / G flow", .{@tagName(session.target.arch())}) catch "G flow";
-                try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", assembly_detail);
-                if (self.instruction_count == 0) {
-                    var unavailable: [96]u8 = undefined;
-                    const message = if (self.assembly_error) |name|
-                        std.fmt.bufPrint(&unavailable, "assembly unavailable: {s}", .{name}) catch "assembly unavailable"
-                    else
-                        "Pause to inspect instructions";
-                    try r.text(font, left + 16, body_y + 55, message, theme.weak);
-                }
-                const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
-                self.assembly_rows = .{ .x = left + 2, .y = body_y + 45, .w = right - left - 6, .count = 0 };
-                for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
-                    const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
-                    if (y + 20 > bottom - 10) break;
-                    self.assembly_rows.count = i + 1;
-                    if (self.assembly_cursor == inst.address and !self.static_from_line) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
-                    if (current_pc != null and inst.address == current_pc.?) {
-                        try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
-                        try r.text(font, left + 8, y, "\u{25b6}", thread_color);
-                    }
-                    try label(r, font, left + 22, y, if (current_pc != null and inst.address == current_pc.?) thread_color else theme.weak, "{x:0>12}", .{inst.address});
-                    const mnemonic = std.mem.sliceTo(@as([]const u8, &inst.mnemonic), 0);
-                    try r.text(font, left + 156, y, mnemonic, theme.neutral);
-                    try r.textFit(font, left + 156 + @max(58, r.measure(font, mnemonic) + 10), y, right - left - 6 - 156 - 70, std.mem.sliceTo(@as([]const u8, &inst.operands), 0), theme.text);
-                }
-            }
+            try self.drawDebuggerColumns(r, font, left, right, bottom, body_y, state, display.architecture, thread_color);
             const side = gpu.Rect{ .x = right + 2, .y = body_y, .w = width - right - 10, .h = bottom - body_y - 5 };
-            try self.language_panel.header(r, font, side, &session.language_tabs);
+            try self.language_panel.header(r, font, side, language);
             const content_y = self.language_panel.content_y;
-            if (session.language_tabs.selected == .native) {
-                if (self.local_diagnostic) |diagnostic| try r.text(font, right + 14, content_y + 4, diagnostic, theme.weak);
-                for (self.locals, 0..) |local, i| {
-                    const y = content_y + @as(f32, @floatFromInt(i)) * 48;
-                    if (y + 40 > bottom - 10) break;
-                    if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = 47 }, 6, 1);
-                    try r.textFit(font, right + 14, y, side.w - 24, local.name, theme.neutral);
-                    const type_x = right + 14 + r.measure(font, local.name) + 14;
-                    const advisory = if (local.value.visualization) |v| v.extent_advisory else false;
-                    try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, if (advisory) "extent unproved" else local.value.type, theme.weak);
-                    try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
-                }
-            } else if (session.language_tabs.selected == .registers) {
-                const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
-                const register_y = content_y + @as(f32, if (restart_slot) 23 else 0);
-                if (restart_slot) try r.textFit(font, right + 14, content_y, side.w - 24, "r0 is the kernel restart slot", theme.weak);
-                if (self.regs) |regs| {
-                    for (regs.descriptions(), 0..) |desc, i| {
-                        const y = register_y + @as(f32, @floatFromInt(i)) * 23;
-                        const value = regs.value(desc) catch null;
-                        const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
-                        const changed = value != null and previous != null and value.? != previous.?;
-                        if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
-                        const name = std.mem.span(desc.name);
-                        try label(r, font, right + 14, y, theme.weak, "{s}", .{name});
-                        if (restart_slot and std.mem.eql(u8, name, "r0")) {
-                            const tag = "slot";
-                            const tag_x = right + 14 + r.measure(font, name) + 6;
-                            if (tag_x + r.measure(font, tag) <= right + 80) try r.text(font, tag_x, y, tag, theme.weak);
-                        }
-                        if (value) |word| {
-                            try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
-                        } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
-                    }
-                } else try r.text(font, right + 14, content_y + 10, "No stopped thread", theme.weak);
+            if (language.selected == .native or language.selected == .registers) {
+                try self.drawNativeValues(r, font, side, content_y, bottom, language.selected, thread_color);
             } else {
-                const language_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[self.selected].tid else 0;
-                try self.language_panel.body(r, font, side, session, language_tid, self.selected_frame, self.locals, self.local_diagnostic);
+                try self.language_panel.drawBody(r, font, side, language, self.selected_frame, self.locals, self.local_diagnostic);
             }
         }
         if (self.show_profile) {
-            try self.timeline.draw(r, font, .{ .x = 8, .y = bottom, .w = width - 16, .h = height - bottom - 37 }, timeline_data);
-            if (self.inspector.open) if (session.profile) |capture| {
-                self.inspector.sync(capture, self.flame.selection.filter);
-                try self.inspector.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, capture, inspectorStack(session, self.inspector.ordinal), if (session.frames.jit_view) |view| view.sample(capture, self.inspector.ordinal, session.frames.evidence_revision) else null);
-            };
+            try self.timeline.drawPrepared(r, font, timeline_bounds);
+            try self.inspector.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 });
             if (self.setup.open) {
-                const snapshot = self.thread_rows.snapshot(session);
-                if (self.thread_selection.sync(&snapshot) == .cleared_replaced) self.setup.message = "The target changed; the earlier thread choice was cleared";
-                try self.setup.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, .{ .snapshot = &snapshot, .defaults = session.profile_defaults, .selection = &self.thread_selection, .facts = if (session.profile) |capture| capture_setup.factsFrom(capture) else null, .clock = .{ .now_ns = linux.now() }, .start_error = session.profile_error, .start_failure = session.profile_failure, .requested_threads = session.profile_requested_threads });
+                const capture = self.capture_view;
+                if (self.thread_selection.sync(&capture.snapshot) == .cleared_replaced) self.setup.message = "The target changed; the earlier thread choice was cleared";
+                try self.setup.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, .{ .snapshot = &capture.snapshot, .defaults = capture.defaults, .selection = &self.thread_selection, .facts = capture.facts, .clock = .{ .now_ns = linux.now() }, .start_error = capture.start_error, .start_failure = capture.start_failure, .requested_threads = capture.requested_threads });
             }
-        } else try self.drawBottom(r, font, session, width, height, left, bottom, thread_color);
+        } else try self.drawBottom(r, font, display.threads, display.events, width, height, left, bottom, thread_color);
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
-        const metadata = session.metadata.snapshot();
-        const pending_metadata: ?@import("../model/debug_metadata.zig").JobStatus = for (metadata.items[0..metadata.count]) |job| {
-            if (!std.mem.eql(u8, job.state, "ready") and !std.mem.eql(u8, job.state, "failed") and !std.mem.eql(u8, job.state, "cancelled")) break job;
-        } else null;
+        const pending_metadata = header.metadata;
         if (self.fd_event_state != .inactive) {
             const message = if (self.fd_event_state == .active)
                 (if (width >= 1100) "Exact FD capture ACTIVE: exact mode slows all syscalls on this machine by roughly 10 % while active" else "Exact FD capture ACTIVE: all host syscalls roughly 10 % slower")
             else
                 "Exact FD capture requested: all host syscalls roughly 10 % slower while active";
             try fit(r, font, 16, height - 23, width - 32, theme.warm, "{s}", .{message});
-        } else if (session.frames.attachment.failure) |err| {
-            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ @tagName(session.frames.attachment.state), @errorName(err) });
+        } else if (header.frame_failure) |err| {
+            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ header.frame_state, err });
         } else if (pending_metadata) |job| {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
         } else if (self.shared_clients) |count| {
             if (self.shared_controller) |owner| {
-                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(session.agent_scope), owner, count });
+                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(header.scope), owner, count });
             } else {
-                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / no controller / {d} clients", .{ self.status, @tagName(session.agent_scope), count });
+                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / no controller / {d} clients", .{ self.status, @tagName(header.scope), count });
             }
         } else {
-            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(session.agent_scope), session.target.snapshot().generation });
+            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(header.scope), display.snapshot.generation });
         }
         if (width >= 900 and self.fd_event_state == .inactive) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
-        try self.probes_panel.draw(r, font, width, height, session);
-        const inspect_tid = if (session.target.snapshot().thread_count > 0) session.target.threadSlice()[@min(self.selected, session.target.snapshot().thread_count - 1)].tid else 0;
-        try self.inspection_panel.draw(r, font, width, height, session, inspect_tid);
-        try self.runtime_type_panel.draw(r, font, width, height, session);
-        try self.inline_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
-        try self.static_panel.draw(r, font, width, height, session, inspect_tid, self.selected_frame);
+        try self.probes_panel.draw(r, font, width, height);
+        try self.inspection_panel.draw(r, font, width, height);
+        try self.runtime_type_panel.drawPrepared(r, font, width, height);
+        try self.inline_panel.draw(r, font, width, height);
+        try self.static_panel.drawPrepared(r, font, width, height);
         if (self.static_panel.open and self.static_panel.running) self.animating = true;
-        try self.stop_panel.draw(r, font, width, height, session, inspect_tid);
-        if (self.show_profile) try self.syscall_panel.draw(r, font, width, height, session.profile, self.flame.selection.filter);
-        try self.allocation_panel.drawLive(r, font, width, height, &session.allocations, inspect_tid);
+        try self.stop_panel.draw(r, font, width, height, self.stop_view);
+        if (self.show_profile) try self.syscall_panel.draw(r, font, width, height);
+        try self.allocation_panel.drawLive(r, font, width, height);
         if (self.allocation_panel.open and self.allocation_panel.mode == .heap and self.allocation_panel.heap_pending) self.animating = true;
         if (self.allocation_save_editor.open) {
             const b = gpu.Rect{ .x = 32, .y = 102, .w = @max(0, width - 64), .h = 92 };
@@ -2045,22 +2002,151 @@ pub const Workspace = struct {
             try self.allocation_save_editor.draw(r, font, .{ .x = b.x + 10, .y = b.y + 34, .w = b.w - 20, .h = 22 });
             try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.allocation_save_editor.message, theme.warm);
         }
-        if (session.process_tree) |tree| try self.process_panel.draw(tree, r, font, width, height);
+        try self.process_panel.draw(r, font, width, height);
+    }
+    /// Pure source, assembly and flow painting from the bound presentation.
+    pub fn drawDebuggerColumns(self: *Workspace, r: *gpu.Renderer, font: *Font, left: f32, right: f32, bottom: f32, body_y: f32, state: linux.State, architecture: @import("../target/arch.zig").Arch, thread_color: gpu.Color) !void {
+        const source_rect = gpu.Rect{ .x = 8, .y = body_y, .w = left - 12, .h = bottom - body_y - 5 };
+        try pane(r, font, source_rect, if (self.source_remote) "SOURCE / remote copy" else if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
+        if (self.source.len == 0) {
+            try r.text(font, 24, body_y + 58, "Open a file with --source <path>", theme.weak);
+            try r.text(font, 24, body_y + 86, "Stop in code with DWARF to follow source.", theme.weak);
+        } else {
+            var lines = std.mem.splitScalar(u8, self.source, '\n');
+            var number: i32 = 0;
+            var y = body_y + 44;
+            var more = false;
+            while (lines.next()) |source| : (number += 1) {
+                if (number < self.source_line) continue;
+                if (y + 20 > bottom - 10) {
+                    more = source.len != 0 or lines.rest().len != 0;
+                    break;
+                }
+                const line_number: u32 = @intCast(number + 1);
+                const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = 23 };
+                const current = self.current_line != null and self.current_line.? == line_number;
+                const has_breakpoint = std.mem.indexOfScalar(u32, self.breakpoint_lines, line_number) != null;
+                if (has_breakpoint) {
+                    const red = style.fade(theme.breakpoint, 0.13);
+                    try r.shape(row, red, .{ .colors = .{ red, style.fade(red, 0), red, style.fade(red, 0) } });
+                }
+                if (self.cursor_line == line_number) {
+                    if (@import("../appearance.zig").active.block_selection) try style.focus(r, row, 0, 1) else try r.rect(row, style.fade(theme.focus, 0.08));
+                }
+                if (current) {
+                    try style.threadLine(r, row, if (self.browse_address != null) theme.focus else thread_color, self.alive, 16);
+                    try r.text(font, 24, y, if (self.browse_address != null) "\u{25c6}" else "\u{25b6}", if (self.browse_address != null) theme.focus else thread_color);
+                }
+                if (has_breakpoint) {
+                    try style.disc(r, 16, y + 9.5, 5, theme.breakpoint);
+                } else if (self.hover_line == line_number and state == .stopped) {
+                    try style.disc(r, 16, y + 9.5, 5, style.fade(theme.breakpoint, 0.3));
+                }
+                try label(r, font, 36, y, if (current) (if (self.browse_address != null) theme.focus else thread_color) else theme.weak, "{d: >4}", .{line_number});
+                const trimmed = std.mem.trimStart(u8, source, " \t");
+                const color = if (std.mem.startsWith(u8, trimmed, "#")) theme.neutral else if (std.mem.startsWith(u8, trimmed, "//")) theme.weak else theme.text;
+                var expanded: [1024]u8 = undefined;
+                try r.textFit(font, 88, y, left - 14 - 88, expandTabs(&expanded, source[0..@min(source.len, 512)]), color);
+                y += 23;
+            }
+            if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
+        }
+        if (self.show_flow) {
+            try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
+            try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) catch null else null);
+        } else {
+            var arch_subtitle: [64]u8 = undefined;
+            const assembly_detail = if (self.browse_address != null)
+                "browsing / G flow"
+            else
+                std.fmt.bufPrint(&arch_subtitle, "{s} / G flow", .{@tagName(architecture)}) catch "G flow";
+            try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "ASSEMBLY", assembly_detail);
+            if (self.instruction_count == 0) {
+                var unavailable: [96]u8 = undefined;
+                const message = if (self.assembly_error) |name|
+                    std.fmt.bufPrint(&unavailable, "assembly unavailable: {s}", .{name}) catch "assembly unavailable"
+                else
+                    "Pause to inspect instructions";
+                try r.text(font, left + 16, body_y + 55, message, theme.weak);
+            }
+            const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
+            self.assembly_rows = .{ .x = left + 2, .y = body_y + 45, .w = right - left - 6, .count = 0 };
+            for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
+                const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
+                if (y + 20 > bottom - 10) break;
+                self.assembly_rows.count = i + 1;
+                if (self.assembly_cursor == inst.address and !self.static_from_line) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
+                if (current_pc != null and inst.address == current_pc.?) {
+                    try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
+                    try r.text(font, left + 8, y, "\u{25b6}", thread_color);
+                }
+                try label(r, font, left + 22, y, if (current_pc != null and inst.address == current_pc.?) thread_color else theme.weak, "{x:0>12}", .{inst.address});
+                const mnemonic = std.mem.sliceTo(@as([]const u8, &inst.mnemonic), 0);
+                try r.text(font, left + 156, y, mnemonic, theme.neutral);
+                try r.textFit(font, left + 156 + @max(58, r.measure(font, mnemonic) + 10), y, right - left - 6 - 156 - 70, std.mem.sliceTo(@as([]const u8, &inst.operands), 0), theme.text);
+            }
+        }
+    }
+    /// Pure locals/register painting. Language inspection is prepared separately.
+    pub fn drawNativeValues(self: *Workspace, r: *gpu.Renderer, font: *Font, side: gpu.Rect, content_y: f32, bottom: f32, tab: @import("../model/language_tabs.zig").Tab, thread_color: gpu.Color) !void {
+        const right = side.x - 2;
+        if (tab == .native) {
+            if (self.local_diagnostic) |diagnostic| try r.text(font, right + 14, content_y + 4, diagnostic, theme.weak);
+            for (self.locals, 0..) |local, i| {
+                const y = content_y + @as(f32, @floatFromInt(i)) * 48;
+                if (y + 40 > bottom - 10) break;
+                if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = 47 }, 6, 1);
+                try r.textFit(font, right + 14, y, side.w - 24, local.name, theme.neutral);
+                const type_x = right + 14 + r.measure(font, local.name) + 14;
+                const advisory = if (local.value.visualization) |v| v.extent_advisory else false;
+                try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, if (advisory) "extent unproved" else local.value.type, theme.weak);
+                try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
+            }
+        } else if (tab == .registers) {
+            const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
+            const register_y = content_y + @as(f32, if (restart_slot) 23 else 0);
+            if (restart_slot) try r.textFit(font, right + 14, content_y, side.w - 24, "r0 is the kernel restart slot", theme.weak);
+            if (self.regs) |regs| {
+                for (regs.descriptions(), 0..) |desc, i| {
+                    const y = register_y + @as(f32, @floatFromInt(i)) * 23;
+                    const value = regs.value(desc) catch null;
+                    const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
+                    const changed = value != null and previous != null and value.? != previous.?;
+                    if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
+                    const name = std.mem.span(desc.name);
+                    try label(r, font, right + 14, y, theme.weak, "{s}", .{name});
+                    if (restart_slot and std.mem.eql(u8, name, "r0")) {
+                        const tag = "slot";
+                        const tag_x = right + 14 + r.measure(font, name) + 6;
+                        if (tag_x + r.measure(font, tag) <= right + 80) try r.text(font, tag_x, y, tag, theme.weak);
+                    }
+                    if (value) |word| {
+                        try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
+                    } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
+                }
+            } else try r.text(font, right + 14, content_y + 10, "No stopped thread", theme.weak);
+        }
     }
     /// Threads, stack and events, below the source view.
-    fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, session: *Session, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
+    pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
         const thread_right = @round(left * 0.36);
-        try pane(r, font, .{ .x = 8, .y = bottom, .w = thread_right - 12, .h = height - bottom - 37 }, "THREADS", "J/K to select");
-        const thread_rows: usize = @intFromFloat(@max(1, (height - bottom - 87) / 25));
-        const first_thread = (self.selected + 1) -| thread_rows;
-        for (session.target.threadSlice(), 0..) |thread, i| {
-            if (i < first_thread) continue;
-            const y = bottom + 44 + @as(f32, @floatFromInt(i - first_thread)) * 25;
-            if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - 3, .w = thread_right - 20, .h = 25 }, 6, 1);
-            try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
-            try fit(r, font, 40, y, thread_right - 12 - 40, if (i == self.selected) theme.text else theme.weak, "{d} {s}", .{ @as(u32, @intCast(thread.tid)), if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state) });
+        const wine = self.compatibility_info.kind == .wine;
+        const hint = if (!wine) "J/K to select" else if (self.thread_list.hide_internal) "H show" else "H hide";
+        try pane(r, font, .{ .x = 8, .y = bottom, .w = thread_right - 12, .h = height - bottom - 37 }, "THREADS", hint);
+        if (wine) {
+            try self.thread_list.draw(r, font, .{ .x = 12, .y = bottom + 42, .w = thread_right - 20, .h = @max(0, height - bottom - 82) }, threads, self.thread_labels, self.selected);
+        } else {
+            const thread_rows: usize = @intFromFloat(@max(1, (height - bottom - 87) / 25));
+            const first_thread = (self.selected + 1) -| thread_rows;
+            for (threads, 0..) |thread, i| {
+                if (i < first_thread) continue;
+                const y = bottom + 44 + @as(f32, @floatFromInt(i - first_thread)) * 25;
+                if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - 3, .w = thread_right - 20, .h = 25 }, 6, 1);
+                try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
+                try fit(r, font, 40, y, thread_right - 12 - 40, if (i == self.selected) theme.text else theme.weak, "{d} {s}", .{ @as(u32, @intCast(thread.tid)), if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state) });
+            }
         }
-        if (session.target.snapshot().thread_count == 0) try r.textFit(font, 24, bottom + 50, thread_right - 40, "Launch with -- <executable> [args]", theme.weak);
+        if (threads.len == 0) try r.textFit(font, 24, bottom + 50, thread_right - 40, "Launch with -- <executable> [args]", theme.weak);
         const stack = gpu.Rect{ .x = thread_right, .y = bottom, .w = left - thread_right - 4, .h = height - bottom - 37 };
         try pane(r, font, stack, "STACK", "click frame / I inline");
         for (self.frames, 0..) |frame, i| {
@@ -2077,11 +2163,11 @@ pub const Workspace = struct {
             if (where.len > 0 and stack.w > 330) try r.text(font, stack.x + stack.w - where_width - 12, y, where, theme.weak);
         }
         const events_rect = gpu.Rect{ .x = left + 2, .y = bottom, .w = width - left - 10, .h = height - bottom - 37 };
-        if (self.show_watch and @intFromEnum(session.language_tabs.selected) >= 2) {
+        if (self.show_watch and @intFromEnum(self.runtime_watch_view.selected_language) >= 2) {
             try pane(r, font, events_rect, "RUNTIME WATCHES", "W binding  Shift+E name  V events  [] scroll  Del remove");
             self.watch_rect = events_rect;
             if (self.watch_focus) try r.rect(.{ .x = events_rect.x + 1, .y = events_rect.y + 32, .w = events_rect.w - 2, .h = 2 }, theme.focus);
-            try self.runtime_watch_panel.draw(session, r, font, r.clip);
+            try self.runtime_watch_panel.draw(self.runtime_watch_view, r, font, r.clip);
             return;
         }
         if (self.show_watch) {
@@ -2089,12 +2175,11 @@ pub const Workspace = struct {
             try pane(r, font, events_rect, "WATCH", if (self.editor.open) (if (self.editor.mode == .live) "Live / Up/Down history  Return add  Esc cancel" else "Pinned / Up/Down history  Return add  Esc cancel") else if (wide) "E/Shift+E add  V events  [] scroll  Shift+L convert  Del remove  Return expand  W write" else "E/Shift+E add  V events  [] scroll");
             if (self.watch_focus) try r.rect(.{ .x = events_rect.x + 1, .y = events_rect.y + 32, .w = events_rect.w - 2, .h = 2 }, theme.focus);
             self.watch_rect = events_rect;
-            try watch_ui.draw(&self.watch, &self.editor, r, font, r.clip, &self.watch_hits);
+            try watch_ui.draw(&self.watch_panel, self.watch_view, &self.editor, r, font, r.clip, &self.watch_hits);
             return;
         }
         self.watch_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
-        try pane(r, font, events_rect, "EVENTS", if (self.watch.count > 0) "monotonic time  /  V watch" else "monotonic time  /  E expression");
-        const events = session.target.eventSlice();
+        try pane(r, font, events_rect, "EVENTS", if (self.watch_view.entries.len > 0) "monotonic time  /  V watch" else "monotonic time  /  E expression");
         const visible: usize = @intFromFloat(@max(1, (height - bottom - 87) / 23));
         const start = events.len -| visible;
         for (events[start..], 0..) |event, i| {
@@ -2118,191 +2203,7 @@ pub const Workspace = struct {
     }
 };
 
-/// Per-frame thread snapshot for the setup panel: rows by value with names
-/// read once per debugger thread ID from the live target's comm files.
-/// Nothing here points into target storage; names live in this cache.
-const ThreadRows = struct {
-    rows: [@import("../profile/linux_perf.zig").max_threads]capture_setup.ThreadRow = undefined,
-    names: [@import("../profile/linux_perf.zig").max_threads]Name = undefined,
-    name_count: usize = 0,
-    key: ?capture_setup.TargetKey = null,
-    const Name = struct { id: u64, len: u8, bytes: [16]u8 };
-
-    fn snapshot(self: *ThreadRows, session: *Session) capture_setup.Snapshot {
-        const target = &session.target;
-        const live = target.core == null and target.snapshot().pid != 0 and target.snapshot().state != .idle and target.snapshot().state != .exited;
-        const key: ?capture_setup.TargetKey = if (live) .{ .pid = target.snapshot().pid, .image_epoch = target.snapshot().image_epoch } else null;
-        if (!std.meta.eql(key, self.key)) {
-            self.key = key;
-            self.name_count = 0;
-        }
-        var n: usize = 0;
-        if (live) for (target.threadSlice()) |thread| {
-            if (n == self.rows.len) break;
-            self.rows[n] = .{ .ref = .{ .id = thread.id, .tid = thread.tid }, .state = switch (thread.state) {
-                .stopped => .stopped,
-                .running => .running,
-                else => .exited,
-            }, .name = self.name(target, thread.id, thread.tid) };
-            n += 1;
-        };
-        const collecting = if (session.profile) |capture| capture.collector != null else false;
-        return .{ .target = key, .stopped = target.snapshot().state == .stopped, .offline = session.offline, .collecting = collecting, .threads = self.rows[0..n] };
-    }
-    fn name(self: *ThreadRows, target: *const @import("../target/linux.zig").Target, id: u64, tid: i32) []const u8 {
-        for (self.names[0..self.name_count]) |*entry| if (entry.id == id) return entry.bytes[0..entry.len];
-        if (self.name_count == self.names.len) return "";
-        const rt = @import("../target/runtime.zig").c;
-        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{ .kind = rt.XRT_FILE_THREAD_COMM, .tid = tid });
-        const entry = &self.names[self.name_count];
-        entry.* = .{ .id = id, .len = 0, .bytes = undefined };
-        var fd: c_int = -1;
-        if (rt.xrt_target_file(target.handle, &request, &fd) == rt.XRT_OK) {
-            defer _ = c.close(fd);
-            const got = c.read(fd, &entry.bytes, entry.bytes.len);
-            if (got > 0) entry.len = @intCast(std.mem.trimEnd(u8, entry.bytes[0..@intCast(got)], "\n").len);
-        }
-        self.name_count += 1;
-        return entry.bytes[0..entry.len];
-    }
-};
-
-/// The timeline's display data for the session capture: per-thread sample
-/// times and debugger stop ranges. Rebuilt when the capture revision changes,
-/// at most four times a second while collecting. Samples follow the capture's
-/// own validity rule (time and TID present, not before start, an opening
-/// thread), so counts agree with flames and `get_profile_timeline`.
-/// Scheduling intervals use the same reconstruction as MCP.
-const TimelineSource = struct {
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    data: ?timeline.Data = null,
-    capture_id: u64 = 0,
-    revision: u64 = 0,
-    built_ns: u64 = 0,
-
-    fn deinit(self: *TimelineSource) void {
-        self.arena.deinit();
-    }
-    fn refresh(self: *TimelineSource, capture: ?*profile.Capture) ?*const timeline.Data {
-        const current = capture orelse {
-            self.data = null;
-            return null;
-        };
-        const same = self.data != null and current.id == self.capture_id;
-        if (same and current.revision == self.revision) return &self.data.?;
-        if (same and current.collector != null and linux.now() -| self.built_ns < 250_000_000) return &self.data.?;
-        self.build(current) catch {
-            self.data = null;
-            return null;
-        };
-        return &self.data.?;
-    }
-    const max_stop_spans = 4096;
-    fn build(self: *TimelineSource, capture: *profile.Capture) !void {
-        self.data = null;
-        _ = self.arena.reset(.retain_capacity);
-        const a = self.arena.allocator();
-        const n = capture.thread_count;
-        var lane_of: std.AutoHashMapUnmanaged(u32, u32) = .empty;
-        try lane_of.ensureTotalCapacity(a, @intCast(n));
-        for (capture.threads[0..n], 0..) |thread, i| lane_of.putAssumeCapacity(@intCast(thread.perf.tid), @intCast(i));
-        const counts = try a.alloc(usize, n);
-        @memset(counts, 0);
-        for (0..capture.samples.len()) |ordinal| {
-            const sample = capture.samples.core(ordinal);
-            if (valid(capture, sample)) if (lane_of.get(sample.tid)) |i| {
-                counts[i] += 1;
-            };
-        }
-        const lanes = try a.alloc(timeline.Lane, n);
-        const times = try a.alloc([]u64, n);
-        for (lanes, times, counts, capture.threads[0..n]) |*lane, *slot, count, thread| {
-            slot.* = try a.alloc(u64, count);
-            lane.* = .{ .tid = @intCast(thread.perf.tid), .debugger_id = thread.debugger_id };
-        }
-        @memset(counts, 0);
-        for (0..capture.samples.len()) |ordinal| {
-            const sample = capture.samples.core(ordinal);
-            if (valid(capture, sample)) if (lane_of.get(sample.tid)) |i| {
-                times[i][counts[i]] = sample.time_ns - capture.started_ns;
-                counts[i] += 1;
-            };
-        }
-        for (lanes, times) |*lane, slot| {
-            std.mem.sort(u64, slot, {}, std.sort.asc(u64));
-            lane.samples = slot;
-        }
-        const extent = capture.extentNs();
-        if (capture.config.context_switch) for (lanes, 0..) |*lane, i| {
-            const spans = try capture.switches.spans(a, i, extent, .{ .from_ns = 0, .to_ns = extent }, capture.schedulingCoverage());
-            const intervals = try a.alloc(timeline.Interval, spans.len);
-            for (spans, intervals) |span, *interval| interval.* = .{
-                .from_ns = span.from_ns,
-                .to_ns = span.to_ns,
-                .state = switch (span.state) {
-                    .running => .running,
-                    .off_cpu => .off_cpu,
-                    .unknown => .unknown,
-                },
-                .from_observed = span.from_ns != 0 and span.state != .unknown,
-                .to_observed = span.to_ns != extent and span.state != .unknown,
-                .preempted = span.switch_out_preempted orelse false,
-                .detail = if (span.unknown_reason) |reason| @tagName(reason) else "",
-            };
-            lane.intervals = intervals;
-        };
-        var omitted: u64 = 0;
-        const stops_ = try stops(a, capture, extent, &omitted);
-        const imported = capture.application_intervals.items.items;
-        const marks = try a.alloc(timeline.Mark, stops_.len + imported.len + capture.syscalls.items.items.len);
-        @memcpy(marks[0..stops_.len], stops_);
-        for (imported, marks[stops_.len..][0..imported.len]) |interval, *mark| mark.* = .{ .from_ns = interval.from_ns, .to_ns = interval.to_ns, .kind = .application, .tid = interval.tid, .label = try std.fmt.allocPrint(a, "  /  imported {s}: {s}", .{ @tagName(interval.kind), interval.label() }) };
-        for (capture.syscalls.items.items, marks[stops_.len + imported.len ..]) |span, *mark| {
-            const from = (span.entry_ns orelse span.exit_ns.?) -| capture.started_ns;
-            const to = (span.exit_ns orelse span.entry_ns.?) -| capture.started_ns;
-            mark.* = .{ .from_ns = from, .to_ns = to, .kind = .syscall, .tid = @intCast(capture.threads[span.thread_index].perf.tid), .label = if (span.elapsed()) |ns| try std.fmt.allocPrint(a, "  /  syscall {s} ({d}): {d:.3} ms elapsed", .{ @import("../profile/syscalls.zig").name(span.nr) orelse "?", span.nr, @as(f64, @floatFromInt(ns)) / 1000000 }) else try std.fmt.allocPrint(a, "  /  syscall ({d}): {s}, duration unknown", .{ span.nr, @tagName(span.reason) }) };
-        }
-        self.data = .{ .capture_id = capture.id, .revision = capture.revision, .extent_ns = extent, .live = capture.collector != null, .scheduling = capture.config.context_switch, .lanes = lanes, .marks = marks, .application_count = imported.len, .syscall_count = capture.syscalls.items.items.len, .debugger_marks_dropped = omitted +| capture.debugger_marker_dropped +| capture.debugger_events_lost, .lost_samples = capture.lost_samples };
-        self.capture_id = capture.id;
-        self.revision = capture.revision;
-        self.built_ns = linux.now();
-    }
-    fn valid(capture: *const profile.Capture, sample: anytype) bool {
-        return sample.timePresent() and sample.tidPresent() and sample.time_ns >= capture.started_ns;
-    }
-    /// Debugger stop ranges from the capture's observed control markers. These
-    /// are debugger timestamps, not exact scheduler boundaries. With lost events
-    /// a pairing could span a missed resume, so none are shown; a stop still open
-    /// at the last retained marker is omitted when later markers were dropped.
-    fn stops(a: std.mem.Allocator, capture: *const profile.Capture, extent: u64, omitted: *u64) ![]timeline.Mark {
-        var out: std.ArrayList(timeline.Mark) = .empty;
-        if (capture.debugger_events_lost > 0) return out.items;
-        for (capture.threads[0..capture.thread_count]) |thread| {
-            var from: ?u64 = null;
-            for (capture.debugger_markers.items) |marker| {
-                if (thread.enrolled_ns) |enrolled| if (marker.offset_ns < enrolled -| capture.started_ns) continue;
-                const all = marker.kind == .capture_open_stopped or marker.kind == .continued or marker.kind == .detach;
-                if (!all and marker.tid != thread.perf.tid) continue;
-                switch (marker.kind) {
-                    .capture_open_stopped, .stop, .breakpoint_hit, .watchpoint_hit, .step_complete => {
-                        if (from == null) from = marker.offset_ns;
-                    },
-                    .continued, .step_started, .exit, .detach => if (from) |start| {
-                        if (marker.offset_ns > start) try stopSpan(a, &out, omitted, .{ .from_ns = start, .to_ns = marker.offset_ns, .kind = .debugger_stop, .tid = @intCast(thread.perf.tid) });
-                        from = null;
-                    },
-                }
-            }
-            if (from) |start| if (capture.debugger_marker_dropped == 0 and extent > start) try stopSpan(a, &out, omitted, .{ .from_ns = start, .to_ns = extent, .kind = .debugger_stop, .tid = @intCast(thread.perf.tid) });
-        }
-        return out.items;
-    }
-    fn stopSpan(a: std.mem.Allocator, out: *std.ArrayList(timeline.Mark), omitted: *u64, mark: timeline.Mark) !void {
-        if (out.items.len == max_stop_spans) {
-            omitted.* +|= 1;
-        } else try out.append(a, mark);
-    }
-};
+const TimelineSource = @import("../model/profile_timeline.zig").Source;
 
 test "queued drag preserves release position and quit ends the batch" {
     var session = Session{ .id = 1 };
@@ -2396,7 +2297,7 @@ test "timeline drag and lane click commit a flame filter; motion does not" {
     capture.addMarker(.{ .offset_ns = 600_000, .sequence = 3, .tid = 41, .kind = .stop });
     var workspace = Workspace{ .show_profile = true };
     defer workspace.deinit();
-    const data = workspace.timeline_source.refresh(capture).?;
+    const data = workspace.timeline_capture.source.refresh(capture).?;
     var lane_total: usize = 0;
     for (data.lanes) |lane| lane_total += lane.samples.len;
     try std.testing.expectEqual(100, lane_total);
@@ -2442,11 +2343,11 @@ test "timeline drag and lane click commit a flame filter; motion does not" {
     // A newly enrolled lane must not inherit the opening all-stop interval.
     capture.threads[1].enrolled_ns = capture.started_ns + 200_000;
     capture.revision += 1;
-    const dynamic = workspace.timeline_source.refresh(capture).?;
+    const dynamic = workspace.timeline_capture.source.refresh(capture).?;
     for (dynamic.marks) |mark| try std.testing.expect(mark.tid != 42);
     // A replacement capture clears both.
     capture.id = 4;
-    const replaced = workspace.timeline_source.refresh(capture).?;
+    const replaced = workspace.timeline_capture.source.refresh(capture).?;
     try std.testing.expect(workspace.timeline.sync(replaced));
     workspace.applyTimeline(&session);
     try std.testing.expectEqual(profile.Filter{}, workspace.flame.selection.filter);
@@ -2478,6 +2379,22 @@ test "timeline adapter bounds maximum scheduling and debugger overlay history" {
     var samples: usize = 0;
     for (data.lanes) |lane| samples += lane.samples.len;
     try std.testing.expectEqual(profile.max_samples, samples);
+    var viewport = timeline.TimelineView{};
+    var arena: std.heap.ArenaAllocator = .init(a);
+    defer arena.deinit();
+    const prepared = try viewport.prepare(arena.allocator(), 1, .{ .bounds = .{ .x = 8, .y = 512, .w = 1264, .h = 251 } }, &data);
+    const boundary = @import("../model/remote_owner.zig");
+    const publication = try boundary.Publication.create(a, .{ .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 }, .revision = 1, .taken_ns = 1, .status = .ready, .timeline = prepared });
+    defer publication.destroy();
+    try std.testing.expect(publication.bytes < 256 * 1024);
+    try std.testing.expectEqual(@as(usize, 65536), publication.value.timeline.?.data.syscall_count);
+    var bucket_total: u64 = 0;
+    for (publication.value.timeline.?.buckets) |bucket| bucket_total += bucket[0];
+    try std.testing.expectEqual(@as(u64, profile.max_samples), bucket_total);
+    _ = arena.reset(.free_all);
+    source.clear();
+    try std.testing.expectEqual(@as(usize, 0), source.arena.queryCapacity());
+    try std.testing.expectEqual(@as(usize, 1024), publication.value.timeline.?.data.lanes.len);
     std.debug.print("timeline adapter maximum history: {d} us; {d} switch events, {d} total overlays\n", .{ (linux.now() - begin) / 1000, capture.switches.retained, data.marks.len });
 }
 
@@ -2525,7 +2442,7 @@ test "capture setup: S opens it, an empty subset never starts, replacement clear
     workspace.input(&w, &session);
     try std.testing.expect(workspace.setup.open);
     // Choose a subset, then empty it: P must not fall back to all threads.
-    const snapshot = workspace.thread_rows.snapshot(&session);
+    const snapshot = workspace.capture_control.rows.snapshot(&session);
     _ = workspace.thread_selection.sync(&snapshot);
     workspace.applySetup(&w, &session, .start_subset);
     try std.testing.expectEqual(capture_setup.Mode.subset, workspace.thread_selection.mode);
@@ -2544,7 +2461,7 @@ test "capture setup: S opens it, an empty subset never starts, replacement clear
     workspace.applySetup(&w, &session, .{ .toggle_thread = .{ .id = 2, .tid = 4243 } });
     try std.testing.expectEqual(@as(usize, 1), workspace.thread_selection.count);
     session.target.testing().image_epoch = 2;
-    const replaced = workspace.thread_rows.snapshot(&session);
+    const replaced = workspace.capture_control.rows.snapshot(&session);
     try std.testing.expectEqual(capture_setup.Notice.cleared_replaced, workspace.thread_selection.sync(&replaced));
     try std.testing.expectEqual(capture_setup.Mode.all, workspace.thread_selection.mode);
     // A P event queued for an earlier target cannot silently start all threads.

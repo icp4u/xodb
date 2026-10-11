@@ -62,7 +62,7 @@ void xmd_poll(struct xmd_job *, struct xmd_snapshot *);
 void xmd_cancel(struct xmd_job *);
 /* Nonblocking join. AGAIN means the worker has not returned yet. */
 enum xbo_status xmd_join(struct xmd_job *);
-/* Joined worker only. Revalidate before reusing a published profile. A failed
+/* Joined worker only, on the owner: foreground validation before reuse. A failed
  * validation withdraws the profile, including when original bytes return. */
 enum xbo_status xmd_validate(struct xmd_job *);
 void xmd_destroy(struct xmd_job *);

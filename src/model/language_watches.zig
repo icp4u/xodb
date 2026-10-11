@@ -71,7 +71,7 @@ pub const State = struct {
             return;
         }
         // One bounded runtime inspection per owner-loop iteration. Never read
-        // the target from a worker or on behalf of a cached-results request.
+        // the target outside its owner or for a cached-results request.
         var ordinal: usize = 0;
         while (ordinal < c.xlw_count(self.core)) : (ordinal += 1) {
             var view: c.struct_xlw_view = undefined;

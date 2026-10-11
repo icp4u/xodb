@@ -64,10 +64,10 @@ fn publishedSymbol(machine: elf.Machine, module_id: u64, symbol: elf.Symbol, add
 pub const Modules = struct {
     // These sealed sparse views contain symbols and placement metadata only.
     // Keep them outside Module so debug/unwind/code paths can never see holes.
-    pub const FileKind = enum { elf, pe, other };
-    const FileKey = struct { inode: u64, device_major: u64, device_minor: u64 };
+    pub const FileKind = enum { elf, pe, macho, other };
+    const FileKey = pe.FileKey;
     const max_file_kinds = 16384;
-    const FileClassification = struct { kind: FileKind, identity: rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null };
+    const FileClassification = struct { kind: FileKind, identity: ?rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null };
     const FileIdentity = struct {
         region: Region,
         identity: ?rt.struct_xrt_file_identity = null,
@@ -950,7 +950,7 @@ pub const Modules = struct {
         defer self.reportBudget();
         self.unsearched = null;
         var cursor = SymbolCursor{};
-        return self.symbolLookup(name, false, true, &cursor);
+        return self.symbolLookup(name, false, true, .any, &cursor);
     }
     /// The mapped images defining `name`, each loaded in full within the
     /// bounds `definerRead` gives. Images without
@@ -967,7 +967,7 @@ pub const Modules = struct {
         } else return error.SymbolDefinerLimit;
         if (scan.name.len == 0 or scan.revision != self.maps_revision) scan.* = .{ .name = name, .revision = self.maps_revision };
         scanning: while (!scan.done) {
-            const symbol = self.symbolLookup(name, false, false, &scan.cursor) catch |err| {
+            const symbol = self.symbolLookup(name, false, false, .any, &scan.cursor) catch |err| {
                 if (scan.cursor.next < self.regions.items.len) return err;
                 scan.done = true;
                 break;
@@ -1182,16 +1182,17 @@ pub const Modules = struct {
     /// can resume the same unfinished file.
     pub const SymbolCursor = struct { next: usize = 0, failure: ?anyerror = null };
     pub fn automaticSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
-        return self.pendingSymbolAddress(name, cursor, false);
+        return self.pendingSymbolAddress(name, cursor, false, .any);
     }
     /// The same resumable lookup for a name the user gave (`--break NAME`,
     /// a pending symbol breakpoint): it may read the main executable in full.
     pub fn breakpointSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
-        return self.pendingSymbolAddress(name, cursor, true);
+        return self.pendingSymbolAddress(name, cursor, true, .code);
     }
-    fn pendingSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor, fallback: bool) !u64 {
+    const SymbolIntent = enum { any, code };
+    fn pendingSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor, fallback: bool, intent: SymbolIntent) !u64 {
         defer self.reportBudget();
-        const found = try self.symbolLookup(name, true, fallback, cursor);
+        const found = try self.symbolLookup(name, true, fallback, intent, cursor);
         // ELFv2 function symbols are the global entry. Planting there misses a
         // local call, which skips the TOC setup. The local entry is inside the
         // same function, and a global call falls through it.
@@ -1291,7 +1292,7 @@ pub const Modules = struct {
         return std.fmt.bufPrint(buffer, "{s}: symbol tables too large to search by name until the image is loaded; only the main executable is read in full for a name", .{snapshot.printable(&name, self.regions.items[missed.region].path, name.len)}) catch null;
     }
     pub const unsearched_text = 512 + 160;
-    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, cursor: *SymbolCursor) !Symbol {
+    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, intent: SymbolIntent, cursor: *SymbolCursor) !Symbol {
         var failure = cursor.failure;
         defer cursor.failure = failure;
         regions: while (cursor.next < self.regions.items.len) : (cursor.next += 1) {
@@ -1316,7 +1317,12 @@ pub const Modules = struct {
             const no_reader = !rt.xrt_target_is_remote(self.target) and (self.immutable or self.target == null);
             if (!no_reader and r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
                 if (self.peRegion(r)) |entry| {
-                    if (try self.peFindSymbol(entry, name, automatic)) |found| return found;
+                    const found = self.peFindSymbol(entry, name, intent == .code) catch |err| {
+                        if (err == error.SymbolDiscoveryPending or err == error.OutOfMemory) return err;
+                        if (failure == null) failure = err;
+                        continue;
+                    };
+                    if (found) |symbol| return symbol;
                     continue;
                 } else |err| switch (err) {
                     error.NotPe => {},
@@ -1396,6 +1402,9 @@ pub const Modules = struct {
             if (self.file_kinds.getPtr(key)) |cached| {
                 cached.checked_revision = self.maps_revision;
                 cached.failure = err;
+            } else {
+                if (self.file_kinds.count() >= max_file_kinds) self.file_kinds.clearRetainingCapacity();
+                self.file_kinds.put(self.allocator, key, .{ .kind = .other, .identity = null, .checked_revision = self.maps_revision, .failure = err }) catch {};
             }
         };
         const path = try self.allocator.dupeZ(u8, region.path);
@@ -1409,16 +1418,17 @@ pub const Modules = struct {
         defer _ = rt.xrt_file_view_close(view);
         const identity = rt.xrt_file_view_identity(view).*;
         if (self.file_kinds.getPtr(key)) |cached| {
-            if (std.meta.eql(cached.identity, identity)) {
+            if (cached.identity != null and std.meta.eql(cached.identity.?, identity)) {
                 cached.checked_revision = self.maps_revision;
                 cached.failure = null;
                 return cached.kind;
             }
         }
-        var magic: [4]u8 = @splat(0);
+        // Eight bytes: a universal Mach-O shares its magic with a Java class file.
+        var magic: [8]u8 = @splat(0);
         const size: usize = @intCast(@min(@max(rt.xrt_file_view_identity(view).*.size, 0), magic.len));
         try runtime_api.check(rt.xrt_file_view_read(view, 0, &magic, size));
-        const kind: FileKind = if (std.mem.eql(u8, &magic, "\x7fELF")) .elf else if (std.mem.eql(u8, magic[0..2], "MZ")) .pe else .other;
+        const kind: FileKind = if (std.mem.eql(u8, magic[0..4], "\x7fELF")) .elf else if (std.mem.eql(u8, magic[0..2], "MZ")) .pe else if (c.xmo_probe(&magic, size) != c.XMO_KIND_NONE) .macho else .other;
         if (self.file_kinds.count() >= max_file_kinds) self.file_kinds.clearRetainingCapacity();
         try self.file_kinds.put(self.allocator, key, .{ .kind = kind, .identity = identity, .checked_revision = self.maps_revision });
         return kind;
@@ -1426,7 +1436,7 @@ pub const Modules = struct {
     /// A mapping pins its inode; once a file leaves the address space its
     /// number may name another file, so the decision is dropped with it.
     fn pruneFileKinds(self: *Modules, regions: []const Region) void {
-        if (self.file_kinds.count() == 0) return;
+        if (self.file_kinds.count() == 0 and self.pe_images.files.items.len == 0) return;
         var mapped: std.AutoHashMapUnmanaged(FileKey, void) = .empty;
         defer mapped.deinit(self.allocator);
         for (regions) |region| if (region.inode != 0) mapped.put(self.allocator, fileKey(region), {}) catch {
@@ -1435,6 +1445,27 @@ pub const Modules = struct {
         };
         var it = self.file_kinds.keyIterator();
         while (it.next()) |key| if (!mapped.contains(key.*)) self.file_kinds.removeByPtr(key);
+        self.pe_images.prune(self.allocator, regions, &mapped);
+    }
+    /// The pinned file behind a mapping whose bytes classify as Mach-O, for a
+    /// read-only look at the file. The caller closes the view. This is not
+    /// module discovery: nothing is bound to the process's regions.
+    pub fn machoFileView(self: *Modules, address: u64) !struct { view: *rt.struct_xrt_file_view, path: []const u8 } {
+        if (self.immutable or self.target == null) return error.NotMachO;
+        const region = for (self.regions.items) |region| {
+            if (address >= region.start and address < region.end) break region;
+        } else return error.NotMachO;
+        if (region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotMachO;
+        if (try self.fileKind(region) != .macho) return error.NotMachO;
+        const path = try self.allocator.dupeZ(u8, region.path);
+        defer self.allocator.free(path);
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{
+            .kind = rt.XRT_FILE_MAPPED,
+            .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path.ptr },
+        });
+        var view: ?*rt.struct_xrt_file_view = null;
+        try self.openFileView(&request, &view);
+        return .{ .view = view.?, .path = region.path };
     }
     fn peRegion(self: *Modules, region: Region) !*pe.Entry {
         if (self.immutable or self.target == null or rt.xrt_target_is_remote(self.target)) return error.NotPe;
@@ -1442,8 +1473,11 @@ pub const Modules = struct {
         if (try self.fileKind(region) != .pe) return error.NotPe;
         // fileKind proved this identity for the revision. A malformed "MZ" file
         // mapped thousands of times must not be reopened for each mapping.
-        if (self.file_kinds.get(fileKey(region))) |cached| if (self.pe_images.failed(cached.identity)) |err| return err;
+        if (self.file_kinds.get(fileKey(region))) |cached| if (cached.identity) |identity| if (self.pe_images.failed(identity)) |err| return err;
         const entry = try self.pe_images.get(self.allocator, self.owner_target, region);
+        // get revalidates the pinned file. Placement and map labels belong to
+        // this revision and must not rescan every mapping on each lookup.
+        if (entry.verified_revision == self.maps_revision) return entry;
         try self.pe_images.bind(entry, self.target.?, self.regions.items, self.maps_revision, &self.next_id);
         const image = entry.image().?;
         const size = c.xpe_info(image).*.image_size;
@@ -1516,7 +1550,7 @@ pub const Modules = struct {
         defer self.allocator.free(z);
         const image = entry.image() orelse return error.SymbolDiscoveryPending;
         if (entry.pdb()) |pdb| if (c.xpdb_find_public(pdb, z)) |symbol| {
-            if (code_only and symbol.*.flags & 3 == 0) return error.BreakpointSymbolNotExecutable;
+            if (code_only and (symbol.*.flags & 3 == 0 or !entry.executable(symbol.*.rva))) return error.BreakpointSymbolNotExecutable;
             const address = try std.math.add(u64, entry.start, symbol.*.rva);
             if (!entry.contains(address)) return error.PeImagePlacementMismatch;
             const function = c.xpe_function_at(image, symbol.*.rva);
@@ -1525,6 +1559,7 @@ pub const Modules = struct {
         };
         const found = c.xpe_find_export(image, z) orelse return null;
         if (found.*.forwarder != null) return error.PeForwardedExportUnavailable;
+        if (code_only and !entry.executable(found.*.rva)) return error.BreakpointSymbolNotExecutable;
         const address = std.math.add(u64, entry.start, found.*.rva) catch return error.InvalidAddress;
         if (!entry.contains(address)) return error.PeImagePlacementMismatch;
         const function = c.xpe_function_at(image, found.*.rva);
@@ -1947,6 +1982,7 @@ test "cached file kinds revalidate PE and other answers once per map revision" {
     const native = @cImport({
         @cDefine("_GNU_SOURCE", "1");
         @cInclude("target_internal.h");
+        @cInclude("stdlib.h");
         @cInclude("sys/mman.h");
         @cInclude("sys/sysmacros.h");
         @cInclude("sys/stat.h");
@@ -1975,6 +2011,13 @@ test "cached file kinds revalidate PE and other answers once per map revision" {
     const cases = [_]struct { magic: []const u8, kind: Modules.FileKind }{
         .{ .magic = "data", .kind = .other },  .{ .magic = "MZ00", .kind = .pe },
         .{ .magic = "\x7fELF", .kind = .elf }, .{ .magic = "none", .kind = .other },
+        // Thin 64-bit, universal with two slices, and the Java class file
+        // (version 52.0) that shares the universal magic.
+        .{ .magic = "\xcf\xfa\xed\xfe", .kind = .macho },
+        .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x02", .kind = .macho },
+        .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x34", .kind = .other },
+        .{ .magic = "\xca\xfe\xba\xbf\x00\x00\x00\x01", .kind = .macho },
+        .{ .magic = "\xfe\xed\xfa\xcf", .kind = .macho },
     };
     for (cases, 0..) |item, i| {
         // A size change makes the identity change deterministic on coarse clocks.
@@ -1989,4 +2032,59 @@ test "cached file kinds revalidate PE and other answers once per map revision" {
     }
     modules.pruneFileKinds(&.{});
     try std.testing.expectEqual(@as(u32, 0), modules.file_kinds.count());
+}
+
+test "automatic PE runtime data lookup has independent breakpoint intent" {
+    const native = @cImport({
+        @cDefine("_GNU_SOURCE", "1");
+        @cInclude("target_internal.h");
+        @cInclude("stdlib.h");
+        @cInclude("sys/mman.h");
+        @cInclude("sys/sysmacros.h");
+        @cInclude("sys/stat.h");
+    });
+    const a = std.testing.allocator;
+    const fd = native.memfd_create("runtime-pe", native.MFD_CLOEXEC);
+    try std.testing.expect(fd >= 0);
+    defer _ = native.close(fd);
+    const bytes = @import("../binary/pe_fixture.zig").dataExport();
+    try std.testing.expectEqual(@as(isize, bytes.len), native.write(fd, &bytes, bytes.len));
+    const address = native.mmap(null, bytes.len, native.PROT_READ, native.MAP_PRIVATE, fd, 0);
+    try std.testing.expect(address != native.MAP_FAILED);
+    defer _ = native.munmap(address, bytes.len);
+    var st: native.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), native.fstat(fd, &st));
+    var target = std.mem.zeroes(native.struct_xrt_target);
+    target.pid = native.getpid();
+    target.state = native.XRT_STOPPED;
+    target.thread_count = 1;
+    target.threads[0].tid = native.getpid();
+    target.threads[0].state = native.XRT_STOPPED;
+    defer native.xodb_maps_free(&target.maps);
+    var modules = Modules.init(a);
+    defer modules.deinit();
+    modules.target = @ptrCast(&target);
+    modules.owner_target = @ptrCast(&target);
+    modules.maps_revision = 1;
+    const path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{fd});
+    try modules.regions.append(a, .{ .start = @intFromPtr(address), .end = @intFromPtr(address) + bytes.len, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path });
+    var load: f64 = 0;
+    _ = native.getloadavg(&load, 1);
+    const cpus: f64 = @floatFromInt(@max(1, native.sysconf(native._SC_NPROCESSORS_ONLN)));
+    const deadline = native.xrt_now() + @as(u64, @intFromFloat(10 * std.time.ns_per_s * @max(1, load / cpus)));
+    var cursor = Modules.SymbolCursor{};
+    const found = while (true) {
+        const value = modules.automaticSymbolAddress("_PyRuntime", &cursor) catch |err| {
+            if (err != error.SymbolDiscoveryPending) return err;
+            if (native.xrt_now() > deadline) return error.TestJobTimeout;
+            _ = native.usleep(100);
+            continue;
+        };
+        break value;
+    };
+    try std.testing.expectEqual(@intFromPtr(address) + @as(u64, if (c.getenv("XODB_TEST_WRONG_PE_INTENT") != null) 0x381 else 0x380), found);
+    cursor = .{};
+    try std.testing.expectError(error.BreakpointSymbolNotExecutable, modules.breakpointSymbolAddress("_PyRuntime", &cursor));
+    try std.testing.expectEqual(found, (try modules.findSymbol("_PyRuntime")).address);
+    try std.testing.expectEqual(@as(u8, 0), @as([*]const u8, @ptrCast(address))[0x380]);
 }

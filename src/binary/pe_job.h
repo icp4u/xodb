@@ -16,9 +16,12 @@ struct xpe_job_snapshot {
     uint64_t source_reads, source_bytes;
 };
 /* Peak allowance includes the PE parser plus a bounded PDB source and parser.
- * pid/path enable adjacent local PDB discovery; zero/null disable it. */
+ * pid/path enable adjacent local PDB discovery; zero/null disable it. A smaller
+ * allowance bounds all PE/PDB allocations and the PDB source buffer. Exhaustion
+ * returns XPE_BUDGET from the joined job, without publishing partial metadata. */
 #define XPE_JOB_MAX_BYTES (XPE_MAX_RETAINED_BYTES + XPDB_MAX_FILE_BYTES + XPDB_MAX_ALLOCATED_BYTES)
-enum xpe_status xpe_job_start(struct xrt_file_view *, int32_t pid, const char *mapped_path, struct xpe_job **);
+enum xpe_status xpe_job_start(struct xrt_file_view *, int32_t pid, const char *mapped_path,
+    uint64_t allowance, struct xpe_job **);
 void xpe_job_poll(struct xpe_job *, struct xpe_job_snapshot *);
 void xpe_job_cancel(struct xpe_job *);
 /* Returns zero while still running, one after join, minus one on join error. */

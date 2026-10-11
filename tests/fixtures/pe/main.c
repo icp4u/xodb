@@ -9,6 +9,33 @@ __declspec(dllimport) void *GetStdHandle(DWORD);
 __declspec(dllimport) int WriteFile(void *, const void *, DWORD, DWORD *, void *);
 __declspec(dllimport) void Sleep(DWORD);
 __declspec(dllimport) __declspec(noreturn) void ExitProcess(DWORD);
+#ifdef PE_UX
+__declspec(dllimport) void *GetCurrentThread(void);
+__declspec(dllimport) void *CreateThread(void *, U64, DWORD (*)(void *), void *, DWORD, DWORD *);
+__declspec(dllimport) void *LocalFree(void *);
+typedef long (*SetDescription)(void *, const unsigned short *);
+typedef long (*GetDescription)(void *, unsigned short **);
+static SetDescription set_description;
+static GetDescription get_description;
+struct named_thread { const unsigned short *name; volatile int ready; };
+static struct named_thread named[] = { {(const unsigned short *)L"GameRender",0}, {(const unsigned short *)L"wine_threadpool_worker",0} };
+static DWORD named_worker(void *arg) {
+    struct named_thread *n=arg;unsigned short *actual=0;
+    if(set_description(GetCurrentThread(),n->name)<0 || get_description(GetCurrentThread(),&actual)<0 || !actual)ExitProcess(95);
+    unsigned i=0;while(n->name[i] && actual[i]==n->name[i])++i;
+    if(actual[i]!=n->name[i])ExitProcess(96);
+    LocalFree(actual);n->ready=1;
+    for(;;)Sleep(100);
+}
+static void start_named_threads(void) {
+    void *kernel=LoadLibraryA("kernel32.dll");
+    set_description=(SetDescription)GetProcAddress(kernel,"SetThreadDescription");
+    get_description=(GetDescription)GetProcAddress(kernel,"GetThreadDescription");
+    if(!set_description || !get_description)ExitProcess(97);
+    for(unsigned i=0;i<2;++i)if(!CreateThread(0,0,named_worker,&named[i],0,0))ExitProcess(98);
+    while(!named[0].ready || !named[1].ready)Sleep(1);
+}
+#endif
 __declspec(dllexport) __declspec(noinline) void pe_ready(void) { __asm__ volatile("" ::: "memory"); }
 #ifdef PE_PDB
 volatile long pe_data_public = 17;
@@ -19,6 +46,9 @@ static
 __declspec(noinline) long pe_hidden(long value) { volatile long stack[20];stack[0]=value;Sleep(1);return stack[0]+5; }
 static char *hex(char *p,U64 value){const char digits[]="0123456789abcdef";for(int i=15;i>=0;--i)*p++=digits[(value>>(i*4))&15];return p;}
 void entry(void) {
+#ifdef PE_UX
+    start_named_threads();
+#endif
     void *dll=LoadLibraryA("owned-pe.dll");if(!dll)ExitProcess(90);
     void *inner=GetProcAddress(dll,"pe_inner"),*outer=GetProcAddress(dll,"pe_outer");if(!inner || !outer)ExitProcess(91);
 #ifdef PE_UNWIND

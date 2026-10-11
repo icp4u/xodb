@@ -1,15 +1,14 @@
 const std = @import("std");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
-const model = @import("../model/session.zig");
+const prepared = @import("../model/debugger_view.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 const pitch: f32 = 119;
 const card_height: f32 = 94;
 
 pub const FlowView = struct {
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    function: ?model.FunctionGraph = null,
+    function: ?prepared.FunctionGraph = null,
     diagnostic: ?[]const u8 = null,
     generation: u64 = std.math.maxInt(u64),
     anchor: u64 = 0,
@@ -17,24 +16,16 @@ pub const FlowView = struct {
     scroll: f32 = 0,
     viewport: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
 
-    pub fn deinit(self: *FlowView) void {
-        self.arena.deinit();
-    }
-    pub fn refresh(self: *FlowView, session: *model.Session, address: u64) void {
-        if (self.generation == session.target.snapshot().generation and self.anchor == address) return;
-        self.generation = session.target.snapshot().generation;
-        self.anchor = address;
-        _ = self.arena.reset(.retain_capacity);
-        self.function = null;
-        self.diagnostic = null;
-        self.selected = 0;
-        self.scroll = 0;
-        if (session.target.snapshot().state != .stopped or address == 0) return;
-        self.function = session.functionGraph(self.arena.allocator(), address) catch |err| {
-            self.diagnostic = @errorName(err);
-            return;
-        };
-        self.selected = self.function.?.graph.blockAt(address) orelse 0;
+    /// Pure presentation update; selection and scroll remain local between
+    /// new function captures. No Session or remote reads enter this view.
+    pub fn present(self: *FlowView, value: prepared.Flow) void {
+        const changed = self.generation != value.generation or self.anchor != value.anchor;
+        self.generation = value.generation;
+        self.anchor = value.anchor;
+        self.function = value.function;
+        self.diagnostic = value.diagnostic;
+        if (!changed) return;
+        self.selected = if (value.function) |function| function.graph.blockAt(value.anchor) orelse 0 else 0;
         self.scroll = @as(f32, @floatFromInt(self.selected)) * pitch;
     }
     pub fn scrollBy(self: *FlowView, delta: i32) void {

@@ -6,6 +6,7 @@ struct directory { uint32_t rva, size; };
 struct xpe_image {
     struct xpe_source source;
     struct xpe_info info;
+    uint64_t allowance, temporary;
     struct xpe_section sections[XPE_MAX_SECTIONS];
     struct directory directories[16];
     struct xpe_export *exports;
@@ -95,10 +96,20 @@ enum xpe_status xpe_read_range(const struct xpe_image *p, uint32_t rva, void *ou
     if (size>available) return XPE_MALFORMED;
     return p->source.read(p->source.context,offset,out,size);
 }
+static enum xpe_status room(const struct xpe_image *p, size_t size) {
+    uint64_t used=p->info.retained_bytes+p->temporary;
+    if(size>XPE_MAX_RETAINED_BYTES-used)return XPE_LIMIT;
+    if(size>p->allowance-used)return XPE_BUDGET;
+    return XPE_OK;
+}
+static void peak(struct xpe_image *p) {
+    uint64_t used=p->info.retained_bytes+p->temporary;
+    if(used>p->info.peak_bytes)p->info.peak_bytes=used;
+}
 static void *retain(struct xpe_image *p, size_t size) {
-    if (!size || size > XPE_MAX_RETAINED_BYTES-p->info.retained_bytes) return NULL;
+    if (!size || room(p,size)!=XPE_OK) return NULL;
     void *result = calloc(1, size);
-    if (result) p->info.retained_bytes += size;
+    if (result) { p->info.retained_bytes += size; peak(p); }
     return result;
 }
 static enum xpe_status string_at(struct xpe_image *p, uint32_t rva, uint64_t bound, char **out) {
@@ -116,7 +127,7 @@ static enum xpe_status string_at(struct xpe_image *p, uint32_t rva, uint64_t bou
         char *end = memchr(bytes+done, 0, count);
         if (end) {
             size_t length = (size_t)(end-bytes)+1;
-            if (length > XPE_MAX_RETAINED_BYTES-p->info.retained_bytes) return XPE_LIMIT;
+            if (room(p,length)!=XPE_OK) return room(p,length);
             char *text = retain(p, length);
             if (!text) return XPE_NOMEM;
             memcpy(text, bytes, length); *out=text; return XPE_OK;
@@ -204,16 +215,32 @@ static enum xpe_status array(struct xpe_image *p, uint32_t rva, unsigned count, 
     if (!count) return XPE_OK;
     size_t size=(size_t)count*width;
     if (count && size/width!=count) return XPE_LIMIT;
-    if (size>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes) return XPE_LIMIT;
+    if (room(p,size)!=XPE_OK) return room(p,size);
     unsigned char *bytes=malloc(size);if(!bytes)return XPE_NOMEM;
+    p->temporary+=size;peak(p);
     enum xpe_status status=xpe_read_rva(p,rva,bytes,size);
-    if(status!=XPE_OK){free(bytes);return status;}
+    if(status!=XPE_OK){free(bytes);p->temporary-=size;return status;}
     *out=bytes;return XPE_OK;
 }
 static int label_order(const void *a, const void *b) {
     const struct label *x=a,*y=b;
     if(x->rva!=y->rva)return x->rva<y->rva?-1:1;
     return x->name<y->name?-1:x->name>y->name;
+}
+static void label_sift(struct label *rows, size_t root, size_t count) {
+    while(root<count/2) {
+        size_t child=root*2+1;
+        if(child+1<count && label_order(&rows[child],&rows[child+1])<0)++child;
+        if(label_order(&rows[root],&rows[child])>=0)return;
+        struct label swap=rows[root];rows[root]=rows[child];rows[child]=swap;root=child;
+    }
+}
+static void label_sort(struct label *rows, size_t count) {
+    if(count<2)return;
+    for(size_t i=count/2;i>0;--i)label_sift(rows,i-1,count);
+    for(size_t i=count-1;i>0;--i) {
+        struct label swap=rows[0];rows[0]=rows[i];rows[i]=swap;label_sift(rows,0,i);
+    }
 }
 static enum xpe_status exports(struct xpe_image *p) {
     struct directory d=p->directories[0];if(!d.rva && !d.size)return XPE_OK;
@@ -225,8 +252,8 @@ static enum xpe_status exports(struct xpe_image *p) {
     if((uint64_t)base+count>UINT64_C(0x100000000))return XPE_MALFORMED;
     char *module=NULL;status=string_at(p,u32(header+12),UINT64_MAX,&module);if(status!=XPE_OK)return status;
     p->info.module_name=module;p->info.export_count=count;p->info.export_name_count=named;
-    if(count){size_t bytes=(size_t)count*sizeof *p->exports;if(bytes>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;p->exports=retain(p,bytes);if(!p->exports)return XPE_NOMEM;}
-    if(named){size_t bytes=(size_t)named*sizeof *p->names;if(bytes>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;p->names=retain(p,bytes);if(!p->names)return XPE_NOMEM;}
+    if(count){size_t bytes=(size_t)count*sizeof *p->exports;if (room(p,bytes)!=XPE_OK) return room(p,bytes);p->exports=retain(p,bytes);if(!p->exports)return XPE_NOMEM;}
+    if(named){size_t bytes=(size_t)named*sizeof *p->names;if (room(p,bytes)!=XPE_OK) return room(p,bytes);p->names=retain(p,bytes);if(!p->names)return XPE_NOMEM;}
     status=array(p,u32(header+28),count,4,&eat);if(status!=XPE_OK)goto done;
     status=array(p,u32(header+32),named,4,&names);if(status!=XPE_OK)goto done;
     status=array(p,u32(header+36),named,2,&ordinals);if(status!=XPE_OK)goto done;
@@ -251,15 +278,18 @@ static enum xpe_status exports(struct xpe_image *p) {
     }
     if(p->label_count) {
         size_t bytes=(size_t)p->label_count*sizeof *p->labels;
-        if(bytes>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes){status=XPE_LIMIT;goto done;}
+        if((status=room(p,bytes))!=XPE_OK)goto done;
         p->labels=retain(p,bytes);if(!p->labels){status=XPE_NOMEM;goto done;}
         for(unsigned i=0,n=0;i<named;++i) {
             const struct xpe_export *e=&p->exports[p->names[i].export_index];
             if(e->rva && !e->forwarder)p->labels[n++]=(struct label){e->rva,i};
         }
-        qsort(p->labels,p->label_count,sizeof *p->labels,label_order);
+        label_sort(p->labels,p->label_count);
     }
 done:
+    if(eat)p->temporary-=(size_t)count*4;
+    if(names)p->temporary-=(size_t)named*4;
+    if(ordinals)p->temporary-=(size_t)named*2;
     free(eat);free(names);free(ordinals);return status;
 }
 static enum xpe_status import_slot(struct xpe_image *p, struct xpe_import **out) {
@@ -269,10 +299,13 @@ static enum xpe_status import_slot(struct xpe_image *p, struct xpe_import **out)
     if(!count || !(count&(count-1))) {
         unsigned capacity=count?count*2:1;
         size_t growth=(size_t)(capacity-count)*sizeof *p->imports;
-        if(growth>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;
-        struct xpe_import *next=realloc(p->imports,(size_t)capacity*sizeof *next);
+        size_t total=(size_t)capacity*sizeof *p->imports;
+        if (room(p,total)!=XPE_OK) return room(p,total);
+        struct xpe_import *next=malloc(total);
         if(!next)return XPE_NOMEM;
-        p->imports=next;p->info.retained_bytes+=growth;
+        p->temporary+=total;peak(p);p->temporary-=total;
+        if(count)memcpy(next,p->imports,(size_t)count*sizeof *next);
+        free(p->imports);p->imports=next;p->info.retained_bytes+=growth;
     }
     *out=&p->imports[p->info.import_count++];**out=(struct xpe_import){0};return XPE_OK;
 }
@@ -336,7 +369,7 @@ static enum xpe_status functions(struct xpe_image *p) {
     }
     p->info.function_skipped=count-kept;
     size_t retained=(size_t)kept*sizeof *p->functions;
-    if(retained>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;
+    if (room(p,retained)!=XPE_OK) return room(p,retained);
     if(kept){p->functions=retain(p,retained);if(!p->functions)return XPE_NOMEM;}
     for(unsigned i=0,n=0;i<count;) {
         unsigned chunk=count-i;if(chunk>sizeof rows/12)chunk=sizeof rows/12;
@@ -376,18 +409,23 @@ static enum xpe_status codeview(struct xpe_image *p) {
         char path[4096];size_t n=length-24;if(n>sizeof path)n=sizeof path;
         status=read_at(p,offset+24,path,n);if(status!=XPE_OK)return status;
         char *end=memchr(path,0,n);if(!end)return length-24>sizeof path?XPE_LIMIT:XPE_MALFORMED;
-        size_t bytes=(size_t)(end-path)+1;if(bytes>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;
+        size_t bytes=(size_t)(end-path)+1;if (room(p,bytes)!=XPE_OK) return room(p,bytes);
         char *saved=retain(p,bytes);if(!saved)return XPE_NOMEM;memcpy(saved,path,bytes);
         struct xpe_codeview *cv=&p->codeviews[p->info.codeview_count++];memcpy(cv->guid,id+4,16);cv->age=u32(id+20);cv->path=saved;
     }
     return XPE_OK;
 }
 enum xpe_status xpe_load(const struct xpe_source *source, struct xpe_image **out) {
+    return xpe_load_budget(source,XPE_MAX_RETAINED_BYTES,out);
+}
+enum xpe_status xpe_load_budget(const struct xpe_source *source, uint64_t allowance, struct xpe_image **out) {
     if(!out)return XPE_MALFORMED;
     *out=NULL;
     if(!source || !source->read || (source->layout!=XPE_FILE && source->layout!=XPE_MEMORY))return XPE_MALFORMED;
+    if(allowance<sizeof(struct xpe_image))return XPE_BUDGET;
     struct xpe_image *p=calloc(1,sizeof *p);if(!p)return XPE_NOMEM;
     p->source=*source;p->info.retained_bytes=sizeof *p;
+    p->allowance=allowance<XPE_MAX_RETAINED_BYTES?allowance:XPE_MAX_RETAINED_BYTES;peak(p);
     enum xpe_status status=headers(p);
     if(status==XPE_OK)status=exports(p);
     if(status==XPE_OK)status=imports(p);

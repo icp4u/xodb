@@ -328,7 +328,10 @@ for just these measurements on a host with syscall tracing configured.
 
 The Gibson city adds `gui-gibson` to the fast GUI lane: real-sample tower
 counts, unknown/collapse/split evidence, camera and picking controls, redaction
-and screen layout. `gui-gibson-evidence` is periodic: flythrough and recorded
+and screen layout. `gui-gibson-camera` uses real press/release edges to check
+held-time distance, repeat independence, combined keys, focus loss and idle
+orbit. The input component also checks a dropped release after queue overflow.
+`gui-gibson-evidence` is periodic: flythrough and recorded
 collapse frames, plus CPU/RSS/load and GPU times for an owned Node process at
 1080p and 4K. Measurements have no absolute performance pass threshold. The
 ordinary component suite covers city data semantics, identity-safe easing,

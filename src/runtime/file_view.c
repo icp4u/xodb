@@ -108,6 +108,14 @@ enum xrt_status xrt_file_view_validate(struct xrt_file_view *v)
         .op = XRT_RPC_FILE_READ, .args = {v->remote_id, 0, 0}, .length = &size});
     return remember(v, status);
 }
+enum xrt_status xrt_file_view_validate_foreground(struct xrt_file_view *v)
+{
+    if (!v || !v->target) return xrt_file_view_validate(v);
+    if (v->failure != XRT_OK) return v->failure;
+    size_t size = 0;
+    return remember(v, xrt_remote_call(v->target, &(struct xrt_call){
+        .op = XRT_RPC_FILE_READ, .args = {v->remote_id, 0, 0}, .length = &size}));
+}
 enum xrt_status xrt_file_view_read(struct xrt_file_view *v, uint64_t offset,
                                  void *out, size_t size)
 {

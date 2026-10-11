@@ -34,6 +34,7 @@ def note(name, detail):
 
 class Display:
     """A private headless Sway and one xodb inside it, with optional MCP on stdio."""
+    # Slow periodic fixtures may set a larger bounded request deadline.
 
     # A test of a very large image (a first read of a gigabyte) raises this.
     reply_seconds = 5
@@ -79,6 +80,14 @@ class Display:
         if wayland_debug:
             app_env["WAYLAND_DEBUG"] = "1"
         self.log = os.path.join(self.dir, "xodb.log")
+        # Opt-in second matrix uses the same GUI oracles with the remote owner.
+        # Explicit backends always win (e.g. a held-reply proxy).
+        agent = os.environ.get("XODB_TEST_RUNTIME_AGENT")
+        options = args[:args.index("--")] if "--" in args else args
+        # Core/profile archives have no live transport and reject runtime-agent.
+        local_only = any(option in options for option in ("--core", "--open-capture", "--open-profile", "--compare-capture"))
+        if agent and not local_only and not any(option in options for option in ("--runtime-agent", "--runtime-ssh", "--gdb-remote")):
+            args = ["--runtime-agent", os.path.abspath(agent), *args]
         self.app = subprocess.Popen([binary or os.path.join(tree, "zig-out", "bin", "xodb"), *(["--mcp"] if stdio else []), *args], cwd=tree, env=app_env, bufsize=0, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=open(self.log, "wb"))
         self.procs.append(self.app)
         self.serial = 0
@@ -133,7 +142,10 @@ class Display:
         raise RuntimeError(f"no MCP response to {method}; log tail: {self.tail()}")
 
     def tool(self, name, **arguments):
-        return self.request("tools/call", {"name": name, "arguments": arguments})["structuredContent"]
+        result = self.request("tools/call", {"name": name, "arguments": arguments})
+        if not isinstance(result, dict) or "structuredContent" not in result:
+            raise AssertionError((name, arguments, result))
+        return result["structuredContent"]
 
     def session(self):
         return self.tool("get_session")

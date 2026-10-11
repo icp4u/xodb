@@ -52,6 +52,7 @@ pub const api = @cImport({
     @cInclude("../language/javascript.h");
     @cInclude("../debug/metadata_job.h");
     @cInclude("../binary/pe_job.h");
+    @cInclude("../binary/macho.h");
     @cInclude("../debug/pe_unwind.h");
     @cInclude("../language/lua.h");
     @cInclude("../language/watch.h");

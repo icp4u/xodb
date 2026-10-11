@@ -460,7 +460,7 @@ enum xbo_status xmd_validate(struct xmd_job *job) {
     if (!job || !job->joined) return XBO_AGAIN;
     if (job->working.state != XMD_READY) return job->working.status;
     if (cancelled(job)) { fail(job, XBO_CANCELLED, NULL); return XBO_CANCELLED; }
-    enum xbo_status status = runtime_status(job, xrt_file_view_validate(job->view));
+    enum xbo_status status = runtime_status(job, xrt_file_view_validate_foreground(job->view));
     if (status != XBO_OK && status != XBO_AGAIN) fail(job, status, NULL);
     return status;
 }

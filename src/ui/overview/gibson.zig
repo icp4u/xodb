@@ -26,6 +26,7 @@ pub const State = struct {
     last: [2]f32 = .{ 0, 0 },
     moved: bool = false,
     frames: u64 = 0,
+    input_revision: u64 = 0,
     /// Shells are built here: the GPU instance buffer is write-only memory.
     shells: std.ArrayList(Box) = .empty,
     pub fn deinit(self: *State) void {
@@ -35,41 +36,58 @@ pub const State = struct {
     }
 };
 
-pub fn key(v: *vw.View, sym: u32, shortcut: u32) bool {
+pub fn heldInput(v: *vw.View, keyboard: *const @import("../../platform/input.zig").Keyboard, enabled: bool, now: u64) bool {
+    const s = &v.memmap.city;
+    const mods = keyboard.mods();
+    if (s.input_revision != keyboard.focus_revision) {
+        s.camera.cancelMotion(now);
+        s.drag = null;
+        s.input_revision = keyboard.focus_revision;
+    }
+    const active = enabled and keyboard.focused and !mods.ctrl and !mods.alt and !mods.logo;
+    var held: [5]f32 = @splat(0);
+    if (active) {
+        const positive = [_]u32{ 'w', 'd', 0xff53, 0xff52, '-' };
+        const negative = [_]u32{ 's', 'a', 0xff51, 0xff54, '=' };
+        for (&held, positive, negative) |*value, plus, minus| value.* = @as(f32, if (keyboard.heldShortcut(plus)) 1 else 0) - @as(f32, if (keyboard.heldShortcut(minus)) 1 else 0);
+        if (keyboard.heldShortcut('+')) held[4] = -1;
+    }
+    const changed = s.camera.controls(held, active, now, @max(s.layout.width, s.layout.depth));
+    if (changed and v.layout != null) std.debug.print("xodb: gibson input focused={} now={d} pan_x={d:.6} pan_z={d:.6}\n", .{ active, now, s.camera.pan[0], s.camera.pan[1] });
+    return changed;
+}
+
+pub fn key(v: *vw.View, event: @import("../../platform/input.zig").Event, now: u64) bool {
     const s = &v.memmap.city;
     const camera = &s.camera;
-    switch (sym) {
+    switch (event.sym) {
         0xff1b => {
             if (s.selected == null) return false;
             s.selected = null;
             v.memmap.cursor = null;
             return true;
         },
-        0xff52, 0xff54 => {
-            camera.automatic = false;
-            camera.pitch = std.math.clamp(camera.pitch + @as(f32, if (sym == 0xff52) 0.06 else -0.06), 0.10, 1.45);
-            return true;
-        },
-        0xff51, 0xff53 => {
-            camera.automatic = false;
-            camera.yaw += @as(f32, if (sym == 0xff51) -0.10 else 0.10);
-            return true;
+        0xff51...0xff54 => {
+            if (event.kind == .press) camera.automatic = false;
+            return true; // Motion comes from authoritative held state.
         },
         else => {},
     }
-    const span = @max(s.layout.width, s.layout.depth);
-    switch (shortcut) {
-        'w' => camera.move(1, 0, span),
-        's' => camera.move(-1, 0, span),
-        'a' => camera.move(0, -1, span),
-        'd' => camera.move(0, 1, span),
-        'f' => camera.automatic = !camera.automatic,
-        'r' => camera.* = .{},
+    switch (event.shortcut) {
+        'w', 's', 'a', 'd', '+', '=', '-' => {
+            if (event.kind == .press) camera.automatic = false;
+            return true;
+        },
+        'f', 'r', 'h', 'c' => {},
+        else => return false,
+    }
+    if (event.kind != .press) return true;
+    switch (event.shortcut) {
+        'f' => camera.fly(now),
+        'r' => camera.* = .{ .last = now },
         'h' => s.height = @enumFromInt((@as(usize, @intFromEnum(s.height)) + 1) % 3),
         'c' => s.colour = if (s.colour == .backing) .district else .backing,
-        '+', '=' => camera.wheel(-1),
-        '-' => camera.wheel(1),
-        else => return false,
+        else => unreachable,
     }
     return true;
 }
@@ -163,7 +181,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const footer: f32 = if (ms.legend) 124 else 76;
     const field = draw.Rect{ .x = rect.x, .y = inner.y + 106, .w = rect.w, .h = @max(0, inner.h - 106 - footer) };
     if (field.w > 0 and field.h > 0 and ctx.r.device != null) {
-        s.camera.tick(now);
+        s.camera.tick(now, @max(s.layout.width, s.layout.depth));
         const vp = s.camera.matrix(s.layout.width, s.layout.depth, field.w / field.h) orelse return;
         // An allocation/device failure leaves the ordinary UI and its status usable.
         renderScene(v, ctx, map, field, vp, now) catch |err| {
@@ -197,7 +215,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     try ctx.textFit(inner.x, y, inner.w, mm.costText(v, &buffer), muted);
     if (v.layout != null or c.getenv("XODB_MEMMAP_PERF") != null) {
         s.frames += 1;
-        std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.automatic, s.camera.yaw, s.camera.pitch, s.camera.zoom, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
+        std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.automatic, s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
     }
 }
 fn renderScene(v: *vw.View, ctx: draw.Ctx, map: *const md.Map, field: draw.Rect, vp: math.Mat4, now: u64) !void {
@@ -210,23 +228,23 @@ fn renderScene(v: *vw.View, ctx: draw.Ctx, map: *const md.Map, field: draw.Rect,
     // at the cell cap that read alone cost tens of milliseconds a frame.
     try s.shells.resize(std.heap.page_allocator, n);
     s.layout.fill(s.shells.items, map, v.memmap.prev(), s.height, s.colour, v.memmap.ease(now), s.selected);
-    @memcpy(boxes[0..n], s.shells.items);
+    boxes.copy(0, s.shells.items);
     // A dim opaque core gives each measured tower depth; its neon shell stays
     // translucent. Without the core, hundreds of additive rear faces merge
     // into one bright slab. Unknown cages never acquire an opaque core.
-    for (s.shells.items, boxes[n..]) |shell, *out| {
+    for (s.shells.items, 0..) |shell, i| {
         var core = shell;
         core.half[0] *= 0.88;
         core.half[2] *= 0.88;
         core.color = .{ shell.color[0] * 0.055, shell.color[1] * 0.055, shell.color[2] * 0.055, if (shell.wire_only > 0) 0 else 1 };
         core.emission = 0;
-        out.* = core;
+        boxes.set(n + i, core);
     }
     const points = try scene.points(s.layout.counts.partial);
     var point: usize = 0;
     for (s.layout.places.items) |place| {
         if (!md.classify(map.cells[place.index]).partial) continue;
-        points[point] = .{ .position = .{ place.x, place.height + 0.06, place.z }, .pixels = 4, .color = .{ 1, 0.55, 0.10, 1 } };
+        points.set(point, .{ .position = .{ place.x, place.height + 0.06, place.z }, .pixels = 4, .color = .{ 1, 0.55, 0.10, 1 } });
         point += 1;
     }
     const grid = try scene.lines(66);
@@ -234,8 +252,8 @@ fn renderScene(v: *vw.View, ctx: draw.Ctx, map: *const md.Map, field: draw.Rect,
     const center = math.Vec3{ s.layout.width / 2, -0.015, s.layout.depth / 2 };
     for (0..33) |i| {
         const at = (@as(f32, @floatFromInt(i)) / 32 - 0.5) * span * 3;
-        grid[i * 2] = .{ .a = math.add(center, .{ at, 0, -span * 1.5 }), .b = math.add(center, .{ at, 0, span * 1.5 }), .color = .{ 0.025, 0.14, 0.22, 0.75 }, .emission = 0.2 };
-        grid[i * 2 + 1] = .{ .a = math.add(center, .{ -span * 1.5, 0, at }), .b = math.add(center, .{ span * 1.5, 0, at }), .color = .{ 0.025, 0.14, 0.22, 0.75 }, .emission = 0.2 };
+        grid.set(i * 2, .{ .a = math.add(center, .{ at, 0, -span * 1.5 }), .b = math.add(center, .{ at, 0, span * 1.5 }), .color = .{ 0.025, 0.14, 0.22, 0.75 }, .emission = 0.2 });
+        grid.set(i * 2 + 1, .{ .a = math.add(center, .{ -span * 1.5, 0, at }), .b = math.add(center, .{ span * 1.5, 0, at }), .color = .{ 0.025, 0.14, 0.22, 0.75 }, .emission = 0.2 });
     }
     if (!v.redact and !map.redacted) {
         // One representative per district class keeps labels legible without

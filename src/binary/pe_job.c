@@ -22,7 +22,8 @@ struct xpe_job {
     struct xpe_job_snapshot snapshot;
     unsigned cancel;
     int joined;
-    uint64_t deadline;
+    uint64_t deadline, allowance;
+    unsigned budget_exhausted;
     int root_fd, pdb_fd;
     char *mapped_path;
     struct xpdb *pdb;
@@ -124,6 +125,9 @@ static void load_pdb(struct xpe_job *job) {
     if(fd<0)return;
     unsigned char *bytes=NULL;size_t size=(size_t)job->pdb_identity.size;
     if(xrt_file_unchanged(fd,&job->pdb_identity)!=XRT_OK){job->pdb_status="changed";goto done;}
+    uint64_t available=job->allowance-xpe_info(job->image)->retained_bytes;
+    size_t source_bytes=size?size:1;
+    if(source_bytes>available){job->budget_exhausted=1;goto done;}
     bytes=malloc(size?size:1);if(!bytes){job->pdb_status="out_of_memory";goto done;}
     for(size_t at=0;at<size;) {
         if(cancelled(job)){job->pdb_status="cancelled";goto done;}
@@ -137,7 +141,9 @@ static void load_pdb(struct xpe_job *job) {
         const struct xpe_section *s=xpe_section(job->image,i);
         sections[i]=(struct xpdb_section){s->rva,s->raw_size>s->virtual_size?s->raw_size:s->virtual_size};
     }
-    enum xpdb_status status=xpdb_load(bytes,size,cv->guid,cv->age,sections,count,&job->pdb);
+    enum xpdb_status status=xpdb_load_budget(bytes,size,cv->guid,cv->age,sections,count,
+        available-source_bytes,&job->pdb);
+    if(status==XPDB_BUDGET)job->budget_exhausted=1;
     job->pdb_status=xpdb_status_name(status);
     if(cancelled(job) || xrt_file_unchanged(fd,&job->pdb_identity)!=XRT_OK) {
         xpdb_destroy(job->pdb);job->pdb=NULL;job->pdb_status=cancelled(job)?"cancelled":"changed";
@@ -149,8 +155,9 @@ static void *worker(void *context) {
     struct xpe_job *job = context;
     const struct xrt_file_identity *identity = xrt_file_view_identity(job->view);
     const struct xpe_source source = {job, (uint64_t)identity->size, XPE_FILE, read_source};
-    enum xpe_status status = xpe_load(&source, &job->image);
+    enum xpe_status status = xpe_load_budget(&source, job->allowance, &job->image);
     if(status==XPE_OK)load_pdb(job);
+    if(job->budget_exhausted)status=XPE_BUDGET;
     if(job->root_fd>=0){close(job->root_fd);job->root_fd=-1;}
     free(job->mapped_path);job->mapped_path=NULL;
     if (status == XPE_OK) status = operation(job, 0, NULL, 0, 1);
@@ -161,13 +168,14 @@ static void *worker(void *context) {
     pthread_mutex_unlock(&job->mutex);
     return NULL;
 }
-enum xpe_status xpe_job_start(struct xrt_file_view *view, int32_t pid, const char *path, struct xpe_job **out) {
+enum xpe_status xpe_job_start(struct xrt_file_view *view, int32_t pid, const char *path, uint64_t allowance, struct xpe_job **out) {
     if (!out) return XPE_MALFORMED;
     *out = NULL;
     const struct xrt_file_identity *identity = xrt_file_view_identity(view);
     if (!view || !identity || identity->size <= 0) return XPE_MALFORMED;
     struct xpe_job *job = calloc(1, sizeof *job);
     if (!job) return XPE_NOMEM;
+    job->allowance=allowance<XPE_JOB_MAX_BYTES?allowance:XPE_JOB_MAX_BYTES;
     job->root_fd=-1;job->pdb_fd=-1;job->pdb_status="absent";
     if(pid>0 && path && !xrt_file_view_remote(view)) {
         if(strnlen(path,4097)>4096){free(job);return XPE_LIMIT;}

@@ -47,6 +47,7 @@ def fixture(opt):
     run(['lld-link', '/dll', '/noentry', '/debug', '/pdb:' + str(stem) + '.pdb',
          '/pdbaltpath:' + stem.name + '.pdb', '/out:' + str(stem) + '.dll', str(stem) + '.obj'], 'link-' + opt)
     actual = run([str(check), str(stem) + '.dll', str(stem) + '.pdb'], 'read-' + opt)
+    run([str(check), str(stem) + '.dll', str(stem) + '.pdb', 'budget'], 'peak-budget-' + opt)
     oracle = run(['llvm-pdbutil', 'dump', '-summary', '-publics', '-l', '-section-headers', str(stem) + '.pdb'], 'llvm-' + opt)
     sections = {int(i): int(rva, 16) for i, rva in re.findall(
         r'SECTION HEADER #(\d+)\s+[^\n]+\n\s+[0-9a-fA-F]+ virtual size\s+([0-9a-fA-F]+) virtual address', oracle)}

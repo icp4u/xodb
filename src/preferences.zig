@@ -40,6 +40,7 @@ pub const ThemePath = struct {
     }
 };
 pub const Preferences = struct {
+    wine: struct { hide_internal_threads: bool = false } = .{},
     profile: Profile = .{},
     allocations: @import("profile/allocation_live.zig").Config = .{},
     symbols: Symbols = .{},
@@ -175,4 +176,10 @@ test "image budget preferences default to unset and refuse values outside the ra
     try std.testing.expectError(error.Overflow, parse(a, "{\"symbols\":{\"image_bytes\":-1}}"));
     try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"symbols\":{\"image_bytes\":\"2G\"}}"));
     try std.testing.expectError(error.UnknownField, parse(a, "{\"symbols\":{\"image_byte\":1048576}}"));
+}
+
+test "Wine thread suppression is explicit and type checked" {
+    try std.testing.expect(!(try parse(std.testing.allocator, "{}")).wine.hide_internal_threads);
+    try std.testing.expect((try parse(std.testing.allocator, "{\"wine\":{\"hide_internal_threads\":true}}")).wine.hide_internal_threads);
+    try std.testing.expectError(error.UnexpectedToken, parse(std.testing.allocator, "{\"wine\":{\"hide_internal_threads\":1}}"));
 }

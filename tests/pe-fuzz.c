@@ -17,5 +17,11 @@ int LLVMFuzzerTestOneInput(const unsigned char *data,size_t size) {
         for(unsigned i=0;i<info->function_count;++i){const struct xpe_function *f=xpe_function(p,i);(void)xpe_function_at(p,f->begin);(void)xpe_function_at(p,f->end);}
         xpe_destroy(p);
     }
+    p=NULL;
+    uint64_t allowance=(uint64_t)(data[0]>>1)*1024;
+    if(xpe_load_budget(&source,allowance,&p)==XPE_OK) {
+        if(!p || xpe_info(p)->peak_bytes>allowance)__builtin_trap();
+    } else if(p)__builtin_trap();
+    xpe_destroy(p);
     return 0;
 }

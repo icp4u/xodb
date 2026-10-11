@@ -8,15 +8,17 @@ import argparse, importlib.util, json, os, select, signal, shutil, struct, subpr
 from pathlib import Path
 from client import Client
 from helpers import orphans
+from helpers.input import load_scale
 
 p=argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work',type=Path,required=True)
 p.add_argument('--wine',default='wine')
 p.add_argument('--eviction',action='store_true')
 p.add_argument('--wrong-result',action='store_true')
+p.add_argument('--ux',action='store_true',help='Wine labels, thread names/filter and executable picker')
 p.add_argument('--unwind',action='store_true')
 p.add_argument('--profile',action='store_true',help='saved PE stacks and archive asset verification')
-p.add_argument('--pdb',choices=('good','missing','mismatch','symlink','changed'),help='local PDB source/publics and refusal cases')
+p.add_argument('--pdb',choices=('good','lying-code','missing','mismatch','symlink','changed'),help='local PDB source/publics and refusal cases')
 a=p.parse_args()
 if a.profile or a.pdb:a.unwind=True
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022);orphans.adopt()
@@ -29,11 +31,11 @@ def command(args,name):
  assert r.returncode==0,(name,r.returncode,r.stderr)
  return r.stdout
 
-(w/'kernel32.def').write_text('LIBRARY KERNEL32.dll\nEXPORTS\n    GetCurrentProcessId\n    LoadLibraryA\n    GetProcAddress\n    GetStdHandle\n    WriteFile\n    Sleep\n    ExitProcess\n')
+(w/'kernel32.def').write_text('LIBRARY KERNEL32.dll\nEXPORTS\n    GetCurrentProcessId\n    GetCurrentThread\n    CreateThread\n    LocalFree\n    LoadLibraryA\n    GetProcAddress\n    GetStdHandle\n    WriteFile\n    Sleep\n    ExitProcess\n')
 command(['lld-link','/lib','/def:'+str(w/'kernel32.def'),'/machine:x64','/out:'+str(w/'kernel32.lib')],'import-library')
 for source in ('library','main'):
  command(['clang','--target=x86_64-pc-windows-msvc','-O2','-g','-gcodeview','-ffile-prefix-map='+str(root)+'=.',
-          '-DPE_COUNT='+str(260 if a.eviction else 0),*(['-DPE_UNWIND'] if a.unwind else []),*(['-DPE_PDB'] if a.pdb else []),'-c','tests/fixtures/pe/'+source+'.c','-o',str(w/(source+'.obj'))],source+'-compile')
+          '-DPE_COUNT='+str(260 if a.eviction else 0),*(['-DPE_UX'] if a.ux else []),*(['-DPE_UNWIND'] if a.unwind else []),*(['-DPE_PDB'] if a.pdb else []),'-c','tests/fixtures/pe/'+source+'.c','-o',str(w/(source+'.obj'))],source+'-compile')
 extra=[]
 if a.unwind:
  (w/'ntdll.def').write_text('LIBRARY ntdll.dll\nEXPORTS\n    RtlCaptureStackBackTrace\n    __chkstk\n    __C_specific_handler\n')
@@ -45,6 +47,15 @@ command(['lld-link','/dll','/noentry','/machine:x64','/debug','/pdb:'+str(w/'lib
          '/out:'+str(w/'owned-pe.dll'),str(w/'library.obj'),str(w/'kernel32.lib'),*extra],'library-link')
 command(['lld-link','/entry:entry','/subsystem:console','/machine:x64','/debug','/pdb:'+str(w/'main.pdb'),
          '/out:'+str(w/'owned-pe.exe'),str(w/'main.obj'),str(w/'kernel32.lib')],'main-link')
+if a.pdb=='lying-code':
+ data=bytearray((w/'main.pdb').read_bytes());name=b'pe_data_public\0';changed=0
+ for at in range(len(data)):
+  if data[at:at+len(name)]==name and data[at-12:at-10]==b'\x0e\x11':
+   assert struct.unpack_from('<I',data,at-10)[0]==0
+   struct.pack_into('<I',data,at-10,3);changed+=1
+ assert changed==1,changed
+ (w/'main.pdb').write_bytes(data)
+ report['pdb_code_flag_lies']=changed
 if a.pdb=='missing':(w/'main.pdb').unlink()
 if a.pdb=='mismatch':shutil.copyfile(w/'library.pdb',w/'main.pdb')
 if a.pdb=='symlink':
@@ -86,7 +97,7 @@ def settled():
  raise AssertionError(('PE discovery did not finish',state))
 
 def action(name,**args):
- deadline=time.monotonic()+20
+ deadline=time.monotonic()+20*load_scale()
  while True:
   response=client.tool(name,generation=client.session()['generation'],**args)
   result=response.get('result',{})
@@ -105,7 +116,7 @@ def pages():
   if not cursor:return rows,failures
 
 def stack(tid):
- deadline=time.monotonic()+20
+ deadline=time.monotonic()+20*load_scale()
  while time.monotonic()<deadline:
   data=client.inspect('get_stack',tid=tid)
   if data['frames'] and data['frames'][0]['diagnostic']!='SymbolDiscoveryPending':return data['frames'][0]
@@ -140,6 +151,9 @@ try:
  report['pid']=candidates[0]
  client=Client('mutate',None,options=['--attach',str(candidates[0])]);client.stopped(seconds=20)
  report['before']=usage(client.p.pid);state=settled();report['loaded']=state['pe_metadata'];report['after']=usage(client.p.pid)
+ if a.ux:
+  from helpers.wine_ux import metadata, gui
+  report['wine_ux_metadata']=metadata(client,candidates[0],a.wrong_result)
  report['load']=os.getloadavg();report['cpus']=os.cpu_count();report['cpu_performance']='not measurable' if report['load'][0]>report['cpus'] else 'single-sample evidence'
  rows,failures=pages();report['rows']=rows;report['failures']=failures
  if a.eviction:
@@ -181,14 +195,14 @@ try:
   action('remove_breakpoint',id=bp)
   if a.pdb=='changed':
    st=(w/'main.pdb').stat();os.utime(w/'main.pdb',ns=(st.st_atime_ns,st.st_mtime_ns+1_000_000_000))
-  if a.pdb=='good':
+  if a.pdb in ('good','lying-code'):
    # PDB data publics remain inspectable, but a symbol breakpoint must not
    # overwrite their storage with a trap instruction.
    data_name='owned-pe.exe!pe_data_public'
    data_symbol=client.inspect('find_symbol',name=data_name)
    data_before=client.inspect('read_memory',address=data_symbol['address'],length=4)['hex']
    data_bp=action('set_breakpoint',symbol=data_name)['id']
-   deadline=time.monotonic()+20
+   deadline=time.monotonic()+20*load_scale()
    while True:
     probes=client.inspect('get_breakpoints')
     definition=next(d for d in probes['definitions'] if d['id']==data_bp)
@@ -205,9 +219,9 @@ try:
   else:hidden_bp=action('set_breakpoint',address=hex(hidden))['id']
   action('continue');state=client.stopped('breakpoint',seconds=20);tid=next(t['tid'] for t in state['threads'] if t['reason']=='breakpoint')
   frame=stack(tid);report['hidden_frame']=frame
-  expected_hidden='owned-pe.exe!pe_hidden' if a.pdb=='good' else 'owned-pe.exe!sub_'+format(hidden-0x140000000,'x')
+  expected_hidden='owned-pe.exe!pe_hidden' if a.pdb in ('good','lying-code') else 'owned-pe.exe!sub_'+format(hidden-0x140000000,'x')
   assert frame['pc']==hidden and frame['symbol']==expected_hidden,frame
-  if a.pdb=='good':
+  if a.pdb in ('good','lying-code'):
    location=client.inspect('get_source_location',address=hex(hidden))['source'];report['pdb_source']=location
    expected_line=next(i+1 for i,line in enumerate((root/'tests/fixtures/pe/main.c').read_text().splitlines()) if line.startswith('__declspec(noinline) long pe_hidden'))
    if a.wrong_result:expected_line+=1
@@ -283,6 +297,9 @@ try:
   assert str(w/selected) in opened,opened
   report['cold_source']['present_after']=True
   assert report['reloaded']['evictions']>report['loaded']['evictions'],report
+ if a.ux:
+  client.close();client=None
+  report['wine_ux_gui']=gui(root,w,candidates[0])
  report['status']='pass'
 finally:
  if report['status']!='pass':report['status']='fail'

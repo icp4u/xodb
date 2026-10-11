@@ -14,10 +14,12 @@
  *   fastdrag X Y X Y  left drag with all edges sent in one batch
  *   middle X Y     middle button at X/Y; button CODE STATE sends a pointer edge
  *   scroll X Y N   move to X/Y and send N vertical wheel steps
+ *   barrier        print ready, wait for a newline on stdin
  *   w MS           wait
  */
 #define _GNU_SOURCE
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -164,6 +166,11 @@ int main(int argc, char **argv) {
                 wl_fixed_from_int(10 * steps), steps);
             zwlr_virtual_pointer_v1_frame(pointer);
             settle(80);
+        } else if (!strcmp(cmd, "barrier")) {
+            wl_display_roundtrip(display);
+            puts("ready");
+            fflush(stdout);
+            if (getchar() != '\n') return 8;
         } else if (!strcmp(cmd, "w")) {
             settle(atoi(argv[++i]));
         } else return 7;

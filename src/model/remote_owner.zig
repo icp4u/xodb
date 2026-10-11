@@ -1,5 +1,5 @@
-//! Remote-session ownership boundary. Dormant until the session worker is wired
-//! in: no live Target, Session, service pointer or borrowed string crosses it.
+//! Remote-session ownership boundary. No live Target, Session, service pointer
+//! or borrowed string crosses the command/publication exchange.
 const std = @import("std");
 const View = @import("../remote/view.zig").View;
 const Allocator = std.mem.Allocator;
@@ -43,7 +43,27 @@ pub const Control = union(enum) {
 pub const Inspection = struct {
     request_id: u64, // Changes with selection, tab, expression or display options.
     selection: Selection,
-    kind: enum { view, stack, locals, registers, disassembly, memory, expression, language },
+    kind: enum { view, debugger, stack, locals, registers, disassembly, memory, expression, language },
+    browse_address: ?u64 = null,
+    browse_assembly: ?u64 = null,
+    show_flow: bool = false,
+    show_stop: bool = false,
+    show_processes: bool = false,
+    show_probes: bool = false,
+    show_setup: bool = false,
+    logical_frames: ?@import("frame_view.zig").Request = null,
+    static_analysis: ?@import("static_view.zig").Request = null,
+    runtime_types: ?@import("runtime_type_view.zig").Request = null,
+    invocations: ?@import("invocation_view.zig").Request = null,
+    allocations: ?@import("allocation_view.zig").Request = null,
+    profile: ?@import("profile_view.zig").Request = null,
+    timeline: ?@import("../ui/timeline.zig").Request = null,
+    sample: ?@import("sample_view.zig").Request = null,
+    syscalls: ?@import("syscall_view.zig").Request = null,
+    memory: ?@import("inspection_view.zig").Request = null,
+    inline_scope: ?@import("inline_view.zig").Request = null,
+    binding_start: usize = 0,
+    language_selection: ?@import("language_view.zig").SelectedKey = null,
     address: u64 = 0,
     limit: usize = 0,
     text: []const u8 = "",
@@ -52,6 +72,21 @@ pub const Action = union(enum) {
     poll,
     inspect: Inspection,
     control: Control,
+    language: @import("language_view.zig").Action,
+    runtime_watch: @import("runtime_watch_view.zig").Action,
+    native_watch: @import("native_watches.zig").Action,
+    memory_action: @import("inspection_view.zig").Action,
+    inline_expression: @import("inline_view.zig").Expression,
+    process: @import("process_view.zig").Operation,
+    probe_policy: @import("probe_view.zig").Request,
+    allocation: @import("allocation_view.zig").Action,
+    capture_control: @import("capture_view.zig").Action,
+    logical_frames: @import("frame_view.zig").Action,
+    static_cancel: u64,
+    runtime_type: @import("runtime_type_view.zig").Action,
+    invocation: @import("invocation_view.zig").Action,
+    workspace: @import("workspace_view.zig").Action,
+    toggle_scope,
     breakpoint: union(enum) {
         address: u64,
         source: struct { path: []const u8, line: u32 },
@@ -72,6 +107,19 @@ pub const Action = union(enum) {
 };
 pub const Request = struct { stamp: Stamp, actor: Actor, action: Action };
 
+// C register storage uses an untagged union of fixed-size values. It can be
+// copied as a value only when every alternative is pointer-free; no inactive
+// pointer or slice may evade the recursive payload budget.
+fn requirePlainValue(comptime T: type) void {
+    switch (@typeInfo(T)) {
+        .pointer => @compileError("untagged message unions must be pointer-free"),
+        .optional => |o| requirePlainValue(o.child),
+        .array => |v| requirePlainValue(v.child),
+        .@"struct" => |s| inline for (s.fields) |f| requirePlainValue(f.type),
+        .@"union" => |u| inline for (u.fields) |f| requirePlainValue(f.type),
+        else => {},
+    }
+}
 // Bound before allocating; count nested slices, not only their outer headers.
 fn payloadBytes(value: anytype, remaining: *usize) error{TooLarge}!void {
     switch (@typeInfo(@TypeOf(value))) {
@@ -84,7 +132,9 @@ fn payloadBytes(value: anytype, remaining: *usize) error{TooLarge}!void {
         },
         .optional => if (value) |v| try payloadBytes(v, remaining),
         .@"struct" => |s| inline for (s.fields) |f| try payloadBytes(@field(value, f.name), remaining),
-        .@"union" => switch (value) {
+        .@"union" => |u| if (u.tag_type == null) {
+            comptime requirePlainValue(@TypeOf(value));
+        } else switch (value) {
             inline else => |v| try payloadBytes(v, remaining),
         },
         .array => for (value) |v| try payloadBytes(v, remaining),
@@ -106,7 +156,10 @@ fn copyOwned(a: Allocator, value: anytype) Allocator.Error!@TypeOf(value) {
             inline for (s.fields) |f| @field(copy, f.name) = try copyOwned(a, @field(value, f.name));
             break :blk copy;
         },
-        .@"union" => switch (value) {
+        .@"union" => |u| if (u.tag_type == null) blk: {
+            comptime requirePlainValue(T);
+            break :blk value;
+        } else switch (value) {
             inline else => |v, tag| @unionInit(T, @tagName(tag), try copyOwned(a, v)),
         },
         .array => blk: {
@@ -116,6 +169,17 @@ fn copyOwned(a: Allocator, value: anytype) Allocator.Error!@TypeOf(value) {
         },
         else => value,
     };
+}
+/// Bounded deep copy for an owner-prepared const view. Callers own the arena;
+/// this helper never belongs on the frame/publication-exchange path.
+pub fn copyView(a: Allocator, value: anytype) !@TypeOf(value) {
+    comptime {
+        @setEvalBranchQuota(20000);
+        @import("debugger_view.zig").requireImmutable(@TypeOf(value));
+    }
+    var remaining: usize = max_publication_bytes;
+    try payloadBytes(value, &remaining);
+    return copyOwned(a, value);
 }
 pub const Command = struct {
     arena: std.heap.ArenaAllocator,
@@ -144,7 +208,12 @@ pub const Command = struct {
     pub fn validate(self: *const Command, current: Stamp, authorizer: anytype) !void {
         const expected = self.request.stamp;
         if (!expected.sameProcess(current)) return error.StaleProcess;
-        if (self.request.action != .poll and
+        // A GUI inspection/control refers to the displayed stop. MCP ingress
+        // instead preserves each tool's existing contract: get_session reads
+        // the execution-time snapshot, while mutations validate the caller's
+        // generation in the authoritative handler. Lease/job operations may
+        // not refer to a target stop at all. Process identity still pins both.
+        if (self.request.action != .poll and self.request.action != .mcp and self.request.action != .toggle_scope and
             (expected.image_epoch != current.image_epoch or expected.generation != current.generation))
             return error.StaleSnapshot;
         try authorizer.authorize(self.request);
@@ -254,13 +323,38 @@ pub const Presentation = struct {
     /// Last confirmed target state. Pending/failure never fabricate a stop,
     /// resume or detach. The view carries its own generation when older.
     view: ?View = null,
+    debugger: ?@import("debugger_view.zig").Presentation = null,
+    language: ?@import("language_view.zig").Presentation = null,
+    runtime_watches: ?@import("runtime_watch_view.zig").View = null,
+    native_watches: ?@import("native_watches.zig").View = null,
+    stop: ?@import("stop_view.zig").View = null,
+    memory: ?@import("inspection_view.zig").View = null,
+    inline_scope: ?@import("inline_view.zig").View = null,
+    processes: ?@import("process_view.zig").View = null,
+    probes: ?@import("probe_view.zig").View = null,
+    allocations: ?@import("allocation_view.zig").View = null,
+    profile: ?@import("profile_view.zig").View = null,
+    capture_control: ?@import("capture_view.zig").View = null,
+    logical_frames: ?@import("frame_view.zig").View = null,
+    static_analysis: ?@import("static_view.zig").View = null,
+    runtime_types: ?@import("runtime_type_view.zig").View = null,
+    invocations: ?@import("invocation_view.zig").View = null,
+    workspace: ?@import("workspace_view.zig").Header = null,
+    timeline: ?@import("../ui/timeline.zig").Prepared = null,
+    sample: ?@import("sample_view.zig").View = null,
+    syscalls: ?@import("syscall_view.zig").View = null,
     diagnostic: []const u8 = "",
+    omitted: u64 = 0,
+    debugger_omitted: u32 = 0,
     pub fn matchesInspection(self: Presentation, expected: Stamp, request_id: u64) bool {
-        const view = self.view orelse return false;
-        return self.status == .ready and self.inspection_id == request_id and
+        const identity = self.status == .ready and self.inspection_id == request_id and
             self.stamp.sameProcess(expected) and self.stamp.image_epoch == expected.image_epoch and
-            self.stamp.generation == expected.generation and view.generation == expected.generation and
-            view.session_id == expected.session and view.pid == expected.pid;
+            self.stamp.generation == expected.generation;
+        if (!identity) return false;
+        if (self.language) |view| return view.header.generation == expected.generation and view.header.session == expected.session;
+        if (self.debugger) |view| return view.snapshot.generation == expected.generation and view.snapshot.pid == expected.pid;
+        if (self.view) |view| return view.generation == expected.generation and view.session_id == expected.session and view.pid == expected.pid;
+        return false;
     }
 };
 pub const Publication = struct {
@@ -277,6 +371,54 @@ pub const Publication = struct {
         result.value = try copyOwned(result.arena.allocator(), value);
         return result;
     }
+    /// Target-sized panes degrade independently. No partial copy is published;
+    /// create still checks the complete resulting payload before allocation.
+    pub fn createDegraded(a: Allocator, original: Presentation) !*const Publication {
+        var value = original;
+        // Leave room for fixed fallback strings and the publication header.
+        var remaining: usize = max_publication_bytes - @sizeOf(Publication) - 4096;
+        inline for (@typeInfo(Presentation).@"struct".fields, 0..) |field, index| {
+            if (comptime std.mem.eql(u8, field.name, "debugger")) {
+                if (value.debugger) |*debugger| {
+                    const empty: @import("debugger_view.zig").Presentation = .{};
+                    inline for (@typeInfo(@TypeOf(empty)).@"struct".fields, 0..) |part, part_index| {
+                        var available = remaining;
+                        if (payloadBytes(@field(debugger, part.name), &available)) {
+                            remaining = available;
+                        } else |_| {
+                            @field(debugger, part.name) = @field(empty, part.name);
+                            value.debugger_omitted |= @as(u32, 1) << part_index;
+                        }
+                    }
+                    if (value.debugger_omitted != 0) debugger.local_diagnostic = if (debugger.locals.len == 0) "View limit: omitted data is listed below" else debugger.local_diagnostic;
+                }
+            } else {
+                var available = remaining;
+                if (payloadBytes(@field(value, field.name), &available)) {
+                    remaining = available;
+                } else |_| {
+                    if (comptime std.mem.eql(u8, field.name, "workspace")) {
+                        // Routing and authority facts must survive even when
+                        // a variable metadata string exceeds the pane limit.
+                        var header = value.workspace.?;
+                        header.metadata = null;
+                        header.frame_failure = null;
+                        header.frame_state = "";
+                        value.workspace = header;
+                        value.omitted |= @as(u64, 1) << index;
+                    } else if (comptime @typeInfo(field.type) == .optional) {
+                        @field(value, field.name) = null;
+                        value.omitted |= @as(u64, 1) << index;
+                    } else if (comptime std.mem.eql(u8, field.name, "diagnostic")) {
+                        value.diagnostic = "Remote diagnostic exceeds the view limit";
+                        value.omitted |= @as(u64, 1) << index;
+                    } else unreachable; // All other fields are fixed-size values.
+                }
+            }
+        }
+        if (value.omitted != 0 or value.debugger_omitted != 0) value.status = .failed;
+        return create(a, value);
+    }
     pub fn destroy(self: *const Publication) void {
         const owned = @constCast(self);
         const a = owned.arena.child_allocator;
@@ -284,6 +426,35 @@ pub const Publication = struct {
         a.destroy(owned);
     }
 };
+
+test "debugger publication retains source inline frames and target rows" {
+    var source = [_]u8{ 'a', '\n' };
+    var name = [_]u8{ 'f', 'n' };
+    var inlines = [_]@import("../debug/info.zig").Inline{.{ .name = &name, .depth = 1, .die_offset = 9 }};
+    var frames = [_]@import("session.zig").Frame{.{ .index = 0, .pc = 1, .lookup_pc = 1, .registers = @splat(null), .symbol = &name, .inline_frames = &inlines }};
+    var threads = [_]@import("../target/linux.zig").Thread{.{ .id = 3, .tid = 7, .state = .stopped }};
+    const publication = try Publication.create(std.testing.allocator, .{
+        .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 7, .image_epoch = 1, .generation = 2 },
+        .revision = 1,
+        .taken_ns = 1,
+        .status = .ready,
+        .inspection_id = 3,
+        .debugger = .{ .snapshot = .{ .pid = 7, .generation = 2 }, .source = .{ .bytes = &source, .path = "sample.c" }, .frames = &frames, .threads = &threads },
+    });
+    defer publication.destroy();
+    @memset(&source, 'x');
+    @memset(&name, 'x');
+    inlines[0].depth = 4;
+    frames[0].pc = 99;
+    threads[0].state = .running;
+    const view = publication.value.debugger.?;
+    try std.testing.expectEqualStrings("a\n", view.source.bytes);
+    try std.testing.expectEqualStrings("fn", view.frames[0].inline_frames[0].name);
+    try std.testing.expectEqual(@as(usize, 1), view.frames[0].inline_frames[0].depth);
+    try std.testing.expectEqual(@as(u64, 1), view.frames[0].pc);
+    try std.testing.expectEqual(@import("../target/linux.zig").State.stopped, view.threads[0].state);
+    try std.testing.expect(publication.value.matchesInspection(publication.value.stamp, 3));
+}
 /// Transfer, not a shared mutable cache. The presenter keeps at most its current
 /// view; a successful take transfers the pending one and it retires the old.
 /// The single slot holds either a new view or the GUI's retired view. Owner
@@ -361,6 +532,24 @@ const FakeOwner = struct {
 };
 fn testRequest(action: Action) Request {
     return .{ .stamp = fixture_stamp, .actor = .human, .action = action };
+}
+test "protocol ingress retains identity while tool handlers own stop freshness" {
+    const a = std.testing.allocator;
+    const command = try Command.create(a, .{ .stamp = fixture_stamp, .actor = .{ .agent = .{ .client = 8, .lease = 7 } }, .action = .{ .mcp = .{ .name = "get_session", .arguments_json = "{}" } } });
+    defer command.destroy();
+    var owner: FakeOwner = .{};
+    var current = fixture_stamp;
+    current.generation += 1;
+    current.image_epoch += 1;
+    try command.validate(current, &owner);
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    current.connection += 1;
+    try std.testing.expectError(error.StaleProcess, command.validate(current, &owner));
+    try std.testing.expectEqual(@as(usize, 1), owner.calls);
+    const inspection = try Command.create(a, testRequest(.{ .inspect = .{ .request_id = 1, .selection = .{ .tid = 42 }, .kind = .view } }));
+    defer inspection.destroy();
+    current.connection = fixture_stamp.connection;
+    try std.testing.expectError(error.StaleSnapshot, inspection.validate(current, &owner));
 }
 test "owner queue preserves GUI MCP order and owns input" {
     var queue: Queue = .{};
@@ -609,4 +798,113 @@ test "process identity compares start times only when both are known" {
     different = unknown;
     different.connection += 1;
     try std.testing.expect(!unknown.sameProcess(different));
+}
+
+test "language publication owns header rows and nested binding values" {
+    const prepared = @import("language_view.zig");
+    const named = @import("language_locals.zig");
+    const Session = @import("session.zig").Session;
+    var session = Session.init();
+    defer session.deinit();
+    session.id = fixture_stamp.session;
+    var state = prepared.header(&session);
+    state.generation = fixture_stamp.generation;
+    state.state = .stopped;
+    state.selected = .ruby;
+    var text = [_]u8{ 'k', 'e', 'p', 't' };
+    state.entries[@intFromEnum(state.selected) - 2] = .{ .present = true, .version = &text };
+    var rows = [_]prepared.Row{.{ .name = &text, .location = &text, .reason = null, .segment = 0, .frame = 1 }};
+    var children = [_]named.Child{.{ .key = &text, .type = "String", .display = &text, .address = null, .diagnostic = null, .advisory = false }};
+    var bindings = [_]named.Row{.{ .name = &text, .scope = .local, .ordinal = 0, .address = null, .value = .{ .type = "Array", .display = &text, .children = &children } }};
+    const publication = try Publication.create(std.testing.allocator, .{
+        .stamp = fixture_stamp,
+        .revision = 1,
+        .taken_ns = 1,
+        .status = .ready,
+        .inspection_id = 17,
+        .language = .{
+            .header = state,
+            .key = state.key(42, 0),
+            .rows = &rows,
+            .expression = &text,
+            .bindings = .{ .generation = fixture_stamp.generation, .tid = 42, .language = .ruby, .segment = 0, .frame = 1, .start = 0, .total = 1, .truncated = false, .rows = &bindings, .diagnostic = null, .runtime_version = &text, .runtime_build_id = &text, .basis = &text, .memory_reads = 1, .memory_bytes = 8 },
+        },
+    });
+    defer publication.destroy();
+    @memset(&text, 'x');
+    rows[0].frame = 9;
+    children[0].advisory = true;
+    bindings[0].hidden = true;
+    const view = publication.value.language.?;
+    try std.testing.expectEqualStrings("kept", view.header.entries[@intFromEnum(view.header.selected) - 2].version);
+    try std.testing.expectEqualStrings("kept", view.rows[0].name);
+    try std.testing.expectEqual(@as(?usize, 1), view.rows[0].frame);
+    try std.testing.expectEqualStrings("kept", view.expression);
+    try std.testing.expectEqualStrings("kept", view.bindings.?.runtime_build_id);
+    try std.testing.expectEqualStrings("kept", view.bindings.?.rows[0].value.children[0].display);
+    try std.testing.expect(!view.bindings.?.rows[0].hidden);
+    try std.testing.expect(!view.bindings.?.rows[0].value.children[0].advisory);
+    try std.testing.expect(publication.value.matchesInspection(fixture_stamp, 17));
+    var changed = fixture_stamp;
+    changed.session += 1;
+    try std.testing.expect(!publication.value.matchesInspection(changed, 17));
+}
+
+test "oversized panes do not discard fitting panes or publication identity" {
+    const a = std.testing.allocator;
+    const large = try a.alloc(u8, max_publication_bytes);
+    defer a.free(large);
+    @memset(large, 'x');
+    const language_header: @import("language_view.zig").Header = .{ .session = 1, .generation = 2, .metadata = 0, .revision = 0, .state = .stopped, .selected = .native, .native_selection = null, .logical_selection = null };
+    const original: Presentation = .{
+        .stamp = fixture_stamp,
+        .revision = 9,
+        .taken_ns = 8,
+        .status = .ready,
+        .inspection_id = 7,
+        .debugger = .{ .source = .{ .bytes = large }, .local_diagnostic = "retained local diagnostic", .snapshot = .{ .generation = 2 } },
+        .language = .{ .header = language_header, .key = language_header.key(0, 0), .message = large },
+        .workspace = .{ .process = 3, .scope = .control, .frame_failure = large },
+        .runtime_watches = .{},
+        .diagnostic = "retained diagnostic",
+    };
+    try std.testing.expectError(error.TooLarge, Publication.create(a, original));
+    const publication = try Publication.createDegraded(a, original);
+    defer publication.destroy();
+    const value = publication.value;
+    try std.testing.expectEqual(fixture_stamp, value.stamp);
+    try std.testing.expectEqual(@as(?u64, 7), value.inspection_id);
+    try std.testing.expectEqual(@as(u64, 9), value.revision);
+    try std.testing.expectEqual(@as(u64, 2), value.debugger.?.snapshot.generation);
+    try std.testing.expectEqual(@as(usize, 0), value.debugger.?.source.bytes.len);
+    try std.testing.expect(value.language == null);
+    try std.testing.expectEqual(@as(u64, 3), value.workspace.?.process);
+    try std.testing.expectEqual(.control, value.workspace.?.scope);
+    try std.testing.expect(value.workspace.?.frame_failure == null);
+    try std.testing.expect(value.runtime_watches != null);
+    try std.testing.expect(value.omitted != 0 and value.debugger_omitted != 0);
+    try std.testing.expectEqual(.failed, value.status);
+    try std.testing.expectEqualStrings("retained diagnostic", value.diagnostic);
+    try std.testing.expect(publication.bytes < max_publication_bytes);
+}
+
+test "pane budget is aggregate and a rejected pane leaves room for later panes" {
+    const a = std.testing.allocator;
+    const part = try a.alloc(u8, max_publication_bytes / 2);
+    defer a.free(part);
+    @memset(part, 'y');
+    const publication = try Publication.createDegraded(a, .{
+        .stamp = fixture_stamp,
+        .revision = 1,
+        .taken_ns = 0,
+        .status = .ready,
+        .debugger = .{ .source = .{ .bytes = part } },
+        .workspace = .{ .frame_failure = part },
+        .diagnostic = "a smaller later pane still fits",
+    });
+    defer publication.destroy();
+    try std.testing.expectEqual(part.len, publication.value.debugger.?.source.bytes.len);
+    try std.testing.expect(publication.value.workspace.?.frame_failure == null);
+    try std.testing.expectEqualStrings("a smaller later pane still fits", publication.value.diagnostic);
+    try std.testing.expect(publication.bytes < max_publication_bytes);
 }

@@ -27,13 +27,18 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('tests/fixtures/large-locals.py',), ('gui-remote-publication',)),
+    (('tests/metadata-ready-validation.c', 'src/runtime/file_view.c', 'src/runtime/xrt_files.h', 'src/debug/metadata_job.c'), ('metadata-ready-validation', 'javascript-watches*', 'metadata-session*')),
     (('src/binary/pe*', 'src/binary/pdb*', 'src/debug/pe_unwind.c', 'src/model/pe_images.zig',
       'tests/pe-*', 'tests/pdb-*', 'tests/fixtures/pe/*'), ('pe-*', 'pdb-*', 'jai-pe-demo-*')),
+    (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*',)),
     (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
      ('runtime-host', 'runtime-agent', 'shared-processes', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
     (('tests/fixtures/unwind-realigned.c',), ('unwind-realigned*',)),
     (('src/debug/demangle.*', 'tests/demangle-names.*', 'tests/fixtures/stack-symbol-names.cc'), ('demangle-names', 'stack-symbol-names*')),
+    (('tests/pe-wine.py', 'tests/fixtures/pe/main.c'), ('pe-wine-*',)),
+    (('src/model/compatibility.zig', 'src/ui/thread_list.zig', 'tests/helpers/wine_ux.py'), ('proton-metadata*', 'pe-wine-ux', 'gui-overview')),
     (('src/language/lua*', 'tests/fixtures/lua/*'), ('lua-*', 'python-lua-*', *LANGUAGE_PANES)),
     (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', *LANGUAGE_PANES)),
     (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', *LANGUAGE_PANES)),
@@ -41,11 +46,12 @@ COVERS = (
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
     (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
     (('src/language/gdscript*', 'tests/fixtures/redot/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
-     ('gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
+     ('gdscript-*', 'gui-owner-gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
     (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
+    (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'gui-remote-owner', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
      ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
@@ -59,17 +65,17 @@ COVERS = (
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
-    (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig'),
+    (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/static_view.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig'),
      ('static-analysis', 'gui-static-analysis')),
     (('src/mcp/observation.zig', 'src/mcp/associations.zig', 'src/mcp/probes.zig', 'src/model/probes.zig',
-      'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
+      'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/model/invocation_view.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
     (('src/profile/*', 'src/mcp/profile.zig', 'src/mcp/sampled_stack.zig', 'src/mcp/archive.zig', 'src/mcp/comparison.zig',
       'src/mcp/imported*', 'src/mcp/allocation*', 'src/runtime/perf*', 'src/runtime/xrt_perf.h', 'src/runtime/xrt_allocations.h',
-      'src/ui/flame.zig', 'src/ui/timeline.zig', 'src/ui/capture_*', 'src/ui/sample_inspector.zig', 'src/ui/syscalls.zig',
+      'src/ui/flame.zig', 'src/ui/timeline.zig', 'src/model/capture_view.zig', 'src/model/profile_view.zig', 'src/model/profile_timeline.zig', 'src/model/sample_view.zig', 'src/model/syscall_view.zig', 'src/model/allocation_view.zig', 'src/ui/capture_*', 'src/ui/sample_inspector.zig', 'src/ui/syscalls.zig',
       'src/ui/flow.zig', 'src/ui/imported.zig', 'src/ui/comparison.zig', 'src/ui/allocations.zig'),
      ('m2-*', 'syscall-timing', 'frame-*', 'allocation-helper', 'comparison', 'scheduling-decode', 'gui-profile', 'gui-flame-status', 'gui-frames',
       'gui-overview-live', 'gui-capture-setup')),
-    (('src/frames/*', 'src/import/*', 'src/mcp/frames.zig', 'src/ui/frames.zig'), ('frame-*', 'gui-frames')),
+    (('src/frames/*', 'src/import/*', 'src/mcp/frames.zig', 'src/ui/frames.zig', 'src/model/frame_view.zig'), ('frame-*', 'gui-frames')),
     (('src/remote/*', 'src/mcp/remote.zig', 'src/ui/remote.zig', 'src/runtime/remote*', 'src/runtime/agent*',
       'src/runtime/wire*', 'src/runtime/rpc.h', 'src/runtime/xrt_remote.h', 'src/runtime/xrt_wire.h', 'src/model/remote_*'),
      ('remote', 'remote-stops', 'agent-startup', 'runtime-agent', 'runtime-host', 'remote-panes', 'gui-remote-caller', '*-agent',
@@ -90,7 +96,7 @@ COVERS = (
       'source-blocks', 'stale-interrupt',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*'),
-     ('vulkan-*', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('scripts/release-check',), ('release-runner',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
@@ -101,7 +107,7 @@ COVERS = (
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
-    'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-evidence',
+    'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-evidence',
     'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
 }
 
@@ -116,7 +122,8 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
-    'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson-evidence',
+    'gui-remote-publication', 'gui-owner-*',
+    'gui-scene3d-evidence', 'gui-gibson-evidence',
     'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
     'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
     'symbol-discovery', 'symbol-discovery-install', 'source-fetch', 'lsof-top', 'memory-observer', 'sysstat-nvml',
@@ -239,6 +246,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pdb-image'], 30))
         steps.append(('pe-unwind', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind'], 30))
+        steps.append(('macho-image', [sys.executable, '-B', 'tests/macho-image.py',
+                      '--work', '.work/macho-image'], 120))
     if tier == 'perf':
         steps.kind = 'periodic'
         steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
@@ -265,6 +274,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pe-image-fuzz', '--fuzz'], 90))
         steps.append(('pdb-image-fuzz', [sys.executable, '-B', 'tests/pdb-image.py',
                       '--work', '.work/pdb-image-fuzz', '--fuzz'], 90))
+        steps.append(('macho-image-fuzz', [sys.executable, '-B', 'tests/macho-image.py',
+                      '--work', '.work/macho-image-fuzz', '--fuzz'], 180))
         for variant in ('eviction', 'budget', 'full-dwarf', 'large-companions'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', '--'+variant, '--work', '.work/'+label], 120))
@@ -274,11 +285,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                           '--wine', wine, '--work', '.work/pe-unwind-runtime'], 180))
             steps.append(('pe-corpus', [sys.executable, '-B', 'tests/pe-corpus.py',
                           '--wine', wine, '--work', '.work/pe-corpus'], 300))
-            for variant in ('native', 'eviction', 'unwind', 'profile'):
+            for variant in ('native', 'eviction', 'unwind', 'profile', 'ux'):
                 label = 'pe-wine-' + variant
                 steps.append((label, [sys.executable, '-B', 'tests/pe-wine.py', '--wine', wine,
                               '--work', '.work/'+label, *(['--'+variant] if variant != 'native' else [])], 240))
-            for variant in ('good', 'missing', 'mismatch', 'symlink', 'changed'):
+            for variant in ('good', 'lying-code', 'missing', 'mismatch', 'symlink', 'changed'):
                 label = 'pe-wine-pdb-' + variant
                 steps.append((label, [sys.executable, '-B', 'tests/pe-wine.py', '--wine', wine,
                               '--work', '.work/'+label, '--pdb', variant], 240))
@@ -320,6 +331,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         for variant, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent']), ('-shared', ['--shared'])):
             label = 'stack-symbol-names' + variant
             steps.append((label, [sys.executable, '-B', 'tests/stack-symbol-names.py', '--work', '.work/' + label, *extra], 30))
+        for agent in (False, True):
+            label = 'proton-metadata' + ('-agent' if agent else '')
+            steps.append((label, [sys.executable, '-B', 'tests/proton-metadata.py', '--work', '.work/' + label,
+                          *(['--agent', 'zig-out/bin/xodb-agent'] if agent else [])], 30))
         steps.append(('module-symbols', [sys.executable, '-B', 'tests/module-symbols.py', '--work', '.work/module-symbols'], 60))
         for variant in ('chain', 'debug-frame', 'companions'):
             label = 'module-unwind-' + variant
@@ -350,17 +365,17 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
-        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
+        for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'macho-mcp', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
                      'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
-                     'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
+                     'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt',
                      'comparison', 'scheduling-decode', 'observation-experiments',
                      'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
-        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges'):
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):
@@ -501,6 +516,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('vulkan-device', ['tests/vulkan-device.py']),
             ('gui-themes', ['tests/themes.py']),
             ('gui-vga', ['tests/vga.py']),
+            ('gui-remote-owner', ['tests/remote-owner-gui.py']),
+            ('gui-remote-publication', ['tests/remote-publication-gui.py']),
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),
             ('gui-live-display', ['tests/live-display-gui.py', *(['--perl', perl] if perl else [])]),
@@ -535,7 +552,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('fence-timeout', ['tests/vulkan-stall.py', 'fence', '--keep-hidden', '--quit', 'close']),
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
-            steps.append((name, [sys.executable, '-B', *args], 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
+            steps.append((name, [sys.executable, '-B', *args], 180 if name == 'gui-remote-publication' else 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
@@ -554,6 +571,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-deepmap', [sys.executable, '-B', 'tests/deepmap-gui.py'], 60))
         steps.append(('gui-deepmap-evidence', [sys.executable, '-B', 'tests/deepmap-gui.py', '--evidence'], 120))
         steps.append(('gui-gibson', [sys.executable, '-B', 'tests/gibson-gui.py'], 60))
+        steps.append(('gui-gibson-camera', [sys.executable, '-B', 'tests/gibson-camera.py'], 60))
         steps.append(('gui-gibson-evidence', [sys.executable, '-B', 'tests/gibson-gui.py', '--evidence'], 120))
         steps.append(('gui-scene3d', [sys.executable, '-B', 'tests/scene3d-gui.py'], 60))
         steps.append(('gui-scene3d-evidence', [sys.executable, '-B', 'tests/scene3d-gui.py', '--evidence'], 120))
@@ -577,6 +595,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if redot:
             steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))
+            steps.append(('gui-owner-gdscript-limit', [sys.executable, '-B', 'tests/gdscript-remote-limit-gui.py', '--redot', redot, '--work', '.work/gdl'], 300))
         if node:
             steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 1200))
             steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200, dict(work=['input-jsc'])))
@@ -604,6 +623,17 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'lua-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--source', source, '--library', library, '--work', f'.work/lwg{index}'], 180))
                 steps.append((f'lua-path-watch-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--paths', '--source', source, '--library', library, '--work', f'.work/lpwg{index}'], 180))
                 steps.append((f'lua-watch-reuse-gui-{index}', [sys.executable, '-B', 'tests/language-watches-gui.py', '--reuse', '--source', source, '--library', library, '--work', f'.work/lwrg{index}'], 180))
+        # Second GUI matrix: identical pane/navigation oracles through the owner.
+        owner_gui = {'gui-frames', 'gui-invocations', 'gui-static-analysis', 'gui-capture-setup',
+                     'gui-inspection', 'gui-inline', 'gui-image-budget', 'gui-restart', 'gui-breakpoints', 'gui-language-tabs',
+                     'gui-jai-runtime', 'gui-jai-browser', 'gui-jai-browser-pages',
+                     'ruby-gui', 'go-gui', 'elisp-gui'}
+        for step in list(steps):
+            if step.name in owner_gui:
+                suffix = step.name[4:] if step.name.startswith('gui-') else step.name
+                steps.append(('gui-owner-' + suffix,
+                              ['env', 'XODB_TEST_RUNTIME_AGENT=zig-out/bin/xodb-agent', *step.argv],
+                              step.timeout, dict(work=step.work, serial=step.serial)))
     return Steps(step for step in steps if periodic(step.name) == moved)
 
 

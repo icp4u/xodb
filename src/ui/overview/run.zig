@@ -21,6 +21,7 @@ pub const usage =
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
     \\  show their reason; nothing unmeasured is drawn as zero.
+    \\  --attach-exe    open the process picker with an editable .exe search filter
     \\  --replay FILE   collector JSON (one snapshot, or one per line) instead of the live system
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
@@ -49,6 +50,7 @@ fn onSignal(signal: c_int) callconv(.c) void {
 }
 
 pub const Options = struct {
+    attach_exe: bool = false,
     replay: ?[:0]const u8 = null,
     session_socket: ?[:0]const u8 = null,
     mcp: bool = false,
@@ -76,6 +78,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--overview")) continue;
+        if (std.mem.eql(u8, arg, "--attach-exe")) {
+            o.attach_exe = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--redact")) {
             o.redact = true;
             continue;
@@ -230,6 +236,12 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     view.paused = o.paused;
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
+    if (o.attach_exe) {
+        view.show(.processes);
+        @memcpy(view.search[0..4], ".exe");
+        view.search_len = 4;
+        view.rows_dirty = true;
+    }
     if (o.files_pid) |pid| view.files.scope(.{ .pid = pid, .start = o.files_start });
     if (o.look) |look| view.memmap.look = look;
     if (o.memmap_pid) |pid| {

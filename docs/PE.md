@@ -67,18 +67,27 @@ and reserved bytes, evictions and an active worker. Symbol breakpoints accept
 `module.dll!export`; forwarded exports refuse with
 `PeForwardedExportUnavailable`. Functions without exported names use
 `module.dll!sub_RVA`. Matching local PDBs add public symbols and source lines as
-described below. PDB data publics remain available to `find_symbol`; a symbol
-breakpoint requires a public marked as code or a function, and otherwise stays
+described below. PDB data publics remain available to `find_symbol` and automatic
+runtime discovery. A symbol breakpoint requires a public marked as code or a
+function in an executable PE section; exported data is also refused. It stays
 pending with `BreakpointSymbolNotExecutable` without changing target bytes.
 
 The cache retains at most 256 jobs, 256 MiB of parsed metadata, and 1,024 identity
 records and 1,024 mapping instances. Mappings of the same exact file share one
-parsed image and one pinned source view. An active worker reserves its 224 MiB
-allocation ceiling: 96 MiB for PE parsing, plus a 64 MiB PDB source and
-64 MiB of PDB parsing allocations. Unused reservations are released when the
-worker finishes. Each pinned file view also has a bounded 64 KiB read buffer; this overhead is separate from
+parsed image and one pinned source view. A worker reserves available cache space,
+up to 224 MiB: 96 MiB for PE parsing, plus a 64 MiB PDB source and 64 MiB of PDB
+parsing allocations. Both parsers enforce the allowance, including temporary
+arrays and allocation growth. If the allowance is exhausted, the owner retries
+with at least twice as much space, evicting only enough old metadata for that
+attempt. The minimum allowance is 1 MiB; at most eight increases reach the
+ceiling. Format and work limits remain permanent refusals. Retained cache bytes
+plus the active allowance never exceed 256 MiB. Unused space is released when
+the worker finishes. Each pinned file view also has a bounded 64 KiB read buffer; this overhead is separate from
 parsed metadata. Eviction closes the view and frees metadata, while IDs and
-original identities survive. Already discovered evicted images reload only when
+original identities survive while the file remains mapped. Refresh removes
+departed mapping instances and file records, including remembered failures; an
+unloaded worker is cancelled and reclaimed after its nonblocking join. Live
+instance IDs stay stable. Already discovered evicted images reload only when
 requested, rather than after every stop. Reload must match the original file
 version. Limits are caps, with allocation following actual metadata sizes.
 

@@ -1,100 +1,142 @@
-//! Breakpoint policy editor. All mutations go through the shared session model.
+//! Breakpoint policy input and painting over immutable owner-prepared rows.
 const std = @import("std");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const keys = @import("../platform/input.zig");
 const Session = @import("../model/session.zig").Session;
-const policy = @import("../model/probes.zig");
+const prepared = @import("../model/probe_view.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 const Editor = @import("watch.zig").Editor;
 pub const Panel = struct {
     open: bool = false,
+    view: prepared.View = .{},
     selected: usize = 0,
+    selected_id: ?u64 = null,
     scroll: usize = 0,
     bounds: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     editor: Editor = .{},
     editing: enum { condition, log, ignore, thread, symbol } = .condition,
     editing_id: u64 = 0,
+    editing_key: ?prepared.Key = null,
     message: []const u8 = "Select a breakpoint; C condition, L logpoint, H ignore count, T thread",
-    fn options(session: *Session, id: u64) policy.Options {
-        if (session.probes.rule(id)) |rule| return .{ .condition = rule.condition.slice(), .log_expression = rule.log_expression.slice(), .thread_id = rule.thread_id, .ignore_count = rule.ignore_remaining, .mode = rule.mode };
-        return .{};
-    }
-    fn apply(self: *Panel, session: *Session, id: u64, opt: policy.Options, enabled: bool) void {
-        session.probes.configure(&session.target, id, opt, enabled) catch |err| {
-            self.message = @errorName(err);
-            return;
+    pub fn present(self: *Panel, view: prepared.View) void {
+        const previous = self.view.key;
+        self.view = view;
+        if (view.key) |current| {
+            if (previous) |before| if (before.session != current.session or before.image != current.image) {
+                self.editor.open = false;
+                self.editing_key = null;
+                self.selected_id = null;
+                self.selected = 0;
+            };
+        }
+        self.selected = @min(self.selected, view.rows.len -| 1);
+        if (self.selected_id) |id| for (view.rows, 0..) |row, i| if (row.probe.id == id) {
+            self.selected = i;
+            break;
         };
-        session.record(.human, "configure_breakpoint");
-        self.message = "Breakpoint updated";
+        self.rememberSelection();
     }
+    fn rememberSelection(self: *Panel) void {
+        self.selected_id = if (self.view.rows.len > 0) self.view.rows[self.selected].probe.id else null;
+    }
+    pub const KeyAction = union(enum) { ignored, local, owner: prepared.Request };
     pub fn key(self: *Panel, session: *Session, event: keys.Event) bool {
-        if (!self.open) return false;
-        if (event.kind != .press and event.kind != .repeat) return true;
+        return switch (self.keyView(event)) {
+            .ignored => false,
+            .local => true,
+            .owner => |request| done: {
+                const result = prepared.apply(session, request, .human) catch |err| {
+                    self.failed(err);
+                    break :done true;
+                };
+                self.complete(result);
+                break :done true;
+            },
+        };
+    }
+    /// Remote callers match the command sequence before applying completion.
+    pub fn complete(self: *Panel, result: prepared.Outcome) void {
+        self.editor.open = false;
+        self.message = switch (result) {
+            .updated => "Breakpoint updated",
+            .removed => "Breakpoint removed",
+            .symbol_added => "Symbol breakpoint added (pending when unloaded)",
+        };
+    }
+    pub fn failed(self: *Panel, failure: anyerror) void {
+        self.message = switch (failure) {
+            error.UnknownBreakpoint => "Breakpoint no longer exists",
+            error.InternalBreakpoint => "Internal loader breakpoint (read-only)",
+            error.ThreadUnavailable => "Thread unavailable",
+            else => @errorName(failure),
+        };
+        if (failure == error.UnknownBreakpoint) self.editor.open = false;
+    }
+    fn makeRequest(self: *Panel, edit: prepared.Edit, editing: bool) KeyAction {
+        const identity = (if (editing) self.editing_key else self.view.key) orelse {
+            self.message = "Breakpoint view pending";
+            return .local;
+        };
+        return .{ .owner = .{ .key = identity, .edit = edit } };
+    }
+    pub fn keyView(self: *Panel, event: keys.Event) KeyAction {
+        if (!self.open) return .ignored;
+        if (event.kind != .press and event.kind != .repeat) return .local;
         if (self.editor.open) {
-            if (event.shortcut == 0xff0d and self.editor.text.len == 0) {
-                self.submit(session, "");
-                return true;
-            }
+            if (event.shortcut == 0xff0d and self.editor.text.len == 0) return self.submit("");
             if (self.editor.key(event)) |action| switch (action) {
                 .edited => {},
                 .cancel => self.message = "Edit cancelled",
-                .submit => |value| self.submit(session, value),
-            } else return false;
-            return true;
+                .submit => |value| return self.submit(value),
+            } else return .ignored;
+            return .local;
         }
-        if (event.shortcut >= 0xffbe and event.shortcut <= 0xffc9) return false;
-        if (!event.plain()) return true;
-        const key_ = event.shortcut;
-        if (key_ == keys.sym.escape or key_ == 'b') {
+        if (event.shortcut >= 0xffbe and event.shortcut <= 0xffc9) return .ignored;
+        if (!event.plain()) return .local;
+        const shortcut = event.shortcut;
+        if (shortcut == keys.sym.escape or shortcut == 'b') {
             self.open = false;
-            return true;
+            return .local;
         }
-        const count = session.target.snapshot().breakpoint_count;
-        if (key_ == 'n') {
+        if (shortcut == 'n') {
+            if (self.view.key == null) {
+                self.message = "Breakpoint view pending";
+                return .local;
+            }
             self.editing = .symbol;
+            self.editing_key = self.view.key;
             self.editor.start();
             self.message = "Symbol name; resolves now or stays pending until its library loads";
-            return true;
+            return .local;
         }
-        if (count == 0) return true;
+        const count = self.view.rows.len;
+        if (count == 0) return .local;
         self.selected = @min(self.selected, count - 1);
-        if (key_ == keys.sym.up) {
-            self.selected -|= 1;
-            return true;
+        if (shortcut == keys.sym.up or shortcut == keys.sym.down) {
+            if (shortcut == keys.sym.up) self.selected -|= 1 else self.selected = @min(count - 1, self.selected + 1);
+            self.rememberSelection();
+            return .local;
         }
-        if (key_ == keys.sym.down) {
-            self.selected = @min(count - 1, self.selected + 1);
-            return true;
-        }
-        if (event.kind == .repeat) return true;
-        const probe = session.target.breakpointSlice()[self.selected];
+        if (event.kind == .repeat) return .local;
+        const item = self.view.rows[self.selected];
+        const probe = item.probe;
         if (probe.internal) {
             self.message = "Internal loader breakpoint (read-only)";
-            return true;
+            return .local;
         }
-        if (key_ == 0xffff or key_ == 0xff08) { // Delete or BackSpace (compact keyboards)
-            session.target.removeBreakpoint(probe.id) catch |err| {
-                self.message = @errorName(err);
-                return true;
-            };
-            session.record(.human, "remove_breakpoint");
-            self.message = "Breakpoint removed";
-        } else if (key_ == keys.sym.space) {
-            self.apply(session, probe.id, options(session, probe.id), !probe.enabled);
-        } else if (key_ == 'o') {
-            var opt = options(session, probe.id);
-            opt.mode = .stop;
-            self.apply(session, probe.id, opt, probe.enabled);
-        } else if (key_ == 'c' or key_ == 'l' or key_ == 'h' or key_ == 't') {
-            self.editing = if (key_ == 'c') .condition else if (key_ == 'l') .log else if (key_ == 'h') .ignore else .thread;
+        if (shortcut == 0xffff or shortcut == 0xff08) return self.makeRequest(.{ .remove = probe.id }, false);
+        if (shortcut == keys.sym.space) return self.makeRequest(.{ .toggle = probe.id }, false);
+        if (shortcut == 'o') return self.makeRequest(.{ .stop = probe.id }, false);
+        if (shortcut == 'c' or shortcut == 'l' or shortcut == 'h' or shortcut == 't') {
+            self.editing = if (shortcut == 'c') .condition else if (shortcut == 'l') .log else if (shortcut == 'h') .ignore else .thread;
             self.editing_id = probe.id;
+            self.editing_key = self.view.key;
             self.editor.start();
-            const rule = session.probes.rule(probe.id);
-            const initial = if (rule) |v| switch (self.editing) {
-                .condition => v.condition.slice(),
-                .log => v.log_expression.slice(),
+            const initial = if (item.rule) |rule| switch (self.editing) {
+                .condition => rule.options.condition,
+                .log => rule.options.log_expression,
                 else => "",
             } else "";
             const n = @min(initial.len, self.editor.text.bytes.len);
@@ -108,75 +150,39 @@ pub const Panel = struct {
                 .symbol => unreachable,
             };
         }
-        return true;
+        return .local;
     }
-    fn submit(self: *Panel, session: *Session, value: []const u8) void {
-        if (self.editing == .symbol) {
-            _ = session.persistent.addSymbol(session, value) catch |err| {
-                self.message = @errorName(err);
-                return;
-            };
-            session.record(.human, "set_breakpoint");
-            self.editor.open = false;
-            self.message = "Symbol breakpoint added (pending when unloaded)";
-            return;
-        }
-        var enabled = true;
-        for (session.target.breakpointSlice()) |probe| {
-            if (probe.id == self.editing_id) {
-                enabled = probe.enabled;
-                break;
-            }
-        } else {
-            self.message = "Breakpoint no longer exists";
-            self.editor.open = false;
-            return;
-        }
-        var opt = options(session, self.editing_id);
-        switch (self.editing) {
-            .symbol => unreachable,
-            .condition => opt.condition = value,
-            .log => {
-                opt.log_expression = value;
-                opt.mode = .log;
-            },
-            .ignore => opt.ignore_count = if (value.len == 0) 0 else std.fmt.parseInt(u64, value, 10) catch {
+    fn submit(self: *Panel, value: []const u8) KeyAction {
+        const edit: prepared.Edit = switch (self.editing) {
+            .symbol => .{ .symbol = value },
+            .condition => .{ .condition = .{ .id = self.editing_id, .text = value } },
+            .log => .{ .log = .{ .id = self.editing_id, .text = value } },
+            .ignore => .{ .ignore = .{ .id = self.editing_id, .count = if (value.len == 0) 0 else std.fmt.parseInt(u64, value, 10) catch {
                 self.message = "Enter a nonnegative integer";
-                return;
-            },
-            .thread => {
-                opt.thread_id = null;
-                if (value.len > 0) {
-                    const tid = std.fmt.parseInt(i32, value, 10) catch {
-                        self.message = "Enter a live thread TID";
-                        return;
-                    };
-                    for (session.target.threadSlice()) |thread| {
-                        if (thread.tid == tid and thread.state != .exited) {
-                            opt.thread_id = thread.id;
-                            break;
-                        }
-                    } else {
-                        self.message = "Thread unavailable";
-                        return;
-                    }
-                }
-            },
-        }
-        self.apply(session, self.editing_id, opt, enabled);
-        self.editor.open = false;
+                return .local;
+            } } },
+            .thread => .{ .thread = .{ .id = self.editing_id, .tid = if (value.len == 0) null else std.fmt.parseInt(i32, value, 10) catch {
+                self.message = "Enter a live thread TID";
+                return .local;
+            } } },
+        };
+        return self.makeRequest(edit, true);
     }
-    pub fn press(self: *Panel, x: f32, y: f32, count: usize) void {
+    pub fn press(self: *Panel, x: f32, y: f32) void {
         if (x < self.bounds.x or x >= self.bounds.x + self.bounds.w or y < self.bounds.y or y >= self.bounds.y + self.bounds.h) {
             self.open = false;
             return;
         }
+        const count = self.view.rows.len;
         if (y >= self.bounds.y + 64 and y < self.bounds.y + self.bounds.h - 124 and count > 0) self.selected = @min(count - 1, self.scroll + @as(usize, @intFromFloat((y - self.bounds.y - 64) / 24)));
+        self.rememberSelection();
     }
-    pub fn wheel(self: *Panel, amount: i32, count: usize) void {
+    pub fn wheel(self: *Panel, amount: i32) void {
+        const count = self.view.rows.len;
         self.selected = @intCast(@max(0, @min(@as(i64, @intCast(count -| 1)), @as(i64, @intCast(self.selected)) + amount)));
+        self.rememberSelection();
     }
-    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, session: *Session) !void {
+    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32) !void {
         if (!self.open) return;
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
@@ -184,45 +190,38 @@ pub const Panel = struct {
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.text(font, b.x + 14, b.y + 10, "BREAKPOINTS   B / Esc close", theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, "N new  Space toggle  Del  C if  L log  O stop  H ignore  T thread", theme.weak);
-        const count = session.target.snapshot().breakpoint_count;
+        const count = self.view.rows.len;
         const visible: usize = @intFromFloat(@max(1, (b.h - 188) / 24));
         self.selected = @min(self.selected, count -| 1);
         if (self.selected < self.scroll) self.scroll = self.selected;
         if (self.selected >= self.scroll + visible) self.scroll = self.selected - visible + 1;
         var buffer: [1024]u8 = undefined;
-        for (session.target.breakpointSlice()[self.scroll..@min(count, self.scroll + visible)], self.scroll..) |probe, i| {
+        for (self.view.rows[self.scroll..@min(count, self.scroll + visible)], self.scroll..) |item, i| {
+            const probe = item.probe;
             const y = b.y + 64 + @as(f32, @floatFromInt(i - self.scroll)) * 24;
             if (i == self.selected) try r.rect(.{ .x = b.x + 6, .y = y - 1, .w = b.w - 12, .h = 24 }, style.fade(theme.focus, 0.16));
-            const rule = session.probes.rule(probe.id);
-            const mode = if (probe.internal) "loader" else if (probe.pending) "PENDING" else if (rule) |v| @tagName(v.mode) else "stop";
-            const condition = if (rule) |v| v.condition.slice() else "";
-            const row = try std.fmt.bufPrint(&buffer, "#{d} {s}  0x{x}  hits {d}  {s}  {s}", .{ probe.id, if (probe.enabled) "on " else "off", probe.address, probe.hit_count, mode, if (probe.pending) (if (session.persistent.entry(probe.id)) |v| (if (v.symbol.len > 0) v.symbol.slice() else v.path) else condition) else condition });
+            const rule = item.rule;
+            const mode = if (probe.internal) "loader" else if (probe.pending) "PENDING" else if (rule) |v| @tagName(v.options.mode) else "stop";
+            const condition = if (rule) |v| v.options.condition else "";
+            const row = try std.fmt.bufPrint(&buffer, "#{d} {s}  0x{x}  hits {d}  {s}  {s}", .{ probe.id, if (probe.enabled) "on " else "off", probe.address, probe.hit_count, mode, if (probe.pending) item.pending_text else condition });
             try r.textFit(font, b.x + 14, y, b.w - 28, row, if (probe.enabled) theme.text else theme.weak);
         }
         if (count == 0) try r.text(font, b.x + 14, b.y + 70, "Set a source/assembly breakpoint to configure it here", theme.weak);
         const y = b.y + b.h - 112;
-        if (count > 0) if (session.probes.rule(session.target.breakpointSlice()[self.selected].id)) |rule| {
-            var thread_buffer: [40]u8 = undefined;
-            var thread_label: []const u8 = "all";
-            if (rule.thread_id) |id| {
-                thread_label = "ended";
-                for (session.target.threadSlice()) |thread| if (thread.id == id) {
-                    thread_label = try std.fmt.bufPrint(&thread_buffer, "{d}", .{thread.tid});
-                };
+        if (count > 0) {
+            const item = self.view.rows[self.selected];
+            if (item.rule) |rule| {
+                const detail = try std.fmt.bufPrint(&buffer, "matched {d}  ignore {d}  thread {s}  {s}", .{ rule.matched_hits, rule.options.ignore_count, rule.thread_label, rule.last_error orelse "" });
+                try r.textFit(font, b.x + 14, y, b.w - 28, detail, if (rule.last_error != null) theme.warm else theme.weak);
             }
-            const detail = try std.fmt.bufPrint(&buffer, "matched {d}  ignore {d}  thread {s}  {s}", .{ rule.matched_hits, rule.ignore_remaining, thread_label, rule.last_error orelse "" });
-            try r.textFit(font, b.x + 14, y, b.w - 28, detail, if (rule.last_error != null) theme.warm else theme.weak);
-        };
-        if (count > 0) if (session.persistent.entry(session.target.breakpointSlice()[self.selected].id)) |definition| {
-            if (definition.diagnostic) |diagnostic| try r.textFit(font, b.x + 14, y, b.w - 28, diagnostic, theme.warm);
-        };
+            if (item.diagnostic) |diagnostic| try r.textFit(font, b.x + 14, y, b.w - 28, diagnostic, theme.warm);
+        }
+        if (self.view.diagnostic) |diagnostic| try r.textFit(font, b.x + 14, y, b.w - 28, diagnostic, theme.warm);
         try r.textFit(font, b.x + 14, y + 24, b.w - 28, self.message, theme.text);
         if (self.editor.open) {
             try style.box(r, .{ .x = b.x + 10, .y = y + 48, .w = b.w - 20, .h = 27 }, theme.background, theme.focus, @splat(3));
             try self.editor.draw(r, font, .{ .x = b.x + 16, .y = y + 52, .w = b.w - 32, .h = 22 });
-        } else if (session.probes.log_count > 0) {
-            const log = &session.probes.logs[session.probes.log_count - 1];
-            const message = try std.fmt.bufPrint(&buffer, "Log #{d} tid {d}: {s} = {s}  (dropped {d})", .{ log.sequence, log.tid, log.expression.slice(), log.display.slice(), session.probes.dropped_logs });
+        } else if (self.view.last_log) |message| {
             try r.textFit(font, b.x + 14, y + 52, b.w - 28, message, theme.neutral);
         }
         try r.textFit(font, b.x + 14, y + 80, b.w - 28, "F4 restart  F5 continue/pause  F12 finish  F9 run to source line", theme.weak);

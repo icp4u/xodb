@@ -111,7 +111,7 @@ pub const ElispValue = struct {
     memory_reads: usize,
     memory_bytes: usize,
     liveness: []const u8 = "unproved; consistent headers do not prove GC liveness or allocation extents",
-    items: []ElispItem,
+    items: []const ElispItem,
 };
 pub const RubyValue = struct { value: @import("language_locals.zig").Value, tagged: u64, runtime_version: []const u8, runtime_build_id: []const u8, memory_reads: usize, memory_bytes: usize, liveness: []const u8 = "unproved; consistent tags do not prove GC liveness" };
 pub const LuaItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, advisory: bool = false };
@@ -129,7 +129,7 @@ pub const LuaValue = struct {
     liveness: []const u8 = "unproved; header consistency is not GC liveness",
     memory_reads: usize,
     memory_bytes: usize,
-    items: []LuaItem,
+    items: []const LuaItem,
 };
 pub const JavaScriptItem = struct { tagged: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8, truncated: bool = false, extent_advisory: bool = false, name_diagnostic: ?[]const u8 = null };
 pub const JavaScriptValue = struct {
@@ -145,7 +145,7 @@ pub const JavaScriptValue = struct {
     dwarf_fields: u64 = 0,
     memory_reads: usize,
     memory_bytes: usize,
-    items: []JavaScriptItem,
+    items: []const JavaScriptItem,
 };
 pub const PerlItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
 pub const PerlValue = struct {
@@ -158,7 +158,7 @@ pub const PerlValue = struct {
     flags: u32,
     body: u64,
     runtime_build_id: []const u8,
-    items: []PerlItem,
+    items: []const PerlItem,
 };
 pub const PythonItem = struct { address: u64, key: []const u8, type: []const u8, display: []const u8, diagnostic: ?[]const u8 };
 pub const PythonValue = struct {
@@ -169,7 +169,7 @@ pub const PythonValue = struct {
     type_object: u64,
     runtime_version: []const u8,
     runtime_build_id: []const u8,
-    items: []PythonItem,
+    items: []const PythonItem,
 };
 pub fn preview(ctx: eval.Context, v: eval.Value) !?Preview {
     if (layout(v.type) == null) return null;

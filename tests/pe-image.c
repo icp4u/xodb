@@ -15,6 +15,15 @@ int main(int argc,char **argv) {
     struct xpe_source source={&file,file.size,XPE_FILE,read_bytes};struct xpe_image *p=NULL;
     enum xpe_status status=xpe_load(&source,&p);fprintf(stderr,"file status=%u\n",status);if(argc>2 && !strncmp(argv[2],"status=",7)){CHECK(status==(enum xpe_status)strtoul(argv[2]+7,NULL,10));CHECK((p!=NULL)==(status==XPE_OK));xpe_destroy(p);free(file.data);return 0;}
     CHECK(status==XPE_OK);
+    if(argc>2 && !strcmp(argv[2],"budget")) {
+        uint64_t peak=xpe_info(p)->peak_bytes;
+        CHECK(peak>=xpe_info(p)->retained_bytes && peak<=XPE_MAX_RETAINED_BYTES);
+        xpe_destroy(p);p=NULL;
+        CHECK(xpe_load_budget(&source,peak-1,&p)==XPE_BUDGET && !p);
+        CHECK(xpe_load_budget(&source,peak,&p)==XPE_OK && p);
+        CHECK(xpe_info(p)->peak_bytes==peak);
+        xpe_destroy(p);free(file.data);puts("PE exact peak allowance checked");return 0;
+    }
     if(argc>2 && !strncmp(argv[2],"functions=",10)) {
         /* functions=KEPT,SKIPPED: empty rows are counted, never looked up. */
         char *end;unsigned long kept=strtoul(argv[2]+10,&end,10),skipped=strtoul(end+1,NULL,10);

@@ -70,6 +70,9 @@ void xrt_file_view_background(struct xrt_file_view *);
 int xrt_file_view_remote(const struct xrt_file_view *);
 enum xrt_file_source xrt_file_view_source(const struct xrt_file_view *);
 enum xrt_status xrt_file_view_validate(struct xrt_file_view *);
+/* Owner only after joining the file worker: identity validation participates
+ * in foreground ordering instead of reporting transport contention as pending. */
+enum xrt_status xrt_file_view_validate_foreground(struct xrt_file_view *);
 enum xrt_status xrt_file_view_read(struct xrt_file_view *, uint64_t, void *, size_t);
 enum xrt_status xrt_file_view_close(struct xrt_file_view *);
 /* Owner-thread scope for automatic remote symbol discovery. Explicit user

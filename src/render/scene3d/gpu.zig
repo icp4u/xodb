@@ -36,6 +36,19 @@ fn memoryType(ctx: Context, bits: u32, flags: c.VkMemoryPropertyFlags) !u32 {
     }
     return error.SceneMemoryTypeUnavailable;
 }
+/// An instance upload exposes stores and copies, never readable GPU slices.
+pub fn Writer(comptime T: type) type {
+    return struct {
+        destination: []T,
+        pub fn set(self: @This(), index: usize, value: T) void {
+            self.destination[index] = value;
+        }
+        pub fn copy(self: @This(), offset: usize, values: []const T) void {
+            @memcpy(self.destination[offset..][0..values.len], values);
+        }
+    };
+}
+
 const Buffer = struct {
     buffer: c.VkBuffer = null,
     memory: c.VkDeviceMemory = null,
@@ -387,29 +400,29 @@ pub const Gpu = struct {
         c.vkCmdDraw(cmd, 6, 1, 0, 0);
         self.stats.draw_calls += 1;
     }
-    pub fn boxes(self: *Gpu, n: usize) ![]types.Box {
+    pub fn boxes(self: *Gpu, n: usize) !Writer(types.Box) {
         if (n > types.max_instances) return error.SceneInstanceLimit;
         try self.box_buffer.ensure(self.ctx, n * @sizeOf(types.Box));
         self.stats.boxes = @intCast(n);
-        return self.box_buffer.slice(types.Box, n);
+        return .{ .destination = self.box_buffer.slice(types.Box, n) };
     }
-    pub fn points(self: *Gpu, n: usize) ![]types.Point {
+    pub fn points(self: *Gpu, n: usize) !Writer(types.Point) {
         if (n > types.max_instances) return error.SceneInstanceLimit;
         try self.point_buffer.ensure(self.ctx, n * @sizeOf(types.Point));
         self.stats.points = @intCast(n);
-        return self.point_buffer.slice(types.Point, n);
+        return .{ .destination = self.point_buffer.slice(types.Point, n) };
     }
-    pub fn lines(self: *Gpu, n: usize) ![]types.Line {
+    pub fn lines(self: *Gpu, n: usize) !Writer(types.Line) {
         if (n > types.max_instances) return error.SceneInstanceLimit;
         try self.line_buffer.ensure(self.ctx, n * @sizeOf(types.Line));
         self.stats.lines = @intCast(n);
-        return self.line_buffer.slice(types.Line, n);
+        return .{ .destination = self.line_buffer.slice(types.Line, n) };
     }
-    pub fn glyphs(self: *Gpu, n: usize) ![]types.Glyph {
+    pub fn glyphs(self: *Gpu, n: usize) !Writer(types.Glyph) {
         if (n > types.max_glyphs) return error.SceneInstanceLimit;
         try self.glyph_buffer.ensure(self.ctx, n * @sizeOf(types.Glyph));
         self.stats.glyphs = @intCast(n);
-        return self.glyph_buffer.slice(types.Glyph, n);
+        return .{ .destination = self.glyph_buffer.slice(types.Glyph, n) };
     }
     pub fn allocated(self: *const Gpu) u64 {
         return self.box_buffer.allocated + self.point_buffer.allocated + self.line_buffer.allocated + self.glyph_buffer.allocated + self.color.allocated + self.depth.allocated + self.blur_a.allocated + self.blur_b.allocated;

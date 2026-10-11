@@ -3,6 +3,7 @@ const std = @import("std");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const Session = @import("../model/session.zig").Session;
+const prepared = @import("../model/runtime_watch_view.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 pub const Panel = struct {
@@ -19,38 +20,51 @@ pub const Panel = struct {
             if (x >= hit.rect.x and x < hit.rect.x + hit.rect.w and y >= hit.rect.y and y < hit.rect.y + hit.rect.h) self.selected = hit.id;
         };
     }
+    pub const KeyAction = union(enum) { ignored, local, remove: u64 };
     pub fn key(self: *Panel, session: *Session, code: u32) !bool {
-        if (code == 26 or code == 27) {
-            self.scrollBy(if (code == 26) -1 else 1);
-            return true;
-        }
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
-        const entries = try session.language_watches.list(arena.allocator());
+        return switch (self.keyView(prepared.snapshot(session, arena.allocator()), code)) {
+            .ignored => false,
+            .local => true,
+            .remove => |id| blk: {
+                _ = try prepared.apply(session, .human, .{ .remove = id });
+                self.selected = null;
+                break :blk true;
+            },
+        };
+    }
+    pub fn keyView(self: *Panel, view: prepared.View, code: u32) KeyAction {
+        if (code == 26 or code == 27) {
+            self.scrollBy(if (code == 26) -1 else 1);
+            return .local;
+        }
+        const entries = view.entries;
         const index = for (entries, 0..) |entry, i| {
             if (self.selected != null and entry.id == self.selected.?) break i;
-        } else return false;
+        } else return .ignored;
         if (code == 111 or code == 14) {
-            try session.language_watches.remove(entries[index].id);
-            self.selected = null;
-            session.record(.human, "remove_language_watch");
-            return true;
+            return .{ .remove = entries[index].id };
         }
         if (code == 103 or code == 108) {
             const next = if (code == 103) index -| 1 else @min(index + 1, entries.len - 1);
             self.selected = entries[next].id;
             self.scroll = next;
-            return true;
+            return .local;
         }
-        return code == 17 or code == 28;
+        return if (code == 17 or code == 28) .local else .ignored;
     }
-    pub fn draw(self: *Panel, session: *Session, r: *gpu.Renderer, font: *Font, rect: gpu.Rect) !void {
+    pub fn draw(self: *Panel, view: prepared.View, r: *gpu.Renderer, font: *Font, rect: gpu.Rect) !void {
         self.hits = @splat(null);
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
-        const entries = try session.language_watches.list(a);
+        const entries = view.entries;
         var y = rect.y + 8;
+        if (view.diagnostic) |why| {
+            try r.textFit(font, rect.x + 12, y, rect.w - 24, why, theme.warm);
+            return;
+        }
         if (entries.len == 0) {
             try r.textFit(font, rect.x + 12, y, rect.w - 24, "Click a supported named language binding, then W; Shift+E adds a name watch", theme.weak);
             return;

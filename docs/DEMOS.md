@@ -29,7 +29,9 @@ xodb --overview --panel memory_map --look gibson --memmap-pid PID
 
 The camera slowly orbits and dollies through the sampled VMAs. **WASD** moves,
 drag or arrow keys orbit, and the wheel zooms. **F** toggles the flythrough;
-**R** resets it. Click a tower to read its block details. **H** switches height
+**R** resets it. Hold movement, arrow or zoom keys for smooth motion; keys
+combine, and focus loss stops movement immediately. Automatic orbit stops
+after five idle seconds. Click a tower to read its block details. **H** switches height
 between present, THP-backed and swapped bytes; **C** switches backing and
 district colours. **G** opens the encoding legend; **O** chooses a process.
 Use `--redact` to hide process names, paths and floating district labels.

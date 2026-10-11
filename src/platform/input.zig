@@ -88,6 +88,9 @@ pub const Keyboard = struct {
     keymap_errors: u64 = 0,
 
     focused: bool = false,
+    /// Authoritative state survives queue overflow; repeats never change it.
+    held: std.StaticBitSet(768) = .initEmpty(),
+    focus_revision: u64 = 0,
     repeat_rate: i32 = 0,
     repeat_delay_ms: i32 = 0,
     repeat_code: ?u32 = null,
@@ -119,7 +122,20 @@ pub const Keyboard = struct {
         self.* = .{};
     }
 
+    fn clearHeld(self: *Keyboard) void {
+        self.held = .initEmpty();
+        self.focus_revision +%= 1;
+    }
+
+    pub fn heldShortcut(self: *const Keyboard, shortcut: u32) bool {
+        if (!self.focused) return false;
+        var it = self.held.iterator(.{});
+        while (it.next()) |code| if (self.shortcutSym(@intCast(code)) == shortcut) return true;
+        return false;
+    }
+
     fn dropKeymap(self: *Keyboard) void {
+        self.clearHeld();
         if (self.compose) |state| c.xkb_compose_state_unref(state);
         if (self.state) |state| c.xkb_state_unref(state);
         if (self.xkb_keymap) |map| c.xkb_keymap_unref(map);
@@ -161,10 +177,12 @@ pub const Keyboard = struct {
     }
 
     pub fn enter(self: *Keyboard) void {
+        self.clearHeld();
         self.focused = true;
     }
     /// wl_keyboard.leave: no key is held from the application's point of view.
     pub fn leave(self: *Keyboard) void {
+        self.clearHeld();
         self.focused = false;
         self.repeat_code = null;
         if (self.state) |state| _ = c.xkb_state_update_mask(state, 0, 0, 0, 0, 0, 0);
@@ -266,6 +284,7 @@ pub const Keyboard = struct {
 
     /// wl_keyboard.key. `now_ns` is the monotonic clock that `tick` will be called with.
     pub fn key(self: *Keyboard, time_ms: u32, code: u32, pressed: bool, now_ns: u64) void {
+        if (code < self.held.capacity()) self.held.setValue(code, pressed and self.focused);
         var event = Event{ .kind = if (pressed) .press else .release, .time_ms = time_ms, .code = code };
         self.translate(&event, pressed);
         self.push(event);
@@ -723,4 +742,30 @@ test "shortcut modifiers cannot commit pending composed text" {
         k.modifiers(0, 0, 0, 0);
         try testing.expectEqualStrings("e", tap(&k, KEY.e).text());
     }
+}
+
+test "held shortcuts survive repeat and queue overflow but never focus or keymap loss" {
+    var k = keyboard("us");
+    defer k.deinit();
+    k.repeatInfo(100, 0);
+    k.key(0, KEY.w, true, 1);
+    k.key(0, KEY.a, true, 1);
+    try testing.expect(k.heldShortcut('w') and k.heldShortcut('a'));
+    for (0..capacity * 2) |i| k.tick(1 + i * 100 * ms);
+    try testing.expect(k.dropped > 0);
+    k.key(0, KEY.w, false, 2);
+    try testing.expect(!k.heldShortcut('w') and k.heldShortcut('a'));
+    const revision = k.focus_revision;
+    k.leave();
+    k.enter();
+    try testing.expect(k.focus_revision != revision);
+    try testing.expect(!k.heldShortcut('a'));
+    k.key(0, KEY.w, true, 3);
+    k.keymap(0, -1, 0);
+    try testing.expect(k.held.count() == 0);
+    k.key(0, KEY.w, true, 4);
+    k.seatRemoved();
+    try testing.expect(k.held.count() == 0 and !k.focused);
+    k.key(0, KEY.w, true, 5);
+    try testing.expect(k.held.count() == 0);
 }

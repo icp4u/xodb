@@ -171,6 +171,19 @@ def mcp(stub):
         client.inspect('list_threads')
         registers = client.inspect('get_registers', tid=tid)['registers']
         name, pc = ('rax', 'rip') if 'rax' in registers else ('x0', 'pc')
+        view = client.inspect('get_debug_view', tid=tid)
+        assert view['architecture'] == initial['architecture'] and view['registers'], view
+        assert view['instructions'] and view['instructions'][0]['address'] == int(registers[pc], 16), view
+        if stub.case.startswith('qemu-'):
+            names = [row['mnemonic'] for row in view['instructions'][:3]]
+            if stub.case == 'qemu-aarch64':
+                # lld may relax the ADRP/ADD pair into NOP/ADR without moving
+                # the following branch. Both are the fixture's actual code.
+                assert names in (['adrp', 'add', 'bl'], ['nop', 'adr', 'bl']), view['instructions'][:4]
+                start = int(registers[pc], 16)
+                assert [row['address'] for row in view['instructions'][:3]] == [start, start + 4, start + 8]
+            else:
+                assert names[0] == 'call', view['instructions'][:4]
         marker, tick = stub.symbols['marker'], stub.symbols['tick']
         assert client.inspect('read_memory', address=marker, length=8)['hex'] == '8877665544332211'
         client.action('write_memory', address=marker, hex='1122334455667788')

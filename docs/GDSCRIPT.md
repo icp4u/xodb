@@ -160,3 +160,9 @@ are kept; control characters are shown as `?`.
   (`GDScriptModuleIdentityUnavailable`).
 - **Remote targets** (the runtime agent) keep the fixed 256 MiB bound for
   whole-file transfers, so an engine with DWARF is refused there.
+
+Runtime-agent sessions retain the fixed 256 MiB image-transfer limit, even
+when `--image-limit` is larger. An engine above that limit reports
+`GDScriptImageBudgetExceeded`; its unavailable tab cannot be selected. The
+large-engine stack and frame-pairing oracle runs natively; the agent GUI
+oracle checks this refusal and unchanged target state.

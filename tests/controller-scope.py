@@ -55,6 +55,8 @@ try:
                 name=definition['name']
                 # Missing fields must not reach a hidden handler either.
                 calls=[{}]
+                if name in ('continue','write_memory'):
+                    calls.extend(dict(process_id=value) for value in ('invalid',1.5,2**63,-1,999999))
                 if name=='add_language_watch':calls.extend(dict(generation=state['generation'],language=language,tid=tid,segment=0,frame=0,expression='x') for language in ('lua','python','perl','ruby'))
                 elif name=='remove_language_watch':calls.append(dict(generation=state['generation'],id=1))
                 elif name in ('cancel_debug_metadata','retry_debug_metadata'):calls.append(dict(id=1))
@@ -97,6 +99,8 @@ try:
                 for definition in shared_restricted:
                     name=definition['name'];assert name not in listed
                     arguments=[{}]
+                    if name in ('continue','write_memory'):
+                        arguments.extend(dict(process_id=value) for value in ('invalid',1.5,2**63,-1,999999))
                     if name=='add_language_watch':arguments.extend(dict(generation=state['generation'],language=language,tid=state['pid'],segment=0,frame=0,expression='x') for language in ('lua','python','perl','ruby'))
                     for params in arguments:
                         reply=observer.raw(name,**params);why=error(reply)

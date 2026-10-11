@@ -369,6 +369,9 @@ pub const View = struct {
 
     pub fn input(self: *View, w: *Window, now: u64) void {
         defer self.windowActions(w);
+        defer if (memmap.gibson.heldInput(self, &w.input, self.gibsonMap() and !self.searching, now)) {
+            w.dirty = true;
+        };
         if (!self.gibsonMap()) self.memmap.city.drag = null;
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };

@@ -51,7 +51,7 @@ def latest():
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1])) if rows else {}
 
 def until(fn, name):
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 10 * h.load_scale()
     while time.monotonic() < deadline:
         if not d.alive():
             raise AssertionError(d.tail())
@@ -69,7 +69,7 @@ def capture(name):
 
 def key(code, predicate, name):
     helper = d.keys('tap', code, wait=False)
-    if helper.wait(timeout=10):
+    if helper.wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
     return until(predicate, name)
 
@@ -141,7 +141,7 @@ try:
     key(45, lambda r: r.get('generation') == '1', 'recreate renderer')
     check('renderer recreation preserves scene and font atlas', red(depth_pixel(capture('reinitialized'))))
     for width, height in ((40, 40), (640, 480), (1280, 720)):
-        subprocess.run(['swaymsg', '-t', 'command', f'output HEADLESS-1 mode {width}x{height}'], env=d.env, capture_output=True, check=True, timeout=10)
+        subprocess.run(['swaymsg', '-t', 'command', f'output HEADLESS-1 mode {width}x{height}'], env=d.env, capture_output=True, check=True, timeout=10 * h.load_scale())
         until(lambda r: r.get('size') == f'{width}x{height}' or (width == 40 and r.get('bytes') == '0'), 'resize scene')
         if width == 40:
             check('empty logical panel allocates no zero-sized images', latest().get('bytes') == '0')

@@ -100,6 +100,11 @@ def alive(pid):
 def client(fixture, *options):
     c = Client('observe', str(fixture), options=list(options))
     s = stopped(c)
+    # The runtime agent remains a direct child for the whole connection. The
+    # inferior is its child; an analysis supervisor is an additional sibling.
+    c.backend_pid = c.collector_pid() if c.runtime_agent else None
+    expected = {c.backend_pid if c.backend_pid is not None else s['pid']}
+    assert children(c.p.pid) == expected, (children(c.p.pid), expected)
     return c, s['pid']
 
 def close(c):
@@ -161,7 +166,9 @@ def bounded(case, c, xodb_pid, target_pid, r, code, limit_ms):
     ok = r.get('status') in ('failed', 'cancelled') and failure.get('code') == code and job.get('elapsed_ms', 1e9) <= limit_ms
     check(f'{case}: {code} within {limit_ms} ms', ok, r)
     check(f'{case}: worker process gone', worker is not None and not alive(worker), worker)
-    extra = children(xodb_pid) - {target_pid}
+    extra = children(xodb_pid) - {c.backend_pid if c.backend_pid is not None else target_pid}
+    if c.backend_pid is not None:
+        extra |= children(c.backend_pid) - {target_pid}
     check(f'{case}: no leaked child of xodb', not extra, sorted(extra))
 
 def lifecycle():

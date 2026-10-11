@@ -55,6 +55,7 @@ import struct
 import subprocess
 import time
 from client import Client
+from helpers.input import load_scale
 
 MIB = 1 << 20
 BIG = 300 * MIB
@@ -666,10 +667,17 @@ MAPS = r'''
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <string.h>
 __attribute__((noinline)) int marker(int n) { __asm__ volatile("" ::: "memory"); return n + 1; }
 int main(int argc, char **argv) {
     int n = argc > 1 ? atoi(argv[1]) : 0, fd = open(argc > 2 ? argv[2] : "/proc/self/exe", O_RDONLY);
-    for (int i = 0; i < n; i++) if (mmap(0, 4096, argc > 3 ? PROT_READ | PROT_EXEC : PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 2;
+    for (int i = 0; i < n; i++) if (mmap(0, 4096, argc > 3 && !strcmp(argv[3], "x") ? PROT_READ | PROT_EXEC : PROT_READ, MAP_PRIVATE, fd, 0) == MAP_FAILED) return 2;
+    if (argc > 3 && !strcmp(argv[3], "unreadable")) {
+        if (fchmod(fd, 0)) return 3;
+        marker(n);
+        if (fchmod(fd, 0644)) return 4;
+    }
     return marker(n) < 0;
 }
 '''
@@ -722,6 +730,77 @@ def mappings(w, a, result):
     assert [f['diagnostic'] for f in failures if f['path'].endswith('/mp_segments.so')] == ['MappingLimit'], failures
     assert seconds < max(2.0, 100 * base), (seconds, base)
     result['mappings'] = {'base_seconds': round(base, 3), 'seconds': rows, 'refused_seconds': round(seconds, 3)}
+    # Repeated lookup cost belongs to each file, not each alias, including
+    # cached parse failures and a file whose very first open is refused.
+    pe = bytearray(4096)
+    pe[:2] = b'MZ'; struct.pack_into('<I', pe, 60, 64); pe[64:68] = b'PE\0\0'
+    struct.pack_into('<HHIIIHH', pe, 68, 0x8664, 1, 0, 0, 0, 240, 0x2022)
+    struct.pack_into('<H', pe, 88, 0x20b)
+    struct.pack_into('<Q', pe, 112, 0x180000000)
+    struct.pack_into('<II', pe, 120, 0x200, 0x200)
+    struct.pack_into('<II', pe, 144, 4096, 0x200)
+    struct.pack_into('<I', pe, 196, 16)
+    struct.pack_into('<8sIIIIIIHHI', pe, 328, b'.text', 512, 512, 512, 512, 0, 0, 0, 0, 0x60000020)
+    (w/'mapped.dll').write_bytes(pe)
+    (w/'malformed-mz').write_bytes(b'MZ\0\0garbage')
+    (w/'unreadable').write_bytes((w/'lk_ok.so').read_bytes())
+    kinds = {'elf': w/'lk_ok.so', 'pe': w/'mapped.dll', 'malformed_mz': w/'malformed-mz', 'unreadable': w/'unreadable'}
+    repeated = {}
+    ticks = os.sysconf('SC_CLK_TCK')
+    def usage(client):
+        fields = Path(f'/proc/{client.p.pid}/stat').read_text().rsplit(')', 1)[1].split()
+        return {'cpu_seconds': (int(fields[11]) + int(fields[12])) / ticks,
+                'rss_bytes': int(fields[21]) * os.sysconf('SC_PAGESIZE')}
+    for kind, path in kinds.items():
+        client = Client('control', str(w/'maps'), args=['40000', str(path), *(['unreadable'] if kind == 'unreadable' else ['x'] if kind == 'pe' else [])],
+                        options=('--break', 'marker'), reply_seconds=120 * load_scale())
+        try:
+            client.continue_initial_stop(); session = client.stopped('breakpoint', seconds=120 * load_scale())
+            frame = client.inspect('get_stack', tid=session['threads'][0]['tid'])['frames'][0]
+            assert frame['symbol'] == 'marker' and frame['diagnostic'] is None, frame
+            if kind == 'unreadable':
+                assert path.stat().st_mode & 0o777 == 0
+                try: path.open('rb').close()
+                except PermissionError: pass
+                else: raise AssertionError('unreadable fixture is readable')
+            def lookup():
+                deadline = time.monotonic() + 30 * load_scale()
+                while True:
+                    reply = client.tool('find_symbol', name='xodb_absent_mapping_probe')['result']
+                    if not reply.get('isError') or reply['content'][0]['text'] != 'SymbolDiscoveryPending': return reply
+                    assert time.monotonic() < deadline, reply
+                    time.sleep(.001)
+            first = lookup()
+            assert first.get('isError'), first
+            before = usage(client); start = time.monotonic()
+            second = lookup()
+            assert second == first, (kind, first, second)
+            second_seconds = time.monotonic() - start
+            for _ in range(4): assert lookup() == first
+            after = usage(client)
+            repeated[kind] = {'second_seconds': second_seconds, 'repeat_cpu_seconds': after['cpu_seconds'] - before['cpu_seconds'],
+                              'before': before, 'after': after, 'answer': first['content'][0]['text']}
+            if kind == 'unreadable':
+                client.action('continue'); client.stopped('breakpoint', seconds=30 * load_scale())
+                assert path.stat().st_mode & 0o777 == 0o644
+                recovered = lookup()
+                assert recovered['content'][0]['text'] == 'SymbolNotFound', recovered
+                repeated[kind]['after_permission_restore'] = recovered['content'][0]['text']
+
+        finally:
+            shut(client)
+            if kind == 'unreadable': path.chmod(0o644)
+    result['mappings']['repeated'] = repeated
+    result['mappings']['load'] = os.getloadavg()[0]
+    result['mappings']['cpu_count'] = len(os.sched_getaffinity(0))
+    # CPU avoids scheduler wall time; tick granularity is part of the measured
+    # ELF control. Old per-alias opens spend seconds on these same lookups.
+    control = repeated['elf']['repeat_cpu_seconds'] + 1 / ticks
+    for kind, row in repeated.items():
+        cost = row['repeat_cpu_seconds']
+        if a.wrong_result and kind == 'malformed_mz': cost += 100 * control
+        assert cost <= 20 * control, (kind, row, repeated['elf'])
+
 
 
 def refused(w, a, result):

@@ -7,7 +7,7 @@
  * different input layouts. The source and its identity belong to the caller;
  * reads must be exact and the caller validates identity before publication. */
 enum xpe_status { XPE_OK, XPE_NOT_PE, XPE_UNSUPPORTED, XPE_MALFORMED,
-    XPE_LIMIT, XPE_IO, XPE_CHANGED, XPE_CANCELLED, XPE_NOMEM, XPE_NOT_FOUND };
+    XPE_LIMIT, XPE_IO, XPE_CHANGED, XPE_CANCELLED, XPE_NOMEM, XPE_NOT_FOUND, XPE_BUDGET };
 enum xpe_layout { XPE_FILE, XPE_MEMORY };
 struct xpe_source {
     void *context;
@@ -40,7 +40,7 @@ struct xpe_import {
 struct xpe_function { uint32_t begin, end, unwind, record_rva; };
 struct xpe_codeview { unsigned char guid[16]; uint32_t age; const char *path; };
 struct xpe_info {
-    uint64_t preferred_base, source_bytes, source_reads, retained_bytes;
+    uint64_t preferred_base, source_bytes, source_reads, retained_bytes, peak_bytes;
     uint32_t image_size, headers_size, entry_rva, timestamp;
     uint32_t section_alignment, file_alignment;
     uint16_t machine, characteristics;
@@ -51,6 +51,9 @@ struct xpe_info {
 };
 struct xpe_image;
 enum xpe_status xpe_load(const struct xpe_source *, struct xpe_image **);
+/* A smaller caller allowance returns XPE_BUDGET, distinct from format/work
+ * caps. Peak includes temporary arrays and allocation growth. */
+enum xpe_status xpe_load_budget(const struct xpe_source *, uint64_t allowance, struct xpe_image **);
 /* Compare loaded placement headers against parsed file metadata. The loaded
  * preferred base may be relocated; structural fields and directories must
  * agree. This does not prove map coverage or stopped-generation coherence. */

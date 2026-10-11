@@ -1,4 +1,5 @@
 {
+  "wine": { "hide_internal_threads": false },
   "appearance": {
     "theme": "builtin:dark"
   },

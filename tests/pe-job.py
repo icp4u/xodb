@@ -31,7 +31,8 @@ exe=w/'check'
 flags=['-O1','-fsanitize=address,undefined','-fno-omit-frame-pointer'] if a.sanitize else ['-O2']
 run('compile',['clang' if a.sanitize else 'cc','-std=c11','-g','-DNDEBUG','-Wall','-Wextra','-Werror','-Wswitch-enum',*flags,
  'tests/pe-job.c','src/binary/pe_job.c','src/binary/pe.c','src/binary/pdb.c',str(a.library.resolve()),'-Wl,--wrap=xrt_file_view_read','-pthread','-latomic','-ldl','-o',str(exe)])
-for mode in ('plain','cancel','barrier','mutation','wrong-result'):
+shutil.copyfile(a.image.with_suffix('.pdb'), w/a.image.with_suffix('.pdb').name)
+for mode in ('plain','cancel','barrier','mutation','budget','wrong-result'):
  image=w/(mode+'.dll');shutil.copyfile(a.image,image)
  run(mode,[str(exe),str(image),mode],expected=-6 if mode=='wrong-result' else 0,timeout=60)
 print(json.dumps(dict(status='pass',checks=len(rows),elapsed_seconds=time.monotonic()-start)))

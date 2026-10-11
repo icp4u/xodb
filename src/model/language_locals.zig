@@ -10,7 +10,7 @@ pub const Value = struct {
     diagnostic: ?[]const u8 = null,
     advisory: bool = false,
     truncated: bool = false,
-    children: []Child = &.{},
+    children: []const Child = &.{},
 };
 pub const Row = struct {
     name: []const u8,
@@ -39,7 +39,7 @@ pub const Result = struct {
     start: usize,
     total: usize,
     truncated: bool,
-    rows: []Row,
+    rows: []const Row,
     diagnostic: ?[]const u8,
     runtime_version: []const u8,
     runtime_build_id: []const u8,

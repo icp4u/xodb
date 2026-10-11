@@ -352,12 +352,11 @@ test "GUI does not cancel a different MCP reconstruction" {
 }
 
 test "sample inspector never substitutes an out-of-filter sample for an empty selection" {
-    const Inspector = @import("../ui/sample_inspector.zig").Inspector;
+    const sample_view = @import("../model/sample_view.zig");
     const capture = try build(90, 4096);
     defer capture.deinit();
-    var inspector = Inspector{ .open = true, .ordinal = 0 };
-    inspector.sync(capture, .{ .from_ns = 1_000_000, .to_ns = 2_000_000 });
-    try std.testing.expectEqual(capture.samples.len(), inspector.ordinal);
-    inspector.sync(capture, .{ .tid = 4101 });
-    try std.testing.expect(Inspector.matches(capture, .{ .tid = 4101 }, inspector.ordinal));
+    var ordinal = sample_view.choose(capture, .{ .from_ns = 1_000_000, .to_ns = 2_000_000 }, 0);
+    try std.testing.expectEqual(capture.samples.len(), ordinal);
+    ordinal = sample_view.choose(capture, .{ .tid = 4101 }, ordinal);
+    try std.testing.expect(sample_view.matches(capture, .{ .tid = 4101 }, ordinal));
 }

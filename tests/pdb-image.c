@@ -52,6 +52,14 @@ int main(int argc,char **argv) {
         free(bytes);xpe_destroy(pe);CHECK(!fclose(file));return 0;
     }
     fprintf(stderr,"PDB status: %s\n",xpdb_status_name(status));CHECK(status==XPDB_OK && image);
+    if(argc==4 && !strcmp(argv[3],"budget")) {
+        uint64_t peak=xpdb_info(image)->peak_bytes;
+        CHECK(peak>=xpdb_info(image)->retained_bytes && peak<=XPDB_MAX_ALLOCATED_BYTES);
+        xpdb_destroy(image);image=NULL;
+        CHECK(xpdb_load_budget(bytes,size,cv->guid,cv->age,sections,count,peak-1,&image)==XPDB_BUDGET && !image);
+        CHECK(xpdb_load_budget(bytes,size,cv->guid,cv->age,sections,count,peak,&image)==XPDB_OK && image);
+        CHECK(xpdb_info(image)->peak_bytes==peak);
+    }
     /* The result must own its names and rows. Poison/free source before use. */
     memset(bytes,0xa5,size);free(bytes);
     CHECK(xpdb_info(image)->public_count && xpdb_info(image)->line_count);

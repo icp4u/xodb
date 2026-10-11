@@ -190,19 +190,86 @@ pub const Camera = struct {
     zoom: f32 = 1,
     pan: [2]f32 = .{ 0, 0 },
     elapsed: f32 = 0,
+    dolly: f32 = 1,
     last: u64 = 0,
-    pub fn tick(self: *Camera, now: u64) void {
-        if (self.automatic and self.last != 0) {
-            const delta = @min(now -| self.last, 100_000_000);
-            self.elapsed += @as(f32, @floatFromInt(delta)) / 1e9;
-            self.yaw += @as(f32, @floatFromInt(delta)) / 1e9 * 0.045;
-        }
+    auto_until: u64 = 0,
+    active: bool = true,
+    // Forward, right, yaw, pitch and logarithmic zoom, in units per second.
+    held: [5]f32 = @splat(0),
+    velocity: [5]f32 = @splat(0),
+    pub const idle_ns = 5 * std.time.ns_per_s;
+
+    pub fn animating(self: *const Camera, now: u64) bool {
+        if (!self.active) return false;
+        if (self.automatic and (self.auto_until == 0 or now < self.auto_until)) return true;
+        for (self.held, self.velocity) |held, velocity| if (held != 0 or velocity != 0) return true;
+        return false;
+    }
+    pub fn cancelMotion(self: *Camera, now: u64) void {
+        self.held = @splat(0);
+        self.velocity = @splat(0);
         self.last = now;
+    }
+    pub fn controls(self: *Camera, held: [5]f32, active: bool, now: u64, span: f32) bool {
+        if (!active) {
+            const changed = self.active;
+            self.cancelMotion(now);
+            self.active = false;
+            return changed;
+        }
+        if (self.active and std.meta.eql(held, self.held)) return false;
+        if (self.active) self.tick(now, span) else self.last = now;
+        self.active = true;
+        self.held = held;
+        for (held) |value| if (value != 0) {
+            self.automatic = false;
+            break;
+        };
+        return true;
+    }
+    pub fn fly(self: *Camera, now: u64) void {
+        self.cancelMotion(now);
+        self.automatic = !self.automatic or (self.auto_until != 0 and now >= self.auto_until);
+        self.auto_until = now +| idle_ns;
+    }
+    pub fn tick(self: *Camera, now: u64, span: f32) void {
+        const dt = @as(f32, @floatFromInt(@min(now -| self.last, 100_000_000))) / 1e9;
+        const first = self.last == 0;
+        self.last = now;
+        if (!self.active) return;
+        if (self.automatic) {
+            if (self.auto_until == 0) self.auto_until = now +| idle_ns;
+            if (now >= self.auto_until) {
+                self.automatic = false;
+            } else if (!first) {
+                self.elapsed += dt;
+                self.yaw += dt * 0.045;
+                self.dolly = 1 + @sin(self.elapsed * 0.17) * 0.12;
+            }
+        }
+        if (first or dt == 0) return;
+        // Integrate exponential easing analytically, so changing frame or key
+        // repeat rate does not change distance over the same held interval.
+        const tau: f32 = 0.04;
+        const decay = @exp(-dt / tau);
+        var distance: [5]f32 = undefined;
+        for (&self.velocity, self.held, &distance) |*velocity, target, *step| {
+            step.* = target * dt + (velocity.* - target) * tau * (1 - decay);
+            velocity.* = target + (velocity.* - target) * decay;
+            if (target == 0 and @abs(velocity.*) < 0.001) velocity.* = 0;
+        }
+        const speed = @max(6, span * 0.24) * self.zoom;
+        self.pan[0] += (-@sin(self.yaw) * distance[0] + @cos(self.yaw) * distance[1]) * speed;
+        self.pan[1] += (-@cos(self.yaw) * distance[0] - @sin(self.yaw) * distance[1]) * speed;
+        self.pan[0] = std.math.clamp(self.pan[0], -span * 3, span * 3);
+        self.pan[1] = std.math.clamp(self.pan[1], -span * 3, span * 3);
+        self.yaw += distance[2] * 1.5;
+        self.pitch = std.math.clamp(self.pitch + distance[3], 0.10, 1.45);
+        self.zoom = std.math.clamp(self.zoom * @exp(distance[4] * 1.2), 0.10, 4);
     }
     pub fn matrix(self: *const Camera, width: f32, depth: f32, aspect: f32) ?math.Mat4 {
         const span = @max(5, @max(width, depth));
-        const dolly: f32 = if (self.automatic) 1 + @sin(self.elapsed * 0.17) * 0.12 else 1;
-        const distance = span * 1.0 * self.zoom * dolly;
+        const distance = span * self.zoom * self.dolly;
         const target: math.Vec3 = .{ width / 2 + self.pan[0], 0.6, depth / 2 + self.pan[1] };
         const eye = math.add(target, .{ @sin(self.yaw) * @cos(self.pitch) * distance, @sin(self.pitch) * distance, @cos(self.yaw) * @cos(self.pitch) * distance });
         return math.mul((math.perspective(0.95, aspect, 0.05, span * 20 + 100) orelse return null), math.lookAt(eye, target, .{ 0, 1, 0 }) orelse return null);
@@ -281,15 +348,64 @@ test "city camera rejects empty aspect, bounds dolly and pan, and pauses flythro
     var camera = Camera{};
     try t.expect(camera.matrix(10, 10, 0) == null);
     try t.expect(math.inverse(camera.matrix(10, 10, 16.0 / 9.0).?) != null);
-    camera.tick(1);
-    camera.tick(1_000_000_001);
+    camera.tick(1, 10);
+    camera.tick(1_000_000_001, 10);
     try t.expect(camera.yaw > 0.7 and camera.yaw < 0.71);
     camera.wheel(-1000);
     for (0..100) |_| camera.wheel(-1000);
     try t.expectEqual(@as(f32, 0.1), camera.zoom);
     const yaw = camera.yaw;
-    camera.tick(2_000_000_001);
+    camera.tick(2_000_000_001, 10);
     try t.expectEqual(yaw, camera.yaw);
     for (0..10000) |_| camera.move(1, 1, 10);
     try t.expect(@abs(camera.pan[0]) <= 30 and @abs(camera.pan[1]) <= 30);
+}
+
+test "held camera distance follows elapsed time across frame rates and settles without redraw" {
+    const t = std.testing;
+    var fine = Camera{ .automatic = false };
+    var coarse = fine;
+    const held: [5]f32 = .{ 1, 1, 0, 0, 0 };
+    _ = fine.controls(held, true, 1, 10);
+    _ = coarse.controls(held, true, 1, 10);
+    for (1..101) |i| fine.tick(1 + i * 10_000_000, 10);
+    for (1..21) |i| coarse.tick(1 + i * 50_000_000, 10);
+    for (fine.pan, coarse.pan) |left, right| try t.expectApproxEqAbs(left, right, 0.00001);
+    const expected = 6 * (1 - 0.04 * (1 - @exp(@as(f32, -25))));
+    const distance = @sqrt(fine.pan[0] * fine.pan[0] + fine.pan[1] * fine.pan[1]);
+    const wrong = std.c.getenv("XODB_TEST_WRONG_CAMERA") != null;
+    try t.expectApproxEqAbs(expected * @sqrt(@as(f32, if (wrong) 1 else 2)), distance, 0.00001);
+    _ = fine.controls(@splat(0), true, 1_000_000_001, 10);
+    try t.expect(fine.animating(1_000_000_001));
+    for (1..21) |i| fine.tick(1_000_000_001 + i * 20_000_000, 10);
+    try t.expect(!fine.animating(1_400_000_001));
+    const stopped = fine.pan;
+    fine.tick(2_000_000_001, 10);
+    try t.expectEqual(stopped, fine.pan);
+}
+
+test "camera focus loss cancels immediately and idle flythrough preserves its last pose" {
+    const t = std.testing;
+    var camera = Camera{};
+    _ = camera.controls(.{ 1, 0, 1, 1, -1 }, true, 1, 10);
+    camera.tick(50_000_001, 10);
+    _ = camera.controls(@splat(0), false, 50_000_001, 10);
+    const stopped = camera;
+    camera.tick(1_000_000_001, 10);
+    try t.expectEqual(stopped.pan, camera.pan);
+    try t.expectEqual(stopped.yaw, camera.yaw);
+    try t.expectEqual(stopped.pitch, camera.pitch);
+    try t.expectEqual(stopped.zoom, camera.zoom);
+    try t.expect(!camera.animating(1_000_000_001));
+    _ = camera.controls(@splat(0), true, 1_000_000_001, 10);
+    camera.fly(1_000_000_001);
+    camera.tick(1_050_000_001, 10);
+    const matrix = camera.matrix(10, 10, 1).?;
+    camera.tick(1_000_000_001 + Camera.idle_ns, 10);
+    try t.expect(!camera.animating(1_000_000_001 + Camera.idle_ns));
+    try t.expectEqual(matrix, camera.matrix(10, 10, 1).?);
+    // An idle deadline can precede the next repaint. F still restarts orbit.
+    camera.automatic = true;
+    camera.fly(camera.auto_until + 1);
+    try t.expect(camera.automatic);
 }

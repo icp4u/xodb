@@ -135,7 +135,48 @@ const running_bit: u8 = 1;
 const off_bit: u8 = 2;
 const unknown_bit: u8 = 4;
 
+/// Viewport and committed selection sent to owner-side preparation.
+pub const Request = struct {
+    session_id: u64 = 0,
+    capture_id: u64 = 0,
+    range: ?Range = null,
+    tid: ?u32 = null,
+    tids: model.ThreadSet = .{},
+    view: ?Range = null,
+    first_lane: usize = 0,
+    pointer: ?[2]f32 = null,
+    bounds: gpu.Rect,
+};
+pub const Readout = struct { text: []const u8, tone: enum { text, weak, warm } = .weak };
+/// Only bounded display runs and the metadata needed by local navigation.
+/// Raw sample/scheduler/overlay histories stay with the owner.
+pub const Prepared = struct {
+    session_id: u64,
+    request: Request,
+    normalized: Request,
+    data: Data,
+    diagnostic: ?[]const u8,
+    buckets: []const [2]u32,
+    bucket_px: usize,
+    bucket_peak: u32,
+    density_peak: u32,
+    state_runs: []const Run,
+    density_runs: []const Run,
+    markers: []const Marker,
+    state_first: [max_visible_lanes + 1]u16,
+    density_first: [max_visible_lanes + 1]u16,
+    marker_first: [max_visible_lanes + 1]u16,
+    readout: Readout,
+};
+comptime {
+    @setEvalBranchQuota(20000);
+    @import("../model/debugger_view.zig").requireImmutable(Prepared);
+}
+
 pub const TimelineView = struct {
+    session_id: u64 = 0,
+    prepared: ?Prepared = null,
+    pending: bool = false,
     capture_id: u64 = 0,
     revision: u64 = 0,
     extent_ns: u64 = 0,
@@ -170,6 +211,160 @@ pub const TimelineView = struct {
     masks: [max_columns]u8 = undefined,
     counts: [max_columns]u32 = undefined,
 
+    pub fn request(self: *const TimelineView, bounds: gpu.Rect) Request {
+        return .{ .session_id = self.session_id, .capture_id = self.capture_id, .range = self.range, .tid = self.tid, .tids = self.tids, .view = self.view, .first_lane = self.first_lane, .pointer = self.pointer, .bounds = bounds };
+    }
+    /// Owner only. Reuse the existing exact history-to-pixel reduction.
+    pub fn prepare(self: *TimelineView, a: std.mem.Allocator, session_id: u64, wanted: Request, data: *const Data) !Prepared {
+        self.prepared = null;
+        const same = wanted.session_id == session_id and wanted.capture_id == data.capture_id;
+        if (self.session_id != session_id) self.* = .{};
+        _ = self.sync(data);
+        self.session_id = session_id;
+        if (same) {
+            self.range = wanted.range;
+            self.tid = wanted.tid;
+            self.tids = wanted.tids;
+            self.view = wanted.view;
+            self.first_lane = wanted.first_lane;
+            _ = self.normalizeSelection(data);
+        }
+        self.pointer = wanted.pointer;
+        self.layout(wanted.bounds, data);
+        self.rebuild(data);
+        const lanes = try a.alloc(Lane, data.lanes.len);
+        for (data.lanes, lanes) |lane, *out| out.* = .{ .tid = lane.tid, .debugger_id = lane.debugger_id, .label = try a.dupe(u8, lane.label) };
+        const g = self.geometry;
+        const view_ = self.currentView();
+        const span = view_.to_ns - view_.from_ns;
+        // The painter consults exact off-CPU intervals only for wide labels.
+        // Preserve those intervals, not every recorded scheduling transition.
+        for (0..g.visible) |row| {
+            var intervals: std.ArrayList(Interval) = .empty;
+            const index = self.first_lane + row;
+            for (self.state_runs[self.state_first[row]..self.state_first[row + 1]]) |run| {
+                if (run.value != off_bit or @as(f32, @floatFromInt(run.x1 - run.x0)) * g.plot.w / @as(f32, @floatFromInt(g.cols)) < 96) continue;
+                const mid = view_.from_ns + boundedTime(@as(f64, @floatFromInt(run.x0 + run.x1)) / 2 / @as(f64, @floatFromInt(g.cols)) * @as(f64, @floatFromInt(span)), span);
+                if (intervalAt(data.lanes[index].intervals, mid)) |interval| {
+                    if (intervals.items.len > 0 and intervals.items[intervals.items.len - 1].from_ns == interval.from_ns) continue;
+                    var owned = interval;
+                    owned.detail = try a.dupe(u8, interval.detail);
+                    try intervals.append(a, owned);
+                }
+            }
+            lanes[index].intervals = intervals.items;
+        }
+        // Keep the union of overlays actually drawn in overview and lanes,
+        // in original order, so each existing bounded painter sees its marks.
+        var selected: std.AutoHashMapUnmanaged(usize, void) = .empty;
+        defer selected.deinit(a);
+        try retainMarks(a, &selected, g.overview, .{ .from_ns = 0, .to_ns = data.extent_ns }, data.marks, null, max_drawn_marks);
+        for (0..g.visible) |row| try retainMarks(a, &selected, g.plot, view_, data.marks, data.lanes[self.first_lane + row].tid, max_lane_marks);
+        const order = try a.alloc(usize, selected.count());
+        var it = selected.keyIterator();
+        var next: usize = 0;
+        while (it.next()) |id| : (next += 1) order[next] = id.*;
+        std.mem.sort(usize, order, {}, std.sort.asc(usize));
+        const marks = try a.alloc(Mark, order.len);
+        for (order, marks) |id, *out| {
+            out.* = data.marks[id];
+            out.label = ""; // Exact hover text is prepared from full history.
+        }
+        var display = data.*;
+        display.lanes = lanes;
+        display.marks = marks;
+        if (data.state_label) |text| display.state_label = try a.dupe(u8, text);
+        var buffer: [512]u8 = undefined;
+        const footer_text = self.readout(&buffer, data);
+        return .{
+            .session_id = session_id,
+            .request = wanted,
+            .normalized = self.request(wanted.bounds),
+            .data = display,
+            .diagnostic = if (self.diagnostic) |text| try a.dupe(u8, text) else null,
+            .buckets = try a.dupe([2]u32, self.buckets[0..self.bucket_count]),
+            .bucket_px = self.bucket_px,
+            .bucket_peak = self.bucket_peak,
+            .density_peak = self.density_peak,
+            .state_runs = try a.dupe(Run, self.state_runs[0..self.state_first[g.visible]]),
+            .density_runs = try a.dupe(Run, self.density_runs[0..self.density_first[g.visible]]),
+            .markers = try a.dupe(Marker, self.markers[0..self.marker_first[g.visible]]),
+            .state_first = self.state_first,
+            .density_first = self.density_first,
+            .marker_first = self.marker_first,
+            .readout = .{ .text = try a.dupe(u8, footer_text.text), .tone = footer_text.tone },
+        };
+    }
+    /// Frontend only. Every borrowed field is replaced before the old
+    /// publication can be touched; selection and drag state are local values.
+    pub fn present(self: *TimelineView, value: ?Prepared, bounds: gpu.Rect) bool {
+        self.prepared = null;
+        self.diagnostic = null;
+        self.pending = false;
+        const incoming = value orelse return false;
+        const before = self.filter();
+        const replaced = self.session_id != incoming.session_id or self.capture_id != incoming.data.capture_id;
+        if (!replaced and !sameRequest(self.request(bounds), incoming.request)) {
+            self.pending = true;
+            return false;
+        }
+        if (self.session_id != incoming.session_id) self.* = .{ .geometry = self.geometry, .pointer = self.pointer };
+        _ = self.sync(&incoming.data);
+        self.session_id = incoming.session_id;
+        self.range = incoming.normalized.range;
+        self.tid = incoming.normalized.tid;
+        self.tids = incoming.normalized.tids;
+        self.view = incoming.normalized.view;
+        self.first_lane = incoming.normalized.first_lane;
+        self.layout(bounds, &incoming.data);
+        self.diagnostic = incoming.diagnostic;
+        self.bucket_count = incoming.buckets.len;
+        self.bucket_px = incoming.bucket_px;
+        self.bucket_peak = incoming.bucket_peak;
+        self.density_peak = incoming.density_peak;
+        @memcpy(self.buckets[0..incoming.buckets.len], incoming.buckets);
+        @memcpy(self.state_runs[0..incoming.state_runs.len], incoming.state_runs);
+        @memcpy(self.density_runs[0..incoming.density_runs.len], incoming.density_runs);
+        @memcpy(self.markers[0..incoming.markers.len], incoming.markers);
+        self.state_first = incoming.state_first;
+        self.density_first = incoming.density_first;
+        self.marker_first = incoming.marker_first;
+        self.prepared = incoming;
+        return !std.meta.eql(before, self.filter());
+    }
+    fn sameRequest(a: Request, b: Request) bool {
+        var left = a;
+        var right = b;
+        // Pointer movement changes only the exact hover readout. It must not
+        // starve the graph while a replacement tooltip is being prepared.
+        left.pointer = null;
+        right.pointer = null;
+        return std.meta.eql(left, right);
+    }
+    pub fn drawPrepared(self: *TimelineView, r: *gpu.Renderer, font: *Font, bounds: gpu.Rect) !void {
+        const ready = if (self.prepared) |value| sameRequest(self.request(bounds), value.normalized) else false;
+        if (!ready and self.prepared != null) self.pending = true;
+        try self.draw(r, font, bounds, if (ready) &self.prepared.?.data else null);
+    }
+
+    fn retainMarks(a: std.mem.Allocator, selected: *std.AutoHashMapUnmanaged(usize, void), rect: gpu.Rect, view_: Range, marks: []const Mark, tid_: ?u32, cap: usize) !void {
+        var drawn: usize = 0;
+        var last_x: f32 = -1;
+        var last_kind: ?MarkKind = null;
+        for (marks, 0..) |mark, index| {
+            if (drawn == cap) break;
+            if (mark.to_ns < view_.from_ns or mark.from_ns > view_.to_ns) continue;
+            if (tid_ != null and mark.tid != null and mark.tid.? != tid_.?) continue;
+            const x0 = xAt(rect, view_.from_ns, view_.to_ns - view_.from_ns, @max(mark.from_ns, view_.from_ns));
+            const x1 = @max(x0 + 1.5, xAt(rect, view_.from_ns, view_.to_ns - view_.from_ns, @min(mark.to_ns, view_.to_ns)));
+            if (last_kind == mark.kind and x1 - last_x < 1) continue;
+            last_x = x1;
+            last_kind = mark.kind;
+            try selected.put(a, index, {});
+            drawn += 1;
+        }
+    }
+
     /// Call with the current data before input and drawing. Returns true when
     /// the committed selection changed, so the coordinator must re-filter.
     pub fn sync(self: *TimelineView, data: *const Data) bool {
@@ -188,6 +383,9 @@ pub const TimelineView = struct {
         self.extent_ns = data.extent_ns;
         self.lane_count = data.lanes.len;
         self.diagnostic = data.validate();
+        return self.normalizeSelection(data);
+    }
+    fn normalizeSelection(self: *TimelineView, data: *const Data) bool {
         var changed = false;
         // Growth keeps the selection. A shorter extent clips it, and a range
         // wholly beyond the new end selects the whole capture again.
@@ -545,7 +743,7 @@ pub const TimelineView = struct {
         try r.textFit(font, bounds.x + 14, bounds.y + 9, 120, "TIMELINE", theme.text);
         const current = data orelse {
             self.geometry = .{ .bounds = bounds };
-            try r.textFit(font, bounds.x + 14, bounds.y + 40, bounds.w - 28, "No capture. Sample density and thread lanes appear while capturing.", theme.weak);
+            try r.textFit(font, bounds.x + 14, bounds.y + 40, bounds.w - 28, if (self.pending) "Preparing timeline for the current selection" else "No capture. Sample density and thread lanes appear while capturing.", theme.weak);
             return;
         };
         self.layout(bounds, current);
@@ -556,7 +754,7 @@ pub const TimelineView = struct {
             return;
         }
         if (g.cols == 0) return;
-        self.rebuild(current);
+        if (self.prepared == null) self.rebuild(current);
         try self.drawOverview(r, font, current);
         try self.drawAxis(r, font);
         try self.drawLanes(r, font, current);
@@ -748,12 +946,20 @@ pub const TimelineView = struct {
         if (selected.to_ns <= view.to_ns) try r.rect(.{ .x = x1 - 1, .y = rect.y, .w = 1, .h = rect.h }, style.fade(theme.focus, 0.9));
     }
     fn footer(self: *TimelineView, r: *gpu.Renderer, font: *Font, data: *const Data) !void {
+        var buffer: [512]u8 = undefined;
+        const line = if (self.prepared) |prepared| (if (std.meta.eql(self.pointer, prepared.request.pointer)) prepared.readout else Readout{ .text = "Preparing timeline detail" }) else self.readout(&buffer, data);
         const g = self.geometry;
-        const y = g.bounds.y + g.bounds.h - footer_h + 2;
-        const w = g.bounds.w - 28;
+        try r.textFit(font, g.bounds.x + 14, g.bounds.y + g.bounds.h - footer_h + 2, g.bounds.w - 28, line.text, switch (line.tone) {
+            .text => theme.text,
+            .weak => theme.weak,
+            .warm => theme.warm,
+        });
+    }
+    fn readout(self: *TimelineView, buffer: []u8, data: *const Data) Readout {
+        const g = self.geometry;
         var a: [32]u8 = undefined;
         var b: [32]u8 = undefined;
-        if (data.debugger_marks_dropped > 0) return label(r, font, g.bounds.x + 14, y, w, theme.warm, "Debugger-stop overlays incomplete: {d} spans/markers omitted; inspect MCP control history.", .{data.debugger_marks_dropped});
+        if (data.debugger_marks_dropped > 0) return readoutFormat(buffer, .warm, "Debugger-stop overlays incomplete: {d} spans/markers omitted; inspect MCP control history.", .{data.debugger_marks_dropped});
         if (self.pointer) |p| if (self.areaAt(p[0], p[1])) |area| if (area != .labels) {
             const view = if (area == .overview) Range{ .from_ns = 0, .to_ns = data.extent_ns } else self.currentView();
             const rect = if (area == .overview) g.overview else g.plot;
@@ -764,17 +970,21 @@ pub const TimelineView = struct {
                 const lane = data.lanes[index];
                 const n = lowerBound(lane.samples, t +| @max(1, per_px)) - lowerBound(lane.samples, t);
                 const state = if (!data.scheduling) "no scheduling evidence" else if (intervalAt(lane.intervals, t)) |i| stateName(i) else "unknown (no record)";
-                return label(r, font, g.bounds.x + 14, y, w, theme.text, "+{s}  TID {d}  {s}  /  samples: {d} in {s}{s}", .{ duration(&a, t), lane.tid, state, n, compact(&b, @max(1, per_px)), markText(data.marks, t, lane.tid) });
+                return readoutFormat(buffer, .text, "+{s}  TID {d}  {s}  /  samples: {d} in {s}{s}", .{ duration(&a, t), lane.tid, state, n, compact(&b, @max(1, per_px)), markText(data.marks, t, lane.tid) });
             };
-            return label(r, font, g.bounds.x + 14, y, w, theme.text, "+{s}{s}  /  wheel here zooms lanes; drag selects a range", .{ duration(&a, t), markText(data.marks, t, null) });
+            return readoutFormat(buffer, .text, "+{s}{s}  /  wheel here zooms lanes; drag selects a range", .{ duration(&a, t), markText(data.marks, t, null) });
         };
-        if (data.lost_samples > 0) return label(r, font, g.bounds.x + 14, y, w, theme.warm, "{d} perf records/samples lost at unknown times: sparse regions may be loss", .{data.lost_samples});
-        if (data.syscall_count > 0) return label(r, font, g.bounds.x + 14, y, w, theme.weak, "{d} syscall spans: amber overlays (bounded drawing); hover or X for detail. Elapsed includes off CPU and debugger pauses.", .{data.syscall_count});
-        if (data.application_count > 0) return label(r, font, g.bounds.x + 14, y, w, theme.weak, "{d} imported application intervals: blue overlays, hover for label; zoom to inspect crowded ranges. Timing is caller-supplied.", .{data.application_count});
-        if (!data.scheduling) return r.textFit(font, g.bounds.x + 14, y, w, "Bars are CPU samples. No scheduling evidence: time without samples is unknown, not waiting.", theme.weak);
-        try r.textFit(font, g.bounds.x + 14, y, w, "Running / off CPU are elapsed time; bars below are CPU samples. Blank is unknown. Orange ticks: edge not observed.", theme.weak);
+        if (data.lost_samples > 0) return readoutFormat(buffer, .warm, "{d} perf records/samples lost at unknown times: sparse regions may be loss", .{data.lost_samples});
+        if (data.syscall_count > 0) return readoutFormat(buffer, .weak, "{d} syscall spans: amber overlays (bounded drawing); hover or X for detail. Elapsed includes off CPU and debugger pauses.", .{data.syscall_count});
+        if (data.application_count > 0) return readoutFormat(buffer, .weak, "{d} imported application intervals: blue overlays, hover for label; zoom to inspect crowded ranges. Timing is caller-supplied.", .{data.application_count});
+        if (!data.scheduling) return .{ .text = "Bars are CPU samples. No scheduling evidence: time without samples is unknown, not waiting." };
+        return .{ .text = "Running / off CPU are elapsed time; bars below are CPU samples. Blank is unknown. Orange ticks: edge not observed." };
     }
 };
+
+fn readoutFormat(buffer: []u8, tone: @FieldType(Readout, "tone"), comptime format: []const u8, args: anytype) Readout {
+    return .{ .text = std.fmt.bufPrint(buffer, format, args) catch "", .tone = tone };
+}
 
 fn stateName(interval: Interval) []const u8 {
     if (interval.detail.len > 0) return interval.detail;
@@ -1341,4 +1551,44 @@ test "Ctrl click unions lanes; plain click replaces; range and pruning survive" 
     try testing.expectEqual(@as(u16, 0), view.tids.len);
     try testing.expect(view.reset());
     try testing.expectEqual(model.Filter{}, view.filter());
+}
+
+test "prepared timeline retains exact counts and hover after history retirement" {
+    const a = std.testing.allocator;
+    var history: std.heap.ArenaAllocator = .init(a);
+    defer history.deinit();
+    var output: std.heap.ArenaAllocator = .init(a);
+    defer output.deinit();
+    var owner = TimelineView{};
+    var frontend = TimelineView{};
+    const times = try history.allocator().dupe(u64, &.{ 100, 200, 200, 400 });
+    const lanes = try history.allocator().alloc(Lane, 1);
+    const intervals = try history.allocator().alloc(Interval, 1);
+    intervals[0] = .{ .from_ns = 0, .to_ns = 1000, .state = .off_cpu, .from_observed = false, .detail = try history.allocator().dupe(u8, "owned scheduling explanation") };
+    lanes[0] = .{ .tid = 7, .samples = times, .intervals = intervals };
+    const data = Data{ .capture_id = 2, .revision = 3, .extent_ns = 1000, .lanes = lanes, .scheduling = true };
+    var wanted = frontend.request(test_bounds);
+    // Layout's first lane is at y94; this points at the sample at t200.
+    wanted.pointer = .{ 400, 100 };
+    const prepared = try owner.prepare(output.allocator(), 1, wanted, &data);
+    try testing.expect(std.mem.indexOf(u8, prepared.readout.text, "owned scheduling explanation") != null);
+    try testing.expect(std.mem.indexOf(u8, prepared.readout.text, "samples: 2") != null);
+    var total: u64 = 0;
+    for (prepared.buckets) |bucket| total += bucket[0];
+    try testing.expectEqual(@as(u64, 4), total);
+    const boundary = @import("../model/remote_owner.zig");
+    const publication = try boundary.Publication.create(a, .{ .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 7, .image_epoch = 1, .generation = 1 }, .revision = 1, .taken_ns = 1, .status = .ready, .timeline = prepared });
+    defer publication.destroy();
+    _ = history.reset(.free_all);
+    _ = output.reset(.free_all);
+    const rt = @import("../target/runtime.zig").c;
+    rt.xrt_remote_io_guard(true);
+    defer rt.xrt_remote_io_guard(false);
+    _ = frontend.present(publication.value.timeline, test_bounds);
+    try testing.expectEqual(@as(usize, 1), frontend.lane_count);
+    try testing.expectEqualStrings("owned scheduling explanation", frontend.prepared.?.data.lanes[0].intervals[0].detail);
+    try testing.expect(frontend.selectLane(7));
+    _ = frontend.present(publication.value.timeline, test_bounds);
+    try testing.expect(frontend.prepared == null and frontend.pending);
+    try testing.expectEqual(@as(?u32, 7), frontend.request(test_bounds).tid);
 }

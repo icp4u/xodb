@@ -55,7 +55,7 @@ pub fn main(init: std.process.Init) !void {
     // The overview is its own window and session with no debug target.
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
-        if (std.mem.eql(u8, arg, "--overview")) return @import("ui/overview/run.zig").main(args, startup_started);
+        if (std.mem.eql(u8, arg, "--overview") or std.mem.eql(u8, arg, "--attach-exe")) return @import("ui/overview/run.zig").main(args, startup_started);
     }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
@@ -67,6 +67,7 @@ pub fn main(init: std.process.Init) !void {
     var follow_forks = false;
     var process_limit: usize = 32;
     var attach: ?i32 = null;
+    var hide_wine_threads: ?bool = null;
     var expected_start: ?u64 = null;
     var start_profile = false;
     var listen: ?[:0]const u8 = null;
@@ -135,6 +136,8 @@ pub fn main(init: std.process.Init) !void {
                 \\A opens allocations; P in that panel starts/stops capture on the selected thread.
                 \\--theme FILE|builtin:dark|builtin:light|builtin:contrast|builtin:vga selects the GUI theme at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
+                \\--wine-threads show|hide controls Wine-internal name hints (default show); H toggles in the GUI.
+                \\--attach-exe opens the process picker with an editable .exe filter; Enter confirms attach.
                 \\T cycles the next capture duration in the profile view; 0 in config/MCP means until stopped.
                 \\--debug-dir DIR replaces default /usr/lib/debug roots (repeatable); local companions are verified.
                 \\--fetch-source opts in to bounded source copies from --runtime-ssh/--runtime-agent; local files and --source-map win.
@@ -181,9 +184,10 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
+        } else if (std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
+            if (std.mem.eql(u8, arg, "--wine-threads")) hide_wine_threads = if (std.mem.eql(u8, args[i], "hide")) true else if (std.mem.eql(u8, args[i], "show")) false else return error.InvalidWineThreadVisibility;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
                 observation_recipe = args[i];
                 headless = true;
@@ -419,6 +423,20 @@ pub fn main(init: std.process.Init) !void {
     if (mcp) try server.init();
     defer if (mcp) server.deinit();
     if (headless) {
+        if (session.target.isRemote()) {
+            const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
+                .connection = 1,
+                .server = if (mcp) server else null,
+                .endpoint = if (shared) |*endpoint| endpoint else null,
+                .source = source,
+            });
+            defer owner.destroy();
+            while (quitting == 0 and !owner.done.load(.acquire)) _ = c.usleep(20000);
+            owner.join();
+            if (owner.failure) |err| return err;
+            try finishRequestedArchive(session, capture_out);
+            return;
+        }
         while (quitting == 0) {
             try tree.poll();
             if (mcp) {
@@ -445,7 +463,7 @@ pub fn main(init: std.process.Init) !void {
         defer font.deinit();
         var workspaces: [@import("model/process_tree.zig").maximum]?*Workspace = @splat(null);
         workspaces[0] = try a.create(Workspace);
-        workspaces[0].?.* = .{};
+        workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
         var workspace = workspaces[0].?;
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
@@ -460,6 +478,19 @@ pub fn main(init: std.process.Init) !void {
         var archive_status: [512]u8 = undefined;
         var archive_completed_id: u64 = 0;
         var archive_status_time: u64 = 0;
+        if (runtime_remote) {
+            const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
+                .connection = 1,
+                .server = if (mcp) server else null,
+                .endpoint = if (shared) |*endpoint| endpoint else null,
+                .source = source,
+                .initial_view = .{ .process = 1, .selection = .{ .tid = 0 }, .request_id = 0, .kind = .debugger },
+            });
+            defer owner.destroy();
+            try remoteGui(owner, &window, &renderer, font, &workspaces, frames, startup_started, mcp);
+            try finishRequestedArchive(session, capture_out);
+            return;
+        }
         if (source) |path| try workspace.loadSource(path);
         var rendered: u64 = 0;
         var last_generation: u64 = std.math.maxInt(u64);
@@ -468,6 +499,7 @@ pub fn main(init: std.process.Init) !void {
         var last_profile_id: u64 = 0;
         var last_language_revision: u64 = 0;
         var last_language_watch_revision: u64 = 0;
+        var last_compatibility_revision: u64 = 0;
         var last_view_serial: u64 = 0;
         var last_import_serial: u64 = 0;
         var last_allocation_serial: u64 = 0;
@@ -486,7 +518,7 @@ pub fn main(init: std.process.Init) !void {
             const active = tree.active();
             if (workspaces[tree.selected] == null) {
                 workspaces[tree.selected] = try a.create(Workspace);
-                workspaces[tree.selected].?.* = .{};
+                workspaces[tree.selected].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
             }
             workspace = workspaces[tree.selected].?;
             if (active.process_id != last_process) {
@@ -537,6 +569,10 @@ pub fn main(init: std.process.Init) !void {
                 workspace.shared_controller = owner;
             }
             if (tree.active() != active) continue;
+            if (last_compatibility_revision != active.compatibility.revision) {
+                last_compatibility_revision = active.compatibility.revision;
+                window.dirty = true;
+            }
             if (last_language_watch_revision != active.language_watches.revision) {
                 last_language_watch_revision = active.language_watches.revision;
                 window.dirty = true;
@@ -598,6 +634,81 @@ pub fn main(init: std.process.Init) !void {
         std.debug.print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
     }
 }
+/// The live family belongs exclusively to the worker for this loop's lifetime.
+/// The frame thread receives no Session, Tree, Server or Endpoint pointer.
+fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window, renderer: *Renderer, font: *Font, workspaces: *[@import("model/process_tree.zig").maximum]?*Workspace, frames: usize, startup_started: u64, mcp: bool) !void {
+    var frontend = @import("ui/remote_workspace.zig").Frontend{ .owner = owner };
+    // Disable the frame guard before joining: bounded transport interruption
+    // and fast-close cancellation are the next lifecycle milestone.
+    defer frontend.deinit();
+    defer owner.join();
+    const rt = @import("target/runtime.zig").c;
+    if (comptime @import("builtin").mode != .ReleaseFast and @import("builtin").mode != .ReleaseSmall) rt.xrt_remote_io_guard(true);
+    defer rt.xrt_remote_io_guard(false);
+    var workspace = workspaces[0].?;
+    var renderer_ready = false;
+    var renderer_started = false;
+    var render_retry: u64 = 0;
+    var rendered: usize = 0;
+    var last_frame = linux.now();
+    while (!window.closing and quitting == 0 and !owner.done.load(.acquire)) {
+        try window.pump(window.input.timeoutMs(linux.now(), 8));
+        if (window.closing or quitting != 0) break;
+        window.input.tick(linux.now());
+        if (window.input.count > 0) window.dirty = true;
+        frontend.pump();
+        if (try frontend.take()) {
+            const process = frontend.header.process;
+            if (process == 0 or process > workspaces.len) return error.InvalidProcess;
+            const index: usize = @intCast(process - 1);
+            if (workspaces[index] == null) {
+                workspaces[index] = try std.heap.page_allocator.create(Workspace);
+                workspaces[index].?.* = .{};
+            }
+            if (workspace != workspaces[index].?) frontend.inspection_hash = null;
+            workspace = workspaces[index].?;
+            frontend.present(workspace, window);
+        }
+        workspace.input(window, &frontend);
+        frontend.inspect(workspace, window);
+        frontend.pump();
+        if (window.closing or quitting != 0) break;
+        const now = linux.now();
+        if (!window.dirty and !workspace.animating and frames == 0 and now -| last_frame < std.time.ns_per_s) continue;
+        if (now < render_retry) continue;
+        if (!renderer_ready) {
+            renderer.init(window) catch |err| {
+                if (!renderer_started and (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent)) return err;
+                workspace.status = @errorName(err);
+                std.debug.print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
+                render_retry = now + std.time.ns_per_s;
+                continue;
+            };
+            renderer_ready = true;
+            renderer_started = true;
+            font.dirty = true;
+        }
+        const presented = renderFrame(renderer, font, workspace, window, &frontend) catch |err| {
+            workspace.status = @errorName(err);
+            std.debug.print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
+            renderer.deinit();
+            renderer_ready = false;
+            render_retry = now + std.time.ns_per_s;
+            continue;
+        };
+        window.dirty = !presented;
+        if (!presented) continue;
+        if (rendered == 0) @import("startup.zig").report(startup_started, mcp);
+        last_frame = now;
+        rendered += 1;
+        if (window.input.trace) std.debug.print("xodb: remote frame={d} publication={d} editor={s}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed" });
+        if (frames > 0 and rendered >= frames) break;
+    }
+    if (owner.done.load(.acquire)) if (owner.failure) |err| return err;
+    const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (frames > 0 and rendered >= frames) "frame_limit" else "owner_exit";
+    std.debug.print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
+}
+
 fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
     session.finishArchive() catch |err| {
         // An MCP job reports its own failure. Failed CLI opening must still
@@ -641,12 +752,12 @@ fn vkList() !void {
     defer if (connected) window.deinit();
     try Renderer.list(if (connected) &window else null);
 }
-fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, session: *Session) !bool {
+fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, context: anytype) !bool {
     var started = linux.now();
     if (!try renderer.begin(window.width, window.height)) return false;
     reportSlow("Vulkan frame begin", started);
     started = linux.now();
-    workspace.draw(renderer, font, window, session) catch |err| {
+    (if (@TypeOf(context) == *Session) workspace.draw(renderer, font, window, context) else context.draw(workspace, renderer, font, window)) catch |err| {
         // Geometry exhaustion or allocation failure can leave a partial frame;
         // presenting it is safe and the next frame reports the error.
         workspace.status = @errorName(err);
@@ -666,6 +777,8 @@ test {
     std.testing.refAllDecls(@import("mcp/remote.zig"));
     std.testing.refAllDecls(@import("mcp/server.zig"));
     std.testing.refAllDecls(@import("preferences.zig"));
+    std.testing.refAllDecls(@import("model/compatibility.zig"));
+    std.testing.refAllDecls(@import("ui/thread_list.zig"));
     std.testing.refAllDecls(@import("profile/archive.zig"));
     std.testing.refAllDecls(@import("profile/linux_syscalls.zig"));
     std.testing.refAllDecls(@import("observe/context.zig"));
@@ -730,6 +843,8 @@ test {
     _ = @import("model/job_owner_test.zig");
     _ = @import("model/remote_source.zig");
     _ = @import("model/remote_owner.zig");
+    _ = @import("model/remote_dispatch.zig");
+    _ = @import("model/remote_worker.zig");
     _ = @import("binary/tls.zig");
     _ = @import("language/gdscript.zig");
     _ = @import("semq/adapter.zig");

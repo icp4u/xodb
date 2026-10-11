@@ -116,6 +116,11 @@ total: one worker per session may read a PDB of at most 64 MiB, allocate at most
 64 MiB for its parser, and perform at most 256 MiB of stream work. These bytes
 are reserved against the separate 256 MiB PE metadata cache; they are not
 controlled by `--image-limit` or `--image-total-limit`.
+A Mach-O file is never read whole. `get_macho_image` reads the header, the load
+commands and the tables it is asked about through ranged reads of the pinned
+file, at most 64 MiB per call (the reader's own caps are 128 MiB read and
+96 MiB retained), and keeps nothing afterwards, so it reserves nothing from
+the image budgets and has no row in the table above. See [MACHO.md](MACHO.md#bounds).
 What a name lookup reads of images that have no symbols-only view
 keeps fixed bounds too (256 MiB each, 512 MiB for one process; see "Name
 lookups and the full image"). With a runtime agent, whole-file transfers keep

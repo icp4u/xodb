@@ -73,13 +73,20 @@ test "a yielded install or image read keeps resolution pending until retried" {
     var session = MockSession{};
     for ([_]anyerror{ error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded }) |err| {
         session.target.failure = err;
+        const revision = manager.display_revision;
         try manager.resolve(&session);
+        try std.testing.expect(manager.display_revision > revision);
+        const settled_revision = manager.display_revision;
+        try manager.resolve(&session);
+        try std.testing.expectEqual(settled_revision, manager.display_revision);
         try std.testing.expect(manager.resolving);
         try std.testing.expect(session.target.site[0].pending);
         try std.testing.expectEqualStrings(@errorName(err), manager.entries.items[0].diagnostic.?);
     }
     session.target.failure = null;
+    const diagnostic_revision = manager.display_revision;
     try manager.resolve(&session);
+    try std.testing.expect(manager.display_revision > diagnostic_revision);
     try std.testing.expect(!manager.resolving);
     try std.testing.expect(!session.target.site[0].pending);
     try std.testing.expectEqual(@as(u64, 0x1234), session.target.site[0].address);
@@ -94,6 +101,7 @@ test "a yielded install or image read keeps resolution pending until retried" {
     try std.testing.expectEqualStrings("SymbolDiscoveryPending", manager.entries.items[0].diagnostic.?);
 }
 pub const Manager = struct {
+    display_revision: u64 = 0,
     entries: std.ArrayList(Entry) = .empty,
     hook: ?u64 = null,
     debug_address: ?u64 = null,
@@ -115,6 +123,7 @@ pub const Manager = struct {
         for (self.entries.items, 0..) |item, i| if (item.id == id) {
             item.deinit();
             _ = self.entries.swapRemove(i);
+            self.display_revision +%= 1;
             return;
         };
     }
@@ -131,6 +140,7 @@ pub const Manager = struct {
         out.debug_address = self.debug_address;
         out.loader_status = self.loader_status;
         out.epoch = self.epoch;
+        out.display_revision = self.display_revision;
         out.cancel = self.cancel;
     }
     pub fn entry(self: *Manager, id: u64) ?*Entry {
@@ -147,6 +157,7 @@ pub const Manager = struct {
             if (probe(session, self.entries.items[i].id) == null) {
                 self.entries.items[i].deinit();
                 _ = self.entries.swapRemove(i);
+                self.display_revision +%= 1;
             } else i += 1;
         }
         if (self.hook) |id| if (probe(session, id) == null) {
@@ -173,6 +184,7 @@ pub const Manager = struct {
         const id = try session.target.reserveBreakpoint();
         errdefer session.target.removeBreakpoint(id) catch {};
         self.entries.appendAssumeCapacity(.{ .id = id, .symbol = text });
+        self.display_revision +%= 1;
         errdefer _ = self.entries.pop();
         self.epoch = session.target.snapshot().image_epoch;
         if (!self.resolving) self.file_reads = std.mem.zeroes(rt.struct_xrt_file_budget);
@@ -206,6 +218,7 @@ pub const Manager = struct {
             } else |_| item.diagnostic = "BreakpointAddressNotRestorable";
             errdefer item.deinit();
             try self.entries.append(A, item);
+            self.display_revision +%= 1;
         }
     }
     fn installHook(self: *Manager, session: anytype) void {
@@ -253,8 +266,14 @@ pub const Manager = struct {
     }
     /// A yielded lookup, image read or install leaves the same item unfinished.
     /// Never publish a completed pass or allow its queued continue in this case.
+    fn diagnostic(self: *Manager, item: *Entry, message: ?[]const u8) void {
+        const same = if (item.diagnostic) |before| if (message) |after| std.mem.eql(u8, before, after) else false else message == null;
+        if (same) return;
+        item.diagnostic = message;
+        self.display_revision +%= 1;
+    }
     fn resolutionError(self: *Manager, item: *Entry, err: anyerror) !bool {
-        item.diagnostic = @errorName(err);
+        self.diagnostic(item, @errorName(err));
         switch (err) {
             error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => {
                 self.resolving = true;
@@ -308,7 +327,7 @@ pub const Manager = struct {
                     break;
                 }
                 if (address == null) {
-                    if (item.diagnostic == null) item.diagnostic = "BreakpointImageNotLoaded";
+                    if (item.diagnostic == null) self.diagnostic(item, "BreakpointImageNotLoaded");
                     continue;
                 }
             } else continue;
@@ -316,7 +335,7 @@ pub const Manager = struct {
                 if (try self.resolutionError(item, err)) return;
                 continue;
             };
-            item.diagnostic = null;
+            self.diagnostic(item, null);
         }
     }
     pub fn poll(self: *Manager, session: anytype) !void {

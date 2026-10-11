@@ -11,10 +11,12 @@ pub fn main(args: []const [:0]const u8) !void {
     var count: usize = 4000;
     var frames: u64 = 0;
     var reverse = false;
+    var retry_scene = false;
     var bloom: f32 = 0.7;
     for (args[1..], 1..) |arg, i| {
         if (std.mem.eql(u8, arg, "--instances") and i + 1 < args.len) count = try std.fmt.parseInt(usize, args[i + 1], 10);
         if (std.mem.eql(u8, arg, "--frames") and i + 1 < args.len) frames = try std.fmt.parseInt(u64, args[i + 1], 10);
+        if (std.mem.eql(u8, arg, "--retry-scene")) retry_scene = true;
         if (std.mem.eql(u8, arg, "--reverse")) reverse = true;
         if (std.mem.eql(u8, arg, "--no-bloom")) bloom = 0;
     }
@@ -76,30 +78,35 @@ pub fn main(args: []const [:0]const u8) !void {
         }
         if (!hidden and bounds.w > 0 and bounds.h > 0) {
             const vp = math.mul(math.perspective(1, bounds.w / bounds.h, 0.1, 1000).?, math.lookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }).?);
-            if (try renderer.scene(bounds, vp)) |scene| {
+            const available = renderer.scene(bounds, vp) catch |err| blk: {
+                if (!retry_scene) return err;
+                std.debug.print("scene3d refused={s} now={d} retry={d}\n", .{ @errorName(err), now(), renderer.scene_retry.next });
+                break :blk null;
+            };
+            if (available) |scene| {
                 scene.bloom = bloom;
                 const boxes = try scene.boxes(count);
                 const side: usize = @max(1, @as(usize, @intFromFloat(@ceil(@sqrt(@as(f32, @floatFromInt(count - 4)))))));
                 const pitch: f32 = 4.4 / @as(f32, @floatFromInt(side));
-                for (boxes, 0..) |*box, k| {
+                for (0..count) |k| {
                     const i = if (reverse) count - 1 - k else k;
                     if (i < 2) {
                         // Red is in front, green behind: the center pixel must
                         // remain red in either submission order.
-                        box.* = .{ .center = .{ 0, 0, if (i == 0) 0 else -1 }, .half = .{ 0.7, 0.7, 0.2 }, .color = if (i == 0) .{ 1, 0.01, 0.01, 1 } else .{ 0.01, 1, 0.01, 1 } };
+                        boxes.set(k, .{ .center = .{ 0, 0, if (i == 0) 0 else -1 }, .half = .{ 0.7, 0.7, 0.2 }, .color = if (i == 0) .{ 1, 0.01, 0.01, 1 } else .{ 0.01, 1, 0.01, 1 } });
                     } else if (i < 4) {
-                        box.* = .{ .center = .{ 1.5, 0.5, if (i == 2) 0 else -0.2 }, .half = .{ 0.25, 0.25, 0.25 }, .emission = 0.5, .color = if (i == 2) .{ 1, 0, 0.2, 0.25 } else .{ 0, 0.8, 1, 0.25 } };
+                        boxes.set(k, .{ .center = .{ 1.5, 0.5, if (i == 2) 0 else -0.2 }, .half = .{ 0.25, 0.25, 0.25 }, .emission = 0.5, .color = if (i == 2) .{ 1, 0, 0.2, 0.25 } else .{ 0, 0.8, 1, 0.25 } });
                     } else {
                         const x: f32 = (@as(f32, @floatFromInt((i - 4) % side)) + 0.5) * pitch - 2.2;
                         const y: f32 = (@as(f32, @floatFromInt((i - 4) / side)) + 0.5) * pitch - 2.2;
-                        box.* = .{ .center = .{ x, y, -3 }, .half = .{ pitch * 0.30, pitch * 0.30, 0.01 }, .color = .{ 0.05, 0.4, 0.8, 1 } };
+                        boxes.set(k, .{ .center = .{ x, y, -3 }, .half = .{ pitch * 0.30, pitch * 0.30, 0.01 }, .color = .{ 0.05, 0.4, 0.8, 1 } });
                     }
                 }
                 const points = try scene.points(2);
-                points[0] = .{ .position = .{ -1.5, 0.5, 0 }, .pixels = 30, .color = .{ 0, 6, 2, 1 } };
-                points[1] = .{ .position = .{ 0, 0, -2 }, .pixels = 40, .color = .{ 0, 10, 0, 1 } };
+                points.set(0, .{ .position = .{ -1.5, 0.5, 0 }, .pixels = 30, .color = .{ 0, 6, 2, 1 } });
+                points.set(1, .{ .position = .{ 0, 0, -2 }, .pixels = 40, .color = .{ 0, 10, 0, 1 } });
                 const lines = try scene.lines(1);
-                lines[0] = .{ .a = .{ -1.5, -1, 0 }, .b = .{ 1.5, -1, 0 }, .emission = 4, .color = .{ 0, 0.7, 1, 1 } };
+                lines.set(0, .{ .a = .{ -1.5, -1, 0 }, .b = .{ 1.5, -1, 0 }, .emission = 4, .color = .{ 0, 0.7, 1, 1 } });
                 try renderer.sceneText(font, .{ 0, 1.3, 0 }, .{ -44, -8 }, "GPU LABEL", .{ 1, 1, 1, 1 });
                 // A second, clipped label forces atlas-instance buffer growth;
                 // the visible first label must survive copying the old storage.

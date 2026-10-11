@@ -2,16 +2,18 @@
 //! retains copied rows and identities, never a target or capture pointer.
 const std = @import("std");
 const model = @import("../profile/allocation_capture.zig");
+const display = @import("../model/allocation_view.zig");
 const events = @import("../profile/allocation_events.zig");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const keys = @import("../platform/input.zig");
 const style = @import("style.zig");
 const theme = style.theme;
-pub const Mode = enum { calls, lifetimes, outstanding, events, heap };
-pub const Row = union(enum) { call: model.SpanRow, lifetime: model.LifetimeRow, event: model.RecordRow };
+pub const Mode = display.Mode;
+pub const Row = display.Row;
 const a = std.heap.page_allocator;
-const max_rows = 64;
+const max_rows = display.max_rows;
+pub const Input = union(enum) { unhandled, local, owner: display.Action };
 fn inside(b: gpu.Rect, x: f32, y: f32) bool {
     return x >= b.x and x < b.x + b.w and y >= b.y and y < b.y + b.h;
 }
@@ -25,7 +27,9 @@ pub const Panel = struct {
     count: usize = 0,
     scanned: usize = 0,
     total: usize = 0,
-    rows: [max_rows]Row = undefined,
+    rows: []const Row = &.{},
+    view: display.View = .{},
+    wanted: usize = max_rows,
     history: std.ArrayList(u32) = .empty,
     key_: ?model.Key = null,
     built_state: ?model.State = null,
@@ -69,14 +73,14 @@ pub const Panel = struct {
         self.filter.outstanding_only = false;
         self.resetPage();
     }
-    pub fn cycleThread(self: *Panel, capture: *const model.Capture) void {
+    pub fn cycleThread(self: *Panel) void {
         var next: ?u64 = null;
         if (self.filter.thread_id) |id| {
-            for (capture.threads[0..capture.thread_count], 0..) |thread, i| if (thread.id == id) {
-                if (i + 1 < capture.thread_count) next = capture.threads[i + 1].id;
+            for (self.view.threads, 0..) |thread, i| if (thread.id == id) {
+                if (i + 1 < self.view.threads.len) next = self.view.threads[i + 1].id;
                 break;
             };
-        } else next = capture.threads[0].id;
+        } else if (self.view.threads.len > 0) next = self.view.threads[0].id;
         var filter = self.filter;
         filter.thread_id = next;
         self.setFilter(filter);
@@ -116,15 +120,15 @@ pub const Panel = struct {
             if (self.selected >= amount) self.selected -= amount else self.back();
         }
     }
-    pub fn key(self: *Panel, capture: ?*model.Capture, event: keys.Event) bool {
-        if (!self.open) return false;
-        if (!event.plain() or (event.kind != .press and event.kind != .repeat)) return true;
+    pub fn key(self: *Panel, event: keys.Event) Input {
+        if (!self.open) return .unhandled;
+        if (!event.plain() or (event.kind != .press and event.kind != .repeat)) return .local;
         switch (event.shortcut) {
             keys.sym.up, 'k' => self.wheel(-1),
             keys.sym.down, 'j' => self.wheel(1),
             0xff55 => self.back(),
             0xff56 => self.forward(),
-            keys.sym.space, 0xffc2, 0xffc3 => return false,
+            keys.sym.space, 0xffc2, 0xffc3 => return .unhandled,
             else => if (event.kind == .press) switch (event.shortcut) {
                 keys.sym.escape => self.open = false,
                 'c' => self.setMode(.calls),
@@ -137,19 +141,14 @@ pub const Panel = struct {
                     self.resetPage();
                 },
                 0xff09 => self.setMode(@enumFromInt((@as(u32, @intFromEnum(self.mode)) + 1) % 5)),
-                't' => if (capture) |current| self.cycleThread(current),
-                'r' => if (capture) |current| {
-                    current.requestAnalysis(true) catch |err| {
-                        self.message = @errorName(err);
-                    };
-                    self.dirty = true;
-                },
+                't' => self.cycleThread(),
+                'r' => if (self.key_) |identity| return .{ .owner = .{ .retry = identity } },
                 else => {},
             },
         }
-        return true;
+        return .local;
     }
-    pub fn press(self: *Panel, capture: ?*model.Capture, x: f32, y: f32) void {
+    pub fn press(self: *Panel, x: f32, y: f32) void {
         if (!self.open) return;
         if (!inside(self.bounds, x, y)) {
             self.open = false;
@@ -162,7 +161,7 @@ pub const Panel = struct {
         };
         for (self.controls, 0..) |rect, i| if (inside(rect, x, y)) {
             switch (i) {
-                0 => if (capture) |current| self.cycleThread(current),
+                0 => self.cycleThread(),
                 1 => self.back(),
                 2 => if (self.mode == .heap) {
                     self.metric = @enumFromInt((@as(u32, @intFromEnum(self.metric)) + 1) % 3);
@@ -185,69 +184,59 @@ pub const Panel = struct {
             if (row < self.count) self.selected = row;
         }
     }
-    pub fn refresh(self: *Panel, capture: *model.Capture, wanted: usize) void {
-        capture.poll();
-        if (self.key_) |old| {
-            if (!std.meta.eql(old.identity, capture.identity)) {
-                self.resetPage();
-                self.filter = .{};
-            }
-        } else self.resetPage();
-        if (capture.ended_ns != null) capture.requestAnalysis(false) catch {};
-        const current = capture.key();
-        const limit = @min(max_rows, @max(1, wanted));
-        if (!self.dirty and self.key_ != null and std.meta.eql(self.key_.?, current) and self.built_state == capture.state and self.built_count == limit) return;
-        self.key_ = current;
-        self.built_state = capture.state;
-        self.built_count = limit;
-        self.dirty = false;
+    pub fn request(self: *Panel, height: f32) ?display.Request {
+        self.wanted = @intFromFloat(@min(max_rows, @max(1, (height - 390) / 22)));
+        if (!self.open) return null;
+        return self.currentRequest();
+    }
+    fn currentRequest(self: *const Panel) display.Request {
+        return .{ .identity = if (self.key_) |id| id.identity else null, .mode = self.mode, .filter = self.filter, .start = self.start, .limit = self.wanted, .metric = self.metric };
+    }
+    pub fn present(self: *Panel, view: display.View) void {
+        self.view = .{};
+        self.rows = &.{};
         self.count = 0;
         self.next = null;
+        self.ready_hits = false;
         self.message = "";
-        self.scanned = 0;
-        self.total = 0;
-        var filter = self.filter;
-        filter.outstanding_only = self.mode == .outstanding;
-        switch (self.mode) {
-            .heap => {},
-            .calls => {
-                const page = capture.spanPage(a, current, filter, self.start, limit) catch |err| {
-                    self.message = @errorName(err);
-                    return;
-                };
-                defer a.free(page.rows);
-                for (page.rows, 0..) |row, i| self.rows[i] = .{ .call = row };
-                self.count = page.rows.len;
-                self.next = page.next;
-                self.scanned = page.scanned;
-                self.total = page.total_unfiltered;
-            },
-            .events => {
-                const page = capture.recordPage(a, current, filter, self.start, limit) catch |err| {
-                    self.message = @errorName(err);
-                    return;
-                };
-                defer a.free(page.rows);
-                for (page.rows, 0..) |row, i| self.rows[i] = .{ .event = row };
-                self.count = page.rows.len;
-                self.next = page.next;
-                self.scanned = page.scanned;
-                self.total = page.total_unfiltered;
-            },
-            .lifetimes, .outstanding => {
-                const page = capture.lifetimePage(a, current, filter, self.start, limit) catch |err| {
-                    self.message = @errorName(err);
-                    return;
-                };
-                defer a.free(page.rows);
-                for (page.rows, 0..) |row, i| self.rows[i] = .{ .lifetime = row };
-                self.count = page.rows.len;
-                self.next = page.next;
-                self.scanned = page.scanned;
-                self.total = page.total_unfiltered;
-            },
+        self.heap_count = 0;
+        self.heap_pending = false;
+        const incoming = view.request orelse {
+            self.view = .{};
+            self.rows = &.{};
+            self.count = 0;
+            self.heap_count = 0;
+            return;
+        };
+        // A result for an earlier tab/page never repaints the new selection.
+        if (incoming.mode != self.mode or incoming.metric != self.metric or incoming.limit != self.wanted) return;
+        if (view.key) |identity| {
+            if (self.key_ == null or !std.meta.eql(self.key_.?.identity, identity.identity)) {
+                self.resetPage();
+                self.filter = .{};
+                self.key_ = identity;
+            }
+            if (!std.meta.eql(incoming, self.currentRequest())) return;
+        } else {
+            self.resetPage();
+            self.filter = .{};
         }
+        self.view = view;
+        self.rows = view.rows;
+        self.key_ = view.key;
+        self.built_state = view.state;
+        self.built_count = incoming.limit;
+        self.count = view.rows.len;
+        self.next = view.next;
+        self.scanned = view.scanned;
+        self.total = view.total;
+        self.heap_pending = view.heap_pending;
+        self.message = view.diagnostic;
         self.selected = @min(self.selected, self.count -| 1);
+        self.dirty = false;
+    }
+    fn current(self: *const Panel) bool {
+        return if (self.view.request) |value| std.meta.eql(value, self.currentRequest()) else false;
     }
     pub fn selectedOrdinal(self: *const Panel) ?u32 {
         if (self.count == 0 or self.selected >= self.count) return null;
@@ -286,37 +275,35 @@ pub const Panel = struct {
     pub fn liveHit(width: f32, x: f32, y: f32) bool {
         return inside(liveButton(width), x, y);
     }
-    fn drawHeap(self: *Panel, r: *gpu.Renderer, font: *Font, b: gpu.Rect, capture: *model.Capture) !void {
+    fn drawHeap(self: *Panel, r: *gpu.Renderer, font: *Font, b: gpu.Rect) !void {
         self.heap_count = 0;
-        self.heap_pending = false;
-        const maybe = capture.heapView(self.filter, self.metric, .gui) catch |err| {
-            try r.textFit(font, b.x + 12, b.y + 160, b.w - 24, @errorName(err), theme.warm);
+        if (self.view.diagnostic.len > 0) {
+            try r.textFit(font, b.x + 12, b.y + 160, b.w - 24, self.view.diagnostic, theme.warm);
             return;
-        };
-        const view = maybe orelse {
-            self.heap_pending = true;
+        }
+        const view = self.view.heap orelse {
             try r.textFit(font, b.x + 12, b.y + 160, b.w - 24, "Building allocation call tree", theme.weak);
             return;
         };
-        const graph = &view.graph;
-        if (self.zoom >= graph.nodes.items.len) self.zoom = 0;
-        const root = graph.nodes.items[self.zoom];
+        if (view.nodes.len == 0) return;
+        if (self.zoom >= view.nodes.len) self.zoom = 0;
+        const root = view.nodes[self.zoom];
         var buffer: [512]u8 = undefined;
         try r.textFit(font, b.x + 12, b.y + 157, b.w - 24, try std.fmt.bufPrint(&buffer, "M metric: {s} / {d} total / {d} excluded / {d} allocations missing caller stacks", .{ switch (self.metric) {
             .allocated_bytes => "Allocated bytes",
             .outstanding_bytes => "Outstanding bytes",
             .allocations => "Allocation count",
-        }, graph.nodes.items[0].inclusive, view.excluded_weight, view.missing_stacks }), theme.text);
+        }, view.nodes[0].inclusive, view.excluded_weight, view.missing_stacks }), theme.text);
         const bounds = gpu.Rect{ .x = b.x + 12, .y = b.y + 184, .w = b.w - 24, .h = @max(0, b.h - 228) };
         if (root.inclusive == 0) {
             try r.textFit(font, bounds.x, bounds.y, bounds.w, "No positive weight for this metric and filter", theme.weak);
             return;
         }
         const scale = bounds.w / @as(f32, @floatFromInt(root.inclusive));
-        for (graph.nodes.items) |node| {
+        for (view.nodes) |node| {
             if (node.depth < root.depth or node.inclusive == 0 or node.x < root.x or node.x - root.x >= root.inclusive) continue;
             var ancestor: ?u32 = node.id;
-            while (ancestor != null and ancestor.? != self.zoom) ancestor = graph.nodes.items[ancestor.?].parent;
+            while (ancestor != null and ancestor.? != self.zoom) ancestor = view.nodes[ancestor.?].parent;
             if (ancestor == null) continue;
             const depth = node.depth - root.depth;
             if (depth < self.heap_scroll) continue;
@@ -324,33 +311,30 @@ pub const Panel = struct {
             if (y + 23 > bounds.y + bounds.h) continue;
             const rect = gpu.Rect{ .x = bounds.x + @as(f32, @floatFromInt(node.x - root.x)) * scale, .y = y, .w = @max(0, @as(f32, @floatFromInt(node.inclusive)) * scale - 1), .h = 23 };
             if (rect.w < 1) continue;
-            const fill = switch (node.frame.kind) {
+            const fill = switch (node.kind) {
                 .root, .thread => theme.flame_root,
                 .incomplete, .unknown, .unverified => theme.flame_unknown,
-                .code => style.mix(theme.flame_low, theme.flame_high, @as(f32, @floatFromInt(std.hash.Wyhash.hash(0, node.frame.name) % 100)) / 100),
+                .code => style.mix(theme.flame_low, theme.flame_high, @as(f32, @floatFromInt(node.color)) / 100),
             };
             try r.rect(rect, fill);
-            if (rect.w > 20) try r.textFit(font, rect.x + 4, rect.y + 2, rect.w - 8, node.frame.name, theme.flame_text);
+            if (rect.w > 20) try r.textFit(font, rect.x + 4, rect.y + 2, rect.w - 8, node.name, theme.flame_text);
             if (self.heap_count < self.heap_hits.len) {
                 self.heap_hits[self.heap_count] = .{ .rect = rect, .node = node.id };
                 self.heap_count += 1;
             }
         }
-        try r.textFit(font, b.x + 12, b.y + b.h - 30, b.w - 24, try std.fmt.bufPrint(&buffer, "Click to zoom; Back resets. {s}: {d}. Outstanding is not proof of a leak.", .{ root.frame.name, root.inclusive }), theme.weak);
+        try r.textFit(font, b.x + 12, b.y + b.h - 30, b.w - 24, try std.fmt.bufPrint(&buffer, "Click to zoom; Back resets. {s}: {d}. Outstanding is not proof of a leak.", .{ root.name, root.inclusive }), theme.weak);
     }
-    pub fn drawLive(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, live: *@import("../profile/allocation_live.zig").Live, tid: i32) !void {
+    pub fn drawLive(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32) !void {
         if (!self.open) return;
-        try self.draw(r, font, width, height, live.capture);
+        try self.draw(r, font, width, height);
         const b = gpu.Rect{ .x = 20, .y = 60, .w = @max(0, width - 40), .h = 36 };
         try style.box(r, b, theme.surface, theme.focus, @splat(6));
-        var buffer: [256]u8 = undefined;
-        const archived = if (live.capture) |capture| capture.archived else false;
-        const message = if (archived) "Offline allocation evidence; S saves a copy" else if (live.failure != null and live.failure.?.kind == .permission) "Permission denied; see docs/ALLOCATIONS.md" else if (live.err) |err| @errorName(err) else if (live.preparing()) "Preparing probes; keep target paused" else if (live.collecting() and live.reason != null) "Stopping capture; releasing probes" else if (live.collecting()) "Tracing selected threads; Space continues/pauses" else if (live.reason) |reason| try std.fmt.bufPrint(&buffer, "Capture stopped: {s}; next start selects TID {d}", .{ @tagName(reason), tid }) else try std.fmt.bufPrint(&buffer, "Start on stopped TID {d}: malloc/calloc/realloc/free", .{tid});
-        try r.textFit(font, b.x + 10, b.y + 9, b.w - 190, message, if (live.err != null) theme.warm else theme.text);
-        if (archived) return;
-        try style.button(r, font, liveButton(width), if (live.preparing()) "Cancel" else if (live.collecting()) "Stop capture" else "Start capture", "P", theme.focus, 0, 0);
+        try r.textFit(font, b.x + 10, b.y + 9, b.w - 190, self.view.banner, if (self.view.banner_warning) theme.warm else theme.text);
+        if (self.view.archived) return;
+        try style.button(r, font, liveButton(width), if (self.view.preparing) "Cancel" else if (self.view.collecting) "Stop capture" else "Start capture", "P", theme.focus, 0, 0);
     }
-    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, current: ?*model.Capture) !void {
+    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32) !void {
         if (!self.open) return;
         self.ready_hits = false;
         const b = gpu.Rect{ .x = 20, .y = 96, .w = @max(0, width - 40), .h = @max(0, height - 136) };
@@ -373,20 +357,17 @@ pub const Panel = struct {
             try style.button(r, font, rect, label, shortcuts[i], if (@intFromEnum(self.mode) == i) theme.focus else theme.weak, 0, 0);
         }
         var buffer: [768]u8 = undefined;
-        const capture = current orelse {
-            self.count = 0;
-            self.next = null;
-            self.key_ = null;
-            self.filter = .{};
-            self.resetPage();
+        if (!self.current()) {
+            try r.textFit(font, b.x + 12, b.y + 84, b.w - 24, "Preparing allocation view", theme.weak);
+            return;
+        }
+        if (self.view.key == null) {
             try r.textFit(font, b.x + 12, b.y + 84, b.w - 24, "No allocation capture in this process.", theme.weak);
             return;
-        };
-        const wanted: usize = @intFromFloat(@min(max_rows, @max(1, (b.h - 254) / 22)));
-        self.refresh(capture, wanted);
-        try r.textFit(font, b.x + 12, b.y + 74, b.w - 24, try std.fmt.bufPrint(&buffer, "Process #{d} / PID {d} / capture #{d} / {s} / {d} selected threads, {d} hooks", .{ capture.identity.process_id, capture.identity.pid, capture.identity.capture_id, @tagName(capture.state), capture.thread_count, capture.hook_count }), theme.weak);
-        const summary = if (capture.summary()) |s| try std.fmt.bufPrint(&buffer, "Whole capture: {d} outstanding / {d} requested bytes / {d} successful allocations", .{ s.outstanding_count, s.outstanding_bytes, s.successful_allocations }) else if (capture.store.first_gap) |gap| try std.fmt.bufPrint(&buffer, "Lifetime totals unavailable: {s}; lost {d}, rejected {d}, unread {s}", .{ @tagName(gap.reason), capture.store.lost, capture.store.rejected, if (capture.store.unread_possible) "possible" else "no" }) else if (capture.failure) |err| try std.fmt.bufPrint(&buffer, "Analysis failed: {s}. Retained calls remain available; R retries.", .{@errorName(err)}) else if (capture.state == .analyzing) "Building lifetime analysis; retained evidence is available" else if (capture.state == .stopping) "Waiting for source cleanup and the final capture boundary" else "Lifetime totals become available after collection ends";
-        try r.textFit(font, b.x + 12, b.y + 96, b.w - 24, summary, if (capture.store.first_gap != null or capture.failure != null) theme.warm else theme.text);
+        }
+        const wanted = self.wanted;
+        try r.textFit(font, b.x + 12, b.y + 74, b.w - 24, self.view.header, theme.weak);
+        try r.textFit(font, b.x + 12, b.y + 96, b.w - 24, self.view.summary, if (self.view.warning) theme.warm else theme.text);
         self.controls = .{
             .{ .x = b.x + 12, .y = b.y + 122, .w = 168, .h = 28 },
             .{ .x = b.x + 188, .y = b.y + 122, .w = 126, .h = 28 },
@@ -400,7 +381,7 @@ pub const Panel = struct {
         self.list = .{ .x = b.x + 8, .y = b.y + 160, .w = b.w - 16, .h = @as(f32, @floatFromInt(wanted)) * 22 };
         self.ready_hits = true;
         if (self.mode == .heap) {
-            try self.drawHeap(r, font, b, capture);
+            try self.drawHeap(r, font, b);
             return;
         }
         for (self.rows[0..self.count], 0..) |row, i| {

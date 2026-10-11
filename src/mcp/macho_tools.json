@@ -1,0 +1,45 @@
+[
+  {
+    "name": "get_macho_image",
+    "description": "Inspect a Mach-O file (macOS executable, dylib or universal binary) that the process has mapped: identity (LC_UUID, architecture, platform and minimum OS), slices of a universal file, segments, linked libraries and entry point, and optionally one symbol by exact stored name (C names carry a leading underscore) or the symbol at a link-time address with its size. Reads the mapped file through bounded ranged reads; nothing is cached and the process's module list is unchanged. Not read: exports trie, chained fixups, compact unwind, DWARF, the dyld shared cache file format, 32-bit and big-endian images. Failures are typed: NotMachO, MachOUnsupported, MachOMalformed, MachOLimit, MachOArchitectureNotFound, MachOFileChanged; a table that cannot be read reports its own status. A file with more than 131072 symbols reports its identity, segments and counts, and answers symbol lookups with status limit.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "Runtime address (hex) inside any mapping of the file, as listed by list_modules."
+        },
+        "arch": {
+          "type": "string",
+          "enum": ["arm64", "x86_64"],
+          "description": "Slice of a universal file; omitted takes the first arm64 or x86_64 slice."
+        },
+        "symbol": {
+          "type": "string",
+          "maxLength": 4096,
+          "description": "Exact symbol name to look up."
+        },
+        "symbol_address": {
+          "type": "string",
+          "description": "Link-time address (hex, as stored in the file): the defined symbol covering it."
+        },
+        "sections": {
+          "type": "boolean",
+          "description": "Include the section list (at most 256 rows; default false)."
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        }
+      },
+      "required": ["address"],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

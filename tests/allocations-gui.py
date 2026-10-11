@@ -34,11 +34,15 @@ edit(tree/'src/main.zig',[
     ('    reportSlow("workspace draw/inspection", started);','    try preview.draw(renderer, font, @floatFromInt(window.width), @floatFromInt(window.height));\n    reportSlow("workspace draw/inspection", started);'),
 ])
 edit(tree/'src/mcp/server.zig',[
+    ('        return self.policies.get(name) orelse error.UnknownTool;',
+     '        if (std.mem.eql(u8, name, "allocation_preview_status")) return .{ .required = .observer, .read_only = true };\n'
+     '        if (std.mem.eql(u8, name, "allocation_preview_scenario") or std.mem.eql(u8, name, "allocation_preview_save")) return .{ .required = .controller, .read_only = false };\n'
+     '        return self.policies.get(name) orelse error.UnknownTool;'),
     ('        const processes = @import("processes.zig");','        if (std.mem.startsWith(u8, name, "allocation_preview_") or std.mem.startsWith(u8, name, "get_allocation_")) return @import("../allocation_preview.zig").call(a, name, args);\n        const processes = @import("processes.zig");'),
 ])
 env=dict(os.environ,TMPDIR=str(work/'tmp'),ZIG_GLOBAL_CACHE_DIR=str(root/'.cache/zig-global'),ZIG_LOCAL_CACHE_DIR=str(work/'zig-cache'))
 with (work/'build.log').open('wb') as output:
-    build=subprocess.run(['zig','build','app','-Doptimize=ReleaseSafe','--summary','all'],cwd=tree,env=env,stdout=output,stderr=subprocess.STDOUT)
+    build=subprocess.run(['zig','build','app','-Doptimize=ReleaseSafe','-j2','--summary','all'],cwd=tree,env=env,stdout=output,stderr=subprocess.STDOUT)
 if build.returncode:
     print((work/'build.log').read_text()[-6000:]);raise SystemExit(build.returncode)
 for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
@@ -48,7 +52,7 @@ h.HELPER=str(work/'vinput')
 subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(work),str(root/'tests/helpers/vinput.c'),str(work/'virtual-pointer.c'),str(work/'virtual-keyboard.c'),'-lwayland-client','-lxkbcommon','-lm','-o',h.HELPER],check=True)
 d=None;checks=[]
 try:
-    d=h.Display(str(tree),[])
+    d=h.Display(str(tree),['--agent-scope','control'])
     def status():return d.tool('allocation_preview_status')
     def load(name):return d.request('tools/call',{'name':'allocation_preview_scenario','arguments':{'name':name}})['structuredContent']
     def until(check,seconds=5):

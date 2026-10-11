@@ -10,6 +10,7 @@ const Renderer = @import("render/vulkan.zig").Renderer;
 const Font = @import("render/font.zig").Font;
 const wire = @import("mcp/profile.zig");
 pub var panel = Panel{};
+var display: @import("model/allocation_view.zig").Capture = .{};
 pub var capture: ?*model.Capture = null;
 var serial: u64 = 100;
 var force_frame = false;
@@ -17,6 +18,7 @@ const a = std.heap.page_allocator;
 pub fn deinit() void {
     if (capture) |data| data.deinit();
     panel.deinit();
+    display.deinit();
 }
 fn sample(time: u64, phase: events.Phase, kind: life.Kind, sp: u64, arg: u64, result: u64) events.Event {
     return .{ .time_ns = time, .data = .{ .sample = .{ .phase = phase, .hook = if (kind == .malloc) 1 else 2, .kind = kind, .stack_key = sp, .arg0 = arg, .result = result } } };
@@ -81,7 +83,15 @@ pub fn input(window: *Window) void {
         if (data.state != before) force_frame = true;
     }
     while (window.input.next()) |event| {
-        if (event.kind == .button_press and event.code == 272) panel.press(capture, event.x, event.y) else if (!panel.open and event.kind == .press and event.shortcut == 'a') panel.show() else _ = panel.key(capture, event);
+        if (event.kind == .button_press and event.code == 272) panel.press(event.x, event.y) else if (!panel.open and event.kind == .press and event.shortcut == 'a') panel.show() else {
+            const action = panel.key(event);
+            if (action == .owner and action.owner == .retry) if (capture) |data| {
+                data.validate(action.owner.retry) catch continue;
+                data.requestAnalysis(true) catch |err| {
+                    panel.message = @errorName(err);
+                };
+            };
+        }
         force_frame = true;
     }
     if (window.scroll != 0) {
@@ -94,7 +104,10 @@ pub fn input(window: *Window) void {
     force_frame = false;
 }
 pub fn draw(renderer: *Renderer, font: *Font, width: f32, height: f32) !void {
-    try panel.draw(renderer, font, width, height, capture);
+    var live: @import("profile/allocation_live.zig").Live = .{ .capture = capture };
+    display.refresh(&live, panel.request(height), 0);
+    panel.present(display.value);
+    try panel.draw(renderer, font, width, height);
     try renderer.textFit(font, 20, 70, width - 40, "FIXTURE DATA / allocation panel prototype / no live process traced", .{ 1, 0.7, 0.25, 1 });
 }
 pub fn call(allocator: std.mem.Allocator, name: []const u8, args: std.json.Value) !std.json.Value {

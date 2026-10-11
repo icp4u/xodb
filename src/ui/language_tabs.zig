@@ -5,15 +5,16 @@ const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const Session = @import("../model/session.zig").Session;
 const tabs = @import("../model/language_tabs.zig");
-const selection = @import("../model/language_selection.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 const named = @import("../model/language_locals.zig");
 const Editor = @import("watch.zig").Editor;
-const Row = struct { following: usize = 0, name: []const u8, location: []const u8, reason: ?[]const u8, segment: usize, frame: ?usize };
+const prepared = @import("../model/language_view.zig");
+const runtime_watch = @import("../model/runtime_watch_view.zig");
+const Row = prepared.Row;
 const Hit = struct { rect: gpu.Rect, segment: usize, frame: usize };
-const SelectedKey = struct { generation: u64, tid: i32, language: tabs.Tab, segment: usize, frame: usize };
-const Key = struct { session: u64, generation: u64, revision: u64, metadata: u64, tid: i32, frame: usize, tab: tabs.Tab };
+const SelectedKey = prepared.SelectedKey;
+const Key = prepared.Key;
 const NativePolicy = enum { auto, expanded, collapsed };
 const Layout = struct { stack: f32, native: f32, collapsed: bool };
 fn sectionLayout(available: f32, has_named: bool, native_count: usize, policy: NativePolicy, named_min: f32) Layout {
@@ -40,8 +41,8 @@ pub const Panel = struct {
     layout_reason: []const u8 = "none",
     hits: [tabs.order.len]?gpu.Rect = @splat(null),
     content_y: f32 = 135,
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
-    rows: []Row = &.{},
+    capture: prepared.Capture = .{},
+    rows: []const Row = &.{},
     row_hits: [64]?Hit = @splat(null),
     scroll: usize = 0,
     native_policy: NativePolicy = .auto,
@@ -69,15 +70,13 @@ pub const Panel = struct {
     editor: Editor = .{},
     editor_key: ?SelectedKey = null,
     editor_watch: bool = false,
-    fn selectedKey(session: *Session) ?SelectedKey {
-        const row = session.language_tabs.logical_selection orelse return null;
-        if (row.generation != session.target.snapshot().generation or row.language != session.language_tabs.selected) return null;
-        return .{ .generation = row.generation, .tid = row.tid, .language = row.language, .segment = row.segment, .frame = row.frame };
-    }
     pub fn syncEditor(self: *Panel, session: *Session) void {
+        self.syncEditorView(prepared.header(session));
+    }
+    pub fn syncEditorView(self: *Panel, state: prepared.Header) void {
         if (!self.editor.open) return;
-        const selected = selectedKey(session);
-        if (@intFromEnum(session.language_tabs.selected) < 2) {
+        const selected = state.selectedKey();
+        if (@intFromEnum(state.selected) < 2) {
             self.editor.open = false;
         } else if (self.editor_key == null) {
             // E before a frame is chosen (or after a stop dropped it) still
@@ -85,43 +84,53 @@ pub const Panel = struct {
             // The first frame the user then selects binds the field.
             if (selected != null) {
                 self.editor_key = selected;
-                self.editor.message = if (named.supported(session.language_tabs.selected)) "" else "Expressions unavailable in this view; Esc cancels";
+                self.editor.message = if (named.supported(state.selected)) "" else "Expressions unavailable in this view; Esc cancels";
             }
         } else if (selected == null or !std.meta.eql(selected.?, self.editor_key.?)) self.editor.open = false;
     }
     pub fn beginExpression(self: *Panel, session: *Session) !void {
-        if (@intFromEnum(session.language_tabs.selected) < 2) return error.LanguageLocalsUnavailable;
-        self.editor_key = selectedKey(session);
+        return self.beginExpressionView(prepared.header(session));
+    }
+    pub fn beginExpressionView(self: *Panel, state: prepared.Header) !void {
+        if (@intFromEnum(state.selected) < 2) return error.LanguageLocalsUnavailable;
+        self.editor_key = state.selectedKey();
         self.editor_watch = false;
         self.editor.start();
-        if (session.language_tabs.selected == .elisp) self.editor.message = "Elisp expressions unavailable; Esc cancels" else if (!named.supported(session.language_tabs.selected)) self.editor.message = "Expressions unavailable in this view; Esc cancels" else if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
+        if (state.selected == .elisp) self.editor.message = "Elisp expressions unavailable; Esc cancels" else if (!named.supported(state.selected)) self.editor.message = "Expressions unavailable in this view; Esc cancels" else if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
     }
     pub fn submitExpression(self: *Panel, session: *Session, text: []const u8) !void {
-        if (session.language_tabs.selected == .elisp) return error.ElispExpressionsUnavailable;
-        if (!named.supported(session.language_tabs.selected)) return error.LanguageLocalsUnavailable;
-        const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
+        if (try self.submitExpressionView(prepared.header(session), text)) |action| {
+            _ = try runtime_watch.apply(session, .human, action);
+            self.editor.open = false;
+        }
+    }
+    /// A returned action must be copied into the owner queue before the editor
+    /// buffer changes. The native wrapper executes it synchronously.
+    pub fn submitExpressionView(self: *Panel, state: prepared.Header, text: []const u8) !?runtime_watch.Action {
+        if (state.selected == .elisp) return error.ElispExpressionsUnavailable;
+        if (!named.supported(state.selected)) return error.LanguageLocalsUnavailable;
+        const selected = state.selectedKey() orelse return error.SelectLanguageFrame;
         if (self.editor_key == null or !std.meta.eql(self.editor_key.?, selected)) return error.StaleLanguageFrame;
         if (text.len == 0 or text.len > self.expression.len) return error.InvalidArguments;
-        if (self.editor_watch) {
-            _ = try session.language_watches.add(session, selected.language, selected.tid, selected.segment, selected.frame, text, null);
-            session.record(.human, "add_language_watch");
-            self.editor.open = false;
-            return;
-        }
+        if (self.editor_watch) return .{ .add = .{ .selected = selected, .metadata = state.metadata, .expression = text } };
         @memcpy(self.expression[0..text.len], text);
         self.expression_len = text.len;
         self.bindings_key = selected;
         self.key = null;
         self.editor.open = false;
+        return null;
     }
     pub fn watchBinding(self: *Panel, session: *Session) !u64 {
-        if (session.language_tabs.selected == .elisp) return error.ElispWatchesUnavailable;
-        const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
+        return (try runtime_watch.apply(session, .human, try self.watchBindingView(prepared.header(session)))).?;
+    }
+    pub fn watchBindingView(self: *Panel, state: prepared.Header) !runtime_watch.Action {
+        if (state.selected == .elisp) return error.ElispWatchesUnavailable;
+        const selected = state.selectedKey() orelse return error.SelectLanguageFrame;
         if (self.bindings_key == null or !std.meta.eql(self.bindings_key.?, selected)) return error.StaleLanguageFrame;
+        const key = self.key orelse return error.StaleLanguageView;
+        if (key.metadata != state.metadata) return error.StaleLanguageView;
         const index = self.binding_selected orelse return error.SelectNamedBindingForWatch;
-        const id = try session.language_watches.add(session, selected.language, selected.tid, selected.segment, selected.frame, null, index);
-        session.record(.human, "add_language_watch");
-        return id;
+        return .{ .add = .{ .selected = selected, .metadata = state.metadata, .row = index } };
     }
     pub fn scrollBindings(self: *Panel, amount: i32) void {
         const result = self.bindings orelse return;
@@ -132,7 +141,7 @@ pub const Panel = struct {
         self.key = null;
     }
     pub fn deinit(self: *Panel) void {
-        self.arena.deinit();
+        self.capture.deinit();
         if (self.text_layout) |layout| std.heap.page_allocator.destroy(layout);
     }
     pub fn hit(self: *const Panel, x: f32, y: f32) ?tabs.Tab {
@@ -141,41 +150,51 @@ pub const Panel = struct {
         };
         return null;
     }
+    pub const Click = union(enum) { ignored, local, select: prepared.Action };
     pub fn click(self: *Panel, session: *Session, x: f32, y: f32) !bool {
-        const key = self.key orelse return false;
+        return switch (try self.clickView(prepared.header(session), x, y)) {
+            .ignored => false,
+            .local => true,
+            .select => |action| blk: {
+                try prepared.apply(session, action);
+                break :blk true;
+            },
+        };
+    }
+    pub fn clickView(self: *Panel, state: prepared.Header, x: f32, y: f32) !Click {
+        const key = self.key orelse return .ignored;
         if (self.native_header_hit) |rect| {
             if (x >= rect.x and x < rect.x + rect.w and y >= rect.y and y < rect.y + rect.h) {
-                if (key.session != session.id or key.generation != session.target.snapshot().generation or key.tab != session.language_tabs.selected) return error.StaleLanguageView;
+                if (key.session != state.session or key.generation != state.generation or key.tab != state.selected) return error.StaleLanguageView;
                 self.native_policy = if (self.native_collapsed) .expanded else .collapsed;
                 self.revealed = null;
-                return true;
+                return .local;
             }
         }
         for (self.binding_hits) |maybe| if (maybe) |binding| {
             const rect = binding.rect;
             if (x >= rect.x and x < rect.x + rect.w and y >= rect.y and y < rect.y + rect.h) {
-                if (key.session != session.id or key.generation != session.target.snapshot().generation or key.tab != session.language_tabs.selected) return error.StaleLanguageView;
-                const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
+                if (key.session != state.session or key.generation != state.generation or key.metadata != state.metadata or key.tab != state.selected) return error.StaleLanguageView;
+                const selected = state.selectedKey() orelse return error.SelectLanguageFrame;
                 if (self.bindings_key == null or !std.meta.eql(selected, self.bindings_key.?)) return error.StaleLanguageFrame;
                 self.binding_selected = binding.index;
-                return true;
+                return .local;
             }
         };
         if (self.native_header_hit) |rect| {
             if (x >= rect.x and x < rect.x + rect.w and y >= rect.y + rect.h and y < self.binding_y) {
                 self.binding_selected = null;
-                return true;
+                return .local;
             }
         }
         for (self.row_hits) |maybe| if (maybe) |row| {
             const rect = row.rect;
             if (x < rect.x or x >= rect.x + rect.w or y < rect.y or y >= rect.y + rect.h) continue;
-            if (key.session != session.id or key.generation != session.target.snapshot().generation or key.metadata != session.metadata.revision or key.tab != session.language_tabs.selected)
+            if (key.session != state.session or key.generation != state.generation or key.metadata != state.metadata or key.tab != state.selected)
                 return error.StaleLanguageView;
-            try selection.selectLogical(session, key.tid, key.tab, row.segment, row.frame);
-            return true;
+            return .{ .select = .{ .logical = .{ .key = key, .segment = row.segment, .frame = row.frame } } };
         };
-        return false;
+        return .ignored;
     }
     pub fn scrollBy(self: *Panel, amount: i32) void {
         if (amount >= 0) self.scroll = @min(self.rows.len -| 1, self.scroll +| @as(usize, @intCast(amount))) else self.scroll -|= @intCast(-@as(i64, amount));
@@ -183,7 +202,7 @@ pub const Panel = struct {
     pub fn scrollNative(self: *Panel, amount: i32) void {
         if (amount >= 0) self.native_scroll = @min(self.native_count -| 1, self.native_scroll +| @as(usize, @intCast(amount))) else self.native_scroll -|= @intCast(-@as(i64, amount));
     }
-    pub fn header(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, state: *const tabs.State) !void {
+    pub fn header(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, state: prepared.Header) !void {
         self.hits = @splat(null);
         r.clip = rect;
         try style.box(r, rect, theme.background, theme.border, @splat(5));
@@ -191,11 +210,7 @@ pub const Panel = struct {
         var y = rect.y + 5;
         for (tabs.order, 0..) |tab, i| {
             if (!state.visible(tab)) continue;
-            var offered = false;
-            for (state.offers.items[0..state.offers.count]) |offer| if (offer.language == tab) {
-                offered = true;
-                break;
-            };
+            const offered = state.offered[@intFromEnum(tab)];
             const width = r.measure(font, tabs.title(tab)) + 16 + @as(f32, if (offered) 14 else 0);
             if (x + width > rect.x + rect.w - 5 and x > rect.x + 6) {
                 x = rect.x + 6;
@@ -223,170 +238,41 @@ pub const Panel = struct {
         self.content_y = y + 39;
         try r.rect(.{ .x = rect.x + 1, .y = y + 31, .w = rect.w - 2, .h = 1 }, theme.border);
     }
-    /// A project path (res://...) is shown whole when it is short, and by
-    /// its end otherwise: the line number after it must stay visible.
-    fn shownPath(a: std.mem.Allocator, stack: anytype, file: []const u8) ![]const u8 {
-        if (!@hasField(@TypeOf(stack), "level_per_native_frame")) return std.fs.path.basename(file);
-        const keep = 18;
-        if (file.len <= keep) return file;
-        var start = file.len - (keep - 3);
-        while (start < file.len and file[start] & 0xc0 == 0x80) start += 1; // not inside a UTF-8 sequence
-        return std.fmt.allocPrint(a, "...{s}", .{file[start..]});
-    }
-    fn collect(self: *Panel, stack: anytype) !void {
-        const a = self.arena.allocator();
-        var rows: std.ArrayList(Row) = .empty;
-        self.message = "Segment anchor; frame pairing unproved";
-        var count: usize = 0;
-        for (stack.segments, 0..) |segment, segment_index| {
-            if (rows.items.len >= 128) {
-                self.message = "LanguageFrameLimit";
-                break;
-            }
-            if (@hasField(@TypeOf(segment), "layout_source")) self.stack_basis = try a.dupe(u8, segment.layout_source);
-            const anchor_name: ?[]const u8 = if (segment.anchor) |anchor| anchor.symbol else null;
-            const segment_title: ?[]const u8 = if (@hasField(@TypeOf(segment), "title")) segment.title else anchor_name;
-            try rows.append(a, .{ .name = if (segment_title) |name| try a.dupe(u8, name) else try std.fmt.allocPrint(a, "Segment {d}", .{segment_index}), .location = if (@hasField(@TypeOf(stack), "level_per_native_frame")) segment.state else if (segment.anchor) |anchor| try std.fmt.allocPrint(a, "segment {d} / native #{d}", .{ segment_index, anchor.frame }) else "native anchor unproved", .reason = if (segment.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = null });
-            for (segment.frames, 0..) |frame, frame_index| {
-                if (count == 64 or rows.items.len == 128) {
-                    self.message = "LanguageFrameLimit";
-                    break;
-                }
-                const paired = @hasField(@TypeOf(stack), "level_per_native_frame");
-                if (@hasField(@TypeOf(frame), "native_binding")) self.message = if (paired) "One native frame each" else "C argument links; other links partial";
-                const label = if (@hasField(@TypeOf(frame), "qualified_name"))
-                    if (frame.qualified_name) |text| try a.dupe(u8, text) else try std.fmt.allocPrint(a, "{s} [owner unproved]", .{frame.name})
-                else if (paired)
-                    // The native frame that runs this level, beside its name.
-                    if (frame.native_binding) |anchor| try std.fmt.allocPrint(a, "{s}  [native #{d}]", .{ frame.name, anchor.frame }) else try a.dupe(u8, frame.name)
-                else
-                    try a.dupe(u8, frame.name);
-                const location = if (@hasField(@TypeOf(frame), "argument_count"))
-                    if (frame.argument_count) |n| try std.fmt.allocPrint(a, "{s} / {d} args", .{ frame.kind, n }) else try std.fmt.allocPrint(a, "{s} / unevaluated", .{frame.kind})
-                else if (frame.file) |file|
-                    if (frame.line) |line| try std.fmt.allocPrint(a, "{s}:{d}", .{ try shownPath(a, stack, file), line }) else try a.dupe(u8, try shownPath(a, stack, file))
-                else
-                    "source position unproved";
-                try rows.append(a, .{ .name = label, .location = location, .reason = if (frame.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = frame_index });
-                count += 1;
-                if (@hasField(@TypeOf(frame), "native_binding") and !paired) {
-                    if (frame.native_binding) |anchor| {
-                        if (rows.items.len < 128) {
-                            rows.items[rows.items.len - 1].following = 1;
-                            try rows.append(a, .{
-                                .name = try std.fmt.allocPrint(a, "C: {s}", .{anchor.symbol}),
-                                .location = try std.fmt.allocPrint(a, "arguments / native #{d}", .{anchor.frame}),
-                                .reason = null,
-                                .segment = segment_index,
-                                .frame = null,
-                            });
-                        }
-                    }
-                }
-                if (@hasField(@TypeOf(segment), "controls")) {
-                    for (segment.controls) |control| {
-                        if (control.frame == null or control.frame.? != frame_index or rows.items.len == 128) continue;
-                        try rows.append(a, .{ .name = try a.dupe(u8, control.kind), .location = "control record; callback not evaluated", .reason = null, .segment = segment_index, .frame = null });
-                    }
-                }
-            }
-        }
-        if (@hasField(@TypeOf(stack), "native_argument_diagnostics")) {
-            for (stack.native_argument_diagnostics) |item| {
-                if (rows.items.len == 128) break;
-                try rows.append(a, .{ .name = try std.fmt.allocPrint(a, "native #{d}: no state argument", .{item.frame}), .location = try a.dupe(u8, item.reason), .reason = null, .segment = 0, .frame = null });
-            }
-        }
-        self.rows = try rows.toOwnedSlice(a);
-    }
     pub fn refresh(self: *Panel, session: *Session, tid: i32, frame: usize) void {
-        self.syncEditor(session);
-        const tab = session.language_tabs.selected;
-        if (@intFromEnum(tab) < 2) return;
-        const key = Key{ .session = session.id, .generation = session.target.snapshot().generation, .revision = session.language_tabs.revision, .metadata = session.metadata.revision, .tid = tid, .frame = frame, .tab = tab };
+        const state = prepared.header(session);
+        self.syncEditorView(state);
+        if (@intFromEnum(state.selected) < 2) return;
+        const key = state.key(tid, frame);
         if (self.key) |previous| if (std.meta.eql(previous, key)) return;
-        if (self.key == null or self.key.?.generation != key.generation or self.key.?.tab != tab or self.key.?.tid != tid) self.scroll = 0;
-        if (self.key == null or self.key.?.generation != key.generation or self.key.?.tab != tab or self.key.?.tid != tid or self.key.?.frame != frame) self.native_scroll = 0;
+        self.capture.refresh(session, .{ .tid = tid, .frame = frame, .selected = self.bindings_key, .binding_start = self.binding_start, .expression = self.expression[0..self.expression_len] });
+        self.present(self.capture.value);
+    }
+    /// Frontend binding only. The caller retains the publication while drawn.
+    pub fn present(self: *Panel, view: prepared.Presentation) void {
+        const key = view.key;
+        const same_selection = self.bindings_key != null and view.selected != null and std.meta.eql(self.bindings_key.?, view.selected.?);
+        const pending_page = same_selection and self.binding_start != view.binding_start;
+        const pending_expression = same_selection and !std.mem.eql(u8, self.expression[0..self.expression_len], view.expression);
+        if (self.key == null or self.key.?.generation != key.generation or self.key.?.tab != key.tab or self.key.?.tid != key.tid) self.scroll = 0;
+        if (self.key == null or self.key.?.generation != key.generation or self.key.?.tab != key.tab or self.key.?.tid != key.tid or self.key.?.frame != key.frame) self.native_scroll = 0;
         if (self.key == null) self.revealed = null;
         self.key = key;
-        self.stack_basis = null;
-        self.bindings = null;
-        self.expression_result = null;
-        self.expression_reason = null;
-        self.bindings_reason = "Select a logical frame for named locals";
-        const selected = selectedKey(session);
-        if (selected == null or self.bindings_key == null or !std.meta.eql(selected.?, self.bindings_key.?)) {
-            self.binding_selected = null;
-            self.binding_start = 0;
-            self.expression_len = 0;
+        self.syncEditorView(view.header);
+        self.rows = view.rows;
+        self.stack_basis = view.stack_basis;
+        self.message = view.message;
+        self.bindings = if (pending_page) null else view.bindings;
+        self.bindings_reason = if (pending_page) "Preparing named locals" else view.bindings_reason;
+        if (view.selected == null or self.bindings_key == null or !std.meta.eql(view.selected.?, self.bindings_key.?)) self.binding_selected = null;
+        self.bindings_key = view.selected;
+        if (!pending_page) self.binding_start = view.binding_start;
+        if (!pending_expression) {
+            std.debug.assert(view.expression.len <= self.expression.len);
+            @memcpy(self.expression[0..view.expression.len], view.expression);
+            self.expression_len = view.expression.len;
         }
-        self.bindings_key = selected;
-        _ = self.arena.reset(.retain_capacity);
-        self.rows = &.{};
-        self.message = "No stopped thread";
-        if (session.target.snapshot().state != .stopped or tid == 0) return;
-        const a = self.arena.allocator();
-        switch (tab) {
-            .python => self.collect(selection.cachedRead(.python, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .perl => self.collect(selection.cachedRead(.perl, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .lua => self.collect(selection.cachedRead(.lua, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .elisp => self.collect(selection.cachedRead(.elisp, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .ruby => self.collect(selection.cachedRead(.ruby, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .javascript => self.collect(selection.cachedRead(.javascript, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .go => self.collect(selection.cachedRead(.go, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            .gdscript => self.collect(selection.cachedRead(.gdscript, session, tid) catch |err| {
-                self.message = @errorName(err);
-                return;
-            }) catch {
-                self.message = "OutOfMemory";
-            },
-            else => unreachable,
-        }
-        if (selected) |row| {
-            self.bindings = named.read(session, a, row.language, row.tid, row.segment, row.frame, self.binding_start, 32) catch |err| result: {
-                self.bindings_reason = @errorName(err);
-                break :result null;
-            };
-            if (self.expression_len != 0) self.expression_result = named.evaluate(session, a, row.language, row.tid, row.segment, row.frame, self.expression[0..self.expression_len]) catch |err| result: {
-                self.expression_reason = @errorName(err);
-                break :result null;
-            };
-        }
+        self.expression_result = if (pending_expression) null else view.expression_result;
+        self.expression_reason = if (pending_expression) "Preparing expression" else view.expression_reason;
     }
     fn drawText(self: *Panel, r: *gpu.Renderer, font: *Font, x: f32, y: f32, width: f32, value: []const u8, color: gpu.Color) !void {
         try r.textFit(font, x, y, width, value, color);
@@ -398,10 +284,10 @@ pub const Panel = struct {
             if (bottom > top) layout.add(.{ .x = left, .y = top, .w = right - left, .h = bottom - top }, value);
         }
     }
-    fn reportLayout(self: *Panel, session: *Session) void {
+    fn reportLayout(self: *Panel, state: prepared.Header) void {
         const layout = self.text_layout orelse return;
-        var hash = std.hash.Wyhash.init(session.target.snapshot().generation);
-        hash.update(@tagName(session.language_tabs.selected));
+        var hash = std.hash.Wyhash.init(state.generation);
+        hash.update(@tagName(state.selected));
         hash.update(self.layout_reason);
         for (0..layout.count) |i| {
             hash.update(std.mem.asBytes(&layout.boxes[i]));
@@ -412,7 +298,7 @@ pub const Panel = struct {
         self.layout_signature = signature;
         var first: [6][]const u8 = @splat("");
         const overlaps = layout.overlaps(&first);
-        std.debug.print("xodb: language layout tab={s} generation={d} boxes={d} selected_reason={s} overlaps={d} first=\"{s}\"/\"{s}\"\n", .{ @tagName(session.language_tabs.selected), session.target.snapshot().generation, layout.count, self.layout_reason, overlaps, first[0], first[1] });
+        std.debug.print("xodb: language layout tab={s} generation={d} boxes={d} selected_reason={s} overlaps={d} first=\"{s}\"/\"{s}\"\n", .{ @tagName(state.selected), state.generation, layout.count, self.layout_reason, overlaps, first[0], first[1] });
     }
     fn wrapped(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, y: *f32, text: []const u8, color: gpu.Color) !void {
         var remaining = text;
@@ -490,25 +376,30 @@ pub const Panel = struct {
         }
     }
     pub fn body(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, session: *Session, tid: i32, frame: usize, native_values: anytype, native_reason: ?[]const u8) !void {
+        const logical = session.language_tabs.logical_selection;
+        const logical_tid = if (logical) |selected| if (selected.generation == session.target.snapshot().generation and selected.language == session.language_tabs.selected) selected.tid else tid else tid;
+        self.refresh(session, logical_tid, frame);
+        return self.drawBody(r, font, rect, prepared.header(session), frame, native_values, native_reason);
+    }
+    pub fn drawBody(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, state: prepared.Header, frame: usize, native_values: anytype, native_reason: ?[]const u8) !void {
         if (self.text_layout == null and c.getenv("XODB_LANGUAGE_LAYOUT") != null) {
             self.text_layout = try std.heap.page_allocator.create(TextLayout);
             self.text_layout.?.* = .{};
         }
         if (self.text_layout) |layout| layout.count = 0;
         self.layout_reason = "none";
-        defer self.reportLayout(session);
+        defer self.reportLayout(state);
         self.row_hits = @splat(null);
         self.binding_hits = @splat(null);
-        const logical = session.language_tabs.logical_selection;
-        const logical_tid = if (logical) |selected| if (selected.generation == session.target.snapshot().generation and selected.language == session.language_tabs.selected) selected.tid else tid else tid;
-        self.refresh(session, logical_tid, frame);
-        const state = &session.language_tabs;
+        self.row_hits = @splat(null);
+        self.binding_hits = @splat(null);
+        const logical = state.logical_selection;
         const entry = &state.entries[@intFromEnum(state.selected) - 2];
         var y = self.content_y;
-        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.version.slice(), theme.neutral);
+        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.version, theme.neutral);
         y += 23;
-        try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis.slice()), theme.weak);
-        if (entry.proof_generation == null or entry.proof_generation.? != session.target.snapshot().generation or entry.reason != null) {
+        try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis), theme.weak);
+        if (entry.proof_generation == null or entry.proof_generation.? != state.generation or entry.reason != null) {
             try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
             y += 23;
         }
@@ -531,7 +422,7 @@ pub const Panel = struct {
         self.native_y = native_top;
         self.binding_y = if (has_named) binding_top else std.math.inf(f32);
         if (logical) |current| {
-            const key = SelectedKey{ .generation = current.generation, .tid = current.tid, .language = current.language, .segment = current.segment, .frame = current.frame };
+            const key = SelectedKey{ .session = state.session, .generation = current.generation, .tid = current.tid, .language = current.language, .segment = current.segment, .frame = current.frame };
             if (self.revealed == null or !std.meta.eql(self.revealed.?, key)) {
                 const visible: usize = @intFromFloat(@max(1, @floor((native_top - y) / 48)));
                 for (self.rows, 0..) |row, index| {
@@ -652,4 +543,25 @@ pub fn watchError(err: anyerror) []const u8 {
         error.SelectLanguageFrame => "Select a logical frame first",
         else => @errorName(err),
     };
+}
+
+test "language publication cannot replace a newer page or expression in the same selection" {
+    const selected: SelectedKey = .{ .session = 1, .generation = 2, .tid = 42, .language = .python, .segment = 0, .frame = 3 };
+    const header: prepared.Header = .{ .session = 1, .generation = 2, .metadata = 0, .revision = 0, .state = .stopped, .selected = .python, .native_selection = null, .logical_selection = null };
+    var panel: Panel = .{};
+    panel.bindings_key = selected;
+    panel.binding_start = 32;
+    @memcpy(panel.expression[0..3], "new");
+    panel.expression_len = 3;
+    panel.present(.{ .header = header, .key = header.key(42, 0), .selected = selected, .binding_start = 0, .expression = "old" });
+    try std.testing.expectEqual(@as(usize, 32), panel.binding_start);
+    try std.testing.expectEqualStrings("new", panel.expression[0..panel.expression_len]);
+    try std.testing.expect(panel.bindings == null and panel.expression_result == null);
+    panel.present(.{ .header = header, .key = header.key(42, 0), .selected = selected, .binding_start = 32, .expression = "new" });
+    try std.testing.expect(panel.expression_reason == null);
+    var changed = selected;
+    changed.frame += 1;
+    panel.present(.{ .header = header, .key = header.key(42, 0), .selected = changed });
+    try std.testing.expectEqual(@as(usize, 0), panel.binding_start);
+    try std.testing.expectEqual(@as(usize, 0), panel.expression_len);
 }

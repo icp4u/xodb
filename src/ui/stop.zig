@@ -3,7 +3,7 @@ const std = @import("std");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const keys = @import("../platform/input.zig");
-const Session = @import("../model/session.zig").Session;
+const prepared = @import("../model/stop_view.zig");
 const style = @import("style.zig");
 const theme = style.theme;
 pub const Panel = struct {
@@ -23,17 +23,22 @@ pub const Panel = struct {
         const b = self.bounds;
         if (x < b.x or x > b.x + b.w or y < b.y or y > b.y + b.h) self.open = false;
     }
-    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, session: *Session, tid: i32) !void {
+    pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, width: f32, height: f32, view: prepared.View) !void {
         if (!self.open) return;
         self.bounds = .{ .x = 20, .y = 96, .w = width - 40, .h = height - 136 };
         const b = self.bounds;
         try r.rect(.{ .x = 0, .y = 84, .w = width, .h = height - 110 }, theme.overlay);
         try style.box(r, b, theme.surface, theme.focus, @splat(8));
         try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "STOP / CRASH DETAILS   C / Esc close", theme.text);
-        const info = session.target.stopInfo(tid) catch |err| {
-            try r.textFit(font, b.x + 14, b.y + 45, b.w - 28, @errorName(err), theme.weak);
+        if (view.failure) |message| {
+            try r.textFit(font, b.x + 14, b.y + 45, b.w - 28, message, theme.weak);
+            return;
+        }
+        const info = view.info orelse {
+            try r.textFit(font, b.x + 14, b.y + 45, b.w - 28, "Stop details pending", theme.weak);
             return;
         };
+        const tid = info.tid;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const a = arena.allocator();
@@ -48,30 +53,12 @@ pub const Panel = struct {
             try r.textFit(font, b.x + 14, y, b.w - 28, row, theme.text);
             y += 27;
         }
-        if (info.pc) |pc| {
-            const site = session.sourceAt(a, pc) catch null;
-            if (site) |source| {
-                try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.allocPrint(a, "{s}:{d}", .{ source.path, source.line }), theme.weak);
-                y += 27;
-            }
+        if (view.source) |source| {
+            try r.textFit(font, b.x + 14, y, b.w - 28, source, theme.weak);
+            y += 27;
         }
-        if (info.fault_address) |address| {
-            var mapped = false;
-            if (session.target.core) |*core| {
-                for (core.segments.items) |segment| if (address >= segment.start and address < segment.end) {
-                    mapped = true;
-                    try r.textFit(font, b.x + 14, y, b.w - 28, if (address - segment.start < segment.stored) "Fault address lies in captured memory" else "Fault address mapped; bytes omitted from core", theme.weak);
-                    break;
-                };
-            } else {
-                session.refreshMaps() catch {};
-                for (session.modules.regions.items) |region| if (address >= region.start and address < region.end) {
-                    mapped = true;
-                    try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.allocPrint(a, "Fault mapping: {s} {s}", .{ &region.permissions, region.path }), theme.weak);
-                    break;
-                };
-            }
-            if (!mapped) try r.textFit(font, b.x + 14, y, b.w - 28, "Fault address has no mapping in the available map snapshot", theme.warm);
+        if (view.mapping) |mapping| {
+            try r.textFit(font, b.x + 14, y, b.w - 28, mapping, if (view.mapping_missing) theme.warm else theme.weak);
             y += 27;
         }
         if (info.diagnostic) |message| {

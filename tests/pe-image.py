@@ -45,6 +45,7 @@ command(['cc','-std=c11','-O2','-g','-DNDEBUG','-Wall','-Wextra','-Werror','test
 actual=command([str(check),str(w/'owned-pe.dll')],'file-and-memory')
 command([str(check),str(w/'owned-pe.dll'),'wrong-result'],'wrong-result',expect=-6)
 command([str(check),str(w/'owned-pe.dll'),'faults'],'source-faults')
+command([str(check),str(w/'owned-pe.dll'),'budget'],'peak-budget')
 oracle=command(['llvm-readobj','--file-headers','--sections','--coff-exports','--coff-imports','--coff-debug-directory','--unwind',str(w/'owned-pe.dll')],'compiler-oracle')
 for line in actual.splitlines():
     if not line.startswith('export\t'):continue

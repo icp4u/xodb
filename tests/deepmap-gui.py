@@ -54,7 +54,7 @@ def field():
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1]))
 
 def until(fn, name, seconds=10):
-    deadline = time.monotonic() + seconds
+    deadline = time.monotonic() + seconds * h.load_scale()
     while time.monotonic() < deadline:
         if not d.alive(): raise AssertionError(d.tail())
         if fn(): return
@@ -62,7 +62,7 @@ def until(fn, name, seconds=10):
     raise AssertionError(name + ': ' + d.tail())
 
 def send(*cmd):
-    if d.keys(*cmd, wait=False).wait(timeout=10): raise AssertionError('private input failed')
+    if d.keys(*cmd, wait=False).wait(timeout=10 * h.load_scale()): raise AssertionError('private input failed')
 
 def close():
     global d
@@ -81,7 +81,7 @@ def close():
 def ocr(name, box):
     path = Path(d.shot(name))
     with Image.open(path) as im: im.crop(box).resize(((box[2]-box[0])*2,(box[3]-box[1])*2)).save(path)
-    return subprocess.check_output(['tesseract',str(path),'stdout','--psm','6'],stderr=subprocess.DEVNULL,text=True,timeout=10)
+    return subprocess.check_output(['tesseract',str(path),'stdout','--psm','6'],stderr=subprocess.DEVNULL,text=True,timeout=10 * h.load_scale())
 
 base, replay = work/'base.jsonl', work/'replay.jsonl'
 subprocess.run(['python3','-B','tests/fixtures/overview-synth.py',str(base),'--frames','3'],check=True)
@@ -115,11 +115,29 @@ def periodic():
                       stdio=False,trace=False,binary=a.binary,output_size=(1920,1080))
         until(lambda: field() and int(field()['pending']) == 0,'live sampled',20)
         # Make one partial overlap while the old exact-address sample is retained.
-        old_origin = field()['origin']
+        before_pan = field()
+        old_origin = before_pan['origin']
         send('tap',106)
-        until(lambda: field()['origin'] != old_origin and 0 < int(field()['pending']) < int(field()['count']), 'actual partial reuse')
-        check('live pan observes partial reuse before the new scan', 0 < int(field()['pending']) < int(field()['count']))
-        until(lambda: int(field()['pending']) == 0, 'pan publication',20)
+        # Deliberately observe only the completed scan. Partial frames can finish
+        # between polls; their evidence must survive in the latest trace row.
+        until(lambda: field()['origin'] != old_origin and int(field()['pending']) == 0, 'pan publication',20)
+        after_pan = field()
+        def partial_reused(row):
+            return (int(row.get('partial_frames', 0)) > int(before_pan.get('partial_frames', 0))
+                    and row.get('partial_origin') == row['origin']
+                    and row.get('partial_cell') == row['cell']
+                    and int(row.get('partial_count', 0)) == int(row['count'])
+                    and 0 < int(row.get('partial_pending', 0)) < int(row['count']))
+        if os.getenv('XODB_TEST_WRONG_DEEPMAP_PARTIAL'):
+            after_pan['partial_pending'] = after_pan['count']
+        check('completed pan retains evidence of partial reuse', partial_reused(after_pan))
+        check('partial-reuse oracle refuses stale, empty and wholly pending evidence', all(
+            not partial_reused(dict(after_pan, **{key: wrong})) for key, wrong in (
+                ('partial_frames', before_pan.get('partial_frames', '0')),
+                ('partial_origin', old_origin), ('partial_cell', '0'),
+                ('partial_count', '0'), ('partial_pending', '0'),
+                ('partial_pending', after_pan['count']))))
+        evidence['partial_reuse'] = dict(before=before_pan, after=after_pan)
         view = (field()['origin'],field()['cell'])
         samples = []
         for phase,seconds in [('visible',8),('hidden',5),('reopened',8),('hidden_again',5)]:
@@ -146,8 +164,8 @@ def periodic():
         if target.poll() is None:
             if Path(os.readlink(f'/proc/{target.pid}/cwd')) != root: raise AssertionError('fixture cwd changed')
             target.terminate()
-        try: target.wait(timeout=5)
-        except subprocess.TimeoutExpired: target.kill(); target.wait(timeout=5)
+        try: target.wait(timeout=5 * h.load_scale())
+        except subprocess.TimeoutExpired: target.kill(); target.wait(timeout=5 * h.load_scale())
 
 try:
     d = h.Display(str(root),['--overview','--look','deep','--panel','memory_map','--redact','--pause','--replay',str(replay)],

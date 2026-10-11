@@ -44,5 +44,10 @@ int LLVMFuzzerTestOneInput(const unsigned char *data,size_t size) {
             CHECK(xpdb_line_at(p,l->rva)==l && xpdb_line_at(p,l->end-1)==l);
         }
     } else CHECK(!p);
+    xpdb_destroy(p);p=NULL;
+    uint64_t allowance=size?(uint64_t)data[size-1]*1024:0;
+    if(xpdb_load_budget(data,size,guid,age,sections,count,allowance,&p)==XPDB_OK)
+        CHECK(p && xpdb_info(p)->peak_bytes<=allowance);
+    else CHECK(!p);
     xpdb_destroy(p);return 0;
 }

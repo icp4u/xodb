@@ -32,28 +32,52 @@ pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source
         session.record(.agent, "detach");
         return asValue(a, session.snapshot());
     }
-    const generation = try number(args, "generation", session.target.snapshot().generation);
-    try session.target.expectGeneration(generation);
-    const frame_index = try number(args, "frame", 0);
-    const tid_number = try number(args, "tid", 0);
-    if (frame_index >= 64 or tid_number > std.math.maxInt(i32)) return error.InvalidArguments;
-    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.snapshot().pid, .architecture = @tagName(session.target.arch()), .state = @tagName(session.target.snapshot().state), .scope = @tagName(session.agent_scope), .continue_pending = session.pending_continue != null, .owned = session.target.snapshot().owned, .frame = @intCast(frame_index) };
+    const tid = try number(args, "tid", 0);
+    const frame = try number(args, "frame", 0);
+    if (tid > std.math.maxInt(i32) or frame >= 64) return error.InvalidArguments;
+    var summary_only = false;
     if (args.object.get("summary_only")) |summary| {
         if (summary != .bool) return error.InvalidArguments;
-        if (summary.bool) return asValue(a, view);
+        summary_only = summary.bool;
     }
+    return asValue(a, try captureView(a, session, .{
+        .generation = try number(args, "generation", session.target.snapshot().generation),
+        .selection = .{ .tid = @intCast(tid), .frame = @intCast(frame) },
+        .summary_only = summary_only,
+        .source = source,
+    }));
+}
+
+pub const ViewRequest = struct {
+    generation: ?u64 = null,
+    selection: @import("../model/remote_owner.zig").Selection = .{ .tid = 0 },
+    summary_only: bool = false,
+    source: ?[:0]const u8 = null,
+};
+/// Owner-thread capture shared by MCP and local remote-session publications.
+/// Allocated rows belong to a; module/register strings may borrow Session state.
+/// Deep-copy the value into a Publication before releasing the owner or arena.
+pub fn captureView(a: A, session: *model.Session, request: ViewRequest) !wire.View {
+    if (session.offline) return error.OfflineSession;
+    const generation = request.generation orelse session.target.snapshot().generation;
+    try session.target.expectGeneration(generation);
+    const frame_index = request.selection.frame;
+    const tid_number = request.selection.tid;
+    if (frame_index >= 64 or tid_number < 0) return error.InvalidArguments;
+    var view = wire.View{ .session_id = session.id, .generation = generation, .pid = session.target.snapshot().pid, .architecture = @tagName(session.target.arch()), .state = @tagName(session.target.snapshot().state), .scope = @tagName(session.agent_scope), .continue_pending = session.pending_continue != null, .owned = session.target.snapshot().owned, .frame = frame_index };
+    if (request.summary_only) return view;
     const threads = session.target.threadSlice();
     var rows: std.ArrayList(wire.Thread) = .empty;
     for (threads[0..@min(threads.len, 256)]) |t| try rows.append(a, .{ .id = t.id, .tid = t.tid, .state = @tagName(t.state), .reason = @tagName(t.reason) });
     view.threads = rows.items;
     view.threads_truncated = rows.items.len != threads.len;
-    view.tid = if (tid_number == 0) defaultThread(threads) else @intCast(tid_number);
+    view.tid = if (tid_number == 0) defaultThread(threads) else tid_number;
     var diagnostics: std.ArrayList(wire.Diagnostic) = .empty;
     if (session.step_diagnostic) |d| try diagnostics.append(a, .{ .component = "step", .message = d });
     if (session.target.snapshot().state == .stopped and view.tid != 0) {
         inspect(a, session, &view, &diagnostics) catch |err| try diagnostics.append(a, .{ .component = "inspection", .message = @errorName(err) });
         // Only a file explicitly supplied by the server operator is shared.
-        if (source) |path| {
+        if (request.source) |path| {
             view.source = readSource(a, path) catch |err| blk: {
                 try diagnostics.append(a, .{ .component = "source", .message = @errorName(err) });
                 break :blk null;
@@ -61,7 +85,7 @@ pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source
         }
     }
     view.diagnostics = diagnostics.items;
-    return asValue(a, view);
+    return view;
 }
 fn defaultThread(threads: []const @import("../target/linux.zig").Thread) i32 {
     // Peers interrupted for all-stop are inspection fallbacks. Follow the
@@ -126,7 +150,7 @@ fn inspect(a: A, session: *model.Session, view: *wire.View, diagnostics: *std.Ar
     var bytes: [256]u8 = undefined;
     var decoded: [32]@import("../model/disassembly.zig").Instruction = undefined;
     const n = try session.target.readMemory(pc, &bytes);
-    const count = try @import("../model/disassembly.zig").decode(bytes[0..n], pc, &decoded);
+    const count = try @import("../model/disassembly.zig").decodeFor(session.target.arch(), bytes[0..n], pc, &decoded);
     const instructions = try a.alloc(wire.Instruction, count);
     for (decoded[0..count], instructions) |inst, *row| row.* = .{ .address = inst.address, .mnemonic = try a.dupe(u8, std.mem.sliceTo(&inst.mnemonic, 0)), .operands = try a.dupe(u8, std.mem.sliceTo(&inst.operands, 0)) };
     view.instructions = instructions;

@@ -254,15 +254,10 @@ test "bundled bitmap font covers every mark the overview source draws" {
     font.* = .{};
     try font.initRetro();
     defer font.deinit();
-    const io = std.testing.io;
-    var dir = try std.Io.Dir.cwd().openDir(io, "src/ui/overview", .{ .iterate = true });
-    defer dir.close(io);
-    var walker = try dir.walk(a);
-    defer walker.deinit();
+    const inputs = @import("overview_font_sources");
     var seen: usize = 0;
-    while (try walker.next(io)) |entry| {
-        if (entry.kind != .file or !std.mem.endsWith(u8, entry.basename, ".zig")) continue;
-        const source = try entry.dir.readFileAllocOptions(io, entry.basename, a, .limited(4 * 1024 * 1024), .of(u8), 0);
+    for (inputs.paths, inputs.sources) |path, text| {
+        const source = try a.dupeZ(u8, text);
         defer a.free(source);
         // Zig's tokenizer skips comments while preserving // inside strings.
         var tokens = std.zig.Tokenizer.init(source);
@@ -278,8 +273,9 @@ test "bundled bitmap font covers every mark the overview source draws" {
             while (it.nextCodepoint()) |cp| {
                 if (cp < 0x80) continue;
                 seen += 1;
-                if (c.FT_Get_Char_Index(font.face, cp) == 0) {
-                    std.debug.print("bundled font lacks U+{X:0>4} in {s}: {s}\n", .{ cp, entry.path, literal });
+                const probe = if (std.c.getenv("XODB_TEST_WRONG_FONT_COVERAGE") != null) 0x10ffff else cp;
+                if (c.FT_Get_Char_Index(font.face, probe) == 0) {
+                    std.debug.print("bundled font lacks U+{X:0>4} in {s}: {s}\n", .{ probe, path, literal });
                     return error.MissingGlyph;
                 }
             }

@@ -142,7 +142,14 @@ class Client:
         return self.tool('claim_session_control', generation=self.session()['generation'], ttl_ms=ttl_ms)
 
     def action(self, name, **args):
-        return self.tool(name, generation=self.session()['generation'], **args)
+        # The generation may advance between the read and the call (metadata
+        # arriving, another client): a refused stale snapshot is retried.
+        for _ in range(20):
+            reply = self.raw(name, generation=self.session()['generation'], **args)
+            if 'error' in reply or reply['result'].get('content') != [{'type': 'text', 'text': 'StaleSnapshot'}]: break
+            time.sleep(.02)
+        assert 'error' not in reply and not reply['result']['isError'], reply
+        return reply['result']['structuredContent']
 
     def close(self):
         if not self.closed:

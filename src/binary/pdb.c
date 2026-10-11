@@ -19,6 +19,7 @@ struct xpdb {
 struct parser {
     const unsigned char *bytes;
     size_t size, allocated, peak;
+    uint64_t allowance;
     uint64_t work;
     uint32_t page_size, page_count, stream_count;
     struct block directory, streams, ownership;
@@ -51,6 +52,7 @@ static void sort(void *data,size_t count,size_t size,int (*compare)(const void *
 }
 static enum xpdb_status alloc(struct parser *p, struct block *b, size_t n) {
     if (n > XPDB_MAX_ALLOCATED_BYTES-p->allocated) return XPDB_LIMIT;
+    if (n > p->allowance-p->allocated) return XPDB_BUDGET;
     b->data = n ? malloc(n) : NULL;
     if (n && !b->data) return XPDB_NOMEM;
     b->size=n; p->allocated+=n;
@@ -411,10 +413,16 @@ done:drop(p,&rows.rows);drop(p,&sections);drop(p,&b);return status;
 }
 enum xpdb_status xpdb_load(const void *bytes,size_t size,const unsigned char guid[16],uint32_t age,
     const struct xpdb_section *sections,unsigned count,struct xpdb **out) {
+    return xpdb_load_budget(bytes,size,guid,age,sections,count,XPDB_MAX_ALLOCATED_BYTES,out);
+}
+enum xpdb_status xpdb_load_budget(const void *bytes,size_t size,const unsigned char guid[16],uint32_t age,
+    const struct xpdb_section *sections,unsigned count,uint64_t allowance,struct xpdb **out) {
     if(!out)return XPDB_MALFORMED;
     *out=NULL;
     if((size && !bytes) || !guid || !sections || !count || count>96)return XPDB_MALFORMED;
-    struct parser p={.bytes=bytes,.size=size,.allocated=sizeof(struct xpdb),.peak=sizeof(struct xpdb)};
+    if(allowance<sizeof(struct xpdb))return XPDB_BUDGET;
+    struct parser p={.bytes=bytes,.size=size,.allocated=sizeof(struct xpdb),.peak=sizeof(struct xpdb),
+        .allowance=allowance<XPDB_MAX_ALLOCATED_BYTES?allowance:XPDB_MAX_ALLOCATED_BYTES};
     p.out=calloc(1,sizeof *p.out);if(!p.out)return XPDB_NOMEM;
     p.out->section_count=count;memcpy(p.out->sections,sections,count*sizeof *sections);
     for(unsigned i=0;i<count;++i)if(sections[i].size>UINT32_MAX-sections[i].rva){xpdb_destroy(p.out);return XPDB_MALFORMED;}
@@ -463,6 +471,6 @@ const char *xpdb_status_name(enum xpdb_status s) {
     switch(s) {
     case XPDB_OK:return "ok";case XPDB_NOT_PDB:return "not_pdb";case XPDB_MALFORMED:return "malformed";
     case XPDB_UNSUPPORTED:return "unsupported";case XPDB_MISMATCH:return "mismatch";
-    case XPDB_LIMIT:return "limit";case XPDB_NOMEM:return "out_of_memory";
+    case XPDB_LIMIT:return "limit";case XPDB_NOMEM:return "out_of_memory";case XPDB_BUDGET:return "budget";
     }return "invalid";
 }

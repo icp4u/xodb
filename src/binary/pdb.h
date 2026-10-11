@@ -11,7 +11,7 @@
 #define XPDB_MAX_ALLOCATED_BYTES (64u * 1024u * 1024u)
 #define XPDB_MAX_ROWS 1048576u
 enum xpdb_status { XPDB_OK, XPDB_NOT_PDB, XPDB_MALFORMED, XPDB_UNSUPPORTED,
-    XPDB_MISMATCH, XPDB_LIMIT, XPDB_NOMEM };
+    XPDB_MISMATCH, XPDB_LIMIT, XPDB_NOMEM, XPDB_BUDGET };
 struct xpdb_section { uint32_t rva, size; };
 struct xpdb_public { const char *name; uint32_t rva, flags; uint16_t section; };
 struct xpdb_line { const char *path; uint32_t rva, end, line, column; unsigned statement; };
@@ -19,6 +19,9 @@ struct xpdb_info { uint32_t public_count, line_count; uint64_t retained_bytes, p
 struct xpdb;
 enum xpdb_status xpdb_load(const void *, size_t, const unsigned char guid[16], uint32_t age,
     const struct xpdb_section *, unsigned section_count, struct xpdb **);
+/* Bounds all parser allocations, excluding the caller-owned source bytes. */
+enum xpdb_status xpdb_load_budget(const void *, size_t, const unsigned char guid[16], uint32_t age,
+    const struct xpdb_section *, unsigned section_count, uint64_t allowance, struct xpdb **);
 void xpdb_destroy(struct xpdb *);
 const struct xpdb_info *xpdb_info(const struct xpdb *);
 const struct xpdb_public *xpdb_public(const struct xpdb *, unsigned);

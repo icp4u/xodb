@@ -45,7 +45,7 @@ int main(int argc,char **argv) {
         .device_major=major(st.st_dev),.device_minor=minor(st.st_dev),.inode=st.st_ino,.path=path}};
     struct xrt_file_view *view=NULL;CHECK(xrt_target_file_view_open(&target,&request,&view)==XRT_OK);
     hold=!strcmp(argv[2],"barrier");
-    struct xpe_job *job=NULL;CHECK(xpe_job_start(view,getpid(),path,&job)==XPE_OK);
+    struct xpe_job *job=NULL;CHECK(xpe_job_start(view,getpid(),path,XPE_JOB_MAX_BYTES,&job)==XPE_OK);
     if (hold) {
         CHECK(!pthread_mutex_lock(&gate));
         while (!entered) CHECK(!pthread_cond_wait(&changed,&gate));
@@ -70,6 +70,19 @@ int main(int argc,char **argv) {
         CHECK(xpe_job_validate(job)==XPE_OK);
         unsigned char mz[2];CHECK(xpe_read_rva(image,0,mz,2)==XPE_OK && mz[0]=='M' && mz[1]=='Z');
         CHECK(snapshot.source_bytes && snapshot.source_reads);
+        if (!strcmp(argv[2],"budget")) {
+            CHECK(xpe_job_pdb(job));
+            uint64_t allowance=xpe_info(image)->retained_bytes+1;
+            xpe_job_destroy(job);job=NULL;view=NULL;
+            CHECK(xrt_target_file_view_open(&target,&request,&view)==XRT_OK);
+            CHECK(xpe_job_start(view,getpid(),path,allowance,&job)==XPE_OK);
+            wait_job(job);xpe_job_poll(job,&snapshot);
+            CHECK(snapshot.state==XPE_JOB_FAILED && snapshot.status==XPE_BUDGET && !xpe_job_image(job));
+            xpe_job_destroy(job);job=NULL;view=NULL;
+            CHECK(xrt_target_file_view_open(&target,&request,&view)==XRT_OK);
+            CHECK(xpe_job_start(view,getpid(),path,XPE_JOB_MAX_BYTES,&job)==XPE_OK);
+            wait_job(job);CHECK(xpe_job_image(job) && xpe_job_pdb(job));
+        }
         if (!strcmp(argv[2],"mutation")) {
             struct timespec times[]={st.st_atim,st.st_mtim};++times[1].tv_sec;CHECK(!futimens(fd,times));
             CHECK(xpe_job_validate(job)==XPE_CHANGED && !xpe_job_image(job));

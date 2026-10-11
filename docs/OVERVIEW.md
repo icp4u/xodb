@@ -676,6 +676,10 @@ and count of unknown and partial towers visible.
 
 **WASD** moves the camera, mouse drag and arrows orbit, the wheel or **+/-**
 zooms, **F** toggles automatic orbit and dolly, and **R** resets the camera.
+Held movement, arrow and zoom keys combine and ease over frame time; they do
+not depend on keyboard repeat. Releasing eases to rest; focus loss stops
+immediately and clears held keys. Automatic orbit stops after five idle
+seconds; **F** or **R** starts it again.
 These controls are local to Gibson: **D** moves right. Click a tower for the
 same block detail text as the 2D views; **Esc** clears the selection. **O**
 chooses a process. Selection is stored by address and cleared on process

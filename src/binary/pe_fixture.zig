@@ -39,3 +39,33 @@ pub fn binary(version: u8) [0x600]u8 {
     b[0x448] = 1;
     return b;
 }
+
+/// A low-alignment loaded image whose sole export is data, for lookup intent.
+pub fn dataExport() [4096]u8 {
+    var b: [4096]u8 = @splat(0);
+    const basic = binary(1);
+    @memcpy(b[0..0x200], basic[0..0x200]);
+    put(&b, 88 + 32, u32, 0x200);
+    put(&b, 88 + 56, u32, b.len);
+    put(&b, 88 + 112, u32, 0x240);
+    put(&b, 88 + 116, u32, 0x80);
+    put(&b, 88 + 136, u32, 0);
+    put(&b, 88 + 140, u32, 0);
+    @memcpy(b[328..333], ".data");
+    put(&b, 336, u32, 0x200);
+    put(&b, 340, u32, 0x200);
+    put(&b, 344, u32, 0x200);
+    put(&b, 364, u32, 0x40000040);
+    put(&b, 0x240 + 12, u32, 0x310);
+    put(&b, 0x240 + 16, u32, 1);
+    put(&b, 0x240 + 20, u32, 1);
+    put(&b, 0x240 + 24, u32, 1);
+    put(&b, 0x240 + 28, u32, 0x2a0);
+    put(&b, 0x240 + 32, u32, 0x2a4);
+    put(&b, 0x240 + 36, u32, 0x2a8);
+    put(&b, 0x2a0, u32, 0x380);
+    put(&b, 0x2a4, u32, 0x330);
+    @memcpy(b[0x310..][0..11], "runtime.dll");
+    @memcpy(b[0x330..][0..10], "_PyRuntime");
+    return b;
+}

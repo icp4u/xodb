@@ -38,7 +38,7 @@ checks = []
 d = None
 
 def until(fn, name):
-    deadline = time.monotonic() + 10
+    deadline = time.monotonic() + 10 * h.load_scale()
     while time.monotonic() < deadline:
         if not d.alive():
             raise AssertionError(d.tail())
@@ -60,7 +60,7 @@ def navy(name, xy):
     return all(abs(a-b) <= 4 for a,b in zip(shot(name).getpixel(xy), (0,0,128)))
 
 def send(*cmd):
-    if d.keys(*cmd, wait=False).wait(timeout=10):
+    if d.keys(*cmd, wait=False).wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
 
 try:
@@ -84,7 +84,7 @@ try:
     until(lambda: navy('legend-closed', (500, 122)), 'Escape closes only the legend')
     # A short screen has readable rows with Later/Earlier buttons, never overlapping Close.
     subprocess.run(['swaymsg', 'output', 'HEADLESS-1', 'mode', '900x480'], env=d.env,
-                   check=True, capture_output=True, timeout=5)
+                   check=True, capture_output=True, timeout=5 * h.load_scale())
     d.width, d.height = 900, 480
     until(lambda: shot('short').size == (900, 480), 'short output configured')
     send('tap', 34, 'm', 2, 100)
@@ -94,7 +94,7 @@ try:
     send('tap', 1, 'm', 2, 100)
     until(lambda: d.alive(), 'short legend closes cleanly')
     subprocess.run(['swaymsg', 'output', 'HEADLESS-1', 'mode', '1920x1080'], env=d.env,
-                   check=True, capture_output=True, timeout=5)
+                   check=True, capture_output=True, timeout=5 * h.load_scale())
     d.width, d.height = 1920, 1080
     until(lambda: shot('defrag-1080').size == (1920, 1080), 'full-size defrag captured')
     send('tap', 34, 'm', 2, 100)

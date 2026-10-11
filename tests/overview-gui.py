@@ -208,8 +208,15 @@ else:
         d.tap('t')
         green = mean(d.shot('theme-green'), (0, 0, 1920, 1080))
         check('t cycles to green phosphor', green[1] > green[0] * 1.5 and green[1] > green[2] * 1.5, green)
-        for _ in range(4):
+        # Return to the original theme before using its panel geometry. The
+        # theme set can grow (for example, Win95 has its own chrome).
+        for _ in range(16):
             d.tap('t')
+            restored = mean(d.shot('theme-restored'), (300, 600, 600, 700))
+            if max(abs(a - b) for a, b in zip(before, restored)) < 1:
+                break
+        check('theme cycle returns to the original dark background',
+              max(abs(a - b) for a, b in zip(before, restored)) < 1, restored)
         # Processes: sort and search.
         d.tap('n3')
         text = ocr(d.shot('sorted-cpu'))

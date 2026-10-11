@@ -62,7 +62,12 @@ for slow in ((False,) if a.fast_only else (True, False)):
         os.environ['XODB_DISCOVERY_RATE'] = str(256*1024 if slow else 1024*1024*1024)
         d = h.Display(str(work/'tree'), ['--agent-scope', 'control', '--runtime-agent',
             str(root/'tests/fixtures/symbol-agent-proxy.py'), '--break', 'owned_stop', '--', str(fixture), str(image)])
-        d.tool('continue', generation=d.session()['generation'])
+        # The async GUI can map while the startup breakpoint is still resolving.
+        # Act on the settled stop, as the synchronous GUI implicitly did.
+        ready = d.wait(lambda s: s['state'] == 'stopped' and not s['symbol_discovery_pending']
+                       and not s['continue_pending'], seconds=90)
+        assert ready, d.tail()
+        d.tool('continue', generation=ready['generation'])
         stopped = d.wait(lambda s: s['state'] == 'stopped' and not s['symbol_discovery_pending'] and
             not s['continue_pending'] and any(t['reason'] == 'breakpoint' for t in s['threads']), seconds=90)
         assert stopped

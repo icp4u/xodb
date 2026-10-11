@@ -26,7 +26,7 @@ pub const Frame = struct {
     symbol: ?[]const u8 = null,
     source: ?info.Site = null,
     unwind_method: ?[]const u8 = null,
-    inline_frames: []info.Inline = &.{},
+    inline_frames: []const info.Inline = &.{},
     inline_diagnostic: ?[]const u8 = null,
     diagnostic: ?[]const u8 = null,
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
@@ -92,6 +92,7 @@ pub const Session = struct {
     fetch_source: bool = false,
     target: linux.Target = .{},
     modules: Modules = Modules.init(std.heap.page_allocator),
+    compatibility: @import("compatibility.zig").Cache = .{},
     debug_files: @import("../binary/debug_files.zig").Files = .{ .allocator = std.heap.page_allocator },
     source_maps: @import("source_maps.zig").Maps = .{},
     metadata: @import("debug_metadata.zig").State = .{},
@@ -1190,6 +1191,7 @@ pub const Session = struct {
         self.modules.discoverPe();
     }
     pub fn poll(self: *Session) !void {
+        defer self.compatibility.poll(self);
         defer self.pollPeImages();
         defer self.modules.reportBudget();
         defer self.language_watches.poll(self);
@@ -1599,14 +1601,15 @@ pub const Session = struct {
                     try frames.append(a, frame);
                     break :stack_walk;
                 };
-                frame.inline_frames = debug.inlineAt(a, try module.linkAddress(frame.lookup_pc)) catch |err| blk: {
+                const inline_frames: []info.Inline = debug.inlineAt(a, try module.linkAddress(frame.lookup_pc)) catch |err| blk: {
                     frame.inline_diagnostic = @errorName(err);
                     break :blk &.{};
                 };
-                for (frame.inline_frames) |*inlined| {
+                for (inline_frames) |*inlined| {
                     if (inlined.call_path) |path| inlined.call_path = try self.sourceMaps().forward(a, path);
                     if (inlined.decl_path) |path| inlined.decl_path = try self.sourceMaps().forward(a, path);
                 }
+                frame.inline_frames = inline_frames;
                 break :step debug.unwind(a, try module.linkAddress(frame.lookup_pc), .{ .registers = registers, .load_bias = module.bias, .user = self, .read = readTarget }) catch |err| {
                     frame.diagnostic = @errorName(err);
                     try frames.append(a, frame);
@@ -1889,9 +1892,10 @@ pub const Session = struct {
         return .{ .id = linux.now() };
     }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .compatibility = self.compatibility.info, .thread_labels = self.compatibility.labels.items, .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
     }
     pub fn deinit(self: *Session) void {
+        self.compatibility.deinit();
         self.language_watches.deinit();
         self.language_tabs.deinit();
         self.metadata.deinit();
@@ -1926,7 +1930,7 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const Snapshot = struct { compatibility: @import("compatibility.zig").Info = .{}, thread_labels: []const @import("compatibility.zig").Label = &.{}, gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

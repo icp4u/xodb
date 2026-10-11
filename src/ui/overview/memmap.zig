@@ -225,7 +225,7 @@ pub const State = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const State, now: u64) bool {
-        if (self.look == .gibson) return self.city.camera.automatic or self.ease(now) < 1;
+        if (self.look == .gibson) return self.city.camera.animating(now) or self.ease(now) < 1;
         return (self.ease(now) < 1 and (!self.viewport() or self.deep.changed())) or (self.look == .modern and self.deep.nav.active);
     }
     /// The DOS look blinks changed cells: redraw at the VGA blink rate.
@@ -280,7 +280,7 @@ pub fn key(v: *vw.View, event: @import("../../platform/input.zig").Event, now: u
         }
         return true;
     }
-    if (s.look == .gibson and gibson.key(v, event.sym, event.shortcut)) return true;
+    if (s.look == .gibson and gibson.key(v, event, now)) return true;
     if (s.viewport() and deepmap.key(v, event.sym, event.shortcut, now)) return true;
     switch (event.sym) {
         0xff52 => return moveCursor(s, -@as(i64, @intCast(s.grid_cols))),
