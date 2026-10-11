@@ -85,7 +85,7 @@ pub const Panel = struct {
             // The first frame the user then selects binds the field.
             if (selected != null) {
                 self.editor_key = selected;
-                self.editor.message = if (named.supported(session.language_tabs.selected)) "" else "Elisp expressions unavailable; Esc cancels";
+                self.editor.message = if (named.supported(session.language_tabs.selected)) "" else "Expressions unavailable in this view; Esc cancels";
             }
         } else if (selected == null or !std.meta.eql(selected.?, self.editor_key.?)) self.editor.open = false;
     }
@@ -94,10 +94,11 @@ pub const Panel = struct {
         self.editor_key = selectedKey(session);
         self.editor_watch = false;
         self.editor.start();
-        if (session.language_tabs.selected == .elisp) self.editor.message = "Elisp expressions unavailable; Esc cancels" else if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
+        if (session.language_tabs.selected == .elisp) self.editor.message = "Elisp expressions unavailable; Esc cancels" else if (!named.supported(session.language_tabs.selected)) self.editor.message = "Expressions unavailable in this view; Esc cancels" else if (self.editor_key == null) self.editor.message = "Select a logical frame first; Esc cancels";
     }
     pub fn submitExpression(self: *Panel, session: *Session, text: []const u8) !void {
         if (session.language_tabs.selected == .elisp) return error.ElispExpressionsUnavailable;
+        if (!named.supported(session.language_tabs.selected)) return error.LanguageLocalsUnavailable;
         const selected = selectedKey(session) orelse return error.SelectLanguageFrame;
         if (self.editor_key == null or !std.meta.eql(self.editor_key.?, selected)) return error.StaleLanguageFrame;
         if (text.len == 0 or text.len > self.expression.len) return error.InvalidArguments;
@@ -572,7 +573,7 @@ pub const Panel = struct {
         if (self.editor.open) {
             try self.editor.draw(r, font, .{ .x = rect.x + 12, .y = y, .w = rect.w - 24, .h = 25 });
             y += 29;
-            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (state.selected == .elisp) "Unavailable; Esc cancels" else if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
+            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, if (state.selected == .elisp or !named.supported(state.selected)) "Unavailable; Esc cancels" else if (self.editor.message.len > 0) self.editor.message else if (self.editor_watch) "Return adds watch; Esc cancels" else "Return reads this stop; Esc cancels", theme.warm);
             y += 24;
         } else if (self.expression_len != 0) {
             const value = if (self.expression_result) |result| if (result.rows.len != 0) result.rows[0].value.display else result.diagnostic orelse "No binding" else self.expression_reason orelse "Value unavailable";
@@ -582,7 +583,7 @@ pub const Panel = struct {
             y += 25;
         }
         if (!named.supported(state.selected)) {
-            try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, "ELISP EXPRESSION", theme.neutral);
+            try self.drawText(r, font, rect.x + 12, heading_y, rect.w - 24, "EXPRESSION", theme.neutral);
             return;
         }
         if (self.bindings) |result| {
