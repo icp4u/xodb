@@ -67,7 +67,7 @@ def send(*cmd):
         raise AssertionError('private input failed')
 
 def field():
-    lines = [line for line in Path(d.log).read_text().splitlines() if 'xodb: memmap deep x=' in line]
+    lines = [line for line in h.complete_lines(d.log) if 'xodb: memmap deep x=' in line]
     if not lines:
         return None
     parts = dict(re.findall(r'(\w+)=([^ ]+)', lines[-1]))
@@ -157,7 +157,7 @@ def periodic():
                 before = snapshot(d.app.pid)
                 t0 = time.monotonic()
                 peak = before['rss_kib']
-                mark = len(Path(d.log).read_text())
+                mark = len(h.complete_lines(d.log))
                 # This is a measurement window, never a timing pass/fail threshold.
                 while time.monotonic() - t0 < 6:
                     if not d.alive():
@@ -168,7 +168,7 @@ def periodic():
                 peak = max(peak, after['rss_kib'])
                 elapsed = time.monotonic() - t0
                 load = os.getloadavg()
-                lines = [line for line in Path(d.log).read_text()[mark:].splitlines() if 'memmap perf ' in line]
+                lines = [line for line in h.complete_lines(d.log)[mark:] if 'memmap perf ' in line]
                 if not lines:
                     raise AssertionError('no frame cost evidence produced')
                 shot(f'live-{size[0]}-{int(continuous)}')
@@ -227,7 +227,7 @@ try:
     until(lambda: field()['origin'] > before, 'arrow key pans the modern viewport')
     until(lambda: field().get('nav') == 0, 'pan geometry settles')
     shot('modern-pan')
-    bad = [line for line in Path(d.log).read_text().splitlines() if 'xodb: overview layout ' in line and 'overlaps=0 ' not in line]
+    bad = [line for line in h.complete_lines(d.log) if 'xodb: overview layout ' in line and 'overlaps=0 ' not in line]
     if bad:
         raise AssertionError(bad[:3])
     checks.append('modern labels do not overlap')

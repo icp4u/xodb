@@ -35,6 +35,7 @@ fn buildId(a: A, l: *const c.struct_xjs_layout) ![]const u8 {
     return out;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+    if (!session.languages.on(.javascript)) return null;
     if (value.availability != .available or value.type.javascript_handle == 0) return null;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
@@ -140,6 +141,7 @@ pub const Stack = struct {
     basis: []const u8 = "verified V8 image and metadata, native-unwind API-exit anchor, bounded stopped reads; physical frames only, no inferred async or inlined frames",
 };
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.javascript);
     if (first >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
@@ -210,11 +212,13 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.javascript);
     const layout = try session.metadata.javascript(session);
     return .{ .version = try text(a, std.mem.sliceTo(&layout.version_string, 0)), .build_id = try buildId(a, &layout), .basis = if (layout.dwarf_fields != 0) "postmortem metadata + partial DWARF" else "postmortem metadata" };
 }
 
 pub fn readContext(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.javascript);
     const named = @import("../model/language_locals.zig");
     const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
     if (segment >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -300,6 +304,7 @@ pub fn readContext(session: *model.Session, a: A, tid: i32, segment: usize, fram
 }
 
 pub fn evaluateLocal(session: *model.Session, tid: i32, segment: usize, frame: usize) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.javascript);
     const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
     if (segment >= observed.segments.len) return error.InvalidLanguageSegment;
     if (frame >= observed.segments[segment].frames.len) return error.InvalidLanguageFrame;
@@ -362,6 +367,7 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     return try a.dupeZ(u8, "context");
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    try session.languages.require(.javascript);
     const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -386,6 +392,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     return capture;
 }
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    try session.languages.require(.javascript);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
     const observed = try @import("../model/language_selection.zig").cachedRead(.javascript, session, tid);
     var saw_runtime = false;

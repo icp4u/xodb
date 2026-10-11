@@ -22,5 +22,16 @@
     "duration_ms": 60000,
     "record_limit": 32768,
     "memory_limit": 33554432
+  },
+  "languages": {
+    "enabled": true,
+    "python": true,
+    "perl": true,
+    "lua": true,
+    "javascript": true,
+    "ruby": true,
+    "go": true,
+    "elisp": true,
+    "gdscript": true
   }
 }

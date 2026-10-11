@@ -2,6 +2,7 @@
 #define XODB_GDB_LINK_H
 #include "gdb_packet.h"
 #include "xrt.h"
+#include "xrt_cancel.h"
 #include <stdbool.h>
 
 #define XRT_GDB_OPERATION_NS UINT64_C(10000000000)
@@ -9,16 +10,19 @@
 
 struct xrt_gdb_link {
     int fd;
-    bool noack, failed, awaiting_ack;
+    bool noack, failed, awaiting_ack, sent_mutation;
     unsigned retries;
     uint64_t operation_deadline_ns;
+    struct xrt_cancel *cancel; /* Borrowed from the owning connection. */
+    uint64_t written; /* Bytes issued, including unconfirmed commands. */
+    uint64_t mutation_written; /* Excludes queries and protocol acknowledgments. */
     size_t packet_size, received, sent;
     uint8_t rx[XRT_GDB_WIRE_MAX], tx[XRT_GDB_WIRE_MAX];
     char reason[128];
 };
 /* One owning thread serializes all link operations. Payload views are copied
  * into caller storage; the link retains only an outstanding command frame. */
-enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *, const char *endpoint);
+enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *, const char *endpoint, struct xrt_cancel *);
 void xrt_gdb_disconnect(struct xrt_gdb_link *);
 enum xrt_status xrt_gdb_send(struct xrt_gdb_link *, const void *, size_t);
 enum xrt_status xrt_gdb_receive(struct xrt_gdb_link *, void *, size_t, size_t *,

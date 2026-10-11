@@ -72,6 +72,8 @@ pub const Collector = struct {
         var ctx = Decoding{ .self = self, .store = store };
         const status = rt.xrt_perf_drain(self.handle, Decoding.decode, &ctx);
         if (ctx.failure) |err| return err;
+        if (status == rt.XRT_PERF_DRAIN_CANCELLED) return error.RemoteCancelled;
+        if (status == rt.XRT_PERF_DRAIN_OUTCOME_UNKNOWN) return error.RemoteOutcomeUnknown;
         if (status == rt.XRT_PERF_DRAIN_MALFORMED) return error.SyscallRingLayout;
         return !self.image_changed and (ctx.more or status == rt.XRT_PERF_DRAIN_CAPACITY);
     }

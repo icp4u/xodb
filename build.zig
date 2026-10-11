@@ -1,5 +1,5 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -124,7 +124,18 @@ pub fn build(b: *std.Build) void {
             module.addAnonymousImport(b.fmt("scene_{s}_{s}", .{ name[0..dot], name[dot + 1 ..] }), .{ .root_source_file = spv });
         }
     }
+    const catalog_check = b.step("check-catalog", "Validate embedded MCP tool catalogs and access classifications");
+    catalog_check.makeFn = struct {
+        fn make(step: *std.Build.Step, _: std.Build.Step.MakeOptions) !void {
+            const catalog = @import("src/mcp/tool_catalog.zig");
+            var failure: ?catalog.Failure = null;
+            catalog.validateInputs(step.owner.allocator, &failure) catch |err| {
+                return step.fail("MCP catalog {s}: {s}", .{ if (failure) |f| f.catalog else "validation", @errorName(err) });
+            };
+        }
+    }.make;
     const exe = b.addExecutable(.{ .name = "xodb", .root_module = module });
+    exe.step.dependOn(catalog_check);
     const install_exe = b.addInstallArtifact(exe, .{});
     b.getInstallStep().dependOn(&install_exe.step);
     const app_step = b.step("app", "Build/install xodb without test fixtures");
@@ -165,14 +176,20 @@ pub fn build(b: *std.Build) void {
     fd_fixture.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/fd-activity.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     b.installArtifact(fd_fixture);
     const tests = b.addTest(.{ .root_module = module });
+    tests.step.dependOn(catalog_check);
+    const remote_lifecycle_tests = b.addTest(.{ .name = "xodb-remote-lifecycle-test", .root_module = module, .filters = &.{ "silent saturated queue", "late old completion", "process identity compares start", "publications retain nested strings" } });
+    b.installArtifact(remote_lifecycle_tests);
+    b.step("remote-lifecycle", "Test remote queue shutdown and stale incarnation refusal").dependOn(&b.addRunArtifact(remote_lifecycle_tests).step);
     if (capstone_link == .vendored) {
         // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
         exe.use_llvm = true;
         tests.use_llvm = true;
+        remote_lifecycle_tests.use_llvm = true;
         // libcapstone.a is linked statically. A search path must not become a
         // RUNPATH; that would record the build tree in the binary.
         exe.each_lib_rpath = false;
         tests.each_lib_rpath = false;
+        remote_lifecycle_tests.each_lib_rpath = false;
     }
     const runtime_tests = b.addExecutable(.{ .name = "xodb-runtime-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     runtime_tests.root_module.addIncludePath(b.path("src/runtime"));
@@ -336,6 +353,16 @@ pub fn build(b: *std.Build) void {
     const fd_events = b.addExecutable(.{ .name = "xodb-fd-events", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     fd_events.root_module.addCSourceFile(.{ .file = b.path("tests/fixtures/fd-events.c"), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror" } });
     b.installArtifact(fd_events);
+    const cancel_tests = b.addExecutable(.{ .name = "xodb-remote-cancel-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    cancel_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/wire.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-cancel.c" }) |source|
+        cancel_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = if (std.mem.endsWith(u8, source, "/wire.c")) &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-U_FORTIFY_SOURCE", "-Dread=xrt_test_read" } else if (std.mem.endsWith(u8, source, "/gdb_link.c")) &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-U_FORTIFY_SOURCE", "-Drecv=xrt_test_recv" } else &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(cancel_tests);
+    const resolve_tests = b.addExecutable(.{ .name = "xodb-remote-resolve-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    resolve_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-resolve.c" }) |source|
+        resolve_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(resolve_tests);
     const gdb_packet_tests = b.addExecutable(.{ .name = "xodb-gdb-packet-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_packet_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/gdb_packet.c", "tests/runtime-gdb-packet.c" }) |source|
@@ -343,7 +370,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(gdb_packet_tests);
     const gdb_link_tests = b.addExecutable(.{ .name = "xodb-gdb-link-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_link_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-gdb-link.c" }) |source|
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-gdb-link.c" }) |source|
         gdb_link_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(gdb_link_tests);
     const gdb_description_tests = b.addExecutable(.{ .name = "xodb-gdb-description-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -359,7 +386,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(gdb_model_tests);
     const wire_tests = b.addExecutable(.{ .name = "xodb-runtime-wire-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     wire_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/wire.c", "tests/runtime-wire.c" }) |source| {
         wire_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     }
     const agent = b.addExecutable(.{ .name = "xodb-agent", .root_module = b.createModule(.{ .target = portable_target, .optimize = optimize, .link_libc = true }) });
@@ -606,7 +633,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

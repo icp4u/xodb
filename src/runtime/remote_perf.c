@@ -22,10 +22,14 @@ static bool request(struct xrt_perf *p, uint16_t op, uint64_t a, uint64_t b, con
                                                              .capacity = capacity,
                                                              .length = &count,
                                                              .value = value});
+    p->remote_status = status;
     if (status != XRT_OK) {
         xrt_perf_fail(&p->remote_info.failure, "runtime transport",
-                      status == XRT_UNSUPPORTED_ARCHITECTURE ? ENOTSUP : EIO, -1,
-                      "remote collector request failed");
+                      status == XRT_UNSUPPORTED_ARCHITECTURE ? ENOTSUP :
+                      status == XRT_REMOTE_CANCELLED ? ECANCELED : EIO, -1,
+                      status == XRT_REMOTE_CANCELLED ? "RemoteCancelled; unread records and remote cleanup unconfirmed" :
+                      status == XRT_REMOTE_OUTCOME_UNKNOWN ? "RemoteOutcomeUnknown; remote collector operation unconfirmed" :
+                      status == XRT_REMOTE_IO_FORBIDDEN ? "RemoteIoForbidden; collector request refused" : "remote collector request failed");
         p->remote_info.failed = true;
         if (f)
             *f = p->remote_info.failure;
@@ -170,6 +174,12 @@ bool xrt_remote_perf_thread(const struct xrt_perf *p, size_t index, struct xrt_p
     *out = thread;
     return true;
 }
+static enum xrt_perf_drain_status drain_failure(const struct xrt_perf *p)
+{
+    if (p->remote_status == XRT_REMOTE_CANCELLED) return XRT_PERF_DRAIN_CANCELLED;
+    if (p->remote_status == XRT_REMOTE_OUTCOME_UNKNOWN) return XRT_PERF_DRAIN_OUTCOME_UNKNOWN;
+    return XRT_PERF_DRAIN_MALFORMED;
+}
 enum xrt_perf_drain_status xrt_remote_perf_drain(struct xrt_perf *p, xrt_perf_decoder decode,
                                                  void *context)
 {
@@ -189,7 +199,7 @@ enum xrt_perf_drain_status xrt_remote_perf_drain(struct xrt_perf *p, xrt_perf_de
         struct xrt_codec extra;
         if (!request(p, XRT_RPC_PERF_RING, index, 0, NULL, 0, bytes, XRT_RPC_DATA_MAX, &extra, NULL,
                      NULL)) {
-            status = XRT_PERF_DRAIN_MALFORMED;
+            status = drain_failure(p);
             break;
         }
         bool present = false;
@@ -235,7 +245,7 @@ enum xrt_perf_drain_status xrt_remote_perf_drain(struct xrt_perf *p, xrt_perf_de
         }
         if (!request(p, XRT_RPC_PERF_ACK, tail, consumed.bytes, NULL, 0, bytes, XRT_RPC_DATA_MAX,
                      &extra, NULL, NULL)) {
-            status = XRT_PERF_DRAIN_MALFORMED;
+            status = drain_failure(p);
             break;
         }
         if (extra.at != extra.size) {

@@ -48,7 +48,7 @@ def check(name, ok):
     print('PASS ' + name, flush=True)
 
 def latest():
-    rows = [line for line in Path(d.log).read_text().splitlines() if line.startswith('xodb: gibson frame=')]
+    rows = [line for line in h.complete_lines(d.log) if line.startswith('xodb: gibson frame=')]
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1])) if rows else {}
 
 def until(fn, name):
@@ -186,7 +186,7 @@ def periodic():
             until(lambda r: int(r['towers']) >= 256 and int(r['unknown']) < int(r['towers']), 'owned Node sampled')
             before = snapshot(d.app.pid)
             begin = time.monotonic()
-            mark = len(Path(d.log).read_text())
+            mark = len(h.complete_lines(d.log))
             peak = before['rss_bytes']
             while time.monotonic()-begin < 6:
                 if not d.alive(): raise AssertionError(d.tail())
@@ -195,7 +195,7 @@ def periodic():
             elapsed = time.monotonic()-begin
             after = snapshot(d.app.pid)
             load = os.getloadavg()
-            lines = Path(d.log).read_text()[mark:].splitlines()
+            lines = h.complete_lines(d.log)[mark:]
             frame_cost = [line for line in lines if 'memmap perf ' in line]
             gpu = [int(m.group(1)) for line in lines if (m := re.search(r'gpu_ns=(\d+)', line))]
             if not frame_cost or not gpu: raise AssertionError('missing real-process timing evidence')
@@ -272,7 +272,7 @@ try:
     key(1, lambda r: r['selected'] == 'null', 'escape clears selection')
     send('tap', 24)  # O: picker
     def picker():
-        rows = re.findall(r'gibson picker selected=(\d+) rows=(\d+)', Path(d.log).read_text())
+        rows = re.findall(r'gibson picker selected=(\d+) rows=(\d+)', '\n'.join(h.complete_lines(d.log)))
         return tuple(map(int, rows[-1])) if rows else None
     until(lambda r: picker() is not None, 'picker opens')
     selected, count = picker()

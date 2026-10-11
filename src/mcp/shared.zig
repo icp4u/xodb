@@ -101,6 +101,12 @@ pub const Endpoint = struct {
         }
         for (&self.clients) |*slot| {
             const client = if (slot.*) |*value| value else continue;
+            // pump() defers reads while this client has an admitted request.
+            // A hangup must still revoke its lease before owner dispatch.
+            if (c.xsvc_disconnected(self.service, client.id)) {
+                self.drop(slot);
+                continue;
+            }
             const server = client.server;
             const before = server.transmitted;
             server.pump(root) catch |err| {

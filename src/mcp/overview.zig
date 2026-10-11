@@ -7,9 +7,7 @@ const Value = std.json.Value;
 
 const fd = @import("fd.zig");
 const memstat = @import("memstat.zig");
-const base_definitions = std.mem.trim(u8, @embedFile("overview_tools.json"), " \n\r\t");
-const fd_definitions = std.mem.trim(u8, fd.definitions, " \n\r\t");
-pub const definitions = base_definitions[0 .. base_definitions.len - 1] ++ "," ++ fd_definitions[1 .. fd_definitions.len - 1] ++ "," ++ memstat.definitions[1..];
+pub const definitions = @import("tool_catalog.zig").overview_definitions;
 
 pub fn handles(name: []const u8) bool {
     if (fd.handles(name)) return true;

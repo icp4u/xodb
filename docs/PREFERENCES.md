@@ -49,8 +49,10 @@ and pass its path. This keeps location, merging and persistence choices open.
 | allocations.memory_limit | 33554432 | Retained allocation evidence/metadata/analysis, 1–128 MiB |
 | allocations.callstacks | true | Capture bounded frame-pointer caller prefixes at allocator entry |
 | profile.user_stack_budget_bytes | 33554432 | Total retained stack bytes, 0–67108864; registers/CPU samples continue after exhaustion |
+| languages.enabled | true | Master switch for the language views; false turns every one off whatever the per-language keys say |
+| languages.python, .perl, .lua, .javascript, .ruby, .go, .elisp, .gdscript | true | false turns that language view off: no runtime search, no file read and no target memory read on its behalf. CLI --language-off NAME or all also turns it off |
 | symbols.image_bytes | 268435456 | Largest ELF image read in full for source, types and names, 1 MiB–1 TiB; CLI --image-limit wins |
-| symbols.image_total_bytes | 536870912 | All full images held by the xodb process: every debugged process, capture, debug file and inflated debug section together; 1 MiB–1 TiB; CLI --image-total-limit wins |
+| symbols.image_total_bytes | 1073741824 | All full images held by the xodb process: every debugged process, capture, debug file and inflated debug section together; 1 MiB–1 TiB; CLI --image-total-limit wins |
 
 Duration accepts an unsigned 32-bit value (up to 4,294,967,295 ms, about 49 days).
 There is no separate one-minute ceiling. A deadline includes time paused in the
@@ -103,7 +105,7 @@ built-in value. Preference loading does not change agent scope; command-line
 --agent-scope and the existing human control remain authoritative.
 
 The image budgets apply from startup and are not changed while running. The
-defaults are 256 MiB for one image and 512 MiB in all; larger values are
+defaults are 256 MiB for one image and 1 GiB in all; larger values are
 yours to set, here or on the command line, and this file is trusted. An
 image over budget is named with its size, the budget and the values to rerun
 with in `get_stack`, `list_modules`, `find_symbol` and the status line; see
@@ -122,6 +124,13 @@ with compressed DWARF needs the image plus its inflated debug sections to fit
 `symbols.image_bytes` together. The automatic debug-file
 budgets (`symbols.auto_file_bytes`, `symbols.auto_total_bytes`) are separate
 and unchanged.
+
+The `languages` switches apply from startup to every process of the session
+and are not changed while running. A language that is off is reported as
+`LanguageDisabled` by its MCP tools and its tab is not offered. Off in the file
+or on the command line is off; nothing turns a language back on. What this
+does and does not protect against:
+[language views and hostile targets](GUIDE.md#language-views-and-hostile-targets).
 
 Allocation prefs affect future captures. Helper use remains an explicit CLI option;
 see [allocation tracing](ALLOCATIONS.md).

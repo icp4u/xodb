@@ -39,12 +39,47 @@ pub const ThemePath = struct {
         return result;
     }
 };
+/// Which language views may run. A view that is off does no work at all:
+/// no runtime search, no file read and no target memory read on its behalf.
+/// `enabled` false turns every one of them off.
+pub const Languages = struct {
+    enabled: bool = true,
+    python: bool = true,
+    perl: bool = true,
+    lua: bool = true,
+    javascript: bool = true,
+    ruby: bool = true,
+    go: bool = true,
+    elisp: bool = true,
+    gdscript: bool = true,
+    /// In language tab order.
+    pub const Name = enum { python, perl, lua, javascript, ruby, go, elisp, gdscript };
+    pub fn on(self: Languages, name: Name) bool {
+        return self.enabled and switch (name) {
+            inline else => |which| @field(self, @tagName(which)),
+        };
+    }
+    pub fn require(self: Languages, name: Name) error{LanguageDisabled}!void {
+        if (!self.on(name)) return error.LanguageDisabled;
+    }
+    /// `all` or one language name, as the command line spells it.
+    pub fn turnOff(self: *Languages, name: []const u8) !void {
+        if (std.mem.eql(u8, name, "all")) {
+            self.enabled = false;
+            return;
+        }
+        switch (std.meta.stringToEnum(Name, name) orelse return error.UnknownLanguage) {
+            inline else => |which| @field(self, @tagName(which)) = false,
+        }
+    }
+};
 pub const Preferences = struct {
     wine: struct { hide_internal_threads: bool = false } = .{},
     profile: Profile = .{},
     allocations: @import("profile/allocation_live.zig").Config = .{},
     symbols: Symbols = .{},
     appearance: struct { theme: ThemePath = .{} } = .{},
+    languages: Languages = .{},
 };
 
 /// CLI wins. File references in preferences are relative to that config file.
@@ -89,6 +124,28 @@ pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
     }
     return error.PreferencesTooLarge;
 }
+test "language views default on, turn off one at a time or all at once, and refuse unknown keys" {
+    const a = std.testing.allocator;
+    const defaults = try parse(a, "{}");
+    inline for (@typeInfo(Languages.Name).@"enum".fields) |field| try std.testing.expect(defaults.languages.on(@enumFromInt(field.value)));
+    try defaults.languages.require(.perl);
+    const one = try parse(a, "{\"languages\":{\"python\":false}}");
+    try std.testing.expectError(error.LanguageDisabled, one.languages.require(.python));
+    inline for (.{ .perl, .lua, .javascript, .ruby, .go, .elisp, .gdscript }) |name| try one.languages.require(name);
+    // The master switch wins over a language left, or set, on.
+    const none = try parse(a, "{\"languages\":{\"enabled\":false,\"perl\":true}}");
+    inline for (@typeInfo(Languages.Name).@"enum".fields) |field| try std.testing.expectError(error.LanguageDisabled, none.languages.require(@enumFromInt(field.value)));
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"languages\":{\"pyton\":false}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"language\":{\"python\":false}}"));
+    try std.testing.expectError(error.UnexpectedToken, parse(a, "{\"languages\":{\"python\":0}}"));
+    var cli = Languages{};
+    try cli.turnOff("ruby");
+    try std.testing.expect(!cli.on(.ruby) and cli.on(.go));
+    try cli.turnOff("all");
+    try std.testing.expect(!cli.on(.go));
+    try std.testing.expectError(error.UnknownLanguage, cli.turnOff("cobol"));
+}
+
 test "preferences partial defaults, custom and unlimited durations, typo and type errors" {
     const a = std.testing.allocator;
     const defaults = try parse(a, "{}");

@@ -1,5 +1,6 @@
 #ifndef XODB_RUNTIME_PERF_INTERNAL_H
 #define XODB_RUNTIME_PERF_INTERNAL_H
+#include "xrt.h"
 #include "xrt_perf.h"
 struct xrt_perf_slot {
     struct xrt_perf_thread thread;
@@ -15,6 +16,7 @@ struct xrt_perf {
     const struct xrt_target *remote_target;
     uint64_t remote_id;
     struct xrt_perf_info remote_info;
+    enum xrt_status remote_status;
     bool remote_retired[XRT_PERF_MAX_THREADS], remote_drained[XRT_PERF_MAX_THREADS];
     struct xrt_perf_slot slots[XRT_PERF_MAX_THREADS];
     size_t count, cursor, max_threads, page_size;

@@ -1080,6 +1080,43 @@
     }
   },
   {
+    "name": "release_profile",
+    "description": "Release a stopped live capture and its retained image budget. Export it first to preserve it. Retry ProfileViewPending after a cancelled reader finishes.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "generation": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "capture_id": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024,
+          "description": "Stable debugger process ID; omitted means original process 1, independent of GUI selection."
+        },
+        "revision": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "generation",
+        "capture_id",
+        "revision"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": false,
+      "xodbSessionAccess": "controller"
+    }
+  },
+  {
     "name": "get_profile",
     "description": "Inspect capture status, user/kernel CPU accounting, accepted perf parameters, thread identities, loss/mapping diagnostics, and actionable start failures. Includes current session defaults for future GUI captures and omitted start_profile arguments.",
     "inputSchema": {

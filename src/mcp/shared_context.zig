@@ -18,27 +18,10 @@ pub fn check(result: c.enum_xsvc_result) !void {
         else => return error.SessionServiceFailed,
     }
 }
-pub const Access = enum { observer, controller, mutator, lease };
-/// Target read-only hints do not describe ownership of retained host jobs.
-/// Missing or invalid classifications fail closed instead of inferring from names.
-pub fn access(definition: Value) !Access {
-    if (definition != .object) return error.MissingToolSessionAccess;
-    const annotations = definition.object.get("annotations") orelse return error.MissingToolSessionAccess;
-    if (annotations != .object) return error.InvalidToolSessionAccess;
-    const value = annotations.object.get("xodbSessionAccess") orelse return error.MissingToolSessionAccess;
-    if (value != .string) return error.InvalidToolSessionAccess;
-    const required = std.meta.stringToEnum(Access, value.string) orelse return error.InvalidToolSessionAccess;
-    if (!try readOnly(definition) and required == .observer) return error.InvalidToolSessionAccess;
-    return required;
-}
-pub fn readOnly(definition: Value) !bool {
-    if (definition != .object) return error.InvalidToolSessionAccess;
-    const annotations = definition.object.get("annotations") orelse return error.InvalidToolSessionAccess;
-    if (annotations != .object) return error.InvalidToolSessionAccess;
-    const value = annotations.object.get("readOnlyHint") orelse return error.InvalidToolSessionAccess;
-    if (value != .bool) return error.InvalidToolSessionAccess;
-    return value.bool;
-}
+const catalog = @import("tool_catalog.zig");
+pub const Access = catalog.Access;
+pub const access = catalog.access;
+pub const readOnly = catalog.readOnly;
 pub const Policy = struct {
     required: Access,
     read_only: bool,

@@ -26,7 +26,7 @@ is written to disk; the debugger still reads what the headers claim.
   mappings a file mapped thousands of times is still placed and named; only
            real work is refused, and the refusal is listed
   refused  a symbols-only view refused after its reader finished stays refused
-  defaults 256 MiB an image and 512 MiB in all unless asked; the refusal says
+  defaults 256 MiB an image and 1 GiB in all unless asked; the refusal says
            what to rerun with, and rerun with exactly that the image loads
   optin    with larger budgets asked for, a 1 GiB image loads
   starve   a search for a source line reads every mapped image, but never so
@@ -834,13 +834,13 @@ def defaults(w, a, result):
     for lib in (one, two): lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, BIG)
     advice = re.compile(r'; rerun with ((?:--image-(?:total-)?limit \d+[MG] ?)+) or set symbols\.image_(?:total_)?bytes')
     try:
-        # Nothing asked for: 256 MiB an image, 512 MiB in all, and a 300 MiB image is refused unread.
+        # Nothing asked for: 256 MiB an image, 1 GiB in all, and a 300 MiB image is refused unread.
         options, said = {}, []
         for attempt in range(4):
             r = Run(w, w/'host', [one, two], options=[x for pair in options.items() for x in pair], env={'CHAIN': '1'})
             try:
                 figures = r.modules().get('image_bytes')
-                if attempt == 0 and figures: assert figures['image_limit'] == 256 * MIB and figures['total_limit'] == 512 * MIB, figures
+                if attempt == 0 and figures: assert figures['image_limit'] == 256 * MIB and figures['total_limit'] == 1024 * MIB, figures
                 found = r.stack()
                 loaded = [name for name in ('probe_wait', 'probe_call') if named(found, name) and named(found, name)['source']]
                 r.holds(len(loaded) * BIG, len(loaded) * BIG + MIB)  # a refused image is not read; the small executable is
@@ -859,8 +859,8 @@ def defaults(w, a, result):
                 r.kill()
         else:
             raise AssertionError(f'following the refusals did not load both images: {said}')
-        # The first refusal is the per-image budget; the total came second.
-        assert said and 'image budget 256 MiB; rerun with --image-limit 400M' in said[0] and len(said) == 2 and 'left of the' in said[1] and '--image-total-limit 1G' in said[1], said
+        # Both images fit after the per-image advice at the default total.
+        assert said and 'image budget 256 MiB; rerun with --image-limit 400M' in said[0] and len(said) == 1, said
         result['defaults'] = {'refusals': said, 'options': options}
     finally:
         for lib in (one, two): lib.unlink(missing_ok=True)
@@ -902,7 +902,7 @@ def junk(w, prefix, each, total):
 def starved(w, a, result, key, capture):
     result[key] = {}
     line = HOST.split('\n').index(next(l for l in HOST.split('\n') if 'int exe_marker(int n)' in l)) + 1
-    for label, options, image, total in (('defaults', (), 256 * MIB, 512 * MIB), ('optin', OPTIN, 2 << 30, 8 << 30)):
+    for label, options, image, total in (('defaults', (), 256 * MIB, 1024 * MIB), ('optin', OPTIN, 2 << 30, 8 << 30)):
         honest = w/f'{key}_honest.so'; honest.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(honest, MIB)
         libs = junk(w, key + '_junk', min(1023 * MIB, image), total)
         assert sum(lib.stat().st_size for lib in libs) > total  # the probe mapped more than the whole total

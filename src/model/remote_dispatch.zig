@@ -433,7 +433,7 @@ test "remote dispatch refuses local ownership and validates queued identities" {
     try std.testing.expectError(error.StaleProcess, executor.execute(a, old_connection, null));
     const old_stop = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .control = .interrupt } });
     defer old_stop.destroy();
-    session.target.invalidate();
+    try session.target.invalidate();
     try std.testing.expectError(error.StaleSnapshot, executor.execute(a, old_stop, null));
 
     const denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .control = .interrupt } });

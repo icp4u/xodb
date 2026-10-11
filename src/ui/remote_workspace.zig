@@ -8,6 +8,7 @@ const Workspace = @import("workspace.zig").Workspace;
 const Window = @import("../platform/wayland.zig").Window;
 const keys = @import("../platform/input.zig");
 const a = std.heap.page_allocator;
+const hashValue = @import("../model/remote_retry.zig").hashValue;
 const empty_language: @import("../model/language_view.zig").Header = .{ .session = 0, .generation = 0, .metadata = 0, .revision = 0, .state = .idle, .selected = .native, .native_selection = null, .logical_selection = null };
 const Pending = struct {
     command: *boundary.Command,
@@ -29,6 +30,9 @@ pub const Frontend = struct {
     inspection_sequence: ?u64 = null,
     inspection_hash: ?u64 = null,
     inspection_id: u64 = 0,
+    inspection_key: u64 = 0,
+    inspection_epoch: u64 = 0,
+    inspection_retry: @import("../model/remote_retry.zig").Retry = .{},
     last_archive: ?u64 = null,
     last_presentation_error: u16 = 0,
     archive_message: [512]u8 = undefined,
@@ -65,6 +69,7 @@ pub const Frontend = struct {
         };
     }
     fn enqueue(self: *Frontend, workspace: *Workspace, identity: boundary.Stamp, action: boundary.Action) !void {
+        if (identity.connection != self.owner.options.connection) return error.StaleProcess;
         const index = for (self.pending, 0..) |slot, i| {
             if (slot == null) break i;
         } else return error.Busy;
@@ -80,7 +85,8 @@ pub const Frontend = struct {
     pub fn pump(self: *Frontend) void {
         while (self.owner.completions.take() catch null) |reply| {
             for (&self.pending) |*slot| if (slot.*) |p| {
-                if (p.sequence == null or p.sequence.? != reply.sequence) continue;
+                if (p.sequence == null or p.sequence.? != reply.sequence or
+                    reply.stamp.connection != p.command.request.stamp.connection) continue;
                 self.complete(p, reply);
                 if (p.command.request.action == .inspect) self.inspection_sequence = null;
                 self.pending_bytes -= p.command.bytes;
@@ -119,7 +125,10 @@ pub const Frontend = struct {
             workspace.status = workspace.presentation_status[0..n];
         };
         if (action == .inspect) {
-            if (reply.failure != null) self.inspection_hash = null;
+            if (reply.failure) |err| {
+                self.inspection_retry.failed(self.inspection_key, err, @import("../target/linux.zig").now());
+                workspace.status = @errorName(err);
+            } else self.inspection_retry.clear();
             return;
         }
         const same_editor = if (editor(workspace, action)) |field| pending.editor_signature != null and editorSignature(field) == pending.editor_signature.? else true;
@@ -131,7 +140,7 @@ pub const Frontend = struct {
             if (action == .runtime_type) workspace.runtime_type_panel.complete(err);
             if (action == .invocation) workspace.invocations.complete(err);
             if (action == .probe_policy and same_editor) workspace.probes_panel.failed(err);
-            self.inspection_hash = null;
+            self.invalidateInspection();
             return;
         }
         switch (action) {
@@ -172,7 +181,12 @@ pub const Frontend = struct {
             .toggle_scope => workspace.status = "Agent scope changed",
             else => {},
         }
+        self.invalidateInspection();
+    }
+    pub fn invalidateInspection(self: *Frontend) void {
         self.inspection_hash = null;
+        self.inspection_epoch +%= 1;
+        self.inspection_retry.clear();
     }
     pub fn scopeInput(self: *Frontend, workspace: *Workspace, window: *Window) void {
         if (workspace.shared_clients == null or window.closing) return;
@@ -354,9 +368,14 @@ pub const Frontend = struct {
             .text = workspace.language_panel.expression[0..workspace.language_panel.expression_len],
         };
         var hash = std.hash.Wyhash.init(identity.process);
+        hashValue(&hash, identity);
+        hashValue(&hash, self.display.metadata_revision);
+        hashValue(&hash, self.language.metadata);
+        hashValue(&hash, self.inspection_epoch);
         hashValue(&hash, request);
         const signature = hash.final();
-        if (self.inspection_hash == signature) return;
+        if (self.inspection_hash == signature and self.inspection_retry.failure == null) return;
+        if (!self.inspection_retry.ready(signature, @import("../target/linux.zig").now())) return;
         request.request_id = self.inspection_id + 1;
         self.enqueue(workspace, identity, .{ .inspect = request }) catch |err| {
             workspace.status = @errorName(err);
@@ -364,6 +383,7 @@ pub const Frontend = struct {
         };
         self.inspection_id = request.request_id;
         self.inspection_hash = signature;
+        self.inspection_key = signature;
     }
     pub fn draw(self: *Frontend, workspace: *Workspace, r: *@import("../render/vulkan.zig").Renderer, font: *@import("../render/font.zig").Font, window: *Window) !void {
         // Local task metadata is never read or borrowed by the remote painter.
@@ -423,28 +443,37 @@ fn editorSignature(editor_: *const @import("watch.zig").Editor) u64 {
     hash.update(editor_.text.slice());
     return hash.final();
 }
-// Requests include viewport coordinates. Hash floats by representation and
-// slices by content; addresses and padding must not turn an unchanged viewport
-// into another remote inspection on every frame.
-fn hashValue(hash: *std.hash.Wyhash, value: anytype) void {
-    switch (@typeInfo(@TypeOf(value))) {
-        .float => std.hash.autoHash(hash, @as(std.meta.Int(.unsigned, @bitSizeOf(@TypeOf(value))), @bitCast(value))),
-        .pointer => {
-            std.hash.autoHash(hash, value.len);
-            for (value) |item| hashValue(hash, item);
-        },
-        .optional => {
-            std.hash.autoHash(hash, value != null);
-            if (value) |item| hashValue(hash, item);
-        },
-        .@"struct" => |structure| inline for (structure.fields) |field| hashValue(hash, @field(value, field.name)),
-        .@"union" => {
-            std.hash.autoHash(hash, std.meta.activeTag(value));
-            switch (value) {
-                inline else => |item| hashValue(hash, item),
-            }
-        },
-        .array => for (value) |item| hashValue(hash, item),
-        else => std.hash.autoHash(hash, value),
-    }
+
+test "late old completion cannot finish a new connection command" {
+    const ta = std.testing.allocator;
+    const owner = try ta.create(Worker);
+    defer ta.destroy(owner);
+    owner.* = .{ .publications = .{ .connection = 2 }, .executor = undefined, .options = .{ .connection = 2 } };
+    defer owner.commands.deinit();
+    defer owner.publications.deinit();
+    const workspace = try ta.create(Workspace);
+    defer ta.destroy(workspace);
+    workspace.* = .{};
+    defer workspace.deinit();
+    var frontend: Frontend = .{ .owner = owner };
+    defer frontend.deinit();
+    const identity: boundary.Stamp = .{ .connection = 2, .session = 2, .process = 1, .pid = 77, .start_ticks = 22, .generation = 1, .image_epoch = 1 };
+    const command = try boundary.Command.create(ta, .{ .stamp = identity, .actor = .human, .action = .{ .inspect = .{ .request_id = 1, .selection = .{ .tid = 77 }, .kind = .view } } });
+    frontend.pending[0] = .{ .command = command, .workspace = workspace, .order = 1, .sequence = 1 };
+    frontend.pending_bytes = command.bytes;
+    frontend.inspection_sequence = 1;
+    var old = identity;
+    old.connection = 1;
+    old.session = 1;
+    old.start_ticks = 11; // Same PID, a distinct target incarnation.
+    owner.completions.put(.{ .sequence = 1, .stamp = old, .failure = error.RemoteOutcomeUnknown });
+    frontend.pump();
+    try std.testing.expect(frontend.pending[0] != null and frontend.inspection_sequence == 1);
+    try std.testing.expect(frontend.inspection_retry.failure == null);
+    try std.testing.expectError(error.StaleProcess, frontend.enqueue(workspace, old, .{ .control = .continue_execution }));
+    owner.completions.put(.{ .sequence = 1, .stamp = identity, .failure = error.RemoteCancelled });
+    frontend.pump();
+    try std.testing.expect(frontend.pending[0] == null and frontend.inspection_sequence == null);
+    try std.testing.expect(frontend.inspection_retry.failure.? == error.RemoteCancelled);
+    try std.testing.expectEqual(@as(usize, 0), frontend.pending_bytes);
 }

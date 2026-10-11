@@ -22,6 +22,17 @@ TARGET = ["--source", "tests/fixtures/target.c", "--", "./zig-out/bin/xodb-fixtu
 THREADS_PANE = "210x170+8+590"
 SIDE_PANE = "250x450+1020+95"
 
+def complete_lines(path):
+    """Read LF-terminated UTF-8 records; a writer's unfinished suffix is ignored.
+
+    Decode after finding complete records, so a split UTF-8 character or CRLF
+    cannot turn a partial write into a row. The next read sees the completed row.
+    """
+    with open(path, 'rb') as stream:
+        data = stream.read()
+    return [line.removesuffix(b'\r').decode('utf-8', errors='replace')
+            for line in data.split(b'\n')[:-1]]
+
 def check(name, ok, detail=""):
     results.append({"check": name, "ok": bool(ok), "detail": str(detail)})
     print(f"{'ok  ' if ok else 'FAIL'} {name}" + (f": {detail}" if detail else ""), flush=True)

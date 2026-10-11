@@ -375,6 +375,7 @@ pub const View = struct {
         if (!self.gibsonMap()) self.memmap.city.drag = null;
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };
+            if (draw.inside(self.memmap.city.field, w.pointer_x, w.pointer_y)) self.cameraInteraction(now);
             w.dirty = true;
             if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self) else if (self.gibsonMap()) memmap.gibson.motion(self);
         }
@@ -389,10 +390,12 @@ pub const View = struct {
                     w.dirty = true;
                     const was_pending = self.pending_action != null;
                     self.key(event, now);
+                    self.cameraInteraction(now);
                     if (!was_pending and self.pending_action != null) self.confirm_key = event.code;
                 },
                 .release => {
                     if (self.confirm_key == event.code) self.confirm_key = null;
+                    self.cameraInteraction(now);
                 },
                 .button_press => {
                     w.dirty = true;
@@ -401,6 +404,7 @@ pub const View = struct {
                         const unobscured = self.pending_action == null and self.classic_menu == null and !self.classic_about;
                         const taken = unobscured and ((self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)));
                         if (!taken) self.click(event.x, event.y, now);
+                        self.cameraInteraction(now);
                     }
                 },
                 .button_release => if (event.code == 272) {
@@ -409,6 +413,7 @@ pub const View = struct {
                         win95.drag(self);
                     }
                     self.classic_scroll = null;
+                    self.cameraInteraction(now);
                     if (self.gibsonMap()) memmap.gibson.release(self, event.x, event.y) else self.memmap.city.drag = null;
                     if (self.deepMap()) {
                         w.dirty = true;
@@ -437,6 +442,10 @@ pub const View = struct {
         }
         self.minimize_requested = false;
         self.maximize_requested = false;
+    }
+
+    fn cameraInteraction(self: *View, now: u64) void {
+        if (self.gibsonMap() and !self.searching) self.memmap.city.camera.interact(now);
     }
 
     fn deepMap(self: *const View) bool {

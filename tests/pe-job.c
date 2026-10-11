@@ -5,6 +5,7 @@
 #include "check.h"
 #include <fcntl.h>
 #include <pthread.h>
+#include <errno.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
@@ -22,6 +23,13 @@ enum xrt_status __wrap_xrt_file_view_read(struct xrt_file_view *view,uint64_t at
     }
     CHECK(!pthread_mutex_unlock(&gate));
     return __real_xrt_file_view_read(view,at,out,size);
+}
+static int join_fault, join_calls;
+int __real_pthread_tryjoin_np(pthread_t, void **);
+int __wrap_pthread_tryjoin_np(pthread_t thread, void **result) {
+    ++join_calls;
+    if (join_fault) { join_fault=0; return EINVAL; }
+    return __real_pthread_tryjoin_np(thread,result);
 }
 static void wait_job(struct xpe_job *job) {
     int joined;
@@ -44,7 +52,9 @@ int main(int argc,char **argv) {
         .start=(uintptr_t)bytes,.end=(uintptr_t)bytes+mapped,.offset=0,
         .device_major=major(st.st_dev),.device_minor=minor(st.st_dev),.inode=st.st_ino,.path=path}};
     struct xrt_file_view *view=NULL;CHECK(xrt_target_file_view_open(&target,&request,&view)==XRT_OK);
-    hold=!strcmp(argv[2],"barrier");
+    int join_error=!strcmp(argv[2],"join-error") || !strcmp(argv[2],"join-wrong-result");
+    join_fault=join_error;
+    hold=!strcmp(argv[2],"barrier") || join_error;
     struct xpe_job *job=NULL;CHECK(xpe_job_start(view,getpid(),path,XPE_JOB_MAX_BYTES,&job)==XPE_OK);
     if (hold) {
         CHECK(!pthread_mutex_lock(&gate));
@@ -52,12 +62,25 @@ int main(int argc,char **argv) {
         struct xpe_job_snapshot snapshot;xpe_job_poll(job,&snapshot);
         CHECK(snapshot.state==XPE_JOB_PENDING && snapshot.source_reads==0);
         CHECK(xpe_job_join(job)==0);
-        xpe_job_cancel(job);xpe_job_poll(job,&snapshot);
-        CHECK(snapshot.state==XPE_JOB_FAILED && snapshot.status==XPE_CANCELLED);
+        if (join_error) CHECK(join_calls==0 && join_fault==1);
+        else {
+            xpe_job_cancel(job);xpe_job_poll(job,&snapshot);
+            CHECK(snapshot.state==XPE_JOB_FAILED && snapshot.status==XPE_CANCELLED);
+        }
         CHECK(xpe_job_join(job)==0); /* Cancellation cannot release a borrowed target. */
         released=1;CHECK(!pthread_cond_broadcast(&changed));CHECK(!pthread_mutex_unlock(&gate));
     }
-    if (!strcmp(argv[2],"cancel") || !strcmp(argv[2],"barrier")) {
+    if (join_error) {
+        int joined;
+        while ((joined=xpe_job_join(job))==0) {
+            const struct timespec pause={.tv_nsec=1000000};nanosleep(&pause,NULL);
+        }
+        CHECK(joined==(!strcmp(argv[2],"join-wrong-result")?1:-1));
+        CHECK(join_calls==1 && !xpe_job_image(job));
+        struct xpe_job_snapshot snapshot;xpe_job_poll(job,&snapshot);
+        CHECK(snapshot.state==XPE_JOB_FAILED && snapshot.status==XPE_CANCELLED);
+        CHECK(xpe_job_join(job)==1); /* ownership release remains terminal */
+    } else if (!strcmp(argv[2],"cancel") || !strcmp(argv[2],"barrier")) {
         xpe_job_cancel(job);struct xpe_job_snapshot snapshot;xpe_job_poll(job,&snapshot);
         CHECK(snapshot.state==XPE_JOB_FAILED && snapshot.status==XPE_CANCELLED);
         wait_job(job);CHECK(!xpe_job_image(job) && xpe_job_validate(job)==XPE_CANCELLED);

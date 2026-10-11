@@ -14,7 +14,7 @@ detailed docs. If you just want to try something, jump to
 | Find a value anywhere in a stopped process (a score, a name, a pointer) | **Memory** (**M**, **W** all writable, **/** `text:` or `hex:`; MCP `search_memory` with `regions` or `ranges`) | One search over every writable mapping (or a list of ranges), exact hits and readable/unreadable bytes per range ([details](MEMORY_REGISTERS.md)) |
 | Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
-| Debug a very large program (a 1 GB game engine, an ML library) | `--image-limit 1100M --image-total-limit 2G`, or `symbols.image_bytes` and `symbols.image_total_bytes`; the defaults are 256 MiB an image and 512 MiB in all, and a refused image says the values to rerun with | Named frames with source; an image over budget is named with its size, the budget and what to raise ([large images](LARGE_IMAGES.md#full-image-budgets)) |
+| Debug a very large program (a 1 GB game engine, an ML library) | `--image-limit 1100M --image-total-limit 3G`, or `symbols.image_bytes` and `symbols.image_total_bytes`; the defaults are 256 MiB an image and 1 GiB in all, and a refused image says the values to rerun with | Named frames with source; an image over budget is named with its size, the budget and what to raise ([large images](LARGE_IMAGES.md#full-image-budgets)) |
 | Identify a macOS binary and look up its symbols | MCP **get_macho_image** on a mapped Mach-O file ([details](MACHO.md#try-it)) | UUID, architecture and platform, slices of a universal file, segments, and a symbol by name or address. A file reader only: no macOS process is debugged |
 | Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS / Ruby / Elisp / GDScript** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a native value | **Watchpoint investigation** (**W** on a C/C++ field) | Every write, with the code and stack that made it |
@@ -255,6 +255,66 @@ script level:
 
 Imported logical frames, including JVM exports, remain separate evidence; see
 [logical frames](LOGICAL_FRAMES.md).
+
+## Language views and hostile targets
+
+The language views (Python, Perl, Lua, JavaScript, Ruby, Go, Emacs Lisp,
+GDScript) do work you did not ask for by name. When a process stops, xodb:
+
+- searches the mapped images for each runtime's marker symbol;
+- opens and parses the file a mapping names, to learn that runtime's layout
+  from its symbols and DWARF;
+- reads target memory and interprets it through that layout.
+
+Nothing in the target is executed, and the target is not written to. But the
+target chooses which files its mappings name and what its memory holds, so
+this is automatic work steered by the target.
+
+The readers are bounded and refuse rather than guess: a build-id that does not
+match, an unsupported version, two candidate runtimes, a chain that loops or
+runs too long, an image over its budget. Those refusals protect you from
+**honest mistakes and unbounded work**. They are not a defence against a file
+crafted to attack the parser, and a target that hides its real runtime (in
+anonymous memory, or behind rewritten file headers) and maps a second copy
+can still have that copy shown as the runtime; see [PE support](PE.md).
+
+If you do not trust the target, turn the views off in the
+[preferences](PREFERENCES.md) file:
+
+~~~json
+{ "languages": { "enabled": false } }
+~~~
+
+or one at a time, `{ "languages": { "python": false } }`.
+`--language-off NAME` (or `all`) does the same from the command line and may
+be repeated.
+
+| With a language off | Meaning |
+| --- | --- |
+| Its runtime is not searched for | No symbol scan for its marker |
+| No file is opened or parsed for it | No layout or DWARF read on its behalf |
+| No target memory is read for it | No stacks, locals, watches or value previews |
+| Its tab is not offered | `get_language_tabs` says `disabled`, reason `LanguageDisabled` |
+| Its MCP tools refuse | `LanguageDisabled`, not "runtime unavailable" |
+
+Turning off one language leaves the others searching the same mapped files
+for their own markers, which reads those files' symbol tables. Only
+`"enabled": false` stops every search.
+
+The switch covers every process of the session, including followed children,
+cores and runtime-agent targets. The agent has no language code of its own: it
+serves files and memory when the client asks, and the client does not ask.
+With `--ssh` the switches are passed to the remote xodb. With `--connect` the
+server owns the target, so start the server with the same setting.
+
+What it does **not** do:
+
+- Native debugging still parses files the target names: ELF symbols, DWARF,
+  separate debug files, PE and PDB. Unwinding still reads target memory.
+- Go, Ruby, JavaScript and Emacs Lisp types found in DWARF are still tagged
+  while debug info is read; with the view off they display as plain native values.
+- It is not a sandbox. xodb runs with your permissions in one process. For a
+  target you believe is hostile, run xodb in a throwaway VM or container.
 
 ## Try it
 

@@ -27,27 +27,36 @@ subprocess.run(['cc', '-g', '-O1', str(work/'main.c'), '-o', str(work/'main'), f
 os.truncate(library, 65 * MIB)  # a hole, not data
 tree = work/'tree'; tree.mkdir()
 (tree/'zig-out').symlink_to(Path(sys.argv[1] if len(sys.argv) > 1 else 'zig-out').resolve(), target_is_directory=True)
-d = None
+def check(kind):
+    d = None
+    try:
+        d = h.Display(str(tree), ['--agent-scope', 'control', '--image-limit', '64M', '--break', 'big_wait', '--', str(work/'main')])
+        d.keys('tap', 63); snap = d.stopped('breakpoint'); assert snap, d.tail()
+        found = d.tool('get_stack', tid=snap['threads'][0]['tid'])
+        notice = found['image_budget']
+        subject = ' (decompressed debug data)' if kind == 'compressed' else ''
+        assert len(str(library)) > 512 and notice == f'{str(library)[:509]}...{subject} is 65 MiB; image budget 64 MiB; rerun with --image-limit 100M or set symbols.image_bytes', found
+        if kind == 'compressed':
+            assert any(f['diagnostic'] == 'CompressedDebugBudget' for f in found['frames']), found
+        wanted = lambda text: ('wrong budget' if '--wrong-result' in sys.argv else 'over budget') in text and 'libbig.so' in text and '65 mib' in text and 'budget 64 mib' in text and (kind != 'compressed' or 'decompressed debug data' in text)
+        deadline = time.monotonic() + 20 * h.load_scale(); attempt = 0
+        while True:
+            shot = d.shot(f'{kind}-over-budget-{attempt}')
+            with Image.open(shot) as image:
+                strip = image.convert('L').crop((0, image.height - 30, image.width, image.height))
+                ImageOps.invert(strip).resize((strip.width * 3, strip.height * 3)).save(shot + '.strip.png')
+            text = ' '.join(h.ocr(shot + '.strip.png', '--psm', '7').lower().split())
+            if wanted(text) or time.monotonic() > deadline: break
+            attempt += 1; time.sleep(.1)
+        assert wanted(text), text
+        d.app.stdin.close(); assert d.app.wait(timeout=5) == 0
+    finally:
+        if d: d.close()
 try:
-    d = h.Display(str(tree), ['--agent-scope', 'control', '--image-limit', '64M', '--break', 'big_wait', '--', str(work/'main')])
-    d.keys('tap', 63); snap = d.stopped('breakpoint'); assert snap, d.tail()
-    found = d.tool('get_stack', tid=snap['threads'][0]['tid'])
-    notice = found['image_budget']
-    assert len(str(library)) > 512 and notice == f'{str(library)[:509]}... is 65 MiB; image budget 64 MiB; rerun with --image-limit 100M or set symbols.image_bytes', found  # the probe saw the refusal
-    # The status line is light text on a coloured bar: read that strip alone.
-    wanted = lambda text: 'over budget' in text and 'libbig.so' in text and '65 mib' in text and 'budget 64 mib' in text
-    deadline = time.monotonic() + 20 * h.load_scale(); attempt = 0
-    while True:
-        shot = d.shot(f'01-over-budget-{attempt}')
-        with Image.open(shot) as image:
-            strip = image.convert('L').crop((0, image.height - 30, image.width, image.height))
-            ImageOps.invert(strip).resize((strip.width * 3, strip.height * 3)).save(shot + '.strip.png')
-        text = ' '.join(h.ocr(shot + '.strip.png', '--psm', '7').lower().split())
-        if wanted(text) or time.monotonic() > deadline: break
-        attempt += 1; time.sleep(.1)
-    assert wanted(text), text
-    d.app.stdin.close(); assert d.app.wait(timeout=5) == 0
-    print('Private GUI: status line names the image over budget, its size and the budget:', work)
+    check('image')
+    (work/'pad.s').write_text('.section .debug_ranges,"",@progbits\n.zero 67108864\n.section .note.GNU-stack,"",@progbits\n')
+    subprocess.run(['cc', '-g', '-O1', '-shared', '-fPIC', str(work/'big.c'), str(work/'pad.s'), '-Wl,--compress-debug-sections=zlib', '-o', str(library)], check=True, timeout=60)
+    check('compressed')
+    print('Private GUI: status names image and decompressed-debug budget refusals:', work)
 finally:
     library.unlink(missing_ok=True)
-    if d: d.close()

@@ -196,15 +196,15 @@ pub const Capture = struct {
             self.value.flow = self.flow.value;
             self.value.language_header = @import("language_view.zig").header(session);
             // Unnamed frames of an image refused in full: say which and why.
-            for (self.value.frames) |frame| {
-                if (frame.inline_diagnostic) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit")) if (session.modules.budgetFailure(frame.lookup_pc)) |failure| {
+            budget_frames: for (self.value.frames) |frame| {
+                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit") or std.mem.eql(u8, why, "CompressedDebugBudget")) if (session.modules.budgetFailure(frame.lookup_pc)) |failure| {
                     // The line is narrow and formatted into a fixed buffer with
                     // the rest of the status: the file name, cut to fit.
                     var name: [128]u8 = undefined;
                     var text: [@import("../binary/snapshot.zig").refusal_text]u8 = undefined;
                     const budget = failure.budget orelse continue;
                     self.value.status = std.fmt.bufPrint(&self.budget_status, "Over budget: {s}", .{budget.write(&text, @import("../binary/snapshot.zig").printable(&name, std.fs.path.basename(failure.path), name.len))}) catch "Image over budget";
-                    break;
+                    break :budget_frames;
                 };
             }
         }

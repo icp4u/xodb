@@ -129,7 +129,7 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
         .pe_metadata_pending = snapshot.pe_pending,
         .image_budget = snapshot.image_budget,
         // One process-wide figure: every session, capture and debug reader.
-        .image_bytes = .{ .held = budget.used(), .peak = budget.peakUsed(), .total_limit = budget.total_limit, .image_limit = budget.per_image_limit },
+        .image_bytes = .{ .held = budget.used(), .peak = budget.peakUsed(), .sweep_held = budget.sweepUsed(), .sweep_limit = budget.sweepLimit(), .total_limit = budget.total_limit, .image_limit = budget.per_image_limit },
         .next = next,
     });
 }

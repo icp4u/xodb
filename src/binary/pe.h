@@ -54,6 +54,9 @@ enum xpe_status xpe_load(const struct xpe_source *, struct xpe_image **);
 /* A smaller caller allowance returns XPE_BUDGET, distinct from format/work
  * caps. Peak includes temporary arrays and allocation growth. */
 enum xpe_status xpe_load_budget(const struct xpe_source *, uint64_t allowance, struct xpe_image **);
+/* Format classification only: at most 100 reads and 4170 bytes, with no
+ * export, import, unwind or debug tables retained. Does not prove placement. */
+enum xpe_status xpe_probe_headers(const struct xpe_source *);
 /* Compare loaded placement headers against parsed file metadata. The loaded
  * preferred base may be relocated; structural fields and directories must
  * agree. This does not prove map coverage or stopped-generation coherence. */

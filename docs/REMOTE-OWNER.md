@@ -74,8 +74,10 @@ Frontend completions are fixed-size values: up to 64 normal completions, plus
 64 slots reserved for cancellation of the remaining input queue. Backpressure
 prevents another frontend operation from executing when normal completion
 capacity is full. Closing admission drains queued requests with cancellation,
-without executing their mutations. Joining still waits for the active transport
-call's deadline; it is not a frame operation or a fast-close guarantee.
+without executing their mutations. A full completion mailbox has reserved space
+for these cancellations, even after a burst followed by silence. A disconnected
+shared client instead has one explicit disposal; its lease is revoked before
+the next command can execute, including while its request is pending.
 
 ## Publications
 
@@ -124,10 +126,17 @@ covers their dispatch/lock boundaries.
 
 `xrt_remote_io_guard(true)` marks the calling thread as forbidden from entering
 remote transport or connection-lock operations. It is thread-local and defaults
-to false. The remote GUI arms it in Debug and ReleaseSafe builds after the
-owner takes the family, and disarms it before joining. The assertion remains
-enabled independently of `NDEBUG` once explicitly armed.
+to false. The remote GUI arms it in every optimization mode after the owner
+takes the family. Production calls refuse with `RemoteIoForbidden` before
+locking or I/O, increment a saturating thread-local counter, and print at most
+one diagnostic per thread. `xrt_remote_io_guard_strict(true)` additionally
+aborts in Debug and explicit assertion tests, independently of `NDEBUG`.
 Native empty-target work and native file-budget no-ops remain allowed.
+
+File-budget updates, GDB capability reads, invalidation and event recording
+return status rather than silently discarding a refusal. Fallible callers
+propagate it; local policy/audit operations retain the failure in the session's
+visible diagnostic. A refused call does not change remote generation or data.
 
 The guard checks both backend opens, foreground/background dispatch, health and
 failure checks, file/symbol retrieval, remote file-budget updates and GDB info
@@ -352,3 +361,44 @@ Background metadata scanning still yields to foreground RPCs. Once its worker
 has joined, validating a ready result uses foreground ordering; transport
 contention is not reported as unfinished metadata. File identity is still
 revalidated before lending that result, and changed bytes remain refused.
+
+## Close and reconnect
+
+Every connection has a separate reference-counted cancellation capability.
+Requesting stop closes admission and sets a terminal atomic flag with a
+nonblocking wake. It never takes the connection mutex or closes its transport
+from the frame thread. Agent framing and GDB packet reads/writes check that flag
+around polls and transfers; a reader waiting for the serialization mutex checks
+again after acquisition. Cancellation cannot make a partially used stream reusable.
+
+A sent mutation whose reply is lost returns `RemoteOutcomeUnknown`. It is not
+safe to repeat it automatically. Queued commands that were never dispatched
+finish cancelled. Local teardown cannot prove that the remote target detached,
+stopped, or cleaned up breakpoints.
+
+The window keeps pumping while the owner drains commands, metadata/file/profile
+readers and its owned transport child. It joins only after the owner reports done.
+An unresponsive owned child is terminated and reaped by the owner; a missing
+child exit status is not treated as confirmed remote cleanup. Startup for a
+remote GUI runs on the owner with the cancellation capability already available.
+GDB name resolution uses at most four independent jobs process-wide, including
+abandoned libc calls. Those jobs own only copied names, results and notification
+pipes. Cancellation releases the connection immediately; it does not claim to
+cancel libc's resolver or let it retain Session/Target/token storage.
+
+**Ctrl+Shift+R** retires the current owner and opens a fresh connection. It resets
+publications, pending GUI commands, inspection keys and shared clients/leases;
+unaccepted old sockets also disconnect. Stdio clients must restart their channel.
+The new session begins in observe scope. No launch, attach, breakpoint or control
+is replayed. A fresh runtime agent therefore starts without a target; starting
+another target requires a new explicit launch/attach invocation. A GDB peer
+reports its current target after the handshake, but matching PID values alone
+do not establish continuity. Remote stamps retain an unknown start time when
+the protocol supplies none; they never substitute the host's `/proc` identity.
+
+**Ctrl+R** retries the current inspection. Automatic retry uses the selection,
+connection, stop and metadata identity plus the failure class. Temporary pending,
+busy and allocation failures back off from 250 ms to 4 s. Permanent refusals
+wait for a new identity/selection or explicit retry. The owner applies the same
+pacing before repeating a full failed capture, and the GUI retains a visible
+error with its last confirmed view. Local input and painting remain available.

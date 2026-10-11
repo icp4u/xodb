@@ -151,13 +151,20 @@ pub const State = struct {
     /// Nonblocking publication; the worker owns file I/O until join succeeds.
     pub fn poll(self: *State) void {
         const entry = self.pending orelse return;
+        self.finish(entry, c.xpe_job_join(entry.job.?));
+    }
+    fn finish(self: *State, entry: *File, joined: c_int) void {
         const job = entry.job.?;
-        const joined = c.xpe_job_join(job);
         if (joined == 0) return;
         if (joined < 0) {
-            // Ownership and reservation cannot be released before join.
-            c.xpe_job_cancel(job);
+            // The job reports a join error only after the worker has released
+            // its source and metadata. Preserve the failure, not a pending loop.
+            self.pending = null;
+            self.bytes -= entry.retained;
+            entry.retained = 0;
             entry.failure = error.PeMetadataUnavailable;
+            c.xpe_job_destroy(job);
+            entry.job = null;
             return;
         }
         self.pending = null;
@@ -247,9 +254,28 @@ pub const State = struct {
         }
         return null;
     }
+    /// One current identity per mapped inode. All aliases switch together;
+    /// a superseded worker keeps its reservation until it releases ownership.
+    pub fn observeIdentity(self: *State, key: FileKey, identity: c.struct_xrt_file_identity) !?*File {
+        for (self.files.items) |file| if (std.meta.eql(file.key, key)) {
+            if (!file.departed and std.meta.eql(file.identity, identity)) return file;
+            if (self.pending == file) {
+                c.xpe_job_cancel(file.job.?);
+                return error.SymbolDiscoveryPending;
+            }
+            if (file.job != null) self.evict(file);
+            file.* = .{ .identity = identity, .key = key };
+            for (self.entries.items) |entry| if (entry.file == file) {
+                entry.id = 0;
+                entry.verified_revision = 0;
+            };
+            return file;
+        };
+        return null;
+    }
     /// Mapping instances share one parsed image for each exact pinned file
     /// identity. Eviction drops the file metadata, retaining instance IDs.
-    pub fn get(self: *State, a: std.mem.Allocator, target: ?*rt.struct_xrt_target, region: anytype) !*Entry {
+    pub fn get(self: *State, a: std.mem.Allocator, target: ?*rt.struct_xrt_target, region: anytype, expected: c.struct_xrt_file_identity) !*Entry {
         if (target == null or rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
         if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotPe;
         self.poll();
@@ -257,6 +283,7 @@ pub const State = struct {
         var existing: ?*Entry = null;
         if (self.anchors.get(region.start)) |entry| {
             if (!sameAnchor(entry, region)) return error.PeImagePlacementMismatch;
+            if (!std.meta.eql(entry.file.identity, expected)) return error.BinaryChangedDuringRead;
             if (entry.file.failure) |err| return err;
             if (self.pending == entry.file) return error.SymbolDiscoveryPending;
             if (entry.image() != null) {
@@ -285,12 +312,20 @@ pub const State = struct {
             _ = c.xrt_file_view_close(view);
         };
         const identity = c.xrt_file_view_identity(view).*;
-        if (existing) |entry| if (!std.meta.eql(entry.file.identity, identity)) {
-            entry.file.failure = error.BinaryChangedDuringRead;
-            return error.BinaryChangedDuringRead;
-        };
+        // The caller owns the observation for this stop. A first open must
+        // match it too, even when no parsed file record exists yet.
+        if (!std.meta.eql(identity, expected)) return error.BinaryChangedDuringRead;
+        const key: FileKey = .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor };
+        // Replacement belongs to the caller's observation for this stop
+        // (observeIdentity). A file that changes after it is refused until
+        // the next observation; replacing it here would undo the caller's
+        // proven identity on every lookup and never settle.
         var known: ?*File = null;
-        for (self.files.items) |file| if (std.meta.eql(file.identity, identity)) {
+        for (self.files.items) |file| if (std.meta.eql(file.key, key)) {
+            if (!std.meta.eql(file.identity, identity)) {
+                file.failure = error.BinaryChangedDuringRead;
+                return error.BinaryChangedDuringRead;
+            }
             known = file;
             break;
         };
@@ -302,7 +337,7 @@ pub const State = struct {
             if (!std.mem.eql(u8, &signature, "MZ")) return error.NotPe;
             const item = try a.create(File);
             errdefer a.destroy(item);
-            item.* = .{ .identity = identity, .key = .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor } };
+            item.* = .{ .identity = identity, .key = key };
             try self.files.append(a, item);
             break :blk item;
         };
@@ -433,6 +468,12 @@ pub fn check(status: c.enum_xpe_status) !void {
     };
 }
 
+fn fixtureIdentity(fd: c_int) !c.struct_xrt_file_identity {
+    var identity: c.struct_xrt_file_identity = undefined;
+    try runtime.check(@intCast(c.xrt_file_identity(fd, &identity)));
+    return identity;
+}
+
 test "PE aliases share parsed identity and eviction reloads only on demand" {
     const native = @cImport({
         @cDefine("_GNU_SOURCE", "1");
@@ -464,14 +505,22 @@ test "PE aliases share parsed identity and eviction reloads only on demand" {
         if (address != null) _ = native.munmap(address, 4096);
     };
     var regions: [32]@import("modules.zig").Region = undefined;
+    const identity = try fixtureIdentity(fd);
     const begun = native.xrt_now();
     for (&addresses, &regions, 0..) |*address, *region, i| {
         address.* = native.mmap(null, 4096, native.PROT_READ, native.MAP_PRIVATE, fd, 0);
         try std.testing.expect(address.* != native.MAP_FAILED);
         target.generation += 1;
         region.* = .{ .start = @intFromPtr(address.*), .end = @intFromPtr(address.*) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path };
+        if (i == 0) {
+            var wrong_identity = identity;
+            wrong_identity.size += if (c.getenv("XODB_TEST_WRONG_PE_STOP_IDENTITY") != null) 0 else 1;
+            try std.testing.expectError(error.BinaryChangedDuringRead, state.get(a, @ptrCast(&target), region.*, wrong_identity));
+            try std.testing.expectEqual(@as(usize, 0), state.files.items.len);
+            try std.testing.expect(state.pending == null);
+        }
         const entry = while (true) {
-            const result = state.get(a, @ptrCast(&target), region.*) catch |err| {
+            const result = state.get(a, @ptrCast(&target), region.*, identity) catch |err| {
                 if (err != error.SymbolDiscoveryPending) return err;
                 if (native.xrt_now() - begun > 5 * std.time.ns_per_s) return error.TestJobTimeout;
                 _ = native.usleep(100);
@@ -492,13 +541,13 @@ test "PE aliases share parsed identity and eviction reloads only on demand" {
     try std.testing.expectEqual(@as(u64, 0), state.bytes);
     for (regions) |region| try std.testing.expect(state.backgroundDeferred(region));
     try std.testing.expect(state.pending == null);
-    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), regions[7]));
+    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), regions[7], identity));
     while (state.pending != null) {
         state.poll();
         if (native.xrt_now() - begun > 5 * std.time.ns_per_s) return error.TestJobTimeout;
         _ = native.usleep(100);
     }
-    const reloaded = try state.get(a, @ptrCast(&target), regions[7]);
+    const reloaded = try state.get(a, @ptrCast(&target), regions[7], identity);
     try std.testing.expectEqual(@as(u64, 8), reloaded.id);
     for (state.entries.items) |entry| try std.testing.expect(entry.image() == reloaded.image());
     var mapped: std.AutoHashMapUnmanaged(FileKey, void) = .empty;
@@ -509,7 +558,12 @@ test "PE aliases share parsed identity and eviction reloads only on demand" {
     try std.testing.expectEqual(@as(usize, 1), state.files.items.len);
     try std.testing.expectEqual(@as(u64, 8), state.entries.items[0].id);
     try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, 4097));
-    try std.testing.expectError(error.PeImageChanged, state.get(a, @ptrCast(&target), regions[7]));
+    try std.testing.expectError(error.PeImageChanged, state.get(a, @ptrCast(&target), regions[7], identity));
+    // After eviction, even the newly opened source must match the same stop's
+    // observation. It cannot silently replace the identity with its own open.
+    state.evict(state.files.items[0]);
+    try std.testing.expectError(error.BinaryChangedDuringRead, state.get(a, @ptrCast(&target), regions[7], identity));
+    try std.testing.expect(state.pending == null);
     mapped.clearRetainingCapacity();
     state.prune(a, regions[0..0], &mapped);
     try std.testing.expectEqual(@as(usize, 0), state.entries.items.len);
@@ -600,9 +654,10 @@ test "PE cache retains large images beside small jobs and retries only under pre
         var st: native.struct_stat = undefined;
         try std.testing.expectEqual(@as(c_int, 0), native.fstat(fd.*, &st));
         const region = @import("modules.zig").Region{ .start = @intFromPtr(address.*), .end = @intFromPtr(address.*) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path.*.? };
+        const identity = try fixtureIdentity(fd.*);
         target.generation += 1;
         entries[i] = while (true) {
-            const entry = state.get(a, @ptrCast(&target), region) catch |err| {
+            const entry = state.get(a, @ptrCast(&target), region, identity) catch |err| {
                 if (err != error.SymbolDiscoveryPending) return err;
                 try std.testing.expect(state.bytes <= byte_limit);
                 for (state.files.items) |file| if (file.allowance > minimum_reserve) {
@@ -631,7 +686,7 @@ test "PE cache retains large images beside small jobs and retries only under pre
     const last = entries[8];
     const last_region = @import("modules.zig").Region{ .start = last.start, .end = last.end, .offset = 0, .inode = last.inode, .device_major = last.device_major, .device_minor = last.device_minor, .permissions = "r--p".*, .path = paths[8].? };
     state.evict(last.file);
-    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), last_region));
+    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), last_region, try fixtureIdentity(fds[8])));
     try std.testing.expect(state.pending != null);
     var mapped: std.AutoHashMapUnmanaged(FileKey, void) = .empty;
     defer mapped.deinit(a);
@@ -663,4 +718,52 @@ test "PE departed records are reclaimed across more than the identity cap" {
         state.prune(a, @as([]const @import("modules.zig").Region, &.{}), &mapped);
         try std.testing.expectEqual(@as(usize, if (c.getenv("XODB_TEST_WRONG_PE_PRUNE") != null) 1 else 0), state.files.items.len);
     }
+}
+
+test "PE join refusal releases the reservation and reports a terminal error" {
+    const native = @cImport({
+        @cDefine("_GNU_SOURCE", "1");
+        @cInclude("target_internal.h");
+        @cInclude("stdlib.h");
+        @cInclude("sys/mman.h");
+        @cInclude("sys/sysmacros.h");
+        @cInclude("sys/stat.h");
+    });
+    const a = std.testing.allocator;
+    const fd = native.memfd_create("join-pe", native.MFD_CLOEXEC);
+    try std.testing.expect(fd >= 0);
+    defer _ = native.close(fd);
+    const bytes = @import("../binary/pe_fixture.zig").binary(1);
+    try std.testing.expectEqual(@as(isize, bytes.len), native.write(fd, &bytes, bytes.len));
+    try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, 4096));
+    const address = native.mmap(null, 4096, native.PROT_READ, native.MAP_PRIVATE, fd, 0);
+    try std.testing.expect(address != native.MAP_FAILED);
+    defer _ = native.munmap(address, 4096);
+    var st: native.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), native.fstat(fd, &st));
+    const path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{fd});
+    defer a.free(path);
+    var target = std.mem.zeroes(native.struct_xrt_target);
+    target.pid = native.getpid();
+    target.state = native.XRT_STOPPED;
+    defer native.xodb_maps_free(&target.maps);
+    var state = State{};
+    defer state.deinit(a);
+    const region = @import("modules.zig").Region{ .start = @intFromPtr(address), .end = @intFromPtr(address) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path };
+    const identity = try fixtureIdentity(fd);
+    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), region, identity));
+    const pending = state.pending.?;
+    const deadline = native.xrt_now() + 5 * std.time.ns_per_s;
+    while (c.xpe_job_join(pending.job.?) == 0) {
+        if (native.xrt_now() > deadline) return error.TestJobTimeout;
+        _ = native.usleep(100);
+    }
+    try std.testing.expect(state.snapshot().reserved_bytes > 0);
+    // The C barrier test proves that an error cannot precede release. Inject
+    // that terminal outcome here to verify the owner's accounting and reply.
+    state.finish(pending, -1);
+    try std.testing.expectEqual(c.getenv("XODB_TEST_WRONG_PE_JOIN_ACCOUNTING") != null, state.snapshot().active_worker);
+    try std.testing.expectEqual(@as(u64, 0), state.bytes);
+    try std.testing.expectEqual(@as(?*c.struct_xpe_job, null), pending.job);
+    try std.testing.expectError(error.PeMetadataUnavailable, state.get(a, @ptrCast(&target), region, identity));
 }

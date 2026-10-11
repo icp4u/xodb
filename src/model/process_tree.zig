@@ -59,7 +59,7 @@ pub const Tree = struct {
         if (limit) |n| if (n == 0 or n > maximum or n < self.count) return error.InvalidProcessLimit;
         if (session.target.core != null) return error.ReadOnlyCore;
         if (session.target.snapshot().state != .stopped) return error.NotStopped;
-        if (session.target.snapshot().follow_processes != enabled) try session.target.setFollowProcesses(enabled) else session.target.invalidate();
+        if (session.target.snapshot().follow_processes != enabled) try session.target.setFollowProcesses(enabled) else try session.target.invalidate();
         if (limit) |n| try self.setLimit(n);
         session.record(actor, "set_process_following");
         self.revision += 1;
@@ -93,7 +93,9 @@ pub const Tree = struct {
         for (self.entries[0..self.count]) |entry| {
             entry.session.agent_scope = scope;
             entry.session.shared_jobs = true;
-            entry.session.target.invalidate();
+            entry.session.target.invalidate() catch |err| {
+                entry.session.step_diagnostic = @errorName(err);
+            };
             entry.session.record(.human, "set_agent_scope");
         }
         self.revision += 1;
@@ -147,6 +149,7 @@ pub const Tree = struct {
         child.agent_scope = self.root().agent_scope;
         child.shared_jobs = self.root().shared_jobs;
         child.profile_defaults = parent.profile_defaults;
+        child.languages = parent.languages;
         child.allocation_defaults = parent.allocation_defaults;
         child.allocation_helper = parent.allocation_helper;
         child.static_analysis.toolchain_dir = parent.static_analysis.toolchain_dir;
@@ -183,6 +186,26 @@ pub const Tree = struct {
         self.count += 1;
         self.revision += 1;
         std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
+    }
+    /// A cancelled remote family has no native vfork links. Each session must
+    /// stop its capture/file borrowers before destroying its target handle.
+    /// The root remains owned by the caller, as in deinit().
+    pub fn deinitRemote(self: *Tree) void {
+        for (self.entries[0..self.count]) |entry| {
+            std.debug.assert(entry.session.target.isRemote() or entry.session.target.handle == null);
+            entry.session.metadata.deinit();
+            entry.session.modules.drainRemoteReaders();
+        }
+        var remaining = self.count;
+        while (remaining > 1) {
+            remaining -= 1;
+            const child = self.entries[remaining].session;
+            child.process_tree = null;
+            child.deinit();
+            if (child.target.handle == null) A.destroy(child) else std.debug.print("xodb: remote cleanup still has borrowers; retaining session storage\n", .{});
+        }
+        if (self.count > 0) self.root().process_tree = null;
+        self.count = 0;
     }
     pub fn deinit(self: *Tree) void {
         // File workers borrow target handles, including each child's shared

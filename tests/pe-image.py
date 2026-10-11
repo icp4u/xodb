@@ -43,6 +43,8 @@ command(['lld-link','/dll','/noentry','/machine:x64','/debug','/pdb:'+str(w/'own
 check=w/'check'
 command(['cc','-std=c11','-O2','-g','-DNDEBUG','-Wall','-Wextra','-Werror','tests/pe-image.c','src/binary/pe.c','-o',str(check)],'compile-check')
 actual=command([str(check),str(w/'owned-pe.dll')],'file-and-memory')
+command([str(check),str(w/'owned-pe.dll'),'headers'],'bounded-headers')
+command([str(check),str(w/'owned-pe.dll'),'headers-wrong-result'],'headers-wrong-result',expect=-6)
 command([str(check),str(w/'owned-pe.dll'),'wrong-result'],'wrong-result',expect=-6)
 command([str(check),str(w/'owned-pe.dll'),'faults'],'source-faults')
 command([str(check),str(w/'owned-pe.dll'),'budget'],'peak-budget')

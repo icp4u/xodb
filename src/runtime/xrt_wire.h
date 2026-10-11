@@ -3,6 +3,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include "xrt_cancel.h"
 #define XRT_WIRE_VERSION 2
 #define XRT_WIRE_HEADER_SIZE 32
 #define XRT_WIRE_MAX_BODY (1024u * 1024u)
@@ -16,11 +17,17 @@ struct xrt_wire_frame {
     uint64_t request;
     uint32_t target, status, size, flags;
 };
-enum xrt_wire_result { XRT_WIRE_OK, XRT_WIRE_EOF, XRT_WIRE_IO, XRT_WIRE_INVALID, XRT_WIRE_TIMEOUT };
+enum xrt_wire_result { XRT_WIRE_OK, XRT_WIRE_EOF, XRT_WIRE_IO, XRT_WIRE_INVALID, XRT_WIRE_TIMEOUT, XRT_WIRE_CANCELLED };
 enum xrt_wire_result xrt_wire_read(int fd, struct xrt_wire_frame *, void *body, size_t capacity,
                                    int timeout_ms);
 enum xrt_wire_result xrt_wire_write(int fd, const struct xrt_wire_frame *, const void *body,
                                     int timeout_ms);
+/* Cancellation is terminal: the caller must abandon a partially used stream.
+ * written includes header bytes and identifies possibly issued requests. */
+enum xrt_wire_result xrt_wire_read_cancel(int fd, struct xrt_wire_frame *, void *body,
+                                         size_t capacity, int timeout_ms, const struct xrt_cancel *);
+enum xrt_wire_result xrt_wire_write_cancel(int fd, const struct xrt_wire_frame *, const void *body,
+                                          int timeout_ms, const struct xrt_cancel *, size_t *written);
 bool xrt_wire_header_encode(const struct xrt_wire_frame *, uint8_t out[XRT_WIRE_HEADER_SIZE]);
 bool xrt_wire_header_decode(const uint8_t in[XRT_WIRE_HEADER_SIZE], struct xrt_wire_frame *);
 /* Bounded payload codec. An error latches; subsequent operations are inert. */

@@ -27,6 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
+      'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
+    (('src/runtime/remote_perf.c', 'src/runtime/perf_internal.h', 'src/runtime/xrt_perf.h', 'src/profile/linux_*.zig', 'src/profile/capture.zig'), ('gui-remote-profile-close', 'gui-remote-profile-ack-close')),
+    (('src/model/remote_retry.zig', 'src/model/remote_worker.zig', 'src/ui/remote_workspace.zig'), ('remote-retry', 'remote-lifecycle', 'gui-remote-close', 'gui-remote-retry')),
+    (('src/runtime/cancel.c', 'src/runtime/xrt_cancel.h', 'src/runtime/wire.c', 'src/runtime/gdb_link.c', 'tests/runtime-cancel.c', 'tests/runtime-resolve.c'), ('gui-remote-profile-close', 'remote-cancel', 'remote-resolve', 'gui-remote-startup', 'gui-remote-reconnect', 'gui-gdb-close')),
     (('tests/fixtures/large-locals.py',), ('gui-remote-publication',)),
     (('tests/metadata-ready-validation.c', 'src/runtime/file_view.c', 'src/runtime/xrt_files.h', 'src/debug/metadata_job.c'), ('metadata-ready-validation', 'javascript-watches*', 'metadata-session*')),
     (('src/binary/pe*', 'src/binary/pdb*', 'src/debug/pe_unwind.c', 'src/model/pe_images.zig',
@@ -49,9 +54,10 @@ COVERS = (
      ('gdscript-*', 'gui-owner-gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
     (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
+    (('src/preferences.zig', 'config/preferences.example.json'), ('language-off*', 'm2-preferences*')),
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
-    (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'gui-remote-owner', 'gui-remote-publication', 'gui-owner-*')),
+    (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
      ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
@@ -123,6 +129,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
     'gui-remote-publication', 'gui-owner-*',
+    'image-budget-lifecycle*', 'image-budget-regressions*', 'image-budget-torch',
     'gui-scene3d-evidence', 'gui-gibson-evidence',
     'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
     'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
@@ -215,8 +222,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps = Steps()
     steps.append(('build-tests', ['scripts/build', 'test', '--summary', 'all',
                   '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600, dict(kind='build')))
+    if tier == 'periodic':
+        steps.append(('catalog-build', [sys.executable, '-B', 'tests/catalog-build.py', '--work', '.work/catalog-build'], 600))
     if tier == 'periodic' and go:
         steps.append(('go-maps-interleaved', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--experiment', 'nomapsplitgroup', '--strace', '--work', '.work/go-maps-interleaved'], 180))
+    steps.append(('remote-retry', ['zig', 'test', 'src/model/remote_retry.zig', '-OReleaseSafe'], 30))
     steps.append(('scene3d-math', ['zig', 'test', 'src/render/scene3d/math.zig', '-OReleaseSafe'], 30))
     steps.append(('go-type-index', [sys.executable, '-B', 'tests/go-type-index.py', '--work', '.work/go-type-index'], 60))
     steps.append(('go-maps-component', [sys.executable, '-B', 'tests/go-maps-component.py', '--work', '.work/go-maps-component'], 60))
@@ -224,6 +234,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'dwarf-types', 'javascript-ranged', 'javascript-image'):
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
+    steps.append(('complete-log-lines', [sys.executable, '-B', 'tests/complete-log-lines.py', '--work', '.work/complete-log-lines'], 10))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
     if tier in ('portable', 'quick', 'host', 'gui', 'all'):
         steps.append(('demangle-names', [sys.executable, '-B', 'tests/demangle-names.py'], 30))
@@ -270,6 +281,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
         steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',
                       '--work', '.work/pe-job', '--image', '.work/pe-image/owned-pe.dll', '--sanitize'], 240, dict(needs=['pe-image'])))
+        steps.append(('pe-cache', [sys.executable, '-B', 'tests/pe-cache.py', '--work', '.work/pe-cache'], 300))
+        if python and perl:
+            for remote in (False, True):
+                label = 'pe-definer-policy' + ('-agent' if remote else '')
+                steps.append((label, [sys.executable, '-B', 'tests/pe-definer-policy.py', '--python', python,
+                              '--perl', perl, '--work', '.work/'+label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 240))
         steps.append(('pe-image-fuzz', [sys.executable, '-B', 'tests/pe-image.py',
                       '--work', '.work/pe-image-fuzz', '--fuzz'], 90))
         steps.append(('pdb-image-fuzz', [sys.executable, '-B', 'tests/pdb-image.py',
@@ -319,6 +337,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps += plan('host', *runtimes, moved=True, redot=redot)
         return steps
     if live:
+        steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))
+        steps.append(('remote-lifecycle', ['zig-out/bin/xodb-remote-lifecycle-test'], 30))
+        steps.append(('remote-resolve', ['zig-out/bin/xodb-remote-resolve-test'], 35))
+        steps.append(('remote-cancel', ['zig-out/bin/xodb-remote-cancel-test'], 35))
         steps.kind = 'live'
         for remote in (False, True):
             label = 'unwind-return-address' + ('-agent' if remote else '')
@@ -386,6 +408,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
         steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt', *language_args], 900 if node else 240))
         steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
+        if python and perl:
+            for remote in (False, True):
+                agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
+                steps.append(('language-off' + ('-agent' if remote else ''), [sys.executable, '-B', 'tests/language-off.py', '--python', python, '--perl', perl, '--work', f'.work/lo{int(remote)}', *agent], 60))
         if python:
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
@@ -394,6 +420,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
         steps.append(('image-budget', [sys.executable, '-B', 'tests/image-budget.py', '--work', '.work/ib'], 60))
         steps.append(('image-budget-hostile', [sys.executable, '-B', 'tests/image-budget-hostile.py', '--work', '.work/ibh'], 60))
+        for name, work in (('image-budget-lifecycle', 'ibl'), ('image-budget-regressions', 'ibr')):
+            for remote in (False, True):
+                steps.append((name + ('-agent' if remote else ''), [sys.executable, '-B', 'tests/' + name + '.py', '--work', '.work/' + work + str(int(remote)), *(['--agent', 'zig-out/bin/xodb-agent'] if remote else []), *(['--only', 'honest,packed,stderr'] if remote and name == 'image-budget-regressions' else [])], 300))
+        steps.append(('image-budget-lifecycle-tight', [sys.executable, '-B', 'tests/image-budget-lifecycle.py', '--work', '.work/iblt', '--only', 's4c', '--total', '512', '--honest-mib', '256'], 180))
+        steps.append(('image-budget-lifecycle-optin', [sys.executable, '-B', 'tests/image-budget-lifecycle.py', '--work', '.work/iblo', '--only', 's4c', '--per', '1100', '--total', '3072', '--exe-mib', '1004'], 180))
+        steps.append(('image-budget-torch', [sys.executable, '-B', 'tests/image-budget-torch.py', '--require'], 180))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
         steps.append(('symbol-discovery', [sys.executable, '-B', 'tests/symbol-discovery.py'], 240))
@@ -403,6 +435,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('apk-symbols', [sys.executable, '-B', 'tests/apk/check.py', '--debug-files'], 90))
         if python:
             sdk = ['--python', python]
+            for remote in (False, True):
+                label = 'pe-runtime-anchor' + ('-agent' if remote else '')
+                steps.append((label, [sys.executable, '-B', 'tests/pe-runtime-anchor.py',
+                              *sdk, '--work', '.work/'+label, *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 60))
             steps.append(('python-component', [sys.executable, '-B', 'tests/python-component.py', *sdk, '--work', '.work/pyc'], 120))
             steps.append(('python-path-component', [sys.executable, '-B', 'tests/python-paths.py', *sdk, '--sanitize', '--work', '.work/pypc'], 180))
             steps.append(('python-image-budget', [sys.executable, '-B', 'tests/python-image-budget.py', *sdk, '--work', '.work/pyib'], 120))
@@ -517,6 +553,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-themes', ['tests/themes.py']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),
+            ('gui-remote-close', ['tests/remote-owner-gui.py', '--close-held']),
+            ('gui-remote-profile-close', ['tests/remote-owner-gui.py', '--capture-held']),
+            ('gui-remote-profile-ack-close', ['tests/remote-owner-gui.py', '--capture-ack']),
+            ('gui-remote-retry', ['tests/remote-owner-gui.py', '--failure-retry']),
+            ('gui-gdb-close', ['tests/remote-gdb-close-gui.py']),
+            ('gui-remote-startup', ['tests/remote-reconnect-gui.py', '--startup']),
+            ('gui-remote-reconnect', ['tests/remote-reconnect-gui.py']),
             ('gui-remote-publication', ['tests/remote-publication-gui.py']),
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),

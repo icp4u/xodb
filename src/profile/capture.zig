@@ -451,6 +451,12 @@ pub const Capture = struct {
             switch (data.status) {
                 .ok => return,
                 .capacity => {}, // drain again, including later thread rings
+                .cancelled, .outcome_unknown => {
+                    self.noteStop(.collector_error, data.reason);
+                    self.trusted_before_ns = 0;
+                    self.revision += 1;
+                    return;
+                },
                 else => {
                     self.noteStop(.decode_error, data.reason);
                     self.trusted_before_ns = 0;

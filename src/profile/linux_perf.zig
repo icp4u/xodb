@@ -130,7 +130,7 @@ pub const Acceptance = struct {
     user_stack_bytes: u32 = 0,
 };
 
-pub const DrainStatus = enum { ok, capacity, malformed, incomplete, closed };
+pub const DrainStatus = enum { ok, capacity, malformed, incomplete, closed, cancelled, outcome_unknown };
 
 pub const Drain = struct {
     /// Valid until the next `drain` or `close` on this collector.
@@ -287,7 +287,7 @@ pub const Collector = struct {
             .user_stack = self.user_stack[0..ctx.used_stack],
             .status = @enumFromInt(status),
             .skipped_unknown = ctx.skipped,
-            .reason = if (status == rt.XRT_PERF_DRAIN_MALFORMED and ctx.reason.len == 0) "ring header is unusable" else ctx.reason,
+            .reason = if (status == rt.XRT_PERF_DRAIN_CANCELLED) "RemoteCancelled; unread records remain" else if (status == rt.XRT_PERF_DRAIN_OUTCOME_UNKNOWN) "RemoteOutcomeUnknown; consumed record acknowledgement unconfirmed" else if (status == rt.XRT_PERF_DRAIN_MALFORMED and ctx.reason.len == 0) "ring header is unusable" else ctx.reason,
         };
     }
     pub fn close(self: *Collector) void {

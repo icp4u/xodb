@@ -123,10 +123,12 @@ static int64_t milliseconds(void)
 /* FDs must be nonblocking. A whole-frame deadline prevents trickled bytes from
  * keeping a failed peer or target operation alive indefinitely. */
 static enum xrt_wire_result transfer(int fd, void *buffer, size_t size, bool sending,
-                                     int64_t deadline, bool header)
+                                     int64_t deadline, bool header, const struct xrt_cancel *cancel,
+                                     size_t *written)
 {
     size_t at = 0;
     while (at < size) {
+        if (xrt_cancel_requested(cancel)) return XRT_WIRE_CANCELLED;
         int timeout = -1;
         if (deadline >= 0) {
             int64_t left = deadline - milliseconds();
@@ -134,8 +136,10 @@ static enum xrt_wire_result transfer(int fd, void *buffer, size_t size, bool sen
                 return XRT_WIRE_TIMEOUT;
             timeout = left > INT32_MAX ? INT32_MAX : (int)left;
         }
-        struct pollfd p = {.fd = fd, .events = sending ? POLLOUT : POLLIN};
-        int ready = poll(&p, 1, timeout);
+        struct pollfd p[2] = {{.fd = fd, .events = sending ? POLLOUT : POLLIN},
+                             {.fd = xrt_cancel_fd(cancel), .events = POLLIN}};
+        int ready = poll(p, cancel ? 2 : 1, timeout);
+        if (xrt_cancel_requested(cancel)) return XRT_WIRE_CANCELLED;
         if (ready < 0) {
             if (errno == EINTR)
                 continue;
@@ -143,13 +147,15 @@ static enum xrt_wire_result transfer(int fd, void *buffer, size_t size, bool sen
         }
         if (!ready)
             return XRT_WIRE_TIMEOUT;
-        if (p.revents & POLLNVAL)
+        if (p[0].revents & POLLNVAL)
             return XRT_WIRE_IO;
         ssize_t n;
         if (sending) {
             n = send(fd, (uint8_t *)buffer + at, size - at, MSG_NOSIGNAL);
-            if (n < 0 && errno == ENOTSOCK)
+            if (n < 0 && errno == ENOTSOCK) {
+                if (xrt_cancel_requested(cancel)) return XRT_WIRE_CANCELLED;
                 n = write(fd, (uint8_t *)buffer + at, size - at);
+            }
         } else
             n = read(fd, (uint8_t *)buffer + at, size - at);
         if (n < 0) {
@@ -160,32 +166,45 @@ static enum xrt_wire_result transfer(int fd, void *buffer, size_t size, bool sen
         if (!n)
             return !sending && !at && header ? XRT_WIRE_EOF : XRT_WIRE_INVALID;
         at += (size_t)n;
+        if (sending && written) *written += (size_t)n;
     }
-    return XRT_WIRE_OK;
+    return xrt_cancel_requested(cancel) ? XRT_WIRE_CANCELLED : XRT_WIRE_OK;
 }
-enum xrt_wire_result xrt_wire_read(int fd, struct xrt_wire_frame *frame, void *body,
-                                   size_t capacity, int timeout)
+enum xrt_wire_result xrt_wire_read_cancel(int fd, struct xrt_wire_frame *frame, void *body,
+                                          size_t capacity, int timeout, const struct xrt_cancel *cancel)
 {
     uint8_t header[32];
     int64_t deadline = timeout < 0 ? -1 : milliseconds() + timeout;
-    enum xrt_wire_result r = transfer(fd, header, sizeof(header), false, deadline, true);
+    enum xrt_wire_result r = transfer(fd, header, sizeof(header), false, deadline, true, cancel, NULL);
     if (r != XRT_WIRE_OK)
         return r;
     struct xrt_wire_frame f;
     if (!xrt_wire_header_decode(header, &f) || f.size > capacity)
         return XRT_WIRE_INVALID;
-    r = transfer(fd, body, f.size, false, deadline, false);
+    r = transfer(fd, body, f.size, false, deadline, false, cancel, NULL);
     if (r == XRT_WIRE_OK)
         *frame = f;
     return r;
 }
-enum xrt_wire_result xrt_wire_write(int fd, const struct xrt_wire_frame *frame, const void *body,
-                                    int timeout)
+enum xrt_wire_result xrt_wire_write_cancel(int fd, const struct xrt_wire_frame *frame, const void *body,
+                                           int timeout, const struct xrt_cancel *cancel, size_t *written)
 {
+    if (written) *written = 0;
+    if (xrt_cancel_requested(cancel)) return XRT_WIRE_CANCELLED;
     uint8_t header[32];
     if (!xrt_wire_header_encode(frame, header))
         return XRT_WIRE_INVALID;
     int64_t deadline = timeout < 0 ? -1 : milliseconds() + timeout;
-    enum xrt_wire_result r = transfer(fd, header, sizeof(header), true, deadline, true);
-    return r == XRT_WIRE_OK ? transfer(fd, (void *)body, frame->size, true, deadline, false) : r;
+    enum xrt_wire_result r = transfer(fd, header, sizeof(header), true, deadline, true, cancel, written);
+    return r == XRT_WIRE_OK ? transfer(fd, (void *)body, frame->size, true, deadline, false, cancel, written) : r;
+}
+enum xrt_wire_result xrt_wire_read(int fd, struct xrt_wire_frame *frame, void *body,
+                                   size_t capacity, int timeout)
+{
+    return xrt_wire_read_cancel(fd, frame, body, capacity, timeout, NULL);
+}
+enum xrt_wire_result xrt_wire_write(int fd, const struct xrt_wire_frame *frame, const void *body,
+                                    int timeout)
+{
+    return xrt_wire_write_cancel(fd, frame, body, timeout, NULL, NULL);
 }

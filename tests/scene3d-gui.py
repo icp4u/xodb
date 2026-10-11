@@ -47,7 +47,7 @@ def check(name, ok):
     print('PASS ' + name, flush=True)
 
 def latest():
-    rows = [line for line in Path(d.log).read_text().splitlines() if line.startswith('scene3d frame=')]
+    rows = [line for line in h.complete_lines(d.log) if line.startswith('scene3d frame=')]
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1])) if rows else {}
 
 def until(fn, name):
@@ -162,7 +162,7 @@ try:
                 wall = time.monotonic() - t0
                 after = snapshot()
                 last = int(latest()['frame'])
-                rows = [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in Path(d.log).read_text().splitlines() if line.startswith('scene3d frame=')]
+                rows = [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in h.complete_lines(d.log) if line.startswith('scene3d frame=')]
                 rows = [r for r in rows if first < int(r['frame']) <= last]
                 gpu = [int(r['gpu_ns']) / 1e6 for r in rows if r.get('gpu_ns') != 'null']
                 load = os.getloadavg()

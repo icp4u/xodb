@@ -13,6 +13,7 @@ import time
 
 p = argparse.ArgumentParser()
 p.add_argument('--wrong-result', action='store_true')
+p.add_argument('--wrong-idle-result', action='store_true')
 p.add_argument('--binary')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -47,9 +48,7 @@ def check(name, ok):
     print('PASS ' + name, flush=True)
 
 def rows(prefix='xodb: gibson frame='):
-    # The application may be mid-write: only newline-terminated lines are rows.
-    text = Path(d.log).read_text()
-    return [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in text[:text.rfind('\n') + 1].splitlines() if line.startswith(prefix)]
+    return [dict(re.findall(r'(\w+)=([^ ]+)', line)) for line in h.complete_lines(d.log) if line.startswith(prefix)]
 
 def latest():
     found = rows()
@@ -162,6 +161,13 @@ try:
     check('focus return does not resurrect held keys', pan(latest()) == pan(focus))
     send('tap', 19)  # reset and start a bounded flythrough
     orbit = until(lambda r: r['auto'] == 'true', 'auto orbit starts')
+    initial_deadline = int(orbit['auto_until'])
+    until(lambda r: int(r['now']) >= initial_deadline - 4_000_000_000, 'interaction after view start')
+    send('tap', 35)  # H changes the height encoding, without taking manual control.
+    changed = until(lambda r: r['height'] != orbit['height'], 'height interaction reached the view')
+    check('interaction renews the orbit deadline', (int(changed['auto_until']) == initial_deadline) if a.wrong_idle_result else (int(changed['auto_until']) > initial_deadline))
+    orbit = changed
+    report['idle_deadlines'] = dict(initial=initial_deadline, renewed=int(orbit['auto_until']))
     deadline = time.monotonic() + 8 * h.load_scale()
     while time.monotonic() < deadline and time.monotonic_ns() < int(orbit['auto_until']) + 100_000_000:
         time.sleep(.02)
@@ -173,6 +179,14 @@ try:
     check('idle orbit preserves its final pose', all(latest()[k] == idle[k] for k in ('yaw','pitch','zoom','pan_x','pan_z')))
     check('idle camera renders only requested repaints', len(rows()) - before <= 3)
     report['idle_after'] = usage()
+    send('m', int(float(idle['x']) + float(idle['w']) / 2), int(float(idle['y']) + float(idle['h']) / 2))
+    resumed = until(lambda r: r['auto'] == 'true' and int(r['auto_until']) > int(orbit['auto_until']) and r['yaw'] != idle['yaw'], 'pointer resumes idle orbit')
+    check('pointer interaction resumes paused auto mode', int(resumed['auto_until']) > int(orbit['auto_until']))
+    send('tap', 33)  # F explicitly disables the running orbit.
+    disabled = until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'explicit orbit off')
+    send('tap', 35)
+    manual = until(lambda r: r['height'] != disabled['height'], 'interaction after explicit orbit off')
+    check('interaction preserves explicit manual mode', manual['auto'] == 'false' and manual['moving'] == 'false')
 finally:
     if d:
         d.close()

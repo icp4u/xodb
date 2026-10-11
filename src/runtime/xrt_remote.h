@@ -1,15 +1,22 @@
 #ifndef XODB_RUNTIME_REMOTE_H
 #define XODB_RUNTIME_REMOTE_H
 #include "xrt_target.h"
+#include "xrt_cancel.h"
 #include <signal.h>
 /* Spawn an authenticated transport (agent executable or ssh argv) with private
  * stdio pipes. argv is passed directly to exec; no shell evaluation on the host. */
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out);
-/* Opt-in thread-local ownership assertion. A thread marked forbidden aborts
- * before entering remote transport I/O or its connection mutex. False by
- * default: existing loops keep their behavior until an owner is installed.
- * This does not restrict native ptrace or immutable presentation reads. */
+/* The caller owns a reference throughout startup; the connection retains its
+ * own reference. A requested token is terminal and cannot be reused. */
+enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_target **out, struct xrt_cancel *);
+/* Thread-local ownership guard: refuse before transport I/O or its mutex.
+ * Violations are counted with saturation and logged once per thread. Debug and
+ * tests may opt into strict assertions. Native ptrace/immutable reads remain. */
 void xrt_remote_io_guard(bool forbidden);
+void xrt_remote_io_guard_strict(bool strict);
+uint32_t xrt_remote_io_violation_count(void);
+/* Owner acquires while the target is alive; release when the holder is done. */
+struct xrt_cancel *xrt_target_cancel(const struct xrt_target *);
 bool xrt_target_is_remote(const struct xrt_target *);
 const struct xrt_arch *xrt_target_arch(const struct xrt_target *);
 /* Standalone service. All ptrace work runs on this one calling OS thread.

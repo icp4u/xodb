@@ -29,6 +29,7 @@ fn buildId(a: A, layout: *const c.struct_xgo_layout) ![]const u8 {
     return out;
 }
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.go);
     // Initial profile: a statically linked Go executable (the default
     // `go build` output), identified by kernel PHDR evidence.
     const runtime = @import("../target/runtime.zig");
@@ -73,6 +74,7 @@ fn verify(session: *model.Session, module: *Module) ![]const u8 {
     return id;
 }
 pub fn verifiedModule(session: *model.Session) !*Module {
+    try session.languages.require(.go);
     const module = try runtimeModule(session);
     _ = try verify(session, module);
     return module;
@@ -107,6 +109,7 @@ fn globals(module: *Module) !c.struct_xgo_globals {
     };
 }
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.go);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     return .{ .version = c.XGO_VERSION, .build_id = try buildId(a, layout), .basis = "same-image DWARF + runtime.buildVersion" };
@@ -171,6 +174,7 @@ fn traced(session: *model.Session, tid: u64) ?i32 {
     return null;
 }
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.go);
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (first != 0) return error.InvalidFrame;
     const generation = session.target.snapshot().generation;

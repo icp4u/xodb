@@ -83,7 +83,7 @@ struct xrt_file_budget {
     uint64_t resumed_bytes, reads;
     const volatile sig_atomic_t *cancel;
 };
-void xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *);
+enum xrt_status xrt_target_file_budget(const struct xrt_target *, struct xrt_file_budget *);
 /* Owner thread only. Remote ELF symbol-only sparse projection; do not use for
  * debug information or code bytes. Partial transfers resume on the next pass.
  * The output fd is sealed; resident counts retained source bytes, not holes. */

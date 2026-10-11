@@ -6,12 +6,13 @@ import subprocess
 import time
 from pathlib import Path
 from PIL import Image, ImageOps
+from .input import complete_lines
 
 
 def check_layout(display, language, reason=None):
     deadline = time.monotonic() + 20
     while True:
-        lines = [line for line in Path(display.log).read_text().splitlines() if 'xodb: language layout ' in line]
+        lines = [line for line in complete_lines(display.log) if 'xodb: language layout ' in line]
         bad = [line for line in lines if ' overlaps=0 ' not in line]
         assert not bad, ('overlapping language text', bad[:3])
         seen = [line for line in lines if f'tab={language} ' in line and int(re.search(r'boxes=(\d+)', line)[1]) > 0

@@ -63,7 +63,7 @@ test "runtime watch publication survives cache removal and frontend actions stay
     session.language_tabs.selected = .lua;
     // Cached comparisons require a confirmed, nonzero generation. Advancing
     // this owned empty native target needs no inferior or transport operation.
-    session.target.invalidate();
+    try session.target.invalidate();
     session.language_watches.core = c.xlw_create() orelse return error.OutOfMemory;
     var scope = std.mem.zeroes(c.struct_xlw_scope);
     scope.language = c.XLW_LUA;
@@ -79,7 +79,7 @@ test "runtime watch publication survives cache removal and frontend actions stay
     const generation = session.target.snapshot().generation;
     try std.testing.expectEqual(@as(c.enum_xlw_result, c.XLW_OK), c.xlw_feed(session.language_watches.core, id, generation, &scope, c.XLW_COMPLETE, &sample, null));
     bytes[0] = 4;
-    session.target.invalidate();
+    try session.target.invalidate();
     try std.testing.expectEqual(@as(c.enum_xlw_result, c.XLW_OK), c.xlw_feed(session.language_watches.core, id, session.target.snapshot().generation, &scope, c.XLW_COMPLETE, &sample, null));
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     var prepared = snapshot(&session, arena.allocator());

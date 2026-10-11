@@ -23,7 +23,7 @@ int main(int argc, char **argv)
     CHECK(view.state == XRT_STOPPED && view.thread_count > 0);
     int32_t tid = view.threads[0].tid;
     if (!native) {
-        struct xrt_gdb_info info; CHECK(xrt_target_gdb_info(t, &info));
+        struct xrt_gdb_info info; CHECK(xrt_target_gdb_info(t, &info) == XRT_OK);
         CHECK(info.supported & XRT_GDB_CAP_THREADS);
     }
     struct xrt_registers regs; CHECK(xrt_target_registers(t, tid, &regs) == XRT_OK);

@@ -135,8 +135,8 @@ enum xrt_status xrt_target_destroy(struct xrt_target *target);
 void xrt_target_view(const struct xrt_target *target, struct xrt_target_view *out);
 uint64_t xrt_now(void);
 /* Host policy invalidation is explicit; there is no writable snapshot. */
-void xrt_target_invalidate(struct xrt_target *target);
-void xrt_target_event(struct xrt_target *target, enum xrt_event_kind kind, int32_t tid,
+enum xrt_status xrt_target_invalidate(struct xrt_target *target);
+enum xrt_status xrt_target_event(struct xrt_target *target, enum xrt_event_kind kind, int32_t tid,
                       int64_t detail);
 enum xrt_status xrt_target_expect(const struct xrt_target *target, uint64_t generation);
 enum xrt_status xrt_target_launch(struct xrt_target *target, const char *const argv[]);

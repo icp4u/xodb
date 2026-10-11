@@ -21,6 +21,7 @@ struct xpe_job {
     struct xpe_image *image;
     struct xpe_job_snapshot snapshot;
     unsigned cancel;
+    unsigned released;
     int joined;
     uint64_t deadline, allowance;
     unsigned budget_exhausted;
@@ -166,6 +167,9 @@ static void *worker(void *context) {
     job->snapshot.status = status;
     job->snapshot.state = status == XPE_OK ? XPE_JOB_READY : XPE_JOB_FAILED;
     pthread_mutex_unlock(&job->mutex);
+    /* Last access to job: even a failed OS join cannot leave ownership of
+     * the source ambiguous or force a caller to publish unfinished data. */
+    __atomic_store_n(&job->released, 1, __ATOMIC_RELEASE);
     return NULL;
 }
 enum xpe_status xpe_job_start(struct xrt_file_view *view, int32_t pid, const char *path, uint64_t allowance, struct xpe_job **out) {
@@ -223,10 +227,17 @@ void xpe_job_cancel(struct xpe_job *job) {
 int xpe_job_join(struct xpe_job *job) {
     if (!job) return -1;
     if (job->joined) return 1;
+    if (!__atomic_load_n(&job->released, __ATOMIC_ACQUIRE)) return 0;
     int status = pthread_tryjoin_np(job->thread, NULL);
     if (status == EBUSY) return 0;
-    if (status) return -1;
     job->joined = 1;
+    if (status) {
+        xpe_job_cancel(job);
+        /* The worker no longer accesses job. A nonjoinable/already reaped
+         * thread needs no join; detach any remaining joinable OS resource. */
+        (void)pthread_detach(job->thread);
+        return -1;
+    }
     return 1;
 }
 struct xpe_image *xpe_job_image(struct xpe_job *job) {
@@ -270,7 +281,15 @@ enum xpe_status xpe_job_validate(struct xpe_job *job) {
 void xpe_job_destroy(struct xpe_job *job) {
     if (!job) return;
     xpe_job_cancel(job);
-    if (!job->joined) pthread_join(job->thread, NULL);
+    if (!job->joined && pthread_join(job->thread, NULL)) {
+        /* Destruction may wait; publication never does. A join failure must
+         * not free a source the worker could still be reading. */
+        while (!__atomic_load_n(&job->released, __ATOMIC_ACQUIRE)) {
+            const struct timespec pause = {.tv_nsec = 1000000};
+            nanosleep(&pause, NULL);
+        }
+        (void)pthread_detach(job->thread);
+    }
     xpe_destroy(job->image);
     xpdb_destroy(job->pdb);
     if(job->pdb_fd>=0)close(job->pdb_fd);

@@ -71,7 +71,10 @@ failure, or read-back mismatch still invalidates the old generation. An
 unconfirmed breakpoint change prevents resuming until its operation is retried
 successfully or the target is detached. After a transport failure, destroying
 the local target releases its storage; it cannot confirm remote detach or
-breakpoint cleanup.
+breakpoint cleanup. Cancellation also wakes packet waits and startup resolution.
+A sent mutation with a lost reply reports `RemoteOutcomeUnknown`; reconnect never
+replays it. The GUI's Ctrl+Shift+R creates a new connection in observe scope;
+Ctrl+R retries an inspection. See [remote lifecycle](REMOTE-OWNER.md#close-and-reconnect).
 
 The tested gdbserver needs an initial stop query before fetching its XML. It
 also directs asynchronous interrupt to the attached target's process group;

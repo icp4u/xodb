@@ -59,7 +59,7 @@ pub fn call(a: std.mem.Allocator, session: *model.Session, name: []const u8, arg
         try tree.detachFamily(session, .agent);
     } else {
         tree.retryAdmissions();
-        session.target.invalidate();
+        try session.target.invalidate();
         session.record(.agent, "retry_process_admission");
     }
     return wire.value(a, session.snapshot());

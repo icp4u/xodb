@@ -199,7 +199,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         .huge => "THP-backed MiB",
         .swapped => "swapped MiB",
     };
-    const encoding = std.fmt.bufPrint(&buffer, "H height: {s}   C colour: {s}   {s}", .{ height_name, @tagName(s.colour), if (s.camera.automatic) "AUTO ORBIT + DOLLY" else "MANUAL CAMERA" }) catch "";
+    const encoding = std.fmt.bufPrint(&buffer, "H height: {s}   C colour: {s}   {s}", .{ height_name, @tagName(s.colour), if (s.camera.orbiting(now)) "AUTO ORBIT + DOLLY" else if (s.camera.automatic) "AUTO ORBIT PAUSED" else "MANUAL CAMERA" }) catch "";
     try ctx.textFit(inner.x, y, inner.w, encoding, white);
     y += 24;
     if (ms.cursor) |index| {
@@ -215,7 +215,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     try ctx.textFit(inner.x, y, inner.w, mm.costText(v, &buffer), muted);
     if (v.layout != null or c.getenv("XODB_MEMMAP_PERF") != null) {
         s.frames += 1;
-        std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.automatic, s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
+        std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.orbiting(now), s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
     }
 }
 fn renderScene(v: *vw.View, ctx: draw.Ctx, map: *const md.Map, field: draw.Rect, vp: math.Mat4, now: u64) !void {

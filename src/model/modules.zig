@@ -8,6 +8,16 @@ const snapshot = @import("../binary/snapshot.zig");
 const mapped_file = @import("../binary/mapped_file.zig");
 const pe = @import("pe_images.zig");
 const DebugInfo = @import("../debug/info.zig").Image;
+// Process-wide, so exec/fork ownership changes cannot restart a burst.
+const BudgetThrottle = struct {
+    next: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    fn allow(self: *BudgetThrottle, now: u64) bool {
+        var old = self.next.load(.acquire);
+        while (now >= old) old = self.next.cmpxchgWeak(old, now +| std.time.ns_per_s, .acq_rel, .acquire) orelse return true;
+        return false;
+    }
+};
+var budget_throttle: BudgetThrottle = .{};
 pub const PeMapping = struct { id: u64, base: u64, path: []const u8 };
 pub const Region = struct { start: u64, end: u64, offset: u64, inode: u64, device_major: u64, device_minor: u64, permissions: [4]u8, path: []const u8, file_source: mapped_file.Source = .unopened, full_image_deferred: bool = false, pe_image: ?PeMapping = null };
 pub const Module = struct {
@@ -21,6 +31,9 @@ pub const Module = struct {
     start: u64,
     end: u64,
     debug: ?DebugInfo = null,
+    debug_sweep: bool = false,
+    debug_refusal: ?snapshot.Refusal = null,
+    debug_refusal_pending: bool = false,
     perl_layout: ?c.struct_xpl_layout = null,
     python_layout: ?c.struct_xpy_layout = null,
     lua_layout: ?c.struct_xl_layout = null,
@@ -41,7 +54,13 @@ pub const Module = struct {
     immutable: bool = false,
     file_source: mapped_file.Source = .unopened,
     pub fn debugInfo(self: *Module) !*DebugInfo {
-        if (self.debug == null) self.debug = try DebugInfo.initWithCompanion(self.image, self.mapping, self.debug_file, self.debug_allocator);
+        if (self.debug == null) {
+            self.debug_refusal = null;
+            self.debug = DebugInfo.initWithBudget(self.image, self.mapping, self.debug_file, self.debug_allocator, self.debug_sweep, &self.debug_refusal) catch |err| {
+                self.debug_refusal_pending = self.debug_refusal != null;
+                return err;
+            };
+        }
         self.debug.?.allow_split = !self.immutable;
         return &self.debug.?;
     }
@@ -67,7 +86,7 @@ pub const Modules = struct {
     pub const FileKind = enum { elf, pe, macho, other };
     const FileKey = pe.FileKey;
     const max_file_kinds = 16384;
-    const FileClassification = struct { kind: FileKind, identity: ?rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null };
+    const FileClassification = struct { kind: FileKind, identity: ?rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null, pe_headers_valid: ?bool = null };
     const FileIdentity = struct {
         region: Region,
         identity: ?rt.struct_xrt_file_identity = null,
@@ -90,6 +109,8 @@ pub const Modules = struct {
     /// `unexamined` is the first image whose symbols could not be read.
     pub const Definers = struct { modules: []const *Module, unexamined: ?anyerror };
     const DefinerScan = struct { name: []const u8 = "", revision: u64 = 0, cursor: SymbolCursor = .{}, done: bool = false, count: usize = 0, modules: [4]*Module = undefined };
+    const Unsearched = struct { region: usize, revision: u64 };
+    const NameScan = struct { name: ?[]u8 = null, revision: u64 = 0, cursor: SymbolCursor = .{}, unsearched: ?Unsearched = null };
     /// `detail` names the size and budget of an image refused in full.
     pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8, detail: ?[]const u8 = null, budget: ?snapshot.Refusal = null };
     /// Local symbol views above this size use the cancellable worker.
@@ -167,7 +188,10 @@ pub const Modules = struct {
     name_fallback: ?FileKey = null,
     /// Region index of the first image the last findSymbol could not search
     /// by name, for this map.
-    unsearched: ?struct { region: usize, revision: u64 } = null,
+    unsearched: ?Unsearched = null,
+    /// Explicit name lookups resume across pending PE/ELF reads. At most 16
+    /// unfinished names, each at most 64 KiB; no parsed image is pinned by one.
+    name_scans: [16]NameScan = @splat(.{}),
     maps_revision: u64 = 0,
     pe_scan_next: usize = 0,
     pid: i32 = 0,
@@ -176,8 +200,6 @@ pub const Modules = struct {
     snapshot_bytes: usize = 0,
     /// The part of `snapshot_bytes` name lookups read under the fixed bounds.
     lookup_bytes: usize = 0,
-    /// The part sweeps read, taken from the process-wide sweep allowance.
-    sweep_bytes: usize = 0,
     sweep_skipped: std.AutoHashMapUnmanaged(FileKey, void) = .empty,
     sweep_first: ?[]u8 = null,
     /// The executable's full read for a name, when it failed for this map.
@@ -211,14 +233,20 @@ pub const Modules = struct {
     pub fn init(a: std.mem.Allocator) Modules {
         return .{ .allocator = a };
     }
+    /// Remote readers borrow the target. Drain them before its last handle,
+    /// even when transport cancellation prevents a confirmed remote detach.
+    pub fn drainRemoteReaders(self: *Modules) void {
+        self.pe_images.deinit(self.allocator);
+        self.cancelSymbolJob();
+    }
     pub fn deinit(self: *Modules) void {
         self.reportBudget();
+        self.clearNameScans();
         self.pe_images.deinit(self.allocator);
         self.file_kinds.deinit(self.allocator);
         self.symbol_refusals.deinit(self.allocator);
         self.beginSweep();
         self.sweep_skipped.deinit(self.allocator);
-        snapshot.releaseSweep(self.sweep_bytes);
         self.dropPlacements();
         self.file_maps.deinit(self.allocator);
         self.region_starts.deinit(self.allocator);
@@ -371,6 +399,7 @@ pub const Modules = struct {
         self.regions = new_regions;
         self.budget_dirty = true;
         self.symbol_refusals.clearRetainingCapacity();
+        self.clearNameScans();
         self.maps_revision +|= 1;
         self.pe_scan_next = 0;
     }
@@ -426,10 +455,8 @@ pub const Modules = struct {
             // symbols-only view.
             .name => if (self.nameFallback(r)) null else .{ .each = lookup_image_limit, .pool = .lookups, .which = .lookup },
             .runtime => if (self.nameFallback(r)) null else .{ .each = lookup_image_limit, .pool = .lookups, .which = .runtime },
-            // One request, every file the target mapped: the main executable
-            // under the image budgets, the rest within the sweep allowance,
-            // so that the frames of the current stop still find room.
-            .sweep => if (self.mainExecutable(r)) null else .{ .each = snapshot.sweep_image_limit, .pool = .sweeps, .which = .sweep },
+            // Every new image, including the executable, shares this bound.
+            .sweep => .{ .each = if (self.mainExecutable(r)) snapshot.per_image_limit else snapshot.sweep_image_limit, .pool = .sweeps, .which = .sweep },
         };
     }
     /// Forget what earlier sweeps skipped; call before a search of every image.
@@ -442,7 +469,7 @@ pub const Modules = struct {
         return .{ .count = self.sweep_skipped.count(), .first = self.sweep_first };
     }
     fn noteSkipped(self: *Modules, region: Region, err: anyerror) void {
-        if (err != error.BinarySnapshotLimit) return;
+        if (err != error.BinarySnapshotLimit and err != error.CompressedDebugBudget) return;
         const entry = self.sweep_skipped.getOrPut(self.allocator, fileKey(region)) catch return;
         if (entry.found_existing or self.sweep_first != null) return;
         var text: [snapshot.refusal_text]u8 = undefined;
@@ -473,14 +500,14 @@ pub const Modules = struct {
         const why = self.refusal;
         self.refusal = null;
         if (err == error.NotElf or err == error.NoBinaryImage) return;
-        if (err == error.BinarySnapshotLimit) {
+        if (err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget) {
             for (self.regions.items) |*item| if (sameFile(item.*, region)) {
                 if (!item.full_image_deferred) self.budget_dirty = true;
                 item.full_image_deferred = true;
             };
         }
         var text: [snapshot.refusal_text]u8 = undefined;
-        const detail = if (err == error.BinarySnapshotLimit and why != null) self.allocator.dupe(u8, why.?.write(&text, region.path)) catch null else null;
+        const detail = if ((err == error.BinarySnapshotLimit or err == error.CompressedDebugBudget) and why != null) self.allocator.dupe(u8, why.?.write(&text, region.path)) catch null else null;
         for (self.load_failures.items) |*failure| if (std.mem.eql(u8, failure.path, region.path) and std.mem.eql(u8, failure.diagnostic, @errorName(err))) {
             // One row per image; its sentence is the latest refusal's, which
             // is the one about what was just asked for.
@@ -504,8 +531,18 @@ pub const Modules = struct {
             if (detail) |owned| self.allocator.free(owned);
             return;
         };
-        if (err != error.BinarySnapshotLimit)
+        if (err != error.BinarySnapshotLimit and err != error.CompressedDebugBudget)
             std.debug.print("xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
+    }
+    /// DWARF opens lazily after the image was loaded. Record its refusal on
+    /// the same surfaces as the initial read, including a source search.
+    pub fn noteDebugFailure(self: *Modules, module: *Module, err: anyerror, why: Reason) void {
+        if (err != error.CompressedDebugBudget) return;
+        module.debug_refusal_pending = false;
+        const region = Region{ .start = module.start, .end = module.end, .offset = module.file_offset, .inode = module.inode, .device_major = module.device_major, .device_minor = module.device_minor, .path = module.path, .permissions = "r-xp".* };
+        self.refusal = module.debug_refusal;
+        if (why == .sweep) self.noteSkipped(region, err);
+        self.noteFailure(region, err);
     }
     /// Summarize full-image refusals once after a scan, with no per-file spam.
     /// Count mapped files independently of the bounded detailed failure list.
@@ -513,6 +550,8 @@ pub const Modules = struct {
         self.budget_generation = generation;
     }
     pub fn reportBudget(self: *Modules) void {
+        for (self.loaded.items) |module| if (module.debug_refusal_pending)
+            self.noteDebugFailure(module, error.CompressedDebugBudget, if (module.debug_sweep) .sweep else .frame);
         if (!self.budget_dirty or self.budget_reported_generation == self.budget_generation) return;
         self.budget_dirty = false;
         var deferred: usize = 0;
@@ -528,8 +567,12 @@ pub const Modules = struct {
             return;
         }
         const counts = .{ .loaded = self.loaded.items.len, .deferred = deferred };
+        const repeated = if (self.budget_reported) |old| old.loaded == counts.loaded and old.deferred == counts.deferred else false;
         self.budget_reported = .{ .loaded = counts.loaded, .deferred = counts.deferred };
         self.budget_reported_generation = self.budget_generation;
+        // Details stay available through list_modules and the requesting tool,
+        // even when stderr is suppressed. Identical stops do not print again.
+        if (repeated or !budget_throttle.allow(rt.xrt_now())) return;
         if (self.budgetDetail(null)) |detail|
             std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred; {s}\n", .{ counts.loaded, counts.deferred, detail })
         else
@@ -724,7 +767,10 @@ pub const Modules = struct {
     }
     fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason) !*Module {
         self.refusal = null;
-        if (self.cachedRange(region, observed)) |module| return module;
+        if (self.cachedRange(region, observed)) |module| {
+            if (why == .frame) module.debug_sweep = false;
+            return module;
+        }
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
         const path = try self.allocator.dupeZ(u8, selected_path);
@@ -749,24 +795,13 @@ pub const Modules = struct {
         if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
         // Some readers keep fixed bounds whatever the image budgets are.
         const bound = self.allowance(why, region);
-        var swept: usize = 0;
-        errdefer snapshot.releaseSweep(swept);
-        if (bound) |b| {
-            // A sweep reads for free what some reader in the process holds.
-            const free = b.pool == .sweeps and snapshot.holds(fd, entry.offset, entry.size);
-            const left = if (b.pool == .sweeps) snapshot.sweepLeft() else lookup_total_limit -| self.lookup_bytes;
-            const refused = snapshot.Refusal{ .size = entry.size, .limit = @min(b.each, left), .which = b.which, .stack_loads = if (b.which == .runtime) self.stackLoads(region) else null };
-            if (!free) {
-                if (entry.size > b.each or entry.size > left) {
-                    self.refusal = refused;
-                    return error.BinarySnapshotLimit;
-                }
-                if (b.pool == .sweeps) swept = snapshot.reserveSweep(entry.size) catch |err| {
-                    self.refusal = refused;
-                    return err;
-                };
+        if (bound) |b| if (b.pool == .lookups) {
+            const left = lookup_total_limit -| self.lookup_bytes;
+            if (entry.size > b.each or entry.size > left) {
+                self.refusal = .{ .size = entry.size, .limit = @min(b.each, left), .which = b.which, .stack_loads = if (b.which == .runtime) self.stackLoads(region) else null };
+                return error.BinarySnapshotLimit;
             }
-        }
+        };
         if (self.core_source == null and !rt.xrt_target_is_remote(self.target)) {
             var identity: rt.struct_xrt_file_identity = undefined;
             try runtime_api.check(rt.xrt_file_identity(fd, &identity));
@@ -776,7 +811,14 @@ pub const Modules = struct {
         // ELF/libdw slices must only reference owned, bounded snapshots.
         // The reader shares a version another owner holds and charges the
         // process-wide total for a new one; it says no before allocating.
-        const mapped = snapshot.readRange(fd, entry.offset, entry.size, snapshot.per_image_limit, null) catch |err| {
+        const mapped = (if (why == .sweep)
+            snapshot.readSweepRange(fd, entry.offset, entry.size, snapshot.per_image_limit, @intCast(bound.?.each))
+        else
+            snapshot.readRange(fd, entry.offset, entry.size, snapshot.per_image_limit, null)) catch |err| {
+            if (err == error.SweepSnapshotLimit) {
+                self.refusal = .{ .size = entry.size, .limit = @min(bound.?.each, snapshot.sweepLeft()), .which = .sweep, .sweep_each = bound.?.each };
+                return error.BinarySnapshotLimit;
+            }
             if (err == error.BinarySnapshotLimit) self.refusal = snapshot.refusal(entry.size);
             return err;
         };
@@ -796,7 +838,7 @@ pub const Modules = struct {
         const p = try self.placement(&image, entry.offset, region, observed);
         const module = try self.allocator.create(Module);
         errdefer self.allocator.destroy(module);
-        module.* = .{ .id = try self.moduleId(region, p.bias, entry.offset), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable };
+        module.* = .{ .id = try self.moduleId(region, p.bias, entry.offset), .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path, .image = image, .bias = p.bias, .start = p.first.start, .end = p.end, .mapping = mapped, .file_offset = entry.offset, .immutable = self.immutable, .debug_sweep = why == .sweep };
         module.file_source = source;
         if (self.debug_files) |files| {
             module.debug_file = (if (entry.offset == 0) self.companionFor(region, &image, path) else files.matching(&image)) catch |err| blk: {
@@ -810,7 +852,6 @@ pub const Modules = struct {
         if (bound) |b| if (b.pool == .lookups) {
             self.lookup_bytes += mapped.len;
         };
-        self.sweep_bytes += swept;
         self.budget_dirty = true;
         self.recordSource(region, source);
         for (self.regions.items) |*item| if (sameFile(item.*, region)) {
@@ -847,15 +888,20 @@ pub const Modules = struct {
     }
     /// Match both mapped identity and placement without opening a target file.
     pub fn cachedAt(self: *Modules, address: u64) !*Module {
-        for (self.regions.items) |region| if (address >= region.start and address < region.end)
-            return self.cachedRange(region, false) orelse error.DebugMetadataNotLoaded;
+        for (self.regions.items) |region| if (address >= region.start and address < region.end) {
+            const module = self.cachedRange(region, false) orelse return error.DebugMetadataNotLoaded;
+            return module;
+        };
         return error.UnmappedAddress;
     }
     pub fn at(self: *Modules, address: u64) !*Module {
         return self.atFor(address, .frame);
     }
     fn atFor(self: *Modules, address: u64, why: Reason) !*Module {
-        if (self.cachedAt(address)) |module| return module else |_| {}
+        if (self.cachedAt(address)) |module| {
+            if (why == .frame) module.debug_sweep = false;
+            return module;
+        } else |_| {}
         if (self.peAt(address)) |_| return error.PeDebugInfoUnavailable else |err| if (err != error.NotPe) return err;
         for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r, why);
         return error.UnmappedAddress;
@@ -948,9 +994,44 @@ pub const Modules = struct {
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
         defer self.reportBudget();
-        self.unsearched = null;
-        var cursor = SymbolCursor{};
-        return self.symbolLookup(name, false, true, .any, &cursor);
+        if (name.len > 64 * 1024) return error.SymbolNameLimit;
+        var empty: ?usize = null;
+        const saved: ?usize = for (&self.name_scans, 0..) |*item, i| {
+            if (item.name != null and item.revision != self.maps_revision) self.clearNameScan(item);
+            if (item.name) |retained| {
+                if (std.mem.eql(u8, retained, name)) break i;
+            } else if (empty == null) empty = i;
+        } else null;
+        // A pending answer retains a disposable cursor, not an active request
+        // or an image pin. Under pressure retire the least recently polled
+        // name, so an abandoned client cannot reserve every slot indefinitely.
+        const index = saved orelse empty orelse self.name_scans.len - 1;
+        if (saved == null) {
+            const retained = try self.allocator.dupe(u8, name);
+            self.clearNameScan(&self.name_scans[index]);
+            self.name_scans[index] = .{ .name = retained, .revision = self.maps_revision };
+        }
+        const selected = self.name_scans[index];
+        var moving = index;
+        while (moving > 0) : (moving -= 1) self.name_scans[moving] = self.name_scans[moving - 1];
+        self.name_scans[0] = selected;
+        const scan = &self.name_scans[0];
+        self.unsearched = scan.unsearched;
+        const result = self.symbolLookup(name, false, true, .any, &scan.cursor) catch |err| {
+            if (err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryBudgetExceeded) {
+                scan.unsearched = self.unsearched;
+            } else self.clearNameScan(scan);
+            return err;
+        };
+        self.clearNameScan(scan);
+        return result;
+    }
+    fn clearNameScan(self: *Modules, scan: *NameScan) void {
+        if (scan.name) |name| self.allocator.free(name);
+        scan.* = .{};
+    }
+    fn clearNameScans(self: *Modules) void {
+        for (&self.name_scans) |*scan| self.clearNameScan(scan);
     }
     /// The mapped images defining `name`, each loaded in full within the
     /// bounds `definerRead` gives. Images without
@@ -967,7 +1048,9 @@ pub const Modules = struct {
         } else return error.SymbolDefinerLimit;
         if (scan.name.len == 0 or scan.revision != self.maps_revision) scan.* = .{ .name = name, .revision = self.maps_revision };
         scanning: while (!scan.done) {
-            const symbol = self.symbolLookup(name, false, false, .any, &scan.cursor) catch |err| {
+            // These callers need native ELF modules for runtime layout/DWARF.
+            // A PE export with the same spelling is not a second ELF runtime.
+            const symbol = self.symbolLookup(name, false, false, .elf, &scan.cursor) catch |err| {
                 if (scan.cursor.next < self.regions.items.len) return err;
                 scan.done = true;
                 break;
@@ -1189,7 +1272,7 @@ pub const Modules = struct {
     pub fn breakpointSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
         return self.pendingSymbolAddress(name, cursor, true, .code);
     }
-    const SymbolIntent = enum { any, code };
+    const SymbolIntent = enum { any, code, elf };
     fn pendingSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor, fallback: bool, intent: SymbolIntent) !u64 {
         defer self.reportBudget();
         const found = try self.symbolLookup(name, true, fallback, intent, cursor);
@@ -1295,6 +1378,7 @@ pub const Modules = struct {
     fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, intent: SymbolIntent, cursor: *SymbolCursor) !Symbol {
         var failure = cursor.failure;
         defer cursor.failure = failure;
+        var classified: usize = 0;
         regions: while (cursor.next < self.regions.items.len) : (cursor.next += 1) {
             const r = self.regions.items[cursor.next];
             // Reuse an existing full image (and its verified debug companion).
@@ -1308,18 +1392,49 @@ pub const Modules = struct {
                 }
                 continue :regions;
             }
-            if ((r.offset != 0 and r.permissions[2] != 'x') or
-                r.path.len == 0 or r.path[0] != '/' or
+            if (r.offset != 0 and r.permissions[2] != 'x') continue;
+            if (r.path.len == 0 or r.path[0] != '/' or
                 std.mem.startsWith(u8, r.path, "/dev/") or
                 std.mem.startsWith(u8, r.path, "/memfd:") or
-                std.mem.endsWith(u8, r.path, " (deleted)")) continue;
+                std.mem.endsWith(u8, r.path, " (deleted)"))
+            {
+                // File-backed executable bytes may hide a native runtime.
+                // Anonymous code and ordinary data mappings are not definers.
+                if (intent == .elf and r.inode != 0 and r.permissions[2] == 'x')
+                    lookupFailure(&failure, intent, error.BinaryIdentityUnavailable);
+                continue;
+            }
             // A core, or a session without a live process, has no symbols-only reader.
             const no_reader = !rt.xrt_target_is_remote(self.target) and (self.immutable or self.target == null);
-            if (!no_reader and r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
+            if (intent == .elf and !no_reader) {
+                // Each first look at a file is a round trip through a runtime
+                // agent. A target chooses how many files it maps, so yield
+                // between them; classified files are kept for this map.
+                if (rt.xrt_target_is_remote(self.target) and !self.fileClassified(r)) {
+                    if (classified == definer_slice_files) return error.SymbolDiscoveryPending;
+                    classified += 1;
+                }
+                const kind = self.fileKind(r) catch |err| {
+                    // A file that cannot be identified is not known to be
+                    // harmless data: its header mapping alone may be all that
+                    // is left of a runtime whose code now runs elsewhere.
+                    lookupFailure(&failure, intent, err);
+                    continue;
+                };
+                if (kind == .pe) {
+                    const valid = self.nativePeHeaders(r) catch |err| {
+                        if (r.permissions[2] == 'x') lookupFailure(&failure, intent, err);
+                        continue;
+                    };
+                    if (!valid and r.permissions[2] == 'x') lookupFailure(&failure, intent, error.BinaryIdentityUnavailable);
+                    continue;
+                }
+            }
+            if (intent != .elf and !no_reader and r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
                 if (self.peRegion(r)) |entry| {
                     const found = self.peFindSymbol(entry, name, intent == .code) catch |err| {
                         if (err == error.SymbolDiscoveryPending or err == error.OutOfMemory) return err;
-                        if (failure == null) failure = err;
+                        lookupFailure(&failure, intent, err);
                         continue;
                     };
                     if (found) |symbol| return symbol;
@@ -1328,7 +1443,7 @@ pub const Modules = struct {
                     error.NotPe => {},
                     error.SymbolDiscoveryPending => return err,
                     else => {
-                        if (failure == null) failure = err;
+                        lookupFailure(&failure, intent, err);
                         continue;
                     },
                 }
@@ -1342,9 +1457,13 @@ pub const Modules = struct {
                     error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => return err,
                     error.UnsupportedMode => why = .container,
                     error.BinarySnapshotLimit => why = .tables,
-                    error.NotElf, error.BinaryIdentityUnavailable => continue,
+                    error.NotElf, error.BinaryIdentityUnavailable => {
+                        if (intent == .elf and r.inode != 0 and r.permissions[2] == 'x')
+                            lookupFailure(&failure, intent, error.BinaryIdentityUnavailable);
+                        continue;
+                    },
                     else => {
-                        if (failure == null) failure = err;
+                        lookupFailure(&failure, intent, err);
                         continue;
                     },
                 }
@@ -1352,10 +1471,13 @@ pub const Modules = struct {
             };
             const image = view orelse {
                 const module = (self.lookupRead(r, why, fallback) catch |err| {
-                    if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
+                    if (err != error.NotElf and err != error.NoBinaryImage)
+                        lookupFailure(&failure, intent, err)
+                    else if (intent == .elf and r.inode != 0 and r.permissions[2] == 'x')
+                        lookupFailure(&failure, intent, error.BinaryIdentityUnavailable);
                     continue;
                 }) orelse {
-                    if (failure == null) failure = error.BinarySnapshotLimit;
+                    lookupFailure(&failure, intent, error.BinarySnapshotLimit);
                     if (self.unsearched == null) self.unsearched = .{ .region = cursor.next, .revision = self.maps_revision };
                     continue;
                 };
@@ -1370,12 +1492,63 @@ pub const Modules = struct {
             const symbol = symbols.findSymbol(name) orelse continue;
             if (!symbol.hasAddress()) continue;
             const p = self.placement(image, 0, r, false) catch |err| {
-                if (failure == null) failure = err;
+                lookupFailure(&failure, intent, err);
                 continue;
             };
             return self.retainSymbol(publishedSymbol(symbols.header.machine, try self.moduleId(r, p.bias, 0), symbol, std.math.add(u64, symbol.value, p.bias) catch return error.InvalidAddress));
         }
         return failure orelse if (automatic) error.BreakpointSymbolNotLoaded else error.SymbolNotFound;
+    }
+    fn lookupFailure(failure: *?anyerror, intent: SymbolIntent, err: anyerror) void {
+        // The language readers may tolerate a budget refusal after finding a
+        // runtime. Such a refusal must not hide a later identity failure.
+        const old_budget = if (failure.*) |old| old == error.BinarySnapshotLimit or old == error.SymbolSnapshotLimit else false;
+        const new_budget = err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
+        if (failure.* == null or (intent == .elf and old_budget and !new_budget)) failure.* = err;
+    }
+    /// Files first examined through a runtime agent in one lookup call. A
+    /// count, not a clock: an ordinary process never meets it, and a call
+    /// that does always makes this much progress.
+    const definer_slice_files = 128;
+    /// Whether the native definer policy can answer for this file without
+    /// opening it again in this map revision.
+    fn fileClassified(self: *const Modules, region: Region) bool {
+        const cached = self.file_kinds.get(fileKey(region)) orelse return false;
+        if (cached.checked_revision != self.maps_revision) return false;
+        return cached.failure != null or cached.kind != .pe or cached.pe_headers_valid != null;
+    }
+    fn readPeHeader(context: ?*anyopaque, offset: u64, out: ?*anyopaque, size: usize) callconv(.c) c.enum_xpe_status {
+        const view: *rt.struct_xrt_file_view = @ptrCast(@alignCast(context.?));
+        return if (rt.xrt_file_view_read(view, offset, out, size) == rt.XRT_OK) c.XPE_OK else c.XPE_IO;
+    }
+    /// MZ alone is not evidence that executable bytes cannot define an ELF
+    /// runtime. Validate bounded structural PE headers, never its large tables.
+    fn nativePeHeaders(self: *Modules, region: Region) !bool {
+        const cached = self.file_kinds.getPtr(fileKey(region)).?;
+        if (cached.pe_headers_valid) |valid| return valid;
+        errdefer |err| if (err != error.OutOfMemory) {
+            cached.failure = err;
+        };
+        const path = try self.allocator.dupeZ(u8, region.path);
+        defer self.allocator.free(path);
+        const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{
+            .kind = rt.XRT_FILE_MAPPED,
+            .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path.ptr },
+        });
+        var view: ?*rt.struct_xrt_file_view = null;
+        try self.openFileView(&request, &view);
+        defer _ = rt.xrt_file_view_close(view);
+        if (!std.meta.eql(cached.identity.?, rt.xrt_file_view_identity(view).*)) {
+            cached.failure = error.BinaryChangedDuringRead;
+            return error.BinaryChangedDuringRead;
+        }
+        const source: c.struct_xpe_source = .{ .context = view, .size = @intCast(cached.identity.?.size), .layout = c.XPE_FILE, .read = readPeHeader };
+        const status = c.xpe_probe_headers(&source);
+        try runtime_api.check(rt.xrt_file_view_validate(view));
+        if (status == c.XPE_NOMEM) return error.OutOfMemory;
+        if (status == c.XPE_IO) return error.BinaryIdentityUnavailable;
+        cached.pe_headers_valid = status == c.XPE_OK;
+        return cached.pe_headers_valid.?;
     }
     fn fileKey(region: Region) FileKey {
         return .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor };
@@ -1473,8 +1646,16 @@ pub const Modules = struct {
         if (try self.fileKind(region) != .pe) return error.NotPe;
         // fileKind proved this identity for the revision. A malformed "MZ" file
         // mapped thousands of times must not be reopened for each mapping.
-        if (self.file_kinds.get(fileKey(region))) |cached| if (cached.identity) |identity| if (self.pe_images.failed(identity)) |err| return err;
-        const entry = try self.pe_images.get(self.allocator, self.owner_target, region);
+        const identity = self.file_kinds.get(fileKey(region)).?.identity orelse return error.BinaryIdentityUnavailable;
+        self.pe_images.poll();
+        _ = try self.pe_images.observeIdentity(fileKey(region), @bitCast(identity));
+        if (self.pe_images.failed(identity)) |err| return err;
+        const entry = self.pe_images.get(self.allocator, self.owner_target, region, @bitCast(identity)) catch |err| {
+            // Cache even a change before the very first PE parse. Otherwise
+            // aliases would reopen a file whose stop identity already failed.
+            if (err == error.BinaryChangedDuringRead) self.file_kinds.getPtr(fileKey(region)).?.failure = err;
+            return err;
+        };
         // get revalidates the pinned file. Placement and map labels belong to
         // this revision and must not rescan every mapping on each lookup.
         if (entry.verified_revision == self.maps_revision) return entry;
@@ -2009,14 +2190,12 @@ test "cached file kinds revalidate PE and other answers once per map revision" {
     modules.owner_target = @ptrCast(&target);
     const region = Region{ .start = @intFromPtr(address), .end = @intFromPtr(address) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path };
     const cases = [_]struct { magic: []const u8, kind: Modules.FileKind }{
-        .{ .magic = "data", .kind = .other },  .{ .magic = "MZ00", .kind = .pe },
-        .{ .magic = "\x7fELF", .kind = .elf }, .{ .magic = "none", .kind = .other },
+        .{ .magic = "data", .kind = .other },                             .{ .magic = "MZ00", .kind = .pe },
+        .{ .magic = "\x7fELF", .kind = .elf },                            .{ .magic = "none", .kind = .other },
         // Thin 64-bit, universal with two slices, and the Java class file
         // (version 52.0) that shares the universal magic.
-        .{ .magic = "\xcf\xfa\xed\xfe", .kind = .macho },
-        .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x02", .kind = .macho },
-        .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x34", .kind = .other },
-        .{ .magic = "\xca\xfe\xba\xbf\x00\x00\x00\x01", .kind = .macho },
+        .{ .magic = "\xcf\xfa\xed\xfe", .kind = .macho },                 .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x02", .kind = .macho },
+        .{ .magic = "\xca\xfe\xba\xbe\x00\x00\x00\x34", .kind = .other }, .{ .magic = "\xca\xfe\xba\xbf\x00\x00\x00\x01", .kind = .macho },
         .{ .magic = "\xfe\xed\xfa\xcf", .kind = .macho },
     };
     for (cases, 0..) |item, i| {
@@ -2087,4 +2266,69 @@ test "automatic PE runtime data lookup has independent breakpoint intent" {
     try std.testing.expectError(error.BreakpointSymbolNotExecutable, modules.breakpointSymbolAddress("_PyRuntime", &cursor));
     try std.testing.expectEqual(found, (try modules.findSymbol("_PyRuntime")).address);
     try std.testing.expectEqual(@as(u8, 0), @as([*]const u8, @ptrCast(address))[0x380]);
+    const native_definers = try modules.definers("_PyRuntime");
+    try std.testing.expectEqual(@as(usize, 0), native_definers.modules.len);
+    try std.testing.expectEqual(@as(?anyerror, null), native_definers.unexamined);
+}
+
+test "pending name lookup slots evict abandoned names and clear on completion or map change" {
+    const a = std.testing.allocator;
+    var modules = Modules.init(a);
+    defer modules.deinit();
+    for (&modules.name_scans, 0..) |*scan, i| {
+        scan.* = .{ .name = try std.fmt.allocPrint(a, "pending-{d}", .{i}), .revision = modules.maps_revision };
+    }
+    try std.testing.expectError(if (c.getenv("XODB_TEST_WRONG_SYMBOL_SCAN_LIMIT") != null) error.SymbolLookupLimit else error.SymbolNotFound, modules.findSymbol("new-name"));
+    for (modules.name_scans) |scan| if (scan.name) |name| try std.testing.expect(!std.mem.eql(u8, name, "pending-15"));
+    try std.testing.expectError(error.SymbolNotFound, modules.findSymbol("pending-0"));
+    try std.testing.expectEqual(@as(?[]u8, null), modules.name_scans[0].name);
+    try std.testing.expectError(error.SymbolNotFound, modules.findSymbol("new-name"));
+    modules.maps_revision += 1;
+    try std.testing.expectError(error.SymbolNotFound, modules.findSymbol("new-revision"));
+    for (modules.name_scans) |scan| try std.testing.expectEqual(@as(?[]u8, null), scan.name);
+    const oversized = try a.alloc(u8, 64 * 1024 + 1);
+    defer a.free(oversized);
+    try std.testing.expectError(error.SymbolNameLimit, modules.findSymbol(oversized));
+}
+
+test "native definer scan knows which files need no further agent round trip" {
+    const a = std.testing.allocator;
+    var modules = Modules.init(a);
+    defer modules.deinit();
+    modules.maps_revision = 7;
+    const region = Region{ .start = 4096, .end = 8192, .offset = 0, .inode = 9, .device_major = 1, .device_minor = 2, .permissions = "r-xp".*, .path = "/owned" };
+    const wrong = c.getenv("XODB_TEST_WRONG_DEFINER_SLICE") != null;
+    try std.testing.expect(!modules.fileClassified(region));
+    try modules.file_kinds.put(a, Modules.fileKey(region), .{ .kind = .other, .identity = null, .checked_revision = 6 });
+    // An answer from an earlier stop must be revalidated: that is a round trip.
+    try std.testing.expectEqual(wrong, modules.fileClassified(region));
+    modules.file_kinds.getPtr(Modules.fileKey(region)).?.checked_revision = 7;
+    try std.testing.expect(modules.fileClassified(region));
+    // "MZ" is settled only after its bounded header probe, or by a failure.
+    modules.file_kinds.getPtr(Modules.fileKey(region)).?.kind = .pe;
+    try std.testing.expect(!modules.fileClassified(region));
+    modules.file_kinds.getPtr(Modules.fileKey(region)).?.pe_headers_valid = false;
+    try std.testing.expect(modules.fileClassified(region));
+    modules.file_kinds.getPtr(Modules.fileKey(region)).?.pe_headers_valid = null;
+    modules.file_kinds.getPtr(Modules.fileKey(region)).?.failure = error.BinaryChangedDuringRead;
+    try std.testing.expect(modules.fileClassified(region));
+}
+
+test "native definer identity refusals cannot be hidden behind a budget exception" {
+    for ([_]anyerror{ error.BinarySnapshotLimit, error.SymbolSnapshotLimit }) |budget| {
+        var failure: ?anyerror = budget;
+        Modules.lookupFailure(&failure, .elf, error.BinaryIdentityUnavailable);
+        try std.testing.expectEqual(@as(?anyerror, if (c.getenv("XODB_TEST_WRONG_DEFINER_POLICY") != null) budget else error.BinaryIdentityUnavailable), failure);
+        Modules.lookupFailure(&failure, .elf, budget);
+        try std.testing.expectEqual(@as(?anyerror, error.BinaryIdentityUnavailable), failure);
+    }
+}
+
+test "budget stderr admits one notice per interval across stops and owners" {
+    var throttle: BudgetThrottle = .{};
+    try std.testing.expect(throttle.allow(100));
+    for (101..10001) |now| try std.testing.expect(!throttle.allow(now));
+    // Burst, silence, then one notice; no backlog is printed.
+    try std.testing.expect(throttle.allow(2 * std.time.ns_per_s));
+    try std.testing.expect(!throttle.allow(2 * std.time.ns_per_s));
 }

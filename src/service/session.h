@@ -66,6 +66,11 @@ int xsvc_accept(struct xsvc *service, uint64_t now_ns, struct xsvc_peer *out);
 enum xsvc_result xsvc_drop(struct xsvc *service, uint64_t id, uint64_t now_ns);
 /* Returns rows copied, up to capacity. NULL out requires zero capacity. */
 size_t xsvc_peers(const struct xsvc *service, struct xsvc_peer *out, size_t capacity);
+/* Full disconnect/error is observable even with buffered or queued requests.
+ * A write half-close alone is not a disconnect: replies may still be drained.
+ * No bytes are consumed. Unknown peers fail closed. Owner drops the peer and
+ * its language adapter before dispatching another admitted command. */
+bool xsvc_disconnected(const struct xsvc *service, uint64_t client_id);
 enum xsvc_result xsvc_tick(struct xsvc *service, uint64_t now_ns, unsigned scope);
 enum xsvc_result xsvc_claim(struct xsvc *service, uint64_t id, uint32_t ttl_ms,
                              uint64_t now_ns);

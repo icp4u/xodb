@@ -134,6 +134,9 @@ pub const Session = struct {
     profile: ?*profile.Capture = null,
     /// Session defaults for future GUI captures and omitted MCP arguments.
     profile_defaults: profile.Config = .{},
+    /// Language views the user left on. Every language adapter asks here
+    /// before it looks for its runtime.
+    languages: @import("../preferences.zig").Languages = .{},
     allocations: @import("../profile/allocation_live.zig").Live = .{},
     observations: @import("../observe/live.zig").Live = .{},
     observation_analysis: ?*@import("../observe/analysis.zig").Job = null,
@@ -701,6 +704,10 @@ pub const Session = struct {
         config.follow_threads = request.follow_threads and request.tids.len == 0;
         config.tids = tids[0..count];
         try self.refreshMaps();
+        // A replacement must not compete with the stopped capture's images.
+        // Validate the request and target first; a later open failure is
+        // reported normally, with the previous capture already released.
+        if (self.profile != null) try self.releaseProfile();
         const opened = try profile.Capture.openTarget(self.target.handle, std.heap.page_allocator, self.next_profile_id, self.id, self.target.snapshot().generation, self.target.snapshot().image_epoch, self.target.snapshot().pid, try self.target.stoppedTid(), config, identities[0..count], linux.now());
         switch (opened) {
             .failed => |failure| {
@@ -732,6 +739,25 @@ pub const Session = struct {
         if (capture.collector == null) return error.ProfileNotRunning;
         self.profileMarkers(capture);
         capture.stop(.manual, linux.now());
+    }
+    /// Drop a completed live capture and its image references. A worker that
+    /// borrows it is cancelled first; the caller retries after it has finished.
+    pub fn releaseProfile(self: *Session) !void {
+        if (self.offline or self.artifact != null) return error.OfflineSession;
+        const capture = self.profile orelse return error.NoProfile;
+        if (capture.collector != null) return error.ProfileStillCollecting;
+        self.pollArchive();
+        if (self.archiveBusy()) return error.ArchiveBusy;
+        self.recorded_views.poll(capture);
+        if (self.recorded_views.job) |job| if (job.source == capture) {
+            job.cancel.store(true, .release);
+            return error.ProfileViewPending;
+        };
+        self.dropDerived();
+        self.profile_view = null;
+        self.profile_view_visible = false;
+        self.profile = null;
+        self.recorded_views.retire(capture);
     }
     fn retireProfileThreads(self: *Session, capture: *profile.Capture) void {
         const now = linux.now();
@@ -1177,7 +1203,12 @@ pub const Session = struct {
         for (self.target.breakpointSlice()) |probe| {
             if (!probe.pending and probe.address > pc and probe.address <= address) return false;
         }
-        const probe = self.target.setBreakpoint(address, true) catch return false;
+        const probe = self.target.setBreakpoint(address, true) catch |err| {
+            // The temporary breakpoint may be planted remotely; do not fall
+            // back to a plain step that then reports an unrelated failure.
+            if (err == error.RemoteOutcomeUnknown) return err;
+            return false;
+        };
         errdefer self.target.removeBreakpoint(probe) catch {};
         step.return_address = address;
         try self.target.continueExecution();
@@ -1496,13 +1527,14 @@ pub const Session = struct {
             const module = found.module;
             const links = lines.get(module.id) orelse links: {
                 var list: std.ArrayList(u64) = .empty;
+                module.debug_sweep = true;
                 if (module.debugInfo()) |debug| {
                     for (originals) |original| {
                         const rows = debug.rowsForLine(a, original, line) catch continue;
                         // The ppc64 entry adjustment, taken where the module itself is loaded.
                         for (rows) |row| try list.append(a, self.ppcLineAddress(try module.runtimeAddress(row.address)) -% module.bias);
                     }
-                } else |_| {}
+                } else |err| self.modules.noteDebugFailure(module, err, .sweep);
                 try lines.put(a, module.id, list.items);
                 break :links list.items;
             };
@@ -1594,6 +1626,7 @@ pub const Session = struct {
                     try frames.append(a, frame);
                     break :stack_walk;
                 };
+                module.debug_sweep = false;
                 frame.module_id = module.id;
                 frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
                 const debug = module.debugInfo() catch |err| {
@@ -1866,7 +1899,10 @@ pub const Session = struct {
         self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .client_id = if (actor == .agent) self.agent_client_id else null, .action = action, .generation = self.target.snapshot().generation };
         self.audit_count += 1;
         if (actor == .agent) {
-            self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence));
+            self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence)) catch |err| {
+                self.step_diagnostic = @errorName(err);
+                return;
+            };
             // Recording the accepted deferred command changes the generation
             // itself. Other later actions must still cancel that command.
             if (self.pending_continue) |*pending| {
@@ -1882,7 +1918,9 @@ pub const Session = struct {
             return;
         }
         self.agent_scope = scope;
-        self.target.invalidate();
+        self.target.invalidate() catch |err| {
+            self.step_diagnostic = @errorName(err);
+        };
         self.record(.human, "set_agent_scope");
     }
     pub fn jobRequester(self: *const Session) @import("../service/job_owner.zig").Requester {
@@ -1899,6 +1937,7 @@ pub const Session = struct {
         self.language_watches.deinit();
         self.language_tabs.deinit();
         self.metadata.deinit();
+        if (self.target.isRemote()) self.modules.drainRemoteReaders();
         self.static_analysis.deinit();
         if (self.observation_archive) |job| job.deinit();
         if (self.observation_associations) |job| job.deinit();

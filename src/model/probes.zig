@@ -78,7 +78,7 @@ pub const Manager = struct {
         const out = slot orelse return error.BreakpointLimit;
         try target.enableBreakpoint(id, enabled);
         out.* = candidate;
-        target.invalidate();
+        try target.invalidate();
     }
     fn prune(self: *Manager, probes: []const bp.Breakpoint) void {
         for (&self.rules) |*item| {

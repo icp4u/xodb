@@ -191,6 +191,15 @@ static enum xpe_status headers(struct xpe_image *p) {
     }
     return XPE_OK;
 }
+enum xpe_status xpe_probe_headers(const struct xpe_source *source) {
+    if (!source || !source->read || source->layout != XPE_FILE) return XPE_MALFORMED;
+    struct xpe_image *image=calloc(1,sizeof *image);
+    if (!image) return XPE_NOMEM;
+    image->source=*source;
+    enum xpe_status status=headers(image);
+    free(image);
+    return status;
+}
 enum xpe_status xpe_validate_loaded_headers(const struct xpe_image *file, const struct xpe_source *source) {
     if (!file || !source || !source->read || source->layout != XPE_MEMORY) return XPE_MALFORMED;
     struct xpe_image *loaded=calloc(1,sizeof *loaded);

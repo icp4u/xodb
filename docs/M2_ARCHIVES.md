@@ -137,7 +137,7 @@ offline sessions, irrespective of agent scope.
 | Encoder temporary / retained decoded Zig allocations | 512 MiB each |
 | New offline filtered graph working allocations | 64 MiB |
 | Live recorded snapshot/graph worker | 96 MiB |
-| Owned ELF/PE snapshots | 256 MiB per image; 512 MiB total, shared |
+| Owned ELF/PE snapshots | 256 MiB per image; 1 GiB total by default, shared |
 | Retained PE parser metadata | 64 MiB total, separate from file snapshots |
 | Mapping path strings | 16 MiB aggregate; 4096 bytes per path |
 | Annotations / graph nodes | 8192 each |

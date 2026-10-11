@@ -86,7 +86,11 @@ enum xrt_status {
     XRT_DISCOVERY_PENDING,
     XRT_DISCOVERY_BUDGET,
     /* A symbol-purpose FILE_OPEN was refused by an older agent's size cap. */
-    XRT_SYMBOL_AGENT_UPDATE_REQUIRED
+    XRT_SYMBOL_AGENT_UPDATE_REQUIRED,
+    /* Local lifecycle results; never put these on the agent wire. */
+    XRT_REMOTE_CANCELLED,
+    XRT_REMOTE_OUTCOME_UNKNOWN,
+    XRT_REMOTE_IO_FORBIDDEN
 };
 
 #endif

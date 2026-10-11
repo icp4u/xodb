@@ -49,7 +49,7 @@ def log():
     return Path(d.log).read_text()
 
 def field():
-    rows = re.findall(r'xodb: memmap deep x=.*', log())
+    rows = [line for line in h.complete_lines(d.log) if line.startswith('xodb: memmap deep x=')]
     if not rows: return {}
     return dict(re.findall(r'(\w+)=([^ ]+)', rows[-1]))
 
@@ -195,7 +195,7 @@ try:
     mark=len(log());send('tap',11)
     until(lambda:'panel=system ' in log()[mark:],'0 System Info')
     check('0 reaches System Info from deep map',True)
-    lines=[line for line in log().splitlines() if 'overview layout ' in line]
+    lines=[line for line in h.complete_lines(d.log) if 'overview layout ' in line]
     check('no label overlaps at 1280',bool(lines) and all('overlaps=0 ' in line for line in lines))
     evidence['header_ocr']=texts[-1];evidence['alias_ocr']=alias_text
     close()

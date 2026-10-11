@@ -86,7 +86,7 @@ int main(void)
     close(listener);
     struct xrt_gdb_link *link = malloc(sizeof(*link)); assert(link);
     char endpoint[64]; snprintf(endpoint, sizeof(endpoint), "127.0.0.1:%u", ntohs(address.sin_port));
-    assert(xrt_gdb_connect(link, endpoint) == XRT_OK);
+    assert(xrt_gdb_connect(link, endpoint, NULL) == XRT_OK);
     uint8_t reply[4096]; size_t size;
     assert(xrt_gdb_exchange(link, "qSupported", 10, reply, sizeof(reply), &size) == XRT_OK);
     assert(size == strlen("PacketSize=4000;QStartNoAckMode+"));
@@ -107,7 +107,7 @@ int main(void)
     int status; assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && !WEXITSTATUS(status));
     const char *invalid[] = {"", "host", ":12", "host:0", "host:65536", "host:x", "::1:33", "[::1]", "[::1]:-1"};
     for (size_t i = 0; i < sizeof(invalid) / sizeof(invalid[0]); ++i)
-        assert(xrt_gdb_connect(link, invalid[i]) == XRT_INVALID_ARGUMENT);
+        assert(xrt_gdb_connect(link, invalid[i], NULL) == XRT_INVALID_ARGUMENT);
     free(link);
     puts("GDB link: TCP, NAK retransmit, checksum retry, no-ack, console, interrupt and EOF pass");
 }

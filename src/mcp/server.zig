@@ -5,10 +5,7 @@ const disasm = @import("../model/disassembly.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 const shared_context = @import("shared_context.zig");
-const base_tool_definitions = std.mem.trimEnd(u8, @embedFile("base_tools.json"), " \n");
-const static_definitions = std.mem.trimEnd(u8, @import("static_analysis.zig").definitions, " \n");
-const macho_definitions = std.mem.trimEnd(u8, @import("macho.zig").definitions, " \n");
-const tool_definitions = base_tool_definitions[0 .. base_tool_definitions.len - 1] ++ "," ++ static_definitions[1 .. static_definitions.len - 1] ++ "," ++ @import("runtime_types.zig").definitions[1 .. @import("runtime_types.zig").definitions.len - 1] ++ "," ++ macho_definitions[1 .. macho_definitions.len - 1] ++ "," ++ overview.definitions[1..];
+const tool_definitions = @import("tool_catalog.zig").native_definitions;
 const overview = @import("overview.zig");
 fn member(value: Value, name: []const u8) ?Value {
     return if (value == .object) value.object.get(name) else null;
@@ -549,7 +546,7 @@ pub const Server = struct {
             // Name the first image this stack could not read in full.
             // A core has no metadata unwinder: its walk ends at that frame.
             const image_budget: ?[]const u8 = found: for (frames) |frame| {
-                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit")) if (session.modules.budgetDetail(frame.lookup_pc)) |detail| break :found try a.dupe(u8, detail);
+                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit") or std.mem.eql(u8, why, "CompressedDebugBudget")) if (session.modules.budgetDetail(frame.lookup_pc)) |detail| break :found try a.dupe(u8, detail);
             } else null;
             var result = try asValue(a, .{ .generation = session.target.snapshot().generation, .image_budget = image_budget, .frames = frames });
             for (result.object.getPtr("frames").?.array.items) |*frame| {
@@ -828,20 +825,13 @@ fn inlineDepth(args: Value) !usize {
 }
 
 test "every advertised tool has a unique name and explicit session access classification" {
-    const a = std.testing.allocator;
-    for ([_][]const u8{ tool_definitions, @import("imported.zig").definitions, shared_context.definitions }, 0..) |definitions, kind| {
-        const parsed = try std.json.parseFromSlice(Value, a, definitions, .{});
-        defer parsed.deinit();
-        for (parsed.value.array.items, 0..) |definition, i| {
-            const name = string(member(definition, "name")) orelse return error.MissingToolName;
-            const annotations = member(definition, "annotations") orelse return error.MissingToolAnnotations;
-            const readonly = member(annotations, "readOnlyHint") orelse return error.MissingToolAccess;
-            try std.testing.expect(readonly == .bool);
-            const access = try shared_context.access(definition);
-            if (kind != 2) try std.testing.expect(access != .lease);
-            for (parsed.value.array.items[0..i]) |previous| try std.testing.expect(!std.mem.eql(u8, name, string(member(previous, "name")).?));
-        }
-    }
+    const catalog = @import("tool_catalog.zig");
+    var failure: ?catalog.Failure = null;
+    try catalog.validate(std.testing.allocator, &.{
+        .{ .name = "debugger", .text = tool_definitions, .group = .native },
+        .{ .name = "imported", .text = @import("imported.zig").definitions, .group = .imported },
+        .{ .name = "session", .text = shared_context.definitions, .group = .session },
+    }, &failure);
 }
 
 test "one oversized reply returns a protocol error and preserves the server" {

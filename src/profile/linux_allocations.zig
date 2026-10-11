@@ -119,6 +119,14 @@ pub const Collector = struct {
         var ctx = Decoding{ .self = self, .out = out };
         const status = rt.xrt_perf_drain(self.handle, Decoding.decode, &ctx);
         ctx.result.more = ctx.result.more or status == rt.XRT_PERF_DRAIN_CAPACITY;
+        if (status == rt.XRT_PERF_DRAIN_CANCELLED) {
+            self.failed = true;
+            ctx.result.failure = fail("allocations.drain", c.ECANCELED, -1, "RemoteCancelled; unread records remain");
+        }
+        if (status == rt.XRT_PERF_DRAIN_OUTCOME_UNKNOWN) {
+            self.failed = true;
+            ctx.result.failure = fail("allocations.drain", c.EIO, -1, "RemoteOutcomeUnknown; consumed record acknowledgement unconfirmed");
+        }
         if (status == rt.XRT_PERF_DRAIN_MALFORMED) {
             self.failed = true;
             if (ctx.result.failure == null) ctx.result.failure = fail("allocations.drain", 0, -1, "invalid perf ring layout or overrun");

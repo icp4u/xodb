@@ -1,6 +1,7 @@
 #ifndef XODB_RUNTIME_GDBREMOTE_H
 #define XODB_RUNTIME_GDBREMOTE_H
 #include "xrt_target.h"
+#include "xrt_cancel.h"
 #define XRT_GDB_CAP_THREADS (UINT64_C(1) << 0)
 #define XRT_GDB_CAP_STEP (UINT64_C(1) << 1)
 #define XRT_GDB_CAP_SOFTWARE_BREAK (UINT64_C(1) << 2)
@@ -16,5 +17,6 @@ struct xrt_gdb_info {
     char architecture[64], reason[128];
 };
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out);
-bool xrt_target_gdb_info(const struct xrt_target *, struct xrt_gdb_info *);
+enum xrt_status xrt_target_gdb_remote_cancel(const char *endpoint, struct xrt_target **out, struct xrt_cancel *);
+enum xrt_status xrt_target_gdb_info(const struct xrt_target *, struct xrt_gdb_info *);
 #endif

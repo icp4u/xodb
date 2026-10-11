@@ -8,9 +8,9 @@ CPPFLAGS += -I$(CURDIR)
 CFLAGS ?= -O2 -g
 CFLAGS += -std=c11 -Wall -Wextra -Werror -Wswitch-enum
 LDLIBS += -latomic -pthread -ldl
-SOURCES := gdb_packet gdb_link gdb_description gdbremote memory arch registers process target probes loongarch_step watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files file_view symbol_job loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker sysstat sysstat_nvml fdevent fdevent_decode fdevent_count fdactivity source binary_object dwarf_cursor source_paths memstat memstat_system memstat_process memstat_pages memstat_cells memobserver
+SOURCES := cancel gdb_packet gdb_link gdb_description gdbremote memory arch registers process target probes loongarch_step watchpoints events family xstate perf perf_cpu perf_syscalls perf_allocations wire wire_target agent remote files file_view symbol_job loader elf_symbols mapped_file perf_wire agent_perf remote_perf fdscan allocation_broker sysstat sysstat_nvml fdevent fdevent_decode fdevent_count fdactivity source binary_object dwarf_cursor source_paths memstat memstat_system memstat_process memstat_pages memstat_cells memobserver
 OBJECTS := $(addprefix $(BUILD)/,$(addsuffix .o,$(SOURCES)))
-TESTS := gdb-packet gdb-link gdb-description gdb-model memory registers process target perf wire snapshot symbols symbol-job fdscan sysstat services fdevent fdevent-count memstat-system memstat-process memstat-cells memobserver
+TESTS := cancel resolve gdb-packet gdb-link gdb-description gdb-model memory registers process target perf wire snapshot symbols symbol-job fdscan sysstat services fdevent fdevent-count memstat-system memstat-process memstat-cells memobserver
 TEST_BINS := $(addprefix $(BUILD)/test-,$(TESTS))
 .PHONY: all check check-leaks clean
 all: $(BUILD)/libxrt.a $(BUILD)/xodb-agent $(BUILD)/xodb-lsof-top
@@ -37,6 +37,14 @@ $(BUILD)/xodb-lsof-top: $(ROOT)/src/lsoftop/main.c $(ROOT)/src/lsoftop/lsoftop.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(ROOT)/src/lsoftop/main.c $(ROOT)/src/lsoftop/lsoftop.c $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-%: $(ROOT)/tests/runtime-%.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
+# Only this fixture pauses after the final syscall, before decoder acceptance.
+# Fortified libc aliases bypass the fixture callbacks; production keeps them.
+$(BUILD)/cancel-wire.o: wire.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -U_FORTIFY_SOURCE -Dread=xrt_test_read -c $< -o $@
+$(BUILD)/cancel-link.o: gdb_link.c | $(BUILD)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -U_FORTIFY_SOURCE -Drecv=xrt_test_recv -c $< -o $@
+$(BUILD)/test-cancel: $(ROOT)/tests/runtime-cancel.c $(BUILD)/cancel-wire.o $(BUILD)/cancel-link.o $(BUILD)/libxrt.a
+	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG $^ $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-remote: $(ROOT)/tests/runtime-remote.c $(BUILD)/libxrt.a
 	$(CC) $(CPPFLAGS) $(CFLAGS) -UNDEBUG -fno-pie -no-pie $< $(BUILD)/libxrt.a $(LDFLAGS) $(LDLIBS) -o $@
 $(BUILD)/test-loader: $(ROOT)/tests/runtime-loader.c $(BUILD)/libxrt.a

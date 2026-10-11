@@ -10,7 +10,7 @@ budgets bound those copies:
 | Budget | Default | Option | Preference |
 | --- | --- | --- | --- |
 | One image | 256 MiB | `--image-limit SIZE` | `symbols.image_bytes` |
-| All images in the xodb process | 512 MiB | `--image-total-limit SIZE` | `symbols.image_total_bytes` |
+| All images in the xodb process | 1 GiB | `--image-total-limit SIZE` | `symbols.image_total_bytes` |
 
 `SIZE` is bytes, or a whole number with `K`, `M` or `G` (`256M`, `4G`); the
 preferences take bytes. Values from 1 MiB to 1 TiB are accepted (2 GiB at most
@@ -30,28 +30,34 @@ When an image does not fit, xodb says which and why, and what to rerun with
 for that image, in the same words everywhere:
 
 ```
-/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 2G or set symbols.image_bytes and symbols.image_total_bytes
-/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 512 MiB total image budget; rerun with --image-total-limit 1G or set symbols.image_total_bytes
+/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes
+/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 1024 MiB total image budget; rerun with --image-total-limit 2G or set symbols.image_total_bytes
 ```
 
 The suggested per-image value is the image's size plus 5%, rounded up to a
 whole number of hundreds of MiB. The suggested total is whole GiB: enough for
-the image beside what is already held, and at least twice the image, so that
-searches of every image keep their share (below). `--image-total-limit` is
-named only when the total is in the way. A suggestion is never above the
+the image beside what is already held, and at least twice the rounded
+per-image suggestion, so searches of every image keep their share (below).
+`--image-total-limit` is also named when that suggestion exceeds half the
+current total. A suggestion is never above the
 accepted range; an image larger than the range says so instead. The
 preferences take the same values in bytes.
 
 - `get_stack` carries it as top-level `image_budget`; the affected frames keep
-  `inline_diagnostic: BinarySnapshotLimit` and stay unnamed.
+  `inline_diagnostic: BinarySnapshotLimit` and stay unnamed. A compressed
+  debug reader keeps `CompressedDebugBudget`; its sentence names the bytes
+  needed for the private copy and decompressed data.
 - `list_modules` carries the first one as top-level `image_budget` and each as
   `detail` in its `load_failures` row; the regions have `full_image_deferred`.
   Its `image_bytes` gives the process-wide figures: `held`, `peak`,
-  `total_limit` and `image_limit`.
+  `total_limit`, `image_limit`, `sweep_held` and `sweep_limit`. The sweep figure
+  includes derived debug bytes read for source searches.
 - `find_symbol` answers `ImageBudgetExceeded`, with the sentence as a second
   text item, when a name is not found while an image is unread.
 - The GUI status line shows `Over budget: FILE is N MiB; …` for the selected thread.
-- stderr has one `module budget:` line per stop, ending with the first refusal.
+- stderr suppresses repeated counts and permits at most one `module budget:`
+  line per second across the process. Current details remain available through
+  the requesting tool and `list_modules`, including after a burst stops.
 
 The path in that sentence is the target's to choose. It is shown as UTF-8 of
 at most 512 bytes: a longer path is cut between characters and ends in `...`,
@@ -249,20 +255,25 @@ bound follows from the reason, in one place (`Modules.allowance`):
 | a saved breakpoint | the image budgets (through a runtime agent: the bounds of rule 3) |
 | a search of every image | below |
 
-A search of every image reads:
+A search of every image reads an already held image at no extra cost. Every
+new image, **including the main executable**, counts against the sweep share:
+`min(total / 2, total - per_image)`. At defaults that is 512 MiB; with
+`--image-limit 2G --image-total-limit 8G` it is 4 GiB. The main executable may
+be as large as the per-image budget; other new images may be at most 256 MiB.
+Derived copies and inflated debug sections opened for a source search also
+count against the share.
 
-- **an image already held** by anything in the xodb process, at no cost;
-- **the main executable**, under the image budgets;
-- **any other image** only if it is at most 256 MiB, and only while all such
-  searches together hold at most half of `--image-total-limit`, and never
-  the last `--image-limit` of it. With the defaults that is 256 MiB; with
-  `--image-limit 2G --image-total-limit 8G` it is 4 GiB. The figure is one
-  for the whole xodb process, like the total, so a capture and a line
-  breakpoint in the same process share it.
+The share belongs to the whole xodb process. Its charge stays with a shared
+file version until the **last** reader releases it: a parent executing a new
+program cannot give back a charge for bytes its followed child still holds.
+A frame using an image first loaded by a sweep does not remove its charge.
 
-What is left of the total is at least one image budget, and it is the stack's.
-The order of requests does not matter: a stack frame's image is never crowded
-out by a search made before it.
+Sweeps alone leave at least one per-image budget free in the total, even
+when the executable is large. Explicit frame, name, runtime and saved-image
+requests use the total too and can consume that remaining room. If the user
+sets the per-image budget at or above the total, the sweep share is zero.
+The options are capped at the accepted range; at its largest values there
+may be no accepted total that is twice the per-image value.
 
 A search that skipped an image says so, so that "no code for this line" is
 never taken for an answer about images that were not read:
@@ -280,8 +291,8 @@ never taken for an answer about images that were not read:
   the Modules list names them.
 
 ```
-/opt/app/libhuge.so is 1023 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded (the main executable excepted); a stack frame in the image loads it
-/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 256 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 1G or set symbols.image_total_bytes; a stack frame in the image loads it
+/opt/app/libhuge.so is 1023 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it
+/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 512 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 2G or set symbols.image_total_bytes; a stack frame in the image loads it
 ```
 
 To search a skipped image, show a stack with a frame in it (it is then held,
@@ -289,6 +300,21 @@ and free to every later search), or raise the total. A search also may skip
 the library the thread is stopped in, if the stack has not been shown yet and
 other images came first; the reply says so, and after `get_stack` the same
 request covers it.
+
+A stopped CPU capture retains its images so its samples can still be resolved
+and exported. To free them before rebuilding or restarting a target, call
+`release_profile` with its `capture_id`, `revision` and the current session
+`generation`. Export first if the capture is needed later. A collecting capture
+refuses release. A borrowed capture returns `ProfileViewPending` while its
+reader is cancelled; retry after it finishes. Starting a replacement capture
+also releases the stopped one **before** reading the new images. A later perf
+open failure therefore leaves no previous capture. Other holders of a shared
+image still count until they release it too.
+
+A compressed-debug refusal adds a `CompressedDebugBudget` row and sentence
+to `list_modules`. A source search counts that file as not searched, even
+though its compressed image fit: missing line information is never silently
+reported as a complete search.
 
 A search reads each file once, through one loaded copy, however many times
 and at whatever addresses the process mapped it; a file that cannot be loaded
@@ -306,7 +332,20 @@ a stack frame has loaded it.
 
 Through a runtime agent the main executable is not told apart in a search
 either: it counts as any other image there, within the same 256 MiB and the
-same share of the total.
+same share of the total. Separate file transfers can have distinct snapshot
+identities, so two agent readers can require separate copies of one target
+file. Release the earlier capture, or restart to release a line reader,
+before testing a fresh capture at a full sweep share. Caller frames use
+metadata-only unwinding until their image is explicitly selected; selecting
+an address uses the frame budget. The agent's fixed 256 MiB whole-file transfer
+cap is unchanged by host budget options.
+
+The periodic `image-budget-lifecycle`, `image-budget-regressions` and
+`image-budget-torch` checks exercise these bounds. The Torch check uses
+`python3` by default; `XODB_TORCH_PYTHON` selects another existing Python with
+Torch installed. It reports named self-sample coverage and requires named
+`libtorch_cpu` samples after the budget advice admits the mapped images;
+it does not assert a fixed percentage.
 
 ## Ranged readers
 

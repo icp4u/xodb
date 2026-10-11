@@ -64,7 +64,10 @@ enum xrt_perf_drain_status {
     XRT_PERF_DRAIN_CAPACITY,
     XRT_PERF_DRAIN_MALFORMED,
     XRT_PERF_DRAIN_INCOMPLETE,
-    XRT_PERF_DRAIN_STOP
+    XRT_PERF_DRAIN_STOP,
+    /* Local remote-connection results, not wire data. */
+    XRT_PERF_DRAIN_CANCELLED,
+    XRT_PERF_DRAIN_OUTCOME_UNKNOWN
 };
 struct xrt_perf_consumed {
     uint64_t bytes;

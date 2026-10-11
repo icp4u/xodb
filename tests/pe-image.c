@@ -1,18 +1,32 @@
 #include "../src/binary/pe.h"
 #include "check.h"
 #include <string.h>
-struct bytes {unsigned char *data;size_t size, reads, fail_at;enum xpe_status failure;};
+struct bytes {unsigned char *data;size_t size, reads, fail_at, read_bytes;enum xpe_status failure;};
 static unsigned le32(const unsigned char *p){return (unsigned)p[0]|(unsigned)p[1]<<8|(unsigned)p[2]<<16|(unsigned)p[3]<<24;}
 static void put32(unsigned char *p,unsigned value){for(unsigned i=0;i<4;++i)p[i]=(unsigned char)(value>>(i*8));}
 static enum xpe_status read_bytes(void *user,uint64_t at,void *out,size_t n) {
     struct bytes *b=user;if(++b->reads==b->fail_at)return b->failure;
     if(at>b->size || n>b->size-at)return XPE_IO;
-    memcpy(out,b->data+(size_t)at,n);return XPE_OK;
+    b->read_bytes+=n;memcpy(out,b->data+(size_t)at,n);return XPE_OK;
 }
 int main(int argc,char **argv) {
     CHECK(argc>=2);FILE *in=fopen(argv[1],"rb");CHECK(in);CHECK(!fseek(in,0,SEEK_END));long length=ftell(in);CHECK(length>0);rewind(in);
     struct bytes file={.data=malloc((size_t)length),.size=(size_t)length};CHECK(file.data);CHECK(fread(file.data,1,file.size,in)==file.size);CHECK(!fclose(in));
     struct xpe_source source={&file,file.size,XPE_FILE,read_bytes};struct xpe_image *p=NULL;
+    if(argc>2 && (!strcmp(argv[2],"headers") || !strcmp(argv[2],"headers-wrong-result"))) {
+        CHECK(xpe_probe_headers(&source)==(!strcmp(argv[2],"headers-wrong-result")?XPE_MALFORMED:XPE_OK));
+        CHECK(file.reads<=100 && file.read_bytes<=4170);
+        size_t calls=file.reads;
+        for(size_t at=1;at<=calls;++at) {
+            file.reads=0;file.fail_at=at;file.failure=XPE_IO;
+            CHECK(xpe_probe_headers(&source)==XPE_IO);
+        }
+        file.fail_at=0;
+        unsigned pe=le32(file.data+60);file.data[pe]='X';
+        CHECK(xpe_probe_headers(&source)==XPE_MALFORMED);
+        file.data[0]='X';CHECK(xpe_probe_headers(&source)==XPE_NOT_PE);
+        free(file.data);puts("bounded structural PE header probe checked");return 0;
+    }
     enum xpe_status status=xpe_load(&source,&p);fprintf(stderr,"file status=%u\n",status);if(argc>2 && !strncmp(argv[2],"status=",7)){CHECK(status==(enum xpe_status)strtoul(argv[2]+7,NULL,10));CHECK((p!=NULL)==(status==XPE_OK));xpe_destroy(p);free(file.data);return 0;}
     CHECK(status==XPE_OK);
     if(argc>2 && !strcmp(argv[2],"budget")) {

@@ -63,6 +63,9 @@ def send(*cmd):
     if d.keys(*cmd, wait=False).wait(timeout=10 * h.load_scale()):
         raise AssertionError('private input failed')
 
+def layout_rows():
+    return [line for line in h.complete_lines(d.log) if 'overview layout ' in line]
+
 try:
     d = h.Display(str(root), ['--overview', '--look', 'win95', '--panel', 'memory_map',
                   '--pause', '--redact', '--replay', str(replay)], stdio=False, trace=False,
@@ -99,7 +102,7 @@ try:
     until(lambda: shot('defrag-1080').size == (1920, 1080), 'full-size defrag captured')
     send('tap', 34, 'm', 2, 100)
     until(lambda: navy('legend-1080', (725, 302)), 'full-size legend captured')
-    layout = [line for line in Path(d.log).read_text().splitlines() if 'overview layout ' in line]
+    layout = layout_rows()
     if not layout or any('overlaps=0 ' not in line for line in layout):
         raise AssertionError(layout)
     if any(x in Path(d.log).read_text() for x in ('panic:', 'Draw failed', 'frame failed')):

@@ -153,7 +153,8 @@ fn preview(ctx: Context, a: A, v: eval.Value, out: *model.ValueSummary) anyerror
     }
 }
 pub fn summarize(session: *model.Session, a: A, v: eval.Value, out: *model.ValueSummary) !bool {
-    if (!supported(v.type)) return false;
+    // With the Go view off these are plain native values.
+    if (!supported(v.type) or !session.languages.on(.go)) return false;
     const ctx = Context.init(session, v.type) catch |err| {
         try partial(a, out, @errorName(err));
         return true;
@@ -163,6 +164,7 @@ pub fn summarize(session: *model.Session, a: A, v: eval.Value, out: *model.Value
     return true;
 }
 pub fn children(session: *model.Session, a: A, v: eval.Value, start: u64, limit: usize) anyerror!model.Session.ValuePage {
+    if (!session.languages.on(.go)) return session.valueChildren(a, v, start, limit, true);
     if (limit == 0 or limit > view.max_children or v.availability != .available) return error.InvalidValuePage;
     const ctx = try Context.init(session, v.type);
     var items: std.ArrayList(model.Session.ValueChild) = .empty;

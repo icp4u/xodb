@@ -4,6 +4,10 @@
 #include "gdb_link.h"
 #include "remote_internal.h"
 #include <pthread.h>
+#include <stdatomic.h>
+#include <sys/syscall.h>
+#include <fcntl.h>
+#include <sched.h>
 #include <sys/resource.h>
 #include <arpa/inet.h>
 #include <assert.h>
@@ -73,7 +77,17 @@ static void reply(int fd, const char *text)
     assert(xrt_gdb_encode((const uint8_t *)text, strlen(text), wire, sizeof(wire), &size) == XRT_GDB_OK);
     send_all(fd, wire, size);
 }
-enum { SLOW_THREADS = 3, CHURN_THREADS = 4, CLOSED_LINK = 5 };
+enum { SLOW_THREADS = 3, CHURN_THREADS = 4, CLOSED_LINK = 5, HOLD_READ = 6, HOLD_WRITE = 7 };
+static int held_notify = -1;
+static void hold_reply(int fd, uint64_t value)
+{
+    assert(held_notify >= 0 && write(held_notify, &value, sizeof(value)) == sizeof(value));
+    close(held_notify);
+    char byte;
+    // Peer closes without our reply/release; with our ack still unread that is a reset.
+    assert(recv(fd, &byte, 1, 0) <= 0);
+    close(fd); _exit(0);
+}
 static void serve(int listener, int mode)
 {
     int fd = accept(listener, NULL, NULL); assert(fd >= 0); close(listener);
@@ -137,11 +151,13 @@ static void serve(int listener, int mode)
             unsigned long long address; unsigned size;
             assert(sscanf(request + 1, "%llx,%x", &address, &size) == 2 && (size == 8 || size == 1));
             if (size == 1) { reply(fd, "90"); continue; }
+            if (mode == HOLD_READ && address == 0x2000) hold_reply(fd, memory);
             encode(address == 0x2000 ? memory : 17, response); response[16] = 0;
         } else if (request[0] == 'M') {
             unsigned long long address; unsigned size; int at = 0;
             assert(sscanf(request + 1, "%llx,%x:%n", &address, &size, &at) == 2 && size == 8);
             if (address == 0x2000) memory = decode(request + 1 + at);
+            if (mode == HOLD_WRITE && address == 0x2000) hold_reply(fd, memory);
             strcpy(response, address == 0x2010 ? "E01" : "OK");
         } else if (!strncmp(request, "Z0,", 3)) strcpy(response, "E01");
         else if (!strncmp(request, "z0,", 3)) strcpy(response, "OK");
@@ -173,6 +189,82 @@ static uint64_t generation(struct xrt_target *target)
 {
     struct xrt_target_view view; xrt_target_view(target, &view); return view.generation;
 }
+struct cancelled_call {
+    struct xrt_target *target;
+    bool mutation, health;
+    atomic_int tid;
+    enum xrt_status status;
+};
+static void *cancelled_call(void *opaque)
+{
+    struct cancelled_call *call = opaque;
+    atomic_store(&call->tid, (int)syscall(SYS_gettid));
+    uint64_t value = 99;
+    size_t length = 0;
+    call->status = call->health ? xrt_remote_health(call->target) :
+        xrt_remote_call(call->target, &(struct xrt_call){
+            .op = call->mutation ? XRT_RPC_WRITE : XRT_RPC_READ, .args = {0x2000, 8},
+            .data = call->mutation ? &value : NULL, .size = call->mutation ? 8 : 0,
+            .out = call->mutation ? NULL : &value, .capacity = call->mutation ? 0 : 8,
+            .length = &length});
+    return NULL;
+}
+static void mutex_waiter(struct cancelled_call *call)
+{
+    for (;;) {
+        int tid = atomic_load(&call->tid);
+        if (tid) {
+            char path[96], line[256];
+            snprintf(path, sizeof(path), "/proc/self/task/%d/syscall", tid);
+            int fd = open(path, O_RDONLY | O_CLOEXEC); assert(fd >= 0);
+            ssize_t n = read(fd, line, sizeof(line)-1); close(fd); assert(n > 0); line[n] = 0;
+            char *end; long number = strtol(line, &end, 10);
+            if (end != line && number == SYS_futex) return;
+        }
+        sched_yield();
+    }
+}
+static void cancellation_checks(void)
+{
+    for (int mode = HOLD_READ; mode <= HOLD_WRITE; ++mode) {
+        int event[2]; assert(!pipe(event)); held_notify = event[1];
+        struct fixture f = start(mode); close(event[1]); held_notify = -1;
+        struct xrt_target *target = NULL;
+        assert(xrt_target_gdb_remote(f.endpoint, &target) == XRT_OK);
+        struct xrt_cancel *cancel = xrt_target_cancel(target); assert(cancel);
+        struct cancelled_call call = {.target = target, .mutation = mode == HOLD_WRITE};
+        struct cancelled_call health = {.target = target, .health = true};
+        atomic_init(&call.tid, 0); atomic_init(&health.tid, 0);
+        pthread_t reader, waiter;
+        assert(!pthread_create(&reader, NULL, cancelled_call, &call));
+        uint64_t applied;
+        assert(read(event[0], &applied, sizeof(applied)) == sizeof(applied)); close(event[0]);
+        assert(applied == (mode == HOLD_WRITE ? 99u : 17u));
+        assert(!pthread_create(&waiter, NULL, cancelled_call, &health));
+        mutex_waiter(&health); // A second reader really is behind the transport mutex.
+        xrt_remote_io_guard(true);
+        assert(xrt_remote_health(target) == XRT_REMOTE_IO_FORBIDDEN);
+        xrt_remote_io_guard(false);
+        xrt_cancel_request(cancel); xrt_cancel_request(cancel);
+        assert(!pthread_join(reader, NULL) && !pthread_join(waiter, NULL));
+        assert(call.status == (mode == HOLD_WRITE ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_REMOTE_CANCELLED));
+        assert(health.status == XRT_REMOTE_CANCELLED);
+        assert(xrt_target_continue(target) == XRT_REMOTE_CANCELLED);
+        assert(xrt_target_destroy(target) == XRT_OK);
+        finish(f);
+        assert(xrt_cancel_requested(cancel)); // Capability outlives target/connection.
+        struct fixture fresh = start(HOLD_READ);
+        target = NULL; assert(xrt_target_gdb_remote(fresh.endpoint, &target) == XRT_OK);
+        struct xrt_cancel *new_cancel = xrt_target_cancel(target);
+        assert(new_cancel && new_cancel != cancel && !xrt_cancel_requested(new_cancel));
+        xrt_cancel_request(cancel);
+        assert(xrt_target_expect(target, generation(target)) == XRT_OK);
+        assert(xrt_target_destroy(target) == XRT_OK);
+        finish(fresh);
+        xrt_cancel_release(new_cancel); xrt_cancel_release(cancel);
+    }
+    puts("remote cancellation: held GDB read/write, mutex waiter, guarded lock refusal, sent mutation outcome unknown and fresh capability pass");
+}
 static void lifecycle_checks(void)
 {
     for (int mode = SLOW_THREADS; mode <= CLOSED_LINK; ++mode) {
@@ -184,7 +276,7 @@ static void lifecycle_checks(void)
             assert(xrt_target_step(target, 1) == XRT_OK);
             assert(xrt_target_wait_stopped(target) == XRT_TRANSPORT_FAILED);
             assert(!clock_gettime(CLOCK_MONOTONIC, &end));
-            struct xrt_gdb_info info; assert(xrt_target_gdb_info(target, &info));
+            struct xrt_gdb_info info; assert(xrt_target_gdb_info(target, &info) == XRT_OK);
             assert(strstr(info.reason, "operation deadline exceeded"));
             assert(xrt_target_poll(target) == XRT_TRANSPORT_FAILED);
             printf("GDB slow inventory: operation deadline failed the link after %.3f s\n",
@@ -223,8 +315,38 @@ static void *guard_worker(void *unused)
     assert(xrt_target_gdb_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
     return NULL;
 }
+static void release_guard(void)
+{
+    int log[2]; assert(!pipe(log));
+    int saved = dup(STDERR_FILENO); assert(saved >= 0);
+    assert(dup2(log[1], STDERR_FILENO) >= 0); close(log[1]);
+    xrt_remote_io_guard_strict(false);
+    xrt_remote_io_guard(true);
+    const uint32_t before = xrt_remote_io_violation_count();
+    for (unsigned i = 0; i < 128; ++i) {
+        assert(xrt_target_remote(NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_target_gdb_remote(NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_call(NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_background_file(NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_health(NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_fail(NULL, XRT_OK) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_file(NULL, NULL, NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+        assert(xrt_remote_symbol_file(NULL, NULL, NULL, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+    }
+    assert(xrt_remote_io_violation_count() == before + 1024);
+    xrt_remote_io_guard(false);
+    fflush(stderr);
+    assert(dup2(saved, STDERR_FILENO) >= 0); close(saved);
+    char bytes[256]; ssize_t n = read(log[0], bytes, sizeof(bytes));
+    assert(n > 0 && n < (ssize_t)sizeof(bytes));
+    unsigned lines = 0;
+    for (ssize_t i = 0; i < n; ++i) lines += bytes[i] == '\n';
+    assert(lines == 1 && read(log[0], bytes, sizeof(bytes)) == 0); close(log[0]);
+    puts("remote release guard: 1024 typed refusals before dereference/lock/I/O, one diagnostic line pass");
+}
 static void owner_guard(void)
 {
+    xrt_remote_io_guard_strict(true);
     xrt_remote_io_guard(true);
     pthread_t worker;
     assert(!pthread_create(&worker, NULL, guard_worker, NULL));
@@ -255,14 +377,18 @@ static void owner_guard(void)
         assert(WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT);
     }
     xrt_remote_io_guard(false);
+    xrt_remote_io_guard_strict(false);
     assert(xrt_target_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
     assert(xrt_target_gdb_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
     puts("remote owner guard: GDB, agent, dispatch and lock entrypoints assert before I/O; worker-local state and native path preserved");
 }
-int main(void)
+int main(int argc, char **argv)
 {
     alarm(90);
+    release_guard();
     owner_guard();
+    cancellation_checks();
+    if (argc == 2 && !strcmp(argv[1], "--cancellation")) return 0;
     lifecycle_checks();
     for (int mode = 0; mode <= 2; ++mode) {
         struct fixture f = start(mode); struct xrt_target *target = NULL;
@@ -272,11 +398,24 @@ int main(void)
         }
         assert(status == XRT_OK && target);
         if (mode == 0) {
+            uint64_t before = generation(target);
+            struct xrt_gdb_info info, untouched;
+            memset(&info, 0xa5, sizeof(info)); untouched = info;
+            xrt_remote_io_guard(true);
+            assert(xrt_target_gdb_info(target, &info) == XRT_REMOTE_IO_FORBIDDEN);
+            assert(!memcmp(&info, &untouched, sizeof(info)));
+            assert(xrt_target_file_budget(target, NULL) == XRT_REMOTE_IO_FORBIDDEN);
+            assert(xrt_target_continue(target) == XRT_REMOTE_IO_FORBIDDEN);
+            assert(xrt_target_invalidate(target) == XRT_REMOTE_IO_FORBIDDEN);
+            assert(xrt_target_event(target, XRT_EVENT_AGENT_ACTION, 1, 0) == XRT_REMOTE_IO_FORBIDDEN);
+            xrt_remote_io_guard(false);
+            assert(generation(target) == before);
             pid_t child = fork(); assert(child >= 0);
             if (!child) {
                 struct rlimit core = {0, 0}; assert(!setrlimit(RLIMIT_CORE, &core));
                 assert(freopen("/dev/null", "w", stderr));
-                xrt_remote_io_guard(true);
+                xrt_remote_io_guard_strict(true);
+    xrt_remote_io_guard(true);
                 struct xrt_gdb_info guarded;
                 (void)xrt_target_gdb_info(target, &guarded);
                 _exit(1);
@@ -284,7 +423,7 @@ int main(void)
             int child_status; assert(waitpid(child, &child_status, 0) == child);
             assert(WIFSIGNALED(child_status) && WTERMSIG(child_status) == SIGABRT);
         }
-        struct xrt_gdb_info info; assert(xrt_target_gdb_info(target, &info));
+        struct xrt_gdb_info info; assert(xrt_target_gdb_info(target, &info) == XRT_OK);
         assert(info.unsupported & XRT_GDB_CAP_STEP);
         assert(mode == 1 ? (info.unsupported & XRT_GDB_CAP_THREADS) : (info.supported & XRT_GDB_CAP_THREADS));
         struct xrt_target_view view; xrt_target_view(target, &view);

@@ -24,7 +24,9 @@ enum xpe_status xpe_job_start(struct xrt_file_view *, int32_t pid, const char *m
     uint64_t allowance, struct xpe_job **);
 void xpe_job_poll(struct xpe_job *, struct xpe_job_snapshot *);
 void xpe_job_cancel(struct xpe_job *);
-/* Returns zero while still running, one after join, minus one on join error. */
+/* Returns zero while still running, one after join, minus one on join error.
+ * A nonzero result guarantees the worker has released all job-owned memory;
+ * a join error cancels publication and permits safe destruction. */
 int xpe_job_join(struct xpe_job *);
 /* Joined ready job only. No I/O; borrowed until destroy or cancellation. */
 struct xpe_image *xpe_job_image(struct xpe_job *);

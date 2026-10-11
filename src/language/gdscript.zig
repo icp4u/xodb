@@ -289,6 +289,7 @@ fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, SymbolDiscover
 /// place, and an engine's symbol tables are too large for a name scan. The
 /// image is read in full under the image budgets.
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.gdscript);
     try session.refreshMaps();
     const runtime = @import("../target/runtime.zig");
     var loader = std.mem.zeroes(runtime.c.struct_xrt_loader);
@@ -487,6 +488,7 @@ fn join(levels: []const Level, level_size: u64, depth: usize, ranges: []const Ra
 }
 
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.gdscript);
     if (first != 0) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
@@ -576,6 +578,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 }
 /// Runtime identity and proof for the language tab.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.gdscript);
     const layout = try profile(session, try runtimeModule(session));
     var memory = Memory{ .context = session, .readFn = sessionRead };
     _ = try language(&memory, layout);

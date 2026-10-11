@@ -238,8 +238,11 @@ pub const Manager = struct {
         if (self.loader_attempt != 0 and now -| self.loader_attempt < 1_000_000_000) return;
         self.loader_attempt = now;
         var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{ .limit_bytes = 128 * 1024, .deadline_ns = now + 2_000_000_000, .cancel = self.cancel });
-        rt.xrt_target_file_budget(session.target.handle, &budget);
-        defer rt.xrt_target_file_budget(session.target.handle, null);
+        runtime.check(rt.xrt_target_file_budget(session.target.handle, &budget)) catch |err| {
+            self.loader_status = @errorName(err);
+            return;
+        };
+        defer _ = rt.xrt_target_file_budget(session.target.handle, null);
         runtime.check(rt.xrt_target_loader(session.target.handle, &self.loader_reads, self.cancel)) catch |err| {
             self.loader_status = if (err == error.InvalidArgument and rt.xrt_target_is_remote(session.target.handle)) "agent needs updating: loader metadata unsupported" else @errorName(err);
             return;
@@ -279,7 +282,9 @@ pub const Manager = struct {
                 self.resolving = true;
                 return true;
             },
-            error.SymbolDiscoveryCancelled => return err,
+            // A sent reserve/resolve whose reply was lost may have patched
+            // the target. Never present that as an ordinary pending row.
+            error.SymbolDiscoveryCancelled, error.RemoteOutcomeUnknown => return err,
             else => return false,
         }
     }
@@ -299,9 +304,9 @@ pub const Manager = struct {
             .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
             .cancel = self.cancel,
         });
-        rt.xrt_target_file_budget(session.target.handle, &slice);
+        try runtime.check(rt.xrt_target_file_budget(session.target.handle, &slice));
         defer {
-            rt.xrt_target_file_budget(session.target.handle, null);
+            _ = rt.xrt_target_file_budget(session.target.handle, null);
             self.file_reads.bytes +|= slice.bytes;
             self.file_reads.files +|= slice.files;
             self.file_reads.negative_hits +|= slice.negative_hits;

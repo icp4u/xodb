@@ -18,13 +18,19 @@
 #include <time.h>
 #include <unistd.h>
 static _Thread_local bool remote_io_forbidden;
+static _Thread_local bool remote_io_strict;
+static _Thread_local uint32_t remote_io_violations;
 void xrt_remote_io_guard(bool forbidden) { remote_io_forbidden = forbidden; }
-static void assert_remote_io_thread(void)
+void xrt_remote_io_guard_strict(bool strict) { remote_io_strict = strict; }
+uint32_t xrt_remote_io_violation_count(void) { return remote_io_violations; }
+static bool remote_io_allowed(void)
 {
-    if (remote_io_forbidden) {
+    if (!remote_io_forbidden) return true;
+    if (remote_io_violations != UINT32_MAX) ++remote_io_violations;
+    if (remote_io_violations == 1)
         fputs("xodb: remote transport entered from a forbidden presentation thread\n", stderr);
-        abort();
-    }
+    if (remote_io_strict) abort();
+    return false;
 }
 struct symbol_range { uint64_t offset; size_t size; };
 struct symbol_partial {
@@ -40,6 +46,7 @@ struct symbol_partial {
 };
 struct xrt_connection {
     struct xrt_gdb *gdb;
+    struct xrt_cancel *cancel;
     pthread_mutex_t mutex;
     uint32_t foreground_waiters;
     int fd;
@@ -52,7 +59,7 @@ struct xrt_connection {
     struct xrt_target *targets[XRT_RPC_TARGETS];
     uint8_t *request_bytes, *reply;
     struct xrt_target *decoded;
-    bool reaped;
+    bool reaped, exit_status_known;
     int exit_status;
     struct xrt_file_budget *file_budget;
     pthread_t budget_owner;
@@ -61,15 +68,29 @@ struct xrt_connection {
     /* Owner-thread symbol discovery only; workers use the ordinary file API. */
     struct symbol_partial *symbols;
 };
-void xrt_target_file_budget(const struct xrt_target *t, struct xrt_file_budget *budget)
+enum xrt_status xrt_target_file_budget(const struct xrt_target *t, struct xrt_file_budget *budget)
 {
     if (t && t->connection) {
-        assert_remote_io_thread();
+        if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
         pthread_mutex_lock(&t->connection->mutex);
+        /* Clearing a borrowed stack budget must remain possible after cancel. */
+        enum xrt_status status = budget && xrt_cancel_requested(t->connection->cancel) ?
+            XRT_REMOTE_CANCELLED : XRT_OK;
+        if (status != XRT_OK) {
+            pthread_mutex_unlock(&t->connection->mutex);
+            return status;
+        }
         t->connection->file_budget = budget;
         t->connection->budget_owner = pthread_self();
         pthread_mutex_unlock(&t->connection->mutex);
     }
+    return XRT_OK;
+}
+struct xrt_cancel *xrt_target_cancel(const struct xrt_target *t)
+{
+    /* Owner-only acquisition while the target is alive. The returned reference
+     * survives target destruction and can be passed to a presentation thread. */
+    return t && t->connection ? xrt_cancel_retain(t->connection->cancel) : NULL;
 }
 /* Called with the connection locked. Profiling workers sharing this transport
  * must not inherit the owner thread's temporary symbol-discovery policy. */
@@ -105,14 +126,26 @@ static enum xrt_status broken(struct xrt_connection *c, enum xrt_status status)
     }
     return status;
 }
-static bool reap(struct xrt_connection *c)
+static enum xrt_status invalid_reply(struct xrt_connection *c, bool mutation)
+{
+    (void)broken(c, XRT_PROTOCOL_ERROR);
+    return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_PROTOCOL_ERROR;
+}
+static bool reap_for(struct xrt_connection *c, uint64_t timeout)
 {
     if (c->reaped)
         return true;
-    const uint64_t deadline = xrt_now() + UINT64_C(5000000000);
+    const uint64_t deadline = xrt_now() + timeout;
     while (xrt_now() < deadline) {
         pid_t got = waitpid(c->child, &c->exit_status, WNOHANG);
         if (got == c->child) {
+            c->reaped = true;
+            c->exit_status_known = true;
+            return true;
+        }
+        if (got < 0 && errno == ECHILD) {
+            /* Another reaper owns the exit status. Never signal this PID
+             * again: it could already identify an unrelated process. */
             c->reaped = true;
             return true;
         }
@@ -122,6 +155,10 @@ static bool reap(struct xrt_connection *c)
         nanosleep(&pause, NULL);
     }
     return false;
+}
+static bool reap(struct xrt_connection *c)
+{
+    return reap_for(c, xrt_cancel_requested(c->cancel) ? UINT64_C(250000000) : UINT64_C(5000000000));
 }
 static void startup_failure(struct xrt_connection *c)
 {
@@ -133,6 +170,7 @@ static void startup_failure(struct xrt_connection *c)
         fprintf(stderr, "xodb: runtime agent startup failed; transport did not exit\n");
         return;
     }
+    if (!c->exit_status_known) return;
     if (WIFSIGNALED(c->exit_status)) {
         int sig = WTERMSIG(c->exit_status);
         const char *name = sig == SIGILL ? "ILL" : sig == SIGSEGV ? "SEGV" :
@@ -154,6 +192,7 @@ static void release_connection(struct xrt_connection *c)
 {
     if (c->gdb) {
         xrt_gdb_free(c->gdb);
+        xrt_cancel_release(c->cancel);
         pthread_mutex_destroy(&c->mutex);
         free(c);
         return;
@@ -167,12 +206,21 @@ static void release_connection(struct xrt_connection *c)
     c->fd = -1;
     if (!reap(c)) {
         kill(c->child, SIGTERM);
-        reap(c);
+        if (!reap_for(c, UINT64_C(500000000))) {
+            kill(c->child, SIGKILL);
+            /* Only the owner waits. The GUI continues pumping until done;
+             * storage cannot be abandoned while a child is still owned. */
+            pid_t got;
+            do got = waitpid(c->child, &c->exit_status, 0); while (got < 0 && errno == EINTR);
+            c->reaped = got == c->child || (got < 0 && errno == ECHILD);
+            c->exit_status_known = got == c->child;
+        }
     }
     free(c->request_bytes);
     free(c->reply);
     free(c->decoded);
     pthread_mutex_destroy(&c->mutex);
+    xrt_cancel_release(c->cancel);
     free(c);
 }
 bool xrt_target_is_remote(const struct xrt_target *t)
@@ -226,15 +274,25 @@ const struct xrt_target *xrt_remote_root(const struct xrt_target *t)
 }
 static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_call *call)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     struct xrt_target *t = (struct xrt_target *)target;
     struct xrt_connection *c = t->connection;
+    if (xrt_cancel_requested(c->cancel)) return broken(c, XRT_REMOTE_CANCELLED);
     if (c->gdb) {
         if (c->failed != XRT_OK) return c->failed;
+        const uint64_t before = xrt_gdb_mutation_bytes(c->gdb);
         enum xrt_status status = xrt_gdb_call(c->gdb, t, call);
+        if (xrt_cancel_requested(c->cancel)) {
+            const bool uncertain = before != xrt_gdb_mutation_bytes(c->gdb);
+            ++t->generation;
+            (void)broken(c, XRT_REMOTE_CANCELLED);
+            return uncertain ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_REMOTE_CANCELLED;
+        }
         if (status == XRT_PROTOCOL_ERROR || xrt_gdb_health(c->gdb) != XRT_OK) {
+            const bool uncertain = before != xrt_gdb_mutation_bytes(c->gdb);
             ++t->generation;
             (void)broken(c, status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED);
+            if (uncertain) return XRT_REMOTE_OUTCOME_UNKNOWN;
         }
         return status;
     }
@@ -271,16 +329,28 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (!request.ok)
         return XRT_BUFFER_TOO_SMALL;
     /* A policy deadline stops the next request, never a reply in flight. */
-    if (xrt_wire_write(c->fd, &frame, c->request_bytes, 10000) != XRT_WIRE_OK)
-        return broken(c, XRT_TRANSPORT_FAILED);
+    size_t written = 0;
+    const bool mutation = rpc_class == XRT_RPC_CLASS_MUTATION ||
+        (rpc_class == XRT_RPC_CLASS_PERF && call->op != XRT_RPC_PERF_INFO &&
+         call->op != XRT_RPC_PERF_THREAD && call->op != XRT_RPC_PERF_RING);
+    enum xrt_wire_result sent = xrt_wire_write_cancel(c->fd, &frame, c->request_bytes, 10000, c->cancel, &written);
+    if (sent != XRT_WIRE_OK) {
+        enum xrt_status status = sent == XRT_WIRE_CANCELLED ? XRT_REMOTE_CANCELLED : XRT_TRANSPORT_FAILED;
+        (void)broken(c, status);
+        return mutation && written ? XRT_REMOTE_OUTCOME_UNKNOWN : status;
+    }
     struct xrt_wire_frame reply;
     enum xrt_wire_result received =
-        xrt_wire_read(c->fd, &reply, c->reply, XRT_WIRE_MAX_BODY, 10000);
-    if (received != XRT_WIRE_OK)
-        return broken(c, received == XRT_WIRE_INVALID ? XRT_PROTOCOL_ERROR : XRT_TRANSPORT_FAILED);
+        xrt_wire_read_cancel(c->fd, &reply, c->reply, XRT_WIRE_MAX_BODY, 10000, c->cancel);
+    if (received != XRT_WIRE_OK) {
+        enum xrt_status status = received == XRT_WIRE_CANCELLED ? XRT_REMOTE_CANCELLED :
+            received == XRT_WIRE_INVALID ? XRT_PROTOCOL_ERROR : XRT_TRANSPORT_FAILED;
+        (void)broken(c, status);
+        return mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : status;
+    }
     if (reply.flags != 1 || reply.request != frame.request || reply.op != frame.op ||
         reply.target != frame.target || reply.status > XRT_AMBIGUOUS_MATCH)
-        return broken(c, XRT_PROTOCOL_ERROR);
+        return invalid_reply(c, mutation);
     struct xrt_codec in = xrt_codec(c->reply, reply.size, true);
     uint64_t value = 0;
     uint32_t size = 0, root = 0;
@@ -288,7 +358,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     xrt_codec_u64(&in, &value);
     xrt_codec_u32(&in, &size);
     if (!in.ok || size > call->capacity || size > in.size - in.at || (size && !call->out))
-        return broken(c, XRT_PROTOCOL_ERROR);
+        return invalid_reply(c, mutation);
     const size_t extra_at = in.at;
     in.at += size;
     xrt_codec_bool(&in, &present);
@@ -301,14 +371,14 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
     if (!in.ok || in.at != in.size || (no_snapshot && present) ||
         (reply.status == XRT_OK &&
          present != (call->op != XRT_RPC_HELLO && call->op != XRT_RPC_DESTROY && !no_snapshot)))
-        return broken(c, XRT_PROTOCOL_ERROR);
+        return invalid_reply(c, mutation);
     /* A created target starts on the agent's HELLO row. Later snapshots keep
      * that resolved identity, and a target's generation never decreases. */
     if (present && (call->op == XRT_RPC_CREATE ? c->decoded->arch->machine != c->machine
                                                 : c->decoded->arch != t->arch))
-        return broken(c, XRT_PROTOCOL_ERROR);
+        return invalid_reply(c, mutation);
     if (present && c->decoded->generation < t->generation)
-        return broken(c, XRT_PROTOCOL_ERROR);
+        return invalid_reply(c, mutation);
     if (call->op == XRT_RPC_REGISTER_WRITE || call->op == XRT_RPC_CONTROL_WRITE) {
         /* Byte 0 issued, byte 1 confirmed, both 0 or 1, all else 0. Only a
          * confirmed write succeeds, and an issued one advanced the generation
@@ -317,7 +387,7 @@ static enum xrt_status invoke(const struct xrt_target *target, const struct xrt_
         if (value >> 16 || issued > 1 || confirmed > issued ||
             confirmed != (reply.status == XRT_OK) ||
             (issued && (!present || c->decoded->generation <= generation)))
-            return broken(c, XRT_PROTOCOL_ERROR);
+            return invalid_reply(c, mutation);
     }
     if (present) {
         /* Connection identity stays immutable: metadata workers may use it
@@ -385,7 +455,7 @@ static void discard_symbols(struct xrt_connection *c)
 }
 enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xrt_call *call)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     struct xrt_connection *c = target->connection;
     __atomic_add_fetch(&c->foreground_waiters, 1, __ATOMIC_SEQ_CST);
     pthread_mutex_lock(&c->mutex);
@@ -401,14 +471,16 @@ enum xrt_status xrt_remote_call(const struct xrt_target *target, const struct xr
 }
 /* Background metadata never queues ahead of an already waiting control RPC.
  * The lock protects one FILE_READ round trip, including identity-only reads.
- * It cannot interrupt an in-flight response; the wire timeout still applies. */
+ * Foreground priority does not preempt an in-flight response; connection
+ * cancellation wakes it, with the ordinary wire deadline as a fallback. */
 enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
                                           const struct xrt_call *call)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (!target || !target->connection || !call || call->op != XRT_RPC_FILE_READ)
         return XRT_INVALID_ARGUMENT;
     struct xrt_connection *c = target->connection;
+    if (xrt_cancel_requested(c->cancel)) return XRT_REMOTE_CANCELLED;
     if (__atomic_load_n(&c->foreground_waiters, __ATOMIC_SEQ_CST) ||
         pthread_mutex_trylock(&c->mutex)) return XRT_DISCOVERY_PENDING;
     enum xrt_status status = __atomic_load_n(&c->foreground_waiters, __ATOMIC_SEQ_CST) ?
@@ -418,16 +490,17 @@ enum xrt_status xrt_remote_background_file(const struct xrt_target *target,
 }
 enum xrt_status xrt_remote_health(const struct xrt_target *t)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     pthread_mutex_lock(&t->connection->mutex);
-    enum xrt_status status = t->connection->failed;
+    enum xrt_status status = xrt_cancel_requested(t->connection->cancel) ?
+        XRT_REMOTE_CANCELLED : t->connection->failed;
     if (status == XRT_OK && t->connection->gdb) status = xrt_gdb_health(t->connection->gdb);
     pthread_mutex_unlock(&t->connection->mutex);
     return status;
 }
 enum xrt_status xrt_remote_fail(const struct xrt_target *t, enum xrt_status status)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     pthread_mutex_lock(&t->connection->mutex);
     status = broken(t->connection, status);
     pthread_mutex_unlock(&t->connection->mutex);
@@ -459,14 +532,21 @@ static enum xrt_status create_remote(struct xrt_connection *c, struct xrt_target
 }
 enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **out)
 {
-    assert_remote_io_thread();
+    return xrt_target_remote_cancel(argv, out, NULL);
+}
+enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_target **out, struct xrt_cancel *cancel)
+{
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (!argv || !argv[0] || !out)
         return XRT_INVALID_ARGUMENT;
+    *out = NULL;
+    if (xrt_cancel_requested(cancel)) return XRT_REMOTE_CANCELLED;
     struct xrt_connection *c = calloc(1, sizeof(*c));
     if (!c)
         return XRT_OUT_OF_MEMORY;
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr)) {
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_OUT_OF_MEMORY;
     }
@@ -475,9 +555,12 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         mutex_error = pthread_mutex_init(&c->mutex, &attr);
     pthread_mutexattr_destroy(&attr);
     if (mutex_error) {
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_OUT_OF_MEMORY;
     }
+    c->cancel = cancel ? xrt_cancel_retain(cancel) : xrt_cancel_create();
+    if (!c->cancel) { pthread_mutex_destroy(&c->mutex); free(c); return XRT_OUT_OF_MEMORY; }
     c->fd = -1;
     c->request_bytes = malloc(XRT_WIRE_MAX_BODY);
     c->reply = malloc(XRT_WIRE_MAX_BODY);
@@ -487,6 +570,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         free(c->reply);
         free(c->decoded);
         pthread_mutex_destroy(&c->mutex);
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_OUT_OF_MEMORY;
     }
@@ -496,6 +580,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         free(c->reply);
         free(c->decoded);
         pthread_mutex_destroy(&c->mutex);
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_OUT_OF_MEMORY;
     }
@@ -506,6 +591,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         free(c->reply);
         free(c->decoded);
         pthread_mutex_destroy(&c->mutex);
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_PIPE_FAILED;
     }
@@ -521,6 +607,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
                 free(c->reply);
                 free(c->decoded);
                 pthread_mutex_destroy(&c->mutex);
+                xrt_cancel_release(c->cancel);
                 free(c);
                 return XRT_PIPE_FAILED;
             }
@@ -536,6 +623,7 @@ enum xrt_status xrt_target_remote(const char *const argv[], struct xrt_target **
         free(c->reply);
         free(c->decoded);
         pthread_mutex_destroy(&c->mutex);
+        xrt_cancel_release(c->cancel);
         free(c);
         return XRT_FORK_FAILED;
     }
@@ -621,6 +709,7 @@ bool xrt_target_source_capable(const struct xrt_target *t)
 }
 enum xrt_status xrt_remote_destroy(struct xrt_target *t)
 {
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (__atomic_load_n(&t->remote_collectors, __ATOMIC_SEQ_CST) ||
         __atomic_load_n(&t->remote_files, __ATOMIC_SEQ_CST))
         return XRT_INVALID_STATE;
@@ -633,13 +722,15 @@ enum xrt_status xrt_remote_destroy(struct xrt_target *t)
         free(t); release_connection(c);
         return XRT_OK;
     }
-    if (status != XRT_OK) {
+    if (status != XRT_OK && !xrt_cancel_requested(c->cancel)) {
         /* A broken stream forces agent cleanup. Exit bit 2 means its detach
          * failed; keep the handle in that case, as the local API does. */
-        if (c->fd >= 0 || !reap(c) || !WIFEXITED(c->exit_status) ||
+        if (c->fd >= 0 || !reap(c) || !c->exit_status_known || !WIFEXITED(c->exit_status) ||
             (WEXITSTATUS(c->exit_status) & 2))
             return status;
     }
+    /* Cancellation abandons local handles after all borrowers have drained.
+     * It cannot confirm the remote target's stop/detach or a sent mutation. */
     unsigned left = 0;
     for (unsigned i = 0; i < XRT_RPC_TARGETS; ++i) {
         if (c->targets[i] == t)
@@ -842,7 +933,7 @@ static enum xrt_status symbol_read(void *context, uint64_t at, void *out, size_t
 enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
         const struct xrt_file_request *request, int *out, uint64_t *resident)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (!t || !t->connection || !request || request->kind != XRT_FILE_MAPPED || !out || !resident)
         return XRT_INVALID_ARGUMENT;
     struct xrt_connection *c = t->connection;
@@ -943,7 +1034,7 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
 enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_file_request *request,
                                 int *out, struct xrt_file_identity *original)
 {
-    assert_remote_io_thread();
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     pthread_mutex_lock(&t->connection->mutex);
     struct xrt_file_budget *budget = current_budget(t->connection);
     pthread_mutex_unlock(&t->connection->mutex);
@@ -1093,9 +1184,14 @@ done:;
 
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out)
 {
-    assert_remote_io_thread();
+    return xrt_target_gdb_remote_cancel(endpoint, out, NULL);
+}
+enum xrt_status xrt_target_gdb_remote_cancel(const char *endpoint, struct xrt_target **out, struct xrt_cancel *cancel)
+{
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     if (!out || !endpoint) return XRT_INVALID_ARGUMENT;
     *out = NULL;
+    if (xrt_cancel_requested(cancel)) return XRT_REMOTE_CANCELLED;
     struct xrt_target *t = xrt_target_create();
     struct xrt_connection *c = calloc(1, sizeof(*c));
     if (!t || !c) { free(t); free(c); return XRT_OUT_OF_MEMORY; }
@@ -1106,21 +1202,27 @@ enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **
     if (!error) error = pthread_mutex_init(&c->mutex, &attr);
     pthread_mutexattr_destroy(&attr);
     if (error) { free(t); free(c); return XRT_OUT_OF_MEMORY; }
-    enum xrt_status status = xrt_gdb_open(endpoint, t, &c->gdb);
+    c->cancel = cancel ? xrt_cancel_retain(cancel) : xrt_cancel_create();
+    if (!c->cancel) { pthread_mutex_destroy(&c->mutex); free(t); free(c); return XRT_OUT_OF_MEMORY; }
+    enum xrt_status status = xrt_gdb_open(endpoint, t, &c->gdb, c->cancel);
     if (status != XRT_OK) {
-        pthread_mutex_destroy(&c->mutex); free(t); free(c); return status;
+        pthread_mutex_destroy(&c->mutex); xrt_cancel_release(c->cancel); free(t); free(c); return status;
     }
     c->targets[0] = t;
     t->connection = c; t->remote_id = t->remote_root = 1;
     *out = t;
     return XRT_OK;
 }
-bool xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_info *out)
+enum xrt_status xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_info *out)
 {
-    if (!t || !t->connection || !t->connection->gdb || !out) return false;
-    assert_remote_io_thread();
+    if (!t || !t->connection || !t->connection->gdb || !out) return XRT_UNSUPPORTED_CONTROL;
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
     pthread_mutex_lock(&t->connection->mutex);
+    if (xrt_cancel_requested(t->connection->cancel)) {
+        pthread_mutex_unlock(&t->connection->mutex);
+        return XRT_REMOTE_CANCELLED;
+    }
     xrt_gdb_info(t->connection->gdb, out);
     pthread_mutex_unlock(&t->connection->mutex);
-    return true;
+    return XRT_OK;
 }

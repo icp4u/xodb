@@ -184,6 +184,7 @@ fn before(previous: ?*const md.Map, map: *const md.Map, cell: md.Cell) ?md.Cell 
 }
 
 pub const Camera = struct {
+    // User preference; an expired idle deadline pauses it without disabling it.
     automatic: bool = true,
     yaw: f32 = 0.7,
     pitch: f32 = 0.58,
@@ -199,9 +200,15 @@ pub const Camera = struct {
     velocity: [5]f32 = @splat(0),
     pub const idle_ns = 5 * std.time.ns_per_s;
 
+    pub fn orbiting(self: *const Camera, now: u64) bool {
+        return self.active and self.automatic and (self.auto_until == 0 or now < self.auto_until);
+    }
+    pub fn interact(self: *Camera, now: u64) void {
+        if (self.active and self.automatic) self.auto_until = now +| idle_ns;
+    }
     pub fn animating(self: *const Camera, now: u64) bool {
         if (!self.active) return false;
-        if (self.automatic and (self.auto_until == 0 or now < self.auto_until)) return true;
+        if (self.orbiting(now)) return true;
         for (self.held, self.velocity) |held, velocity| if (held != 0 or velocity != 0) return true;
         return false;
     }
@@ -219,7 +226,9 @@ pub const Camera = struct {
         }
         if (self.active and std.meta.eql(held, self.held)) return false;
         if (self.active) self.tick(now, span) else self.last = now;
+        const regained = !self.active;
         self.active = true;
+        if (regained) self.interact(now);
         self.held = held;
         for (held) |value| if (value != 0) {
             self.automatic = false;
@@ -239,9 +248,7 @@ pub const Camera = struct {
         if (!self.active) return;
         if (self.automatic) {
             if (self.auto_until == 0) self.auto_until = now +| idle_ns;
-            if (now >= self.auto_until) {
-                self.automatic = false;
-            } else if (!first) {
+            if (now < self.auto_until and !first) {
                 self.elapsed += dt;
                 self.yaw += dt * 0.045;
                 self.dolly = 1 + @sin(self.elapsed * 0.17) * 0.12;
@@ -408,4 +415,45 @@ test "camera focus loss cancels immediately and idle flythrough preserves its la
     camera.automatic = true;
     camera.fly(camera.auto_until + 1);
     try t.expect(camera.automatic);
+}
+
+test "orbit idle deadline follows interaction without overriding manual control" {
+    const t = std.testing;
+    const start = 1;
+    var camera = Camera{};
+    camera.tick(start, 10);
+    const original = camera.auto_until;
+    camera.interact(start + Camera.idle_ns / 2);
+    const renewed = camera.auto_until;
+    const wrong = std.c.getenv("XODB_TEST_WRONG_CAMERA_IDLE") != null;
+    try t.expectEqual(if (wrong) original else start + Camera.idle_ns / 2 + Camera.idle_ns, renewed);
+    camera.tick(original, 10);
+    try t.expect(camera.orbiting(original));
+    const pose = camera.matrix(10, 10, 1).?;
+    camera.tick(renewed, 10);
+    try t.expect(!camera.animating(renewed));
+    try t.expectEqual(pose, camera.matrix(10, 10, 1).?);
+    // Ordinary repaints and unchanged held state do not renew the deadline.
+    _ = camera.controls(@splat(0), true, renewed + 1, 10);
+    camera.tick(renewed + Camera.idle_ns, 10);
+    try t.expectEqual(renewed, camera.auto_until);
+    camera.interact(renewed + Camera.idle_ns);
+    try t.expect(camera.orbiting(renewed + Camera.idle_ns));
+    _ = camera.controls(@splat(0), false, renewed + Camera.idle_ns + 1, 10);
+    const paused_deadline = camera.auto_until;
+    camera.interact(paused_deadline + 1);
+    try t.expectEqual(paused_deadline, camera.auto_until);
+    _ = camera.controls(@splat(0), true, paused_deadline + 1, 10);
+    try t.expect(camera.orbiting(paused_deadline + 1));
+    camera.fly(paused_deadline + 2); // Explicitly switch off active orbit.
+    camera.interact(paused_deadline + 3);
+    try t.expect(!camera.automatic and !camera.animating(paused_deadline + 3));
+    camera.fly(paused_deadline + 4);
+    camera.wheel(1);
+    camera.interact(paused_deadline + 5);
+    try t.expect(!camera.automatic);
+    camera.fly(paused_deadline + 6);
+    _ = camera.controls(.{ 1, 0, 0, 0, 0 }, true, paused_deadline + 7, 10);
+    camera.interact(paused_deadline + 8);
+    try t.expect(!camera.automatic);
 }

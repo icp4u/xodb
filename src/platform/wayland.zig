@@ -170,6 +170,14 @@ pub const Window = struct {
         self.frame_callback = null;
     }
     pub fn pump(self: *Window, timeout_ms: i32) !void {
+        return self.pumpUntil(timeout_ms, false);
+    }
+    /// A remote owner may still be draining after the close event. Keep
+    /// answering compositor events without turning the close flag into a spin.
+    pub fn pumpDuringClose(self: *Window, timeout_ms: i32) !void {
+        return self.pumpUntil(timeout_ms, true);
+    }
+    fn pumpUntil(self: *Window, timeout_ms: i32, draining: bool) !void {
         if (c.xclip_tick(self.clipboard)) self.dirty = true;
         // Graphics libraries can read another queue on this display. Reserve a
         // read before polling: poll + dispatch can block after another reader
@@ -177,11 +185,11 @@ pub const Window = struct {
         while (c.wl_display_prepare_read(self.display) != 0) {
             if (std.c._errno().* != c.EAGAIN) return error.WaylandDisconnected;
             if (c.wl_display_dispatch_pending(self.display) < 0) return error.WaylandDisconnected;
-            if (self.closing) return;
+            if (self.closing and !draining) return;
         }
         var prepared = true;
         defer if (prepared) c.wl_display_cancel_read(self.display);
-        if (self.closing) return;
+        if (self.closing and !draining) return;
         var fd = c.pollfd{ .fd = c.wl_display_get_fd(self.display), .events = c.POLLIN, .revents = 0 };
         if (c.wl_display_flush(self.display) < 0) {
             if (std.c._errno().* != c.EAGAIN) return error.WaylandDisconnected;

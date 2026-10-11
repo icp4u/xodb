@@ -720,7 +720,8 @@ void xrt_gdb_free(struct xrt_gdb *g)
     if (!g) return;
     xrt_gdb_disconnect(&g->link); free(g->last_stop); free(g);
 }
-enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out)
+uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *g) { return g->link.mutation_written; }
+enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
 {
     const uint64_t deadline = xrt_now() + XRT_GDB_OPEN_NS;
     *out = NULL;
@@ -729,7 +730,7 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     uint8_t *initial_stop = NULL; size_t initial_size = 0;
     g->info.attached = -1;
     g->info.unsupported = XRT_GDB_CAP_WATCH | XRT_GDB_CAP_LIBRARIES | XRT_GDB_CAP_BINARY_WRITE;
-    enum xrt_status status = xrt_gdb_connect(&g->link, endpoint);
+    enum xrt_status status = xrt_gdb_connect(&g->link, endpoint, cancel);
     g->link.operation_deadline_ns = deadline;
     if (status != XRT_OK) goto fail;
     status = query(g, "qSupported:multiprocess+;qXfer:features:read+;xmlRegisters=i386;swbreak+");

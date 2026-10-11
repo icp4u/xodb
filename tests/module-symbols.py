@@ -69,6 +69,16 @@ try:
     # Ask for every symbol, so placement ordering cannot hide a full scan.
     requested = {}
     for i in range(12):
+        name = f'module_marker_{i}'
+        deadline = time.monotonic()+15
+        while True:
+            reply = c.tool('find_symbol', name=name)['result']
+            if not reply.get('isError'):
+                break
+            assert reply['content'] == [{'type':'text','text':'SymbolDiscoveryPending'}], reply
+            assert time.monotonic()<deadline, reply
+            time.sleep(.002)
+        assert int(reply['structuredContent']['address'],16) == expected[name], (name,reply,expected[name])
         ident = action(c, 'set_breakpoint', symbol=f'module_marker_{i}')['id']
         requested[f'module_marker_{i}'] = ident
         deadline = time.monotonic()+15

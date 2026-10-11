@@ -9,7 +9,7 @@ const mib = 1024 * 1024;
 pub const min_limit: u64 = mib;
 pub const max_limit: u64 = if (@sizeOf(usize) >= 8) 1 << 40 else 1 << 31;
 pub var per_image_limit: usize = 256 * mib;
-pub var total_limit: usize = 512 * mib;
+pub var total_limit: usize = 1024 * mib;
 /// Whole-file transfers from a runtime agent keep the agent's fixed cap.
 pub const remote_image_limit: usize = 256 * mib;
 /// Null keeps the default. Values are bytes.
@@ -40,6 +40,8 @@ pub const Refusal = struct {
     size: u64,
     limit: u64,
     which: enum { image, total, remote, lookup, runtime, sweep },
+    derived: bool = false,
+    sweep_each: u64 = sweep_image_limit,
     /// What the total had left when the image was refused.
     left: u64 = 0,
     /// runtime: whether a stack frame in the image loads it (it has debug
@@ -48,14 +50,14 @@ pub const Refusal = struct {
     /// A per-image value that admits `size` with a little room: 5% over, as
     /// a whole number of hundreds of MiB, within the accepted range.
     fn imageOption(size: u64) u64 {
-        const need = (size + mib - 1) / mib;
+        const need = size / mib + @intFromBool(size % mib != 0);
         return @min((need + need / 20 + 99) / 100 * 100, max_limit / mib);
     }
     /// A total, in GiB, that admits `size` beside what is held, and twice
     /// `size` at least so that searches keep their share; within the range.
     fn totalOption(self: Refusal) u64 {
         const gib = 1024 * mib;
-        const want = @max(self.size *| 2, (total_limit -| self.left) +| self.size);
+        const want = @max(@max(imageOption(self.size) * mib, per_image_limit) *| 2, (total_limit -| self.left) +| self.size);
         return @min(want / gib + @intFromBool(want % gib != 0), max_limit / gib);
     }
     /// A total, in GiB, whose share for sweeps admits `size` beside what
@@ -67,15 +69,17 @@ pub const Refusal = struct {
         return @min(want / gib + @intFromBool(want % gib != 0), max_limit / gib);
     }
     /// "PATH is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M
-    /// --image-total-limit 2G or set symbols.image_bytes and symbols.image_total_bytes"
+    /// --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes"
     pub fn write(self: Refusal, buffer: []u8, path: []const u8) []const u8 {
         var name: [path_text]u8 = undefined;
-        const shown = printable(&name, path, path_text);
-        const need = (self.size + mib - 1) / mib;
+        const path_name = printable(&name, path, path_text);
+        var subject: [path_text + 32]u8 = undefined;
+        const shown = if (self.derived) std.fmt.bufPrint(&subject, "{s} (decompressed debug data)", .{path_name}) catch path_name else path_name;
+        const need = self.size / mib + @intFromBool(self.size % mib != 0);
         return switch (self.which) {
             .image => if (self.size > max_limit)
                 std.fmt.bufPrint(buffer, "{s} is {d} MiB; image budget {d} MiB; no accepted --image-limit is that large", .{ shown, need, self.limit / mib })
-            else if (self.size > self.left)
+            else if (self.size > self.left or imageOption(self.size) * mib > total_limit / 2)
                 std.fmt.bufPrint(buffer, "{s} is {d} MiB; image budget {d} MiB; rerun with --image-limit {d}M --image-total-limit {d}G or set symbols.image_bytes and symbols.image_total_bytes", .{ shown, need, self.limit / mib, imageOption(self.size), self.totalOption() })
             else
                 std.fmt.bufPrint(buffer, "{s} is {d} MiB; image budget {d} MiB; rerun with --image-limit {d}M or set symbols.image_bytes", .{ shown, need, self.limit / mib, imageOption(self.size) }),
@@ -83,15 +87,15 @@ pub const Refusal = struct {
             .remote => std.fmt.bufPrint(buffer, "{s}: remote image transfer is capped at {d} MiB", .{ shown, self.limit / mib }),
             .lookup => std.fmt.bufPrint(buffer, "{s} is {d} MiB and has no symbols-only view; a name lookup may read {d} MiB of it (such images: 256 MiB each, 512 MiB per process)", .{ shown, need, self.limit / mib }),
             .runtime => std.fmt.bufPrint(buffer, "{s} is {d} MiB; a language view may read {d} MiB of the image it finds its runtime in, unless that is the main executable (256 MiB each, 512 MiB per process); {s}", .{ shown, need, self.limit / mib, if (self.stack_loads) |loads| (if (loads) "a stack frame in it loads it" else "it has no debug info, so a stack does not load it either") else "it is used once something else loads it" }),
-            .sweep => if (self.size > sweep_image_limit)
-                std.fmt.bufPrint(buffer, "{s} is {d} MiB; a search of every mapped image reads at most {d} MiB of an image that is not loaded (the main executable excepted); a stack frame in the image loads it", .{ shown, need, sweep_image_limit / mib })
+            .sweep => if (self.size > self.sweep_each)
+                std.fmt.bufPrint(buffer, "{s} is {d} MiB; a search of every mapped image reads at most {d} MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it", .{ shown, need, self.sweep_each / mib })
             else
-                std.fmt.bufPrint(buffer, "{s} is {d} MiB; {d} MiB left of the {d} MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit {d}G or set symbols.image_total_bytes; a stack frame in the image loads it", .{ shown, need, self.limit / mib, sweepLimit() / mib, self.sweepOption() }),
+                std.fmt.bufPrint(buffer, "{s} is {d} MiB; {d} MiB left of the {d} MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit {d}G or set symbols.image_total_bytes; a stack frame in the image loads it; if a stopped capture holds images, use release_profile before searching again", .{ shown, need, self.limit / mib, sweepLimit() / mib, self.sweepOption() }),
         } catch buffer[0..0];
     }
 };
 const path_text = 512;
-pub const refusal_text = path_text + 288;
+pub const refusal_text = path_text + 384;
 /// `text` as valid UTF-8 in at most `limit` bytes of `buffer`, for a
 /// diagnostic line. A path is the target's to choose: control characters and
 /// bytes that are not UTF-8 become '?', so the line cannot drive a terminal
@@ -142,22 +146,26 @@ pub fn refusal(size: u64) Refusal {
 }
 /// Readers that search every mapped image (a source line, a capture's start)
 /// act for one request and read files the target chose. Of images that are
-/// not held yet and are not the main executable they read this much of one,
-/// and all of them together hold at most `sweepLimit`: half the total, and
+/// not held yet they read at most this much of a non-main image (the main
+/// executable uses the per-image limit). All sweeps together hold at most
+/// `sweepLimit`: half the total, and
 /// never the last per-image budget of it, which a stack frame may need.
 pub const sweep_image_limit: usize = 256 * mib;
 var swept = std.atomic.Value(usize).init(0);
 pub fn sweepLimit() usize {
     return @min(total_limit / 2, total_limit -| per_image_limit);
 }
+pub fn sweepUsed() usize {
+    return swept.load(.acquire);
+}
 pub fn sweepLeft() usize {
-    return sweepLimit() -| swept.load(.acquire);
+    return sweepLimit() -| sweepUsed();
 }
 pub fn reserveSweep(bytes: u64) error{BinarySnapshotLimit}!usize {
     const n = std.math.cast(usize, bytes) orelse return error.BinarySnapshotLimit;
     var old = swept.load(.acquire);
     while (true) {
-        if (n > sweep_image_limit or n > sweepLimit() -| old) return error.BinarySnapshotLimit;
+        if (n > sweepLimit() -| old) return error.BinarySnapshotLimit;
         old = swept.cmpxchgWeak(old, old + n, .acq_rel, .acquire) orelse return n;
     }
 }
@@ -190,7 +198,7 @@ pub const Bytes = []align(std.heap.page_size_min) u8;
 // library. The key is the identity the reader already checks around its read;
 // the bytes are read-only once stored.
 const Stamp = struct { device: u64, inode: u64, size: i64, mtime: [2]i64, ctime: [2]i64 };
-const Shared = struct { stamp: Stamp, offset: u64, bytes: Bytes, holders: usize };
+const Shared = struct { stamp: Stamp, offset: u64, bytes: Bytes, holders: usize, sweep_bytes: usize };
 var store_lock: std.atomic.Mutex = .unlocked;
 var store: std.ArrayList(Shared) = .empty;
 fn lockStore() void {
@@ -223,7 +231,8 @@ pub fn free(bytes: Bytes) void {
         if (item.bytes.ptr != bytes.ptr) continue;
         item.holders -= 1;
         if (item.holders != 0) return store_lock.unlock();
-        _ = store.swapRemove(i);
+        const last = store.swapRemove(i);
+        releaseSweep(last.sweep_bytes);
         break true;
     } else false;
     store_lock.unlock();
@@ -240,6 +249,14 @@ pub fn read(fd: c_int, limit: usize, cancel: ?*const std.atomic.Value(bool)) !By
 /// applied here. A version of the file some reader already holds is shared
 /// and costs nothing more.
 pub fn readRange(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool)) !Bytes {
+    return readRangeFor(fd, file_offset, size, limit, cancel, null);
+}
+/// A new image is charged to the sweep share until its last reader releases
+/// it. Sharing across a fork or capture never transfers or forgets that charge.
+pub fn readSweepRange(fd: c_int, file_offset: u64, size: usize, limit: usize, each: usize) !Bytes {
+    return readRangeFor(fd, file_offset, size, limit, null, each);
+}
+fn readRangeFor(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel: ?*const std.atomic.Value(bool), sweep: ?usize) !Bytes {
     var before: c.struct_stat = undefined;
     if (c.fstat(fd, &before) != 0 or before.st_mode & c.S_IFMT != c.S_IFREG or before.st_size <= 0 or size == 0) return error.BinaryUnavailable;
     if (size > limit) return error.BinarySnapshotLimit;
@@ -250,8 +267,13 @@ pub fn readRange(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel:
     const shared = held(key, file_offset, size);
     store_lock.unlock();
     if (shared) |bytes| return bytes;
-    const charged = try reserve(size);
+    const swept_bytes = if (sweep) |each| block: {
+        if (size > each) return error.SweepSnapshotLimit;
+        break :block reserveSweep(size) catch return error.SweepSnapshotLimit;
+    } else 0;
     var owned = false;
+    defer if (!owned) releaseSweep(swept_bytes);
+    const charged = try reserve(size);
     defer if (!owned) release(charged);
     const ptr = c.mmap(null, size, c.PROT_READ | c.PROT_WRITE, c.MAP_PRIVATE | c.MAP_ANONYMOUS, -1, 0);
     if (ptr == std.c.MAP_FAILED) return error.OutOfMemory;
@@ -274,7 +296,7 @@ pub fn readRange(fd: c_int, file_offset: u64, size: usize, limit: usize, cancel:
     defer store_lock.unlock();
     // Another thread may have read the same version meanwhile: keep theirs.
     if (held(key, file_offset, size)) |first| return first;
-    try store.append(std.heap.page_allocator, .{ .stamp = key, .offset = file_offset, .bytes = bytes, .holders = 1 });
+    try store.append(std.heap.page_allocator, .{ .stamp = key, .offset = file_offset, .bytes = bytes, .holders = 1, .sweep_bytes = swept_bytes });
     owned = true;
     return bytes;
 }
@@ -298,8 +320,8 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
     const gib = 1024 * mib;
     // The defaults: larger budgets are the user's choice.
     try std.testing.expectEqual(@as(usize, 256 * mib), per_image_limit);
-    try std.testing.expectEqual(@as(usize, 512 * mib), total_limit);
-    try std.testing.expectEqual(@as(usize, 256 * mib), sweepLimit());
+    try std.testing.expectEqual(@as(usize, 1024 * mib), total_limit);
+    try std.testing.expectEqual(@as(usize, 512 * mib), sweepLimit());
     try std.testing.expectEqual(@as(u64, 268435456), try parseSize("268435456"));
     try std.testing.expectEqual(@as(u64, 256 * mib), try parseSize("256M"));
     try std.testing.expectEqual(@as(u64, 2 * gib), try parseSize("2g"));
@@ -313,7 +335,7 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
     const start = used();
     // The sentence names the option and a value that admits the image; the
     // suggestion parses, and is within the accepted range.
-    try std.testing.expectEqualStrings("/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 2G or set symbols.image_bytes and symbols.image_total_bytes", refusal(1052237576).write(&text, "/opt/game/engine"));
+    try std.testing.expectEqualStrings("/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes", refusal(1052237576).write(&text, "/opt/game/engine"));
     try std.testing.expectEqualStrings("/lib/c.so is 300 MiB; image budget 256 MiB; rerun with --image-limit 400M or set symbols.image_bytes", refusal(300 * mib).write(&text, "/lib/c.so"));
     try std.testing.expect(1100 * mib >= 1052237576 + 1052237576 / 20 and try parseSize("1100M") <= max_limit);
     try std.testing.expectEqual(max_limit / mib, Refusal.imageOption(max_limit));
@@ -358,9 +380,9 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
     releaseSweep(a);
     releaseSweep(b);
     try std.testing.expectEqual(swept_before, sweepLeft());
-    try std.testing.expectEqualStrings("/lib/s.so is 300 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded (the main executable excepted); a stack frame in the image loads it", (Refusal{ .size = 300 * mib, .limit = 32 * mib, .which = .sweep }).write(&text, "/lib/s.so"));
+    try std.testing.expectEqualStrings("/lib/s.so is 300 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it", (Refusal{ .size = 300 * mib, .limit = 32 * mib, .which = .sweep }).write(&text, "/lib/s.so"));
     // 20 of the 32 MiB are held and 30 more are wanted: 50 MiB for sweeps is a total of 114 MiB (64 are a frame's).
-    try std.testing.expectEqualStrings("/lib/t.so is 30 MiB; 12 MiB left of the 32 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 1G or set symbols.image_total_bytes; a stack frame in the image loads it", (Refusal{ .size = 30 * mib, .limit = 12 * mib, .which = .sweep }).write(&text, "/lib/t.so"));
+    try std.testing.expectEqualStrings("/lib/t.so is 30 MiB; 12 MiB left of the 32 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 1G or set symbols.image_total_bytes; a stack frame in the image loads it; if a stopped capture holds images, use release_profile before searching again", (Refusal{ .size = 30 * mib, .limit = 12 * mib, .which = .sweep }).write(&text, "/lib/t.so"));
     try configure(256 * mib, 512 * mib);
     try std.testing.expectEqual(@as(u64, 1), (Refusal{ .size = 256 * mib, .limit = 0, .which = .sweep }).sweepOption()); // 512 MiB for sweeps is a total of 1 GiB
     try std.testing.expectEqual(@as(u64, 1), (Refusal{ .size = mib, .limit = 0, .which = .sweep }).sweepOption());
@@ -412,4 +434,74 @@ test "diagnostic paths are cut between characters and carry no control bytes" {
     const line = refusal(300 * mib).write(&text, &long);
     try std.testing.expect(std.unicode.utf8ValidateSlice(line));
     try std.testing.expect(std.mem.indexOf(u8, line, "... is 300 MiB; ") != null);
+}
+
+test "sweep charges survive their first reader and leave a frame image of headroom" {
+    const saved = .{ per_image_limit, total_limit };
+    defer per_image_limit = saved[0];
+    defer total_limit = saved[1];
+    try configure(mib, 4 * mib);
+    const before = used();
+    const swept_before = sweepUsed();
+    var files: [3]c_int = undefined;
+    for (&files) |*file| {
+        file.* = c.memfd_create("xodb-sweep-test", c.MFD_CLOEXEC);
+        try std.testing.expect(file.* >= 0);
+        try std.testing.expectEqual(@as(c_int, 0), c.ftruncate(file.*, mib));
+    }
+    defer for (files) |file| {
+        _ = c.close(file);
+    };
+    const original = try readSweepRange(files[0], 0, mib, per_image_limit, sweep_image_limit);
+    const child = try readSweepRange(files[0], 0, mib, per_image_limit, sweep_image_limit);
+    try std.testing.expectEqual(original.ptr, child.ptr);
+    free(original); // parent execs, but the child's sweep still holds the file
+    try std.testing.expectEqual(swept_before + mib, sweepUsed());
+    const library = try readSweepRange(files[1], 0, mib, per_image_limit, sweep_image_limit);
+    try std.testing.expectEqual(swept_before + 2 * mib, sweepUsed());
+    try std.testing.expectError(error.SweepSnapshotLimit, readSweepRange(files[2], 0, mib, per_image_limit, sweep_image_limit));
+    const frame = try readRange(files[2], 0, mib, per_image_limit, null);
+    try std.testing.expect(used() <= total_limit);
+    free(frame);
+    free(child);
+    free(library);
+    try std.testing.expectEqual(before, used());
+    try std.testing.expectEqual(swept_before, sweepUsed());
+}
+
+test "rounded image advice preserves a sweep share and converges with total advice" {
+    const saved = .{ per_image_limit, total_limit };
+    defer per_image_limit = saved[0];
+    defer total_limit = saved[1];
+    const gib = 1024 * mib;
+    var text: [refusal_text]u8 = undefined;
+    for ([_]u64{ 300 * mib, 500 * mib, 1004 * mib }) |size| {
+        try configure(256 * mib, 512 * mib);
+        const why = refusal(size);
+        const sentence = why.write(&text, "/owned.so");
+        try std.testing.expect(std.mem.indexOf(u8, sentence, "--image-total-limit") != null);
+        const each = Refusal.imageOption(size) * mib;
+        const total = why.totalOption() * gib;
+        try configure(each, total);
+        try std.testing.expect(per_image_limit >= size);
+        try std.testing.expect(per_image_limit <= total_limit / 2);
+        const search = Refusal{ .size = 256 * mib, .limit = 0, .which = .sweep };
+        try configure(null, search.sweepOption() * gib);
+        try std.testing.expect(per_image_limit >= size);
+        try std.testing.expect(sweepLimit() >= 256 * mib);
+    }
+}
+
+test "compressed debug refusal handles saturated declarations and long paths" {
+    var path: [600]u8 = @splat('x');
+    path[0] = '/';
+    var buffer: [refusal_text]u8 = undefined;
+    var why = refusal(std.math.maxInt(u64));
+    why.derived = true;
+    const text = why.write(&buffer, &path);
+    try std.testing.expect(std.mem.indexOf(u8, text, "(decompressed debug data)") != null);
+    try std.testing.expect(std.mem.endsWith(u8, text, "no accepted --image-limit is that large"));
+    try std.testing.expectEqual(max_limit / mib, Refusal.imageOption(std.math.maxInt(u64)));
+    const large = Refusal{ .size = 256 * mib, .limit = 0, .which = .sweep, .derived = true };
+    try std.testing.expect(std.mem.indexOf(u8, large.write(&buffer, &path), "--image-total-limit") != null);
 }

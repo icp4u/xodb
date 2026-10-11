@@ -28,6 +28,7 @@ fn buildId(a: A, layout: *const c.struct_xel_layout) ![]const u8 {
     return out;
 }
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.elisp);
     // Initial profile: a standalone/static Emacs Lisp executable, identified by
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
     const runtime = @import("../target/runtime.zig");
@@ -86,6 +87,7 @@ fn globalAddress(module: *Module, name: []const u8) !u64 {
     return module.runtimeAddress(sym.value);
 }
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.elisp);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     return .{ .version = c.XEL_VERSION, .build_id = try buildId(a, layout), .basis = "same-image DWARF + loaded identity" };
@@ -142,6 +144,7 @@ pub const Stack = struct {
     basis: []const u8 = "main-thread specpdl; unique native argument bindings and bytecode saved-slot proofs when available; segment links otherwise; no target calls",
 };
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.elisp);
     if (session.target.gdbRemoteInfo() != null) return error.ElispThreadAssociationUnproved;
     const snap = session.target.snapshot();
     if (snap.state != .stopped) return error.NotStopped;
@@ -268,6 +271,7 @@ fn nativeActivation(session: *model.Session, a: A, module: *Module, native: []co
 }
 
 pub fn preview(session: *model.Session, a: A, value: @import("../model/evaluate.zig").Value) !?@import("../model/value_view.zig").Preview {
+    if (!session.languages.on(.elisp)) return null;
     const view = @import("../model/value_view.zig");
     if (value.availability != .available or !value.type.elisp_object or value.type.kind != .pointer or value.type.size != 8) return null;
     const snap = session.target.snapshot();
@@ -308,6 +312,7 @@ fn readContext(module: *Module) !c.struct_xel_context {
 }
 const named = @import("../model/language_locals.zig");
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+    try session.languages.require(.elisp);
     const observed = try @import("../model/language_selection.zig").cachedRead(.elisp, session, tid);
     if (segment != 0 or observed.segments.len != 1) return error.InvalidLanguageSegment;
     if (frame >= observed.segments[0].frames.len) return error.InvalidLanguageFrame;

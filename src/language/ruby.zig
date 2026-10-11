@@ -31,6 +31,7 @@ fn buildId(a: A, layout: *const c.struct_xrb_layout) ![]const u8 {
     return out;
 }
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.ruby);
     // Initial profile: a standalone/static CRuby executable, identified by
     // kernel PHDR evidence. A shared-library runtime stays unavailable.
     const runtime = @import("../target/runtime.zig");
@@ -95,6 +96,7 @@ fn zjitEntry(session: *model.Session, module: *Module) !u64 {
     return std.mem.readInt(u64, &bytes, .little);
 }
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.ruby);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     return .{ .version = c.XRB_VERSION ++ "dev", .build_id = try buildId(a, layout), .basis = "DWARF + exact revision" };
@@ -112,6 +114,7 @@ fn converted(a: A, v: *const c.struct_xrb_value) !named.Value {
     return .{ .type = try a.dupe(u8, std.mem.sliceTo(&v.type, 0)), .display = try a.dupe(u8, std.mem.sliceTo(&v.display, 0)), .count = if (std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "String") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Array") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Symbol") or std.mem.eql(u8, std.mem.sliceTo(&v.type, 0), "Hash")) v.count else null, .diagnostic = try reason(a, v.reason), .truncated = v.truncated != 0, .children = children };
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+    if (!session.languages.on(.ruby)) return null;
     if (value.availability != .available or !value.type.ruby_value or value.type.kind != .unsigned or value.type.size != 8) return null;
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
@@ -130,6 +133,7 @@ pub const Segment = struct { runtime: Runtime, runtime_instance: Instance, ancho
 pub const ArgumentDiagnostic = struct { frame: usize, reason: []const u8 };
 pub const Stack = struct { session_id: u64, generation: u64, tid: i32, segments: []Segment, native_stack_incomplete: bool, native_argument_diagnostics: []ArgumentDiagnostic, basis: []const u8 = "CRuby control frames from native rb_vm_exec ec; segment anchor only, logical/native pairing unproved; no target calls" };
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.ruby);
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
     const module = try runtimeModule(session);
@@ -196,6 +200,7 @@ fn recoveredEc(session: *model.Session, a: A, frame: model.Frame) !u64 {
     return error.RubyExecutionContextArgumentUnavailable;
 }
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+    try session.languages.require(.ruby);
     return bindings(session, a, tid, segment, frame, start, limit, null);
 }
 fn checkedExpression(a: A, text: []const u8) ![:0]const u8 {
@@ -228,6 +233,7 @@ fn readContext(module: *Module, expression: []const u8) !c.struct_xrb_context {
     return context;
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !named.Result {
+    try session.languages.require(.ruby);
     _ = try checkedExpression(a, expression);
     return bindings(session, a, tid, segment, frame, 0, 1, expression);
 }
@@ -318,6 +324,7 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     return if (expression) |query| try checkedExpression(a, query) else try a.dupeZ(u8, "binding");
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    try session.languages.require(.ruby);
     const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -342,6 +349,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     return capture;
 }
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    try session.languages.require(.ruby);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
     const observed = try @import("../model/language_selection.zig").cachedRead(.ruby, session, tid);
     const module_id = (try runtimeModule(session)).id;

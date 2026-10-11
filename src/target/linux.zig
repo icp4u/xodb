@@ -177,19 +177,25 @@ pub const Target = struct {
         return rt.xrt_target_is_remote(self.handle);
     }
     pub fn connectRemote(self: *Target, argv: []const [:0]const u8) !void {
+        return self.connectRemoteCancel(argv, null);
+    }
+    pub fn connectRemoteCancel(self: *Target, argv: []const [:0]const u8, cancel: ?*rt.struct_xrt_cancel) !void {
         if (self.handle != null or self.core != null) return error.ConflictingTargets;
         if (argv.len == 0 or argv.len > 255) return error.TooManyArguments;
         var raw: [256]?[*:0]const u8 = @splat(null);
         for (argv, 0..) |arg, i| raw[i] = arg.ptr;
-        try runtime.check(rt.xrt_target_remote(@ptrCast(&raw), &self.handle));
+        try runtime.check(rt.xrt_target_remote_cancel(@ptrCast(&raw), &self.handle, cancel));
     }
     pub fn connectGdbRemote(self: *Target, endpoint: [:0]const u8) !void {
+        return self.connectGdbRemoteCancel(endpoint, null);
+    }
+    pub fn connectGdbRemoteCancel(self: *Target, endpoint: [:0]const u8, cancel: ?*rt.struct_xrt_cancel) !void {
         if (self.handle != null or self.core != null) return error.ConflictingTargets;
-        try runtime.check(rt.xrt_target_gdb_remote(endpoint.ptr, &self.handle));
+        try runtime.check(rt.xrt_target_gdb_remote_cancel(endpoint.ptr, &self.handle, cancel));
     }
     pub fn gdbRemoteInfo(self: *const Target) ?GdbRemoteInfo {
         const cache = &@constCast(self).gdb_cache;
-        if (!rt.xrt_target_gdb_info(self.handle, cache)) return null;
+        runtime.check(rt.xrt_target_gdb_info(self.handle, cache)) catch return null;
         return .{
             .architecture = std.mem.sliceTo(&cache.architecture, 0),
             .packet_size = cache.packet_size,
@@ -257,11 +263,11 @@ pub const Target = struct {
     pub fn expectGeneration(self: *const Target, generation: u64) !void {
         try runtime.check(rt.xrt_target_expect(self.handle, generation));
     }
-    pub fn invalidate(self: *Target) void {
-        rt.xrt_target_invalidate(self.get() catch @panic("runtime allocation failed"));
+    pub fn invalidate(self: *Target) !void {
+        try runtime.check(rt.xrt_target_invalidate(try self.get()));
     }
-    pub fn event(self: *Target, kind: @FieldType(Event, "kind"), tid: i32, detail: i64) void {
-        rt.xrt_target_event(self.get() catch @panic("runtime allocation failed"), @intFromEnum(kind), tid, detail);
+    pub fn event(self: *Target, kind: @FieldType(Event, "kind"), tid: i32, detail: i64) !void {
+        try runtime.check(rt.xrt_target_event(try self.get(), @intFromEnum(kind), tid, detail));
     }
     pub fn launch(self: *Target, argv: []const [:0]const u8) !void {
         if (argv.len == 0) return error.InvalidState;

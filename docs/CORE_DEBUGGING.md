@@ -53,7 +53,7 @@ signal. A signal/fault address describes the stop, not its root cause.
 
 Initial bounds: 4,096 program headers, 1,024 threads, 65,536 file mappings,
 32 MiB of notes and 1,024 cached module-identity checks. Referenced ELF snapshots
-use the existing 256 MiB per-image / 512 MiB total bounds. Reading a large dump
+use the existing image budgets (by default 256 MiB per image, 1 GiB in total). Reading a large dump
 does not allocate its entire file. Metadata/first symbol loading is synchronous.
 
 Supported core format is ELF64 little-endian Linux x86-64, with ordinary program

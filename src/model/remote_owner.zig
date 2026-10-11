@@ -238,13 +238,13 @@ pub const Queue = struct {
     poll_pending: ?*Command = null,
     bytes: usize = 0,
     next_sequence: u64 = 1,
-    closed: bool = false,
+    closed: std.atomic.Value(bool) = .init(false),
     pub fn trySubmit(self: *Queue, command: *Command) !u64 {
         var coalesced: ?*Command = null;
         defer if (coalesced) |c| c.destroy(); // After unlocking; success owns input.
         if (!self.mutex.tryLock()) return error.Busy;
         defer self.mutex.unlock();
-        if (self.closed) return error.Closed;
+        if (self.closed.load(.acquire)) return error.Closed;
         if (command.sequence != 0) return error.AlreadySubmitted;
         if (command.request.action == .poll) {
             if (self.poll_pending) |pending| {
@@ -301,9 +301,7 @@ pub const Queue = struct {
     /// Stop accepting commands; queued commands still require explicit failed
     /// completions. This does not interrupt a transport or confirm detach.
     pub fn close(self: *Queue) !void {
-        if (!self.mutex.tryLock()) return error.Busy;
-        defer self.mutex.unlock();
-        self.closed = true;
+        self.closed.store(true, .release);
     }
     /// After owner/producer shutdown only; never join or free on the frame.
     pub fn deinit(self: *Queue) void {

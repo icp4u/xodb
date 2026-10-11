@@ -6,6 +6,9 @@ supported stopped-memory profile is Linux x86-64, LP64, little-endian. It requir
 full interpreter DWARF and a GNU build-id in the loaded image. No Perl headers,
 CPAN packages, or Perl installation are needed to build xodb itself.
 
+To turn this view off for a target you do not trust, see
+[language views and hostile targets](GUIDE.md#language-views-and-hostile-targets).
+
 ## Try the array demo
 
 ```sh

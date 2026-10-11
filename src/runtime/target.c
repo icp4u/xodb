@@ -72,13 +72,14 @@ void xrt_target_view(const struct xrt_target *t, struct xrt_target_view *out)
                                     .watchpoints = t->watchpoints,
                                     .births = t->births};
 }
-void xrt_target_invalidate(struct xrt_target *t)
+enum xrt_status xrt_target_invalidate(struct xrt_target *t)
 {
+    if (!t) return XRT_INVALID_ARGUMENT;
     if (t && t->connection) {
-        (void)xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_INVALIDATE});
-        return;
+        return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_INVALIDATE});
     }
     ++t->generation;
+    return XRT_OK;
 }
 enum xrt_status xrt_target_expect(const struct xrt_target *t, uint64_t generation)
 {
@@ -89,13 +90,13 @@ enum xrt_status xrt_target_expect(const struct xrt_target *t, uint64_t generatio
     }
     return (t ? t->generation : 0) == generation ? XRT_OK : XRT_STALE_SNAPSHOT;
 }
-void xrt_target_event(struct xrt_target *t, enum xrt_event_kind kind, int32_t tid, int64_t detail)
+enum xrt_status xrt_target_event(struct xrt_target *t, enum xrt_event_kind kind, int32_t tid, int64_t detail)
 {
+    if (!t) return XRT_INVALID_ARGUMENT;
     if (t && t->connection) {
-        (void)xrt_remote_call(t,
+        return xrt_remote_call(t,
                               &(struct xrt_call){.op = XRT_RPC_EVENT,
                                                  .args = {kind, (uint32_t)tid, (uint64_t)detail}});
-        return;
     }
     ++t->sequence;
     if (t->event_count == XRT_MAX_EVENTS) {
@@ -110,6 +111,7 @@ void xrt_target_event(struct xrt_target *t, enum xrt_event_kind kind, int32_t ti
                                                      .before_valid = true,
                                                      .after_valid = true};
     ++t->generation;
+    return XRT_OK;
 }
 int xrt_thread_index(const struct xrt_target *t, int32_t tid)
 {

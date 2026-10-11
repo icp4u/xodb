@@ -2,8 +2,9 @@
  * Run: runtime-replies [PATH-TO-XODB-AGENT]
  * Each crafted case starts this executable as a scripted agent behind the
  * production transport (xrt_target_remote) and sends one reply the real agent
- * never produces. The host must break the connection with XRT_PROTOCOL_ERROR
- * and leave the published snapshot unchanged. Matching well-formed replies
+ * never produces. The host must preserve XRT_PROTOCOL_ERROR as connection
+ * health and leave the published snapshot unchanged. A sent mutation instead
+ * returns XRT_REMOTE_OUTCOME_UNKNOWN to its caller. Matching well-formed replies
  * from the same scripted agent are accepted. With an agent path, a real agent
  * then serves an owned child of this executable with the thread and probe
  * tables at capacity, and every reply must be accepted. */
@@ -628,7 +629,8 @@ static int crafted_replies(const char *self)
             EXPECT(before.generation == CREATE_GENERATION && before.thread_count == 1);
             const struct xrt_arch *const arch_before = t->arch;
             status = trigger(t, s->trigger);
-            rejected = status == XRT_PROTOCOL_ERROR;
+            const bool mutation = s->trigger == CONTROL || s->trigger == REGISTER_WRITE;
+            rejected = status == (mutation ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_PROTOCOL_ERROR);
             if (rejected) {
                 EXPECT(xrt_remote_health(t) == XRT_PROTOCOL_ERROR);
                 struct xrt_target_view after;

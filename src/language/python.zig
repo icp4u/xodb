@@ -318,6 +318,7 @@ fn anchorOrder(_: void, x: Segment, y: Segment) bool {
 }
 
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.python);
     if (first >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
@@ -342,6 +343,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 // Type aliases carry no owning image id. Refuse ambiguous runtimes rather
 // than choosing the first CPython image found in the mappings.
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.python);
     if (session.modules.regions.items.len > 4096) return error.PythonModuleLimit;
     const found = session.modules.definers("_PyRuntime") catch |err| return moduleError(err);
     if (found.modules.len > 1) return error.PythonRuntimeAmbiguous;
@@ -370,6 +372,7 @@ fn objectHead(t: *const eval.Type, depth: u32) bool {
     return false;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+    if (!session.languages.on(.python)) return null;
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
     if (!objectHead(child, 0)) return null;
@@ -427,6 +430,7 @@ test "version text, code kinds and object heads" {
 
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.python);
     const layout = try profile(session, try runtimeModule(session));
     const runtime = try runtimeOf(a, layout);
     return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = runtime.layout };
@@ -435,9 +439,11 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
 /// Read a frame/code pair selected from the canonical stopped Python stack.
 /// The C reader owns name, stackref, cell and bounded-value decoding.
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.python);
     return readBindings(session, a, tid, segment, frame, start, limit, null);
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.python);
     if (c.xpy_expression_valid(try a.dupeZ(u8, expression)) == 0) return error.UnsupportedLanguageExpression;
     return readBindings(session, a, tid, segment, frame, 0, 1, expression);
 }
@@ -497,6 +503,7 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     return checked_expression;
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    try session.languages.require(.python);
     const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -522,6 +529,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     return capture;
 }
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    try session.languages.require(.python);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
     const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
     const module_id = (try runtimeModule(session)).id;

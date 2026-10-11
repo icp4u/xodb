@@ -145,6 +145,7 @@ pub const Image = struct {
     split_bytes: usize = 0,
     /// Charged to the snapshot budget for a private copy and its decompressed sections.
     derived_bytes: usize = 0,
+    sweep_bytes: usize = 0,
     units_error: ?anyerror = null,
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
     go_type_index: ?*c.struct_xgo_type_index = null,
@@ -159,17 +160,22 @@ pub const Image = struct {
         return initWithCompanion(binary, bytes, null, allocator);
     }
     pub fn initWithCompanion(binary: elf.Image, bytes: []u8, companion: ?*const @import("../binary/debug_files.zig").File, allocator: std.mem.Allocator) !Image {
+        return initWithBudget(binary, bytes, companion, allocator, false, null);
+    }
+    pub fn initWithBudget(binary: elf.Image, bytes: []u8, companion: ?*const @import("../binary/debug_files.zig").File, allocator: std.mem.Allocator, sweep: bool, refusal: ?*?image_budget.Refusal) !Image {
         if (c.elf_version(c.EV_CURRENT) == c.EV_NONE) return error.ElfLibraryUnavailable;
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
         var charged: usize = 0;
         errdefer image_budget.releaseDerived(charged);
-        const object_bytes = try libelfBytes(binary, bytes, arena.allocator(), &charged);
+        var swept: usize = 0;
+        errdefer image_budget.releaseSweep(swept);
+        const object_bytes = try libelfBytes(binary, bytes, arena.allocator(), &charged, &swept, sweep, refusal);
         const object = c.elf_memory(@ptrCast(object_bytes.ptr), object_bytes.len) orelse return error.InvalidDebugImage;
         errdefer _ = c.elf_end(object);
         var debug_copied = false;
         const debug_object = if (companion) |file| blk: {
-            const debug_bytes = try libelfBytes(file.image, file.bytes, arena.allocator(), &charged);
+            const debug_bytes = try libelfBytes(file.image, file.bytes, arena.allocator(), &charged, &swept, sweep, refusal);
             debug_copied = debug_bytes.ptr != file.bytes.ptr;
             break :blk c.elf_memory(@ptrCast(debug_bytes.ptr), debug_bytes.len) orelse return error.InvalidDebugImage;
         } else object;
@@ -184,7 +190,11 @@ pub const Image = struct {
             image_budget.releaseDerived(charged - actual);
             charged = actual;
         }
-        return .{ .architecture = @enumFromInt(@intFromEnum(binary.header.machine)), .object = object, .debug_object = debug_object, .dwarf = dwarf, .eh = c.dwarf_getcfi_elf(object), .debug_cfi = if (dwarf) |d| c.dwarf_getcfi(d) else null, .arena = arena, .derived_bytes = charged, .address_table = if (dwarf != null) addressTable(debug_binary, debug_object) else &.{} };
+        if (swept > actual) {
+            image_budget.releaseSweep(swept - actual);
+            swept = actual;
+        }
+        return .{ .sweep_bytes = swept, .architecture = @enumFromInt(@intFromEnum(binary.header.machine)), .object = object, .debug_object = debug_object, .dwarf = dwarf, .eh = c.dwarf_getcfi_elf(object), .debug_cfi = if (dwarf) |d| c.dwarf_getcfi(d) else null, .arena = arena, .derived_bytes = charged, .address_table = if (dwarf != null) addressTable(debug_binary, debug_object) else &.{} };
     }
     fn addressTable(binary: elf.Image, object: *c.Elf) []const u8 {
         // dwarf_begin_elf has decompressed recognized sections in this private
@@ -221,7 +231,7 @@ pub const Image = struct {
         }
         return total;
     }
-    fn libelfBytes(binary: elf.Image, bytes: []u8, a: std.mem.Allocator, charged: *usize) ![]u8 {
+    fn libelfBytes(binary: elf.Image, bytes: []u8, a: std.mem.Allocator, charged: *usize, swept: *usize, sweep: bool, refusal: ?*?image_budget.Refusal) ![]u8 {
         // elf_memory borrows its buffer as writable private storage. Even
         // DWARF_C_READ decompresses sections by rewriting their ELF headers.
         // Keep those writes off read-only mappings and shared capture evidence.
@@ -243,8 +253,28 @@ pub const Image = struct {
             inflated +|= declared;
         }
         if (!compressed) return bytes;
-        charged.* += try image_budget.reserveDerived(inflated +| bytes.len);
-        return a.dupe(u8, bytes);
+        const needed = inflated +| bytes.len;
+        const held = image_budget.reserveDerived(needed) catch |err| {
+            if (refusal) |out| {
+                var why = image_budget.refusal(needed);
+                why.derived = true;
+                out.* = why;
+            }
+            return err;
+        };
+        errdefer image_budget.releaseDerived(held);
+        const share = if (sweep) image_budget.reserveSweep(needed) catch {
+            if (refusal) |out| out.* = .{ .size = needed, .limit = image_budget.sweepLeft(), .which = .sweep, .derived = true, .sweep_each = image_budget.per_image_limit };
+            return error.CompressedDebugBudget;
+        } else 0;
+        charged.* += held;
+        swept.* += share;
+        return a.dupe(u8, bytes) catch |err| {
+            charged.* -= held;
+            swept.* -= share;
+            image_budget.releaseSweep(share);
+            return err;
+        };
     }
     pub fn deinit(self: *Image) void {
         c.xgo_type_index_free(self.go_type_index);
@@ -254,6 +284,7 @@ pub const Image = struct {
         _ = c.elf_end(self.object);
         self.arena.deinit();
         image_budget.releaseDerived(self.derived_bytes);
+        image_budget.releaseSweep(self.sweep_bytes);
     }
     // Jetty ships elfutils 0.170. Its public iterator supports the demo's DWARF 4;
     // reject newer unit versions explicitly instead of guessing their headers.

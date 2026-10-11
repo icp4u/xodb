@@ -216,6 +216,7 @@ fn constrainSkipped(a: A, segment_: *Segment, skipped: []const SkippedAnchor) !v
 }
 
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    try session.languages.require(.perl);
     if (first >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
@@ -277,6 +278,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
 // Type aliases currently carry no owning image id. Refuse ambiguous layouts
 // rather than choosing the first interpreter library found in the mappings.
 fn valueModule(session: *model.Session) !*Module {
+    try session.languages.require(.perl);
     if (session.modules.regions.items.len > 4096) return error.PerlModuleLimit;
     const found = session.modules.definers("Perl_runops_standard") catch |err| return moduleError(err);
     // An image too large to examine does not hide a runtime that was found.
@@ -302,6 +304,7 @@ fn moduleError(err: anyerror) error{ PerlImageBudgetExceeded, SymbolDiscoveryPen
     return error.PerlModuleIdentityUnavailable;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+    if (!session.languages.on(.perl)) return null;
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
     if (child.kind != .structure or child.size != 24) return null;
@@ -379,6 +382,7 @@ test "Perl layout search bounds retain their diagnostics" {
 
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.perl);
     const module = try valueModule(session);
     const layout = try profile(session, module);
     return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
@@ -387,9 +391,11 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
 /// Frame selection comes from the retained canonical stack, never raw client
 /// interpreter/CV/pad addresses. The C reader revalidates that context's pad.
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.perl);
     return readBindings(session, a, tid, segment_index, frame, start, limit, null);
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: []const u8) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.perl);
     if (c.xpl_expression_check(try a.dupeZ(u8, expression)) != null) return error.UnsupportedPerlExpression;
     return readBindings(session, a, tid, segment_index, frame, 0, 1, expression);
 }
@@ -522,6 +528,7 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     return try a.dupeZ(u8, expression orelse "binding");
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    try session.languages.require(.perl);
     const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -548,6 +555,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     return capture;
 }
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    try session.languages.require(.perl);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
     const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
     const module_id = (try valueModule(session)).id;

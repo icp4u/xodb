@@ -77,6 +77,7 @@ fn singleRuntime(module: *Module) !void {
     }
 }
 fn runtimeModule(session: *model.Session) !*Module {
+    try session.languages.require(.lua);
     // These profiles cover standalone interpreters and static embedded hosts.
     // Kernel PHDR evidence identifies their image without loading unrelated
     // modules or treating a filename as runtime identity.
@@ -129,6 +130,7 @@ fn matchesField(t: *const eval.Type, path: []const u8, offset: u32, size: u32) b
     return false;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
+    if (!session.languages.on(.lua)) return null;
     if (value.availability != .available or value.type.kind != .pointer or value.bits == 0) return null;
     const child = value.type.child orelse return null;
     const state = stateType(child);
@@ -255,6 +257,7 @@ fn fromFrame(session: *model.Session, a: A, frame: model.Frame, requested: ?u64,
     if (typed_parameter and !recovered_parameter) return unavailable;
 }
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?u64) !Stack {
+    try session.languages.require(.lua);
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
     const native = try session.stack(a, tid, 64);
@@ -321,6 +324,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize, requested: ?
 
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
+    try session.languages.require(.lua);
     const module = try runtimeModule(session);
     const layout = try profile(session, module);
     return .{ .version = try versionText(a, layout), .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
@@ -329,9 +333,11 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
 /// Select through the canonical reader stack; raw target addresses are never
 /// accepted as a substitute for the requested retained logical frame.
 pub fn readLocals(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.lua);
     return readBindings(session, a, tid, segment_index, frame, start, limit, null);
 }
 pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, text: []const u8) !@import("../model/language_locals.zig").Result {
+    try session.languages.require(.lua);
     return readBindings(session, a, tid, segment_index, frame, 0, 1, text);
 }
 fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !@import("../model/language_locals.zig").Result {
@@ -456,6 +462,7 @@ pub fn watchExpression(a: A, expression: ?[]const u8, row: ?usize) ![:0]const u8
     return checked_expression;
 }
 pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize, frame: usize, expression: ?[]const u8, row: ?usize) !WatchCapture {
+    try session.languages.require(.lua);
     const checked_expression = try watchExpression(a, expression, row);
     const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
     if (segment_index >= observed.segments.len) return error.InvalidLanguageSegment;
@@ -474,6 +481,7 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     return capture;
 }
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
+    try session.languages.require(.lua);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
     const observed = try @import("../model/language_selection.zig").cachedRead(.lua, session, tid);
     const module_id = (try runtimeModule(session)).id;

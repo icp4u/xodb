@@ -8,6 +8,7 @@ const Server = @import("../mcp/server.zig").Server;
 const Endpoint = @import("../mcp/shared.zig").Endpoint;
 const linux = @import("../target/linux.zig");
 const c = @import("../c.zig").api;
+const rt = @import("../target/runtime.zig").c;
 const a = std.heap.page_allocator;
 
 pub const Completion = struct {
@@ -34,7 +35,9 @@ pub const Completions = struct {
         defer self.mutex.unlock();
         return self.count < boundary.max_commands;
     }
-    fn put(self: *Completions, value: Completion) void {
+    /// Owner only; normal dispatch respects available(), teardown uses the
+    /// reserved cancellation capacity. Fixtures can inject delayed replies.
+    pub fn put(self: *Completions, value: Completion) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         defer self.mutex.unlock();
         std.debug.assert(self.count < self.items.len);
@@ -57,6 +60,14 @@ pub const Options = struct {
     endpoint: ?*Endpoint = null,
     source: ?[:0]const u8 = null,
     initial_view: ?ViewSelection = null,
+    trace: bool = false,
+    test_directory: ?[:0]const u8 = null,
+    // Empty remote sessions can establish their first connection here. The
+    // cancellation capability exists before any startup transport operation.
+    bootstrap: ?struct { context: *anyopaque, run: *const fn (*anyopaque, *rt.struct_xrt_cancel) anyerror!void } = null,
+    // Called after every admitted command is completed/disposed, before done.
+    // The caller keeps context and all borrowed model storage alive until then.
+    shutdown: ?struct { context: *anyopaque, run: *const fn (*anyopaque) anyerror!void } = null,
 };
 pub const ViewSelection = struct {
     process: u64,
@@ -97,6 +108,8 @@ pub const Worker = struct {
     done: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null, // Read only after done.acquire or join.
     presentation_error: std.atomic.Value(u16) = .init(0),
+    startup_error: std.atomic.Value(u16) = .init(0),
+    connected: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     executor: dispatch.Executor,
     options: Options,
@@ -112,12 +125,20 @@ pub const Worker = struct {
     selection: ?ViewSelection = null,
     next_poll_ns: u64 = 0,
     active: ?*const boundary.Command = null,
+    cancel: ?*rt.struct_xrt_cancel = null,
+    preparation_retry: @import("remote_retry.zig").Retry = .{},
+    preparation_attempts: std.atomic.Value(u64) = .init(0),
+    test_probes: @import("remote_test.zig").Probes = .{},
 
     /// Exclusive ownership of tree/server/endpoint transfers until join. Native
     /// ptrace never transfers. Startup may establish a remote link beforehand.
     pub fn start(tree: *Tree, options: Options) !*Worker {
         if (tree.count == 0 or options.connection == 0) return error.InvalidArguments;
-        for (tree.entries[0..tree.count]) |entry| if (!entry.session.target.isRemote()) return error.RemoteSessionRequired;
+        for (tree.entries[0..tree.count]) |entry| {
+            if (options.bootstrap != null) {
+                if (entry.session.target.handle != null or entry.session.target.core != null) return error.ConflictingTargets;
+            } else if (!entry.session.target.isRemote()) return error.RemoteSessionRequired;
+        }
         if (options.initial_view) |view| {
             _ = try tree.find(view.process);
             if (view.text_len > view.text.len or view.binding_start > 4096 or
@@ -130,7 +151,11 @@ pub const Worker = struct {
             .executor = .{ .connection = options.connection, .tree = tree, .service = if (options.endpoint) |endpoint| endpoint.service else null, .source = options.source },
             .options = options,
             .selection = options.initial_view,
+            .cancel = if (options.bootstrap != null) rt.xrt_cancel_create() else rt.xrt_target_cancel(tree.root().target.handle),
+            .test_probes = .{ .directory = options.test_directory },
         };
+        if (self.cancel == null) return error.RemoteSessionRequired;
+        errdefer rt.xrt_cancel_release(self.cancel);
         self.configure(true);
         errdefer self.configure(false);
         self.thread = try std.Thread.spawn(.{}, run, .{self});
@@ -152,21 +177,28 @@ pub const Worker = struct {
         }
     }
     pub fn requestStop(self: *Worker) void {
+        self.commands.close() catch unreachable;
         self.stopping.store(true, .release);
+        rt.xrt_cancel_request(self.cancel);
     }
-    /// Shutdown path only. Transport interruption/fast window close is a
-    /// separate lifecycle operation; this join can wait for the call deadline.
+    /// Blocking owner hand-back for non-GUI callers. A frame waits for done
+    /// while pumping its window, then calls joinCompleted instead.
     pub fn join(self: *Worker) void {
         self.requestStop();
         if (self.thread) |thread| thread.join();
         self.thread = null;
         self.configure(false);
     }
+    pub fn joinCompleted(self: *Worker) void {
+        std.debug.assert(self.done.load(.acquire));
+        self.join();
+    }
     pub fn destroy(self: *Worker) void {
         std.debug.assert(self.thread == null);
         self.commands.deinit();
         self.publications.deinit();
         self.executor.deinit();
+        rt.xrt_cancel_release(self.cancel);
         a.destroy(self);
     }
     fn serverFor(self: *Worker, sequence: u64) ?*Server {
@@ -175,7 +207,17 @@ pub const Worker = struct {
         return null;
     }
     fn run(self: *Worker) void {
-        self.loop();
+        if (self.options.bootstrap) |bootstrap| bootstrap.run(bootstrap.context, self.cancel.?) catch |err| {
+            self.startup_error.store(@intFromError(err), .release);
+        };
+        if (self.startup_error.load(.acquire) == 0) {
+            self.connected.store(true, .release);
+            self.loop();
+        } else {
+            // Keep the lifecycle available to close/reconnect while displaying
+            // the startup refusal. Never poll a missing target as native.
+            while (!self.stopping.load(.acquire)) _ = c.usleep(20000);
+        }
         // Close admission before cancelling queued requests. No mutation is
         // executed merely to drain the queue, when shutdown was requested.
         while (true) {
@@ -198,6 +240,10 @@ pub const Worker = struct {
             self.complete(command, error.Cancelled);
             self.commands.finish();
         }
+        if (self.options.trace) std.debug.print("xodb: remote quiesce poll_error={s}\n", .{self.executor.tree.root().step_diagnostic orelse "none"});
+        if (self.options.shutdown) |shutdown| shutdown.run(shutdown.context) catch |err| {
+            self.failure = err;
+        };
         self.done.store(true, .release);
     }
     fn reportPresentationError(self: *Worker, err: anyerror) void {
@@ -226,6 +272,7 @@ pub const Worker = struct {
             }
         }
         if (self.options.endpoint) |endpoint| endpoint.pump(root) catch |err| self.reportPresentationError(err);
+        if (self.stopping.load(.acquire)) return false;
         const now = linux.now();
         const batch = self.protocolBatch();
         if (batch == .boundary or (batch != .continuation and now >= self.next_poll_ns)) {
@@ -242,6 +289,11 @@ pub const Worker = struct {
         var progressed = false;
         if (self.active == null) self.active = self.commands.take() catch null;
         if (self.active) |command| {
+            if (!(self.test_probes.dispatchAllowed(command, self.serverFor(command.sequence) != null, now) catch |err| {
+                self.failure = err;
+                self.requestStop();
+                return false;
+            })) return false;
             const needs_completion = command.request.action != .mcp and command.request.action != .poll;
             if (!needs_completion or self.completions.available()) {
                 var arena = std.heap.ArenaAllocator.init(a);
@@ -258,6 +310,7 @@ pub const Worker = struct {
                         if (value == .language) self.rememberLanguage(value.language);
                         if (value == .debugger) self.rememberDebugger(value.debugger);
                         self.publish(if (value == .view) value.view else null, if (value == .debugger) value.debugger else null, if (value == .language) value.language else null, null) catch |err| {
+                            self.preparation_retry.failed(self.preparationKey(), err, now);
                             result = err;
                         };
                     }
@@ -268,7 +321,14 @@ pub const Worker = struct {
                 progressed = true;
             }
         }
-        self.refresh(now) catch |err| self.reportPresentationError(err);
+        if (self.stopping.load(.acquire)) return false;
+        const preparation_key = self.preparationKey();
+        if (self.preparation_retry.ready(preparation_key, now)) {
+            self.refresh(now) catch |err| {
+                self.preparation_retry.failed(preparation_key, err, now);
+                self.reportPresentationError(err);
+            };
+        }
         if (self.publications.collect() catch null) |retired| retired.destroy();
         // Drain ready work in order before sleeping. Poll admission keeps
         // its cadence even during a request flood; a full completion box
@@ -309,6 +369,20 @@ pub const Worker = struct {
             }
         }
     }
+    fn preparationKey(self: *Worker) u64 {
+        const selected = self.selection orelse return 0;
+        const session = (self.executor.tree.find(selected.process) catch return 0).session;
+        var hash = std.hash.Wyhash.init(self.options.connection);
+        std.hash.autoHash(&hash, selected.process);
+        var inspection = selected.inspection();
+        inspection.request_id = 0; // Automatic retries keep the same selection key.
+        @import("remote_retry.zig").hashValue(&hash, inspection);
+        std.hash.autoHash(&hash, session.id);
+        std.hash.autoHash(&hash, session.target.snapshot().generation);
+        std.hash.autoHash(&hash, session.metadata.revision);
+        std.hash.autoHash(&hash, session.language_tabs.revision);
+        return hash.final();
+    }
     fn protocolBatch(self: *const Worker) enum { none, continuation, boundary } {
         // Stdio normally admits eight requests per pump; a shared peer admits
         // one. Preserve those finite batches across deferred owner replies.
@@ -331,7 +405,13 @@ pub const Worker = struct {
             return;
         }
         if (command.request.action == .mcp) {
-            const server = self.serverFor(command.sequence) orelse return;
+            const server = self.serverFor(command.sequence) orelse {
+                // A dropped client's admitted command is disposed exactly once;
+                // there is no socket to receive a terminal protocol reply.
+                self.test_probes.completed(command, true);
+                return;
+            };
+            self.test_probes.completed(command, false);
             const json: anyerror![]const u8 = if (result) |value| if (value == .json) value.json else error.InvalidOwnerReply else |err| err;
             server.completeQueued(command.sequence, json) catch |err| {
                 self.failServer(server, err);
@@ -419,6 +499,7 @@ pub const Worker = struct {
         self.selection.?.selection = .{ .tid = view.request.tid, .frame = view.selected_frame };
     }
     fn publish(self: *Worker, view: ?@import("../remote/view.zig").View, debugger: ?@import("debugger_view.zig").Presentation, language_: ?@import("language_view.zig").Presentation, failure: ?anyerror) !void {
+        _ = self.preparation_attempts.fetchAdd(1, .monotonic);
         // A workspace always has the native columns and the selected language
         // body in the same publication, even when the selected tab is native.
         const language = if (debugger != null) try self.executor.captureLanguage((try self.executor.tree.find(self.selection.?.process)).session, self.selection.?.inspection()) else language_;
@@ -514,6 +595,7 @@ pub const Worker = struct {
             .syscalls = syscalls,
             .diagnostic = if (failure) |err| @errorName(err) else "",
         };
+        if (try self.test_probes.failPublication()) return error.OutOfMemory;
         const publication = try boundary.Publication.createDegraded(a, presentation);
         errdefer publication.destroy();
         while (true) {
@@ -526,6 +608,7 @@ pub const Worker = struct {
             break;
         }
         self.presentation_error.store(0, .release);
+        self.preparation_retry.clear();
         self.last_workspace_signature = @import("workspace_view.zig").signature(workspace);
         self.last_workspace_ns = linux.now();
         self.last_generation = generation;
@@ -536,6 +619,66 @@ pub const Worker = struct {
         self.last_tree_revision = if (processes) |v| v.revision else self.executor.tree.revision;
     }
 };
+
+test "silent saturated queue cancels exactly once with full completions" {
+    const test_a = std.testing.allocator;
+    const session = try test_a.create(@import("session.zig").Session);
+    defer test_a.destroy(session);
+    session.* = @import("session.zig").Session.init();
+    defer session.deinit();
+    const tree = try test_a.create(Tree);
+    defer test_a.destroy(tree);
+    tree.* = .{};
+    tree.init(session);
+    defer tree.deinit();
+    const Barrier = struct {
+        released: std.atomic.Value(bool) = .init(false),
+        fn run(context: *anyopaque, _: *rt.struct_xrt_cancel) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            while (!self.released.load(.acquire)) _ = c.usleep(1000);
+        }
+    };
+    var barrier: Barrier = .{};
+    const worker = try Worker.start(tree, .{ .connection = 1, .bootstrap = .{ .context = &barrier, .run = Barrier.run } });
+    defer {
+        barrier.released.store(true, .release);
+        worker.join();
+        worker.destroy();
+    }
+    const identity = dispatch.stamp(1, session);
+    for (0..boundary.max_commands) |index| {
+        worker.completions.put(.{ .sequence = 1000 + index, .stamp = identity });
+        const command = try boundary.Command.create(test_a, .{ .stamp = identity, .actor = .human, .action = .{ .control = .continue_execution } });
+        try std.testing.expectEqual(index + 1, try worker.commands.trySubmit(command));
+    }
+    try std.testing.expect(!worker.completions.available());
+    // Quiescing itself cannot depend on acquiring a producer's queue lock.
+    try std.testing.expect(worker.commands.mutex.tryLock());
+    worker.requestStop();
+    const cancelled = rt.xrt_cancel_requested(worker.cancel);
+    worker.commands.mutex.unlock();
+    try std.testing.expect(cancelled);
+    barrier.released.store(true, .release);
+    const deadline = linux.now() + 10 * std.time.ns_per_s;
+    while (!worker.done.load(.acquire)) {
+        if (linux.now() > deadline) return error.CancellationDeadline;
+        _ = c.usleep(1000);
+    }
+    worker.joinCompleted();
+    // No further producer input or completion consumption was needed to finish.
+    for (0..2 * boundary.max_commands) |index| {
+        const reply = (try worker.completions.take()).?;
+        if (index < boundary.max_commands) {
+            try std.testing.expectEqual(1000 + index, reply.sequence);
+            try std.testing.expect(reply.failure == null);
+        } else {
+            try std.testing.expectEqual(index - boundary.max_commands + 1, reply.sequence);
+            try std.testing.expect(reply.failure.? == error.Cancelled);
+        }
+    }
+    try std.testing.expect((try worker.completions.take()) == null);
+    try std.testing.expectEqual(@as(usize, 0), worker.commands.bytes);
+}
 
 test "completion capacity reserves cancellation without losing earlier replies" {
     var replies: Completions = .{};
@@ -589,7 +732,6 @@ test "live remote owner publishes while frontend transport guard is armed" {
         worker.join();
         worker.destroy();
     }
-    const rt = @import("../target/runtime.zig").c;
     rt.xrt_remote_io_guard(true);
     defer rt.xrt_remote_io_guard(false);
     // This is a bounded functional wait, not a latency requirement. From this

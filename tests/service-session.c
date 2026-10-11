@@ -536,6 +536,28 @@ static void job_owners(void) {
     }
 }
 
+static void test_queued_disconnect(void)
+{
+    struct xsvc *s = xsvc_open(path); CHECK(s);
+    struct xsvc_peer peer;
+    int client = add(s, 1, &peer);
+    OK(xsvc_tick(s, 2, XSVC_MUTATE));
+    OK(xsvc_claim(s, peer.id, 1000, 3));
+    CHECK(write(client, "queued request", 14) == 14);
+    CHECK(!xsvc_disconnected(s, peer.id));
+    CHECK(shutdown(client, SHUT_WR) == 0);
+    CHECK(!xsvc_disconnected(s, peer.id)); // A half-close can drain its replies.
+    OK(xsvc_authorize(s, peer.id, XSVC_MUTATE, 4));
+    CHECK(close(client) == 0);
+    CHECK(xsvc_disconnected(s, peer.id)); // Even though unread bytes remain.
+    CHECK(xsvc_authorize(s, peer.id, XSVC_MUTATE, 5) == XSVC_NO_CLIENT);
+    char bytes[32]; CHECK(read(peer.fd, bytes, sizeof(bytes)) == 14);
+    CHECK(!memcmp(bytes, "queued request", 14)); // Probe did not consume them.
+    OK(xsvc_drop(s, peer.id, 6));
+    CHECK(state(s).controller == 0 && state(s).peer_count == 0);
+    CHECK(xsvc_disconnected(s, peer.id));
+    xsvc_close(s); gone(); ++groups;
+}
 int main(void)
 {
     job_owners();
@@ -547,6 +569,7 @@ int main(void)
     /* Private IPC directory intentionally remains 0700. */
     n = snprintf(path, sizeof(path), "%s/session.sock", directory);
     CHECK(n > 0 && (size_t)n < sizeof(path));
+    test_queued_disconnect();
     test_open();
     test_open_failure_cleanup();
     test_accept_pressure();

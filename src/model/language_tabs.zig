@@ -146,15 +146,25 @@ pub const State = struct {
             return;
         };
         const entry = &self.entries[self.next];
+        // Off in the preferences: not searched for, and not offered.
+        if (!session.languages.on(@enumFromInt(self.next))) {
+            entry.present = false;
+            entry.proof_generation = null;
+            self.finish("LanguageDisabled");
+            return;
+        }
         if (!entry.found) {
             const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version", "runtime.buildVersion", "emacs_version", @import("../language/gdscript.zig").singleton_symbol };
             var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
                 .limit_bytes = 128 * 1024,
                 .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
             });
-            rt.xrt_target_file_budget(session.target.handle, &budget);
+            @import("../target/runtime.zig").check(rt.xrt_target_file_budget(session.target.handle, &budget)) catch |err| {
+                self.finish(@errorName(err));
+                return;
+            };
             const result = session.modules.automaticSymbolAddress(symbols[self.next], &entry.cursor);
-            rt.xrt_target_file_budget(session.target.handle, null);
+            _ = rt.xrt_target_file_budget(session.target.handle, null);
             _ = result catch |err| {
                 if (pending(err)) {
                     entry.reason = @errorName(err);
@@ -226,7 +236,7 @@ pub const State = struct {
             items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
             if (i >= 2) {
                 const entry = &self.entries[i - 2];
-                items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null) "unavailable" else "ready";
+                items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "LanguageDisabled")) "disabled" else if (entry.reason != null) "unavailable" else "ready";
                 items[i].reason = entry.reason;
                 items[i].version = if (entry.present) entry.version.slice() else null;
                 items[i].build_id = if (entry.present) entry.build_id.slice() else null;

@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -258,6 +259,18 @@ size_t xsvc_peers(const struct xsvc *s, struct xsvc_peer *out, size_t capacity)
     return count;
 }
 
+bool xsvc_disconnected(const struct xsvc *s, uint64_t id)
+{
+    if (!owned(s)) return true;
+    const struct xsvc_peer *peer = NULL;
+    for (size_t i = 0; i < XSVC_MAX_PEERS; ++i)
+        if (s->peers[i].id == id && id) { peer = &s->peers[i]; break; }
+    if (!peer) return true;
+    struct pollfd fd = {.fd = peer->fd, .events = POLLIN};
+    int result = poll(&fd, 1, 0);
+    return (result < 0 && errno != EINTR) ||
+        (result > 0 && (fd.revents & (POLLHUP | POLLERR | POLLNVAL)) != 0);
+}
 enum xsvc_result xsvc_tick(struct xsvc *s, uint64_t now, unsigned scope)
 {
     if (!owned(s) || now < s->now_ns || scope > XSVC_MUTATE)
@@ -333,6 +346,7 @@ enum xsvc_result xsvc_authorize(struct xsvc *s, uint64_t id, unsigned required, 
         return XSVC_BAD_REQUEST;
     if (result != XSVC_OK)
         return result;
+    if (xsvc_disconnected(s, id)) return XSVC_NO_CLIENT;
     if (!room(s, due(s, now) || required != XSVC_OBSERVE ? 1 : 0))
         return XSVC_LIMIT;
     advance(s, now);

@@ -9,6 +9,9 @@ Supported: Linux x86-64, little-endian, GIL (not free-threaded) builds of
 CPython **3.14** final releases and the **3.16** development series. Other
 versions and free-threaded builds are refused.
 
+To turn this view off for a target you do not trust, see
+[language views and hostile targets](GUIDE.md#language-views-and-hostile-targets).
+
 ## Try the demo
 
 ```sh

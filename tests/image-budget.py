@@ -18,7 +18,7 @@ from client import Client
 
 MIB = 1 << 20
 SIZE = 257 * MIB  # just above the default per-image budget
-DEFAULTS = {'image_limit': 256 * MIB, 'total_limit': 512 * MIB}
+DEFAULTS = {'image_limit': 256 * MIB, 'total_limit': 1024 * MIB}
 LIBRARY = '''
 #include <unistd.h>
 __attribute__((noinline)) int big_wait(int fd) {
@@ -132,7 +132,7 @@ def main():
         assert target.stdout.readline() == 'ready\n', target.stderr.read()
         tid = target.pid; attach = ['--attach', str(tid)]
 
-        # Default budgets: 256 MiB an image, 512 MiB in all, and the refusal
+        # Default budgets: 256 MiB an image, 1 GiB in all, and the refusal
         # says what to rerun with for this image.
         client = Client('control', None, options=attach)
         figures = client.inspect('list_modules', limit=1)['image_bytes']
@@ -185,7 +185,7 @@ def main():
 
         # The total is a budget too, and says what is left of it.
         client = Client('control', None, options=[*attach, '--image-limit', '1G', '--image-total-limit', '200M'])
-        total = refused(client, tid, library, 'MiB left of the 200 MiB total image budget; rerun with --image-total-limit 1G', ('--image-total-limit', 'symbols.image_total_bytes'))
+        total = refused(client, tid, library, 'MiB left of the 200 MiB total image budget; rerun with --image-total-limit 2G', ('--image-total-limit', 'symbols.image_total_bytes'))
         close(client); client = None
         result['total'] = total
 
@@ -206,7 +206,7 @@ def main():
         library.unlink(missing_ok=True)
         result['elapsed_seconds'] = round(time.monotonic() - started, 3)
         (w/'results.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(f"image budget: defaults are 256 MiB an image and 512 MiB in all; a {SIZE // MIB} MiB image is refused with: {result['option'].replace(str(w), '.')}; "
+    print(f"image budget: defaults are 256 MiB an image and 1 GiB in all; a {SIZE // MIB} MiB image is refused with: {result['option'].replace(str(w), '.')}; "
           f"rerun with {result['advised']['options']} it loads and symbolises ({result['advised']['rss_bytes'] >> 20} MiB resident)")
 
 

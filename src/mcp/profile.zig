@@ -5,7 +5,7 @@ const profile = @import("../profile/capture.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 pub fn handles(name: []const u8) bool {
-    for ([_][]const u8{ "start_profile", "stop_profile", "get_profile", "get_flamegraph", "get_profile_frame", "get_profile_mappings", "get_profile_timeline", "get_profile_schedule", "get_profile_syscalls", "add_profile_intervals", "get_profile_intervals", "export_profile", "get_profile_samples", "get_profile_stack", "get_profile_stack_coverage" }) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
+    for ([_][]const u8{ "start_profile", "stop_profile", "release_profile", "get_profile", "get_flamegraph", "get_profile_frame", "get_profile_mappings", "get_profile_timeline", "get_profile_schedule", "get_profile_syscalls", "add_profile_intervals", "get_profile_intervals", "export_profile", "get_profile_samples", "get_profile_stack", "get_profile_stack_coverage" }) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
     return false;
 }
 pub fn value(a: Allocator, object: anytype) !Value {
@@ -246,6 +246,17 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: Value) !Val
             if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
         }
         return value(a, .{ .defaults = .{ .sample_limit = session.profile_defaults.sample_limit, .follow_threads = session.profile_defaults.follow_threads, .ring_budget_bytes = session.profile_defaults.ring_budget_bytes, .frequency_hz = session.profile_defaults.frequency_hz, .duration_ms = session.profile_defaults.duration_ms, .context_switch = session.profile_defaults.context_switch, .syscall_timing = session.profile_defaults.syscall_timing, .syscall_limit = session.profile_defaults.syscall_limit, .user_stack_bytes = session.profile_defaults.user_stack_bytes, .user_stack_budget_bytes = session.profile_defaults.user_stack_budget_bytes }, .offline = session.offline, .archive_job = if (session.archive_job) |job| job.status() else null, .recorded_view_job = if (session.recorded_views.job) |job| .{ .id = job.id, .capture_id = job.key.capture_id, .revision = job.key.revision, .sample_count = job.sample_count, .done = job.done.load(.acquire), .cancelled = job.cancel.load(.acquire) } else null, .capture = if (session.profile) |capture| capture.summary() else null, .displayed_view = if (session.profile_view) |view| .{ .visible = session.profile_view_visible, .basis = view.basis, .capture_id = view.capture_id, .revision = view.revision, .view_id = if (view.view_id) |id| @as(?[]const u8, &id) else null, .sample_count = view.sample_count, .filter = .{ .tid = view.filter.tid, .tids = view.filter.tids.optional(), .from_ns = view.filter.from_ns, .to_ns = if (view.filter.to_ns == std.math.maxInt(u64)) null else @as(?u64, view.filter.to_ns) } } else null, .last_open_failure = session.profile_failure, .last_start_error = session.profile_error, .requested_threads = session.profile_requested_threads, .thread_limit = @import("../profile/linux_perf.zig").max_threads });
+    }
+    if (std.mem.eql(u8, name, "release_profile")) {
+        try fields(args, &.{ "generation", "capture_id", "revision" });
+        try session.authorize(.agent, .execution, try number(args, "generation", null));
+        const capture = session.profile orelse return error.NoProfile;
+        if (try number(args, "capture_id", null) != capture.id) return error.StaleCapture;
+        if (try number(args, "revision", null) != capture.revision) return error.StaleProfile;
+        const id = capture.id;
+        try session.releaseProfile();
+        session.record(.agent, "release_profile");
+        return value(a, .{ .released_capture_id = id, .session = session.snapshot() });
     }
     if (std.mem.eql(u8, name, "stop_profile")) {
         try fields(args, &.{ "generation", "capture_id" });

@@ -71,6 +71,45 @@ described below. PDB data publics remain available to `find_symbol` and automati
 runtime discovery. A symbol breakpoint requires a public marked as code or a
 function in an executable PE section; exported data is also refused. It stays
 pending with `BreakpointSymbolNotExecutable` without changing target bytes.
+Python and Perl's native layout readers require ELF/DWARF. They use this
+policy locally and through the Linux runtime agent:
+
+| Mapped image | Native runtime discovery |
+| --- | --- |
+| Examined ELF defining the anchor | Candidate; ordinary identity, ambiguity and version checks still apply |
+| Examined ELF without the anchor | Ignore |
+| Structurally valid PE32+ x64 headers | Ignore, even if an export or PDB public has the anchor's name |
+| Executable file mapping with malformed MZ, other non-ELF bytes, or unreadable backing file | Refuse with a module identity diagnostic |
+| Deleted, memfd or device-backed executable file mapping with an inode | Refuse with a module identity diagnostic |
+| File mapped from offset 0 that cannot be opened or identified, with or without execute permission | Refuse with a module identity diagnostic |
+| Anonymous code, or non-ELF data mapping without execute permission | Ignore |
+| Unexamined image exceeding the symbol/full-image budget | Report a budget refusal if no runtime is found; an otherwise verified runtime remains usable |
+
+An identity refusal takes precedence over the budget exception. Ordinary ELF
+files embedded in supported containers still follow the ELF reader's policy.
+A PE exclusion checks DOS, COFF, optional and section headers (at most 100 reads,
+4170 bytes); it does not parse large export/unwind tables or prove what the loader
+originally loaded. This is a format-based proof with two known gaps. A target
+that overwrites the first few hundred bytes of its mapped ELF runtime with
+structurally valid PE headers before the first observation, or that runs its
+runtime from anonymous memory, hides that runtime; another mapped ELF defining
+the anchor is then the only candidate and is selected. Previously verified ELF
+snapshots remain candidates; a changed magic cannot erase one.
+Through a runtime agent the scan first examines at most 128 files per request
+and answers `SymbolDiscoveryPending` in between, so many mapped files cannot
+hold one request.
+These rules favor an explicit refusal when executable file bytes cannot be
+identified, including executable memfd JIT code. Anonymous JIT code is unaffected.
+
+Explicit `find_symbol` requests retain a scan cursor across pending reads, so
+a scan can finish even when its images cannot all fit in the metadata cache.
+No images are pinned by a cursor. At most 16 unfinished names, each at most
+64 KiB, are retained per module set. A new name under pressure evicts the least
+recently polled cursor; asking for an evicted name restarts its scan. Oversized
+names return `SymbolNameLimit`. A terminal answer or map revision change releases
+the cursor and its name. Different pending names have separate cursors and
+diagnostics. An abandoned client cannot reserve all slots indefinitely; continual
+churn of more than 16 actively polled names can still restart scans.
 
 The cache retains at most 256 jobs, 256 MiB of parsed metadata, and 1,024 identity
 records and 1,024 mapping instances. Mappings of the same exact file share one
@@ -84,12 +123,18 @@ ceiling. Format and work limits remain permanent refusals. Retained cache bytes
 plus the active allowance never exceed 256 MiB. Unused space is released when
 the worker finishes. Each pinned file view also has a bounded 64 KiB read buffer; this overhead is separate from
 parsed metadata. Eviction closes the view and frees metadata, while IDs and
-original identities survive while the file remains mapped. Refresh removes
-departed mapping instances and file records, including remembered failures; an
-unloaded worker is cancelled and reclaimed after its nonblocking join. Live
-instance IDs stay stable. Already discovered evicted images reload only when
+identities survive while the file remains unchanged. Each device/inode has one
+current identity record. A new stop's changed file identity invalidates every
+alias and its instance ID before new metadata is bound; it cannot accumulate
+old records while the inode remains mapped. A superseded worker is cancelled
+and keeps its reservation until it releases ownership. Refresh removes departed
+mapping instances and file records, including remembered failures. IDs stay
+stable for unchanged live instances. Already discovered evicted images reload only when
 requested, rather than after every stop. Reload must match the original file
 version. Limits are caps, with allocation following actual metadata sizes.
+An OS join failure is reported only after the worker releases its source and
+metadata; it becomes `PeMetadataUnavailable` and releases the reservation,
+instead of leaving discovery pending indefinitely.
 
 This integration currently supports native local targets with a known file-backed
 header. Agent/remote and core PE discovery, and images without
@@ -171,7 +216,7 @@ have matching executable placement. Each successful step reports
 `windows_unwind`, `windows_leaf` or `windows_epilog`. Missing bytes, unsupported
 records and unverified mappings terminate a partial result.
 
-PE and ELF snapshots share the 256-image, 256 MiB per-file and 512 MiB total file
+PE and ELF snapshots share the 256-image, 256 MiB per-file and 1 GiB total file
 budgets. PE parser allocations have a separate 256 MiB retained cap. These limits
 do not preallocate storage. Capture opening is synchronous, as for existing ELF
 snapshots. Header/unwind comparison does not establish byte-for-byte loaded code

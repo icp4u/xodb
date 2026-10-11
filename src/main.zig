@@ -60,6 +60,7 @@ pub fn main(init: std.process.Init) !void {
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
     var config_path: ?[:0]const u8 = null;
+    var languages_off = @import("preferences.zig").Languages{};
     var theme_path: ?[:0]const u8 = null;
     var headless = !build_options.gui;
     var mcp = false;
@@ -136,6 +137,7 @@ pub fn main(init: std.process.Init) !void {
                 \\A opens allocations; P in that panel starts/stops capture on the selected thread.
                 \\--theme FILE|builtin:dark|builtin:light|builtin:contrast|builtin:vga selects the GUI theme at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
+                \\--language-off NAME|all turns a language view off, as "languages" in the preferences does; repeatable.
                 \\--wine-threads show|hide controls Wine-internal name hints (default show); H toggles in the GUI.
                 \\--attach-exe opens the process picker with an editable .exe filter; Enter confirms attach.
                 \\T cycles the next capture duration in the profile view; 0 in config/MCP means until stopped.
@@ -144,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--source-map FROM=TO substitutes absolute source directory prefixes (repeatable; server paths).
                 \\--debug-file FILE explicitly supplies a build-ID-matched debug ELF (repeatable; server path).
                 \\--image-limit SIZE and --image-total-limit SIZE bound full ELF images read for code, source and types
-                \\  (bytes, or K/M/G; default 256M per image and 512M in total; a refused image says what to raise).
+                \\  (bytes, or K/M/G; default 256M per image and 1G in total; a refused image says what to raise).
                 \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
@@ -184,7 +186,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
+        } else if (std.mem.eql(u8, arg, "--language-off") or std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--wine-threads")) hide_wine_threads = if (std.mem.eql(u8, args[i], "hide")) true else if (std.mem.eql(u8, args[i], "show")) false else return error.InvalidWineThreadVisibility;
@@ -214,6 +216,10 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--session-socket")) session_socket = args[i];
             if (std.mem.eql(u8, arg, "--listen")) listen = args[i];
             if (std.mem.eql(u8, arg, "--config")) config_path = args[i];
+            if (std.mem.eql(u8, arg, "--language-off")) languages_off.turnOff(args[i]) catch |err| {
+                std.debug.print("xodb: --language-off takes all, python, perl, lua, javascript, ruby, go, elisp or gdscript; not {s}\n", .{args[i]});
+                return err;
+            };
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
             if (std.mem.eql(u8, arg, "--expected-start-ticks")) expected_start = try std.fmt.parseInt(u64, args[i], 10);
             if (std.mem.eql(u8, arg, "--profile-out")) profile_out = args[i];
@@ -284,6 +290,9 @@ pub fn main(init: std.process.Init) !void {
         if (err == error.InvalidImageBudget) std.debug.print("xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
         return err;
     } else @import("preferences.zig").Preferences{};
+    // Off in either place is off.
+    var languages = preferences.languages;
+    inline for (@typeInfo(@TypeOf(languages)).@"struct".fields) |field| @field(languages, field.name) = @field(languages, field.name) and @field(languages_off, field.name);
     // The command line wins over the config file; both were range-checked.
     try snapshot.configure(image_limit orelse preferences.symbols.image_bytes, image_total_limit orelse preferences.symbols.image_total_bytes);
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
@@ -295,8 +304,14 @@ pub fn main(init: std.process.Init) !void {
     if (remote_gui) {
         if (comptime build_options.gui) {
             var remote_args: std.ArrayList([:0]const u8) = .empty;
+            if (connect != null and !std.meta.eql(languages, .{})) std.debug.print("xodb: the server owns the target; language views are turned off where it was started, not here\n", .{});
             const endpoint: @import("remote/client.zig").Endpoint = if (connect) |address| .{ .tcp = address } else blk: {
                 try remote_args.appendSlice(a, &.{ remote_xodb, "--headless", "--mcp", "--agent-scope", if (scope_explicit) try a.dupeZ(u8, @tagName(agent_scope)) else "control" });
+                // The server reads the target, so the switches go with it.
+                if (!languages.enabled) try remote_args.appendSlice(a, &.{ "--language-off", "all" });
+                inline for (@typeInfo(@TypeOf(languages).Name).@"enum".fields) |field| {
+                    if (!@field(languages, field.name)) try remote_args.appendSlice(a, &.{ "--language-off", field.name });
+                }
                 if (source) |path| try remote_args.appendSlice(a, &.{ "--source", path });
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
@@ -326,6 +341,7 @@ pub fn main(init: std.process.Init) !void {
     session.agent_scope = agent_scope;
     session.shared_jobs = !headless or session_socket != null;
     session.profile_defaults = preferences.profile.config();
+    session.languages = languages;
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
     session.static_analysis.toolchain_dir = static_analysis;
@@ -333,28 +349,30 @@ pub fn main(init: std.process.Init) !void {
         const swept = @import("semq/host.zig").sweepStale();
         if (swept > 0) std.debug.print("xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
     }
-    defer session.deinit();
+    var remote_destroyed = false; // Read only after the remote owner finishes.
+    defer if (!remote_destroyed) session.deinit();
     // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
     var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
-    if (gdb_remote) |endpoint| try session.target.connectGdbRemote(endpoint);
+    const async_remote_start = runtime_remote and !headless;
+    var remote_transport: std.ArrayList([:0]const u8) = .empty;
+    if (!async_remote_start) if (gdb_remote) |endpoint| try session.target.connectGdbRemote(endpoint);
     if (runtime_agent != null or runtime_ssh != null) {
-        var transport: std.ArrayList([:0]const u8) = .empty;
         const agent = runtime_agent orelse "xodb-agent";
         if (runtime_ssh) |host| {
-            try transport.appendSlice(a, &.{ "ssh", "-T", "-o", "BatchMode=yes" });
-            if (ssh_config) |path| try transport.appendSlice(a, &.{ "-F", path });
+            try remote_transport.appendSlice(a, &.{ "ssh", "-T", "-o", "BatchMode=yes" });
+            if (ssh_config) |path| try remote_transport.appendSlice(a, &.{ "-F", path });
             // Retain a remote shell to translate a signal into 128 + signo.
             // SSH otherwise collapses a directly signalled agent to exit 255.
             const agent_command = try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" });
             const command = try std.fmt.allocPrintSentinel(a, "({s}); xodb_status=$?; exit \"$xodb_status\"", .{agent_command}, 0);
-            try transport.appendSlice(a, &.{ "--", host, command });
-        } else try transport.appendSlice(a, &.{ agent, "--stdio" });
-        try session.target.connectRemote(transport.items);
+            try remote_transport.appendSlice(a, &.{ "--", host, command });
+        } else try remote_transport.appendSlice(a, &.{ agent, "--stdio" });
+        if (!async_remote_start) try session.target.connectRemote(remote_transport.items);
     }
     var tree = ProcessTree{ .limit = process_limit };
     tree.init(session);
-    defer tree.deinit();
+    defer if (!remote_destroyed) tree.deinit();
     session.debug_files.automatic = preferences.symbols.automatic;
     session.debug_files.auto_file_limit = preferences.symbols.auto_file_bytes;
     session.debug_files.auto_total_limit = preferences.symbols.auto_total_bytes;
@@ -366,43 +384,38 @@ pub fn main(init: std.process.Init) !void {
         if (err == error.BinarySnapshotLimit) std.debug.print("xodb: image budget is {d} MiB per image and {d} MiB in total (--image-limit, --image-total-limit)\n", .{ snapshot.per_image_limit >> 20, snapshot.total_limit >> 20 });
         return err;
     };
-    defer if (profile_out) |path| {
-        if (session.profile) |capture| {
-            if (capture.collector != null) capture.stop(.manual, linux.now());
-            if (@import("profile/export.zig").save(capture, path, .{})) |result| {
-                std.debug.print("xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
-            } else |err| std.debug.print("xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
-        } else std.debug.print("xodb: profile export skipped: no capture; {s}\n", .{path});
-    };
-    defer if (record_path) |path| session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
+    defer if (!remote_destroyed) exportProfileOnExit(session, profile_out);
+    defer if (!remote_destroyed) if (record_path) |path| session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
     if (open_profile) |path| try session.openImported(path);
     if (open_frames) |path| try session.openFrames(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
-    if (attach) |pid| {
-        if (expected_start) |ticks| try @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks });
-        const started = linux.now();
-        std.debug.print("xodb: attaching to pid={d}\n", .{pid});
-        session.target.attach(pid) catch |err| {
-            std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
-            return err;
-        };
-        if (expected_start) |ticks| @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks }) catch |err| {
-            session.target.detach() catch {};
-            return err;
-        };
-        if (start_profile) {
-            _ = try session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
-            try session.continueExecution(.human);
+    if (!async_remote_start) {
+        if (attach) |pid| {
+            if (expected_start) |ticks| try @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks });
+            const started = linux.now();
+            std.debug.print("xodb: attaching to pid={d}\n", .{pid});
+            session.target.attach(pid) catch |err| {
+                std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
+                return err;
+            };
+            if (expected_start) |ticks| @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks }) catch |err| {
+                session.target.detach() catch {};
+                return err;
+            };
+            if (start_profile) {
+                _ = try session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
+                try session.continueExecution(.human);
+            }
+            std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
         }
-        std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
-    }
-    if (launch.len > 0) try session.launch(launch);
-    if (follow_forks) try session.target.setFollowProcesses(true);
-    for (initial_breakpoints[0..initial_breakpoint_count]) |name| {
-        try session.refreshMaps();
-        _ = try session.persistent.addSymbol(session, name);
+        if (launch.len > 0) try session.launch(launch);
+        if (follow_forks) try session.target.setFollowProcesses(true);
+        for (initial_breakpoints[0..initial_breakpoint_count]) |name| {
+            try session.refreshMaps();
+            _ = try session.persistent.addSymbol(session, name);
+        }
     }
     if (observation_recipe) |path| {
         try @import("observe/cli.zig").run(a, session, path, observation_out.?, observation_threshold, &quitting);
@@ -424,8 +437,11 @@ pub fn main(init: std.process.Init) !void {
     defer if (mcp) server.deinit();
     if (headless) {
         if (session.target.isRemote()) {
+            var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = capture_out, .profile_out = profile_out, .record_path = record_path };
             const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
                 .connection = 1,
+                .shutdown = .{ .context = &shutdown, .run = RemoteShutdown.run },
+                .test_directory = @import("model/remote_test.zig").Probes.environment(),
                 .server = if (mcp) server else null,
                 .endpoint = if (shared) |*endpoint| endpoint else null,
                 .source = source,
@@ -434,7 +450,6 @@ pub fn main(init: std.process.Init) !void {
             while (quitting == 0 and !owner.done.load(.acquire)) _ = c.usleep(20000);
             owner.join();
             if (owner.failure) |err| return err;
-            try finishRequestedArchive(session, capture_out);
             return;
         }
         while (quitting == 0) {
@@ -479,17 +494,87 @@ pub fn main(init: std.process.Init) !void {
         var archive_completed_id: u64 = 0;
         var archive_status_time: u64 = 0;
         if (runtime_remote) {
-            const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
-                .connection = 1,
-                .server = if (mcp) server else null,
-                .endpoint = if (shared) |*endpoint| endpoint else null,
-                .source = source,
-                .initial_view = .{ .process = 1, .selection = .{ .tid = 0 }, .request_id = 0, .kind = .debugger },
-            });
-            defer owner.destroy();
-            try remoteGui(owner, &window, &renderer, font, &workspaces, frames, startup_started, mcp);
-            try finishRequestedArchive(session, capture_out);
-            return;
+            const first_workspace = workspaces[0].?;
+            var incarnation: u64 = 1;
+            var protocol_server: ?*Server = if (mcp) server else null;
+            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count] };
+            while (true) {
+                var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = if (incarnation == 1) capture_out else null, .profile_out = if (incarnation == 1) profile_out else null, .record_path = if (incarnation == 1) record_path else null };
+                const reconnect = lifecycle: {
+                    const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
+                        .connection = incarnation,
+                        .bootstrap = .{ .context = &startup, .run = RemoteStartup.run },
+                        .shutdown = .{ .context = &shutdown, .run = RemoteShutdown.run },
+                        .trace = window.input.trace,
+                        .test_directory = @import("model/remote_test.zig").Probes.environment(),
+                        .server = protocol_server,
+                        .endpoint = if (shared) |*endpoint| endpoint else null,
+                        .source = source,
+                        .initial_view = .{ .process = 1, .selection = .{ .tid = 0 }, .request_id = 0, .kind = .debugger },
+                    });
+                    defer owner.destroy();
+                    break :lifecycle try remoteGui(owner, &window, &renderer, font, &workspaces, frames, startup_started, mcp);
+                };
+                if (!reconnect) return;
+                if (!remote_destroyed or session.target.handle != null) return error.RemoteReadersStillActive;
+                // Recreate the listener as well as peers: even a not-yet-
+                // accepted old socket must not submit into the new session.
+                if (shared) |*endpoint| {
+                    endpoint.deinit();
+                    shared = null;
+                    shared = try SharedSession.init(session_socket.?, source);
+                }
+                // Stdio cannot identify a new peer. Terminate that channel;
+                // shared clients may connect again and acquire a new lease.
+                if (protocol_server) |old| {
+                    old.closed = true;
+                    // Keep descriptors 0/1 occupied. Once freed, the next
+                    // pipe or socket (the new cancellation wake, a transport)
+                    // would take those numbers, and any stray stdout write
+                    // or stdin read in this process would then land in it.
+                    _ = c.fcntl(old.output_fd, c.F_SETFL, old.stdout_flags);
+                    const sink = c.open("/dev/null", c.O_RDWR | c.O_CLOEXEC);
+                    if (sink >= 0) {
+                        _ = c.dup2(sink, old.input_fd);
+                        if (old.output_fd != old.input_fd) _ = c.dup2(sink, old.output_fd);
+                        if (sink != old.input_fd and sink != old.output_fd) _ = c.close(sink);
+                    } else {
+                        _ = c.close(old.input_fd);
+                        if (old.output_fd != old.input_fd) _ = c.close(old.output_fd);
+                    }
+                    old.input_fd = -1;
+                    old.output_fd = -1;
+                    protocol_server = null;
+                }
+                for (&workspaces, 0..) |*entry, index| if (entry.*) |view| {
+                    view.deinit();
+                    if (index != 0) std.heap.page_allocator.destroy(view);
+                    entry.* = null;
+                };
+                workspaces[0] = first_workspace;
+                workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
+                session.* = Session.init();
+                remote_destroyed = false;
+                session.persistent.cancel = &quitting;
+                session.agent_scope = .observe;
+                session.shared_jobs = true;
+                session.profile_defaults = preferences.profile.config();
+                session.allocation_defaults = preferences.allocations;
+                session.allocation_helper = allocation_helper;
+                session.static_analysis.toolchain_dir = static_analysis;
+                session.debug_files.automatic = preferences.symbols.automatic;
+                session.debug_files.auto_file_limit = preferences.symbols.auto_file_bytes;
+                session.debug_files.auto_total_limit = preferences.symbols.auto_total_bytes;
+                for (debug_dirs.items) |path| try session.debug_files.addRoot(path);
+                for (source_maps.items) |spec| try session.source_maps.add(spec);
+                for (debug_files.items) |path| try session.debug_files.add(path);
+                session.fetch_source = fetch_source;
+                tree = .{ .limit = process_limit };
+                tree.init(session);
+                startup.initial_actions = false;
+                incarnation = std.math.add(u64, incarnation, 1) catch return error.ConnectionIncarnationExhausted;
+                window.dirty = true;
+            }
         }
         if (source) |path| try workspace.loadSource(path);
         var rendered: u64 = 0;
@@ -636,26 +721,52 @@ pub fn main(init: std.process.Init) !void {
 }
 /// The live family belongs exclusively to the worker for this loop's lifetime.
 /// The frame thread receives no Session, Tree, Server or Endpoint pointer.
-fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window, renderer: *Renderer, font: *Font, workspaces: *[@import("model/process_tree.zig").maximum]?*Workspace, frames: usize, startup_started: u64, mcp: bool) !void {
+fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window, renderer: *Renderer, font: *Font, workspaces: *[@import("model/process_tree.zig").maximum]?*Workspace, frames: usize, startup_started: u64, mcp: bool) !bool {
     var frontend = @import("ui/remote_workspace.zig").Frontend{ .owner = owner };
-    // Disable the frame guard before joining: bounded transport interruption
-    // and fast-close cancellation are the next lifecycle milestone.
     defer frontend.deinit();
-    defer owner.join();
+    // All stack-owned model/server/endpoint storage remains alive while the
+    // owner drains its readers and reaps its transport. Never join a live
+    // owner from a frame, including an early renderer/window error.
+    defer finishRemoteOwner(owner, window);
     const rt = @import("target/runtime.zig").c;
-    if (comptime @import("builtin").mode != .ReleaseFast and @import("builtin").mode != .ReleaseSmall) rt.xrt_remote_io_guard(true);
-    defer rt.xrt_remote_io_guard(false);
+    rt.xrt_remote_io_guard_strict(comptime @import("builtin").mode == .Debug);
+    rt.xrt_remote_io_guard(true);
+    defer {
+        rt.xrt_remote_io_guard(false);
+        rt.xrt_remote_io_guard_strict(false);
+    }
     var workspace = workspaces[0].?;
+    workspace.status = if (owner.options.connection == 1) "Connecting; Ctrl+Shift+R starts a fresh connection" else "Reconnecting; target continuity and prior control outcomes are unconfirmed";
+    var reconnect = false;
+    defer renderer.deinit();
     var renderer_ready = false;
     var renderer_started = false;
     var render_retry: u64 = 0;
     var rendered: usize = 0;
     var last_frame = linux.now();
+    var confirmed_connection = false;
     while (!window.closing and quitting == 0 and !owner.done.load(.acquire)) {
         try window.pump(window.input.timeoutMs(linux.now(), 8));
         if (window.closing or quitting != 0) break;
         window.input.tick(linux.now());
         if (window.input.count > 0) window.dirty = true;
+        const keys = @import("platform/input.zig");
+        for (0..window.input.count) |offset| {
+            const event = &window.input.queue[(window.input.head + offset) % keys.capacity];
+            if (event.kind == .press and event.mods.ctrl and !event.mods.alt and !event.mods.logo and event.shortcut == 'r') {
+                if (event.mods.shift) {
+                    reconnect = true;
+                } else {
+                    frontend.invalidateInspection();
+                }
+                event.* = .{ .kind = .release };
+            }
+        }
+        if (reconnect) break;
+        const startup_error = owner.startup_error.load(.acquire);
+        if (startup_error != 0) {
+            workspace.status = std.fmt.bufPrint(&workspace.presentation_status, "Connection unavailable: {s}; Ctrl+Shift+R reconnects", .{@errorName(@errorFromInt(startup_error))}) catch "Connection unavailable";
+        }
         frontend.pump();
         if (try frontend.take()) {
             const process = frontend.header.process;
@@ -665,9 +776,13 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
                 workspaces[index] = try std.heap.page_allocator.create(Workspace);
                 workspaces[index].?.* = .{};
             }
-            if (workspace != workspaces[index].?) frontend.inspection_hash = null;
+            if (workspace != workspaces[index].?) frontend.invalidateInspection();
             workspace = workspaces[index].?;
             frontend.present(workspace, window);
+            if (!confirmed_connection) {
+                workspace.status = if (owner.options.connection == 1) "Connected; Ctrl+R retries inspection; Ctrl+Shift+R reconnects" else "Fresh connection; previous target and control outcomes remain unconfirmed";
+                confirmed_connection = true;
+            }
         }
         workspace.input(window, &frontend);
         frontend.inspect(workspace, window);
@@ -701,12 +816,82 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         if (rendered == 0) @import("startup.zig").report(startup_started, mcp);
         last_frame = now;
         rendered += 1;
-        if (window.input.trace) std.debug.print("xodb: remote frame={d} publication={d} editor={s}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed" });
+        if (window.input.trace) std.debug.print("xodb: remote frame={d} publication={d} editor={s} preparations={d}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed", owner.preparation_attempts.load(.monotonic) });
         if (frames > 0 and rendered >= frames) break;
     }
-    if (owner.done.load(.acquire)) if (owner.failure) |err| return err;
+    finishRemoteOwner(owner, window);
+    if (owner.failure) |err| return err;
     const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (frames > 0 and rendered >= frames) "frame_limit" else "owner_exit";
-    std.debug.print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
+    std.debug.print("xodb: {d} frames, remote owner closed (reason={s}, signal={d}); remote target cleanup unconfirmed\n", .{ rendered, reason, quitting });
+    if (reconnect) {
+        // Discard input collected while the old owner was quiescing.
+        window.input.count = 0;
+        std.debug.print("xodb: remote incarnation={d} retired; no controls replayed\n", .{owner.options.connection});
+    }
+    return reconnect and !window.closing and quitting == 0;
+}
+
+fn finishRemoteOwner(owner: *@import("model/remote_worker.zig").Worker, window: *Window) void {
+    owner.requestStop();
+    while (!owner.done.load(.acquire)) {
+        window.pumpDuringClose(8) catch {
+            _ = c.usleep(8000);
+        };
+    }
+    owner.joinCompleted();
+}
+const RemoteStartup = struct {
+    session: *Session,
+    gdb: ?[:0]const u8,
+    transport: []const [:0]const u8,
+    attach: ?i32,
+    launch: []const [:0]const u8,
+    follow: bool,
+    breakpoints: []const []const u8,
+    initial_actions: bool = true,
+    fn run(context: *anyopaque, cancel: *@import("target/runtime.zig").c.struct_xrt_cancel) !void {
+        const self: *RemoteStartup = @ptrCast(@alignCast(context));
+        if (self.gdb) |endpoint| {
+            try self.session.target.connectGdbRemoteCancel(endpoint, cancel);
+        } else try self.session.target.connectRemoteCancel(self.transport, cancel);
+        // A reconnect establishes a new transport only. Never replay attach,
+        // launch, breakpoints, resume, or the old session's controller grant.
+        if (!self.initial_actions) return;
+        if (self.attach) |pid| try self.session.target.attach(pid);
+        if (self.launch.len > 0) try self.session.launch(self.launch);
+        if (self.follow) try self.session.target.setFollowProcesses(true);
+        for (self.breakpoints) |name| {
+            try self.session.refreshMaps();
+            _ = try self.session.persistent.addSymbol(self.session, name);
+        }
+    }
+};
+const RemoteShutdown = struct {
+    tree: *ProcessTree,
+    session: *Session,
+    destroyed: *bool,
+    capture_out: ?[:0]const u8,
+    profile_out: ?[:0]const u8,
+    record_path: ?[:0]const u8,
+    fn run(context: *anyopaque) !void {
+        const self: *RemoteShutdown = @ptrCast(@alignCast(context));
+        defer self.destroyed.* = true;
+        defer self.session.deinit();
+        defer self.tree.deinitRemote();
+        defer if (self.record_path) |path| self.session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
+        defer exportProfileOnExit(self.session, self.profile_out);
+        try finishRequestedArchive(self.session, self.capture_out);
+    }
+};
+fn exportProfileOnExit(session: *Session, profile_out: ?[:0]const u8) void {
+    if (profile_out) |path| {
+        if (session.profile) |capture| {
+            if (capture.collector != null) capture.stop(.manual, linux.now());
+            if (@import("profile/export.zig").save(capture, path, .{})) |result| {
+                std.debug.print("xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
+            } else |err| std.debug.print("xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
+        } else std.debug.print("xodb: profile export skipped: no capture; {s}\n", .{path});
+    }
 }
 
 fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
@@ -845,6 +1030,7 @@ test {
     _ = @import("model/remote_owner.zig");
     _ = @import("model/remote_dispatch.zig");
     _ = @import("model/remote_worker.zig");
+    if (build_options.gui) _ = @import("ui/remote_workspace.zig");
     _ = @import("binary/tls.zig");
     _ = @import("language/gdscript.zig");
     _ = @import("semq/adapter.zig");
