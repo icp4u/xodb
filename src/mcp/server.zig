@@ -38,6 +38,8 @@ pub const Server = struct {
     request_limit: usize = 8,
     transmitted: u64 = 0,
     reported_revision: ?u64 = null,
+    /// A sentence for the error being returned; lives in the request arena.
+    error_detail: ?[]const u8 = null,
     input: [65536]u8 = undefined,
     used: usize = 0,
     // Accommodates a full 1024-thread session plus capture in a single reply.
@@ -118,6 +120,15 @@ pub const Server = struct {
     }
     fn failure(self: *Server, a: Allocator, id: Value, code: i32, message: []const u8) !void {
         try self.queue(try std.json.Stringify.valueAlloc(a, .{ .jsonrpc = "2.0", .id = id, .@"error" = .{ .code = code, .message = message } }, .{}));
+    }
+    /// A source line that was not found: when the search left images unread
+    /// for a budget, the reply says how many and names the first, so "no
+    /// code" is not taken for an answer about all of them.
+    fn lineError(self: *Server, a: Allocator, session: *Session, err: anyerror) anyerror {
+        if (err != error.NoCodeForSourceLine) return err;
+        const skipped = session.modules.skipped();
+        if (skipped.first) |first| self.error_detail = std.fmt.allocPrint(a, "{d} images not searched; {s}", .{ skipped.count, first }) catch null;
+        return err;
     }
     fn tool(self: *Server, a: Allocator, root: *Session, name: []const u8, args: Value) !Value {
         if (args != .object) return error.InvalidArguments;
@@ -230,7 +241,7 @@ pub const Server = struct {
         const associations = @import("associations.zig");
         if (associations.handles(name)) return associations.call(a, session, name, args);
         const probes = @import("probes.zig");
-        if (probes.handles(name)) return probes.call(a, session, name, args);
+        if (probes.handles(name)) return probes.call(a, session, name, args) catch |err| return self.lineError(a, session, err);
         const remote = @import("remote.zig");
         if (remote.handles(name)) return remote.call(a, session, name, args, self.source_path);
         if (std.mem.eql(u8, name, "get_profile_comparison")) return @import("comparison.zig").call(a, session, args);
@@ -275,7 +286,13 @@ pub const Server = struct {
         }
         if (std.mem.eql(u8, name, "find_symbol")) {
             try session.refreshMaps();
-            const symbol = try session.modules.findSymbol(string(member(args, "name")) orelse return error.InvalidArguments);
+            const symbol = session.modules.findSymbol(string(member(args, "name")) orelse return error.InvalidArguments) catch |err| {
+                // A name that is not found may live in an image refused in full.
+                const terminal = err == error.SymbolNotFound or err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
+                var text: [@import("../model/modules.zig").Modules.unsearched_text]u8 = undefined;
+                self.error_detail = if (terminal) if (session.modules.budgetDetail(null) orelse session.modules.unsearchedDetail(&text)) |detail| try a.dupe(u8, detail) else null else null;
+                return if (self.error_detail != null) error.ImageBudgetExceeded else err;
+            };
             return asValue(a, .{ .module_id = symbol.module_id, .name = symbol.name, .address = try std.fmt.allocPrint(a, "0x{x}", .{symbol.address}), .size = symbol.size, .local_entry = symbol.entry });
         }
         if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpointSlice(), .watchpoints = session.target.watchpointSlice(), .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .loader_reads = session.persistent.loader_reads, .symbol_transfer = .{ .bytes = session.persistent.file_reads.bytes, .files = session.persistent.file_reads.files, .negative_hits = session.persistent.file_reads.negative_hits, .skipped = session.persistent.file_reads.skipped, .resumed_bytes = session.persistent.file_reads.resumed_bytes, .cached_modules = session.modules.cachedSymbolCount(), .retained_bytes = session.modules.symbol_bytes }, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = session.target.gdbRemoteInfo() == null and session.target.arch() == .x86_64 });
@@ -315,9 +332,10 @@ pub const Server = struct {
                     if (member(args, "address") != null or member(args, "symbol") != null) return error.InvalidArguments;
                     const line_number = number(member(args, "line")) orelse return error.InvalidArguments;
                     if (line_number == 0 or line_number > std.math.maxInt(u32)) return error.InvalidArguments;
-                    const ids = try session.setSourceBreakpoint(a, file, @intCast(line_number));
+                    const ids = session.setSourceBreakpoint(a, file, @intCast(line_number)) catch |err| return self.lineError(a, session, err);
                     session.record(.agent, action);
-                    return asValue(a, .{ .id = ids[0], .ids = ids, .session = session.snapshot() });
+                    const skipped = session.modules.skipped();
+                    return asValue(a, .{ .id = ids[0], .ids = ids, .images_not_searched = skipped.count, .image_budget = skipped.first, .session = session.snapshot() });
                 }
                 if (member(args, "line") != null) return error.InvalidArguments;
                 var location: u64 = undefined;
@@ -385,7 +403,13 @@ pub const Server = struct {
         if (std.mem.eql(u8, name, "get_stack")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
             if (tid == 0 or tid > std.math.maxInt(i32)) return error.InvalidArguments;
-            return asValue(a, .{ .generation = session.target.snapshot().generation, .frames = try session.stack(a, @intCast(tid), 64) });
+            const frames = try session.stack(a, @intCast(tid), 64);
+            // Name the first image this stack could not read in full.
+            // A core has no metadata unwinder: its walk ends at that frame.
+            const image_budget: ?[]const u8 = found: for (frames) |frame| {
+                for ([_]?[]const u8{ frame.inline_diagnostic, frame.diagnostic }) |reason| if (reason) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit")) if (session.modules.budgetDetail(frame.lookup_pc)) |detail| break :found try a.dupe(u8, detail);
+            } else null;
+            return asValue(a, .{ .generation = session.target.snapshot().generation, .image_budget = image_budget, .frames = frames });
         }
         if (std.mem.eql(u8, name, "get_value_children")) {
             const tid = number(member(args, "tid")) orelse return error.InvalidArguments;
@@ -556,9 +580,15 @@ pub const Server = struct {
                 return;
             };
             const args = member(params, "arguments") orelse Value{ .object = .{} };
+            self.error_detail = null;
             const result = self.tool(a, session, name, args) catch |err| {
                 if (err == error.UnknownTool or err == error.InvalidArguments) {
                     try self.failure(a, id, -32602, @errorName(err));
+                    return;
+                }
+                // The name stays first; the second line says which image and budget.
+                if (self.error_detail) |detail| {
+                    try self.reply(a, id, .{ .isError = true, .content = .{ .{ .type = "text", .text = @errorName(err) }, .{ .type = "text", .text = detail } } });
                     return;
                 }
                 try self.reply(a, id, .{ .isError = true, .content = .{.{ .type = "text", .text = @errorName(err) }} });

@@ -10,7 +10,12 @@ const Workspace = @import("ui/workspace.zig").Workspace;
 const Server = @import("mcp/server.zig").Server;
 const SharedSession = @import("mcp/shared.zig").Endpoint;
 const linux = @import("target/linux.zig");
+const snapshot = @import("binary/snapshot.zig");
 var quitting: c.sig_atomic_t = 0;
+fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerror {
+    std.debug.print("xodb: {s} {s}: expected a size from 1M to {d}G (bytes, or a whole number with K, M or G)\n", .{ option, value, snapshot.max_limit >> 30 });
+    return err;
+}
 fn onSignal(signal: c_int) callconv(.c) void {
     quitting = signal;
 }
@@ -89,6 +94,8 @@ pub fn main(init: std.process.Init) !void {
     var browse_observation: ?[:0]const u8 = null;
     var observation_threshold: ?u64 = null;
     var symbols: ?[:0]const u8 = null;
+    var image_limit: ?u64 = null;
+    var image_total_limit: ?u64 = null;
     var debug_files: std.ArrayList([:0]const u8) = .empty;
     var debug_dirs: std.ArrayList([:0]const u8) = .empty;
     var source_maps: std.ArrayList([:0]const u8) = .empty;
@@ -129,6 +136,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--fetch-source opts in to bounded source copies from --runtime-ssh/--runtime-agent; local files and --source-map win.
                 \\--source-map FROM=TO substitutes absolute source directory prefixes (repeatable; server paths).
                 \\--debug-file FILE explicitly supplies a build-ID-matched debug ELF (repeatable; server path).
+                \\--image-limit SIZE and --image-total-limit SIZE bound full ELF images read for code, source and types
+                \\  (bytes, or K/M/G; default 256M per image and 512M in total; a refused image says what to raise).
                 \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
@@ -168,7 +177,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file")) {
+        } else if (std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--observe-recipe")) {
@@ -209,6 +218,11 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--debug-dir")) try debug_dirs.append(a, args[i]);
             if (std.mem.eql(u8, arg, "--source-map")) try source_maps.append(a, args[i]);
             if (std.mem.eql(u8, arg, "--debug-file")) try debug_files.append(a, args[i]);
+            if (std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
+                const size = snapshot.parseSize(args[i]) catch |err| return imageBudgetError(err, arg, args[i]);
+                if (size < snapshot.min_limit or size > snapshot.max_limit) return imageBudgetError(error.InvalidImageBudget, arg, args[i]);
+                if (arg.len == "--image-limit".len) image_limit = size else image_total_limit = size;
+            }
             if (std.mem.eql(u8, arg, "--break")) {
                 if (initial_breakpoint_count == initial_breakpoints.len) return error.InitialBreakpointLimit;
                 initial_breakpoints[initial_breakpoint_count] = args[i];
@@ -249,7 +263,7 @@ pub fn main(init: std.process.Init) !void {
     if (session_socket != null and (mcp or listen != null or remote_gui)) return error.SharedSessionOptionConflict;
     if (remote_gui and (headless or mcp or listen != null or open_capture != null or symbols != null or record_path != null or capture_out != null or profile_out != null)) return error.RemoteGuiOptionConflict;
     if (fetch_source and (runtime_agent == null and runtime_ssh == null or connect != null or ssh != null or core_file != null or open_profile != null or open_capture != null)) return error.SourceFetchRequiresRuntimeAgent;
-    if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint_count != 0 or scope_explicit)) return error.RemoteConnectTargetBelongsOnServer;
+    if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint_count != 0 or scope_explicit or image_limit != null or image_total_limit != null)) return error.RemoteConnectTargetBelongsOnServer;
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
     if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
@@ -259,8 +273,11 @@ pub fn main(init: std.process.Init) !void {
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
         std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
+        if (err == error.InvalidImageBudget) std.debug.print("xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
         return err;
     } else @import("preferences.zig").Preferences{};
+    // The command line wins over the config file; both were range-checked.
+    try snapshot.configure(image_limit orelse preferences.symbols.image_bytes, image_total_limit orelse preferences.symbols.image_total_bytes);
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
     try @import("target/runtime.zig").saveLaunchSignals();
     _ = c.signal(c.SIGINT, onSignal);
@@ -276,6 +293,8 @@ pub fn main(init: std.process.Init) !void {
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
                 for (debug_files.items) |path| try remote_args.appendSlice(a, &.{ "--debug-file", path });
+                if (image_limit) |n| try remote_args.appendSlice(a, &.{ "--image-limit", try std.fmt.allocPrintSentinel(a, "{d}", .{n}, 0) });
+                if (image_total_limit) |n| try remote_args.appendSlice(a, &.{ "--image-total-limit", try std.fmt.allocPrintSentinel(a, "{d}", .{n}, 0) });
                 for (initial_breakpoints[0..initial_breakpoint_count]) |name| try remote_args.appendSlice(a, &.{ "--break", try a.dupeZ(u8, name) });
                 if (attach) |pid| {
                     try remote_args.appendSlice(a, &.{ "--attach", try std.fmt.allocPrintSentinel(a, "{d}", .{pid}, 0) });
@@ -336,6 +355,7 @@ pub fn main(init: std.process.Init) !void {
     session.fetch_source = fetch_source;
     for (debug_files.items) |path| session.debug_files.add(path) catch |err| {
         std.debug.print("xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
+        if (err == error.BinarySnapshotLimit) std.debug.print("xodb: image budget is {d} MiB per image and {d} MiB in total (--image-limit, --image-total-limit)\n", .{ snapshot.per_image_limit >> 20, snapshot.total_limit >> 20 });
         return err;
     };
     defer if (profile_out) |path| {

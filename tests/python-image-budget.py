@@ -8,7 +8,6 @@ import argparse
 import json
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import time
@@ -17,9 +16,13 @@ from client import Client
 FIXTURE = 'tests/fixtures/python/budget.py'
 
 
+# The budgets are runtime values; pin small ones so the padded images stay cheap.
+LIMITS = {'per_image_limit': 256 << 20, 'total_limit': 512 << 20}
+BUDGET = ['--image-limit', str(LIMITS['per_image_limit']), '--image-total-limit', str(LIMITS['total_limit'])]
+
+
 def limit(name):
-    text = Path('src/binary/snapshot.zig').read_text()
-    return eval(re.search(rf'pub const {name}: usize = ([0-9* ]+);', text).group(1))
+    return LIMITS[name]
 
 
 def modules(client):
@@ -67,7 +70,7 @@ def main():
         names = {str(pad) for pad in pads}
 
         # Every pad is mapped and unread in full; the stack still resolves.
-        client = Client('control', None, options=['--attach', str(target.pid)])
+        client = Client('control', None, options=['--attach', str(target.pid), *BUDGET])
         generation = client.stopped()['generation']
         found, why = stack(client, generation=generation, tid=tid)
         assert found, why
@@ -91,7 +94,7 @@ def main():
 
         # Spend the budget on the pads first: now the interpreter's own image
         # is the one refused, and both replies name the budget.
-        client = Client('control', None, options=['--attach', str(target.pid)])
+        client = Client('control', None, options=['--attach', str(target.pid), *BUDGET])
         generation = client.stopped()['generation']
         for address in addresses[:total // each]:
             client.inspect('get_function_graph', generation=generation, address=hex(address))

@@ -2,6 +2,7 @@
 const std = @import("std");
 const c = @import("c.zig").api;
 const Config = @import("profile/capture.zig").Config;
+const snapshot = @import("binary/snapshot.zig");
 pub const max_bytes = 64 * 1024;
 pub const Profile = struct {
     sample_limit: u32 = (Config{}).sample_limit,
@@ -18,7 +19,9 @@ pub const Profile = struct {
         return .{ .sample_limit = self.sample_limit, .follow_threads = self.follow_threads, .ring_budget_bytes = self.ring_budget_bytes, .frequency_hz = self.frequency_hz, .duration_ms = self.duration_ms, .context_switch = self.context_switch, .syscall_timing = self.syscall_timing, .syscall_limit = self.syscall_limit, .user_stack_bytes = self.user_stack_bytes, .user_stack_budget_bytes = self.user_stack_budget_bytes };
     }
 };
-pub const Symbols = struct { automatic: bool = true, auto_file_bytes: u32 = 64 * 1024 * 1024, auto_total_bytes: u32 = 128 * 1024 * 1024 };
+/// `image_bytes` and `image_total_bytes` bound full ELF images read for code,
+/// source and types; null keeps the defaults (see binary/snapshot.zig).
+pub const Symbols = struct { automatic: bool = true, auto_file_bytes: u32 = 64 * 1024 * 1024, auto_total_bytes: u32 = 128 * 1024 * 1024, image_bytes: ?u64 = null, image_total_bytes: ?u64 = null };
 /// Inline storage keeps a parsed preference independent of the JSON arena.
 pub const ThemePath = struct {
     bytes: [4096]u8 = @splat(0),
@@ -60,6 +63,9 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     try parsed.value.profile.config().validate();
     try parsed.value.allocations.validate();
     if (parsed.value.symbols.auto_file_bytes == 0 or parsed.value.symbols.auto_file_bytes > 256 * 1024 * 1024 or parsed.value.symbols.auto_total_bytes == 0 or parsed.value.symbols.auto_total_bytes > 512 * 1024 * 1024) return error.InvalidSymbolBudget;
+    for ([_]?u64{ parsed.value.symbols.image_bytes, parsed.value.symbols.image_total_bytes }) |value| if (value) |n| {
+        if (n < snapshot.min_limit or n > snapshot.max_limit) return error.InvalidImageBudget;
+    };
     return parsed.value;
 }
 pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
@@ -154,4 +160,19 @@ test "theme preferences own their path and resolve against config with CLI prece
     try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"\"}}"));
     try std.testing.expectError(error.UnknownField, parse(a, "{\"appearance\":{\"thme\":\"x\"}}"));
     try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"a\\u0000b\"}}"));
+}
+
+test "image budget preferences default to unset and refuse values outside the range" {
+    const a = std.testing.allocator;
+    const defaults = try parse(a, "{}");
+    try std.testing.expect(defaults.symbols.image_bytes == null and defaults.symbols.image_total_bytes == null);
+    const custom = try parse(a, "{\"symbols\":{\"image_bytes\":3221225472,\"image_total_bytes\":6442450944}}");
+    try std.testing.expectEqual(@as(?u64, 3 << 30), custom.symbols.image_bytes);
+    try std.testing.expectEqual(@as(?u64, 6 << 30), custom.symbols.image_total_bytes);
+    try std.testing.expectEqual(@as(u32, 128 * 1024 * 1024), custom.symbols.auto_total_bytes); // automatic budgets are separate
+    for ([_][]const u8{ "{\"symbols\":{\"image_bytes\":0}}", "{\"symbols\":{\"image_bytes\":4096}}", "{\"symbols\":{\"image_total_bytes\":1048575}}", "{\"symbols\":{\"image_total_bytes\":1099511627777}}" }) |invalid|
+        try std.testing.expectError(error.InvalidImageBudget, parse(a, invalid));
+    try std.testing.expectError(error.Overflow, parse(a, "{\"symbols\":{\"image_bytes\":-1}}"));
+    try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"symbols\":{\"image_bytes\":\"2G\"}}"));
+    try std.testing.expectError(error.UnknownField, parse(a, "{\"symbols\":{\"image_byte\":1048576}}"));
 }

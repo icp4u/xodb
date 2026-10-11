@@ -110,7 +110,7 @@ pub fn prepareTarget(target: ?*const rt.struct_xrt_target, pid: i32, region: mod
     errdefer result.close();
     const before = try identity(result.fd);
     const bytes = snapshot.read(result.fd, limit, cancel) catch |err| return if (err == error.ArchiveCancelled) error.AllocationPreparationCancelled else err;
-    defer _ = c.munmap(bytes.ptr, bytes.len);
+    defer snapshot.free(bytes);
     const image = try elf.Image.parse(bytes);
     for (requests, 0..) |request, i| {
         const location = try resolve(&image, region, request.name, cancel);

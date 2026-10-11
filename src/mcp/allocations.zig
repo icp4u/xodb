@@ -60,6 +60,8 @@ pub fn status(a: Allocator, capture: *model.Capture) !Value {
         .stack_method = "perf_frame_pointers_and_entry_return_address",
         .stack_completeness = "prefix_only",
         .symbol_basis = if (capture.archived) "recorded_archive_annotations" else "opening_immutable_elf_snapshots",
+        .images_not_searched = if (capture.symbols) |symbols| symbols.skipped().count else 0,
+        .image_budget = if (capture.symbols) |symbols| symbols.skipped().first else null,
         .lost = capture.store.lost,
         .throttles = capture.store.throttles,
         .rejected = capture.store.rejected,

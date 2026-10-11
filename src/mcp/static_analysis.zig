@@ -160,7 +160,8 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
         };
         selector = .{ .line = .{ .path = path, .line = @intCast(number), .addresses = addresses } };
         line_addresses = addresses;
-        if (addresses.len == 0) return out(a, .{ .status = "no_selection", .reason = "the debugger's line table has no code for this line" });
+        // Not found is only as good as the search: say what it left unread.
+        if (addresses.len == 0) return out(a, .{ .status = "no_selection", .reason = "the debugger's line table has no code for this line", .images_not_searched = session.modules.skipped().count, .image_budget = session.modules.skipped().first });
         // A line inlined or split into several functions is a choice for the caller.
         var entries: std.ArrayList(struct { function: []const u8, entry: u64 }) = .empty;
         for (addresses) |at| {

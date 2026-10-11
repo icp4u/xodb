@@ -1191,15 +1191,15 @@ fn loadImage(self: *Capture, report: *ImageReport, resolver: Resolver, a: Alloca
         report.status = .size_mismatch;
         return;
     }
-    const bytes = snapshot.read(fd, @min(snapshot.per_image_limit, snapshot.total_limit - self.images.snapshot_bytes), if (state) |p| &p.cancel else null) catch |err| {
+    // An archive names its own image kinds: PE keeps the bound its readers were written for.
+    const limit = if (report.kind == .pe) @min(@import("pe_assets.zig").image_limit, snapshot.per_image_limit) else snapshot.per_image_limit;
+    const bytes = snapshot.read(fd, limit, if (state) |p| &p.cancel else null) catch |err| {
         if (err == error.ArchiveCancelled or err == error.OutOfMemory) return err;
         report.status = if (err == error.BinarySnapshotLimit) .limit else .unreadable;
         return;
     };
     var keep = false;
-    defer if (!keep) {
-        _ = c.munmap(bytes.ptr, bytes.len);
-    };
+    defer if (!keep) snapshot.free(bytes);
     const identity = identify(bytes);
     if (!std.mem.eql(u8, &identity.sha256, &report.identity.sha256)) {
         report.status = .content_mismatch;

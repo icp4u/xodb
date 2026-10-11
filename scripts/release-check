@@ -73,7 +73,7 @@ COVERS = (
       'gui-symbol-discovery', 'gui-debug', 'm2-recovery')),
     (('src/binary/*', 'src/model/modules.zig'),
      ('mapping-identity', 'cache-pool', 'object-cache', 'symbol-query', 'module-*', 'source-paths*', 'apk-symbols', 'core-debugging', 'local-large-symbols', 'symbol-discovery*',
-      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget')),
+      'mcp-modules', 'm2-mappings', 'demo-binary', 'gui-symbol-discovery', 'python-image-budget', 'image-budget', 'image-budget-hostile', 'gui-image-budget')),
     (('src/target/*', 'src/runtime/target*', 'src/runtime/process.c', 'src/runtime/watchpoints.c', 'src/runtime/arch.c',
       'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
       'src/runtime/xrt_arch.h', 'src/runtime/xrt_xstate.h', 'src/runtime/xrt_loader.h', 'src/ui/stop.zig', 'src/ui/watch*'),
@@ -343,6 +343,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((f'language-selection-cache-{int(remote)}', [sys.executable, '-B', 'tests/language-selection-cache.py', '--python', python, '--work', f'.work/lc{int(remote)}', *agent], 180))
         storage = ['--storage', os.environ['XODB_LARGE_IMAGE_STORAGE']] if os.environ.get('XODB_LARGE_IMAGE_STORAGE') else []
         steps.append(('local-large-symbols', [sys.executable, '-B', 'tests/local-large-symbols.py', '--work', '.work/ls', *storage], 120))
+        steps.append(('image-budget', [sys.executable, '-B', 'tests/image-budget.py', '--work', '.work/ib'], 60))
+        steps.append(('image-budget-hostile', [sys.executable, '-B', 'tests/image-budget-hostile.py', '--work', '.work/ibh'], 60))
         steps.append(('remote', [sys.executable, '-B', 'tests/remote.py', '--bin', 'zig-out/bin'], 90))
         steps.append(('remote-stops', [sys.executable, '-B', 'tests/remote-stops.py'], 90))
         steps.append(('symbol-discovery', [sys.executable, '-B', 'tests/symbol-discovery.py'], 240))
@@ -485,6 +487,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-restart', ['tests/restart-gui.py', 'zig-out']),
             ('gui-run-control', ['tests/run-control-gui.py']),
             ('gui-inline', ['tests/optimized-gui.py', 'zig-out']),
+            ('gui-image-budget', ['tests/image-budget-gui.py', 'zig-out']),
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),

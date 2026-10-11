@@ -112,7 +112,8 @@ def action(client, name, **arguments):
         return result['structuredContent']
 
 
-c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction else 'chain'])
+# These variants were sized against a 256 MiB image and 512 MiB total budget.
+c = Client('control', str(fixture), args=[str(w), str(w/'oracle'), str(count), 'eviction' if a.eviction else 'chain'], options=['--image-limit', '256M', '--image-total-limit', '512M'])
 report = dict(status='running', baseline=a.baseline, eviction=a.eviction, budget=a.budget, debug_frame=a.debug_frame, companions=companions, full_dwarf=a.full_dwarf, stacks=[])
 try:
     c.stopped()

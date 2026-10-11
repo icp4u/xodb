@@ -1448,25 +1448,66 @@ pub const Session = struct {
         if (symbol.entry == 0 or address != symbol.address) return address;
         return std.math.add(u64, address, symbol.entry) catch address;
     }
+    /// The most addresses one source line may have. A line in a file the
+    /// target mapped thousands of times would otherwise make every caller
+    /// walk them all; no caller uses more than a breakpoint set holds.
+    pub const max_line_addresses = 4096;
+    /// Runtime addresses of `path:line` in every mapped image. Each image is
+    /// read and searched once, through one loaded copy, for every place its
+    /// file is mapped; a file that does not load is tried once. This is a
+    /// sweep (see Modules.Reason): what it left unread for a budget is in
+    /// `modules.skipped()` afterwards, so "no code" is never silently partial.
     pub fn sourceAddresses(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
         try self.refreshMaps();
+        self.modules.beginSweep();
         var addresses: std.ArrayList(u64) = .empty;
         const originals = try self.sourceMaps().originals(a, path);
+        const whole = std.math.maxInt(u64);
+        var tried: std.AutoHashMapUnmanaged([4]u64, void) = .empty; // file and mapping offset
+        var lines: std.AutoHashMapUnmanaged(u64, []const u64) = .empty; // module id: link addresses
+        var placed: std.AutoHashMapUnmanaged([2]u64, void) = .empty; // module id, bias
         for (self.modules.regions.items) |region| {
             if (region.offset != 0 and region.permissions[2] != 'x') continue;
-            const module = self.modules.load(region) catch continue;
-            const debug = module.debugInfo() catch continue;
-            for (originals) |original| {
-                const rows = debug.rowsForLine(a, original, line) catch continue;
-                for (rows) |row| {
-                    const address = self.ppcLineAddress(try module.runtimeAddress(row.address));
-                    var found = false;
-                    for (addresses.items) |old| if (old == address) {
-                        found = true;
-                        break;
-                    };
-                    if (!found) try addresses.append(a, address);
-                }
+            var plain = false;
+            const found = self.modules.instanceOf(region, &plain) orelse instance: {
+                // A mapping of a loaded ELF file that fits none of its segments.
+                if (plain) continue;
+                var key = [4]u64{ region.inode, region.device_major, region.device_minor, whole };
+                if (tried.contains(key)) continue;
+                key[3] = region.offset;
+                if (tried.contains(key)) continue;
+                const module = self.modules.load(region, .sweep) catch |err| {
+                    // A budget refusal is the file's; anything else may be one entry of a container.
+                    if (err == error.BinarySnapshotLimit) key[3] = whole;
+                    try tried.put(a, key, {});
+                    continue;
+                };
+                break :instance Modules.Instance{ .module = module, .bias = module.bias };
+            };
+            const module = found.module;
+            const links = lines.get(module.id) orelse links: {
+                var list: std.ArrayList(u64) = .empty;
+                if (module.debugInfo()) |debug| {
+                    for (originals) |original| {
+                        const rows = debug.rowsForLine(a, original, line) catch continue;
+                        // The ppc64 entry adjustment, taken where the module itself is loaded.
+                        for (rows) |row| try list.append(a, self.ppcLineAddress(try module.runtimeAddress(row.address)) -% module.bias);
+                    }
+                } else |_| {}
+                try lines.put(a, module.id, list.items);
+                break :links list.items;
+            };
+            if (links.len == 0 or (try placed.getOrPut(a, .{ module.id, found.bias })).found_existing) continue;
+            for (links) |link| {
+                const address = std.math.add(u64, link, found.bias) catch return error.InvalidAddress;
+                var seen = false;
+                for (addresses.items) |old| if (old == address) {
+                    seen = true;
+                    break;
+                };
+                if (seen) continue;
+                if (addresses.items.len == max_line_addresses) return error.SourceLineAddressLimit;
+                try addresses.append(a, address);
             }
         }
         if (addresses.items.len == 0) return error.NoCodeForSourceLine;

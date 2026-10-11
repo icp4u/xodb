@@ -8,6 +8,7 @@ const pe = @import("../model/pe_images.zig");
 const snapshot = @import("../binary/snapshot.zig");
 const windows = @import("../debug/windows.zig");
 pub const metadata_limit: usize = 256 * 1024 * 1024;
+pub const image_limit: usize = 256 * 1024 * 1024;
 pub const Placement = struct { device_major: u64, device_minor: u64, inode: u64, bias: u64, start: u64, end: u64 };
 pub const Asset = struct {
     id: u64,
@@ -33,7 +34,7 @@ pub const Asset = struct {
     }
     pub fn deinit(self: *Asset, a: std.mem.Allocator) void {
         c.xpe_destroy(self.image);
-        _ = c.munmap(self.mapping.ptr, self.mapping.len);
+        snapshot.free(self.mapping);
         a.free(self.path);
         a.destroy(self);
     }
@@ -93,7 +94,7 @@ pub const Assets = struct {
 /// Capture the exact pinned file version and prove its stopped placement again.
 /// Later code reads use this immutable file; in-place code changes during the
 /// capture have the same explicit coverage limitation as ELF CFI attribution.
-pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: *const pe.Entry, id: u64, limit: usize) !*Asset {
+pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: *const pe.Entry, id: u64) !*Asset {
     if (rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
     if (rt.xrt_target_shared_vm(target)) return error.PeSharedVmUnavailable;
     var context = TargetReader{ .target = target, .base = entry.start };
@@ -105,11 +106,10 @@ pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: 
     try runtime.check(@intCast(c.xrt_target_file_open(@ptrCast(target), &request, &fd, &identity)));
     defer _ = c.close(fd);
     if (!std.meta.eql(identity, entry.identity)) return error.BinaryChangedDuringRead;
-    const bytes = try snapshot.read(fd, @min(snapshot.per_image_limit, limit), null);
+    // PE readers keep their 256 MiB image bound whatever the ELF budget is.
+    const bytes = try snapshot.read(fd, @min(image_limit, snapshot.per_image_limit), null);
     var owned_bytes = true;
-    errdefer if (owned_bytes) {
-        _ = c.munmap(bytes.ptr, bytes.len);
-    };
+    errdefer if (owned_bytes) snapshot.free(bytes);
     try runtime.check(@intCast(c.xrt_file_unchanged(fd, &entry.identity)));
     const original = entry.image() orelse return error.SymbolDiscoveryPending;
     const size = c.xpe_info(original).*.image_size;

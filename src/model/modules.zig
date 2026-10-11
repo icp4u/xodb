@@ -86,7 +86,62 @@ pub const Modules = struct {
     /// `unexamined` is the first image whose symbols could not be read.
     pub const Definers = struct { modules: []const *Module, unexamined: ?anyerror };
     const DefinerScan = struct { name: []const u8 = "", revision: u64 = 0, cursor: SymbolCursor = .{}, done: bool = false, count: usize = 0, modules: [4]*Module = undefined };
-    pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8 };
+    /// `detail` names the size and budget of an image refused in full.
+    pub const LoadFailure = struct { start: u64, end: u64, path: []const u8, diagnostic: []const u8, detail: ?[]const u8 = null, budget: ?snapshot.Refusal = null };
+    /// Local symbol views above this size use the cancellable worker.
+    const symbol_immediate_limit = 256 * 1024 * 1024;
+    /// What a name lookup may read in full of images that have no
+    /// symbols-only view: one image, and all of them for one process.
+    const lookup_image_limit = 256 * 1024 * 1024;
+    const lookup_total_limit = 512 * 1024 * 1024;
+    /// Why a name lookup wants an image in full; see `lookupRead`.
+    const Unviewed = enum { no_reader, container, tables };
+    /// Why an image is wanted in full; `allowance` turns it into a bound.
+    ///   frame    a stack frame in it, or an address the user gave
+    ///   name     a name lookup that has no symbols-only view of it
+    ///   runtime  a language view found its runtime's symbol in it
+    ///   restore  a saved breakpoint was set in it
+    ///   sweep    a search of every mapped image: a source line, the start
+    ///            of a capture, an observation recipe
+    pub const Reason = enum { frame, name, runtime, restore, sweep };
+    const Bound = struct { each: u64, pool: enum { lookups, sweeps }, which: @FieldType(snapshot.Refusal, "which") };
+    /// A loaded image and one load bias its file is mapped at.
+    pub const Instance = struct { module: *Module, bias: u64 };
+    /// Images the sweeps since `beginSweep` left unread for a budget: how
+    /// many files, and the first one's sentence (valid until the next one).
+    pub const Skipped = struct { count: usize = 0, first: ?[]const u8 = null };
+    /// The mappings of one file and, per image inside it, where each load
+    /// bias places it. Built once per map revision, so placing every mapping
+    /// of a file costs mappings x segments, not that squared.
+    const FileRef = struct { inode: u64, device_major: u64, device_minor: u64, path: []const u8 };
+    const FileRefContext = struct {
+        pub fn hash(_: @This(), k: FileRef) u64 {
+            var h = std.hash.Wyhash.init(0);
+            h.update(std.mem.asBytes(&[3]u64{ k.inode, k.device_major, k.device_minor }));
+            h.update(k.path);
+            return h.final();
+        }
+        pub fn eql(_: @This(), a: FileRef, b: FileRef) bool {
+            return a.inode == b.inode and a.device_major == b.device_major and a.device_minor == b.device_minor and std.mem.eql(u8, a.path, b.path);
+        }
+    };
+    /// `first` is a region index: the header mapping, or a lower one that fits.
+    const Extent = struct { first: u32, start: u64, end: u64 };
+    /// For one image in a file: what each load bias covers, and the bias of
+    /// each mapping (by region index), or that two fit it.
+    const Placed = struct {
+        file_offset: u64,
+        segments: u64,
+        /// Why this image cannot be placed in this map, once that is known.
+        refused: ?anyerror = null,
+        biases: std.AutoHashMapUnmanaged(u64, Extent) = .empty,
+        fits: std.AutoHashMapUnmanaged(u32, ?u64) = .empty,
+        fn deinit(self: *Placed, a: std.mem.Allocator) void {
+            self.biases.deinit(a);
+            self.fits.deinit(a);
+        }
+    };
+    const FileMaps = struct { regions: std.ArrayList(u32) = .empty, placed: std.ArrayList(Placed) = .empty };
     target: ?*const rt.struct_xrt_target = null,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
     expected_machine: ?u16 = null,
@@ -100,11 +155,37 @@ pub const Modules = struct {
     pe_images: pe.State = .{},
     file_kinds: std.AutoHashMapUnmanaged(FileKey, FileKind) = .empty,
     file_kind_reads: u64 = 0,
+    /// Files whose symbols-only view failed for good, for this map.
+    /// Asking again would only restart a reader that must fail again.
+    symbol_refusals: std.AutoHashMapUnmanaged(FileKey, anyerror) = .empty,
+    /// The one file a name lookup may read in full when its symbol tables
+    /// are too large for the symbols-only view: the main executable.
+    name_fallback: ?FileKey = null,
+    /// Region index of the first image the last findSymbol could not search
+    /// by name, for this map.
+    unsearched: ?struct { region: usize, revision: u64 } = null,
     maps_revision: u64 = 0,
     pe_scan_next: usize = 0,
     pid: i32 = 0,
     immutable: bool = false,
+    /// Full-image bytes this owner holds; the budget is the process-wide one.
     snapshot_bytes: usize = 0,
+    /// The part of `snapshot_bytes` name lookups read under the fixed bounds.
+    lookup_bytes: usize = 0,
+    /// The part sweeps read, taken from the process-wide sweep allowance.
+    sweep_bytes: usize = 0,
+    sweep_skipped: std.AutoHashMapUnmanaged(FileKey, void) = .empty,
+    sweep_first: ?[]u8 = null,
+    /// The executable's full read for a name, when it failed for this map.
+    fallback_failure: ?struct { revision: u64, err: anyerror } = null,
+    /// Mappings by file, with their placements; valid for `placed_for`.
+    file_maps: std.HashMapUnmanaged(FileRef, FileMaps, FileRefContext, 80) = .empty,
+    region_starts: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    placed_for: ?struct { revision: u64, regions: usize } = null,
+    /// Placement steps spent on this map revision; see `placement_work`.
+    placement_spent: u64 = 0,
+    /// Why the load in progress was refused; noteFailure takes it.
+    refusal: ?snapshot.Refusal = null,
     debug_files: ?*@import("../binary/debug_files.zig").Files = null,
     load_failures: std.ArrayList(LoadFailure) = .empty,
     budget_reported: ?struct { loaded: usize, deferred: usize } = null,
@@ -130,6 +211,13 @@ pub const Modules = struct {
         self.reportBudget();
         self.pe_images.deinit(self.allocator);
         self.file_kinds.deinit(self.allocator);
+        self.symbol_refusals.deinit(self.allocator);
+        self.beginSweep();
+        self.sweep_skipped.deinit(self.allocator);
+        snapshot.releaseSweep(self.sweep_bytes);
+        self.dropPlacements();
+        self.file_maps.deinit(self.allocator);
+        self.region_starts.deinit(self.allocator);
         self.cancelSymbolJob();
         for (self.symbol_images.items) |*item| {
             _ = c.munmap(item.bytes.ptr, item.bytes.len);
@@ -162,7 +250,7 @@ pub const Modules = struct {
             if (m.go_value_layout) |layout| m.debug_allocator.destroy(layout);
             if (m.go_map_layout) |layout| m.debug_allocator.destroy(layout);
             if (m.debug) |*info| info.deinit();
-            if (m.owns_mapping) _ = c.munmap(m.mapping.ptr, m.mapping.len);
+            if (m.owns_mapping) snapshot.free(m.mapping);
             self.allocator.free(m.path);
             self.allocator.destroy(m);
         }
@@ -181,8 +269,8 @@ pub const Modules = struct {
             defer _ = c.close(fd);
             var stat: c.struct_stat = undefined;
             if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.CoreExecutableUnavailable;
-            const data = try snapshot.readRange(fd, 0, @intCast(stat.st_size), snapshot.per_image_limit, null);
-            defer _ = c.munmap(data.ptr, data.len);
+            const data = try snapshot.readRange(fd, 0, std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit, snapshot.per_image_limit, null);
+            defer snapshot.free(data);
             const image = try elf.Image.parse(data);
             const id = image.buildId() orelse return error.CoreExecutableBuildIdMissing;
             const path = try self.allocator.dupeZ(u8, std.mem.span(real));
@@ -271,12 +359,14 @@ pub const Modules = struct {
         }
         if (c.ferror(file) != 0) return error.ProcessMapsUnavailable;
         self.pruneFileKinds(new_regions.items);
+        self.dropPlacements();
         self.clearFailures();
         self.relabelRegions(new_regions.items);
         for (self.regions.items) |r| self.allocator.free(r.path);
         self.regions.deinit(self.allocator);
         self.regions = new_regions;
         self.budget_dirty = true;
+        self.symbol_refusals.clearRetainingCapacity();
         self.maps_revision +|= 1;
         self.pe_scan_next = 0;
     }
@@ -310,18 +400,74 @@ pub const Modules = struct {
             item.file_source = source;
         };
     }
-    pub fn load(self: *Modules, region: Region) !*Module {
+    pub fn load(self: *Modules, region: Region, why: Reason) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, false) catch |err| {
+        return self.loadRange(region, false, why) catch |err| {
+            if (why == .sweep) self.noteSkipped(region, err);
             self.noteFailure(region, err);
             return err;
         };
     }
+    /// The one place that says how much of an image a reader may take, by
+    /// why it asks. Null is the image budgets alone. An image this owner has
+    /// loaded already never gets here: it costs nothing whoever asks.
+    fn allowance(self: *Modules, why: Reason, r: Region) ?Bound {
+        return switch (why) {
+            // The user is stopped there, or named the address.
+            .frame => null,
+            // A saved breakpoint names its own image. Through a runtime
+            // agent only a container entry gets here.
+            .restore => if (rt.xrt_target_is_remote(self.target)) .{ .each = lookup_image_limit, .pool = .lookups, .which = .lookup } else null,
+            // See lookupRead: the main executable, or an image with no
+            // symbols-only view.
+            .name => if (self.nameFallback(r)) null else .{ .each = lookup_image_limit, .pool = .lookups, .which = .lookup },
+            .runtime => if (self.nameFallback(r)) null else .{ .each = lookup_image_limit, .pool = .lookups, .which = .runtime },
+            // One request, every file the target mapped: the main executable
+            // under the image budgets, the rest within the sweep allowance,
+            // so that the frames of the current stop still find room.
+            .sweep => if (self.mainExecutable(r)) null else .{ .each = snapshot.sweep_image_limit, .pool = .sweeps, .which = .sweep },
+        };
+    }
+    /// Forget what earlier sweeps skipped; call before a search of every image.
+    pub fn beginSweep(self: *Modules) void {
+        self.sweep_skipped.clearRetainingCapacity();
+        if (self.sweep_first) |text| self.allocator.free(text);
+        self.sweep_first = null;
+    }
+    pub fn skipped(self: *const Modules) Skipped {
+        return .{ .count = self.sweep_skipped.count(), .first = self.sweep_first };
+    }
+    fn noteSkipped(self: *Modules, region: Region, err: anyerror) void {
+        if (err != error.BinarySnapshotLimit) return;
+        const entry = self.sweep_skipped.getOrPut(self.allocator, fileKey(region)) catch return;
+        if (entry.found_existing or self.sweep_first != null) return;
+        var text: [snapshot.refusal_text]u8 = undefined;
+        if (self.refusal) |why| self.sweep_first = self.allocator.dupe(u8, why.write(&text, region.path)) catch null;
+    }
+    /// The image of `region`'s file that this owner holds, and the load bias
+    /// `region` maps it at: every mapping of one file is searched through one
+    /// image, however many times and wherever the target mapped it. `plain`
+    /// is set when the file is one ELF image, so that a mapping of it which
+    /// fits nowhere need not be tried on its own.
+    pub fn instanceOf(self: *Modules, region: Region, plain: *bool) ?Instance {
+        for (self.loaded.items) |m| {
+            if (m.inode != region.inode or m.device_major != region.device_major or m.device_minor != region.device_minor or (self.core_source == null and !std.mem.eql(u8, m.path, region.path))) continue;
+            if (m.file_offset == 0) plain.* = true;
+            const p = self.placement(&m.image, m.file_offset, region, false) catch continue;
+            return .{ .module = m, .bias = p.bias };
+        }
+        return null;
+    }
     fn clearFailures(self: *Modules) void {
-        for (self.load_failures.items) |failure| self.allocator.free(failure.path);
+        for (self.load_failures.items) |failure| {
+            self.allocator.free(failure.path);
+            if (failure.detail) |detail| self.allocator.free(detail);
+        }
         self.load_failures.clearRetainingCapacity();
     }
     fn noteFailure(self: *Modules, region: Region, err: anyerror) void {
+        const why = self.refusal;
+        self.refusal = null;
         if (err == error.NotElf or err == error.NoBinaryImage) return;
         if (err == error.BinarySnapshotLimit) {
             for (self.regions.items) |*item| if (sameFile(item.*, region)) {
@@ -329,11 +475,29 @@ pub const Modules = struct {
                 item.full_image_deferred = true;
             };
         }
-        for (self.load_failures.items) |failure| if (std.mem.eql(u8, failure.path, region.path) and std.mem.eql(u8, failure.diagnostic, @errorName(err))) return;
-        if (self.load_failures.items.len >= 64) return;
-        const path = self.allocator.dupe(u8, region.path) catch return;
-        self.load_failures.append(self.allocator, .{ .start = region.start, .end = region.end, .path = path, .diagnostic = @errorName(err) }) catch {
+        var text: [snapshot.refusal_text]u8 = undefined;
+        const detail = if (err == error.BinarySnapshotLimit and why != null) self.allocator.dupe(u8, why.?.write(&text, region.path)) catch null else null;
+        for (self.load_failures.items) |*failure| if (std.mem.eql(u8, failure.path, region.path) and std.mem.eql(u8, failure.diagnostic, @errorName(err))) {
+            // One row per image; its sentence is the latest refusal's, which
+            // is the one about what was just asked for.
+            if (detail) |latest| {
+                if (failure.detail) |old| self.allocator.free(old);
+                failure.detail = latest;
+                failure.budget = why;
+            }
+            return;
+        };
+        if (self.load_failures.items.len >= 64) {
+            if (detail) |owned| self.allocator.free(owned);
+            return;
+        }
+        const path = self.allocator.dupe(u8, region.path) catch {
+            if (detail) |owned| self.allocator.free(owned);
+            return;
+        };
+        self.load_failures.append(self.allocator, .{ .start = region.start, .end = region.end, .path = path, .diagnostic = @errorName(err), .detail = detail, .budget = if (detail != null) why else null }) catch {
             self.allocator.free(path);
+            if (detail) |owned| self.allocator.free(owned);
             return;
         };
         if (err != error.BinarySnapshotLimit)
@@ -362,13 +526,35 @@ pub const Modules = struct {
         const counts = .{ .loaded = self.loaded.items.len, .deferred = deferred };
         self.budget_reported = .{ .loaded = counts.loaded, .deferred = counts.deferred };
         self.budget_reported_generation = self.budget_generation;
-        std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred\n", .{ counts.loaded, counts.deferred });
+        if (self.budgetDetail(null)) |detail|
+            std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred; {s}\n", .{ counts.loaded, counts.deferred, detail })
+        else
+            std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred\n", .{ counts.loaded, counts.deferred });
+    }
+    /// The image, its size and the budget for a full image refused at
+    /// `address`, or for the first one refused when no address is given.
+    /// Valid until the next map refresh.
+    pub fn budgetDetail(self: *const Modules, address: ?u64) ?[]const u8 {
+        return if (self.budgetFailure(address)) |failure| failure.detail else null;
+    }
+    pub fn budgetFailure(self: *const Modules, address: ?u64) ?LoadFailure {
+        const path: ?[]const u8 = if (address) |at_| for (self.regions.items) |region| {
+            if (at_ >= region.start and at_ < region.end) break region.path;
+        } else return null else null;
+        for (self.load_failures.items) |failure| {
+            if (path) |wanted| if (!std.mem.eql(u8, wanted, failure.path)) continue;
+            if (failure.detail != null) return failure;
+        }
+        return null;
     }
     /// A perf record describes one range at one file offset, not the current
     /// collection of VMAs. Do not combine it with the opening/live map snapshot.
     pub fn loadObserved(self: *Modules, region: Region) !*Module {
         if (region.path.len == 0 or region.path[0] != '/') return error.NoBinaryImage;
-        return self.loadRange(region, true);
+        return self.loadRange(region, true, .sweep) catch |err| {
+            self.noteSkipped(region, err);
+            return err;
+        };
     }
     fn pageSize(self: *const Modules) !u64 {
         const result = rt.xrt_target_page_size(self.target);
@@ -379,55 +565,150 @@ pub const Modules = struct {
         return a.inode == b.inode and a.device_major == b.device_major and a.device_minor == b.device_minor and std.mem.eql(u8, a.path, b.path);
     }
     const Placement = struct { first: Region, end: u64, bias: u64 };
-    fn placement(self: *Modules, image: *const elf.Image, file_offset: u64, region: Region, observed: bool) !Placement {
-        if (region.offset < file_offset) return error.BadMapping;
-        var relative = region;
-        relative.offset -= file_offset;
-        if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
-        const page = try self.pageSize();
+    /// Placement steps (mappings of a file x its segments) allowed per map
+    /// revision. Measured at 5 to 15 ns a step, this is one to two seconds
+    /// of work. A process with 60,000 mappings of an ordinary 13-segment
+    /// image spends under a hundredth of it; reaching it takes tens of
+    /// thousands of mappings of files with thousands of program headers.
+    const placement_work = 1 << 27;
+    const placement_free = 4096;
+    fn dropPlacements(self: *Modules) void {
+        var files = self.file_maps.valueIterator();
+        while (files.next()) |file| {
+            for (file.placed.items) |*item| item.deinit(self.allocator);
+            file.placed.deinit(self.allocator);
+            file.regions.deinit(self.allocator);
+        }
+        self.file_maps.clearRetainingCapacity();
+        self.region_starts.clearRetainingCapacity();
+        self.placed_for = null;
+        self.placement_spent = 0;
+    }
+    /// Where each load bias places the image at `file_offset` of `region`'s
+    /// file, from every mapping of that file in the current map.
+    fn placedIn(self: *Modules, image: *const elf.Image, file_offset: u64, region: Region, page: u64) !*const Placed {
+        const a = self.allocator;
+        const current = self.placed_for;
+        if (current == null or current.?.revision != self.maps_revision or current.?.regions != self.regions.items.len) {
+            self.dropPlacements();
+            if (self.regions.items.len > std.math.maxInt(u32)) return error.MappingLimit;
+            errdefer self.dropPlacements();
+            for (self.regions.items, 0..) |r, i| {
+                try self.region_starts.put(a, r.start, @intCast(i));
+                if (r.path.len == 0) continue;
+                const entry = try self.file_maps.getOrPut(a, .{ .inode = r.inode, .device_major = r.device_major, .device_minor = r.device_minor, .path = r.path });
+                if (!entry.found_existing) entry.value_ptr.* = .{};
+                try entry.value_ptr.regions.append(a, @intCast(i));
+            }
+            self.placed_for = .{ .revision = self.maps_revision, .regions = self.regions.items.len };
+        }
+        const file = self.file_maps.getPtr(.{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = region.path }) orelse return error.BadMapping;
+        for (file.placed.items) |*old| if (old.file_offset == file_offset and old.segments == image.segment_print) {
+            if (old.refused) |err| return err;
+            return old;
+        };
+        var memo = Placed{ .file_offset = file_offset, .segments = image.segment_print };
+        self.fillPlaced(&memo, image, file, page) catch |err| {
+            memo.deinit(a);
+            // Asked once per mapping; the answer is the same each time.
+            if (err != error.MappingLimit and err != error.NoLoadSegment and err != error.BadMapping) return err;
+            memo = .{ .file_offset = file_offset, .segments = image.segment_print, .refused = err };
+            if (err == error.MappingLimit) self.noteFailure(region, err);
+        };
+        // One image per offset in practice; a changed file replaces its entry.
+        const slot = for (file.placed.items) |*old| {
+            if (old.file_offset == file_offset) {
+                old.deinit(a);
+                break old;
+            }
+        } else file.placed.addOne(a) catch |err| {
+            memo.deinit(a);
+            return err;
+        };
+        slot.* = memo;
+        if (slot.refused) |err| return err;
+        return slot;
+    }
+    fn fillPlaced(self: *Modules, memo: *Placed, image: *const elf.Image, file: *const FileMaps, page: u64) !void {
+        const a = self.allocator;
+        const file_offset = memo.file_offset;
         var first_segment: ?elf.Segment = null;
         for (0..image.header.segment_count) |i| {
             const segment = try image.segment(@intCast(i));
             if (segment.type == .load and (first_segment == null or segment.vaddr < first_segment.?.vaddr)) first_segment = segment;
         }
         const segment = first_segment orelse return error.NoLoadSegment;
-        const header_offset = std.math.add(u64, file_offset, segment.offset - segment.offset % page) catch return error.BadMapping;
-        var found: ?Placement = null;
-        for (self.regions.items) |r| {
-            if (!sameFile(r, region) or r.offset != header_offset) continue;
-            const bias = image.loadBias(r.start, r.offset - file_offset) catch continue;
-            if (!mappingFits(image, relative, bias, page)) continue;
-            if (found != null and found.?.bias != bias) return error.AmbiguousLoadBias;
-            found = .{ .first = r, .end = r.end, .bias = bias };
+        const lead = segment.offset % page;
+        const header_offset = std.math.add(u64, file_offset, segment.offset - lead) catch return error.BadMapping;
+        // The target chooses both counts. What is refused is real work, and
+        // it is listed with the other images that could not be used.
+        const work = std.math.mul(u64, file.regions.items.len, @max(image.header.segment_count, 1)) catch std.math.maxInt(u64);
+        // An ordinary library is a few dozen steps. Small placements are
+        // neither refused nor counted, so a file that spends the allowance
+        // cannot take the names of the libraries beside it.
+        if (work >= placement_free) {
+            if (work > placement_work - self.placement_spent) return error.MappingLimit;
+            self.placement_spent += work;
         }
-        var result = found orelse return error.BadMapping;
-        for (self.regions.items) |r| {
-            if (!sameFile(r, region) or r.offset < file_offset) continue;
-            var rel = r;
+
+        // A header mapping gives a bias, as Image.loadBias computes it.
+        if (lead <= segment.vaddr and (segment.alignment <= 1 or lead < segment.alignment)) for (file.regions.items) |index| {
+            const r = self.regions.items[index];
+            if (r.offset == header_offset) try memo.biases.put(a, r.start -% (segment.vaddr - lead), .{ .first = index, .start = r.start, .end = r.end });
+        };
+        for (file.regions.items) |index| {
+            var rel = self.regions.items[index];
+            if (rel.offset < file_offset) continue;
             rel.offset -= file_offset;
-            if (!mappingFits(image, rel, result.bias, page)) continue;
-            if (r.start < result.first.start) result.first = r;
-            result.end = @max(result.end, r.end);
+            for (0..image.header.segment_count) |i| {
+                const bias = fitBias(image.segment(@intCast(i)) catch continue, rel, page) orelse continue;
+                const extent = memo.biases.getPtr(bias) orelse continue;
+                if (rel.start < extent.start) extent.* = .{ .first = index, .start = rel.start, .end = extent.end };
+                extent.end = @max(extent.end, rel.end);
+                const fit = try memo.fits.getOrPut(a, index);
+                if (!fit.found_existing) fit.value_ptr.* = bias else if (fit.value_ptr.* != bias) fit.value_ptr.* = null;
+            }
         }
-        return result;
     }
-    fn mappingFits(image: *const elf.Image, r: Region, bias: u64, page: u64) bool {
-        if (r.end <= r.start) return false;
-        for (0..image.header.segment_count) |i| {
-            const segment = image.segment(@intCast(i)) catch continue;
-            if (segment.type != .load or segment.file_size == 0) continue;
-            if (r.permissions[2] == 'x' and segment.flags & elf.pf.x == 0) continue;
-            if (r.permissions[1] == 'w' and segment.flags & elf.pf.w == 0) continue;
-            const low = segment.offset - segment.offset % page;
-            const segment_end = std.math.add(u64, segment.offset, segment.file_size) catch continue;
-            const high = std.math.add(u64, segment_end, page - 1) catch continue;
-            const file_end = high - high % page;
-            if (r.offset < low or r.offset >= file_end or r.end - r.start > file_end - r.offset) continue;
-            const virtual = std.math.sub(u64, segment.vaddr, segment.offset - low) catch continue;
-            const address = std.math.add(u64, bias, virtual) catch continue;
-            if ((std.math.add(u64, address, r.offset - low) catch continue) == r.start) return true;
+    fn placement(self: *Modules, image: *const elf.Image, file_offset: u64, region: Region, observed: bool) !Placement {
+        if (region.offset < file_offset) return error.BadMapping;
+        var relative = region;
+        relative.offset -= file_offset;
+        if (observed) return .{ .first = region, .end = region.end, .bias = try observedBias(image, relative) };
+        const page = try self.pageSize();
+        const memo = try self.placedIn(image, file_offset, region, page);
+        // The bias is one a header mapping gives and this mapping fits. For a
+        // mapping of the current map that was settled when the file was placed.
+        var found: ?u64 = null;
+        const known: ?u32 = if (self.region_starts.get(region.start)) |index| blk: {
+            const r = self.regions.items[index];
+            break :blk if (r.end == region.end and r.offset == region.offset and std.mem.eql(u8, &r.permissions, &region.permissions) and sameFile(r, region)) index else null;
+        } else null;
+        if (known) |index| {
+            found = (memo.fits.get(index) orelse return error.BadMapping) orelse return error.AmbiguousLoadBias;
+        } else for (0..image.header.segment_count) |i| {
+            const bias = fitBias(image.segment(@intCast(i)) catch continue, relative, page) orelse continue;
+            if (!memo.biases.contains(bias)) continue;
+            if (found != null and found.? != bias) return error.AmbiguousLoadBias;
+            found = bias;
         }
-        return false;
+        const bias = found orelse return error.BadMapping;
+        const extent = memo.biases.get(bias).?;
+        return .{ .first = self.regions.items[extent.first], .end = extent.end, .bias = bias };
+    }
+    /// The load bias under which `r` maps file pages of `segment`, if any.
+    fn fitBias(segment: elf.Segment, r: Region, page: u64) ?u64 {
+        if (r.end <= r.start or segment.type != .load or segment.file_size == 0) return null;
+        if (r.permissions[2] == 'x' and segment.flags & elf.pf.x == 0) return null;
+        if (r.permissions[1] == 'w' and segment.flags & elf.pf.w == 0) return null;
+        const low = segment.offset - segment.offset % page;
+        const segment_end = std.math.add(u64, segment.offset, segment.file_size) catch return null;
+        const high = std.math.add(u64, segment_end, page - 1) catch return null;
+        const file_end = high - high % page;
+        if (r.offset < low or r.offset >= file_end or r.end - r.start > file_end - r.offset) return null;
+        const virtual = std.math.sub(u64, segment.vaddr, segment.offset - low) catch return null;
+        const address = std.math.sub(u64, r.start, r.offset - low) catch return null;
+        return std.math.sub(u64, address, virtual) catch null;
     }
     fn cachedRange(self: *Modules, region: Region, observed: bool) ?*Module {
         for (self.loaded.items) |m| {
@@ -437,7 +718,8 @@ pub const Modules = struct {
         }
         return null;
     }
-    fn loadRange(self: *Modules, region: Region, observed: bool) !*Module {
+    fn loadRange(self: *Modules, region: Region, observed: bool, why: Reason) !*Module {
+        self.refusal = null;
         if (self.cachedRange(region, observed)) |module| return module;
         const expected = if (self.core_source != null) try self.coreId(region.path) else null;
         const selected_path = if (self.core_executable) |exe| (if (expected != null and std.mem.eql(u8, expected.?, exe.id)) exe.path else region.path) else region.path;
@@ -446,7 +728,11 @@ pub const Modules = struct {
         // Only read the inode actually mapped by the target. map_files can need
         // privileges unavailable to run-as, so exe/path retain inode checks.
         var source: mapped_file.Source = if (self.core_source != null) .core_path else .unopened;
-        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else try mapped_file.openResolved(self.target, self.pid, region, null, &source);
+        const fd = if (self.core_source != null) c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK) else mapped_file.openResolved(self.target, self.pid, region, null, &source) catch |err| {
+            // A runtime agent refuses whole files above its own fixed cap.
+            if (err == error.BinarySnapshotLimit) self.refusal = .{ .size = 0, .limit = snapshot.remote_image_limit, .which = .remote };
+            return err;
+        };
         if (fd < 0) return error.BinaryIdentityUnavailable;
         defer _ = c.close(fd);
         try self.verifySymbolIdentity(region, fd);
@@ -454,8 +740,29 @@ pub const Modules = struct {
         if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.BinaryUnavailable;
         var signature: [4]u8 = undefined;
         if (c.pread(fd, &signature, signature.len, 0) != signature.len) return error.NotElf;
-        const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = @intCast(stat.st_size) } else try apk.find(self.allocator, fd, @intCast(stat.st_size), region.offset);
+        const file_size = std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit;
+        const entry: apk.Entry = if (std.mem.eql(u8, &signature, "\x7fELF")) .{ .offset = 0, .size = file_size } else try apk.find(self.allocator, fd, file_size, region.offset);
         if (entry.offset % try self.pageSize() != 0) return error.ApkEntryNotPageAligned;
+        // Some readers keep fixed bounds whatever the image budgets are.
+        const bound = self.allowance(why, region);
+        var swept: usize = 0;
+        errdefer snapshot.releaseSweep(swept);
+        if (bound) |b| {
+            // A sweep reads for free what some reader in the process holds.
+            const free = b.pool == .sweeps and snapshot.holds(fd, entry.offset, entry.size);
+            const left = if (b.pool == .sweeps) snapshot.sweepLeft() else lookup_total_limit -| self.lookup_bytes;
+            const refused = snapshot.Refusal{ .size = entry.size, .limit = @min(b.each, left), .which = b.which, .stack_loads = if (b.which == .runtime) self.stackLoads(region) else null };
+            if (!free) {
+                if (entry.size > b.each or entry.size > left) {
+                    self.refusal = refused;
+                    return error.BinarySnapshotLimit;
+                }
+                if (b.pool == .sweeps) swept = snapshot.reserveSweep(entry.size) catch |err| {
+                    self.refusal = refused;
+                    return err;
+                };
+            }
+        }
         if (self.core_source == null and !rt.xrt_target_is_remote(self.target)) {
             var identity: rt.struct_xrt_file_identity = undefined;
             try runtime_api.check(rt.xrt_file_identity(fd, &identity));
@@ -463,8 +770,13 @@ pub const Modules = struct {
         }
         // MAP_PRIVATE still faults against the file after truncation. Parsed
         // ELF/libdw slices must only reference owned, bounded snapshots.
-        const mapped = try snapshot.readRange(fd, entry.offset, entry.size, @min(snapshot.per_image_limit, snapshot.total_limit - self.snapshot_bytes), null);
-        errdefer _ = c.munmap(mapped.ptr, mapped.len);
+        // The reader shares a version another owner holds and charges the
+        // process-wide total for a new one; it says no before allocating.
+        const mapped = snapshot.readRange(fd, entry.offset, entry.size, snapshot.per_image_limit, null) catch |err| {
+            if (err == error.BinarySnapshotLimit) self.refusal = snapshot.refusal(entry.size);
+            return err;
+        };
+        errdefer snapshot.free(mapped);
         // The source may change between the pre-read identity check and the
         // snapshot reader's own initial stat. Recheck the retained version too.
         try self.verifySymbolIdentity(region, fd);
@@ -491,6 +803,10 @@ pub const Modules = struct {
         }
         try self.loaded.append(self.allocator, module);
         self.snapshot_bytes += mapped.len;
+        if (bound) |b| if (b.pool == .lookups) {
+            self.lookup_bytes += mapped.len;
+        };
+        self.sweep_bytes += swept;
         self.budget_dirty = true;
         self.recordSource(region, source);
         for (self.regions.items) |*item| if (sameFile(item.*, region)) {
@@ -532,10 +848,28 @@ pub const Modules = struct {
         return error.UnmappedAddress;
     }
     pub fn at(self: *Modules, address: u64) !*Module {
+        return self.atFor(address, .frame);
+    }
+    fn atFor(self: *Modules, address: u64, why: Reason) !*Module {
         if (self.cachedAt(address)) |module| return module else |_| {}
         if (self.peAt(address)) |_| return error.PeDebugInfoUnavailable else |err| if (err != error.NotPe) return err;
-        for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r);
+        for (self.regions.items) |r| if (address >= r.start and address < r.end) return self.load(r, why);
         return error.UnmappedAddress;
+    }
+    /// Whether a stack frame in the file loads it in full, which only an
+    /// image with debug info does (see prefersUnwindMetadata); null when
+    /// that is not known yet. Nothing is read to answer.
+    fn stackLoads(self: *Modules, region: Region) ?bool {
+        const index = self.identityIndex(region);
+        if (index) |i| if (self.identities.items[i].metadata_only) |decision| return !decision;
+        for (self.symbol_images.items) |*item| if (sameFile(item.region, region)) {
+            if (item.image.sectionByName(".debug_info") != null or item.image.sectionByName(".zdebug_info") != null or
+                item.image.sectionByName(".debug_frame") != null or item.image.sectionByName(".zdebug_frame") != null) return true;
+            if (self.debug_files == null) return false;
+            const decided = self.identities.items[index orelse return null].companion orelse return null;
+            return decided == .found;
+        };
+        return null;
     }
     /// Keep ordinary stripped-library stack frames on the bounded CFI path.
     /// Full DWARF (including verified companions) retains source/inline views.
@@ -610,28 +944,16 @@ pub const Modules = struct {
     }
     pub fn findSymbol(self: *Modules, name: []const u8) !Symbol {
         defer self.reportBudget();
-        if (rt.xrt_target_is_remote(self.target) or !self.immutable) {
-            var cursor = SymbolCursor{};
-            return self.symbolLookup(name, false, &cursor);
-        }
-        // APKs have no offset-zero ELF mapping. Executable VMAs identify their
-        // embedded libraries; Modules.load deduplicates the other mappings.
-        var failure: ?anyerror = null;
-        for (self.regions.items) |r| {
-            if ((r.offset != 0 and r.permissions[2] != 'x') or r.path.len == 0 or r.path[0] != '/') continue;
-            const module = self.load(r) catch |err| {
-                if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
-                continue;
-            };
-            const symbol = module.symbols().findSymbol(name) orelse continue;
-            if (!symbol.hasAddress()) continue;
-            return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
-        }
-        return failure orelse error.SymbolNotFound;
+        self.unsearched = null;
+        var cursor = SymbolCursor{};
+        return self.symbolLookup(name, false, true, &cursor);
     }
-    /// The mapped images defining `name`, each loaded in full. Images without
+    /// The mapped images defining `name`, each loaded in full within the
+    /// bounds `definerRead` gives. Images without
     /// it are read through the bounded symbol views, so a runtime search does
-    /// not spend the full-image budget on every library. The scan is kept for
+    /// not spend the full-image budget on every library. An image whose
+    /// tables are too large for that view is reported in `unexamined`, never
+    /// read in full to look. The scan is kept for
     /// the current map snapshot: a repeated lookup neither reopens every file
     /// nor restarts a pending large-file read. `name` must outlive the session.
     pub fn definers(self: *Modules, name: []const u8) !Definers {
@@ -641,12 +963,17 @@ pub const Modules = struct {
         } else return error.SymbolDefinerLimit;
         if (scan.name.len == 0 or scan.revision != self.maps_revision) scan.* = .{ .name = name, .revision = self.maps_revision };
         scanning: while (!scan.done) {
-            const symbol = self.symbolLookup(name, false, &scan.cursor) catch |err| {
+            const symbol = self.symbolLookup(name, false, false, &scan.cursor) catch |err| {
                 if (scan.cursor.next < self.regions.items.len) return err;
                 scan.done = true;
                 break;
             };
-            const module = try self.at(symbol.address);
+            // The image that defines the name is wanted in full, and nobody
+            // asked: see lookupRead. One more than the scan holds is not read.
+            const module = self.cachedAt(symbol.address) catch blk: {
+                if (scan.count == scan.modules.len) return error.SymbolDefinerLimit;
+                break :blk try self.definerRead(symbol.address);
+            };
             scan.cursor.next += 1;
             for (scan.modules[0..scan.count]) |old| if (old.id == module.id) continue :scanning;
             if (scan.count == scan.modules.len) return error.SymbolDefinerLimit;
@@ -655,11 +982,19 @@ pub const Modules = struct {
         }
         return .{ .modules = scan.modules[0..scan.count], .unexamined = scan.cursor.failure };
     }
+    /// The full image at `address` for a language view that found its
+    /// runtime there. An automatic read of a file the target chose: the
+    /// main executable under the image budgets, any other image within the
+    /// fixed lookup bounds.
+    fn definerRead(self: *Modules, address: u64) !*Module {
+        return self.atFor(address, .runtime);
+    }
     fn symbolImage(self: *Modules, region: Region) !*const elf.Image {
         for (self.symbol_images.items) |*item| if (sameFile(item.region, region)) {
             self.touchSymbols(item);
             return &item.image;
         };
+        if (self.symbol_refusals.get(fileKey(region))) |refused| return refused;
         const file_index = try self.fileIdentity(region);
         const path = try self.allocator.dupeZ(u8, region.path);
         defer self.allocator.free(path);
@@ -675,17 +1010,29 @@ pub const Modules = struct {
             try runtime_api.check(rt.xrt_remote_symbol_file(self.target, &request, &fd, &resident));
         } else {
             var pinned: rt.struct_xrt_file_identity = undefined;
-            try self.localSymbolFile(region, &request, &fd, &resident, &source, &pinned, self.identities.items[file_index].identity);
+            self.localSymbolFile(region, &request, &fd, &resident, &source, &pinned, self.identities.items[file_index].identity) catch |err| {
+                // Every answer but "not finished yet" is final for this map
+                // and is remembered: asking again would start the reader
+                // again, answer Pending, and reach the same error, for ever.
+                switch (err) {
+                    error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => {},
+                    else => self.symbol_refusals.put(self.allocator, fileKey(region), err) catch {},
+                }
+                return err;
+            };
             identity = pinned;
         }
         defer _ = c.close(fd);
+        // The reader finished; whatever refuses its view from here on (too
+        // large, not a usable ELF, no memory for it) is final for this map too.
+        errdefer |err| self.symbol_refusals.put(self.allocator, fileKey(region), err) catch {};
         var stat: c.struct_stat = undefined;
         if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_blocks < 0) return error.BinaryUnavailable;
         // Sparse files may allocate a whole page for each tiny distant table.
         // Charge backing pages as well as copied bytes, never the hole extent.
         const retained = @max(resident, std.math.mul(u64, @intCast(stat.st_blocks), 512) catch return error.SymbolSnapshotLimit);
         if (retained > self.symbol_limit) return error.SymbolSnapshotLimit;
-        const size: usize = @intCast(stat.st_size);
+        const size = std.math.cast(usize, stat.st_size) orelse return error.SymbolSnapshotLimit;
         const ptr = c.mmap(null, size, c.PROT_READ, c.MAP_PRIVATE, fd, 0);
         if (ptr == c.MAP_FAILED) return error.OutOfMemory;
         const bytes: []align(std.heap.page_size_min) u8 = @as([*]align(std.heap.page_size_min) u8, @ptrCast(@alignCast(ptr)))[0..size];
@@ -780,7 +1127,7 @@ pub const Modules = struct {
             };
             // Ordinary local symbol lookups stay immediate while retaining only
             // metadata. Large files keep the existing cancellable worker path.
-            if (rt.xrt_file_view_identity(view).*.size <= snapshot.per_image_limit) {
+            if (rt.xrt_file_view_identity(view).*.size <= symbol_immediate_limit) {
                 defer _ = rt.xrt_file_view_close(view);
                 try runtime_api.check(rt.xrt_local_symbol_file(view, fd, resident));
                 source.* = mapped_file.Source.fromRuntime(rt.xrt_file_view_source(view));
@@ -823,8 +1170,16 @@ pub const Modules = struct {
     /// can resume the same unfinished file.
     pub const SymbolCursor = struct { next: usize = 0, failure: ?anyerror = null };
     pub fn automaticSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
+        return self.pendingSymbolAddress(name, cursor, false);
+    }
+    /// The same resumable lookup for a name the user gave (`--break NAME`,
+    /// a pending symbol breakpoint): it may read the main executable in full.
+    pub fn breakpointSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor) !u64 {
+        return self.pendingSymbolAddress(name, cursor, true);
+    }
+    fn pendingSymbolAddress(self: *Modules, name: []const u8, cursor: *SymbolCursor, fallback: bool) !u64 {
         defer self.reportBudget();
-        const found = try self.symbolLookup(name, true, cursor);
+        const found = try self.symbolLookup(name, true, fallback, cursor);
         // ELFv2 function symbols are the global entry. Planting there misses a
         // local call, which skips the TOC setup. The local entry is inside the
         // same function, and a global call falls through it.
@@ -845,12 +1200,86 @@ pub const Modules = struct {
             const p = try self.placement(image, 0, region, false);
             return std.math.add(u64, offset, p.bias) catch error.InvalidAddress;
         }
-        const module = try self.load(region);
+        // A saved breakpoint names its own image. Through a runtime agent
+        // only a container entry gets here, under the lookup bounds.
+        const module = try self.load(region, .restore);
         const id = module.image.buildId() orelse return error.BreakpointImageHasNoBuildId;
         if (!std.mem.eql(u8, id, build_id)) return error.BreakpointBuildIdMismatch;
         return module.runtimeAddress(offset);
     }
-    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, cursor: *SymbolCursor) !Symbol {
+    /// Whether `r` is the main executable, the one image `lookupRead` may
+    /// read in full for a name. Once one file has been chosen for this
+    /// process image no other ever is.
+    fn nameFallback(self: *Modules, r: Region) bool {
+        return !self.immutable and self.mainExecutable(r);
+    }
+    /// The same question for a sweep, which a capture's own (immutable)
+    /// module set asks of a live process too.
+    fn mainExecutable(self: *Modules, r: Region) bool {
+        const key = fileKey(r);
+        if (self.name_fallback) |chosen| return std.meta.eql(chosen, key);
+        if (self.pid <= 0 or self.core_source != null or rt.xrt_target_is_remote(self.target)) return false;
+        if (!isExecutable(self.pid, r)) return false;
+        self.name_fallback = key;
+        return true;
+    }
+    extern fn xodb_mapped_file_matches(fd: c_int, pid: c_int, start: u64, end: u64, device_major: u64, device_minor: u64, inode: u64, strict: c_int) c_int;
+    /// Whether mapping `r` of `pid` is the file `/proc/PID/exe` names: same
+    /// device, inode and path. An inode number alone repeats across
+    /// filesystems, and a path alone can be mounted over.
+    fn isExecutable(pid: i32, r: Region) bool {
+        var link: [32]u8 = undefined;
+        const exe = std.fmt.bufPrintZ(&link, "/proc/{d}/exe", .{pid}) catch return false;
+        var path: [4097]u8 = undefined;
+        const n = c.readlink(exe.ptr, &path, path.len);
+        if (n <= 0 or n >= path.len or !std.mem.eql(u8, path[0..@intCast(n)], r.path)) return false;
+        const fd = c.open(exe.ptr, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+        if (fd < 0) return false;
+        defer _ = c.close(fd);
+        return xodb_mapped_file_matches(fd, pid, r.start, r.end, r.device_major, r.device_minor, r.inode, 0) != 0;
+    }
+    /// The one place a name lookup decides to read an image in full. The
+    /// target chooses what it maps and what those files say, so the rule is:
+    ///
+    /// 1. An image already loaded (a stack frame in it, say) is searched at
+    ///    no cost; that is done before this is asked.
+    /// 2. An image with a symbols-only view is never read in full to look,
+    ///    except that a name someone asked for (`explicit`: find_symbol, a
+    ///    breakpoint by symbol, --break NAME in the process it was given
+    ///    for) may read one image whose tables are too large for that view:
+    ///    the main executable, once per process image, under the image
+    ///    budgets.
+    /// 3. An image with no symbols-only view (an entry inside a container,
+    ///    any image of a core or of another session without a live process)
+    ///    is read in full by explicit and automatic lookups alike, but only
+    ///    within lookup_image_limit each and lookup_total_limit per process.
+    /// 4. The image a language view found its runtime in is wanted in full
+    ///    with nobody asking (`definerRead`): the main executable under the
+    ///    image budgets, any other image within the bounds of 3, and no
+    ///    more images than a definer scan holds.
+    ///
+    /// Null means the rule says no. An error is a read that was tried.
+    fn lookupRead(self: *Modules, r: Region, why: Unviewed, explicit: bool) !?*Module {
+        if (why == .tables) {
+            if (!explicit or !self.nameFallback(r)) return null;
+            if (self.fallback_failure) |failed| if (failed.revision == self.maps_revision) return failed.err;
+        }
+        return self.load(r, .name) catch |err| {
+            // A full read of the executable that failed is not repeated for this map.
+            if (why == .tables and err != error.OutOfMemory) self.fallback_failure = .{ .revision = self.maps_revision, .err = err };
+            return err;
+        };
+    }
+    /// Says which image the last findSymbol could not search, when it ended
+    /// without the name. Valid until the next map refresh.
+    pub fn unsearchedDetail(self: *const Modules, buffer: []u8) ?[]const u8 {
+        const missed = self.unsearched orelse return null;
+        if (missed.revision != self.maps_revision or missed.region >= self.regions.items.len) return null;
+        var name: [512]u8 = undefined;
+        return std.fmt.bufPrint(buffer, "{s}: symbol tables too large to search by name until the image is loaded; only the main executable is read in full for a name", .{snapshot.printable(&name, self.regions.items[missed.region].path, name.len)}) catch null;
+    }
+    pub const unsearched_text = 512 + 160;
+    fn symbolLookup(self: *Modules, name: []const u8, automatic: bool, fallback: bool, cursor: *SymbolCursor) !Symbol {
         var failure = cursor.failure;
         defer cursor.failure = failure;
         regions: while (cursor.next < self.regions.items.len) : (cursor.next += 1) {
@@ -871,17 +1300,9 @@ pub const Modules = struct {
                 std.mem.startsWith(u8, r.path, "/dev/") or
                 std.mem.startsWith(u8, r.path, "/memfd:") or
                 std.mem.endsWith(u8, r.path, " (deleted)")) continue;
-            if (!rt.xrt_target_is_remote(self.target) and (self.immutable or self.target == null)) {
-                if (automatic and r.permissions[2] != 'x') continue;
-                const module = self.load(r) catch |err| {
-                    if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
-                    continue;
-                };
-                const symbol = module.symbols().findSymbol(name) orelse continue;
-                if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
-                continue;
-            }
-            if (r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
+            // A core, or a session without a live process, has no symbols-only reader.
+            const no_reader = !rt.xrt_target_is_remote(self.target) and (self.immutable or self.target == null);
+            if (!no_reader and r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
                 if (self.peRegion(r)) |entry| {
                     if (try self.peFindSymbol(entry, name)) |found| return found;
                     continue;
@@ -895,25 +1316,33 @@ pub const Modules = struct {
                 }
             }
             // Offset-0 data mappings are admitted above for PE headers only.
-            if ((automatic and r.permissions[2] != 'x') or self.file_kinds.get(fileKey(r)) == .pe) continue;
-            const image = self.symbolImage(r) catch |err| {
+            if (automatic and r.permissions[2] != 'x') continue;
+            if (!no_reader and self.file_kinds.get(fileKey(r)) == .pe) continue;
+            var why: Unviewed = .no_reader;
+            const view: ?*const elf.Image = if (no_reader) null else self.symbolImage(r) catch |err| blk: {
                 switch (err) {
                     error.SymbolDiscoveryPending, error.SymbolDiscoveryCancelled, error.SymbolDiscoveryBudgetExceeded => return err,
-                    error.UnsupportedMode => {
-                        // APKs retain the existing full-image path and limits.
-                        const module = self.load(r) catch |load_err| {
-                            if (failure == null) failure = load_err;
-                            continue;
-                        };
-                        if (module.symbols().findSymbol(name)) |symbol| {
-                            if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
-                        }
-                    },
-                    error.NotElf, error.BinaryIdentityUnavailable => {},
-                    else => if (failure == null) {
-                        failure = err;
+                    error.UnsupportedMode => why = .container,
+                    error.BinarySnapshotLimit => why = .tables,
+                    error.NotElf, error.BinaryIdentityUnavailable => continue,
+                    else => {
+                        if (failure == null) failure = err;
+                        continue;
                     },
                 }
+                break :blk null;
+            };
+            const image = view orelse {
+                const module = (self.lookupRead(r, why, fallback) catch |err| {
+                    if (err != error.NotElf and err != error.NoBinaryImage and failure == null) failure = err;
+                    continue;
+                }) orelse {
+                    if (failure == null) failure = error.BinarySnapshotLimit;
+                    if (self.unsearched == null) self.unsearched = .{ .region = cursor.next, .revision = self.maps_revision };
+                    continue;
+                };
+                const symbol = module.symbols().findSymbol(name) orelse continue;
+                if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, try module.runtimeAddress(symbol.value));
                 continue;
             };
             const symbols = if (self.debug_files != null) blk: {
@@ -1130,6 +1559,9 @@ test "APK placement keeps two entries and repeated load instances separate" {
     for (&regions, 0..) |*r, i| r.* = .{ .start = 0x100000 + (i / 2) * 0x10000 + (i % 2) * 4096, .end = 0x101000 + (i / 2) * 0x10000 + (i % 2) * 4096, .offset = (if (i < 4) @as(u64, 0x4000) else 0x10000) + (i % 2) * 4096, .inode = 7, .device_major = 1, .device_minor = 1, .permissions = if (i % 2 == 0) "r--p".* else "r-xp".*, .path = "/test.apk" };
     var modules = Modules.init(std.testing.allocator);
     modules.regions = .{ .items = &regions, .capacity = regions.len };
+    defer modules.region_starts.deinit(std.testing.allocator);
+    defer modules.file_maps.deinit(std.testing.allocator);
+    defer modules.dropPlacements();
     for (0..3) |i| {
         const entry = if (i < 2) @as(u64, 0x4000) else 0x10000;
         const placed = try modules.placement(&image, entry, regions[i * 2 + 1], false);
@@ -1347,4 +1779,110 @@ test "identity ledger distinguishes embedded images with equal load bias" {
     const second = try modules.moduleId(region, 0x40000, 0x10000);
     try std.testing.expect(first != second);
     try std.testing.expectEqual(first, try modules.moduleId(region, 0x40000, 0x4000));
+}
+
+test "placing many mappings of one file is linear, and the work bound is reported" {
+    var bytes: [64 + 2 * 56]u8 align(std.heap.page_size_min) = @splat(0);
+    const wr = struct {
+        fn f(buffer: []u8, comptime T: type, at_: usize, value: T) void {
+            std.mem.writeInt(T, buffer[at_..][0..@sizeOf(T)], value, .little);
+        }
+    }.f;
+    @memcpy(bytes[0..4], "\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    wr(&bytes, u16, 16, 3);
+    wr(&bytes, u16, 18, 62);
+    wr(&bytes, u32, 20, 1);
+    wr(&bytes, u64, 32, 64);
+    wr(&bytes, u16, 52, 64);
+    wr(&bytes, u16, 54, 56);
+    wr(&bytes, u16, 56, 2);
+    for (0..2) |i| {
+        const at_ = 64 + i * 56;
+        wr(&bytes, u32, at_, 1);
+        wr(&bytes, u32, at_ + 4, if (i == 0) 4 else 5);
+        wr(&bytes, u64, at_ + 8, i * 4096);
+        wr(&bytes, u64, at_ + 16, i * 4096);
+        wr(&bytes, u64, at_ + 32, 4096);
+        wr(&bytes, u64, at_ + 40, 4096);
+        wr(&bytes, u64, at_ + 48, 4096);
+    }
+    const image = try elf.Image.parse(&bytes);
+    // 20,000 copies of the header page and one text page after the last.
+    const count = 20000;
+    const regions = try std.testing.allocator.alloc(Region, count + 1);
+    defer std.testing.allocator.free(regions);
+    for (regions[0..count], 0..) |*r, i| r.* = .{ .start = 0x100000 + i * 0x10000, .end = 0x101000 + i * 0x10000, .offset = 0, .inode = 7, .device_major = 1, .device_minor = 2, .permissions = "r--p".*, .path = "/many" };
+    regions[count] = .{ .start = regions[count - 1].start + 4096, .end = regions[count - 1].start + 8192, .offset = 4096, .inode = 7, .device_major = 1, .device_minor = 2, .permissions = "r-xp".*, .path = "/many" };
+    var modules = Modules.init(std.testing.allocator);
+    modules.regions = .{ .items = regions, .capacity = regions.len };
+    defer {
+        modules.clearFailures();
+        modules.load_failures.deinit(std.testing.allocator);
+        modules.dropPlacements();
+        modules.file_maps.deinit(std.testing.allocator);
+        modules.region_starts.deinit(std.testing.allocator);
+    }
+    // Every mapping is placed; the file's mappings are walked once, not once each.
+    for (regions[0..count], 0..) |r, i| {
+        const p = try modules.placement(&image, 0, r, false);
+        try std.testing.expectEqual(r.start, p.bias);
+        try std.testing.expectEqual(if (i == count - 1) regions[count].end else r.end, p.end);
+    }
+    try std.testing.expectEqual(regions[count - 1].start, (try modules.placement(&image, 0, regions[count], false)).bias);
+    // One walk of the file's mappings, whatever the number of questions.
+    try std.testing.expectEqual(@as(u64, (count + 1) * 2), modules.placement_spent);
+    // An ordinary library is a handful of steps: placed, and not counted.
+    var other = regions[0];
+    other.path = "/other";
+    regions[0] = other;
+    modules.maps_revision += 1;
+    try std.testing.expectEqual(other.start, (try modules.placement(&image, 0, other, false)).bias);
+    try std.testing.expectEqual(@as(u64, 0), modules.placement_spent);
+    // With the allowance used up, a file whose placement is real work is
+    // refused, and the refusal is listed with the other unusable images.
+    modules.placement_spent = Modules.placement_work;
+    try std.testing.expectError(error.MappingLimit, modules.placement(&image, 0, regions[1], false));
+    try std.testing.expectEqual(@as(usize, 1), modules.load_failures.items.len);
+    try std.testing.expectEqualStrings("MappingLimit", modules.load_failures.items[0].diagnostic);
+    try std.testing.expectEqualStrings("/many", modules.load_failures.items[0].path);
+    // The small file beside it is still placed when nothing is left.
+    var third = regions[2];
+    third.path = "/third";
+    regions[2] = third;
+    modules.maps_revision += 1;
+    _ = try modules.placement(&image, 0, other, false);
+    modules.placement_spent = Modules.placement_work;
+    try std.testing.expectEqual(third.start, (try modules.placement(&image, 0, third, false)).bias);
+    try std.testing.expectEqual(@as(u64, Modules.placement_work), modules.placement_spent);
+}
+
+test "the main executable is identified by device as well as inode and path" {
+    var modules = Modules.init(std.testing.allocator);
+    defer modules.deinit();
+    const pid: i32 = @intCast(c.getpid());
+    try modules.refresh(pid);
+    var path: [4097]u8 = undefined;
+    const n = c.readlink("/proc/self/exe", &path, path.len);
+    try std.testing.expect(n > 0);
+    const exe = for (modules.regions.items) |r| {
+        if (r.offset == 0 and std.mem.eql(u8, r.path, path[0..@intCast(n)])) break r;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expect(Modules.isExecutable(pid, exe));
+    var other = exe;
+    other.device_minor +%= 1;
+    try std.testing.expect(!Modules.isExecutable(pid, other));
+    other = exe;
+    other.device_major +%= 1;
+    try std.testing.expect(!Modules.isExecutable(pid, other));
+    other = exe;
+    other.inode +%= 1;
+    try std.testing.expect(!Modules.isExecutable(pid, other));
+    // Another mapped file is not the executable whatever its numbers say.
+    for (modules.regions.items) |r| if (r.path.len > 0 and r.path[0] == '/' and !std.mem.eql(u8, r.path, exe.path)) {
+        try std.testing.expect(!Modules.isExecutable(pid, r));
+        break;
+    };
 }

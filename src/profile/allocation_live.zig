@@ -133,7 +133,7 @@ const Job = struct {
             if (symbols.regions.items.len > 16384) return error.AllocationMapLimit;
             for (symbols.regions.items) |region| {
                 if (self.cancel.load(.acquire)) return error.AllocationPreparationCancelled;
-                if (region.permissions[2] == 'x') _ = symbols.load(region) catch continue;
+                if (region.permissions[2] == 'x') _ = symbols.load(region, .sweep) catch continue;
             }
         }
     }

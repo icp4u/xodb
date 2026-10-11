@@ -14,6 +14,9 @@ pub const Entry = struct {
     offset: u64 = 0,
     diagnostic: ?[]const u8 = null,
     enabled: bool = true,
+    /// Copied from the parent at a fork, not asked for in this process. Its
+    /// lookup is automatic: it never reads an executable in full for the name.
+    inherited: bool = false,
     cursor: @import("modules.zig").Modules.SymbolCursor = .{},
     fn deinit(self: Entry) void {
         if (self.path.len > 0) A.free(self.path);
@@ -49,8 +52,11 @@ test "a yielded install or image read keeps resolution pending until retried" {
             .permissions = "r-xp".*,
             .path = "fixture",
         }} },
-        pub fn automaticSymbolAddress(_: *@This(), _: []const u8, _: *modules.Modules.SymbolCursor) !u64 {
+        pub fn breakpointSymbolAddress(_: *@This(), _: []const u8, _: *modules.Modules.SymbolCursor) !u64 {
             return 0x1234;
+        }
+        pub fn automaticSymbolAddress(_: *@This(), _: []const u8, _: *modules.Modules.SymbolCursor) !u64 {
+            return error.BreakpointSymbolNotLoaded;
         }
         pub fn restoredAddress(_: *@This(), _: modules.Region, _: []const u8, _: u64) !u64 {
             return error.SymbolDiscoveryPending;
@@ -117,6 +123,7 @@ pub const Manager = struct {
         try out.entries.ensureTotalCapacityPrecise(A, self.entries.items.len);
         for (self.entries.items) |item| {
             var copy = item;
+            copy.inherited = true;
             if (item.path.len > 0) copy.path = try A.dupe(u8, item.path);
             out.entries.appendAssumeCapacity(copy);
         }
@@ -151,7 +158,15 @@ pub const Manager = struct {
         if (name.len == 0) return error.InvalidSymbol;
         const text = try policy.Text.init(name);
         self.prune(session);
-        for (self.entries.items) |v| if (std.mem.eql(u8, v.symbol.slice(), name)) return v.id;
+        for (self.entries.items) |*v| if (std.mem.eql(u8, v.symbol.slice(), name)) {
+            // Asked for in this process now: it is no longer only inherited.
+            if (v.inherited) {
+                v.inherited = false;
+                v.cursor = .{};
+                try self.resolve(session);
+            }
+            return v.id;
+        };
         if (self.entries.items.len >= 128) return error.BreakpointLimit;
         try self.entries.ensureUnusedCapacity(A, 1);
         try session.refreshMaps();
@@ -279,7 +294,7 @@ pub const Manager = struct {
             if (!current.pending) continue;
             var address: ?u64 = null;
             if (item.symbol.len > 0) {
-                if (session.modules.automaticSymbolAddress(item.symbol.slice(), &item.cursor)) |resolved| address = resolved else |err| {
+                if (if (item.inherited) session.modules.automaticSymbolAddress(item.symbol.slice(), &item.cursor) else session.modules.breakpointSymbolAddress(item.symbol.slice(), &item.cursor)) |resolved| address = resolved else |err| {
                     if (try self.resolutionError(item, err)) return;
                     continue;
                 }

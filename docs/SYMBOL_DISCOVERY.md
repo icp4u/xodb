@@ -25,7 +25,7 @@ Example:
 `symbols.automatic` in preferences disables automatic discovery. Defaults are
 64 MiB per automatic file and 128 MiB total; `symbols.auto_file_bytes` and
 `symbols.auto_total_bytes` configure them up to the existing 256/512 MiB bounds.
-Explicit files share the overall 512 MiB, 64-file retention limit. Files are
+Explicit files share the [full-image budgets](LARGE_IMAGES.md#full-image-budgets) and a 64-file retention limit. Files are
 snapshotted, checked for changes during reading, and retained read-only.
 
 Matching checks build ID when present, debuglink CRC when that method is used,

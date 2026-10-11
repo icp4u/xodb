@@ -38,7 +38,7 @@ pub fn addElf(capture: *Capture, path: []const u8, start: u64, end: u64) !*modul
     var stat: c.struct_stat = undefined;
     if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0) return error.FixtureElfMissing;
     const mapped = try @import("../binary/snapshot.zig").read(fd, @import("../binary/snapshot.zig").per_image_limit, null);
-    errdefer _ = c.munmap(mapped.ptr, mapped.len);
+    errdefer @import("../binary/snapshot.zig").free(mapped);
     const module = try a.create(modules.Module);
     errdefer a.destroy(module);
     module.* = .{ .id = capture.images.next_id, .inode = @intCast(stat.st_ino), .device_major = c.major(stat.st_dev), .device_minor = c.minor(stat.st_dev), .path = name, .image = try elf.Image.parse(mapped), .bias = elf_bias, .start = start, .end = end, .mapping = mapped, .immutable = true };

@@ -28,7 +28,7 @@ pub const Files = struct {
         self.roots.deinit(self.allocator);
     }
     fn destroy(self: *Files, file: *File) void {
-        _ = c.munmap(file.bytes.ptr, file.bytes.len);
+        snapshot.free(file.bytes);
         self.allocator.free(file.path);
         self.allocator.destroy(file);
     }
@@ -45,8 +45,8 @@ pub const Files = struct {
         const fd = c.open(path, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
         if (fd < 0) return error.DebugFileUnavailable;
         defer _ = c.close(fd);
-        const bytes = try snapshot.read(fd, @min(limit, snapshot.total_limit - self.retained), null);
-        errdefer _ = c.munmap(bytes.ptr, bytes.len);
+        const bytes = try snapshot.read(fd, limit, null);
+        errdefer snapshot.free(bytes);
         const image = try elf.Image.parse(bytes);
         if (image.sectionByName(".debug_info") == null and image.sectionByName(".zdebug_info") == null) return error.DebugFileMissingDwarf;
         const name = try self.allocator.dupeZ(u8, path);
@@ -174,7 +174,7 @@ test "debug companions require build identity and matching virtual layout" {
     try t.expect(fd >= 0);
     defer _ = c.close(fd);
     const bytes = try snapshot.read(fd, snapshot.per_image_limit, null);
-    defer _ = c.munmap(bytes.ptr, bytes.len);
+    defer snapshot.free(bytes);
     var image = try elf.Image.parse(bytes);
     try t.expect((try files.matching(&image)).? == files.items.items[0]);
     image.header.machine = .aarch64;
@@ -195,7 +195,7 @@ test "debug companions require build identity and matching virtual layout" {
     try t.expect(foreign_fd >= 0);
     defer _ = c.close(foreign_fd);
     const foreign_bytes = try snapshot.read(foreign_fd, snapshot.per_image_limit, null);
-    defer _ = c.munmap(foreign_bytes.ptr, foreign_bytes.len);
+    defer snapshot.free(foreign_bytes);
     const foreign = try elf.Image.parse(foreign_bytes);
     try t.expect(try files.matching(&foreign) == null);
 }

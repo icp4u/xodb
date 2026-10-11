@@ -162,9 +162,12 @@ fn stoppedOutcome(session: *const Session) @FieldType(Outcome, "reason") {
 fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64) !u64 {
     try session.refreshMaps();
     var found: ?u64 = null;
+    session.modules.beginSweep();
+    // Say so when the functions were looked for in fewer images than are mapped.
+    defer if (session.modules.skipped().first) |first| std.debug.print("xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
     for (session.modules.regions.items) |region| {
         if (region.permissions[2] != 'x' or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
-        const module = session.modules.load(region) catch continue;
+        const module = session.modules.load(region, .sweep) catch continue;
         var all = true;
         var first: u64 = 0;
         for (recipe.functions, 0..) |name, i| {

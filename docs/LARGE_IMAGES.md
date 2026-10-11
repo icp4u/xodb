@@ -1,11 +1,311 @@
 # Bounded object and DWARF readers
 
+## Full-image budgets
+
+Source lines, inline frames, types, disassembly and names for a native stack
+need the whole ELF image. xodb copies it into its own memory, checks that the
+file did not change during the copy, and never maps the file itself. Two
+budgets bound those copies:
+
+| Budget | Default | Option | Preference |
+| --- | --- | --- | --- |
+| One image | 256 MiB | `--image-limit SIZE` | `symbols.image_bytes` |
+| All images in the xodb process | 512 MiB | `--image-total-limit SIZE` | `symbols.image_total_bytes` |
+
+`SIZE` is bytes, or a whole number with `K`, `M` or `G` (`256M`, `4G`); the
+preferences take bytes. Values from 1 MiB to 1 TiB are accepted (2 GiB at most
+on a 32-bit host); anything else stops startup with the accepted range. The
+command line wins over the preferences file. An image must fit both its own
+budget and what is left of the total. The budgets are caps, not allocations:
+memory is used only for images that are actually read, one copy each.
+
+The defaults are small on purpose. The files a debugged process maps are the
+process's to choose, and a budget is what xodb will read of them without
+being asked. Larger budgets are opt-in: a 1 GB executable with DWARF costs
+about 1 GB of resident memory once a stack through it is shown, and that is a
+choice for whoever runs the debugger. The preferences file is the user's own
+and is trusted with it.
+
+When an image does not fit, xodb says which and why, and what to rerun with
+for that image, in the same words everywhere:
+
+```
+/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 2G or set symbols.image_bytes and symbols.image_total_bytes
+/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 512 MiB total image budget; rerun with --image-total-limit 1G or set symbols.image_total_bytes
+```
+
+The suggested per-image value is the image's size plus 5%, rounded up to a
+whole number of hundreds of MiB. The suggested total is whole GiB: enough for
+the image beside what is already held, and at least twice the image, so that
+searches of every image keep their share (below). `--image-total-limit` is
+named only when the total is in the way. A suggestion is never above the
+accepted range; an image larger than the range says so instead. The
+preferences take the same values in bytes.
+
+- `get_stack` carries it as top-level `image_budget`; the affected frames keep
+  `inline_diagnostic: BinarySnapshotLimit` and stay unnamed.
+- `list_modules` carries the first one as top-level `image_budget` and each as
+  `detail` in its `load_failures` row; the regions have `full_image_deferred`.
+  Its `image_bytes` gives the process-wide figures: `held`, `peak`,
+  `total_limit` and `image_limit`.
+- `find_symbol` answers `ImageBudgetExceeded`, with the sentence as a second
+  text item, when a name is not found while an image is unread.
+- The GUI status line shows `Over budget: FILE is N MiB; …` for the selected thread.
+- stderr has one `module budget:` line per stop, ending with the first refusal.
+
+The path in that sentence is the target's to choose. It is shown as UTF-8 of
+at most 512 bytes: a longer path is cut between characters and ends in `...`,
+and control characters and bytes that are not UTF-8 become `?`. The GUI status
+line shows the file name only, cut to 128 bytes the same way.
+
+### One total for the whole process
+
+The total is a single figure for the xodb process. Everything that holds
+full-image bytes reserves from it before reading and gives the bytes back when
+it lets go:
+
+| Holder | What it holds |
+| --- | --- |
+| Each debugged process (every followed child with `--follow-forks`) | images read for stacks, source, types and names |
+| Each CPU capture | every executable mapping of the process, read when the capture starts (up to 256 images), and each one mapped while it runs; within the bounds for [searches of every image](#searches-of-every-mapped-image) |
+| Each opened profile archive | the verified local images its samples resolve against, when asked to resolve them |
+| Allocation capture | every executable mapping of the process, read when the capture is prepared, for its call stacks; within the same bounds |
+| An observation recipe (`--observe-recipe`) | every executable mapping, searched for the recipe's functions; within the same bounds |
+| Explicit and discovered debug files | each companion file |
+| Debug readers | the private copy and inflated sections of compressed DWARF |
+| Opening a core | the named executable, while its build ID is read |
+
+One version of a file is read once and shared. A file is identified by device,
+inode, size, modification time and change time, the same identity the reader
+checks before and after its copy. So a session and a capture of the same
+program hold one copy of its executable, and 32 followed processes that map
+the same library hold one copy between them. The copy is still xodb's own
+read-only memory, never a mapping of the file; a file that changes is a new
+version and is read again.
+
+A debugged process keeps its images until it is restarted, it execs, or the
+session ends. They are not released when the process exits: its module list
+stays readable, and the parts of xodb that hold on to a loaded image are only
+told to let go when the process image changes. An exited process therefore
+still counts toward the total, once per file however many processes shared it.
+
+The symbols-only views of the next sections (128 MiB per debugged process) and
+libdw's own working memory are separate from this total.
+
+### Compressed debug sections
+
+An image whose debug sections are compressed (`SHF_COMPRESSED` or `.zdebug_*`)
+needs a private copy of the image plus the inflated sections. Before anything
+is allocated the copy plus the sizes the section headers declare must fit both
+budgets, or the reader refuses with `CompressedDebugBudget`. Once the sections
+are inflated the charge drops to what exists: the copy and the sections that
+did inflate. A section that declares a large size and then fails to inflate
+holds nothing.
+
+The declared size is a sound bound: a stream larger than it declares is not
+inflated. The consequence is that an image with compressed DWARF needs the
+image plus the inflated DWARF to fit `--image-limit` at once: an image whose
+compressed debug info inflates to more than what the budget has left over the
+image cannot open its debug info. Raise `--image-limit` for it.
+
+### Other bounds
+
+Windows (PE) images keep their 256 MiB bound, including from a profile
+archive. What a name lookup reads of images that have no symbols-only view
+keeps fixed bounds too (256 MiB each, 512 MiB for one process; see "Name
+lookups and the full image"). With a runtime agent, whole-file transfers keep
+the agent's fixed 256 MiB cap, whatever the local budget is; the refusal says so. Opening a
+profile archive reads only verified local assets under the same two budgets,
+so an archive cannot make xodb read more than they allow.
+
+A full image may have up to 1,048,576 sections and 4,096 program headers, its
+section names may total 64 MiB, and no single name may exceed 1 MiB. An image
+outside those bounds is refused with `TableLimit` rather than walked.
+
+Working out where an image is loaded takes one pass over the mappings of its
+file, once per map, whatever the number of mappings: 60,000 mappings of the
+executable cost a fraction of a second. The pass is mappings × program
+headers steps, and one map gets 2^27 of them, between one and two seconds of
+work. A file that would exceed what is left (tens of thousands of mappings of
+a file with thousands of program headers) is refused with `MappingLimit`,
+which `list_modules` shows under `load_failures`. Files already placed are
+not affected, and a placement of fewer than 4,096 steps (any ordinary
+library) is neither counted nor refused, so a file that uses the allowance up
+does not take the names of the libraries beside it.
+
+### Name lookups and the full image
+
+Symbol lookups normally read only the symbol tables (next sections). A target
+chooses what it maps and what those files say: it can make that reader refuse
+an image, by giving it more than 64 MiB of symbol tables or too many sections,
+and it chooses how many such images it maps. So one rule decides whether a
+name lookup may read an image in full:
+
+1. **An image already loaded** for another reason, such as a stack frame in
+   it, is searched at no further cost.
+2. **An image with a symbols-only view** (an ordinary ELF file of a live
+   process) is never read in full to look, with one exception. For a name
+   someone asked for (`find_symbol`, a breakpoint by symbol, `--break NAME`),
+   the **main executable** is read in full when its tables are too large for
+   the symbols-only view, under the image budgets. It is the one file a
+   process cannot multiply, and the one whose names are wanted first: this is
+   what makes `find_symbol` work on a 1 GB game engine with 105 MB of symbol
+   tables. It is identified by device, inode and path, and once a file has
+   been chosen for a process image no other file ever is.
+3. **An image with no symbols-only view** is read in full by any lookup, but
+   only within fixed bounds: 256 MiB each and 512 MiB for one process,
+   whatever the image budgets are. These are libraries stored inside a
+   container (an APK), and every image of a core or of another session
+   without a live process. A larger one is refused with its own sentence:
+
+   ```
+   /data/app/base.apk is 300 MiB and has no symbols-only view; a name lookup may read 256 MiB of it (such images: 256 MiB each, 512 MiB per process)
+   ```
+
+4. **The image a language view finds its runtime in** is then read in full,
+   because the view needs its types, and nobody asked for it by name. If it
+   is the main executable it is read under the image budgets, like the
+   executable the Lua, Ruby, Go and Emacs Lisp views read. Any other image
+   (a `libpython` or `libperl`) is read within the fixed bounds of rule 3,
+   and at most four images that define the runtime's symbol are read for one
+   view. A larger interpreter library makes the view, and its tab, report
+   the budget error. The sentence ends with whether anything else will load
+   the image:
+
+   ```
+   /opt/app/libperl.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in, unless that is the main executable (256 MiB each, 512 MiB per process); a stack frame in it loads it
+   /opt/app/libpython3.so is 300 MiB; a language view may read 256 MiB of the image it finds its runtime in, unless that is the main executable (256 MiB each, 512 MiB per process); it has no debug info, so a stack does not load it either
+   ```
+
+   A library with debug info is loaded by a stack frame in it, under the
+   image budgets; the tab is looked at again whenever another image has been
+   loaded, so it does not go on saying "unavailable" when the view works. A
+   library without debug info is unwound from its frame tables and is never
+   loaded in full, so a stripped interpreter library over 256 MiB keeps the
+   view unavailable. That is a limit of this rule, not of the budgets:
+   raising them does not change it.
+
+Automatic lookups (runtime detection for Python, Perl and the other language
+views) follow the same rule without the exception in 2: they never read an
+image that has a symbols-only view in full to look, and report their budget
+error instead.
+
+So a lookup costs at most one image plus the bounded reads of rules 3 and 4,
+whatever the target maps. When a name is not found and some library could not
+be searched, `find_symbol` answers `ImageBudgetExceeded` with a second text
+item naming the first such library:
+
+```
+/opt/game/libhuge.so: symbol tables too large to search by name until the image is loaded; only the main executable is read in full for a name
+```
+
+Its names resolve once the image is loaded, for example by stopping in it.
+
+With `--follow-forks`, the exception in rule 2 belongs to the process the
+name was given for. A followed child inherits its parent's pending
+breakpoints, and resolving an inherited one is an automatic lookup: it does
+not read the child's executable in full. So `--break NAME` on a launcher that
+forks and then execs a very large program does not resolve in that program by
+itself. Asking in the child (`find_symbol` or a breakpoint by symbol with its
+process ID) is a request for that process and may read its executable; so
+does anything that loads the image, such as showing a stack in it.
+
+Two other requests read one full image each and are outside this rule,
+because they need more than names: a stack frame (or an address you give)
+loads the image it is in, under the image budgets, and a saved breakpoint is
+restored by loading the one image it was set in.
+
+### Searches of every mapped image
+
+Some requests have to look in every image the process maps, and the process
+chooses how many there are and how large:
+
+| Request | What it reads |
+| --- | --- |
+| A breakpoint, `run_to`, `control_dependencies` or `slice_value` by `FILE:LINE` (MCP and the GUI's source pane) | every mapped image, for its line tables |
+| Starting a CPU capture | every executable mapping, so samples resolve later |
+| Preparing an allocation capture with call stacks | every executable mapping |
+| `--observe-recipe` with functions | every executable mapping, for those functions |
+
+One such request must not fill the total and leave nothing for the frame you
+are stopped in. So every load in xodb states why it wants the image, and the
+bound follows from the reason, in one place (`Modules.allowance`):
+
+| Reason | Bound |
+| --- | --- |
+| a stack frame, or an address you gave | the image budgets |
+| a name lookup | rules 2 and 3 above |
+| a language view's runtime | rule 4 above |
+| a saved breakpoint | the image budgets (through a runtime agent: the bounds of rule 3) |
+| a search of every image | below |
+
+A search of every image reads:
+
+- **an image already held** by anything in the xodb process, at no cost;
+- **the main executable**, under the image budgets;
+- **any other image** only if it is at most 256 MiB, and only while all such
+  searches together hold at most half of `--image-total-limit`, and never
+  the last `--image-limit` of it. With the defaults that is 256 MiB; with
+  `--image-limit 2G --image-total-limit 8G` it is 4 GiB. The figure is one
+  for the whole xodb process, like the total, so a capture and a line
+  breakpoint in the same process share it.
+
+What is left of the total is at least one image budget, and it is the stack's.
+The order of requests does not matter: a stack frame's image is never crowded
+out by a search made before it.
+
+A search that skipped an image says so, so that "no code for this line" is
+never taken for an answer about images that were not read:
+
+- `set_breakpoint` and `run_to` by line carry `images_not_searched` (a count
+  of files) and `image_budget` (the first one's sentence) in their result.
+  When the line is found nowhere the error is still `NoCodeForSourceLine`,
+  with a second text item `N images not searched; SENTENCE`.
+- `control_dependencies` and `slice_value` carry the same two fields in their
+  `no_selection` answer.
+- `start_profile` and `get_profile` carry them under `mapping_history`;
+  `get_allocation_capture` carries them at the top; `--observe-recipe` prints one
+  line to stderr.
+- The GUI status line says that some images are over the image budget, and
+  the Modules list names them.
+
+```
+/opt/app/libhuge.so is 1023 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded (the main executable excepted); a stack frame in the image loads it
+/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 256 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 1G or set symbols.image_total_bytes; a stack frame in the image loads it
+```
+
+To search a skipped image, show a stack with a frame in it (it is then held,
+and free to every later search), or raise the total. A search also may skip
+the library the thread is stopped in, if the stack has not been shown yet and
+other images came first; the reply says so, and after `get_stack` the same
+request covers it.
+
+A search reads each file once, through one loaded copy, however many times
+and at whatever addresses the process mapped it; a file that cannot be loaded
+is tried once. Its time is linear in the number of mappings: 8,000 mappings
+of one file answer in a tenth of a second. One source line may resolve to at
+most 4,096 addresses; a line in a file mapped more often than that is refused
+with `SourceLineAddressLimit` (a breakpoint by line holds at most 128 anyway). A line
+of a small inline or template function in a header can reach the bound in one
+large optimised program as well (`Vector::size()` in a 1.3 GB game engine
+does); give an address or a symbol for such a line.
+
+A core is searched the same way, and has no main executable for this
+purpose: every image of a core over 256 MiB is searched for a line only once
+a stack frame has loaded it.
+
+Through a runtime agent the main executable is not told apart in a search
+either: it counts as any other image there, within the same 256 MiB and the
+same share of the total.
+
+## Ranged readers
+
 The C components in `src/binary/object*` and `src/debug/dwarf_*` provide ranged
 reads and reusable name indexes for large ELF debug images. The live JavaScript reader uses these components through a background metadata
 job. Native stripped-library stacks use bounded CFI-only views directly;
 images with DWARF, `.debug_frame`, or a verified companion retain the full
 source/inline path.
-Native stacks that exceed the full-image cap can also request a CFI-only view. Other full-image consumers retain their existing snapshot limits;
+Native stacks that exceed the full-image budget can also request a CFI-only view. Other full-image consumers retain their existing snapshot limits;
 these paths do not imply complete large-image source or type support.
 
 Ordinary local name lookups also use a symbols-only ELF projection. Headers,

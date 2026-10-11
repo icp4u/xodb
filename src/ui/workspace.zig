@@ -124,6 +124,12 @@ const WatchSource = struct {
     }
 };
 
+/// A source line that was not found is only as good as the search: say so
+/// when images were left unread for a budget.
+fn lineStatus(session: *const Session, err: anyerror) []const u8 {
+    if (err == error.NoCodeForSourceLine and session.modules.skipped().count != 0) return "NoCodeForSourceLine in the images searched; some are over the image budget (Modules lists them)";
+    return @errorName(err);
+}
 pub const Workspace = struct {
     runtime_type_signature: ?u64 = null,
     shared_clients: ?usize = null,
@@ -202,6 +208,7 @@ pub const Workspace = struct {
     reported_dropped: u64 = 0,
     reported_keymap_errors: u64 = 0,
     status: []const u8 = "Ready",
+    budget_status: [128 + 288 + 32]u8 = undefined,
     fd_event_state: @import("../model/system.zig").FdEventState = .inactive,
     allocation_busy: bool = false,
     allocation_collecting: bool = false,
@@ -739,7 +746,7 @@ pub const Workspace = struct {
             const a = scratch.allocator();
             const addresses = session.sourceAddresses(a, self.source_path, line) catch &.{};
             if (addresses.len == 0) {
-                self.status = "No code at the selected line for static analysis";
+                self.status = if (session.modules.skipped().count != 0) "No code at the selected line in the images searched; some are over the image budget (Modules lists them)" else "No code at the selected line for static analysis";
                 return;
             }
             var functions: std.ArrayList(@import("static_analysis.zig").Choice) = .empty;
@@ -1258,7 +1265,7 @@ pub const Workspace = struct {
             defer scratch.deinit();
             const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
             const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, number) catch |err| {
-                self.status = @errorName(err);
+                self.status = lineStatus(session, err);
                 return;
             };
             var removed = false;
@@ -1277,6 +1284,7 @@ pub const Workspace = struct {
                 return;
             };
             session.record(.human, "toggle_source_breakpoint");
+            if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
         }
         if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
@@ -1307,7 +1315,7 @@ pub const Workspace = struct {
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
                 const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, line_number) catch |err| {
-                    self.status = @errorName(err);
+                    self.status = lineStatus(session, err);
                     return;
                 };
                 if (addresses.len == 0) {
@@ -1600,6 +1608,18 @@ pub const Workspace = struct {
         };
         const a = self.arena.allocator();
         self.frames = session.stack(a, tid, 64) catch &.{};
+        // Unnamed frames of an image refused in full: say which and why.
+        for (self.frames) |frame| {
+            if (frame.inline_diagnostic) |why| if (std.mem.eql(u8, why, "BinarySnapshotLimit")) if (session.modules.budgetFailure(frame.lookup_pc)) |failure| {
+                // The line is narrow and formatted into a fixed buffer with
+                // the rest of the status: the file name, cut to fit.
+                var name: [128]u8 = undefined;
+                var text: [@import("../binary/snapshot.zig").refusal_text]u8 = undefined;
+                const budget = failure.budget orelse continue;
+                self.status = std.fmt.bufPrint(&self.budget_status, "Over budget: {s}", .{budget.write(&text, @import("../binary/snapshot.zig").printable(&name, std.fs.path.basename(failure.path), name.len))}) catch "Image over budget";
+                break;
+            };
+        }
         if (self.frames.len > 0) {
             self.selected_frame = @min(self.selected_frame, self.frames.len - 1);
             // Publish the freshly displayed default frame too; its index does

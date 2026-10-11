@@ -46,6 +46,8 @@ pub const State = struct {
     entries: [7]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
+    /// Full images loaded when the last pass over the runtimes ended.
+    loaded_images: usize = 0,
     pub fn deinit(self: *State) void {
         self.cache.deinit();
     }
@@ -122,6 +124,18 @@ pub const State = struct {
                 self.entries[3].checked = false;
                 self.revision +%= 1;
             }
+        }
+        // A view refused for an image budget works once its image is loaded
+        // for another reason, such as a stack frame in it. Look again then:
+        // the tab must not say less than the view does.
+        if (self.next == self.entries.len and self.loaded_images != session.modules.loaded.items.len) {
+            self.loaded_images = session.modules.loaded.items.len;
+            for (&self.entries, 0..) |*entry, i| if (entry.reason) |why| if (std.mem.endsWith(u8, why, "ImageBudgetExceeded")) {
+                self.next = i;
+                entry.checked = false;
+                self.revision +%= 1;
+                break;
+            };
         }
         if (self.next == self.entries.len) return;
         session.refreshMaps() catch |err| {

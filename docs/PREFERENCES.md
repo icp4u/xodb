@@ -48,6 +48,8 @@ and pass its path. This keeps location, merging and persistence choices open.
 | allocations.memory_limit | 33554432 | Retained allocation evidence/metadata/analysis, 1–128 MiB |
 | allocations.callstacks | true | Capture bounded frame-pointer caller prefixes at allocator entry |
 | profile.user_stack_budget_bytes | 33554432 | Total retained stack bytes, 0–67108864; registers/CPU samples continue after exhaustion |
+| symbols.image_bytes | 268435456 | Largest ELF image read in full for source, types and names, 1 MiB–1 TiB; CLI --image-limit wins |
+| symbols.image_total_bytes | 536870912 | All full images held by the xodb process: every debugged process, capture, debug file and inflated debug section together; 1 MiB–1 TiB; CLI --image-total-limit wins |
 
 Duration accepts an unsigned 32-bit value (up to 4,294,967,295 ms, about 49 days).
 There is no separate one-minute ceiling. A deadline includes time paused in the
@@ -98,6 +100,27 @@ MCP get_profile exposes defaults separately from capture. Agents should read
 those defaults rather than assume every omitted argument means the original
 built-in value. Preference loading does not change agent scope; command-line
 --agent-scope and the existing human control remain authoritative.
+
+The image budgets apply from startup and are not changed while running. The
+defaults are 256 MiB for one image and 512 MiB in all; larger values are
+yours to set, here or on the command line, and this file is trusted. An
+image over budget is named with its size, the budget and the values to rerun
+with in `get_stack`, `list_modules`, `find_symbol` and the status line; see
+[large images](LARGE_IMAGES.md#full-image-budgets). Searches of every mapped
+image (a breakpoint by source line, the start of a capture) may hold half of
+the total, less when `symbols.image_bytes` is more than half of it, so keep
+the total at twice the per-image value or more. The total is one figure
+for the whole xodb process, not one per debugged process or capture, and a
+file that several of them hold is read and counted once. A name lookup reads
+at most the main executable in full; libraries whose symbol tables are too
+large for the symbols-only view are searched once they are loaded. Images
+that have no symbols-only view (inside an APK, or named by a core) are read
+by a lookup only up to fixed bounds that these settings do not change; see
+[name lookups](LARGE_IMAGES.md#name-lookups-and-the-full-image). An image
+with compressed DWARF needs the image plus its inflated debug sections to fit
+`symbols.image_bytes` together. The automatic debug-file
+budgets (`symbols.auto_file_bytes`, `symbols.auto_total_bytes`) are separate
+and unchanged.
 
 Allocation prefs affect future captures. Helper use remains an explicit CLI option;
 see [allocation tracing](ALLOCATIONS.md).

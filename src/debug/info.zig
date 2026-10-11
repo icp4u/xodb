@@ -4,6 +4,7 @@ const std = @import("std");
 const c = @import("../c.zig").api;
 const elf = @import("../binary/elf.zig");
 const loc = @import("location.zig");
+const image_budget = @import("../binary/snapshot.zig");
 const eval = @import("../model/evaluate.zig");
 pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, line: u32, column: u32, address: u64, is_statement: bool, prologue_end: bool, discriminator: u32 };
 pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, diagnostic: ?[]const u8 = null };
@@ -142,6 +143,8 @@ pub const Image = struct {
     allow_split: bool = false,
     split_count: usize = 0,
     split_bytes: usize = 0,
+    /// Charged to the snapshot budget for a private copy and its decompressed sections.
+    derived_bytes: usize = 0,
     units_error: ?anyerror = null,
     types: std.AutoHashMapUnmanaged(u64, *eval.Type) = .empty,
     go_type_index: ?*c.struct_xgo_type_index = null,
@@ -159,16 +162,29 @@ pub const Image = struct {
         if (c.elf_version(c.EV_CURRENT) == c.EV_NONE) return error.ElfLibraryUnavailable;
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-        const object_bytes = try libelfBytes(binary, bytes, arena.allocator());
+        var charged: usize = 0;
+        errdefer image_budget.releaseDerived(charged);
+        const object_bytes = try libelfBytes(binary, bytes, arena.allocator(), &charged);
         const object = c.elf_memory(@ptrCast(object_bytes.ptr), object_bytes.len) orelse return error.InvalidDebugImage;
         errdefer _ = c.elf_end(object);
+        var debug_copied = false;
         const debug_object = if (companion) |file| blk: {
-            const debug_bytes = try libelfBytes(file.image, file.bytes, arena.allocator());
+            const debug_bytes = try libelfBytes(file.image, file.bytes, arena.allocator(), &charged);
+            debug_copied = debug_bytes.ptr != file.bytes.ptr;
             break :blk c.elf_memory(@ptrCast(debug_bytes.ptr), debug_bytes.len) orelse return error.InvalidDebugImage;
         } else object;
         const debug_binary = if (companion) |file| file.image else binary;
         const dwarf = c.dwarf_begin_elf(debug_object, c.DWARF_C_READ, null);
-        return .{ .architecture = @enumFromInt(@intFromEnum(binary.header.machine)), .object = object, .debug_object = debug_object, .dwarf = dwarf, .eh = c.dwarf_getcfi_elf(object), .debug_cfi = if (dwarf) |d| c.dwarf_getcfi(d) else null, .arena = arena, .address_table = if (dwarf != null) addressTable(debug_binary, debug_object) else &.{} };
+        // The declared sizes were the bound to get this far. Keep only what
+        // exists now: the copies and the sections libdw did inflate. A header
+        // that declares much and inflates nothing must not hold the budget.
+        const actual = derivedBytes(binary, object, object_bytes.ptr != bytes.ptr, bytes.len) +|
+            (if (companion) |file| derivedBytes(file.image, debug_object, debug_copied, file.bytes.len) else 0);
+        if (actual < charged) {
+            image_budget.releaseDerived(charged - actual);
+            charged = actual;
+        }
+        return .{ .architecture = @enumFromInt(@intFromEnum(binary.header.machine)), .object = object, .debug_object = debug_object, .dwarf = dwarf, .eh = c.dwarf_getcfi_elf(object), .debug_cfi = if (dwarf) |d| c.dwarf_getcfi(d) else null, .arena = arena, .derived_bytes = charged, .address_table = if (dwarf != null) addressTable(debug_binary, debug_object) else &.{} };
     }
     fn addressTable(binary: elf.Image, object: *c.Elf) []const u8 {
         // dwarf_begin_elf has decompressed recognized sections in this private
@@ -180,17 +196,55 @@ pub const Image = struct {
         const bytes: [*]const u8 = @ptrCast(data.*.d_buf orelse return &.{});
         return bytes[0..data.*.d_size];
     }
-    fn libelfBytes(binary: elf.Image, bytes: []u8, a: std.mem.Allocator) ![]u8 {
+    /// What a private handle holds beyond the snapshot: its copy, and every
+    /// compressed section that is now inflated in place.
+    fn derivedBytes(binary: elf.Image, object: *c.Elf, copied: bool, copy: usize) usize {
+        if (!copied) return 0;
+        var total: usize = copy;
+        for (0..binary.header.section_count) |i| {
+            const section = binary.section(@intCast(i)) catch continue;
+            const gnu = std.mem.startsWith(u8, section.name, ".zdebug");
+            if (section.flags & elf.shf.compressed == 0 and !gnu) continue;
+            const scn = c.elf_getscn(object, i) orelse continue;
+            var header: c.GElf_Shdr = undefined;
+            if (c.gelf_getshdr(scn, &header) == null) continue;
+            // Inflating clears the flag, or for the GNU form replaces the data.
+            if (header.sh_flags & elf.shf.compressed != 0) continue;
+            // A GNU section of unchanged size was not inflated, unless its
+            // stream declares exactly its own size: then the sizes cannot
+            // tell, and it is charged.
+            if (gnu and header.sh_size == section.size) {
+                const data = binary.sectionData(section) catch continue;
+                if (data.len < 12 or !std.mem.eql(u8, data[0..4], "ZLIB") or std.mem.readInt(u64, data[4..12], .big) != section.size) continue;
+            }
+            total +|= std.math.cast(usize, header.sh_size) orelse std.math.maxInt(usize);
+        }
+        return total;
+    }
+    fn libelfBytes(binary: elf.Image, bytes: []u8, a: std.mem.Allocator, charged: *usize) ![]u8 {
         // elf_memory borrows its buffer as writable private storage. Even
         // DWARF_C_READ decompresses sections by rewriting their ELF headers.
         // Keep those writes off read-only mappings and shared capture evidence.
         // Plain images need no copy: our read-only libdw calls do not edit them.
+        // The copy and what libdw then inflates are a second image or more.
+        // Charge both before allocating; a header may declare any size.
+        var inflated: u64 = 0;
+        var compressed = false;
         for (0..binary.header.section_count) |i| {
             const section = try binary.section(@intCast(i));
-            if (section.flags & elf.shf.compressed != 0 or std.mem.startsWith(u8, section.name, ".zdebug"))
-                return a.dupe(u8, bytes);
+            const gnu = std.mem.startsWith(u8, section.name, ".zdebug");
+            if (section.flags & elf.shf.compressed == 0 and !gnu) continue;
+            compressed = true;
+            const data = binary.sectionData(section) catch continue;
+            const declared: u64 = if (section.flags & elf.shf.compressed != 0) blk: {
+                if (binary.format.is64) break :blk if (data.len >= 24) std.mem.readInt(u64, data[8..16], binary.format.endian) else 0;
+                break :blk if (data.len >= 12) std.mem.readInt(u32, data[4..8], binary.format.endian) else 0;
+            } else if (data.len >= 12 and std.mem.eql(u8, data[0..4], "ZLIB")) std.mem.readInt(u64, data[4..12], .big) else 0;
+            inflated +|= declared;
         }
-        return bytes;
+        if (!compressed) return bytes;
+        charged.* += try image_budget.reserveDerived(inflated +| bytes.len);
+        return a.dupe(u8, bytes);
     }
     pub fn deinit(self: *Image) void {
         c.xgo_type_index_free(self.go_type_index);
@@ -199,6 +253,7 @@ pub const Image = struct {
         if (self.debug_object != self.object) _ = c.elf_end(self.debug_object);
         _ = c.elf_end(self.object);
         self.arena.deinit();
+        image_budget.releaseDerived(self.derived_bytes);
     }
     // Jetty ships elfutils 0.170. Its public iterator supports the demo's DWARF 4;
     // reject newer unit versions explicitly instead of guessing their headers.
@@ -277,7 +332,7 @@ pub const Image = struct {
         defer _ = c.close(fd);
         var stat: c.struct_stat = undefined;
         if (c.fstat(fd, &stat) != 0 or stat.st_mode & c.S_IFMT != c.S_IFREG or stat.st_size <= 0) return error.SplitDwarfNotRegular;
-        const size: usize = @intCast(stat.st_size);
+        const size = std.math.cast(usize, stat.st_size) orelse return error.SplitDwarfByteLimit;
         if (size > 64 * 1024 * 1024 or size > 256 * 1024 * 1024 - self.split_bytes) return error.SplitDwarfByteLimit;
         self.split_count += 1;
         self.split_bytes += size;
@@ -855,13 +910,13 @@ test "compressed DWARF preserves read-only ELF images and companions" {
                 if (fd < 0) return error.FixtureUnavailable;
                 defer _ = c.close(fd);
                 const bytes = try snapshot.read(fd, snapshot.per_image_limit, null);
-                defer _ = c.munmap(bytes.ptr, bytes.len);
+                defer snapshot.free(bytes);
                 const binary = try elf.Image.parse(bytes);
                 const debug_fd = c.open("tests/fixtures/elf/out/" ++ compiler ++ "-pie.debug" ++ suffix, c.O_RDONLY | c.O_CLOEXEC);
                 if (debug_fd < 0) return error.FixtureUnavailable;
                 defer _ = c.close(debug_fd);
                 const debug_bytes = try snapshot.read(debug_fd, snapshot.per_image_limit, null);
-                defer _ = c.munmap(debug_bytes.ptr, debug_bytes.len);
+                defer snapshot.free(debug_bytes);
                 const debug_binary = try elf.Image.parse(debug_bytes);
                 const companion = File{ .path = "fixture.debug", .image = debug_binary, .bytes = debug_bytes, .build_id = debug_binary.buildId() orelse &.{} };
                 const before = std.hash.Wyhash.hash(0, bytes);
@@ -879,7 +934,7 @@ test "compressed DWARF preserves read-only ELF images and companions" {
                     if (plain_fd < 0) return error.FixtureUnavailable;
                     defer _ = c.close(plain_fd);
                     const plain_bytes = try snapshot.read(plain_fd, snapshot.per_image_limit, null);
-                    defer _ = c.munmap(plain_bytes.ptr, plain_bytes.len);
+                    defer snapshot.free(plain_bytes);
                     const plain = try elf.Image.parse(plain_bytes);
                     const expected = try plain.sectionData(plain.sectionByName(".debug_addr") orelse return error.FixtureUnavailable);
                     try std.testing.expect(expected.len > 0);

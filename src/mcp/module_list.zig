@@ -3,6 +3,7 @@ const std = @import("std");
 const Session = @import("../model/session.zig").Session;
 const model = @import("../model/modules.zig");
 const wire = @import("profile.zig");
+const budget = @import("../binary/snapshot.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 const Hash = std.crypto.hash.sha2.Sha256;
@@ -18,6 +19,7 @@ const Snapshot = struct {
     regions: []const model.Region,
     failures: []const model.Modules.LoadFailure,
     pe_pending: bool = false,
+    image_budget: ?[]const u8 = null,
 };
 fn hashNumber(hash: *Hash, n: u64) void {
     var bytes: [8]u8 = undefined;
@@ -59,6 +61,7 @@ fn identity(snapshot: Snapshot) [64]u8 {
         hashNumber(&hash, f.end);
         hashText(&hash, f.path);
         hashText(&hash, f.diagnostic);
+        hashText(&hash, if (f.detail) |detail| detail else "");
     }
     var digest: [32]u8 = undefined;
     hash.final(&digest);
@@ -107,7 +110,7 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
     }
     while (end == snapshot.regions.len and failure_end < snapshot.failures.len and rows < limit) {
         const failure = snapshot.failures[failure_end];
-        const bytes = rowBytes(failure.path, failure.diagnostic);
+        const bytes = rowBytes(failure.path, failure.diagnostic) +| (if (failure.detail) |detail| detail.len else 0) *| 16;
         if (bytes > page_bytes - used) break;
         used += bytes;
         rows += 1;
@@ -124,6 +127,9 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
         .map_generation = snapshot.generation,
         .image_epoch = snapshot.epoch,
         .pe_metadata_pending = snapshot.pe_pending,
+        .image_budget = snapshot.image_budget,
+        // One process-wide figure: every session, capture and debug reader.
+        .image_bytes = .{ .held = budget.used(), .peak = budget.peakUsed(), .total_limit = budget.total_limit, .image_limit = budget.per_image_limit },
         .next = next,
     });
 }
@@ -136,6 +142,7 @@ pub fn call(a: Allocator, session: *Session, args: Value) !Value {
         .regions = session.modules.regions.items,
         .failures = session.modules.load_failures.items,
         .pe_pending = session.modules.peDiscoveryPending(),
+        .image_budget = session.modules.budgetDetail(null),
     }, args);
 }
 

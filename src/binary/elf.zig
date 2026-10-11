@@ -41,7 +41,19 @@ pub const Error = error{
     NoLoadSegment,
     /// The mapping passed to `loadBias` cannot be the image's first PT_LOAD.
     BadMapping,
+    /// More sections, segments or section-name bytes than a reader will walk.
+    TableLimit,
 };
+/// A file chooses its own counts and may point every name at one long string.
+/// These keep a walk over all sections bounded whatever the file says. Full
+/// images with more than 0xff00 sections are supported, so the section count
+/// is wider than the symbols-only reader's; the name total is what bounds a
+/// walk.
+pub const max_sections = 1 << 20;
+pub const max_segments = 4096;
+pub const max_section_name_bytes = 64 * 1024 * 1024;
+/// No name is longer than this; a longer one reads as unterminated.
+pub const max_name = 1024 * 1024;
 
 const ehdr_size = 64;
 const phdr_size = 56;
@@ -189,7 +201,7 @@ fn span(bytes: []const u8, offset: u64, size: u64) Error![]const u8 {
 fn str(table: []const u8, offset: u32) Error![]const u8 {
     if (offset == 0 and table.len == 0) return "";
     if (offset >= table.len) return error.BadString;
-    const rest = table[offset..];
+    const rest = table[offset..][0..@min(table.len - offset, max_name + 1)];
     return rest[0 .. std.mem.indexOfScalar(u8, rest, 0) orelse return error.BadString];
 }
 fn strIs(table: []const u8, offset: u32, name: []const u8) bool {
@@ -267,6 +279,9 @@ pub const Image = struct {
     segment_table: []const u8,
     section_table: []const u8,
     section_names: []const u8,
+    /// Identifies the program headers as parsed, so results computed from
+    /// them can be kept without walking the table again to compare.
+    segment_print: u64,
 
     /// Validates the ELF header and the extent of the segment table, section
     /// table, and section-name table. Entries are validated when accessed.
@@ -311,8 +326,10 @@ pub const Image = struct {
                 if (shstrndx == shn_xindex) shstrndx = f.read(u32, zero, if (f.is64) 40 else 24);
                 if (phnum == pn_xnum) phnum = f.read(u32, zero, if (f.is64) 44 else 28);
             }
+            if (shnum > max_sections) return error.TableLimit;
             section_table = try span(bytes, shoff, @as(u64, shnum) * f.shSize());
         }
+        if (phnum > max_segments) return error.TableLimit;
         var segment_table: []const u8 = &.{};
         if (phnum != 0) {
             if (f.read(u16, bytes, if (f.is64) 54 else 42) != f.phSize()) return error.BadHeader;
@@ -324,6 +341,17 @@ pub const Image = struct {
             const h = section_table[@as(usize, shstrndx) * f.shSize() ..][0..f.shSize()];
             if (f.read(u32, h, 4) != @intFromEnum(SectionType.strtab)) return error.BadSection;
             section_names = try span(bytes, f.word(h, 24, 16), f.word(h, 32, 20));
+            // Every later walk reads each name to its NUL. Do that once here
+            // with a total, so many sections cannot share one enormous name.
+            var scanned: usize = 0;
+            var i: usize = 0;
+            while (i < shnum) : (i += 1) {
+                const at = f.read(u32, section_table[i * f.shSize() ..][0..f.shSize()], 0);
+                if (at >= section_names.len) continue;
+                const rest = section_names[at..][0..@min(section_names.len - at, max_name + 1)];
+                scanned += if (std.mem.indexOfScalar(u8, rest, 0)) |end| end + 1 else rest.len;
+                if (scanned > max_section_name_bytes) return error.TableLimit;
+            }
         }
         return .{
             .format = f,
@@ -342,6 +370,7 @@ pub const Image = struct {
                 .section_name_index = shstrndx,
             },
             .segment_table = segment_table,
+            .segment_print = std.hash.Wyhash.hash(phnum, segment_table),
             .section_table = section_table,
             .section_names = section_names,
         };
@@ -444,34 +473,44 @@ pub const Image = struct {
     /// symbol below the address is used as a label when no sized symbol starts
     /// between them and the address is inside the label's section.
     pub fn symbolAt(self: *const Image, address: u64) ?Located {
-        var best: ?Symbol = null;
-        var label: ?Symbol = null;
+        // Candidates are compared by their fixed fields; only the winners'
+        // names are read. A table may hold millions of entries that each
+        // improve on the last, and a name is a scan of the string table.
+        const Pick = struct { table: SymbolTable, index: u32, value: u64, rank: [2]u8 };
+        var picks: [2]?Pick = .{ null, null }; // sized, then labels
         var barrier: ?u64 = null;
         for ([_]SymbolTable.Kind{ .symtab, .dynsym }) |kind| {
             const table = (self.symbols(kind) catch continue) orelse continue;
+            // A string table that does not end in NUL is malformed, and every
+            // name near its end would be a scan to the end: not walked.
+            if (table.strings.len != 0 and table.strings[table.strings.len - 1] != 0) continue;
             var i: u32 = 1;
             while (i < table.count()) : (i += 1) {
                 const e = table.entry(i);
                 const value = self.format.word(e, 8, 4);
                 const shndx = self.format.read(u16, e, if (self.format.is64) 6 else 14);
-                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(e[if (self.format.is64) 4 else 12]))) continue;
+                const info = e[if (self.format.is64) 4 else 12];
+                if (value > address or shndx == shn_undef or (shndx >= shn_loreserve and shndx != shn_xindex) or !addressType(@truncate(info))) continue;
                 const size = self.format.word(e, 16, 8);
                 if (size != 0 and address - value >= size) {
                     if (barrier == null or value > barrier.?) barrier = value;
                     continue;
                 }
-                const slot = if (size == 0) &label else &best;
+                const slot = &picks[@intFromBool(size == 0)];
+                const rank = [2]u8{ typeRank(@truncate(info)), bindRank(@truncate(info >> 4)) };
                 if (slot.*) |old| {
                     if (value < old.value) continue;
-                    if (value == old.value) {
-                        const new = [2]u8{ typeRank(@truncate(e[if (self.format.is64) 4 else 12])), bindRank(@truncate(e[if (self.format.is64) 4 else 12] >> 4)) };
-                        const cur = [2]u8{ typeRank(@intFromEnum(old.type)), bindRank(@intFromEnum(old.bind)) };
-                        if (std.mem.order(u8, &new, &cur) != .lt) continue;
-                    }
+                    if (value == old.value and std.mem.order(u8, &rank, &old.rank) != .lt) continue;
                 }
-                slot.* = table.get(i) catch continue;
+                // What `get` refuses, checked without reading the name.
+                const name = self.format.read(u32, e, 0);
+                if (name >= table.strings.len and !(name == 0 and table.strings.len == 0)) continue;
+                if (shndx == shn_xindex and table.extended.len == 0) continue;
+                slot.* = .{ .table = table, .index = i, .value = value, .rank = rank };
             }
         }
+        const best: ?Symbol = if (picks[0]) |pick| pick.table.get(pick.index) catch null else null;
+        const label: ?Symbol = if (picks[1]) |pick| pick.table.get(pick.index) catch null else null;
         if (best) |s| return .{ .symbol = s, .offset = address - s.value };
         const s = label orelse return null;
         if (address != s.value) {

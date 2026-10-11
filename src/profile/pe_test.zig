@@ -95,7 +95,7 @@ fn build(file: *const File) !*model.Capture {
     errdefer capture.deinit();
     const bytes = try @import("../binary/snapshot.zig").read(file.fd, 4096, null);
     const asset = assets.Asset.fromBytes(a, 1, file.name(), .{ .bias = bias, .start = bias, .end = bias + 0x2000, .device_major = 0, .device_minor = 0, .inode = 1 }, bytes) catch |err| {
-        _ = c.munmap(bytes.ptr, bytes.len);
+        @import("../binary/snapshot.zig").free(bytes);
         return err;
     };
     capture.pe_assets.append(a, asset) catch |err| {

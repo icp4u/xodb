@@ -60,7 +60,14 @@ pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Val
             try session.runTo(@intCast(tid), address, null, .agent);
         }
         session.record(.agent, if (finish) "finish" else "run_to");
-        return asValue(a, session.snapshot());
+        var result = try asValue(a, session.snapshot());
+        // A line was searched for: say what the search left unread.
+        if (!finish and member(args, "file") != null) {
+            const skipped = session.modules.skipped();
+            try result.object.put(a, "images_not_searched", .{ .integer = @intCast(skipped.count) });
+            try result.object.put(a, "image_budget", if (skipped.first) |first| .{ .string = try a.dupe(u8, first) } else .null);
+        }
+        return result;
     }
     const configure = std.mem.eql(u8, name, "configure_breakpoint");
     var fields = args.object.iterator();
