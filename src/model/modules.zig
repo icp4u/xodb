@@ -67,6 +67,7 @@ pub const Modules = struct {
     pub const FileKind = enum { elf, pe, other };
     const FileKey = struct { inode: u64, device_major: u64, device_minor: u64 };
     const max_file_kinds = 16384;
+    const FileClassification = struct { kind: FileKind, identity: rt.struct_xrt_file_identity, checked_revision: u64, failure: ?anyerror = null };
     const FileIdentity = struct {
         region: Region,
         identity: ?rt.struct_xrt_file_identity = null,
@@ -146,6 +147,7 @@ pub const Modules = struct {
     };
     const FileMaps = struct { regions: std.ArrayList(u32) = .empty, placed: std.ArrayList(Placed) = .empty };
     target: ?*const rt.struct_xrt_target = null,
+    owner_target: ?*rt.struct_xrt_target = null,
     // Worker-owned immutable snapshots must not read the owner's changing ISA.
     expected_machine: ?u16 = null,
     core_source: ?*const @import("../binary/core.zig").Core = null,
@@ -156,8 +158,7 @@ pub const Modules = struct {
     loaded: std.ArrayList(*Module) = .empty,
     next_id: u64 = 1,
     pe_images: pe.State = .{},
-    file_kinds: std.AutoHashMapUnmanaged(FileKey, FileKind) = .empty,
-    file_kind_reads: u64 = 0,
+    file_kinds: std.AutoHashMapUnmanaged(FileKey, FileClassification) = .empty,
     /// Files whose symbols-only view failed for good, for this map.
     /// Asking again would only restart a reader that must fail again.
     symbol_refusals: std.AutoHashMapUnmanaged(FileKey, anyerror) = .empty,
@@ -1130,7 +1131,7 @@ pub const Modules = struct {
         }
         if (self.symbol_pending == null) {
             var view: ?*rt.struct_xrt_file_view = null;
-            try runtime_api.check(rt.xrt_target_file_view_open(self.target, request, &view));
+            try self.openFileView(request, &view);
             const pinned = rt.xrt_file_view_identity(view).*;
             if (expected) |old| if (!std.meta.eql(old, pinned)) {
                 _ = rt.xrt_file_view_close(view);
@@ -1315,7 +1316,7 @@ pub const Modules = struct {
             const no_reader = !rt.xrt_target_is_remote(self.target) and (self.immutable or self.target == null);
             if (!no_reader and r.offset == 0 and !rt.xrt_target_is_remote(self.target)) {
                 if (self.peRegion(r)) |entry| {
-                    if (try self.peFindSymbol(entry, name)) |found| return found;
+                    if (try self.peFindSymbol(entry, name, automatic)) |found| return found;
                     continue;
                 } else |err| switch (err) {
                     error.NotPe => {},
@@ -1328,7 +1329,7 @@ pub const Modules = struct {
             }
             // Offset-0 data mappings are admitted above for PE headers only.
             if (automatic and r.permissions[2] != 'x') continue;
-            if (!no_reader and self.file_kinds.get(fileKey(r)) == .pe) continue;
+            if (!no_reader and self.file_kinds.contains(fileKey(r)) and (self.fileKind(r) catch null) == .pe) continue;
             var why: Unviewed = .no_reader;
             const view: ?*const elf.Image = if (no_reader) null else self.symbolImage(r) catch |err| blk: {
                 switch (err) {
@@ -1373,11 +1374,30 @@ pub const Modules = struct {
     fn fileKey(region: Region) FileKey {
         return .{ .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor };
     }
-    /// Which reader, if any, applies to a mapped file. Decided once from its
-    /// first bytes and shared by the ELF and PE paths, so a stop never
-    /// reopens a file only to learn again that it is neither.
+    fn openFileView(self: *Modules, request: *const rt.struct_xrt_file_request, view: *?*rt.struct_xrt_file_view) !void {
+        try runtime_api.check(if (self.owner_target) |target|
+            rt.xrt_target_file_view_open_owner(target, request, view)
+        else
+            rt.xrt_target_file_view_open(self.target, request, view));
+    }
+    /// Classify bytes once per exact file identity, sharing the answer with
+    /// both readers. Revalidate even a negative answer once per map revision:
+    /// an inode can change between stops, but thousands of mappings of the
+    /// same file must not each reopen and recheck its live VMA.
     fn fileKind(self: *Modules, region: Region) !FileKind {
-        if (self.file_kinds.get(fileKey(region))) |kind| return kind;
+        const key = fileKey(region);
+        if (self.file_kinds.get(key)) |cached| if (cached.checked_revision == self.maps_revision) {
+            if (cached.failure) |err| return err;
+            return cached.kind;
+        };
+        // A failed revalidation also belongs to this observation; repeating it
+        // for every alias must not turn a stale cached file into an I/O flood.
+        errdefer |err| if (err != error.OutOfMemory) {
+            if (self.file_kinds.getPtr(key)) |cached| {
+                cached.checked_revision = self.maps_revision;
+                cached.failure = err;
+            }
+        };
         const path = try self.allocator.dupeZ(u8, region.path);
         defer self.allocator.free(path);
         const request = std.mem.zeroInit(rt.struct_xrt_file_request, .{
@@ -1385,15 +1405,22 @@ pub const Modules = struct {
             .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .device_major = region.device_major, .device_minor = region.device_minor, .inode = region.inode, .path = path.ptr },
         });
         var view: ?*rt.struct_xrt_file_view = null;
-        try runtime_api.check(rt.xrt_target_file_view_open(self.target, &request, &view));
+        try self.openFileView(&request, &view);
         defer _ = rt.xrt_file_view_close(view);
+        const identity = rt.xrt_file_view_identity(view).*;
+        if (self.file_kinds.getPtr(key)) |cached| {
+            if (std.meta.eql(cached.identity, identity)) {
+                cached.checked_revision = self.maps_revision;
+                cached.failure = null;
+                return cached.kind;
+            }
+        }
         var magic: [4]u8 = @splat(0);
         const size: usize = @intCast(@min(@max(rt.xrt_file_view_identity(view).*.size, 0), magic.len));
         try runtime_api.check(rt.xrt_file_view_read(view, 0, &magic, size));
         const kind: FileKind = if (std.mem.eql(u8, &magic, "\x7fELF")) .elf else if (std.mem.eql(u8, magic[0..2], "MZ")) .pe else .other;
         if (self.file_kinds.count() >= max_file_kinds) self.file_kinds.clearRetainingCapacity();
-        try self.file_kinds.put(self.allocator, fileKey(region), kind);
-        self.file_kind_reads +|= 1;
+        try self.file_kinds.put(self.allocator, key, .{ .kind = kind, .identity = identity, .checked_revision = self.maps_revision });
         return kind;
     }
     /// A mapping pins its inode; once a file leaves the address space its
@@ -1413,7 +1440,10 @@ pub const Modules = struct {
         if (self.immutable or self.target == null or rt.xrt_target_is_remote(self.target)) return error.NotPe;
         if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotPe;
         if (try self.fileKind(region) != .pe) return error.NotPe;
-        const entry = try self.pe_images.get(self.allocator, self.target, region);
+        // fileKind proved this identity for the revision. A malformed "MZ" file
+        // mapped thousands of times must not be reopened for each mapping.
+        if (self.file_kinds.get(fileKey(region))) |cached| if (self.pe_images.failed(cached.identity)) |err| return err;
+        const entry = try self.pe_images.get(self.allocator, self.owner_target, region);
         try self.pe_images.bind(entry, self.target.?, self.regions.items, self.maps_revision, &self.next_id);
         const image = entry.image().?;
         const size = c.xpe_info(image).*.image_size;
@@ -1442,11 +1472,9 @@ pub const Modules = struct {
             if (address - region.start > std.math.maxInt(u32)) break;
             if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
             if (mapped.inode != 0 and !sameFile(mapped, region)) continue;
-            // Only a file not classified yet costs an open.
-            if (!self.file_kinds.contains(fileKey(region))) {
-                attempts += 1;
-                if (attempts > 64) return error.PeDiscoveryLimit;
-            }
+            // Cached classifications prove file identity once per map revision.
+            attempts += 1;
+            if (attempts > 64) return error.PeDiscoveryLimit;
             const entry = self.peRegion(region) catch |err| {
                 if (err == error.NotPe) continue;
                 return err;
@@ -1469,6 +1497,7 @@ pub const Modules = struct {
             const region = self.regions.items[self.pe_scan_next];
             if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/' or
                 std.mem.startsWith(u8, region.path, "/dev/") or std.mem.startsWith(u8, region.path, "/memfd:")) continue;
+            if (self.pe_images.backgroundDeferred(region)) continue;
             checked += 1;
             _ = self.peRegion(region) catch |err| {
                 if (err == error.SymbolDiscoveryPending) return;
@@ -1477,7 +1506,7 @@ pub const Modules = struct {
             };
         }
     }
-    fn peFindSymbol(self: *Modules, entry: *pe.Entry, name: []const u8) !?Symbol {
+    fn peFindSymbol(self: *Modules, entry: *pe.Entry, name: []const u8, code_only: bool) !?Symbol {
         var requested = name;
         if (std.mem.indexOfScalar(u8, name, '!')) |bang| {
             if (!std.ascii.eqlIgnoreCase(std.fs.path.basename(entry.path), name[0..bang])) return null;
@@ -1486,6 +1515,14 @@ pub const Modules = struct {
         const z = try self.allocator.dupeZ(u8, requested);
         defer self.allocator.free(z);
         const image = entry.image() orelse return error.SymbolDiscoveryPending;
+        if (entry.pdb()) |pdb| if (c.xpdb_find_public(pdb, z)) |symbol| {
+            if (code_only and symbol.*.flags & 3 == 0) return error.BreakpointSymbolNotExecutable;
+            const address = try std.math.add(u64, entry.start, symbol.*.rva);
+            if (!entry.contains(address)) return error.PeImagePlacementMismatch;
+            const function = c.xpe_function_at(image, symbol.*.rva);
+            const size: u64 = if (function != null and function.*.begin == symbol.*.rva) function.*.end - symbol.*.rva else 0;
+            return try self.retainSymbol(.{ .module_id = entry.id, .name = std.mem.span(symbol.*.name), .address = address, .size = size });
+        };
         const found = c.xpe_find_export(image, z) orelse return null;
         if (found.*.forwarder != null) return error.PeForwardedExportUnavailable;
         const address = std.math.add(u64, entry.start, found.*.rva) catch return error.InvalidAddress;
@@ -1498,9 +1535,17 @@ pub const Modules = struct {
         const image = entry.image() orelse return error.SymbolDiscoveryPending;
         const rva: u32 = @intCast(address - entry.start);
         const function = c.xpe_function_at(image, rva);
-        const begin: u32 = if (function != null) function.*.begin else rva;
+        var begin: u32 = if (function != null) function.*.begin else rva;
         const exported = c.xpe_export_name_at(image, begin);
-        const label: ?[]const u8 = if (exported != null) std.mem.span(exported) else null;
+        var label: ?[]const u8 = if (exported != null) std.mem.span(exported) else null;
+        if (entry.pdb()) |pdb| if (c.xpdb_public_at(pdb, rva)) |symbol| {
+            // Publics have no extent: never carry the nearest name across a
+            // proven function boundary or through an unproved leaf/gap.
+            if (symbol.*.flags & 3 != 0 and (symbol.*.rva == rva or (function != null and symbol.*.rva >= function.*.begin))) {
+                begin = symbol.*.rva;
+                label = std.mem.span(symbol.*.name);
+            }
+        };
         if (label == null and function == null) return error.SymbolNotFound;
         const text = if (label) |value|
             try std.fmt.allocPrint(self.allocator, "{s}!{s}", .{ std.fs.path.basename(entry.path), value })
@@ -1896,4 +1941,52 @@ test "the main executable is identified by device as well as inode and path" {
         try std.testing.expect(!Modules.isExecutable(pid, r));
         break;
     };
+}
+
+test "cached file kinds revalidate PE and other answers once per map revision" {
+    const native = @cImport({
+        @cDefine("_GNU_SOURCE", "1");
+        @cInclude("target_internal.h");
+        @cInclude("sys/mman.h");
+        @cInclude("sys/sysmacros.h");
+        @cInclude("sys/stat.h");
+    });
+    const a = std.testing.allocator;
+    const fd = native.memfd_create("mapped-kind", native.MFD_CLOEXEC);
+    try std.testing.expect(fd >= 0);
+    defer _ = native.close(fd);
+    try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, 4096));
+    const address = native.mmap(null, 4096, native.PROT_READ, native.MAP_PRIVATE, fd, 0);
+    try std.testing.expect(address != native.MAP_FAILED);
+    defer _ = native.munmap(address, 4096);
+    var st: native.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), native.fstat(fd, &st));
+    const path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{fd});
+    defer a.free(path);
+    var target = std.mem.zeroes(native.struct_xrt_target);
+    target.pid = native.getpid();
+    target.state = native.XRT_STOPPED;
+    defer native.xodb_maps_free(&target.maps);
+    var modules = Modules.init(a);
+    defer modules.deinit();
+    modules.target = @ptrCast(&target);
+    modules.owner_target = @ptrCast(&target);
+    const region = Region{ .start = @intFromPtr(address), .end = @intFromPtr(address) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path };
+    const cases = [_]struct { magic: []const u8, kind: Modules.FileKind }{
+        .{ .magic = "data", .kind = .other },  .{ .magic = "MZ00", .kind = .pe },
+        .{ .magic = "\x7fELF", .kind = .elf }, .{ .magic = "none", .kind = .other },
+    };
+    for (cases, 0..) |item, i| {
+        // A size change makes the identity change deterministic on coarse clocks.
+        try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, @intCast(4096 + i)));
+        try std.testing.expectEqual(@as(isize, @intCast(item.magic.len)), native.pwrite(fd, item.magic.ptr, item.magic.len, 0));
+        // The prior observation is stable within one stop, even after a file
+        // change. A new map revision must prove the changed identity again.
+        if (i != 0) try std.testing.expectEqual(cases[i - 1].kind, try modules.fileKind(region));
+        modules.maps_revision += 1;
+        try std.testing.expectEqual(item.kind, try modules.fileKind(region));
+        try std.testing.expectEqual(item.kind, try modules.fileKind(region));
+    }
+    modules.pruneFileKinds(&.{});
+    try std.testing.expectEqual(@as(u32, 0), modules.file_kinds.count());
 }

@@ -321,27 +321,40 @@ static enum xpe_status functions(struct xpe_image *p) {
     struct directory d=p->directories[3];if(!d.rva && !d.size)return XPE_OK;
     if(!d.rva || !d.size || d.size%12)return XPE_MALFORMED;
     unsigned count=d.size/12;if(count>XPE_MAX_FUNCTIONS)return XPE_LIMIT;
-    unsigned char *rows=NULL;enum xpe_status status=array(p,d.rva,count,12,&rows);if(status!=XPE_OK)return status;
-    /* Linkers leave empty rows behind for discarded functions. They cover
-     * no address, so they are counted and left out, not fatal. */
-    unsigned kept=0;
-    for(unsigned i=0;i<count;++i)if(u32(rows+i*12)<u32(rows+i*12+4))++kept;
+    uint64_t offset,available;
+    enum xpe_status status=locate(p,d.rva,&offset,&available);
+    if(status!=XPE_OK)return status;
+    if(d.size>available)return XPE_MALFORMED;
+    /* Count then fill in fixed windows: a cap-sized table must not allocate
+     * another 50 MiB beyond the worker's retained-metadata reservation. */
+    unsigned char rows[4080];unsigned kept=0;
+    for(unsigned i=0;i<count;) {
+        unsigned n=count-i;if(n>sizeof rows/12)n=sizeof rows/12;
+        status=xpe_read_rva(p,d.rva+i*12,rows,n*12);if(status!=XPE_OK)return status;
+        for(unsigned j=0;j<n;++j)if(u32(rows+j*12)<u32(rows+j*12+4))++kept;
+        i+=n;
+    }
     p->info.function_skipped=count-kept;
     size_t retained=(size_t)kept*sizeof *p->functions;
-    if(retained>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes){free(rows);return XPE_LIMIT;}
-    if(kept){p->functions=retain(p,retained);if(!p->functions){free(rows);return XPE_NOMEM;}}
-    for(unsigned i=0,n=0;i<count;++i) {
-        unsigned char *r=rows+i*12;
-        struct xpe_function f={u32(r),u32(r+4),u32(r+8),d.rva+i*12};
-        if(f.begin>=f.end)continue;
-        /* Unwind records are located and checked when they are read. */
-        if(f.end>p->info.image_size || !f.unwind || f.unwind>=p->info.image_size ||
-           (n && f.begin<p->functions[n-1].end)){status=XPE_MALFORMED;break;}
-        const struct xpe_section *section=virtual_range(p,f.begin,(uint64_t)f.end-f.begin);
-        if(!section || !(section->characteristics&0x20000000u)){status=XPE_MALFORMED;break;}
-        p->functions[n++]=f;p->info.function_count=n;
+    if(retained>XPE_MAX_RETAINED_BYTES-p->info.retained_bytes)return XPE_LIMIT;
+    if(kept){p->functions=retain(p,retained);if(!p->functions)return XPE_NOMEM;}
+    for(unsigned i=0,n=0;i<count;) {
+        unsigned chunk=count-i;if(chunk>sizeof rows/12)chunk=sizeof rows/12;
+        status=xpe_read_rva(p,d.rva+i*12,rows,chunk*12);if(status!=XPE_OK)return status;
+        for(unsigned j=0;j<chunk;++j) {
+            const unsigned char *r=rows+j*12;
+            struct xpe_function f={u32(r),u32(r+4),u32(r+8),d.rva+(i+j)*12};
+            if(f.begin>=f.end)continue;
+            if(n>=kept)return XPE_CHANGED;
+            if(f.end>p->info.image_size || !f.unwind || f.unwind>=p->info.image_size ||
+               (n && f.begin<p->functions[n-1].end))return XPE_MALFORMED;
+            const struct xpe_section *section=virtual_range(p,f.begin,(uint64_t)f.end-f.begin);
+            if(!section || !(section->characteristics&0x20000000u))return XPE_MALFORMED;
+            p->functions[n++]=f;p->info.function_count=n;
+        }
+        i+=chunk;
     }
-    free(rows);return status;
+    return p->info.function_count==kept?XPE_OK:XPE_CHANGED;
 }
 static enum xpe_status codeview(struct xpe_image *p) {
     struct directory d=p->directories[6];if(!d.rva && !d.size)return XPE_OK;

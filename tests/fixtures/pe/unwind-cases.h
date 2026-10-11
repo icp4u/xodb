@@ -36,11 +36,18 @@ static const struct uw_case uw_cases[] = {
     {"epilog-jmp-out", {1,5,2,0, 5,0x32, 1,0x30}, {0x48,0x83,0xc4,32,0x5b,0xe9,0x7e,0,0,0}, 8, 10, 0x170, 40, 1, 0, UW_EPILOG, 1},
     /* "sub rsp,8" undone by popping a volatile register. */
     {"epilog-pop-volatile", {1,4,1,0, 4,0x02}, {0x59,0xc3}, 6, 2, 0x170, 8, 0, 0, UW_EPILOG, 1},
-    /* A jmp between fragments of one function keeps the frame. The platform
-     * takes any jmp out of the table row for a tail call and reports the
-     * wrong caller here, so these two follow the frame, not the platform. */
-    {"fragment-jmp-inside", {1,5,2,0, 5,0x32, 1,0x30}, {0xe9,0x1b,0,0,0}, 8, 5, 0x170, 40, 1, 0, UW_UNWIND, 0},
+    /* Ordinary callees may have interior entry points: the frame is gone. */
+    {"tail-jmp-interior", {1,5,2,0, 5,0x32, 1,0x30}, {0xe9,0x1b,0,0,0}, 8, 5, 0x170, 0, 0, 0, UW_EPILOG, 1},
+    /* Wine 11.19 treats these unchained fragment jumps as tail calls. */
+    {"fragment-jmp-hot", {1,0,2,0, 0,0x32, 0,0x30}, {0xe9,0x1b,0,0,0}, 8, 5, 0x170, 40, 1, 0, UW_UNWIND, 0},
     {"fragment-jmp-cold", {1,5,2,0, 5,0x32, 1,0x30}, {0xe9,0x4b,0,0,0}, 8, 5, 0x170, 40, 1, 0, UW_UNWIND, 0},
+    {"fragment-jmp-chain", {1,5,2,0, 5,0x32, 1,0x30}, {0xe9,0x0b,1,0,0}, 8, 5, 0x170, 40, 1, 0, UW_UNWIND, 1},
+    /* Wine 11.19 does not recognize BND-prefixed final transfers. */
+    {"bnd-tail-ret", {1,5,2,0, 5,0x32, 1,0x30}, {0xf2,0xc3}, 8, 2, 0x170, 0, 0, 0, UW_EPILOG, 0},
+    {"bnd-pop-ret", {1,5,2,0, 5,0x32, 1,0x30}, {0x5b,0xf2,0xc3}, 8, 3, 0x170, 8, 1, 0, UW_EPILOG, 0},
+    {"bnd-tail-jmp", {1,5,2,0, 5,0x32, 1,0x30}, {0xf2,0xe9,0x0a,0,0,0}, 8, 6, 0x170, 0, 0, 0, UW_EPILOG, 0},
+    {"bnd-tail-rex-jmp", {1,5,2,0, 5,0x32, 1,0x30}, {0xf2,0x48,0xff,0xe0}, 8, 4, 0x170, 0, 0, 0, UW_EPILOG, 0},
+    {"bnd-body-jmp", {1,5,2,0, 5,0x32, 1,0x30}, {0xf2,0xff,0xe0}, 8, 3, 0x170, 40, 1, 0, UW_UNWIND, 1},
     /* Records a GCC-style toolchain emits: every code at offset 0 with no
      * prolog (a cold half), here stopped on its first instruction; and the
      * frame pointer set between pushes, "push rbp; mov rbp,rsp; push rbx". */
@@ -49,5 +56,6 @@ static const struct uw_case uw_cases[] = {
 };
 static const unsigned char uw_callee_record[] = {1,4,1,0, 4,0x42};
 static const unsigned char uw_cold_record[] = {1,0,2,0, 0,0x32, 0,0x30};
-static const unsigned uw_rows[3][3] = {{0x100,0x180,0x200},{0x180,0x1c0,0x240},{0x1c0,0x1f0,0x250}};
+static const unsigned char uw_chain_record[] = {0x21,0,0,0, 0,1,0,0, 0x80,1,0,0, 0,2,0,0};
+static const unsigned uw_rows[4][3] = {{0x100,0x180,0x200},{0x180,0x1c0,0x240},{0x1c0,0x1f0,0x250},{0x280,0x290,0x260}};
 #endif

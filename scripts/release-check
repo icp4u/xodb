@@ -27,6 +27,10 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('src/binary/pe*', 'src/binary/pdb*', 'src/debug/pe_unwind.c', 'src/model/pe_images.zig',
+      'tests/pe-*', 'tests/pdb-*', 'tests/fixtures/pe/*'), ('pe-*', 'pdb-*', 'jai-pe-demo-*')),
+    (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
+     ('runtime-host', 'runtime-agent', 'shared-processes', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
     (('tests/fixtures/unwind-realigned.c',), ('unwind-realigned*',)),
     (('src/debug/demangle.*', 'tests/demangle-names.*', 'tests/fixtures/stack-symbol-names.cc'), ('demangle-names', 'stack-symbol-names*')),
@@ -231,6 +235,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if tier != 'perf':
         steps.append(('pe-image', [sys.executable, '-B', 'tests/pe-image.py',
                       '--work', '.work/pe-image'], 30))
+        steps.append(('pdb-image', [sys.executable, '-B', 'tests/pdb-image.py',
+                      '--work', '.work/pdb-image'], 30))
         steps.append(('pe-unwind', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind'], 30))
     if tier == 'perf':
@@ -257,6 +263,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pe-job', '--image', '.work/pe-image/owned-pe.dll', '--sanitize'], 240, dict(needs=['pe-image'])))
         steps.append(('pe-image-fuzz', [sys.executable, '-B', 'tests/pe-image.py',
                       '--work', '.work/pe-image-fuzz', '--fuzz'], 90))
+        steps.append(('pdb-image-fuzz', [sys.executable, '-B', 'tests/pdb-image.py',
+                      '--work', '.work/pdb-image-fuzz', '--fuzz'], 90))
         for variant in ('eviction', 'budget', 'full-dwarf', 'large-companions'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', '--'+variant, '--work', '.work/'+label], 120))
@@ -270,6 +278,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 label = 'pe-wine-' + variant
                 steps.append((label, [sys.executable, '-B', 'tests/pe-wine.py', '--wine', wine,
                               '--work', '.work/'+label, *(['--'+variant] if variant != 'native' else [])], 240))
+            for variant in ('good', 'missing', 'mismatch', 'symlink', 'changed'):
+                label = 'pe-wine-pdb-' + variant
+                steps.append((label, [sys.executable, '-B', 'tests/pe-wine.py', '--wine', wine,
+                              '--work', '.work/'+label, '--pdb', variant], 240))
             for remote in (False, True):
                 label = f'jai-pe-demo-{int(remote)}'
                 steps.append((label, [sys.executable, '-B', 'tests/jai-demo.py', '--writes', '--kind', 'pe', '--wine', wine, '--work', '.work/' + label,

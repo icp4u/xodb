@@ -86,7 +86,7 @@ try:
         assert '28 RtlVirtualUnwind boundary comparisons passed' in (w / 'runtime.log').read_text()
         assert '2 RtlVirtualUnwind chained-save comparisons passed' in (w / 'runtime.log').read_text()
         shapes = [line for line in (w / 'runtime.log').read_text().splitlines() if 'shape comparisons' in line]
-        assert shapes == ['14 RtlVirtualUnwind shape comparisons passed, 02 documented platform differences seen'], shapes
+        assert shapes == ['17 RtlVirtualUnwind shape comparisons passed, 06 documented platform differences seen'], shapes
         run('wrong-result', [a.wine, str(w / 'runtime.exe'), 'wrong-result'], expected=90, cwd=w)
         run('wrong-shape', [a.wine, str(w / 'runtime.exe'), 'wrong-shape'], expected=90, cwd=w)
 finally:

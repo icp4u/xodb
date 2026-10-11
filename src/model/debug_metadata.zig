@@ -138,7 +138,7 @@ pub const State = struct {
         errdefer A.free(path);
         const request = c.struct_xrt_file_request{ .kind = c.XRT_FILE_MAPPED, .mapping = .{ .start = region.start, .end = region.end, .offset = region.offset, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = path } };
         var view: ?*c.struct_xrt_file_view = null;
-        try runtime.check(@intCast(c.xrt_target_file_view_open(@ptrCast(session.target.handle), &request, &view)));
+        try runtime.check(@intCast(c.xrt_target_file_view_open_owner(@ptrCast(session.target.handle), &request, &view)));
         errdefer _ = c.xrt_file_view_close(view);
         const local = c.xrt_file_view_remote(view) == 0;
         const identity = c.xrt_file_view_identity(view).*;

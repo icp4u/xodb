@@ -18,6 +18,9 @@ truth_path = w / 'truth.txt'
 def check(condition, message):
     if not condition: raise SystemExit('FAIL: ' + str(message))
 
+def compare_values(shown, stage, ratio):
+    check(shown['stage'] == stage and shown['ratio'] == ratio and shown['ok'] == 'true', shown)
+
 def parse_truth(text):
     """goroutine id -> (state, [(function, basename, line)], created_by)."""
     out = {}
@@ -109,7 +112,16 @@ try:
     check(frame0['symbol'] == 'main.marker' and frame0['source']['line'] > 37, frame0)
     rows = {l['name']: l for l in client.inspect('list_locals', tid=tid, frame=0)['locals']}
     shown = {name: rows[name]['value']['display'] for name in ('stage', 'label', 'items', 'ratio', 'ok', 'first', 'counts', 'err', 'results')}
-    check(shown['stage'] == '30' and shown['ratio'] == '7.5' and shown['ok'] == 'true', shown)
+    # Which worker receives each job changes total; compare against the fixture's
+    # actual arguments instead of assuming every job went to worker 3.
+    expected_stage, expected_ratio = Path(str(truth_path) + '.values').read_text().split()
+    compare_values(shown, expected_stage, expected_ratio)
+    try:
+        compare_values(shown, str(int(expected_stage) + 1), expected_ratio)
+    except SystemExit:
+        pass
+    else:
+        raise SystemExit('FAIL: planted wrong scalar value was accepted')
     check(shown['label'] == '"ready" [5 bytes]', shown)
     check(re.fullmatch(r'len 3 cap 3 \[main\.Item\] @ 0x[0-9a-f]+', shown['items']), shown)
     check(rows['p']['value']['kind'] == 'pointer' and rows['p']['value']['bits'] != 0, rows['p'])

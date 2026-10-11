@@ -118,13 +118,11 @@ enum xrt_status xrt_target_file_open(const struct xrt_target *t, const struct xr
 {
     return xrt_target_file_resolved(t, r, fd, identity, NULL);
 }
-/* One maps read serves every mapped-file open of a stop. Each event, resume
- * and mutation advances the generation, and a stopped address space that no
- * vfork relative shares cannot drop a mapping in between. Owner thread only. */
-static const struct xodb_maps *stopped_maps(const struct xrt_target *target, int32_t pid)
+/* Owner-thread hint only: even a stopped target may have untraced VM sharers.
+ * Each candidate open also checks its current VMA through map_files. */
+static const struct xodb_maps *stopped_maps(struct xrt_target *t, int32_t pid)
 {
-    struct xrt_target *t = (struct xrt_target *)target;
-    if (t->state != XRT_STOPPED || t->vfork_parent)
+    if (t->state != XRT_STOPPED || t->vfork_parent || t->vfork_hold || t->birth_count)
         return NULL;
     for (size_t i = 0; i < XRT_MAX_THREADS; ++i)
         if (t->vfork_children[i])
@@ -140,13 +138,9 @@ static const struct xodb_maps *stopped_maps(const struct xrt_target *target, int
     }
     return t->maps_valid ? &t->maps : NULL;
 }
-enum xrt_status xrt_target_file_resolved(const struct xrt_target *t, const struct xrt_file_request *r,
-        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source)
-{
-    return xrt_target_file_owner(t, r, fd, identity, source, 0);
-}
-enum xrt_status xrt_target_file_owner(const struct xrt_target *t, const struct xrt_file_request *r,
-        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source, int owner)
+static enum xrt_status target_file(const struct xrt_target *t, const struct xrt_file_request *r,
+        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source,
+        struct xrt_target *owner)
 {
     if (!t || !r || !fd)
         return XRT_INVALID_ARGUMENT;
@@ -169,7 +163,7 @@ enum xrt_status xrt_target_file_owner(const struct xrt_target *t, const struct x
     int opened = -1;
     enum xrt_file_source selected;
     const struct xodb_maps *maps =
-        owner && r->kind == XRT_FILE_MAPPED ? stopped_maps(t, pid) : NULL;
+        owner && r->kind == XRT_FILE_MAPPED ? stopped_maps(owner, pid) : NULL;
     enum xrt_status status = process_file(pid, r, &opened, &selected, maps);
     if (status != XRT_OK)
         return status;
@@ -186,6 +180,16 @@ enum xrt_status xrt_target_file_owner(const struct xrt_target *t, const struct x
     if (source)
         *source = selected;
     return XRT_OK;
+}
+enum xrt_status xrt_target_file_resolved(const struct xrt_target *t, const struct xrt_file_request *r,
+        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source)
+{
+    return target_file(t, r, fd, identity, source, NULL);
+}
+enum xrt_status xrt_target_file_owner(struct xrt_target *t, const struct xrt_file_request *r,
+        int *fd, struct xrt_file_identity *identity, enum xrt_file_source *source)
+{
+    return target_file(t, r, fd, identity, source, t);
 }
 enum xrt_status xrt_file_identity(int fd, struct xrt_file_identity *out)
 {

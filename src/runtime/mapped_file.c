@@ -91,29 +91,55 @@ int xodb_maps_read(int pid, struct xodb_maps *out)
         xodb_maps_free(out);
     return ok;
 }
-/* The candidate descriptor is already open and pins its inode while maps is
- * read. A matching live VMA therefore cannot refer to a freed inode whose
- * number the candidate later reused. This is an identity check at observation
- * time, not a promise that a running target keeps the mapping afterwards.
- * A caller's snapshot was read earlier; see xodb_maps for when that holds. */
-static int mapping_present(int pid, const struct xodb_maps *known, uint64_t start, uint64_t end,
-                           uint64_t ma, uint64_t mi, uint64_t ino)
+/* Both strings come from kernel-held objects, not the caller's filename. */
+static int mapping_path(int fd, int pid, uint64_t start, uint64_t end)
+{
+    char map_path[128], fd_path[64], actual[8192], candidate[8192];
+    snprintf(map_path, sizeof map_path, "/proc/%d/map_files/%llx-%llx", pid,
+             (unsigned long long)start, (unsigned long long)end);
+    snprintf(fd_path, sizeof fd_path, "/proc/self/fd/%d", fd);
+    ssize_t a = readlink(map_path, actual, sizeof actual);
+    ssize_t b = readlink(fd_path, candidate, sizeof candidate);
+    return a > 0 && a < (ssize_t)sizeof actual && a == b &&
+           !memcmp(actual, candidate, (size_t)a);
+}
+/* The open candidate pins its inode during the live mapping observation.
+ * A snapshot predates that open, so it additionally needs a fresh VMA check. */
+static int mapping_present(int fd, int pid, const struct xodb_maps *known,
+                           uint64_t start, uint64_t end, uint64_t ma, uint64_t mi, uint64_t ino)
 {
     if (start >= end || !ino)
         return 0;
-    struct xodb_maps fresh = {0};
-    if (!known) {
-        if (!xodb_maps_read(pid, &fresh))
-            return 0;
-        known = &fresh;
+    if (known) {
+        for (size_t i = 0; i < known->count; ++i) {
+            const struct xodb_maps_row *r = &known->rows[i];
+            if (r->start < end && start < r->end && r->device_major == ma &&
+                r->device_minor == mi && r->inode == ino &&
+                mapping_path(fd, pid, r->start, r->end))
+                return 1;
+        }
+        return 0;
     }
+    char path[64], line[8192];
+    snprintf(path, sizeof path, "/proc/%d/maps", pid);
+    FILE *maps = fopen(path, "re");
+    if (!maps)
+        return 0;
+    __atomic_add_fetch(&maps_reads, 1, __ATOMIC_RELAXED);
     int match = 0;
-    for (size_t i = 0; i < known->count && !match; ++i) {
-        const struct xodb_maps_row *r = &known->rows[i];
-        match = r->start < end && start < r->end && r->device_major == ma &&
-                r->device_minor == mi && r->inode == ino;
+    for (unsigned i = 0; i < 65536 && fgets(line, sizeof line, maps); ++i) {
+        unsigned long long s, e, offset, inode;
+        unsigned major_number, minor_number;
+        char permissions[5];
+        if (sscanf(line, "%llx-%llx %4s %llx %x:%x %llu", &s, &e, permissions, &offset,
+                   &major_number, &minor_number, &inode) != 7)
+            continue;
+        if (s < end && start < e && major_number == ma && minor_number == mi && inode == ino) {
+            match = 1;
+            break;
+        }
     }
-    xodb_maps_free(&fresh);
+    fclose(maps);
     return match;
 }
 
@@ -133,7 +159,7 @@ int xodb_mapped_file_matches_in(int fd, int pid, const struct xodb_maps *maps, u
         return 0;
     if ((unsigned long)fs.f_type != XODB_BTRFS_SUPER_MAGIC)
         return major(candidate.st_dev) == ma && minor(candidate.st_dev) == mi &&
-               (pid <= 0 || mapping_present(pid, maps, start, end, ma, mi, inode));
+               (pid <= 0 || mapping_present(fd, pid, maps, start, end, ma, mi, inode));
     if (pid <= 0 || start >= end || !mapping_identity(fd, ma, mi, inode))
         return 0;
 
@@ -158,10 +184,5 @@ int xodb_mapped_file_matches_in(int fd, int pid, const struct xodb_maps *maps, u
      * addition to normalized device and inode. In particular, a clone in a
      * different subvolume with the same inode must not pass this check. Reject
      * inaccessible/renamed/deleted paths rather than guessing from inode alone. */
-    char fd_path[64], actual_path[8192], candidate_path[8192];
-    snprintf(fd_path, sizeof fd_path, "/proc/self/fd/%d", fd);
-    ssize_t a = readlink(map_path, actual_path, sizeof actual_path);
-    ssize_t b = readlink(fd_path, candidate_path, sizeof candidate_path);
-    return a > 0 && a < (ssize_t)sizeof actual_path && a == b &&
-           !memcmp(actual_path, candidate_path, (size_t)a);
+    return mapping_path(fd, pid, start, end);
 }

@@ -107,10 +107,9 @@ struct xrt_target {
 
 enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uintptr_t data);
 int xrt_thread_index(const struct xrt_target *t, int32_t tid);
-/* xrt_target_file_resolved; owner != 0 is the target's owner thread and may
- * reuse this stop's maps snapshot. */
-enum xrt_status xrt_target_file_owner(const struct xrt_target *, const struct xrt_file_request *,
-        int *, struct xrt_file_identity *, enum xrt_file_source *, int owner);
+/* Owner-thread open may update the target's maps snapshot. */
+enum xrt_status xrt_target_file_owner(struct xrt_target *, const struct xrt_file_request *,
+        int *, struct xrt_file_identity *, enum xrt_file_source *);
 int xrt_breakpoint_index(const struct xrt_target *t, uint64_t id);
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address);
 enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn);

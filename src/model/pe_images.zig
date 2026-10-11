@@ -7,8 +7,15 @@ const Source = @import("../binary/mapped_file.zig").Source;
 const max_entries = 1024;
 const max_jobs = 256;
 const byte_limit = 256 * 1024 * 1024;
-const reserve_bytes = c.XPE_MAX_RETAINED_BYTES;
+const reserve_bytes = c.XPE_JOB_MAX_BYTES;
 
+const File = struct {
+    identity: c.struct_xrt_file_identity,
+    job: ?*c.struct_xpe_job = null,
+    retained: u64 = 0,
+    used: u64 = 0,
+    failure: ?anyerror = null,
+};
 pub const Entry = struct {
     start: u64,
     end: u64,
@@ -16,16 +23,34 @@ pub const Entry = struct {
     device_major: u64,
     device_minor: u64,
     path: [:0]const u8,
-    identity: c.struct_xrt_file_identity,
+    file: *File,
     source: Source,
     id: u64 = 0,
-    job: ?*c.struct_xpe_job = null,
-    retained: u64 = 0,
-    used: u64 = 0,
     verified_revision: u64 = 0,
-    failure: ?anyerror = null,
     pub fn image(self: *const Entry) ?*c.struct_xpe_image {
-        return if (self.job) |job| c.xpe_job_image(job) else null;
+        return if (self.file.job) |job| c.xpe_job_image(job) else null;
+    }
+    pub fn pdb(self: *const Entry) ?*const c.struct_xpdb {
+        const job = self.file.job orelse return null;
+        check(c.xpe_job_validate(job)) catch return null;
+        return c.xpe_job_pdb(job);
+    }
+    pub fn sourceAt(self: *const Entry, a: std.mem.Allocator, address: u64) !@import("../debug/info.zig").Site {
+        if (address < self.start or address - self.start > std.math.maxInt(u32)) return error.InvalidAddress;
+        const symbols = self.pdb() orelse {
+            const job = self.file.job orelse return error.SymbolDiscoveryPending;
+            const status = std.mem.span(c.xpe_job_pdb_status(job));
+            if (std.mem.eql(u8, status, "mismatch")) return error.PePdbIdentityMismatch;
+            if (std.mem.eql(u8, status, "changed")) return error.PePdbChanged;
+            if (std.mem.eql(u8, status, "unsupported")) return error.PePdbUnsupported;
+            if (std.mem.eql(u8, status, "malformed")) return error.PePdbMalformed;
+            if (std.mem.eql(u8, status, "limit")) return error.PePdbLimit;
+            return error.PePdbUnavailable;
+        };
+        const line = c.xpdb_line_at(symbols, @intCast(address - self.start)) orelse return error.NoSourceLocation;
+        return .{ .path = try a.dupe(u8, std.mem.span(line.*.path)), .line = line.*.line, .column = line.*.column,
+            .address = try std.math.add(u64, self.start, line.*.rva), .is_statement = line.*.statement != 0,
+            .prologue_end = false, .discriminator = 0 };
     }
     pub fn contains(self: *const Entry, address: u64) bool {
         const image_ = self.image() orelse return false;
@@ -41,50 +66,55 @@ pub const Entry = struct {
         const image_ = self.image() orelse return error.SymbolDiscoveryPending;
         if (rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
         if (rt.xrt_target_shared_vm(target)) return error.PeSharedVmUnavailable;
-        try check(c.xpe_job_validate(self.job.?));
+        try check(c.xpe_job_validate(self.file.job.?));
         var context = Reader{ .target = target, .base = self.start };
         rt.xrt_target_view(target, &context.expected);
         try context.unchanged();
         const reader = @import("../debug/windows.zig").Reader{ .user = &context, .read = Reader.readBytes };
         const result = try @import("../debug/windows.zig").unwind(image_, self.start, pc, registers, reader, reader);
-        try check(c.xpe_job_validate(self.job.?));
+        try check(c.xpe_job_validate(self.file.job.?));
         try context.unchanged();
         return result;
     }
 };
 pub const State = struct {
     entries: std.ArrayList(*Entry) = .empty,
-    pending: ?*Entry = null,
+    files: std.ArrayList(*File) = .empty,
+    pending: ?*File = null,
     bytes: u64 = 0,
     clock: u64 = 0,
     evictions: u64 = 0,
     pub fn deinit(self: *State, a: std.mem.Allocator) void {
         for (self.entries.items) |entry| {
-            if (entry.job) |job| c.xpe_job_destroy(job);
             a.free(entry.path);
             a.destroy(entry);
         }
         self.entries.deinit(a);
+        for (self.files.items) |file| {
+            if (file.job) |job| c.xpe_job_destroy(job);
+            a.destroy(file);
+        }
+        self.files.deinit(a);
         self.* = .{};
     }
-    pub const Snapshot = struct { identity_count: usize = 0, resident_images: usize = 0, retained_bytes: u64 = 0, reserved_bytes: u64 = 0, evictions: u64 = 0, active_worker: bool = false };
+    pub const Snapshot = struct { identity_count: usize = 0, mapping_count: usize = 0, resident_images: usize = 0, retained_bytes: u64 = 0, reserved_bytes: u64 = 0, evictions: u64 = 0, active_worker: bool = false };
     pub fn snapshot(self: *const State) Snapshot {
         var count: usize = 0;
-        for (self.entries.items) |entry| if (entry.job != null and self.pending != entry) {
+        for (self.files.items) |entry| if (entry.job != null and self.pending != entry) {
             count += 1;
         };
         const reserved = if (self.pending) |entry| entry.retained else 0;
-        return .{ .identity_count = self.entries.items.len, .resident_images = count, .retained_bytes = self.bytes - reserved, .reserved_bytes = reserved, .evictions = self.evictions, .active_worker = self.pending != null };
+        return .{ .identity_count = self.files.items.len, .mapping_count = self.entries.items.len, .resident_images = count, .retained_bytes = self.bytes - reserved, .reserved_bytes = reserved, .evictions = self.evictions, .active_worker = self.pending != null };
     }
-    fn touch(self: *State, entry: *Entry) void {
+    fn touch(self: *State, entry: *File) void {
         self.clock +|= 1;
         entry.used = self.clock;
     }
     fn trim(self: *State) !void {
         while (true) {
             var count: usize = 0;
-            var oldest: ?*Entry = null;
-            for (self.entries.items) |entry| {
+            var oldest: ?*File = null;
+            for (self.files.items) |entry| {
                 if (entry.job == null) continue;
                 count += 1;
                 if (self.pending == entry) continue;
@@ -92,13 +122,19 @@ pub const State = struct {
             }
             if (count < max_jobs and self.bytes <= byte_limit - reserve_bytes) return;
             const victim = oldest orelse return error.PeMetadataBudgetLimit;
-            c.xpe_job_destroy(victim.job.?);
-            victim.job = null;
-            self.bytes -= victim.retained;
-            victim.retained = 0;
-            victim.verified_revision = 0;
-            self.evictions +|= 1;
+            self.evict(victim);
         }
+    }
+    fn evict(self: *State, victim: *File) void {
+        c.xpe_job_destroy(victim.job.?);
+        victim.job = null;
+        self.bytes -= victim.retained;
+        victim.retained = 0;
+        for (self.entries.items) |entry| if (entry.file == victim) {
+            entry.verified_revision = 0;
+        };
+
+        self.evictions +|= 1;
     }
     /// Nonblocking publication; the worker owns file I/O until join succeeds.
     pub fn poll(self: *State) void {
@@ -121,11 +157,11 @@ pub const State = struct {
             entry.job = null;
             return;
         };
-        const image_ = c.xpe_job_image(job) orelse {
+        _ = c.xpe_job_image(job) orelse {
             entry.failure = error.PeMetadataUnavailable;
             return;
         };
-        entry.retained = c.xpe_info(image_).*.retained_bytes;
+        entry.retained = c.xpe_job_retained_bytes(job);
         self.bytes += entry.retained;
         self.touch(entry);
     }
@@ -133,18 +169,34 @@ pub const State = struct {
         return entry.start == region.start and entry.end == region.end and entry.inode == region.inode and
             entry.device_major == region.device_major and entry.device_minor == region.device_minor and std.mem.eql(u8, entry.path, region.path);
     }
-    /// Local file discovery starts one bounded worker. Remote discovery needs
-    /// the service's worker-owned target path and is explicitly unavailable here.
-    pub fn get(self: *State, a: std.mem.Allocator, target: ?*const rt.struct_xrt_target, region: anytype) !*Entry {
+    pub fn backgroundDeferred(self: *const State, region: anytype) bool {
+        for (self.entries.items) |entry| if (sameAnchor(entry, region)) {
+            return entry.id != 0 and entry.file.job == null;
+        };
+        return false;
+    }
+    /// A parse failure belongs to an exact file identity. A caller that has
+    /// proved that identity for the current stop reuses the answer for every
+    /// other mapping of the file; `get` would reopen the file to find it.
+    pub fn failed(self: *const State, identity: anytype) ?anyerror {
+        for (self.files.items) |file| {
+            if (std.mem.eql(u8, std.mem.asBytes(&file.identity), std.mem.asBytes(&identity))) return file.failure;
+        }
+        return null;
+    }
+    /// Mapping instances share one parsed image for each exact pinned file
+    /// identity. Eviction drops the file metadata, retaining instance IDs.
+    pub fn get(self: *State, a: std.mem.Allocator, target: ?*rt.struct_xrt_target, region: anytype) !*Entry {
         if (target == null or rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
         if (region.offset != 0 or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') return error.NotPe;
         self.poll();
         var existing: ?*Entry = null;
         for (self.entries.items) |entry| if (sameAnchor(entry, region)) {
-            if (entry.failure) |err| return err;
-            if (self.pending == entry) return error.SymbolDiscoveryPending;
+            if (entry.file.failure) |err| return err;
+            if (self.pending == entry.file) return error.SymbolDiscoveryPending;
             if (entry.image() != null) {
-                self.touch(entry);
+                try check(c.xpe_job_validate(entry.file.job.?));
+                self.touch(entry.file);
                 return entry;
             }
             existing = entry;
@@ -152,8 +204,8 @@ pub const State = struct {
         };
         if (self.pending != null) return error.SymbolDiscoveryPending;
         if (existing == null and self.entries.items.len >= max_entries) return error.PeMetadataIdentityLimit;
-        const path = if (existing) |entry| entry.path else try a.dupeZ(u8, region.path);
-        defer if (existing == null) a.free(path);
+        const path = try a.dupeZ(u8, region.path);
+        defer a.free(path);
         const request = c.struct_xrt_file_request{ .kind = c.XRT_FILE_MAPPED, .mapping = .{
             .start = region.start,
             .end = region.end,
@@ -164,43 +216,63 @@ pub const State = struct {
             .path = path,
         } };
         var view: ?*c.struct_xrt_file_view = null;
-        try runtime.check(@intCast(c.xrt_target_file_view_open(@ptrCast(target), &request, &view)));
-        var owns_view = true;
-        errdefer if (owns_view) {
+        try runtime.check(@intCast(c.xrt_target_file_view_open_owner(@ptrCast(target), &request, &view)));
+        defer if (view != null) {
             _ = c.xrt_file_view_close(view);
         };
         const identity = c.xrt_file_view_identity(view).*;
-        if (existing) |entry| if (!std.meta.eql(entry.identity, identity)) {
-            entry.failure = error.BinaryChangedDuringRead;
+        if (existing) |entry| if (!std.meta.eql(entry.file.identity, identity)) {
+            entry.file.failure = error.BinaryChangedDuringRead;
             return error.BinaryChangedDuringRead;
         };
-        if (identity.size < 2) return error.NotPe;
-        var signature: [2]u8 = undefined;
-        try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &signature, signature.len)));
-        if (!std.mem.eql(u8, &signature, "MZ")) return error.NotPe;
-        try self.trim();
+        var known: ?*File = null;
+        for (self.files.items) |file| if (std.meta.eql(file.identity, identity)) {
+            known = file;
+            break;
+        };
+        const file = known orelse blk: {
+            if (self.files.items.len >= max_entries) return error.PeMetadataIdentityLimit;
+            if (identity.size < 2) return error.NotPe;
+            var signature: [2]u8 = undefined;
+            try runtime.check(@intCast(c.xrt_file_view_read(view, 0, &signature, signature.len)));
+            if (!std.mem.eql(u8, &signature, "MZ")) return error.NotPe;
+            const item = try a.create(File);
+            errdefer a.destroy(item);
+            item.* = .{ .identity = identity };
+            try self.files.append(a, item);
+            break :blk item;
+        };
+        if (file.failure) |err| return err;
         const entry = existing orelse blk: {
             const item = try a.create(Entry);
             errdefer a.destroy(item);
-            item.* = .{ .start = region.start, .end = region.end, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = try a.dupeZ(u8, path), .identity = identity, .source = Source.fromRuntime(@intCast(c.xrt_file_view_source(view))) };
+            item.* = .{ .start = region.start, .end = region.end, .inode = region.inode, .device_major = region.device_major, .device_minor = region.device_minor, .path = try a.dupeZ(u8, path), .file = file, .source = Source.fromRuntime(@intCast(c.xrt_file_view_source(view))) };
             errdefer a.free(item.path);
             try self.entries.append(a, item);
             break :blk item;
         };
+        if (file.job) |job| {
+            try check(c.xpe_job_validate(job));
+            self.touch(file);
+            return entry;
+        }
+        try self.trim();
         var job: ?*c.struct_xpe_job = null;
-        try check(c.xpe_job_start(view, &job));
-        owns_view = false;
-        entry.job = job.?;
-        entry.retained = reserve_bytes;
+        var target_view: rt.struct_xrt_target_view = undefined;
+        rt.xrt_target_view(target.?, &target_view);
+        try check(c.xpe_job_start(view, target_view.pid, path, &job));
+        view = null;
+        file.job = job.?;
+        file.retained = reserve_bytes;
         self.bytes += reserve_bytes;
-        self.pending = entry;
-        self.touch(entry);
+        self.pending = file;
+        self.touch(file);
         return error.SymbolDiscoveryPending;
     }
     pub fn bind(self: *State, entry: *Entry, target: *const rt.struct_xrt_target, regions: anytype, revision: u64, next_id: *u64) !void {
         if (entry.verified_revision == revision) return;
         const image_ = entry.image() orelse return error.SymbolDiscoveryPending;
-        try check(c.xpe_job_validate(entry.job.?));
+        try check(c.xpe_job_validate(entry.file.job.?));
         var context = Reader{ .target = target, .base = entry.start };
         rt.xrt_target_view(target, &context.expected);
         if (context.expected.state != rt.XRT_STOPPED) return error.NotStopped;
@@ -221,7 +293,7 @@ pub const State = struct {
             const extent = @max(section.virtual_size, section.raw_size);
             if (extent != 0) try covered(entry, regions, section.rva, extent, section.characteristics & 0x20000000 != 0);
         }
-        try check(c.xpe_job_validate(entry.job.?));
+        try check(c.xpe_job_validate(entry.file.job.?));
         try context.unchanged();
         if (entry.id == 0) {
             const following = std.math.add(u64, next_id.*, 1) catch return error.PeMetadataIdentityLimit;
@@ -229,7 +301,7 @@ pub const State = struct {
             next_id.* = following;
         }
         entry.verified_revision = revision;
-        self.touch(entry);
+        self.touch(entry.file);
     }
 };
 fn covered(entry: *const Entry, regions: anytype, rva: u64, size: u64, executable: bool) !void {
@@ -288,4 +360,75 @@ pub fn check(status: c.enum_xpe_status) !void {
         c.XPE_NOT_FOUND => error.SymbolNotFound,
         else => error.PeMetadataUnavailable,
     };
+}
+
+test "PE aliases share parsed identity and eviction reloads only on demand" {
+    const native = @cImport({
+        @cDefine("_GNU_SOURCE", "1");
+        @cInclude("target_internal.h");
+        @cInclude("sys/mman.h");
+        @cInclude("sys/sysmacros.h");
+        @cInclude("sys/stat.h");
+    });
+    const a = std.testing.allocator;
+    const fd = native.memfd_create("shared-pe", native.MFD_CLOEXEC);
+    try std.testing.expect(fd >= 0);
+    defer _ = native.close(fd);
+    const fixture_bytes = @import("../binary/pe_fixture.zig").binary(1);
+    try std.testing.expectEqual(@as(isize, fixture_bytes.len), native.write(fd, &fixture_bytes, fixture_bytes.len));
+    try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, 4096));
+    var st: native.struct_stat = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), native.fstat(fd, &st));
+    const path = try std.fmt.allocPrint(a, "/proc/self/fd/{d}", .{fd});
+    defer a.free(path);
+    var target = std.mem.zeroes(native.struct_xrt_target);
+    target.pid = native.getpid();
+    target.state = native.XRT_STOPPED;
+    defer native.xodb_maps_free(&target.maps);
+    var state = State{};
+    defer state.deinit(a);
+    var addresses: [32]?*anyopaque = @splat(null);
+    defer for (addresses) |address| {
+        if (address != null) _ = native.munmap(address, 4096);
+    };
+    var regions: [32]@import("modules.zig").Region = undefined;
+    const begun = native.xrt_now();
+    for (&addresses, &regions, 0..) |*address, *region, i| {
+        address.* = native.mmap(null, 4096, native.PROT_READ, native.MAP_PRIVATE, fd, 0);
+        try std.testing.expect(address.* != native.MAP_FAILED);
+        target.generation += 1;
+        region.* = .{ .start = @intFromPtr(address.*), .end = @intFromPtr(address.*) + 4096, .offset = 0, .inode = st.st_ino, .device_major = native.major(st.st_dev), .device_minor = native.minor(st.st_dev), .permissions = "r--p".*, .path = path };
+        const entry = while (true) {
+            const result = state.get(a, @ptrCast(&target), region.*) catch |err| {
+                if (err != error.SymbolDiscoveryPending) return err;
+                if (native.xrt_now() - begun > 5 * std.time.ns_per_s) return error.TestJobTimeout;
+                _ = native.usleep(100);
+                continue;
+            };
+            break result;
+        };
+        entry.id = i + 1;
+        try std.testing.expect(entry.file == state.entries.items[0].file);
+        try std.testing.expect(entry.image() == state.entries.items[0].image());
+    }
+    const stats = state.snapshot();
+    try std.testing.expectEqual(@as(usize, 32), stats.mapping_count);
+    try std.testing.expectEqual(@as(usize, if (c.getenv("XODB_TEST_WRONG_PE_CACHE") != null) 2 else 1), stats.identity_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.resident_images);
+    try std.testing.expectEqual(c.xpe_info(state.entries.items[0].image()).*.retained_bytes, state.bytes);
+    state.evict(state.files.items[0]);
+    try std.testing.expectEqual(@as(u64, 0), state.bytes);
+    for (regions) |region| try std.testing.expect(state.backgroundDeferred(region));
+    try std.testing.expect(state.pending == null);
+    try std.testing.expectError(error.SymbolDiscoveryPending, state.get(a, @ptrCast(&target), regions[7]));
+    while (state.pending != null) {
+        state.poll();
+        if (native.xrt_now() - begun > 5 * std.time.ns_per_s) return error.TestJobTimeout;
+        _ = native.usleep(100);
+    }
+    const reloaded = try state.get(a, @ptrCast(&target), regions[7]);
+    try std.testing.expectEqual(@as(u64, 8), reloaded.id);
+    for (state.entries.items) |entry| try std.testing.expect(entry.image() == reloaded.image());
+    try std.testing.expectEqual(@as(c_int, 0), native.ftruncate(fd, 4097));
+    try std.testing.expectError(error.PeImageChanged, state.get(a, @ptrCast(&target), regions[0]));
 }

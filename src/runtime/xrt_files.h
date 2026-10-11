@@ -60,6 +60,9 @@ enum xrt_status xrt_file_unchanged(int fd, const struct xrt_file_identity *);
 struct xrt_file_view;
 enum xrt_status xrt_target_file_view_open(const struct xrt_target *,
         const struct xrt_file_request *, struct xrt_file_view **);
+/* Mutable owner-thread variant may reuse the stopped maps cache. */
+enum xrt_status xrt_target_file_view_open_owner(struct xrt_target *,
+        const struct xrt_file_request *, struct xrt_file_view **);
 const struct xrt_file_identity *xrt_file_view_identity(const struct xrt_file_view *);
 /* One-worker mode: a remote read yields with DISCOVERY_PENDING while a
  * foreground RPC owns or awaits the transport. No wire request was sent. */

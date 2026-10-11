@@ -95,7 +95,7 @@ static enum xpu_status records(const struct xpu_source *s,struct xpu_function f,
         for (unsigned i=0;i<r->slots;) {
             const unsigned char *p=r->codes+2*i;
             unsigned op=p[1]&15,info=p[1]>>4,n=slots(op,info);
-            if (n>r->slots-i || p[0]>previous) return XPU_MALFORMED;
+            if (n>r->slots-i || p[0]>previous || (!p[0] && r->prolog)) return XPU_MALFORMED;
             previous=p[0];
             if ((op==0 || op==4 || op==5) && !nonvolatile(info)) return XPU_MALFORMED;
             if ((op==8 || op==9) && info<6) return XPU_MALFORMED;
@@ -140,11 +140,11 @@ static enum xpu_status code(struct code_reader *r,unsigned char *out,unsigned n)
     if (!r->source->code(r->source->context,r->start+r->at,out,n)) return XPU_CODE_MISSING;
     r->at+=n; return XPU_OK;
 }
-/* A bare jmp that leaves the function is a tail call only if it lands on a
- * callee. Landing inside another table row, or on a row whose frame exists on
- * entry (a chained record, or codes with no prolog), is a jump between
- * fragments of one function and the frame is still intact. */
-static enum xpu_status tail_target(const struct xpu_source *s,uint32_t target,int *tail) {
+/* A bare relative jump into an ordinary callee is a tail call, including
+ * interior entry points. Frame-sharing fragments require evidence in the
+ * source or target metadata; a mid-row address alone is not evidence. */
+static enum xpu_status tail_target(const struct xpu_source *s,const struct record *from,
+                                    uint32_t target,int *tail) {
     struct xpu_function f; unsigned char header[4];
     if (!s->function) return XPU_UNSUPPORTED_EPILOG;
     int found=s->function(s->context,target,&f);
@@ -152,12 +152,13 @@ static enum xpu_status tail_target(const struct xpu_source *s,uint32_t target,in
     *tail=1;
     if (!found) return XPU_OK;
     if (target<f.begin || target>=f.end) return XPU_MALFORMED;
-    if (f.begin!=target) { *tail=0; return XPU_OK; }
     if ((f.unwind&3) || !f.unwind) return XPU_UNSUPPORTED_EPILOG;
     enum xpu_status status=metadata(s,f.unwind,header,sizeof header);
     if (status!=XPU_OK) return status;
-    if ((header[0]&7)!=1) return XPU_UNSUPPORTED_EPILOG;
-    *tail=!((header[0]>>3)&4) && (header[1] || !header[2]);
+    if ((header[0]&7)!=1 && (header[0]&7)!=2) return XPU_UNSUPPORTED_EPILOG;
+    int source_fragment=(from->flags&4) || (!from->prolog && from->slots);
+    int target_fragment=((header[0]>>3)&4) || (!header[1] && header[2]);
+    *tail=!(target_fragment || (source_fragment && target!=f.begin));
     return XPU_OK;
 }
 /* Recognize the entire suffix before reading any stack data. This is the
@@ -211,6 +212,14 @@ static enum xpu_status epilog(struct step *s,const struct record *r,uint32_t pc,
         pops[pop_count++]=reg; rex=0;
         status=code(&reader,b,1); if (status!=XPU_OK) return status; opcode=b[0];
     }
+    /* BND prefixes apply to the final transfer, after stack adjustment/pops. */
+    if (!rex && opcode==0xf2) {
+        status=code(&reader,b,1); if (status!=XPU_OK) return status; opcode=b[0];
+        if ((opcode&0xf0)==0x40) {
+            rex=opcode; status=code(&reader,b,1); if (status!=XPU_OK) return status; opcode=b[0];
+        }
+        if (opcode!=0xc3 && opcode!=0xc2 && opcode!=0xff && opcode!=0xe9 && opcode!=0xeb) return XPU_OK;
+    }
     if (!rex && opcode==0xc3) found=1;
     else if (!rex && opcode==0xf3) {
         status=code(&reader,b,1); if (status!=XPU_OK) return status;
@@ -232,7 +241,7 @@ static enum xpu_status epilog(struct step *s,const struct record *r,uint32_t pc,
             found=target==r->function.begin && !(r->flags&4) && r->prolog;
         else if (adjusted || pop_count || target<0 || target>=s->source->image_size) found=1;
         else {
-            status=tail_target(s->source,(uint32_t)target,&found); if (status!=XPU_OK) return status;
+            status=tail_target(s->source,r,(uint32_t)target,&found); if (status!=XPU_OK) return status;
         }
     }
     if (!found) return XPU_OK;

@@ -10,7 +10,13 @@ __declspec(dllimport) int WriteFile(void *, const void *, DWORD, DWORD *, void *
 __declspec(dllimport) void Sleep(DWORD);
 __declspec(dllimport) __declspec(noreturn) void ExitProcess(DWORD);
 __declspec(dllexport) __declspec(noinline) void pe_ready(void) { __asm__ volatile("" ::: "memory"); }
-static __declspec(noinline) long pe_hidden(long value) { volatile long stack[20];stack[0]=value;Sleep(1);return stack[0]+5; }
+#ifdef PE_PDB
+volatile long pe_data_public = 17;
+#endif
+#ifndef PE_PDB
+static
+#endif
+__declspec(noinline) long pe_hidden(long value) { volatile long stack[20];stack[0]=value;Sleep(1);return stack[0]+5; }
 static char *hex(char *p,U64 value){const char digits[]="0123456789abcdef";for(int i=15;i>=0;--i)*p++=digits[(value>>(i*4))&15];return p;}
 void entry(void) {
     void *dll=LoadLibraryA("owned-pe.dll");if(!dll)ExitProcess(90);
@@ -28,6 +34,9 @@ void entry(void) {
     char text[192],*p=text;p=hex(p,(U64)dll);*p++=' ';p=hex(p,(U64)inner);*p++=' ';p=hex(p,(U64)&pe_ready);*p++=' ';p=hex(p,(U64)&pe_hidden);*p++=' ';p=hex(p,(U64)first);*p++=' ';p=hex(p,(U64)first_inner);*p++=' ';p=hex(p,(U64)last);*p++=' ';p=hex(p,(U64)last_inner);*p++='\n';
     DWORD done;WriteFile(GetStdHandle((DWORD)-11),text,(DWORD)(p-text),&done,0);
     long result=0;
+#ifdef PE_PDB
+    result+=pe_data_public;
+#endif
     for (int i=0;i<6000;++i) { pe_ready();result+=((long (*)(long))outer)(i);result+=pe_hidden(i);if(first_inner)result+=((long (*)(long))first_inner)(i);if(last_inner)result+=((long (*)(long))last_inner)(i);
 #ifdef PE_UNWIND
         result+=((long (*)(long))unwind)(8);

@@ -28,10 +28,10 @@ static int stack_read(void *user,uint64_t at,void *out,size_t size) {
     if(at<base || at-base>sizeof memory || size>sizeof memory-(at-base))return 0;
     memcpy(out,(void *)(uintptr_t)at,size);return 1;
 }
-static RUNTIME_FUNCTION shape_rows[3];
+static RUNTIME_FUNCTION shape_rows[4];
 static int shape_lookup(void *user,uint32_t rva,struct xpu_function *out) {
     (void)user;
-    for(unsigned i=0;i<3;++i)if(rva>=shape_rows[i].BeginAddress && rva<shape_rows[i].EndAddress) {
+    for(unsigned i=0;i<4;++i)if(rva>=shape_rows[i].BeginAddress && rva<shape_rows[i].EndAddress) {
         *out=(struct xpu_function){shape_rows[i].BeginAddress,shape_rows[i].EndAddress,shape_rows[i].UnwindData};return 1;
     }
     return 0;
@@ -120,8 +120,8 @@ void entry(void) {
      * platform can look up what a jmp lands on, as the decoder does. Dynamic
      * tables are consulted only outside loaded modules, hence the allocation. */
     image=VirtualAlloc(NULL,image_size,MEM_COMMIT|MEM_RESERVE,PAGE_READWRITE);REQUIRE(image);
-    for(unsigned i=0;i<3;++i)shape_rows[i]=(RUNTIME_FUNCTION){uw_rows[i][0],uw_rows[i][1],uw_rows[i][2]};
-    REQUIRE(RtlAddFunctionTable(shape_rows,3,(uintptr_t)image));
+    for(unsigned i=0;i<4;++i)shape_rows[i]=(RUNTIME_FUNCTION){uw_rows[i][0],uw_rows[i][1],uw_rows[i][2]};
+    REQUIRE(RtlAddFunctionTable(shape_rows,4,(uintptr_t)image));
     int wrong_shape=strstr(GetCommandLineA(),"wrong-shape")!=NULL;
     unsigned compared=0,apart=0;
     for(unsigned i=0;i<sizeof uw_cases/sizeof uw_cases[0];++i) {
@@ -129,6 +129,7 @@ void entry(void) {
         memset(image,0x90,image_size);
         memcpy(image+0x200,k->record,k->record_size);memcpy(image+k->pc,k->code,k->code_size);
         memcpy(image+0x240,uw_callee_record,sizeof uw_callee_record);memcpy(image+0x250,uw_cold_record,sizeof uw_cold_record);
+        memcpy(image+0x260,uw_chain_record,sizeof uw_chain_record);
         memset((void *)(uintptr_t)(top-64),0,64);
         if(k->frame){memcpy((void *)(uintptr_t)(top-8),&rbp,8);memcpy((void *)(uintptr_t)(top-16),&rbx,8);}
         else memcpy((void *)(uintptr_t)(top-8),&rbx,8);
@@ -149,7 +150,7 @@ void entry(void) {
         RtlVirtualUnwind(0,base,input.rip,function,&runtime,&data,&establisher,NULL);
         int same=runtime.Rip==result.caller.rip && runtime.Rsp==result.caller.gpr[4] &&
             runtime.Rbx==result.caller.gpr[3] && runtime.Rbp==result.caller.gpr[5];
-        if(!k->platform){apart+=!same;continue;}
+        if(!k->platform){REQUIRE(!same);++apart;continue;}
         if(wrong_shape)same=result.caller.rip+1==runtime.Rip;
         if(!same){say("shape ");say(k->name);say(": RtlVirtualUnwind disagrees\n");ExitProcess(90);}
         ++compared;

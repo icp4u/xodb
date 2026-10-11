@@ -45,7 +45,7 @@ int main(int argc,char **argv) {
         .device_major=major(st.st_dev),.device_minor=minor(st.st_dev),.inode=st.st_ino,.path=path}};
     struct xrt_file_view *view=NULL;CHECK(xrt_target_file_view_open(&target,&request,&view)==XRT_OK);
     hold=!strcmp(argv[2],"barrier");
-    struct xpe_job *job=NULL;CHECK(xpe_job_start(view,&job)==XPE_OK);
+    struct xpe_job *job=NULL;CHECK(xpe_job_start(view,getpid(),path,&job)==XPE_OK);
     if (hold) {
         CHECK(!pthread_mutex_lock(&gate));
         while (!entered) CHECK(!pthread_cond_wait(&changed,&gate));

@@ -4,8 +4,8 @@
 memory layout. It follows the [Microsoft PE format](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format).
 Native Linux sessions discover file-anchored Wine images, including anonymous
 code/data mappings covered by their sections. Export names and `.pdata` function
-starts supply stack labels and symbol breakpoints. Native Windows x64 stack
-walking uses version-1 SEH unwind records and reports its method per frame.
+starts supply stack labels and symbol breakpoints. Windows x64 stack
+walking from the Linux host uses version-1 SEH unwind records and reports its method per frame.
 
 The reader retains sections, export entries and aliases, forwarder strings,
 imports, CodeView RSDS identities and sorted executable runtime-function ranges.
@@ -29,8 +29,8 @@ Caps are 96 sections, 65,536 exports/names/imports, 4,194,304 runtime functions,
 at 96 MiB; total source reads at 128 MiB and 262,144 callbacks. Strings are capped
 at 4,096 bytes including their terminator. A retained runtime-function row costs
 16 bytes, so a game executable with a million functions retains 16 MiB and the
-cap itself 64 MiB; the table is read once into a temporary buffer of 12 bytes a
-row. An empty row (`begin >= end`, left behind by some linkers) covers no address:
+cap itself 64 MiB. Two passes through a 4 KiB window count and fill retained
+rows without allocating a second cap-sized table. An empty row (`begin >= end`, left behind by some linkers) covers no address:
 it is left out and counted in `function_skipped`, and the image keeps its other
 rows. Unwind records are not read while loading; each is located and checked
 when an unwind consults it. Export labels by address use an index sorted once
@@ -49,11 +49,16 @@ sections must have executable mappings. Runtime addresses use the actual mapped
 header base, including relocated DLLs. File bytes and loaded-memory RVAs remain
 separate. Matching structural headers does not compare all executable bytes.
 
-Each mapped file is classified once, from its first bytes, as ELF, PE or neither,
-and the ELF and PE paths share that decision; it is dropped when the file leaves
-the address space. A stop therefore does not reopen files that are not PE images.
-File views opened during one stop share a single read of the process's maps: a
-stopped, unshared address space cannot drop a mapping between two views.
+Each exact file identity is classified from its first bytes as ELF, PE or neither.
+The ELF and PE readers share that decision, rechecking file identity once per
+map revision before using cached answers, including negative answers. A new
+stop's revision revalidates the file; all its mappings share that observation.
+Changed bytes can select a different reader even when device and inode stay
+the same. Failed revalidation of a cached file is shared for that revision too.
+Owner-thread file views can share one maps read per stop, but every open also
+checks the current VMA through `map_files`. Untraced address-space sharers can
+change mappings while the observed threads are stopped. Pending births and held
+vforks disable snapshot reuse. Background readers use fresh mapping evidence.
 
 `list_modules` preserves each raw kernel mapping and adds nullable `pe_image`
 attribution with module ID, base and path. `pe_metadata_pending` marks incomplete
@@ -61,15 +66,21 @@ discovery. Session `pe_metadata` counts resident images, identity records, retai
 and reserved bytes, evictions and an active worker. Symbol breakpoints accept
 `module.dll!export`; forwarded exports refuse with
 `PeForwardedExportUnavailable`. Functions without exported names use
-`module.dll!sub_RVA`. PDB paths and GUIDs are metadata only; PDB symbols and lines
-are not loaded yet.
+`module.dll!sub_RVA`. Matching local PDBs add public symbols and source lines as
+described below. PDB data publics remain available to `find_symbol`; a symbol
+breakpoint requires a public marked as code or a function, and otherwise stays
+pending with `BreakpointSymbolNotExecutable` without changing target bytes.
 
 The cache retains at most 256 jobs, 256 MiB of parsed metadata, and 1,024 identity
-records. An active worker reserves its 96 MiB allocation ceiling. Each pinned
-file view also has a bounded 64 KiB read buffer; this overhead is separate from
+records and 1,024 mapping instances. Mappings of the same exact file share one
+parsed image and one pinned source view. An active worker reserves its 224 MiB
+allocation ceiling: 96 MiB for PE parsing, plus a 64 MiB PDB source and
+64 MiB of PDB parsing allocations. Unused reservations are released when the
+worker finishes. Each pinned file view also has a bounded 64 KiB read buffer; this overhead is separate from
 parsed metadata. Eviction closes the view and frees metadata, while IDs and
-original identities survive. Reload must match the original file version.
-Limits are caps, with allocation following actual metadata sizes.
+original identities survive. Already discovered evicted images reload only when
+requested, rather than after every stop. Reload must match the original file
+version. Limits are caps, with allocation following actual metadata sizes.
 
 This integration currently supports native local targets with a known file-backed
 header. Agent/remote and core PE discovery, and images without
@@ -112,12 +123,15 @@ reserve for leaving: `jmp [rip+disp]`, any indirect `jmp` carrying REX.W, and a
 relative `jmp` out of the function (or to its own start). Without REX.W,
 `jmp rax` and `jmp [table+reg*8]` are switch dispatch in the body. Anything not
 recognised, a doubtful case included, is unwound from the unwind codes.
-One case departs from the platform on purpose: a bare relative `jmp` that lands
-inside another table row, or on a row whose frame exists on entry (a chained
-record, or codes with no prolog), is a jump between fragments of one function,
-so the frame is intact and the unwind codes apply. `RtlVirtualUnwind` treats
-such a `jmp` as a tail call and reports the wrong caller. When no function table
-is available to classify the target, that one form is refused.
+A bare relative jump to an ordinary callee is a tail call even when it targets
+an interior entry point. A chained or no-prologue record supplies evidence that
+the target shares an existing frame; a source fragment can also jump back inside
+an ordinary row without removing its frame. The fixture verifies these cases
+against Wine's `RtlVirtualUnwind`: chained targets agree; Wine 11.19 differs on
+the two unchained fragment cases. BND-prefixed final returns and jumps are also
+recognized; Wine 11.19 does not recognize the four tested BND epilogues. These
+comparisons describe Wine, not a native Windows run. When no function table is
+available to classify a bare relative target, that form is refused.
 
 Wine transitions use available Windows metadata or existing ELF CFI. Missing or
 unsupported rules leave a partial stack with the failing frame's diagnostic;
@@ -134,6 +148,12 @@ runtime-function table and every unwind record that can produce a caller with
 the pinned file version. Pending discovery and failed retention are reported in
 the capture's `mapping_history` summary. A PE loaded later in the capture has no
 retained PE asset; its addresses remain available with partial analysis.
+
+One capture opening shares a verification budget of 65,536 functions, 131,072
+target reads and 16 MiB of target metadata bytes across all PE mappings. An image
+that exceeds the remaining function budget is refused before its file is copied.
+Budget exhaustion leaves that asset unavailable and increments the capture's
+failed-retention count. The limits bound work, not elapsed time under host load.
 
 Saved Windows stacks use only captured perf registers, the saved stack window,
 timestamped mappings and immutable file assets. They never read the live target
@@ -205,9 +225,10 @@ The fast unwind lane checks compiler-assembled SEH tables at prologue/epilogue
 boundaries, recovered nonvolatile registers, chained saves, malformed records,
 and every-read failure. `--fuzz` adds the periodic sanitizer lane. The runtime
 oracle compares the decoder with `RtlVirtualUnwind` at 28 compiler instruction
-boundaries, two chained-save states and 14 crafted epilogue and record shapes
-(`tests/fixtures/pe/unwind-cases.h`), and checks that the two documented
-fragment jumps do differ from the platform; it requires Zig's Windows headers. The live oracle compares optimized
+boundaries, two chained-save states and 23 crafted epilogue and record shapes
+(`tests/fixtures/pe/unwind-cases.h`). Seventeen shapes agree with Wine 11.19 and
+six explicitly checked differences cover fragment and BND behavior; the fixture
+requires Zig's Windows headers. The live oracle compares optimized
 recursive/dynamic/SEH frames with `RtlCaptureStackBackTrace` and a compiler return
 address, then changes and restores loaded unwind metadata. Both include planted
 wrong results. Keep private compositor work paths short enough for Unix sockets.
@@ -219,3 +240,39 @@ plants a wrong saved caller. Fast Zig tests cover truncated stack windows,
 unsupported metadata, actual-PC placement, immutable file ownership, worker
 borrowing and the typed archive feature boundary; build-tests runs them in every
 release-check lane.
+
+
+## Local PDB symbols and lines
+
+For a PE mapped into a local Wine/Proton process, the existing metadata worker
+also tries the RSDS PDB basename beside the module in the target's filesystem.
+It never follows the embedded Windows directory, downloads symbols, or executes
+source-server commands. Put the matching PDB beside the EXE or DLL. Discovery
+is case-sensitive, and a final symlink or non-regular file is refused. Missing
+or rejected PDBs leave PE exports and Windows unwind metadata usable.
+
+The in-house reader supports MSF 7 containers, public symbols referenced by the
+public address map, and C13 source lines. GUID, age, machine and section placement
+must match the PE. Public names can resolve an unexported function for a symbol
+breakpoint. A public record has no extent; address labels are constrained by
+`.pdata` function bounds, or by an exact public address for a leaf function.
+Source locations use C13 contribution ranges and preserve hidden-line gaps.
+They appear in live stack frames and explicit source-location queries. Existing
+source maps can translate compiler paths into local source paths.
+
+PDB bytes are read and parsed on the worker. The source is capped at 64 MiB,
+parsing allocations (including temporary streams) at 64 MiB, aggregate stream
+work at 256 MiB, individual strings at 4 KiB, and public/line rows at 1,048,576
+each. File descriptors pin the selected files. Metadata and full file identities
+are rechecked before publication, and a later change withdraws the PDB names
+and lines until the module is rediscovered. Bounds limit work and memory, not
+filesystem syscall latency. Eviction releases PDB metadata with its shared PE
+file identity, so aliases are charged once.
+
+This is deliberately a partial PDB reader. Types/TPI, locals, inlining, C11
+lines, FASTLINK, OMAP, public thunk maps, object-local C13 string tables and
+ambiguous folded line ranges are unavailable. Only one RSDS identity per image
+is supported. Source-line breakpoint lookup and embedding PDB data in recorded
+profiles are not implemented; use symbol or address breakpoints, and live
+source-location queries. These limits do not claim native Windows debugger
+support.

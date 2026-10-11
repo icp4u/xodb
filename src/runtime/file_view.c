@@ -21,8 +21,8 @@ static enum xrt_status remember(struct xrt_file_view *v, enum xrt_status status)
         v->failure = status == XRT_INVALID_ARGUMENT ? XRT_FILE_CHANGED : status;
     return v->failure != XRT_OK ? v->failure : status;
 }
-enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
-        const struct xrt_file_request *request, struct xrt_file_view **out)
+static enum xrt_status file_view_open(const struct xrt_target *t,
+        const struct xrt_file_request *request, struct xrt_file_view **out, struct xrt_target *owner)
 {
     if (!t || !request || !out || request->kind != XRT_FILE_MAPPED)
         return XRT_INVALID_ARGUMENT;
@@ -31,7 +31,8 @@ enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
     v->fd = -1;
     enum xrt_status status;
     if (!t->connection) {
-        status = xrt_target_file_owner(t, request, &v->fd, &v->identity, &v->source, 1);
+        status = owner ? xrt_target_file_owner(owner, request, &v->fd, &v->identity, &v->source) :
+                         xrt_target_file_resolved(t, request, &v->fd, &v->identity, &v->source);
     } else {
         struct xrt_file_request copy = *request;
         struct xrt_codec wire = xrt_codec(v->bytes, sizeof(v->bytes), false);
@@ -65,6 +66,16 @@ enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
     }
     *out = v;
     return XRT_OK;
+}
+enum xrt_status xrt_target_file_view_open(const struct xrt_target *t,
+        const struct xrt_file_request *request, struct xrt_file_view **out)
+{
+    return file_view_open(t, request, out, NULL);
+}
+enum xrt_status xrt_target_file_view_open_owner(struct xrt_target *t,
+        const struct xrt_file_request *request, struct xrt_file_view **out)
+{
+    return file_view_open(t, request, out, t);
 }
 const struct xrt_file_identity *xrt_file_view_identity(const struct xrt_file_view *v)
 {

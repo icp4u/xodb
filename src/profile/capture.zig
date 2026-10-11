@@ -662,6 +662,7 @@ pub const Capture = struct {
             if (a.start != b.start or a.end != b.end or a.offset != b.offset or a.inode != b.inode or a.device_major != b.device_major or a.device_minor != b.device_minor or !std.mem.eql(u8, &a.permissions, &b.permissions) or !std.mem.eql(u8, a.path, b.path)) return error.PeImagePlacementMismatch;
         }
         self.pe_assets_pending = live.peDiscoveryPending();
+        var verification_budget = @import("pe_assets.zig").VerificationBudget{};
         for (live.pe_images.entries.items) |entry| {
             if (entry.id == 0 or entry.verified_revision != live.maps_revision or entry.image() == null) continue;
             const present = for (live.regions.items) |region| {
@@ -671,7 +672,7 @@ pub const Capture = struct {
             const id = self.images.next_id;
             const asset = asset: {
                 if (self.images.loaded.items.len + self.pe_assets.entries.items.len >= 256) break :asset null;
-                const held = @import("pe_assets.zig").retain(self.allocator, target, entry, id) catch |err| {
+                const held = @import("pe_assets.zig").retain(self.allocator, target, entry, id, &verification_budget) catch |err| {
                     if (err == error.OutOfMemory) return err;
                     break :asset null;
                 };

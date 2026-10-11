@@ -91,13 +91,32 @@ pub const Assets = struct {
         return null;
     }
 };
+/// Shared across one capture opening, including every mapped PE instance.
+/// This bounds synchronous target reads even when hostile files use large
+/// function tables or long chains. Exhaustion leaves the asset unavailable.
+pub const VerificationBudget = struct {
+    functions: u32 = 65536,
+    reads: usize = 131072,
+    bytes: usize = 16 * 1024 * 1024,
+    fn reserve(self: *VerificationBudget, count: u32) !void {
+        if (count > self.functions) return error.PeMetadataLimit;
+        self.functions -= count;
+    }
+    fn charge(self: *VerificationBudget, count: usize) !void {
+        if (self.reads == 0 or count > self.bytes) return error.PeMetadataLimit;
+        self.reads -= 1;
+        self.bytes -= count;
+    }
+};
 /// Capture the exact pinned file version and prove its stopped placement again.
 /// Later code reads use this immutable file; in-place code changes during the
 /// capture have the same explicit coverage limitation as ELF CFI attribution.
-pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: *const pe.Entry, id: u64) !*Asset {
+pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: *const pe.Entry, id: u64, budget: *VerificationBudget) !*Asset {
     if (rt.xrt_target_is_remote(target)) return error.PeRemoteMetadataUnavailable;
     if (rt.xrt_target_shared_vm(target)) return error.PeSharedVmUnavailable;
-    var context = TargetReader{ .target = target, .base = entry.start };
+    const original = entry.image() orelse return error.SymbolDiscoveryPending;
+    try budget.reserve(c.xpe_info(original).*.function_count);
+    var context = TargetReader{ .target = target, .base = entry.start, .budget = budget };
     rt.xrt_target_view(target, &context.expected);
     try context.unchanged();
     const request = c.struct_xrt_file_request{ .kind = c.XRT_FILE_MAPPED, .mapping = .{ .start = entry.start, .end = entry.end, .offset = 0, .device_major = entry.device_major, .device_minor = entry.device_minor, .inode = entry.inode, .path = entry.path } };
@@ -105,13 +124,12 @@ pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: 
     var identity: c.struct_xrt_file_identity = undefined;
     try runtime.check(@intCast(c.xrt_target_file_open(@ptrCast(target), &request, &fd, &identity)));
     defer _ = c.close(fd);
-    if (!std.meta.eql(identity, entry.identity)) return error.BinaryChangedDuringRead;
+    if (!std.meta.eql(identity, entry.file.identity)) return error.BinaryChangedDuringRead;
     // PE readers keep their 256 MiB image bound whatever the ELF budget is.
     const bytes = try snapshot.read(fd, @min(image_limit, snapshot.per_image_limit), null);
     var owned_bytes = true;
     errdefer if (owned_bytes) snapshot.free(bytes);
-    try runtime.check(@intCast(c.xrt_file_unchanged(fd, &entry.identity)));
-    const original = entry.image() orelse return error.SymbolDiscoveryPending;
+    try runtime.check(@intCast(c.xrt_file_unchanged(fd, &entry.file.identity)));
     const size = c.xpe_info(original).*.image_size;
     const placement = Placement{ .start = entry.start, .end = try std.math.add(u64, entry.start, size), .bias = entry.start, .device_major = entry.device_major, .device_minor = entry.device_minor, .inode = entry.inode };
     const asset = try Asset.fromBytes(a, id, entry.path, placement, bytes);
@@ -125,6 +143,7 @@ pub fn retain(a: std.mem.Allocator, target: *const rt.struct_xrt_target, entry: 
     return asset;
 }
 const TargetReader = struct {
+    budget: *VerificationBudget,
     target: *const rt.struct_xrt_target,
     base: u64,
     expected: rt.struct_xrt_target_view = undefined,
@@ -135,6 +154,7 @@ const TargetReader = struct {
     }
     fn read(ptr: ?*anyopaque, rva: u64, raw: ?*anyopaque, n: usize) callconv(.c) c.enum_xpe_status {
         const self: *TargetReader = @ptrCast(@alignCast(ptr.?));
+        self.budget.charge(n) catch return c.XPE_LIMIT;
         self.unchanged() catch return c.XPE_CHANGED;
         const address = std.math.add(u64, self.base, rva) catch return c.XPE_MALFORMED;
         var count: usize = 0;
@@ -195,3 +215,16 @@ const Verifier = struct {
         }
     }
 };
+
+test "PE capture verification shares finite operation budgets across assets" {
+    var budget = VerificationBudget{};
+    try budget.reserve(60000);
+    try std.testing.expectError(error.PeMetadataLimit, budget.reserve(60000));
+    try std.testing.expectEqual(@as(u32, 5536), budget.functions);
+    budget.reads = 1;
+    try budget.charge(4);
+    try std.testing.expectError(error.PeMetadataLimit, budget.charge(4));
+    budget = .{ .bytes = 4 };
+    try std.testing.expectError(error.PeMetadataLimit, budget.charge(5));
+    try std.testing.expectEqual(@as(usize, 131072), budget.reads);
+}

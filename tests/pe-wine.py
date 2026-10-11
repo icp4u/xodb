@@ -16,11 +16,12 @@ p.add_argument('--eviction',action='store_true')
 p.add_argument('--wrong-result',action='store_true')
 p.add_argument('--unwind',action='store_true')
 p.add_argument('--profile',action='store_true',help='saved PE stacks and archive asset verification')
+p.add_argument('--pdb',choices=('good','missing','mismatch','symlink','changed'),help='local PDB source/publics and refusal cases')
 a=p.parse_args()
-if a.profile:a.unwind=True
+if a.profile or a.pdb:a.unwind=True
 root=Path(__file__).resolve().parents[1];os.chdir(root);os.umask(0o022);orphans.adopt()
 w=a.work.resolve();w.mkdir(parents=True)
-start=time.monotonic();report=dict(status='running',eviction=a.eviction)
+start=time.monotonic();report=dict(status='running',eviction=a.eviction,pdb=a.pdb)
 
 def command(args,name):
  r=subprocess.run(args,capture_output=True,text=True,timeout=60)
@@ -32,7 +33,7 @@ def command(args,name):
 command(['lld-link','/lib','/def:'+str(w/'kernel32.def'),'/machine:x64','/out:'+str(w/'kernel32.lib')],'import-library')
 for source in ('library','main'):
  command(['clang','--target=x86_64-pc-windows-msvc','-O2','-g','-gcodeview','-ffile-prefix-map='+str(root)+'=.',
-          '-DPE_COUNT='+str(260 if a.eviction else 0),*(['-DPE_UNWIND'] if a.unwind else []),'-c','tests/fixtures/pe/'+source+'.c','-o',str(w/(source+'.obj'))],source+'-compile')
+          '-DPE_COUNT='+str(260 if a.eviction else 0),*(['-DPE_UNWIND'] if a.unwind else []),*(['-DPE_PDB'] if a.pdb else []),'-c','tests/fixtures/pe/'+source+'.c','-o',str(w/(source+'.obj'))],source+'-compile')
 extra=[]
 if a.unwind:
  (w/'ntdll.def').write_text('LIBRARY ntdll.dll\nEXPORTS\n    RtlCaptureStackBackTrace\n    __chkstk\n    __C_specific_handler\n')
@@ -44,6 +45,10 @@ command(['lld-link','/dll','/noentry','/machine:x64','/debug','/pdb:'+str(w/'lib
          '/out:'+str(w/'owned-pe.dll'),str(w/'library.obj'),str(w/'kernel32.lib'),*extra],'library-link')
 command(['lld-link','/entry:entry','/subsystem:console','/machine:x64','/debug','/pdb:'+str(w/'main.pdb'),
          '/out:'+str(w/'owned-pe.exe'),str(w/'main.obj'),str(w/'kernel32.lib')],'main-link')
+if a.pdb=='missing':(w/'main.pdb').unlink()
+if a.pdb=='mismatch':shutil.copyfile(w/'library.pdb',w/'main.pdb')
+if a.pdb=='symlink':
+ (w/'main.pdb').rename(w/'main-real.pdb');(w/'main.pdb').symlink_to('main-real.pdb')
 command(['cc','-O2','-Wall','-Wextra','-Werror','tests/fixtures/pe/launcher.c','-o',str(w/'launcher')],'launcher')
 command(['llvm-readobj','--file-headers','--coff-exports','--unwind',str(w/'owned-pe.exe')],'exe-oracle')
 if a.unwind:
@@ -162,7 +167,7 @@ try:
  bp=action('set_breakpoint',symbol=symbol_name)['id']
  action('continue');state=client.stopped('breakpoint',seconds=25);tid=next(t['tid'] for t in state['threads'] if t['reason']=='breakpoint')
  frame=stack(tid);report['export_frame']=frame
- assert frame['pc']==expected and frame['symbol']==('wrong-export' if a.wrong_result and not a.unwind else symbol_name),frame
+ assert frame['pc']==expected and frame['symbol']==('wrong-export' if a.wrong_result and not a.unwind and not a.pdb else symbol_name),frame
  assert frame['module_id']==module_id and frame['diagnostic'] is None and frame['unwind_method']=='windows_unwind',frame
  if not a.eviction:
   data=(w/'owned-pe.dll').read_bytes();pe=struct.unpack_from('<I',data,60)[0];stamp=base+pe+8
@@ -173,10 +178,50 @@ try:
   assert refused['symbol'] is None and refused['diagnostic']=='PeImageChanged',refused
   action('write_memory',address=hex(stamp),hex=original)
   restored=stack(tid);assert restored['symbol']==symbol_name and restored['module_id']==module_id,restored
-  action('remove_breakpoint',id=bp);hidden_bp=action('set_breakpoint',address=hex(hidden))['id']
+  action('remove_breakpoint',id=bp)
+  if a.pdb=='changed':
+   st=(w/'main.pdb').stat();os.utime(w/'main.pdb',ns=(st.st_atime_ns,st.st_mtime_ns+1_000_000_000))
+  if a.pdb=='good':
+   # PDB data publics remain inspectable, but a symbol breakpoint must not
+   # overwrite their storage with a trap instruction.
+   data_name='owned-pe.exe!pe_data_public'
+   data_symbol=client.inspect('find_symbol',name=data_name)
+   data_before=client.inspect('read_memory',address=data_symbol['address'],length=4)['hex']
+   data_bp=action('set_breakpoint',symbol=data_name)['id']
+   deadline=time.monotonic()+20
+   while True:
+    probes=client.inspect('get_breakpoints')
+    definition=next(d for d in probes['definitions'] if d['id']==data_bp)
+    probe=next(d for d in probes['breakpoints'] if d['id']==data_bp)
+    if not probe['pending'] or definition['diagnostic'] not in (None,'SymbolDiscoveryPending'):break
+    assert time.monotonic()<deadline,probes
+    time.sleep(.005)
+   assert definition['diagnostic']=='BreakpointSymbolNotExecutable',definition
+   assert probe['pending'],probes
+   assert client.inspect('read_memory',address=data_symbol['address'],length=4)['hex']==data_before
+   report['pdb_data_public']={'findable':True,'breakpoint_diagnostic':definition['diagnostic'],'unchanged':True}
+   action('remove_breakpoint',id=data_bp)
+   hidden_bp=action('set_breakpoint',symbol='owned-pe.exe!pe_hidden')['id']
+  else:hidden_bp=action('set_breakpoint',address=hex(hidden))['id']
   action('continue');state=client.stopped('breakpoint',seconds=20);tid=next(t['tid'] for t in state['threads'] if t['reason']=='breakpoint')
   frame=stack(tid);report['hidden_frame']=frame
-  assert frame['pc']==hidden and frame['symbol']=='owned-pe.exe!sub_'+format(hidden-0x140000000,'x'),frame
+  expected_hidden='owned-pe.exe!pe_hidden' if a.pdb=='good' else 'owned-pe.exe!sub_'+format(hidden-0x140000000,'x')
+  assert frame['pc']==hidden and frame['symbol']==expected_hidden,frame
+  if a.pdb=='good':
+   location=client.inspect('get_source_location',address=hex(hidden))['source'];report['pdb_source']=location
+   expected_line=next(i+1 for i,line in enumerate((root/'tests/fixtures/pe/main.c').read_text().splitlines()) if line.startswith('__declspec(noinline) long pe_hidden'))
+   if a.wrong_result:expected_line+=1
+   assert location['line']==expected_line and location['path'].endswith('/tests/fixtures/pe/main.c'),location
+   assert frame['source']['line']==expected_line,frame
+  elif a.pdb:
+   assert frame['source'] is None,frame
+   refusal=client.tool('get_source_location',generation=client.session()['generation'],address=hex(hidden))
+   report['pdb_refusal']=refusal
+   assert refusal.get('result',{}).get('isError'),refusal
+   settled()
+   attempt=client.tool('find_symbol',name='owned-pe.exe!pe_hidden')
+   report['pdb_symbol_refusal']=attempt
+   assert attempt.get('result',{}).get('isError'),attempt
   assert frame['diagnostic'] is None and frame['unwind_method']=='windows_unwind',frame
   if a.unwind:
    # Stop before the next invocation so the pipe oracle belongs to this stack.

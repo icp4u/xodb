@@ -900,6 +900,7 @@ pub const Session = struct {
             }
             self.modules.debug_files = self.symbolFiles();
             self.modules.target = self.target.handle;
+            self.modules.owner_target = self.target.handle;
             self.modules.beginStop(self.target.snapshot().generation);
             try self.modules.refresh(try self.target.stoppedTid());
             self.maps_generation = self.target.snapshot().generation;
@@ -1415,9 +1416,15 @@ pub const Session = struct {
     }
     pub fn sourceAt(self: *Session, a: std.mem.Allocator, address: u64) !info.Site {
         try self.refreshMaps();
-        const module = try self.modules.at(address);
-        var site = try (try module.debugInfo()).siteAt(a, try module.linkAddress(address));
-        site.address = try module.runtimeAddress(site.address);
+        var site = blk: {
+            const module = self.modules.at(address) catch |err| {
+                if (err != error.PeDebugInfoUnavailable) return err;
+                break :blk try (try self.modules.peAt(address)).sourceAt(a, address);
+            };
+            var result = try (try module.debugInfo()).siteAt(a, try module.linkAddress(address));
+            result.address = try module.runtimeAddress(result.address);
+            break :blk result;
+        };
         const mapped = try self.sourceMaps().forward(a, site.path);
         if (mapped.ptr != site.path.ptr) {
             site.original_path = site.path;
@@ -1566,6 +1573,7 @@ pub const Session = struct {
                             break :stack_walk;
                         };
                         frame.module_id = image.id;
+                        frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
                         break :step image.unwind(self.target.handle.?, pc, registers) catch |pe_error| {
                             frame.diagnostic = @errorName(pe_error);
                             try frames.append(a, frame);

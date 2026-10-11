@@ -223,3 +223,14 @@ and the allocating `DemangleString`/`__cxa_demangle` wrapper; replaces two
 length-delimited C interface. The remaining C++17 code uses only libc symbols,
 no allocation, exceptions, RTTI or C++ standard-library runtime. Zig's existing
 C++ frontend builds it with the host application; it is not part of the C agent.
+
+## PDB format reader
+
+`src/binary/pdb.c` is an in-house bounded reader for public symbols and C13 lines;
+it links no external PDB library. Format references are LLVM's
+[MSF description](https://llvm.org/docs/PDB/MsfFile.html),
+[PDB information stream](https://llvm.org/docs/PDB/PdbStream.html),
+[DBI stream](https://llvm.org/docs/PDB/DbiStream.html), and
+[module stream](https://llvm.org/docs/PDB/ModiStream.html), together with the
+CodeView record layouts in the LLVM headers. Compiler fixtures use clang/lld,
+and `llvm-pdbutil` is an independent test oracle, not a runtime dependency.

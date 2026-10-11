@@ -111,7 +111,12 @@ image cannot open its debug info. Raise `--image-limit` for it.
 ### Other bounds
 
 Windows (PE) images keep their 256 MiB bound, including from a profile
-archive. What a name lookup reads of images that have no symbols-only view
+archive. The optional adjacent PDB reader is outside the process-wide image
+total: one worker per session may read a PDB of at most 64 MiB, allocate at most
+64 MiB for its parser, and perform at most 256 MiB of stream work. These bytes
+are reserved against the separate 256 MiB PE metadata cache; they are not
+controlled by `--image-limit` or `--image-total-limit`.
+What a name lookup reads of images that have no symbols-only view
 keeps fixed bounds too (256 MiB each, 512 MiB for one process; see "Name
 lookups and the full image"). With a runtime agent, whole-file transfers keep
 the agent's fixed 256 MiB cap, whatever the local budget is; the refusal says so. Opening a

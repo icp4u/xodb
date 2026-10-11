@@ -139,6 +139,7 @@ static void synthetic(struct fixture *f) {
     for(unsigned i=0;i<16;++i)CHECK(out.caller.xmm[6][i]==0x77);
     /* Versions, truncated operands, ordering, reserved fields and flags. */
     const struct { unsigned char bytes[12];enum xpu_status status; } bad[]={
+        {{1,5,1,0,0,0x30},XPU_MALFORMED},
         {{2,0,0,0},XPU_UNSUPPORTED_VERSION},{{3,0,0,0},XPU_UNSUPPORTED_VERSION},
         {{1,4,1,0,4,1},XPU_MALFORMED},{{1,4,1,0,4,0x21},XPU_MALFORMED},
         {{1,4,1,0,4,6},XPU_UNSUPPORTED_OPCODE},{{1,4,1,0,4,10},XPU_MACHINE_FRAME},
@@ -185,10 +186,11 @@ static void shapes(struct fixture *f,int wrong) {
     for(size_t i=0;i<sizeof uw_cases/sizeof uw_cases[0];++i) {
         const struct uw_case *k=&uw_cases[i];
         memset(f->image,0x90,f->size);memset(f->memory,0,0x100000);
-        for(unsigned r=0;r<3;++r)for(unsigned j=0;j<3;++j)put32(f->image+0x300+r*12+j*4,uw_rows[r][j]);
-        f->rows=3;
+        for(unsigned r=0;r<4;++r)for(unsigned j=0;j<3;++j)put32(f->image+0x300+r*12+j*4,uw_rows[r][j]);
+        f->rows=4;
         metadata(f,0x200,k->record,k->record_size);metadata(f,k->pc,k->code,k->code_size);
         metadata(f,0x240,uw_callee_record,sizeof uw_callee_record);metadata(f,0x250,uw_cold_record,sizeof uw_cold_record);
+        metadata(f,0x260,uw_chain_record,sizeof uw_chain_record);
         save(f,ENTRY,RETURN_PC);
         struct xpu_context c=context(ENTRY-k->used);
         if(k->frame){save(f,ENTRY-8,OLD_RBP);save(f,ENTRY-16,OLD_RBX);c.gpr[5]=ENTRY-8;}

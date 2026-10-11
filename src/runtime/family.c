@@ -182,6 +182,7 @@ enum xrt_status xrt_target_adopt(struct xrt_target *t, int32_t pid, struct xrt_t
     }
     /* A reused handle keeps counting: contexts taken before the reuse stay stale. */
     const uint64_t generation = out->generation;
+    xodb_maps_free(&out->maps);
     memset(out, 0, sizeof(*out));
     out->generation = generation;
     out->remote_collectors = 0; /* Adopted handle is not published yet. */
@@ -439,6 +440,8 @@ enum xrt_status xrt_target_close(struct xrt_target *t)
         return xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_CLOSE});
     if (!t)
         return XRT_OK;
+    xodb_maps_free(&t->maps);
+    t->maps_valid = false;
     if (t->core) {
         t->core = false;
         t->pid = 0;

@@ -110,6 +110,8 @@ func main() {
 	}
 	if len(os.Args) > 1 {
 		os.WriteFile(os.Args[1], snapshot[:n], 0o644)
+		// Worker assignment is scheduler-dependent; record the actual marker arguments.
+		os.WriteFile(os.Args[1]+".values", []byte(fmt.Sprintf("%d %g\n", total, ratio)), 0o644)
 	} else {
 		os.Stdout.Write(snapshot[:n])
 	}
