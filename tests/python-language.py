@@ -176,6 +176,7 @@ def corrupt_value(run, checks):
 def corrupt_frames(run, checks):
     """Corrupt the stopped thread's frame chain in place and restore it."""
     good = run.stack()
+    named_loop = bool(loop_frames(run.c.inspect('get_stack', tid=run.tid)['frames']))
     top = int(good['segments'][0]['frames'][0]['frame_address'], 16)
     middle = int(good['segments'][0]['frames'][1]['frame_address'], 16)
     cases = [
@@ -188,13 +189,21 @@ def corrupt_frames(run, checks):
         old = run.c.inspect('read_memory', address=hex(address), length=len(data)//2)['hex']
         try:
             run.c.action('write_memory', address=hex(address), hex=data)
-            result = run.stack()
-            assert all(s['state'] == 'partial' for s in result['segments'][:1]) and ok(result), result
+            response = run.c.tool('get_language_stack', tid=run.tid, language='python', generation=run.c.session()['generation'])
+            if response.get('result', {}).get('isError'):
+                # Without a named native loop, corrupting the logical chain
+                # can remove the only execution witness (entry containment).
+                # Such a stack must refuse; a named loop still gives the
+                # reader enough independent evidence for partial diagnostics.
+                assert not named_loop and response['result']['content'][0]['text'] == 'PythonInterpreterFrameUnavailable', response
+            else:
+                result = json.loads(response['result']['content'][0]['text'])
+                assert all(s['state'] == 'partial' for s in result['segments'][:1]) and ok(result), result
         finally:
             run.c.action('write_memory', address=hex(address), hex=old)
     after = run.stack()
     assert [frames(s) for s in after['segments']] == [frames(s) for s in good['segments']] and after['segments'][0]['state'] == 'complete'
-    checks.append('corrupted owner / executable / cycle / unreadable previous are partial with reasons, then restored')
+    checks.append('corrupted owner / executable / cycle / unreadable previous are partial with reasons, or refuse when unnamed entry evidence is lost; restored complete')
 
 
 LOOP = '_PyEval_EvalFrameDefault'
@@ -241,7 +250,15 @@ def skipped_entry(python, work, checks, skips):
         thread_state = int(segments[0]['runtime_instance']['thread_state'], 16)
         corrupt(thread_state + current, '00' * 8, 'current-frame-null')
         after = run.stack()
-        assert after['segments'] == good['segments'], after
+        # Restoring bytes creates a new retained stop. The language data is
+        # identical, while its module binding must name the current generation.
+        assert after['binding_token']['generation'] == after['generation'], after
+        assert after['binding_token']['generation'] > good['binding_token']['generation'], (good, after)
+        for segment in after['segments']:
+            assert segment['binding_token'] == after['binding_token'], after
+        def language_data(stack):
+            return [{k: v for k, v in segment.items() if k != 'binding_token'} for segment in stack['segments']]
+        assert language_data(after) == language_data(good), after
         checks.append('V1: skipped middle entry, entry.previous=NULL and current_frame=NULL leave reasoned partial segments for frame 0/1/N-1/N/N+1; restored complete')
     finally:
         run.close('sorted3')
@@ -466,7 +483,14 @@ def run_modes(python, tag, work, checks, skips):
     for mode, depth in (('deep300', 300), ('deep5000', 5000)):
         run = Run(python, mode, work)
         try:
-            result = run.stack()
+            response = run.c.tool('get_language_stack', tid=run.tid, language='python', generation=run.c.session()['generation'])
+            if response.get('result', {}).get('isError'):
+                native = run.c.inspect('get_stack', tid=run.tid)['frames']
+                assert depth >= 4096 and not loop_frames(native), (depth, native, response)
+                assert response['result']['content'][0]['text'] == 'PythonInterpreterFrameUnavailable', response
+                checks.append(f'{tag}: recursion {depth} refuses without a named loop or entry witness within the frame budget')
+                continue
+            result = json.loads(response['result']['content'][0]['text'])
             (work/(tag+'-'+mode+'.json')).write_text(json.dumps(result, indent=1)+'\n')
             assert len(result['segments']) == 1, result
             s = result['segments'][0]

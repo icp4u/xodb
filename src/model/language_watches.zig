@@ -11,11 +11,14 @@ const javascript = @import("../language/javascript.zig");
 const perl = @import("../language/perl.zig");
 const Capture = @import("../language/watch.zig").Capture;
 const A = std.mem.Allocator;
+const runtime_binding = @import("../language/runtime_binding.zig");
+const RuntimeEvidence = struct { id: u64, generation: u64, identity: runtime_binding.Identity };
 const Attempt = struct { id: u64, generation: u64, metadata: u64 };
 pub const State = struct {
     core: ?*c.struct_xlw_set = null,
     attempts: [c.XLW_ENTRIES]?Attempt = @splat(null),
     revision: u64 = 0,
+    runtime_evidence: [c.XLW_ENTRIES]?RuntimeEvidence = @splat(null),
     pub fn deinit(self: *State) void {
         c.xlw_destroy(self.core);
         self.core = null;
@@ -58,14 +61,31 @@ pub const State = struct {
     pub fn remove(self: *State, id: u64) !void {
         if (self.core == null) return error.LanguageWatchNotFound;
         try check(c.xlw_remove(self.core, id));
+        for (&self.runtime_evidence) |*item| if (item.* != null and item.*.?.id == id) {
+            item.* = null;
+        };
         self.revision +%= 1;
+    }
+    fn evidence(self: *State, id: u64, generation: u64, identity: ?runtime_binding.Identity) void {
+        for (&self.runtime_evidence) |*item| if (item.* != null and item.*.?.id == id) {
+            item.* = null;
+        };
+        const proved = identity orelse return;
+        for (&self.runtime_evidence) |*item| if (item.* == null) {
+            item.* = .{ .id = id, .generation = generation, .identity = proved };
+            return;
+        };
     }
     fn feed(self: *State, id: u64, generation: u64, capture: Capture) !void {
         try check(c.xlw_feed(self.core, id, generation, &capture.scope, capture.observation, if (capture.sample) |*sample| sample else null, if (capture.diagnostic) |why| why.ptr else null));
+        self.evidence(id, generation, capture.runtime_identity);
     }
     pub fn poll(self: *State, session: *Session) void {
         if (self.core == null) return;
         const snapshot = session.target.snapshot();
+        for (&self.runtime_evidence) |*item| if (item.* != null and (snapshot.state != .stopped or item.*.?.generation != snapshot.generation)) {
+            item.* = null;
+        };
         if (snapshot.state == .running) {
             c.xlw_running(self.core);
             return;
@@ -105,6 +125,8 @@ pub const State = struct {
                 else => error.LanguageWatchRuntimeUnsupported,
             }) catch |err| {
                 if (session.target.snapshot().state != .stopped or session.target.snapshot().generation != snapshot.generation) return;
+                self.evidence(view.id, snapshot.generation, null);
+                if (std.mem.endsWith(u8, @errorName(err), "Pending") or err == error.SymbolDiscoveryBudgetExceeded) self.attempts[ordinal] = null;
                 _ = c.xlw_feed(self.core, view.id, snapshot.generation, &scope, c.XLW_INCOMPLETE, null, @errorName(err).ptr);
                 self.revision +%= 1;
                 return;
@@ -121,8 +143,11 @@ pub const State = struct {
         for (entries, 0..) |*entry, ordinal| {
             var view: c.struct_xlw_view = undefined;
             try check(c.xlw_get(self.core, ordinal, &view));
+            const runtime: ?RuntimeEvidence = for (self.runtime_evidence) |item| {
+                if (item != null and item.?.id == view.id) break item;
+            } else null;
             const row_watch = view.scope.language == c.XLW_JAVASCRIPT or binding(view.scope);
-            entry.* = .{ .semantics = if (view.scope.language == c.XLW_JAVASCRIPT) "explicit context storage; lexical visibility unproved; complete UTF-16 strings and IEEE binary64 numbers; no coercion or automatic interruption" else if (view.scope.language == c.XLW_PERL) "stopped complete scalar representations; public IOK/NOK/POK changes count; no coercion or automatic interruption" else sample_semantics, .identity = if (view.scope.language == c.XLW_JAVASCRIPT) "entry/isolate/frame location, GC-stable function id and scope/slot match; continuous activation lifetime between stops unproved" else if (view.scope.language == c.XLW_PERL) "stackinfo/context index and CV match; continuous activation lifetime between stops unproved" else frame_identity, .id = view.id, .language = switch (view.scope.language) {
+            entry.* = .{ .runtime = runtime, .semantics = if (view.scope.language == c.XLW_JAVASCRIPT) "explicit context storage; lexical visibility unproved; complete UTF-16 strings and IEEE binary64 numbers; no coercion or automatic interruption" else if (view.scope.language == c.XLW_PERL) "stopped complete scalar representations; public IOK/NOK/POK changes count; no coercion or automatic interruption" else sample_semantics, .identity = if (view.scope.language == c.XLW_JAVASCRIPT) "entry/isolate/frame location, GC-stable function id and scope/slot match; continuous activation lifetime between stops unproved" else if (view.scope.language == c.XLW_PERL) "stackinfo/context index and CV match; continuous activation lifetime between stops unproved" else frame_identity, .id = view.id, .language = switch (view.scope.language) {
                 c.XLW_PYTHON => .python,
                 c.XLW_PERL => .perl,
                 c.XLW_RUBY => .ruby,
@@ -166,6 +191,7 @@ fn value(a: A, v: c.struct_xlw_value) !Value {
 const sample_semantics = "stopped typed-byte comparison; storage re-resolved each stop; no automatic interruption";
 const frame_identity = "frame location and code/prototype match; continuous activation lifetime between stops unproved";
 pub const Entry = struct {
+    runtime: ?RuntimeEvidence = null,
     id: u64,
     language: Tab,
     expression: []const u8,

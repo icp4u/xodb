@@ -211,7 +211,10 @@ pub const Panel = struct {
         for (tabs.order, 0..) |tab, i| {
             if (!state.visible(tab)) continue;
             const offered = state.offered[@intFromEnum(tab)];
-            const width = r.measure(font, tabs.title(tab)) + 16 + @as(f32, if (offered) 14 else 0);
+            const unwitnessed = i >= 2 and state.entries[i - 2].identity == .unwitnessed;
+            var title_buffer: [64]u8 = undefined;
+            const title = if (unwitnessed) try std.fmt.bufPrint(&title_buffer, "{s} ?", .{tabs.title(tab)}) else tabs.title(tab);
+            const width = r.measure(font, title) + 16 + @as(f32, if (offered) 14 else 0);
             if (x + width > rect.x + rect.w - 5 and x > rect.x + 6) {
                 x = rect.x + 6;
                 y += 28;
@@ -219,9 +222,16 @@ pub const Panel = struct {
             const button = gpu.Rect{ .x = x, .y = y, .w = width, .h = 25 };
             self.hits[i] = button;
             if (state.selected == tab) try style.focus(r, button, 4, 1);
-            try r.text(font, x + 8, y + 3, tabs.title(tab), if (state.selected == tab) theme.text else theme.weak);
+            try r.text(font, x + 8, y + 3, title, if (unwitnessed) theme.warm else if (state.selected == tab) theme.text else theme.weak);
             if (offered) try r.text(font, x + width - 15, y + 3, "*", theme.neutral);
             x += width + 2;
+        }
+        for (state.entries) |entry| {
+            if (!entry.present or entry.identity != .unwitnessed) continue;
+            y += 26;
+            try self.wrapped(r, font, rect, &y, "runtime not seen executing", theme.warm);
+            y -= 23;
+            break;
         }
         // Detected-but-unsupported runtimes are evidence, not selectable tabs.
         for (state.entries, 0..) |entry, i| {
@@ -400,8 +410,12 @@ pub const Panel = struct {
         y += 23;
         try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis), theme.weak);
         if (entry.proof_generation == null or entry.proof_generation.? != state.generation or entry.reason != null) {
-            try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
-            y += 23;
+            if (entry.identity == .unwitnessed) {
+                try self.wrapped(r, font, rect, &y, "Runtime not seen executing", theme.warm);
+            } else {
+                try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
+                y += 23;
+            }
         }
         try self.wrapped(r, font, rect, &y, explanation(self.message), theme.weak);
         y += 7;

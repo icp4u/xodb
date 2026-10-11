@@ -97,6 +97,7 @@ pub const Session = struct {
     source_maps: @import("source_maps.zig").Maps = .{},
     metadata: @import("debug_metadata.zig").State = .{},
     language_tabs: @import("language_tabs.zig").State = .{},
+    language_bindings: @import("../language/runtime_binding.zig").State = .{},
     language_watches: @import("language_watches.zig").State = .{},
     maps_epoch: u64 = 0,
     gdb_map: @import("gdb_images.zig").Map = .{},
@@ -2025,6 +2026,7 @@ pub const Session = struct {
         self.gdb_map.deinit();
         self.language_watches.deinit();
         self.language_tabs.deinit();
+        self.language_bindings.deinit();
         self.metadata.deinit();
         if (self.target.isRemote()) self.modules.drainRemoteReaders();
         self.static_analysis.deinit();

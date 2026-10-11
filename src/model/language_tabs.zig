@@ -22,8 +22,9 @@ pub fn title(tab: Tab) []const u8 {
         .gdscript => "GDScript",
     };
 }
-pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8 };
+pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8, identity: ?@import("../language/runtime_binding.zig").Identity = null };
 const Entry = struct {
+    identity: ?@import("../language/runtime_binding.zig").Identity = null,
     present: bool = false,
     checked: bool = false,
     version: Text = .{},
@@ -47,6 +48,9 @@ pub const State = struct {
     entries: [8]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
+    binding_maps: u64 = 0,
+    binding_metadata: u64 = 0,
+    binding_threads: u64 = 0,
     /// Full images loaded when the last pass over the runtimes ended.
     loaded_images: usize = 0,
     pub fn deinit(self: *State) void {
@@ -103,16 +107,39 @@ pub const State = struct {
             self.generation = std.math.maxInt(u64);
             self.revision +%= 1;
         }
-        if (snapshot.state != .stopped or session.persistent.resolving or session.pending_continue != null) return;
+        if (snapshot.state != .stopped) {
+            session.language_bindings.clear();
+            if (self.entries[0].checked or self.entries[1].checked) {
+                self.entries[0] = .{};
+                self.entries[1] = .{};
+                self.revision +%= 1;
+            }
+            return;
+        }
+        if (session.persistent.resolving or session.pending_continue != null) return;
         if (self.generation != snapshot.generation) {
             self.generation = snapshot.generation;
             self.next = 0;
+            self.entries[0] = .{};
+            self.entries[1] = .{};
             for (&self.entries) |*entry| {
                 entry.checked = false;
                 entry.cursor = .{};
                 entry.found = false;
                 entry.reason = null;
+                entry.identity = null;
+                entry.proof_generation = null;
             }
+            self.revision +%= 1;
+        }
+        const binding_threads = @import("../language/runtime_binding.zig").threadStamp(session);
+        if (self.binding_maps != session.modules.maps_revision or self.binding_metadata != session.metadata.revision or self.binding_threads != binding_threads) {
+            self.binding_maps = session.modules.maps_revision;
+            self.binding_metadata = session.metadata.revision;
+            self.binding_threads = binding_threads;
+            self.entries[0] = .{};
+            self.entries[1] = .{};
+            self.next = 0;
             self.revision +%= 1;
         }
         // Consume a metadata change only once the pass is complete: a later
@@ -145,15 +172,15 @@ pub const State = struct {
             self.finish(@errorName(err));
             return;
         };
+        self.binding_maps = session.modules.maps_revision;
         const entry = &self.entries[self.next];
         // Off in the preferences: not searched for, and not offered.
         if (!session.languages.on(@enumFromInt(self.next))) {
-            entry.present = false;
-            entry.proof_generation = null;
+            entry.* = .{};
             self.finish("LanguageDisabled");
             return;
         }
-        if (!entry.found) {
+        if (self.next >= 2 and !entry.found) {
             const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version", "runtime.buildVersion", "emacs_version", @import("../language/gdscript.zig").singleton_symbol };
             var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
                 .limit_bytes = 128 * 1024,
@@ -200,6 +227,22 @@ pub const State = struct {
                 entry.reason = @errorName(err);
                 return;
             }
+            // No image defines the runtime anchor: an unexaminable mapping is
+            // not evidence of this runtime. Direct requests keep the refusal.
+            const no_candidate = (err == error.PythonModuleIdentityUnavailable or err == error.PerlModuleIdentityUnavailable) and session.language_bindings.vetoedWithoutCandidate(self.next);
+            if (err == error.PythonRuntimeUnavailable or err == error.PerlRuntimeUnavailable or no_candidate) {
+                entry.present = false;
+                entry.proof_generation = null;
+                entry.identity = null;
+                self.finish("RuntimeNotDetected");
+                return;
+            }
+            if (self.next < 2) {
+                entry.found = true;
+                entry.present = false;
+                entry.proof_generation = null;
+                entry.identity = null;
+            }
             self.finish(@errorName(err));
             return;
         };
@@ -219,8 +262,10 @@ pub const State = struct {
         entry.build_id = build_id;
         entry.basis = basis;
         entry.present = true;
-        entry.proof_generation = snapshot.generation;
-        self.finish(null);
+        entry.found = true;
+        entry.identity = d.identity;
+        entry.proof_generation = if (d.identity == .unwitnessed) null else snapshot.generation;
+        self.finish(if (d.identity == .unwitnessed) "RuntimeNotSeenExecuting" else null);
     }
     fn finish(self: *State, reason: ?[]const u8) void {
         self.entries[self.next].reason = reason;
@@ -230,13 +275,14 @@ pub const State = struct {
         self.revision +%= 1;
     }
     pub fn jsonStringify(self: State, writer: anytype) !void {
-        const Item = struct { tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
+        const Item = struct { identity: ?@import("../language/runtime_binding.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
         var items: [order.len]Item = undefined;
         for (order, 0..) |tab, i| {
             items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
             if (i >= 2) {
                 const entry = &self.entries[i - 2];
-                items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "LanguageDisabled")) "disabled" else if (entry.reason != null) "unavailable" else "ready";
+                items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "LanguageDisabled")) "disabled" else if (entry.identity == .unwitnessed) "unwitnessed" else if (entry.reason != null) "unavailable" else "ready";
+                items[i].identity = entry.identity;
                 items[i].reason = entry.reason;
                 items[i].version = if (entry.present) entry.version.slice() else null;
                 items[i].build_id = if (entry.present) entry.build_id.slice() else null;

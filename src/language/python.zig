@@ -9,6 +9,7 @@ const Module = @import("../model/modules.zig").Module;
 const eval = @import("../model/evaluate.zig");
 const view = @import("../model/value_view.zig");
 const A = std.mem.Allocator;
+const binding = @import("runtime_binding.zig");
 
 fn read(ctx: ?*anyopaque, address: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
     const session: *model.Session = @ptrCast(@alignCast(ctx.?));
@@ -155,6 +156,7 @@ pub const Frame = struct {
     identity_proved: bool = false,
 };
 pub const Segment = struct {
+    binding_token: ?binding.Token = null,
     runtime: Runtime,
     runtime_instance: ?Instance,
     anchor: ?Anchor,
@@ -169,6 +171,8 @@ pub const Segment = struct {
     unanchored_loop_frames: []const usize = &.{},
 };
 pub const Stack = struct {
+    binding_token: ?binding.Token = null,
+    identity: binding.Identity = .witnessed,
     session_id: u64,
     generation: u64,
     tid: i32,
@@ -204,22 +208,43 @@ fn runtimeOf(a: A, layout: *const c.struct_xpy_layout) !Runtime {
         .layout = if (layout.dwarf_verified != 0) "published offsets + DWARF-verified table" else "published offsets + final-release table (no DWARF)",
     };
 }
-fn readRuntime(session: *model.Session, a: A, module: *Module, tid: i32, native: []const model.Frame, first: usize, segments: *std.ArrayList(Segment), totals: *[2]usize) !void {
-    const layout = try profile(session, module);
-    // Every native frame is a candidate: the proof is containment of the
-    // entry frame in [sp, cfa), not a symbol name (stripped builds split the
-    // loop into unnamed parts).
+fn nativeRanges(session: *model.Session, module: *Module, native: []const model.Frame, ranges: []c.struct_xpy_range) void {
+    for (native, ranges) |frame, *range| {
+        const sp = frame.registers[session.target.arch().sp()];
+        range.* = if (binding.owns(session, module, frame) and sp != null and frame.cfa != null and frame.cfa.? > sp.?) .{ .low = sp.?, .high = frame.cfa.? } else .{ .low = 0, .high = 0 };
+    }
+}
+pub fn runtimeWitness(session: *model.Session, a: A, module: *Module, tid: i32, native: []const model.Frame, first: usize, budget: *binding.Budget) !binding.Witness {
     var ranges: [c.XPY_MAX_RANGES]c.struct_xpy_range = undefined;
     const count = @min(native.len, ranges.len);
-    for (native[0..count], ranges[0..count]) |frame, *range| {
-        const sp = frame.registers[session.target.arch().sp()];
-        range.* = if (sp != null and frame.cfa != null and frame.cfa.? > sp.?) .{ .low = sp.?, .high = frame.cfa.? } else .{ .low = 0, .high = 0 };
-    }
+    nativeRanges(session, module, native[0..count], ranges[0..count]);
+    const has_owned_range = for (ranges[0..count]) |range| {
+        if (range.high > range.low) break true;
+    } else false;
+    // A sized interpreter-loop symbol is independent execution evidence,
+    // including when corrupt logical frames prevent entry containment. A
+    // stripped/unnamed loop still needs the reader's owned-range proof.
+    const named_loop = for (native) |frame| {
+        if (!binding.owns(session, module, frame)) continue;
+        const found = module.symbols().symbolAt(module.linkAddress(frame.lookup_pc) catch continue) orelse continue;
+        if (found.symbol.type == .func and found.symbol.size != 0 and found.offset < found.symbol.size and isLoop(found.symbol.name)) break true;
+    } else false;
+    if (!has_owned_range and !named_loop) return .{ .seen = false };
+    const layout = try profile(session, module);
     const raw = try a.create(c.struct_xpy_stack);
     var r = reader(session);
+    r.reads = budget.reads;
+    r.bytes = budget.bytes;
     c.xpy_stack_read(layout, &r, @intCast(tid), &ranges, count, first, raw);
-    totals[0] += r.reads;
-    totals[1] += r.bytes;
+    budget.* = .{ .reads = r.reads, .bytes = r.bytes };
+    for (raw.segments[0..raw.segment_count]) |segment| if (segment.anchor >= 0 and @as(usize, @intCast(segment.anchor)) < count) return .{ .seen = true, .python_stack = raw };
+    return .{ .seen = named_loop, .python_stack = if (named_loop) raw else null };
+}
+fn readRuntime(session: *model.Session, a: A, module: *Module, raw: *const c.struct_xpy_stack, native: []const model.Frame, first: usize, segments: *std.ArrayList(Segment)) !void {
+    const layout = try profile(session, module);
+    // Reuse the canonical read that proved the owned entry-frame range.
+    // Candidate checks share its read budget; no second stack walk is hidden.
+    const count = @min(native.len, c.XPY_MAX_RANGES);
     const runtime = try runtimeOf(a, layout);
     if (raw.reason != null and raw.segment_count == 0) {
         try segments.append(a, .{ .runtime = runtime, .runtime_instance = null, .anchor = null, .state = "partial", .reason = try reason(a, raw.reason), .frames = &.{}, .examined_frames = 0 });
@@ -322,44 +347,29 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     if (first >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
+    try binding.discover(.python, session);
     const native = try session.stack(a, tid, 64);
     if (first >= native.len) return error.InvalidFrame;
     var segments: std.ArrayList(Segment) = .empty;
-    var totals = [2]usize{ 0, 0 };
-    try readRuntime(session, a, try runtimeModule(session), tid, native, first, &segments, &totals);
+    const bound = try binding.thread(.python, session, a, tid, native, first);
+    try readRuntime(session, a, bound.module, bound.python_stack.?, native, first, &segments);
+    for (segments.items) |*segment| segment.binding_token = bound.token;
     std.mem.sort(Segment, segments.items, {}, anchorOrder);
     try session.target.expectGeneration(generation);
     return .{
+        .binding_token = bound.token,
         .session_id = session.id,
         .generation = generation,
         .tid = tid,
         .segments = try segments.toOwnedSlice(a),
         .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null),
-        .memory_reads = totals[0],
-        .memory_bytes = totals[1],
+        .memory_reads = bound.budget.reads,
+        .memory_bytes = bound.budget.bytes,
     };
 }
 
-// Type aliases carry no owning image id. Refuse ambiguous runtimes rather
-// than choosing the first CPython image found in the mappings.
-fn runtimeModule(session: *model.Session) !*Module {
-    try session.languages.require(.python);
-    if (session.modules.regions.items.len > 4096) return error.PythonModuleLimit;
-    const found = session.modules.definers("_PyRuntime") catch |err| return moduleError(err);
-    if (found.modules.len > 1) return error.PythonRuntimeAmbiguous;
-    // An image too large to examine does not hide a runtime that was found.
-    if (found.unexamined) |err| if (found.modules.len == 0 or !overBudget(err)) return moduleError(err);
-    return if (found.modules.len == 1) found.modules[0] else error.PythonRuntimeUnavailable;
-}
-fn overBudget(err: anyerror) bool {
-    return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
-}
-fn moduleError(err: anyerror) error{ PythonImageBudgetExceeded, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, PythonModuleIdentityUnavailable } {
-    if (overBudget(err)) return error.PythonImageBudgetExceeded;
-    if (err == error.SymbolDiscoveryPending) return error.SymbolDiscoveryPending;
-    if (err == error.SymbolDiscoveryCancelled) return error.SymbolDiscoveryCancelled;
-    if (err == error.SymbolDiscoveryBudgetExceeded) return error.SymbolDiscoveryBudgetExceeded;
-    return error.PythonModuleIdentityUnavailable;
+fn runtimeBinding(session: *model.Session) !binding.Binding {
+    return binding.process(.python, session);
 }
 /// A DWARF struct that begins with a CPython object head: `ob_type` at 8,
 /// or `ob_base` at 0 leading (recursively) to one.
@@ -378,7 +388,8 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
     if (!objectHead(child, 0)) return null;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     // A non-Python program may have its own object-like structs.
-    const module = runtimeModule(session) catch |err| return if (err == error.PythonRuntimeUnavailable) null else err;
+    const bound = runtimeBinding(session) catch |err| return if (err == error.PythonRuntimeUnavailable) null else err;
+    const module = bound.module;
     const layout = try profile(session, module);
     var r = reader(session);
     const raw = try a.create(c.struct_xpy_value);
@@ -392,6 +403,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .diagnostic = try reason(a, item.reason),
     };
     return .{
+        .identity = bound.identity,
         .presentation = .scalar,
         .data_address = value.bits,
         .count = raw.count,
@@ -431,9 +443,10 @@ test "version text, code kinds and object heads" {
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
     try session.languages.require(.python);
-    const layout = try profile(session, try runtimeModule(session));
+    const bound = try runtimeBinding(session);
+    const layout = try profile(session, bound.module);
     const runtime = try runtimeOf(a, layout);
-    return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = runtime.layout };
+    return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = runtime.layout, .identity = bound.identity };
 }
 
 /// Read a frame/code pair selected from the canonical stopped Python stack.
@@ -453,8 +466,7 @@ const WatchCapture = @import("watch.zig").Capture;
 // interpreter-id/thread-state, frame = frame/code/selector-flags/declaration.
 const watch_binding: u64 = 1;
 const watch_generator: u64 = 2;
-fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, row: ?usize) !void {
-    const module = try runtimeModule(session);
+fn watchValue(session: *model.Session, a: A, module: *Module, capture: *WatchCapture, row: ?usize) !void {
     if (module.id != capture.scope.runtime[0]) return error.PythonWatchRuntimeChanged;
     const layout = try profile(session, module);
     var r = reader(session);
@@ -515,15 +527,16 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     const thread = for (session.target.threadSlice()) |entry| {
         if (entry.tid == tid) break entry.id;
     } else return error.InvalidThread;
-    var capture = WatchCapture{ .scope = .{
+    const module = try binding.retained(session, segment.binding_token orelse return error.StaleLanguageFrame);
+    var capture = WatchCapture{ .runtime_identity = .witnessed, .scope = .{
         .language = c.XLW_PYTHON,
         .session = session.id,
         .image = session.target.snapshot().image_epoch,
         .thread = thread,
-        .runtime = .{ (try runtimeModule(session)).id, try std.fmt.parseInt(u64, instance.address, 0), instance.interpreter_id, try std.fmt.parseInt(u64, instance.thread_state, 0) },
+        .runtime = .{ module.id, try std.fmt.parseInt(u64, instance.address, 0), instance.interpreter_id, try std.fmt.parseInt(u64, instance.thread_state, 0) },
         .frame = .{ try std.fmt.parseInt(u64, selected.frame_address, 0), try std.fmt.parseInt(u64, selected.code, 0), if (std.mem.eql(u8, selected.owner, "generator")) watch_generator else 0, 0 },
     }, .expression = checked_expression };
-    try watchValue(session, a, &capture, row);
+    try watchValue(session, a, module, &capture, row);
     if (row != null and capture.scope.frame[2] & watch_binding == 0) return error.PythonWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);
     return capture;
@@ -531,8 +544,18 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
     try session.languages.require(.python);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
-    const observed = try @import("../model/language_selection.zig").cachedRead(.python, session, tid);
-    const module_id = (try runtimeModule(session)).id;
+    const observed = @import("../model/language_selection.zig").cachedRead(.python, session, tid) catch |err| {
+        if (err != binding.noFrame(.python)) return err;
+        const dormant = try binding.process(.python, session);
+        capture.runtime_identity = dormant.identity;
+        // Keep the last sample as history. Without a canonical thread frame,
+        // do not dereference its remembered address or declare it retired.
+        capture.diagnostic = try a.dupeZ(u8, if (dormant.module.id == scope.runtime[0]) "RuntimeNotSeenExecuting" else "PythonWatchRuntimeChanged");
+        if (dormant.module.id != scope.runtime[0]) capture.scope.runtime[0] = dormant.module.id;
+        return capture;
+    };
+    const module_id = (try binding.retained(session, observed.binding_token orelse return error.StaleLanguageFrame)).id;
+    capture.runtime_identity = .witnessed;
     if (module_id != scope.runtime[0]) {
         capture.scope.runtime[0] = module_id;
         capture.diagnostic = try a.dupeZ(u8, "PythonWatchRuntimeChanged");
@@ -558,7 +581,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
                 return capture;
             }
             if (try std.fmt.parseInt(u64, frame.code, 0) != scope.frame[1]) continue;
-            try watchValue(session, a, &capture, null);
+            try watchValue(session, a, try binding.retained(session, segment.binding_token orelse return error.StaleLanguageFrame), &capture, null);
             try session.target.expectGeneration(observed.generation);
             return capture;
         }
@@ -585,7 +608,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
     const version = try a.dupe(u8, selected.runtime.version);
     const id = try a.dupe(u8, selected.runtime.build_id);
     const stack_reason = if (selected.reason) |why| try a.dupe(u8, why) else null;
-    const layout = try profile(session, try runtimeModule(session));
+    const layout = try profile(session, try binding.retained(session, selected.binding_token orelse return error.StaleLanguageFrame));
     if (!std.mem.eql(u8, id, try buildId(a, layout))) return error.PythonBuildIdMismatch;
     var r = reader(session);
     const raw = try a.create(c.struct_xpy_locals);
@@ -632,6 +655,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .generation = generation,
         .tid = tid,
         .language = .python,
+        .identity = .witnessed,
         .segment = segment_index,
         .frame = frame,
         .start = raw.start,

@@ -7,12 +7,16 @@ import os
 from pathlib import Path
 import subprocess
 import time
+from PIL import Image, ImageOps
 
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--work', required=True, type=Path)
 p.add_argument('--python', type=Path)
+p.add_argument('--identity-marker', action='store_true', help='Only the dormant Python/Perl marker cases')
+p.add_argument('--wrong-result', action='store_true')
+p.add_argument('--agent', type=Path)
 p.add_argument('--perl', type=Path)
 p.add_argument('--lua', type=Path)
 p.add_argument('--node', type=Path)
@@ -52,6 +56,9 @@ if a.unsupported_perl:
 if a.unsupported_lua:
     cases.append(('unsupported-lua', a.unsupported_lua, [], ('-e', 'print(1)')))
     unavailable['unsupported-lua'] = ('lua', 'lua_pcallk', 'LuaImplementationUnsupported', 'Unsupported Lua build')
+if a.identity_marker:
+    cases = [case for case in cases if case[0] in ('python', 'perl')]
+    assert cases, 'identity marker needs Python or Perl'
 results = []
 
 
@@ -68,12 +75,35 @@ for label, executable, languages, arguments in cases:
     d = None
     report = {'case': label, 'status': 'running'}
     try:
-        d = h.Display(str(root), ['--agent-scope', 'control', '--break', unavailable[label][1] if label in unavailable else 'main', '--', str(executable), *arguments])
+        d = h.Display(str(root), [*(['--runtime-agent', str(a.agent.resolve())] if a.agent else []), '--agent-scope', 'control', '--break', unavailable[label][1] if label in unavailable else 'main', '--', str(executable), *arguments])
         d.tool('continue', generation=d.session()['generation'])
         assert d.stopped('breakpoint')
         view = poll_tabs(d, lambda v: v['complete'])
         tabs = [t['tab'] for t in view['tabs'] if t['visible']]
         assert tabs == ['registers', 'native', *languages], view
+        if a.identity_marker:
+            entry = next(t for t in view['tabs'] if t['tab'] == label)
+            assert entry['status'] == 'unwitnessed' and entry['identity'] == 'unwitnessed' and entry['visible'], entry
+            deadline = time.monotonic()+15*h.load_scale()
+            while True:
+                shot = d.shot(label+'-identity')
+                # OCR the header alone so adjacent source/assembly columns
+                # cannot interleave the warning's wrapped lines.
+                crop = shot+'.header.png'
+                with Image.open(shot) as capture:
+                    pane = ImageOps.invert(capture.crop((1013, 91, 1272, 178)).convert('L'))
+                    pane.resize((pane.width*3, pane.height*3)).save(crop)
+                text = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30*h.load_scale()).stdout
+                normalized = ' '.join(text.lower().split())
+                if 'runtime not seen executing' in normalized:
+                    break
+                assert time.monotonic() < deadline, text
+                time.sleep(.05)
+            if a.wrong_result:
+                assert 'deliberately wrong identity marker' in normalized, text
+            Path(shot+'.txt').write_text(text)
+            report.update(status='pass', tab=entry, marker='runtime not seen executing')
+            continue
         if label in unavailable:
             language, _, reason, hint = unavailable[label]
             entry = next(t for t in view['tabs'] if t['tab']==language)

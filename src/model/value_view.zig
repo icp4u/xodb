@@ -79,6 +79,7 @@ pub fn sequence(ctx: eval.Context, v: eval.Value) !?Sequence {
     return .{ .address = p.bits, .count = n.bits, .element = child, .presentation = if (child.kind == .unsigned and child.size == 1) .bytes else .slice, .capacity = capacity };
 }
 pub const Preview = struct {
+    identity: ?@import("../language/runtime_binding.zig").Identity = null,
     presentation: Presentation,
     data_address: u64,
     count: u64,

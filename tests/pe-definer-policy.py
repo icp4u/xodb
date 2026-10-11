@@ -111,7 +111,7 @@ try:
             min_calls = 15
         else:
             shutil.copyfile(decoy, image)
-        expected = 'ready' if mode in ('pe', 'data', 'many') else ('PythonRuntimeAmbiguous' if mode == 'elf' else 'PythonModuleIdentityUnavailable')
+        expected = 'PythonRuntimeAmbiguous' if mode == 'elf' else 'ready' if mode in ('pe', 'data', 'many') else 'PythonModuleIdentityUnavailable'
         observe('python', mode, [a.python, 'tests/fixtures/pe/definer.py', str(image), mode], expected,
                 changed=image if mode not in ('pe', 'data', 'unknown', 'unreadable', 'many') else None, min_calls=min_calls)
     for mode in ('elf', 'mz', 'other', 'macho', 'deleted'):

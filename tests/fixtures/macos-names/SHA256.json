@@ -20,7 +20,7 @@
   "corpus/out/swift/arm64-Onone/swiftprog": "2cbb2f8f81cabcf4abe9272a15db0dd2345f585846075c3c7e607c81ebb1c4e5",
   "transcripts/c-O2-basic.json": "65b5839e5dffc9ece00d8f124333b09b098daea83a9cae41196f4ef2abcb7ba2",
   "transcripts/c-arm64e-basic.json": "e2f3c1031afe30749fce4421715b68fb21e7da9dd638f0c00852547369279343",
-  "transcripts/c-crash-abort.json": "6e8f058b3d537017230f61770b008b940b5166c95f2c73b3b18606e05d67e431",
+  "transcripts/c-crash-abort.json": "e1dca6572351aba64e0377e62bf390530fc6504d3f21d17ccf27c870bcc49e84",
   "transcripts/c-handshake.json": "70872c1baacbb85919c75832d1516e4d0f5bd4c1e9db49b701e842b96580ebab",
   "transcripts/c-images-dlopen.json": "411b6667307abe2da2afae1a72ca134597957da55d0f09fb404bee15cff21567",
   "transcripts/c-stripped-basic.json": "7ec3a3af096ad6a7014319df6cf2e93c44713d34930e66431147d83d29183dd3",

@@ -10,6 +10,7 @@ pub const Row = struct { following: usize = 0, name: []const u8, location: []con
 pub const SelectedKey = struct { session: u64 = 0, generation: u64, tid: i32, language: tabs.Tab, segment: usize, frame: usize };
 pub const Key = struct { session: u64, generation: u64, revision: u64, metadata: u64, tid: i32, frame: usize, tab: tabs.Tab };
 pub const Entry = struct {
+    identity: ?@import("../language/runtime_binding.zig").Identity = null,
     present: bool = false,
     checked: bool = false,
     found: bool = false,
@@ -48,7 +49,7 @@ pub fn header(session: *const Session) Header {
     const state = &session.language_tabs;
     const snapshot = session.target.snapshot();
     var result = Header{ .session = session.id, .generation = snapshot.generation, .metadata = session.metadata.revision, .revision = state.revision, .state = snapshot.state, .selected = state.selected, .native_selection = state.native_selection, .logical_selection = state.logical_selection };
-    for (&state.entries, &result.entries) |*entry, *out| out.* = .{ .present = entry.present, .checked = entry.checked, .found = entry.found, .version = entry.version.slice(), .basis = entry.basis.slice(), .reason = entry.reason, .proof_generation = entry.proof_generation };
+    for (&state.entries, &result.entries) |*entry, *out| out.* = .{ .identity = entry.identity, .present = entry.present, .checked = entry.checked, .found = entry.found, .version = entry.version.slice(), .basis = entry.basis.slice(), .reason = entry.reason, .proof_generation = entry.proof_generation };
     for (state.offers.items[0..state.offers.count]) |offer| result.offered[@intFromEnum(offer.language)] = true;
     return result;
 }

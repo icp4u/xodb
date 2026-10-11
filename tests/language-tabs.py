@@ -98,7 +98,11 @@ def case(label, executable, language=None, args=()):
 
         for tab in before['view']['tabs']:
             if tab['visible'] and tab['tab'] not in ('registers', 'native'):
-                assert tab['version'] and tab['build_id'] and tab['basis'] and tab['proof_generation'] == generation, tab
+                assert tab['version'] and tab['build_id'] and tab['basis'], tab
+                if tab['tab'] in ('python', 'perl'):
+                    assert tab['identity'] == 'unwitnessed' and tab['status'] == 'unwitnessed' and tab['proof_generation'] is None, tab
+                else:
+                    assert tab['proof_generation'] == generation, tab
         s.expect_error(observer.raw('select_language_tab', generation=generation, tab='registers'), 'ControlLeaseRequired')
         assert 'select_language_tab' not in s.listed_tools(observer)
         owner.claim(ttl_ms=60000)
@@ -120,7 +124,10 @@ def case(label, executable, language=None, args=()):
         assert after['view']['native_selection'] is None and after['view']['logical_selection'] is None, after
         if language:
             tab = next(t for t in after['view']['tabs'] if t['tab'] == language)
-            assert tab['proof_generation'] == stepped['generation'], tab
+            if language in ('python', 'perl'):
+                assert tab['identity'] == 'unwitnessed' and tab['status'] == 'unwitnessed' and tab['proof_generation'] is None, tab
+            else:
+                assert tab['proof_generation'] == stepped['generation'], tab
         if a.strace:
             pc = observer.tool('get_stack', tid=tid)['frames'][0]['pc']
             def observe():

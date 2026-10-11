@@ -228,8 +228,20 @@ release may be stripped, as `/usr/bin/python3` usually is: stacks and named
 locals then work. Discovering Python object pointers among native C variables
 still needs their DWARF types.
 `PythonVersionUnsupported` and `PythonFreeThreadedUnsupported` refuse the rest.
-Several different CPython images in one process are refused
-(`PythonRuntimeAmbiguous`) rather than guessed.
+A stopped interpreter-frame PC must belong to the selected image: a sized
+interpreter-loop symbol or the published entry-frame containment establishes
+that witness. The identity read and canonical stack share one read budget.
+The process tab refuses with `PythonRuntimeAmbiguous` whenever two or more
+candidate images are discoverable, whatever their witnesses. Python thread
+stacks, named locals, expressions, frame watches and frame-selection offers
+also refuse with `PythonRuntimeAmbiguous` before walking that thread. A sole dormant
+candidate stays usable for native object previews with `identity: unwitnessed`;
+a thread stack without its own witness refuses with
+`PythonInterpreterFrameUnavailable`. Without a named native loop, corruption
+or a chain exceeding the examination budget can remove the entry witness;
+that stack refuses instead of displaying unbound partial frames. Named loops
+still allow the existing reasoned partial diagnostics. See the
+[discovery policy](PE.md).
 
 ### Bounds
 

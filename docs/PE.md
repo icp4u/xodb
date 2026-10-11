@@ -76,7 +76,7 @@ policy locally and through the Linux runtime agent:
 
 | Mapped image | Native runtime discovery |
 | --- | --- |
-| Examined ELF defining the anchor | Candidate; ordinary identity, ambiguity and version checks still apply |
+| Examined ELF defining the anchor | Candidate; mapped identity and layout checks still apply, with execution evidence required for `ready` |
 | Examined ELF without the anchor | Ignore |
 | Structurally valid PE32+ x64 headers | Ignore, even if an export or PDB public has the anchor's name |
 | Executable file mapping with malformed MZ, other non-ELF bytes, or unreadable backing file | Refuse with a module identity diagnostic |
@@ -89,12 +89,82 @@ An identity refusal takes precedence over the budget exception. Ordinary ELF
 files embedded in supported containers still follow the ELF reader's policy.
 A PE exclusion checks DOS, COFF, optional and section headers (at most 100 reads,
 4170 bytes); it does not parse large export/unwind tables or prove what the loader
-originally loaded. This is a format-based proof with two known gaps. A target
-that overwrites the first few hundred bytes of its mapped ELF runtime with
-structurally valid PE headers before the first observation, or that runs its
-runtime from anonymous memory, hides that runtime; another mapped ELF defining
-the anchor is then the only candidate and is selected. Previously verified ELF
-snapshots remain candidates; a changed magic cannot erase one.
+originally loaded. Previously verified ELF snapshots remain candidates; a changed
+magic cannot erase one. These file rules are conservative discovery filters,
+not proof that a candidate is executing.
+
+Python and Perl bind a ready runtime to a stopped interpreter frame in that
+exact mapped image instance, using the caller's `lookup_pc` rather than its
+unadjusted return PC. Python uses a sized interpreter-loop symbol or published entry-frame
+containment in the owning image; the latter also works without loop symbol
+names. A named loop still identifies the runtime when corrupt logical frames
+prevent containment, so the stack can report the reader's partial diagnostics.
+Perl uses its runops frame. The process tab refuses as ambiguous whenever
+two or more candidate image instances are discoverable, even when only one
+has a witness or their build IDs match. Existing version, mapped
+build-ID, offset and DWARF checks still apply.
+
+A sole candidate without a witness remains available with tab status and MCP
+`identity` **`unwitnessed`**, reason `RuntimeNotSeenExecuting`, and a visible
+"runtime not seen executing" marker. It never reports ready. A native stop in libc can still have a
+deeper interpreter witness; an idle embedded interpreter may have none.
+With one candidate, thread-specific language stacks require a witness on the
+requested thread, otherwise `PythonInterpreterFrameUnavailable` or
+`PerlInterpreterFrameUnavailable`. Python also refuses every thread request
+with `PythonRuntimeAmbiguous` when two or more candidates are discoverable;
+this applies to stacks, locals, expressions, frame watches and selection offers.
+
+| Candidates | Witness | Process tab | Python thread request | Perl thread request |
+| --- | --- | --- | --- | --- |
+| None found | None | Absent | Unavailable | Unavailable |
+| One | No stopped thread witnesses it | Unwitnessed; native previews marked | Interpreter frame unavailable | Interpreter frame unavailable |
+| One | Requested thread witnesses it | Ready, witnessed | Its stack, witnessed | Its stack, witnessed |
+| One | Only another thread witnesses it | Ready, witnessed | Interpreter frame unavailable | Interpreter frame unavailable |
+| Two or more | Any | Ambiguous, before walking threads | Ambiguous, before walking the thread | Own frame binding only; multiple witnessed images or ambiguous value runtime refuse |
+
+Perl retains its existing thread behavior; its value reader also requires a
+unique runtime. A forged leaf return into a twin therefore refuses in both
+languages while both candidates remain visible.
+Native object previews can use the sole unwitnessed layout and carry that
+identity marker. Frame watches retain their last sample as history if no
+canonical thread frame can be recovered; they do not dereference an old frame
+address or infer retirement from this absence.
+
+Overwriting a runtime's first 240 file bytes with valid PE headers, or moving
+its code into anonymous memory, can still hide it from discovery. An unexecuted
+runtime twin can then be the sole candidate, but is only **unwitnessed**, and a
+stack request on the executing thread refuses instead of reading that twin.
+These observations do not authenticate hostile code or stacks. The witness is
+read from the target, and the target can supply it for the twin:
+
+- one forged return address on a parked thread's stack, or unwind tables that
+  name a caller in the twin, with no twin instruction ever executed;
+- a thread spinning inside the twin's interpreter-loop function;
+- a second interpreter really running in the twin.
+
+Each makes the twin **witnessed** and `ready`, with the twin's build ID, while
+the hidden runtime stays invisible. When both images remain discoverable,
+the process tab refuses even if the target forges the twin's witness and
+blinds the real thread's unwind. Python thread requests refuse too. If the
+real runtime is hidden and only the twin remains discoverable, a thread
+request can still bind to its own forged frame, including on the thread
+really running the hidden runtime. A forged return address can divert its
+unwind into the twin before any real interpreter frame. `witnessed` therefore means "a stopped thread's unwound
+frame lies in this image", not "this is the interpreter running the program".
+Disable language views with `languages.enabled=false` or `--language-off all`
+for a target you do not trust.
+
+When no examined image defines a runtime's anchor, an unexaminable mapping (a
+JIT memfd, a deleted library) is not evidence of that runtime: its tab stays
+absent. A direct stack request still answers the identity diagnostic.
+
+Bindings are invalidated across stops, image/map/thread changes and metadata
+revisions. Process discovery considers at most 1,024 threads, one bounded
+64-frame native walk per poll; it retains one native walk and bounded candidate
+records. Multiple candidates refuse before a thread walk. For a sole candidate,
+the pass ends as soon as a witness is found. Otherwise every stopped thread is walked on each
+stop, so a process with hundreds of threads and an idle interpreter shows its
+tab, and decodes previews, only after that many polls. No synchronous-walk latency guarantee is implied by these count caps.
 Through a runtime agent the scan first examines at most 128 files per request
 and answers `SymbolDiscoveryPending` in between, so many mapped files cannot
 hold one request.

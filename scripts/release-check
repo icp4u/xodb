@@ -29,6 +29,7 @@ LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
+    (("src/language/runtime_binding.zig", "tests/runtime-binding.py", "tests/fixtures/pe/runtime-binding.c"), ("runtime-binding*", "gui-runtime-binding*", "python-*", "perl-*", *LANGUAGE_PANES)),
     (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
       'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
     (('src/runtime/remote_perf.c', 'src/runtime/perf_internal.h', 'src/runtime/xrt_perf.h', 'src/profile/linux_*.zig', 'src/profile/capture.zig'), ('gui-remote-profile-close', 'gui-remote-profile-ack-close')),
@@ -48,8 +49,8 @@ COVERS = (
     (('tests/pe-wine.py', 'tests/fixtures/pe/main.c'), ('pe-wine-*',)),
     (('src/model/compatibility.zig', 'src/ui/thread_list.zig', 'tests/helpers/wine_ux.py'), ('proton-metadata*', 'pe-wine-ux', 'gui-overview')),
     (('src/language/lua*', 'tests/fixtures/lua/*'), ('lua-*', 'python-lua-*', *LANGUAGE_PANES)),
-    (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', *LANGUAGE_PANES)),
-    (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', *LANGUAGE_PANES)),
+    (('src/language/python*', 'tests/fixtures/python/*'), ('python-*', 'runtime-binding*', 'gui-runtime-binding*', *LANGUAGE_PANES)),
+    (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', 'runtime-binding*', 'gui-runtime-binding*', *LANGUAGE_PANES)),
     (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
     (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
@@ -298,6 +299,14 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append((label, [sys.executable, '-B', 'tests/pe-definer-policy.py', '--python', python,
                               '--perl', perl, '--work', '.work/'+label,
                               *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 240))
+        if python:
+            steps.append(('python-stack-integrity', [sys.executable, '-B', 'tests/python-language.py', '--python', python, '--work', '.work/python-integrity'], 180))
+        if perl:
+            for remote in (False, True):
+                label = 'runtime-binding-matrix' + ('-agent' if remote else '')
+                steps.append((label, [sys.executable, '-B', 'tests/runtime-binding.py', '--perl', perl,
+                              '--matrix', '--work', '.work/'+label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 180))
         steps.append(('pe-image-fuzz', [sys.executable, '-B', 'tests/pe-image.py',
                       '--work', '.work/pe-image-fuzz', '--fuzz'], 90))
         steps.append(('pdb-image-fuzz', [sys.executable, '-B', 'tests/pdb-image.py',
@@ -433,6 +442,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('metadata-session-agent', [sys.executable, '-B', 'tests/metadata-session.py', '--work', '.work/ma', '--agent', 'zig-out/bin/xodb-agent'], 240))
         steps.append(('language-tabs', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/lt', *language_args], 900 if node else 240))
         steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
+        if perl:
+            for remote in (False, True):
+                label = 'runtime-binding' + ('-agent' if remote else '')
+                steps.append((label, [sys.executable, '-B', 'tests/runtime-binding.py', '--perl', perl,
+                              '--work', '.work/'+label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
         if python and perl:
             for remote in (False, True):
                 agent = ['--agent', 'zig-out/bin/xodb-agent'] if remote else []
@@ -622,6 +637,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
             steps.append((name, [sys.executable, '-B', *args], 180 if name == 'gui-remote-publication' else 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
+        if python and perl:
+            for remote in (False, True):
+                label = 'gui-runtime-binding' + ('-agent' if remote else '')
+                steps.append((label, [sys.executable, '-B', 'tests/language-tabs-gui.py',
+                              '--identity-marker', '--python', python, '--perl', perl,
+                              # Short: the private compositor's socket path must fit sun_path.
+                              '--work', '.work/grb'+str(int(remote)), *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))

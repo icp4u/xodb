@@ -32,7 +32,7 @@ UNREGISTERED = {
         ('needs a device profile', ('simpleperf-import.py', 'simpleperf-import-gui.py',)),
         ('needs sudo: the privileged allocation helper, or a configured host', ('allocations-live.py', 'm2-syscall-configured.py',)),
         ('measurement, no pass criteria', ('allocation-cost.py', 'memory-cost.py', 'm2-server-cost.py', 'm2-workload-cost.py',)),
-        ('not gated: needs arguments or fixtures that no step builds', ('cfi-image.py', 'metadata-job.py', 'metadata-image-job.py', 'source-confinement.py', 'observation-association-lifecycle.py', 'observation-saved-associations.py', 'python-language.py', 'vulkan-leaks.py', 'frame-jit.py', 'jitmap-fixture.py', 'jitmap-perf-crosscheck.py', 'jitmap-runtime-producers.py',)),
+        ('not gated: needs arguments or fixtures that no step builds', ('cfi-image.py', 'metadata-job.py', 'metadata-image-job.py', 'source-confinement.py', 'observation-association-lifecycle.py', 'observation-saved-associations.py', 'vulkan-leaks.py', 'frame-jit.py', 'jitmap-fixture.py', 'jitmap-perf-crosscheck.py', 'jitmap-runtime-producers.py',)),
         ('not gated: needs output from another test', ('core-gui.py', 'discovery-gui.py', 'syscall-gui.py', 'm2-archive-gui.py', 'm2-limits-gui.py',)),
         ('not gated: passes alone, but its compositor socket path is too long inside a gate snapshot', ('m2-intervals-gui.py', 'm2-preferences-gui.py', 'm2-values-gui.py',)),
         ('not gated: passes, but leaves a process behind, which the runner reports as a leak', ('process-tree.py',)),

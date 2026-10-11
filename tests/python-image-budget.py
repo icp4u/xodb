@@ -115,8 +115,8 @@ def main():
         target.stdin.write('\n'); target.stdin.flush()
         target.wait(timeout=10); assert target.returncode == 0, target.stderr.read()
 
-        # A second mapped image defining the runtime symbol is still refused,
-        # whichever of the two the symbols-only scan reaches first.
+        # Both the process tab and Python thread requests refuse a second
+        # discoverable definer, even while the real runtime is executing.
         (w/'decoy.c').write_text('char _PyRuntime[64] = "decoy";\nint xodb_pad(void) { return 7; }\n')
         subprocess.run(['cc', '-shared', '-fPIC', '-O1', str(w/'decoy.c'), '-o', str(w/'decoy.so')], check=True, timeout=60)
         target = subprocess.Popen([a.python, FIXTURE, str(w/'decoy.so')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -124,9 +124,16 @@ def main():
         client = Client('control', None, options=['--attach', str(target.pid)])
         generation = client.stopped()['generation']
         found, why = stack(client, generation=generation, tid=target.pid)
-        assert why == 'PythonRuntimeAmbiguous', (found, why)
+        assert found is None and why == 'PythonRuntimeAmbiguous', (found, why)
         assert str(w/'decoy.so') in {r['path'] for r in modules(client)[0]}  # the probe saw the decoy mapped
-        result['ambiguous'] = {'error': why}
+        deadline = time.monotonic() + 60
+        while True:
+            view = client.inspect('get_language_tabs')['view']
+            if view['complete']: break
+            assert time.monotonic() < deadline, view
+        tab = next(t for t in view['tabs'] if t['tab'] == 'python')
+        assert tab['status'] == 'unavailable' and tab['reason'] == 'PythonRuntimeAmbiguous', tab
+        result['unexecuted_decoy'] = {'tab': tab, 'error': why}
         client.close(); client = None
         target.stdin.write('\n'); target.stdin.flush()
         target.wait(timeout=10); assert target.returncode == 0, target.stderr.read()

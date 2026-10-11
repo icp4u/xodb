@@ -29,6 +29,7 @@ pub const Row = struct {
     value: Value,
 };
 pub const Result = struct {
+    identity: ?@import("../language/runtime_binding.zig").Identity = null,
     view_kind: enum { named_locals, context_storage } = .named_locals,
     lexical_visibility: ?[]const u8 = null,
     generation: u64,

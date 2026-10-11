@@ -7,6 +7,7 @@ const Module = @import("../model/modules.zig").Module;
 const eval = @import("../model/evaluate.zig");
 const view = @import("../model/value_view.zig");
 const A = std.mem.Allocator;
+const binding = @import("runtime_binding.zig");
 
 fn read(ctx: ?*anyopaque, address: u64, out: ?*anyopaque, n: usize) callconv(.c) c_int {
     const session: *model.Session = @ptrCast(@alignCast(ctx.?));
@@ -96,6 +97,7 @@ pub const Frame = struct {
     reason: ?[]const u8,
 };
 pub const Segment = struct {
+    binding_token: ?binding.Token = null,
     runtime: Runtime,
     runtime_instance: ?Instance,
     anchor: ?Anchor,
@@ -110,6 +112,8 @@ pub const Segment = struct {
     memory_bytes: usize,
 };
 pub const Stack = struct {
+    binding_token: ?binding.Token = null,
+    identity: binding.Identity = .witnessed,
     session_id: u64,
     generation: u64,
     tid: i32,
@@ -220,16 +224,17 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     if (first >= 64) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     const generation = session.target.snapshot().generation;
+    try binding.discover(.perl, session);
     const native = try session.stack(a, tid, 64);
     if (first >= native.len) return error.InvalidFrame;
+    const bound = try binding.thread(.perl, session, a, tid, native, first);
     var segments: std.ArrayList(Segment) = .empty;
     var unresolved_inner = false;
     var recovered_anchor = false;
     var skipped: [64]SkippedAnchor = undefined;
     var skipped_count: usize = 0;
-    for (native) |frame| {
-        const name = frame.symbol orelse continue;
-        if (!std.mem.eql(u8, name, "Perl_runops_standard") and !std.mem.eql(u8, name, "Perl_runops_debug")) continue;
+    for (native) |raw_frame| {
+        const frame = runopsFrame(session, bound.module, raw_frame) orelse continue;
         var s = try segment(session, a, frame, true);
         if (s.runtime_instance == null) unresolved_inner = true;
         if (frame.index < first) {
@@ -260,7 +265,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     }
     // A readable current-frame argument can provide an unanchored observation;
     // it never establishes ordering relative to a different runtime segment.
-    if (!recovered_anchor) {
+    if (!recovered_anchor and binding.owns(session, bound.module, native[first])) {
         const frame = native[first];
         const module = try session.modules.at(frame.lookup_pc);
         if (module.symbols().findSymbol("Perl_runops_standard") != null) {
@@ -272,36 +277,28 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
             } else if (segments.items.len == 0) try segments.append(a, fallback);
         }
     }
+    for (segments.items) |*item| item.binding_token = bound.token;
     try session.target.expectGeneration(generation);
-    return .{ .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null) };
+    return .{ .binding_token = bound.token, .session_id = session.id, .generation = generation, .tid = tid, .segments = try segments.toOwnedSlice(a), .native_stack_incomplete = native.len == 64 or (native.len > 0 and native[native.len - 1].diagnostic != null) };
 }
-// Type aliases currently carry no owning image id. Refuse ambiguous layouts
-// rather than choosing the first interpreter library found in the mappings.
-fn valueModule(session: *model.Session) !*Module {
-    try session.languages.require(.perl);
-    if (session.modules.regions.items.len > 4096) return error.PerlModuleLimit;
-    const found = session.modules.definers("Perl_runops_standard") catch |err| return moduleError(err);
-    // An image too large to examine does not hide a runtime that was found.
-    if (found.unexamined) |err| if (found.modules.len == 0 or !overBudget(err)) return moduleError(err);
-    if (found.modules.len == 0) return error.PerlRuntimeUnavailable;
-    const chosen = found.modules[0];
-    for (found.modules[1..]) |module| {
-        const a_id = chosen.image.buildId() orelse return error.PerlBuildIdUnavailable;
-        const b_id = module.image.buildId() orelse return error.PerlBuildIdUnavailable;
-        if (!std.mem.eql(u8, a_id, b_id)) return error.PerlValueRuntimeAmbiguous;
+fn valueBinding(session: *model.Session) !binding.Binding {
+    return binding.process(.perl, session);
+}
+fn runopsFrame(session: *model.Session, module: *Module, frame: model.Frame) ?model.Frame {
+    if (!binding.owns(session, module, frame)) return null;
+    const located = module.symbols().symbolAt(module.linkAddress(frame.lookup_pc) catch return null) orelse return null;
+    const name = located.symbol.name;
+    if (!std.mem.eql(u8, name, "Perl_runops_standard") and !std.mem.eql(u8, name, "Perl_runops_debug")) return null;
+    var result = frame;
+    result.symbol = name;
+    return result;
+}
+pub fn runtimeWitness(session: *model.Session, module: *Module, native: []const model.Frame) !bool {
+    for (native) |frame| if (runopsFrame(session, module, frame) != null) {
         _ = try profile(session, module);
-    }
-    return chosen;
-}
-fn overBudget(err: anyerror) bool {
-    return err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
-}
-fn moduleError(err: anyerror) error{ PerlImageBudgetExceeded, SymbolDiscoveryPending, SymbolDiscoveryCancelled, SymbolDiscoveryBudgetExceeded, PerlModuleIdentityUnavailable } {
-    if (overBudget(err)) return error.PerlImageBudgetExceeded;
-    if (err == error.SymbolDiscoveryPending) return error.SymbolDiscoveryPending;
-    if (err == error.SymbolDiscoveryCancelled) return error.SymbolDiscoveryCancelled;
-    if (err == error.SymbolDiscoveryBudgetExceeded) return error.SymbolDiscoveryBudgetExceeded;
-    return error.PerlModuleIdentityUnavailable;
+        return true;
+    };
+    return false;
 }
 pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview {
     if (!session.languages.on(.perl)) return null;
@@ -329,7 +326,8 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         };
         if (!found) return null;
     }
-    const module = try valueModule(session);
+    const bound = try valueBinding(session);
+    const module = bound.module;
     const layout = try profile(session, module);
     for (fields) |wanted| {
         var found = false;
@@ -351,6 +349,7 @@ pub fn preview(session: *model.Session, a: A, value: eval.Value) !?view.Preview 
         .diagnostic = try reason(a, item.reason),
     };
     return .{
+        .identity = bound.identity,
         .presentation = .scalar,
         .data_address = value.bits,
         .count = raw.count,
@@ -383,9 +382,10 @@ test "Perl layout search bounds retain their diagnostics" {
 /// Runtime identity and proof from the existing stopped-memory reader.
 pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.zig").Description {
     try session.languages.require(.perl);
-    const module = try valueModule(session);
+    const bound = try valueBinding(session);
+    const module = bound.module;
     const layout = try profile(session, module);
-    return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF" };
+    return .{ .version = "5.44.0", .build_id = try buildId(a, layout), .basis = if (module.debug_file != null) "build-id companion DWARF" else "same-image DWARF", .identity = bound.identity };
 }
 
 /// Frame selection comes from the retained canonical stack, never raw client
@@ -413,10 +413,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
     const version = try a.dupe(u8, selected.runtime.version);
     const id = try a.dupe(u8, selected.runtime.build_id);
     const stack_reason = if (selected.reason) |why| try a.dupe(u8, why) else null;
-    const module = if (selected.anchor) |anchor|
-        try session.modules.at(try std.fmt.parseInt(u64, anchor.pc, 0))
-    else
-        try valueModule(session);
+    const module = try binding.retained(session, selected.binding_token orelse return error.StaleLanguageFrame);
     const layout = try profile(session, module);
     if (!std.mem.eql(u8, id, try buildId(a, layout))) return error.PerlBuildIdMismatch;
     var r = reader(session);
@@ -461,6 +458,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
         .generation = generation,
         .tid = tid,
         .language = .perl,
+        .identity = .witnessed,
         .segment = segment_index,
         .frame = frame,
         .start = raw.start,
@@ -479,8 +477,7 @@ fn readBindings(session: *model.Session, a: A, tid: i32, segment_index: usize, f
 const WatchCapture = @import("watch.zig").Capture;
 // Runtime words: module/interpreter/stackinfo. Frame words: context index + 1
 // (zero for main)/CV/binding selector/pad declaration. Never retain cxstack.
-fn watchValue(session: *model.Session, a: A, capture: *WatchCapture, frame: usize, expected_context: u64, row: ?usize) !void {
-    const module = try valueModule(session);
+fn watchValue(session: *model.Session, a: A, module: *Module, capture: *WatchCapture, frame: usize, expected_context: u64, row: ?usize) !void {
     if (module.id != capture.scope.runtime[0]) return error.PerlWatchRuntimeChanged;
     const layout = try profile(session, module);
     var r = reader(session);
@@ -541,15 +538,16 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
     const thread = for (session.target.threadSlice()) |entry| {
         if (entry.tid == tid) break entry.id;
     } else return error.InvalidThread;
-    var capture = WatchCapture{ .scope = .{
+    const module = try binding.retained(session, segment_.binding_token orelse return error.StaleLanguageFrame);
+    var capture = WatchCapture{ .runtime_identity = .witnessed, .scope = .{
         .language = c.XLW_PERL,
         .session = session.id,
         .image = session.target.snapshot().image_epoch,
         .thread = thread,
-        .runtime = .{ (try valueModule(session)).id, try std.fmt.parseInt(u64, instance_.address, 0), selected.stackinfo, 0 },
+        .runtime = .{ module.id, try std.fmt.parseInt(u64, instance_.address, 0), selected.stackinfo, 0 },
         .frame = .{ if (selected.stackinfo == 0) 0 else selected.context_index + 1, try std.fmt.parseInt(u64, selected.cv, 0), 0, 0 },
     }, .expression = checked_expression };
-    try watchValue(session, a, &capture, frame, try std.fmt.parseInt(u64, selected.context_address, 0), row);
+    try watchValue(session, a, module, &capture, frame, try std.fmt.parseInt(u64, selected.context_address, 0), row);
     if (row != null and capture.scope.frame[2] == 0) return error.PerlWatchBindingUnavailable;
     try session.target.expectGeneration(observed.generation);
     return capture;
@@ -557,8 +555,18 @@ pub fn createWatch(session: *model.Session, a: A, tid: i32, segment_index: usize
 pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw_scope, expression: []const u8) !WatchCapture {
     try session.languages.require(.perl);
     var capture = WatchCapture{ .scope = scope, .expression = try a.dupeZ(u8, expression) };
-    const observed = try @import("../model/language_selection.zig").cachedRead(.perl, session, tid);
-    const module_id = (try valueModule(session)).id;
+    const observed = @import("../model/language_selection.zig").cachedRead(.perl, session, tid) catch |err| {
+        if (err != binding.noFrame(.perl)) return err;
+        const dormant = try binding.process(.perl, session);
+        capture.runtime_identity = dormant.identity;
+        // Keep the last sample as history. Without a canonical thread frame,
+        // do not dereference its remembered address or declare it retired.
+        capture.diagnostic = try a.dupeZ(u8, if (dormant.module.id == scope.runtime[0]) "RuntimeNotSeenExecuting" else "PerlWatchRuntimeChanged");
+        if (dormant.module.id != scope.runtime[0]) capture.scope.runtime[0] = dormant.module.id;
+        return capture;
+    };
+    const module_id = (try binding.retained(session, observed.binding_token orelse return error.StaleLanguageFrame)).id;
+    capture.runtime_identity = .witnessed;
     if (module_id != scope.runtime[0]) {
         capture.scope.runtime[0] = module_id;
         capture.diagnostic = try a.dupeZ(u8, "PerlWatchRuntimeChanged");
@@ -578,7 +586,7 @@ pub fn observeWatch(session: *model.Session, a: A, tid: i32, scope: c.struct_xlw
                 return capture;
             }
             if (try std.fmt.parseInt(u64, frame.cv, 0) != scope.frame[1]) continue;
-            try watchValue(session, a, &capture, index, try std.fmt.parseInt(u64, frame.context_address, 0), null);
+            try watchValue(session, a, try binding.retained(session, segment_.binding_token orelse return error.StaleLanguageFrame), &capture, index, try std.fmt.parseInt(u64, frame.context_address, 0), null);
             try session.target.expectGeneration(observed.generation);
             return capture;
         }

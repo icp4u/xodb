@@ -130,7 +130,18 @@ stopped-memory reader verifies a runtime, its tab appears. **Tab** cycles the
 visible tabs; clicking a tab selects it. The version and layout proof appear
 above that runtime's logical stack, including explicit reasons when the stop
 has no proved language frame. Selection survives stops and stays local to each
-debugged process. `get_language_tabs` reads this state; a controller holding the
+debugged process. Python/Perl tabs marked **?** and "runtime not seen executing" have a usable
+layout but no stopped interpreter-frame witness. This is normal for an idle
+embedded interpreter. A language stack still requires evidence on its requested
+thread. Two or more discoverable candidates make the process tab refuse as
+ambiguous, regardless of witnesses. Python thread stacks, locals, expressions
+and frame watches also refuse when more than one candidate is visible. MCP tabs and decoded previews expose `identity: witnessed|unwitnessed`;
+Python/Perl stack and named-local results carry `identity: witnessed`. Runtime
+watches expose the observation's `runtime.identity` and generation separately
+from their existing frame-lifetime explanation in `identity`. A watch without a
+recoverable canonical frame retains its previous sample as history.
+
+`get_language_tabs` reads this state; a controller holding the
 shared-session lease uses `select_language_tab` with `generation` and `tab`.
 Tab selection does not change registers or resume the target. The cycle goes
 from C/C++ through each available language tab, then Regs; reaching Regs can
@@ -271,12 +282,19 @@ target chooses which files its mappings name and what its memory holds, so
 this is automatic work steered by the target.
 
 The readers are bounded and refuse rather than guess: a build-id that does not
-match, an unsupported version, two candidate runtimes, a chain that loops or
+match, an unsupported version, unresolved runtime ambiguity, a chain that loops or
 runs too long, an image over its budget. Those refusals protect you from
 **honest mistakes and unbounded work**. They are not a defence against a file
 crafted to attack the parser, and a target that hides its real runtime (in
 anonymous memory, or behind rewritten file headers) and maps a second copy
-can still have that copy shown as the runtime; see [PE support](PE.md).
+can still leave that copy as the only discoverable candidate. Python and Perl
+mark such a candidate **unwitnessed**, with "runtime not seen executing" on the
+tab, unless a stopped thread's unwound interpreter frame lies in its exact
+mapped image. It cannot report ready or supply a thread stack without that
+evidence. The evidence itself comes from the target: a forged return address
+or a thread parked inside the copy is enough to make the copy report ready,
+so this guards against an accidental or lazy decoy, not a determined one; see
+[PE support](PE.md).
 
 If you do not trust the target, turn the views off in the
 [preferences](PREFERENCES.md) file:
