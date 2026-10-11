@@ -59,7 +59,7 @@ replays['deep'] = work / 'deep.jsonl'
 subprocess.run([sys.executable, '-B', 'tests/fixtures/memmap-synth.py', str(base), str(replays['deep']), '--scenario', 'process', '--viewports'], check=True)
 last_map = json.loads(replays['process'].read_text().splitlines()[-1])['memory_map']
 results = []
-KEY = dict(h.KEY, n0=11, n3=4, t=20, p=25, d=32, g=34, m=50, o=24, x=45, enter=28, esc=1, down=108, up=103, right=106, left=105,
+KEY = dict(h.KEY, n0=11, f=33, n3=4, t=20, p=25, d=32, g=34, m=50, o=24, x=45, enter=28, esc=1, down=108, up=103, right=106, left=105,
            pgdn=109, pgup=104, minus=12, equal=13, bracketright=27, bracketleft=26)
 sections = set((args.only or 'looks,layout,redact,states,buttons,handoff,deep' + (',live,deeplive' if args.live else '') + (',perf' if args.perf else '')).split(','))
 shots = args.shots.resolve() if args.shots else None
@@ -269,7 +269,7 @@ DOS = dict(blue=(0, 0, 0xaa), grey=(0xaa, 0xaa, 0xaa), cyan=(0, 0xaa, 0xaa))
 if 'looks' in sections or 'layout' in sections:
     for size in ((1920, 1080), (1280, 720)):
         for look in ('win9x', 'dos', 'modern'):
-            d = Overview(['--pause', '--redact', '--panel', 'memory_map', '--look', look], size=size)
+            d = Overview(['--pause', '--redact', '--panel', 'memory_map', '--look', look], size=size, source=replays['deep'] if look == 'modern' else None)
             try:
                 shot = d.shot(f'{look}-{size[0]}')
                 save(shot, f'{look}-{size[0]}x{size[1]}.png')
@@ -294,7 +294,7 @@ if 'looks' in sections or 'layout' in sections:
                 if look == 'modern':
                     nav = 236 if size[0] >= 1500 else 196
                     text = ocr(shot, (nav + 250, 52, size[0], size[1] - 28)) + ' ' + ocr(shot)
-                    check(f'modern {size[0]} names coverage and the legend', 'coverage' in text.lower() and 'unmapped' in text.lower(), text[:200])
+                    check(f'modern {size[0]} names coverage and the legend', 'coverage' in text.lower() and ('unmapped' in text.lower() or 'gap' in text.lower()), text[:200])
                 lines = d.layout_lines()
                 bad = [l for l in lines if 'overlaps=0 ' not in l]
                 sized = [l for l in lines if f'layout {size[0]}x{size[1]} ' in l]
@@ -518,9 +518,9 @@ if 'deep' in sections:
                 check(f'deep {tag} pending cell says not recorded, shows no data', 'pending' in det and 'not recorded' in det and 'mapped' not in det, det)
             # Back to the fit, then 2 MiB at the centre.
             d.move(*OUTSIDE)
-            d.tap('n0')
+            d.tap('f')
             g = d.wait_deep(lambda g: g['cell'] == fit_cell)
-            check(f'deep {tag} 0 fits the process again', g['cell'] == fit_cell and g['origin'] == ARENA, g)
+            check(f'deep {tag} f fits the process again', g['cell'] == fit_cell and g['origin'] == ARENA, g)
             d.tap(*['minus'] * log2(2 * MIB // fit_cell))
             g = d.wait_deep(lambda g: g['cell'] == 2 * MIB)
             check(f'deep {tag} - zooms out to 2 MiB cells around the same place', g['cell'] == 2 * MIB and g['origin'] <= ARENA < g['origin'] + g['count'] * 2 * MIB, g)
@@ -529,7 +529,7 @@ if 'deep' in sections:
             box = [float(v) for v in g['box'].split('..')]
             check(f'deep {tag} 2 MiB: the minimap box spans the arena island', box[1] - box[0] > 20, g['box'])
             # Pan: a drag of 20 cells left moves the view 20 cells on; arrows pan too.
-            d.tap('n0')
+            d.tap('f')
             g = d.wait_deep(lambda g: g['cell'] == fit_cell)
             x, y = d.deep_xy(ARENA + fit_cell * (g['cols'] * 10 + 40))
             d.keys('fastdrag', int(x), int(y), int(x - 20 * g['pitch']), int(y))
@@ -542,7 +542,7 @@ if 'deep' in sections:
             shot = d.shot('deep-pan-' + tag)
             save(shot, f'deep-pan-{tag}.png')
             # [ jumps VMA by VMA back to the heap (recorded at 64 KiB): the huge zero page is never THP.
-            d.tap('n0')
+            d.tap('f')
             if fit_cell != 65536:
                 d.tap(*['equal'] * log2(fit_cell // 65536))
             for _ in range(3):
@@ -567,7 +567,7 @@ if 'deep' in sections:
             check(f'deep {tag} minimap click moves the view to that island', g['origin'] < 0x600000000000, hex(g['origin']))
             # Pending: an unrecorded zoom (16 KiB) is all pending, never the old cells relabelled.
             d.move(*OUTSIDE)
-            d.tap('n0')
+            d.tap('f')
             g = d.wait_deep(lambda g: g['cell'] == fit_cell)
             d.tap(*['equal'] * log2(fit_cell // 16384))
             g = d.wait_deep(lambda g: g['cell'] == 16384)
@@ -578,8 +578,8 @@ if 'deep' in sections:
             check(f'deep {tag} pending is labelled on screen', 'not recorded' in text.lower(), text[-200:])
             lines = [l for l in d.layout_lines() if f'layout {tag} ' in l]
             check(f'deep {tag} no overlapping labels across zooms and pans', lines and all('overlaps=0 ' in l for l in lines), lines[-2:])
-            # t cycles deep -> win9x.
-            d.tap('t')
+            # t cycles deep -> Gibson -> win9x; Gibson has its focused GPU lane.
+            d.tap('t', 't')
             shot = d.shot('deep-cycle')
             check(f'deep {tag} t cycles on to the Windows 9x look', count_rgb(shot, WIN9X['desktop'], 4) > 1000 and d.app.poll() is None)
         finally:

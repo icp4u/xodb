@@ -11,6 +11,7 @@ const std = @import("std");
 const c = @import("../../c.zig").api;
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
+const win95 = @import("win95.zig");
 const m = @import("model.zig");
 pub const md = @import("../../memdefrag/model.zig");
 const dos = @import("../../memdefrag/dos.zig");
@@ -18,6 +19,7 @@ const vga = @import("../../memdefrag/vga.zig");
 const Collector = @import("../../model/system.zig").Collector;
 pub const deepmap = @import("deepmap.zig");
 const Font = @import("../../render/font.zig").Font;
+const History = @import("memmap_history.zig").History;
 const rgb = @import("../../appearance.zig").rgb;
 const Ctx = draw.Ctx;
 const Rect = draw.Rect;
@@ -25,10 +27,11 @@ const Color = draw.Color;
 const fade = draw.fade;
 const mix = draw.mix;
 
-pub const Look = enum { win9x, dos, modern, deep };
-pub const look_names = [_][]const u8{ "Windows 9x Defrag", "MS-DOS DEFRAG", "modern", "deep map" };
+pub const gibson = @import("gibson.zig");
+pub const Look = enum { win9x, dos, modern, deep, gibson };
+pub const look_names = [_][]const u8{ "Windows 9x Defrag", "MS-DOS DEFRAG", "modern", "deep map", "Gibson city" };
 pub const Button = enum { stop, pause, legend, details, close_legend, look, picker };
-pub const Click = union(enum) { button: Button, pick: usize, cell: usize, scroll: i32 };
+pub const Click = union(enum) { vma_address: u64, legend_scroll: i32, button: Button, pick: usize, cell: usize, scroll: i32 };
 const zooms = [_]u64{ 2 << 20, 512 << 10, 128 << 10, 32 << 10, 8 << 10, 4 << 10 };
 const ease_ns: u64 = 420_000_000;
 /// The grid never draws more cells than this in one frame (vertex budget).
@@ -41,6 +44,8 @@ pub const State = struct {
     reader: md.Reader = .{},
     current: ?*md.Owned = null,
     previous: ?*md.Owned = null,
+    /// Sidebar values survive hiding; no map storage or borrowed strings.
+    sidebar_coverage: ?md.Coverage = null,
     /// Replay maps belong to the replay sample, not to this state.
     replay_current: ?*const md.Map = null,
     replay_previous: ?*const md.Map = null,
@@ -50,12 +55,16 @@ pub const State = struct {
     replay_viewports: []const md.Map = &.{},
     replay_viewports_prev: []const md.Map = &.{},
     deep: deepmap.Deep = .{},
+    history: History = .{},
+    city: gibson.State = .{},
     accepted_at: u64 = 0,
     zoom: usize = 0,
     scroll: usize = 0,
     cursor: ?usize = null,
     hover: ?usize = null,
     legend: bool = false,
+    legend_top: usize = 0,
+    legend_visible: usize = 18,
     compact: bool = false,
     picker_open: bool = false,
     pick: usize = 0,
@@ -71,10 +80,32 @@ pub const State = struct {
     grid_cols: usize = 1,
 
     pub fn deinit(self: *State) void {
+        self.history.deinit();
+        self.city.deinit();
         if (self.current) |p| p.destroy();
         if (self.previous) |p| p.destroy();
         self.current = null;
         self.previous = null;
+    }
+    pub fn coverage(self: *const State) ?md.Coverage {
+        return if (self.map()) |mp| md.coverage(mp) else self.sidebar_coverage;
+    }
+    pub fn hide(self: *State) void {
+        self.history.deinit();
+        self.city.deinit();
+        if (!self.viewport() or self.replay_current != null) return;
+        if (self.coverage()) |cov| self.sidebar_coverage = switch (cov) {
+            .unknown => .{ .unknown = "last sample unknown" },
+            else => cov,
+        };
+        self.deinit();
+        self.reader.reset();
+        self.deep.drag = null;
+        self.deep.hover = null;
+        self.deep.nav = .{};
+        self.deep.counts = .{};
+        self.deep.pending = false;
+        self.accepted_at = 0;
     }
     pub fn map(self: *const State) ?*const md.Map {
         if (self.replay_current) |p| {
@@ -99,6 +130,7 @@ pub const State = struct {
     pub fn open(self: *State, id: ?md.Identity, now: u64) void {
         if (std.meta.eql(id, self.target)) return;
         self.target = id;
+        self.sidebar_coverage = null;
         self.target_since = now;
         self.reader.reset();
         self.cursor = null;
@@ -107,6 +139,10 @@ pub const State = struct {
         self.zoom = 0;
         self.deep.reset();
         self.deinit();
+    }
+
+    pub fn viewport(self: *const State) bool {
+        return self.look == .deep or (self.look == .modern and self.target != null);
     }
 
     /// Live: renew demand and copy a newer publication. True when it changed.
@@ -118,11 +154,11 @@ pub const State = struct {
             if (self.cursor) |i| if (i < mp.cells.len) break :blk mp.cells[i].start;
             break :blk if (mp.cells.len > 0) mp.cells[0].start else 0;
         };
-        const req = if (self.look == .deep) deepmap.request(self, redact, now) else md.Request{ .cell_bytes = zooms[self.zoom], .anchor = anchor, .redact = redact };
+        const req = if (self.viewport()) deepmap.request(self, redact, now) else md.Request{ .cell_bytes = zooms[self.zoom], .anchor = anchor, .redact = redact };
         self.reader.renew(observer, self.target, req, now) catch return false;
         const scope_before = .{ self.reader.seen_ticket, self.reader.seen_scope };
-        const got = (self.reader.read(gpa, observer, self.target, req) catch null) orelse return false;
-        if (self.look == .deep) {
+        const got = (self.reader.read(if (self.viewport()) std.heap.page_allocator else gpa, observer, self.target, req) catch null) orelse return false;
+        if (self.viewport()) {
             self.workerCost(got, now);
             // System counters publish on their own clock; only a new page
             // scan of the process scope is a new snapshot to animate.
@@ -135,11 +171,19 @@ pub const State = struct {
             return false;
         };
         self.workerCost(got, now);
-        if (self.previous) |p| p.destroy();
-        self.previous = self.current;
-        self.current = got;
-        self.accepted_at = now;
+        const scanned = scope_before[0] != self.reader.seen_ticket or scope_before[1] != self.reader.seen_scope;
+        self.publishCompact(got, now, scanned);
         return true;
+    }
+    fn publishCompact(self: *State, got: *md.Owned, now: u64, scanned: bool) void {
+        if (self.look == .gibson and !scanned and self.current != null) {
+            self.current.?.destroy();
+        } else {
+            if (self.previous) |p| p.destroy();
+            self.previous = self.current;
+            self.accepted_at = now;
+        }
+        self.current = got;
     }
     /// Worker cost over this view's own clock: publications of the process
     /// scope and of the system counters interleave, so their stamps differ.
@@ -181,7 +225,8 @@ pub const State = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const State, now: u64) bool {
-        return self.ease(now) < 1;
+        if (self.look == .gibson) return self.city.camera.automatic or self.ease(now) < 1;
+        return (self.ease(now) < 1 and (!self.viewport() or self.deep.changed())) or (self.look == .modern and self.deep.nav.active);
     }
     /// The DOS look blinks changed cells: redraw at the VGA blink rate.
     pub fn waitMs(self: *const State, now: u64) u64 {
@@ -224,7 +269,19 @@ pub fn key(v: *vw.View, event: @import("../../platform/input.zig").Event, now: u
         }
         return true;
     }
-    if (s.look == .deep and deepmap.key(v, event.sym, event.shortcut, now)) return true;
+    if (s.legend and s.look != .dos and s.look != .gibson and v.pal().win95) {
+        switch (event.sym) {
+            0xff1b, 0xff0d, 0xff8d => s.legend = false,
+            0xff52, 0xff55 => legendScroll(s, -1),
+            0xff54, 0xff56 => legendScroll(s, 1),
+            else => if (event.shortcut == 'g') {
+                s.legend = false;
+            },
+        }
+        return true;
+    }
+    if (s.look == .gibson and gibson.key(v, event.sym, event.shortcut)) return true;
+    if (s.viewport() and deepmap.key(v, event.sym, event.shortcut, now)) return true;
     switch (event.sym) {
         0xff52 => return moveCursor(s, -@as(i64, @intCast(s.grid_cols))),
         0xff54 => return moveCursor(s, @intCast(s.grid_cols)),
@@ -256,12 +313,14 @@ pub fn click(v: *vw.View, what: Click, now: u64) void {
     const s = &v.memmap;
     switch (what) {
         .button => |b| press(v, b, now),
+        .vma_address => |address| deepmap.focusAddress(&s.deep, address),
         .pick => |i| {
             s.pick = i;
             choose(v, i, now);
         },
         .cell => |i| s.cursor = if (s.cursor == i) null else i,
         .scroll => |by| _ = scrollBy(s, by),
+        .legend_scroll => |by| legendScroll(s, by),
     }
 }
 fn press(v: *vw.View, b: Button, now: u64) void {
@@ -276,19 +335,29 @@ fn press(v: *vw.View, b: Button, now: u64) void {
             v.paused = !v.paused;
             v.setStatus("{s}", .{if (v.paused) "Paused: page scans lapse after their three-second demand" else "Resumed"}, now);
         },
-        .legend => s.legend = !s.legend,
+        .legend => {
+            s.legend = !s.legend;
+            s.legend_top = 0;
+        },
         .close_legend => s.legend = false,
         .details => s.compact = !s.compact,
         .look => {
-            const was_deep = s.look == .deep;
+            const was_deep = s.viewport();
             s.look = @enumFromInt((@as(usize, @intFromEnum(s.look)) + 1) % look_names.len);
+            if (s.look == .gibson and s.zoom != 0) {
+                s.zoom = 0;
+                s.deinit();
+                s.reader.reset();
+            }
             // The deep look asks for explicit viewports, the others for the
             // compact map: never draw one's cells in the other's geometry.
-            if (was_deep != (s.look == .deep) and s.replay_current == null) {
+            if (was_deep != s.viewport() and s.replay_current == null) {
                 s.deinit();
                 s.reader.reset();
                 s.deep.reset();
             }
+            if (s.look != .modern) s.history.deinit();
+            if (s.look != .gibson) s.city.deinit();
             v.setStatus("Memory map look: {s}", .{look_names[@intFromEnum(s.look)]}, now);
         },
         .picker => s.picker_open = !s.picker_open,
@@ -356,6 +425,8 @@ pub fn openSelected(v: *vw.View, now: u64) void {
 /// The picker rows: the system view, then processes by resident memory.
 fn pickList(v: *vw.View) void {
     const s = &v.memmap;
+    // Freeze row identities and the cursor while the keyboard picker is open.
+    if (s.picker_open) return;
     s.pick_count = 0;
     const snap = v.snap() orelse return;
     var order: [512]u32 = undefined;
@@ -392,8 +463,8 @@ fn pickLabel(v: *vw.View, buf: []u8, index: usize) []const u8 {
     return std.fmt.bufPrint(buf, "{d:>7}  {s:<15} {s:>9}", .{ @as(u32, @intCast(@max(0, p.pid))), vw.processName(v, p, &nb), m.bytes(&rb, @floatFromInt(p.rss.get() orelse 0)) }) catch "";
 }
 
-// Reserve the RSS column before fitting PID/name; long names may elide.
-fn drawPick(v: *vw.View, ctx: Ctx, r: Rect, index: usize, ink: Color) !void {
+// Keep PID and alias readable; omit RSS before shortening the identity.
+pub fn drawPick(v: *vw.View, ctx: Ctx, r: Rect, index: usize, ink: Color) !void {
     var buf: [128]u8 = undefined;
     if (index == 0) return ctx.textFit(r.x, r.y, r.w, pickLabel(v, &buf, index), ink);
     const id = v.memmap.picks[index - 1];
@@ -404,8 +475,9 @@ fn drawPick(v: *vw.View, ctx: Ctx, r: Rect, index: usize, ink: Color) !void {
     const rss = if (p.rss.get()) |bytes| m.bytes(&rb, @floatFromInt(bytes)) else "—";
     const rss_w = ctx.measure(rss);
     const left = std.fmt.bufPrint(&buf, "{d}  {s}", .{ p.pid, vw.processName(v, p, &nb) }) catch "";
-    try ctx.textFit(r.x, r.y, @max(0, r.w - rss_w - 10), left, ink);
-    try ctx.textRight(r.x + r.w, r.y, rss, ink);
+    const show_rss = ctx.measure(left) + rss_w + 10 <= r.w;
+    try ctx.textFit(r.x, r.y, if (show_rss) r.w - rss_w - 10 else r.w, left, ink);
+    if (show_rss) try ctx.textRight(r.x + r.w, r.y, rss, ink);
 }
 
 fn cellCount(mp: *const md.Map) usize {
@@ -478,7 +550,7 @@ fn findPrev(prev: ?*const md.Map, cur: *const md.Map, cell: md.Cell) ?md.Cell {
 }
 
 /// Detail text of one cell: range, VMA, mapping, state, known bits.
-fn detail(v: *vw.View, mp: *const md.Map, index: usize, buf: []u8) []const u8 {
+pub fn detail(v: *vw.View, mp: *const md.Map, index: usize, buf: []u8) []const u8 {
     if (mp.process == null) {
         const r = systemCellsFor(mp);
         if (index >= r.count) return "";
@@ -510,12 +582,13 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         .win9x => try win9x(v, ctx, rect, now),
         .dos => try dosLook(v, ctx, rect, now),
         .modern => try modern(v, ctx, rect, now),
+        .gibson => try gibson.render(v, ctx, rect, now),
         .deep => {
             try deepmap.render(v, ctx, rect, now);
             if (s.legend) try legend9x(v, ctx, rect, s.map());
         },
     }
-    deepmap.perfLine(v, &s.deep, @tagName(s.look), if (s.look == .deep) s.deep.count() else 0, now);
+    deepmap.perfLine(v, &s.deep, @tagName(s.look), if (s.look == .gibson) s.city.layout.places.items.len else if (s.viewport()) s.deep.count() else 0, now);
 }
 
 /// Cell colours per look. `t` blends from the previous poll's state.
@@ -725,6 +798,7 @@ fn auditRows(scr: *const dos.Screen) void {
 
 const face = 0xc0c0c0;
 fn bevel(ctx: Ctx, r: Rect, raised: bool, thick: bool) !void {
+    if (ctx.p.win95) return ctx.bevel(r, !raised);
     const tl_outer = if (raised) hex(if (thick) 0xdfdfdf else 0xffffff) else hex(0x808080);
     const br_outer = if (raised) hex(0x000000) else hex(0xffffff);
     try ctx.r.rect(.{ .x = r.x, .y = r.y, .w = r.w, .h = 1 }, tl_outer);
@@ -744,6 +818,19 @@ fn boldText(ctx: Ctx, x: f32, y: f32, w: f32, s: []const u8, color: Color) !void
 }
 /// A 9x window: face, bevels and a gradient title bar. Returns the client area.
 fn window9x(v: *vw.View, ctx: Ctx, r: Rect, title: []const u8, active: bool, close: ?Click) !Rect {
+    if (ctx.p.win95) {
+        try ctx.bevel(r, false);
+        const bar = Rect{ .x = r.x + 4, .y = r.y + 4, .w = @max(0, r.w - 8), .h = 26 };
+        try win95.title(ctx, bar, "");
+        try ctx.textFit(bar.x + 6, bar.y + 3, bar.w - (if (close != null) @as(f32, 34) else 12), title, hex(0xffffff));
+        if (close) |action| {
+            const b = Rect{ .x = bar.x + bar.w - 25, .y = bar.y + 3, .w = 22, .h = 20 };
+            try ctx.button(b, false);
+            try ctx.text(b.x + 3, b.y, "×", hex(0x000000));
+            v.hit(b, .{ .memmap = action });
+        }
+        return .{ .x = r.x + 6, .y = bar.y + bar.h + 4, .w = @max(0, r.w - 12), .h = @max(0, r.h - 40) };
+    }
     // Drop shadow on the desktop.
     try ctx.r.rect(.{ .x = r.x + 4, .y = r.y + 4, .w = r.w, .h = r.h }, fade(hex(0x000000), 0.28));
     try ctx.r.rect(r, hex(face));
@@ -779,6 +866,13 @@ fn window9x(v: *vw.View, ctx: Ctx, r: Rect, title: []const u8, active: bool, clo
     return .{ .x = r.x + 6, .y = bar.y + bar.h + 4, .w = r.w - 12, .h = r.h - (bar.h + 13) };
 }
 fn button9x(v: *vw.View, ctx: Ctx, r: Rect, text: []const u8, action: Click, pressed: bool) !void {
+    if (ctx.p.win95) {
+        try ctx.button(r, pressed);
+        const shift: f32 = if (pressed) 1 else 0;
+        try ctx.textFit(r.x + @max(4, (r.w - ctx.measure(text)) / 2) + shift, r.y + @floor((r.h - 20) / 2) + shift, r.w - 8, text, hex(0x000000));
+        v.hit(r, .{ .memmap = action });
+        return;
+    }
     try ctx.r.rect(r, hex(face));
     // The default-button frame of the original dialog.
     try ctx.r.shape(r, hex(0x000000), .{ .border = 1 });
@@ -788,13 +882,20 @@ fn button9x(v: *vw.View, ctx: Ctx, r: Rect, text: []const u8, action: Click, pre
     v.hit(r, .{ .memmap = action });
 }
 fn sunken(ctx: Ctx, r: Rect, fill: Color) !void {
+    if (ctx.p.win95) {
+        try ctx.bevel(r, true);
+        return ctx.r.rect(draw.inset(r, 2), fill);
+    }
     try ctx.r.rect(r, fill);
     try bevel(ctx, r, false, true);
 }
 
-fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
+fn win9x(v: *vw.View, outer_ctx: Ctx, rect: Rect, now: u64) !void {
     const s = &v.memmap;
-    try ctx.r.rect(rect, hex(0x008080));
+    var ctx = outer_ctx;
+    // The modal covers the background labels; audit its visible rows separately.
+    if (s.legend and ctx.p.win95) ctx.layout = null;
+    try ctx.r.rect(rect, if (ctx.p.win95) ctx.p.panel else hex(0x008080));
     const black = hex(0x000000);
     var buf: [256]u8 = undefined;
     var lb: [64]u8 = undefined;
@@ -864,7 +965,7 @@ fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         const inner = Rect{ .x = frame.x + 3, .y = frame.y + 3, .w = frame.w - 6 - 17, .h = frame.h - 6 };
         // Scrollbar.
         const sb = Rect{ .x = frame.x + frame.w - 2 - 17, .y = frame.y + 2, .w = 17, .h = frame.h - 4 };
-        try hatchRect(ctx, sb, hex(0xe0e0e0), hex(0xc8c8c8), 2);
+        if (ctx.p.win95) try ctx.r.rect(sb, hex(0xdfdfdf)) else try hatchRect(ctx, sb, hex(0xe0e0e0), hex(0xc8c8c8), 2);
         const up = Rect{ .x = sb.x, .y = sb.y, .w = 17, .h = 17 };
         const down = Rect{ .x = sb.x, .y = sb.y + sb.h - 17, .w = 17, .h = 17 };
         for ([_]Rect{ up, down }, 0..) |b, k| {
@@ -938,6 +1039,10 @@ fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     var ctb: [160]u8 = undefined;
     const cost = costText(v, &ctb);
     const cost_w = @min(client.w * 0.30, ctx.measure(cost));
+    if (ctx.p.win95) {
+        try ctx.bevel(.{ .x = client.x + 2, .y = by + btn_h * 2 + 16, .w = @max(0, client.w - cost_w - 20), .h = 24 }, true);
+        try ctx.bevel(.{ .x = client.x + client.w - cost_w - 14, .y = by + btn_h * 2 + 16, .w = cost_w + 12, .h = 24 }, true);
+    }
     if (mp) |x| {
         var fb: [96]u8 = undefined;
         const fr = freshness(v, x, now, &fb);
@@ -956,7 +1061,7 @@ fn win9x(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
             v.tooltip_style = .win9x;
         }
     };
-    if (s.legend) try legend9x(v, ctx, rect, mp);
+    if (s.legend) try legend9x(v, outer_ctx, rect, mp);
 }
 pub fn vmaText(v: *vw.View, vma: md.Vma) []const u8 {
     if (v.redact) switch (vma.kind) {
@@ -1050,6 +1155,7 @@ fn emptyReason(v: *vw.View, mp: *const md.Map) []const u8 {
 
 const legend_states = [_]md.State{ .thp, .mixed, .anon, .file, .zero, .swapped, .not_present, .unmovable, .unmapped, .gap, .unknown, .free_contig, .free_frag };
 fn legend9x(v: *vw.View, ctx: Ctx, rect: Rect, mp: ?*const md.Map) !void {
+    if (ctx.p.win95) return legendClassic(v, ctx, rect, mp);
     const w: f32 = @min(700, rect.w - 40);
     const h: f32 = 452;
     const r = Rect{ .x = rect.x + (rect.w - w) / 2, .y = rect.y + @max(10, (rect.h - h) / 2), .w = w, .h = @min(h, rect.h - 20) };
@@ -1086,6 +1192,54 @@ fn legend9x(v: *vw.View, ctx: Ctx, rect: Rect, mp: ?*const md.Map) !void {
     try ctx.textFit(client.x + 10, y + 22, client.w - 20, "Physical migration is not observable in this per-process view.", hex(0x404040));
     const ok = Rect{ .x = client.x + client.w - 100, .y = client.y + client.h - 34, .w = 92, .h = 28 };
     try button9x(v, ctx, ok, "Close", .{ .button = .close_legend }, false);
+}
+
+fn legendScroll(s: *State, by: i32) void {
+    const last = 18 -| s.legend_visible;
+    s.legend_top = if (by < 0) s.legend_top -| @as(usize, @intCast(-by)) else @min(last, s.legend_top + @as(usize, @intCast(by)));
+}
+
+/// Shared chrome and readable rows; short dialogs page instead of squeezing text.
+fn legendClassic(v: *vw.View, ctx: Ctx, rect: Rect, mp: ?*const md.Map) !void {
+    if (rect.w < 40 or rect.h < 90) return;
+    const s = &v.memmap;
+    const r = Rect{ .x = rect.x + @max(8, (rect.w - 700) / 2), .y = rect.y + @max(8, (rect.h - 510) / 2), .w = @min(700, rect.w - 16), .h = @min(510, rect.h - 16) };
+    v.hit(rect, .{ .memmap = .{ .button = .close_legend } });
+    v.hit(r, .{ .memmap = .{ .legend_scroll = 0 } });
+    const client = try window9x(v, ctx, r, "Defrag Legend", true, .{ .button = .close_legend });
+    const body = Rect{ .x = client.x + 2, .y = client.y, .w = @max(0, client.w - 4), .h = @max(0, client.h - 36) };
+    try sunken(ctx, body, hex(0xffffff));
+    s.legend_visible = @min(18, @as(usize, @intFromFloat(@max(0, @floor((body.h - 6) / 22)))));
+    s.legend_top = @min(s.legend_top, 18 - s.legend_visible);
+    const pal = win9xPalette();
+    const changes = [_]md.Change{ .changed, .collapsed, .split };
+    const backend: []const u8 = if (mp) |x| if (x.process) |p| switch (p.backend) {
+        .pagemap_scan => "Backend: PAGEMAP_SCAN (huge pages observable)",
+        .pagemap_flags => "Backend: pagemap flags; page size unknown (hatched)",
+        .none => "Backend: no page states (cells unknown)",
+    } else "System view: buddyinfo counts, no positions" else "No sample yet";
+    for (s.legend_top..s.legend_top + s.legend_visible) |i| {
+        const y = body.y + 3 + @as(f32, @floatFromInt(i - s.legend_top)) * 22;
+        const sw = Rect{ .x = body.x + 8, .y = y + 3, .w = 15, .h = 15 };
+        const text: []const u8 = if (i < legend_states.len) blk: {
+            const st = legend_states[i];
+            if (st == .unknown) try hatchRect(ctx, sw, pal.hatch_bg, pal.hatch, 4) else try ctx.r.rect(sw, pal.state[@intFromEnum(st)]);
+            break :blk md.stateName(st);
+        } else if (i < 16) blk: {
+            const ch = changes[i - legend_states.len];
+            try ctx.r.rect(sw, if (ch == .changed) pal.changed else pal.state[@intFromEnum(if (ch == .collapsed) md.State.thp else md.State.anon)]);
+            if (ch == .collapsed) try ctx.r.shape(draw.inset(sw, 1), pal.collapsed, .{ .border = 2 });
+            if (ch == .split) try ctx.r.shape(sw, pal.split, .{ .border = 3 });
+            break :blk md.changeName(ch);
+        } else if (i == 16) backend else "Physical migration is not observable in this view.";
+        if (i < 16) try ctx.r.shape(sw, hex(0x000000), .{ .border = 1 });
+        try ctx.textFit(body.x + 32, y, body.w - 38, text, hex(0x000000));
+    }
+    const bw = @min(100, @max(0, (client.w - 16) / 3));
+    const y = client.y + client.h - 30;
+    if (s.legend_top > 0) try button9x(v, ctx, .{ .x = client.x + 2, .y = y, .w = bw, .h = 28 }, "Earlier", .{ .legend_scroll = -1 }, false);
+    if (s.legend_top + s.legend_visible < 18) try button9x(v, ctx, .{ .x = client.x + bw + 8, .y = y, .w = bw, .h = 28 }, "Later", .{ .legend_scroll = 1 }, false);
+    try button9x(v, ctx, .{ .x = client.x + client.w - bw - 2, .y = y, .w = bw, .h = 28 }, "Close", .{ .button = .close_legend }, false);
 }
 
 /// Buddy orders per zone, THP/compaction deltas and THP settings.
@@ -1353,6 +1507,14 @@ fn shade(ctx: Ctx, cp: u21, cx: f32, cy: f32, cw: f32, ch: f32, scale: f32, fg: 
 /// Clean high-contrast grid in the overview's own palette (the compact map;
 /// the deep look in deepmap.zig is the high-resolution field).
 fn modern(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
+    if (v.memmap.viewport()) {
+        if (v.memmap.map()) |map| v.memmap.history.observe(v.gpa, map) catch |err| v.setStatus("VMA history unavailable: {s}", .{@errorName(err)}, now);
+        var styled = ctx;
+        if (!ctx.p.monochrome) styled.p = &@import("modern_map.zig").palette;
+        try deepmap.render(v, styled, rect, now);
+        if (v.memmap.legend) try legend9x(v, ctx, rect, v.memmap.map());
+        return;
+    }
     const side_w = try sidePanels(v, ctx, rect);
     const main = Rect{ .x = rect.x + side_w, .y = rect.y, .w = rect.w - side_w, .h = rect.h };
     try modernMain(v, ctx, rect, main, now);
@@ -1506,4 +1668,121 @@ fn shortName(st: md.State) []const u8 {
         .zero => "zero page",
         else => md.stateName(st),
     };
+}
+
+// Fast component lane: a modal legend must never forward destructive shortcuts.
+test "classic memory legend captures shortcuts and clamps readable pages" {
+    var v = try vw.View.init(std.testing.allocator);
+    defer v.deinit();
+    v.palette = @import("theme.zig").find("win95").?;
+    v.memmap.legend = true;
+    v.memmap.legend_visible = 4;
+    const input = @import("../../platform/input.zig").Event;
+    for ("qdtop") |ch| {
+        try std.testing.expect(key(&v, input{ .kind = .press, .sym = ch, .shortcut = ch }, 1));
+        try std.testing.expect(v.memmap.legend and !v.quit and !v.paused and !v.memmap.compact);
+    }
+    for (0..40) |_| _ = key(&v, .{ .kind = .press, .sym = 0xff54 }, 1);
+    try std.testing.expectEqual(@as(usize, 14), v.memmap.legend_top);
+    for (0..40) |_| click(&v, .{ .legend_scroll = -1 }, 1);
+    try std.testing.expectEqual(@as(usize, 0), v.memmap.legend_top);
+    _ = key(&v, .{ .kind = .press, .sym = 0xff1b }, 1);
+    try std.testing.expect(!v.memmap.legend and !v.quit);
+}
+
+test "city retains the preceding page scan and animation clock across system publications" {
+    const t = std.testing;
+    var state = State{ .look = .gibson };
+    defer state.deinit();
+    const first = try md.Owned.create(t.allocator);
+    first.map.sequence = 10;
+    state.publishCompact(first, 100, true);
+    const second = try md.Owned.create(t.allocator);
+    second.map.sequence = 11;
+    state.publishCompact(second, 200, true);
+    const counters = try md.Owned.create(t.allocator);
+    counters.map.sequence = 11;
+    state.publishCompact(counters, 300, false);
+    try t.expectEqual(@as(u64, 200), state.accepted_at);
+    try t.expectEqual(@as(u64, 10), state.previous.?.map.sequence);
+    try t.expect(state.current.? == counters);
+    const third = try md.Owned.create(t.allocator);
+    third.map.sequence = 12;
+    state.publishCompact(third, 400, true);
+    try t.expectEqual(@as(u64, 400), state.accepted_at);
+    try t.expectEqual(@as(u64, 11), state.previous.?.map.sequence);
+}
+
+test "Gibson legend leaves local movement active in classic chrome" {
+    var v = try vw.View.init(std.testing.allocator);
+    defer v.deinit();
+    v.palette = @import("theme.zig").find("win95").?;
+    v.memmap.look = .gibson;
+    v.memmap.legend = true;
+    try std.testing.expect(key(&v, .{ .kind = .press, .sym = 'd', .shortcut = 'd' }, 1));
+    try std.testing.expect(!v.memmap.city.camera.automatic);
+    try std.testing.expect(!v.memmap.compact and v.memmap.legend);
+    v.memmap.picker_open = true;
+    v.memmap.city.camera.automatic = true;
+    try std.testing.expect(key(&v, .{ .kind = .press, .sym = 'd', .shortcut = 'd' }, 1));
+    try std.testing.expect(v.memmap.city.camera.automatic);
+}
+
+test "open memory picker retains row identities and keyboard cursor across repaint" {
+    var v = try vw.View.init(std.testing.allocator);
+    defer v.deinit();
+    v.memmap.picker_open = true;
+    v.memmap.pick_count = 2;
+    v.memmap.picks[0] = .{ .pid = 12, .start = 34 };
+    v.memmap.picks[1] = .{ .pid = 56, .start = 78 };
+    v.memmap.pick = 1;
+    try std.testing.expect(key(&v, .{ .kind = .press, .sym = 0xff54 }, 1));
+    pickList(&v);
+    try std.testing.expectEqual(@as(usize, 2), v.memmap.pick);
+    try std.testing.expectEqual(@as(usize, 2), v.memmap.pick_count);
+    try std.testing.expectEqual(md.Identity{ .pid = 56, .start = 78 }, v.memmap.picks[1]);
+    try std.testing.expect(key(&v, .{ .kind = .press, .sym = 0xff1b }, 1));
+    try std.testing.expect(!v.memmap.picker_open);
+}
+
+// Fast component lane: allocation ownership, hidden/reopened state and PID reuse.
+test "hiding a live viewport frees both owned maps and retains only numeric coverage" {
+    const t = std.testing;
+    var v = try vw.View.init(t.allocator);
+    defer v.deinit();
+    const s = &v.memmap;
+    v.show(.memory_map);
+    s.look = .deep;
+    s.target = .{ .pid = 12, .start = 34 };
+    s.current = try md.Owned.create(t.allocator);
+    s.current.?.map.process = .{ .pid = 12, .start_ticks = 34, .coverage_numerator = 2, .coverage_denominator = 8 };
+    s.current.?.map.cells = try s.current.?.arena.allocator().alloc(md.Cell, 64);
+    s.previous = try md.Owned.create(t.allocator);
+    s.previous.?.map.cells = try s.previous.?.arena.allocator().alloc(md.Cell, 64);
+    s.reader.seen_any = true;
+    s.deep = .{ .origin = 0x100000, .cols = 8, .rows = 8, .placed = true, .moved = true, .selected = 0x101000, .drag = .{ .x = 1, .y = 1, .origin = 0 } };
+    v.show(.summary);
+    try t.expect(s.current == null and s.previous == null and s.map() == null);
+    try t.expect(!s.reader.seen_any and s.deep.drag == null);
+    try t.expectEqual(@as(f64, 0.25), s.coverage().?.value.fraction);
+    v.show(.memory_map);
+    const req = deepmap.request(s, true, 1);
+    try t.expectEqual(@as(u64, 0x100000), req.range.?.start);
+    try t.expectEqual(@as(?u64, 0x101000), s.deep.selected);
+    const pending = try md.Owned.create(t.allocator);
+    pending.map.pending = true;
+    _ = deepmap.accept(s, pending, 2, false);
+    try t.expect(s.deep.pending and s.current.?.map.cells.len == 0);
+    s.open(.{ .pid = 12, .start = 35 }, 3);
+    try t.expect(s.coverage() == null and s.deep.selected == null);
+}
+
+test "hiding a replay never frees its borrowed map" {
+    const t = std.testing;
+    const replay = md.Map{ .sequence = 7 };
+    var s = State{ .look = .deep, .replay_current = &replay };
+    defer s.deinit();
+    s.hide();
+    try t.expect(s.map().? == &replay);
+    try t.expectEqual(@as(u64, 7), s.map().?.sequence);
 }

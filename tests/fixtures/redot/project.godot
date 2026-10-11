@@ -1,0 +1,13 @@
+; Synthetic project for the GDScript stack tests and scripts/demo-redot.
+; Three scripts, one scene, no assets.
+config_version=5
+
+[application]
+
+config/name="xodb-gdscript-fixture"
+run/main_scene="res://main.tscn"
+run/max_fps=20
+
+[debug]
+
+gdscript/warnings/enable=false

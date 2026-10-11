@@ -217,7 +217,11 @@ pub const View = struct {
         self.sample_time = now;
         self.samples += 1;
         if (sample.snap.fresh[@intFromEnum(m.Group.processes)]) self.rows_dirty = true;
-        if (sample.snap.memory_map) |map| self.memmap.acceptReplay(map, sample.snap.memory_viewports, now);
+        if (sample.snap.memory_map) |map| {
+            self.memmap.acceptReplay(map, sample.snap.memory_viewports, now);
+            if (self.panel == .memory_map and self.memmap.look == .modern)
+                self.memmap.history.observe(self.gpa, map) catch |err| self.setStatus("VMA history unavailable: {s}", .{@errorName(err)}, now);
+        }
         self.record(&sample.snap);
     }
 
@@ -365,10 +369,11 @@ pub const View = struct {
 
     pub fn input(self: *View, w: *Window, now: u64) void {
         defer self.windowActions(w);
+        if (!self.gibsonMap()) self.memmap.city.drag = null;
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };
             w.dirty = true;
-            if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self);
+            if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self) else if (self.gibsonMap()) memmap.gibson.motion(self);
         }
         if (w.scroll != 0) {
             if (self.classic_menu != null) win95.scrollMenu(self, w.scroll) else if (!self.classic_about and self.pending_action == null) self.wheel(w.scroll);
@@ -389,7 +394,11 @@ pub const View = struct {
                 .button_press => {
                     w.dirty = true;
                     // The deep map's field and minimap take presses (drag, select, jump).
-                    if (event.code == 272 and !(self.deepMap() and self.pending_action == null and self.classic_menu == null and !self.classic_about and memmap.deepmap.press(self, event.x, event.y))) self.click(event.x, event.y, now);
+                    if (event.code == 272) {
+                        const unobscured = self.pending_action == null and self.classic_menu == null and !self.classic_about;
+                        const taken = unobscured and ((self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)));
+                        if (!taken) self.click(event.x, event.y, now);
+                    }
                 },
                 .button_release => if (event.code == 272) {
                     if (self.classic_scroll != null) {
@@ -397,6 +406,7 @@ pub const View = struct {
                         win95.drag(self);
                     }
                     self.classic_scroll = null;
+                    if (self.gibsonMap()) memmap.gibson.release(self, event.x, event.y) else self.memmap.city.drag = null;
                     if (self.deepMap()) {
                         w.dirty = true;
                         memmap.deepmap.release(self, event.x, event.y);
@@ -427,10 +437,17 @@ pub const View = struct {
     }
 
     fn deepMap(self: *const View) bool {
-        return self.panel == .memory_map and self.memmap.look == .deep and !self.memmap.legend and !self.memmap.picker_open;
+        return self.panel == .memory_map and self.memmap.viewport() and !self.memmap.legend and !self.memmap.picker_open;
+    }
+    fn gibsonMap(self: *const View) bool {
+        return self.panel == .memory_map and self.memmap.look == .gibson and !self.memmap.picker_open and self.classic_menu == null and !self.classic_about and self.pending_action == null;
     }
     fn wheel(self: *View, lines: i32) void {
-        if (self.panel == .memory_map and self.memmap.look == .deep) return memmap.deepmap.wheel(self, lines);
+        if (self.gibsonMap()) {
+            self.memmap.city.camera.wheel(lines);
+            return;
+        }
+        if (self.deepMap()) return memmap.deepmap.wheel(self, lines);
         if (self.panel == .files) {
             if (lines > 0) self.files.top += @intCast(lines) else self.files.top -|= @intCast(-lines);
             return;
@@ -560,6 +577,7 @@ pub const View = struct {
         }
     }
     pub fn show(self: *View, panel: Panel) void {
+        if (self.panel == .memory_map and panel != .memory_map) self.memmap.hide();
         self.classic_menu = null;
         self.classic_scroll = null;
         self.panel = panel;
@@ -1253,8 +1271,8 @@ pub const View = struct {
                 .treemap => .{ .text = if (self.treemap.tree) |tree| std.fmt.bufPrint(&vb, "{d} handles", .{tree.fd_count}) catch "" else "sampled when shown" },
                 .inheritance => .{ .text = if (self.graph.inheritance) |rows| std.fmt.bufPrint(&vb, "{d} sampled matches", .{rows.matched}) catch "" else "sampled when shown" },
                 .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
-                .memory_map => .{ .text = if (self.memmap.map()) |mm| switch (memmap.md.coverage(mm)) {
-                    .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (mm.process == null) "free contiguous" else "THP" }) catch "",
+                .memory_map => .{ .text = if (self.memmap.coverage()) |coverage| switch (coverage) {
+                    .value => |cov| std.fmt.bufPrint(&vb, "{d:.0}% {s}", .{ cov.fraction * 100, if (self.memmap.target == null) "free contiguous" else "THP" }) catch "",
                     .none => "nothing eligible",
                     .unknown => "coverage unknown",
                 } else "THP map when shown" },
@@ -1295,7 +1313,7 @@ pub const View = struct {
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
-            const hints = if (self.panel == .memory_map and self.memmap.look == .deep) "t look  wheel/+/- zoom  drag/arrows pan  0 fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
+            const hints = if (self.panel == .memory_map and self.memmap.look == .gibson) "WASD move  drag orbit  wheel zoom  f fly  r reset  h height  c colour  g legend  click details  o process" else if (self.panel == .memory_map and self.memmap.look == .modern and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  p pause" else if (self.panel == .memory_map and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
             try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
         }
     }
@@ -1659,7 +1677,7 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
     font.* = .{};
     try font.init("/usr/share/fonts/TTF/DejaVuSansMono.ttf");
     defer font.deinit();
-    const buffer = try a.alignedAlloc(u8, .@"16", 8 * 1024 * 1024);
+    const buffer = try a.alignedAlloc(u8, .@"16", gpu.buffer_bytes);
     defer a.free(buffer);
     var r = gpu.Renderer{};
     r.mapped = buffer.ptr;
@@ -1673,6 +1691,7 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
     const vmas = [_]memmap.md.Vma{ .{ .start = 0, .end = 150 * B }, .{ .start = 150 * B, .end = 300 * B } };
     const map = memmap.md.Map{ .process = .{ .pid = 7, .start_ticks = 1, .coverage_numerator = 1, .coverage_denominator = 3 }, .vmas = &vmas, .cells = &cells };
     v.memmap.replay_current = &map;
+    v.memmap.target = .{ .pid = 7, .start = 1 };
     var w = Window{};
     const sizes = [_][2]u32{ .{ 0, 0 }, .{ 1, 1 }, .{ 40, 20 }, .{ 120, 60 }, .{ 300, 200 }, .{ 480, 540 }, .{ 700, 300 }, .{ 960, 1080 }, .{ 3000, 30 }, .{ 30, 2000 }, .{ 1, 1 } };
     const pointers = [_][2]f32{ .{ -1, -1 }, .{ 0, 0 }, .{ 5, 5 }, .{ 300, 200 }, .{ 1e6, 1e6 }, .{ -1e6, 5 } };
@@ -1690,6 +1709,8 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
                     w.height = size[1];
                     v.pointer = pointer;
                     r.vertices = 0;
+                    r.cells_used = 0;
+                    r.batch_count = 0;
                     r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(size[0]), .h = @floatFromInt(size[1]) };
                     v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
                     if (palette == themes.find("win95").? and panel == .summary) {
@@ -1699,6 +1720,8 @@ test "every panel draws through a resize from 0x0 to half screen with the pointe
                             v.classic_about = overlay == menus.len;
                             v.pending_action = if (overlay == menus.len + 1) .{ .kind = .files, .id = .{ .pid = 7, .start = 1 } } else null;
                             r.vertices = 0;
+                            r.cells_used = 0;
+                            r.batch_count = 0;
                             v.frame(&r, font, &w, 2_000_000_000) catch |err| if (err != error.VertexBufferFull) return err;
                         }
                         v.classic_menu = null;
@@ -1794,6 +1817,8 @@ test "classic scrollbar geometry does not grow with the trough height" {
     var used: [2]usize = undefined;
     for ([_]f32{ 200, 4000 }, &used) |height, *n| {
         r.vertices = 0;
+        r.cells_used = 0;
+        r.batch_count = 0;
         r.clip = .{ .x = 0, .y = 0, .w = 100, .h = height };
         v.hit_count = 0;
         try win95.scrollbar(&v, .{ .r = &r, .font = font, .p = v.pal() }, .{ .x = 10, .y = 0, .w = 16, .h = height }, 5, 1000, 20);

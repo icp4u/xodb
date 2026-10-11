@@ -385,11 +385,11 @@ this wall-time classification through `sensor_timing_disabled` in the C limits.
 
 The **Memory map** panel (**M**, or **m** on a Processes row) draws one
 process's virtual memory as fixed 2 MiB address cells inside its VMAs, from the
-same shared observer as the MCP tools below. **t** on the panel cycles four
+same shared observer as the MCP tools below. **t** on the panel cycles five
 looks: a Windows 9x *Disk Defragmenter* dialog, the MS-DOS 6 *DEFRAG* text
 screen (the same 80x25 composer as `xodb --memdefrag`, see
-[MEMDEFRAG.md](MEMDEFRAG.md)), a modern grid and the zoomable **deep map**
-(below). `--look win9x|dos|modern|deep` picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
+[MEMDEFRAG.md](MEMDEFRAG.md)), the granular modern view, the zoomable **deep map**,
+and the **Gibson** 3D city (below). `--look win9x|dos|modern|deep|gibson` picks one at start; `--memmap-pid N [--memmap-start-ticks N]` opens a process.
 
 - Cells are address ranges, so gaps between VMAs stay visible (dark). Long
   gaps and large never-resident VMAs are one compressed cell marked with a
@@ -433,6 +433,38 @@ Numbers collected when load exceeds the available CPUs are marked not measurable
 The script reports measurements without fixed timing or CPU assertions; adaptive
 refresh and per-scope costs remain visible.
 
+### Modern memory map
+
+`--overview --panel memory_map --look modern --memmap-pid PID` uses the same
+explicit viewport as the deep map, with up to 65,536 cells down to one 4 KiB
+page. Wheel or **+/-** zoom at the pointer; drag or arrows pan; **f** fits the
+VMA cluster; **[ ]** selects the previous or next VMA. Click a VMA ribbon to
+move to its start. **0** retains its System Info shortcut. Without a process,
+the modern view shows the system's buddy counts instead of an address map.
+
+The dark panels, accents and rounded cells are drawn procedurally. Navigation
+eases the displayed geometry, and picking follows that geometry. An unsampled
+zoom or range stays dotted and pending; a recorded replay never fabricates
+missing viewports. Hatched unknown cells, collapse rings and split edges keep
+their distinct meanings. Bright pulses and closing/opening edges follow only
+observed sample-to-sample changes.
+
+The activity strip labels khugepaged/compaction counters as **system-wide**.
+Each visible VMA ribbon shows its own AnonHugePages divided by its whole VMA
+span (a different denominator from the process's eligible-THP coverage bar).
+Its sparkline holds at most 32 actual process samples, spaced by their recorded
+timestamps; missing measurements are gaps, not zeroes. History is capped at
+4,096 ranges. Target changes, disappearing ranges and backwards replay time
+reset the corresponding history. These are sampled range histories: an
+indistinguishable remapping between scans is not a proven allocation lifetime.
+History storage is released when leaving the panel or the modern look.
+
+`tests/memdefrag-modern-gui.py` runs the fast private-display navigation checks.
+Its periodic `--evidence` mode captures replayed collapse frames and reports
+frame CPU, process CPU and resident memory at 1080p and 4K using a large owned
+Node fixture (`--node PATH` selects the executable). Performance numbers are
+evidence rather than fixed timing thresholds.
+
 ### Uniform memory viewport data
 
 The shared presentation model can publish up to 65536 cells in one explicit
@@ -463,6 +495,9 @@ row limit.
 
 ### Deep map
 
+The deep and modern memory maps use `f` to fit the mapped address range; `0` still opens System Info. Navigation stops at the highest observed user VMA end (kernel pseudo mappings are excluded). Pending cells never borrow data from another address: the header marks partly previous scans and keeps the refresh age and full viewport range visible. The process list keeps PID and alias before RSS at narrow widths. Hiding a live viewport releases its page-backed snapshots immediately; the sidebar retains only the last coverage numbers, and reopening requests fresh data for the retained view.
+
+
 The fourth look is a dense field of up to 65,536 fixed cells, from 2 MiB per
 cell (128 GiB in view) down to one 4 KiB page per cell (256 MiB in view), drawn
 as one batch of instanced quads. It asks the observer for exactly the viewport
@@ -472,7 +507,7 @@ on screen (the uniform request above), so collection follows the view.
 |---|---|
 | Zoom, keeping the cell under the pointer in place | mouse wheel, or **+**/**-** (at the pointer, else the centre) |
 | Pan | drag, arrows (an eighth of the field), Page Up/Down |
-| Fit the process's densest VMA cluster at the finest cell size that holds it | **0** (also the first view) |
+| Fit the process's densest VMA cluster at the finest cell size that holds it | **f** (also the first view) |
 | Previous / next VMA to the top-left, selected | **[** / **]** |
 | Jump anywhere | click the minimap: the whole address space, gaps over 1 GiB compressed to breaks, the view boxed |
 | Details of a cell | hover, or click to select (Esc clears) |
@@ -619,3 +654,40 @@ live syscall tracing by default (~11% host cost); **E** stops it. Click to zoom,
 **Backspace** to go up, **Esc** for root and **L** for one sampled holder's Files.
 Area represents open handles, including duplicates, rather than file size.
 See [controls, bounds and passive MCP queries](FD_TREEMAP.md).
+
+### Gibson memory city
+
+`--panel memory_map --look gibson` draws the compact memory map through the
+shared Vulkan scene layer. Each sampled cell (normally 2 MiB) occupies one
+lot. VMAs form separate blocks with streets; compressed gaps and reserved
+spans are omitted, and truncated maps are explicitly labelled. This is a
+packing of sampled virtual ranges, not physical memory geography. It retains
+the compact map's 65,536-cell cap. The system-only view asks for a process
+because aggregate system counters have no virtual-address geometry.
+
+Height defaults to present MiB, including present zero-page mappings. **H**
+cycles present / THP-backed / swapped bytes; **C** cycles backing / district
+colours. Unknown measurements draw fixed wire cages whose height has no byte
+meaning. Partial heights are lower bounds over observed bytes. Known zero
+heights retain selectable flat footprints. Purple backing means present pages
+whose page size could not be measured. **G** shows the encoding legend. The
+header keeps the publication age, refresh cadence, pending state, truncation
+and count of unknown and partial towers visible.
+
+**WASD** moves the camera, mouse drag and arrows orbit, the wheel or **+/-**
+zooms, **F** toggles automatic orbit and dolly, and **R** resets the camera.
+These controls are local to Gibson: **D** moves right. Click a tower for the
+same block detail text as the 2D views; **Esc** clears the selection. **O**
+chooses a process. Selection is stored by address and cleared on process
+identity changes. Rendering uses depth, instancing and additive translucency;
+CPU rays handle clicks, without projecting or sorting the geometry on the CPU.
+
+Towers ease only between compatible process/range/VMA identities. Collapse
+flashes require measured PMD change flags; publication of unrelated system
+counters does not restart them. Replays preserve those distinctions. With
+`--redact`, floating labels disappear and ordinary process/path labels use the
+existing redaction rules. One representative each for heap, stack, anonymous, library and other file
+districts is labelled. A dim opaque core under each measured tower's
+translucent shell keeps neighbouring buildings distinguishable. CPU
+layout storage is freed when the look or panel is hidden; the scene layer
+retires its GPU buffers and attachments after the frame fence.

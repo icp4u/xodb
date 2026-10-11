@@ -24,7 +24,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/service"));
     // Allocation-free C++ parser; no C++ standard-library runtime is used.
     module.addCSourceFile(.{ .file = b.path("src/debug/demangle.cc"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror" } });
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pe_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pe_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/debug/dwarf_types.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -111,6 +111,14 @@ pub fn build(b: *std.Build) void {
             const import = if (std.mem.eql(u8, name, "ui")) b.fmt("{s}_spv", .{stage}) else b.fmt("{s}_{s}_spv", .{ name, stage });
             module.addAnonymousImport(import, .{ .root_source_file = spv });
         };
+        for ([_][]const u8{ "box.vert", "point.vert", "line.vert", "glyph.vert", "scene.frag", "post.vert", "blur.frag", "composite.frag" }) |name| {
+            const shader = b.addSystemCommand(&.{"glslc"});
+            shader.addFileArg(b.path(b.fmt("src/render/scene3d/{s}", .{name})));
+            shader.addArg("-o");
+            const spv = shader.addOutputFileArg(b.fmt("{s}.spv", .{name}));
+            const dot = std.mem.indexOfScalar(u8, name, '.').?;
+            module.addAnonymousImport(b.fmt("scene_{s}_{s}", .{ name[0..dot], name[dot + 1 ..] }), .{ .root_source_file = spv });
+        }
     }
     const exe = b.addExecutable(.{ .name = "xodb", .root_module = module });
     const install_exe = b.addInstallArtifact(exe, .{});
@@ -394,6 +402,8 @@ pub fn build(b: *std.Build) void {
     b.step("agent", "Build the standalone C runtime agent").dependOn(&install_agent.step);
     app_step.dependOn(&install_agent.step);
     const test_step = b.step("test", "Run unit and real target integration tests");
+    const scene_math = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("src/render/scene3d/math.zig"), .target = target, .optimize = optimize }) });
+    test_step.dependOn(&b.addRunArtifact(scene_math).step);
     test_step.dependOn(&fdgraph_run.step);
     test_step.dependOn(&fdinherit_run.step);
     test_step.dependOn(&fdtreemap_run.step);

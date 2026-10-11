@@ -146,12 +146,12 @@ static int poison(void) { char v[8]; return rule("poison", v, sizeof v) && v[0] 
 
 /* Object accounting. */
 enum kind { K_INSTANCE, K_SURFACE, K_DEVICE, K_POOL, K_SEMAPHORE, K_FENCE, K_BUFFER, K_MEMORY, K_IMAGE, K_VIEW, K_SAMPLER,
-            K_SETLAYOUT, K_DESCPOOL, K_LAYOUT, K_SWAPCHAIN, K_PASS, K_SHADER, K_PIPELINE, K_FRAMEBUFFER, K_KINDS };
+            K_SETLAYOUT, K_DESCPOOL, K_LAYOUT, K_SWAPCHAIN, K_PASS, K_SHADER, K_PIPELINE, K_FRAMEBUFFER, K_QUERY, K_KINDS };
 static const char *kind_names[K_KINDS] = {"instance", "surface", "device", "command_pool", "semaphore", "fence", "buffer", "memory",
     "image", "image_view", "sampler", "descriptor_set_layout", "descriptor_pool", "pipeline_layout", "swapchain", "render_pass",
-    "shader_module", "pipeline", "framebuffer"};
+    "shader_module", "pipeline", "framebuffer", "query_pool"};
 #define MAXO 8192
-static struct { uint64_t h, bytes; int kind; int pending; } objs[MAXO];
+static struct { uint64_t h, bytes; int kind; int pending; int mapped; } objs[MAXO];
 static unsigned long created[K_KINDS], destroyed[K_KINDS], violations, leaks;
 static uint64_t allocated_bytes, freed_bytes, live_bytes, peak_bytes, leaked_bytes;
 static unsigned long retired_instances, dirty_retirements;
@@ -171,7 +171,7 @@ static void track_bytes(int kind, uint64_t h, uint64_t bytes) {
     for (int i = 0; i < MAXO; ++i) if (!objs[i].h) { slot = i; break; }
     if (slot < 0) violation("object accounting capacity exceeded", h);
     else {
-        objs[slot].h = h; objs[slot].kind = kind; objs[slot].pending = 0;
+        objs[slot].h = h; objs[slot].kind = kind; objs[slot].pending = 0; objs[slot].mapped = 0;
         objs[slot].bytes = bytes;
         if (UINT64_MAX - live_bytes < bytes || UINT64_MAX - allocated_bytes < bytes)
             violation("allocation accounting overflow", h);
@@ -263,6 +263,8 @@ CREATE(vkCreateRenderPass, K_PASS, VkRenderPassCreateInfo, VkRenderPass)
 DESTROY(vkDestroyRenderPass, K_PASS, VkRenderPass)
 CREATE(vkCreateShaderModule, K_SHADER, VkShaderModuleCreateInfo, VkShaderModule)
 DESTROY(vkDestroyShaderModule, K_SHADER, VkShaderModule)
+CREATE(vkCreateQueryPool, K_QUERY, VkQueryPoolCreateInfo, VkQueryPool)
+DESTROY(vkDestroyQueryPool, K_QUERY, VkQueryPool)
 CREATE(vkCreateFramebuffer, K_FRAMEBUFFER, VkFramebufferCreateInfo, VkFramebuffer)
 DESTROY(vkDestroyFramebuffer, K_FRAMEBUFFER, VkFramebuffer)
 DESTROY(vkDestroyPipeline, K_PIPELINE, VkPipeline)
@@ -374,16 +376,27 @@ VKAPI_ATTR VkResult VKAPI_CALL vkAllocateMemory(VkDevice d, const VkMemoryAlloca
 VKAPI_ATTR void VKAPI_CALL vkFreeMemory(VkDevice d, VkDeviceMemory h, const VkAllocationCallbacks *a) {
     REAL(vkFreeMemory); untrack(K_MEMORY, (uint64_t)h); real(d, h, a);
 }
-static VkDeviceMemory mapped_memory;
+/* Every scene instance buffer can be mapped at once. Track each allocation,
+ * rather than the last successful map, just as for every other live handle. */
+static void map_state(VkDeviceMemory memory, int mapped) {
+    if (!active()) return;
+    pthread_mutex_lock(&lock);
+    int i = find((uint64_t)memory);
+    if (i < 0 || objs[i].kind != K_MEMORY) violation("map state for unknown memory", (uint64_t)memory);
+    else {
+        if (objs[i].mapped == mapped) violation(mapped ? "memory mapped twice" : "unmap of memory that is not mapped", (uint64_t)memory);
+        objs[i].mapped = mapped;
+    }
+    pthread_mutex_unlock(&lock);
+}
 VKAPI_ATTR VkResult VKAPI_CALL vkMapMemory(VkDevice d, VkDeviceMemory m, VkDeviceSize o, VkDeviceSize s, VkMemoryMapFlags f, void **out) {
     REAL(vkMapMemory); VkResult r;
     if (scheduled("vkMapMemory", &r)) { POISON(out); return r; }
-    r = real(d, m, o, s, f, out); if (r == VK_SUCCESS) mapped_memory = m; return r;
+    r = real(d, m, o, s, f, out); if (r == VK_SUCCESS) map_state(m, 1); return r;
 }
 VKAPI_ATTR void VKAPI_CALL vkUnmapMemory(VkDevice d, VkDeviceMemory m) {
     REAL(vkUnmapMemory);
-    if (active() && m != mapped_memory) violation("unmap of memory that is not mapped", (uint64_t)m);
-    mapped_memory = VK_NULL_HANDLE;
+    map_state(m, 0);
     real(d, m);
 }
 VKAPI_ATTR VkResult VKAPI_CALL vkCreateGraphicsPipelines(VkDevice d, VkPipelineCache c, uint32_t n, const VkGraphicsPipelineCreateInfo *i, const VkAllocationCallbacks *a, VkPipeline *out) {

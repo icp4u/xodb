@@ -61,5 +61,6 @@ pub const api = @cImport({
     @cInclude("../language/go_type_index.h");
     @cInclude("../language/jai_job.h");
     @cInclude("../language/elisp.h");
+    @cInclude("../debug/dwarf_types.h");
     @cInclude("dwarf.h");
 });

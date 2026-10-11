@@ -35,6 +35,9 @@ def note(name, detail):
 class Display:
     """A private headless Sway and one xodb inside it, with optional MCP on stdio."""
 
+    # A test of a very large image (a first read of a gigabyte) raises this.
+    reply_seconds = 5
+
     def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True, binary=None, output_size=(1280, 800)):
         Display.count = getattr(Display, "count", 0) + 1
         self.tree = tree
@@ -114,7 +117,7 @@ class Display:
             message["params"] = params
         self.app.stdin.write((json.dumps(message) + "\n").encode())
         self.app.stdin.flush()
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + self.reply_seconds
         while time.monotonic() < deadline:
             ready, _, _ = select.select([self.app.stdout], [], [], max(0, deadline - time.monotonic()))
             if not ready:

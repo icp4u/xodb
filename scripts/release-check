@@ -36,20 +36,22 @@ COVERS = (
     (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
     (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
+    (('src/language/gdscript*', 'tests/fixtures/redot/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
+     ('gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
     (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
-     ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', *LANGUAGE_PANES)),
+     ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
      ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
       'src/runtime/registers.c', 'src/runtime/xrt_memory.h'), ('memory-registers', 'memory-search-*')),
     (('src/mcp/memstat*', 'src/runtime/memstat*', 'src/runtime/memobserver.c', 'src/runtime/xrt_mem*', 'src/memdefrag/*'),
-     ('memory-observer', 'memdefrag-tui', 'gui-memdefrag*', 'gui-vga')),
+     ('memory-observer', 'memdefrag-tui', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-vga')),
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
       'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h'),
-     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-safe-keys*', 'gui-themes')),
+     ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-safe-keys*', 'gui-themes')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
@@ -84,7 +86,7 @@ COVERS = (
       'source-blocks', 'stale-interrupt',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*'),
-     ('vulkan-*', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('scripts/release-check',), ('release-runner',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
@@ -95,12 +97,13 @@ COVERS = (
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
-    'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
+    'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-evidence',
+    'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
 }
 
 # GUI steps that are never retried: they inject faults or race the renderer,
 # so one failure in several runs is the defect they exist to catch.
-NO_RETRY = {'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
 
 # Host and gui steps (name globs) that run in `periodic` (live) or
 # `periodic-gui` (gui) instead, with the same commands: soaks, stress and
@@ -109,7 +112,8 @@ NO_RETRY = {'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-wind
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
-    'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
+    'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson-evidence',
+    'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
     'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
     'symbol-discovery', 'symbol-discovery-install', 'source-fetch', 'lsof-top', 'memory-observer', 'sysstat-nvml',
     'metadata-session-agent', 'm2-preferences-agent', 'python-lua-named-1',
@@ -187,7 +191,7 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -202,10 +206,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                   '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600, dict(kind='build')))
     if tier == 'periodic' and go:
         steps.append(('go-maps-interleaved', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--experiment', 'nomapsplitgroup', '--strace', '--work', '.work/go-maps-interleaved'], 180))
+    steps.append(('scene3d-math', ['zig', 'test', 'src/render/scene3d/math.zig', '-OReleaseSafe'], 30))
     steps.append(('go-type-index', [sys.executable, '-B', 'tests/go-type-index.py', '--work', '.work/go-type-index'], 60))
     steps.append(('go-maps-component', [sys.executable, '-B', 'tests/go-maps-component.py', '--work', '.work/go-maps-component'], 60))
     steps.append(('go-values-component', [sys.executable, '-B', 'tests/go-values-component.py', '--work', '.work/go-values-component'], 60))
-    for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'javascript-ranged', 'javascript-image'):
+    for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'dwarf-types', 'javascript-ranged', 'javascript-image'):
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
@@ -282,12 +287,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 ('vulkan-faults', [sys.executable, '-B', 'tests/vulkan-fault.py',
                  'zig-out/bin/xodb', '.work/vulkan-faults.json'], 600),
                 ('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py'], 900),
+                ('gui-memdefrag-modern-evidence', [sys.executable, '-B', 'tests/memdefrag-modern-gui.py', '--evidence'], 240),
                 ('gui-win95-all-panels', [sys.executable, '-B', 'tests/overview-win95-gui.py', '--all-panels'], 300),
                 ('gui-clipboard', [sys.executable, '-B', 'tests/clipboard-gui.py'], 90),
             ]
-            steps += plan('gui', *runtimes, moved=True)
+            steps += plan('gui', *runtimes, moved=True, redot=redot)
         elif not headless:
-            steps += plan('host', *runtimes, moved=True)
+            steps += plan('host', *runtimes, moved=True, redot=redot)
         return steps
     if live:
         steps.kind = 'live'
@@ -435,6 +441,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-values', [sys.executable, '-B', 'tests/go-values.py', '--go', go, '--strace', '--work', '.work/go-values'], 180))
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
             steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
+        if redot:
+            # A Godot 4 / Redot engine with DWARF: about a gigabyte read once per xodb.
+            steps.append(('gdscript-stack', [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot, '--strace', '--work', '.work/gds'], 600))
+            steps.append(('gdscript-demo', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--work', '.work/gdd'], 600))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('javascript-watches'+suffix, [sys.executable, '-B', 'tests/javascript-watches.py', '--node', node, '--include', node_include, '--strace', '--work', '.work/jw'+suffix, *extra], 300))
@@ -529,6 +539,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-decoration', [sys.executable, '-B', 'tests/window-decoration-gui.py'], 60))
         steps.append(('gui-memdefrag-smoke', [sys.executable, '-B', 'tests/memdefrag-gui.py', '--only', 'redact'], 180))
         steps.append(('gui-memdefrag', [sys.executable, '-B', 'tests/memdefrag-gui.py'], 600))
+        steps.append(('gui-deepmap', [sys.executable, '-B', 'tests/deepmap-gui.py'], 60))
+        steps.append(('gui-deepmap-evidence', [sys.executable, '-B', 'tests/deepmap-gui.py', '--evidence'], 120))
+        steps.append(('gui-gibson', [sys.executable, '-B', 'tests/gibson-gui.py'], 60))
+        steps.append(('gui-gibson-evidence', [sys.executable, '-B', 'tests/gibson-gui.py', '--evidence'], 120))
+        steps.append(('gui-scene3d', [sys.executable, '-B', 'tests/scene3d-gui.py'], 60))
+        steps.append(('gui-scene3d-evidence', [sys.executable, '-B', 'tests/scene3d-gui.py', '--evidence'], 120))
+        steps.append(('scene3d-faults', [sys.executable, '-B', 'tests/scene3d-faults.py'], 180, dict(paths=['tests/scene3d-faults.py', 'tests/vulkan-fault.c', 'tests/vulkan-fault-accounting.c'])))
+        steps.append(('gui-memdefrag-modern', [sys.executable, '-B', 'tests/memdefrag-modern-gui.py'], 120))
+        steps.append(('gui-memdefrag-win95', [sys.executable, '-B', 'tests/memdefrag-win95-gui.py'], 120))
         if emacs:
             steps.append(('elisp-gui', [sys.executable, '-B', 'tests/elisp-gui.py', '--emacs', emacs, '--work', '.'], 300, dict(work=['input-eli'])))
             for remote in (False, True):
@@ -544,6 +563,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         if go:
             steps.append(('go-native-values-gui', [sys.executable, '-B', 'tests/go-native-values-gui.py', '--go', go, '--work', '.work/input-gnv'], 180))
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
+        if redot:
+            steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))
         if node:
             steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 1200))
             steps.append(('javascript-context-gui', [sys.executable, '-B', 'tests/javascript-context-gui.py', '--node', node, '--include', node_include, '--work', '.'], 1200, dict(work=['input-jsc'])))
@@ -915,7 +936,7 @@ def affected(steps, changed, fallback, registered=()):
     return select(steps, [step.name for step in steps if step.name in wanted]), lines
 
 
-def registered_since(base, runtimes):
+def registered_since(base, runtimes, redot=None):
     """Names of the steps that base's scripts/release-check plans differently
     or not at all. Empty when that plan cannot be made."""
     old = subprocess.run(['git', 'show', base + ':scripts/release-check'], cwd=ROOT, capture_output=True, text=True)
@@ -925,7 +946,7 @@ def registered_since(base, runtimes):
         before = {step[0]: list(step) for step in scope['plan']('all', *runtimes)}
     except Exception:
         return []
-    return [step.name for step in plan('all', *runtimes) if before.get(step.name) != list(step)]
+    return [step.name for step in plan('all', *runtimes, redot=redot) if before.get(step.name) != list(step)]
 
 
 def snapshot(destination):
@@ -987,6 +1008,7 @@ def main(argv=None):
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
     parser.add_argument('--wine', help='Include owned stripped PE/Jai checks with this Wine executable (periodic tiers; private prefix)')
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
+    parser.add_argument('--redot', help='Include GDScript stack checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -1027,6 +1049,8 @@ def main(argv=None):
         parser.error('--ruby is not for the portable or perf tier')
     if args.go and args.tier in ('portable', 'perf'):
         parser.error('--go is not for the portable or perf tier')
+    if args.redot and args.tier in ('portable', 'perf'):
+        parser.error('--redot is not for the portable or perf tier')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1034,7 +1058,7 @@ def main(argv=None):
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes)
+    steps = plan(args.tier, *runtimes, redot=args.redot)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'
@@ -1044,18 +1068,18 @@ def main(argv=None):
             parser.error('git diff failed: ' + diff.stderr.strip())
         if not changed:
             parser.error(f'no tracked file differs from {base}; nothing is affected (pass --base REV, or run a tier)')
-        registered = registered_since(base, runtimes) if 'scripts/release-check' in changed else ()
-        steps += plan('all', *runtimes, moved=True)  # selected only by their own test scripts
+        registered = registered_since(base, runtimes, args.redot) if 'scripts/release-check' in changed else ()
+        steps += plan('all', *runtimes, moved=True, redot=args.redot)  # selected only by their own test scripts
         everything = steps
-        steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes)], registered)
+        steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes, redot=args.redot)], registered)
         # A runtime that was not passed has no steps to select. Say what the change lost.
         chosen = {step.name for step in steps}
         for flag, more in (('perl', dict(perl='PERL')), ('padwalker', dict(perl=args.perl or 'PERL', padwalker='PADWALKER')), ('python', dict(python='PYTHON')),
-                           ('emacs', dict(emacs='EMACS')), ('ruby', dict(ruby='RUBY')), ('node', dict(node='NODE')), ('go', dict(go='GO')),
+                           ('emacs', dict(emacs='EMACS')), ('ruby', dict(ruby='RUBY')), ('node', dict(node='NODE')), ('go', dict(go='GO')), ('redot', dict(redot='REDOT')),
                            ('lua', dict(lua=[('LUA', 'SOURCE', 'LIBRARY')]))):
             if getattr(args, flag):
                 continue
-            named = dict(zip(('headless', 'optimize', 'uprobes', 'perl', 'node', 'node_include', 'lua', 'python', 'padwalker', 'ruby', 'node_refusal', 'go', 'wine', 'emacs'), runtimes), **more)
+            named = dict(zip(('headless', 'optimize', 'uprobes', 'perl', 'node', 'node_include', 'lua', 'python', 'padwalker', 'ruby', 'node_refusal', 'go', 'wine', 'emacs'), runtimes), **dict(dict(redot=args.redot), **more))
             lost = [step.name for step in affected(plan('all', **named), changed, [step.name for step in plan('gui', **named)], registered)[0] if step.name not in chosen]
             if lost:
                 missing.append('--' + flag)
@@ -1087,7 +1111,7 @@ def main(argv=None):
     logs = run / 'logs'
     logs.mkdir()
     report = dict(schema=1, tier=tier, jobs=args.jobs, affected=decisions, affected_missing_runtimes=missing, gui_build=not args.headless, capstone=args.capstone,
-                  optimize=args.optimize, elisp_language=bool(args.emacs), keep_going=args.keep_going, retry_flaky=retries, only=args.only, start=args.start, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
+                  optimize=args.optimize, elisp_language=bool(args.emacs), keep_going=args.keep_going, retry_flaky=retries, only=args.only, start=args.start, perl_live_display=bool(args.perl), node_language=bool(args.node), node_frame_refusal=bool(args.node_refusal), lua_runtimes=len(args.lua), python_language=bool(args.python), ruby_language=bool(args.ruby), go_language=bool(args.go), gdscript_language=bool(args.redot), jai_pe=bool(args.wine), perl_named=bool(args.perl and args.padwalker), started=datetime.now(timezone.utc).isoformat(),
                   host=platform.uname()._asdict(), load_start=os.getloadavg(), allowed_cpus=len(os.sched_getaffinity(0)), steps=[], status='failed',
                   excluded=['ARM64/device checks', 'real GPU soak'] +
                     (['live ptrace/perf checks', 'GUI execution'] if args.tier == 'portable' else
@@ -1103,6 +1127,7 @@ def main(argv=None):
                     (['Elisp stack checks (use --emacs PATH)'] if args.tier not in ('portable', 'perf') and not args.emacs else []) +
                     (['Ruby language checks (use --ruby PATH)'] if args.tier not in ('portable', 'perf') and not args.ruby else []) +
                     (['Go goroutine checks (use --go PATH)'] if args.tier not in ('portable', 'perf') and not args.go else []) +
+                    (['GDScript stack checks (use --redot ENGINE)'] if args.tier not in ('portable', 'perf') and not args.redot else []) +
                     (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'perf') and not args.node else []) +
                     (['Node.js frame-proof refusal (use --node-refusal PATH)'] if args.tier in ('gui', 'all') and not args.node_refusal else []) +
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'perf') and not args.lua else []) +

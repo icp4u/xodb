@@ -15,11 +15,12 @@ detailed docs. If you just want to try something, jump to
 | Inspect huge pages and memory fragmentation | MCP **get_memory_map**, **get_thp_state**, **get_fragmentation** | Pinned process maps, page states and system-wide buddy/THP counters; unknown and partial coverage remain explicit ([details](OVERVIEW.md#memory-page-observations-over-mcp)) |
 | Stop a program and look around | **Debugger** (breakpoints, stepping, Locals) | Source, stack, variables and registers at one moment |
 | Debug a very large program (a 1 GB game engine, an ML library) | `--image-limit 1100M --image-total-limit 2G`, or `symbols.image_bytes` and `symbols.image_total_bytes`; the defaults are 256 MiB an image and 512 MiB in all, and a refused image says the values to rerun with | Named frames with source; an image over budget is named with its size, the budget and what to raise ([large images](LARGE_IMAGES.md#full-image-budgets)) |
-| Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS / Ruby / Elisp** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
+| Switch between native and language views | **Tab** or click **Regs / C/C++ / Python / Perl / Lua / JS / Ruby / Elisp / GDScript** | Detected runtime tabs show version, layout proof and logical stack evidence; selection is shared with MCP |
 | Catch who changes a native value | **Watchpoint investigation** (**W** on a C/C++ field) | Every write, with the code and stack that made it |
 | Find where time goes | **Profile** (**P**) | Hot functions and flame graphs for the whole process |
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
+| See which GDScript function a Godot or Redot game is in | **GDScript** tab (`REDOT=ENGINE scripts/demo-redot`; MCP `get_language_stack` with `gdscript`) | The script call stack with `res://` path and line, each level paired with its native engine frame; read from a running debug-enabled game, no engine debugger needed ([details](GDSCRIPT.md)) |
 | Read Lua locals by name | **Lua** tab, click a Lua frame, **E** `count`, **Return** | Active locals and upvalues from this stop; innermost lexical binding wins; no target execution |
 | Read Lua values and coroutine stacks at a native stop | **Lua view** (`scripts/demo-lua`, **E** `L`; MCP `get_language_stack`) | Bounded values and source lines from stopped memory; separate coroutine observations ([details](LUA.md)) |
 | Label JIT code in a native profile | **JIT evidence** (MCP import, then **I** in the profile) | Time-aware names, candidate citations and explicit ambiguity; raw PCs stay intact |
@@ -218,7 +219,7 @@ script level:
   Freed or overwritten objects and inconsistent headers are marked; no
   `__repr__` or other code runs in the target. Needs CPython DWARF types.
 - **The script's stack at a native stop.** Agents ask `get_language_stack`
-  (language `perl`, `python`, `javascript`, `lua`, `ruby` or `go`) for sub/function names and file:line, read
+  (language `perl`, `python`, `javascript`, `lua`, `ruby`, `go` or `gdscript`) for sub/function names and file:line, read
   straight from the stopped interpreter without running any code in it. Each
   piece is tied to the native interpreter-loop frame it came from, and it says
   `partial` when a boundary can't be proven. For CPython the tie is proved by
@@ -270,6 +271,7 @@ Imported logical frames, including JVM exports, remain separate evidence; see
 | Inside CRuby | `./scripts/demo-cruby` | **Space**, **Ruby**, select **tick**, **Shift+E** `round` or `values[0]` **Return**, then **Space**. **V** shows stopped scalar changes with the frame-lifetime caveat; **W** on a named local retains that declaration. |
 | Inside a Rails model | `XODB_RAILS_GEMS=DIR ./scripts/demo-rails` (activemodel installed in DIR, see [Ruby](RUBY.md#rails-demo)) | **Space**, **Tab** to **Ruby**, click **checkout!**, **E** `attrs` **Return**; click **valid?** for `validations.rb:367`; back on **checkout!**, **Shift+E** `attrs[:line_items][0][:price]` **Return**, then **Space**. |
 | Goroutines in a Go program | `./scripts/demo-go` | **Space**, **Go**, select **main.blocked** for a goroutine parked on a mutex; workers sit in `select`, one goroutine sleeps. **C/C++** shows `label`, `items` (len/cap) and `first` (struct). |
+| Inside a Redot or Godot 4 game | `REDOT=ENGINE ./scripts/demo-redot` (a debug-enabled engine binary with DWARF) | **Space**, **Tab** to **GDScript**: `leaf` ← `step` ← `plan` ← `_process` with `res://` path:line, each over its native `GDScriptFunction::call` frame; click **plan**. In a second terminal `./scripts/demo-redot stack` prints the script stack and the labelled native stack |
 | Inside Emacs Lisp | `./scripts/demo-emacs` | **Space**, **Elisp**, select **xodb-demo-checkpoint** for its label; nearby **let** rows show task titles, points and dynamic stage. **Space** visits two items, rendering, then a handled error. [Walkthrough](ELISP.md#try-the-demo). |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |

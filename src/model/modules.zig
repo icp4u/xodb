@@ -25,6 +25,9 @@ pub const Module = struct {
     python_layout: ?c.struct_xpy_layout = null,
     lua_layout: ?c.struct_xl_layout = null,
     elisp_layout: ?c.struct_xel_layout = null,
+    gdscript_layout: ?@import("../language/gdscript.zig").Layout = null,
+    /// Why this image's DWARF gave no layouts, once that has been found out.
+    gdscript_refusal: ?anyerror = null,
     ruby_layout: ?c.struct_xrb_layout = null,
     go_layout: ?c.struct_xgo_layout = null,
     go_value_layout: ?*c.struct_xgv_layout = null,
@@ -987,6 +990,14 @@ pub const Modules = struct {
     /// main executable under the image budgets, any other image within the
     /// fixed lookup bounds.
     fn definerRead(self: *Modules, address: u64) !*Module {
+        return self.atFor(address, .runtime);
+    }
+    /// The same read for a language view that knows where its runtime must
+    /// be without a scan: the image at an address the kernel reported, such
+    /// as the main executable's program headers. An executable whose symbol
+    /// tables are too large for the symbols-only view is found this way.
+    pub fn runtimeAt(self: *Modules, address: u64) !*Module {
+        defer self.reportBudget();
         return self.atFor(address, .runtime);
     }
     fn symbolImage(self: *Modules, region: Region) !*const elf.Image {

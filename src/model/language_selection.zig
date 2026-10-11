@@ -45,6 +45,7 @@ pub fn Stack(comptime language: Tab) type {
         .ruby => @import("../language/ruby.zig").Stack,
         .go => @import("../language/go.zig").Stack,
         .elisp => @import("../language/elisp.zig").Stack,
+        .gdscript => @import("../language/gdscript.zig").Stack,
         else => @compileError("a language stack is required"),
     };
 }
@@ -57,6 +58,7 @@ pub fn read(comptime language: Tab, session: *model.Session, a: A, tid: i32) !St
         .ruby => @import("../language/ruby.zig").stack(session, a, tid, 0),
         .go => @import("../language/go.zig").stack(session, a, tid, 0),
         .elisp => @import("../language/elisp.zig").stack(session, a, tid, 0),
+        .gdscript => @import("../language/gdscript.zig").stack(session, a, tid, 0),
         else => unreachable,
     };
 }
@@ -67,8 +69,8 @@ pub const Cache = struct {
     arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(std.heap.page_allocator),
     key: ?CacheKey = null,
     native: ?[]model.Frame = null,
-    stacks: std.meta.Tuple(&.{ ?Stack(.python), ?Stack(.perl), ?Stack(.lua), ?Stack(.javascript), ?Stack(.ruby), ?Stack(.go), ?Stack(.elisp) }) = .{ null, null, null, null, null, null, null },
-    errors: [7]?anyerror = @splat(null),
+    stacks: std.meta.Tuple(&.{ ?Stack(.python), ?Stack(.perl), ?Stack(.lua), ?Stack(.javascript), ?Stack(.ruby), ?Stack(.go), ?Stack(.elisp), ?Stack(.gdscript) }) = .{ null, null, null, null, null, null, null, null },
+    errors: [8]?anyerror = @splat(null),
     pub fn deinit(self: *Cache) void {
         self.arena.deinit();
     }
@@ -76,7 +78,7 @@ pub const Cache = struct {
         _ = self.arena.reset(.free_all);
         self.key = null;
         self.native = null;
-        self.stacks = .{ null, null, null, null, null, null, null };
+        self.stacks = .{ null, null, null, null, null, null, null, null };
         self.errors = @splat(null);
     }
     fn prepare(self: *Cache, session: *model.Session, tid: i32) !void {
@@ -163,17 +165,24 @@ fn appendOffers(offers: *Offers, language: Tab, stack: anytype, index: usize, na
         var offer = Offer{ .language = language, .segment = i, .first_frame = if (segment.frames.len > 0) 0 else null, .native_anchor = index, .reason = try diagnostic(segment.reason) };
         var bound: ?usize = null;
         var bound_count: usize = 0;
+        var bound_basis: []const u8 = "unique live native argument storage; not a bijection of complete stacks";
         for (segment.frames, 0..) |frame, fi| {
             const anchor = argumentAnchor(frame, native) catch null;
             if (anchor != null and anchor.? == index) {
                 bound = fi;
                 bound_count += 1;
+                // A reader that proves the pairing another way says how.
+                if (comptime @typeInfo(@TypeOf(frame)) == .@"struct" and @hasField(@TypeOf(frame), "native_binding")) {
+                    if (frame.native_binding) |binding| if (@hasField(@TypeOf(binding), "proof")) {
+                        bound_basis = binding.proof;
+                    };
+                }
             }
         }
         if (bound_count == 1 and bound.? < 64) {
             offer.first_frame = bound;
             offer.anchor_basis = .reader_arguments;
-            offer.basis = "unique live native argument storage; not a bijection of complete stacks";
+            offer.basis = bound_basis;
             offer.reason = null;
         }
         offers.items[offers.count] = offer;
@@ -192,7 +201,7 @@ pub fn selectNative(session: *model.Session, tid: i32, frame: usize) !void {
     @memcpy(native, borrowed_native);
     if (frame >= native.len) return error.InvalidFrame;
     var offers = Offers{};
-    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby, Tab.go, Tab.elisp }) |language| {
+    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby, Tab.go, Tab.elisp, Tab.gdscript }) |language| {
         if (session.language_tabs.visible(language)) {
             if (cachedRead(language, session, tid)) |stack| {
                 try appendOffers(&offers, language, stack, frame, native);
@@ -268,7 +277,7 @@ pub fn selectLogical(session: *model.Session, tid: i32, language: Tab, segment: 
     const borrowed_native = try cachedNative(session, tid);
     const native = native_storage[0..borrowed_native.len];
     @memcpy(native, borrowed_native);
-    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby, Tab.go, Tab.elisp }) |candidate| {
+    inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby, Tab.go, Tab.elisp, Tab.gdscript }) |candidate| {
         if (language == candidate) {
             const stack = try cachedRead(candidate, session, tid);
             return fromStack(session, candidate, tid, stack, segment, frame, native);

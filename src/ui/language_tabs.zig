@@ -216,11 +216,21 @@ pub const Panel = struct {
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, hint, theme.warm);
             y += 23;
             const reason = entry.reason.?;
-            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else if (std.mem.eql(u8, reason, "RubyStaticRuntimeUnavailable")) "Needs standalone Ruby" else if (std.mem.eql(u8, reason, "RubyVersionUnsupported")) "Revision not supported" else if (std.mem.eql(u8, reason, "RubyArchitectureUnsupported")) "Unsupported Ruby CPU" else if (std.mem.eql(u8, reason, "RubyVersionMismatch") or std.mem.eql(u8, reason, "RubyBuildIdMismatch")) "Runtime image mismatch" else reason;
+            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else if (std.mem.eql(u8, reason, "RubyStaticRuntimeUnavailable")) "Needs standalone Ruby" else if (std.mem.eql(u8, reason, "RubyVersionUnsupported")) "Revision not supported" else if (std.mem.eql(u8, reason, "RubyArchitectureUnsupported")) "Unsupported Ruby CPU" else if (std.mem.eql(u8, reason, "RubyVersionMismatch") or std.mem.eql(u8, reason, "RubyBuildIdMismatch")) "Runtime image mismatch" else if (std.mem.eql(u8, reason, "GDScriptDwarfUnavailable")) "Needs engine debug info (DWARF)" else if (std.mem.eql(u8, reason, "GDScriptCallStackNotTracked")) "Engine build does not track script calls" else if (std.mem.eql(u8, reason, "GDScriptLayoutUnsupported")) "Engine layout not supported" else reason;
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, detail, theme.weak);
         }
         self.content_y = y + 39;
         try r.rect(.{ .x = rect.x + 1, .y = y + 31, .w = rect.w - 2, .h = 1 }, theme.border);
+    }
+    /// A project path (res://...) is shown whole when it is short, and by
+    /// its end otherwise: the line number after it must stay visible.
+    fn shownPath(a: std.mem.Allocator, stack: anytype, file: []const u8) ![]const u8 {
+        if (!@hasField(@TypeOf(stack), "level_per_native_frame")) return std.fs.path.basename(file);
+        const keep = 18;
+        if (file.len <= keep) return file;
+        var start = file.len - (keep - 3);
+        while (start < file.len and file[start] & 0xc0 == 0x80) start += 1; // not inside a UTF-8 sequence
+        return std.fmt.allocPrint(a, "...{s}", .{file[start..]});
     }
     fn collect(self: *Panel, stack: anytype) !void {
         const a = self.arena.allocator();
@@ -235,26 +245,30 @@ pub const Panel = struct {
             if (@hasField(@TypeOf(segment), "layout_source")) self.stack_basis = try a.dupe(u8, segment.layout_source);
             const anchor_name: ?[]const u8 = if (segment.anchor) |anchor| anchor.symbol else null;
             const segment_title: ?[]const u8 = if (@hasField(@TypeOf(segment), "title")) segment.title else anchor_name;
-            try rows.append(a, .{ .name = if (segment_title) |name| try a.dupe(u8, name) else try std.fmt.allocPrint(a, "Segment {d}", .{segment_index}), .location = if (segment.anchor) |anchor| try std.fmt.allocPrint(a, "segment {d} / native #{d}", .{ segment_index, anchor.frame }) else "native anchor unproved", .reason = if (segment.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = null });
+            try rows.append(a, .{ .name = if (segment_title) |name| try a.dupe(u8, name) else try std.fmt.allocPrint(a, "Segment {d}", .{segment_index}), .location = if (@hasField(@TypeOf(stack), "level_per_native_frame")) segment.state else if (segment.anchor) |anchor| try std.fmt.allocPrint(a, "segment {d} / native #{d}", .{ segment_index, anchor.frame }) else "native anchor unproved", .reason = if (segment.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = null });
             for (segment.frames, 0..) |frame, frame_index| {
                 if (count == 64 or rows.items.len == 128) {
                     self.message = "LanguageFrameLimit";
                     break;
                 }
-                if (@hasField(@TypeOf(frame), "native_binding")) self.message = "C argument links; other links partial";
+                const paired = @hasField(@TypeOf(stack), "level_per_native_frame");
+                if (@hasField(@TypeOf(frame), "native_binding")) self.message = if (paired) "One native frame each" else "C argument links; other links partial";
                 const label = if (@hasField(@TypeOf(frame), "qualified_name"))
                     if (frame.qualified_name) |text| try a.dupe(u8, text) else try std.fmt.allocPrint(a, "{s} [owner unproved]", .{frame.name})
+                else if (paired)
+                    // The native frame that runs this level, beside its name.
+                    if (frame.native_binding) |anchor| try std.fmt.allocPrint(a, "{s}  [native #{d}]", .{ frame.name, anchor.frame }) else try a.dupe(u8, frame.name)
                 else
                     try a.dupe(u8, frame.name);
                 const location = if (@hasField(@TypeOf(frame), "argument_count"))
                     if (frame.argument_count) |n| try std.fmt.allocPrint(a, "{s} / {d} args", .{ frame.kind, n }) else try std.fmt.allocPrint(a, "{s} / unevaluated", .{frame.kind})
                 else if (frame.file) |file|
-                    if (frame.line) |line| try std.fmt.allocPrint(a, "{s}:{d}", .{ std.fs.path.basename(file), line }) else try a.dupe(u8, std.fs.path.basename(file))
+                    if (frame.line) |line| try std.fmt.allocPrint(a, "{s}:{d}", .{ try shownPath(a, stack, file), line }) else try a.dupe(u8, try shownPath(a, stack, file))
                 else
                     "source position unproved";
                 try rows.append(a, .{ .name = label, .location = location, .reason = if (frame.reason) |value| try a.dupe(u8, value) else null, .segment = segment_index, .frame = frame_index });
                 count += 1;
-                if (@hasField(@TypeOf(frame), "native_binding")) {
+                if (@hasField(@TypeOf(frame), "native_binding") and !paired) {
                     if (frame.native_binding) |anchor| {
                         if (rows.items.len < 128) {
                             rows.items[rows.items.len - 1].following = 1;
@@ -349,6 +363,12 @@ pub const Panel = struct {
                 self.message = "OutOfMemory";
             },
             .go => self.collect(selection.cachedRead(.go, session, tid) catch |err| {
+                self.message = @errorName(err);
+                return;
+            }) catch {
+                self.message = "OutOfMemory";
+            },
+            .gdscript => self.collect(selection.cachedRead(.gdscript, session, tid) catch |err| {
                 self.message = @errorName(err);
                 return;
             }) catch {

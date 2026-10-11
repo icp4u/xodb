@@ -7,6 +7,7 @@ const display_gpu = @import("../platform/display_gpu.zig");
 /// `--vk-device`: an index from `--vk-list` or part of a device name. It wins
 /// over XODB_VK_DEVICE.
 pub var device_request: ?[]const u8 = null;
+pub const scene3d = @import("scene3d/gpu.zig");
 pub const Color = [4]f32;
 pub const Rect = struct { x: f32, y: f32, w: f32, h: f32 };
 const Vertex = extern struct { position: [2]f32, uv: [2]f32, color: Color, local: [2]f32 = .{ 0, 0 }, half: [2]f32 = .{ 0, 0 }, shape: [3]f32 = .{ 0, 0, 0 } };
@@ -18,11 +19,13 @@ const vertex_bytes = 8 * 1024 * 1024;
 /// vertices from one 32-byte record instead of six 60-byte vertices.
 /// `kind` bits 0-1 pick the base (0 fill, 1 hatch, 2 dots, 3 lower `fraction`
 /// in `accent`); bit 2 adds light hatching; bit 3 an inner ring and bit 4 a
-/// top-left edge, both in `overlay`; bits 8-15 hold the fraction (0-255).
+/// top-left edge, both in `overlay`; bit 5 rounds/insets modern cells;
+/// bits 8-15 hold the fraction and 16-23 the measured-change pulse (0-255).
 pub const Cell = extern struct { rect: [4]f32, fill: [4]u8, accent: [4]u8, overlay: [4]u8, kind: u32 };
 pub const cell_capacity = 65536 + 8192;
 const cell_offset = vertex_bytes + fonts.atlas_size * fonts.atlas_size;
-const buffer_bytes = cell_offset + cell_capacity * @sizeOf(Cell);
+/// Mapped storage size, also used by CPU-side renderer tests.
+pub const buffer_bytes = cell_offset + cell_capacity * @sizeOf(Cell);
 /// A run of cells drawn after the vertices recorded before it, clipped to `clip`.
 const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect };
 fn info(comptime T: type, kind: c.VkStructureType) T {
@@ -120,6 +123,10 @@ pub const Renderer = struct {
     cells_used: u32 = 0,
     batches: [8]CellBatch = undefined,
     batch_count: usize = 0,
+    scene_gpu: ?scene3d.Gpu = null,
+    scene_requested: bool = false,
+    scene_at: usize = 0,
+    scene_after_batches: usize = 0,
     clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     gpu_name: [256]u8 = @splat(0),
     /// Instance has VK_KHR_get_physical_device_properties2 for DRM nodes.
@@ -647,6 +654,7 @@ pub const Renderer = struct {
     }
     /// Releases what depends on the extent. The swapchain handle survives to seed its replacement.
     fn destroySwap(self: *Renderer) void {
+        if (self.scene_gpu) |*scene_gpu| scene_gpu.destroyExtent();
         for (self.framebuffers) |framebuffer| if (framebuffer != null) c.vkDestroyFramebuffer(self.device, framebuffer, null);
         for (self.views) |view| if (view != null) c.vkDestroyImageView(self.device, view, null);
         for (self.finished) |semaphore| if (semaphore != null) c.vkDestroySemaphore(self.device, semaphore, null);
@@ -664,6 +672,8 @@ pub const Renderer = struct {
         if (self.window) |window| window.cancelFrame();
         if (self.device != null) {
             _ = c.vkDeviceWaitIdle(self.device);
+            if (self.scene_gpu) |*scene_gpu| scene_gpu.deinit();
+            self.scene_gpu = null;
             self.destroySwap();
             if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
             if (self.cell_pipeline != null) c.vkDestroyPipeline(self.device, self.cell_pipeline, null);
@@ -703,6 +713,8 @@ pub const Renderer = struct {
         }
         try check(ready);
         self.fence_wait.complete("frame fence");
+        if (self.scene_gpu) |*scene_gpu| scene_gpu.timerRead();
+        self.scene_requested = false;
         if (width != self.extent.width or height != self.extent.height) {
             try check(c.vkDeviceWaitIdle(self.device));
             self.destroySwap();
@@ -713,6 +725,67 @@ pub const Renderer = struct {
         self.batch_count = 0;
         self.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(self.extent.width), .h = @floatFromInt(self.extent.height) };
         return true;
+    }
+    /// Record one clipped scene at the current UI layer. Call only after begin
+    /// returns true; returned instance slices remain valid until the next reserve.
+    pub fn scene(self: *Renderer, bounds: Rect, view_projection: scene3d.math.Mat4) !?*scene3d.Gpu {
+        if (self.scene_requested) return error.SceneAlreadyRecorded;
+        for ([_]f32{ bounds.x, bounds.y, bounds.w, bounds.h, bounds.x + bounds.w, bounds.y + bounds.h }) |v| if (!std.math.isFinite(v)) return error.InvalidSceneBounds;
+        for (view_projection) |v| if (!std.math.isFinite(v)) return error.InvalidSceneMatrix;
+        const x0 = @max(0, @max(self.clip.x, bounds.x));
+        const y0 = @max(0, @max(self.clip.y, bounds.y));
+        const x1 = @min(@as(f32, @floatFromInt(self.extent.width)), @min(self.clip.x + self.clip.w, bounds.x + bounds.w));
+        const y1 = @min(@as(f32, @floatFromInt(self.extent.height)), @min(self.clip.y + self.clip.h, bounds.y + bounds.h));
+        if (x1 <= x0 or y1 <= y0) return null;
+        if (self.scene_gpu == null) {
+            self.scene_gpu = .{ .ctx = .{ .device = self.device, .physical = self.physical, .font_layout = self.descriptor_layout, .font_descriptor = self.descriptor, .family = self.family } };
+            self.scene_gpu.?.init() catch |err| {
+                self.scene_gpu = null;
+                return err;
+            };
+        }
+        const out = &self.scene_gpu.?;
+        try out.extent(self.extent.width, self.extent.height, self.pass);
+        out.stats = .{ .gpu_ns = out.stats.gpu_ns };
+        out.bounds = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        out.push.view_projection = view_projection;
+        self.scene_at = self.vertices;
+        self.scene_after_batches = self.batch_count;
+        self.scene_requested = true;
+        return out;
+    }
+    /// Screen-sized glyphs anchored in world space, using the ordinary shaped
+    /// glyph cache and atlas. The GPU projects the anchor and depth-tests them.
+    pub fn sceneText(self: *Renderer, font: *fonts.Font, anchor: [3]f32, offset: [2]f32, str: []const u8, color: Color) !void {
+        if (!self.scene_requested) return error.SceneNotRecorded;
+        if (str.len > 4096) return error.SceneTextLimit;
+        const run = shapeRun(font, str);
+        const gpu = &self.scene_gpu.?;
+        const first = gpu.stats.glyphs;
+        const glyphs = try gpu.glyphs(@as(usize, first) + run.count);
+        var pen = offset[0];
+        for (0..run.count) |i| {
+            const pos = run.positions[i];
+            const g = font.glyph(run.glyphs[i].codepoint) catch try font.glyph(0);
+            glyphs[first + i] = .{
+                .anchor = .{ anchor[0], anchor[1], anchor[2], 1 },
+                .rect = .{ @round(pen + @as(f32, @floatFromInt(pos.x_offset)) / 64 + @as(f32, @floatFromInt(g.left))), @round(offset[1] + 16 - @as(f32, @floatFromInt(g.top)) - @as(f32, @floatFromInt(pos.y_offset)) / 64), @floatFromInt(g.w), @floatFromInt(g.h) },
+                .uv = .{ @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, @as(f32, @floatFromInt(g.h)) / fonts.atlas_size },
+                .color = color,
+            };
+            pen += @as(f32, @floatFromInt(pos.x_advance)) / 64;
+        }
+    }
+    fn sceneComposite(self: *Renderer) void {
+        self.scene_gpu.?.composite(self.command);
+        c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+        const offset: u64 = 0;
+        c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
+        c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
+        const size = [2]f32{ @floatFromInt(self.extent.width), @floatFromInt(self.extent.height) };
+        c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
+        const clip = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent };
+        c.vkCmdSetScissor(self.command, 0, 1, &clip);
     }
     pub fn quad(self: *Renderer, bounds: Rect, uv: Rect, color: Color) !void {
         const x0 = @max(bounds.x, self.clip.x);
@@ -854,6 +927,10 @@ pub const Renderer = struct {
         }
     }
     pub fn end(self: *Renderer, font: *fonts.Font) !bool {
+        if (!self.scene_requested) {
+            if (self.scene_gpu) |*scene_gpu| scene_gpu.deinit();
+            self.scene_gpu = null;
+        }
         var image_index: u32 = 0;
         var call_started = Wait.now();
         const acquired = c.vkAcquireNextImageKHR(self.device, self.swap, 0, self.available, null, &image_index);
@@ -872,6 +949,7 @@ pub const Renderer = struct {
         var begin_info = info(c.VkCommandBufferBeginInfo, c.VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO);
         begin_info.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         try check(c.vkBeginCommandBuffer(self.command, &begin_info));
+        if (self.scene_requested) self.scene_gpu.?.timerStart(self.command);
         if (font.dirty) {
             const dest: [*]u8 = @ptrCast(self.mapped.?);
             @memcpy(dest[vertex_bytes..][0..font.pixels.len], &font.pixels);
@@ -898,6 +976,7 @@ pub const Renderer = struct {
             font.dirty = false;
             self.atlas_ready = true;
         }
+        if (self.scene_requested) self.scene_gpu.?.record(self.command);
         const clear = c.VkClearValue{ .color = .{ .float32 = @import("../appearance.zig").active.colors.background } };
         var pass = info(c.VkRenderPassBeginInfo, c.VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO);
         pass.renderPass = self.pass;
@@ -917,7 +996,14 @@ pub const Renderer = struct {
         const size = [2]f32{ @floatFromInt(self.extent.width), @floatFromInt(self.extent.height) };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
         var drawn: usize = 0;
-        for (self.batches[0..self.batch_count]) |b| {
+        var scene_drawn = false;
+        for (self.batches[0..self.batch_count], 0..) |b, batch_index| {
+            if (self.scene_requested and !scene_drawn and batch_index == self.scene_after_batches) {
+                if (self.scene_at > drawn) c.vkCmdDraw(self.command, @intCast(self.scene_at - drawn), 1, @intCast(drawn), 0);
+                drawn = self.scene_at;
+                self.sceneComposite();
+                scene_drawn = true;
+            }
             if (b.at > drawn) c.vkCmdDraw(self.command, @intCast(b.at - drawn), 1, @intCast(drawn), 0);
             drawn = b.at;
             const x0: i32 = @intFromFloat(@max(0, @floor(b.clip.x)));
@@ -935,8 +1021,14 @@ pub const Renderer = struct {
             c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
             c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
         }
+        if (self.scene_requested and !scene_drawn) {
+            if (self.scene_at > drawn) c.vkCmdDraw(self.command, @intCast(self.scene_at - drawn), 1, @intCast(drawn), 0);
+            drawn = self.scene_at;
+            self.sceneComposite();
+        }
         if (self.vertices > drawn) c.vkCmdDraw(self.command, @intCast(self.vertices - drawn), 1, @intCast(drawn), 0);
         c.vkCmdEndRenderPass(self.command);
+        if (self.scene_requested) self.scene_gpu.?.timerEnd(self.command);
         try check(c.vkEndCommandBuffer(self.command));
         try check(c.vkResetFences(self.device, 1, &self.fence));
         const wait_stage: c.VkPipelineStageFlags = c.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT;
@@ -1012,4 +1104,21 @@ test "empty text is safe with the bitmap font" {
     try std.testing.expectEqual(@as(f32, 0), renderer.measure(font, ""));
     try renderer.text(font, 0, 0, "", .{ 1, 1, 1, 1 });
     try std.testing.expectEqual(@as(f32, 32), renderer.measure(font, "xodb"));
+}
+
+test "scene rejects invalid bounds, matrices and counts before Vulkan allocation" {
+    var renderer = Renderer{};
+    const matrix = scene3d.math.identity();
+    try std.testing.expect(try renderer.scene(.{ .x = 0, .y = 0, .w = 0, .h = 0 }, matrix) == null);
+    try std.testing.expect(renderer.scene_gpu == null);
+    try std.testing.expectError(error.InvalidSceneBounds, renderer.scene(.{ .x = std.math.nan(f32), .y = 0, .w = 1, .h = 1 }, matrix));
+    var invalid = matrix;
+    invalid[0] = std.math.inf(f32);
+    try std.testing.expectError(error.InvalidSceneMatrix, renderer.scene(.{ .x = 0, .y = 0, .w = 1, .h = 1 }, invalid));
+    var gpu = scene3d.Gpu{ .ctx = .{ .device = null, .physical = null, .font_layout = null, .font_descriptor = null, .family = 0 } };
+    try std.testing.expectError(error.SceneInstanceLimit, gpu.boxes(scene3d.types.max_instances + 1));
+    try std.testing.expectError(error.SceneInstanceLimit, gpu.points(scene3d.types.max_instances + 1));
+    try std.testing.expectError(error.SceneInstanceLimit, gpu.lines(scene3d.types.max_instances + 1));
+    try std.testing.expectError(error.SceneInstanceLimit, gpu.glyphs(scene3d.types.max_glyphs + 1));
+    try std.testing.expectEqual(@as(u64, 0), gpu.allocated());
 }

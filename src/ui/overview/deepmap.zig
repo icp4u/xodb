@@ -23,13 +23,14 @@ const Rect = draw.Rect;
 const Color = draw.Color;
 const fade = draw.fade;
 const mix = draw.mix;
+const modern = @import("modern_map.zig");
 
 /// Cell sizes: about 1 px per 2 MiB block, down to one cell per 4 KiB page.
 pub const levels = [_]u64{ 2 << 20, 1 << 20, 512 << 10, 256 << 10, 128 << 10, 64 << 10, 32 << 10, 16 << 10, 8 << 10, 4 << 10 };
 const min_pitch: f32 = 3;
 /// A moving view reaches the collector only after it rests this long.
 const settle_ns: u64 = 150_000_000;
-/// Highest address the field pans to (57-bit user space).
+/// Hard ceiling; observed user VMAs provide the tighter navigation bound.
 const top_address: u64 = 1 << 57;
 /// Address gaps wider than this split the minimap into islands.
 const island_gap: u64 = 1 << 30;
@@ -42,6 +43,7 @@ pub const Counts = struct { pending: usize = 0, unknown: usize = 0, gap: usize =
 pub const Deep = struct {
     level: usize = 0,
     origin: u64 = 0,
+    address_end: u64 = top_address,
     /// The first map placed the view (fit); later maps leave it alone. Until
     /// the user moves it, a resized field fits again.
     placed: bool = false,
@@ -63,15 +65,20 @@ pub const Deep = struct {
     drag: ?Drag = null,
     selected: ?u64 = null,
     hover: ?u64 = null,
-    cache_key: u64 = 0,
+    pulse: u8 = 0,
     counts: Counts = .{},
     perf: Perf = .{},
+    modern: bool = false,
+    nav: Navigation = .{},
 
     pub fn reset(self: *Deep) void {
         self.* = .{ .perf = self.perf };
     }
     pub fn cell(self: *const Deep) u64 {
         return levels[self.level];
+    }
+    pub fn changed(self: *const Deep) bool {
+        return self.counts.changed > 0 or self.counts.collapsed > 0 or self.counts.split > 0;
     }
     pub fn count(self: *const Deep) usize {
         return self.cols * self.rows;
@@ -81,7 +88,7 @@ pub const Deep = struct {
     }
     /// Moves the view; never below 0 or past the top of user space.
     fn moveTo(self: *Deep, origin: i128) void {
-        const top: i128 = top_address - @as(i128, self.span());
+        const top: i128 = self.address_end - @as(i128, self.span());
         const cell_ = self.cell();
         const clamped: u64 = @intCast(std.math.clamp(origin, 0, @max(0, top)));
         self.origin = clamped - clamped % cell_;
@@ -92,6 +99,57 @@ pub const Deep = struct {
         return self;
     }
 };
+
+/// Display-only navigation: the new request always owns the cell identities.
+/// Its geometry eases into place; hit testing uses the exact inverse transform.
+const Navigation = struct {
+    origin: ?u64 = null,
+    level: usize = 0,
+    at: u64 = 0,
+    from_scale: f32 = 1,
+    from_shift: [2]f32 = .{ 0, 0 },
+    scale: f32 = 1,
+    shift: [2]f32 = .{ 0, 0 },
+    anchor: [2]f32 = .{ 0, 0 },
+    active: bool = false,
+
+    fn update(n: *Navigation, d: *const Deep, pointer: [2]f32, now: u64) void {
+        if (n.origin != null and (n.origin.? != d.origin or n.level != d.level)) {
+            n.at = now;
+            n.from_scale = n.scale;
+            n.from_shift = n.shift;
+            n.anchor = if (draw.inside(d.field, pointer[0], pointer[1])) pointer else .{ d.field.x + d.field.w / 2, d.field.y + d.field.h / 2 };
+            if (n.level != d.level) {
+                n.from_scale = std.math.clamp(n.scale * @sqrt(@as(f32, @floatFromInt(d.cell())) / @as(f32, @floatFromInt(levels[n.level]))), 0.25, 4);
+            } else {
+                const delta = @divTrunc(@as(i128, d.origin) - @as(i128, n.origin.?), @as(i128, d.cell()));
+                const cols: i128 = @intCast(d.cols);
+                n.from_shift = .{
+                    std.math.clamp(n.shift[0] + @as(f32, @floatFromInt(@rem(delta, cols))) * d.pitch, -d.field.w * 0.25, d.field.w * 0.25),
+                    std.math.clamp(n.shift[1] + @as(f32, @floatFromInt(@divTrunc(delta, cols))) * d.pitch, -d.field.h * 0.25, d.field.h * 0.25),
+                };
+            }
+        }
+        n.origin = d.origin;
+        n.level = d.level;
+        const t = std.math.clamp(@as(f32, @floatFromInt(now -| n.at)) / 180_000_000, 0, 1);
+        const remain = (1 - t) * (1 - t) * (1 - t);
+        n.scale = 1 + (n.from_scale - 1) * remain;
+        n.shift = .{ n.from_shift[0] * remain, n.from_shift[1] * remain };
+        n.active = t < 1;
+    }
+    fn forward(n: *const Navigation, p: [2]f32) [2]f32 {
+        return .{ n.anchor[0] + (p[0] - n.anchor[0]) * n.scale + n.shift[0], n.anchor[1] + (p[1] - n.anchor[1]) * n.scale + n.shift[1] };
+    }
+    fn inverse(n: *const Navigation, p: [2]f32) [2]f32 {
+        return .{ n.anchor[0] + (p[0] - n.anchor[0] - n.shift[0]) / n.scale, n.anchor[1] + (p[1] - n.anchor[1] - n.shift[1]) / n.scale };
+    }
+};
+
+pub fn focusAddress(d: *Deep, address: u64) void {
+    d.selected = address;
+    d.user().moveTo(address);
+}
 
 /// Frame cost evidence (XODB_MEMMAP_PERF=1): cell build and whole-frame CPU.
 const Perf = struct {
@@ -308,40 +366,59 @@ fn cellRect(d: *const Deep, index: usize) Rect {
     const x0 = @round(col * d.pitch);
     const y0 = @round(row * d.pitch);
     const gap: f32 = if (d.pitch >= 6) 1 else 0;
-    return .{ .x = d.field.x + x0, .y = d.field.y + y0, .w = @round((col + 1) * d.pitch) - x0 - gap, .h = @round((row + 1) * d.pitch) - y0 - gap };
+    const at = d.nav.forward(.{ d.field.x + x0, d.field.y + y0 });
+    return .{ .x = at[0], .y = at[1], .w = (@round((col + 1) * d.pitch) - x0 - gap) * d.nav.scale, .h = (@round((row + 1) * d.pitch) - y0 - gap) * d.nav.scale };
 }
 fn indexAt(d: *const Deep, x: f32, y: f32) ?usize {
     if (d.count() == 0 or !draw.inside(d.field, x, y)) return null;
-    const col: usize = @intFromFloat(@floor((x - d.field.x) / d.pitch));
-    const row: usize = @intFromFloat(@floor((y - d.field.y) / d.pitch));
+    const p = d.nav.inverse(.{ x, y });
+    if (p[0] < d.field.x or p[1] < d.field.y) return null;
+    const col: usize = @intFromFloat(@floor((p[0] - d.field.x) / d.pitch));
+    const row: usize = @intFromFloat(@floor((p[1] - d.field.y) / d.pitch));
     if (col >= d.cols or row >= d.rows) return null;
     return row * d.cols + col;
 }
 
-/// Fit: the densest cluster of VMAs that one view can hold, at the finest
-/// cell size that shows it whole.
+fn userVma(vma: md.Vma) bool {
+    return vma.start < vma.end and vma.end <= top_address;
+}
+fn addressEnd(vmas: []const md.Vma) u64 {
+    var end: u64 = 0;
+    for (vmas) |vma| if (userVma(vma)) {
+        end = @max(end, vma.end);
+    };
+    return if (end == 0) top_address else end;
+}
+
+/// Fit the densest user VMA cluster at the finest cell size that holds it.
 pub fn fit(d: *Deep, vmas: []const md.Vma) void {
+    d.address_end = addressEnd(vmas);
     if (vmas.len == 0 or d.count() == 0) return;
     const cap = @as(u64, d.count()) * levels[0];
     var best_start: u64 = vmas[0].start;
     var best_end: u64 = vmas[0].end;
-    var best_weight: u64 = 0;
+    var best_weight: ?u64 = null;
     var i: usize = 0;
     while (i < vmas.len) {
+        if (!userVma(vmas[i])) {
+            i += 1;
+            continue;
+        }
         var j = i;
         var weight: u64 = 0;
-        while (j < vmas.len and vmas[j].end -| vmas[i].start <= cap) : (j += 1) weight += vmas[j].rss orelse (vmas[j].end - vmas[j].start);
+        while (j < vmas.len and userVma(vmas[j]) and vmas[j].end -| vmas[i].start <= cap) : (j += 1) weight += vmas[j].rss orelse (vmas[j].end - vmas[j].start);
         if (j == i) {
             weight = vmas[i].end - vmas[i].start;
             j = i + 1;
         }
-        if (weight > best_weight) {
+        if (best_weight == null or weight > best_weight.?) {
             best_weight = weight;
             best_start = vmas[i].start;
             best_end = @min(vmas[j - 1].end, vmas[i].start +| cap);
         }
         i = j;
     }
+    if (best_weight == null) return;
     var level: usize = 0;
     for (levels, 0..) |size, k| {
         const first = best_start - best_start % size;
@@ -383,7 +460,7 @@ fn jump(v: *vw.View, by: i32, now: u64) void {
     const focus = d.selected orelse d.origin;
     var target: ?usize = null;
     if (by > 0) {
-        for (vmas, 0..) |x, i| if (x.start > focus) {
+        for (vmas, 0..) |x, i| if (userVma(x) and x.start > focus) {
             target = i;
             break;
         };
@@ -391,7 +468,7 @@ fn jump(v: *vw.View, by: i32, now: u64) void {
         var i = vmas.len;
         while (i > 0) {
             i -= 1;
-            if (vmas[i].start < focus) {
+            if (userVma(vmas[i]) and vmas[i].start < focus) {
                 target = i;
                 break;
             }
@@ -432,7 +509,7 @@ pub fn key(v: *vw.View, sym: u32, shortcut: u32, now: u64) bool {
         else => switch (shortcut) {
             '=', '+' => zoom(d.user(), @min(d.level + 1, levels.len - 1), anchorIndex(v)),
             '-' => zoom(d.user(), d.level -| 1, anchorIndex(v)),
-            '0' => {
+            'f' => {
                 fit(d, vmaList(s));
                 v.setStatus("Fit: {s} cells", .{sizeText(d.cell())}, now);
             },
@@ -505,6 +582,7 @@ fn layoutMini(vmas: []const md.Vma, r: Rect) void {
     mini_rect = r;
     island_count = 0;
     for (vmas) |x| {
+        if (!userVma(x)) continue;
         if (island_count > 0 and x.start -| islands[island_count - 1].end <= island_gap) {
             islands[island_count - 1].end = @max(islands[island_count - 1].end, x.end);
         } else if (island_count < islands.len) {
@@ -533,7 +611,7 @@ fn miniX(address: u64) f32 {
     if (address < first.start) return mini_rect.x + break_w * frac(address, 0, first.start);
     for (islands[0..island_count], 0..) |is, i| {
         if (address <= is.end) return is.x + is.w * frac(address, is.start, is.end);
-        const next_start = if (i + 1 < island_count) islands[i + 1].start else top_address;
+        const next_start = if (i + 1 < island_count) islands[i + 1].start else is.end;
         if (address < next_start) return is.x + is.w + break_w * frac(address, is.end, next_start);
     }
     return mini_rect.x + mini_rect.w;
@@ -569,6 +647,7 @@ fn drawMini(ctx: Ctx, d: *const Deep, vmas: []const md.Vma, pt: *const Paint) !v
     }
     var last_x: f32 = -1;
     for (vmas) |x| {
+        if (!userVma(x)) continue;
         const x0 = miniX(x.start);
         const x1 = @max(x0 + 1, miniX(x.end));
         if (@floor(x1) <= last_x) continue;
@@ -590,8 +669,9 @@ fn drawMini(ctx: Ctx, d: *const Deep, vmas: []const md.Vma, pt: *const Paint) !v
 // --- Rendering ------------------------------------------------------------------------------
 
 var cache: [md.max_cells]gpu.Cell = undefined;
+var cache_key: u64 = 0;
 var swatches: [24]gpu.Cell = undefined;
-var audited: [12]u64 = @splat(0);
+var audited: [14]u64 = @splat(0);
 var audited_detail: u64 = 0;
 
 fn sizeText(bytes: u64) []const u8 {
@@ -613,6 +693,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     const s = &v.memmap;
     const d = &s.deep;
     const p = ctx.p;
+    d.modern = s.look == .modern;
     const pt = paint(p);
     var buf: [256]u8 = undefined;
     var lb: [96]u8 = undefined;
@@ -624,13 +705,14 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     const inner_w = main.w - 28;
     // Row 1: process, worker cost.
     const cost = mm.costText(v, &buf);
-    const cost_w = @min(ctx.measure(cost), inner_w * 0.55);
+    const process_label = mm.label(v, &lb);
+    const cost_w = @min(ctx.measure(cost), @max(0, inner_w - ctx.measure(process_label) - 24));
     try ctx.textFit(main.x + main.w - 14 - cost_w, main.y + 8, cost_w, cost, p.dim);
-    try ctx.textFit(x0, main.y + 8, inner_w - cost_w - 24, mm.label(v, &lb), p.text);
+    try ctx.textFit(x0, main.y + 8, inner_w - cost_w - 24, process_label, p.text);
     // Row 2: coverage (whole process), cadence and age.
     var fb: [96]u8 = undefined;
     const fresh: []const u8 = if (mp) |x| mm.freshness(v, x, now, &fb) else "Refresh unknown · waiting";
-    const fresh_w = @min(ctx.measure(fresh), inner_w * 0.45);
+    const fresh_w = @min(ctx.measure(fresh), inner_w);
     try ctx.textFit(main.x + main.w - 14 - fresh_w, main.y + 34, fresh_w, fresh, if (mp != null and md.cadence(mp.?, null).cost_limited) p.warn else p.dim);
     const cov = if (mp) |x| md.coverage(x) else md.Coverage{ .unknown = "no sample" };
     const bar = Rect{ .x = x0, .y = main.y + 37, .w = @min(160, inner_w * 0.2), .h = 12 };
@@ -646,14 +728,13 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         .unknown => |why| std.fmt.bufPrint(&buf, "coverage unknown: {s}", .{why}) catch "",
     };
     try ctx.textFit(bar.x + bar.w + 12, main.y + 34, inner_w - bar.w - 12 - fresh_w - 24, ctext, if (cov == .unknown) p.warn else p.text);
-    // Row 3: the viewport and its request state.
-    const live = v.action_hook != null;
-    const pend_text: []const u8 = if (s.target == null) "" else if (!live) (if (d.counts.pending > 0) "pending: not recorded in this replay" else "replay viewport") else if (d.pending)
-        (std.fmt.bufPrint(&nb, "viewport pending {d:.1} s", .{@as(f64, @floatFromInt(now -| d.pending_since)) / 1e9}) catch "")
-    else if (d.counts.pending > 0) "viewport requested" else "viewport sampled";
-    const pend_w = ctx.measure(pend_text);
-    try ctx.textFit(main.x + main.w - 14 - pend_w, main.y + 60, pend_w, pend_text, if (d.pending or d.counts.pending > 0) p.warn else p.dim);
-    const field_top = main.y + 116;
+    // Range and pending state each get a row, even at narrow widths.
+    const modern_rows: f32 = if (d.modern and main.h >= 360) 88 else 0;
+    if (modern_rows > 0) {
+        try modern.activity(v, ctx, .{ .x = x0, .y = main.y + 142, .w = inner_w, .h = 26 });
+        try modern.ribbons(v, ctx, .{ .x = x0, .y = main.y + 176, .w = inner_w, .h = 46 });
+    }
+    const field_top = main.y + 142 + modern_rows;
     // Bottom: details (three lines) and the legend.
     const legend_h: f32 = if (inner_w < legendWidth(ctx)) 44 else 22;
     const details_h: f32 = 66;
@@ -661,15 +742,17 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     if (s.compact or field.h < 40) return;
     layout(d, field);
     const vmas = vmaList(s);
+    if (vmas.len > 0) d.address_end = addressEnd(vmas);
     if (s.target != null and vmas.len > 0 and (!d.placed or !d.moved and d.fitted_count != d.count())) {
         fit(d, vmas);
         d.placed = true;
     }
     if (d.count() > 0) d.moveTo(d.origin);
-    const vtext = std.fmt.bufPrint(&buf, "{s} cells · {d} × {d} = {d} · 0x{x}–0x{x}", .{ sizeText(d.cell()), d.cols, d.rows, d.count(), d.origin, d.origin + d.span() }) catch "";
-    try ctx.textFit(x0, main.y + 60, inner_w - pend_w - 24, vtext, p.dim);
+    if (d.modern) d.nav.update(d, v.pointer, now) else d.nav = .{};
+    const vtext = std.fmt.bufPrint(&buf, "0x{x}–0x{x} · {s} cells · {d} cells", .{ d.origin, d.origin + d.span(), sizeText(d.cell()), d.count() }) catch "";
+    try ctx.textFit(x0, main.y + 60, inner_w, vtext, p.dim);
     // Minimap.
-    layoutMini(vmas, .{ .x = x0, .y = main.y + 86, .w = inner_w, .h = 22 });
+    layoutMini(vmas, .{ .x = x0, .y = main.y + 112, .w = inner_w, .h = 22 });
     d.mini = mini_rect;
     try drawMini(ctx, d, vmas, &pt);
 
@@ -691,6 +774,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     try ctx.r.rect(field, pt.gap);
     const started = md.threadNs();
     const e = s.ease(now);
+    d.pulse = @intFromFloat((1 - e) * 255);
     var src = sources(s, false);
     var key_hasher = std.hash.Wyhash.init(0);
     key_hasher.update(std.mem.asBytes(&d.origin));
@@ -700,36 +784,52 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     key_hasher.update(std.mem.asBytes(&field));
     key_hasher.update(std.mem.asBytes(&d.pitch));
     key_hasher.update(std.mem.asBytes(&p));
+    key_hasher.update(std.mem.asBytes(&d.modern));
+    key_hasher.update(std.mem.asBytes(&s.accepted_at));
     for (src.maps[0..src.n]) |x| key_hasher.update(std.mem.asBytes(&x));
     const key_now = key_hasher.final();
     const count = d.count();
-    if (key_now != d.cache_key or e < 1) {
+    if (key_now != cache_key or (e < 1 and d.changed()) or d.nav.active) {
         var prev_src = sources(s, true);
         var counts: Counts = .{};
         const cell_bytes = d.cell();
         for (0..count) |i| {
             const address = d.origin + @as(u64, i) * cell_bytes;
-            var out = style(&pt, src.find(cell_bytes, address), &counts);
-            if (e < 1) if (prev_src.find(cell_bytes, address)) |old| {
+            const found = src.find(cell_bytes, address);
+            const changing = if (found) |f| md.classify(f.cell.*).change != .none else false;
+            var out = style(&pt, found, &counts);
+            if (e < 1 and changing) if (prev_src.find(cell_bytes, address)) |old| {
                 const before = style(&pt, old, null);
                 if (before.kind & 3 != 2) out.fill = pack(mix(unpack(before.fill), unpack(out.fill), e));
             };
+            if (d.modern) {
+                out.kind |= 32;
+                if (found) |f| {
+                    const change = md.classify(f.cell.*).change;
+                    if (change != .none) {
+                        if (change == .changed) out.overlay = pack(p.accent);
+                        out.kind |= @as(u32, @intFromFloat((1 - e) * 255)) << 16;
+                    }
+                }
+            }
             const r = cellRect(d, i);
             out.rect = .{ r.x, r.y, r.w, r.h };
             cache[i] = out;
         }
         d.counts = counts;
-        d.cache_key = if (e < 1) 0 else key_now;
+        cache_key = if ((e < 1 and d.changed()) or d.nav.active) 0 else key_now;
         d.perf.builds += 1;
         const took = md.threadNs() -| started;
         d.perf.build_ns += took;
         d.perf.build_max = @max(d.perf.build_max, took);
     }
+    // Counts belong to this frame, including immediately after a pan.
+    const pend_text = pendingText(d, v.action_hook != null, now, &buf);
+    try ctx.textFit(x0, main.y + 86, inner_w, pend_text, if (d.pending or d.counts.pending > 0) p.warn else p.dim);
     const saved = ctx.r.clip;
     ctx.r.clip = draw.intersect(saved, field);
     const out = try ctx.r.cells(count);
     @memcpy(out, cache[0..count]);
-    ctx.r.clip = saved;
 
     // Hover and selection outlines, above the cells.
     d.hover = null;
@@ -742,10 +842,21 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         const outer = Rect{ .x = r.x - 2, .y = r.y - 2, .w = r.w + 4, .h = r.h + 4 };
         try ctx.r.shape(outer, if (k == 0) p.text else rgb(0xffd000), .{ .border = 2 });
     };
+    ctx.r.clip = saved;
     // Details: the hovered cell, else the selected one.
     try details(v, ctx, .{ .x = x0, .y = field.y + field.h + 8, .w = inner_w, .h = details_h }, &src);
     try legend(v, ctx, .{ .x = x0, .y = field.y + field.h + details_h + 18, .w = inner_w, .h = legend_h }, &pt);
     if (v.layout != null) audit(d);
+}
+
+fn pendingText(d: *const Deep, live: bool, now: u64, buf: []u8) []const u8 {
+    if (!live) return if (d.counts.pending > 0) "pending: not recorded in this replay" else "replay viewport";
+    if (d.counts.pending > 0) return std.fmt.bufPrint(buf, "{s} · {d} cells pending", .{
+        if (d.counts.pending < d.count()) "partly previous scan" else "no sampled cells",
+        d.counts.pending,
+    }) catch "pending";
+    if (d.pending) return std.fmt.bufPrint(buf, "previous scan · waiting {d:.1} s", .{@as(f64, @floatFromInt(now -| d.pending_since)) / 1e9}) catch "previous scan";
+    return "viewport sampled";
 }
 
 fn details(v: *vw.View, ctx: Ctx, r: Rect, src: *Sources) !void {
@@ -893,12 +1004,12 @@ fn legend(v: *vw.View, ctx: Ctx, r: Rect, pt: *const Paint) !void {
 /// With the layout audit on, tests learn the field geometry and what it shows.
 fn audit(d: *const Deep) void {
     const k = d.counts;
-    const now_ = [12]u64{ @intFromFloat(d.field.x * 10), @intFromFloat(d.field.y * 10), @intFromFloat(d.pitch * 1000), d.cols, d.rows, d.origin, d.cell(), k.pending, k.unknown, k.split + k.collapsed * 7 + k.changed * 131, @intFromFloat(miniX(d.origin) * 10), k.zero };
+    const now_ = [14]u64{ @intFromFloat(d.field.x * 10), @intFromFloat(d.field.y * 10), @intFromFloat(d.pitch * 1000), d.cols, d.rows, d.origin, d.cell(), k.pending, k.unknown, k.split + k.collapsed * 7 + k.changed * 131, @intFromFloat(miniX(d.origin) * 10), k.zero, @intFromBool(d.nav.active), d.pulse / 32 };
     if (std.mem.eql(u64, &now_, &audited)) return;
     audited = now_;
-    std.debug.print("xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1}\n", .{
-        d.field.x, d.field.y, d.pitch,  d.cols,   d.rows,          d.origin,                   d.cell(), d.count(), k.pending, k.unknown, k.gap, k.thp, k.mixed, k.anon, k.file, k.zero, k.other, k.changed, k.collapsed, k.split,
-        d.mini.x,  d.mini.y,  d.mini.w, d.mini.h, miniX(d.origin), miniX(d.origin + d.span()),
+    std.debug.print("xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1} nav={d} pulse={d}\n", .{
+        d.field.x, d.field.y, d.pitch,  d.cols,   d.rows,          d.origin,                   d.cell(),                   d.count(), k.pending, k.unknown, k.gap, k.thp, k.mixed, k.anon, k.file, k.zero, k.other, k.changed, k.collapsed, k.split,
+        d.mini.x,  d.mini.y,  d.mini.w, d.mini.h, miniX(d.origin), miniX(d.origin + d.span()), @intFromBool(d.nav.active), d.pulse,
     });
 }
 /// Called for every look: the deep look reports its cell count, the others 0.
@@ -980,4 +1091,88 @@ test "cells: pending is not data, unknown hatched, huge zero page not THP, chang
     try std.testing.expect(changed.kind & 24 == 0 and !std.mem.eql(u8, &changed.fill, &ring.fill));
     try std.testing.expectEqual(@as(usize, 1), k.pending);
     try std.testing.expectEqual(@as(usize, 1), k.zero);
+}
+
+// Fast component lane: picking follows rendered geometry throughout navigation,
+// including a second operation while the first one is still easing.
+test "modern navigation inverse selects the drawn address while zooming and panning" {
+    var d = Deep{ .modern = true };
+    layout(&d, .{ .x = 80, .y = 120, .w = 900, .h = 400 });
+    d.origin = 0x700000000000;
+    const i: usize = 1024;
+    const first = cellRect(&d, i);
+    const pointer = [2]f32{ first.x + first.w / 2, first.y + first.h / 2 };
+    d.nav.update(&d, pointer, 1_000_000_000);
+    zoom(&d, 1, i);
+    for ([_]u64{ 0, 30_000_000, 90_000_000, 180_000_000 }) |dt| {
+        d.nav.update(&d, pointer, 2_000_000_000 + dt);
+        const r = cellRect(&d, i);
+        try std.testing.expectEqual(@as(?usize, i), indexAt(&d, r.x + r.w / 2, r.y + r.h / 2));
+    }
+    try std.testing.expect(!d.nav.active);
+    pan(&d, @intCast(d.cols * 3));
+    d.nav.update(&d, pointer, 3_000_000_000);
+    try std.testing.expect(d.nav.active and d.nav.shift[1] > 0);
+    const r = cellRect(&d, i);
+    try std.testing.expectEqual(@as(?usize, i), indexAt(&d, r.x + r.w / 2, r.y + r.h / 2));
+    zoom(&d, 2, i);
+    d.nav.update(&d, pointer, 3_050_000_000);
+    const moved = cellRect(&d, i);
+    try std.testing.expectEqual(@as(?usize, i), indexAt(&d, moved.x + moved.w / 2, moved.y + moved.h / 2));
+    try std.testing.expect(indexAt(&d, -1, -1) == null);
+}
+
+// Fast component lane: real navigation bounds and fresh pending counts.
+test "pan and minimap exclude high kernel mappings and clamp at the last user VMA" {
+    const t = std.testing;
+    const vmas = [_]md.Vma{
+        .{ .start = 0x200000, .end = 0x400000 },
+        .{ .start = 0x700000000000, .end = 0x700000001000 },
+        .{ .start = 0xffffffffff600000, .end = 0xffffffffff601000 },
+    };
+    var d = Deep{ .cols = 8, .rows = 8, .level = 9, .address_end = addressEnd(&vmas) };
+    d.moveTo(std.math.maxInt(u64));
+    try t.expectEqual(vmas[1].end, d.origin + d.span());
+    layoutMini(&vmas, .{ .x = 0, .y = 0, .w = 900, .h = 22 });
+    try t.expectEqual(@as(usize, 2), island_count);
+    try t.expectEqual(@as(?u64, vmas[1].end), miniAddress(900));
+    try t.expectEqual(@as(f32, 900), miniX(top_address));
+    d.address_end = 4096;
+    d.moveTo(4000);
+    try t.expectEqual(@as(u64, 0), d.origin);
+    try t.expectEqual(top_address, addressEnd(&.{}));
+    var v = try vw.View.init(t.allocator);
+    defer v.deinit();
+    v.memmap.deep = d;
+    v.memmap.look = .deep;
+    try t.expect(!key(&v, '0', '0', 1));
+    try t.expect(key(&v, 'f', 'f', 1));
+}
+
+test "pending header distinguishes partial reuse from an entirely unsampled viewport" {
+    const t = std.testing;
+    var d = Deep{ .cols = 8, .rows = 8, .counts = .{ .pending = 8 } };
+    var buf: [128]u8 = undefined;
+    try t.expectEqualStrings("partly previous scan · 8 cells pending", pendingText(&d, true, 0, &buf));
+    d.counts.pending = d.count();
+    try t.expectEqualStrings("no sampled cells · 64 cells pending", pendingText(&d, true, 0, &buf));
+    d.counts.pending = 0;
+    try t.expectEqualStrings("viewport sampled", pendingText(&d, true, 0, &buf));
+    d.pending = true;
+    try t.expectEqualStrings("previous scan · waiting 1.0 s", pendingText(&d, true, 1_000_000_000, &buf));
+}
+
+test "fit retains mapped zero-resident regions and refuses a kernel-only list" {
+    const t = std.testing;
+    const maps = [_]md.Vma{
+        .{ .start = 0x100000, .end = 0x102000, .rss = 0 },
+        .{ .start = 0xffffffffff600000, .end = 0xffffffffff601000 },
+    };
+    var d = Deep{ .cols = 1, .rows = 2 };
+    fit(&d, &maps);
+    try t.expectEqual(@as(u64, 4096), d.cell());
+    try t.expectEqual(@as(u64, 0x100000), d.origin);
+    d.origin = 0;
+    fit(&d, maps[1..]);
+    try t.expectEqual(@as(u64, 0), d.origin);
 }

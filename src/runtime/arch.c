@@ -1,9 +1,11 @@
 #include "xrt_arch.h"
 #include <string.h>
 
+/* fs_base (18) and gs_base (19) are the thread pointers: shown, so that
+ * thread-local storage can be found, and never written. */
 #define X86_DESC(name, dwarf, word, id, role)                                                      \
     {#name, id, dwarf, offsetof(struct xrt_x86_registers, name), (word) * 8, 8, role,             \
-     XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
+     (id) >= 18 ? XRT_REG_READ_ONLY : XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
 static const struct xrt_register_desc x86_registers[] = {XRT_X86_REGISTERS(X86_DESC)};
 #undef X86_DESC
 #define ARM_DESC(name, dwarf, word, id, role)                                                      \
@@ -70,7 +72,7 @@ static const struct xrt_arch architectures[] = {
      .kernel_gpr_bytes = 216,
      .address_bits = 64,
      .little_endian = 1,
-     .register_count = 18,
+     .register_count = 20,
      .dwarf_count = 17,
      .trap_size = 1,
      .trap_alignment = 1,

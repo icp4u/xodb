@@ -55,6 +55,7 @@ pub fn read(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32, se
     if (tid <= 0 or segment >= 64 or frame >= 64 or start > 4096 or limit == 0 or limit > 32) return error.InvalidArguments;
     return switch (language) {
         .elisp => @import("../language/elisp.zig").readLocals(session, a, tid, segment, frame, start, limit),
+        .gdscript => error.GDScriptLocalsUnavailable,
         .ruby => @import("../language/ruby.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .lua => @import("../language/lua.zig").readLocals(session, a, tid, segment, frame, start, limit),
         .perl => @import("../language/perl.zig").readLocals(session, a, tid, segment, frame, start, limit),
@@ -71,6 +72,7 @@ pub fn evaluate(session: *Session, a: std.mem.Allocator, language: Tab, tid: i32
     if (tid <= 0 or segment >= 64 or frame >= 64 or text.len == 0 or text.len > 128 or std.mem.indexOfScalar(u8, text, 0) != null) return error.InvalidArguments;
     return switch (language) {
         .elisp => error.ElispExpressionsUnavailable,
+        .gdscript => error.GDScriptLocalsUnavailable,
         .ruby => @import("../language/ruby.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .lua => @import("../language/lua.zig").evaluateLocal(session, a, tid, segment, frame, text),
         .perl => @import("../language/perl.zig").evaluateLocal(session, a, tid, segment, frame, text),

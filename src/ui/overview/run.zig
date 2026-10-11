@@ -17,7 +17,7 @@ const Session = @import("../../model/session.zig").Session;
 
 pub const usage =
     \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
-    \\               [--look win95|win9x|dos|modern|deep] [--memmap-pid N [--memmap-start-ticks N]]
+    \\               [--look win95|win9x|dos|modern|deep|gibson] [--memmap-pid N [--memmap-start-ticks N]]
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
     \\  show their reason; nothing unmeasured is drawn as zero.
@@ -30,7 +30,7 @@ pub const usage =
     \\  --graph-pid N   restrict descriptor collection and captured threads to these PIDs (repeatable)
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
     \\  --files-start-ticks N  require this exact identity with --files-pid
-    \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern or deep (zoomable)
+    \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern, deep (zoomable), gibson (3D city)
     \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
     \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)

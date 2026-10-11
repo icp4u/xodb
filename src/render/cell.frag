@@ -25,5 +25,19 @@ void main() {
     bool near_right = local.x >= cell_rect.z - b, near_bottom = local.y >= cell_rect.w - b;
     if ((cell_kind & 8u) != 0u && (near_left || near_top || near_right || near_bottom)) c = cell_overlay;  // collapse ring
     if ((cell_kind & 16u) != 0u && (near_left || near_top)) c = cell_overlay;  // split edge
+    if ((cell_kind & 32u) != 0u) {
+        float pulse = float((cell_kind >> 16) & 255u) / 255.0;
+        vec2 half_size = cell_rect.zw * 0.5;
+        float inset = min(0.45, min(half_size.x, half_size.y) * 0.18);
+        float radius = min(1.8, min(half_size.x, half_size.y) * 0.35);
+        vec2 q = abs(local - half_size) - (half_size - vec2(inset + radius));
+        float distance = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
+        float mask = 1.0 - smoothstep(-0.3, 0.4, distance);
+        c.rgb = mix(c.rgb, cell_overlay.rgb, pulse * 0.5);
+        // The boundary settles after an observed collapse; a split's seam opens.
+        if ((cell_kind & 8u) != 0u && distance > -0.5 - pulse) c.rgb = mix(c.rgb, cell_overlay.rgb, 0.5 + pulse * 0.5);
+        if ((cell_kind & 16u) != 0u && abs(local.x - half_size.x) < pulse * 0.7) c.rgb *= 0.35;
+        c.a *= mask;
+    }
     color = c;
 }

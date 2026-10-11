@@ -48,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--vk-list")) return vkList();
     }
+    if (comptime build_options.gui) for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--scene3d-probe")) return @import("render/scene3d/probe.zig").main(args);
+    };
     // The overview is its own window and session with no debug target.
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -726,6 +730,8 @@ test {
     _ = @import("model/job_owner_test.zig");
     _ = @import("model/remote_source.zig");
     _ = @import("model/remote_owner.zig");
+    _ = @import("binary/tls.zig");
+    _ = @import("language/gdscript.zig");
     _ = @import("semq/adapter.zig");
     _ = @import("semq/answer.zig");
     _ = @import("semq/host.zig");

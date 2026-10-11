@@ -66,6 +66,25 @@ class RunnerTests(unittest.TestCase):
             if tier in ('gui', 'all'):
                 self.assertIn('go-native-values-gui', steps)
 
+    def test_gdscript_lanes(self):
+        # The engine is a runtime option like the others: no steps without it.
+        for tier in ('host', 'gui', 'all', 'periodic', 'periodic-gui'):
+            self.assertFalse([name for name, _, _ in lane(tier) if name.startswith('gdscript-')], tier)
+            self.assertIn('dwarf-types', {name for name, _, _ in gate.plan(tier)})
+        for tier in ('host', 'all'):
+            steps = {name: cmd for name, cmd, _ in gate.plan(tier, redot='/fixture/engine')}
+            self.assertIn('--strace', steps['gdscript-stack'])
+            for name in ('gdscript-stack', 'gdscript-demo'):
+                self.assertEqual(steps[name][steps[name].index('--redot') + 1], '/fixture/engine')
+        for tier in ('gui', 'all'):
+            steps = {name: cmd for name, cmd, _ in gate.plan(tier, redot='/fixture/engine')}
+            self.assertEqual(steps['gdscript-gui'][steps['gdscript-gui'].index('--redot') + 1], '/fixture/engine')
+        self.assertNotIn('gdscript-gui', {name for name, _, _ in gate.plan('host', redot='/fixture/engine')})
+        self.assertNotIn('gdscript-stack', {name for name, _, _ in gate.plan('gui', redot='/fixture/engine')})
+        for tier in ('portable', 'perf'):
+            with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+                gate.main([tier, '--redot', '/fixture/engine', '--list'])
+
     def test_go_value_lanes(self):
         for tier in ('host', 'all', 'gui'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier)}
@@ -319,10 +338,10 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
-                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
+                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
-                      ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E')
+                      ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD')
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):
@@ -371,7 +390,8 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(kinds['source-paths'].needs, ('build-tests', 'source-paths-build'))
         self.assertEqual(kinds['perl-gui'].needs, ('build-tests', 'perl-gui-fixtures'))
         self.assertTrue(kinds['gui-memdefrag-smoke'].serial and not kinds['gui-fdgraph'].serial)
-        self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-win95-all-panels', 'gui-clipboard', 'gui-memdefrag', 'gui-files'}
+        self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-win95-all-panels', 'gui-clipboard', 'gui-memdefrag', 'gui-files',
+                         'gui-memdefrag-modern-evidence'}
                         <= {step.name for step in gate.plan('periodic-gui') if step.kind == 'gui'})
         records = self.listed('gui', '--records')
         self.assertEqual(records['schema'], 2)

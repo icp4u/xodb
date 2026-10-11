@@ -6,8 +6,8 @@ const Modules = @import("modules.zig").Modules;
 const rt = @import("../target/runtime.zig").c;
 const Text = @import("probes.zig").Text;
 const selection = @import("language_selection.zig");
-pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby, go, elisp };
-pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby, .go, .elisp };
+pub const Tab = enum { registers, native, python, perl, lua, javascript, ruby, go, elisp, gdscript };
+pub const order = [_]Tab{ .registers, .native, .python, .perl, .lua, .javascript, .ruby, .go, .elisp, .gdscript };
 pub fn title(tab: Tab) []const u8 {
     return switch (tab) {
         .registers => "Regs",
@@ -19,6 +19,7 @@ pub fn title(tab: Tab) []const u8 {
         .ruby => "Ruby",
         .go => "Go",
         .elisp => "Elisp",
+        .gdscript => "GDScript",
     };
 }
 pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8 };
@@ -43,7 +44,7 @@ pub const State = struct {
     revision: u64 = 0,
     epoch: u64 = std.math.maxInt(u64),
     generation: u64 = std.math.maxInt(u64),
-    entries: [7]Entry = @splat(.{}),
+    entries: [8]Entry = @splat(.{}),
     next: usize = 0,
     metadata_revision: u64 = 0,
     /// Full images loaded when the last pass over the runtimes ended.
@@ -130,7 +131,9 @@ pub const State = struct {
         // the tab must not say less than the view does.
         if (self.next == self.entries.len and self.loaded_images != session.modules.loaded.items.len) {
             self.loaded_images = session.modules.loaded.items.len;
-            for (&self.entries, 0..) |*entry, i| if (entry.reason) |why| if (std.mem.endsWith(u8, why, "ImageBudgetExceeded")) {
+            // The same for a runtime whose symbol tables were too large to
+            // search without the image.
+            for (&self.entries, 0..) |*entry, i| if (entry.reason) |why| if (std.mem.endsWith(u8, why, "ImageBudgetExceeded") or (!entry.found and std.mem.endsWith(u8, why, "SnapshotLimit"))) {
                 self.next = i;
                 entry.checked = false;
                 self.revision +%= 1;
@@ -144,7 +147,7 @@ pub const State = struct {
         };
         const entry = &self.entries[self.next];
         if (!entry.found) {
-            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version", "runtime.buildVersion", "emacs_version" };
+            const symbols = [_][]const u8{ "_PyRuntime", "Perl_runops_standard", "lua_ident", "_ZN2v88internal7Version15version_string_E", "ruby_version", "runtime.buildVersion", "emacs_version", @import("../language/gdscript.zig").singleton_symbol };
             var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{
                 .limit_bytes = 128 * 1024,
                 .deadline_ns = @import("../target/linux.zig").now() + 25_000_000,
@@ -179,6 +182,7 @@ pub const State = struct {
             4 => @import("../language/ruby.zig").describe(session, a),
             5 => @import("../language/go.zig").describe(session, a),
             6 => @import("../language/elisp.zig").describe(session, a),
+            7 => @import("../language/gdscript.zig").describe(session, a),
             else => unreachable,
         };
         const d = description catch |err| {

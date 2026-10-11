@@ -1,0 +1,166 @@
+#!/usr/bin/env bash
+# Redot / Godot 4 demo: the GDScript call stack of a running game, read from
+# stopped memory and joined to the engine's native stack. Nothing runs in the
+# game and nothing is written to it.
+#
+#   REDOT=ENGINE scripts/demo-redot [XODB OPTIONS]   GUI attached to a small game
+#   scripts/demo-redot stack                         from another terminal, while
+#                                                    stopped: print the script stack
+#                                                    and each level's native frame
+#
+# REDOT is the engine binary: a debug-enabled build with DWARF (an editor or a
+# template_debug binary built with debug_symbols=yes). GODOT is accepted too.
+# REDOT_PROJECT=DIR runs another project; the default is a copy of
+# tests/fixtures/redot. Binary order: XODB, ./zig-out/bin/xodb, xodb on PATH.
+set -euo pipefail
+demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$demo_root"
+# A private per-user directory holds the shared-session socket and the game's output.
+session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-redot-$(id -u)"
+socket="$session_dir/session.sock"
+
+if [[ "${1-}" == stack ]]; then
+    if [[ ! -S "$socket" ]]; then
+        printf '%s\n' "No running demo session at $socket; start scripts/demo-redot first" >&2
+        exit 1
+    fi
+    exec python3 - "$socket" <<'PY'
+import json, shutil, socket, subprocess, sys, time
+connection = socket.socket(socket.AF_UNIX)
+connection.connect(sys.argv[1])
+stream = connection.makefile('rwb', buffering=0)
+sequence = 0
+def call(method, params):
+    global sequence
+    sequence += 1
+    stream.write((json.dumps({'jsonrpc': '2.0', 'id': sequence, 'method': method, 'params': params}) + '\n').encode())
+    while True:
+        line = stream.readline()
+        if not line:
+            sys.exit('xodb closed the session')
+        reply = json.loads(line)
+        if reply.get('id') == sequence:
+            return reply
+def tool(name, **arguments):
+    deadline = time.monotonic() + 120
+    while True:
+        reply = call('tools/call', {'name': name, 'arguments': arguments})
+        if 'error' in reply:
+            sys.exit(name + ': ' + reply['error']['message'])
+        if not reply['result'].get('isError'):
+            return reply['result']['structuredContent']
+        problem = [item['text'] for item in reply['result']['content']]
+        if not problem[0].endswith('Pending') or time.monotonic() > deadline:
+            sys.exit(name + ': ' + '\n'.join(problem))
+        time.sleep(.05)
+call('initialize', {'protocolVersion': '2025-06-18', 'capabilities': {}, 'clientInfo': {'name': 'demo-redot', 'version': '1'}})
+stream.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+session = tool('get_session')
+if session['state'] != 'stopped':
+    sys.exit('The game is running: press Space in xodb to stop it, then run this again.')
+tid = session['pid']
+stack = tool('get_language_stack', tid=tid, language='gdscript')
+segment = stack['segments'][0]
+if not stack['in_script'] and not segment['reason']:
+    print(f'GDScript on thread {tid}: not in script code at this stop. Press Space in xodb and run this again.')
+    sys.exit(0)
+print(f"GDScript on thread {tid}: {segment['depth']} level{'' if segment['depth'] == 1 else 's'}, {segment['state']}{' (' + segment['reason'] + ')' if segment['reason'] else ''}")
+native = tool('get_stack', tid=tid)['frames']
+names = [frame['symbol'] or '(unnamed)' for frame in native]
+if shutil.which('c++filt'):
+    # Readable C++ names when binutils is installed; the mangled ones otherwise.
+    done = subprocess.run(['c++filt', '-p'], input='\n'.join(names), capture_output=True, text=True)
+    if done.returncode == 0 and len(done.stdout.splitlines()) == len(names):
+        names = done.stdout.splitlines()
+width = max((len(frame['name']) for frame in segment['frames']), default=0)
+for frame in segment['frames']:
+    binding = frame['native_binding']
+    where = f"native #{binding['frame']} {names[binding['frame']]}" if binding else 'no native frame proved'
+    print(f"  {frame['name']:<{width}}  {frame['file']}:{frame['line']}   <- {where}{'   [' + frame['reason'] + ']' if frame['reason'] else ''}")
+print('Native stack, with the script level each GDScriptFunction::call frame is running:')
+levels = {frame['native_binding']['frame']: frame for frame in segment['frames'] if frame['native_binding']}
+last = max(levels) if levels else 0
+for frame in native[:last + 4]:
+    level = levels.get(frame['index'])
+    print(f"  #{frame['index']:<2} {names[frame['index']][:60]}" + (f"   <= {level['name']} {level['file']}:{level['line']}" if level else ''))
+if len(native) > last + 4:
+    print(f'  ... {len(native) - last - 4} more native frames')
+PY
+fi
+
+engine=${REDOT:-${GODOT:-}}
+if [[ -z "$engine" ]]; then
+    cat >&2 <<'NEED'
+Set REDOT to a Redot or Godot 4 engine binary built with debugging enabled and
+DWARF (an editor build, or a template_debug build with debug_symbols=yes):
+    REDOT=/path/to/redot.linuxbsd.template_debug.x86_64 scripts/demo-redot
+A release template tracks no script calls, and a stripped engine has no layouts.
+NEED
+    exit 1
+fi
+if [[ ! -x "$engine" ]]; then
+    printf '%s\n' "REDOT=$engine is not an executable file" >&2
+    exit 1
+fi
+xodb="$(python3 scripts/helpers/demo-binary.py gdscript)"
+mkdir -p -m 700 "$session_dir"
+if [[ ! -O "$session_dir" || "$(stat -c %a "$session_dir")" != 700 ]]; then
+    printf '%s\n' "$session_dir must be a private directory owned by you" >&2
+    exit 1
+fi
+if [[ -S "$socket" ]] && python3 -c 'import socket, sys; socket.socket(socket.AF_UNIX).connect(sys.argv[1])' "$socket" 2>/dev/null; then
+    printf '%s\n' "Another demo session is running at $socket" >&2
+    exit 1
+fi
+rm -f "$socket"
+if [[ -n "${REDOT_PROJECT:-}" ]]; then
+    project=$REDOT_PROJECT
+else
+    # The engine may keep a cache beside a project: run a private copy.
+    project="$session_dir/project"
+    rm -rf "$project"
+    cp -r tests/fixtures/redot "$project"
+fi
+if [[ ! -f "$project/project.godot" ]]; then
+    printf '%s\n' "$project has no project.godot" >&2
+    exit 1
+fi
+
+# The engine with DWARF is far larger than the default image budget: allow
+# this one image (its size plus a tenth) and twice that in total.
+bytes=$(stat -L -c %s "$engine")
+each=$(( bytes * 11 / 10 / 1048576 + 1 ))
+total=$(( each * 2 > 512 ? each * 2 : 512 ))
+
+"$engine" --headless --path "$project" >"$session_dir/game.log" 2>&1 </dev/null &
+demo_pid=$!
+cleanup() {
+    kill "$demo_pid" 2>/dev/null || :
+    wait "$demo_pid" 2>/dev/null || :
+    rm -f "$socket"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+# The demo game says when its scripts run; any other project gets a moment.
+for _ in $(seq 300); do
+    if ! kill -0 "$demo_pid" 2>/dev/null; then
+        printf '%s\n' "The engine exited; its output:" >&2
+        tail -n 20 "$session_dir/game.log" >&2
+        exit 1
+    fi
+    if [[ -n "${REDOT_PROJECT:-}" ]]; then sleep 2; break; fi
+    grep -q '^ORACLE stack ' "$session_dir/game.log" && break
+    sleep 0.1
+done
+cat >&2 <<'TIPS'
+Try: Space (run to the next script call of OS.delay_msec) · Tab to GDScript
+     the tab lists leaf <- step <- plan <- _process with res:// path:line, and
+     under each the native GDScriptFunction::call frame that is running it
+     click plan: the native stack moves to that level's call frame
+     In another terminal: scripts/demo-redot stack   (the same script stack as
+     text, and the native stack with each call frame labelled by its function)
+TIPS
+set -x
+# CoreBind::OS::delay_msec: the engine function behind the script's OS.delay_msec().
+"$xodb" --session-socket "$socket" --image-limit "${each}M" --image-total-limit "${total}M" "$@" --attach "$demo_pid" --break _ZNK8CoreBind2OS10delay_msecEi

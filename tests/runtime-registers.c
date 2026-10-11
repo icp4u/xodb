@@ -65,6 +65,16 @@ static void descriptors(void)
             CHECK(regs.values.x86.rip == word(16) && regs.values.x86.rsp == word(19));
             CHECK(regs.values.x86.rax == word(10) && regs.values.x86.eflags == word(18));
             CHECK(regs.values.x86.r15 == word(0) && regs.values.x86.r8 == word(9));
+            /* The thread pointers are user_regs_struct words 21 and 22: shown, never written. */
+            CHECK(arch->register_count == 20 && regs.values.x86.fs_base == word(21) && regs.values.x86.gs_base == word(22));
+            uint64_t base = 0;
+            CHECK(xrt_registers_value(&regs, "fs_base", 7, &base) == XRT_OK && base == word(21));
+            CHECK(xrt_registers_value(&regs, "gs_base", 7, &base) == XRT_OK && base == word(22));
+            for (uint16_t id = 0; id < arch->register_count; ++id)
+                CHECK(xrt_register_admit(xrt_arch_register_id(arch, id), 1) == (id >= 18 ? XRT_REGISTER_NOT_WRITABLE : XRT_OK));
+            unsigned char raw[216] = {0};
+            CHECK(xrt_registers_poke(arch, raw, sizeof raw, "fs_base", 7, 0x1000) == XRT_REGISTER_NOT_WRITABLE);
+            CHECK(xrt_registers_poke(arch, raw, sizeof raw, "gs_base", 7, 0x1000) == XRT_REGISTER_NOT_WRITABLE);
         } else {
             CHECK(regs.values.arm.x0 == word(0) && regs.values.arm.x30 == word(30));
             CHECK(regs.values.arm.sp == word(31) && regs.values.arm.pc == word(32));
@@ -250,7 +260,8 @@ static void contract(void)
 
     const struct xrt_arch *x86 = xrt_arch_get(XRT_X86_64);
     CHECK(x86 && xrt_arch_validate(x86) == XRT_OK);
-    struct xrt_register_desc high[18];
+    struct xrt_register_desc high[20];
+    CHECK(x86->register_count == sizeof(high) / sizeof(high[0]));
     memcpy(high, x86->registers, sizeof(high));
     high[3].dwarf = 300;
     struct xrt_arch high_row = copy_row(x86, 0xfffe, high, x86->register_count, x86->probes,
@@ -849,7 +860,13 @@ int main(int argc, char **argv)
         CHECK(after.values.ppc.r12 == UINT64_C(0xabcdef1234567890));
     else
         CHECK(after.values.arm.x9 == UINT64_C(0xabcdef1234567890));
-    CHECK(xrt_register_write(child, "fs_base", 7, 0) == XRT_UNKNOWN_REGISTER);
+    /* A thread pointer is listed on x86-64 and is never writable (the kernel
+       image compared below proves it stayed); elsewhere it is not a register. */
+    CHECK(xrt_register_write(child, "fs_base", 7, 0) ==
+          (arch->machine == XRT_X86_64 ? XRT_REGISTER_NOT_WRITABLE : XRT_UNKNOWN_REGISTER));
+    CHECK(xrt_register_write(child, "gs_base", 7, 0) ==
+          (arch->machine == XRT_X86_64 ? XRT_REGISTER_NOT_WRITABLE : XRT_UNKNOWN_REGISTER));
+    CHECK(xrt_register_write(child, "fs", 2, 0) == XRT_UNKNOWN_REGISTER);
     CHECK(xrt_register_write(child, "rax\0", 4, 0) == XRT_UNKNOWN_REGISTER);
     CHECK(xrt_register_write_pc(child, pc_value) == XRT_OK);
 #if defined(__x86_64__) && !defined(__ILP32__)

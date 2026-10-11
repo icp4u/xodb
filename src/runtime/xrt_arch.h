@@ -63,7 +63,9 @@
     X(r13, 13, 2, 14, XRT_ROLE_NONE)                                                               \
     X(r14, 14, 1, 15, XRT_ROLE_NONE)                                                               \
     X(r15, 15, 0, 16, XRT_ROLE_NONE)                                                               \
-    X(eflags, XRT_DWARF_NONE, 18, 17, XRT_ROLE_NONE)
+    X(eflags, XRT_DWARF_NONE, 18, 17, XRT_ROLE_NONE)                                               \
+    X(fs_base, XRT_DWARF_NONE, 21, 18, XRT_ROLE_NONE)                                              \
+    X(gs_base, XRT_DWARF_NONE, 22, 19, XRT_ROLE_NONE)
 
 #define XRT_ARM_REGISTERS(X)                                                                       \
     X(x0, 0, 0, 0, XRT_ROLE_NONE)                                                                  \

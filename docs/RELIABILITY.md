@@ -324,3 +324,12 @@ labelled not measurable. The ordinary syscall check still requires exact
 records, observable overflow/loss, closed perf descriptors and lossless archive
 roundtrips. Run `python3 tests/syscall-timing.py --perf --work .work/syscall-perf`
 for just these measurements on a host with syscall tracing configured.
+
+
+The Gibson city adds `gui-gibson` to the fast GUI lane: real-sample tower
+counts, unknown/collapse/split evidence, camera and picking controls, redaction
+and screen layout. `gui-gibson-evidence` is periodic: flythrough and recorded
+collapse frames, plus CPU/RSS/load and GPU times for an owned Node process at
+1080p and 4K. Measurements have no absolute performance pass threshold. The
+ordinary component suite covers city data semantics, identity-safe easing,
+page-publication clocks, CPU-storage retirement and all-look resize extremes.
