@@ -31,5 +31,12 @@ enum xrt_status xrt_gdb_receive(struct xrt_gdb_link *, void *, size_t, size_t *,
 enum xrt_status xrt_gdb_receive_stop(struct xrt_gdb_link *, void *, size_t, size_t *, bool);
 enum xrt_status xrt_gdb_exchange(struct xrt_gdb_link *, const void *, size_t,
                                  void *, size_t, size_t *);
+/* A reply above the packet limit is not fatal here. Its checksum is verified
+ * while the tail is discarded (at most XRT_GDB_DISCARD_MAX bytes within the
+ * operation deadline); the raw, still escaped prefix is stored and the status
+ * is XRT_BUFFER_TOO_SMALL. */
+#define XRT_GDB_DISCARD_MAX (UINT64_C(16) * 1024 * 1024)
+enum xrt_status xrt_gdb_exchange_prefix(struct xrt_gdb_link *, const void *, size_t,
+                                        void *, size_t, size_t *);
 enum xrt_status xrt_gdb_interrupt(struct xrt_gdb_link *);
 #endif

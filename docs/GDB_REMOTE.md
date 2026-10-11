@@ -41,6 +41,12 @@ steps that thread, restores it, and continues. AArch64 exclusive/ordered memory
 instructions refuse instruction stepping and breakpoint step-over before
 execution; an exclusive sequence is not split into single steps.
 
+A stub that announces `native-signals+` (Apple's debugserver) is also asked
+`qHostInfo` and `qProcessInfo`. Its stop replies carry the target system's
+own signal numbers, shown with that system's names; other stubs keep GDB's
+numbering with Linux names. A stub without a `g` packet has its registers
+read one `p` packet each.
+
 The client negotiates `qSupported`, `target.xml` and its remote XML includes,
 `vCont?`, optional no-ack mode, all-stop mode, and `qAttached`. Non-stop mode,
 process following and remote exec adoption are unsupported. An unexpected
@@ -61,6 +67,7 @@ software breakpoints, which become available after confirmation.
 | Asynchronous interrupt | Supported in the owned launch/attach fixtures | Failed with the tested 11.1.1 user-mode stubs |
 | Detach while stopped | Supported | Supported |
 | Hardware watches; library maps; binary `X` writes | Unsupported by this client | Unsupported by this client |
+| Apple debugserver (arm64 macOS) | See [MACOS.md](MACOS.md) | Watchpoints, Darwin signal numbers, regions and images work there |
 | Source/symbol breakpoints, source stepping, module-backed stack/locals | Unavailable without remote library/image support | Unavailable without remote library/image support |
 
 Memory writes use hexadecimal `M` packets. Register writes first try `P`; if

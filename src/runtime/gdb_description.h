@@ -22,6 +22,11 @@ typedef enum xrt_status (*xrt_gdb_annex)(void *ctx, const char *name,
 enum xrt_status xrt_gdb_description_parse(struct xrt_gdb_description *,
                                           const char *, size_t,
                                           xrt_gdb_annex, void *);
+/* fallback names the architecture when the document has no <architecture>
+ * element and another trusted-by-the-same-stub source (qHostInfo) does. */
+enum xrt_status xrt_gdb_description_parse_for(struct xrt_gdb_description *,
+                                              const char *, size_t,
+                                              xrt_gdb_annex, void *, const char *fallback);
 const struct xrt_gdb_register *xrt_gdb_description_register(
     const struct xrt_gdb_description *, const struct xrt_register_desc *);
 enum xrt_status xrt_gdb_description_decode(const struct xrt_gdb_description *,

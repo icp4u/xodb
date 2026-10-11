@@ -365,9 +365,18 @@ revalidated before lending that result, and changed bytes remain refused.
 ## Close and reconnect
 
 Every connection has a separate reference-counted cancellation capability.
-Requesting stop closes admission and sets a terminal atomic flag with a
-nonblocking wake. It never takes the connection mutex or closes its transport
-from the frame thread. Agent framing and GDB packet reads/writes check that flag
+An ordinary quit, primary stdio EOF, or reconnect closes admission immediately
+and gives the owner two seconds to finish its active operation and shutdown
+exports on the live connection. Queued commands are cancelled without dispatch.
+The deadline starts with the first stop request; repeated requests cannot extend
+it. The joining thread requests transport cancellation if the owner is still
+working when the grace expires. Internal owner failures may cancel immediately.
+The grace bounds when cancellation is requested, not local disk writes or the
+final wait for an owned transport child to be reaped.
+
+Cancellation sets a terminal atomic flag with a nonblocking wake. It never takes
+the connection mutex or closes its transport from the frame thread.
+Agent framing and GDB packet reads/writes check that flag
 around polls and transfers; a reader waiting for the serialization mutex checks
 again after acquisition. Cancellation cannot make a partially used stream reusable.
 
@@ -375,6 +384,13 @@ A sent mutation whose reply is lost returns `RemoteOutcomeUnknown`. It is not
 safe to repeat it automatically. Queued commands that were never dispatched
 finish cancelled. Local teardown cannot prove that the remote target detached,
 stopped, or cleaned up breakpoints.
+
+`--profile-out`, `--capture-out`, and investigation export run before connection
+cancellation on a normal close. A stalled or already-broken connection still
+reports an incomplete collector drain. Optional breakpoint discovery and
+source-step fallbacks must propagate `RemoteOutcomeUnknown`, including an
+uncertain internal loader-hook installation, rather than reporting a pending
+breakpoint or attempting another target operation.
 
 The window keeps pumping while the owner drains commands, metadata/file/profile
 readers and its owned transport child. It joins only after the owner reports done.

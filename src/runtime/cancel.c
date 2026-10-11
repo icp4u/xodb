@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "xrt_cancel.h"
+#include "host_compat.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -16,7 +17,7 @@ struct xrt_cancel *xrt_cancel_create(void)
 {
     struct xrt_cancel *c = malloc(sizeof(*c));
     if (!c) return NULL;
-    if (pipe2(c->wake, O_CLOEXEC | O_NONBLOCK)) { free(c); return NULL; }
+    if (xrt_host_pipe(c->wake)) { free(c); return NULL; }
     atomic_init(&c->references, 1);
     atomic_init(&c->requested, false);
     return c;

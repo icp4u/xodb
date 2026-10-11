@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #define _FILE_OFFSET_BITS 64
 #include "remote_internal.h"
+#include "host_compat.h"
 #include "gdbremote.h"
 #include "target_internal.h"
 #include "wire_target.h"
@@ -135,8 +136,16 @@ static bool reap_for(struct xrt_connection *c, uint64_t timeout)
 {
     if (c->reaped)
         return true;
-    const uint64_t deadline = xrt_now() + timeout;
+    uint64_t deadline = xrt_now() + timeout;
+    bool cancelled = xrt_cancel_requested(c->cancel);
     while (xrt_now() < deadline) {
+        /* A cancellation that arrives during the wait (a graceful stop
+         * reaching its deadline) shortens it; it never extends it. */
+        if (!cancelled && xrt_cancel_requested(c->cancel)) {
+            cancelled = true;
+            const uint64_t limit = xrt_now() + UINT64_C(250000000);
+            if (limit < deadline) deadline = limit;
+        }
         pid_t got = waitpid(c->child, &c->exit_status, WNOHANG);
         if (got == c->child) {
             c->reaped = true;
@@ -585,7 +594,7 @@ enum xrt_status xrt_target_remote_cancel(const char *const argv[], struct xrt_ta
         return XRT_OUT_OF_MEMORY;
     }
     int sockets[2];
-    if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets)) {
+    if (xrt_host_socketpair(AF_UNIX, SOCK_STREAM, 0, sockets)) {
         free(t);
         free(c->request_bytes);
         free(c->reply);
@@ -725,8 +734,11 @@ enum xrt_status xrt_remote_destroy(struct xrt_target *t)
     if (status != XRT_OK && !xrt_cancel_requested(c->cancel)) {
         /* A broken stream forces agent cleanup. Exit bit 2 means its detach
          * failed; keep the handle in that case, as the local API does. */
-        if (c->fd >= 0 || !reap(c) || !c->exit_status_known || !WIFEXITED(c->exit_status) ||
-            (WEXITSTATUS(c->exit_status) & 2))
+        const bool unconfirmed = c->fd >= 0 || !reap(c) || !c->exit_status_known ||
+                                 !WIFEXITED(c->exit_status) || (WEXITSTATUS(c->exit_status) & 2);
+        /* Cancelled while waiting: abandon below, so the transport child is
+         * terminated and reaped instead of outliving a retained handle. */
+        if (unconfirmed && !xrt_cancel_requested(c->cancel))
             return status;
     }
     /* Cancellation abandons local handles after all borrowers have drained.
@@ -990,7 +1002,7 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
             return XRT_OUT_OF_MEMORY;
         }
         struct symbol_partial *p = c->symbols;
-        p->fd = memfd_create("xodb-symbols", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+        p->fd = xrt_host_sealed_file("xodb-symbols");
         p->identity = identity;
         p->target = t->remote_id;
         p->epoch = t->image_epoch;
@@ -1017,8 +1029,7 @@ enum xrt_status xrt_remote_symbol_file(const struct xrt_target *t,
     if (budget && (status == XRT_INVALID_ARGUMENT || status == XRT_FILE_LIMIT)) ++budget->skipped;
     enum xrt_status closed = xrt_remote_call(t, &(struct xrt_call){.op = XRT_RPC_FILE_CLOSE, .args = {p->file}});
     if (closed != XRT_OK) status = closed;
-    if (status == XRT_OK && fcntl(p->fd, F_ADD_SEALS,
-            F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0)
+    if (status == XRT_OK && xrt_host_seal(p->fd) < 0)
         status = XRT_FILE_UNAVAILABLE;
     if (status == XRT_OK) {
         *out = p->fd;
@@ -1116,7 +1127,7 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
             goto done;
         }
     }
-    fd = memfd_create("xodb-target-file", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    fd = xrt_host_sealed_file("xodb-target-file");
     if (fd < 0) {
         status = XRT_FILE_UNAVAILABLE;
         goto done;
@@ -1163,7 +1174,7 @@ enum xrt_status xrt_remote_file(const struct xrt_target *t, const struct xrt_fil
         at += size;
     }
     if (status == XRT_OK &&
-        (fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_SHRINK | F_SEAL_GROW | F_SEAL_WRITE) < 0 ||
+        (xrt_host_seal(fd) < 0 ||
          lseek(fd, 0, SEEK_SET) < 0))
         status = XRT_FILE_UNAVAILABLE;
 done:;
@@ -1225,4 +1236,44 @@ enum xrt_status xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_i
     xrt_gdb_info(t->connection->gdb, out);
     pthread_mutex_unlock(&t->connection->mutex);
     return XRT_OK;
+}
+/* Region and image lists do I/O with the stub; a malformed reply ends the
+ * connection like any other protocol error, a typed refusal keeps it. */
+static enum xrt_status gdb_list(struct xrt_target *t, void *out, size_t capacity, size_t *total,
+                                bool images)
+{
+    if (!t || !t->connection || !t->connection->gdb) return XRT_INVALID_ARGUMENT;
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
+    struct xrt_connection *c = t->connection;
+    pthread_mutex_lock(&c->mutex);
+    enum xrt_status status = c->failed;
+    if (status == XRT_OK && xrt_cancel_requested(c->cancel)) status = broken(c, XRT_REMOTE_CANCELLED);
+    else if (status == XRT_OK) {
+        /* The same outcome rules as an ordinary call: see invoke(). */
+        const uint64_t before = xrt_gdb_mutation_bytes(c->gdb);
+        status = images ? xrt_gdb_images(c->gdb, t, out, capacity, total) :
+            xrt_gdb_regions(c->gdb, t, out, capacity, total);
+        const bool uncertain = before != xrt_gdb_mutation_bytes(c->gdb);
+        if (xrt_cancel_requested(c->cancel)) {
+            ++t->generation;
+            (void)broken(c, XRT_REMOTE_CANCELLED);
+            status = uncertain ? XRT_REMOTE_OUTCOME_UNKNOWN : XRT_REMOTE_CANCELLED;
+        } else if (status == XRT_PROTOCOL_ERROR || xrt_gdb_health(c->gdb) != XRT_OK) {
+            ++t->generation;
+            (void)broken(c, status == XRT_PROTOCOL_ERROR ? status : XRT_TRANSPORT_FAILED);
+            if (uncertain) status = XRT_REMOTE_OUTCOME_UNKNOWN;
+        }
+    }
+    pthread_mutex_unlock(&c->mutex);
+    return status;
+}
+enum xrt_status xrt_target_gdb_regions(struct xrt_target *t, struct xrt_gdb_region *out,
+                                       size_t capacity, size_t *total)
+{
+    return gdb_list(t, out, capacity, total, false);
+}
+enum xrt_status xrt_target_gdb_images(struct xrt_target *t, struct xrt_gdb_image *out,
+                                      size_t capacity, size_t *total)
+{
+    return gdb_list(t, out, capacity, total, true);
 }

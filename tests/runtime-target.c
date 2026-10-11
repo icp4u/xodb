@@ -5,6 +5,7 @@
 #include "wire_target.h"
 #include "mapped_file.h"
 #include <sys/mman.h>
+#include <sys/ptrace.h>
 #include <sys/stat.h>
 #include <sys/sysmacros.h>
 #include <errno.h>

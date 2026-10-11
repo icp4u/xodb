@@ -134,6 +134,15 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
     });
 }
 pub fn call(a: Allocator, session: *Session, args: Value) !Value {
+    // A Darwin target behind a GDB stub: the stub's regions, and every Mach-O
+    // image as a typed load failure. Nothing there is read as ELF.
+    if (try session.gdbMap()) |map| return page(a, .{
+        .session_id = session.id,
+        .generation = map.generation,
+        .epoch = session.target.snapshot().image_epoch,
+        .regions = map.regions,
+        .failures = map.images,
+    }, args);
     try session.refreshMaps();
     return page(a, .{
         .session_id = session.id,

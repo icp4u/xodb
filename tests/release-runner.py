@@ -338,10 +338,10 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
-                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
+                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
-                      ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD')
+                      ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD', macos_ssh='MAC')
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):

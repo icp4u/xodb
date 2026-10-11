@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*',)),
+    (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown',)),
     (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
       'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
     (('src/runtime/remote_perf.c', 'src/runtime/perf_internal.h', 'src/runtime/xrt_perf.h', 'src/profile/linux_*.zig', 'src/profile/capture.zig'), ('gui-remote-profile-close', 'gui-remote-profile-ack-close')),
@@ -104,6 +106,8 @@ COVERS = (
     (('src/render/*', 'src/platform/*'),
      ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
+    (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
+     ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
@@ -128,10 +132,11 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'remote-unknown-matrix',
     'gui-remote-publication', 'gui-owner-*',
     'image-budget-lifecycle*', 'image-budget-regressions*', 'image-budget-torch',
     'gui-scene3d-evidence', 'gui-gibson-evidence',
-    'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout',
+    'gui-deepmap-evidence', 'gui-memdefrag', 'acquire-timeout', 'fence-timeout', 'gdb-debugserver-deadline',
     'm2-limits', 'm2-sampled', 'm2-recorded-views', 'm2-dynamic-threads', 'm2-scheduling', 'syscall-timing',
     'symbol-discovery', 'symbol-discovery-install', 'source-fetch', 'lsof-top', 'memory-observer', 'sysstat-nvml',
     'metadata-session-agent', 'm2-preferences-agent', 'python-lua-named-1',
@@ -209,7 +214,7 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -277,6 +282,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 steps.append(('elisp-preview-stress-agent', [sys.executable, '-B', 'tests/elisp-limits.py',
                               '--emacs', emacs, '--work', '.work/elisp-preview-stress-agent',
                               '--case', 'budget', '--agent', 'zig-out/bin/xodb-agent'], 180))
+            if macos_ssh:
+                # A real Mac over ssh: debugserver on its loopback, reached through a tunnel. Never has a default host.
+                steps.append(('macos-debugserver', [sys.executable, '-B', 'tests/macos-debugserver.py', '--ssh', macos_ssh,
+                              '--work', '.work/macos-debugserver'], 300))
         steps.append(('pe-unwind-fuzz', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
         steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',
@@ -332,9 +341,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 ('gui-win95-all-panels', [sys.executable, '-B', 'tests/overview-win95-gui.py', '--all-panels'], 300),
                 ('gui-clipboard', [sys.executable, '-B', 'tests/clipboard-gui.py'], 90),
             ]
-            steps += plan('gui', *runtimes, moved=True, redot=redot)
+            steps += plan('gui', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
         elif not headless:
-            steps += plan('host', *runtimes, moved=True, redot=redot)
+            steps += plan('host', *runtimes, moved=True, redot=redot, macos_ssh=macos_ssh)
         return steps
     if live:
         steps.append(('remote-queued-drop', [sys.executable, '-B', 'tests/remote-queued-drop.py', '--work', '.work/remote-queued-drop'], 60))
@@ -342,6 +351,16 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('remote-resolve', ['zig-out/bin/xodb-remote-resolve-test'], 35))
         steps.append(('remote-cancel', ['zig-out/bin/xodb-remote-cancel-test'], 35))
         steps.kind = 'live'
+        steps.append(('remote-exit-export', [sys.executable, '-B', 'tests/remote-exit-export.py', '--work', '.work/rexit'], 60))
+        steps.append(('remote-exit-export-stdio', [sys.executable, '-B', 'tests/remote-exit-export.py', '--stdio', '--work', '.work/rexit-stdio'], 60))
+        steps.append(('remote-unknown', [sys.executable, '-B', 'tests/remote-unknown.py', '--work', '.work/runknown'], 60))
+        steps.append(('remote-unknown-matrix', [sys.executable, '-B', 'tests/remote-unknown.py', '--matrix', '--work', '.work/runknown-matrix'], 120))
+        # A recorded Apple debugserver session replayed by a loopback stub, then hostile replies.
+        # The one case that waits out the five-second request deadline runs in periodic.
+        steps.append(('gdb-debugserver', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver',
+                      '--skip', 'truncated-packet'], 60))
+        steps.append(('gdb-debugserver-deadline', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver-deadline',
+                      '--cases', 'truncated-packet'], 60))
         for remote in (False, True):
             label = 'unwind-return-address' + ('-agent' if remote else '')
             steps.append((label, [sys.executable, '-B', 'tests/unwind-return-address.py', '--work', '.work/' + label,
@@ -1094,6 +1113,7 @@ def main(argv=None):
     parser.add_argument('--wine', help='Include owned stripped PE/Jai checks with this Wine executable (periodic tiers; private prefix)')
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
     parser.add_argument('--redot', help='Include GDScript stack checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
+    parser.add_argument('--macos-ssh', metavar='HOST', help='Include the live Apple debugserver test against this Mac, reached with ssh HOST (periodic tier; no default host)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -1136,6 +1156,8 @@ def main(argv=None):
         parser.error('--go is not for the portable or perf tier')
     if args.redot and args.tier in ('portable', 'perf'):
         parser.error('--redot is not for the portable or perf tier')
+    if args.macos_ssh and (args.tier != 'periodic' or args.headless):
+        parser.error('--macos-ssh requires the periodic tier without --headless')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1143,7 +1165,7 @@ def main(argv=None):
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'

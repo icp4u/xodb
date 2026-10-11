@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sys/ptrace.h>
 #include "wire_target.h"
 #include <dirent.h>
 #include <stdio.h>

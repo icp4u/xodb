@@ -151,7 +151,7 @@ pub fn main(init: std.process.Init) !void {
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
                 \\O opens process selection; MCP process_id defaults to the original process regardless of GUI selection.
-                \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver or QEMU target.
+                \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver, QEMU or Apple debugserver target.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
@@ -447,7 +447,7 @@ pub fn main(init: std.process.Init) !void {
                 .source = source,
             });
             defer owner.destroy();
-            while (quitting == 0 and !owner.done.load(.acquire)) _ = c.usleep(20000);
+            while (quitting == 0 and !owner.done.load(.acquire) and !owner.stopping.load(.acquire)) _ = c.usleep(20000);
             owner.join();
             if (owner.failure) |err| return err;
             return;
@@ -745,7 +745,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
     var rendered: usize = 0;
     var last_frame = linux.now();
     var confirmed_connection = false;
-    while (!window.closing and quitting == 0 and !owner.done.load(.acquire)) {
+    while (!window.closing and quitting == 0 and !owner.done.load(.acquire) and !owner.stopping.load(.acquire)) {
         try window.pump(window.input.timeoutMs(linux.now(), 8));
         if (window.closing or quitting != 0) break;
         window.input.tick(linux.now());
@@ -832,8 +832,9 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
 }
 
 fn finishRemoteOwner(owner: *@import("model/remote_worker.zig").Worker, window: *Window) void {
-    owner.requestStop();
+    owner.requestGracefulStop();
     while (!owner.done.load(.acquire)) {
+        owner.cancelExpiredStop(linux.now());
         window.pumpDuringClose(8) catch {
             _ = c.usleep(8000);
         };

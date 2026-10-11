@@ -10,13 +10,41 @@
 #define XRT_GDB_CAP_BINARY_WRITE (UINT64_C(1) << 5)
 #define XRT_GDB_CAP_REGISTER_WRITE (UINT64_C(1) << 6)
 #define XRT_GDB_CAP_INTERRUPT (UINT64_C(1) << 7)
+#define XRT_GDB_CAP_REGIONS (UINT64_C(1) << 8)
+#define XRT_GDB_CAP_IMAGES (UINT64_C(1) << 9)
+#define XRT_GDB_REGIONS_MAX 4096
+#define XRT_GDB_IMAGES_MAX 4096
+/* The target's operating system selects its signal numbering. Unknown keeps
+ * the GDB protocol numbers and their Linux display mapping. */
+enum xrt_gdb_os { XRT_GDB_OS_UNKNOWN, XRT_GDB_OS_LINUX, XRT_GDB_OS_DARWIN };
 struct xrt_gdb_info {
     uint64_t supported, unsupported, failed;
     uint32_t packet_size, register_count;
     int attached; /* -1 means qAttached unavailable; zero means stub launched. */
     char architecture[64], reason[128];
+    enum xrt_gdb_os os;
+    uint32_t address_bits; /* zero means unknown; pointers above it carry tags. */
+};
+/* Remote text is untrusted: names are printable ASCII, bounded and cut. */
+struct xrt_gdb_region {
+    uint64_t start, size;
+    bool mapped, read, write, execute;
+    char type[32], name[128];
+};
+struct xrt_gdb_image {
+    uint64_t load_address;
+    bool path_truncated;
+    char path[256];
 };
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out);
 enum xrt_status xrt_target_gdb_remote_cancel(const char *endpoint, struct xrt_target **out, struct xrt_cancel *);
 enum xrt_status xrt_target_gdb_info(const struct xrt_target *, struct xrt_gdb_info *);
+/* Stopped targets of a stub with the LLDB extensions only. At most capacity
+ * rows are stored; *total above capacity means the list was cut. A stub
+ * without the packet, or a reply above the packet limit, is the typed
+ * XRT_FILE_UNAVAILABLE or XRT_BUFFER_TOO_SMALL with the connection kept. */
+enum xrt_status xrt_target_gdb_regions(struct xrt_target *, struct xrt_gdb_region *,
+                                       size_t capacity, size_t *total);
+enum xrt_status xrt_target_gdb_images(struct xrt_target *, struct xrt_gdb_image *,
+                                      size_t capacity, size_t *total);
 #endif

@@ -2,6 +2,7 @@
 #include "gdbremote.h"
 #include "gdb_link.h"
 #include "gdb_description.h"
+#include "gdb_lldb.h"
 #include "target_internal.h"
 #include "wire_target.h"
 #include <inttypes.h>
@@ -24,6 +25,14 @@ struct xrt_gdb {
     uint8_t reply[XRT_GDB_PAYLOAD_MAX + 1];
     size_t length, last_stop_size;
     uint8_t *last_stop;
+    /* LLDB extensions (Apple debugserver). native_signals: stop replies carry
+     * the target's own signal numbers, not GDB's. */
+    struct xrt_gdb_host host;
+    bool native_signals, single_registers, bank_valid, rewatch, watch_armed[XRT_MAX_WATCHPOINTS];
+    /* Registers read one p packet at a time, kept until the next resume or write. */
+    char *bank;
+    int32_t bank_tid, watch_tid; /* watch_tid stopped before its watched access. */
+    uint8_t watch_capacity;
 };
 static enum xrt_status problem(struct xrt_gdb *g, enum xrt_status status, const char *reason)
 {
@@ -63,6 +72,21 @@ static enum xrt_status query(struct xrt_gdb *g, const char *text)
         status = xrt_gdb_receive(&g->link, g->reply, sizeof(g->reply) - 1, &g->length, true);
         if (status != XRT_OK) return problem(g, status, g->link.reason);
     }
+    if (memchr(g->reply, 0, g->length)) return problem(g, XRT_PROTOCOL_ERROR, "NUL in GDB text response");
+    g->reply[g->length] = 0;
+    return XRT_OK;
+}
+/* A reply above the packet limit keeps the link: *cut marks its raw prefix. */
+static enum xrt_status query_prefix(struct xrt_gdb *g, const char *text, bool *cut)
+{
+    *cut = false;
+    if (strlen(text) > g->link.packet_size) return problem(g, XRT_BUFFER_TOO_SMALL, "GDB command exceeds PacketSize");
+    enum xrt_status status = xrt_gdb_exchange_prefix(&g->link, text, strlen(text),
+                                                     g->reply, sizeof(g->reply) - 1, &g->length);
+    if (status == XRT_BUFFER_TOO_SMALL && !g->link.failed) {
+        *cut = true;
+        if (g->length > 512) g->length = 512;
+    } else if (status != XRT_OK) return problem(g, status, g->link.reason);
     if (memchr(g->reply, 0, g->length)) return problem(g, XRT_PROTOCOL_ERROR, "NUL in GDB text response");
     g->reply[g->length] = 0;
     return XRT_OK;
@@ -247,9 +271,42 @@ static enum xrt_status registers(struct xrt_gdb *g, struct xrt_target *t,
 {
     if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
     enum xrt_status status = select_thread(g, tid);
-    if (status == XRT_OK) status = query(g, "g");
     if (status != XRT_OK) return status;
-    if (!g->length || g->reply[0] == 'E') return XRT_REGISTER_UNAVAILABLE;
+    if (!g->single_registers) {
+        status = query(g, "g");
+        if (status != XRT_OK) return status;
+        if (g->length && g->reply[0] == 'E') return XRT_REGISTER_UNAVAILABLE;
+        if (g->length) return xrt_gdb_description_decode(&g->description, g->reply, g->length, out);
+        g->single_registers = true; /* debugserver has no g packet. */
+    }
+    /* Build the same hexadecimal bank from p packets, for the registers this
+     * client maps. Everything else stays unavailable ('x'). */
+    size_t bytes = 0;
+    for (unsigned i = 0; i < g->description.arch->register_count; ++i) {
+        const struct xrt_gdb_register *r =
+            xrt_gdb_description_register(&g->description, &g->description.arch->registers[i]);
+        if (r && r->offset + r->bytes > bytes) bytes = r->offset + r->bytes;
+    }
+    if (!bytes || bytes > XRT_GDB_PAYLOAD_MAX / 2) return XRT_REGISTER_UNAVAILABLE;
+    if (!g->bank && !(g->bank = malloc(XRT_GDB_PAYLOAD_MAX))) return XRT_OUT_OF_MEMORY;
+    if (!g->bank_valid || g->bank_tid != tid) {
+        g->bank_valid = false;
+        memset(g->bank, 'x', 2 * bytes);
+        for (unsigned i = 0; i < g->description.arch->register_count; ++i) {
+            const struct xrt_gdb_register *r =
+                xrt_gdb_description_register(&g->description, &g->description.arch->registers[i]);
+            if (!r) continue;
+            char command[24]; snprintf(command, sizeof(command), "p%x", r->number);
+            status = query(g, command);
+            if (status != XRT_OK) return status;
+            if (!g->length || g->reply[0] == 'E') continue;
+            if (g->length != 2 * (size_t)r->bytes) return XRT_UNEXPECTED_REGISTER_SIZE;
+            memcpy(g->bank + 2 * (size_t)r->offset, g->reply, g->length);
+        }
+        g->bank_tid = tid; g->bank_valid = true;
+    }
+    memcpy(g->reply, g->bank, 2 * bytes);
+    g->length = 2 * bytes; g->reply[g->length] = 0;
     return xrt_gdb_description_decode(&g->description, g->reply, g->length, out);
 }
 static enum xrt_status read_memory(struct xrt_gdb *g, struct xrt_target *t,
@@ -341,6 +398,7 @@ static enum xrt_status write_register(struct xrt_gdb *g, struct xrt_target *t,
     if (!expected) return XRT_OUT_OF_MEMORY;
     expected[0] = 'G'; memcpy(expected + 1, g->reply, bank_size); expected[bank_size + 1] = 0;
     memcpy(expected + 1 + 2 * r->offset, command + n, 2 * r->bytes);
+    g->bank_valid = false;
     if (!g->single_write_unavailable) {
         if (packed) *packed = 1;
         ++t->generation;
@@ -447,6 +505,52 @@ static enum xrt_status cleanup_plant(struct xrt_gdb *g, struct xrt_target *t)
     }
     return status;
 }
+static enum xrt_status watch_packet(struct xrt_gdb *g, struct xrt_target *t, unsigned slot, bool enable)
+{
+    const struct xrt_watchpoint *watch = &t->watchpoints[slot];
+    if (g->watch_armed[slot] == enable) return XRT_OK;
+    char command[64];
+    snprintf(command, sizeof(command), "%c%c,%" PRIx64 ",%x", enable ? 'Z' : 'z',
+             watch->kind == XRT_WATCH_WRITE ? '2' : '4', watch->address, watch->length);
+    ++t->generation;
+    enum xrt_status status = ok(g, command, "GDB hardware watchpoint unconfirmed");
+    if (status == XRT_OK) g->watch_armed[slot] = enable;
+    return status;
+}
+static enum xrt_status watch_all(struct xrt_gdb *g, struct xrt_target *t, bool enable)
+{
+    for (unsigned i = 0; i < XRT_MAX_WATCHPOINTS; ++i)
+        if (t->watchpoints[i].present) {
+            enum xrt_status status = watch_packet(g, t, i, enable);
+            if (status != XRT_OK) return status;
+        }
+    return XRT_OK;
+}
+/* The stub stops before the access: the value read here is the old one.
+ * Returns whether a watchpoint of this client covers the address. */
+static bool publish_watch(struct xrt_gdb *g, struct xrt_target *t, int32_t tid,
+                          bool known_pc, uint64_t pc, uint64_t address)
+{
+    for (unsigned i = 0; i < XRT_MAX_WATCHPOINTS; ++i) {
+        struct xrt_watchpoint *watch = &t->watchpoints[i];
+        if (!watch->present || address < watch->address || address - watch->address >= watch->length)
+            continue;
+        uint8_t bytes[8] = {0}; size_t count = 0; uint64_t value = 0;
+        bool valid = read_memory(g, t, watch->address, bytes, watch->length, &count) == XRT_OK &&
+            count == watch->length;
+        for (unsigned n = 0; n < watch->length; ++n) value |= (uint64_t)bytes[n] << (8 * n);
+        event(t, XRT_EVENT_WATCHPOINT_HIT, tid, (int64_t)watch->id);
+        struct xrt_event *hit = &t->events[t->event_count - 1];
+        hit->pc = known_pc ? pc : 0; hit->pc_known = known_pc;
+        hit->address = watch->address; hit->size = watch->length;
+        hit->has_trap = true; hit->trap_pc = hit->pc; hit->trap_address = address;
+        hit->watch_phase = 2; /* The access has not completed. */
+        hit->before = value; hit->before_valid = valid;
+        if (valid) watch->previous = value;
+        return true;
+    }
+    return false;
+}
 static enum xrt_status send_run(struct xrt_gdb *g, struct xrt_target *t,
                                  int32_t tid, bool step)
 {
@@ -472,7 +576,8 @@ static enum xrt_status send_run(struct xrt_gdb *g, struct xrt_target *t,
     ++t->generation;
     enum xrt_status status = xrt_gdb_send(&g->link, command, strlen(command));
     if (status != XRT_OK) return problem(g, status, g->link.reason);
-    g->pending_signal = 0;
+    g->pending_signal = 0; g->bank_valid = false;
+    if (!step || tid == g->watch_tid) g->watch_tid = 0;
     t->state = XRT_RUNNING; t->want_run = !step; t->stepping = step;
     for (size_t i = 0; i < t->thread_count; ++i) {
         t->threads[i].state = step && t->threads[i].tid != tid ? XRT_STOPPED : XRT_RUNNING;
@@ -510,31 +615,42 @@ static enum xrt_status resume(struct xrt_gdb *g, struct xrt_target *t, int32_t t
     if (status != XRT_OK || xrt_registers_pc(&regs, &pc) != XRT_OK)
         return status != XRT_OK ? status : XRT_REGISTER_UNAVAILABLE;
     if (step) { status = admit_step(g, t, pc); if (status != XRT_OK) return status; }
-    for (size_t n = 0; n < t->breakpoint_count; ++n) {
+    /* A breakpoint at this PC, or a watched access this thread stopped
+     * before, is lifted for one hidden step and restored at its stop. */
+    struct xrt_breakpoint *here = NULL;
+    for (size_t n = 0; n < t->breakpoint_count && !here; ++n) {
         struct xrt_breakpoint *bp = &t->breakpoints[n];
-        if (!bp->pending && bp->enabled && bp->patched && bp->address == pc) {
-            if (!step) { status = admit_step(g, t, pc); if (status != XRT_OK) return status; }
-            status = breakpoint_packet(g, t, bp, false);
-            if (status != XRT_OK) return status;
-            g->rearm = bp->id; g->step_after_rearm = step;
-            status = send_run(g, t, tid, true);
-            if (status != XRT_OK) {
-                enum xrt_status restored = breakpoint_packet(g, t, bp, true);
-                g->rearm = 0;
-                return restored != XRT_OK ? restored : status;
-            }
-            return XRT_OK;
-        }
+        if (!bp->pending && bp->enabled && bp->patched && bp->address == pc) here = bp;
     }
-    return send_run(g, t, tid, step);
+    const bool watch = g->watch_tid == tid;
+    if (!here && !watch) return send_run(g, t, tid, step);
+    if (!step) { status = admit_step(g, t, pc); if (status != XRT_OK) return status; }
+    if (here) { status = breakpoint_packet(g, t, here, false); if (status != XRT_OK) return status; }
+    if (watch) status = watch_all(g, t, false);
+    if (status == XRT_OK) {
+        g->rearm = here ? here->id : 0; g->rewatch = watch; g->step_after_rearm = step;
+        status = send_run(g, t, tid, true);
+        if (status == XRT_OK) return XRT_OK;
+    }
+    g->rearm = 0; g->rewatch = false;
+    enum xrt_status restored = here ? breakpoint_packet(g, t, here, true) : XRT_OK;
+    if (watch && restored == XRT_OK) restored = watch_all(g, t, true);
+    return restored != XRT_OK ? restored : status;
 }
-static int native_signal(unsigned remote)
+static int target_signal(const struct xrt_gdb *g, unsigned remote)
 {
-    /* RSP uses GDB's portable signal numbering, not the host's numbering. */
-    static const int signals[] = {0, SIGHUP, SIGINT, SIGQUIT, SIGILL, SIGTRAP, SIGABRT,
-        0, SIGFPE, SIGKILL, SIGBUS, SIGSEGV, SIGSYS, SIGPIPE, SIGALRM, SIGTERM,
-        SIGURG, SIGSTOP, SIGTSTP, SIGCONT, SIGCHLD, SIGTTIN, SIGTTOU, SIGIO,
-        SIGXCPU, SIGXFSZ, SIGVTALRM, SIGPROF, SIGWINCH, 0, SIGUSR1, SIGUSR2, SIGPWR, SIGPOLL};
+    /* A stub announcing native-signals reports the target system's own
+     * numbers; info.os names the table that displays them. */
+    if (g->native_signals && g->host.os != XRT_GDB_OS_UNKNOWN)
+        return remote < (g->host.os == XRT_GDB_OS_DARWIN ? 32u : 65u) ? (int)remote : 0;
+    /* Otherwise RSP uses GDB's portable numbering. Map it to Linux's generic
+     * numbers: these describe the target, never the host running this client. */
+    static const uint8_t signals[] = {0, 1 /* HUP */, 2 /* INT */, 3 /* QUIT */, 4 /* ILL */,
+        5 /* TRAP */, 6 /* ABRT */, 0, 8 /* FPE */, 9 /* KILL */, 7 /* BUS */, 11 /* SEGV */,
+        31 /* SYS */, 13 /* PIPE */, 14 /* ALRM */, 15 /* TERM */, 23 /* URG */, 19 /* STOP */,
+        20 /* TSTP */, 18 /* CONT */, 17 /* CHLD */, 21 /* TTIN */, 22 /* TTOU */, 29 /* IO */,
+        24 /* XCPU */, 25 /* XFSZ */, 26 /* VTALRM */, 27 /* PROF */, 28 /* WINCH */, 0,
+        10 /* USR1 */, 12 /* USR2 */, 30 /* PWR */, 29 /* POLL */};
     return remote < sizeof(signals) / sizeof(signals[0]) ? signals[remote] : 0;
 }
 static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
@@ -547,15 +663,23 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
     memcpy(copy, packet, size); free(g->last_stop);
     g->last_stop = copy; g->last_stop_size = size;
     unsigned signal = (unsigned)(hex(packet[1]) * 16 + hex(packet[2]));
+    g->bank_valid = false;
     if (packet[0] == 'W' || packet[0] == 'X') {
         t->state = XRT_EXITED; t->stepping = t->want_run = false; g->rearm = 0;
+        g->rewatch = false; g->watch_tid = 0;
         for (size_t i = 0; i < t->thread_count; ++i) t->threads[i].state = XRT_EXITED;
         event(t, XRT_EVENT_EXIT, t->pid, signal);
         return XRT_OK;
     }
     if (packet[0] != 'T' && packet[0] != 'S') return XRT_PROTOCOL_ERROR;
     if (packet[0] == 'S' && size != 3) return XRT_PROTOCOL_ERROR;
-    uint64_t pid = 0, raw_tid = 0; bool has_thread = false, swbreak = false;
+    uint64_t pid = 0, raw_tid = 0, watch_address = 0, fault = 0, exception = 0;
+    bool has_thread = false, swbreak = false, watch = false, has_fault = false;
+    /* debugserver expedites the fault address register with every stop. */
+    const struct xrt_gdb_register *far = NULL;
+    for (uint32_t i = 0; i < g->description.count && !far; ++i)
+        if (!strcmp(g->description.registers[i].name, "far") && g->description.registers[i].bytes == 8)
+            far = &g->description.registers[i];
     if (packet[0] == 'T') {
         size_t at = 3;
         while (at < size) {
@@ -568,11 +692,29 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
                 if (has_thread || !thread_id((const char *)colon + 1, n, &pid, &raw_tid)) return XRT_PROTOCOL_ERROR;
                 has_thread = true;
             } else if (key == 7 && !memcmp(packet + at, "swbreak", 7)) swbreak = true;
+            else if (key == 10 && !memcmp(packet + at, "watch_addr", 10)) {
+                /* debugserver: the address of the watchpoint that fired. */
+                if (watch || !hexadecimal((const char *)colon + 1, n, &watch_address)) return XRT_PROTOCOL_ERROR;
+                watch = true;
+            } else if (key == 6 && !memcmp(packet + at, "metype", 6)) {
+                if (!hexadecimal((const char *)colon + 1, n, &exception)) return XRT_PROTOCOL_ERROR;
+            }
             else if ((key == 4 && !memcmp(packet + at, "fork", 4)) ||
                      (key == 5 && !memcmp(packet + at, "vfork", 5)) ||
                      (key == 4 && !memcmp(packet + at, "exec", 4))) {
                 t->state = XRT_STOPPED; t->identity_admitted = 0; ++t->generation;
                 return problem(g, XRT_UNSUPPORTED_PROCESS_FOLLOWING, "GDB exec/fork requires a new target admission");
+            } else if (far && n == 16 && !has_fault) {
+                /* An expedited register: hexadecimal number, target-order bytes. */
+                uint64_t number;
+                if (hexadecimal((const char *)packet + at, key, &number) && number == far->number) {
+                    for (unsigned i = 0; i < 8; ++i) {
+                        int hi = hex(colon[1 + 2 * i]), lo = hex(colon[2 + 2 * i]);
+                        if (hi < 0 || lo < 0) return XRT_PROTOCOL_ERROR;
+                        fault |= (uint64_t)(hi * 16 + lo) << (8 * (t->arch && !t->arch->little_endian ? 7 - i : i));
+                    }
+                    has_fault = true;
+                }
             }
             at = (size_t)(end - packet) + 1;
         }
@@ -609,14 +751,15 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
     }
     enum xrt_stop_reason reason = initial ? XRT_STOP_EXEC : XRT_STOP_SIGNAL;
     if (!initial && stepping && signal == 5) reason = XRT_STOP_SINGLE_STEP;
-    if (!initial && g->interrupt && signal == 2) {
+    if (!initial && g->interrupt &&
+        (signal == 2 || (g->host.os == XRT_GDB_OS_DARWIN && signal == 17 /* its SIGSTOP */))) {
         reason = XRT_STOP_INTERRUPT;
         g->info.supported |= XRT_GDB_CAP_INTERRUPT;
         g->info.failed &= ~XRT_GDB_CAP_INTERRUPT;
     }
     g->interrupt = false; g->pending_signal = 0; g->unmapped_signal = false;
     if (reason == XRT_STOP_SIGNAL) {
-        int native = native_signal(signal);
+        int native = target_signal(g, signal);
         if (!native && signal) {
             g->pending_signal = signal; g->signal_tid = tid; g->unmapped_signal = true;
             t->threads[index].reason = XRT_STOP_SIGNAL;
@@ -624,7 +767,11 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB signal has no host display mapping; explicit suppression is required to resume");
         }
         t->threads[index].signal = native; g->pending_signal = signal; g->signal_tid = tid;
+        /* A Mach EXC_BREAKPOINT (6) is shown as SIGTRAP but was never raised
+         * as a signal: resuming must not deliver one. */
+        if (exception == 6) g->pending_signal = 0;
     }
+    if (g->watch_tid && thread_index(g, g->watch_tid) < 0) g->watch_tid = 0;
     struct xrt_registers regs; uint64_t pc = 0; bool known_pc = false;
     status = registers(g, t, tid, &regs);
     if (g->link.failed) return status;
@@ -643,16 +790,32 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             break;
         }
     }
+    if (!initial && watch) {
+        reason = XRT_STOP_WATCHPOINT; g->pending_signal = 0; t->threads[index].signal = 0;
+        g->watch_tid = tid;
+        /* The fault address is the byte accessed; the stub's own figure is
+         * the watchpoint's start. Trust the first only inside a watchpoint. */
+        if (!has_fault || !publish_watch(g, t, tid, known_pc, pc, fault))
+            (void)publish_watch(g, t, tid, known_pc, pc, watch_address);
+        if (g->link.failed) return XRT_TRANSPORT_FAILED;
+    }
     if (swbreak && reason != XRT_STOP_BREAKPOINT) {
         reason = XRT_STOP_BREAKPOINT; g->pending_signal = 0; t->threads[index].signal = 0;
     }
     t->threads[index].reason = reason;
-    if (g->rearm) {
-        int bp_index = xrt_breakpoint_index(t, g->rearm);
-        g->rearm = 0;
-        if (bp_index < 0) return XRT_UNKNOWN_BREAKPOINT;
-        status = breakpoint_packet(g, t, &t->breakpoints[bp_index], true);
-        if (status != XRT_OK) return status;
+    if (g->rearm || g->rewatch) {
+        if (g->rewatch) {
+            g->rewatch = false;
+            status = watch_all(g, t, true);
+            if (status != XRT_OK) { g->rearm = 0; return status; }
+        }
+        if (g->rearm) {
+            int bp_index = xrt_breakpoint_index(t, g->rearm);
+            g->rearm = 0;
+            if (bp_index < 0) return XRT_UNKNOWN_BREAKPOINT;
+            status = breakpoint_packet(g, t, &t->breakpoints[bp_index], true);
+            if (status != XRT_OK) return status;
+        }
         if (!g->step_after_rearm && reason == XRT_STOP_SINGLE_STEP) return send_run(g, t, tid, false);
     }
     event(t, reason == XRT_STOP_SINGLE_STEP ? XRT_EVENT_STEP_COMPLETE : XRT_EVENT_STOP, tid, signal);
@@ -693,6 +856,8 @@ static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
             status = breakpoint_packet(g, t, &t->breakpoints[i], false);
             if (status != XRT_OK) return status;
         }
+    status = watch_all(g, t, false);
+    if (status != XRT_OK) return status;
     char command[40];
     if (g->multiprocess && g->process) snprintf(command, sizeof(command), "D;%" PRIx64, g->process);
     else strcpy(command, "D");
@@ -702,6 +867,7 @@ static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
     event(t, XRT_EVENT_DETACH, t->pid, 0);
     t->pid = 0; t->thread_count = t->breakpoint_count = 0; t->state = XRT_IDLE;
     t->detach_pending = t->owned = false; g->thread_count = 0; g->process = 0; g->selected = 0;
+    memset(t->watchpoints, 0, sizeof(t->watchpoints)); g->watch_tid = 0; g->rewatch = false;
     return XRT_OK;
 }
 enum xrt_status xrt_gdb_health(const struct xrt_gdb *g)
@@ -713,12 +879,14 @@ void xrt_gdb_info(const struct xrt_gdb *g, struct xrt_gdb_info *out)
     *out = g->info;
     out->packet_size = (uint32_t)g->link.packet_size;
     out->register_count = g->description.count;
+    out->os = g->host.os;
+    out->address_bits = g->host.address_bits;
 }
 void xrt_gdb_abandon(struct xrt_gdb *g) { xrt_gdb_disconnect(&g->link); }
 void xrt_gdb_free(struct xrt_gdb *g)
 {
     if (!g) return;
-    xrt_gdb_disconnect(&g->link); free(g->last_stop); free(g);
+    xrt_gdb_disconnect(&g->link); free(g->last_stop); free(g->bank); free(g);
 }
 uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *g) { return g->link.mutation_written; }
 enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
@@ -738,6 +906,7 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     g->multiprocess = feature((char *)g->reply, "multiprocess+");
     bool noack = feature((char *)g->reply, "QStartNoAckMode+");
     bool nonstop = feature((char *)g->reply, "QNonStop+");
+    g->native_signals = feature((char *)g->reply, "native-signals+");
     if (!feature((char *)g->reply, "qXfer:features:read+")) {
         status = problem(g, XRT_REGISTER_UNAVAILABLE, "GDB stub lacks qXfer:features:read target.xml");
         goto fail;
@@ -770,6 +939,35 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     g->vcont_signal_step = feature((char *)g->reply, "S");
     if (g->vcont_step) g->info.supported |= XRT_GDB_CAP_STEP;
     else g->info.unsupported |= XRT_GDB_CAP_STEP;
+    g->info.unsupported |= XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES;
+    if (g->native_signals) {
+        /* An LLDB-family stub. Its host and process descriptions select the
+         * signal table and stand in for what target.xml leaves out. */
+        status = query(g, "qHostInfo");
+        if (status != XRT_OK) goto fail;
+        if (g->length && g->reply[0] != 'E' &&
+            xrt_gdb_host_parse((char *)g->reply, g->length, &g->host) != XRT_OK) {
+            status = problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB qHostInfo reply"); goto fail;
+        }
+        status = query(g, "qProcessInfo");
+        if (status != XRT_OK) goto fail;
+        if (g->length && g->reply[0] != 'E' &&
+            xrt_gdb_process_parse((char *)g->reply, g->length, &g->host) != XRT_OK) {
+            status = problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB qProcessInfo reply"); goto fail;
+        }
+        if (g->host.pid && !g->multiprocess) g->process = g->host.pid;
+    }
+    if (g->host.os == XRT_GDB_OS_DARWIN) {
+        g->info.unsupported &= ~(XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES);
+        status = query(g, "qWatchpointSupportInfo:");
+        if (status != XRT_OK) goto fail;
+        uint64_t slots = 0;
+        if (g->length > 5 && !memcmp(g->reply, "num:", 4) && g->reply[g->length - 1] == ';' &&
+            hexadecimal((char *)g->reply + 4, g->length - 5, &slots) && slots) {
+            g->watch_capacity = slots > XRT_MAX_WATCHPOINTS ? XRT_MAX_WATCHPOINTS : (uint8_t)slots;
+            g->info.unsupported &= ~XRT_GDB_CAP_WATCH;
+        }
+    }
     /* Establish the stopped inferior before requesting target.xml. Some
      * gdbservers build their description only while encoding this reply. */
     status = query(g, "?");
@@ -779,7 +977,11 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     memcpy(initial_stop, g->reply, initial_size);
     char *xml = NULL; size_t size = 0;
     status = annex(g, "target.xml", &xml, &size);
-    if (status == XRT_OK) status = xrt_gdb_description_parse(&g->description, xml, size, annex, g);
+    /* debugserver's target.xml names no architecture; its Mach CPU type does. */
+    const char *fallback = g->host.os == XRT_GDB_OS_DARWIN &&
+        g->host.cputype == UINT32_C(0x0100000c) ? "aarch64" : NULL;
+    if (status == XRT_OK)
+        status = xrt_gdb_description_parse_for(&g->description, xml, size, annex, g, fallback);
     free(xml);
     if (status != XRT_OK) {
         if (g->description.reason[0]) snprintf(g->info.reason, sizeof(g->info.reason), "%s", g->description.reason);
@@ -840,7 +1042,7 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
     if (!t->identity_admitted) return XRT_UNSUPPORTED_ARCHITECTURE;
     switch (call->op) {
     case XRT_RPC_CONTINUE: {
-        int32_t tid = g->pending_signal ? g->signal_tid : 0;
+        int32_t tid = g->pending_signal ? g->signal_tid : g->watch_tid;
         if (!tid) {
             for (size_t i = 0; i < t->thread_count; ++i)
                 if (t->threads[i].reason != XRT_STOP_NONE) { tid = t->threads[i].tid; break; }
@@ -946,8 +1148,52 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
         return problem(g, XRT_FILE_UNAVAILABLE, "GDB process files and library mapping are unavailable");
     case XRT_RPC_WATCH_SET:
     case XRT_RPC_WATCH_REMOVE:
-    case XRT_RPC_WATCH_CAPACITY:
-        return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB hardware watchpoints are unsupported by this client");
+    case XRT_RPC_WATCH_CAPACITY: {
+        if (!g->watch_capacity)
+            return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB hardware watchpoints are unsupported by this client");
+        if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
+        if (call->op == XRT_RPC_WATCH_CAPACITY) {
+            if (call->value) *call->value = g->watch_capacity;
+            return XRT_OK;
+        }
+        if (call->op == XRT_RPC_WATCH_REMOVE) {
+            for (unsigned i = 0; i < XRT_MAX_WATCHPOINTS; ++i) {
+                struct xrt_watchpoint *watch = &t->watchpoints[i];
+                if (!watch->present || watch->id != call->args[0]) continue;
+                enum xrt_status status = watch_packet(g, t, i, false);
+                if (status != XRT_OK) return status;
+                watch->present = false;
+                event(t, XRT_EVENT_WATCHPOINT_REMOVED, t->pid, (int64_t)call->args[0]);
+                return XRT_OK;
+            }
+            return XRT_UNKNOWN_WATCHPOINT;
+        }
+        const uint64_t address = call->args[0], length = call->args[1], kind = call->args[2];
+        if (kind > XRT_WATCH_EXECUTE) return XRT_INVALID_ARGUMENT;
+        if (kind == XRT_WATCH_EXECUTE) return XRT_EXECUTION_WATCHPOINTS_UNSUPPORTED;
+        if ((length != 1 && length != 2 && length != 4 && length != 8) || address % length)
+            return XRT_INVALID_WATCH_RANGE;
+        unsigned slot = 0;
+        while (slot < g->watch_capacity && t->watchpoints[slot].present) ++slot;
+        if (slot == g->watch_capacity || t->next_probe_id == UINT64_MAX) return XRT_WATCHPOINT_LIMIT;
+        uint8_t bytes[8] = {0}; size_t count; uint64_t previous = 0;
+        enum xrt_status status = read_memory(g, t, address, bytes, (size_t)length, &count);
+        if (status != XRT_OK || count != length) return status != XRT_OK ? status : XRT_MEMORY_UNREADABLE;
+        for (unsigned i = 0; i < length; ++i) previous |= (uint64_t)bytes[i] << (8 * i);
+        t->watchpoints[slot] = (struct xrt_watchpoint){.address = address, .length = (uint8_t)length,
+            .kind = (enum xrt_watch_kind)kind, .previous = previous};
+        status = watch_packet(g, t, slot, true);
+        if (status != XRT_OK) {
+            if (status == XRT_UNSUPPORTED_CONTROL) g->info.unsupported |= XRT_GDB_CAP_WATCH;
+            return status;
+        }
+        t->watchpoints[slot].id = t->next_probe_id++; t->watchpoints[slot].present = true;
+        g->info.supported |= XRT_GDB_CAP_WATCH;
+        event(t, XRT_EVENT_WATCHPOINT_SET, t->pid, (int64_t)t->watchpoints[slot].id);
+        t->events[t->event_count - 1].address = address;
+        if (call->value) *call->value = t->watchpoints[slot].id;
+        return XRT_OK;
+    }
     case XRT_RPC_LAUNCH:
     case XRT_RPC_ATTACH:
     case XRT_RPC_RESET:
@@ -955,4 +1201,76 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
     default:
         return problem(g, XRT_UNSUPPORTED_CONTROL, "Operation is unavailable on the GDB remote backend");
     }
+}
+enum xrt_status xrt_gdb_regions(struct xrt_gdb *g, struct xrt_target *t,
+                                struct xrt_gdb_region *out, size_t capacity, size_t *total)
+{
+    if (!g || !t || !total || (capacity && !out)) return XRT_INVALID_ARGUMENT;
+    *total = 0;
+    if (g->link.failed) return XRT_TRANSPORT_FAILED;
+    if (g->info.unsupported & XRT_GDB_CAP_REGIONS)
+        return problem(g, XRT_FILE_UNAVAILABLE, "GDB stub has no memory region query");
+    if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
+    /* One round trip per region. The walk stops at the region limit or after
+     * most of one operation budget, well before the link deadline. */
+    const uint64_t budget = xrt_now() + XRT_GDB_OPERATION_NS / 10 * 8;
+    g->link.operation_deadline_ns = xrt_now() + XRT_GDB_OPERATION_NS;
+    for (uint64_t address = 0;;) {
+        char command[48]; bool cut;
+        snprintf(command, sizeof(command), "qMemoryRegionInfo:%" PRIx64, address);
+        enum xrt_status status = query_prefix(g, command, &cut);
+        if (status != XRT_OK) return status;
+        if ((!g->length || g->reply[0] == 'E') && !*total) {
+            if (!g->length) g->info.unsupported |= XRT_GDB_CAP_REGIONS;
+            return problem(g, XRT_FILE_UNAVAILABLE, "GDB stub has no memory region query");
+        }
+        if (!g->length || g->reply[0] == 'E') break;
+        struct xrt_gdb_region region;
+        if (xrt_gdb_region_parse((char *)g->reply, g->length, cut, address, &region) != XRT_OK) {
+            g->info.failed |= XRT_GDB_CAP_REGIONS;
+            return problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB memory region reply");
+        }
+        if (!region.size) break;
+        if (*total == XRT_GDB_REGIONS_MAX)
+            return problem(g, XRT_BUFFER_TOO_SMALL, "GDB memory map exceeds the region limit");
+        if (xrt_now() > budget)
+            return problem(g, XRT_DISCOVERY_BUDGET, "GDB memory map walk exceeded its time budget");
+        if (*total < capacity) out[*total] = region;
+        ++*total;
+        const uint64_t last = region.start + (region.size - 1);
+        if (last == UINT64_MAX) break;
+        address = last + 1; /* Past the address asked: the walk always advances. */
+    }
+    g->info.supported |= XRT_GDB_CAP_REGIONS; g->info.failed &= ~XRT_GDB_CAP_REGIONS;
+    return XRT_OK;
+}
+enum xrt_status xrt_gdb_images(struct xrt_gdb *g, struct xrt_target *t,
+                               struct xrt_gdb_image *out, size_t capacity, size_t *total)
+{
+    if (!g || !t || !total || (capacity && !out)) return XRT_INVALID_ARGUMENT;
+    *total = 0;
+    if (g->link.failed) return XRT_TRANSPORT_FAILED;
+    if (g->info.unsupported & XRT_GDB_CAP_IMAGES)
+        return problem(g, XRT_FILE_UNAVAILABLE, "GDB stub has no loaded-image query");
+    if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
+    g->link.operation_deadline_ns = xrt_now() + XRT_GDB_OPERATION_NS;
+    bool cut;
+    /* Addresses and paths only: load commands would multiply the reply. */
+    enum xrt_status status = query_prefix(g,
+        "jGetLoadedDynamicLibrariesInfos:{\"fetch_all_solibs\":true,\"report_load_commands\":false}", &cut);
+    if (status != XRT_OK) return status;
+    if (cut) return problem(g, XRT_BUFFER_TOO_SMALL, "GDB loaded-image list exceeds the packet limit");
+    if (!g->length || g->reply[0] != '{') {
+        if (!g->length) g->info.unsupported |= XRT_GDB_CAP_IMAGES;
+        return problem(g, XRT_FILE_UNAVAILABLE, "GDB stub has no loaded-image query");
+    }
+    status = xrt_gdb_images_parse((char *)g->reply, g->length, out, capacity, total);
+    if (status == XRT_BUFFER_TOO_SMALL)
+        return problem(g, status, "GDB loaded-image list exceeds the image limit");
+    if (status != XRT_OK) {
+        g->info.failed |= XRT_GDB_CAP_IMAGES;
+        return problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB loaded-image list");
+    }
+    g->info.supported |= XRT_GDB_CAP_IMAGES; g->info.failed &= ~XRT_GDB_CAP_IMAGES;
+    return XRT_OK;
 }

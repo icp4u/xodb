@@ -83,6 +83,9 @@ test "a yielded install or image read keeps resolution pending until retried" {
         try std.testing.expect(session.target.site[0].pending);
         try std.testing.expectEqualStrings(@errorName(err), manager.entries.items[0].diagnostic.?);
     }
+    session.target.failure = error.RemoteOutcomeUnknown;
+    try std.testing.expectError(error.RemoteOutcomeUnknown, manager.resolve(&session));
+    try std.testing.expectEqualStrings("RemoteOutcomeUnknown", manager.entries.items[0].diagnostic.?);
     session.target.failure = null;
     const diagnostic_revision = manager.display_revision;
     try manager.resolve(&session);
@@ -189,7 +192,7 @@ pub const Manager = struct {
         self.epoch = session.target.snapshot().image_epoch;
         if (!self.resolving) self.file_reads = std.mem.zeroes(rt.struct_xrt_file_budget);
         try self.resolve(session);
-        self.installHook(session);
+        try self.installHook(session);
         self.observed = session.target.snapshot().generation;
         return id;
     }
@@ -221,7 +224,7 @@ pub const Manager = struct {
             self.display_revision +%= 1;
         }
     }
-    fn installHook(self: *Manager, session: anytype) void {
+    fn installHook(self: *Manager, session: anytype) !void {
         if (self.hook != null or self.entries.items.len == 0) return;
         // Resuming a planted breakpoint needs a hardware step or software
         // successors. Skip discovery when the row has neither. Symbols already
@@ -240,11 +243,13 @@ pub const Manager = struct {
         var budget = std.mem.zeroInit(rt.struct_xrt_file_budget, .{ .limit_bytes = 128 * 1024, .deadline_ns = now + 2_000_000_000, .cancel = self.cancel });
         runtime.check(rt.xrt_target_file_budget(session.target.handle, &budget)) catch |err| {
             self.loader_status = @errorName(err);
+            try runtime.propagateUnknownOutcome(err);
             return;
         };
         defer _ = rt.xrt_target_file_budget(session.target.handle, null);
         runtime.check(rt.xrt_target_loader(session.target.handle, &self.loader_reads, self.cancel)) catch |err| {
             self.loader_status = if (err == error.InvalidArgument and rt.xrt_target_is_remote(session.target.handle)) "agent needs updating: loader metadata unsupported" else @errorName(err);
+            try runtime.propagateUnknownOutcome(err);
             return;
         };
         const function = self.loader_reads.break_address;
@@ -259,9 +264,14 @@ pub const Manager = struct {
         };
         const id = session.target.setBreakpoint(function, false) catch |err| {
             self.loader_status = @errorName(err);
+            try runtime.propagateUnknownOutcome(err);
             return;
         };
-        session.target.markBreakpointInternal(id, true) catch return;
+        session.target.markBreakpointInternal(id, true) catch |err| {
+            self.loader_status = @errorName(err);
+            try runtime.propagateUnknownOutcome(err);
+            return;
+        };
         self.hook = id;
         self.debug_address = debug;
         self.loader_status = "glibc loader rendezvous";
@@ -277,14 +287,13 @@ pub const Manager = struct {
     }
     fn resolutionError(self: *Manager, item: *Entry, err: anyerror) !bool {
         self.diagnostic(item, @errorName(err));
+        try runtime.propagateUnknownOutcome(err);
         switch (err) {
             error.SymbolDiscoveryPending, error.SymbolDiscoveryBudgetExceeded => {
                 self.resolving = true;
                 return true;
             },
-            // A sent reserve/resolve whose reply was lost may have patched
-            // the target. Never present that as an ordinary pending row.
-            error.SymbolDiscoveryCancelled, error.RemoteOutcomeUnknown => return err,
+            error.SymbolDiscoveryCancelled => return err,
             else => return false,
         }
     }
@@ -384,7 +393,7 @@ pub const Manager = struct {
             try self.resolve(session);
             return;
         }
-        self.installHook(session);
+        try self.installHook(session);
         var loader_hit = false;
         if (self.hook) |id| for (session.target.threadSlice()) |thread| {
             if (thread.reason == .breakpoint and probe(session, id) != null and thread.breakpoint_address == probe(session, id).?.address) loader_hit = true;

@@ -1,6 +1,5 @@
 #include "gdb_description.h"
 #include "gdb_packet.h"
-#include <elf.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -113,6 +112,7 @@ static enum xrt_status add_register(struct parser *p, const struct token *t)
 {
     struct xrt_gdb_description *d = p->description;
     const char *name = attribute(t, "name"), *regnum = attribute(t, "regnum");
+    const bool pseudo = attribute(t, "value_regnums") != NULL;
     uint32_t bits, n = d->next_number;
     if (!name || !*name || strlen(name) >= sizeof(d->registers[0].name) ||
         !number(attribute(t, "bitsize"), &bits) || !bits || bits % 8 ||
@@ -123,9 +123,13 @@ static enum xrt_status add_register(struct parser *p, const struct token *t)
     for (uint32_t i = 0; i < d->count; ++i)
         if (!strcmp(name, d->registers[i].name))
             return error(p, XRT_PROTOCOL_ERROR, "Duplicate GDB XML register name");
+    d->next_number = n + 1;
+    /* A view of other registers (debugserver's w0 over x0) owns a number but
+     * no bytes of the register bank. */
+    if (pseudo) return XRT_OK;
     struct xrt_gdb_register *r = &d->registers[d->count++];
     strcpy(r->name, name); r->number = n; r->offset = d->register_bytes; r->bytes = bits / 8;
-    d->register_bytes += r->bytes; d->next_number = n + 1;
+    d->register_bytes += r->bytes;
     return XRT_OK;
 }
 static enum xrt_status document(struct parser *p, const char *text, size_t size, unsigned depth)
@@ -210,11 +214,14 @@ static enum xrt_status document(struct parser *p, const char *text, size_t size,
 const struct xrt_gdb_register *xrt_gdb_description_register(
     const struct xrt_gdb_description *d, const struct xrt_register_desc *desc)
 {
-    const char *name = desc->name;
+    const char *name = desc->name, *other = NULL;
     if (!strcmp(name, "pstate")) name = "cpsr";
+    /* debugserver names the AArch64 frame and link registers by role. */
+    if (d->arch && d->arch->machine == XRT_AARCH64)
+        other = !strcmp(name, "x29") ? "fp" : !strcmp(name, "x30") ? "lr" : NULL;
     for (uint32_t i = 0; i < d->count; ++i) {
         const struct xrt_gdb_register *r = &d->registers[i];
-        if (!strcmp(r->name, name) &&
+        if ((!strcmp(r->name, name) || (other && !strcmp(r->name, other))) &&
             (r->bytes == desc->width || (r->bytes == 4 &&
              (!strcmp(desc->name, "eflags") || !strcmp(desc->name, "pstate")))))
             return r;
@@ -225,13 +232,22 @@ enum xrt_status xrt_gdb_description_parse(struct xrt_gdb_description *d,
                                           const char *text, size_t size,
                                           xrt_gdb_annex loader, void *context)
 {
+    return xrt_gdb_description_parse_for(d, text, size, loader, context, NULL);
+}
+enum xrt_status xrt_gdb_description_parse_for(struct xrt_gdb_description *d,
+                                              const char *text, size_t size,
+                                              xrt_gdb_annex loader, void *context,
+                                              const char *fallback)
+{
     if (!d) return XRT_INVALID_ARGUMENT;
     *d = (struct xrt_gdb_description){0};
     struct parser p = {.description = d, .load = loader, .context = context};
     enum xrt_status status = document(&p, text, size, 0);
     if (status != XRT_OK) return status;
-    if (!strcmp(d->architecture, "i386:x86-64")) d->arch = xrt_arch_get(EM_X86_64);
-    else if (!strcmp(d->architecture, "aarch64")) d->arch = xrt_arch_get(EM_AARCH64);
+    if (!d->architecture[0] && fallback && strlen(fallback) < sizeof(d->architecture))
+        strcpy(d->architecture, fallback);
+    if (!strcmp(d->architecture, "i386:x86-64")) d->arch = xrt_arch_get(XRT_X86_64);
+    else if (!strcmp(d->architecture, "aarch64")) d->arch = xrt_arch_get(XRT_AARCH64);
     else return error(&p, XRT_UNSUPPORTED_ARCHITECTURE, "GDB target.xml architecture has no supported register mapping");
     if (!d->arch || !d->count)
         return error(&p, XRT_REGISTER_UNAVAILABLE, "GDB target.xml has no register description");

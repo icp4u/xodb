@@ -105,6 +105,7 @@ pub const Worker = struct {
     publications: boundary.Publications,
     completions: Completions = .{},
     stopping: std.atomic.Value(bool) = .init(false),
+    stop_deadline: std.atomic.Value(u64) = .init(0),
     done: std.atomic.Value(bool) = .init(false),
     failure: ?anyerror = null, // Read only after done.acquire or join.
     presentation_error: std.atomic.Value(u16) = .init(0),
@@ -176,15 +177,33 @@ pub const Worker = struct {
             };
         }
     }
-    pub fn requestStop(self: *Worker) void {
+    pub const stop_grace_ns = 2 * std.time.ns_per_s;
+
+    /// Close admission immediately, preserving the connection for the active
+    /// command and shutdown exports. Repeated requests never extend the grace.
+    pub fn requestGracefulStop(self: *Worker) void {
         self.commands.close() catch unreachable;
+        _ = self.stop_deadline.cmpxchgStrong(0, linux.now() +| stop_grace_ns, .acq_rel, .acquire);
         self.stopping.store(true, .release);
+    }
+    /// Fatal owner failures can still cancel immediately.
+    pub fn requestStop(self: *Worker) void {
+        self.requestGracefulStop();
         rt.xrt_cancel_request(self.cancel);
+    }
+    /// Called by the joining thread, including while the GUI pumps close events.
+    pub fn cancelExpiredStop(self: *Worker, now: u64) void {
+        const deadline = self.stop_deadline.load(.acquire);
+        if (deadline != 0 and now >= deadline and !self.done.load(.acquire)) rt.xrt_cancel_request(self.cancel);
     }
     /// Blocking owner hand-back for non-GUI callers. A frame waits for done
     /// while pumping its window, then calls joinCompleted instead.
     pub fn join(self: *Worker) void {
-        self.requestStop();
+        self.requestGracefulStop();
+        while (!self.done.load(.acquire)) {
+            self.cancelExpiredStop(linux.now());
+            _ = c.usleep(1000);
+        }
         if (self.thread) |thread| thread.join();
         self.thread = null;
         self.configure(false);
@@ -267,7 +286,7 @@ pub const Worker = struct {
             // the GUI's commands and the refresh below.
             server.pump(root) catch |err| self.reportPresentationError(err);
             if (server.closed and server.queued == 0 and server.pending_sequence == null) {
-                self.requestStop();
+                self.requestGracefulStop();
                 return false;
             }
         }
@@ -619,6 +638,72 @@ pub const Worker = struct {
         self.last_tree_revision = if (processes) |v| v.revision else self.executor.tree.revision;
     }
 };
+
+test "graceful shutdown preserves the connection until its fixed deadline" {
+    const Barrier = struct {
+        bootstrap_release: std.atomic.Value(bool) = .init(false),
+        shutdown_entered: std.atomic.Value(bool) = .init(false),
+        shutdown_release: std.atomic.Value(bool) = .init(false),
+        fn bootstrap(context: *anyopaque, _: *rt.struct_xrt_cancel) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            while (!self.bootstrap_release.load(.acquire)) _ = c.usleep(1000);
+        }
+        fn shutdown(context: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(context));
+            self.shutdown_entered.store(true, .release);
+            while (!self.shutdown_release.load(.acquire)) _ = c.usleep(1000);
+        }
+    };
+    for ([_]bool{ false, true }) |expire| {
+        const test_a = std.testing.allocator;
+        const session = try test_a.create(@import("session.zig").Session);
+        defer test_a.destroy(session);
+        session.* = @import("session.zig").Session.init();
+        defer session.deinit();
+        const tree = try test_a.create(Tree);
+        defer test_a.destroy(tree);
+        tree.* = .{};
+        tree.init(session);
+        defer tree.deinit();
+        var barrier: Barrier = .{};
+        const worker = try Worker.start(tree, .{
+            .connection = 1,
+            .bootstrap = .{ .context = &barrier, .run = Barrier.bootstrap },
+            .shutdown = .{ .context = &barrier, .run = Barrier.shutdown },
+        });
+        defer {
+            barrier.bootstrap_release.store(true, .release);
+            barrier.shutdown_release.store(true, .release);
+            worker.join();
+            worker.destroy();
+        }
+        worker.requestGracefulStop();
+        const deadline = worker.stop_deadline.load(.acquire);
+        try std.testing.expect(deadline != 0);
+        const command = try boundary.Command.create(a, .{ .stamp = dispatch.stamp(1, session), .actor = .human, .action = .poll });
+        defer command.destroy();
+        try std.testing.expectError(error.Closed, worker.commands.trySubmit(command));
+        barrier.bootstrap_release.store(true, .release);
+        const wait_deadline = linux.now() + 10 * std.time.ns_per_s;
+        while (!barrier.shutdown_entered.load(.acquire)) {
+            if (linux.now() > wait_deadline) return error.ShutdownDeadline;
+            _ = c.usleep(1000);
+        }
+        try std.testing.expect(!rt.xrt_cancel_requested(worker.cancel));
+        worker.cancelExpiredStop(deadline - 1);
+        try std.testing.expect(!rt.xrt_cancel_requested(worker.cancel));
+        worker.requestGracefulStop();
+        try std.testing.expectEqual(deadline, worker.stop_deadline.load(.acquire));
+        if (expire) {
+            worker.cancelExpiredStop(deadline);
+            try std.testing.expect(rt.xrt_cancel_requested(worker.cancel));
+        }
+        barrier.shutdown_release.store(true, .release);
+        worker.join();
+        worker.cancelExpiredStop(std.math.maxInt(u64));
+        try std.testing.expectEqual(expire, rt.xrt_cancel_requested(worker.cancel));
+    }
+}
 
 test "silent saturated queue cancels exactly once with full completions" {
     const test_a = std.testing.allocator;

@@ -1,5 +1,8 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+// The subset of runtime_sources (plus the agent's main) that has no Linux-only
+// dependency; the macos-seam step and `test` compile it for aarch64-macos.
+const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "arch.c", "loongarch_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -378,6 +381,21 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/gdb_description.c", "tests/runtime-gdb-description.c" }) |source|
         gdb_description_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(gdb_description_tests);
+    const gdb_lldb_tests = b.addExecutable(.{ .name = "xodb-gdb-lldb-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    gdb_lldb_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/gdb_lldb.c", "tests/runtime-gdb-lldb.c" }) |source|
+        gdb_lldb_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(gdb_lldb_tests);
+    // The GDB remote and agent wire clients, and the decoders around them,
+    // must keep compiling for a macOS host. Objects only: nothing is linked,
+    // so Zig's bundled Darwin headers are all it needs. Linux-only sources
+    // (ptrace, perf, /proc, ELF loading) are deliberately not in this list.
+    const macos_seam = b.addLibrary(.{ .name = "xodb-macos-seam", .linkage = .static, .root_module = b.createModule(.{ .target = b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .macos }), .optimize = optimize, .link_libc = true }) });
+    macos_seam.root_module.addIncludePath(b.path("src/runtime"));
+    for (macos_seam_sources) |source|
+        macos_seam.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    const macos_seam_step = b.step("macos-seam", "Compile the portable runtime client sources for aarch64-macos");
+    macos_seam_step.dependOn(&macos_seam.step);
     const gdb_model_tests = b.addExecutable(.{ .name = "xodb-gdb-model-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_model_tests.root_module.addIncludePath(b.path("src/runtime"));
     for (runtime_sources) |source|
@@ -459,6 +477,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(gdb_link_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_description_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_model_tests).step);
+    test_step.dependOn(&b.addRunArtifact(gdb_lldb_tests).step);
+    test_step.dependOn(&macos_seam.step);
     const symbol_tests = b.addExecutable(.{ .name = "xodb-runtime-symbol-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     symbol_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/elf_symbols.c", "tests/runtime-symbols.c" }) |source| {

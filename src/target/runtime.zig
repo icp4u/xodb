@@ -52,6 +52,12 @@ pub fn registerText(allocator: std.mem.Allocator, regs: Registers, desc: c.struc
 }
 pub const DwarfRegisters = [c.XRT_DWARF_REGISTER_COUNT]?u64;
 
+/// A fallback must not hide a target mutation whose reply was lost. Other
+/// failures may still use the caller's ordinary pending/unavailable policy.
+pub fn propagateUnknownOutcome(err: anyerror) error{RemoteOutcomeUnknown}!void {
+    if (err == error.RemoteOutcomeUnknown) return error.RemoteOutcomeUnknown;
+}
+
 pub fn check(status: c.enum_xrt_status) !void {
     switch (status) {
         c.XRT_OK => {},

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sys/ptrace.h>
 #include <stdio.h>
 #include <sys/syscall.h>
 

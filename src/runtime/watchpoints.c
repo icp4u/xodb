@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sys/ptrace.h>
 #include <sys/uio.h>
 #if defined(__x86_64__) && !defined(__ILP32__)
 #include <sys/user.h>

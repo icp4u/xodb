@@ -44,6 +44,47 @@ pub fn signalName(number: i32) []const u8 {
         else => "signal",
     };
 }
+/// Signal numbers belong to the target's operating system, not to this host.
+/// Darwin shares 1-6, 8, 9, 11 and 13-15 with Linux and differs elsewhere.
+pub const SignalTable = enum { linux, darwin };
+pub fn signalNameIn(table: SignalTable, number: i32) []const u8 {
+    if (table == .linux) return signalName(number);
+    return switch (number) {
+        0 => "none",
+        1 => "SIGHUP",
+        2 => "SIGINT",
+        3 => "SIGQUIT",
+        4 => "SIGILL",
+        5 => "SIGTRAP",
+        6 => "SIGABRT",
+        7 => "SIGEMT",
+        8 => "SIGFPE",
+        9 => "SIGKILL",
+        10 => "SIGBUS",
+        11 => "SIGSEGV",
+        12 => "SIGSYS",
+        13 => "SIGPIPE",
+        14 => "SIGALRM",
+        15 => "SIGTERM",
+        16 => "SIGURG",
+        17 => "SIGSTOP",
+        18 => "SIGTSTP",
+        19 => "SIGCONT",
+        20 => "SIGCHLD",
+        21 => "SIGTTIN",
+        22 => "SIGTTOU",
+        23 => "SIGIO",
+        24 => "SIGXCPU",
+        25 => "SIGXFSZ",
+        26 => "SIGVTALRM",
+        27 => "SIGPROF",
+        28 => "SIGWINCH",
+        29 => "SIGINFO",
+        30 => "SIGUSR1",
+        31 => "SIGUSR2",
+        else => "signal",
+    };
+}
 pub const State = enum { idle, running, stopped, exited };
 pub const Thread = struct { id: u64, tid: c.pid_t, state: State, signal: c_int = 0, newborn: bool = false, interrupt_pending: bool = false, reason: bp.StopReason = .none, breakpoint_address: u64 = 0, saved_debug: ?bp.DebugRegisters = null, arm_watch_slots: ?u8 = null, arm_watch_hit: ?bp.ArmWatchHit = null };
 pub const X86Registers = runtime.X86Registers;
@@ -136,6 +177,13 @@ fn birthSnapshot(v: rt.struct_xrt_birth) Birth {
 pub const GdbAvailability = enum { available, unsupported, failed, not_tested };
 pub const GdbRemoteInfo = struct {
     architecture: []const u8,
+    /// The target's operating system as the stub reports it; it selects the
+    /// signal table. `unknown` keeps GDB's numbering with Linux names.
+    os: enum { unknown, linux, darwin },
+    /// Significant pointer bits (zero: unknown); higher bits may carry tags.
+    address_bits: u32,
+    memory_regions: GdbAvailability,
+    images: GdbAvailability,
     packet_size: u32,
     register_count: u32,
     attached: ?bool,
@@ -149,6 +197,14 @@ pub const GdbRemoteInfo = struct {
     interrupt: GdbAvailability,
     last_reason: []const u8,
 };
+fn gdbListStatus(status: rt.enum_xrt_status) !void {
+    return switch (status) {
+        rt.XRT_FILE_UNAVAILABLE => error.GdbListUnavailable,
+        rt.XRT_BUFFER_TOO_SMALL => error.GdbListTooLarge,
+        rt.XRT_DISCOVERY_BUDGET => error.GdbListBudgetExceeded,
+        else => runtime.check(status),
+    };
+}
 fn gdbAvailability(info: rt.struct_xrt_gdb_info, bit: u64) GdbAvailability {
     return if (info.failed & bit != 0) .failed else if (info.supported & bit != 0) .available else if (info.unsupported & bit != 0) .unsupported else .not_tested;
 }
@@ -198,6 +254,14 @@ pub const Target = struct {
         runtime.check(rt.xrt_target_gdb_info(self.handle, cache)) catch return null;
         return .{
             .architecture = std.mem.sliceTo(&cache.architecture, 0),
+            .os = switch (cache.os) {
+                rt.XRT_GDB_OS_LINUX => .linux,
+                rt.XRT_GDB_OS_DARWIN => .darwin,
+                else => .unknown,
+            },
+            .address_bits = cache.address_bits,
+            .memory_regions = gdbAvailability(cache.*, rt.XRT_GDB_CAP_REGIONS),
+            .images = gdbAvailability(cache.*, rt.XRT_GDB_CAP_IMAGES),
             .packet_size = cache.packet_size,
             .register_count = cache.register_count,
             .attached = if (cache.attached < 0) null else cache.attached != 0,
@@ -211,6 +275,22 @@ pub const Target = struct {
             .interrupt = gdbAvailability(cache.*, rt.XRT_GDB_CAP_INTERRUPT),
             .last_reason = std.mem.sliceTo(&cache.reason, 0),
         };
+    }
+    /// The table naming this target's signal numbers.
+    pub fn signalTable(self: *const Target) SignalTable {
+        const info = self.gdbRemoteInfo() orelse return .linux;
+        return if (info.os == .darwin) .darwin else .linux;
+    }
+    /// Rows stored in `out`; a longer list is cut. Stopped Darwin stubs only.
+    pub fn gdbRegions(self: *Target, out: []rt.struct_xrt_gdb_region) !usize {
+        var total: usize = 0;
+        try gdbListStatus(rt.xrt_target_gdb_regions(self.handle, out.ptr, out.len, &total));
+        return @min(total, out.len);
+    }
+    pub fn gdbImages(self: *Target, out: []rt.struct_xrt_gdb_image) !usize {
+        var total: usize = 0;
+        try gdbListStatus(rt.xrt_target_gdb_images(self.handle, out.ptr, out.len, &total));
+        return @min(total, out.len);
     }
     fn rawView(self: *const Target) rt.struct_xrt_target_view {
         var view: rt.struct_xrt_target_view = undefined;
@@ -438,7 +518,7 @@ pub const Target = struct {
         const index_ = self.index(tid) orelse return error.UnknownThread;
         const t = self.threadSlice()[index_];
         if (t.state != .stopped) return error.NotStopped;
-        var result = StopInfo{ .tid = tid, .reason = t.reason, .signal = t.signal, .signal_name = signalName(t.signal), .read_only = self.core != null, .pending_delivery = self.core == null and t.signal != 0 };
+        var result = StopInfo{ .tid = tid, .reason = t.reason, .signal = t.signal, .signal_name = signalNameIn(self.signalTable(), t.signal), .read_only = self.core != null, .pending_delivery = self.core == null and t.signal != 0 };
         result.pc = try programCounter(try self.registers(tid));
         if (self.core) |*core| {
             // Linux supplies signal info for the dumping thread; GDB may
@@ -459,7 +539,7 @@ pub const Target = struct {
             return result;
         };
         result.signal = signal.number;
-        result.signal_name = signalName(result.signal);
+        result.signal_name = signalNameIn(self.signalTable(), result.signal);
         result.code = signal.code;
         result.errno = signal.error_number;
         if (signal.has_address and signal.number != c.SIGTRAP) result.fault_address = signal.address;

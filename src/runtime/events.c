@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sys/ptrace.h>
 
 /* Wait only on TIDs learned through launch, attach or kernel birth events.
  * Other subsystems may own traced children of this same debugger process. */

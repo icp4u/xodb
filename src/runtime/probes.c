@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sys/ptrace.h>
 #include "loongarch_step.h"
 
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address)

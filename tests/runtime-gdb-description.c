@@ -52,6 +52,33 @@ int main(void)
     assert(d->register_bytes == 65552);
     assert(xrt_gdb_description_decode(d, hex, 32, &regs) == XRT_OK);
     assert(xrt_registers_value(&regs, "pc", 2, &value) == XRT_OK && value == 0x1234);
+    /* Apple's debugserver: no <architecture>, frame and link registers named
+     * by role, 32-bit views (value_regnums) that own a number but no bytes. */
+    const char *apple = "<target version=\"1.0\"><feature name=\"com.apple.debugserver.arm64\">"
+        "<reg name=\"x0\" regnum=\"0\" offset=\"0\" bitsize=\"64\" altname=\"arg1\" generic=\"arg1\" invalidate_regnums=\"0,6\"/>"
+        "<reg name=\"fp\" regnum=\"1\" offset=\"8\" bitsize=\"64\" altname=\"x29\" generic=\"fp\"/>"
+        "<reg name=\"lr\" regnum=\"2\" offset=\"16\" bitsize=\"64\" altname=\"x30\" generic=\"ra\"/>"
+        "<reg name=\"sp\" regnum=\"3\" offset=\"24\" bitsize=\"64\"/><reg name=\"pc\" regnum=\"4\" offset=\"32\" bitsize=\"64\"/>"
+        "<reg name=\"cpsr\" regnum=\"5\" offset=\"40\" bitsize=\"32\"/>"
+        "<reg name=\"w0\" regnum=\"6\" offset=\"0\" bitsize=\"32\" value_regnums=\"0\" invalidate_regnums=\"0,6\"/>"
+        "<reg name=\"far\" regnum=\"7\" offset=\"44\" bitsize=\"64\"/></feature>"
+        "<groups><group id=\"1\" name=\"General Purpose Registers\"/></groups></target>";
+    assert(xrt_gdb_description_parse(d, apple, strlen(apple), NULL, NULL) == XRT_UNSUPPORTED_ARCHITECTURE);
+    assert(xrt_gdb_description_parse_for(d, apple, strlen(apple), NULL, NULL, "mips") == XRT_UNSUPPORTED_ARCHITECTURE);
+    assert(xrt_gdb_description_parse_for(d, apple, strlen(apple), NULL, NULL, "aarch64") == XRT_OK);
+    assert(!strcmp(d->architecture, "aarch64") && d->count == 7 && d->register_bytes == 52 && d->next_number == 8);
+    assert(!strcmp(d->registers[6].name, "far") && d->registers[6].number == 7 && d->registers[6].offset == 44);
+    const uint8_t bank[] = "0100000000000000" "2900000000000000" "3000000000000000" "3412000000000000"
+                           "7856000000000000" "00000060";
+    assert(xrt_gdb_description_decode(d, bank, sizeof(bank) - 1, &regs) == XRT_OK);
+    assert(xrt_registers_value(&regs, "x29", 3, &value) == XRT_OK && value == 0x29);
+    assert(xrt_registers_value(&regs, "x30", 3, &value) == XRT_OK && value == 0x30);
+    assert(xrt_registers_value(&regs, "sp", 2, &value) == XRT_OK && value == 0x1234);
+    assert(xrt_registers_value(&regs, "pstate", 6, &value) == XRT_OK && value == 0x60000000);
+    assert(xrt_registers_value(&regs, "x1", 2, &value) == XRT_REGISTER_UNAVAILABLE);
+    /* A document that names its architecture is never overridden. */
+    assert(xrt_gdb_description_parse_for(d, valid, strlen(valid), NULL, NULL, "aarch64") == XRT_OK);
+    assert(!strcmp(d->architecture, "i386:x86-64"));
     const char *bad[] = {
         "<target><architecture>i386:x86-64</architecture></target>",
         "<target><architecture>unsupported</architecture></target>",

@@ -99,6 +99,7 @@ pub const Session = struct {
     language_tabs: @import("language_tabs.zig").State = .{},
     language_watches: @import("language_watches.zig").State = .{},
     maps_epoch: u64 = 0,
+    gdb_map: @import("gdb_images.zig").Map = .{},
     maps_generation: u64 = std.math.maxInt(u64),
     agent_scope: AgentScope = .observe,
     /// A human GUI or multiple clients can retain jobs in this session. Never
@@ -1206,7 +1207,7 @@ pub const Session = struct {
         const probe = self.target.setBreakpoint(address, true) catch |err| {
             // The temporary breakpoint may be planted remotely; do not fall
             // back to a plain step that then reports an unrelated failure.
-            if (err == error.RemoteOutcomeUnknown) return err;
+            try @import("../target/runtime.zig").propagateUnknownOutcome(err);
             return false;
         };
         errdefer self.target.removeBreakpoint(probe) catch {};
@@ -1275,6 +1276,7 @@ pub const Session = struct {
             self.suppress_probe_resume = true;
             self.step_diagnostic = @errorName(err);
             std.debug.print("xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
+            try @import("../target/runtime.zig").propagateUnknownOutcome(err);
         };
         self.memory.poll(self);
         self.pollProfile();
@@ -1324,6 +1326,7 @@ pub const Session = struct {
             } else {
                 self.target.continueExecution() catch |err| {
                     self.step_diagnostic = @errorName(err);
+                    try @import("../target/runtime.zig").propagateUnknownOutcome(err);
                     return;
                 };
                 return;
@@ -1364,6 +1367,7 @@ pub const Session = struct {
             self.advanceSourceStep() catch |err| {
                 self.step_diagnostic = @errorName(err);
                 self.source_step = null;
+                try @import("../target/runtime.zig").propagateUnknownOutcome(err);
             };
         }
     }
@@ -1567,9 +1571,73 @@ pub const Session = struct {
         }
         return ids;
     }
+    /// Regions and images of a Darwin target behind a GDB stub; null otherwise.
+    pub fn gdbMap(self: *Session) !?*const @import("gdb_images.zig").Map {
+        const gdb = self.target.gdbRemoteInfo() orelse return null;
+        if (gdb.os != .darwin) return null;
+        try self.gdb_map.refresh(&self.target);
+        return &self.gdb_map;
+    }
+    /// Mach-O unwind data is not read by this build. AArch64 Darwin code keeps
+    /// frame records, so walk them: [fp] holds the caller's fp and [fp+8] its
+    /// return address. Frames are unsymbolised and name how they were found.
+    /// A leaf function, or one stopped in its prologue, has not pushed its
+    /// record yet: there x30 is the caller, and is reported as such only when
+    /// no frame setup precedes the PC in the same function.
+    fn framePointerStack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize, address_bits: u32) ![]Frame {
+        const arch_ = self.target.arch();
+        const start = loc.registers(try self.target.registers(tid));
+        // Return addresses of arm64e code carry authentication bits above the address.
+        const mask: u64 = if (address_bits != 0 and address_bits < 64) (@as(u64, 1) << @intCast(address_bits)) - 1 else std.math.maxInt(u64);
+        const reason = @import("gdb_images.zig").image_diagnostic;
+        var frames: std.ArrayList(Frame) = .empty;
+        const pc = start[arch_.pc()] orelse return error.RegisterUnavailable;
+        try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = 0, .pc = pc, .lookup_pc = pc, .registers = start, .unwind_method = "registers", .inline_diagnostic = reason });
+        var fp = start[29] orelse return frames.toOwnedSlice(a);
+        var sp = start[arch_.sp()] orelse fp;
+        const max = @min(64, limit);
+        if (start[30]) |raw| link: {
+            const lr = raw & mask;
+            // Scan back at most 32 instructions for this function's frame setup.
+            var window: [128]u8 = undefined;
+            if (pc < window.len or lr == 0 or frames.items.len >= max) break :link;
+            if ((self.target.readMemory(pc - window.len, &window) catch break :link) != window.len) break :link;
+            var at: usize = window.len;
+            const entered = while (at >= 4) : (at -= 4) {
+                const word = std.mem.readInt(u32, window[at - 4 ..][0..4], .little);
+                if (word & 0xffc003ff == 0x910003fd) break true; // add x29, sp, #imm
+                // ret, retaa, retab, or the zero padding before an image's first function.
+                if (word == 0xd65f03c0 or word == 0xd65f0bff or word == 0xd65f0fff or word == 0) break false;
+            } else true;
+            if (entered) break :link;
+            var caller: loc.RegisterSet = @splat(null);
+            caller[arch_.pc()] = lr;
+            caller[29] = fp;
+            caller[arch_.sp()] = sp;
+            try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = 1, .pc = lr, .lookup_pc = arch_.callerLookup(lr) orelse break :link, .registers = caller, .cfa = sp, .unwind_method = "link_register", .inline_diagnostic = reason });
+        }
+        while (frames.items.len < max and fp != 0 and fp % 16 == 0 and fp >= sp) {
+            var pair: [16]u8 = undefined;
+            if ((self.target.readMemory(fp, &pair) catch break) != pair.len) break;
+            const next = std.mem.readInt(u64, pair[0..8], .little);
+            const ret = std.mem.readInt(u64, pair[8..16], .little) & mask;
+            if (ret == 0) break;
+            sp = fp + 16;
+            var caller: loc.RegisterSet = @splat(null);
+            caller[arch_.pc()] = ret;
+            caller[29] = next;
+            caller[arch_.sp()] = sp;
+            // A caller found through x30 is not repeated by the record below it.
+            if (frames.items.len != 2 or frames.items[1].pc != ret or !std.mem.eql(u8, frames.items[1].unwind_method.?, "link_register"))
+                try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = frames.items.len, .pc = ret, .lookup_pc = arch_.callerLookup(ret) orelse break, .registers = caller, .cfa = sp, .unwind_method = "frame_pointer", .inline_diagnostic = reason });
+            fp = next; // The loop condition requires the chain to move up the stack.
+        }
+        return frames.toOwnedSlice(a);
+    }
     pub fn stack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize) ![]Frame {
         defer self.modules.reportBudget();
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin and self.target.arch() == .aarch64) return self.framePointerStack(a, tid, limit, gdb.address_bits);
         try self.refreshMaps();
         const raw_registers = try self.target.registers(tid);
         var registers = loc.registers(raw_registers);
@@ -1934,6 +2002,7 @@ pub const Session = struct {
     }
     pub fn deinit(self: *Session) void {
         self.compatibility.deinit();
+        self.gdb_map.deinit();
         self.language_watches.deinit();
         self.language_tabs.deinit();
         self.metadata.deinit();

@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "gdb_link.h"
+#include "host_compat.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -125,7 +126,7 @@ static enum xrt_status resolve(struct xrt_gdb_link *l, const char *host,
     } while (!atomic_compare_exchange_weak_explicit(&resolver_jobs, &jobs, jobs + 1,
                                                    memory_order_acq_rel, memory_order_acquire));
     struct resolution *r = calloc(1, sizeof(*r));
-    if (!r || pipe2(r->wake, O_CLOEXEC | O_NONBLOCK)) {
+    if (!r || xrt_host_pipe(r->wake)) {
         free(r);
         atomic_fetch_sub_explicit(&resolver_jobs, 1, memory_order_release);
         return fail(l, XRT_OUT_OF_MEMORY, "GDB name resolver allocation failed");
@@ -223,7 +224,7 @@ enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *l, const char *endpoint, st
     const uint64_t deadline = deadline_for(l, now() + TIMEOUT_NS);
     for (struct addrinfo *a = addresses; a && now() < deadline; a = a->ai_next) {
         if (xrt_cancel_requested(cancel)) break;
-        int fd = socket(a->ai_family, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, a->ai_protocol);
+        int fd = xrt_host_socket(a->ai_family, SOCK_STREAM, a->ai_protocol, 1);
         if (fd < 0) continue;
         int one = 1; (void)setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         int result = connect(fd, a->ai_addr, a->ai_addrlen);
@@ -268,8 +269,58 @@ static bool console_packet(const uint8_t *p, size_t n)
               (p[i] >= 'A' && p[i] <= 'F'))) return false;
     return true;
 }
+static enum xrt_status discard(struct xrt_gdb_link *l, void *out, size_t cap, size_t *length,
+                               uint64_t deadline)
+{
+    size_t at = 1;
+    uint64_t total = 0, body = 0;
+    unsigned sum = 0, mark = 0, digits[2] = {0, 0};
+    bool data = false;
+    *length = l->received - 1 < cap ? l->received - 1 : cap;
+    memcpy(out, l->rx + 1, *length);
+    for (;;) {
+        for (; at < l->received && mark < 3; ++at) {
+            const uint8_t byte = l->rx[at];
+            if (mark) { digits[mark++ - 1] = byte; continue; }
+            if (!data && byte == '#') { mark = 1; continue; }
+            if (!data && byte == '$') return fail(l, XRT_PROTOCOL_ERROR, "GDB oversized response is malformed");
+            /* An escaped byte or a repeat count is data even if it resembles framing. */
+            data = !data && (byte == '}' || byte == '*');
+            sum += byte; ++body;
+        }
+        if (mark == 3) break;
+        total += l->received;
+        if (total > XRT_GDB_DISCARD_MAX)
+            return fail(l, XRT_PROTOCOL_ERROR, "GDB oversized response exceeds the discard limit");
+        l->received = 0; at = 0;
+        if (xrt_cancel_requested(l->cancel)) return cancelled(l);
+        if (expired(l)) return operation_timeout(l);
+        if (ready(l, l->fd, POLLIN, deadline) <= 0) {
+            if (xrt_cancel_requested(l->cancel)) return cancelled(l);
+            if (expired(l)) return operation_timeout(l);
+            return fail(l, XRT_TRANSPORT_FAILED, "GDB response failed or timed out");
+        }
+        ssize_t n = recv(l->fd, l->rx, sizeof(l->rx), 0);
+        if (n > 0) { l->received = (size_t)n; continue; }
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)) continue;
+        return fail(l, XRT_TRANSPORT_FAILED, "GDB peer closed the connection");
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+        const unsigned c = digits[i];
+        digits[i] = c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 :
+            c >= 'A' && c <= 'F' ? c - 'A' + 10 : 256;
+    }
+    if (digits[0] * 16 + digits[1] != (sum & 255))
+        return fail(l, XRT_PROTOCOL_ERROR, "GDB oversized response has a bad checksum");
+    memmove(l->rx, l->rx + at, l->received - at);
+    l->received -= at;
+    l->awaiting_ack = false;
+    if (*length > body) *length = (size_t)body; /* Never bytes of a following frame. */
+    if (!l->noack && write_bytes(l, "+", 1, deadline, false) != XRT_OK) return XRT_TRANSPORT_FAILED;
+    return xrt_cancel_requested(l->cancel) ? cancelled(l) : XRT_BUFFER_TOO_SMALL;
+}
 static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
-                                size_t *length, bool wait, bool stop)
+                                size_t *length, bool wait, bool stop, bool prefix)
 {
     if (!l || !out || !length) return XRT_INVALID_ARGUMENT;
     *length = 0;
@@ -284,6 +335,8 @@ static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
             struct xrt_gdb_view view;
             enum xrt_gdb_decode_status decoded =
                 xrt_gdb_decode(l->rx, l->received, out, cap, &view);
+            if (decoded == XRT_GDB_BUFFER_TOO_SMALL && prefix && l->rx[0] == '$')
+                return discard(l, out, cap, length, deadline);
             if (decoded != XRT_GDB_NEED_MORE) {
                 if (!view.consumed || view.consumed > l->received)
                     return fail(l, XRT_PROTOCOL_ERROR, "GDB malformed frame");
@@ -329,18 +382,24 @@ static enum xrt_status receive(struct xrt_gdb_link *l, void *out, size_t cap,
 enum xrt_status xrt_gdb_receive(struct xrt_gdb_link *l, void *out, size_t cap,
                                 size_t *length, bool wait)
 {
-    return receive(l, out, cap, length, wait, false);
+    return receive(l, out, cap, length, wait, false, false);
 }
 enum xrt_status xrt_gdb_receive_stop(struct xrt_gdb_link *l, void *out, size_t cap,
                                      size_t *length, bool wait)
 {
-    return receive(l, out, cap, length, wait, true);
+    return receive(l, out, cap, length, wait, true, false);
 }
 enum xrt_status xrt_gdb_exchange(struct xrt_gdb_link *l, const void *payload, size_t size,
                                  void *out, size_t cap, size_t *length)
 {
     enum xrt_status status = xrt_gdb_send(l, payload, size);
     return status == XRT_OK ? xrt_gdb_receive(l, out, cap, length, true) : status;
+}
+enum xrt_status xrt_gdb_exchange_prefix(struct xrt_gdb_link *l, const void *payload, size_t size,
+                                        void *out, size_t cap, size_t *length)
+{
+    enum xrt_status status = xrt_gdb_send(l, payload, size);
+    return status == XRT_OK ? receive(l, out, cap, length, true, false, true) : status;
 }
 enum xrt_status xrt_gdb_interrupt(struct xrt_gdb_link *l)
 {
