@@ -151,6 +151,7 @@ pub const Worker = struct {
             .publications = .{ .connection = options.connection },
             .executor = .{ .connection = options.connection, .tree = tree, .service = if (options.endpoint) |endpoint| endpoint.service else null, .source = options.source },
             .options = options,
+            .connected = .init(options.bootstrap == null),
             .selection = options.initial_view,
             .cancel = if (options.bootstrap != null) rt.xrt_cancel_create() else rt.xrt_target_cancel(tree.root().target.handle),
             .test_probes = .{ .directory = options.test_directory },
@@ -185,6 +186,8 @@ pub const Worker = struct {
         self.commands.close() catch unreachable;
         _ = self.stop_deadline.cmpxchgStrong(0, linux.now() +| stop_grace_ns, .acq_rel, .acquire);
         self.stopping.store(true, .release);
+        // A startup operation has no connected session to drain or export.
+        if (!self.connected.load(.acquire)) rt.xrt_cancel_request(self.cancel);
     }
     /// Fatal owner failures can still cancel immediately.
     pub fn requestStop(self: *Worker) void {
@@ -259,7 +262,14 @@ pub const Worker = struct {
             self.complete(command, error.Cancelled);
             self.commands.finish();
         }
-        if (self.options.trace) std.debug.print("xodb: remote quiesce poll_error={s}\n", .{self.executor.tree.root().step_diagnostic orelse "none"});
+        const root = self.executor.tree.root();
+        // Only the owner inspects the connection: presentation threads must
+        // not borrow a target handle or take its transport mutex. A failed
+        // link cannot drain exports, and cancellation releases local handles
+        // even when an already-dead transport cannot confirm remote cleanup.
+        if (root.target.isRemote() and rt.xrt_target_expect(root.target.handle, root.target.snapshot().generation) != rt.XRT_OK)
+            rt.xrt_cancel_request(self.cancel);
+        if (self.options.trace) std.debug.print("xodb: remote quiesce poll_error={s}\n", .{root.step_diagnostic orelse "none"});
         if (self.options.shutdown) |shutdown| shutdown.run(shutdown.context) catch |err| {
             self.failure = err;
         };
@@ -639,7 +649,7 @@ pub const Worker = struct {
     }
 };
 
-test "graceful shutdown preserves the connection until its fixed deadline" {
+test "graceful shutdown cancels startup immediately but preserves a connected drain until its deadline" {
     const Barrier = struct {
         bootstrap_release: std.atomic.Value(bool) = .init(false),
         shutdown_entered: std.atomic.Value(bool) = .init(false),
@@ -654,7 +664,9 @@ test "graceful shutdown preserves the connection until its fixed deadline" {
             while (!self.shutdown_release.load(.acquire)) _ = c.usleep(1000);
         }
     };
-    for ([_]bool{ false, true }) |expire| {
+    for ([_]u8{ 0, 1, 2 }) |mode| {
+        const connected = mode != 2;
+        const expire = mode == 1;
         const test_a = std.testing.allocator;
         const session = try test_a.create(@import("session.zig").Session);
         defer test_a.destroy(session);
@@ -677,7 +689,11 @@ test "graceful shutdown preserves the connection until its fixed deadline" {
             worker.join();
             worker.destroy();
         }
+        // The barrier stands for an active operation after connection, or
+        // for startup itself. Neither branch needs a timing-based oracle.
+        worker.connected.store(connected, .release);
         worker.requestGracefulStop();
+        try std.testing.expectEqual(!connected, rt.xrt_cancel_requested(worker.cancel));
         const deadline = worker.stop_deadline.load(.acquire);
         try std.testing.expect(deadline != 0);
         const command = try boundary.Command.create(a, .{ .stamp = dispatch.stamp(1, session), .actor = .human, .action = .poll });
@@ -689,9 +705,9 @@ test "graceful shutdown preserves the connection until its fixed deadline" {
             if (linux.now() > wait_deadline) return error.ShutdownDeadline;
             _ = c.usleep(1000);
         }
-        try std.testing.expect(!rt.xrt_cancel_requested(worker.cancel));
+        try std.testing.expectEqual(!connected, rt.xrt_cancel_requested(worker.cancel));
         worker.cancelExpiredStop(deadline - 1);
-        try std.testing.expect(!rt.xrt_cancel_requested(worker.cancel));
+        try std.testing.expectEqual(!connected, rt.xrt_cancel_requested(worker.cancel));
         worker.requestGracefulStop();
         try std.testing.expectEqual(deadline, worker.stop_deadline.load(.acquire));
         if (expire) {
@@ -701,7 +717,7 @@ test "graceful shutdown preserves the connection until its fixed deadline" {
         barrier.shutdown_release.store(true, .release);
         worker.join();
         worker.cancelExpiredStop(std.math.maxInt(u64));
-        try std.testing.expectEqual(expire, rt.xrt_cancel_requested(worker.cancel));
+        try std.testing.expectEqual(expire or !connected, rt.xrt_cancel_requested(worker.cancel));
     }
 }
 

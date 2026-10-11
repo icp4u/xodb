@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
-    (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*',)),
+    (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown',)),
     (('tests/gibson-gui.py', 'tests/scene3d-gui.py', 'tests/memdefrag-modern-gui.py', 'tests/gibson-camera.py',
       'tests/deepmap-gui.py', 'tests/memdefrag-win95-gui.py'), ('complete-log-lines',)),
@@ -353,6 +353,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.kind = 'live'
         steps.append(('remote-exit-export', [sys.executable, '-B', 'tests/remote-exit-export.py', '--work', '.work/rexit'], 60))
         steps.append(('remote-exit-export-stdio', [sys.executable, '-B', 'tests/remote-exit-export.py', '--stdio', '--work', '.work/rexit-stdio'], 60))
+        steps.append(('remote-broken-exit', [sys.executable, '-B', 'tests/remote-broken-exit.py', '--work', '.work/rbroken'], 60))
         steps.append(('remote-unknown', [sys.executable, '-B', 'tests/remote-unknown.py', '--work', '.work/runknown'], 60))
         steps.append(('remote-unknown-matrix', [sys.executable, '-B', 'tests/remote-unknown.py', '--matrix', '--work', '.work/runknown-matrix'], 120))
         # A recorded Apple debugserver session replayed by a loopback stub, then hostile replies.

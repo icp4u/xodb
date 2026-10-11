@@ -369,10 +369,18 @@ An ordinary quit, primary stdio EOF, or reconnect closes admission immediately
 and gives the owner two seconds to finish its active operation and shutdown
 exports on the live connection. Queued commands are cancelled without dispatch.
 The deadline starts with the first stop request; repeated requests cannot extend
-it. The joining thread requests transport cancellation if the owner is still
+it. Startup cancels immediately because no connected session exists to export.
+The owner also cancels an already-failed link before shutdown exports; releasing
+local handles does not claim that remote detach succeeded.
+The joining thread requests transport cancellation if the owner is still
 working when the grace expires. Internal owner failures may cancel immediately.
 The grace bounds when cancellation is requested, not local disk writes or the
 final wait for an owned transport child to be reaped.
+
+Primary stdio EOF starts this grace only when the owner observes it. If the
+owner is inside a silent peer's request, the transport's absolute 10-second
+request timeout can elapse first. SIGINT/SIGTERM and GUI close are observed by
+the presentation/main thread and start the stop independently of that request.
 
 Cancellation sets a terminal atomic flag with a nonblocking wake. It never takes
 the connection mutex or closes its transport from the frame thread.
