@@ -206,11 +206,14 @@ static void thread_lists(void)
     struct { struct xrt_gdb_thread_info rows[2]; uint64_t canary; } out = {.canary = 771};
     size_t count;
     CHECK(xrt_gdb_threads_parse(sample, sizeof sample - 1, out.rows, 2, &count) == XRT_OK && count == 2);
-    CHECK(out.rows[0].remote_tid == 4097 && out.rows[0].queue_address == 8192 && out.rows[0].has_queue);
+    CHECK(out.rows[0].remote_tid == 4097 && !out.rows[0].has_dispatch_queue);
     CHECK(out.rows[0].has_name && !strcmp(out.rows[0].name, "worker??"));
-    CHECK(!out.rows[1].has_name && !out.rows[1].has_queue && out.canary == 771);
-    if (getenv("XRT_THREAD_INFO_WRONG_RESULT")) out.rows[0].queue_address++;
-    CHECK(out.rows[0].queue_address == 8192);
+    CHECK(!out.rows[1].has_name && !out.rows[1].has_dispatch_queue && out.canary == 771);
+    uint64_t queue=0;
+    const char extended[]="{\"pthread_t\":1,\"dispatch_queue_t\":8192}";
+    CHECK(xrt_gdb_thread_extended_parse(extended,sizeof extended-1,&queue)==XRT_OK && queue==8192);
+    if (getenv("XRT_THREAD_INFO_WRONG_RESULT")) queue++;
+    CHECK(queue == 8192);
     static const char *bad[] = {"{}", "[{}]", "[{\"tid\":0}]", "[{\"tid\":-1}]", "[{\"tid\":4294967296}]",
         "[{\"tid\":1.0}]", "[{\"tid\":1,\"tid\":2}]", "[{\"tid\":1},{\"tid\":1}]", "[{\"tid\":1,\"name\":null}]",
         "[{\"tid\":1,\"qaddr\":-1}]", "[{\"tid\":1,\"qaddr\":0,\"qaddr\":1}]", "[{\"tid\":1},]", "[]x"};

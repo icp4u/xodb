@@ -35,8 +35,10 @@ enum xrt_status xrt_gdb_region_parse(const char *, size_t, bool cut, uint64_t as
  * rows; *total counts every image, up to XRT_GDB_IMAGES_MAX. */
 enum xrt_status xrt_gdb_images_parse(const char *, size_t, struct xrt_gdb_image *,
                                      size_t capacity, size_t *total);
-/* jThreadsInfo array. Names are bounded printable text; registers/memory are
- * ignored. Missing/duplicate IDs and repeated known fields are refused. */
+/* jThreadsInfo array. Names are bounded printable text; registers/memory and
+ * qaddr (a queue-pointer slot, not a queue) are ignored after validation. */
 enum xrt_status xrt_gdb_threads_parse(const char *, size_t, struct xrt_gdb_thread_info *,
                                       size_t capacity, size_t *total);
+/* jThreadExtendedInfo's optional real dispatch_queue_t. */
+enum xrt_status xrt_gdb_thread_extended_parse(const char *, size_t, uint64_t *dispatch_queue);
 #endif

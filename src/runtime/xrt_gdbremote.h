@@ -29,7 +29,7 @@ struct xrt_gdb_info {
     /* Last causal stop, cached without IO. Signal delivery differs from Mach
      * exception reporting, even when debugserver also supplies a signal byte. */
     int32_t stop_tid;
-    bool has_exception, has_fault, pending_delivery;
+    bool has_exception, has_fault, pending_delivery, regions_cut;
     uint32_t exception_count;
     uint64_t exception_type, exception_codes[4], fault_address;
 };
@@ -40,10 +40,10 @@ struct xrt_gdb_region {
     char type[32], name[128];
 };
 /* Optional stopped-thread metadata. The thread inventory remains authoritative;
- * a JSON row cannot create a thread. Queue addresses are opaque, not names. */
+ * a JSON row cannot create a thread. Dispatch queues are opaque addresses. */
 struct xrt_gdb_thread_info {
-    uint64_t remote_tid, queue_address;
-    bool has_name, name_truncated, has_queue;
+    uint64_t remote_tid, dispatch_queue;
+    bool has_name, name_truncated, has_dispatch_queue;
     char name[128];
 };
 struct xrt_gdb_image_segment {

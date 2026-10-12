@@ -37,6 +37,11 @@ int xmo_job_join(struct xmo_job *);
  * no table read or pathname reopen occurs. Copy the name before destruction. */
 enum xmo_status xmo_job_symbol(struct xmo_job *, uint64_t link_address,
     char *name, size_t capacity, uint64_t *value, uint64_t *size);
+/* Find one executable text symbol by its user-facing name. The leading Mach-O
+ * underscore is optional. Ambiguous or non-code definitions are not usable as
+ * breakpoint locations. */
+enum xmo_status xmo_job_find_symbol(struct xmo_job *, const char *name,
+    uint64_t *value, uint64_t *size);
 const struct xmo_info *xmo_job_info(struct xmo_job *);
 enum xmo_debug_status { XMO_DEBUG_READY, XMO_DEBUG_MISSING, XMO_DEBUG_UUID,
     XMO_DEBUG_ARCH, XMO_DEBUG_REFUSED, XMO_DEBUG_LIMIT, XMO_DEBUG_CHANGED };
@@ -48,6 +53,9 @@ enum xmo_status xmo_job_unwind(struct xmo_job *, const struct xmo_dwarf **);
 enum xmo_status xmo_job_compact(struct xmo_job *, uint64_t linked_pc, struct xmu_row *);
 enum xmo_status xmo_job_object(struct xmo_job *, uint64_t linked_pc, uint32_t *index,
                              uint64_t *object_pc, const struct xmo_dwarf **);
+enum xmo_status xmo_job_object_count(struct xmo_job *, uint32_t *count);
+enum xmo_status xmo_job_object_debug(struct xmo_job *, uint32_t index,
+                                    const struct xmo_dwarf **);
 enum xmo_status xmo_job_object_address(struct xmo_job *, uint32_t index,
                                      uint64_t object, uint64_t *linked);
 void xmo_job_destroy(struct xmo_job *);

@@ -76,7 +76,7 @@ class Stop:
 class Replay(Fake):
     def __init__(self, recording, phases, mutate=None):
         self.recording,self.phases,self.phase = recording,phases,0
-        self.extra,self.image_reads = [],0
+        self.extra,self.image_reads,self.probes = [],0,[]
         self.metadata = dict(recording['exchanges'][:4])
         super().__init__([],mutate)
 
@@ -102,13 +102,16 @@ class Replay(Fake):
         if request == 'qfThreadInfo': return ['m1001']
         if request == 'qsThreadInfo': return ['l']
         if request in ('Hg1001','Hc1001'): return ['OK']
+        if re.fullmatch(r'[Zz]0,[0-9a-f]+,[0-9a-f]+',request):
+            self.probes.append(request)
+            return ['OK']
         if request == 'D': return ['OK']
         if request in ('vCont;c','c') and self.phase+1<len(self.phases):
             self.phase += 1
             return [self.phases[self.phase].stop]
         if request in COMMON: return COMMON[request]
         # These optional capabilities were not enabled in the recording.
-        if request in ('QStartNoAckMode','qAttached','qMemoryRegionInfo:0'): return ['']
+        if request in ('QStartNoAckMode','qAttached','qMemoryRegionInfo:0') or request.startswith('jThreadExtendedInfo:'): return ['']
         self.extra.append(request)
         return ['']
 

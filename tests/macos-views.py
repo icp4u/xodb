@@ -51,6 +51,7 @@ class Stop:
                 self.memory.append((int(query[1:].split(',')[0],16), bytes.fromhex(replies[0])))
         self.threads = next((replies[0] for q,replies in self.reads if q == 'qfThreadInfo'), None)
         self.thread_info = next((replies[0] for q,replies in self.reads if q == 'jThreadsInfo'), '')
+        self.extended = {q:replies[0] for q,replies in self.reads if q.startswith('jThreadExtendedInfo:')}
         self.images = next((replies[0] for q,replies in reversed(rows[:end]) if q == names.IMAGES), '')
         self.process = next((replies[0] for q,replies in reversed(rows[:end]) if q == 'qProcessInfo'), names.COMMON['qProcessInfo'][0])
         self.regions = {q:r for q,r in self.reads if q.startswith('qMemoryRegionInfo:')}
@@ -111,6 +112,8 @@ class Replay(Fake):
         if query == 'jThreadsInfo':
             self.served['threads'] += 1
             return [self.transform(stop.thread_info) if self.transform else stop.thread_info]
+        if query.startswith('jThreadExtendedInfo:'):
+            return [stop.extended.get(query,'')]
         if query.startswith(('Hg','Hc')):
             tid = int(query[2:],16)
             assert tid in stop.banks, 'selection outside recorded thread bank'
@@ -166,14 +169,16 @@ def thread_case(work, kind, wrong):
         availability = state['gdb_remote']['thread_info']
         if kind in ('duplicate','oversized','unsupported'):
             assert availability == ('unsupported' if kind == 'unsupported' else 'failed'), state
-            assert all(r['name'] is None and r['queue_address'] is None for r in labels), labels
+            assert all(r['name'] is None and r['dispatch_queue'] is None for r in labels), labels
             assert client.inspect('get_registers',tid=stop.tid)['registers']['pc']
         else:
             assert availability == 'available', state
-            if wrong: labels[1]['queue_address'] = '0x1'
+            expected_queues={json.loads(q.split(':',1)[1])['thread']:json.loads(reply).get('dispatch_queue_t') for q,reply in stop.extended.items()}
+            if wrong: labels[0]['dispatch_queue'] = '0x1'
             for actual, recorded in zip(labels, expected):
                 assert actual['source'] == 'gdb_thread_info' and not actual['wine_internal_name'], actual
-                assert actual['queue_address'] == hex(recorded['qaddr']), actual
+                queue=expected_queues.get(recorded['tid'])
+                assert actual['dispatch_queue'] == (hex(queue) if queue else None), actual
                 if kind == 'name' and actual['tid'] == 4098:
                     assert actual['name'].startswith('worker??') and len(actual['name']) == 127 and actual['possibly_truncated'], actual
                 else: assert actual['name'] == recorded.get('name'), actual
@@ -234,41 +239,48 @@ def stop_case(work, kind, wrong):
             events=client.inspect('query_events')['events']
             if wrong:events[-1]['detail']=4
             assert events[-1]['kind']=='exit' and events[-1]['detail']==3, events
+            assert state['exit']==dict(kind='status',status=3,signal=None,signal_name=None),state
             evidence.append(dict(state=state,events=events))
         else:
             state=client.stopped()
             info=client.inspect('get_stop_info',tid=stops[1].tid)['stop']
-            if wrong: info['signal_name']='wrong'
+            if wrong:
+                if kind == 'fork': info['reason']='signal'
+                else: info['signal_name']='wrong'
             if kind=='crash-bad-access':
                 assert info['reason']=='exception' and info['signal']==0 and info['signal_name']=='none',info
                 assert info['fault_address']==16 and info['mach_exception']==dict(type=1,name='EXC_BAD_ACCESS',codes=['0x1','0x10']),info
                 assert not info['pending_delivery'] and info['diagnostic'] is None,info
+                assert 'repeat this bad access' in state['resume_warning'],state
                 client.action('continue');client.stopped('exception')
                 assert stub.served['controls']==['vCont;c','vCont;c'],stub.served
-            elif kind in ('crash-abort','fork'):
-                number,label=(6,'SIGABRT') if kind=='crash-abort' else (20,'SIGCHLD')
+            elif kind == 'crash-abort':
+                number,label=6,'SIGABRT'
                 assert info['reason']=='signal' and info['signal']==number and info['signal_name']==label,info
                 assert info['pending_delivery'] and info['mach_exception']['type']==5,info
                 assert info['fault_address'] is None and info['diagnostic'] is None,info
                 client.action('continue')
                 assert stub.served['controls'][-1]=='vCont;C%02x:%x;c'%(number,tid),stub.served
-                if kind=='crash-abort':
-                    wait_state(client,'exited')
-                    stub.join(timeout=2)
-                    assert stub.closed_on_exit and not stub.is_alive()
-                    assert client.session()['state']=='exited'
-                    events=client.inspect('query_events')['events']
-                    assert events[-1]['kind']=='exit' and events[-1]['detail']==-6,events
-                else:
-                    client.stopped()
-                    processes=client.inspect('get_processes')
-                    assert len(processes['processes'])==1,processes
+                wait_state(client,'exited')
+                stub.join(timeout=2)
+                assert stub.closed_on_exit and not stub.is_alive()
+                exited=client.session()
+                assert exited['state']=='exited'
+                assert exited['exit']['kind']=='signal' and exited['exit']['signal_name']=='SIGABRT',exited
+                events=client.inspect('query_events')['events']
+                assert events[-1]['kind']=='exit' and events[-1]['detail']==-6,events
+            elif kind == 'fork':
+                assert info['reason']!='signal' and not info['pending_delivery'],info
+                assert stub.served['controls'][:2]==['vCont;c','vCont;C14:%x;c'%tid],stub.served
+                processes=client.inspect('get_processes')
+                assert len(processes['processes'])==1,processes
             elif kind=='exec':
                 if wrong:state['image_epoch']=original['image_epoch']
                 assert info['reason']=='exec' and not info['pending_delivery'] and info['mach_exception'] is None,info
                 assert state['image_epoch']==original['image_epoch']+1,state
                 assert [r['tid'] for r in state['threads']]==[stops[1].tid] and stops[1].tid!=tid,state
                 assert not client.inspect('get_breakpoints')['breakpoints'],state
+                assert 'breakpoints were removed' in state['image_notice'],state
                 assert stub.served['process']==2,stub.served
                 assert not any(q.startswith('z0,') for q in stub.requests),stub.requests
                 absent=client.tool('get_macho_image',address=hex(pc))['result']
@@ -313,8 +325,10 @@ def region_case(work, wrong, variant='recorded'):
         address=image['load_address']+data['vmaddr']-text
         found=next(r for r in regions if r['start']<=address<r['end'])
         if wrong: found['path']='wrong-image'
-        assert found['path']==(image['pathname'] if variant=='recorded' else '') and address!=image['load_address'],found
+        if variant=='recorded': assert found['path']==image['pathname'],found
+        else: assert found['path'].startswith('[shared cache: ') and found['path'].endswith(' images]'),found
         assert any(r['path']=='[stack]' for r in regions),regions
+        if variant=='recorded': assert any(r['path'].startswith('[shared cache: ') for r in regions),regions
         assert not stub.extra,stub.extra
         return dict(case='regions-'+variant,status='pass',queries=stub.served,regions=regions,
                     resources_before=before,resources_after=resource(client.p.pid))

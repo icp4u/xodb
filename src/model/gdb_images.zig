@@ -3,6 +3,7 @@
 const std = @import("std");
 const linux = @import("../target/linux.zig");
 const rt = @import("../target/runtime.zig").c;
+const capi = @import("../c.zig").api;
 const modules = @import("modules.zig");
 const symbols = @import("macho_images.zig");
 const a = std.heap.page_allocator;
@@ -86,11 +87,13 @@ pub const Map = struct {
     raw: []rt.struct_xrt_gdb_image = &.{},
     ids: []u64 = &.{},
     ranges: []Range = &.{},
+    mappings: []Range = &.{},
     region_ranges: []Range = &.{},
     anchors: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     next_id: u64 = 1,
     list_failure: ?[]const u8 = null,
     geometry_failure: ?[]const u8 = null,
+    regions_cut: bool = false,
     symbols: symbols.State = .{},
 
     pub fn deinit(self: *Map) void {
@@ -181,7 +184,13 @@ pub const Map = struct {
             last_end = @max(last_end, range.end);
         }
         const range_rows = try ranges.toOwnedSlice(alloc);
-        const region_ranges = try uniqueRanges(alloc, mappings.items, count);
+        std.mem.sort(Range, mappings.items, {}, struct {
+            fn less(_: void, x: Range, y: Range) bool {
+                return x.start < y.start;
+            }
+        }.less);
+        const mapping_rows = try mappings.toOwnedSlice(alloc);
+        const region_ranges = try uniqueRanges(alloc, mapping_rows, count);
         const failures = try alloc.alloc(modules.Modules.LoadFailure, count + 1);
         self.symbols.prune(raw);
         if (self.arena) |*previous| previous.deinit();
@@ -189,6 +198,7 @@ pub const Map = struct {
         self.raw = raw;
         self.ids = ids;
         self.ranges = range_rows;
+        self.mappings = mapping_rows;
         self.region_ranges = region_ranges;
         self.anchors = anchors;
         self.failure_buffer = failures;
@@ -226,19 +236,41 @@ pub const Map = struct {
         errdefer arena.deinit();
         const alloc = arena.allocator();
         var regions: std.ArrayList(modules.Region) = .empty;
+        const seen = try alloc.alloc(bool, self.raw.len);
+        var active: std.ArrayList(Range) = .empty;
+        var mapping_at: usize = 0;
         for (raw_regions[0..count]) |*region| {
             if (!region.mapped) continue;
+            const end = region.start +| region.size;
+            while (mapping_at < self.mappings.len and self.mappings[mapping_at].start < end) : (mapping_at += 1)
+                try active.append(alloc, self.mappings[mapping_at]);
+            var active_at: usize = 0;
+            while (active_at < active.items.len) {
+                if (active.items[active_at].end <= region.start) {
+                    _ = active.swapRemove(active_at);
+                } else active_at += 1;
+            }
             var path: []const u8 = std.mem.sliceTo(&region.name, 0);
-            if (regionOwner(self.region_ranges, region.start, region.start +| region.size) orelse self.anchors.get(region.start)) |image|
+            if (regionOwner(self.region_ranges, region.start, end) orelse self.anchors.get(region.start)) |image|
                 path = std.mem.sliceTo(&self.raw[image].path, 0);
             const kind = std.mem.sliceTo(&region.type, 0);
-            const region_label = if (path.len != 0) try alloc.dupe(u8, path) else if (kind.len != 0) try std.fmt.allocPrint(alloc, "[{s}]", .{kind}) else "";
-            try regions.append(alloc, .{ .start = region.start, .end = region.start +| region.size, .offset = 0, .inode = 0, .device_major = 0, .device_minor = 0, .permissions = .{ if (region.read) 'r' else '-', if (region.write) 'w' else '-', if (region.execute) 'x' else '-', 'p' }, .path = region_label });
+            var shared: usize = 0;
+            if (path.len == 0 and seen.len > 0) {
+                @memset(seen, false);
+                for (active.items) |mapping| {
+                    if (seen[mapping.image]) continue;
+                    seen[mapping.image] = true;
+                    shared += 1;
+                }
+            }
+            const region_label = if (path.len != 0) try alloc.dupe(u8, path) else if (shared > 1) try std.fmt.allocPrint(alloc, "[shared cache: {d} images]", .{shared}) else if (kind.len != 0) try std.fmt.allocPrint(alloc, "[{s}]", .{kind}) else "";
+            try regions.append(alloc, .{ .start = region.start, .end = end, .offset = 0, .inode = 0, .device_major = 0, .device_minor = 0, .permissions = .{ if (region.read) 'r' else '-', if (region.write) 'w' else '-', if (region.execute) 'x' else '-', 'p' }, .path = region_label });
         }
         const rows = try regions.toOwnedSlice(alloc);
         if (self.region_arena) |*previous| previous.deinit();
         self.region_arena = arena;
         self.regions = rows;
+        self.regions_cut = (target.gdbRemoteInfo() orelse unreachable).memory_regions_cut;
         self.region_generation = snapshot.generation;
     }
     pub const Label = struct { name: []const u8, module: u64, diagnostic: ?[]const u8 };
@@ -291,6 +323,52 @@ pub const Map = struct {
         const image = &self.raw[found.index];
         const debug = try self.symbols.debugInfo(image, roots, found.text, found.link);
         return .{ .info = debug.info, .link = debug.pc, .job = debug.job, .object = debug.object, .load = image.load_address, .text = found.text };
+    }
+    pub fn findSymbol(self: *Map, name: []const u8, roots: []const [:0]const u8) !modules.Symbol {
+        // The main executable is the useful interactive case and normally
+        // comes first. Do not make a hit there wait while workers prove that
+        // every system image is absent from the user's debug roots.
+        var searchable = false;
+        inline for (.{ true, false }) |executables| for (self.raw, 0..) |*image, i| {
+            if ((image.filetype == capi.XMO_MH_EXECUTE) != executables) continue;
+            const text = textAddress(image) orelse continue;
+            searchable = true;
+            const symbol = self.symbols.findSymbol(image, roots, name, text) catch |err| switch (err) {
+                error.MachOLocalFileUnavailable, error.MachOIdentityUnavailable => continue,
+                else => return err,
+            } orelse continue;
+            const address = relocated(image, text, symbol.address) orelse return error.MachOImageRangeOverflow;
+            return .{ .module_id = self.ids[i], .name = name, .address = address, .size = symbol.size };
+        };
+        if (!searchable) return error.GdbLibrariesUnavailable;
+        return error.SymbolNotFound;
+    }
+    pub fn sourceAddresses(self: *Map, alloc: std.mem.Allocator, path: []const u8, line: u32, roots: []const [:0]const u8) ![]u64 {
+        var addresses: std.ArrayList(u64) = .empty;
+        inline for (.{ true, false }) |executables| for (self.raw) |*image| {
+            if ((image.filetype == capi.XMO_MH_EXECUTE) != executables) continue;
+            const text = textAddress(image) orelse continue;
+            const rows = self.symbols.sourceAddresses(alloc, image, roots, text, path, line) catch |err| switch (err) {
+                error.MachOLocalFileUnavailable, error.MachOIdentityUnavailable, error.MachODebugInfoUnavailable, error.MachOObjectDebugUnavailable, error.MachOObjectDebugUnsupported => continue,
+                else => return err,
+            };
+            for (rows) |row| {
+                const address = relocated(image, text, row) orelse return error.MachOImageRangeOverflow;
+                var duplicate = false;
+                for (addresses.items) |old| if (old == address) {
+                    duplicate = true;
+                    break;
+                };
+                if (duplicate) continue;
+                if (addresses.items.len == @import("session.zig").Session.max_line_addresses) return error.SourceLineAddressLimit;
+                try addresses.append(alloc, address);
+            }
+            // A source file in the executable should not wait while workers
+            // prove that unrelated system images are absent from debug roots.
+            if (addresses.items.len > 0 and executables) return addresses.toOwnedSlice(alloc);
+        };
+        if (addresses.items.len == 0) return error.NoCodeForSourceLine;
+        return addresses.toOwnedSlice(alloc);
     }
     pub fn unwind(self: *Map, allocator: std.mem.Allocator, address: u64, roots: []const [:0]const u8, context_: @import("../debug/location.zig").Context, mask: u64, top: bool) !@import("../debug/info.zig").Unwind {
         const found = try self.locate(address) orelse return error.UnmappedAddress;

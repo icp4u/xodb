@@ -20,6 +20,7 @@ const Snapshot = struct {
     failures: []const model.Modules.LoadFailure,
     pe_pending: bool = false,
     image_budget: ?[]const u8 = null,
+    map_cut: bool = false,
 };
 fn hashNumber(hash: *Hash, n: u64) void {
     var bytes: [8]u8 = undefined;
@@ -37,6 +38,7 @@ fn identity(snapshot: Snapshot) [64]u8 {
     hashNumber(&hash, snapshot.generation);
     hashNumber(&hash, snapshot.epoch);
     hashNumber(&hash, snapshot.regions.len);
+    hashNumber(&hash, @intFromBool(snapshot.map_cut));
     for (snapshot.regions) |r| {
         hashNumber(&hash, r.start);
         hashNumber(&hash, r.end);
@@ -123,6 +125,7 @@ fn page(a: Allocator, snapshot: Snapshot, args: Value) !Value {
         .regions = snapshot.regions[start..end],
         .load_failures = snapshot.failures[failure_start..failure_end],
         .total_regions = snapshot.regions.len,
+        .map_cut = snapshot.map_cut,
         .total_load_failures = snapshot.failures.len,
         .map_generation = snapshot.generation,
         .image_epoch = snapshot.epoch,
@@ -142,6 +145,7 @@ pub fn call(a: Allocator, session: *Session, args: Value) !Value {
         .epoch = session.target.snapshot().image_epoch,
         .regions = map.regions,
         .failures = map.images,
+        .map_cut = map.regions_cut,
     }, args);
     try session.refreshMaps();
     return page(a, .{

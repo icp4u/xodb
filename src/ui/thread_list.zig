@@ -36,6 +36,18 @@ pub const Panel = struct {
         const at = std.mem.indexOfScalar(usize, self.rows[0..self.count], selected) orelse 0;
         return self.rows[if (down) (at + 1) % self.count else at -| 1];
     }
+    pub fn hit(self: *Panel, rect: gpu.Rect, threads: []const linux.Thread, labels: []const compat.Label, selected: usize, x: f32, y: f32) ?usize {
+        if (x < rect.x or x >= rect.x + rect.w or y < rect.y or y >= rect.y + rect.h) return null;
+        self.prepare(threads, labels, selected);
+        const heading: f32 = if (self.hide_internal) 20 else 0;
+        if (y < rect.y + heading) return null;
+        const visible: usize = @intFromFloat(@max(1, (rect.h - heading) / 39));
+        const at = std.mem.indexOfScalar(usize, self.rows[0..self.count], selected) orelse 0;
+        const first = (at + 1) -| visible;
+        const row: usize = @intFromFloat((y - rect.y - heading) / 39);
+        const result = first + row;
+        return if (result < self.count and result < first + visible) self.rows[result] else null;
+    }
     pub fn draw(self: *Panel, renderer: *gpu.Renderer, font: *Font, rect: gpu.Rect, threads: []const linux.Thread, labels: []const compat.Label, selected: usize) !void {
         if (rect.w <= 16 or rect.h < 20) return;
         self.prepare(threads, labels, selected);
@@ -53,15 +65,12 @@ pub const Panel = struct {
             const row = if (index < labels.len and labels[index].id == thread.id and labels[index].tid == thread.tid) &labels[index] else null;
             const y = rect.y + heading + @as(f32, @floatFromInt(offset)) * 39;
             if (index == selected) try style.focus(renderer, .{ .x = rect.x, .y = y - 2, .w = rect.w, .h = 38 }, 5, 1);
-            const text = if (row) |name| if (name.readable) name.text() else "name unavailable" else "name pending";
-            const title = std.fmt.bufPrint(&buffer, "{d} {s}{s}", .{ thread.tid, text, if (row != null and row.?.possibly_truncated) "~" else "" }) catch "";
+            const text = if (row) |name| if (name.readable) name.text() else if (index == 0) "main" else "" else "";
+            const title = std.fmt.bufPrint(&buffer, "{d}{s}{s}{s}", .{ thread.tid, if (text.len > 0) " " else "", text, if (row != null and row.?.possibly_truncated) "~" else "" }) catch "";
             try renderer.textFit(font, rect.x + 8, y, rect.w - 16, title, if (index == selected) style.theme.text else style.theme.weak);
             const state = if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state);
-            const detail = if (row != null and row.?.queue_address != null)
-                // jThreadsInfo's qaddr is where the thread keeps its dispatch
-                // queue pointer, present on every thread; it is not a queue.
-                // The stop reason comes first so a narrow pane cuts the address.
-                std.fmt.bufPrint(&buffer, "{s} / queue slot 0x{x}", .{ state, row.?.queue_address.? }) catch state
+            const detail = if (row != null and row.?.dispatch_queue != null)
+                std.fmt.bufPrint(&buffer, "{s} / queue 0x{x}", .{ state, row.?.dispatch_queue.? }) catch state
             else
                 std.fmt.bufPrint(&buffer, "{s}{s}", .{ state, if (row != null and row.?.internal_name) " / Wine internal name" else if (row != null and row.?.source == .gdb_thread_info) "" else " / other" }) catch state;
             try renderer.textFit(font, rect.x + 8, y + 18, rect.w - 16, detail, style.theme.weak);
@@ -88,4 +97,18 @@ test "Wine filtering groups hints but preserves selected and faulting threads" {
     labels[0].id = 99; // A recycled slot cannot inherit an old classification.
     panel.prepare(&threads, &labels, 1);
     try std.testing.expectEqual(@as(usize, 3), panel.count);
+}
+
+test "thread row hit follows the prepared visible order" {
+    const threads = [_]linux.Thread{
+        .{ .id = 1, .tid = 11, .state = .stopped },
+        .{ .id = 2, .tid = 12, .state = .stopped },
+        .{ .id = 3, .tid = 13, .state = .stopped },
+    };
+    var labels = [_]compat.Label{ .{ .id = 1, .tid = 11 }, .{ .id = 2, .tid = 12 }, .{ .id = 3, .tid = 13 } };
+    var panel: Panel = .{};
+    const rect = gpu.Rect{ .x = 10, .y = 20, .w = 200, .h = 80 };
+    try std.testing.expectEqual(@as(?usize, 1), panel.hit(rect, &threads, &labels, 2, 20, 24));
+    try std.testing.expectEqual(@as(?usize, 2), panel.hit(rect, &threads, &labels, 2, 20, 63));
+    try std.testing.expectEqual(@as(?usize, null), panel.hit(rect, &threads, &labels, 2, 220, 24));
 }

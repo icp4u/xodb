@@ -46,9 +46,14 @@ def case(name, work, wrong=False, objects=False):
         for object_ in binary.parent.glob('*.o'):
             shutil.copyfile(object_, directory/object_.name)
         binary = local
+    # A name on the command line resolves through the same Mach-O symbols.
+    startup = ('--break', 'outer') if name == 'c-O2-basic' else ()
     client = Client('mutate', executable=None, options=('--gdb-remote', stub.endpoint,
-                    '--exe', str(binary)), reply_seconds=30)
+                    '--exe', str(binary))+startup, reply_seconds=30)
     try:
+        if startup:
+            outer = recording['static']['symbols']['outer']+int(recording['notes']['slide'], 0)
+            assert stub.probes == ['Z0,%x,4' % outer], stub.probes
         before = names.resources(client.p.pid)
         tid = client.session()['threads'][0]['tid']
         frames = names.wait_stack(client, tid)
@@ -62,6 +67,16 @@ def case(name, work, wrong=False, objects=False):
             assert frames[1]['pc'] == int.from_bytes(bytes.fromhex(stops[0].registers[30]), 'little'), frames[1]
             assert frames[1]['registers'][31] == int.from_bytes(bytes.fromhex(stops[0].registers[31]), 'little'), frames[1]
         locals_ = client.inspect('list_locals', tid=tid)['locals']
+        breakpoints = None
+        if name == 'c-O2-basic':
+            symbol = client.inspect('find_symbol', name='main')
+            expected = recording['static']['symbols']['main']+int(recording['notes']['slide'], 0)
+            assert int(symbol['address'], 0) == expected, symbol
+            by_name = client.action('set_breakpoint', symbol='main')
+            by_line = client.action('set_breakpoint', file='/xodb-corpus/src/c/main.c', line=31)
+            assert by_name['pending'] is False and by_line['ids'], (by_name, by_line)
+            assert len([q for q in stub.probes if q.startswith('Z0,')]) == 2+len(by_line['ids']), stub.probes
+            breakpoints = dict(symbol=symbol, by_name=by_name, by_line=by_line)
         marker = 'cxx_marker' if name.startswith('cxx') else 'objc_marker' if name.startswith('objc') else 'marker' if name.startswith('c-') else None
         if marker:
             global_ = next(local for local in locals_ if local['name']==marker)
@@ -80,13 +95,19 @@ def case(name, work, wrong=False, objects=False):
                 assert (int(bits, 0) if isinstance(bits, str) else bits) == expected, total
             elif argument == 'missing-type':
                 assert 0 in stops[0].registers, 'recorded argument register absent'
-                assert total['value']['availability'] == 'unavailable', total
-                assert total['value']['kind'] == 'unknown' and total['diagnostic'] == 'SwiftTypeLayoutUnavailable', total
+                expected = int.from_bytes(bytes.fromhex(stops[0].registers[0]), 'little')
+                assert total['value']['availability'] == 'available', total
+                assert total['value']['kind'] == 'signed', total
+                bits = total['value']['bits']
+                assert (int(bits, 0) if isinstance(bits, str) else bits) == expected, total
             else:
                 assert total['value']['availability'] != 'available', total
                 assert total['diagnostic'] or total['value'].get('diagnostic'), total
+        if name.startswith('swift'):
+            swift_frame = next(frame for frame in frames if '$s9swiftprog8bpTarget' in frame.get('symbol', ''))
+            assert 'swiftprog.bpTarget' in swift_frame['symbol_display'], swift_frame
         assert not stub.extra, stub.extra
-        return dict(case=name, mode='objects' if objects else 'dsym', status='pass', source=source, locals=locals_, frames=frames,
+        return dict(case=name, mode='objects' if objects else 'dsym', status='pass', source=source, locals=locals_, frames=frames, breakpoints=breakpoints,
                     resources_before=before, resources_after=names.resources(client.p.pid))
     finally:
         (work/f'{name}-calls.json').write_text(json.dumps(client.transcript, indent=2)+'\n')

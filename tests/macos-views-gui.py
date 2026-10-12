@@ -71,7 +71,7 @@ def main():
                                        'Mach exception details not rendered',timeout=10*scale)
                     # The exact numeric value is asserted through MCP above;
                     # OCR commonly confuses hexadecimal zero with O or @.
-                    assert 'Fault address' in visible and 'pending application signal' in visible,visible
+                    assert 'Fault address' in visible and 'Continuing will repeat this bad access' in visible,visible
                     assert 'Fault map unavailable' in visible and 'GdbListUnavailable' in visible,visible
                     assert 'qMemoryRegionInfo:0' in stub.requests,stub.requests
                 assert not stub.extra,stub.extra

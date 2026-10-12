@@ -73,7 +73,16 @@ pub const Panel = struct {
             try r.textFit(font, b.x + 14, y, b.w - 28, message, theme.warm);
             y += 27;
         }
-        try r.textFit(font, b.x + 14, b.y + b.h - 54, b.w - 28, if (info.read_only) "Read-only dump: no execution, target writes or live process attachment" else if (info.pending_delivery) "Continue forwards this pending signal to the target" else "Continue has no pending application signal to forward", theme.weak);
+        const repeats_bad_access = if (info.mach_exception) |exception| exception.kind == 1 else false;
+        const continue_message = if (info.read_only)
+            "Read-only dump: no execution, target writes or live process attachment"
+        else if (repeats_bad_access)
+            "Continuing will repeat this bad access unless the program state changes"
+        else if (info.pending_delivery)
+            "Continue forwards this pending signal to the target"
+        else
+            "Continue has no pending application signal to forward";
+        try r.textFit(font, b.x + 14, b.y + b.h - 54, b.w - 28, continue_message, if (repeats_bad_access) theme.warm else theme.weak);
         try r.textFit(font, b.x + 14, b.y + b.h - 28, b.w - 28, "Stop evidence identifies the stop; it does not establish the root cause", theme.weak);
     }
 };

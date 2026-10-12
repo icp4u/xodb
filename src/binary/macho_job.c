@@ -476,6 +476,29 @@ enum xmo_status xmo_job_object(struct xmo_job *j, uint64_t linked, uint32_t *ind
     if (status==XMO_OK) { *out=&object->dwarf;*index=found->object; }
     return status;
 }
+enum xmo_status xmo_job_object_count(struct xmo_job *j, uint32_t *count) {
+    if (!count) return XMO_MALFORMED;
+    *count=0;
+    if (!xmo_job_info(j)) return XMO_UNAVAILABLE;
+    if (xrt_file_unchanged(j->fd,&j->identity)!=XRT_OK) return XMO_CHANGED;
+    if (j->map_status!=XMO_OK) return j->map_status;
+    *count=j->object_count;
+    return XMO_OK;
+}
+enum xmo_status xmo_job_object_debug(struct xmo_job *j, uint32_t index,
+                                    const struct xmo_dwarf **out) {
+    if (!out) return XMO_MALFORMED;
+    *out=NULL;
+    if (!xmo_job_info(j)) return XMO_UNAVAILABLE;
+    if (xrt_file_unchanged(j->fd,&j->identity)!=XRT_OK) return XMO_CHANGED;
+    if (j->map_status!=XMO_OK) return j->map_status;
+    if (index>=j->object_count) return XMO_NOT_FOUND;
+    struct debug_object *object=&j->objects[index];
+    if (object->status!=XMO_OK) return object->status;
+    if (xrt_file_unchanged(object->fd,&object->identity)!=XRT_OK) return XMO_CHANGED;
+    *out=&object->dwarf;
+    return XMO_OK;
+}
 enum xmo_status xmo_job_object_address(struct xmo_job *j, uint32_t index,
                                      uint64_t object, uint64_t *linked) {
     if (!xmo_job_info(j) || index>=j->object_count || j->objects[index].status!=XMO_OK) return XMO_UNAVAILABLE;
@@ -497,6 +520,35 @@ enum xmo_status xmo_job_symbol(struct xmo_job *j, uint64_t address, char *name, 
     status=xmo_string(j->image,symbol->strx,name,capacity);
     if (status==XMO_OK) *value=symbol->value;
     return status;
+}
+static enum xmo_status executable_symbol(struct xmo_job *j, const struct xmo_symbol *symbol,
+                                         uint64_t *value, uint64_t *size) {
+    if (!symbol || !(xmo_symbol_flags(symbol)&XMO_SYMBOL_DEFINED) || !symbol->sect) return XMO_NOT_FOUND;
+    const struct xmo_section *section=xmo_section(j->image,symbol->sect-1);
+    if (!section) return XMO_NOT_FOUND;
+    const struct xmo_segment *segment=xmo_segment(j->image,section->segment_index);
+    if (!segment || !(segment->initprot&4) || !(section->flags&0x80000400u)) return XMO_NOT_FOUND;
+    *value=symbol->value;
+    const struct xmo_symbol *at=NULL;
+    enum xmo_status status=xmo_symbol_at(j->image,symbol->value,&at,size);
+    return status==XMO_OK ? XMO_OK : status;
+}
+enum xmo_status xmo_job_find_symbol(struct xmo_job *j, const char *name,
+                                    uint64_t *value, uint64_t *size) {
+    if (!j || !name || !value || !size || !xmo_job_info(j)) return XMO_UNAVAILABLE;
+    *value=0;*size=0;
+    if (__atomic_load_n(&j->cancel,__ATOMIC_ACQUIRE)) return XMO_CANCELLED;
+    if (xrt_file_unchanged(j->fd,&j->identity)!=XRT_OK) return XMO_CHANGED;
+    const struct xmo_symbol *symbol=NULL;
+    enum xmo_status status=xmo_symbol_unique(j->image,name,&symbol);
+    if (status==XMO_NOT_FOUND && name[0]!='_') {
+        size_t length=strnlen(name,XMO_MAX_NAME+1);
+        if (length && length<XMO_MAX_NAME) {
+            char stored[XMO_MAX_NAME+1];stored[0]='_';memcpy(stored+1,name,length+1);
+            status=xmo_symbol_unique(j->image,stored,&symbol);
+        }
+    }
+    return status==XMO_OK ? executable_symbol(j,symbol,value,size) : status;
 }
 void xmo_job_destroy(struct xmo_job *j) {
     if (!j) return;

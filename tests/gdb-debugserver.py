@@ -109,6 +109,18 @@ def region_reply(make, expected, alive):
     return case
 
 
+def region_flood_cut(exchanges, static, log):
+    hostile = Replace(lambda request, replies: request.startswith(REGION),
+                      lambda request, replies: f'start:{int(request[len(REGION):],16):x};size:4000;permissions:r;')
+    fake, client = session(exchanges, hostile)
+    started = time.monotonic()
+    page = client.inspect('list_modules', limit=1)
+    assert page['map_cut'] and page['total_regions'] == 4096 and len(page['regions']) == 1, page
+    assert hostile.served == 4097 and time.monotonic() - started < 12, hostile.served
+    assert client.inspect('get_registers', tid=client.session()['threads'][0]['tid'])['registers']['pc']
+    client.action('detach'); finish(client)
+
+
 def region_oversized(exchanges, static, log):
     pages = ','.join('%x' % (0x100000000 + 0x4000 * n) for n in range(30000))
     hostile = Replace(lambda request, replies: request.startswith(REGION) and 'permissions' in replies[0],
@@ -187,7 +199,7 @@ CASES = {
     'images-deep': malformed_images('{"images":[{"load_address":1,"extra":' + '[' * 40 + ']' * 40 + '}]}'),
     'images-truncated': malformed_images('{"images":[{"load_address":4294967296,"pathname":"/tmp/xodb-fix'),
     'images-negative': malformed_images('{"images":[{"load_address":-1,"pathname":"/tmp/xodb-fixture/a"}]}'),
-    'region-flood': region_reply(lambda asked: f'start:{asked:x};size:4000;permissions:r;', 'GdbListTooLarge', True),
+    'region-flood': region_flood_cut,
     'region-backwards': region_reply(lambda asked: f'start:{asked + 0x4000:x};size:4000;permissions:r;', 'ProtocolError', False),
     'region-zero': region_reply(lambda asked: f'start:{asked:x};size:0;permissions:r;', 'ProtocolError', False),
     'region-oversized': region_oversized,

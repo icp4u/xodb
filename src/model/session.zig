@@ -1507,12 +1507,47 @@ pub const Session = struct {
     /// target mapped thousands of times would otherwise make every caller
     /// walk them all; no caller uses more than a breakpoint set holds.
     pub const max_line_addresses = 4096;
+    pub fn findSymbol(self: *Session, name: []const u8) !@import("modules.zig").Symbol {
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+            try self.gdb_map.refreshImages(&self.target);
+            // Local Mach-O tables load on a worker and normally settle within
+            // milliseconds. Wait briefly so the first request does not have
+            // to be made twice.
+            const deadline = linux.now() + macho_settle_ns;
+            while (true) return self.gdb_map.findSymbol(name, self.debug_files.roots.items) catch |err| {
+                if (err != error.MachOSymbolsPending or linux.now() > deadline) return err;
+                _ = @import("../c.zig").api.usleep(2000);
+                continue;
+            };
+        };
+        try self.refreshMaps();
+        return try self.modules.findSymbol(name);
+    }
+    const macho_settle_ns = 2 * std.time.ns_per_s;
+    /// A breakpoint at a function name, for the command line, the breakpoint
+    /// field and agents alike. A Darwin stub target has no loader hook to
+    /// re-resolve a name against, so the name becomes an address breakpoint.
+    pub fn breakSymbol(self: *Session, name: []const u8) !u64 {
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin)
+            return self.target.setBreakpoint((try self.findSymbol(name)).address, false);
+        try self.refreshMaps();
+        return self.persistent.addSymbol(self, name);
+    }
     /// Runtime addresses of `path:line` in every mapped image. Each image is
     /// read and searched once, through one loaded copy, for every place its
     /// file is mapped; a file that does not load is tried once. This is a
     /// sweep (see Modules.Reason): what it left unread for a budget is in
     /// `modules.skipped()` afterwards, so "no code" is never silently partial.
     pub fn sourceAddresses(self: *Session, a: std.mem.Allocator, path: []const u8, line: u32) ![]u64 {
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+            try self.gdb_map.refreshImages(&self.target);
+            const deadline = linux.now() + macho_settle_ns;
+            while (true) return self.gdb_map.sourceAddresses(a, path, line, self.debug_files.roots.items) catch |err| {
+                if ((err != error.MachOSymbolsPending and err != error.MachODebugInfoPending) or linux.now() > deadline) return err;
+                _ = @import("../c.zig").api.usleep(2000);
+                continue;
+            };
+        };
         try self.refreshMaps();
         self.modules.beginSweep();
         var addresses: std.ArrayList(u64) = .empty;
@@ -2064,8 +2099,38 @@ pub const Session = struct {
     pub fn init() Session {
         return .{ .id = linux.now() };
     }
+    fn exitSummary(self: *const Session) ?ExitSummary {
+        if (self.target.snapshot().state != .exited) return null;
+        const events = self.target.eventSlice();
+        var i = events.len;
+        while (i > 0) {
+            i -= 1;
+            const event = events[i];
+            if (event.kind != .exit) continue;
+            // Events also arrive from agents and archives: no trap on a wild value.
+            if (event.detail >= 0) return .{ .kind = .status, .status = std.math.cast(i32, event.detail) orelse return null };
+            const signal = std.math.cast(i32, -%event.detail) orelse return null;
+            if (signal < 0) return null;
+            return .{ .kind = .signal, .signal = signal, .signal_name = linux.signalNameIn(self.target.signalTable(), signal) };
+        }
+        return null;
+    }
+    fn imageNotice(self: *const Session) ?[]const u8 {
+        if (self.target.snapshot().state != .stopped) return null;
+        const events = self.target.eventSlice();
+        var i = events.len;
+        while (i > 0) {
+            i -= 1;
+            switch (events[i].kind) {
+                .image_replaced => return "Program image changed; breakpoints were removed",
+                .continued => return null,
+                else => {},
+            }
+        }
+        return null;
+    }
     pub fn snapshot(self: *const Session) Snapshot {
-        return .{ .compatibility = self.compatibility.info, .thread_labels = self.compatibility.labels.items, .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null };
+        return .{ .compatibility = self.compatibility.info, .thread_labels = self.compatibility.labels.items, .gdb_remote = self.target.gdbRemoteInfo(), .mode = if (self.imported != null) .imported else if (self.offline) .archive else if (self.target.core != null) .core else .live, .process_id = self.process_id, .session_id = self.id, .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .pid = self.target.snapshot().pid, .architecture = if (self.imported) |state| (if (state.profile) |data| data.wire.architecture else "pending") else @tagName(self.target.arch()), .state = self.target.snapshot().state, .threads = self.target.threadSlice(), .last_event_sequence = self.target.snapshot().sequence, .agent_scope = self.agent_scope, .source_stepping = self.source_step != null, .symbol_discovery_pending = self.persistent.resolving, .pe_metadata_pending = self.modules.peDiscoveryPending(), .pe_metadata = self.modules.pe_images.snapshot(), .debug_metadata = self.metadata.snapshot(), .continue_pending = self.pending_continue != null, .source_step_resumes = self.source_step_resumes, .source_step_planned_instructions = self.source_step_batched, .running_to = if (self.run_to) |run| run.address else null, .step_diagnostic = self.step_diagnostic, .last_action = if (self.audit_count > 0) self.audit[self.audit_count - 1] else null, .exit = self.exitSummary(), .resume_warning = self.target.resumeWarning(), .image_notice = self.imageNotice() };
     }
     pub fn deinit(self: *Session) void {
         self.compatibility.deinit();
@@ -2106,7 +2171,8 @@ pub const Session = struct {
         self.investigation_arena.deinit();
     }
 };
-pub const Snapshot = struct { compatibility: @import("compatibility.zig").Info = .{}, thread_labels: []const @import("compatibility.zig").Label = &.{}, gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit };
+pub const ExitSummary = struct { kind: enum { status, signal }, status: ?i32 = null, signal: ?i32 = null, signal_name: ?[]const u8 = null };
+pub const Snapshot = struct { compatibility: @import("compatibility.zig").Info = .{}, thread_labels: []const @import("compatibility.zig").Label = &.{}, gdb_remote: ?linux.GdbRemoteInfo = null, process_id: u64 = 1, mode: enum { live, core, archive, imported } = .live, session_id: u64, generation: u64, image_epoch: u64 = 0, pid: i32, architecture: []const u8, state: linux.State, threads: []const linux.Thread, last_event_sequence: u64, agent_scope: AgentScope, source_stepping: bool, symbol_discovery_pending: bool = false, pe_metadata_pending: bool = false, pe_metadata: @import("pe_images.zig").State.Snapshot = .{}, debug_metadata: @import("debug_metadata.zig").Snapshot = .{}, continue_pending: bool = false, source_step_resumes: usize = 0, source_step_planned_instructions: usize = 0, running_to: ?u64, step_diagnostic: ?[]const u8, last_action: ?Audit, exit: ?ExitSummary = null, resume_warning: ?[]const u8 = null, image_notice: ?[]const u8 = null };
 test {
     std.testing.refAllDecls(linux);
     std.testing.refAllDecls(cfg);

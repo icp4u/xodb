@@ -230,6 +230,7 @@ pub const GdbRemoteInfo = struct {
     /// Significant pointer bits (zero: unknown); higher bits may carry tags.
     address_bits: u32,
     memory_regions: GdbAvailability,
+    memory_regions_cut: bool,
     images: GdbAvailability,
     packet_size: u32,
     register_count: u32,
@@ -309,6 +310,7 @@ pub const Target = struct {
             },
             .address_bits = cache.address_bits,
             .memory_regions = gdbAvailability(cache.*, rt.XRT_GDB_CAP_REGIONS),
+            .memory_regions_cut = cache.regions_cut,
             .images = gdbAvailability(cache.*, rt.XRT_GDB_CAP_IMAGES),
             .packet_size = cache.packet_size,
             .register_count = cache.register_count,
@@ -334,6 +336,13 @@ pub const Target = struct {
     pub fn signalTable(self: *const Target) SignalTable {
         const info = self.gdbRemoteInfo() orelse return .linux;
         return if (info.os == .darwin) .darwin else .linux;
+    }
+    pub fn resumeWarning(self: *const Target) ?[]const u8 {
+        const info = self.gdbRemoteInfo() orelse return null;
+        if (info.os != .darwin or self.snapshot().state != .stopped) return null;
+        if (self.gdb_cache.has_exception and self.gdb_cache.exception_type == 1)
+            return "Continuing will repeat this bad access unless the program state changes";
+        return null;
     }
     /// Rows stored in `out`; a longer list is cut. Stopped Darwin stubs only.
     pub fn gdbRegions(self: *Target, out: []rt.struct_xrt_gdb_region) !usize {

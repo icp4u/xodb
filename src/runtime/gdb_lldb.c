@@ -446,8 +446,8 @@ static bool thread_info(struct json *j, struct xrt_gdb_thread_info *out)
             if (!text(j, out->name, sizeof out->name, &out->name_truncated)) return false;
             out->has_name = true;
         } else {
-            if (!unsigned_number(j, &out->queue_address)) return false;
-            out->has_queue = out->queue_address != 0;
+            uint64_t queue_slot;
+            if (!unsigned_number(j, &queue_slot)) return false;
         }
     } while (take(j, ','));
     return take(j, '}') && (seen & 1);
@@ -472,6 +472,28 @@ enum xrt_status xrt_gdb_threads_parse(const char *input, size_t size, struct xrt
             ++*total;
         } while (take(&j, ','));
         if (!take(&j, ']')) return XRT_PROTOCOL_ERROR;
+    }
+    blank(&j);
+    return j.at == j.end ? XRT_OK : XRT_PROTOCOL_ERROR;
+}
+
+enum xrt_status xrt_gdb_thread_extended_parse(const char *input, size_t size, uint64_t *dispatch_queue)
+{
+    if (!input || !dispatch_queue || !size || memchr(input, 0, size)) return XRT_PROTOCOL_ERROR;
+    *dispatch_queue = 0;
+    struct json j = {input, input + size};
+    char key[32];
+    bool seen = false;
+    if (!take(&j, '{')) return XRT_PROTOCOL_ERROR;
+    if (!take(&j, '}')) {
+        do {
+            if (!text(&j, key, sizeof key, NULL) || !take(&j, ':')) return XRT_PROTOCOL_ERROR;
+            if (!strcmp(key, "dispatch_queue_t")) {
+                if (seen || !unsigned_number(&j, dispatch_queue)) return XRT_PROTOCOL_ERROR;
+                seen = true;
+            } else if (!skip(&j, 2)) return XRT_PROTOCOL_ERROR;
+        } while (take(&j, ','));
+        if (!take(&j, '}')) return XRT_PROTOCOL_ERROR;
     }
     blank(&j);
     return j.at == j.end ? XRT_OK : XRT_PROTOCOL_ERROR;

@@ -105,7 +105,7 @@ pub fn apply(session: *model.Session, request: Request, actor: model.Actor) !Out
     const current = sessionKey(session);
     if (request.key.session != current.session or request.key.image != current.image or request.key.generation != current.generation) return error.StaleSnapshot;
     if (request.edit == .symbol) {
-        _ = try session.persistent.addSymbol(session, request.edit.symbol);
+        _ = try session.breakSymbol(request.edit.symbol);
         session.record(actor, "set_breakpoint");
         return .symbol_added;
     }

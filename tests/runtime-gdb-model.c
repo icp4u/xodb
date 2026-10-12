@@ -428,6 +428,7 @@ int main(int argc, char **argv)
         assert(mode == 1 ? (info.unsupported & XRT_GDB_CAP_THREADS) : (info.supported & XRT_GDB_CAP_THREADS));
         struct xrt_target_view view; xrt_target_view(target, &view);
         assert(view.thread_count == (mode == 1 ? 1u : 2u));
+        assert(view.threads[0].reason == XRT_STOP_INTERRUPT); /* qAttached=1 is not an exec stop. */
         uint64_t before = generation(target);
         assert(xrt_target_step(target, 1) == XRT_UNSUPPORTED_CONTROL);
         assert(generation(target) == before);

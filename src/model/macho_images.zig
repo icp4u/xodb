@@ -26,6 +26,41 @@ const Entry = struct {
     cfi_checked: bool = false,
     object_errors: [c.XMO_MAX_DEBUG_OBJECTS]?anyerror = @splat(null),
 };
+fn objectImage(e: *Entry, index_: u32, container: *const c.struct_xmo_dwarf) !*dwarf.Image {
+    const index: usize = @intCast(index_);
+    if (index >= e.objects.len) return error.MachOObjectMalformed;
+    if (e.object_errors[index]) |err| return err;
+    if (e.objects[index] == null) {
+        const bytes = container.*.bytes[0..container.*.size];
+        const binary = elf.Image.parse(bytes) catch |err| {
+            e.object_errors[index] = err;
+            return err;
+        };
+        const debug = try a.create(dwarf.Image);
+        errdefer a.destroy(debug);
+        debug.* = dwarf.Image.init(binary, bytes) catch |err| {
+            e.object_errors[index] = err;
+            return err;
+        };
+        e.objects[index] = debug;
+    }
+    return e.objects[index].?;
+}
+fn primaryImage(e: *Entry, container: *const c.struct_xmo_dwarf) !*dwarf.Image {
+    if (e.debug_error) |err| return err;
+    if (e.debug == null) {
+        const bytes = container.*.bytes[0..container.*.size];
+        const binary = elf.Image.parse(bytes) catch |err| {
+            e.debug_error = err;
+            return err;
+        };
+        e.debug = dwarf.Image.init(binary, bytes) catch |err| {
+            e.debug_error = err;
+            return err;
+        };
+    }
+    return &e.debug.?;
+}
 pub const State = struct {
     entries: std.ArrayList(*Entry) = .empty,
     pending: ?*Entry = null,
@@ -171,7 +206,28 @@ pub const State = struct {
         self.pending = e;
         return e;
     }
-    pub const Symbol = struct { name: []const u8, address: u64 };
+    pub const Symbol = struct { name: []const u8, address: u64, size: u64 };
+    pub fn findSymbol(self: *State, image: *const rt.struct_xrt_gdb_image, roots: []const [:0]const u8, name: []const u8, text_address: u64) !?Symbol {
+        if (name.len == 0 or name.len > c.XMO_MAX_NAME or std.mem.indexOfScalar(u8, name, 0) != null) return error.SymbolNameLimit;
+        _ = self.poll();
+        self.clock +|= 1;
+        const e = self.find(image) orelse try self.start(image, roots);
+        e.used = self.clock;
+        if (self.pending == e) return error.MachOSymbolsPending;
+        if (e.failure != null) return null;
+        const job = e.job orelse return null;
+        const info = c.xmo_job_info(job) orelse return error.MachOSymbolsUnavailable;
+        if (info.*.has_text == 0 or info.*.text_vmaddr != text_address) return error.MachOLayoutMismatch;
+        const stored = try a.dupeZ(u8, name);
+        defer a.free(stored);
+        var value: u64 = 0;
+        var size: u64 = 0;
+        const result = c.xmo_job_find_symbol(job, stored.ptr, &value, &size);
+        if (result == c.XMO_NOT_FOUND) return null;
+        if (result == c.XMO_UNAVAILABLE) return error.SymbolAmbiguous;
+        if (result != c.XMO_OK) return error.MachOSymbolsUnavailable;
+        return .{ .name = name, .address = value, .size = size };
+    }
     pub fn unwind(self: *State, allocator: std.mem.Allocator, image: *const rt.struct_xrt_gdb_image, roots: []const [:0]const u8, text: u64, pc: u64, context: @import("../debug/location.zig").Context, mask: u64, top: bool) !dwarf.Unwind {
         if (image.cputype != c.XMO_CPU_ARM64) return error.MachOUnwindArchitectureUnsupported;
         _ = self.poll();
@@ -242,39 +298,78 @@ pub const State = struct {
                     c.XMO_UNSUPPORTED => return error.MachOObjectDebugUnsupported,
                     else => return error.MachOObjectDebugUnavailable,
                 }
-                if (index >= e.objects.len) return error.MachOObjectMalformed;
-                if (e.object_errors[index]) |err| return err;
-                if (e.objects[index] == null) {
-                    const bytes = container.*.bytes[0..container.*.size];
-                    const binary = elf.Image.parse(bytes) catch |err| {
-                        e.object_errors[index] = err;
-                        return err;
-                    };
-                    const debug = try a.create(dwarf.Image);
-                    errdefer a.destroy(debug);
-                    debug.* = dwarf.Image.init(binary, bytes) catch |err| {
-                        e.object_errors[index] = err;
-                        return err;
-                    };
-                    e.objects[index] = debug;
-                }
-                return .{ .info = e.objects[index].?, .job = job, .object = index, .pc = object_pc };
+                return .{ .info = try objectImage(e, index, container), .job = job, .object = index, .pc = object_pc };
             },
             else => return error.MachODebugFileRefused,
         }
-        if (e.debug_error) |err| return err;
-        if (e.debug == null) {
-            const bytes = container.*.bytes[0..container.*.size];
-            const binary = elf.Image.parse(bytes) catch |err| {
-                e.debug_error = err;
-                return err;
-            };
-            e.debug = dwarf.Image.init(binary, bytes) catch |err| {
-                e.debug_error = err;
-                return err;
-            };
+        return .{ .info = try primaryImage(e, container), .job = job, .pc = pc };
+    }
+    /// Link-time addresses for a source line. A linked image with an N_OSO
+    /// debug map has no single object PC that can nominate its DWARF, so a
+    /// source search must visit every pinned object rather than asking for the
+    /// object that owns the executable's text base.
+    pub fn sourceAddresses(self: *State, alloc: std.mem.Allocator, image: *const rt.struct_xrt_gdb_image, roots: []const [:0]const u8, text_address: u64, path: []const u8, line: u32) ![]u64 {
+        _ = self.poll();
+        self.clock +|= 1;
+        const e = self.find(image) orelse try self.start(image, roots);
+        e.used = self.clock;
+        if (self.pending == e) return error.MachODebugInfoPending;
+        if (e.failure != null) return error.MachODebugInfoUnavailable;
+        const job = e.job orelse return error.MachODebugInfoUnavailable;
+        const info = c.xmo_job_info(job) orelse return error.MachODebugInfoUnavailable;
+        if (info.*.has_text == 0 or info.*.text_vmaddr != text_address) return error.MachOLayoutMismatch;
+        var addresses: std.ArrayList(u64) = .empty;
+        var container: [*c]const c.struct_xmo_dwarf = null;
+        switch (c.xmo_job_debug(job, &container)) {
+            c.XMO_DEBUG_READY => {
+                const debug = try primaryImage(e, container);
+                const rows = debug.rowsForLine(alloc, path, line) catch return addresses.toOwnedSlice(alloc);
+                for (rows) |row| try addresses.append(alloc, row.address);
+            },
+            c.XMO_DEBUG_UUID => return error.MachODsymUuidMismatch,
+            c.XMO_DEBUG_ARCH => return error.MachODsymArchitectureMismatch,
+            c.XMO_DEBUG_LIMIT => return error.MachODebugInfoBudget,
+            c.XMO_DEBUG_CHANGED => return error.MachODebugFileChanged,
+            c.XMO_DEBUG_MISSING => {
+                var count: u32 = 0;
+                switch (c.xmo_job_object_count(job, &count)) {
+                    c.XMO_OK => {},
+                    c.XMO_LIMIT => return error.MachOObjectDebugBudget,
+                    c.XMO_CHANGED => return error.MachOObjectChanged,
+                    c.XMO_MALFORMED => return error.MachOObjectMalformed,
+                    else => return error.MachOObjectDebugUnavailable,
+                }
+                for (0..count) |index_| {
+                    const index: u32 = @intCast(index_);
+                    switch (c.xmo_job_object_debug(job, index, &container)) {
+                        c.XMO_OK => {},
+                        c.XMO_NOT_FOUND, c.XMO_UNAVAILABLE, c.XMO_IO, c.XMO_UNSUPPORTED => continue,
+                        c.XMO_LIMIT => return error.MachOObjectDebugBudget,
+                        c.XMO_CHANGED => return error.MachOObjectChanged,
+                        c.XMO_MALFORMED => return error.MachOObjectMalformed,
+                        else => return error.MachOObjectDebugUnavailable,
+                    }
+                    const debug = try objectImage(e, index, container);
+                    const rows = debug.rowsForLine(alloc, path, line) catch continue;
+                    for (rows) |row| {
+                        var linked: u64 = 0;
+                        switch (c.xmo_job_object_address(job, index, row.address, &linked)) {
+                            c.XMO_OK => {},
+                            c.XMO_CHANGED => return error.MachOObjectChanged,
+                            else => continue,
+                        }
+                        var duplicate = false;
+                        for (addresses.items) |old| if (old == linked) {
+                            duplicate = true;
+                            break;
+                        };
+                        if (!duplicate) try addresses.append(alloc, linked);
+                    }
+                }
+            },
+            else => return error.MachODebugFileRefused,
         }
-        return .{ .info = &e.debug.?, .job = job, .pc = pc };
+        return addresses.toOwnedSlice(alloc);
     }
     pub fn symbol(self: *State, allocator: std.mem.Allocator, image: *const rt.struct_xrt_gdb_image, roots: []const [:0]const u8, link: u64, text_address: u64) !?Symbol {
         _ = self.poll();
@@ -297,7 +392,7 @@ pub const State = struct {
         }
         const stored = std.mem.sliceTo(&name, 0);
         if (!std.unicode.utf8ValidateSlice(stored)) return error.MachOSymbolNameInvalid;
-        return .{ .name = try allocator.dupe(u8, if (std.mem.startsWith(u8, stored, "_")) stored[1..] else stored), .address = value };
+        return .{ .name = try allocator.dupe(u8, if (std.mem.startsWith(u8, stored, "_")) stored[1..] else stored), .address = value, .size = size };
     }
 };
 fn statusName(status: c.enum_xmo_status) []const u8 {

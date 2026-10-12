@@ -31,7 +31,7 @@ pub const Label = struct {
     tid: i32 = 0,
     name: [128]u8 = @splat(0),
     source: enum { linux_task_comm, gdb_thread_info } = .linux_task_comm,
-    queue_address: ?u64 = null,
+    dispatch_queue: ?u64 = null,
     readable: bool = false,
     internal_name: bool = false,
     possibly_truncated: bool = false,
@@ -40,7 +40,7 @@ pub const Label = struct {
     }
     pub fn jsonStringify(self: Label, writer: *std.json.Stringify) !void {
         var queue: [18]u8 = undefined;
-        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = self.source, .queue_address = if (self.queue_address) |address| std.fmt.bufPrint(&queue, "0x{x}", .{address}) catch unreachable else null, .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name });
+        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = self.source, .dispatch_queue = if (self.dispatch_queue) |address| std.fmt.bufPrint(&queue, "0x{x}", .{address}) catch unreachable else null, .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name });
     }
 };
 
@@ -156,7 +156,7 @@ pub const Cache = struct {
                     row.readable = true;
                     row.possibly_truncated = detail.name_truncated;
                 }
-                if (detail.has_queue) row.queue_address = detail.queue_address;
+                if (detail.has_dispatch_queue) row.dispatch_queue = detail.dispatch_queue;
             }
             self.remote_generation = snap.generation;
             self.revision +%= 1;

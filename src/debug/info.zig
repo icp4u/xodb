@@ -115,6 +115,34 @@ fn swift(die: *c.Dwarf_Die) bool {
     var cu: c.Dwarf_Die = undefined;
     return c.dwarf_diecu(die, &cu, null, null) != null and c.dwarf_srclang(&cu) == std.dwarf.LANG.Swift;
 }
+fn swiftScalar(t: *eval.Type, address_bytes: usize) void {
+    const Scalar = struct { name: []const u8, kind: eval.Kind, size: u64 };
+    const word: u64 = @intCast(address_bytes);
+    const scalars = [_]Scalar{
+        .{ .name = "Int", .kind = .signed, .size = word },
+        .{ .name = "UInt", .kind = .unsigned, .size = word },
+        .{ .name = "Int8", .kind = .signed, .size = 1 },
+        .{ .name = "UInt8", .kind = .unsigned, .size = 1 },
+        .{ .name = "Int16", .kind = .signed, .size = 2 },
+        .{ .name = "UInt16", .kind = .unsigned, .size = 2 },
+        .{ .name = "Int32", .kind = .signed, .size = 4 },
+        .{ .name = "UInt32", .kind = .unsigned, .size = 4 },
+        .{ .name = "Int64", .kind = .signed, .size = 8 },
+        .{ .name = "UInt64", .kind = .unsigned, .size = 8 },
+        .{ .name = "Bool", .kind = .boolean, .size = 1 },
+        .{ .name = "Float", .kind = .float, .size = 4 },
+        .{ .name = "Double", .kind = .float, .size = 8 },
+    };
+    var value_name = t.name;
+    if (std.mem.startsWith(u8, value_name, "Swift::")) value_name = value_name[7..];
+    if (std.mem.startsWith(u8, value_name, "const ")) value_name = value_name[6..];
+    for (scalars) |scalar| if (std.mem.eql(u8, value_name, scalar.name)) {
+        if (t.size != 0 and t.size != scalar.size) return;
+        t.kind = scalar.kind;
+        t.size = scalar.size;
+        return;
+    };
+}
 /// Unwind-only libdw state over C's private, bounded EH-section container.
 /// It borrows the bytes; destroy this before releasing the metadata job.
 /// It never enters Modules and cannot provide symbols, code, types or sources.
@@ -749,6 +777,10 @@ pub const Image = struct {
             },
             else => {},
         }
+        // dsymutil commonly omits the fields of Swift standard-library
+        // scalars. Their ABI sizes are stable and sufficient to present a
+        // value held directly in a register.
+        if (swift(&die) and t.kind == .unknown) swiftScalar(t, self.architecture.addressBytes());
         if (go_meta.present & c.XGO_META_RUNTIME != 0) t.go_runtime_offset = go_meta.runtime_offset;
         if (go_meta.present & c.XGO_META_IFACE != 0) t.go_interface_nonempty = go_meta.interface_nonempty != 0;
         if (go_meta.present & c.XGO_META_KEY != 0) t.go_key = try self.typeOf(go_meta.key, depth + 1);

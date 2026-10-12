@@ -419,8 +419,7 @@ pub const Server = struct {
             try session.target.expectGeneration(generation);
         }
         if (std.mem.eql(u8, name, "find_symbol")) {
-            try session.refreshMaps();
-            const symbol = session.modules.findSymbol(string(member(args, "name")) orelse return error.InvalidArguments) catch |err| {
+            const symbol = session.findSymbol(string(member(args, "name")) orelse return error.InvalidArguments) catch |err| {
                 // A name that is not found may live in an image refused in full.
                 const terminal = err == error.SymbolNotFound or err == error.BinarySnapshotLimit or err == error.SymbolSnapshotLimit;
                 var text: [@import("../model/modules.zig").Modules.unsearched_text]u8 = undefined;
@@ -475,10 +474,10 @@ pub const Server = struct {
                 var location: u64 = undefined;
                 if (string(member(args, "symbol"))) |symbol_name| {
                     if (member(args, "address") != null) return error.InvalidArguments;
-                    try session.refreshMaps();
-                    created_id = try session.persistent.addSymbol(session, symbol_name);
+                    created_id = try session.breakSymbol(symbol_name);
                     session.record(.agent, action);
-                    return asValue(a, .{ .id = created_id, .pending = @import("../model/persistent.zig").Manager.probe(session, created_id.?).?.pending, .session = session.snapshot() });
+                    const persistent = @import("../model/persistent.zig").Manager.probe(session, created_id.?);
+                    return asValue(a, .{ .id = created_id, .pending = if (persistent) |probe| probe.pending else false, .session = session.snapshot() });
                 } else location = try address(args);
                 created_id = try session.target.setBreakpoint(location, false);
             } else if (std.mem.eql(u8, name, "remove_breakpoint")) {

@@ -265,6 +265,31 @@ static enum xrt_status refresh_thread_info(struct xrt_gdb *g)
         return XRT_OK;
     }
     g->thread_info_count = count;
+    for (size_t i = 0; i < count; ++i) {
+        char command[80]; bool extended_cut;
+        snprintf(command,sizeof command,"jThreadExtendedInfo:{\"thread\":%" PRIu64 "}",
+                 g->thread_info[i].remote_tid);
+        status=query_prefix(g,command,&extended_cut);
+        if (status!=XRT_OK) return status;
+        /* Unsupported: do not pay one more round trip per thread at this stop. */
+        if (!g->length) break;
+        if (g->reply[0]=='E') continue;
+        if (extended_cut) {
+            g->thread_info_count=0;
+            g->info.failed|=XRT_GDB_CAP_THREAD_INFO;
+            return XRT_OK;
+        }
+        uint64_t queue=0;
+        if (xrt_gdb_thread_extended_parse((const char *)g->reply,g->length,&queue)!=XRT_OK) {
+            g->thread_info_count=0;
+            g->info.failed|=XRT_GDB_CAP_THREAD_INFO;
+            return XRT_OK;
+        }
+        if (queue) {
+            g->thread_info[i].dispatch_queue=queue;
+            g->thread_info[i].has_dispatch_queue=true;
+        }
+    }
     g->info.supported |= XRT_GDB_CAP_THREAD_INFO;
     return XRT_OK;
 }
@@ -822,7 +847,9 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         t->threads[i].signal = 0; t->threads[i].breakpoint_address = 0;
     }
     g->info.stop_tid = tid;
-    enum xrt_stop_reason reason = initial || stop.exec ? XRT_STOP_EXEC : XRT_STOP_SIGNAL;
+    enum xrt_stop_reason reason = initial ?
+        (g->info.attached == 1 ? XRT_STOP_INTERRUPT : XRT_STOP_EXEC) :
+        (stop.exec ? XRT_STOP_EXEC : XRT_STOP_SIGNAL);
     if (!initial && !stop.exec && stop.has_exception && stop.exception != 5)
         reason = XRT_STOP_EXCEPTION;
     if (!initial && stepping && signal == 5) reason = XRT_STOP_SINGLE_STEP;
@@ -833,6 +860,7 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         g->info.failed &= ~XRT_GDB_CAP_INTERRUPT;
     }
     g->interrupt = false; g->pending_signal = 0; g->unmapped_signal = false;
+    bool pass_sigchld = false;
     if (reason == XRT_STOP_SIGNAL) {
         int native = target_signal(g, signal);
         if (!native && signal) {
@@ -842,6 +870,8 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB signal has no host display mapping; explicit suppression is required to resume");
         }
         t->threads[index].signal = native; g->pending_signal = signal; g->signal_tid = tid;
+        /* Not during a step: resuming here would turn the step into a run. */
+        pass_sigchld = g->host.os == XRT_GDB_OS_DARWIN && native == 20 && !stepping;
     }
     if (g->watch_tid && thread_index(g, g->watch_tid) < 0) g->watch_tid = 0;
     struct xrt_registers regs; uint64_t pc = 0; bool known_pc = false;
@@ -889,6 +919,11 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             if (status != XRT_OK) return status;
         }
         if (!g->step_after_rearm && reason == XRT_STOP_SINGLE_STEP) return send_run(g, t, tid, false);
+    }
+    if (pass_sigchld && reason == XRT_STOP_SIGNAL) {
+        t->threads[index].reason = XRT_STOP_NONE;
+        t->threads[index].signal = 0;
+        return send_run(g, t, tid, false);
     }
     g->info.pending_delivery = g->pending_signal != 0;
     event(t, reason == XRT_STOP_SINGLE_STEP ? XRT_EVENT_STEP_COMPLETE : XRT_EVENT_STOP, tid, signal);
@@ -1093,6 +1128,14 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     status = query(g, command);
     if (status != XRT_OK) goto fail;
     if (g->length == 1 && (g->reply[0] == '0' || g->reply[0] == '1')) g->info.attached = g->reply[0] - '0';
+    /* The initial stop must be decoded before qAttached because decoding may
+     * read registers and debugserver recordings preserve that packet order.
+     * No observer can see the target until open returns, so correct an
+     * attached target's provisional exec reason here. */
+    if (g->info.attached == 1) {
+        int initial = xrt_thread_index(t, g->info.stop_tid);
+        if (initial >= 0) t->threads[initial].reason = XRT_STOP_INTERRUPT;
+    }
     /* A program started by the stub is still not a locally owned child. */
     t->owned = false; ++t->image_epoch;
     event(t, XRT_EVENT_ATTACH, t->pid, 0);
@@ -1302,6 +1345,7 @@ enum xrt_status xrt_gdb_regions(struct xrt_gdb *g, struct xrt_target *t,
 {
     if (!g || !t || !total || (capacity && !out)) return XRT_INVALID_ARGUMENT;
     *total = 0;
+    g->info.regions_cut = false;
     if (g->link.failed) return XRT_TRANSPORT_FAILED;
     if (g->info.unsupported & XRT_GDB_CAP_REGIONS)
         return problem(g, XRT_FILE_UNAVAILABLE, "GDB stub has no memory region query");
@@ -1326,8 +1370,10 @@ enum xrt_status xrt_gdb_regions(struct xrt_gdb *g, struct xrt_target *t,
             return problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB memory region reply");
         }
         if (!region.size) break;
-        if (*total == XRT_GDB_REGIONS_MAX)
-            return problem(g, XRT_BUFFER_TOO_SMALL, "GDB memory map exceeds the region limit");
+        if (*total == XRT_GDB_REGIONS_MAX) {
+            g->info.regions_cut = true;
+            break;
+        }
         if (xrt_now() > budget)
             return problem(g, XRT_DISCOVERY_BUDGET, "GDB memory map walk exceeded its time budget");
         if (*total < capacity) out[*total] = region;

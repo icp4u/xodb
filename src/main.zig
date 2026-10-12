@@ -414,8 +414,7 @@ pub fn main(init: std.process.Init) !void {
         if (launch.len > 0) try session.launch(launch);
         if (follow_forks) try session.target.setFollowProcesses(true);
         for (initial_breakpoints[0..initial_breakpoint_count]) |name| {
-            try session.refreshMaps();
-            _ = try session.persistent.addSymbol(session, name);
+            _ = try session.breakSymbol(name);
         }
     }
     if (!async_remote_start) if (observation_recipe) |path| {
@@ -908,8 +907,7 @@ const RemoteStartup = struct {
         if (self.launch.len > 0) try self.session.launch(self.launch);
         if (self.follow) try self.session.target.setFollowProcesses(true);
         for (self.breakpoints) |name| {
-            try self.session.refreshMaps();
-            _ = try self.session.persistent.addSymbol(self.session, name);
+            _ = try self.session.breakSymbol(name);
         }
         self.completed = true;
     }

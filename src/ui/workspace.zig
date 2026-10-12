@@ -1322,6 +1322,27 @@ pub const Workspace = struct {
         }
         const stack_x = @round(@as(f32, @floatFromInt(w.width)) * self.split * self.thread_width_fraction);
         const stack_y = self.bottomY(@floatFromInt(w.height)) + 44;
+        if (click and !self.show_profile and threads.len > 0 and w.pointer_x >= 12 and w.pointer_x < stack_x and w.pointer_y >= stack_y - 2) {
+            const bottom = self.bottomY(@floatFromInt(w.height));
+            const wine = self.compatibility_info.kind == .wine;
+            const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
+            const selected = if (wine or darwin)
+                self.thread_list.hit(.{ .x = 12, .y = bottom + 42, .w = stack_x - 20, .h = @max(0, @as(f32, @floatFromInt(w.height)) - bottom - 82) }, threads, self.thread_labels, self.selected, w.pointer_x, w.pointer_y)
+            else blk: {
+                const visible: usize = @intFromFloat(@max(1, (@as(f32, @floatFromInt(w.height)) - bottom - 87) / 25));
+                const first = (self.selected + 1) -| visible;
+                const row: usize = @intFromFloat((w.pointer_y - stack_y) / 25);
+                const index = first + row;
+                break :blk if (index < threads.len and row < visible) index else null;
+            };
+            if (selected) |index| {
+                self.selected = index;
+                self.selected_frame = 0;
+                self.browse_address = null;
+                self.selectNative(context);
+                w.dirty = true;
+            }
+        }
         if (click and !self.show_profile and w.pointer_x >= stack_x and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= stack_y and self.frames.len > 0) {
             self.browse_address = null;
             self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / 25)));
@@ -1961,7 +1982,7 @@ pub const Workspace = struct {
                 if (self.thread_selection.sync(&capture.snapshot) == .cleared_replaced) self.setup.message = "The target changed; the earlier thread choice was cleared";
                 try self.setup.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = height - body_y - 37 }, .{ .snapshot = &capture.snapshot, .defaults = capture.defaults, .selection = &self.thread_selection, .facts = capture.facts, .clock = .{ .now_ns = linux.now() }, .start_error = capture.start_error, .start_failure = capture.start_failure, .requested_threads = capture.requested_threads });
             }
-        } else try self.drawBottom(r, font, display.threads, display.events, width, height, left, bottom, thread_color);
+        } else try self.drawBottom(r, font, display.threads, display.events, display.signal_table, width, height, left, bottom, thread_color);
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
@@ -2130,7 +2151,7 @@ pub const Workspace = struct {
         }
     }
     /// Threads, stack and events, below the source view.
-    pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
+    pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, signal_table: linux.SignalTable, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
         const wine = self.compatibility_info.kind == .wine;
         const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
         self.thread_width_fraction = if (darwin) 0.48 else 0.36;
@@ -2202,6 +2223,13 @@ pub const Workspace = struct {
                 if (!event.before_valid or !event.after_valid or event.watch_attribution == .candidate) {
                     try fit(r, font, left + 325, y, events_rect.w - 335, theme.warm, "0x{x}: {s} / {s}", .{ event.address, @tagName(event.watch_phase), if (event.watch_attribution == .candidate) "candidate watch" else "value unavailable" });
                 } else try fit(r, font, left + 325, y, events_rect.w - 335, theme.warm, "0x{x}: {d} -> {d}", .{ event.address, event.before, event.after });
+            } else if (event.kind == .exit) {
+                if (event.detail >= 0)
+                    try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "exited with status {d}", .{event.detail})
+                else
+                    try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "killed by {s} ({d})", .{ linux.signalNameIn(signal_table, std.math.cast(i32, -%event.detail) orelse 0), -%event.detail });
+            } else if (event.kind == .image_replaced) {
+                try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "program image changed; breakpoints removed", .{});
             } else try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "thread {d}   detail {d}", .{ event.tid, event.detail });
         }
     }

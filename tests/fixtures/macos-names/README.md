@@ -40,3 +40,8 @@ unavailable. Run-control replays use recorded stops; hostile variants and the
 retained-probe/over-generous-slot cases explicitly alter those inputs. Raw
 thread IDs in RSP fields, `jThreadsInfo` JSON and the hex-encoded `jstopinfo`
 JSON of stop replies are normalized to the same synthetic range. The SHA-256 manifest covers every fixture file listed.
+
+For a new harvest, decode every hex-encoded `jstopinfo` JSON payload before
+scrubbing identifiers, normalize its JSON thread and process values alongside
+the visible RSP fields, then encode the JSON again. A text-only replacement
+does not see identifiers hidden in those hexadecimal bytes.

@@ -62,6 +62,7 @@ pub const Presentation = struct {
     snapshot: linux.Snapshot = .{},
     metadata_revision: u64 = 0,
     architecture: @import("../target/arch.zig").Arch = .x86_64,
+    signal_table: linux.SignalTable = .linux,
     threads: []const linux.Thread = &.{},
     thread_labels: []const @import("compatibility.zig").Label = &.{},
     events: []const linux.Event = &.{},
@@ -191,7 +192,7 @@ pub const Capture = struct {
     /// retain the returned presentation before any subsequent owner mutation.
     pub fn refresh(self: *Capture, session: *model.Session, request: Request) void {
         _ = self.arena.reset(.retain_capacity);
-        self.value = .{ .request = request, .snapshot = session.target.snapshot(), .metadata_revision = session.metadata.revision, .architecture = session.target.arch(), .threads = session.target.threadSlice(), .thread_labels = session.compatibility.labels.items, .events = session.target.eventSlice(), .selected_frame = request.frame };
+        self.value = .{ .request = request, .snapshot = session.target.snapshot(), .metadata_revision = session.metadata.revision, .architecture = session.target.arch(), .signal_table = session.target.signalTable(), .threads = session.target.threadSlice(), .thread_labels = session.compatibility.labels.items, .events = session.target.eventSlice(), .selected_frame = request.frame };
         defer {
             self.value.source = self.source.value;
             self.value.flow = self.flow.value;
