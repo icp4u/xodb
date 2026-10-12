@@ -1,6 +1,6 @@
 //! Cached, observer-only page metadata. No target bytes or physical addresses.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const wire = @import("profile.zig");
 const State = @import("../model/system.zig").Collector;
 const V = std.json.Value;

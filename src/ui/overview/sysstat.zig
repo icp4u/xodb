@@ -3,7 +3,7 @@
 //! that knows the C layout.
 const std = @import("std");
 const m = @import("model.zig");
-pub const c = @import("../../c.zig").api;
+pub const c = @import("../../c_ui.zig").api;
 
 comptime {
     if (c.XRT_SYS_ABI != 1) @compileError("overview adapter expects xrt_sysstat ABI 1");

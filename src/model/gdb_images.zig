@@ -11,6 +11,70 @@ pub const image_detail = "The stub did not provide the UUID and segment data nee
 const Range = struct { start: u64, end: u64, image: usize };
 const absent = std.math.maxInt(u64);
 
+// Disjoint, uniquely owned intervals. Shared-cache LINKEDIT can overlap
+// across images; no label may silently pick one of those owners.
+fn uniqueRanges(alloc: std.mem.Allocator, ranges: []const Range, image_count: usize) ![]Range {
+    const Edge = struct { address: u64, image: usize, begin: bool };
+    var edges: std.ArrayList(Edge) = .empty;
+    defer edges.deinit(a);
+    for (ranges) |range| {
+        try edges.append(a, .{ .address = range.start, .image = range.image, .begin = true });
+        try edges.append(a, .{ .address = range.end, .image = range.image, .begin = false });
+    }
+    std.mem.sort(Edge, edges.items, {}, struct {
+        fn less(_: void, x: Edge, y: Edge) bool {
+            return x.address < y.address;
+        }
+    }.less);
+    const counts = try a.alloc(u32, image_count);
+    defer a.free(counts);
+    @memset(counts, 0);
+    var owners: usize = 0;
+    var owner: usize = 0;
+    var cursor: u64 = 0;
+    var result: std.ArrayList(Range) = .empty;
+    errdefer result.deinit(alloc);
+    var i: usize = 0;
+    while (i < edges.items.len) {
+        const address = edges.items[i].address;
+        if (owners == 1 and address > cursor) {
+            if (result.items.len > 0 and result.items[result.items.len - 1].end == cursor and result.items[result.items.len - 1].image == owner) {
+                result.items[result.items.len - 1].end = address;
+            } else try result.append(alloc, .{ .start = cursor, .end = address, .image = owner });
+        }
+        // Resolve all edges at the same address together. Endpoints carry
+        // no bytes; adjacent segments of one image stay one interval.
+        while (i < edges.items.len and edges.items[i].address == address) : (i += 1) {
+            const edge = edges.items[i];
+            if (edge.begin) {
+                if (counts[edge.image] == 0) {
+                    owners += 1;
+                    owner ^= edge.image;
+                }
+                counts[edge.image] += 1;
+            } else {
+                counts[edge.image] -= 1;
+                if (counts[edge.image] == 0) {
+                    owners -= 1;
+                    owner ^= edge.image;
+                }
+            }
+        }
+        cursor = address;
+    }
+    return result.toOwnedSlice(alloc);
+}
+fn regionOwner(ranges: []const Range, start: u64, end: u64) ?usize {
+    var lo: usize = 0;
+    var hi = ranges.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (ranges[mid].start <= start) lo = mid + 1 else hi = mid;
+    }
+    if (lo == 0 or start >= ranges[lo - 1].end or end > ranges[lo - 1].end) return null;
+    return ranges[lo - 1].image;
+}
+
 pub const Map = struct {
     arena: ?std.heap.ArenaAllocator = null,
     region_arena: ?std.heap.ArenaAllocator = null,
@@ -22,6 +86,8 @@ pub const Map = struct {
     raw: []rt.struct_xrt_gdb_image = &.{},
     ids: []u64 = &.{},
     ranges: []Range = &.{},
+    region_ranges: []Range = &.{},
+    anchors: std.AutoHashMapUnmanaged(u64, usize) = .empty,
     next_id: u64 = 1,
     list_failure: ?[]const u8 = null,
     geometry_failure: ?[]const u8 = null,
@@ -70,6 +136,8 @@ pub const Map = struct {
         var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
         defer seen.deinit(a);
         var ranges: std.ArrayList(Range) = .empty;
+        var mappings: std.ArrayList(Range) = .empty;
+        var anchors: std.AutoHashMapUnmanaged(u64, usize) = .empty;
         var geometry_failure: ?[]const u8 = null;
         for (raw, 0..) |*image, i| {
             const present = try seen.getOrPut(a, image.load_address);
@@ -83,15 +151,23 @@ pub const Map = struct {
                 ids[i] = self.next_id;
                 self.next_id += 1;
             }
-            const text = textAddress(image) orelse continue;
+            const text = textAddress(image) orelse {
+                // A reduced image list still identifies the mapping starting
+                // exactly at its load address. It says nothing about later
+                // mappings; only full segment geometry can label those.
+                try anchors.put(alloc, image.load_address, i);
+                continue;
+            };
             for (image.segments[0..image.segment_count]) |segment| {
                 // Frame labels require executable ranges; never use PAGEZERO
                 // or shared, overlapping LINKEDIT ranges as code owners.
-                if (segment.maxprot & 4 == 0 or segment.vmsize == 0) continue;
+                if (segment.maxprot == 0 or segment.vmsize == 0 or std.mem.eql(u8, std.mem.sliceTo(&segment.name, 0), "__PAGEZERO")) continue;
                 const start = relocated(image, text, segment.vmaddr) orelse return error.MachOImageRangeOverflow;
                 const end = std.math.add(u64, start, segment.vmsize) catch return error.MachOImageRangeOverflow;
-                if (ranges.items.len == 16384) return error.MachOImageRangeLimit;
-                try ranges.append(alloc, .{ .start = start, .end = end, .image = i });
+                if (mappings.items.len == 16384) return error.MachOImageRangeLimit;
+                const range = Range{ .start = start, .end = end, .image = i };
+                try mappings.append(alloc, range);
+                if (segment.maxprot & 4 != 0) try ranges.append(alloc, range);
             }
         }
         std.mem.sort(Range, ranges.items, {}, struct {
@@ -105,6 +181,7 @@ pub const Map = struct {
             last_end = @max(last_end, range.end);
         }
         const range_rows = try ranges.toOwnedSlice(alloc);
+        const region_ranges = try uniqueRanges(alloc, mappings.items, count);
         const failures = try alloc.alloc(modules.Modules.LoadFailure, count + 1);
         self.symbols.prune(raw);
         if (self.arena) |*previous| previous.deinit();
@@ -112,6 +189,8 @@ pub const Map = struct {
         self.raw = raw;
         self.ids = ids;
         self.ranges = range_rows;
+        self.region_ranges = region_ranges;
+        self.anchors = anchors;
         self.failure_buffer = failures;
         self.generation = snapshot.generation;
         self.list_failure = list_failure;
@@ -150,9 +229,8 @@ pub const Map = struct {
         for (raw_regions[0..count]) |*region| {
             if (!region.mapped) continue;
             var path: []const u8 = std.mem.sliceTo(&region.name, 0);
-            for (self.raw) |*image| if (image.load_address == region.start) {
-                path = std.mem.sliceTo(&image.path, 0);
-            };
+            if (regionOwner(self.region_ranges, region.start, region.start +| region.size) orelse self.anchors.get(region.start)) |image|
+                path = std.mem.sliceTo(&self.raw[image].path, 0);
             const kind = std.mem.sliceTo(&region.type, 0);
             const region_label = if (path.len != 0) try alloc.dupe(u8, path) else if (kind.len != 0) try std.fmt.allocPrint(alloc, "[{s}]", .{kind}) else "";
             try regions.append(alloc, .{ .start = region.start, .end = region.start +| region.size, .offset = 0, .inode = 0, .device_major = 0, .device_minor = 0, .permissions = .{ if (region.read) 'r' else '-', if (region.write) 'w' else '-', if (region.execute) 'x' else '-', 'p' }, .path = region_label });
@@ -164,7 +242,12 @@ pub const Map = struct {
         self.region_generation = snapshot.generation;
     }
     pub const Label = struct { name: []const u8, module: u64, diagnostic: ?[]const u8 };
-    pub fn label(self: *Map, alloc: std.mem.Allocator, pc: u64, lookup: u64, roots: []const [:0]const u8) !?Label {
+    const Located = struct { index: usize, text: u64, link: u64 };
+    fn locate(self: *Map, lookup: u64) !?Located {
+        if (self.list_failure) |failure| {
+            if (std.mem.eql(u8, failure, "GdbListTooLarge")) return error.GdbListTooLarge;
+            return error.GdbListUnavailable;
+        }
         if (self.geometry_failure != null) return error.MachOAmbiguousImageRange;
         var lo: usize = 0;
         var hi = self.ranges.len;
@@ -177,20 +260,92 @@ pub const Map = struct {
         const image = &self.raw[index];
         const text = textAddress(image).?;
         const link = if (lookup >= image.load_address) std.math.add(u64, text, lookup - image.load_address) catch return error.MachOImageRangeOverflow else std.math.sub(u64, text, image.load_address - lookup) catch return error.MachOImageRangeOverflow;
+        return .{ .index = index, .text = text, .link = link };
+    }
+    pub const Debug = struct {
+        info: *@import("../debug/info.zig").Image,
+        link: u64,
+        job: *@import("../c.zig").api.struct_xmo_job,
+        object: ?u32,
+        load: u64,
+        text: u64,
+        pub fn runtimeAddress(self: *const Debug, address: u64) !u64 {
+            var link = address;
+            if (self.object) |index| {
+                const c = @import("../c.zig").api;
+                switch (c.xmo_job_object_address(self.job, index, address, &link)) {
+                    c.XMO_OK => {},
+                    c.XMO_CHANGED => return error.MachOObjectChanged,
+                    else => return error.MachOObjectAddressUnavailable,
+                }
+            }
+            return if (link >= self.text) std.math.add(u64, self.load, link - self.text) catch return error.MachOImageRangeOverflow else std.math.sub(u64, self.load, self.text - link) catch return error.MachOImageRangeOverflow;
+        }
+        pub fn imageAddress(user: *const anyopaque, address: u64) !u64 {
+            const self: *const Debug = @ptrCast(@alignCast(user));
+            return self.runtimeAddress(address);
+        }
+    };
+    pub fn debugAt(self: *Map, address: u64, roots: []const [:0]const u8) !Debug {
+        const found = try self.locate(address) orelse return error.UnmappedAddress;
+        const image = &self.raw[found.index];
+        const debug = try self.symbols.debugInfo(image, roots, found.text, found.link);
+        return .{ .info = debug.info, .link = debug.pc, .job = debug.job, .object = debug.object, .load = image.load_address, .text = found.text };
+    }
+    pub fn unwind(self: *Map, allocator: std.mem.Allocator, address: u64, roots: []const [:0]const u8, context_: @import("../debug/location.zig").Context, mask: u64, top: bool) !@import("../debug/info.zig").Unwind {
+        const found = try self.locate(address) orelse return error.UnmappedAddress;
+        const image = &self.raw[found.index];
+        const Relocation = struct {
+            load: u64,
+            text: u64,
+            fn resolve(user: *const anyopaque, link: u64) !u64 {
+                const self_: *const @This() = @ptrCast(@alignCast(user));
+                return if (link >= self_.text) std.math.add(u64, self_.load, link - self_.text) catch return error.MachOImageRangeOverflow else std.math.sub(u64, self_.load, self_.text - link) catch return error.MachOImageRangeOverflow;
+            }
+        };
+        const relocation = Relocation{ .load = image.load_address, .text = found.text };
+        var context = context_;
+        context.image_address = Relocation.resolve;
+        context.image_user = &relocation;
+        return self.symbols.unwind(allocator, image, roots, found.text, found.link, context, mask, top);
+    }
+    pub fn label(self: *Map, alloc: std.mem.Allocator, pc: u64, lookup: u64, roots: []const [:0]const u8) !?Label {
+        const found = try self.locate(lookup) orelse return null;
+        const index = found.index;
+        const image = &self.raw[index];
+        const text = found.text;
+        const link = found.link;
         var diagnostic: ?[]const u8 = null;
         const symbol = self.symbols.symbol(alloc, image, roots, link, text) catch |err| blk: {
             diagnostic = @errorName(err);
             break :blk null;
         };
-        // The stub chose this name. '!' separates image from symbol, so it
-        // must not supply one: an unsymbolised address would read as a symbol.
-        const base = try alloc.dupe(u8, std.fs.path.basename(std.mem.sliceTo(&image.path, 0)));
-        defer alloc.free(base);
-        std.mem.replaceScalar(u8, base, '!', '?');
-        if (symbol) |found| {
-            const address = relocated(image, text, found.address) orelse return error.MachOImageRangeOverflow;
-            return .{ .name = try std.fmt.allocPrint(alloc, "{s}!{s}+0x{x}", .{ base, found.name, pc -| address }), .module = self.ids[index], .diagnostic = null };
+        const path = std.mem.sliceTo(&image.path, 0);
+        if (symbol) |value| {
+            const address = relocated(image, text, value.address) orelse return error.MachOImageRangeOverflow;
+            return .{ .name = try @import("image_label.zig").format(alloc, path, value.name, pc -| address), .module = self.ids[index], .diagnostic = null };
         }
-        return .{ .name = try std.fmt.allocPrint(alloc, "{s}+0x{x}", .{ base, pc -| image.load_address }), .module = self.ids[index], .diagnostic = diagnostic orelse self.symbols.status(image) orelse "MachOSymbolUnavailable" };
+        return .{ .name = try @import("image_label.zig").format(alloc, path, null, pc -| image.load_address), .module = self.ids[index], .diagnostic = diagnostic orelse self.symbols.status(image) orelse "MachOSymbolUnavailable" };
     }
 };
+
+test "region ownership excludes ambiguity and gaps, merges one owner's segments" {
+    const alloc = std.testing.allocator;
+    const ranges = try uniqueRanges(alloc, &.{
+        .{ .start = 100, .end = 200, .image = 0 },
+        .{ .start = 120, .end = 150, .image = 0 },
+        .{ .start = 200, .end = 300, .image = 0 },
+        .{ .start = 180, .end = 220, .image = 1 },
+        .{ .start = 310, .end = 320, .image = 2 },
+    }, 3);
+    defer alloc.free(ranges);
+    try std.testing.expectEqual(@as(?usize, 0), regionOwner(ranges, 100, 180));
+    try std.testing.expectEqual(@as(?usize, null), regionOwner(ranges, 170, 190));
+    try std.testing.expectEqual(@as(?usize, null), regionOwner(ranges, 180, 181));
+    try std.testing.expectEqual(@as(?usize, 0), regionOwner(ranges, 220, 300));
+    try std.testing.expectEqual(@as(?usize, null), regionOwner(ranges, 299, 311));
+    try std.testing.expectEqual(@as(?usize, 2), regionOwner(ranges, 310, 320));
+    const adjacent = try uniqueRanges(alloc, &.{ .{ .start = 10, .end = 20, .image = 0 }, .{ .start = 20, .end = 30, .image = 0 } }, 1);
+    defer alloc.free(adjacent);
+    try std.testing.expectEqual(@as(?usize, 0), regionOwner(adjacent, 10, 30));
+}

@@ -11,6 +11,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
@@ -154,7 +155,10 @@ def long_register(exchanges, static, log):
 
 
 def unknown_signal(exchanges, static, log):
-    hostile = Replace(lambda request, replies: request == 'vCont;c', lambda request, replies: 'T40' + replies[0][3:], once=True)
+    # The recorded stop also carries a Mach exception. Remove that independent
+    # cause so this case continues to exercise an unmapped signal itself.
+    hostile = Replace(lambda request, replies: request == 'vCont;c',
+                      lambda request, replies: re.sub(r'(?:metype|mecount|medata):[^;]*;', '', 'T40' + replies[0][3:]), once=True)
     fake, client = session(exchanges, hostile)
     client.action('continue')
     stopped = client.stopped('signal', seconds=10)

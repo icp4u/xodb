@@ -1,0 +1,15 @@
+; Synthetic project for the GDScript value tests and scripts/demo-redot values.
+; Three scripts, one scene, no assets. The debug setting makes the engine keep
+; the names of local variables without its own debugger attached.
+config_version=5
+
+[application]
+
+config/name="xodb-gdscript-values"
+run/main_scene="res://arena.tscn"
+run/max_fps=20
+
+[debug]
+
+gdscript/warnings/enable=false
+settings/gdscript/always_track_local_variables=true

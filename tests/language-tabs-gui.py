@@ -75,7 +75,7 @@ for label, executable, languages, arguments in cases:
     d = None
     report = {'case': label, 'status': 'running'}
     try:
-        d = h.Display(str(root), [*(['--runtime-agent', str(a.agent.resolve())] if a.agent else []), '--agent-scope', 'control', '--break', unavailable[label][1] if label in unavailable else 'main', '--', str(executable), *arguments])
+        d = h.Display(str(root), [*(['--runtime-agent', str(a.agent.resolve())] if a.agent else []), '--theme', 'builtin:dark', '--agent-scope', 'control', '--break', unavailable[label][1] if label in unavailable else 'main', '--', str(executable), *arguments])
         d.tool('continue', generation=d.session()['generation'])
         assert d.stopped('breakpoint')
         view = poll_tabs(d, lambda v: v['complete'])
@@ -84,25 +84,34 @@ for label, executable, languages, arguments in cases:
         if a.identity_marker:
             entry = next(t for t in view['tabs'] if t['tab'] == label)
             assert entry['status'] == 'unwitnessed' and entry['identity'] == 'unwitnessed' and entry['visible'], entry
+            generation = d.session()['generation']
+            d.tool('select_language_tab', generation=generation, tab=label)
+            poll_tabs(d, lambda v: v['selected'] == label)
             deadline = time.monotonic()+15*h.load_scale()
             while True:
                 shot = d.shot(label+'-identity')
-                # OCR the header alone so adjacent source/assembly columns
-                # cannot interleave the warning's wrapped lines.
-                crop = shot+'.header.png'
+                crop = shot+'.pane.png'
+                header = shot+'.header.png'
                 with Image.open(shot) as capture:
-                    pane = ImageOps.invert(capture.crop((1013, 91, 1272, 178)).convert('L'))
+                    right = capture.crop((1013, 91, 1272, 520)).convert('RGB')
+                    # The dormant marker is ordinary secondary text, never the
+                    # default theme's warning colour.
+                    assert sum(pixel == (245, 179, 110) for pixel in right.get_flattened_data()) == 0
+                    pane = ImageOps.invert(right.convert('L'))
                     pane.resize((pane.width*3, pane.height*3)).save(crop)
+                    top = ImageOps.invert(capture.crop((1013, 91, 1272, 178)).convert('L'))
+                    top.resize((top.width*3, top.height*3)).save(header)
                 text = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30*h.load_scale()).stdout
+                header_text = subprocess.run(['tesseract', header, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30*h.load_scale()).stdout
                 normalized = ' '.join(text.lower().split())
-                if 'runtime not seen executing' in normalized:
+                if normalized.count('runtime not seen executing') == 1 and 'runtime not seen executing' not in ' '.join(header_text.lower().split()):
                     break
                 assert time.monotonic() < deadline, text
                 time.sleep(.05)
             if a.wrong_result:
                 assert 'deliberately wrong identity marker' in normalized, text
             Path(shot+'.txt').write_text(text)
-            report.update(status='pass', tab=entry, marker='runtime not seen executing')
+            report.update(status='pass', tab=entry, marker='runtime not seen executing', warning_pixels=0)
             continue
         if label in unavailable:
             language, _, reason, hint = unavailable[label]

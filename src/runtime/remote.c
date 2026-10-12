@@ -1239,6 +1239,17 @@ enum xrt_status xrt_target_gdb_info(const struct xrt_target *t, struct xrt_gdb_i
     pthread_mutex_unlock(&t->connection->mutex);
     return XRT_OK;
 }
+enum xrt_status xrt_target_gdb_thread_info(const struct xrt_target *t, int32_t tid,
+                                          struct xrt_gdb_thread_info *out)
+{
+    if (!t || !t->connection || !t->connection->gdb || !out) return XRT_UNSUPPORTED_CONTROL;
+    if (!remote_io_allowed()) return XRT_REMOTE_IO_FORBIDDEN;
+    pthread_mutex_lock(&t->connection->mutex);
+    enum xrt_status status = xrt_cancel_requested(t->connection->cancel) ? XRT_REMOTE_CANCELLED :
+        xrt_gdb_thread_info(t->connection->gdb, tid, out);
+    pthread_mutex_unlock(&t->connection->mutex);
+    return status;
+}
 /* Region and image lists do I/O with the stub; a malformed reply ends the
  * connection like any other protocol error, a typed refusal keeps it. */
 static enum xrt_status gdb_list(struct xrt_target *t, void *out, size_t capacity, size_t *total,

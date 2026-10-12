@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """The actual scripts/demo-redot launcher, driven without a display: the stop
 it promises, and the text its `stack` subcommand prints, against the stack
-the demo game printed itself (fast lane; about 3 s).
-Run: python3 tests/gdscript-demo.py --redot /path/to/engine --work out/gdd"""
+the demo game printed itself (fast lane; about 3 s). With --values: the
+`values` game and the text of the `locals` subcommand, against the values
+that game printed.
+Run: python3 tests/gdscript-demo.py --redot /path/to/engine --work out/gdd [--values]"""
 import argparse, importlib.util, json, os, re, signal, subprocess, time
 from pathlib import Path
 from types import SimpleNamespace
@@ -10,6 +12,7 @@ from types import SimpleNamespace
 p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--redot', type=Path, required=True)
 p.add_argument('--work', type=Path, required=True)
+p.add_argument('--values', action='store_true')
 a = p.parse_args()
 os.umask(0o022)
 root = Path(__file__).resolve().parents[1]; os.chdir(root)
@@ -29,13 +32,13 @@ assert idle.returncode == 1 and 'No running demo session' in idle.stderr, idle
 env['REDOT'] = str(a.redot.resolve())
 session = runtime / f'xodb-demo-redot-{os.getuid()}'
 server = SimpleNamespace(path=session / 'session.sock', clients=[])
-def stack_text():
-    done = subprocess.run(['scripts/demo-redot', 'stack'], env=env, capture_output=True, text=True, timeout=180)
+def stack_text(*command):
+    done = subprocess.run(['scripts/demo-redot', *(command or ['stack'])], env=env, capture_output=True, text=True, timeout=180)
     return done.returncode, done.stdout + done.stderr
 result = {'status': 'failed'}
 log = open(w / 'demo.log', 'wb')
 # Its own process group: the script, xodb and the game.
-demo = subprocess.Popen(['scripts/demo-redot', '--headless', '--agent-scope', 'control'], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+demo = subprocess.Popen(['scripts/demo-redot', *(['values'] if a.values else []), '--headless', '--agent-scope', 'control'], env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 server.proc = demo
 try:
     deadline = time.monotonic() + 180
@@ -47,7 +50,8 @@ try:
     owner.claim(ttl_ms=60000)
     ready = lambda state: state['state'] == 'stopped' and not state['symbol_discovery_pending'] and not state['continue_pending']
     state = s.eventually(owner.session, ready, 'attach stop', timeout=180)
-    truth = next(json.loads(l.split(' ', 2)[2]) for l in (session / 'game.log').read_text(errors='replace').splitlines() if l.startswith('ORACLE stack '))
+    printed = {l.split(' ', 2)[1]: json.loads(l.split(' ', 2)[2]) for l in (session / 'game.log').read_text(errors='replace').splitlines() if l.startswith('ORACLE ')}
+    truth = printed['stack']
     # Space in the GUI: run to the script's OS.delay_msec().
     owner.action('continue')
     state = s.eventually(owner.session, lambda state: ready(state) and any(t['reason'] == 'breakpoint' for t in state['threads']), 'script stop', timeout=180)
@@ -63,10 +67,37 @@ try:
     labelled = [l for l in lines if '   <= ' in l]
     assert [l.split('   <= ')[1] for l in labelled] == [f"{f['function']} {f['source']}:{f['line']}" for f in truth], labelled
     # The planted wrong answer: one line off must not match what was printed.
-    assert not re.search(rf"^  leaf +res://worker\.gd:{truth[0]['line'] + 1} ", text, re.M), text
+    assert not re.search(rf"^  {truth[0]['function']} +{re.escape(truth[0]['source'])}:{truth[0]['line'] + 1} ", text, re.M), text
+    assert [f['function'] for f in truth] == (['take_hit', 'swing', 'act', '_process'] if a.values else ['leaf', 'step', 'plan', '_process']), truth
     # Reading and printing changed nothing.
     assert owner.session()['generation'] == state['generation']
     result = {'status': 'passed', 'stack': lines[:5], 'labelled_native_frames': len(labelled)}
+    if a.values:
+        # The second terminal's `locals`: every level, then one level, as text.
+        code, text = stack_text('locals')
+        (w / 'demo-locals.txt').write_text(text)
+        assert code == 0, text
+        shown = text.splitlines()
+        heads = [l for l in shown if l.startswith('#')]
+        assert heads == [f"#{i} {f['function']}  {f['source']}:{f['line']}" for i, f in enumerate(truth)], heads
+        level = lambda i: shown[shown.index(heads[i]) + 1:shown.index(heads[i + 1]) if i + 1 < len(heads) else len(shown)]
+        for line in ('    parameter weapon = Dictionary(3) {"damage": 12, "tags": Array(2) ["sharp", "steel"], "reach": 1.5}', '                  "tags": Array(2) ["sharp", "steel"]', '    parameter power = 3.0', '    local     tags = Array(2) ["sharp", "steel"]',
+                     '    member    velocity = (3.25, -4.5)', '    member    inventory = Dictionary(4) {"sword": Dictionary(3) {"damage": 12, "tags": Array(2), "reach": 1.5}, "potions": Array(3) [3, 5, 8], "gold": 250, 7: "lucky"}', '    member    hp = 90'):
+            assert line in level(1), (line, level(1))
+        assert any(re.fullmatch(r'    context   self = Player:<Node2D#\d+> /root/Arena/Player \(res://player\.gd\)', l) for l in level(1)), level(1)
+        assert any(re.fullmatch(r'    member    hand = Hand:<Node2D#\d+> /root/Arena/Player/Hand', l) for l in level(1)), level(1)
+        # What the innermost level printed about itself, and its planted wrong answer.
+        told = lambda values: [f"    parameter damage = {values['damage']}", f"    local     dealt = {values['dealt']}", f"    local     note = {json.dumps(values['note'])}", f"    member    armor = {values['armor']}"]
+        assert all(line in level(0) for line in told(printed['locals'])) and not all(line in level(0) for line in told(printed['wrong'])), level(0)
+        assert '    member    v_quat = (0, 0, 0, 1)' in level(3) and '                  ... 100 in all' in level(3), level(3)
+        code, one = stack_text('locals', '2')
+        assert code == 0 and [l for l in one.splitlines() if l.startswith('#')] == [heads[2]] and one.splitlines()[2:] == level(2), one
+        code, none = stack_text('locals', '9')
+        assert code == 1 and 'There is no level 9: 4 listed' in none, none
+        # No path of this host in what the demo prints.
+        assert str(Path.home()) not in text and str(root) not in text, text
+        assert owner.session()['generation'] == state['generation']
+        result['locals_lines'] = len(shown)
 finally:
     for client in server.clients:
         try: client.close()

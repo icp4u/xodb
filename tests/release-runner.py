@@ -74,13 +74,17 @@ class RunnerTests(unittest.TestCase):
         for tier in ('host', 'all'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier, redot='/fixture/engine')}
             self.assertIn('--strace', steps['gdscript-stack'])
-            for name in ('gdscript-stack', 'gdscript-demo'):
+            self.assertIn('--strace', steps['gdscript-values'])
+            self.assertIn('--values', steps['gdscript-demo-values'])
+            self.assertNotEqual(steps['gdscript-demo'][-1], steps['gdscript-demo-values'][-1])
+            for name in ('gdscript-stack', 'gdscript-demo', 'gdscript-values', 'gdscript-demo-values'):
                 self.assertEqual(steps[name][steps[name].index('--redot') + 1], '/fixture/engine')
         for tier in ('gui', 'all'):
             steps = {name: cmd for name, cmd, _ in gate.plan(tier, redot='/fixture/engine')}
-            self.assertEqual(steps['gdscript-gui'][steps['gdscript-gui'].index('--redot') + 1], '/fixture/engine')
-        self.assertNotIn('gdscript-gui', {name for name, _, _ in gate.plan('host', redot='/fixture/engine')})
-        self.assertNotIn('gdscript-stack', {name for name, _, _ in gate.plan('gui', redot='/fixture/engine')})
+            for name in ('gdscript-gui', 'gdscript-values-gui'):
+                self.assertEqual(steps[name][steps[name].index('--redot') + 1], '/fixture/engine')
+        self.assertFalse({'gdscript-gui', 'gdscript-values-gui'} & {name for name, _, _ in gate.plan('host', redot='/fixture/engine')})
+        self.assertFalse({'gdscript-stack', 'gdscript-values'} & {name for name, _, _ in gate.plan('gui', redot='/fixture/engine')})
         for tier in ('portable', 'perf'):
             with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
                 gate.main([tier, '--redot', '/fixture/engine', '--list'])

@@ -1,7 +1,7 @@
 //! Observer-only whole-system tools backed by the C sysstat collector. They
 //! need no debug target; rates come from the previous observation.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const wire = @import("profile.zig");
 const Value = std.json.Value;
 

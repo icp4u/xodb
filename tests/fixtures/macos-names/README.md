@@ -25,3 +25,18 @@ The dylib oracle comes from `llvm-nm --format=posix --defined-only --extern-only
 `_plug_entry` at `0x390`. The abort address example is checked directly through
 `get_macho_image`, including the link register. Its image label does not imply
 that the unwinder has proved an extra frame from that register.
+
+The source/locals fixtures also include matching dSYM DWARF files, N_OSO
+objects, and optimized C++/Objective-C/Swift recordings from the same owned,
+scrubbed corpus. `SHA256.json` covers these additions. Source paths remain
+under `/xodb-corpus`; no host paths or private recordings are used. The
+recordings provide only their captured memory, so absent values deliberately
+remain unavailable. Compiler-generated compact/EH data is retained in the
+original images and used as an independent unwind oracle.
+
+The regions, threads, bad-access, exec, exit, fork, signal and hardware-slot
+recordings also drive `tests/macos-views.py`. Missing read packets remain
+unavailable. Run-control replays use recorded stops; hostile variants and the
+retained-probe/over-generous-slot cases explicitly alter those inputs. Raw
+thread IDs in RSP fields, `jThreadsInfo` JSON and the hex-encoded `jstopinfo`
+JSON of stop replies are normalized to the same synthetic range. The SHA-256 manifest covers every fixture file listed.

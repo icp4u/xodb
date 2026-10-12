@@ -111,7 +111,8 @@ try:
             min_calls = 15
         else:
             shutil.copyfile(decoy, image)
-        expected = 'PythonRuntimeAmbiguous' if mode == 'elf' else 'ready' if mode in ('pe', 'data', 'many') else 'PythonModuleIdentityUnavailable'
+        # One examined, executing runtime keeps its view beside any of these.
+        expected = 'ready'
         observe('python', mode, [a.python, 'tests/fixtures/pe/definer.py', str(image), mode], expected,
                 changed=image if mode not in ('pe', 'data', 'unknown', 'unreadable', 'many') else None, min_calls=min_calls)
     for mode in ('elf', 'mz', 'other', 'macho', 'deleted'):
@@ -124,7 +125,10 @@ try:
         exe.chmod(0o755)
         shutil.copyfile(runtime, lib)
         env = dict(os.environ, LD_LIBRARY_PATH=str(own))
-        expected = 'PerlValueRuntimeAmbiguous' if mode == 'elf' else 'PerlModuleIdentityUnavailable'
+        # The executing runtime wins beside a loaded second definer. Once the
+        # runtime's own file cannot be examined, the decoy is the only examined
+        # candidate and fails its own version read: still no view.
+        expected = 'ready' if mode == 'elf' else 'PerlVersionUnavailable'
         observe('perl', mode, [str(exe), 'tests/fixtures/pe/definer.pl', str(decoy), str(lib), mode], expected, env, lib)
     assert rows, 'unknown table row'
 finally:

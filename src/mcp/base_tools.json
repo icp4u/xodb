@@ -5012,7 +5012,7 @@
   },
   {
     "name": "get_language_locals",
-    "description": "Page retained language bindings. Emacs returns per-frame dynamic bindings and saved interpreter environments; optimized compiled locals remain unproved. JavaScript returns context storage with lexical visibility explicitly unproved, scope depth and provenance; stack-only bindings are not shown. Unavailable layouts and names have diagnostics; no target code runs.",
+    "description": "Page retained language bindings. Emacs returns per-frame dynamic bindings and saved interpreter environments; optimized compiled locals remain unproved. JavaScript returns context storage with lexical visibility explicitly unproved, scope depth and provenance; stack-only bindings are not shown. GDScript (Godot 4 / Redot) returns the parameters and locals of the call level, then self and the script instance's members, each with a Variant preview and its first children; local names need the engine to have recorded them (GDScriptLocalNamesNotTracked otherwise: parameters keep their names, other slots are listed as stack[N]). Unavailable layouts and names have diagnostics; no target code runs.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5027,7 +5027,8 @@
             "lua",
             "javascript",
             "ruby",
-            "elisp"
+            "elisp",
+            "gdscript"
           ]
         },
         "tid": {
@@ -5076,7 +5077,7 @@
   },
   {
     "name": "evaluate_language_expression",
-    "description": "Resolve a bounded language expression in a retained logical frame without target execution. Lua accepts an ASCII local/upvalue name plus up to four .identifier or [int32] raw-table selectors (128 bytes); metatables are refused; Lua 5.4 follows at most 128 collision nodes while Lua 5.2 hash scans remain capped at 128 slots; Perl accepts a sigil plus ASCII identifier from the active pad. Python accepts exact fast-local, cell and free-variable roots with up to four [int32] or quoted printable ASCII-key subscripts (128 bytes), through exact builtin dict/list/tuple storage; custom keys, subclasses and oversized scans refuse. JavaScript refuses unproved bare names with JavaScriptLexicalUnproved: a retained context name may be shadowed by a stack binding. These readers refuse target execution.",
+    "description": "Resolve a bounded language expression in a retained logical frame without target execution. Lua accepts an ASCII local/upvalue name plus up to four .identifier or [int32] raw-table selectors (128 bytes); metatables are refused; Lua 5.4 follows at most 128 collision nodes while Lua 5.2 hash scans remain capped at 128 slots; Perl accepts a sigil plus ASCII identifier from the active pad. Python accepts exact fast-local, cell and free-variable roots with up to four [int32] or quoted printable ASCII-key subscripts (128 bytes), through exact builtin dict/list/tuple storage; custom keys, subclasses and oversized scans refuse. JavaScript refuses unproved bare names with JavaScriptLexicalUnproved: a retained context name may be shadowed by a stack binding. GDScript accepts a local, parameter or member name, or self, plus up to eight .member, [integer] or [\"text\"] steps (128 bytes) through Array, Dictionary, packed arrays, script members of objects and vector components; a missing name, key or index is a diagnostic with no rows. These readers refuse target execution.",
     "inputSchema": {
       "type": "object",
       "properties": {
@@ -5090,7 +5091,8 @@
             "perl",
             "lua",
             "javascript",
-            "ruby"
+            "ruby",
+            "gdscript"
           ]
         },
         "tid": {

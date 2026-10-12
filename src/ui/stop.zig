@@ -53,6 +53,14 @@ pub const Panel = struct {
             try r.textFit(font, b.x + 14, y, b.w - 28, row, theme.text);
             y += 27;
         }
+        if (info.mach_exception) |exception| {
+            try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.allocPrint(a, "Mach: {s} ({d})", .{ exception.name(), exception.kind }), theme.text);
+            y += 27;
+            for (exception.codes[0..@min(exception.count, exception.codes.len)], 0..) |code, i| {
+                try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.allocPrint(a, "Exception code {d}: 0x{x}", .{ i, code }), theme.text);
+                y += 27;
+            }
+        }
         if (view.source) |source| {
             try r.textFit(font, b.x + 14, y, b.w - 28, source, theme.weak);
             y += 27;
@@ -66,6 +74,6 @@ pub const Panel = struct {
             y += 27;
         }
         try r.textFit(font, b.x + 14, b.y + b.h - 54, b.w - 28, if (info.read_only) "Read-only dump: no execution, target writes or live process attachment" else if (info.pending_delivery) "Continue forwards this pending signal to the target" else "Continue has no pending application signal to forward", theme.weak);
-        try r.textFit(font, b.x + 14, b.y + b.h - 28, b.w - 28, "Signal evidence identifies the stop; it does not establish the root cause", theme.weak);
+        try r.textFit(font, b.x + 14, b.y + b.h - 28, b.w - 28, "Stop evidence identifies the stop; it does not establish the root cause", theme.weak);
     }
 };

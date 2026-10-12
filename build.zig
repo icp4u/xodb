@@ -14,11 +14,15 @@ pub fn build(b: *std.Build) void {
     portable_query.cpu_features_sub = .empty;
     const portable_target = b.resolveTargetQuery(portable_query);
     const gui = b.option(bool, "gui", "Build the Wayland/Vulkan interface (disable for headless MCP)") orelse true;
+    // The window system behind src/platform/window.zig. null has no display: it runs the unit tests.
+    const Platform = enum { wayland, null };
+    const platform = b.option(Platform, "platform", "Window system backend for the interface") orelse if (target.result.os.tag == .linux) Platform.wayland else .null;
     const capstone_link = b.option(enum { system, vendored }, "capstone", "Link system Capstone, or the private static prefix from scripts/build-capstone") orelse .system;
     const font_path = b.option([]const u8, "font-path", "Default GUI font (runtime --font overrides this)") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", gui);
+    options.addOption(Platform, "platform", platform);
     options.addOption(bool, "capstone_vendored", capstone_link == .vendored);
     options.addOption([]const u8, "font_path", font_path);
     module.addOptions("build_options", options);
@@ -31,7 +35,7 @@ pub fn build(b: *std.Build) void {
     module.addIncludePath(b.path("src/service"));
     // Allocation-free C++ parser; no C++ standard-library runtime is used.
     module.addCSourceFile(.{ .file = b.path("src/debug/demangle.cc"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti", "-Wall", "-Wextra", "-Werror" } });
-    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pdb.c", "src/binary/pe_job.c", "src/binary/macho.c", "src/binary/macho_job.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/debug/dwarf_types.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
+    for ([_][]const u8{ "src/language/perl.c", "src/language/perl_layout.c", "src/language/python.c", "src/language/python_layout.c", "src/language/javascript.c", "src/language/javascript_layout.c", "src/language/javascript_ranged.c", "src/language/javascript_image.c", "src/binary/symbol_query.c", "src/binary/pe.c", "src/binary/pdb.c", "src/binary/pe_job.c", "src/binary/macho.c", "src/binary/macho_job.c", "src/debug/macho_dwarf.c", "src/debug/macho_object.c", "src/debug/macho_unwind.c", "src/debug/pe_unwind.c", "src/binary/placement.c", "src/debug/metadata_job.c", "src/debug/cfi_image.c", "src/binary/object_cache.c", "src/binary/cache_pool.c", "src/debug/dwarf_index.c", "src/debug/dwarf_names.c", "src/debug/dwarf_types.c", "src/language/watch.c", "src/language/lua.c", "src/language/lua_layout.c", "src/language/ruby.c", "src/language/ruby_layout.c", "src/language/elisp.c", "src/language/elisp_layout.c", "src/language/go.c", "src/language/go_layout.c", "src/language/go_type_index.c", "src/language/go_value.c", "src/language/go_value_layout.c", "src/language/go_map.c", "src/language/go_map_layout.c", "src/language/jai_layout.c", "src/language/jai_reader.c", "src/language/jai_value.c", "src/language/jai_container.c", "src/language/jai_write.c", "src/language/jai_journal.c", "src/language/jai_job.c" }) |source| {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
@@ -76,7 +80,7 @@ pub fn build(b: *std.Build) void {
             });
         },
     }
-    if (gui) {
+    if (gui and platform == .wayland) {
         const header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
         const xdg_header = header.addOutputFileArg("xdg-shell-client-protocol.h");
         const protocol = b.addSystemCommand(&.{ "wayland-scanner", "private-code", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
@@ -109,7 +113,10 @@ pub fn build(b: *std.Build) void {
         module.addIncludePath(dmabuf_header.addOutputFileArg("linux-dmabuf-v1-client-protocol.h").dirname());
         const dmabuf_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", dmabuf_xml });
         module.addCSourceFile(.{ .file = dmabuf_code.addOutputFileArg("linux-dmabuf-v1.c"), .flags = &.{} });
-        for ([_][]const u8{ "wayland-client", "xkbcommon", "vulkan", "freetype2", "harfbuzz" }) |lib| module.linkSystemLibrary(lib, .{});
+        for ([_][]const u8{ "wayland-client", "xkbcommon" }) |lib| module.linkSystemLibrary(lib, .{});
+    }
+    if (gui) {
+        for ([_][]const u8{ "vulkan", "freetype2", "harfbuzz" }) |lib| module.linkSystemLibrary(lib, .{});
         for ([_][]const u8{ "ui", "cell" }) |name| for ([_][]const u8{ "vert", "frag" }) |stage| {
             const shader = b.addSystemCommand(&.{"glslc"});
             shader.addFileArg(b.path(b.fmt("src/render/{s}.{s}", .{ name, stage })));

@@ -1,9 +1,29 @@
+//! The Wayland backend of window.zig: xdg-shell toplevel, wl_seat input
+//! through xkb.zig, clipboard.c, and the Vulkan surface for both.
 const std = @import("std");
-const c = @import("../c.zig").api;
-const input = @import("input.zig");
-
-/// Pointer images, as wp_cursor_shape_device_v1 shape values.
-pub const Cursor = enum(u32) { default = 1, col_resize = 30 };
+pub const c = @cImport({
+    @cUndef("_FORTIFY_SOURCE"); // as in c_ui.zig
+    @cDefine("_GNU_SOURCE", "1");
+    @cDefine("VK_USE_PLATFORM_WAYLAND_KHR", "1");
+    @cInclude("unistd.h");
+    @cInclude("stdlib.h");
+    @cInclude("errno.h");
+    @cInclude("poll.h");
+    @cInclude("time.h");
+    @cInclude("wayland-client.h");
+    @cInclude("../platform/clipboard.h");
+    @cInclude("xdg-shell-client-protocol.h");
+    @cInclude("xdg-decoration-unstable-v1-client-protocol.h");
+    @cInclude("cursor-shape-v1-client-protocol.h");
+    @cInclude("linux-dmabuf-v1-client-protocol.h");
+    @cInclude("vulkan/vulkan.h");
+});
+const vk = @import("../c_ui.zig").api;
+const platform = @import("window.zig");
+const Cursor = platform.Cursor;
+const clip = platform.clip;
+const Node = @import("../render/vk_select.zig").Node;
+pub const Keyboard = @import("xkb.zig").Keyboard;
 
 pub const Window = struct {
     display: *c.wl_display = undefined,
@@ -21,7 +41,7 @@ pub const Window = struct {
     pointer_serial: u32 = 0,
     pointer_inside: bool = false,
     /// Ordered key and button events; drain with `input.next()`.
-    input: input.Keyboard = .{},
+    input: Keyboard = .{},
     keyboard: ?*c.wl_keyboard = null,
     pointer: ?*c.wl_pointer = null,
     surface: *c.wl_surface = undefined,
@@ -40,7 +60,7 @@ pub const Window = struct {
     /// From the latest xdg_toplevel configure; the compositor decides it.
     maximized: bool = false,
     closing: bool = false,
-    close_reason: enum { none, compositor_close, quit_key } = .none,
+    close_reason: platform.CloseReason = .none,
     dirty: bool = true,
     /// One compositor pacing callback for the last queued presentation. Hidden
     /// surfaces may never receive it until they become visible again.
@@ -53,7 +73,7 @@ pub const Window = struct {
 
     // Call on the final address: Wayland listeners retain this pointer.
     pub fn init(self: *Window) !void {
-        self.input = input.Keyboard.init(null);
+        self.input = Keyboard.init(null);
         self.input.trace = c.getenv("XODB_INPUT_TRACE") != null;
         errdefer self.input.deinit();
         self.display = c.wl_display_connect(null) orelse return error.WaylandUnavailable;
@@ -152,7 +172,84 @@ pub const Window = struct {
     }
     fn applyCursor(self: *Window) void {
         const device = self.cursor_device orelse return;
-        if (self.pointer_inside) c.wp_cursor_shape_device_v1_set_shape(device, self.pointer_serial, @intFromEnum(self.cursor));
+        if (self.pointer_inside) c.wp_cursor_shape_device_v1_set_shape(device, self.pointer_serial, switch (self.cursor) {
+            .default => c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_DEFAULT,
+            .col_resize => c.WP_CURSOR_SHAPE_DEVICE_V1_SHAPE_COL_RESIZE,
+        });
+    }
+    pub fn setTitle(self: *Window, title: [*:0]const u8) void {
+        if (self.top) |top| c.xdg_toplevel_set_title(top, title);
+    }
+    /// Names the application to the compositor (window rules, task lists).
+    pub fn setAppId(self: *Window, id: [*:0]const u8) void {
+        if (self.top) |top| c.xdg_toplevel_set_app_id(top, id);
+    }
+    pub fn setMinSize(self: *Window, width: i32, height: i32) void {
+        if (self.top) |top| c.xdg_toplevel_set_min_size(top, width, height);
+    }
+    pub fn minimize(self: *Window) void {
+        if (self.top) |top| c.xdg_toplevel_set_minimized(top);
+    }
+    /// The compositor owns this state: it may maximize or restore by other means.
+    pub fn toggleMaximized(self: *Window) void {
+        if (self.top) |top| toggleMaximize(c, top, self.maximized);
+    }
+    /// Hands the pointer to the compositor to drag the window, from a button
+    /// press on a frame the content draws itself.
+    pub fn beginMove(self: *Window) void {
+        if (self.top) |top| if (self.seat) |seat| c.xdg_toplevel_move(top, seat, self.last_input_serial);
+    }
+    pub fn beginResize(self: *Window, edge: platform.Edge) void {
+        if (self.top) |top| if (self.seat) |seat| c.xdg_toplevel_resize(top, seat, self.last_input_serial, switch (edge) {
+            .top => c.XDG_TOPLEVEL_RESIZE_EDGE_TOP,
+            .bottom => c.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM,
+            .left => c.XDG_TOPLEVEL_RESIZE_EDGE_LEFT,
+            .right => c.XDG_TOPLEVEL_RESIZE_EDGE_RIGHT,
+            .top_left => c.XDG_TOPLEVEL_RESIZE_EDGE_TOP_LEFT,
+            .top_right => c.XDG_TOPLEVEL_RESIZE_EDGE_TOP_RIGHT,
+            .bottom_left => c.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_LEFT,
+            .bottom_right => c.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT,
+        });
+    }
+    /// One buffer pixel per UI unit: no buffer scale is negotiated.
+    pub fn scale(_: *const Window) f32 {
+        return 1;
+    }
+    pub const vk_surface_extension: [*:0]const u8 = "VK_KHR_wayland_surface";
+    pub fn createSurface(self: *Window, instance: vk.VkInstance, surface: *vk.VkSurfaceKHR) vk.VkResult {
+        var info = std.mem.zeroes(c.VkWaylandSurfaceCreateInfoKHR);
+        info.sType = c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;
+        info.display = self.display;
+        info.surface = self.surface;
+        return c.vkCreateWaylandSurfaceKHR(@ptrCast(instance), &info, null, @ptrCast(surface));
+    }
+    /// The DRM device the compositor renders with, when it says.
+    pub fn displayGpu(self: *Window) ?Node {
+        return @import("display_gpu.zig").query(self.display);
+    }
+    /// Changing the active editor cancels both pending and completed old pastes.
+    pub fn clipFocus(self: *Window, destination: u64, epoch: u64) void {
+        c.xclip_focus(self.clipboard, destination, epoch);
+    }
+    pub fn clipRequest(self: *Window, primary: bool) clip.Status {
+        return @enumFromInt(c.xclip_request(self.clipboard, primary));
+    }
+    pub fn clipTake(self: *Window, out: *clip.Result) bool {
+        var result: c.xclip_result = undefined;
+        if (!c.xclip_take(self.clipboard, &result)) return false;
+        out.destination = result.destination;
+        out.epoch = result.epoch;
+        out.status = @enumFromInt(result.status);
+        out.size = result.size;
+        @memcpy(out.bytes[0..result.size], result.bytes[0..result.size]);
+        return true;
+    }
+    pub fn clipPending(self: *const Window) bool {
+        return c.xclip_pending(self.clipboard);
+    }
+    /// Offers `bytes` under the serial of the latest key or button event.
+    pub fn clipCopy(self: *Window, primary: bool, bytes: []const u8) bool {
+        return c.xclip_copy(self.clipboard, primary, self.last_input_serial, bytes.ptr, bytes.len);
     }
     pub fn frameReady(self: *const Window) bool {
         return self.frame_callback == null;
@@ -252,7 +349,7 @@ fn configured(data: ?*anyopaque, surface: ?*c.xdg_surface, serial: u32) callconv
     window(data).configured = true;
     window(data).dirty = true;
 }
-pub fn hasState(states: []const u32, state: u32) bool {
+fn hasState(states: []const u32, state: u32) bool {
     return std.mem.indexOfScalar(u32, states, state) != null;
 }
 fn resized(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, states: ?*c.wl_array) callconv(.c) void {
@@ -378,3 +475,38 @@ fn frameDone(data: ?*anyopaque, callback: ?*c.wl_callback, _: u32) callconv(.c) 
     // input, animation and target changes already retain their dirty state.
 }
 const frame_listener = c.wl_callback_listener{ .done = frameDone };
+
+fn toggleMaximize(comptime protocol: type, top: anytype, maximized: bool) void {
+    if (maximized) protocol.xdg_toplevel_unset_maximized(top) else protocol.xdg_toplevel_set_maximized(top);
+}
+
+test "maximize toggle requests the opposite compositor state" {
+    const Protocol = struct {
+        fn xdg_toplevel_set_maximized(out: *bool) void {
+            out.* = true;
+        }
+        fn xdg_toplevel_unset_maximized(out: *bool) void {
+            out.* = false;
+        }
+    };
+    var requested = false;
+    toggleMaximize(Protocol, &requested, false);
+    try std.testing.expect(requested);
+    toggleMaximize(Protocol, &requested, true);
+    try std.testing.expect(!requested);
+    // An external restore, not the previous request, determines the next action.
+    toggleMaximize(Protocol, &requested, false);
+    try std.testing.expect(requested);
+}
+
+test "maximize state follows the compositor's configure states" {
+    const state = hasState;
+    const none = [_]u32{};
+    try std.testing.expect(!state(&none, 1));
+    try std.testing.expect(!state(&[_]u32{ 4, 5, 6 }, 1)); // activated and tiled edges only
+    try std.testing.expect(state(&[_]u32{ 4, 1 }, 1));
+}
+
+test {
+    _ = @import("xkb.zig");
+}

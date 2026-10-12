@@ -49,8 +49,12 @@ read one `p` packet each.
 
 The client negotiates `qSupported`, `target.xml` and its remote XML includes,
 `vCont?`, optional no-ack mode, all-stop mode, and `qAttached`. Non-stop mode,
-process following and remote exec adoption are unsupported. An unexpected
-fork/exec stop requires a new target admission.
+process following and generic remote exec adoption are unsupported. Darwin's
+`reason:exec` stop clears old probes and threads, advances the image epoch, and
+admits the new process only after `qProcessInfo` confirms the same process,
+CPU, pointer size and byte order. Changed or missing identity fields refuse
+control before reading new registers. Explicit fork/vfork/exec process-following
+packets still require a new target admission.
 
 The MCP session contains a `gdb_remote` object with architecture, packet size,
 register count, attach provenance, last reason, and capability states:

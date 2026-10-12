@@ -9,9 +9,18 @@
 #define XRT_GDB_JSON_DEPTH 16
 struct xrt_gdb_host {
     enum xrt_gdb_os os;
-    uint32_t cputype, address_bits;
+    uint32_t cputype, address_bits, pointer_size;
+    bool has_endian, little_endian;
     uint64_t pid;
 };
+struct xrt_gdb_stop {
+    bool exec, has_exception;
+    uint64_t exception, codes[4];
+    unsigned code_count;
+};
+/* Mach exception and exec fields from a T stop. Duplicate or incomplete
+ * exception tuples are refused. Unknown types retain their numeric codes. */
+enum xrt_status xrt_gdb_stop_parse(const char *, size_t, struct xrt_gdb_stop *);
 /* key:value; lists. Unknown keys are ignored; a repeated known key, a pair
  * without ':' or a number out of range is a protocol error. */
 enum xrt_status xrt_gdb_host_parse(const char *, size_t, struct xrt_gdb_host *);
@@ -26,4 +35,8 @@ enum xrt_status xrt_gdb_region_parse(const char *, size_t, bool cut, uint64_t as
  * rows; *total counts every image, up to XRT_GDB_IMAGES_MAX. */
 enum xrt_status xrt_gdb_images_parse(const char *, size_t, struct xrt_gdb_image *,
                                      size_t capacity, size_t *total);
+/* jThreadsInfo array. Names are bounded printable text; registers/memory are
+ * ignored. Missing/duplicate IDs and repeated known fields are refused. */
+enum xrt_status xrt_gdb_threads_parse(const char *, size_t, struct xrt_gdb_thread_info *,
+                                      size_t capacity, size_t *total);
 #endif

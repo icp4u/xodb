@@ -14,11 +14,11 @@ def module(name,path):
 
 def main():
     os.umask(0o022)
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary');p.add_argument('--wrong-result',action='store_true');args=p.parse_args()
+    p=argparse.ArgumentParser(description=__doc__);p.add_argument('--binary');p.add_argument('--debug',action='store_true');p.add_argument('--wrong-result',action='store_true');args=p.parse_args()
     root=Path(__file__).resolve().parents[1];os.chdir(root)
     owner=module('owner',root/'tests/remote-owner-gui.py');shared=module('shared',root/'tests/shared-sessions.py');names=module('names',root/'tests/macos-names.py')
     h,work=owner.setup(root);scale=h.load_scale()
-    recording=json.loads((names.FIXTURES/'transcripts/cxx-basic.json').read_text());stops=names.phases(recording)
+    recording=json.loads((names.FIXTURES/'transcripts'/('cxx-O2-basic.json' if args.debug else 'cxx-basic.json')).read_text());stops=names.phases(recording)
     class Reconnect(names.Replay):
         def run(self):
             try:
@@ -43,7 +43,18 @@ def main():
             value=owner.wait(lambda:label(client),'symbols did not settle',timeout=30*scale)
             if args.wrong_result:value['label']='planted-wrong-label'
             assert value['status']=='ready' and value['label']=='cxxprog!bp_target+0x0',value
-            report['rows'].append(dict(session=state['session_id'],label=value))
+            row=dict(session=state['session_id'],label=value)
+            if args.debug:
+                source=client.raw('get_source_location',address=hex(stops[0].pc))['result']
+                assert not source.get('isError'),source
+                source=source['structuredContent']['source']
+                assert source['path']=='/xodb-corpus/src/cxx/main.cpp' and source['line']==7,source
+                locals_=client.raw('list_locals',tid=state['threads'][0]['tid'])['result']
+                assert not locals_.get('isError'),locals_
+                total=next(v for v in locals_['structuredContent']['locals'] if v['name']=='total')
+                assert total['value']['availability']=='available',total
+                row.update(source=source,argument=total)
+            report['rows'].append(row)
             if n==0:
                 display.keys('down',29,'down',42,'tap',19,'up',42,'up',29)
                 owner.wait(lambda:'remote incarnation=1 retired;' in Path(display.log).read_text(),'old owner did not retire',timeout=30*scale)

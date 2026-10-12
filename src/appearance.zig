@@ -1,6 +1,6 @@
 //! Startup-only themes. Parsing returns owned colors for all GUI views.
 const std = @import("std");
-const c = @import("c.zig").api;
+const c = @import("c_ui.zig").api;
 pub const Color = [4]f32;
 pub const max_bytes = 64 * 1024;
 pub fn rgb(hex: u24) Color {

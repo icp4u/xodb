@@ -10,7 +10,7 @@ pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, l
 pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, diagnostic: ?[]const u8 = null };
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
-pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog }, outermost: bool = false };
+pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
 const Unit = struct { die: c.Dwarf_Die, kind: u8, split: ?c.Dwarf_Die = null, split_error: ?anyerror = null };
 pub const Inline = struct { name: []const u8, depth: usize, die_offset: u64, call_path: ?[]const u8 = null, call_line: ?u32 = null, call_column: ?u32 = null, decl_path: ?[]const u8 = null, decl_line: ?u32 = null };
 const unknown = eval.Type{ .name = "unknown", .kind = .unknown, .size = 0 };
@@ -38,7 +38,8 @@ fn reference(die: *c.Dwarf_Die, code: c_uint) ?c.Dwarf_Die {
     return out;
 }
 // libdw on this workstation does not descend every namespace from a CU.
-// Retry namespaces explicitly, retaining outer scopes and bounding our walk.
+// Retry namespaces and Swift modules explicitly, retaining outer scopes and
+// bounding our walk. A module is a lexical container, not an address range.
 fn scopesIn(a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64, budget: *usize, depth: usize) anyerror![]c.Dwarf_Die {
     if (depth > 64) return error.ScopeLimit;
     var raw: [*c]c.Dwarf_Die = null;
@@ -52,7 +53,7 @@ fn scopesIn(a: std.mem.Allocator, die: *c.Dwarf_Die, pc: u64, budget: *usize, de
     while (true) {
         if (budget.* == 0) return error.ScopeLimit;
         budget.* -= 1;
-        if (c.dwarf_tag(&child) == std.dwarf.TAG.namespace) {
+        if (c.dwarf_tag(&child) == std.dwarf.TAG.namespace or c.dwarf_tag(&child) == std.dwarf.TAG.module) {
             const nested = try scopesIn(a, &child, pc, budget, depth + 1);
             defer a.free(nested);
             if (nested.len > 0) {
@@ -109,6 +110,10 @@ fn language(die: *c.Dwarf_Die) eval.Language {
         if (producer != null and std.mem.startsWith(u8, std.mem.span(producer), "zig ")) return .zig;
     }
     return .unknown;
+}
+fn swift(die: *c.Dwarf_Die) bool {
+    var cu: c.Dwarf_Die = undefined;
+    return c.dwarf_diecu(die, &cu, null, null) != null and c.dwarf_srclang(&cu) == std.dwarf.LANG.Swift;
 }
 /// Unwind-only libdw state over C's private, bounded EH-section container.
 /// It borrows the bytes; destroy this before releasing the metadata job.
@@ -715,6 +720,10 @@ pub const Image = struct {
                     if (c.dwarf_siblingof(&child, &child) != 0) break;
                 };
                 t.fields = try fields.toOwnedSlice(a);
+                // Swift may reference imported module types whose layout was
+                // omitted by dsymutil. A named, nonempty value with no fields
+                // is not evidence of an empty structure or an integer ABI.
+                if (swift(&die) and t.fields.len == 0 and (t.size != 0 or c.dwarf_hasattr(&die, std.dwarf.AT.declaration) != 0)) t.kind = .unknown;
                 const js_handle = c.xjs_dwarf_handle(&die);
                 if (js_handle != 0) {
                     t.javascript_handle = @intCast(js_handle);
@@ -919,6 +928,10 @@ pub const Image = struct {
                         } else |err| {
                             value.diagnostic = @errorName(err);
                             value.value.availability = if (err == error.OptimizedOut) .optimized_out else if (err == error.PrologueNotComplete or err == error.LocationUnavailable or err == error.RegisterUnavailable or err == error.FrameBaseUnavailable or err == error.CfaUnavailable or err == error.EntryValueUnavailable) .unavailable else .unsupported;
+                        }
+                        if (value.value.availability == .available and t.kind == .unknown and swift(&die)) {
+                            value.value.availability = .unavailable;
+                            value.diagnostic = "SwiftTypeLayoutUnavailable";
                         }
                         try out.append(a, value);
                         if (out.items.len == 4096) return error.LocalLimit;

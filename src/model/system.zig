@@ -1,6 +1,6 @@
 //! One owner-thread collector and cache, borrowed by the view and every MCP peer.
 const std = @import("std");
-pub const c = @import("../c.zig").api;
+pub const c = @import("../c_ui.zig").api;
 const a = std.heap.c_allocator;
 const Snapshot = c.struct_xrt_sys_snapshot;
 const count = c.XRT_SYS_G_COUNT;

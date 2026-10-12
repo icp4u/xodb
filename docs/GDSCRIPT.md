@@ -1,4 +1,4 @@
-# GDScript stacks in a Godot 4 or Redot game
+# GDScript stacks and values in a Godot 4 or Redot game
 
 Run `REDOT=/path/to/engine scripts/demo-redot`, press **Space** to stop in
 the game's next `OS.delay_msec()` call, then choose the **GDScript** tab. It
@@ -47,9 +47,169 @@ Agents ask `get_language_stack` with `language` `gdscript`. Each frame has
 and its object id, and `native_binding` (the native frame's index, pc and
 symbol).
 
+Selecting a level also lists its **named locals**: parameters and local
+variables, then `self` and the members of its script, each with a preview of
+its value. [Values](#values) below has the walkthrough.
+
 xodb attaches to a game that was started normally. It does not use the
 engine's remote debugger, runs no code in the game and writes nothing to it,
 so it also works on a game that hangs in a script loop.
+
+## Values
+
+Run `REDOT=/path/to/engine scripts/demo-redot values`. This game has a player
+with an inventory, a target and a child node; every frame runs
+`_process` → `act` → `swing` → `take_hit`, which sleeps in `OS.delay_msec()`.
+Press **Space**, choose the **GDScript** tab, and click **swing**. **NAMED
+LOCALS** then shows the level you clicked (scroll the list for the rest):
+
+```
+weapon = Dictionary(3) {"damage": 12, "tags": Array(2) ["sharp", "steel"], "reach": 1.5}
+parameter
+power = 3.0
+parameter
+damage = 12
+local
+tags = Array(2) ["sharp", "steel"]
+local
+aim = (6.5, -9.0)
+local
+self = Player:<Node2D#28823257355> /root/Arena/Player (res://player.gd)
+context
+title = "Aria"
+member
+hp = 90
+member
+...
+inventory = Dictionary(4) {"sword": Dictionary(3) {"damage": 12, "tags": Array(2), "reach": 1.5}, "potions": Array(3) [3, 5, 8], "gold": 250, 7: "lucky"}
+member
+hand = Hand:<Node2D#28840034572> /root/Arena/Player/Hand
+member
+target = Dummy:<Node2D#28856811789> /root/Arena/Dummy (res://dummy.gd)
+member
+```
+
+Press **E**, type a path and press **Return** to read one value:
+
+| Type | Shows |
+| --- | --- |
+| `inventory["sword"].damage` | `12` |
+| `inventory.potions[-1]` | `8` (a negative index counts from the end) |
+| `target.armor` | `3`, a member of another object's script |
+| `velocity.x` | `3.25` |
+| `hand` | `Hand:<Node2D#...> /root/Arena/Player/Hand` |
+
+Click **_process** for one value of every Variant type (the members of the
+`Arena` node). In a second terminal `scripts/demo-redot locals` prints every
+level as text, and `scripts/demo-redot locals 1` one level:
+
+```
+#1 swing  res://player.gd:36
+    parameter weapon = Dictionary(3) {"damage": 12, "tags": Array(2) ["sharp", "steel"], "reach": 1.5}
+                  "damage": 12
+                  "tags": Array(2) ["sharp", "steel"]
+                  "reach": 1.5
+    parameter power = 3.0
+    local     damage = 12
+    ...
+    member    hp = 90
+```
+
+Agents use `get_language_locals` (`language` `gdscript`, the `segment` and
+`frame` of a level from `get_language_stack`, `start` and `limit` to page) and
+`evaluate_language_expression` with the same paths. Each row has the name, its
+`scope` (`parameter`, `local`, `context` for `self`, `member`), and a `value`
+with `type`, `display`, `count`, and the first `children` (key, type, display)
+of a container or of an object's script. `slot_address` is where the Variant
+is stored in the game, and `address` an object's own address.
+
+### What a value looks like
+
+| Variant type | Example |
+| --- | --- |
+| `Nil`, `bool`, `int`, `float` | `null`, `true`, `-42`, `2.5`, `3.0` |
+| `String`, `StringName`, `NodePath` | `"héllo wörld"`, `&"beta_name"`, `^"/root/Arena/Player:position:x"` |
+| `Vector2`, `Vector2i`, `Vector3`, `Vector3i`, `Vector4`, `Vector4i` | `(3.25, -4.5)`, `(7, -9)`, `(1.0, 2.0, 0.5)` |
+| `Rect2`, `Rect2i`, `Plane`, `Quaternion`, `Color` | `[P: (1.0, 2.0), S: (30.0, 40.0)]`, `[N: (0.0, 1.0, 0.0), D: 2.5]`, `(0, 0, 0, 1)`, `(1.0, 0.5, 0.25, 1.0)` |
+| `Transform2D`, `AABB`, `Basis`, `Transform3D`, `Projection` | `[X: (1.0, 0.0), Y: (0.0, 1.0), O: (5.0, 6.0)]`, as the engine prints them |
+| `Array` | `Array(7) [4, 1.5, "alpha", (3.25, -4.5), Array(2) [1, Array(1)], Dictionary(1) {"a": 1}, null]` |
+| `Dictionary` | `Dictionary(4) {"k_int": 4, "k_str": "alpha", 7: 2.5, &"k_name": (1, 2)}`, in insertion order |
+| `PackedByteArray` ... `PackedVector4Array` | `PackedInt32Array(3) [10, 20, -30]` |
+| `Object` | `Player:<Node2D#28823257355> /root/Arena/Player (res://player.gd)`: node name, class, instance id, path in the scene tree, script. `<RefCounted#-9223372009>`, `<null>`, `<Freed Object#...>` |
+| `Callable`, `Signal`, `RID` | `Callable(noted on #28806480138)`, `Callable(custom)`, `Signal(tree_exiting on #28806480138)`, `RID(77)` |
+
+A container's line shows its size and its first eight elements; a container
+inside it shows its first four, and one inside that only its size. A row
+carries the first 12 children (an expression's result 32); an index or key
+reaches any element (`v_big[57]`). Strings are cut at 96 characters with `…`,
+and `count` then has the full length.
+
+### Paths
+
+An expression is a name, then up to eight steps. The name is a parameter or
+local of the level (the innermost declaration wins), `self`, or a member.
+
+| Step | On | Means |
+| --- | --- | --- |
+| `[2]`, `[-1]` | `Array`, packed arrays | Element by index |
+| `["key"]`, `.key` | `Dictionary` | The pair whose key is that `String` or `StringName` |
+| `[7]` | `Dictionary` | The pair whose key is that `int` (or the equal `float`) |
+| `.member`, `["member"]` | `Object` with a GDScript | A member of its script instance |
+| `.x .y .z .w`, `.r .g .b .a`, `.position .size` | vectors, `Quaternion`, `Color`, `Rect2` | One component |
+
+Nothing is evaluated: there are no operators, calls, properties of engine
+classes (`position`, `name`) or getters. A step that finds nothing answers
+with no rows and a reason: `GDScriptNameNotFound`, `GDScriptKeyNotFound`,
+`GDScriptIndexOutOfRange`, `GDScriptMemberNotFound`,
+`GDScriptObjectHasNoScript`, `GDScriptObjectNull`, `GDScriptObjectFreed`,
+`GDScriptPathNotContainer`, `GDScriptPathNeedsIndex`,
+`GDScriptPathNotIndexable`. Text that is not a path is refused
+(`GDScriptExpressionUnsupported`). A dictionary is searched pair by pair, up
+to 262,144 pairs (`GDScriptDictionaryScanLimit`).
+
+### Local names
+
+The engine records the names of local variables only when it was told to:
+with the project setting `debug/settings/gdscript/always_track_local_variables`
+(the demo project sets it), or when its own debugger was attached while the
+script was compiled. Otherwise the view says `GDScriptLocalNamesNotTracked`
+and still shows every value: parameters keep their names (they are also in the
+function's signature), other slots that hold something are listed as
+`stack[6]`, `stack[7]` (locals and the engine's temporaries; it does not keep
+which), and `self` and the members are unaffected.
+
+### How values are read
+
+- **The level's stack.** A call record points at the function's array of
+  Variants: slot 0 is `self`, the arguments start at slot 3, locals and
+  temporaries follow. Names come from the function's debug records, replayed
+  up to the current line by the engine's own rule.
+- **Members.** The script instance holds a vector of Variants; the script's
+  member table maps each name to its index (base classes first).
+- **Layouts.** As for the stack, every offset and size comes from the binary's
+  DWARF: `Variant` and its `Type` enumerators, `Variant::ObjData`,
+  `ArrayPrivate`, `DictionaryPrivate`, the hash map element types, the debug
+  record list, `PropertyInfo`, `Object`, `Node`, `NodePath`, a packed-array
+  holder, `Callable` and `Signal`. A type this build does not have, or that
+  two units define differently, turns off only what needs it, with a reason
+  (`GDScriptArrayLayoutUnavailable`, `GDScriptDictionaryLayoutUnavailable`,
+  `GDScriptPackedArrayLayoutUnavailable`, `GDScriptObjectLayoutUnavailable`,
+  `GDScriptMemberLayoutUnavailable`, `GDScriptNodePathLayoutUnavailable`);
+  without `Variant` itself there are no values
+  (`GDScriptValueLayoutUnavailable`). The stack does not depend on any of them.
+- **Objects.** A Variant remembers an object's id and address. The object is
+  described only if it still carries that id (`GDScriptObjectFreed`
+  otherwise). Its class and whether it is a `Node` come from the C++ type
+  information its vtable points at; its script instance is trusted only when
+  its vtable is `GDScriptInstance`'s.
+- **Bounds.** One page of locals makes at most 16,384 reads and one expression
+  1,048,576 (`GDScriptReadLimit`); a level's first 1,024 stack slots and 2,048
+  members are read (`GDScriptMemberLimit` says when there are more); element counts come from the containers' own headers and
+  are checked before use.
+
+Measured on the demo with a 1.4 GB `template_debug` engine: a page of locals
+costs 17 to 26 ms and 340 to 530 reads (about 8 to 12 KB); an expression 2 to
+4 ms. The first request after a stop also reads the stack (about 75 ms).
 
 ## What is needed
 
@@ -70,7 +230,8 @@ xodb --image-limit 1600M --image-total-limit 4G --attach PID
 
 Reading a 1.4 GB engine costs about that much memory in xodb once, and about
 a second for the first stack: the image is copied, and its type descriptions
-are searched for eight types. Later stops reuse both.
+are searched for the stack's eight types and the value reader's twenty. Later
+stops reuse both.
 
 ## How it is read
 
@@ -139,10 +300,17 @@ are kept; control characters are shown as `?`.
   script calls unless the project sets
   `debug/settings/gdscript/always_track_call_stacks`, and has no DWARF unless
   it was built with it.
-- **Stack only.** Local variables, members and values are not shown yet. When
-  they are, local *names* will need the engine to have recorded them: it does
-  so only with `debug/settings/gdscript/always_track_local_variables`, or when
-  its own debugger was attached while the script was compiled.
+- **Values are read, not evaluated.** No expressions with operators or calls,
+  no properties of engine classes (a node's `position` is not a script member)
+  and no writes. Local names need the engine to have recorded them
+  ([above](#local-names)).
+- **Engines built with double precision** (`precision=double`) have a larger
+  Variant; values are refused there (`GDScriptValueLayoutUnavailable`) by the
+  size check alone. No such build was tried.
+- **A freed object** is recognised by its id no longer being in its memory.
+  The engine's own object table is not consulted.
+- **Language watches** (**W**) do not cover GDScript yet; a hardware
+  watchpoint on a row's `slot_address` plus 8 does (`set_watchpoint`).
 - **Suspended coroutines are not shown.** A function waiting in `await` is not
   on the thread's list until it resumes.
 - **A script stack overflow** leaves native frames without records; the

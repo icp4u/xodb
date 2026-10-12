@@ -2,7 +2,7 @@
 //! This does not wait for compositor scanout or asynchronous target/data loading.
 const std = @import("std");
 const linux = @import("target/linux.zig");
-const c = @import("c.zig").api;
+const c = @import("c_ui.zig").api;
 
 pub fn report(started: u64, protocol_stdout: bool) void {
     const elapsed_us = (linux.now() -| started) / 1000;

@@ -111,8 +111,9 @@ pub const Editor = struct {
     positions: [max_text + 1]f32 = @splat(0),
     view_start: usize = 0,
     pub const Action = union(enum) { edited, cancel, submit: []const u8 };
-    const Window = @import("../platform/wayland.zig").Window;
-    const c = @import("../c.zig").api;
+    const Window = @import("../platform/window.zig").Window;
+    const paste = @import("../platform/window.zig").clip;
+    const c = @import("../c_ui.zig").api;
 
     pub fn start(self: *Editor) void {
         self.open = true;
@@ -281,7 +282,7 @@ pub const Editor = struct {
                 w.dirty = true;
             }
         };
-        c.xclip_focus(w.clipboard, if (e) |v| @intFromPtr(v) else 0, if (e) |v| v.epoch else 0);
+        w.clipFocus(if (e) |v| @intFromPtr(v) else 0, if (e) |v| v.epoch else 0);
         if (e) |v| {
             if (v.dragging) {
                 if (w.mouse_down) {
@@ -292,24 +293,24 @@ pub const Editor = struct {
                     }
                 }
             }
-            var result: c.xclip_result = undefined;
-            if (c.xclip_take(w.clipboard, &result) and result.destination == @intFromPtr(v) and result.epoch == v.epoch) {
+            var result: paste.Result = undefined;
+            if (w.clipTake(&result) and result.destination == @intFromPtr(v) and result.epoch == v.epoch) {
                 switch (result.status) {
-                    c.XCLIP_READY, c.XCLIP_TRUNCATED => v.insert(result.bytes[0..result.size], result.status == c.XCLIP_TRUNCATED),
-                    c.XCLIP_TIMEOUT => v.message = "Paste timed out; field unchanged",
-                    c.XCLIP_UNAVAILABLE => v.message = "Clipboard has no plain text",
+                    .ready, .truncated => v.insert(result.bytes[0..result.size], result.status == .truncated),
+                    .timeout => v.message = "Paste timed out; field unchanged",
+                    .unavailable => v.message = "Clipboard has no plain text",
                     else => v.message = "Paste failed; field unchanged",
                 }
-                if (w.input.trace) std.debug.print("editor clipboard result={d} bytes={d} field_bytes={d} cursor={d}\n", .{ result.status, result.size, v.text.len, v.at() });
+                if (w.input.trace) std.debug.print("editor clipboard result={d} bytes={d} field_bytes={d} cursor={d}\n", .{ @intFromEnum(result.status), result.size, v.text.len, v.at() });
                 w.dirty = true;
-            } else if (!c.xclip_pending(w.clipboard) and std.mem.eql(u8, v.message, "Pasting...")) {
+            } else if (!w.clipPending() and std.mem.eql(u8, v.message, "Pasting...")) {
                 v.message = "Paste cancelled (focus changed)";
                 w.dirty = true;
             }
             if (v.selection_dirty) {
                 v.selection_dirty = false;
                 const selected = v.selectedText();
-                if (selected.len > 0) _ = c.xclip_copy(w.clipboard, true, w.last_input_serial, selected.ptr, selected.len);
+                if (selected.len > 0) _ = w.clipCopy(true, selected);
             }
         }
     }
@@ -343,25 +344,25 @@ pub const Editor = struct {
                 return true;
             }
             if (event.code == 274) {
-                const status = c.xclip_request(w.clipboard, true);
+                const status = w.clipRequest(true);
                 // An absent primary-selection protocol must not move the
                 // cursor or cancel another transfer.
-                if (status == c.XCLIP_IDLE) return true;
-                if (status == c.XCLIP_UNAVAILABLE) {
-                    var ignored: c.xclip_result = undefined;
-                    _ = c.xclip_take(w.clipboard, &ignored);
+                if (status == .idle) return true;
+                if (status == .unavailable) {
+                    var ignored: paste.Result = undefined;
+                    _ = w.clipTake(&ignored);
                     return true;
                 }
-                if (status == c.XCLIP_PENDING or status == c.XCLIP_READY or status == c.XCLIP_TRUNCATED) self.move(self.position(event.x), false);
+                if (status == .pending or status == .ready or status == .truncated) self.move(self.position(event.x), false);
                 w.dirty = true;
                 return true;
             }
         }
-        if ((event.kind != .press and event.kind != .repeat) or !event.mods.ctrl or event.mods.alt or event.mods.logo) return false;
+        if ((event.kind != .press and event.kind != .repeat) or !event.mods.ctrl or event.mods.alt or event.mods.super) return false;
         if (event.shortcut == 'v') {
             if (event.kind == .press) {
-                const status = c.xclip_request(w.clipboard, false);
-                if (status == c.XCLIP_PENDING) self.message = "Pasting...";
+                const status = w.clipRequest(false);
+                if (status == .pending) self.message = "Pasting...";
                 w.dirty = true;
             }
             return true;
@@ -370,7 +371,7 @@ pub const Editor = struct {
             if (event.kind == .press) {
                 const selected = self.selectedText();
                 const bytes = if (selected.len > 0) selected else self.text.slice();
-                self.message = if (c.xclip_copy(w.clipboard, false, w.last_input_serial, bytes.ptr, bytes.len)) "Copied text" else "Clipboard unavailable";
+                self.message = if (w.clipCopy(false, bytes)) "Copied text" else "Clipboard unavailable";
                 w.dirty = true;
             }
             return true;

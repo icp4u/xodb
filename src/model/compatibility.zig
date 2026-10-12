@@ -1,4 +1,4 @@
-//! Best-effort local Wine labels. They never change runtime thread inventory.
+//! Thread label providers and local Wine hints. Neither changes thread inventory.
 const std = @import("std");
 const linux = @import("../target/linux.zig");
 const identity = @import("process_identity.zig");
@@ -29,7 +29,9 @@ pub const Info = struct {
 pub const Label = struct {
     id: u64 = 0,
     tid: i32 = 0,
-    name: [16]u8 = @splat(0),
+    name: [128]u8 = @splat(0),
+    source: enum { linux_task_comm, gdb_thread_info } = .linux_task_comm,
+    queue_address: ?u64 = null,
     readable: bool = false,
     internal_name: bool = false,
     possibly_truncated: bool = false,
@@ -37,7 +39,8 @@ pub const Label = struct {
         return std.mem.sliceTo(&self.name, 0);
     }
     pub fn jsonStringify(self: Label, writer: *std.json.Stringify) !void {
-        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = "linux_task_comm", .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name });
+        var queue: [18]u8 = undefined;
+        try writer.write(.{ .id = self.id, .tid = self.tid, .name = if (self.readable) self.text() else null, .source = self.source, .queue_address = if (self.queue_address) |address| std.fmt.bufPrint(&queue, "0x{x}", .{address}) catch unreachable else null, .possibly_truncated = self.possibly_truncated, .wine_internal_name = self.internal_name });
     }
 };
 
@@ -124,6 +127,7 @@ pub const Cache = struct {
     next: u64 = 0,
     cursor: usize = 0,
     revision: u64 = 0,
+    remote_generation: ?u64 = null,
     pub fn deinit(self: *Cache) void {
         self.labels.deinit(std.heap.page_allocator);
         self.* = .{};
@@ -139,6 +143,25 @@ pub const Cache = struct {
             self.pid = snap.pid;
             self.epoch = snap.image_epoch;
         }
+        if (session.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+            self.info = .{ .kind = .unavailable };
+            if (snap.state != .stopped or self.remote_generation == snap.generation) return;
+            const threads = session.target.threadSlice();
+            self.labels.resize(std.heap.page_allocator, threads.len) catch return;
+            for (threads, self.labels.items) |thread, *row| {
+                row.* = .{ .id = thread.id, .tid = thread.tid, .source = .gdb_thread_info };
+                const detail = session.target.gdbThreadInfo(thread.tid) catch continue;
+                if (detail.has_name) {
+                    safeName(&row.name, std.mem.sliceTo(&detail.name, 0));
+                    row.readable = true;
+                    row.possibly_truncated = detail.name_truncated;
+                }
+                if (detail.has_queue) row.queue_address = detail.queue_address;
+            }
+            self.remote_generation = snap.generation;
+            self.revision +%= 1;
+            return;
+        };
         if (session.target.isRemote() or session.target.core != null or session.offline) {
             self.info = .{ .kind = .unavailable };
             self.labels.clearRetainingCapacity();
@@ -194,7 +217,7 @@ pub const Cache = struct {
             var next = Label{ .id = row.id, .tid = row.tid };
             if (raw) |text| {
                 const trimmed = std.mem.trimEnd(u8, text, "\n");
-                safeName(&next.name, trimmed);
+                safeName(next.name[0..16], trimmed);
                 next.possibly_truncated = trimmed.len >= 15;
                 next.readable = true;
                 next.internal_name = internalName(next.text());
@@ -218,7 +241,7 @@ test "Wine names are bounded hints and ordinary application names remain visible
     var label: Label = .{};
     safeName(&label.name, "render\x1b[31m\n");
     try std.testing.expectEqualStrings("render?[31m?", label.text());
-    safeName(&label.name, "very-long-thread-name");
+    safeName(label.name[0..16], "very-long-thread-name");
     try std.testing.expectEqual(@as(usize, 15), label.text().len);
     safeName(&label.name, "caf\xc3\xa9");
     try std.testing.expectEqualStrings("caf\xc3\xa9", label.text());

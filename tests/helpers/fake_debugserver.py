@@ -21,6 +21,7 @@ class Fake(threading.Thread):
         super().__init__(daemon=True)
         self.exchanges, self.mutate = exchanges, mutate
         self.at, self.unexpected, self.requests, self.error = 0, [], [], None
+        self.close_on_exit = self.closed_on_exit = False
         self.listener = socket.socket(); self.listener.bind(('127.0.0.1', 0)); self.listener.listen(1)
         self.endpoint = '127.0.0.1:%d' % self.listener.getsockname()[1]
 
@@ -52,6 +53,10 @@ class Fake(threading.Thread):
         if request.startswith('jGetLoadedDynamicLibrariesInfos:'):
             previous = [i for i in range(at) if ex[i][0] == request]
             if previous: return ex[previous[-1]][1]
+        # Older recordings contain no optional thread metadata. Exercise the
+        # client's typed unsupported path, never invent names from a future stop.
+        if request == 'jThreadsInfo' and not any(q == request for q, _ in ex):
+            return ['']
         return None
 
     def run(self):
@@ -79,6 +84,9 @@ class Fake(threading.Thread):
                         if self.mutate: replies = self.mutate(request, replies)
                         sent = [reply if isinstance(reply, bytes) else rsp.frame(reply.encode('latin-1')) for reply in replies]
                         for raw in sent: connection.sendall(raw)
+                        if self.close_on_exit and any(isinstance(r, str) and r.startswith(('W', 'X')) for r in replies):
+                            self.closed_on_exit = True
+                            return
                         if request == 'QStartNoAckMode': acks = False
         except OSError as error: self.error = error
         finally: self.listener.close()

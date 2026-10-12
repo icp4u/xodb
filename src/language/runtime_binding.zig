@@ -78,7 +78,9 @@ pub const State = struct {
                 .perl => "Perl_runops_standard",
             }) catch |err| return moduleError(language, err);
             scan.vetoed_empty = false;
-            if (found.unexamined) |err| if (found.modules.len == 0 or !overBudget(err)) {
+            // One examined anchor is sufficient for a cooperative target:
+            // unrelated JIT or deleted mappings cannot identify this runtime.
+            if (found.unexamined) |err| if (found.modules.len == 0 or (found.modules.len != 1 and !overBudget(err))) {
                 scan.vetoed_empty = found.modules.len == 0 and !overBudget(err);
                 return moduleError(language, err);
             };
@@ -159,18 +161,12 @@ fn bind(session: *model.Session, module: *Module, identity: Identity) Binding {
     return .{ .module = module, .identity = identity, .token = .{ .module_id = module.id, .generation = snapshot.generation, .epoch = snapshot.image_epoch, .maps = session.modules.maps_revision } };
 }
 pub fn discover(comptime language: Language, session: *model.Session) !void {
-    const scan = try session.language_bindings.prepare(session, language);
-    // Python thread requests use the same conservative candidate rule as
-    // process requests. Unwind evidence cannot discard another visible image.
-    if (language == .python and scan.count != 1) return ambiguous(language);
+    _ = try session.language_bindings.prepare(session, language);
 }
 /// At most one native thread walk per call. The caller retries pending work.
 pub fn process(comptime language: Language, session: *model.Session) !Binding {
     const state = &session.language_bindings;
     const scan = try state.prepare(session, language);
-    // A process-wide choice cannot discard another discoverable runtime on
-    // the strength of target-controlled unwind evidence.
-    if (scan.count != 1) return ambiguous(language);
     const generation = state.key.?.generation;
     if (!scan.done) {
         const threads = session.target.threadSlice();
@@ -208,7 +204,6 @@ pub fn process(comptime language: Language, session: *model.Session) !Binding {
 pub fn thread(comptime language: Language, session: *model.Session, a: A, tid: i32, native: []const model.Frame, first: usize) !Binding {
     const state = &session.language_bindings;
     const scan = try state.prepare(session, language);
-    if (language == .python and scan.count != 1) return ambiguous(language);
     const generation = state.key.?.generation;
     var chosen: ?Binding = null;
     var budget = Budget{};

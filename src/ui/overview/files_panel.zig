@@ -1,6 +1,6 @@
 //! Descriptor activity drawn with the overview's existing theme and renderer.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
 const m = @import("model.zig");

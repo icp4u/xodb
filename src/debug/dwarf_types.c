@@ -9,7 +9,17 @@ struct scan {
     struct xdt_stats *stats;
     uint64_t work, limit;
     const char *error;
+    uint8_t seen[XDT_MAX_FIELDS];
+    uint64_t dropped; /* optional types whose definitions were not usable */
 };
+/* An optional type that is not what the schema expects, or that two units
+ * define differently, is left out; the other types keep their answers. */
+static void settle(struct scan *s, unsigned t) {
+    if (!s->error || !(s->schema->optional_types >> t & 1)) return;
+    if (strcmp(s->error, "DwarfTypeAmbiguous") && strcmp(s->error, "DwarfFieldNotFound") && strcmp(s->error, "DwarfFieldMismatch")) return;
+    s->dropped |= 1ull << t;
+    s->error = NULL;
+}
 static int tick(struct scan *s) {
     if (s->error) return 0;
     if (++s->work > s->limit) { s->error = "DwarfTypesWorkLimit"; return 0; }
@@ -59,12 +69,69 @@ static int kind_matches(Dwarf_Die *d, unsigned want) {
     if (want == XDT_SIGNED) return encoding == DW_ATE_signed || encoding == DW_ATE_signed_char;
     return encoding == DW_ATE_unsigned || encoding == DW_ATE_unsigned_char;
 }
+/* What one definition gave for types[t], against the ones before it. */
+static void merge(struct scan *s, unsigned t, const struct xdt_slot *got, uint64_t total) {
+    const struct xdt_schema *schema = s->schema;
+    for (unsigned f = 0; f < schema->field_count; ++f) {
+        if (schema->fields[f].owner != t || got[f].present == 2) continue;
+        if (!got[f].present && !schema->fields[f].optional) { s->error = "DwarfFieldNotFound"; return; }
+        if (s->seen[f] && (got[f].offset != s->fields[f].offset || got[f].size != s->fields[f].size ||
+                           got[f].present != s->fields[f].present)) { s->error = "DwarfTypeAmbiguous"; return; }
+        s->fields[f] = got[f]; s->seen[f] = 1;
+    }
+    if (s->stats->definitions[t] && s->sizes[t] != (uint32_t)total) { s->error = "DwarfTypeAmbiguous"; return; }
+    s->sizes[t] = (uint32_t)total;
+    if (s->stats->definitions[t] != UINT32_MAX) ++s->stats->definitions[t];
+}
+/* The data member `name[0..len)` of `type`: 1 with its offset and resolved
+ * type, 0 when there is none, -1 with s->error set. */
+static int member_of(struct scan *s, Dwarf_Die *type, const char *name, size_t len, uint64_t *at, Dwarf_Die *out) {
+    Dwarf_Die child; int found = 0;
+    int rc = dwarf_child(type, &child);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return -1; }
+    if (rc == 0) do {
+        if (!tick(s)) return -1;
+        if (dwarf_tag(&child) != DW_TAG_member) continue;
+        const char *have = dwarf_diename(&child);
+        if (!have || strncmp(have, name, len) || have[len]) continue;
+        if (dwarf_hasattr(&child, DW_AT_bit_size) || dwarf_hasattr(&child, DW_AT_data_bit_offset)) { s->error = "DwarfFieldMismatch"; return -1; }
+        if (!ud(&child, DW_AT_data_member_location, at)) continue;
+        if (found) { s->error = "DwarfTypeAmbiguous"; return -1; }
+        if (!type_of(&child, out) || !resolve(out, s)) {
+            if (!s->error) s->error = "DwarfFieldMismatch";
+            return -1;
+        }
+        found = 1;
+    } while ((rc = dwarf_siblingof(&child, &child)) == 0);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return -1; }
+    return found;
+}
+/* The rest of a member path, through members held by value: 1 found, 0 when
+ * this unit only declares a type on the way or the member is absent
+ * (*absent), -1 with s->error set. */
+static int nested(struct scan *s, Dwarf_Die *type, const char *path, uint64_t *at, int *absent) {
+    for (unsigned depth = 0; depth < 8; ++depth) {
+        size_t len = strcspn(path, ".");
+        uint64_t inner; Dwarf_Die next;
+        if (!aggregate(dwarf_tag(type))) { s->error = "DwarfFieldMismatch"; return -1; }
+        if (flag(type, DW_AT_declaration)) return 0;
+        int rc = member_of(s, type, path, len, &inner, &next);
+        if (rc < 0) return -1;
+        if (!rc) { *absent = 1; return 0; }
+        if (inner > 1u << 24 || *at > 1u << 24) { s->error = "DwarfFieldMismatch"; return -1; }
+        *at += inner; *type = next;
+        if (!path[len]) return 1;
+        path += len + 1;
+    }
+    s->error = "DwarfFieldMismatch";
+    return -1;
+}
 /* One complete definition of types[t]: every requested member, checked. */
 static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
     const struct xdt_schema *schema = s->schema;
     struct xdt_slot got[XDT_MAX_FIELDS];
     uint64_t total;
-    memset(got, 0, sizeof got);
+    memset(got, 0, schema->field_count * sizeof got[0]);
     if (!byte_size(die, &total) || total > UINT32_MAX) { s->error = "DwarfTypesMalformed"; return; }
     Dwarf_Die child;
     int rc = dwarf_child(die, &child);
@@ -76,7 +143,9 @@ static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
         if (!name) continue;
         for (unsigned f = 0; f < schema->field_count; ++f) {
             const struct xdt_field *field = &schema->fields[f];
-            if (field->owner != t || strcmp(name, field->name)) continue;
+            if (field->owner != t) continue;
+            size_t len = strcspn(field->name, ".");
+            if (strncmp(name, field->name, len) || name[len]) continue;
             uint64_t at, bytes; Dwarf_Die member;
             /* A bit-field is not a whole member. */
             if (dwarf_hasattr(&child, DW_AT_bit_size) || dwarf_hasattr(&child, DW_AT_data_bit_offset)) { s->error = "DwarfFieldMismatch"; return; }
@@ -87,6 +156,11 @@ static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
                 if (!s->error) s->error = "DwarfFieldMismatch";
                 return;
             }
+            if (field->name[len]) {
+                int absent = 0, found = nested(s, &member, field->name + len + 1, &at, &absent);
+                if (found < 0) return;
+                if (!found) { got[f].present = absent ? 0 : 2; continue; }
+            }
             if (dwarf_tag(&member) == DW_TAG_pointer_type || dwarf_tag(&member) == DW_TAG_reference_type) bytes = 8;
             else if (!byte_size(&member, &bytes)) { s->error = "DwarfFieldMismatch"; return; }
             if (at > total || bytes > total - at || !kind_matches(&member, field->kind) ||
@@ -95,15 +169,33 @@ static void definition(struct scan *s, unsigned t, Dwarf_Die *die) {
         }
     } while ((rc = dwarf_siblingof(&child, &child)) == 0);
     if (rc < 0) { s->error = "DwarfTypesMalformed"; return; }
-    for (unsigned f = 0; f < schema->field_count; ++f) {
-        if (schema->fields[f].owner != t) continue;
-        if (!got[f].present && !schema->fields[f].optional) { s->error = "DwarfFieldNotFound"; return; }
-        if (s->stats->definitions[t] && memcmp(&got[f], &s->fields[f], sizeof got[f])) { s->error = "DwarfTypeAmbiguous"; return; }
-        s->fields[f] = got[f];
-    }
-    if (s->stats->definitions[t] && s->sizes[t] != (uint32_t)total) { s->error = "DwarfTypeAmbiguous"; return; }
-    s->sizes[t] = (uint32_t)total;
-    if (s->stats->definitions[t] != UINT32_MAX) ++s->stats->definitions[t];
+    merge(s, t, got, total);
+}
+/* One complete enumeration types[t]: each requested enumerator's value. */
+static void enumeration(struct scan *s, unsigned t, Dwarf_Die *die) {
+    const struct xdt_schema *schema = s->schema;
+    struct xdt_slot got[XDT_MAX_FIELDS];
+    uint64_t total;
+    memset(got, 0, schema->field_count * sizeof got[0]);
+    if (!ud(die, DW_AT_byte_size, &total) || !total || total > 8) { s->error = "DwarfTypesMalformed"; return; }
+    Dwarf_Die child;
+    int rc = dwarf_child(die, &child);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return; }
+    if (rc == 0) do {
+        if (!tick(s)) return;
+        if (dwarf_tag(&child) != DW_TAG_enumerator) continue;
+        const char *name = dwarf_diename(&child);
+        if (!name) continue;
+        for (unsigned f = 0; f < schema->field_count; ++f) {
+            uint64_t value;
+            if (schema->fields[f].owner != t || strcmp(name, schema->fields[f].name)) continue;
+            if (got[f].present) { s->error = "DwarfTypeAmbiguous"; return; }
+            if (!ud(&child, DW_AT_const_value, &value) || value > UINT32_MAX) { s->error = "DwarfFieldMismatch"; return; }
+            got[f] = (struct xdt_slot){(uint32_t)value, 0, 1};
+        }
+    } while ((rc = dwarf_siblingof(&child, &child)) == 0);
+    if (rc < 0) { s->error = "DwarfTypesMalformed"; return; }
+    merge(s, t, got, total);
 }
 /* Children of `parent` against the path suffixes still wanted. `rest[t]` is
  * the unmatched tail of types[t], or NULL when this scope is not on its path. */
@@ -115,7 +207,7 @@ static void scope(struct scan *s, Dwarf_Die *parent, const char *const *rest, un
     do {
         if (!tick(s)) return;
         int tag = dwarf_tag(&d);
-        if (!aggregate(tag) && tag != DW_TAG_namespace) continue;
+        if (!aggregate(tag) && tag != DW_TAG_namespace && tag != DW_TAG_enumeration_type) continue;
         const char *name = dwarf_diename(&d);
         if (!name) continue;
         size_t len = strlen(name);
@@ -124,9 +216,13 @@ static void scope(struct scan *s, Dwarf_Die *parent, const char *const *rest, un
             inner[t] = NULL;
             if (!rest[t] || strncmp(rest[t], name, len)) continue;
             if (!rest[t][len]) {
-                if (aggregate(tag) && !flag(&d, DW_AT_declaration) && dwarf_hasattr(&d, DW_AT_byte_size)) definition(s, t, &d);
+                if (!(s->dropped >> t & 1) && !flag(&d, DW_AT_declaration) && dwarf_hasattr(&d, DW_AT_byte_size)) {
+                    if (aggregate(tag)) definition(s, t, &d);
+                    else if (tag == DW_TAG_enumeration_type) enumeration(s, t, &d);
+                    settle(s, t);
+                }
                 if (s->error) return;
-            } else if (rest[t][len] == ':' && rest[t][len + 1] == ':') { inner[t] = rest[t] + len + 2; descend = 1; }
+            } else if (tag != DW_TAG_enumeration_type && rest[t][len] == ':' && rest[t][len + 1] == ':') { inner[t] = rest[t] + len + 2; descend = 1; }
         }
         if (descend && depth < 8) { scope(s, &d, inner, depth + 1); if (s->error) return; }
     } while ((rc = dwarf_siblingof(&d, &d)) == 0);
@@ -156,7 +252,20 @@ const char *xdt_layout_build(Dwarf *dwarf, const struct xdt_schema *schema, uint
     if (rc < 0 && !s.error) s.error = "DwarfTypesMalformed";
     stats->work = s.work;
     if (!s.error && !stats->units) s.error = "DwarfTypesUnavailable";
-    for (unsigned t = 0; !s.error && t < schema->type_count; ++t) if (!stats->definitions[t]) s.error = "DwarfTypeNotFound";
+    for (unsigned t = 0; !s.error && t < schema->type_count; ++t)
+        if (!stats->definitions[t] && !(schema->optional_types >> t & 1)) s.error = "DwarfTypeNotFound";
+    /* A member path that no unit could follow to its end. */
+    for (unsigned f = 0; !s.error && f < schema->field_count; ++f)
+        if (!s.seen[f] && !schema->fields[f].optional && stats->definitions[schema->fields[f].owner]) {
+            s.error = "DwarfFieldNotFound";
+            settle(&s, schema->fields[f].owner);
+        }
+    for (unsigned t = 0; !s.error && t < schema->type_count; ++t) {
+        if (!(s.dropped >> t & 1)) continue;
+        sizes[t] = 0; stats->definitions[t] = 0;
+        for (unsigned f = 0; f < schema->field_count; ++f) if (schema->fields[f].owner == t) fields[f] = (struct xdt_slot){0, 0, 0};
+    }
+    stats->dropped = s.dropped;
     if (s.error) {
         memset(fields, 0, schema->field_count * sizeof *fields);
         memset(sizes, 0, schema->type_count * sizeof *sizes);

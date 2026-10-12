@@ -91,7 +91,7 @@ fn defaultThread(threads: []const @import("../target/linux.zig").Thread) i32 {
     // Peers interrupted for all-stop are inspection fallbacks. Follow the
     // thread that actually hit a probe, completed a step or received a signal.
     for (threads) |t| if (t.state == .stopped) switch (t.reason) {
-        .breakpoint, .watchpoint, .single_step, .signal, .exec => return t.tid,
+        .breakpoint, .watchpoint, .single_step, .exception, .signal, .exec => return t.tid,
         else => {},
     };
     for (threads) |t| if (t.state == .stopped) return t.tid;
@@ -196,7 +196,7 @@ test "remote default follows a worker stop ahead of interrupted peers" {
         .{ .id = 1, .tid = 100, .state = .stopped, .reason = .interrupt },
         .{ .id = 2, .tid = 101, .state = .stopped, .reason = .breakpoint },
     };
-    for ([_]@import("../target/breakpoints.zig").StopReason{ .breakpoint, .watchpoint, .single_step, .signal }) |reason| {
+    for ([_]@import("../target/breakpoints.zig").StopReason{ .breakpoint, .watchpoint, .single_step, .exception, .signal }) |reason| {
         threads[1].reason = reason;
         try std.testing.expectEqual(@as(i32, 101), defaultThread(&threads));
     }

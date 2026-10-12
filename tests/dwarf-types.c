@@ -7,7 +7,7 @@
 #include <string.h>
 #include <unistd.h>
 /* dwarf-types IMAGE WORK TYPE... -- FIELD...   where FIELD is
- * owner:name:kind:width[:optional]. Prints one line per type and field, or
+ * owner:name:kind:width[:optional] and "?TYPE" may be absent. Prints one line per type and field, or
  * "error NAME" and exits 2. */
 static unsigned kind_of(const char *s) {
     static const char *const names[] = {"any", "pointer", "unsigned", "signed", "boolean"};
@@ -17,8 +17,12 @@ static unsigned kind_of(const char *s) {
 int main(int argc, char **argv) {
     CHECK(argc >= 4);
     const char *types[XDT_MAX_TYPES + 2]; struct xdt_field fields[XDT_MAX_FIELDS + 2];
-    unsigned type_count = 0, field_count = 0; int i = 3;
-    for (; i < argc && strcmp(argv[i], "--"); ++i) { CHECK(type_count < XDT_MAX_TYPES + 2); types[type_count++] = argv[i]; }
+    unsigned type_count = 0, field_count = 0; int i = 3; uint64_t optional_types = 0;
+    for (; i < argc && strcmp(argv[i], "--"); ++i) {
+        CHECK(type_count < XDT_MAX_TYPES + 2);
+        if (argv[i][0] == '?') { optional_types |= 1ull << type_count; ++argv[i]; }
+        types[type_count++] = argv[i];
+    }
     for (++i; i < argc; ++i) {
         CHECK(field_count < XDT_MAX_FIELDS + 2);
         char *owner = strtok(argv[i], ":"), *name = strtok(NULL, ":"), *kind = strtok(NULL, ":"), *width = strtok(NULL, ":"), *optional = strtok(NULL, ":");
@@ -30,7 +34,7 @@ int main(int argc, char **argv) {
         fd = open(argv[1], O_RDONLY | O_CLOEXEC); CHECK(fd >= 0);
         dwarf = dwarf_begin(fd, DWARF_C_READ);
     }
-    struct xdt_schema schema = {types, fields, type_count, field_count};
+    struct xdt_schema schema = {types, fields, type_count, field_count, optional_types};
     struct xdt_slot slots[XDT_MAX_FIELDS + 2]; uint32_t sizes[XDT_MAX_TYPES + 2]; struct xdt_stats stats;
     memset(slots, 0xa5, sizeof slots); memset(sizes, 0xa5, sizeof sizes);
     const char *why = xdt_layout_build(dwarf, &schema, strtoull(argv[2], NULL, 0), slots, sizes, &stats);

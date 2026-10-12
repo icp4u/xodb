@@ -8,7 +8,7 @@
 //! Data comes from the shared memory observer; rendering copies a bounded
 //! Map under the publication lock and never reads /proc itself.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
 const win95 = @import("win95.zig");

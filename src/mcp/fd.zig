@@ -1,7 +1,7 @@
 //! Cached fd observers. No filesystem access, perf calls, sleeps or target control
 //! occur in a tool call; the bounded C owner does sampling asynchronously.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const system = @import("../model/system.zig");
 const wire = @import("profile.zig");
 const Value = std.json.Value;

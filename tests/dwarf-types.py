@@ -35,7 +35,9 @@ public:
     const volatile Name name = {};
     unsigned flags : 3;
     char pad[5];
+    enum Kind { NONE, FIRST, SEVENTH = 7 };
 };
+struct Holder { int tag; Name::Data inner; Engine *engine; struct { char skip[3]; short at; } pair; };
 namespace outer { namespace inner { struct Deep { short a; long long b; }; } }
 int use(Engine *);
 ''')
@@ -46,6 +48,8 @@ Engine *Engine::singleton;
 thread_local Engine::Level *Engine::top;
 int main() {
     Engine engine; Engine::Level level = {}; outer::inner::Deep deep = {}; Engine::top = &level;
+    Holder holder = {}; Engine::Kind kind = Engine::SEVENTH;
+    std::printf("NESTED %zu %zu %zu %d %zu\\n", offsetof(Holder, inner) + offsetof(Name::Data, name) + offsetof(Text, data), offsetof(Holder, pair) + 4, sizeof(Engine::Kind), (int)kind + holder.tag, sizeof(Holder));
     std::printf("ORACLE %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu %zu\\n", sizeof(Engine), offsetof(Engine, limit), offsetof(Engine, tracking), offsetof(Engine, name),
         sizeof(Engine::Level), offsetof(Engine::Level, function), offsetof(Engine::Level, line), offsetof(Engine::Level, prev),
         sizeof(Name::Data), offsetof(Name::Data, name), offsetof(outer::inner::Deep, b));
@@ -78,7 +82,8 @@ for compiler in ('g++', 'clang++'):
         tag = f'{compiler}-{version}'
         image = w / tag
         subprocess.run([compiler, '-O1', '-Wno-invalid-offsetof', f'-gdwarf-{version}', str(w / 'engine.cc'), str(w / 'user.cc'), '-o', str(image)], check=True, timeout=120)
-        oracle = [int(n) for n in subprocess.run([str(image)], capture_output=True, text=True, timeout=30, check=True).stdout.split()[1:]]
+        printed = subprocess.run([str(image)], capture_output=True, text=True, timeout=30, check=True).stdout.splitlines()
+        nested, oracle = [int(n) for n in printed[0].split()[1:]], [int(n) for n in printed[1].split()[1:]]
         text = run(tag, image)
         got, size = offsets(text), sizes(text)
         assert [size['Engine'][0], got['Engine.limit'][0], got['Engine.tracking'][0], got['Engine.name'][0], size['Engine::Level'][0], got['Engine::Level.function'][0],
@@ -86,6 +91,25 @@ for compiler in ('g++', 'clang++'):
         # Two units define Level and Name; only the key function's defines Engine.
         assert size['Engine'][1] == 1 and size['Engine::Level'][1] >= 1 and size['Name'][1] == 2 and size['Text'][0] == 8, (tag, text)
         assert got['Engine.missing'] == (0, 0, 0) and got['Engine.limit'][1:] == (4, 1), (tag, text)
+        # A path through members held by value adds the offsets up; an
+        # enumerator answers with its value; a type marked "?" may be absent.
+        text2 = run(tag + '-nested', image, types=['Holder', 'Engine::Kind', '?Nowhere', '?Engine::Level'],
+                    fields=['0:inner.name.data:pointer:8', '0:pair.at:signed:2', '1:NONE:any:0', '1:FIRST:any:0', '1:SEVENTH:any:0', '2:x:any:0', '0:inner.gone:any:0:optional', '1:EIGHTH:any:0:optional', '3:prev:pointer:8'])
+        got2, size2 = offsets(text2), sizes(text2)
+        assert [got2['Holder.inner.name.data'][0], got2['Holder.pair.at'][0], size2['Engine::Kind'][0], got2['Engine::Kind.SEVENTH'][0], size2['Holder'][0]] == nested, (tag, text2, nested)
+        assert got2['Engine::Kind.NONE'] == (0, 0, 1) and got2['Engine::Kind.FIRST'] == (1, 0, 1) and got2['Nowhere.x'] == (0, 0, 0) and size2['Nowhere'] == (0, 0), (tag, text2)
+        assert got2['Holder.inner.gone'] == (0, 0, 0) and got2['Engine::Kind.EIGHTH'] == (0, 0, 0) and got2['Engine::Level.prev'][2] == 1, (tag, text2)
+        # An optional type that is not what was asked is left out, alone.
+        text3 = run(tag + '-dropped', image, types=['?Holder', 'Text', '?Engine::Kind', '?Name'], fields=['0:inner.gone:any:0', '0:tag:signed:4', '1:data:pointer:8', '2:EIGHTH:any:0', '3:data:signed:8'])
+        got3, size3 = offsets(text3), sizes(text3)
+        assert size3['Holder'] == (0, 0) and size3['Engine::Kind'] == (0, 0) and size3['Name'] == (0, 0) and size3['Text'][0] == 8, (tag, text3)
+        assert got3['Holder.tag'] == (0, 0, 0) and got3['Text.data'] == (0, 8, 1) and got3['Name.data'] == (0, 0, 0), (tag, text3)
+        run(tag + '-nested-absent', image, types=['Holder'], fields=['0:inner.gone:any:0'], reason='DwarfFieldNotFound')
+        run(tag + '-nested-scalar', image, types=['Holder'], fields=['0:tag.x:any:0'], reason='DwarfFieldMismatch')
+        # A path may not cross a pointer: Engine is only pointed at.
+        run(tag + '-nested-pointer', image, types=['Holder'], fields=['0:engine.limit:any:0'], reason='DwarfFieldMismatch')
+        run(tag + '-enumerator-absent', image, types=['Engine::Kind'], fields=['0:EIGHTH:any:0'], reason='DwarfFieldNotFound')
+        run(tag + '-type-absent', image, types=['Nowhere'], fields=[], reason='DwarfTypeNotFound')
         # A static member, a bit-field and a member of the wrong kind or width are not accepted.
         run(tag + '-static', image, fields=['0:singleton:pointer:8'], reason='DwarfFieldNotFound')
         run(tag + '-tls', image, fields=['0:top:pointer:8'], reason='DwarfFieldNotFound')
@@ -107,13 +131,15 @@ for compiler in ('g++', 'clang++'):
         clash = w / (tag + '-clash')
         subprocess.run([compiler, '-O1', f'-gdwarf-{version}', '-shared', '-fPIC', str(w / 'clash.cc'), str(w / 'main2.cc'), str(w / 'user.cc'), '-o', str(clash)], check=True, timeout=120)
         run(tag + '-ambiguous', clash, types=['Name::Data'], fields=['0:name:any:8'], reason='DwarfTypeAmbiguous')
+        text4 = run(tag + '-ambiguous-optional', clash, types=['?Name::Data', 'Name'], fields=['0:name:any:8', '1:data:pointer:8'])
+        assert sizes(text4)['Name::Data'] == (0, 0) and offsets(text4)['Name::Data.name'] == (0, 0, 0) and offsets(text4)['Name.data'] == (0, 8, 1), (tag, text4)
         # An image without DWARF.
         stripped = w / (tag + '-stripped')
         subprocess.run(['objcopy', '--strip-debug', str(image), str(stripped)], check=True, timeout=60)
         run(tag + '-stripped', stripped, reason='DwarfTypesUnavailable')
 run('no-dwarf', 'none', reason='DwarfTypesUnavailable')
-run('too-many-types', w / 'g++-5', types=['T'] * 17, fields=[], reason='DwarfTypesSchemaLimit')
-run('too-many-fields', w / 'g++-5', types=['Engine'], fields=['0:limit:any:0'] * 65, reason='DwarfTypesSchemaLimit')
+run('too-many-types', w / 'g++-5', types=['T'] * 49, fields=[], reason='DwarfTypesSchemaLimit')
+run('too-many-fields', w / 'g++-5', types=['Engine'], fields=['0:limit:any:0'] * 161, reason='DwarfTypesSchemaLimit')
 run('bad-owner', w / 'g++-5', types=['Engine'], fields=['3:limit:any:0'], reason='DwarfTypesSchemaLimit')
 run('no-types', w / 'g++-5', types=[], fields=[], reason='DwarfTypesSchemaLimit')
 # Damaged debug sections: garbled DIEs and a unit that claims to be 2 GiB long.

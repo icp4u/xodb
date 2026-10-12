@@ -62,7 +62,7 @@ static void thread(struct xrt_codec *c, struct xrt_thread *t)
     i32(c, &t->signal);
     BOOL(t->newborn);
     BOOL(t->interrupt_pending);
-    ENUM(t->reason, XRT_STOP_VFORK_DONE);
+    ENUM(t->reason, XRT_STOP_EXCEPTION);
     U64(t->breakpoint_address);
     BOOL(t->has_saved_debug);
     if (t->has_saved_debug)

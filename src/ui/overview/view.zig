@@ -4,7 +4,7 @@
 const std = @import("std");
 const gpu = @import("../../render/vulkan.zig");
 const Font = @import("../../render/font.zig").Font;
-const Window = @import("../../platform/wayland.zig").Window;
+const Window = @import("../../platform/window.zig").Window;
 const m = @import("model.zig");
 const h = @import("history.zig");
 const draw = @import("draw.zig");
@@ -430,16 +430,10 @@ pub const View = struct {
     }
 
     fn windowActions(self: *View, w: *Window) void {
-        const c = @import("../../c.zig").api;
         // The theme key may have switched to or from the look with its own title bar.
         w.setOwnFrame(self.pal().win95);
-        if (w.top) |top| {
-            if (self.minimize_requested) c.xdg_toplevel_set_minimized(top);
-            // The compositor owns this state: it may maximize or restore by other means.
-            if (self.maximize_requested) {
-                toggleMaximize(c, top, w.maximized);
-            }
-        }
+        if (self.minimize_requested) w.minimize();
+        if (self.maximize_requested) w.toggleMaximized();
         self.minimize_requested = false;
         self.maximize_requested = false;
     }
@@ -664,7 +658,7 @@ pub const View = struct {
         const row = f.rows.items[f.selected_row];
         if (row != .descriptor or row.descriptor.fd >= s.fd_count) return;
         const fd = s.fds[row.descriptor.fd];
-        if (fd.flags & @import("../../c.zig").api.XRT_FD_STAT == 0) return;
+        if (fd.flags & @import("../../c_ui.zig").api.XRT_FD_STAT == 0) return;
         f.filter = null;
         f.file_filter = .{ .device = fd.device, .inode = fd.inode };
         f.query_len = 0;
@@ -1050,7 +1044,7 @@ pub const View = struct {
         if (self.rows.items.len == 0) self.selected = null else self.selectRow(self.selected_row);
     }
     fn auditProcessSelection(self: *const View) void {
-        if (@import("../../c.zig").api.getenv("XODB_OVERVIEW_AUDIT") == null) return;
+        if (@import("../../c_ui.zig").api.getenv("XODB_OVERVIEW_AUDIT") == null) return;
         const query_pid = std.fmt.parseInt(i32, self.searchText(), 10) catch 0;
         var query_row: i64 = -1;
         if (self.snap()) |snapshot| for (self.rows.items, 0..) |row, i| {
@@ -1838,37 +1832,6 @@ test "classic scrollbar geometry does not grow with the trough height" {
     }
     try std.testing.expect(used[0] > 0);
     try std.testing.expectEqual(used[0], used[1]);
-}
-
-fn toggleMaximize(comptime protocol: type, top: anytype, maximized: bool) void {
-    if (maximized) protocol.xdg_toplevel_unset_maximized(top) else protocol.xdg_toplevel_set_maximized(top);
-}
-
-test "maximize toggle requests the opposite compositor state" {
-    const Protocol = struct {
-        fn xdg_toplevel_set_maximized(out: *bool) void {
-            out.* = true;
-        }
-        fn xdg_toplevel_unset_maximized(out: *bool) void {
-            out.* = false;
-        }
-    };
-    var requested = false;
-    toggleMaximize(Protocol, &requested, false);
-    try std.testing.expect(requested);
-    toggleMaximize(Protocol, &requested, true);
-    try std.testing.expect(!requested);
-    // An external restore, not the previous request, determines the next action.
-    toggleMaximize(Protocol, &requested, false);
-    try std.testing.expect(requested);
-}
-
-test "maximize state follows the compositor's configure states" {
-    const state = @import("../../platform/wayland.zig").hasState;
-    const none = [_]u32{};
-    try std.testing.expect(!state(&none, 1));
-    try std.testing.expect(!state(&[_]u32{ 4, 5, 6 }, 1)); // activated and tiled edges only
-    try std.testing.expect(state(&[_]u32{ 4, 1 }, 1));
 }
 
 test "short classic menus expose every full-height item by keyboard and paging" {

@@ -1763,10 +1763,9 @@ pub const Modules = struct {
             }
         };
         if (label == null and function == null) return error.SymbolNotFound;
-        const text = if (label) |value|
-            try std.fmt.allocPrint(self.allocator, "{s}!{s}", .{ std.fs.path.basename(entry.path), value })
-        else
-            try std.fmt.allocPrint(self.allocator, "{s}!sub_{x}", .{ std.fs.path.basename(entry.path), begin });
+        var generated: [32]u8 = undefined;
+        const value = label orelse try std.fmt.bufPrint(&generated, "sub_{x}", .{begin});
+        const text = try @import("image_label.zig").format(self.allocator, entry.path, value, null);
         defer self.allocator.free(text);
         return self.retainSymbol(.{ .module_id = entry.id, .name = text, .address = entry.start + begin, .size = if (function != null) function.*.end - begin else 0, .offset = rva - begin });
     }

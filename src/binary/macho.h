@@ -82,7 +82,7 @@ struct xmo_segment {
 struct xmo_section {
     char segment[17], name[17];
     uint64_t address, size;
-    uint32_t offset, align, flags, segment_index;
+    uint32_t offset, align, flags, segment_index, relocation_offset, relocation_count;
 };
 enum xmo_dylib_kind { XMO_DYLIB_ID, XMO_DYLIB_LOAD, XMO_DYLIB_WEAK,
     XMO_DYLIB_REEXPORT, XMO_DYLIB_LAZY, XMO_DYLIB_UPWARD };
@@ -152,6 +152,10 @@ enum xmo_status xmo_section_range(const struct xmo_image *, const struct xmo_sec
 /* At most XMO_MAX_CHUNK bytes, inside the section. Not charged to the image's
  * read budget: the consumer brings its own. */
 enum xmo_status xmo_read_section(const struct xmo_image *, const struct xmo_section *, uint64_t at, void *, size_t);
+/* Raw 8-byte Mach-O relocation records, FILE layout only. Consumer supplies
+ * its own total read/work budget, as for section bytes. */
+enum xmo_status xmo_read_relocations(const struct xmo_image *, const struct xmo_section *,
+                                   uint32_t first, uint32_t count, void *);
 /* slide = runtime header address - __TEXT's link address (modulo 2^64). */
 enum xmo_status xmo_slide(const struct xmo_image *, uint64_t header_address, uint64_t *slide);
 
@@ -166,6 +170,9 @@ enum xmo_status xmo_string(struct xmo_image *, uint32_t strx, char *out, size_t 
 /* Exact name, as stored (C names carry a leading underscore). A defined
  * symbol wins over an undefined one of the same name, then table order. */
 enum xmo_status xmo_symbol_find(struct xmo_image *, const char *name, const struct xmo_symbol **);
+/* Debug-map matching needs a unique definition, never table-order selection.
+ * UNAVAILABLE if the same name defines different addresses or sections. */
+enum xmo_status xmo_symbol_unique(struct xmo_image *, const char *name, const struct xmo_symbol **);
 /* The defined symbol at or before a link address, inside the same section.
  * size runs to the next symbol, the next function start or the section end,
  * whichever is first. External symbols win ties. */

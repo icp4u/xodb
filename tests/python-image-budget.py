@@ -115,8 +115,8 @@ def main():
         target.stdin.write('\n'); target.stdin.flush()
         target.wait(timeout=10); assert target.returncode == 0, target.stderr.read()
 
-        # Both the process tab and Python thread requests refuse a second
-        # discoverable definer, even while the real runtime is executing.
+        # A second image that only defines the runtime symbol does not cost the
+        # executing interpreter its view: the witnessed image is selected.
         (w/'decoy.c').write_text('char _PyRuntime[64] = "decoy";\nint xodb_pad(void) { return 7; }\n')
         subprocess.run(['cc', '-shared', '-fPIC', '-O1', str(w/'decoy.c'), '-o', str(w/'decoy.so')], check=True, timeout=60)
         target = subprocess.Popen([a.python, FIXTURE, str(w/'decoy.so')], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -124,7 +124,8 @@ def main():
         client = Client('control', None, options=['--attach', str(target.pid)])
         generation = client.stopped()['generation']
         found, why = stack(client, generation=generation, tid=target.pid)
-        assert found is None and why == 'PythonRuntimeAmbiguous', (found, why)
+        assert found and found['identity'] == 'witnessed' and any(frame['name'] == 'leaf' for segment in found['segments'] for frame in segment['frames']), (found, why)
+        build = {segment['runtime']['build_id'] for segment in found['segments']}
         assert str(w/'decoy.so') in {r['path'] for r in modules(client)[0]}  # the probe saw the decoy mapped
         deadline = time.monotonic() + 60
         while True:
@@ -132,8 +133,8 @@ def main():
             if view['complete']: break
             assert time.monotonic() < deadline, view
         tab = next(t for t in view['tabs'] if t['tab'] == 'python')
-        assert tab['status'] == 'unavailable' and tab['reason'] == 'PythonRuntimeAmbiguous', tab
-        result['unexecuted_decoy'] = {'tab': tab, 'error': why}
+        assert tab['status'] == 'ready' and tab['identity'] == 'witnessed' and tab['reason'] is None and {tab['build_id']} == build, tab
+        result['unexecuted_decoy'] = {'tab': tab, 'build_id': tab['build_id']}
         client.close(); client = None
         target.stdin.write('\n'); target.stdin.flush()
         target.wait(timeout=10); assert target.returncode == 0, target.stderr.read()
@@ -143,7 +144,7 @@ def main():
         if target.poll() is None: target.kill(); target.wait()
         for pad in pads: pad.unlink(missing_ok=True)
         (w/'results.json').write_text(json.dumps(result, indent=2)+'\n')
-    print(f'Python image budget: stack and tab resolved with {len(pads)} padded images ({sum(sizes) >> 20} MiB mapped, {total >> 20} MiB budget); budget refusal named in the reply and the tab; a second image defining the runtime symbol refused')
+    print(f'Python image budget: stack and tab resolved with {len(pads)} padded images ({sum(sizes) >> 20} MiB mapped, {total >> 20} MiB budget); budget refusal named in the reply and the tab; a second image defining the runtime symbol left the executing runtime selected')
 
 
 if __name__ == '__main__':

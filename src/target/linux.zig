@@ -16,7 +16,54 @@ pub const StopInfo = struct {
     read_only: bool = false,
     pending_delivery: bool = false,
     diagnostic: ?[]const u8 = null,
+    mach_exception: ?MachException = null,
 };
+pub const MachException = struct {
+    kind: u64,
+    count: u32,
+    codes: [4]u64,
+    pub fn name(self: MachException) []const u8 {
+        return switch (self.kind) {
+            1 => "EXC_BAD_ACCESS",
+            2 => "EXC_BAD_INSTRUCTION",
+            3 => "EXC_ARITHMETIC",
+            4 => "EXC_EMULATION",
+            5 => "EXC_SOFTWARE",
+            6 => "EXC_BREAKPOINT",
+            7 => "EXC_SYSCALL",
+            8 => "EXC_MACH_SYSCALL",
+            9 => "EXC_RPC_ALERT",
+            10 => "EXC_CRASH",
+            11 => "EXC_RESOURCE",
+            12 => "EXC_GUARD",
+            13 => "EXC_CORPSE_NOTIFY",
+            else => "Mach exception",
+        };
+    }
+    pub fn jsonStringify(self: MachException, stream: anytype) !void {
+        try stream.beginObject();
+        try stream.objectField("type");
+        try stream.write(self.kind);
+        try stream.objectField("name");
+        try stream.write(self.name());
+        try stream.objectField("codes");
+        try stream.beginArray();
+        for (self.codes[0..@min(self.count, self.codes.len)]) |code| {
+            var buffer: [18]u8 = undefined;
+            try stream.write(std.fmt.bufPrint(&buffer, "0x{x}", .{code}) catch unreachable);
+        }
+        try stream.endArray();
+        try stream.endObject();
+    }
+};
+test "Mach exception names cover the kernel's exception types" {
+    const guard = MachException{ .kind = 12, .count = 0, .codes = @splat(0) };
+    try std.testing.expectEqualStrings("EXC_GUARD", guard.name());
+    const crash = MachException{ .kind = 10, .count = 0, .codes = @splat(0) };
+    try std.testing.expectEqualStrings("EXC_CRASH", crash.name());
+    const unknown = MachException{ .kind = 99, .count = 0, .codes = @splat(0) };
+    try std.testing.expectEqualStrings("Mach exception", unknown.name());
+}
 pub fn signalName(number: i32) []const u8 {
     return switch (number) {
         0 => "none",
@@ -188,6 +235,7 @@ pub const GdbRemoteInfo = struct {
     register_count: u32,
     attached: ?bool,
     threads: GdbAvailability,
+    thread_info: GdbAvailability,
     step: GdbAvailability,
     software_breakpoints: GdbAvailability,
     watchpoints: GdbAvailability,
@@ -266,6 +314,7 @@ pub const Target = struct {
             .register_count = cache.register_count,
             .attached = if (cache.attached < 0) null else cache.attached != 0,
             .threads = gdbAvailability(cache.*, rt.XRT_GDB_CAP_THREADS),
+            .thread_info = gdbAvailability(cache.*, rt.XRT_GDB_CAP_THREAD_INFO),
             .step = gdbAvailability(cache.*, rt.XRT_GDB_CAP_STEP),
             .software_breakpoints = gdbAvailability(cache.*, rt.XRT_GDB_CAP_SOFTWARE_BREAK),
             .watchpoints = gdbAvailability(cache.*, rt.XRT_GDB_CAP_WATCH),
@@ -275,6 +324,11 @@ pub const Target = struct {
             .interrupt = gdbAvailability(cache.*, rt.XRT_GDB_CAP_INTERRUPT),
             .last_reason = std.mem.sliceTo(&cache.reason, 0),
         };
+    }
+    pub fn gdbThreadInfo(self: *const Target, tid: i32) !rt.struct_xrt_gdb_thread_info {
+        var result: rt.struct_xrt_gdb_thread_info = undefined;
+        try runtime.check(rt.xrt_target_gdb_thread_info(self.handle, tid, &result));
+        return result;
     }
     /// The table naming this target's signal numbers.
     pub fn signalTable(self: *const Target) SignalTable {
@@ -529,6 +583,15 @@ pub const Target = struct {
                 result.code = signal.code;
                 result.errno = signal.errno;
                 result.fault_address = signal.address;
+            }
+            return result;
+        }
+        if (self.gdbRemoteInfo() != null) {
+            const info = self.gdb_cache;
+            result.pending_delivery = info.stop_tid == tid and info.pending_delivery;
+            if (info.stop_tid == tid) {
+                if (info.has_exception) result.mach_exception = .{ .kind = info.exception_type, .count = info.exception_count, .codes = info.exception_codes };
+                if (info.has_fault) result.fault_address = info.fault_address;
             }
             return result;
         }

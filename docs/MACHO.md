@@ -182,16 +182,84 @@ Image lists are refreshed at each stopped generation. Unloaded images lose
 their mappings, and completed metadata for departed UUIDs is released; a
 pending worker is cancelled before it can be reused. IDs remain stable for
 an unchanged UUID at the same address. The map is not a shared-cache symbol
-extractor: source lines, locals, compact unwind and system symbol names still
-require further metadata. A labelled link-register address is not proof that
+extractor: shared-cache system symbols still require separate local metadata. A labelled link-register address is not proof that
 it is an additional stack frame.
+
+## Source locations, locals and unwind metadata
+
+The Darwin image cache also supplies `get_source_location`, stack source
+locations and `list_locals`. It searches for `<image>.dSYM/Contents/Resources/DWARF/<image>`
+next to the selected executable and beneath each explicit debug directory;
+a debug directory may itself be a dSYM bundle. CPU, subtype and LC_UUID must
+match. Every derived component is opened without following symlinks; a final
+file must be regular. Retained descriptors are revalidated before each query.
+No source path or absolute build path found in DWARF is opened by this worker.
+
+If no dSYM is available, the linked image's N_OSO/N_FUN debug map can identify
+object DWARF. Relative object paths are searched beneath explicit roots;
+absolute build paths contribute only their basename. Traversal components,
+archive-member syntax and backslashes are refused. Nonzero N_OSO timestamps
+must match the object. Objects lack the executable's LC_UUID: architecture,
+timestamp when supplied, and the named function ranges are checked, but these
+checks do not authenticate a build. A changed pinned object refuses later
+queries. Ambiguous definitions and missing object addresses remain unavailable.
+
+Translation is per function. Optimized linking can move a cold function by a
+different amount from another function in the same object, so one object-wide
+slide would give wrong lines. Defined data symbols and unresolved external
+relocations have separate checked mappings. The supported object relocation
+form is 64-bit, non-PC-relative UNSIGNED; other forms produce
+`MachOObjectDebugUnsupported`. Missing external definitions never become zero
+addresses. Register and stack locations retain their runtime coordinates;
+only DWARF image addresses pass through the object/link/runtime translation.
+
+A private section container exposes the selected DWARF sections to the existing
+libdw reader. It contains no program headers or code, never enters the module
+map, and preserves link or object addresses, including PC-relative EH data.
+The worker's 96 MiB retained-data cap includes companion bytes, object maps and
+compact rows; all companion reads share its existing read/deadline budgets.
+Object fallback allows at most 64 objects and 16,384 function records. This
+figure covers the worker's retained storage, not libdw's internal allocations
+or the existing DWARF reader's decoded type/line caches. CPU and RSS evidence
+for actual replays is reported separately from those storage counters.
+
+The cache key includes UUID, CPU/subtype, file type and basename; executable
+and debug-directory configuration is fixed for that session. Invalid `.` or
+`..` basenames are negatively cached as `MachOImageBasenameInvalid` without
+starting a worker. An oversized refused image list reports `GdbListTooLarge`
+at the frame and `get_macho_image` request that needs it. Image labels share
+the PE formatter: a target-chosen `!` in an image name cannot supply the
+image/symbol separator.
+
+ARM64 stacks first try the image's EH-frame CFI, then compact unwind, then the
+explicit frame-pointer/prologue fallback. Compact regular and compressed pages
+are bounded and validated. Frame-based recipes restore FP/LR and saved integer
+register pairs; frameless recipes restore SP and use LR. Unreadable saved
+registers stay unknown. At an asynchronous first frame, only a zero-stack leaf
+can use compact metadata alone; other prologue/epilogue positions need precise
+CFI or the fallback. A compact row's start is not treated as a function entry,
+because a linker can coalesce adjacent identical recipes. SIMD registers are
+not supplied by this transport and are not invented. PAC masking applies to
+recovered ARM64e return/frame addresses before lookup.
+
+Each frame's `unwind_method` describes the step from that frame to its caller,
+as on native CFI stacks. A recording without executable segment geometry
+reports `UnmappedAddress` for inline metadata while the bounded register/frame
+fallback can still recover callers.
+
+The owned recordings cover C, C++, Objective-C and Swift at their recorded
+entry stops, including optimized line tables and register arguments. Missing
+recorded stack/global memory remains `MemoryUnreadable`. Swift dSYMs may omit
+member layouts despite supplying names and sizes; those locals report
+`SwiftTypeLayoutUnavailable` with unknown type instead of interpreting a
+mangled name as a layout. This path does not add Darwin source-line breakpoints,
+`run_to`, runtime Swift metadata decoding, shared-cache DWARF, or x86_64 Darwin
+stack unwinding. Those require separate run-control or runtime evidence.
 
 ## Not read yet
 
 | Missing | Effect | Where it belongs |
 | --- | --- | --- |
-| Debug info | no source lines, locals or types | debug map (`N_OSO` to the `.o` files) and `.dSYM` by `LC_UUID`, into the DWARF readers |
-| Compact unwind and `__eh_frame` | no Mach-O stack unwinding | a `__unwind_info` decoder that hands DWARF-mode entries to the existing CFI code |
 | The dyld shared cache as a file | `unsupported`; cache libraries are read from memory instead | a cache-file reader, with the `.symbols` file for stripped locals |
 | Exports trie, chained fixups, bind and rebase opcodes | exported-only names of stripped images are not found; pointers in a file are not resolved | with symbolication of stripped system libraries |
 | 32-bit, big-endian, arm64_32 | `unsupported` | not planned |
@@ -217,3 +285,12 @@ as a shared observer.
 stripped, universal and arm64e recordings, the abort address example, and
 dlopen/dlclose. Hostile UUIDs, ranges and local files must refuse. Its periodic
 matrix exercises an index above 131,072 symbols and a small image budget.
+
+`tests/macos-debug.py` checks source/locals through the real MCP endpoint with
+both dSYMs and object fallback, including changed/hostile companions and Swift
+missing layouts. `tests/macos-dwarf.py` compares component source queries and
+per-function object translation. `tests/macos-unwind.py` compares compact rows
+with LLVM's dump of the original linked files and checks malformed regular
+pages; the Zig unit test checks an actual Swift EH recipe against explicit
+synthetic saved-register memory. Sanitized full-file matrices, the production
+worker mutation harness and LLDB parser fuzzing run in the periodic lane.

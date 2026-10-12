@@ -1,7 +1,7 @@
 //! One optional 3D panel, rendered offscreen and composited into the 2D sequence.
 //! The caller must have completed its frame fence before resizing or reserving.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 pub const types = @import("types.zig");
 pub const math = @import("math.zig");
 pub const Rect = struct { x: f32, y: f32, w: f32, h: f32 };

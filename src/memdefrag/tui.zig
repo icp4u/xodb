@@ -3,7 +3,7 @@
 //! alternate screen, synchronized output, line-diffed frames, --once/--json
 //! snapshots, NO_COLOR honoured. The screen itself is dos.zig's 80x25 grid.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const t = @cImport({
     @cDefine("_GNU_SOURCE", "1");
     @cInclude("termios.h");

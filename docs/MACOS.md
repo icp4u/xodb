@@ -2,8 +2,8 @@
 
 xodb runs on Linux and debugs a process on an Apple-silicon Mac by talking to
 Apple's own `debugserver` with its [GDB remote client](GDB_REMOTE.md). Nothing
-of xodb runs on the Mac. This is the first macOS target; a native backend,
-Mach-O symbols and source come later.
+of xodb runs on the Mac. See [Mach-O metadata](MACHO.md) for UUID-matched
+local files and frame names.
 
 ## Quick start
 
@@ -54,33 +54,55 @@ keep it in a file on the Mac.
 | Operation | State | Notes |
 | --- | --- | --- |
 | Session identity | Works | `get_session` reports `architecture: aarch64` and `gdb_remote.os: darwin` |
-| Threads | Works | Listed at every stop; thread IDs are the stub's |
+| Threads | Works | Inventory at every stop; optional names and dispatch queue slot addresses (`qaddr`) from `jThreadsInfo` |
 | Registers `x0`-`x30`, `sp`, `pc`, `pstate` | Read and write | debugserver's `fp`, `lr` and `cpsr` map to `x29`, `x30`, `pstate`; its `w`/`v`/`s`/`d` views are not shown |
 | Memory | Read and write | Writes are read back |
 | Breakpoints by address | Works | Insert, remove, hit counts, step over |
 | Instruction step, continue, interrupt | Works | Interrupt arrives as Darwin `SIGSTOP` and is shown as an interrupt |
 | Hardware watchpoints | Write and read/write, 1/2/4/8 bytes, 4 slots | The stop comes **before** the access: the event has the old value and the exact address accessed |
-| Signals | Works | Darwin numbers and names: `SIGUSR1` is 30, `SIGSTOP` 17. Continuing delivers the signal |
-| Memory regions | `list_modules` regions | Start, end, permissions; the image path at an image's first region, else the stub's type such as `[stack]` |
-| Loaded images | `list_modules` load failures | One `MachOImageUnsupported` row per image with its load address and path |
-| Stack | Frame-pointer walk | Unsymbolised; each frame says how it was found (`registers`, `link_register`, `frame_pointer`) |
+| Signals | Works | Darwin numbers and names: `SIGUSR1` is 30, `SIGSTOP` 17; ordinary pending signals are delivered on continue |
+| Mach exceptions | `get_stop_info`, C stop panel | Exception type and hexadecimal codes; `EXC_BAD_ACCESS` includes the fault address. A Mach exception has no application signal to forward |
+| Exec and exit | Recorded transitions | Exec discards old probes and thread identities and verifies the process architecture again; `W` exits normally, `X` records negative signal termination |
+| Fork | Parent stop only | The recorded `SIGCHLD` is delivered as signal 20; no child is adopted |
+| Memory regions | `list_modules` regions | Start, end, permissions; image paths for uniquely covered segment ranges, otherwise the stub's type such as `[stack]` |
+| Loaded images | `list_modules` | Load addresses, image paths and metadata diagnostics; see [Mach-O metadata](MACHO.md) for local file matching |
+| Stack, source and locals | Recorded metadata | UUID-matched dSYM or N_OSO object DWARF supplies names, lines and available locals; ARM64 EH-frame/compact unwind precedes the bounded register/frame fallback |
 | Detach | Works | Breakpoints and watchpoints are removed first |
 
 ## Limits
 
 | Not available | What you get instead |
 | --- | --- |
-| Symbols, source lines, locals, `find_symbol`, source breakpoints | `GdbLibrariesUnavailable`. Use addresses: `nm program` on the Mac gives link addresses; add the image's load address from `list_modules` minus `0x100000000` |
-| Unwind tables (compact unwind, DWARF CFI) | The frame-pointer walk. In a leaf function or a prologue the caller comes from `x30`; that guess is labelled `link_register` and can be wrong after an early return |
+| `find_symbol` and source breakpoints | `GdbLibrariesUnavailable`. Frame names use the separate UUID-matched image path; address breakpoints use runtime addresses |
+| Missing dSYM or object DWARF | A typed metadata refusal; frame names can still use Mach-O symbols and unwinding can still use image metadata or the bounded register/frame fallback |
 | Kill | xodb has no kill action for a stub's target. Detach, then `kill PID` on the Mac |
 | Vector and floating-point registers | `ExtendedRegistersUnavailable` |
 | Execute watchpoints | `ExecutionWatchpointsUnsupported` |
-| Stop details (`si_code`, fault address) | `get_stop_info` says `TaskInfoUnavailable`; the signal number and name are still right |
-| More than about 700 loaded images | `GdbListTooLarge`: the image list must fit one 64 KiB packet. Regions still list |
+| POSIX `siginfo` fields | The stub does not supply `si_code` or `errno`; these stay null. Mach exception codes are separate |
+| Oversized loaded-image list | `GdbListTooLarge`: the decoded list must fit the 512 KiB packet bound. Regions still list |
 | Very large address spaces | A region walk is one round trip per region and stops after 8 seconds or 4,096 regions with `GdbListBudgetExceeded` or `GdbListTooLarge` |
 | arm64e targets, Rosetta (x86-64) processes, iOS devices | Not tested. Return addresses are masked to the 47 address bits the stub reports |
 | Non-ASCII image paths | Shown with `?` for each byte outside printable ASCII |
 | Launching or restarting from xodb | Start debugserver again |
+
+`thread_labels` identifies its provider as `gdb_thread_info`. `queue_address`
+is the stub's `qaddr`: the address of the slot where that thread keeps its
+dispatch queue pointer. Every thread has one, including plain pthreads that are
+on no queue, so it does not identify a queue or group threads; the slot is not
+read, and no queue name is shown.
+`qfThreadInfo` remains the thread inventory: extra JSON rows cannot create
+threads. Metadata is cached for the stopped generation. Unsupported metadata
+leaves names and queue addresses unavailable.
+
+A reduced image list without segment geometry labels only the mapping starting
+exactly at an image's load address. Segment geometry extends labels to data
+and later code mappings only where one image covers the whole region. Shared
+or overlapping ranges remain unlabelled. Image paths are display labels.
+
+The recorded hardware has six execution-breakpoint slots and four data-watch
+slots, although the stub granted eight `Z1` insertions. This client exposes
+software breakpoints and up to four data watchpoints; execution watches stay
+unsupported. It does not infer usable hardware slots from successful insertions.
 
 Paths in these lists come from the Mac. xodb displays them and never opens a
 file of that name on the Linux host.
@@ -92,22 +114,28 @@ bounds in [GDB_REMOTE.md](GDB_REMOTE.md):
 
 | Input | Bound |
 | --- | --- |
-| Image list (`jGetLoadedDynamicLibrariesInfos`) | One packet (64 KiB), 4,096 images, nesting depth 16, paths cut at 255 bytes; no allocation while parsing |
+| Image list (`jGetLoadedDynamicLibrariesInfos`) | One packet (512 KiB), 4,096 images, nesting depth 16, paths cut at 255 bytes; no allocation while parsing |
+| Thread metadata (`jThreadsInfo`) | 1,024 unique positive 32-bit IDs, depth 16, names cut at 127 printable ASCII bytes; malformed/oversized optional metadata is marked failed without losing registers or control |
+| Mach stop fields | One type and count, at most four 64-bit codes; duplicate, incomplete or contradictory fault addresses refuse the stop |
+| Region image labels | At most 16,384 segment ranges and 32,768 sorted boundaries; overlapping images and regions crossing a gap do not acquire a guessed owner |
 | Region reply (`qMemoryRegionInfo`) | Must contain the address asked, so the walk always advances; names cut at 127 bytes |
 | Oversized reply to those two | Discarded under its checksum, at most 16 MiB within the request deadline; the connection survives. A region keeps its leading fields |
 | `qHostInfo`, `qProcessInfo` | Known keys once each, numbers range-checked |
 | Registers without a `g` packet | One `p` per mapped register; a reply of the wrong width refuses the read |
 | Waits | Five seconds per request, ten per operation, as for every stub |
 
-A reply that breaks a packet's grammar ends the connection with
-`ProtocolError`. A list that is merely too large is a typed refusal and the
-session continues.
+Malformed stop packets invalidate the connection and require reconnecting;
+old threads cannot be resumed or decoded. Optional thread metadata has a
+separate failed capability state. A list that is merely too large is a typed
+refusal and the session continues.
 
 ## Tests
 
 ```sh
 # No Mac needed: a recorded session replayed by a loopback stub, then hostile replies.
 python3 -B tests/gdb-debugserver.py --work .work/gdb-debugserver
+# Names, queues, region ownership, Mach stops, exec and slot limits from recordings.
+python3 -B tests/macos-views.py --work .work/macos-views
 # The real thing. Builds a fixture on the Mac, runs launch and attach, cleans up.
 python3 -B tests/macos-debugserver.py --ssh mac --work .work/macos-debugserver
 scripts/release-check periodic --macos-ssh mac

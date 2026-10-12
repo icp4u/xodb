@@ -23,7 +23,7 @@ pub const Breakpoint = struct {
 };
 pub const WatchKind = enum { write, read_write, execute };
 pub const Watchpoint = struct { id: u64, address: u64, length: u8, kind: WatchKind, previous: u64 = 0 };
-pub const StopReason = enum { none, exec, interrupt, signal, breakpoint, watchpoint, single_step, clone, fork, vfork, vfork_done };
+pub const StopReason = enum { none, exec, interrupt, signal, breakpoint, watchpoint, single_step, clone, fork, vfork, vfork_done, exception };
 pub const ArmWatchHit = struct {
     pc: u64,
     address: u64,

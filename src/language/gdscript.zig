@@ -30,13 +30,14 @@ const max_reads = max_chain + 1 + max_frames * 16 + 16;
 /// DIEs visited to find the layouts: about six times what a 1.4 GB engine needs.
 const dwarf_work = 1 << 25;
 
-const Field = enum(u8) { level_stack, level_function, level_instance, level_ip, level_line, level_prev, function_name, function_source, function_script, script_path, instance_owner_id, language_track, language_max, name_string, string_name_data, string_data };
-const type_names = [_][*:0]const u8{ "GDScriptLanguage::CallLevel", "GDScriptFunction", "GDScript", "GDScriptInstance", "GDScriptLanguage", "StringName::_Data", "StringName", "String" };
+pub const values = @import("gdscript_values.zig");
+pub const Field = enum(u8) { level_stack, level_function, level_instance, level_ip, level_line, level_prev, function_name, function_source, function_script, script_path, instance_owner_id, language_track, language_max, name_string, string_name_data, string_data };
+const stack_type_names = [_][*:0]const u8{ "GDScriptLanguage::CallLevel", "GDScriptFunction", "GDScript", "GDScriptInstance", "GDScriptLanguage", "StringName::_Data", "StringName", "String" };
 fn want(owner: u8, name: [*:0]const u8, kind: c_uint, width: u8, optional: bool) c.struct_xdt_field {
     return .{ .owner = owner, .name = name, .kind = @intCast(kind), .width = width, .optional = @intFromBool(optional) };
 }
 // In `Field` order.
-const wanted = [_]c.struct_xdt_field{
+const stack_wanted = [_]c.struct_xdt_field{
     want(0, "stack", c.XDT_POINTER, 8, false),
     want(0, "function", c.XDT_POINTER, 8, false),
     want(0, "instance", c.XDT_POINTER, 8, false),
@@ -55,15 +56,26 @@ const wanted = [_]c.struct_xdt_field{
     want(7, "_cowdata", c.XDT_ANY, 8, false),
 };
 comptime {
-    std.debug.assert(wanted.len == @typeInfo(Field).@"enum".fields.len);
+    std.debug.assert(stack_wanted.len == @typeInfo(Field).@"enum".fields.len);
 }
+// The value reader's types follow, each of them optional: a build without
+// one of them still has its stack.
+const type_names = stack_type_names ++ values.type_names;
+const wanted = stack_wanted ++ values.wanted(stack_type_names.len);
 
 /// Offsets proved from one image's DWARF and program headers.
 pub const Layout = struct {
     build_id: [64]u8 = undefined,
     build_id_len: u8 = 0,
     level_size: u32,
-    offsets: [wanted.len]?u32,
+    offsets: [stack_wanted.len]?u32,
+    /// Members, sizes and `Variant::Type` values for the value reader; null
+    /// where this build's DWARF does not have them.
+    value_offsets: [values.field_count]?u32 = @splat(null),
+    value_sizes: [values.type_names.len]u32 = @splat(0),
+    kinds: [values.kind_count]?u32 = @splat(null),
+    /// Runtime address a GDScriptInstance's vtable pointer holds.
+    instance_vtable: ?u64 = null,
     /// The executable's static TLS block and the two objects in it.
     block: tls.Block,
     call_stack: u64,
@@ -71,7 +83,7 @@ pub const Layout = struct {
     /// Runtime address of `GDScriptLanguage::singleton`.
     singleton: u64,
     units: u64,
-    fn at(self: *const Layout, field: Field) u32 {
+    pub fn at(self: *const Layout, field: Field) u32 {
         return self.offsets[@intFromEnum(field)].?;
     }
 };
@@ -82,25 +94,30 @@ pub const Memory = struct {
     readFn: *const fn (*anyopaque, u64, []u8) bool,
     reads: usize = 0,
     bytes: usize = 0,
-    fn read(self: *Memory, address: u64, out: []u8) bool {
-        if (self.reads >= max_reads) return false;
+    limit: usize = max_reads,
+    pub fn read(self: *Memory, address: u64, out: []u8) bool {
+        if (self.reads >= self.limit) return false;
         self.reads += 1;
         self.bytes += out.len;
         if (address > std.math.maxInt(u64) - out.len) return false;
         return self.readFn(self.context, address, out);
     }
-    fn word(self: *Memory, address: u64) ?u64 {
+    pub fn word(self: *Memory, address: u64) ?u64 {
         var bytes: [8]u8 = undefined;
         return if (self.read(address, &bytes)) std.mem.readInt(u64, &bytes, .little) else null;
     }
 };
 
-const Text = struct { text: []const u8 = "", reason: ?[]const u8 = null, truncated: bool = false };
+pub const Text = struct { text: []const u8 = "", reason: ?[]const u8 = null, truncated: bool = false, length: u64 = 0 };
 /// An engine `String`: one pointer to UTF-32 data. Its CowData header keeps
 /// a reference count at -16 and the element count, terminator included, at
 /// -8. The header is checked against the data it describes: the count must
 /// lead to the terminator and every element must be a code point.
-fn string(memory: *Memory, a: A, data: u64) !Text {
+pub fn string(memory: *Memory, a: A, data: u64) !Text {
+    return stringCut(memory, a, data, max_chars);
+}
+/// The same, keeping at most `most` (<= max_chars) code points.
+pub fn stringCut(memory: *Memory, a: A, data: u64, most: usize) !Text {
     if (data == 0) return .{};
     if (data < 16 or data % 4 != 0) return .{ .reason = "GDScriptStringInvalid" };
     var header: [16]u8 = undefined;
@@ -108,8 +125,8 @@ fn string(memory: *Memory, a: A, data: u64) !Text {
     const references = std.mem.readInt(u64, header[0..8], .little);
     const size = std.mem.readInt(u64, header[8..16], .little);
     if (references == 0 or references > std.math.maxInt(u32) or size == 0 or size > 1 << 24) return .{ .reason = "GDScriptStringInvalid" };
-    const whole = size <= max_chars + 1;
-    const units: usize = if (whole) @intCast(size) else max_chars;
+    const whole = size <= most + 1;
+    const units: usize = if (whole) @intCast(size) else most;
     var raw: [(max_chars + 1) * 4]u8 = undefined;
     if (!memory.read(data, raw[0 .. units * 4])) return .{ .reason = "GDScriptStringUnreadable" };
     const body = if (whole) units - 1 else units;
@@ -124,12 +141,17 @@ fn string(memory: *Memory, a: A, data: u64) !Text {
         const n = std.unicode.utf8Encode(if (point < 0x20 or (point >= 0x7f and point < 0xa0)) '?' else @intCast(point), &encoded) catch unreachable;
         try out.appendSlice(a, encoded[0..n]);
     }
-    return .{ .text = try out.toOwnedSlice(a), .truncated = !whole };
+    return .{ .text = try out.toOwnedSlice(a), .truncated = !whole, .length = size - 1 };
 }
 /// A `StringName` stored at `address`: a pointer to shared `_Data`, whose
 /// `name` is a String. Null is the empty name.
-fn stringName(memory: *Memory, a: A, layout: *const Layout, address: u64) !Text {
+pub fn stringName(memory: *Memory, a: A, layout: *const Layout, address: u64) !Text {
     const data = memory.word(address +% layout.at(.string_name_data)) orelse return .{ .reason = "GDScriptStringUnreadable" };
+    return nameData(memory, a, layout, data);
+}
+/// The name behind a `StringName::_Data` pointer. Names are interned: equal
+/// names are one pointer.
+pub fn nameData(memory: *Memory, a: A, layout: *const Layout, data: u64) !Text {
     if (data == 0) return .{};
     if (data % 8 != 0) return .{ .reason = "GDScriptStringInvalid" };
     const chars = memory.word(data +% layout.at(.name_string) +% layout.at(.string_data)) orelse return .{ .reason = "GDScriptStringUnreadable" };
@@ -139,6 +161,7 @@ fn stringName(memory: *Memory, a: A, layout: *const Layout, address: u64) !Text 
 pub const Bounds = struct { low: u64, high: u64 };
 pub const Level = struct {
     address: u64,
+    stack: u64 = 0,
     function: u64,
     instance: u64,
     line_address: u64,
@@ -200,6 +223,7 @@ pub fn chain(memory: *Memory, a: A, layout: *const Layout, head: u64, size: u32,
         }
         if (levels.items.len < max_frames) try levels.append(a, .{
             .address = at,
+            .stack = std.mem.readInt(u64, raw[layout.at(.level_stack)..][0..8], .little),
             .function = std.mem.readInt(u64, raw[layout.at(.level_function)..][0..8], .little),
             .instance = std.mem.readInt(u64, raw[layout.at(.level_instance)..][0..8], .little),
             .line_address = std.mem.readInt(u64, raw[layout.at(.level_line)..][0..8], .little),
@@ -258,14 +282,14 @@ fn decode(memory: *Memory, a: A, layout: *const Layout, level: *Level, thread_st
     }
 }
 
-fn sessionRead(context: *anyopaque, address: u64, out: []u8) bool {
+pub fn sessionRead(context: *anyopaque, address: u64, out: []u8) bool {
     const session: *model.Session = @ptrCast(@alignCast(context));
     return (session.target.readMemory(address, out) catch return false) == out.len;
 }
 fn hex(a: A, value: u64) ![]const u8 {
     return std.fmt.allocPrint(a, "0x{x}", .{value});
 }
-fn buildId(a: A, layout: *const Layout) ![]const u8 {
+pub fn buildId(a: A, layout: *const Layout) ![]const u8 {
     const out = try a.alloc(u8, @as(usize, layout.build_id_len) * 2);
     const digits = "0123456789abcdef";
     for (layout.build_id[0..layout.build_id_len], 0..) |b, i| {
@@ -288,7 +312,7 @@ fn moduleError(err: anyerror) error{ GDScriptImageBudgetExceeded, SymbolDiscover
 /// its program headers: only the executable's thread-locals have a fixed
 /// place, and an engine's symbol tables are too large for a name scan. The
 /// image is read in full under the image budgets.
-fn runtimeModule(session: *model.Session) !*Module {
+pub fn runtimeModule(session: *model.Session) !*Module {
     try session.languages.require(.gdscript);
     try session.refreshMaps();
     const runtime = @import("../target/runtime.zig");
@@ -317,7 +341,7 @@ fn tlsObject(module: *Module, block: tls.Block, name: []const u8, size: u64) !u6
     _ = tls.executableAddress(block, block.below, symbol.value, size) catch return error.GDScriptLayoutUnsupported;
     return symbol.value;
 }
-fn profile(session: *model.Session, module: *Module) !*const Layout {
+pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
     if (session.target.arch() != .x86_64) return error.GDScriptArchitectureUnsupported;
     // The DWARF read from the file must describe the image that is running.
@@ -339,9 +363,10 @@ fn profile(session: *model.Session, module: *Module) !*const Layout {
     const call_stack = try tlsObject(module, block, call_stack_symbol, 8);
     const call_stack_size = try tlsObject(module, block, call_stack_size_symbol, 4);
     const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GDScriptDwarfUnavailable;
-    const schema = c.struct_xdt_schema{ .types = @ptrCast(&type_names), .fields = &wanted, .type_count = type_names.len, .field_count = wanted.len };
+    const schema = c.struct_xdt_schema{ .types = @ptrCast(&type_names), .fields = &wanted, .type_count = type_names.len, .field_count = wanted.len, .optional_types = ((@as(u64, 1) << values.type_names.len) - 1) << stack_type_names.len };
     var slots: [wanted.len]c.struct_xdt_slot = undefined;
     var sizes: [type_names.len]u32 = undefined;
+    comptime std.debug.assert(wanted.len <= c.XDT_MAX_FIELDS and type_names.len <= c.XDT_MAX_TYPES);
     var stats: c.struct_xdt_stats = undefined;
     // A refusal is the answer for this image: the search is not repeated at
     // every stop and for every request.
@@ -355,7 +380,14 @@ fn profile(session: *model.Session, module: *Module) !*const Layout {
         return error.GDScriptLayoutUnsupported;
     }
     var layout = Layout{ .level_size = sizes[0], .offsets = undefined, .block = block, .call_stack = call_stack, .call_stack_size = call_stack_size, .singleton = try module.runtimeAddress(singleton.value), .units = stats.units };
-    for (slots, &layout.offsets) |slot, *offset| offset.* = if (slot.present != 0) slot.offset else null;
+    for (slots[0..stack_wanted.len], &layout.offsets) |slot, *offset| offset.* = if (slot.present != 0) slot.offset else null;
+    for (slots[stack_wanted.len..][0..values.field_count], &layout.value_offsets) |slot, *offset| offset.* = if (slot.present != 0) slot.offset else null;
+    for (slots[stack_wanted.len + values.field_count ..], &layout.kinds) |slot, *kind| kind.* = if (slot.present != 0) slot.offset else null;
+    @memcpy(&layout.value_sizes, sizes[stack_type_names.len..]);
+    if (module.symbols().findSymbol(values.instance_vtable_symbol)) |vtable| {
+        // An object's vtable pointer is past the offset-to-top and RTTI slots.
+        if (vtable.hasAddress() and vtable.size >= 16) layout.instance_vtable = (module.runtimeAddress(vtable.value) catch 0) +% 16;
+    }
     @memcpy(layout.build_id[0..id.len], id);
     layout.build_id_len = @intCast(id.len);
     module.gdscript_layout = layout;
@@ -583,6 +615,84 @@ pub fn describe(session: *model.Session, a: A) !@import("../model/language_tabs.
     var memory = Memory{ .context = session, .readFn = sessionRead };
     _ = try language(&memory, layout);
     return .{ .version = version_text, .build_id = try buildId(a, layout), .basis = layout_text };
+}
+
+const named = @import("../model/language_locals.zig");
+pub fn readLocals(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize) !named.Result {
+    return readBindings(session, a, tid, segment, frame, start, limit, null);
+}
+/// A local, parameter or member name, or `self`, then `.member`, `[index]`
+/// and `["key"]` steps: storage only, nothing is evaluated.
+pub fn evaluateLocal(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, text: []const u8) !named.Result {
+    return readBindings(session, a, tid, segment, frame, 0, 1, text);
+}
+fn readBindings(session: *model.Session, a: A, tid: i32, segment: usize, frame: usize, start: usize, limit: usize, expression: ?[]const u8) !named.Result {
+    try session.languages.require(.gdscript);
+    const path = if (expression) |text| try values.parse(text) else null;
+    const observed = try @import("../model/language_selection.zig").cachedRead(.gdscript, session, tid);
+    if (segment != 0 or observed.segments.len != 1) return error.InvalidLanguageSegment;
+    if (frame >= observed.segments[0].frames.len) return error.InvalidLanguageFrame;
+    const selected = observed.segments[0].frames[frame];
+    // A level the engine is still entering or leaving has no settled stack.
+    if (frame == 0 and observed.segments[0].top_in_transition) return error.GDScriptCallLevelInTransition;
+    const layout = try profile(session, try runtimeModule(session));
+    if (values.usable(layout) != null) return error.GDScriptValueLayoutUnavailable;
+    var memory = Memory{ .context = session, .readFn = sessionRead, .limit = if (path == null) values.page_reads else values.path_reads };
+    var r = values.Reader{ .memory = &memory, .a = a, .layout = layout };
+    const found = try values.frame(&r, .{ .call_level = try std.fmt.parseInt(u64, selected.call_level, 0), .function = try std.fmt.parseInt(u64, selected.function, 0), .line = selected.line });
+    var rows: std.ArrayList(named.Row) = .empty;
+    var diagnostic = found.diagnostic;
+    var total = found.bindings.len;
+    var first = @min(start, total);
+    if (path) |wanted_path| {
+        total = 0;
+        first = 0;
+        if (try values.resolve(&r, &found, &wanted_path)) |target| {
+            total = 1;
+            try rows.append(a, try row(&r, expression.?, target.scope, 0, target.slot, values.path_children));
+        } else diagnostic = r.why;
+    } else for (found.bindings[first..@min(total, first + limit)], first..) |*binding, ordinal|
+        try rows.append(a, try row(&r, try values.bindingName(&r, binding), binding.scope, ordinal, binding.slot, values.row_children));
+    try session.target.expectGeneration(observed.generation);
+    return .{
+        .generation = observed.generation,
+        .tid = tid,
+        .language = .gdscript,
+        .segment = segment,
+        .frame = frame,
+        .start = first,
+        .total = total,
+        .truncated = memory.reads >= memory.limit,
+        .rows = rows.items,
+        .diagnostic = if (memory.reads >= memory.limit) "GDScriptReadLimit" else diagnostic,
+        .runtime_version = version_text,
+        .runtime_build_id = try buildId(a, layout),
+        .basis = "the call level's own Variant stack, its function's debug records and signature, and the instance's script members; Variant, container and object layouts and Variant::Type values from the image's DWARF; object classes from their vtables' type information; bounded reads, no inferior calls",
+        .memory_reads = memory.reads,
+        .memory_bytes = memory.bytes,
+    };
+}
+fn row(r: *values.Reader, name: []const u8, scope: values.Scope, ordinal: usize, slot: values.Slot, children: usize) !named.Row {
+    const described = try r.describe(&slot.raw, children);
+    const shown = described.shown;
+    return .{
+        .name = name,
+        .scope = switch (scope) {
+            .parameter => .parameter,
+            .local => .local,
+            .context => .context,
+            .member => .member,
+        },
+        .ordinal = ordinal,
+        .address = shown.object,
+        .slot_address = slot.address,
+        .provenance = switch (scope) {
+            .parameter, .local => "Variant slot of the call level's stack",
+            .context => "slot 0 of the call level's stack",
+            .member => "Variant slot of the script instance's members",
+        },
+        .value = .{ .count = shown.count, .type = shown.type, .display = shown.display, .diagnostic = shown.reason, .truncated = shown.truncated, .children = described.children },
+    };
 }
 
 // ---- tests: synthetic memory only ----

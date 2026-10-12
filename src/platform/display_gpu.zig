@@ -1,7 +1,7 @@
 //! The DRM device the compositor renders with, from linux-dmabuf feedback.
 //! One short exchange on a private event queue at startup; nothing is retained.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("wayland.zig").c;
 const Node = @import("../render/vk_select.zig").Node;
 
 const Probe = struct {

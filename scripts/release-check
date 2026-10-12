@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
     (("src/language/runtime_binding.zig", "tests/runtime-binding.py", "tests/fixtures/pe/runtime-binding.c"), ("runtime-binding*", "gui-runtime-binding*", "python-*", "perl-*", *LANGUAGE_PANES)),
@@ -39,8 +40,8 @@ COVERS = (
     (('tests/metadata-ready-validation.c', 'src/runtime/file_view.c', 'src/runtime/xrt_files.h', 'src/debug/metadata_job.c'), ('metadata-ready-validation', 'javascript-watches*', 'metadata-session*')),
     (('src/binary/pe*', 'src/binary/pdb*', 'src/debug/pe_unwind.c', 'src/model/pe_images.zig',
       'tests/pe-*', 'tests/pdb-*', 'tests/fixtures/pe/*'), ('pe-*', 'pdb-*', 'jai-pe-demo-*')),
-    (('src/model/macho_images.zig', 'src/model/gdb_images.zig', 'src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'tests/macos-names*.py', 'tests/fixtures/macos-names/*'), ('macos-names*', 'gui-macos-names', 'gdb-debugserver*')),
-    (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*', 'macos-names*', 'gui-macos-names')),
+    (('src/model/macho_images.zig', 'src/model/gdb_images.zig', 'src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'tests/macos-names*.py', 'tests/fixtures/macos-names/*'), ('macos-names*', 'macos-debug*', 'gui-macos-names', 'gui-macos-debug', 'macos-views*', 'gui-macos-views', 'gdb-debugserver*')),
+    (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*', 'macos-debug*', 'macos-names*', 'gui-macos-names', 'gui-macos-debug')),
     (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
      ('runtime-host', 'runtime-agent', 'shared-processes', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
@@ -54,7 +55,7 @@ COVERS = (
     (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
     (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
-    (('src/language/gdscript*', 'tests/fixtures/redot/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
+    (('src/language/gdscript*', 'tests/fixtures/redot/*', 'tests/fixtures/redot-values/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
      ('gdscript-*', 'gui-owner-gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
     (('src/language/jai*',), ('jai-*', 'gui-jai-*')),
@@ -106,7 +107,7 @@ COVERS = (
       'source-blocks', 'stale-interrupt',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*'),
-     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
      ('gdb-debugserver*', 'macos-debugserver')),
@@ -229,6 +230,13 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps = Steps()
     steps.append(('build-tests', ['scripts/build', 'test', '--summary', 'all',
                   '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600, dict(kind='build')))
+    if not headless and tier in ('gui', 'all'):
+        # The interface with no window system behind src/platform/window.zig: nothing else may name one.
+        steps.append(('platform-null', ['scripts/build', 'app', '-Dplatform=null', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-null'], 600, dict(kind='build')))
+    if not headless and tier == 'periodic':
+        steps.append(('platform-null-tests', ['scripts/build', 'test', '-Dplatform=null', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-null'], 900, dict(kind='build')))
     if tier == 'periodic':
         steps.append(('catalog-build', [sys.executable, '-B', 'tests/catalog-build.py', '--work', '.work/catalog-build'], 600))
     if tier == 'periodic' and go:
@@ -266,6 +274,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pe-unwind'], 30))
         steps.append(('macho-image', [sys.executable, '-B', 'tests/macho-image.py',
                       '--work', '.work/macho-image'], 120))
+        steps.append(('macos-unwind', [sys.executable, '-B', 'tests/macos-unwind.py', '--work', '.work/macos-unwind'], 30))
+        steps.append(('macos-dwarf', [sys.executable, '-B', 'tests/macos-dwarf.py', '--work', '.work/macos-dwarf'], 30))
     if tier == 'perf':
         steps.kind = 'periodic'
         steps.append(('observer-measurements', [sys.executable, '-B', 'tests/perf-observers.py',
@@ -278,6 +288,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if tier in ('periodic', 'periodic-gui'):
         steps.kind = 'periodic'
         if tier == 'periodic':
+            steps.append(('macos-unwind-matrix', [sys.executable, '-B', 'tests/macos-unwind.py', '--matrix', '--work', '.work/macos-unwind-matrix'], 60))
+            steps.append(('macos-dwarf-matrix', [sys.executable, '-B', 'tests/macos-dwarf.py', '--matrix', '--work', '.work/macos-dwarf-matrix'], 60))
             steps.append(('jai-fuzz', [sys.executable, '-B', 'tests/jai-fuzz.py',
                           '--work', '.work/jai-fuzz', '--cases', '2000'], 900))
             if emacs:
@@ -313,6 +325,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       '--work', '.work/pdb-image-fuzz', '--fuzz'], 90))
         steps.append(('macho-image-fuzz', [sys.executable, '-B', 'tests/macho-image.py',
                       '--work', '.work/macho-image-fuzz', '--fuzz'], 180))
+        steps.append(('gdb-lldb-fuzz', [sys.executable, '-B', 'tests/macos-fuzz.py', '--work', '.work/gdb-lldb-fuzz'], 90))
+        steps.append(('macho-job-fuzz', [sys.executable, '-B', 'tests/macos-fuzz.py', '--worker', '--work', '.work/macho-job-fuzz'], 240))
+        steps.append(('macos-views-fuzz', [sys.executable, '-B', 'tests/macos-views-fuzz.py', '--work', '.work/macos-views-fuzz'], 60))
         for variant in ('eviction', 'budget', 'full-dwarf', 'large-companions'):
             label = 'module-unwind-' + variant
             steps.append((label, [sys.executable, '-B', 'tests/module-unwind.py', '--'+variant, '--work', '.work/'+label], 120))
@@ -370,7 +385,11 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('remote-unknown-matrix', [sys.executable, '-B', 'tests/remote-unknown.py', '--matrix', '--work', '.work/runknown-matrix'], 120))
         # A recorded Apple debugserver session replayed by a loopback stub, then hostile replies.
         # The one case that waits out the five-second request deadline runs in periodic.
+        steps.append(('macos-views', [sys.executable, '-B', 'tests/macos-views.py', '--work', '.work/macos-views'], 60))
         steps.append(('macos-names', [sys.executable, '-B', 'tests/macos-names.py', '--work', '.work/macos-names'], 120))
+        steps.append(('macos-debug', [sys.executable, '-B', 'tests/macos-debug.py', '--work', '.work/macos-debug'], 60))
+        steps.append(('macos-debug-objects', [sys.executable, '-B', 'tests/macos-debug.py', '--objects', '--work', '.work/macos-debug-objects'], 60))
+        steps.append(('macos-debug-hostile', [sys.executable, '-B', 'tests/macos-debug.py', '--hostile', '--work', '.work/macos-debug-hostile'], 60))
         steps.append(('macos-names-matrix', [sys.executable, '-B', 'tests/macos-names.py', '--matrix', '--only', 'large-index', '--work', '.work/macos-names-matrix'], 120))
         steps.append(('gdb-debugserver', [sys.executable, '-B', 'tests/gdb-debugserver.py', '--work', '.work/gdb-debugserver',
                       '--skip', 'truncated-packet'], 60))
@@ -548,6 +567,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             # A Godot 4 / Redot engine with DWARF: about a gigabyte read once per xodb.
             steps.append(('gdscript-stack', [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot, '--strace', '--work', '.work/gds'], 600))
             steps.append(('gdscript-demo', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--work', '.work/gdd'], 600))
+            steps.append(('gdscript-values', [sys.executable, '-B', 'tests/gdscript-values.py', '--redot', redot, '--strace', '--work', '.work/gdv'], 600))
+            steps.append(('gdscript-demo-values', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--values', '--work', '.work/gddv'], 600))
         if node:
             for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
                 steps.append(('javascript-watches'+suffix, [sys.executable, '-B', 'tests/javascript-watches.py', '--node', node, '--include', node_include, '--strace', '--work', '.work/jw'+suffix, *extra], 300))
@@ -601,6 +622,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-remote-startup', ['tests/remote-reconnect-gui.py', '--startup']),
             ('gui-remote-reconnect', ['tests/remote-reconnect-gui.py']),
             ('gui-macos-names', ['tests/macos-names-gui.py']),
+            ('gui-macos-debug', ['tests/macos-names-gui.py', '--debug']),
+            ('gui-macos-views', ['tests/macos-views-gui.py']),
             ('gui-remote-publication', ['tests/remote-publication-gui.py']),
             ('gui-frames', ['tests/frames-gui.py']),
             ('gui-language-tabs', ['tests/language-tabs-gui.py', '--work', '.work/lt', *gui_language_args]),
@@ -686,6 +709,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if redot:
             steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))
+            steps.append(('gdscript-values-gui', [sys.executable, '-B', 'tests/gdscript-values-gui.py', '--redot', redot, '--work', '.work/gdvg'], 600))
             steps.append(('gui-owner-gdscript-limit', [sys.executable, '-B', 'tests/gdscript-remote-limit-gui.py', '--redot', redot, '--work', '.work/gdl'], 300))
         if node:
             steps.append(('javascript-watches-gui', [sys.executable, '-B', 'tests/language-watches-gui.py', '--node', node, '--include', node_include, '--work', '.work/jwg'], 1200))
@@ -1141,7 +1165,7 @@ def main(argv=None):
     parser.add_argument('--node', help='Include Node.js language checks using this explicitly selected runtime')
     parser.add_argument('--wine', help='Include owned stripped PE/Jai checks with this Wine executable (periodic tiers; private prefix)')
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
-    parser.add_argument('--redot', help='Include GDScript stack checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
+    parser.add_argument('--redot', help='Include GDScript stack and value checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
     parser.add_argument('--macos-ssh', metavar='HOST', help='Include the live Apple debugserver test against this Mac, reached with ssh HOST (periodic tier; no default host)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
@@ -1223,7 +1247,9 @@ def main(argv=None):
         decisions.append(f'affected: {len(changed)} changed files against {base} select {len(steps)} of {len(everything)} steps')
         print('\n'.join(decisions), file=sys.stderr if args.list else sys.stdout, flush=True)
     if args.capstone == 'vendored':
-        next(step for step in steps if step.name == 'build-tests').argv.append('-Dcapstone=vendored')
+        for step in steps:
+            if step.name in ('build-tests', 'platform-null', 'platform-null-tests'):
+                step.argv.append('-Dcapstone=vendored')
     try:
         if args.only or args.start:
             steps = select(steps, args.only.split(',') if args.only else None, args.start)

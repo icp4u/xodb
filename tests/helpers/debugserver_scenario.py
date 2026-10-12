@@ -90,8 +90,10 @@ def run(client, static, printed=None, log=print, launched=True):
     for frame, name in zip(frames, order):
         low = at[name]; high = bounds[bounds.index(low) + 1]
         assert low <= frame['pc'] < high, (name, hex(frame['pc']))
-        assert frame['symbol'] is None and frame['inline_diagnostic'] == IMAGE_REFUSAL, frame
-    assert [f['unwind_method'] for f in frames[:5]] == ['registers', 'link_register', 'frame_pointer', 'frame_pointer', 'frame_pointer'], frames
+        # This recording has no executable segment geometry or local metadata.
+        assert frame['symbol'] is None and frame['inline_diagnostic'] == 'UnmappedAddress', frame
+    # Like native CFI, the method describes unwinding this frame to its caller.
+    assert [f['unwind_method'] for f in frames[:5]] == ['link_register', 'frame_pointer', 'frame_pointer', 'frame_pointer', 'frame_pointer'], frames
     assert 5 <= len(frames) <= 8, len(frames)
     log('stack: ' + ' <- '.join(f"{f['pc']:#x}({f['unwind_method']})" for f in frames))
 

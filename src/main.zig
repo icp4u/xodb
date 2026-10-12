@@ -3,7 +3,7 @@ const build_options = @import("build_options");
 const c = @import("c.zig").api;
 const ProcessTree = @import("model/process_tree.zig").Tree;
 const Session = @import("model/session.zig").Session;
-const Window = @import("platform/wayland.zig").Window;
+const Window = @import("platform/window.zig").Window;
 const Renderer = @import("render/vulkan.zig").Renderer;
 const Font = @import("render/font.zig").Font;
 const Workspace = @import("ui/workspace.zig").Workspace;
@@ -770,7 +770,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         const keys = @import("platform/input.zig");
         for (0..window.input.count) |offset| {
             const event = &window.input.queue[(window.input.head + offset) % keys.capacity];
-            if (event.kind == .press and event.mods.ctrl and !event.mods.alt and !event.mods.logo and event.shortcut == 'r') {
+            if (event.kind == .press and event.mods.ctrl and !event.mods.alt and !event.mods.super and event.shortcut == 'r') {
                 if (event.mods.shift) {
                     reconnect = true;
                 } else {
@@ -1056,6 +1056,7 @@ test {
         std.testing.refAllDecls(@import("render/font.zig"));
         _ = @import("render/vk_select.zig");
         std.testing.refAllDecls(@import("platform/input.zig"));
+        _ = @import("platform/window.zig");
         std.testing.refAllDecls(@import("ui/workspace.zig"));
         std.testing.refAllDecls(@import("ui/allocations.zig"));
         std.testing.refAllDecls(@import("ui/watch.zig"));
@@ -1073,6 +1074,8 @@ test {
         _ = @import("ui/overview/sysstat.zig");
         _ = @import("ui/overview/view.zig");
         _ = @import("ui/overview/run.zig");
+        _ = @import("ui/overview/options.zig");
+        _ = @import("ui/overview/loop.zig");
         _ = @import("ui/overview/memmap.zig");
         _ = @import("ui/overview/deepmap.zig");
     }
@@ -1104,6 +1107,8 @@ test {
     std.testing.refAllDecls(@import("model/evaluate.zig"));
     std.testing.refAllDecls(@import("model/value_view.zig"));
     std.testing.refAllDecls(@import("debug/location.zig"));
+    std.testing.refAllDecls(@import("debug/macho_unwind.zig"));
+    std.testing.refAllDecls(@import("model/image_label.zig"));
 }
 
 test {

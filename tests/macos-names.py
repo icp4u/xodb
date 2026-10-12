@@ -216,6 +216,9 @@ def hostile_case(name,work):
         if name=='bad-uuid':image['uuid']='bad'
         if name=='segment-overflow':image['segments'][1]['vmaddr']=(1<<64)-1
         if name=='segment-cap':image['segments']*=33
+        if name=='image-list-cap':value['images']=[image]*4097
+        if name=='basename-dot':image['pathname']='/owned/.'
+        if name=='basename-dotdot':image['pathname']='/owned/..'
         if name=='remote-path':image['pathname']='/../../'+str(binary)
         # '!' separates image from symbol; a stub-chosen name must not supply it.
         if name=='image-name-separator':image['pathname']='/xodb-corpus/out/libsystem_c.dylib!abort'
@@ -226,10 +229,13 @@ def hostile_case(name,work):
     if name in ('remote-path','image-name-separator'):options=['--debug-dir',str(directory/'empty')];(directory/'empty').mkdir()
     stub=Replay(recording,stops,mutate);stub.start();client=Client('mutate',executable=None,options=('--gdb-remote',stub.endpoint,*options),reply_seconds=30)
     try:
-        if name in ('duplicate-image','overlap','bad-uuid','segment-overflow','segment-cap'):
+        if name in ('duplicate-image','overlap','bad-uuid','segment-overflow','segment-cap','image-list-cap'):
             answer=client.tool('get_macho_image',address=hex(stops[0].pc))['result']
-            expected={'duplicate-image':'MachODuplicateImageAddress','overlap':'MachOAmbiguousImageRange'}.get(name,'ProtocolError')
+            expected={'duplicate-image':'MachODuplicateImageAddress','overlap':'MachOAmbiguousImageRange','image-list-cap':'GdbListTooLarge'}.get(name,'ProtocolError')
             assert answer['isError'] and answer['content'][0]['text']==expected,answer
+            if name=='image-list-cap':
+                frame=wait_stack(client,client.session()['threads'][0]['tid'])[0]
+                assert frame['diagnostic']==expected,frame
         else:
             label=wait_label(client,stops[0].pc)
             if name=='file-changed':
@@ -238,7 +244,7 @@ def hostile_case(name,work):
                 with local.open('r+b') as out:out.seek(64);byte=out.read(1);out.seek(64);out.write(bytes([byte[0]^1]))
                 os.utime(local,ns=(before.st_atime_ns,before.st_mtime_ns+1000000000))
                 label=wait_label(client,stops[0].pc)
-            expected={'uuid-mismatch':'MachOUuidMismatch','file-changed':'MachOFileChanged','symlink':'MachOLocalFileRefused','fifo':'MachOLocalFileRefused','remote-path':'MachOLocalFileUnavailable','image-name-separator':'MachOLocalFileUnavailable'}[name]
+            expected={'uuid-mismatch':'MachOUuidMismatch','file-changed':'MachOFileChanged','symlink':'MachOLocalFileRefused','fifo':'MachOLocalFileRefused','remote-path':'MachOLocalFileUnavailable','basename-dot':'MachOImageBasenameInvalid','basename-dotdot':'MachOImageBasenameInvalid','image-name-separator':'MachOLocalFileUnavailable'}[name]
             assert label['status']=='image_only' and label['diagnostic']==expected and '!' not in label['label'],label
             if name=='image-name-separator':
                 assert label['label']=='libsystem_c.dylib?abort+0x%x'%(stops[0].pc-stops[0].images[0]['load_address']),label
@@ -322,7 +328,7 @@ def main():
     os.environ['XODB_BIN']=str(Path(os.environ.get('XODB_BIN',ROOT/'zig-out/bin/xodb')).resolve())
     for name,digest in json.loads((FIXTURES/'SHA256.json').read_text()).items():assert hashlib.sha256((FIXTURES/name).read_bytes()).hexdigest()==digest,name
     names=['c-O2-basic','c-arm64e-basic','c-universal-basic','c-stripped-basic','cxx-basic','objc-basic','swift-basic','c-crash-abort']
-    hostile=['uuid-mismatch','file-changed','symlink','fifo','remote-path','image-name-separator','duplicate-image','overlap','bad-uuid','segment-overflow','segment-cap']
+    hostile=['uuid-mismatch','file-changed','symlink','fifo','remote-path','image-name-separator','basename-dot','basename-dotdot','image-list-cap','duplicate-image','overlap','bad-uuid','segment-overflow','segment-cap']
     selected=[n for n in names+hostile+['addresses']+(['large-index'] if args.matrix else []) if args.only in (None,n)];assert selected,'no selected case'
     result=dict(status='running',rows=[],load=os.getloadavg());started=time.monotonic()
     try:

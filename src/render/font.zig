@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 pub const atlas_size = 1024;
 pub const Glyph = struct { id: u32, x: u32, y: u32, w: u32, h: u32, left: i32, top: i32 };
 pub const Font = struct {

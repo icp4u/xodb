@@ -63,7 +63,14 @@ pub const Capture = struct {
                 };
             } else {
                 session.refreshMaps() catch {};
-                for (session.modules.regions.items) |region| if (address >= region.start and address < region.end) {
+                const remote_map = session.gdbMap() catch |err| {
+                    // Optional map failure must not hide the causal stop.
+                    self.value.mapping_missing = true;
+                    self.value.mapping = try std.fmt.allocPrint(a, "Fault map unavailable: {s}", .{@errorName(err)});
+                    return;
+                };
+                const regions = if (remote_map) |map| map.regions else session.modules.regions.items;
+                for (regions) |region| if (address >= region.start and address < region.end) {
                     self.value.mapping = try std.fmt.allocPrint(a, "Fault mapping: {s} {s}", .{ &region.permissions, region.path });
                     break;
                 };

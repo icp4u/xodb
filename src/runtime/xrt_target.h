@@ -22,7 +22,8 @@ enum xrt_stop_reason {
     XRT_STOP_CLONE,
     XRT_STOP_FORK,
     XRT_STOP_VFORK,
-    XRT_STOP_VFORK_DONE
+    XRT_STOP_VFORK_DONE,
+    XRT_STOP_EXCEPTION
 };
 enum xrt_event_kind {
     XRT_EVENT_LAUNCH,

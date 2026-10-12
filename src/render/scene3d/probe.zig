@@ -1,7 +1,6 @@
 //! Explicitly synthetic GPU probe, also used by the private GUI regression lane.
 const std = @import("std");
-const c = @import("../../c.zig").api;
-const Window = @import("../../platform/wayland.zig").Window;
+const Window = @import("../../platform/window.zig").Window;
 const Renderer = @import("../vulkan.zig").Renderer;
 const Font = @import("../font.zig").Font;
 const math = @import("math.zig");
@@ -24,8 +23,8 @@ pub fn main(args: []const [:0]const u8) !void {
     var window = Window{};
     try window.init();
     defer window.deinit();
-    c.xdg_toplevel_set_min_size(window.top, 32, 32);
-    c.xdg_toplevel_set_title(window.top, "xodb synthetic scene3d probe");
+    window.setMinSize(32, 32);
+    window.setTitle("xodb synthetic scene3d probe");
     var renderer = Renderer{};
     try renderer.init(&window);
     defer renderer.deinit();

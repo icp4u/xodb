@@ -1,186 +1,124 @@
 //! `xodb --overview` entry: its own window and session, no debug target.
+//! The window loop and the replay path are loop.zig; this adds the live system.
 const std = @import("std");
-const c = @import("../../c.zig").api;
-const Window = @import("../../platform/wayland.zig").Window;
-const Renderer = @import("../../render/vulkan.zig").Renderer;
-const Font = @import("../../render/font.zig").Font;
+const c = @import("../../c_ui.zig").api;
+const Window = @import("../../platform/window.zig").Window;
 const now = @import("../../target/linux.zig").now;
 const m = @import("model.zig");
-const themes = @import("theme.zig");
 const vw = @import("view.zig");
-const Replay = @import("replay.zig").Replay;
-const Live = @import("sysstat.zig").Live;
+const loop = @import("loop.zig");
+const Options = @import("options.zig").Options;
 const Collector = @import("../../model/system.zig").Collector;
 const Shared = @import("../../mcp/shared.zig").Endpoint;
 const Server = @import("../../mcp/server.zig").Server;
 const Session = @import("../../model/session.zig").Session;
-
-pub const usage =
-    \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
-    \\               [--look win95|win9x|dos|modern|deep|gibson] [--memmap-pid N [--memmap-start-ticks N]]
-    \\  A system overview window with no debug target: CPU, memory, disks, network,
-    \\  connections, sensors, processes, users, services and packages. Unmeasured values
-    \\  show their reason; nothing unmeasured is drawn as zero.
-    \\  --attach-exe    open the process picker with an editable .exe search filter
-    \\  --replay FILE   collector JSON (one snapshot, or one per line) instead of the live system
-    \\  --redact        hide hostname, users, addresses, mount points and command arguments
-    \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
-    \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance or treemap
-    \\  Graph/galaxy/treemap starts LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
-    \\  --graph-pid N   restrict descriptor collection and captured threads to these PIDs (repeatable)
-    \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
-    \\  --files-start-ticks N  require this exact identity with --files-pid
-    \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern, deep (zoomable), gibson (3D city)
-    \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
-    \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
-    \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)
-    \\  --session-socket PATH  share this live cache with observer-only MCP clients
-    \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
-    \\  --pause         start paused (replay: show the last frame with full history)
-    \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
-    \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
-    \\      B treemap, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
-    \\
-;
-
-var quitting: c.sig_atomic_t = 0;
-fn onSignal(signal: c_int) callconv(.c) void {
-    quitting = signal;
-}
-
-pub const Options = struct {
-    attach_exe: bool = false,
-    replay: ?[:0]const u8 = null,
-    session_socket: ?[:0]const u8 = null,
-    mcp: bool = false,
-    redact: bool = false,
-    theme: ?[]const u8 = null,
-    panel: ?vw.Panel = null,
-    files_pid: ?i32 = null,
-    files_start: u64 = 0,
-    graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
-    graph_count: usize = 0,
-    look: ?vw.memmap.Look = null,
-    memmap_pid: ?i32 = null,
-    memmap_start: u64 = 0,
-    interval_ms: ?u64 = null,
-    paused: bool = false,
-    frames: u64 = 0,
-    font: [:0]const u8 = @import("build_options").font_path ++ "",
-};
-
-/// Parses overview arguments (args[0] is the program). Debugger options are
-/// rejected: the overview has no target.
-pub fn parse(args: []const [:0]const u8) !Options {
-    var o = Options{};
-    var i: usize = 1;
-    while (i < args.len) : (i += 1) {
-        const arg = args[i];
-        if (std.mem.eql(u8, arg, "--overview")) continue;
-        if (std.mem.eql(u8, arg, "--attach-exe")) {
-            o.attach_exe = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--redact")) {
-            o.redact = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--mcp")) {
-            o.mcp = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--pause")) {
-            o.paused = true;
-            continue;
-        }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--vk-device" };
-        var known = false;
-        for (takes) |t| known = known or std.mem.eql(u8, arg, t);
-        if (!known) {
-            std.debug.print("xodb: --overview does not accept {s}\n{s}", .{ arg, usage });
-            return error.OverviewOptionConflict;
-        }
-        i += 1;
-        if (i == args.len) return error.MissingArgument;
-        const value = args[i];
-        if (std.mem.eql(u8, arg, "--replay")) o.replay = value;
-        if (std.mem.eql(u8, arg, "--session-socket")) o.session_socket = value;
-        if (std.mem.eql(u8, arg, "--theme")) {
-            _ = themes.find(value) orelse return error.UnknownOverviewTheme;
-            o.theme = value;
-        }
-        if (std.mem.eql(u8, arg, "--panel")) o.panel = std.meta.stringToEnum(vw.Panel, value) orelse return error.UnknownOverviewPanel;
-        if (std.mem.eql(u8, arg, "--graph-pid")) {
-            const pid = try std.fmt.parseInt(i32, value, 10);
-            if (pid <= 0 or o.graph_count == o.graph_pids.len) return error.InvalidGraphScope;
-            if (std.mem.indexOfScalar(i32, o.graph_pids[0..o.graph_count], pid) == null) {
-                o.graph_pids[o.graph_count] = pid;
-                o.graph_count += 1;
-            }
-        }
-        if (std.mem.eql(u8, arg, "--files-pid")) {
-            const pid = try std.fmt.parseInt(i32, value, 10);
-            if (pid <= 0) return error.InvalidFilesIdentity;
-            o.files_pid = pid;
-        }
-        if (std.mem.eql(u8, arg, "--files-start-ticks")) {
-            o.files_start = try std.fmt.parseInt(u64, value, 10);
-            if (o.files_start == 0) return error.InvalidFilesIdentity;
-        }
-        if (std.mem.eql(u8, arg, "--look")) {
-            if (std.mem.eql(u8, value, "win95")) o.theme = "win95" else o.look = std.meta.stringToEnum(vw.memmap.Look, value) orelse return error.UnknownMemoryMapLook;
-        }
-        if (std.mem.eql(u8, arg, "--memmap-pid")) {
-            const pid = try std.fmt.parseInt(i32, value, 10);
-            if (pid <= 0) return error.InvalidMemoryMapIdentity;
-            o.memmap_pid = pid;
-        }
-        if (std.mem.eql(u8, arg, "--memmap-start-ticks")) {
-            o.memmap_start = try std.fmt.parseInt(u64, value, 10);
-            if (o.memmap_start == 0) return error.InvalidMemoryMapIdentity;
-        }
-        if (std.mem.eql(u8, arg, "--interval-ms")) {
-            const ms = try std.fmt.parseInt(u64, value, 10);
-            if (ms < 250 or ms > 10_000) return error.InvalidOverviewInterval;
-            o.interval_ms = ms;
-        }
-        if (std.mem.eql(u8, arg, "--frames")) o.frames = try std.fmt.parseInt(u64, value, 10);
-        if (std.mem.eql(u8, arg, "--font")) o.font = value;
-    }
-    if (o.replay != null and (o.mcp or o.session_socket != null)) return error.ReplayHasNoLiveSession;
-    if (o.files_start != 0 and o.files_pid == null) return error.InvalidFilesIdentity;
-    if (o.memmap_start != 0 and o.memmap_pid == null) return error.InvalidMemoryMapIdentity;
-    if (o.memmap_pid != null) {
-        if (o.replay != null or o.files_pid != null or (o.panel != null and o.panel.? != .memory_map)) return error.InvalidMemoryMapIdentity;
-        o.panel = .memory_map;
-    }
-    if (o.files_pid != null) {
-        if (o.replay != null or (o.panel != null and o.panel.? != .files)) return error.InvalidFilesIdentity;
-        o.panel = .files;
-    }
-    if (o.graph_count > 0) {
-        if (o.replay != null or (o.panel != null and o.panel.? != .graph and o.panel.? != .galaxy and o.panel.? != .inheritance and o.panel.? != .treemap)) return error.InvalidGraphScope;
-        if (o.panel == null) o.panel = .galaxy;
-    }
-    return o;
-}
-
-const Source = union(enum) {
-    replay: Replay,
-    live: Live,
-};
+const Launcher = @import("actions.zig").Launcher;
 
 pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
-    if (comptime !@import("build_options").gui) return error.GuiNotBuilt;
-    for (args) |arg| if (std.mem.eql(u8, arg, "--help")) {
-        std.debug.print("{s}", .{usage});
-        return;
-    };
-    const o = try parse(args);
-    _ = c.signal(c.SIGINT, onSignal);
-    _ = c.signal(c.SIGTERM, onSignal);
-    _ = c.signal(c.SIGHUP, onSignal);
+    return loop.main(args, startup_started, live);
+}
+
+/// The live system as loop.zig's source.
+const Source = struct {
+    o: *const Options,
+    gpa: std.mem.Allocator,
+    collector: *Collector,
+    session: *Session,
+    shared: ?*Shared,
+    server: ?*Server,
+    launcher: *Launcher,
+    sysstat: @import("sysstat.zig").Live,
+
+    pub fn prepare(self: *Source, view: *vw.View) !void {
+        if (self.o.memmap_pid) |pid| {
+            // pid + start is the identity; without --memmap-start-ticks the current start is pinned.
+            const start = if (self.o.memmap_start != 0) self.o.memmap_start else @import("../../memdefrag/tui.zig").startTicks(pid) orelse {
+                std.debug.print("xodb: overview: process {d} not found\n", .{pid});
+                return error.InvalidMemoryMapIdentity;
+            };
+            @import("../../model/process_identity.zig").validate(.{ .pid = pid, .start = start }) catch |err| {
+                std.debug.print("xodb: overview: process {d} start {d}: {s}\n", .{ pid, start, @errorName(err) });
+                return err;
+            };
+            view.memmap.open(.{ .pid = pid, .start = start }, now());
+        }
+    }
+    pub fn interval(self: *Source, ns: u64) void {
+        self.collector.fast_ns = ns;
+    }
+    /// MCP clients are served from the loop, so it must not sleep long.
+    pub fn serving(self: *const Source) bool {
+        return self.shared != null or self.server != null;
+    }
+    pub fn sample(self: *Source, gpa: std.mem.Allocator) !*m.Owned {
+        return self.sysstat.sample(gpa);
+    }
+    pub fn poll(self: *Source, view: *vw.View, window: *Window, current: u64) !void {
+        self.launcher.redact = view.redact;
+        if (self.launcher.poll()) view.setStatus("Process action failed; check target identity and access", .{}, current);
+        const started = vw.threadNs();
+        self.collector.redact = view.redact;
+        if (view.graph.flow_demand and ((view.panel != .graph and view.panel != .galaxy) or view.paused)) view.graph.stopCapture();
+        if (view.treemap.flow_demand and (view.panel != .treemap or view.paused)) view.treemap.stopCapture();
+        if (view.files.event_authorized and (view.panel != .files or view.paused)) view.files.stopCapture();
+        if (view.files.refreshStatus(self.collector)) window.dirty = true;
+        if (view.panel == .files) {
+            const changed = view.files.refresh(self.gpa, self.collector, current, view.paused) catch |err| blk: {
+                view.setStatus("Descriptor sampling failed: {s}", .{@errorName(err)}, current);
+                break :blk false;
+            };
+            view.files.rebuild(self.gpa, view.redact) catch |err| view.setStatus("Descriptor list failed: {s}", .{@errorName(err)}, current);
+            if (changed) {
+                window.dirty = true;
+                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ self.collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
+            }
+        }
+        if (view.panel == .graph or view.panel == .galaxy or view.panel == .inheritance) {
+            if (view.graph.refresh(self.collector, current, view.paused, view.panel != .inheritance) catch |err| blk: {
+                view.setStatus("Graph update failed: {s}", .{@errorName(err)}, current);
+                break :blk false;
+            }) {
+                window.dirty = true;
+                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.graph) |graph| {
+                    const projection = view.graph.projection.?;
+                    std.debug.print("xodb: fdgraph sequence={d} processes={d} descriptors={d} peer_edges={d} stars={d} particles={d} scope_count={d}\n", .{ graph.sequence, graph.processes, graph.member_count, graph.peer_edges, projection.star_count, projection.particle_count, self.o.graph_count });
+                    var rate: f64 = 0;
+                    if (view.graph.metrics) |metrics| for (metrics.stars[0..metrics.star_count]) |metric| {
+                        rate += metric.read_rate + metric.write_rate;
+                    };
+                    std.debug.print("xodb: fdgraph-flow running={d} requested={d} sequence={d} matched={d} bytes={d} unknown={d} rate={d:.0} lost={d} cpus={d}/{d} status={d}\n", .{ @intFromBool(view.graph.flow_running), @intFromBool(view.graph.flow_requested), view.graph.flow_sequence, if (view.graph.metrics) |metrics| metrics.matched_rows else 0, view.graph.flow_bytes, view.graph.flow_unknown, rate, view.graph.flow_lost, view.graph.flow_active_cpus, view.graph.flow_online_cpus, view.graph.flow_status });
+                };
+            }
+        }
+        if (view.panel == .treemap) {
+            if (view.treemap.refresh(self.collector, current, view.paused) catch |err| blk: {
+                view.setStatus("Treemap update failed: {s}", .{@errorName(err)}, current);
+                break :blk false;
+            }) {
+                window.dirty = true;
+                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.treemap.tree) |tree|
+                    std.debug.print("xodb: fdtreemap sequence={d} flow={d} fds={d} nodes={d} focus={d} scope_count={d} running={d} measured={d} read={d} write={d}\n", .{ tree.sequence, tree.flow_sequence, tree.fd_count, tree.count, view.treemap.focus, self.o.graph_count, @intFromBool(view.treemap.flow_running), tree.nodes[0].total.flow_measured, tree.nodes[0].total.read_bytes, tree.nodes[0].total.write_bytes });
+            }
+        }
+        if (view.panel == .inheritance and view.graph.refreshInheritance()) {
+            window.dirty = true;
+            if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.inheritance) |rows|
+                std.debug.print("xodb: fdinherit sequence={d} matched={d} shown={d} cloexec={d} no_cloexec={d} unknown={d} scope_count={d}\n", .{ rows.sequence, rows.matched, rows.count, rows.cloexec, rows.no_cloexec, rows.flags_unknown, self.o.graph_count });
+        }
+        if (view.panel == .memory_map) {
+            if (view.memmap.refresh(self.gpa, self.collector, current, view.paused, view.redact)) window.dirty = true;
+        }
+        _ = self.collector.tick(current, if (view.paused) 0 else view.groups(true), view.panel == .processes) catch |err| blk: {
+            view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
+            break :blk false;
+        };
+        view.sourceCost(vw.threadNs() -| started);
+        if (self.shared) |endpoint| try endpoint.pump(self.session);
+        if (self.server) |p| try p.pump(self.session);
+    }
+};
+
+fn live(o: *const Options, startup_started: u64) !void {
     const gpa = std.heap.c_allocator;
     var collector: Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count] };
     defer collector.deinit();
@@ -205,255 +143,13 @@ pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
         try p.init();
         std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     }
-    var source: Source = if (o.replay) |path| blk: {
-        const bytes = readFile(gpa, path) catch |err| {
-            std.debug.print("xodb: overview replay failed: {s}; {s}\n", .{ @errorName(err), path });
-            return err;
-        };
-        defer gpa.free(bytes);
-        break :blk .{ .replay = try Replay.load(gpa, bytes) };
-    } else .{ .live = .{ .collector = &collector } };
-    defer switch (source) {
-        .replay => |*r| r.deinit(),
-        .live => {},
-    };
     var view = try vw.View.init(gpa);
     defer view.deinit();
-    var layout: ?*@import("draw.zig").Layout = null;
-    if (c.getenv("XODB_OVERVIEW_LAYOUT") != null) {
-        layout = try gpa.create(@import("draw.zig").Layout);
-        layout.?.* = .{};
-        view.layout = layout;
-    }
-    defer if (layout) |l| gpa.destroy(l);
-    var launcher: @import("actions.zig").Launcher = .{ .redact = o.redact };
-    if (source == .live) {
-        view.action_hook = launchAction;
-        view.action_context = &launcher;
-    }
-    view.font_path = o.font;
-    view.redact = o.redact;
-    view.paused = o.paused;
-    if (o.theme) |t| view.palette = themes.find(t).?;
-    if (o.panel) |p| view.show(p);
-    if (o.attach_exe) {
-        view.show(.processes);
-        @memcpy(view.search[0..4], ".exe");
-        view.search_len = 4;
-        view.rows_dirty = true;
-    }
-    if (o.files_pid) |pid| view.files.scope(.{ .pid = pid, .start = o.files_start });
-    if (o.look) |look| view.memmap.look = look;
-    if (o.memmap_pid) |pid| {
-        // pid + start is the identity; without --memmap-start-ticks the current start is pinned.
-        const start = if (o.memmap_start != 0) o.memmap_start else @import("../../memdefrag/tui.zig").startTicks(pid) orelse {
-            std.debug.print("xodb: overview: process {d} not found\n", .{pid});
-            return error.InvalidMemoryMapIdentity;
-        };
-        @import("../../model/process_identity.zig").validate(.{ .pid = pid, .start = start }) catch |err| {
-            std.debug.print("xodb: overview: process {d} start {d}: {s}\n", .{ pid, start, @errorName(err) });
-            return err;
-        };
-        view.memmap.open(.{ .pid = pid, .start = start }, now());
-    }
-    view.source_label = if (source == .replay) "REPLAY" else "live";
-    view.owns_samples = source == .live;
-
-    var window = Window{ .own_frame = view.pal().win95 };
-    try window.init();
-    defer window.deinit();
-    if (window.top) |top| {
-        c.xdg_toplevel_set_title(top, "xodb overview");
-        c.xdg_toplevel_set_app_id(top, "xodb-overview");
-    }
-    var renderer = Renderer{};
-    defer renderer.deinit();
-    const font = try gpa.create(Font);
-    defer gpa.destroy(font);
-    font.* = .{};
-    if (view.pal().win95) try font.initRetro() else try font.initMode(o.font, false);
-    defer font.deinit();
-
-    const interval = (o.interval_ms orelse if (source == .live) @as(u64, 500) else 1000) * 1_000_000;
-    collector.fast_ns = interval;
-    view.files.interval_ms = if (o.interval_ms == 250) 250 else 1000;
-    // The owner clock refreshes processes at 1 Hz, independently of MCP calls.
-    var next_sample: u64 = 0;
-    var shown_panel = view.panel;
-    // Animate transitions only when samples are far enough apart to see them;
-    // at 4 Hz the samples themselves are the motion.
-    view.ease_ns = if (interval >= 1_000_000_000 and view.panel != .processes) 150_000_000 else 0;
-    // A replay fills history from every frame so graphs are complete at once.
-    if (source == .replay) {
-        for (0..source.replay.frames.len) |_| view.accept(source.replay.advance(), now());
-        view.sample_time = 0;
-        next_sample = now() + interval;
-    }
-    var recovery = @import("../../render/recovery.zig").Recovery{};
-    var rendered: u64 = 0;
-    var last_frame: u64 = 0;
-    while (!window.closing and quitting == 0) {
-        const t = now();
-        const frame_gap: u64 = if (view.panel == .files) 66_000_000 else 33_000_000;
-        // Eases redraw at 30 fps; idle waits for the next sample or input.
-        const idle_cap: u64 = if (shared != null or server != null) 20 else if (view.panel == .memory_map) view.memmap.waitMs(t) else 250;
-        const wait_ms: i32 = if (window.dirty) 4 else if (view.animating(t)) @intCast(@max(1, (last_frame + frame_gap -| t) / 1_000_000)) else @intCast(@min(idle_cap, (next_sample -| t) / 1_000_000 + 1));
-        try window.pump(window.input.timeoutMs(t, wait_ms));
-        window.input.tick(now());
-        view.input(&window, now());
-        if (window.closing or quitting != 0) break;
-        const current = now();
-        view.roll(current);
-        launcher.redact = view.redact;
-        if (launcher.poll()) view.setStatus("Process action failed; check target identity and access", .{}, current);
-        // A newly shown panel gets its groups at once rather than at the next slow tick.
-        if (view.panel != shown_panel) {
-            shown_panel = view.panel;
-            view.ease_ns = if (interval >= 1_000_000_000 and view.panel != .processes) 150_000_000 else 0;
-            next_sample = 0;
-        }
-        if (source == .live) {
-            const started = vw.threadNs();
-            collector.redact = view.redact;
-            if (view.graph.flow_demand and ((view.panel != .graph and view.panel != .galaxy) or view.paused)) view.graph.stopCapture();
-            if (view.treemap.flow_demand and (view.panel != .treemap or view.paused)) view.treemap.stopCapture();
-            if (view.files.event_authorized and (view.panel != .files or view.paused)) view.files.stopCapture();
-            if (view.files.refreshStatus(&collector)) window.dirty = true;
-            if (view.panel == .files) {
-                const changed = view.files.refresh(gpa, &collector, current, view.paused) catch |err| blk: {
-                    view.setStatus("Descriptor sampling failed: {s}", .{@errorName(err)}, current);
-                    break :blk false;
-                };
-                view.files.rebuild(gpa, view.redact) catch |err| view.setStatus("Descriptor list failed: {s}", .{@errorName(err)}, current);
-                if (changed) {
-                    window.dirty = true;
-                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
-                }
-            }
-            if (view.panel == .graph or view.panel == .galaxy or view.panel == .inheritance) {
-                if (view.graph.refresh(&collector, current, view.paused, view.panel != .inheritance) catch |err| blk: {
-                    view.setStatus("Graph update failed: {s}", .{@errorName(err)}, current);
-                    break :blk false;
-                }) {
-                    window.dirty = true;
-                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.graph) |graph| {
-                        const projection = view.graph.projection.?;
-                        std.debug.print("xodb: fdgraph sequence={d} processes={d} descriptors={d} peer_edges={d} stars={d} particles={d} scope_count={d}\n", .{ graph.sequence, graph.processes, graph.member_count, graph.peer_edges, projection.star_count, projection.particle_count, o.graph_count });
-                        var rate: f64 = 0;
-                        if (view.graph.metrics) |metrics| for (metrics.stars[0..metrics.star_count]) |metric| {
-                            rate += metric.read_rate + metric.write_rate;
-                        };
-                        std.debug.print("xodb: fdgraph-flow running={d} requested={d} sequence={d} matched={d} bytes={d} unknown={d} rate={d:.0} lost={d} cpus={d}/{d} status={d}\n", .{ @intFromBool(view.graph.flow_running), @intFromBool(view.graph.flow_requested), view.graph.flow_sequence, if (view.graph.metrics) |metrics| metrics.matched_rows else 0, view.graph.flow_bytes, view.graph.flow_unknown, rate, view.graph.flow_lost, view.graph.flow_active_cpus, view.graph.flow_online_cpus, view.graph.flow_status });
-                    };
-                }
-            }
-            if (view.panel == .treemap) {
-                if (view.treemap.refresh(&collector, current, view.paused) catch |err| blk: {
-                    view.setStatus("Treemap update failed: {s}", .{@errorName(err)}, current);
-                    break :blk false;
-                }) {
-                    window.dirty = true;
-                    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.treemap.tree) |tree|
-                        std.debug.print("xodb: fdtreemap sequence={d} flow={d} fds={d} nodes={d} focus={d} scope_count={d} running={d} measured={d} read={d} write={d}\n", .{ tree.sequence, tree.flow_sequence, tree.fd_count, tree.count, view.treemap.focus, o.graph_count, @intFromBool(view.treemap.flow_running), tree.nodes[0].total.flow_measured, tree.nodes[0].total.read_bytes, tree.nodes[0].total.write_bytes });
-                }
-            }
-            if (view.panel == .inheritance and view.graph.refreshInheritance()) {
-                window.dirty = true;
-                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.graph.inheritance) |rows|
-                    std.debug.print("xodb: fdinherit sequence={d} matched={d} shown={d} cloexec={d} no_cloexec={d} unknown={d} scope_count={d}\n", .{ rows.sequence, rows.matched, rows.count, rows.cloexec, rows.no_cloexec, rows.flags_unknown, o.graph_count });
-            }
-            if (view.panel == .memory_map) {
-                if (view.memmap.refresh(gpa, &collector, current, view.paused, view.redact)) window.dirty = true;
-            }
-            _ = collector.tick(current, if (view.paused) 0 else view.groups(true), view.panel == .processes) catch |err| blk: {
-                view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
-                break :blk false;
-            };
-            view.sourceCost(vw.threadNs() -| started);
-            if (shared) |*endpoint| try endpoint.pump(session);
-            if (server) |p| try p.pump(session);
-        }
-        if (!view.paused and current >= next_sample) {
-            const started = vw.threadNs();
-            switch (source) {
-                .replay => |*r| view.accept(r.advance(), current),
-                .live => |*l| {
-                    const sample = l.sample(gpa) catch |err| {
-                        view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
-                        next_sample = current + interval;
-                        continue;
-                    };
-                    view.accept(sample, current);
-                },
-            }
-            view.sourceCost(vw.threadNs() -| started);
-            next_sample = current + interval;
-            window.dirty = true;
-        } else if (view.paused) next_sample = @max(next_sample, current + 50_000_000);
-        if (view.panel == .memory_map and view.memmap.tick(current)) window.dirty = true;
-        const eased = view.animating(current) and current -| last_frame >= frame_gap;
-        if (!(window.dirty or eased or o.frames > 0 or current -| last_frame > 1_000_000_000)) continue;
-        if (current < recovery.retry_at) continue;
-        if (!recovery.ready) {
-            if (!try recovery.init(&renderer, &window, current)) continue;
-            font.dirty = true;
-        }
-        const presented = frame(&renderer, font, &view, &window, current) catch |err| {
-            std.debug.print("xodb: overview frame failed: {s}; recreating renderer\n", .{@errorName(err)});
-            recovery.lost(&renderer, current);
-            continue;
-        };
-        window.dirty = !presented;
-        if (!presented) continue;
-        if (rendered == 0) @import("../../startup.zig").report(startup_started, o.mcp);
-        last_frame = current;
-        rendered += 1;
-        if (o.frames > 0 and rendered >= o.frames) break;
-    }
-    const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else "frame_limit";
-    std.debug.print("xodb: overview {d} frames, {d} samples, clean shutdown (reason={s})\n", .{ rendered, view.samples, reason });
-}
-
-fn frame(r: *Renderer, font: *Font, view: *vw.View, window: *Window, t: u64) !bool {
-    if (!try r.begin(window.width, window.height)) return false;
-    view.frame(r, font, window, t) catch |err| {
-        // A partial frame is safe to present; report and continue.
-        view.setStatus("Draw failed: {s}", .{@errorName(err)}, t);
-    };
-    return r.end(font);
-}
-
-fn readFile(gpa: std.mem.Allocator, path: [:0]const u8) ![]u8 {
-    const fd = c.open(path.ptr, c.O_RDONLY | c.O_CLOEXEC);
-    if (fd < 0) return error.ReplayOpenFailed;
-    defer _ = c.close(fd);
-    var st: c.struct_stat = undefined;
-    if (c.fstat(fd, &st) != 0 or st.st_mode & c.S_IFMT != c.S_IFREG) return error.ReplayNotRegular;
-    if (st.st_size < 0 or st.st_size > @import("replay.zig").max_bytes) return error.ReplayTooLarge;
-    const bytes = try gpa.alloc(u8, @intCast(st.st_size));
-    errdefer gpa.free(bytes);
-    var n: usize = 0;
-    while (n < bytes.len) {
-        const got = c.read(fd, bytes.ptr + n, bytes.len - n);
-        if (got < 0 and std.c._errno().* == c.EINTR) continue;
-        if (got <= 0) return error.ReplayReadFailed;
-        n += @intCast(got);
-    }
-    return bytes;
-}
-
-test "overview options reject debugger targets and bad values" {
-    const ok = try parse(&.{ "xodb", "--overview", "--redact", "--theme", "builtin:green", "--panel", "disk_space", "--interval-ms", "250" });
-    const classic = try parse(&.{ "xodb", "--overview", "--look", "win95", "--look", "deep" });
-    try std.testing.expectEqualStrings("win95", classic.theme.?);
-    try std.testing.expectEqual(vw.memmap.Look.deep, classic.look.?);
-    try std.testing.expect(ok.redact);
-    try std.testing.expectEqual(vw.Panel.disk_space, ok.panel.?);
-    try std.testing.expectEqual(@as(?u64, 250), ok.interval_ms);
-    try std.testing.expectError(error.OverviewOptionConflict, parse(&.{ "xodb", "--overview", "--attach", "1" }));
-    try std.testing.expectError(error.UnknownOverviewTheme, parse(&.{ "xodb", "--overview", "--theme", "neon" }));
-    try std.testing.expectError(error.InvalidOverviewInterval, parse(&.{ "xodb", "--overview", "--interval-ms", "10" }));
-    try std.testing.expectError(error.UnknownOverviewPanel, parse(&.{ "xodb", "--overview", "--panel", "flight" }));
+    var launcher: Launcher = .{ .redact = o.redact };
+    view.action_hook = launchAction;
+    view.action_context = &launcher;
+    var source = Source{ .o = o, .gpa = gpa, .collector = &collector, .session = session, .shared = if (shared) |*endpoint| endpoint else null, .server = server, .launcher = &launcher, .sysstat = .{ .collector = &collector } };
+    try loop.run(o, gpa, &view, &source, startup_started);
 }
 
 fn launchAction(context: ?*anyopaque, request: @import("actions.zig").Request) !void {

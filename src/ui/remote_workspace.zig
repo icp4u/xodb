@@ -5,7 +5,7 @@ const boundary = @import("../model/remote_owner.zig");
 const Worker = @import("../model/remote_worker.zig").Worker;
 const Completion = @import("../model/remote_worker.zig").Completion;
 const Workspace = @import("workspace.zig").Workspace;
-const Window = @import("../platform/wayland.zig").Window;
+const Window = @import("../platform/window.zig").Window;
 const keys = @import("../platform/input.zig");
 const a = std.heap.page_allocator;
 const hashValue = @import("../model/remote_retry.zig").hashValue;
@@ -386,9 +386,11 @@ pub const Frontend = struct {
         self.inspection_key = signature;
     }
     pub fn draw(self: *Frontend, workspace: *Workspace, r: *@import("../render/vulkan.zig").Renderer, font: *@import("../render/font.zig").Font, window: *Window) !void {
-        // Local task metadata is never read or borrowed by the remote painter.
+        // Thread metadata is copied into the immutable owner publication;
+        // the painter never reads target or local task metadata itself.
         workspace.compatibility_info = .{ .kind = .unavailable };
-        workspace.thread_labels = &.{};
+        workspace.thread_labels = self.display.thread_labels;
+        defer workspace.thread_labels = &.{};
         if (workspace.logical_frames.open) {
             workspace.animating = workspace.logical_frames.value.busy;
             try workspace.logical_frames.drawPrepared(r, font, window);

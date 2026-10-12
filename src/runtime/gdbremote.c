@@ -17,6 +17,8 @@ struct xrt_gdb {
     struct xrt_gdb_info info;
     struct remote_thread threads[XRT_MAX_THREADS];
     size_t thread_count;
+    struct xrt_gdb_thread_info thread_info[XRT_MAX_THREADS];
+    size_t thread_info_count;
     uint64_t process, rearm;
     int32_t selected, signal_tid;
     unsigned pending_signal;
@@ -238,6 +240,32 @@ static enum xrt_status threads(struct xrt_gdb *g, struct xrt_target *t)
     }
     g->info.supported |= XRT_GDB_CAP_THREADS;
     g->info.unsupported &= ~XRT_GDB_CAP_THREADS;
+    return XRT_OK;
+}
+static enum xrt_status refresh_thread_info(struct xrt_gdb *g)
+{
+    g->thread_info_count = 0;
+    if (g->host.os != XRT_GDB_OS_DARWIN || (g->info.unsupported & XRT_GDB_CAP_THREAD_INFO)) return XRT_OK;
+    bool cut;
+    enum xrt_status status = query_prefix(g, "jThreadsInfo", &cut);
+    if (status != XRT_OK) return status;
+    g->info.supported &= ~XRT_GDB_CAP_THREAD_INFO;
+    g->info.failed &= ~XRT_GDB_CAP_THREAD_INFO;
+    if (!g->length) {
+        g->info.unsupported |= XRT_GDB_CAP_THREAD_INFO;
+        return XRT_OK;
+    }
+    size_t count = 0;
+    status = cut ? XRT_BUFFER_TOO_SMALL :
+        xrt_gdb_threads_parse((const char *)g->reply, g->length, g->thread_info, XRT_MAX_THREADS, &count);
+    if (status != XRT_OK) {
+        g->info.failed |= XRT_GDB_CAP_THREAD_INFO;
+        /* This optional metadata cannot change authoritative thread/control
+         * state. Discard partial rows and keep the framed connection usable. */
+        return XRT_OK;
+    }
+    g->thread_info_count = count;
+    g->info.supported |= XRT_GDB_CAP_THREAD_INFO;
     return XRT_OK;
 }
 static enum xrt_status annex(void *ctx, const char *name, char **out, size_t *size)
@@ -668,12 +696,19 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         t->state = XRT_EXITED; t->stepping = t->want_run = false; g->rearm = 0;
         g->rewatch = false; g->watch_tid = 0;
         for (size_t i = 0; i < t->thread_count; ++i) t->threads[i].state = XRT_EXITED;
-        event(t, XRT_EVENT_EXIT, t->pid, signal);
+        g->pending_signal = 0; g->info.pending_delivery = false;
+        g->info.stop_tid = 0; g->thread_info_count = 0;
+        int code = packet[0] == 'X' ? -(target_signal(g, signal) ? target_signal(g, signal) : (int)signal) : (int)signal;
+        event(t, XRT_EVENT_EXIT, t->pid, code);
         return XRT_OK;
     }
     if (packet[0] != 'T' && packet[0] != 'S') return XRT_PROTOCOL_ERROR;
     if (packet[0] == 'S' && size != 3) return XRT_PROTOCOL_ERROR;
-    uint64_t pid = 0, raw_tid = 0, watch_address = 0, fault = 0, exception = 0;
+    struct xrt_gdb_stop stop = {0};
+    if (g->host.os == XRT_GDB_OS_DARWIN && packet[0] == 'T' &&
+        xrt_gdb_stop_parse((const char *)packet, size, &stop) != XRT_OK)
+        return problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB Mach exception or exec stop");
+    uint64_t pid = 0, raw_tid = 0, watch_address = 0, fault = 0;
     bool has_thread = false, swbreak = false, watch = false, has_fault = false;
     /* debugserver expedites the fault address register with every stop. */
     const struct xrt_gdb_register *far = NULL;
@@ -696,10 +731,7 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
                 /* debugserver: the address of the watchpoint that fired. */
                 if (watch || !hexadecimal((const char *)colon + 1, n, &watch_address)) return XRT_PROTOCOL_ERROR;
                 watch = true;
-            } else if (key == 6 && !memcmp(packet + at, "metype", 6)) {
-                if (!hexadecimal((const char *)colon + 1, n, &exception)) return XRT_PROTOCOL_ERROR;
-            }
-            else if ((key == 4 && !memcmp(packet + at, "fork", 4)) ||
+            } else if ((key == 4 && !memcmp(packet + at, "fork", 4)) ||
                      (key == 5 && !memcmp(packet + at, "vfork", 5)) ||
                      (key == 4 && !memcmp(packet + at, "exec", 4))) {
                 t->state = XRT_STOPPED; t->identity_admitted = 0; ++t->generation;
@@ -719,9 +751,47 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             at = (size_t)(end - packet) + 1;
         }
     }
+    if (stop.has_exception && stop.exception == 1 && stop.code_count >= 2) {
+        if (has_fault && fault != stop.codes[1])
+            return problem(g, XRT_PROTOCOL_ERROR, "GDB fault register contradicts Mach exception address");
+        fault = stop.codes[1]; has_fault = true;
+    }
+    g->info.stop_tid = 0;
+    g->info.has_exception = stop.has_exception;
+    g->info.exception_type = stop.exception;
+    g->info.exception_count = stop.code_count;
+    memcpy(g->info.exception_codes, stop.codes, sizeof(stop.codes));
+    g->info.has_fault = stop.has_exception && stop.exception == 1 && has_fault;
+    g->info.fault_address = g->info.has_fault ? fault : 0;
+    g->info.pending_delivery = false;
     bool stepping = t->stepping;
     t->state = XRT_STOPPED; t->stepping = t->want_run = false; g->selected = 0;
     ++t->generation;
+    if (stop.exec) {
+        /* All old probes belonged to the replaced address space. Never
+         * unplant their bytes or retain their step/rearm state. */
+        t->identity_admitted = 0; t->breakpoint_count = 0; t->thread_count = 0;
+        memset(t->watchpoints, 0, sizeof(t->watchpoints));
+        memset(&t->plant_cleanup, 0, sizeof(t->plant_cleanup));
+        t->inherited_rearm = t->watchpoints_dirty = t->watch_cancelled = false;
+        g->rearm = 0; g->rewatch = false; g->watch_tid = 0;
+        memset(g->watch_armed, 0, sizeof(g->watch_armed));
+        g->thread_count = g->thread_info_count = 0;
+        g->pending_signal = 0; g->signal_tid = 0; g->unmapped_signal = false;
+        ++t->image_epoch;
+        event(t, XRT_EVENT_IMAGE_REPLACED, t->pid, (int64_t)t->image_epoch);
+        struct xrt_gdb_host current = {0};
+        enum xrt_status admission = query(g, "qProcessInfo");
+        if (admission != XRT_OK) return admission;
+        if (xrt_gdb_process_parse((char *)g->reply, g->length, &current) != XRT_OK ||
+            current.os != XRT_GDB_OS_DARWIN || current.pid != g->process ||
+            current.cputype != g->host.cputype || !t->arch ||
+            current.pointer_size * 8 != t->arch->address_bits || !current.has_endian ||
+            current.little_endian != (t->arch->little_endian != 0))
+            return problem(g, XRT_UNSUPPORTED_ARCHITECTURE, "GDB exec changed or omitted the admitted process architecture");
+        t->identity_admitted = 1;
+        stepping = false;
+    }
     if (!has_thread) {
         enum xrt_status status = query(g, "qC");
         if (status != XRT_OK) return status;
@@ -730,6 +800,8 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
     }
     int32_t tid = 0;
     enum xrt_status status = threads(g, t);
+    if (status != XRT_OK) return status;
+    status = refresh_thread_info(g);
     if (status != XRT_OK) return status;
     if (has_thread) {
         if (g->info.supported & XRT_GDB_CAP_THREADS) {
@@ -749,7 +821,10 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         t->threads[i].state = XRT_STOPPED; t->threads[i].reason = XRT_STOP_NONE;
         t->threads[i].signal = 0; t->threads[i].breakpoint_address = 0;
     }
-    enum xrt_stop_reason reason = initial ? XRT_STOP_EXEC : XRT_STOP_SIGNAL;
+    g->info.stop_tid = tid;
+    enum xrt_stop_reason reason = initial || stop.exec ? XRT_STOP_EXEC : XRT_STOP_SIGNAL;
+    if (!initial && !stop.exec && stop.has_exception && stop.exception != 5)
+        reason = XRT_STOP_EXCEPTION;
     if (!initial && stepping && signal == 5) reason = XRT_STOP_SINGLE_STEP;
     if (!initial && g->interrupt &&
         (signal == 2 || (g->host.os == XRT_GDB_OS_DARWIN && signal == 17 /* its SIGSTOP */))) {
@@ -767,9 +842,6 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
             return problem(g, XRT_UNSUPPORTED_CONTROL, "GDB signal has no host display mapping; explicit suppression is required to resume");
         }
         t->threads[index].signal = native; g->pending_signal = signal; g->signal_tid = tid;
-        /* A Mach EXC_BREAKPOINT (6) is shown as SIGTRAP but was never raised
-         * as a signal: resuming must not deliver one. */
-        if (exception == 6) g->pending_signal = 0;
     }
     if (g->watch_tid && thread_index(g, g->watch_tid) < 0) g->watch_tid = 0;
     struct xrt_registers regs; uint64_t pc = 0; bool known_pc = false;
@@ -818,6 +890,7 @@ static enum xrt_status publish_stop(struct xrt_gdb *g, struct xrt_target *t,
         }
         if (!g->step_after_rearm && reason == XRT_STOP_SINGLE_STEP) return send_run(g, t, tid, false);
     }
+    g->info.pending_delivery = g->pending_signal != 0;
     event(t, reason == XRT_STOP_SINGLE_STEP ? XRT_EVENT_STEP_COMPLETE : XRT_EVENT_STOP, tid, signal);
     t->events[t->event_count - 1].pc_known = known_pc;
     t->events[t->event_count - 1].pc = known_pc ? pc : 0;
@@ -837,6 +910,16 @@ static enum xrt_status poll_stop(struct xrt_gdb *g, struct xrt_target *t, bool w
     if (!saved) return XRT_OUT_OF_MEMORY;
     size_t size = g->length; memcpy(saved, g->reply, size);
     status = publish_stop(g, t, saved, size, false);
+    if (status == XRT_PROTOCOL_ERROR) {
+        /* A received but malformed stop cannot leave stale threads looking
+         * runnable. No further decoding or control is safe on this link. */
+        t->identity_admitted = 0; t->state = XRT_STOPPED;
+        t->stepping = t->want_run = false; t->thread_count = 0;
+        g->thread_count = g->thread_info_count = 0; g->info.stop_tid = 0;
+        g->pending_signal = 0; g->bank_valid = false;
+        ++t->generation; g->link.failed = true;
+        snprintf(g->info.reason, sizeof(g->info.reason), "Malformed GDB stop; reconnect required");
+    }
     free(saved); return status;
 }
 static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
@@ -877,10 +960,22 @@ enum xrt_status xrt_gdb_health(const struct xrt_gdb *g)
 void xrt_gdb_info(const struct xrt_gdb *g, struct xrt_gdb_info *out)
 {
     *out = g->info;
+    out->pending_delivery = g->pending_signal != 0;
     out->packet_size = (uint32_t)g->link.packet_size;
     out->register_count = g->description.count;
     out->os = g->host.os;
     out->address_bits = g->host.address_bits;
+}
+enum xrt_status xrt_gdb_thread_info(const struct xrt_gdb *g, int32_t tid, struct xrt_gdb_thread_info *out)
+{
+    int index = thread_index(g, tid);
+    if (index < 0) return XRT_UNKNOWN_THREAD;
+    if (!(g->info.supported & XRT_GDB_CAP_THREAD_INFO)) return XRT_TASK_INFO_UNAVAILABLE;
+    for (size_t i = 0; i < g->thread_info_count; ++i) if (g->thread_info[i].remote_tid == g->threads[index].tid) {
+        *out = g->thread_info[i];
+        return XRT_OK;
+    }
+    return XRT_TASK_INFO_UNAVAILABLE;
 }
 void xrt_gdb_abandon(struct xrt_gdb *g) { xrt_gdb_disconnect(&g->link); }
 void xrt_gdb_free(struct xrt_gdb *g)
@@ -939,7 +1034,7 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     g->vcont_signal_step = feature((char *)g->reply, "S");
     if (g->vcont_step) g->info.supported |= XRT_GDB_CAP_STEP;
     else g->info.unsupported |= XRT_GDB_CAP_STEP;
-    g->info.unsupported |= XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES;
+    g->info.unsupported |= XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES | XRT_GDB_CAP_THREAD_INFO;
     if (g->native_signals) {
         /* An LLDB-family stub. Its host and process descriptions select the
          * signal table and stand in for what target.xml leaves out. */
@@ -958,7 +1053,7 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
         if (g->host.pid && !g->multiprocess) g->process = g->host.pid;
     }
     if (g->host.os == XRT_GDB_OS_DARWIN) {
-        g->info.unsupported &= ~(XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES);
+        g->info.unsupported &= ~(XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES | XRT_GDB_CAP_THREAD_INFO);
         status = query(g, "qWatchpointSupportInfo:");
         if (status != XRT_OK) goto fail;
         uint64_t slots = 0;

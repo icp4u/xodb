@@ -18,6 +18,10 @@ pub const Context = struct {
     allow_stack_prefix: bool = false,
     frame_base: ?u64 = null,
     load_bias: u64 = 0,
+    /// Object-file DWARF may need a verified per-symbol mapping instead of
+    /// one load bias. Applies only to DW_OP_addr, never register/stack values.
+    image_address: ?*const fn (*const anyopaque, u64) anyerror!u64 = null,
+    image_user: ?*const anyopaque = null,
     user: *anyopaque,
     read: *const fn (*anyopaque, u64, []u8) anyerror!usize,
 };
@@ -52,7 +56,7 @@ pub fn evaluate(ctx: Context, ops: []const Op) !Place {
         if (count == stack.len) return error.ExpressionTooDeep;
         switch (op.atom) {
             OP.addr => {
-                stack[count] = std.math.add(u64, op.number, ctx.load_bias) catch return error.InvalidAddress;
+                stack[count] = if (ctx.image_address) |resolve| try resolve(ctx.image_user orelse return error.InvalidAddress, op.number) else std.math.add(u64, op.number, ctx.load_bias) catch return error.InvalidAddress;
                 count += 1;
             },
             OP.lit0...OP.lit31 => {

@@ -234,6 +234,11 @@ int main(int argc, char **argv, char **envp) {
     } else if (!strcmp(mode, "memfdextra")) { /* a harmless executable memfd beside the real runtime */
         int fd = memfd_create("jit", 0); if (ftruncate(fd, 8192)) DIE("truncate");
         if (mmap(NULL, 8192, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0) == MAP_FAILED) DIE("memfd map");
+    } else if (!strcmp(mode, "deletedextra")) { /* deleted executable scratch mapping beside the real runtime */
+        char path[] = "/tmp/xodb-jit-XXXXXX";
+        int fd = mkstemp(path); if (fd < 0 || ftruncate(fd, 8192)) DIE("deleted truncate");
+        if (mmap(NULL, 8192, PROT_READ | PROT_EXEC, MAP_SHARED, fd, 0) == MAP_FAILED) DIE("deleted map");
+        if (unlink(path)) DIE("deleted unlink");
     } else if (strcmp(mode, "none") && strcmp(mode, "idle") && strcmp(mode, "both") && strcmp(mode, "threads") && strcmp(mode, "transition") && strcmp(mode, "memfd") && strcmp(mode, "forged") && strcmp(mode, "leafra")) DIE("unknown mode %s", mode);
     if (!strcmp(mode, "forged")) {
         if (!second || sem_init(&forge_ready, 0, 0)) DIE("forge setup");

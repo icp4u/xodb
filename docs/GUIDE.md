@@ -22,6 +22,7 @@ detailed docs. If you just want to try something, jump to
 | Understand why *some* calls to a function are slow | **Observation** (a recipe) | Every call timed, with its arguments, and fast vs slow compared |
 | Open Python, Ruby or JVM logical stacks | **Logical frames** (`--open-frames FILE`, **L**) | Exact observation counts, source locations and collection provenance, separate from native stacks |
 | See which GDScript function a Godot or Redot game is in | **GDScript** tab (`REDOT=ENGINE scripts/demo-redot`; MCP `get_language_stack` with `gdscript`) | The script call stack with `res://` path and line, each level paired with its native engine frame; read from a running debug-enabled game, no engine debugger needed ([details](GDSCRIPT.md)) |
+| Read a GDScript function's locals and its node's members | **GDScript** tab, click a level, **E** `inventory["sword"].damage`, **Return** (`scripts/demo-redot values`; MCP `get_language_locals`, `evaluate_language_expression`) | Parameters, locals, `self` and script members with Variant previews: containers with size and first elements, objects with class, id, node path and script; paths step into them. Read from memory, nothing evaluated ([details](GDSCRIPT.md#values)) |
 | Read Lua locals by name | **Lua** tab, click a Lua frame, **E** `count`, **Return** | Active locals and upvalues from this stop; innermost lexical binding wins; no target execution |
 | Read Lua values and coroutine stacks at a native stop | **Lua view** (`scripts/demo-lua`, **E** `L`; MCP `get_language_stack`) | Bounded values and source lines from stopped memory; separate coroutine observations ([details](LUA.md)) |
 | Label JIT code in a native profile | **JIT evidence** (MCP import, then **I** in the profile) | Time-aware names, candidate citations and explicit ambiguity; raw PCs stay intact |
@@ -130,12 +131,15 @@ stopped-memory reader verifies a runtime, its tab appears. **Tab** cycles the
 visible tabs; clicking a tab selects it. The version and layout proof appear
 above that runtime's logical stack, including explicit reasons when the stop
 has no proved language frame. Selection survives stops and stays local to each
-debugged process. Python/Perl tabs marked **?** and "runtime not seen executing" have a usable
-layout but no stopped interpreter-frame witness. This is normal for an idle
+debugged process. Python/Perl tabs marked **?** have a usable layout but no
+stopped interpreter-frame witness; selecting one shows the quiet
+"runtime not seen executing" explanation. This is normal for an idle
 embedded interpreter. A language stack still requires evidence on its requested
-thread. Two or more discoverable candidates make the process tab refuse as
-ambiguous, regardless of witnesses. Python thread stacks, locals, expressions
-and frame watches also refuse when more than one candidate is visible. MCP tabs and decoded previews expose `identity: witnessed|unwitnessed`;
+thread. With several discoverable candidates, a sole image witnessed by stopped
+threads supplies the process tab; none or several witnessed images are
+ambiguous: the pane then shows "Several runtimes loaded" instead of a tab, while
+MCP thread requests still answer. Python and Perl thread stacks, locals, expressions and frame watches
+use the image witnessed on that thread. MCP tabs and decoded previews expose `identity: witnessed|unwitnessed`;
 Python/Perl stack and named-local results carry `identity: witnessed`. Runtime
 watches expose the observation's `runtime.identity` and generation separately
 from their existing frame-lifetime explanation in `identity`. A watch without a
@@ -351,6 +355,7 @@ What it does **not** do:
 | Inside a Rails model | `XODB_RAILS_GEMS=DIR ./scripts/demo-rails` (activemodel installed in DIR, see [Ruby](RUBY.md#rails-demo)) | **Space**, **Tab** to **Ruby**, click **checkout!**, **E** `attrs` **Return**; click **valid?** for `validations.rb:367`; back on **checkout!**, **Shift+E** `attrs[:line_items][0][:price]` **Return**, then **Space**. |
 | Goroutines in a Go program | `./scripts/demo-go` | **Space**, **Go**, select **main.blocked** for a goroutine parked on a mutex; workers sit in `select`, one goroutine sleeps. **C/C++** shows `label`, `items` (len/cap) and `first` (struct). |
 | Inside a Redot or Godot 4 game | `REDOT=ENGINE ./scripts/demo-redot` (a debug-enabled engine binary with DWARF) | **Space**, **Tab** to **GDScript**: `leaf` ← `step` ← `plan` ← `_process` with `res://` path:line, each over its native `GDScriptFunction::call` frame; click **plan**. In a second terminal `./scripts/demo-redot stack` prints the script stack and the labelled native stack |
+| Script state of a Redot or Godot 4 game | `REDOT=ENGINE ./scripts/demo-redot values` | **Space**, **Tab** to **GDScript**, click **swing**: `weapon`, `power`, `damage`, `tags`, `aim`, then `self` and the player's members. **E** `inventory["sword"].damage` **Return** gives `12`. Click **_process** for one value of every Variant type. `./scripts/demo-redot locals` prints every level. [Walkthrough](DEMOS.md#redot--godot-script-state-of-a-running-game) |
 | Inside Emacs Lisp | `./scripts/demo-emacs` | **Space**, **Elisp**, select **xodb-demo-checkpoint** for its label; nearby **let** rows show task titles, points and dynamic stage. **Space** visits two items, rendering, then a handled error. [Walkthrough](ELISP.md#try-the-demo). |
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |

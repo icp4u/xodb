@@ -1456,8 +1456,15 @@ pub const Session = struct {
         return .{ .generation = self.target.snapshot().generation, .image_epoch = self.target.snapshot().image_epoch, .module_id = module.id, .symbol = try a.dupe(u8, function_name), .link_address = link, .extent_source = extent_source, .range_index = range_index, .range_count = range_count, .graph = graph };
     }
     pub fn sourceAt(self: *Session, a: std.mem.Allocator, address: u64) !info.Site {
-        try self.refreshMaps();
         var site = blk: {
+            if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+                try self.gdb_map.refreshImages(&self.target);
+                const debug = try self.gdb_map.debugAt(address, self.debug_files.roots.items);
+                var result = try debug.info.siteAt(a, debug.link);
+                result.address = try debug.runtimeAddress(result.address);
+                break :blk result;
+            };
+            try self.refreshMaps();
             const module = self.modules.at(address) catch |err| {
                 if (err != error.PeDebugInfoUnavailable) return err;
                 break :blk try (try self.modules.peAt(address)).sourceAt(a, address);
@@ -1582,65 +1589,89 @@ pub const Session = struct {
         try self.gdb_map.refresh(&self.target);
         return &self.gdb_map;
     }
-    /// Mach-O unwind data is not read by this build. AArch64 Darwin code keeps
-    /// frame records, so walk them: [fp] holds the caller's fp and [fp+8] its
-    /// return address. UUID-matched Mach-O files may supply frame labels;
-    /// source and unwind metadata still require separate debug-info support.
-    /// A leaf function, or one stopped in its prologue, has not pushed its
-    /// record yet: there x30 is the caller, and is reported as such only when
-    /// no frame setup precedes the PC in the same function.
-    fn framePointerStack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize, address_bits: u32) ![]Frame {
-        const arch_ = self.target.arch();
-        const start = loc.registers(try self.target.registers(tid));
-        // Return addresses of arm64e code carry authentication bits above the address.
-        const mask: u64 = if (address_bits != 0 and address_bits < 64) (@as(u64, 1) << @intCast(address_bits)) - 1 else std.math.maxInt(u64);
-        const reason = @import("gdb_images.zig").image_diagnostic;
-        var frames: std.ArrayList(Frame) = .empty;
-        const pc = start[arch_.pc()] orelse return error.RegisterUnavailable;
-        try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = 0, .pc = pc, .lookup_pc = pc, .registers = start, .unwind_method = "registers", .inline_diagnostic = reason });
-        var fp = start[29] orelse 0;
-        var sp = start[arch_.sp()] orelse fp;
-        const max = @min(64, limit);
-        if (start[30]) |raw| link: {
+    const DarwinFallback = struct { caller: loc.RegisterSet, cfa: ?u64, method: []const u8 };
+    fn darwinFallback(self: *Session, registers: loc.RegisterSet, pc: u64, mask: u64, top: bool) !DarwinFallback {
+        const fp = (registers[29] orelse return error.RegisterUnavailable) & mask;
+        if (top) if (registers[30]) |raw| link: {
             const lr = raw & mask;
-            // Scan back at most 32 instructions for this function's frame setup.
             var window: [128]u8 = undefined;
-            if (pc < window.len or lr == 0 or frames.items.len >= max) break :link;
+            if (pc < window.len or lr == 0) break :link;
             if ((self.target.readMemory(pc - window.len, &window) catch break :link) != window.len) break :link;
             var at: usize = window.len;
             const entered = while (at >= 4) : (at -= 4) {
-                const word = std.mem.readInt(u32, window[at - 4 ..][0..4], .little);
-                if (word & 0xffc003ff == 0x910003fd) break true; // add x29, sp, #imm
-                // ret, retaa, retab, or the zero padding before an image's first function.
-                if (word == 0xd65f03c0 or word == 0xd65f0bff or word == 0xd65f0fff or word == 0) break false;
+                const instruction = std.mem.readInt(u32, window[at - 4 ..][0..4], .little);
+                if (instruction & 0xffc003ff == 0x910003fd) break true;
+                if (instruction == 0xd65f03c0 or instruction == 0xd65f0bff or instruction == 0xd65f0fff or instruction == 0) break false;
             } else true;
             if (entered) break :link;
             var caller: loc.RegisterSet = @splat(null);
-            caller[arch_.pc()] = lr;
+            caller[32] = lr;
             caller[29] = fp;
-            caller[arch_.sp()] = sp;
-            try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = 1, .pc = lr, .lookup_pc = arch_.callerLookup(lr) orelse break :link, .registers = caller, .cfa = sp, .unwind_method = "link_register", .inline_diagnostic = reason });
-        }
-        while (frames.items.len < max and fp != 0 and fp % 16 == 0 and fp >= sp) {
-            var pair: [16]u8 = undefined;
-            if ((self.target.readMemory(fp, &pair) catch break) != pair.len) break;
-            const next = std.mem.readInt(u64, pair[0..8], .little);
-            const ret = std.mem.readInt(u64, pair[8..16], .little) & mask;
-            if (ret == 0) break;
-            sp = fp + 16;
-            var caller: loc.RegisterSet = @splat(null);
-            caller[arch_.pc()] = ret;
-            caller[29] = next;
-            caller[arch_.sp()] = sp;
-            // A caller found through x30 is not repeated by the record below it.
-            if (frames.items.len != 2 or frames.items[1].pc != ret or !std.mem.eql(u8, frames.items[1].unwind_method.?, "link_register"))
-                try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = frames.items.len, .pc = ret, .lookup_pc = arch_.callerLookup(ret) orelse break, .registers = caller, .cfa = sp, .unwind_method = "frame_pointer", .inline_diagnostic = reason });
-            fp = next; // The loop condition requires the chain to move up the stack.
-        }
-        self.gdb_map.refreshImages(&self.target) catch |err| {
-            for (frames.items) |*frame| frame.diagnostic = @errorName(err);
-            return frames.toOwnedSlice(a);
+            // A missing frame setup does not prove that SP was unchanged.
+            // Preserve SP only at a DWARF-proven function entry. Otherwise
+            // the next FP record can recover it without guessing stack locals.
+            var cfa: ?u64 = null;
+            if (self.gdb_map.debugAt(pc, self.debug_files.roots.items)) |debug| {
+                var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer arena.deinit();
+                if (debug.info.functionRangeAt(arena.allocator(), debug.link)) |range| {
+                    if (range.address == debug.link) cfa = registers[31];
+                } else |_| {}
+            } else |_| {}
+            caller[31] = cfa;
+            return .{ .caller = caller, .cfa = cfa, .method = "link_register" };
         };
+        if (fp == 0 or fp % 16 != 0 or (registers[31] != null and fp < registers[31].?)) return error.InvalidFrame;
+        var pair: [16]u8 = undefined;
+        if (try self.target.readMemory(fp, &pair) != pair.len) return error.MemoryUnreadable;
+        const next = std.mem.readInt(u64, pair[0..8], .little) & mask;
+        const ret = std.mem.readInt(u64, pair[8..16], .little) & mask;
+        if (ret == 0 or (next != 0 and next <= fp)) return error.InvalidFrame;
+        const cfa = std.math.add(u64, fp, 16) catch return error.InvalidFrame;
+        var caller: loc.RegisterSet = @splat(null);
+        caller[32] = ret;
+        caller[29] = next;
+        caller[31] = cfa;
+        return .{ .caller = caller, .cfa = cfa, .method = "frame_pointer" };
+    }
+    /// Prefer precise EH CFI, then established compact frames. The explicit
+    /// link-register/frame-pointer fallback remains for incomplete metadata.
+    fn framePointerStack(self: *Session, a: std.mem.Allocator, tid: i32, limit: usize, address_bits: u32) ![]Frame {
+        const arch_ = self.target.arch();
+        var registers = loc.registers(try self.target.registers(tid));
+        const mask: u64 = if (address_bits != 0 and address_bits < 64) (@as(u64, 1) << @intCast(address_bits)) - 1 else std.math.maxInt(u64);
+        var frames: std.ArrayList(Frame) = .empty;
+        const map_failure: ?anyerror = if (self.gdb_map.refreshImages(&self.target)) |_| null else |err| err;
+        while (frames.items.len < @min(64, limit)) {
+            const pc = (registers[32] orelse break) & mask;
+            if (pc == 0) break;
+            const lookup = if (frames.items.len == 0) pc else arch_.callerLookup(pc) orelse break;
+            const repeated = for (frames.items) |previous| {
+                if (previous.pc == pc and previous.registers[29] == registers[29] and previous.registers[31] == registers[31]) break true;
+            } else false;
+            if (repeated) break;
+            try frames.append(a, .{ .architecture = arch_, .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = lookup, .registers = registers, .unwind_method = "registers" });
+            const frame = &frames.items[frames.items.len - 1];
+            if (map_failure) |err| frame.diagnostic = @errorName(err);
+            var context = LocalContext{ .session = self };
+            const step = if (map_failure == null) self.gdb_map.unwind(a, lookup, self.debug_files.roots.items, .{ .registers = registers, .user = &context, .read = LocalContext.read }, mask, frames.items.len == 1) else error.MachOUnwindInfoUnavailable;
+            if (step) |result| {
+                frame.cfa = result.cfa;
+                frame.unwind_method = @tagName(result.method);
+                if (result.outermost) break;
+                registers = result.caller;
+            } else |unwind_error| {
+                if (unwind_error == error.MachOSymbolsPending) frame.diagnostic = "MachOSymbolsPending";
+                const fallback = self.darwinFallback(registers, pc, mask, frames.items.len == 1) catch |err| {
+                    frame.diagnostic = @errorName(err);
+                    break;
+                };
+                frame.cfa = fallback.cfa;
+                frame.unwind_method = fallback.method;
+                registers = fallback.caller;
+            }
+        }
+        if (map_failure != null) return frames.toOwnedSlice(a);
         for (frames.items) |*frame| {
             const label = self.gdb_map.label(a, frame.pc, frame.lookup_pc, self.debug_files.roots.items) catch |err| {
                 frame.diagnostic = @errorName(err);
@@ -1649,9 +1680,17 @@ pub const Session = struct {
             if (label) |name| {
                 frame.symbol = name.name;
                 frame.module_id = name.module;
-                frame.diagnostic = name.diagnostic;
+                if (frame.diagnostic == null) frame.diagnostic = name.diagnostic;
                 frame.inline_diagnostic = "MachODebugInfoUnavailable";
             }
+            frame.source = self.sourceAt(a, frame.lookup_pc) catch null;
+            if (self.gdb_map.debugAt(frame.lookup_pc, self.debug_files.roots.items)) |debug| {
+                frame.inline_frames = debug.info.inlineAt(a, debug.link) catch |err| {
+                    frame.inline_diagnostic = @errorName(err);
+                    continue;
+                };
+                frame.inline_diagnostic = null;
+            } else |err| frame.inline_diagnostic = @errorName(err);
         }
         return frames.toOwnedSlice(a);
     }
@@ -1771,6 +1810,13 @@ pub const Session = struct {
     pub fn frameLocalsAtDepth(self: *Session, a: std.mem.Allocator, frame: Frame, depth: usize) ![]info.Local {
         if (depth > frame.inline_frames.len) return error.InvalidInlineDepth;
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.os == .darwin) {
+            try self.gdb_map.refreshImages(&self.target);
+            const debug = try self.gdb_map.debugAt(frame.lookup_pc, self.debug_files.roots.items);
+            if (debug.info.architecture != frame.architecture) return error.MachODebugArchitectureMismatch;
+            var context = LocalContext{ .session = self };
+            return debug.info.localsAtDepth(a, debug.link, .{ .registers = frame.registers, .cfa = frame.cfa, .image_user = &debug, .image_address = @import("gdb_images.zig").Map.Debug.imageAddress, .user = &context, .read = LocalContext.read, .register_data = LocalContext.register }, depth);
+        };
         const module = try self.modules.at(frame.lookup_pc);
         var context = LocalContext{ .session = self };
         if (self.target.arch() == .x86_64 and frame.index == 0 and frame.tid != 0) context.vector = self.target.extendedRegisters(frame.tid) catch null;

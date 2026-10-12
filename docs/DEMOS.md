@@ -15,6 +15,35 @@ lambda and `condition-case`. **Space** continues; **Shift+Q** quits. See the
 [Emacs walkthrough](ELISP.md#try-the-demo) for executable overrides and current
 limits, or the [Guide's demo table](GUIDE.md#try-it) for other runtimes.
 
+## Redot / Godot: script state of a running game
+
+```sh
+REDOT=path/to/redot.linuxbsd.template_debug.x86_64 scripts/demo-redot values
+```
+
+The engine must be a debug-enabled build with DWARF. The launcher starts a
+small headless game (a player, a target, an inventory) and attaches to it.
+
+1. **Space** stops in the script's `OS.delay_msec()`; **Tab** to **GDScript**.
+   The tab lists `take_hit` ← `swing` ← `act` ← `_process` with `res://`
+   path:line, each over its native `GDScriptFunction::call` frame.
+2. Click **swing**. **NAMED LOCALS** shows `weapon = Dictionary(3) {"damage":
+   12, "tags": Array(2) ["sharp", "steel"], "reach": 1.5}`, `power = 3.0`,
+   `damage = 12`, `tags`, `aim = (6.5, -9.0)`, then `self` and the player's
+   members: `inventory`, `velocity`, `hand` (a child node, with its scene-tree
+   path) and `target` (another scripted node).
+3. **E**, `inventory["sword"].damage`, **Return**: `12`. Try `target.armor`,
+   `velocity.x`, `inventory.potions[-1]`.
+4. Click **_process**: the `Arena` node's members are one value of every
+   Variant type, shown as the engine itself prints them.
+5. In a second terminal, `scripts/demo-redot locals` prints all four levels as
+   text, and `scripts/demo-redot stack` the script stack with the labelled
+   native stack.
+
+Nothing runs in the game and nothing is written to it; the game was started
+without the engine's debugger. See [GDScript](GDSCRIPT.md#values) for value
+formats, paths, what local names need, and limits.
+
 ## Memory: defrag to Gibson
 
 Start `xodb --overview --look win95` for the classic desktop. Select an owned

@@ -11,7 +11,7 @@
 //! virtual observations; vmstat activity is system-wide, never attributed to
 //! the selected process.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 
 pub const schema = "xodb-memdefrag/1";
 pub const default_cell: u64 = 2 * 1024 * 1024;

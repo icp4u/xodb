@@ -204,9 +204,14 @@ def main():
                     'tests/fixtures/pe/runtime-binding.c', '-ldl', '-pthread', '-o', str(exe)], check=True, timeout=60*scale)
     rows = []
     began = time.monotonic()
-    cases = [('pehdr', 'twin'), ('anon', 'twin'), ('forged', 'twin'), ('leafra', 'twin')]
+    # The fast lane covers cooperative targets: ordinary JIT mappings beside
+    # one runtime, and two loaded runtimes whose stopped threads identify the
+    # instance they use. Hostile mapping/return-address cases stay periodic.
+    cases = [('memfdextra', 'none'), ('deletedextra', 'none'), ('none', 'twin'), ('both', 'twin')]
     if a.matrix:
-        cases += [('none', 'none'), ('none', 'twin'), ('idle', 'none'), ('idle', 'twin'), ('both', 'twin'), ('threads', 'none'), ('stripped', 'none'), ('transition', 'none')]
+        cases += [('pehdr', 'twin'), ('anon', 'twin'), ('forged', 'twin'), ('leafra', 'twin'),
+                  ('none', 'none'), ('idle', 'none'), ('idle', 'twin'),
+                  ('threads', 'none'), ('stripped', 'none'), ('transition', 'none')]
     if a.only:
         requested_language, mode, decoy = a.only.split(':')
         cases = [(mode, decoy)]
@@ -269,6 +274,10 @@ def main():
                                 continue
                             matching = [line.split() for line in maps if int(line.split('-')[0], 16) <= int(lo, 0) < int(line.split()[0].split('-')[1], 16)]
                             check(matching and all(fields[4] == '0' for fields in matching), 'executing real image is anonymous')
+                    if mode == 'memfdextra':
+                        check(any('memfd:jit' in line and 'x' in line.split()[1] for line in maps), 'executable JIT memfd observed beside runtime')
+                    if mode == 'deletedextra':
+                        check(any('xodb-jit-' in line and '(deleted)' in line and 'x' in line.split()[1] for line in maps), 'deleted executable mapping observed beside runtime')
                     options = ['--attach', str(target.pid)]
                     if a.agent:
                         options += ['--runtime-agent', str(a.agent.resolve())]
@@ -308,19 +317,13 @@ def main():
                         row['forged_twin_frame_seen'] = True
                         row['main_frames'] = frames
                         row['forged_leaf_return_observed'] = True
-                        refused = client.tool('get_language_stack', language=language, tid=target.pid)['result']
-                        expected = 'PythonRuntimeAmbiguous' if language == 'python' else 'PerlValueRuntimeAmbiguous'
-                        if a.wrong_result:
-                            refused = {'isError': False, 'structuredContent': {'identity': 'witnessed'}}
-                        check(refused.get('isError') and refused['content'][0]['text'] == expected, refused)
-                        if language == 'python':
-                            generation = client.session()['generation']
-                            request = dict(language=language, generation=generation, tid=target.pid, segment=0, frame=0)
-                            for tool, extra in [('get_language_locals', {}), ('evaluate_language_expression', {'expression':'held'}), ('add_language_watch', {'expression':'held'})]:
-                                denied = client.tool(tool, **request, **extra)['result']
-                                check(denied.get('isError') and denied['content'][0]['text'] == expected, (tool, denied))
-                            check(not client.inspect('get_language_watches')['watches'], 'refused watch left no binding')
-                            row['thread_refusals'] = ['stack', 'locals', 'expression', 'watch']
+                        if language == 'perl' and real_seen:
+                            refused = client.tool('get_language_stack', language=language, tid=target.pid)['result']
+                            check(refused.get('isError') and refused['content'][0]['text'] == 'PerlValueRuntimeAmbiguous', refused)
+                        else:
+                            specific = client.inspect('get_language_stack', language=language, tid=target.pid)
+                            check(specific['identity'] == 'witnessed' and specific['segments'], specific)
+                            check(all(seg['runtime']['build_id'] == bait_id for seg in specific['segments']), 'thread follows its witnessed runtime image')
                     if mode == 'forged':
                         forged_frames = native_stack(client, ranges['forged_tid'], scale)['frames']
                         forged_pcs = [int(f['lookup_pc'], 0) if isinstance(f['lookup_pc'], str) else f['lookup_pc'] for f in forged_frames]
@@ -331,7 +334,7 @@ def main():
                         check(any(str(bait) in line and 'x' in line.split()[1] for line in maps), 'twin still discoverable')
                         row['forged_twin_frame_seen'] = True
                         refused = client.tool('get_language_stack', language=language, tid=target.pid)['result']
-                        expected = 'PythonRuntimeAmbiguous' if language == 'python' else 'PerlInterpreterFrameUnavailable'
+                        expected = language.title()+'InterpreterFrameUnavailable'
                         check(refused.get('isError') and refused['content'][0]['text'] == expected, refused)
                     if mode == 'both':
                         other_pcs = []
@@ -343,12 +346,11 @@ def main():
                         for thread in client.session()['threads']:
                             native_ = native_stack(client, thread['tid'], scale)['frames']
                             pcs_ = [int(f['lookup_pc'], 0) if isinstance(f['lookup_pc'], str) else f['lookup_pc'] for f in native_]
-                            expected_id = bait_id if any(inside(pc, ranges['twin']) for pc in pcs_) else real_id
-                            if language == 'python':
-                                refused = client.tool('get_language_stack', language=language, tid=thread['tid'])['result']
-                                check(refused.get('isError') and refused['content'][0]['text'] == 'PythonRuntimeAmbiguous', refused)
-                                thread_stacks.append(expected_id)
+                            owns_twin = any(inside(pc, ranges['twin']) for pc in pcs_)
+                            owns_real = any(inside(pc, ranges['real']) for pc in pcs_)
+                            if not owns_twin and not owns_real:
                                 continue
+                            expected_id = bait_id if owns_twin else real_id
                             specific = client.inspect('get_language_stack', language=language, tid=thread['tid'])
                             check(specific['identity'] == 'witnessed' and specific['segments'], specific)
                             check(all(seg['runtime']['build_id'] == expected_id for seg in specific['segments']), 'thread binds its own executing image')
@@ -359,19 +361,15 @@ def main():
                     if mode != 'leafra':
                         check(real_seen == (mode not in ('idle', 'forged')), ('fixture execution evidence', mode, pcs, ranges))
                     if a.wrong_result:
-                        tab = dict(tab, status='ready', identity='witnessed')
+                        ambiguous_tab = mode in ('both', 'idle') or (mode == 'leafra' and language == 'perl')
+                        tab = dict(tab, status='ready', identity='witnessed', reason=None, build_id=real_id) if ambiguous_tab else dict(tab, status='unavailable', reason=language.title()+'RuntimeAmbiguous')
                     row.update(tab=tab, real_frame_seen=real_seen, twin_frame_seen=twin_seen,
                                calls=calls, worst_call_seconds=worst_call,
                                resources_before=before, resources_after={name: usage(pid) for name, pid in measured.items()})
-                    if mode in ('both', 'none', 'idle', 'forged', 'leafra') and kind == 'twin':
+                    if (mode in ('both', 'idle') and kind == 'twin') or (mode == 'leafra' and language == 'perl'):
                         check(tab['status'] == 'unavailable' and tab['reason'].endswith('Ambiguous'), tab)
-                        if language == 'python':
-                            refused = client.tool('get_language_stack', language=language, tid=target.pid)['result']
-                            check(refused.get('isError') and refused['content'][0]['text'] == 'PythonRuntimeAmbiguous', refused)
-                        elif mode == 'none':
-                            stack = client.inspect('get_language_stack', language=language, tid=target.pid)
-                            check(stack['identity'] == 'witnessed' and stack['segments'], stack)
-                            check(all(segment['runtime']['build_id'] == real_id for segment in stack['segments']), stack)
+                    elif mode in ('forged', 'leafra') and kind == 'twin':
+                        check(tab['status'] == 'ready' and tab['identity'] == 'witnessed' and tab['build_id'] == bait_id, tab)
                     elif mode in ('pehdr', 'anon', 'idle'):
                         check(tab['status'] == 'unwitnessed' and tab['identity'] == 'unwitnessed' and tab['reason'] == 'RuntimeNotSeenExecuting', tab)
                         check(tab['visible'] and tab['proof_generation'] is None, tab)

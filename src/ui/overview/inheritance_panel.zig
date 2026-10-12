@@ -1,6 +1,6 @@
 //! Parent/child descriptor comparison; all matching and accounting is C-owned.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 const vw = @import("view.zig");
 const draw = @import("draw.zig");
 const fm = @import("files_model.zig");

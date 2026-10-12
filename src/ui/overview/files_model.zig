@@ -1,7 +1,7 @@
 //! Owned presentation snapshot of the shared background descriptor collector.
 //! Rendering never holds the collector's publication lock or scans procfs.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 const system = @import("../../model/system.zig");
 const Collector = system.Collector;
 pub const Mode = enum { files, processes, leaks, deleted, events };

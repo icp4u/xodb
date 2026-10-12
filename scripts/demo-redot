@@ -1,17 +1,22 @@
 #!/usr/bin/env bash
-# Redot / Godot 4 demo: the GDScript call stack of a running game, read from
-# stopped memory and joined to the engine's native stack. Nothing runs in the
-# game and nothing is written to it.
+# Redot / Godot 4 demo: the GDScript call stack of a running game and the
+# values in it, read from stopped memory and joined to the engine's native
+# stack. Nothing runs in the game and nothing is written to it.
 #
 #   REDOT=ENGINE scripts/demo-redot [XODB OPTIONS]   GUI attached to a small game
+#   REDOT=ENGINE scripts/demo-redot values [...]     the same with a game that has
+#                                                    state to look at: a player, its
+#                                                    inventory, one value of every type
 #   scripts/demo-redot stack                         from another terminal, while
 #                                                    stopped: print the script stack
 #                                                    and each level's native frame
+#   scripts/demo-redot locals [LEVEL]                and each level's parameters,
+#                                                    locals and members
 #
 # REDOT is the engine binary: a debug-enabled build with DWARF (an editor or a
 # template_debug binary built with debug_symbols=yes). GODOT is accepted too.
 # REDOT_PROJECT=DIR runs another project; the default is a copy of
-# tests/fixtures/redot. Binary order: XODB, ./zig-out/bin/xodb, xodb on PATH.
+# tests/fixtures/redot (tests/fixtures/redot-values for `values`). Binary order: XODB, ./zig-out/bin/xodb, xodb on PATH.
 set -euo pipefail
 demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$demo_root"
@@ -19,12 +24,12 @@ cd "$demo_root"
 session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-redot-$(id -u)"
 socket="$session_dir/session.sock"
 
-if [[ "${1-}" == stack ]]; then
+if [[ "${1-}" == stack || "${1-}" == locals ]]; then
     if [[ ! -S "$socket" ]]; then
         printf '%s\n' "No running demo session at $socket; start scripts/demo-redot first" >&2
         exit 1
     fi
-    exec python3 - "$socket" <<'PY'
+    exec python3 - "$socket" "$1" "${2-}" <<'PY'
 import json, shutil, socket, subprocess, sys, time
 connection = socket.socket(socket.AF_UNIX)
 connection.connect(sys.argv[1])
@@ -65,6 +70,36 @@ if not stack['in_script'] and not segment['reason']:
     print(f'GDScript on thread {tid}: not in script code at this stop. Press Space in xodb and run this again.')
     sys.exit(0)
 print(f"GDScript on thread {tid}: {segment['depth']} level{'' if segment['depth'] == 1 else 's'}, {segment['state']}{' (' + segment['reason'] + ')' if segment['reason'] else ''}")
+if sys.argv[2] == 'locals':
+    # Each level's parameters and locals, then self and its members, with the
+    # first children of containers and objects one step in.
+    chosen = [int(sys.argv[3])] if sys.argv[3] else range(len(segment['frames']))
+    for index in chosen:
+        if not 0 <= index < len(segment['frames']):
+            sys.exit(f"There is no level {index}: {len(segment['frames'])} listed")
+        frame = segment['frames'][index]
+        print(f"#{index} {frame['name']}  {frame['file']}:{frame['line']}")
+        start = 0
+        while True:
+            reply = call('tools/call', {'name': 'get_language_locals', 'arguments': dict(generation=stack['generation'], language='gdscript', tid=tid, segment=0, frame=index, start=start)})
+            if 'error' in reply or reply['result'].get('isError'):
+                print('    ' + (reply['error']['message'] if 'error' in reply else reply['result']['content'][0]['text']))
+                break
+            page = reply['result']['structuredContent']
+            if start == 0 and page['diagnostic']:
+                print(f"    ({page['diagnostic']})")
+            for row in page['rows']:
+                value = row['value']
+                print(f"    {row['scope']:<9} {row['name']} = {value['display']}" + (f"   [{value['diagnostic']}]" if value['diagnostic'] else ''))
+                # self's members follow as rows of their own.
+                for item in value['children'][:6] if row['scope'] != 'context' else []:
+                    print(f"                  {item['key']}: {item['display']}")
+                if row['scope'] != 'context' and value['count'] is not None and value['count'] > 6 and value['children']:
+                    print(f"                  ... {value['count']} in all")
+            start += len(page['rows'])
+            if start >= page['total'] or not page['rows']:
+                break
+    sys.exit(0)
 native = tool('get_stack', tid=tid)['frames']
 names = [frame['symbol'] or '(unnamed)' for frame in native]
 if shutil.which('c++filt'):
@@ -88,6 +123,11 @@ if len(native) > last + 4:
 PY
 fi
 
+fixture=tests/fixtures/redot
+if [[ "${1-}" == values ]]; then
+    fixture=tests/fixtures/redot-values
+    shift
+fi
 engine=${REDOT:-${GODOT:-}}
 if [[ -z "$engine" ]]; then
     cat >&2 <<'NEED'
@@ -119,7 +159,7 @@ else
     # The engine may keep a cache beside a project: run a private copy.
     project="$session_dir/project"
     rm -rf "$project"
-    cp -r tests/fixtures/redot "$project"
+    cp -r "$fixture" "$project"
 fi
 if [[ ! -f "$project/project.godot" ]]; then
     printf '%s\n' "$project has no project.godot" >&2
@@ -153,6 +193,17 @@ for _ in $(seq 300); do
     grep -q '^ORACLE stack ' "$session_dir/game.log" && break
     sleep 0.1
 done
+if [[ "$fixture" == tests/fixtures/redot-values ]]; then
+    cat >&2 <<'TIPS'
+Try: Space (run to the next script call of OS.delay_msec) · Tab to GDScript
+     the tab lists take_hit <- swing <- act <- _process; click swing: NAMED
+     LOCALS shows weapon, power, damage, tags, aim, then self and the player's
+     members (inventory, velocity, hand, target); scroll for more
+     E, then inventory["sword"].damage or target.armor or velocity.x, Return
+     click _process: its members are one value of every Variant type
+     In another terminal: scripts/demo-redot locals   (every level as text)
+TIPS
+else
 cat >&2 <<'TIPS'
 Try: Space (run to the next script call of OS.delay_msec) · Tab to GDScript
      the tab lists leaf <- step <- plan <- _process with res:// path:line, and
@@ -161,6 +212,7 @@ Try: Space (run to the next script call of OS.delay_msec) · Tab to GDScript
      In another terminal: scripts/demo-redot stack   (the same script stack as
      text, and the native stack with each call frame labelled by its function)
 TIPS
+fi
 set -x
 # CoreBind::OS::delay_msec: the engine function behind the script's OS.delay_msec().
 "$xodb" --session-socket "$socket" --image-limit "${each}M" --image-total-limit "${total}M" "$@" --attach "$demo_pid" --break _ZNK8CoreBind2OS10delay_msecEi

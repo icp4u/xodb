@@ -1,6 +1,6 @@
 //! The GPU memory city consumes the same bounded page observations as the 2D map.
 const std = @import("std");
-const c = @import("../../c.zig").api;
+const c = @import("../../c_ui.zig").api;
 const city = @import("city.zig");
 const mm = @import("memmap.zig");
 const vw = @import("view.zig");
@@ -44,7 +44,7 @@ pub fn heldInput(v: *vw.View, keyboard: *const @import("../../platform/input.zig
         s.drag = null;
         s.input_revision = keyboard.focus_revision;
     }
-    const active = enabled and keyboard.focused and !mods.ctrl and !mods.alt and !mods.logo;
+    const active = enabled and keyboard.focused and !mods.ctrl and !mods.alt and !mods.super;
     var held: [5]f32 = @splat(0);
     if (active) {
         const positive = [_]u32{ 'w', 'd', 0xff53, 0xff52, '-' };

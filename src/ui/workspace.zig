@@ -1,8 +1,8 @@
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
-const Window = @import("../platform/wayland.zig").Window;
+const Window = @import("../platform/window.zig").Window;
 const model = @import("../model/session.zig");
 const Session = model.Session;
 const linux = @import("../target/linux.zig");
@@ -88,6 +88,8 @@ pub const Workspace = struct {
     thread_list: @import("thread_list.zig").Panel = .{},
     compatibility_info: @import("../model/compatibility.zig").Info = .{ .kind = .unavailable },
     thread_labels: []const @import("../model/compatibility.zig").Label = &.{},
+    // Hit testing uses the geometry last drawn, never a retired publication.
+    thread_width_fraction: f32 = 0.36,
     inspection_capture: @import("../model/inspection_view.zig").Capture = .{},
     selected_frame: usize = 0,
     last_frame: usize = std.math.maxInt(usize),
@@ -1318,7 +1320,7 @@ pub const Workspace = struct {
             self.status = if (code == 88) "Running until selected frame returns" else "Running to selected source line";
             self.browse_address = null;
         }
-        const stack_x = @as(f32, @floatFromInt(w.width)) * self.split * 0.36;
+        const stack_x = @round(@as(f32, @floatFromInt(w.width)) * self.split * self.thread_width_fraction);
         const stack_y = self.bottomY(@floatFromInt(w.height)) + 44;
         if (click and !self.show_profile and w.pointer_x >= stack_x and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= stack_y and self.frames.len > 0) {
             self.browse_address = null;
@@ -1796,7 +1798,7 @@ pub const Workspace = struct {
             .running => target = theme.pop,
             .exited => target = theme.good_pop,
             .stopped => for (threads) |thread| switch (thread.reason) {
-                .breakpoint, .watchpoint, .signal => target = theme.bad_pop,
+                .breakpoint, .watchpoint, .exception, .signal => target = theme.bad_pop,
                 else => {},
             },
             .idle => {},
@@ -2129,11 +2131,13 @@ pub const Workspace = struct {
     }
     /// Threads, stack and events, below the source view.
     pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
-        const thread_right = @round(left * 0.36);
         const wine = self.compatibility_info.kind == .wine;
+        const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
+        self.thread_width_fraction = if (darwin) 0.48 else 0.36;
+        const thread_right = @round(left * self.thread_width_fraction);
         const hint = if (!wine) "J/K to select" else if (self.thread_list.hide_internal) "H show" else "H hide";
         try pane(r, font, .{ .x = 8, .y = bottom, .w = thread_right - 12, .h = height - bottom - 37 }, "THREADS", hint);
-        if (wine) {
+        if (wine or darwin) {
             try self.thread_list.draw(r, font, .{ .x = 12, .y = bottom + 42, .w = thread_right - 20, .h = @max(0, height - bottom - 82) }, threads, self.thread_labels, self.selected);
         } else {
             const thread_rows: usize = @intFromFloat(@max(1, (height - bottom - 87) / 25));
@@ -2255,7 +2259,7 @@ test "queued frame selection refreshes locals before starting a watch" {
     while (linux.now() < deadline) {
         try session.poll();
         if (session.target.snapshot().state == .stopped and !session.target.onlyInternalStops()) break;
-        _ = @import("../c.zig").api.usleep(1000);
+        _ = @import("../c_ui.zig").api.usleep(1000);
     }
     try std.testing.expectEqual(linux.State.stopped, session.target.snapshot().state);
     var workspace = Workspace{};

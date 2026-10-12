@@ -1,6 +1,6 @@
 //! Provisional, explicitly loaded preferences. No implicit files or write-back.
 const std = @import("std");
-const c = @import("c.zig").api;
+const c = @import("c_ui.zig").api;
 const Config = @import("profile/capture.zig").Config;
 const snapshot = @import("binary/snapshot.zig");
 pub const max_bytes = 64 * 1024;

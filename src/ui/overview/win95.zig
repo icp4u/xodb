@@ -141,7 +141,7 @@ pub fn chrome(v: *View, ctx: Ctx) !Rect {
     }
     try ctx.bevel(tray, true);
     var b: [80]u8 = undefined;
-    const seconds: u64 = @intCast(@mod(@import("../../c.zig").api.time(null), 86400));
+    const seconds: u64 = @intCast(@mod(@import("../../c_ui.zig").api.time(null), 86400));
     const time_text = std.fmt.bufPrint(&b, "{d:0>2}:{d:0>2} UTC", .{ @divTrunc(seconds, 3600), @divTrunc(@mod(seconds, 3600), 60) }) catch "";
     try ctx.textRight(tray.x + tray.w - 8, tray.y + 5, time_text, ctx.p.text);
     if (w >= 760) {

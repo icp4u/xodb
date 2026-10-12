@@ -1,4 +1,5 @@
 #include "gdb_lldb.h"
+#include "check.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,31 @@ static void hosts(void)
         assert(xrt_gdb_process_parse(bad_process[i], strlen(bad_process[i]), &h) == XRT_PROTOCOL_ERROR);
     assert(xrt_gdb_host_parse("vendor:apple;\0x", 15, &h) == XRT_PROTOCOL_ERROR);
     assert(xrt_gdb_host_parse("", 0, &h) == XRT_PROTOCOL_ERROR);
+}
+static void stops(void)
+{
+    struct xrt_gdb_stop stop;
+    const char *bad_access = "T91thread:1001;metype:1;mecount:2;medata:1;medata:10;";
+    CHECK(xrt_gdb_stop_parse(bad_access, strlen(bad_access), &stop) == XRT_OK);
+    if (getenv("XRT_MACH_STOP_WRONG_RESULT")) stop.codes[1] = 17;
+    CHECK(stop.has_exception && stop.exception == 1 && stop.code_count == 2 && stop.codes[1] == 16 && !stop.exec);
+    const char *exec = "T05thread:1002;reason:exec;";
+    CHECK(xrt_gdb_stop_parse(exec, strlen(exec), &stop) == XRT_OK && stop.exec && !stop.has_exception);
+    const char *unknown = "T91metype:ffff;mecount:1;medata:ffffffffffffffff;";
+    CHECK(xrt_gdb_stop_parse(unknown, strlen(unknown), &stop) == XRT_OK && stop.exception == 65535 && stop.codes[0] == UINT64_MAX);
+    const char *bad[] = {"T91metype:1;", "T91mecount:0;", "T91medata:1;", "T91metype:0;mecount:0;",
+        "T91metype:1;metype:1;mecount:0;", "T91metype:1;mecount:2;medata:1;",
+        "T91metype:1;mecount:5;", "T91metype:1;mecount:0;mecount:0;", "T91metype:1;mecount:1;medata:-1;",
+        "T91reason:exec;reason:exec;", "T91metype:1;mecount:0;reason:exec;", "Txx", "S91"};
+    for (size_t i = 0; i < sizeof(bad) / sizeof(bad[0]); ++i)
+        CHECK(xrt_gdb_stop_parse(bad[i], strlen(bad[i]), &stop) == XRT_PROTOCOL_ERROR);
+    struct xrt_gdb_host h = {0};
+    CHECK(xrt_gdb_process_parse(process, strlen(process), &h) == XRT_OK);
+    CHECK(h.cputype == 0x100000c && h.pointer_size == 8 && h.has_endian && h.little_endian && h.os == XRT_GDB_OS_DARWIN);
+    const char *bad_process[] = {"cputype:100000000;", "cputype:1;cputype:2;", "ptrsize:3;", "ptrsize:8;ptrsize:8;",
+        "endian:sideways;", "endian:little;endian:big;", "ostype:macosx;ostype:linux;"};
+    for (size_t i = 0; i < sizeof(bad_process) / sizeof(bad_process[0]); ++i)
+        CHECK(xrt_gdb_process_parse(bad_process[i], strlen(bad_process[i]), &h) == XRT_PROTOCOL_ERROR);
 }
 static void regions(void)
 {
@@ -173,9 +199,48 @@ static void damaged(const char *sample)
         free(copy);
     }
 }
+static void thread_lists(void)
+{
+    static const char sample[] = "[{\"tid\":4097,\"qaddr\":8192,\"name\":\"worker\\n\\u001b\",\"registers\":{\"0\":\"01000000\"}},"
+        "{\"tid\":4098,\"qaddr\":0,\"reason\":\"none\"}]";
+    struct { struct xrt_gdb_thread_info rows[2]; uint64_t canary; } out = {.canary = 771};
+    size_t count;
+    CHECK(xrt_gdb_threads_parse(sample, sizeof sample - 1, out.rows, 2, &count) == XRT_OK && count == 2);
+    CHECK(out.rows[0].remote_tid == 4097 && out.rows[0].queue_address == 8192 && out.rows[0].has_queue);
+    CHECK(out.rows[0].has_name && !strcmp(out.rows[0].name, "worker??"));
+    CHECK(!out.rows[1].has_name && !out.rows[1].has_queue && out.canary == 771);
+    if (getenv("XRT_THREAD_INFO_WRONG_RESULT")) out.rows[0].queue_address++;
+    CHECK(out.rows[0].queue_address == 8192);
+    static const char *bad[] = {"{}", "[{}]", "[{\"tid\":0}]", "[{\"tid\":-1}]", "[{\"tid\":4294967296}]",
+        "[{\"tid\":1.0}]", "[{\"tid\":1,\"tid\":2}]", "[{\"tid\":1},{\"tid\":1}]", "[{\"tid\":1,\"name\":null}]",
+        "[{\"tid\":1,\"qaddr\":-1}]", "[{\"tid\":1,\"qaddr\":0,\"qaddr\":1}]", "[{\"tid\":1},]", "[]x"};
+    for (size_t i = 0; i < sizeof bad / sizeof *bad; ++i)
+        CHECK(xrt_gdb_threads_parse(bad[i], strlen(bad[i]), out.rows, 2, &count) == XRT_PROTOCOL_ERROR);
+    for (size_t n = 0; n < sizeof sample - 1; ++n) {
+        CHECK(xrt_gdb_threads_parse(sample, n, out.rows, 2, &count) != XRT_OK);
+        CHECK(out.canary == 771);
+    }
+    char long_name[400];
+    memcpy(long_name, "[{\"tid\":1,\"name\":\"", 18);
+    memset(long_name + 18, 'a', 300);
+    strcpy(long_name + 318, "\"}]");
+    CHECK(xrt_gdb_threads_parse(long_name, strlen(long_name), out.rows, 2, &count) == XRT_OK);
+    CHECK(strlen(out.rows[0].name) == 127 && out.rows[0].name_truncated);
+    size_t size = (XRT_MAX_THREADS + 1) * 24 + 4;
+    char *many = malloc(size); CHECK(many);
+    for (unsigned n = XRT_MAX_THREADS; n <= XRT_MAX_THREADS + 1; ++n) {
+        size_t at = 0; many[at++] = '[';
+        for (unsigned i = 0; i < n; ++i) at += (size_t)sprintf(many + at, "%s{\"tid\":%u}", i ? "," : "", i + 1);
+        strcpy(many + at, "]");
+        CHECK(xrt_gdb_threads_parse(many, strlen(many), out.rows, 2, &count) ==
+            (n == XRT_MAX_THREADS ? XRT_OK : XRT_BUFFER_TOO_SMALL));
+        CHECK(count == XRT_MAX_THREADS && out.canary == 771);
+    }
+    free(many);
+}
 int main(void)
 {
-    hosts(); regions(); image_lists();
+    hosts(); stops(); regions(); image_lists(); thread_lists();
     damaged(host); damaged(process); damaged(region); damaged(images);
     puts("GDB LLDB extensions: host, process, region and image replies, bounds and damaged input pass");
 }

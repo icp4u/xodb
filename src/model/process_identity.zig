@@ -1,6 +1,6 @@
 //! Identity supplied by a sampled process row. Never use the PID alone.
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 pub const Identity = struct { pid: i32, start: u64 };
 
 pub fn parse(stat: []const u8) !u64 {

@@ -80,17 +80,69 @@ enum xrt_status xrt_gdb_process_parse(const char *text, size_t size, struct xrt_
     if (!text || !out || !size || memchr(text, 0, size)) return XRT_PROTOCOL_ERROR;
     struct pairs list = {text, text + size, false};
     struct pair p;
-    bool has_pid = false;
+    unsigned seen = 0;
     int state;
-    while ((state = next(&list, &p)) > 0)
-        if (is(&p, "pid")) {
-            uint64_t value;
-            if (has_pid || !number(p.value, p.value_size, 16, &value) || !value || value > INT32_MAX)
+    while ((state = next(&list, &p)) > 0) {
+        unsigned field = is(&p, "pid") ? 1 : is(&p, "cputype") ? 2 :
+            is(&p, "ptrsize") ? 4 : is(&p, "endian") ? 8 : is(&p, "ostype") ? 16 : 0;
+        if (seen & field) return XRT_PROTOCOL_ERROR;
+        seen |= field;
+        uint64_t value;
+        if (field == 1) {
+            if (!number(p.value, p.value_size, 16, &value) || !value || value > INT32_MAX)
                 return XRT_PROTOCOL_ERROR;
-            has_pid = true; out->pid = value;
+            out->pid = value;
+        } else if (field == 2) {
+            if (!number(p.value, p.value_size, 16, &value) || !value || value > UINT32_MAX)
+                return XRT_PROTOCOL_ERROR;
+            out->cputype = (uint32_t)value;
+        } else if (field == 4) {
+            if (!number(p.value, p.value_size, 10, &value) || (value != 4 && value != 8))
+                return XRT_PROTOCOL_ERROR;
+            out->pointer_size = (uint32_t)value;
+        } else if (field == 8) {
+            if (!value_is(&p, "little") && !value_is(&p, "big")) return XRT_PROTOCOL_ERROR;
+            out->has_endian = true; out->little_endian = value_is(&p, "little");
+        } else if (field == 16) {
+            out->os = value_is(&p, "macosx") ? XRT_GDB_OS_DARWIN :
+                value_is(&p, "linux") ? XRT_GDB_OS_LINUX : XRT_GDB_OS_UNKNOWN;
         }
+    }
     return state < 0 ? XRT_PROTOCOL_ERROR : XRT_OK;
 }
+enum xrt_status xrt_gdb_stop_parse(const char *text, size_t size, struct xrt_gdb_stop *out)
+{
+    if (!text || !out || size < 3 || text[0] != 'T' || hex((uint8_t)text[1]) < 0 ||
+        hex((uint8_t)text[2]) < 0 || memchr(text, 0, size)) return XRT_PROTOCOL_ERROR;
+    *out = (struct xrt_gdb_stop){0};
+    struct pairs list = {text + 3, text + size, false};
+    struct pair p;
+    bool has_count = false, has_reason = false;
+    uint64_t count = 0, value;
+    int state;
+    while ((state = next(&list, &p)) > 0) {
+        if (is(&p, "metype")) {
+            if (out->has_exception || !number(p.value, p.value_size, 16, &out->exception) ||
+                !out->exception || out->exception > UINT32_MAX) return XRT_PROTOCOL_ERROR;
+            out->has_exception = true;
+        } else if (is(&p, "mecount")) {
+            if (has_count || !number(p.value, p.value_size, 16, &count) || count > 4)
+                return XRT_PROTOCOL_ERROR;
+            has_count = true;
+        } else if (is(&p, "medata")) {
+            if (out->code_count == 4 || !number(p.value, p.value_size, 16, &value))
+                return XRT_PROTOCOL_ERROR;
+            out->codes[out->code_count++] = value;
+        } else if (is(&p, "reason")) {
+            if (has_reason) return XRT_PROTOCOL_ERROR;
+            has_reason = true; out->exec = value_is(&p, "exec");
+        }
+    }
+    if (state < 0 || out->has_exception != has_count || count != out->code_count ||
+        (out->exec && out->has_exception)) return XRT_PROTOCOL_ERROR;
+    return XRT_OK;
+}
+
 static void label(char *out, size_t capacity, const char *text, size_t size, bool hexadecimal)
 {
     size_t n = 0;
@@ -374,4 +426,53 @@ enum xrt_status xrt_gdb_images_parse(const char *input, size_t size, struct xrt_
     }
     blank(&j);
     return found && j.at == j.end ? XRT_OK : XRT_PROTOCOL_ERROR;
+}
+
+static bool thread_info(struct json *j, struct xrt_gdb_thread_info *out)
+{
+    unsigned seen = 0;
+    char key[32];
+    *out = (struct xrt_gdb_thread_info){0};
+    if (!take(j, '{') || take(j, '}')) return false;
+    do {
+        if (!text(j, key, sizeof key, NULL) || !take(j, ':')) return false;
+        unsigned bit = !strcmp(key, "tid") ? 1 : !strcmp(key, "name") ? 2 : !strcmp(key, "qaddr") ? 4 : 0;
+        if (!bit) { if (!skip(j, 2)) return false; continue; }
+        if (seen & bit) return false;
+        seen |= bit;
+        if (bit == 1) {
+            if (!unsigned_number(j, &out->remote_tid) || !out->remote_tid || out->remote_tid > UINT32_MAX) return false;
+        } else if (bit == 2) {
+            if (!text(j, out->name, sizeof out->name, &out->name_truncated)) return false;
+            out->has_name = true;
+        } else {
+            if (!unsigned_number(j, &out->queue_address)) return false;
+            out->has_queue = out->queue_address != 0;
+        }
+    } while (take(j, ','));
+    return take(j, '}') && (seen & 1);
+}
+
+enum xrt_status xrt_gdb_threads_parse(const char *input, size_t size, struct xrt_gdb_thread_info *out,
+                                      size_t capacity, size_t *total)
+{
+    if (!input || !total || (capacity && !out) || !size || memchr(input, 0, size)) return XRT_PROTOCOL_ERROR;
+    *total = 0;
+    uint64_t ids[XRT_MAX_THREADS];
+    struct json j = {input, input + size};
+    if (!take(&j, '[')) return XRT_PROTOCOL_ERROR;
+    if (!take(&j, ']')) {
+        do {
+            struct xrt_gdb_thread_info row;
+            if (*total == XRT_MAX_THREADS) return XRT_BUFFER_TOO_SMALL;
+            if (!thread_info(&j, &row)) return XRT_PROTOCOL_ERROR;
+            for (size_t i = 0; i < *total; ++i) if (ids[i] == row.remote_tid) return XRT_PROTOCOL_ERROR;
+            ids[*total] = row.remote_tid;
+            if (*total < capacity) out[*total] = row;
+            ++*total;
+        } while (take(&j, ','));
+        if (!take(&j, ']')) return XRT_PROTOCOL_ERROR;
+    }
+    blank(&j);
+    return j.at == j.end ? XRT_OK : XRT_PROTOCOL_ERROR;
 }

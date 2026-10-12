@@ -19,7 +19,7 @@ pub const Panel = struct {
             if (internal != group) continue;
             // A selected thread or an actual debugger stop must stay visible.
             const important = i == selected or (thread.state == .stopped and switch (thread.reason) {
-                .breakpoint, .watchpoint, .signal, .single_step => true,
+                .breakpoint, .watchpoint, .exception, .signal, .single_step => true,
                 else => false,
             });
             if (internal and self.hide_internal and !important) {
@@ -57,7 +57,13 @@ pub const Panel = struct {
             const title = std.fmt.bufPrint(&buffer, "{d} {s}{s}", .{ thread.tid, text, if (row != null and row.?.possibly_truncated) "~" else "" }) catch "";
             try renderer.textFit(font, rect.x + 8, y, rect.w - 16, title, if (index == selected) style.theme.text else style.theme.weak);
             const state = if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state);
-            const detail = std.fmt.bufPrint(&buffer, "{s}{s}", .{ state, if (row != null and row.?.internal_name) " / Wine internal name" else " / other" }) catch state;
+            const detail = if (row != null and row.?.queue_address != null)
+                // jThreadsInfo's qaddr is where the thread keeps its dispatch
+                // queue pointer, present on every thread; it is not a queue.
+                // The stop reason comes first so a narrow pane cuts the address.
+                std.fmt.bufPrint(&buffer, "{s} / queue slot 0x{x}", .{ state, row.?.queue_address.? }) catch state
+            else
+                std.fmt.bufPrint(&buffer, "{s}{s}", .{ state, if (row != null and row.?.internal_name) " / Wine internal name" else if (row != null and row.?.source == .gdb_thread_info) "" else " / other" }) catch state;
             try renderer.textFit(font, rect.x + 8, y + 18, rect.w - 16, detail, style.theme.weak);
         }
     }

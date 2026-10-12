@@ -1,5 +1,5 @@
 const std = @import("std");
-const c = @import("../c.zig").api;
+const c = @import("../c_ui.zig").api;
 const TextLayout = @import("overview/draw.zig").Layout;
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
@@ -222,16 +222,9 @@ pub const Panel = struct {
             const button = gpu.Rect{ .x = x, .y = y, .w = width, .h = 25 };
             self.hits[i] = button;
             if (state.selected == tab) try style.focus(r, button, 4, 1);
-            try r.text(font, x + 8, y + 3, title, if (unwitnessed) theme.warm else if (state.selected == tab) theme.text else theme.weak);
+            try r.text(font, x + 8, y + 3, title, if (state.selected == tab) theme.text else theme.weak);
             if (offered) try r.text(font, x + width - 15, y + 3, "*", theme.neutral);
             x += width + 2;
-        }
-        for (state.entries) |entry| {
-            if (!entry.present or entry.identity != .unwitnessed) continue;
-            y += 26;
-            try self.wrapped(r, font, rect, &y, "runtime not seen executing", theme.warm);
-            y -= 23;
-            break;
         }
         // Detected-but-unsupported runtimes are evidence, not selectable tabs.
         for (state.entries, 0..) |entry, i| {
@@ -242,7 +235,7 @@ pub const Panel = struct {
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, hint, theme.warm);
             y += 23;
             const reason = entry.reason.?;
-            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else if (std.mem.eql(u8, reason, "RubyStaticRuntimeUnavailable")) "Needs standalone Ruby" else if (std.mem.eql(u8, reason, "RubyVersionUnsupported")) "Revision not supported" else if (std.mem.eql(u8, reason, "RubyArchitectureUnsupported")) "Unsupported Ruby CPU" else if (std.mem.eql(u8, reason, "RubyVersionMismatch") or std.mem.eql(u8, reason, "RubyBuildIdMismatch")) "Runtime image mismatch" else if (std.mem.eql(u8, reason, "GDScriptDwarfUnavailable")) "Needs engine debug info (DWARF)" else if (std.mem.eql(u8, reason, "GDScriptCallStackNotTracked")) "Engine build does not track script calls" else if (std.mem.eql(u8, reason, "GDScriptLayoutUnsupported")) "Engine layout not supported" else reason;
+            const detail = if (std.mem.eql(u8, reason, "PerlVersionUnsupported")) "Unsupported version" else if (std.mem.eql(u8, reason, "LuaImplementationUnsupported")) "Unsupported Lua build" else if (std.mem.eql(u8, reason, "RubyStaticRuntimeUnavailable")) "Needs standalone Ruby" else if (std.mem.eql(u8, reason, "RubyVersionUnsupported")) "Revision not supported" else if (std.mem.eql(u8, reason, "RubyArchitectureUnsupported")) "Unsupported Ruby CPU" else if (std.mem.eql(u8, reason, "RubyVersionMismatch") or std.mem.eql(u8, reason, "RubyBuildIdMismatch")) "Runtime image mismatch" else if (std.mem.eql(u8, reason, "GDScriptDwarfUnavailable")) "Needs engine debug info (DWARF)" else if (std.mem.eql(u8, reason, "GDScriptCallStackNotTracked")) "Engine build does not track script calls" else if (std.mem.eql(u8, reason, "GDScriptLayoutUnsupported")) "Engine layout not supported" else if (std.mem.eql(u8, reason, "PythonRuntimeAmbiguous") or std.mem.eql(u8, reason, "PerlValueRuntimeAmbiguous")) "Several runtimes loaded" else reason;
             try r.textFit(font, rect.x + 12, y + 3, rect.w - 24, detail, theme.weak);
         }
         self.content_y = y + 39;
@@ -329,6 +322,8 @@ pub const Panel = struct {
         if (std.mem.eql(u8, reason, "LuaStateArgumentUnavailable")) return "No Lua state at this native frame";
         if (std.mem.eql(u8, reason, "JavaScriptNativeAnchorUnavailable")) return "No JavaScript anchor at this stop";
         if (std.mem.eql(u8, reason, "PerlInterpreterUnavailable")) return "No Perl interpreter at this native frame";
+        if (std.mem.eql(u8, reason, "PythonInterpreterFrameUnavailable")) return "No Python frames on this thread";
+        if (std.mem.eql(u8, reason, "PerlInterpreterFrameUnavailable")) return "No Perl frames on this thread";
         return reason;
     }
     fn basisText(basis: []const u8) []const u8 {
@@ -411,13 +406,14 @@ pub const Panel = struct {
         try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis), theme.weak);
         if (entry.proof_generation == null or entry.proof_generation.? != state.generation or entry.reason != null) {
             if (entry.identity == .unwitnessed) {
-                try self.wrapped(r, font, rect, &y, "Runtime not seen executing", theme.warm);
+                try self.wrapped(r, font, rect, &y, "Runtime not seen executing", theme.weak);
             } else {
                 try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.reason orelse "Runtime proof pending for this stop", theme.warm);
                 y += 23;
             }
         }
-        try self.wrapped(r, font, rect, &y, explanation(self.message), theme.weak);
+        // The idle marker already explains a missing interpreter frame.
+        if (entry.identity != .unwitnessed or !std.mem.endsWith(u8, self.message, "InterpreterFrameUnavailable")) try self.wrapped(r, font, rect, &y, explanation(self.message), theme.weak);
         y += 7;
         if (logical) |selected| {
             if (selected.native_anchor == null) try self.wrapped(r, font, rect, &y, "Selected logical row has no proved native anchor", theme.warm);

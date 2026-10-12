@@ -1,9 +1,8 @@
 const std = @import("std");
-const c = @import("../c.zig").api;
-const Window = @import("../platform/wayland.zig").Window;
+const c = @import("../c_ui.zig").api;
+const Window = @import("../platform/window.zig").Window;
 const fonts = @import("font.zig");
 const select = @import("vk_select.zig");
-const display_gpu = @import("../platform/display_gpu.zig");
 /// `--vk-device`: an index from `--vk-list` or part of a device name. It wins
 /// over XODB_VK_DEVICE.
 pub var device_request: ?[]const u8 = null;
@@ -140,13 +139,10 @@ pub const Renderer = struct {
         self.window = window;
         errdefer self.deinit();
         try self.createInstance();
-        var surface_info = info(c.VkWaylandSurfaceCreateInfoKHR, c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
-        surface_info.display = window.display;
-        surface_info.surface = window.surface;
-        try created(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface), &self.surface);
+        try created(window.createSurface(self.instance, &self.surface), &self.surface);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
-        const display = display_gpu.query(window.display);
+        const display = window.displayGpu();
         const choice = try pick(found.items, display);
         self.physical = found.items[choice.index].physical;
         self.family = found.items[choice.index].family;
@@ -192,7 +188,7 @@ pub const Renderer = struct {
         var app = info(c.VkApplicationInfo, c.VK_STRUCTURE_TYPE_APPLICATION_INFO);
         app.pApplicationName = "xodb";
         app.apiVersion = c.VK_API_VERSION_1_0;
-        const extensions = [_][*c]const u8{ "VK_KHR_surface", "VK_KHR_wayland_surface", "VK_KHR_get_physical_device_properties2", "VK_EXT_debug_utils" };
+        const extensions = [_][*c]const u8{ "VK_KHR_surface", Window.vk_surface_extension, "VK_KHR_get_physical_device_properties2", "VK_EXT_debug_utils" };
         var messenger = info(c.VkDebugUtilsMessengerCreateInfoEXT, c.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT);
         messenger.messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
         messenger.messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
@@ -337,15 +333,10 @@ pub const Renderer = struct {
         var self = Renderer{};
         defer self.deinit();
         try self.createInstance();
-        if (window) |w| {
-            var surface_info = info(c.VkWaylandSurfaceCreateInfoKHR, c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR);
-            surface_info.display = w.display;
-            surface_info.surface = w.surface;
-            try created(c.vkCreateWaylandSurfaceKHR(self.instance, &surface_info, null, &self.surface), &self.surface);
-        }
+        if (window) |w| try created(w.createSurface(self.instance, &self.surface), &self.surface);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
-        const display = if (window) |w| display_gpu.query(w.display) else null;
+        const display = if (window) |w| w.displayGpu() else null;
         var described: [64]select.Device = undefined;
         const devices = describeAll(found.items, &described);
         const choice: ?select.Choice = pick(found.items, display) catch null;

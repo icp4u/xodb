@@ -157,6 +157,7 @@ static enum xmo_status segment(struct xmo_image *p, const unsigned char *c, uint
         memcpy(section->name, raw, 16); memcpy(section->segment, raw+16, 16);
         section->address = u64(raw+32); section->size = u64(raw+40);
         section->offset = u32(raw+48); section->align = u32(raw+52); section->flags = u32(raw+64);
+        section->relocation_offset = u32(raw+56); section->relocation_count = u32(raw+60);
         section->segment_index = index;
         if (section->address < s->vmaddr || !span(section->address-s->vmaddr, section->size, s->vmsize)) return XMO_MALFORMED;
     }
@@ -417,6 +418,17 @@ enum xmo_status xmo_read_section(const struct xmo_image *p, const struct xmo_sec
     if (!span(at, size, range.size)) return XMO_MALFORMED;
     return size ? p->source.read(p->source.context, range.source_offset+at, out, size) : XMO_OK;
 }
+enum xmo_status xmo_read_relocations(const struct xmo_image *p, const struct xmo_section *s,
+                                   uint32_t first, uint32_t count, void *out) {
+    if (!p || !s || s<p->sections || s>=p->sections+p->info.section_count || (!out && count)) return XMO_MALFORMED;
+    if (p->source.layout!=XMO_FILE) return XMO_UNAVAILABLE;
+    if (count>XMO_MAX_CHUNK/8) return XMO_LIMIT;
+    if (first>s->relocation_count || count>s->relocation_count-first) return XMO_MALFORMED;
+    uint64_t at;
+    enum xmo_status status=locate(p,s->relocation_offset,(uint64_t)s->relocation_count*8,&at);
+    if (status!=XMO_OK) return status;
+    return count ? p->source.read(p->source.context,at+(uint64_t)first*8,out,(size_t)count*8) : XMO_OK;
+}
 enum xmo_status xmo_slide(const struct xmo_image *p, uint64_t header_address, uint64_t *slide) {
     if (!p || !slide) return XMO_MALFORMED;
     if (!p->info.has_text) return XMO_UNAVAILABLE;
@@ -610,7 +622,7 @@ static enum xmo_status load_names(struct xmo_image *p) {
     p->name_count = kept; p->info.unnamed_symbols = unnamed;
     return XMO_OK;
 }
-enum xmo_status xmo_symbol_find(struct xmo_image *p, const char *name, const struct xmo_symbol **out) {
+static enum xmo_status symbol_find(struct xmo_image *p, const char *name, const struct xmo_symbol **out, int unique) {
     char stored[XMO_MAX_NAME+1];
     if (!p || !name || !out) return XMO_MALFORMED;
     *out = NULL;
@@ -625,18 +637,28 @@ enum xmo_status xmo_symbol_find(struct xmo_image *p, const char *name, const str
     }
     /* Equal hashes are compared by reading each name: a bounded number, so a
      * table built to collide costs a typed refusal, not a long walk. */
-    const struct xmo_symbol *undefined = NULL;
+    const struct xmo_symbol *undefined = NULL, *defined = NULL;
     for (uint32_t work=0; low < p->name_count && p->hashes[p->by_name[low]] == wanted; ++low, ++work) {
         const struct xmo_symbol *s = &p->symbols[p->by_name[low]];
         if (work == XMO_MAX_NAME_CANDIDATES) return XMO_LIMIT;
         status = name_at(p, s->strx, stored, sizeof stored, &found, &defect);
         if (status != XMO_OK) return status;
         if (defect != XMO_OK || found != length || memcmp(stored, name, length)) continue;
-        if ((s->type&N_TYPE) != 0) { *out = s; return XMO_OK; }
+        if ((s->type&N_TYPE) != 0) {
+            if (!unique) { *out = s;return XMO_OK; }
+            if (defined && (defined->value!=s->value || defined->sect!=s->sect || (defined->type&N_TYPE)!=(s->type&N_TYPE))) return XMO_UNAVAILABLE;
+            defined=s;continue;
+        }
         if (!undefined) undefined = s;
     }
-    *out = undefined;
-    return undefined ? XMO_OK : XMO_NOT_FOUND;
+    *out = defined ? defined : undefined;
+    return *out ? XMO_OK : XMO_NOT_FOUND;
+}
+enum xmo_status xmo_symbol_find(struct xmo_image *p, const char *name, const struct xmo_symbol **out) {
+    return symbol_find(p,name,out,0);
+}
+enum xmo_status xmo_symbol_unique(struct xmo_image *p, const char *name, const struct xmo_symbol **out) {
+    return symbol_find(p,name,out,1);
 }
 static int fatal(enum xmo_status status) {
     return status == XMO_IO || status == XMO_CHANGED || status == XMO_CANCELLED || status == XMO_NOMEM;

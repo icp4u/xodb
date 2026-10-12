@@ -1,10 +1,8 @@
-const gui = @import("build_options").gui;
-
+//! C seen by the debug engine. Rendering, platform and UI code use c_ui.zig.
 pub const api = @cImport({
     @cUndef("_FORTIFY_SOURCE"); // glibc's fortified fcntl wrappers do not translate; ReleaseSafe defines it
     @cDefine("_GNU_SOURCE", "1");
     @cDefine("BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD", "1"); // translate-c needs one ioctl declaration
-    if (gui) @cDefine("VK_USE_PLATFORM_WAYLAND_KHR", "1");
     @cInclude("unistd.h");
     @cInclude("stdlib.h");
     @cInclude("stdio.h");
@@ -26,25 +24,7 @@ pub const api = @cImport({
     @cInclude("sys/sysmacros.h");
     @cInclude("../runtime/mapped_file.h");
     @cInclude("../lsoftop/lsoftop.h");
-    @cInclude("../runtime/xrt_sysstat.h");
-    @cInclude("../runtime/xrt_fdactivity.h");
-    @cInclude("../runtime/xrt_fdflow_graph.h");
-    @cInclude("../runtime/xrt_fdinherit.h");
-    @cInclude("../runtime/xrt_fdtreemap.h");
-    @cInclude("../runtime/xrt_memobserver.h");
     @cInclude("../text.h");
-    if (gui) {
-        @cInclude("wayland-client.h");
-        @cInclude("../platform/clipboard.h");
-        @cInclude("xdg-shell-client-protocol.h");
-        @cInclude("xdg-decoration-unstable-v1-client-protocol.h");
-        @cInclude("cursor-shape-v1-client-protocol.h");
-        @cInclude("linux-dmabuf-v1-client-protocol.h");
-        @cInclude("vulkan/vulkan.h");
-        @cInclude("freetype/freetype.h");
-        @cInclude("hb.h");
-        @cInclude("hb-ft.h");
-    }
     @cInclude("capstone/capstone.h");
     @cInclude("elfutils/libdw.h");
     @cInclude("../language/perl.h");

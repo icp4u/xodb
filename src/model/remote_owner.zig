@@ -431,13 +431,15 @@ test "debugger publication retains source inline frames and target rows" {
     var inlines = [_]@import("../debug/info.zig").Inline{.{ .name = &name, .depth = 1, .die_offset = 9 }};
     var frames = [_]@import("session.zig").Frame{.{ .index = 0, .pc = 1, .lookup_pc = 1, .registers = @splat(null), .symbol = &name, .inline_frames = &inlines }};
     var threads = [_]@import("../target/linux.zig").Thread{.{ .id = 3, .tid = 7, .state = .stopped }};
+    var labels = [_]@import("compatibility.zig").Label{.{ .id = 3, .tid = 7, .source = .gdb_thread_info, .queue_address = 0x1234, .readable = true }};
+    @memcpy(labels[0].name[0..6], "worker");
     const publication = try Publication.create(std.testing.allocator, .{
         .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 7, .image_epoch = 1, .generation = 2 },
         .revision = 1,
         .taken_ns = 1,
         .status = .ready,
         .inspection_id = 3,
-        .debugger = .{ .snapshot = .{ .pid = 7, .generation = 2 }, .source = .{ .bytes = &source, .path = "sample.c" }, .frames = &frames, .threads = &threads },
+        .debugger = .{ .snapshot = .{ .pid = 7, .generation = 2 }, .source = .{ .bytes = &source, .path = "sample.c" }, .frames = &frames, .threads = &threads, .thread_labels = &labels },
     });
     defer publication.destroy();
     @memset(&source, 'x');
@@ -445,12 +447,16 @@ test "debugger publication retains source inline frames and target rows" {
     inlines[0].depth = 4;
     frames[0].pc = 99;
     threads[0].state = .running;
+    labels[0].name[0] = 'x';
+    labels[0].queue_address = 0;
     const view = publication.value.debugger.?;
     try std.testing.expectEqualStrings("a\n", view.source.bytes);
     try std.testing.expectEqualStrings("fn", view.frames[0].inline_frames[0].name);
     try std.testing.expectEqual(@as(usize, 1), view.frames[0].inline_frames[0].depth);
     try std.testing.expectEqual(@as(u64, 1), view.frames[0].pc);
     try std.testing.expectEqual(@import("../target/linux.zig").State.stopped, view.threads[0].state);
+    try std.testing.expectEqualStrings("worker", view.thread_labels[0].text());
+    try std.testing.expectEqual(@as(?u64, 0x1234), view.thread_labels[0].queue_address);
     try std.testing.expect(publication.value.matchesInspection(publication.value.stamp, 3));
 }
 /// Transfer, not a shared mutable cache. The presenter keeps at most its current

@@ -12,6 +12,7 @@
 #define XRT_GDB_CAP_INTERRUPT (UINT64_C(1) << 7)
 #define XRT_GDB_CAP_REGIONS (UINT64_C(1) << 8)
 #define XRT_GDB_CAP_IMAGES (UINT64_C(1) << 9)
+#define XRT_GDB_CAP_THREAD_INFO (UINT64_C(1) << 10)
 #define XRT_GDB_REGIONS_MAX 4096
 #define XRT_GDB_IMAGES_MAX 4096
 #define XRT_GDB_IMAGE_SEGMENTS_MAX 64
@@ -25,12 +26,25 @@ struct xrt_gdb_info {
     char architecture[64], reason[128];
     enum xrt_gdb_os os;
     uint32_t address_bits; /* zero means unknown; pointers above it carry tags. */
+    /* Last causal stop, cached without IO. Signal delivery differs from Mach
+     * exception reporting, even when debugserver also supplies a signal byte. */
+    int32_t stop_tid;
+    bool has_exception, has_fault, pending_delivery;
+    uint32_t exception_count;
+    uint64_t exception_type, exception_codes[4], fault_address;
 };
 /* Remote text is untrusted: names are printable ASCII, bounded and cut. */
 struct xrt_gdb_region {
     uint64_t start, size;
     bool mapped, read, write, execute;
     char type[32], name[128];
+};
+/* Optional stopped-thread metadata. The thread inventory remains authoritative;
+ * a JSON row cannot create a thread. Queue addresses are opaque, not names. */
+struct xrt_gdb_thread_info {
+    uint64_t remote_tid, queue_address;
+    bool has_name, name_truncated, has_queue;
+    char name[128];
 };
 struct xrt_gdb_image_segment {
     uint64_t vmaddr, vmsize;
@@ -49,6 +63,8 @@ struct xrt_gdb_image {
 enum xrt_status xrt_target_gdb_remote(const char *endpoint, struct xrt_target **out);
 enum xrt_status xrt_target_gdb_remote_cancel(const char *endpoint, struct xrt_target **out, struct xrt_cancel *);
 enum xrt_status xrt_target_gdb_info(const struct xrt_target *, struct xrt_gdb_info *);
+enum xrt_status xrt_target_gdb_thread_info(const struct xrt_target *, int32_t tid,
+                                          struct xrt_gdb_thread_info *);
 /* Stopped targets of a stub with the LLDB extensions only. At most capacity
  * rows are stored; *total above capacity means the list was cut. A stub
  * without the packet, or a reply above the packet limit, is the typed
