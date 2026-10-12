@@ -294,13 +294,63 @@ and must lead to the terminator, and every element must be a Unicode code
 point, or the string is refused rather than shown. At most 1,024 characters
 are kept; control characters are shown as `?`.
 
+## Engine scene tree and object inspector
+
+`REDOT=/path/to/engine scripts/demo-redot scene` starts an owned game with
+the engine debugger enabled. Press **U** for the scene tree and inspector.
+Click a node (or use arrows) to see its script and properties, including
+engine properties such as a Node2D's `position`. **Tab** changes keyboard
+focus, the wheel scrolls either pane, **P** shows properties, **S** shows
+Signal-valued properties, **R** refreshes, and **U** or **Esc** closes.
+
+The header says **ENGINE DEBUGGER PROTOCOL / cooperative**: these are retained
+snapshots reported by the running engine. This view needs a responsive debug
+engine, but no DWARF. Pausing the native target leaves its last snapshot
+visible; requests stay pending until it runs again. The memory-based script
+stack and values described above remain available independently.
+
+For an existing project, launch xodb with:
+
+```sh
+xodb --redot-debugger -- /path/to/engine --path /path/to/project
+```
+
+xodb supplies `--remote-debug` with a loopback ephemeral port, accepts one
+peer, and checks its announced PID against the owned launch. Do not supply a
+second `--remote-debug` option. The engine protocol has no authentication;
+the PID check is a consistency check, not protection against another local
+process impersonating the engine. Only scene and inspection requests are
+sent; no property setters, evaluation or method-call commands are exposed.
+The engine itself handles inspection, which can invoke a project's property
+getters. Arbitrary attach, remote-agent sessions, and automatic reconnect or
+restart are not supported yet; restart this xodb launch to reconnect.
+
+The launch starts stopped like any other: **Continue** it, and the tree fills
+in once the game is running. Helper programs the engine starts on the way
+(Redot runs `xdg-user-dir`) are released on their own. The `scene` demo does
+the Continue for you and leaves unexpected signals or breakpoints stopped for
+inspection. Packed arrays show their length and first eight elements, and a
+property preview is cut at about 500 bytes.
+
+MCP observers can use `get_redot_scene_tree` (`start`, `limit`, `refresh`) and
+`inspect_redot_object` (`object_id`, `refresh`). Poll a pending answer until
+the engine responds. IDs are decimal strings to preserve all 64 bits. Each
+answer names its source and revision. Property values are bounded previews,
+not expandable memory paths. Selection is shared between observers; an
+answer is returned only for the requested object ID.
+
+The tested Redot 26.2 / Godot 4.5 protocol does not enumerate declared signals
+or connections. The signals pane shows only properties whose value is a
+Signal (for example the demo Arena's `v_signal = tree_exiting`), and states
+that limitation. Signal connection graphs remain future work.
+
 ## Limits
 
 - **Debug-enabled builds only.** A release export template does not track
   script calls unless the project sets
   `debug/settings/gdscript/always_track_call_stacks`, and has no DWARF unless
   it was built with it.
-- **Values are read, not evaluated.** No expressions with operators or calls,
+- **Memory values are read, not evaluated.** No expressions with operators or calls,
   no properties of engine classes (a node's `position` is not a script member)
   and no writes. Local names need the engine to have recorded them
   ([above](#local-names)).

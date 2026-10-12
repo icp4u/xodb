@@ -1,0 +1,32 @@
+[
+  {
+    "name": "get_redot_scene_tree",
+    "description": "Read the Redot/Godot scene tree reported by an owned launch's loopback engine-debugger protocol peer. Results identify their cooperative protocol source and are paged.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "start": { "type": "integer", "minimum": 0 },
+        "limit": { "type": "integer", "minimum": 1, "maximum": 512 },
+        "refresh": { "type": "boolean", "description": "Ask the responsive engine for a fresh tree before a later poll." },
+        "process_id": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      },
+      "additionalProperties": false
+    },
+    "annotations": { "readOnlyHint": true, "xodbSessionAccess": "observer" }
+  },
+  {
+    "name": "inspect_redot_object",
+    "description": "Select a Redot/Godot scene object and read its engine-reported script, properties, and Signal-valued properties. Object IDs may be decimal strings to preserve 64-bit values.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "object_id": { "anyOf": [{ "type": "string", "pattern": "^[0-9]+$" }, { "type": "integer", "minimum": 1 }] },
+        "refresh": { "type": "boolean" },
+        "process_id": { "type": "integer", "minimum": 1, "maximum": 1024 }
+      },
+      "required": ["object_id"],
+      "additionalProperties": false
+    },
+    "annotations": { "readOnlyHint": true, "xodbSessionAccess": "observer" }
+  }
+]

@@ -71,6 +71,7 @@ pub fn main(init: std.process.Init) !void {
     var hide_wine_threads: ?bool = null;
     var expected_start: ?u64 = null;
     var start_profile = false;
+    var redot_debugger = false;
     var listen: ?[:0]const u8 = null;
     var connect: ?[:0]const u8 = null;
     var ssh: ?[:0]const u8 = null;
@@ -116,6 +117,10 @@ pub fn main(init: std.process.Init) !void {
             start_profile = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--redot-debugger")) {
+            redot_debugger = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 \\xodb — native Linux debugger (M1 workstation baseline)
@@ -150,8 +155,10 @@ pub fn main(init: std.process.Init) !void {
                 \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
-                \\O opens process selection; MCP process_id defaults to the original process regardless of GUI selection.
+                \\O opens process selection; U opens the Redot/Godot scene tree and inspector (local launches).
+                \\MCP process_id defaults to the original process regardless of GUI selection.
                 \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver, QEMU or Apple debugserver target.
+                \\--redot-debugger adds a private loopback scene-debugger peer to a local owned Redot/Godot launch.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
@@ -283,6 +290,7 @@ pub fn main(init: std.process.Init) !void {
     if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
     if ((expected_start != null or start_profile) and (attach == null or runtime_remote or remote_gui)) return error.IdentityRequiresLocalAttach;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
+    if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
@@ -344,6 +352,14 @@ pub fn main(init: std.process.Init) !void {
     session.languages = languages;
     session.allocation_defaults = preferences.allocations;
     session.allocation_helper = allocation_helper;
+    var redot_launch: std.ArrayList([:0]const u8) = .empty;
+    if (redot_debugger) {
+        const port = try session.redot.listen();
+        try redot_launch.appendSlice(a, launch);
+        try redot_launch.appendSlice(a, &.{ "--remote-debug", try std.fmt.allocPrintSentinel(a, "tcp://127.0.0.1:{d}", .{port}, 0) });
+        launch = redot_launch.items;
+        std.debug.print("xodb: Redot/Godot scene debugger listening on private loopback port {d}; waiting for owned pid\n", .{port});
+    }
     if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
     session.static_analysis.toolchain_dir = static_analysis;
     if (static_analysis != null) {
@@ -599,6 +615,7 @@ pub fn main(init: std.process.Init) !void {
         var last_profile_revision: u64 = 0;
         var last_profile_id: u64 = 0;
         var last_language_revision: u64 = 0;
+        var last_redot_revision: u64 = 0;
         var last_language_watch_revision: u64 = 0;
         var last_compatibility_revision: u64 = 0;
         var last_view_serial: u64 = 0;
@@ -680,6 +697,10 @@ pub fn main(init: std.process.Init) !void {
             }
             if (last_language_revision != active.language_tabs.revision) {
                 last_language_revision = active.language_tabs.revision;
+                window.dirty = true;
+            }
+            if (last_redot_revision != active.redot.revision) {
+                last_redot_revision = active.redot.revision;
                 window.dirty = true;
             }
             reportSlow("workspace input/inspection", phase_started);
@@ -1011,6 +1032,7 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
 }
 
 test {
+    std.testing.refAllDecls(@import("redot/protocol.zig"));
     std.testing.refAllDecls(@import("appearance.zig"));
     std.testing.refAllDecls(@import("remote/transport.zig"));
     std.testing.refAllDecls(@import("remote/client.zig"));

@@ -362,6 +362,8 @@ pub const Server = struct {
         if (@import("language_watches.zig").handles(name)) return @import("language_watches.zig").call(a, session, name, args);
         const language_tabs = @import("language_tabs.zig");
         if (language_tabs.handles(name)) return language_tabs.call(a, session, name, args);
+        const redot = @import("redot.zig");
+        if (redot.handles(name)) return redot.call(a, session, name, args);
         const allocations = @import("allocation_control.zig");
         if (allocations.handles(name)) return allocations.call(a, session, name, args);
         const runtime_types = @import("runtime_types.zig");

@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
 COVERS = (
+    (('src/redot/*', 'src/mcp/redot*', 'src/ui/redot.zig', 'scripts/helpers/redot*'), ('redot-protocol*',)),
     (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
@@ -122,7 +123,7 @@ COVERS = (
 SERIAL = {
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
     'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-evidence',
-    'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile',
+    'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile', 'gui-fdgalaxy',
 }
 
 # GUI steps that are never retried: they inject faults or race the renderer,
@@ -565,6 +566,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
             steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
         if redot:
+            steps.append(('redot-protocol', [sys.executable, '-B', 'tests/redot-protocol.py', '--redot', redot, '--work', '.work/rdp'], 60))
             # A Godot 4 / Redot engine with DWARF: about a gigabyte read once per xodb.
             steps.append(('gdscript-stack', [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot, '--strace', '--work', '.work/gds'], 600))
             steps.append(('gdscript-demo', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--work', '.work/gdd'], 600))
@@ -676,6 +678,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
         steps.append(('gui-files-selection', [sys.executable, '-B', 'tests/files-selection-gui.py'], 180))
         steps.append(('gui-fdgraph', [sys.executable, '-B', 'tests/fdgraph-gui.py', '--work-dir', '.work/fg'], 120))
+        steps.append(('gui-fdgalaxy', [sys.executable, '-B', 'tests/fdgalaxy-gui.py', '--work-dir', '.work/fx'], 60))
         steps.append(('gui-fdinherit', [sys.executable, '-B', 'tests/fdinherit-gui.py', '--work-dir', '.work/fi'], 120))
         steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
         steps.append(('gui-fdflow-denied', [sys.executable, '-B', 'tests/fdflow-gui.py', '--work-dir', '.work/ff', '--expect-denied'], 120))
@@ -709,6 +712,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-native-values-gui', [sys.executable, '-B', 'tests/go-native-values-gui.py', '--go', go, '--work', '.work/input-gnv'], 180))
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if redot:
+            steps.append(('redot-protocol-gui', [sys.executable, '-B', 'tests/redot-protocol-gui.py', '--redot', redot, '--work', '.work/rdg'], 90))
             steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))
             steps.append(('gdscript-values-gui', [sys.executable, '-B', 'tests/gdscript-values-gui.py', '--redot', redot, '--work', '.work/gdvg'], 600))
             steps.append(('gui-owner-gdscript-limit', [sys.executable, '-B', 'tests/gdscript-remote-limit-gui.py', '--redot', redot, '--work', '.work/gdl'], 300))

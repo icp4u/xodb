@@ -44,6 +44,13 @@ Nothing runs in the game and nothing is written to it; the game was started
 without the engine's debugger. See [GDScript](GDSCRIPT.md#values) for value
 formats, paths, what local names need, and limits.
 
+For the engine's own scene view, run
+`REDOT=path/to/engine scripts/demo-redot scene`. Press **U**, select **Player**
+to inspect its script, inventory and Node2D properties; select **Arena**, then
+**S** to see its `tree_exiting` Signal value. **R** refreshes the retained
+snapshot. This cooperative view needs the game running; the pane labels its
+source. See [the engine-view controls and limits](GDSCRIPT.md#engine-scene-tree-and-object-inspector).
+
 ## Memory: defrag to Gibson
 
 Start `xodb --overview --look win95` for the classic desktop. Select an owned
@@ -71,3 +78,29 @@ measured zero is a flat footprint; a partial height counts only observed
 bytes. Tower movement and collapse flashes follow page samples. The replay
 mode uses the same observations and can demonstrate these transitions without
 collecting a live process.
+
+## Descriptors: the galaxy
+
+```sh
+xodb --overview --galaxy-demo 150
+```
+
+A synthetic galaxy: 150 made-up processes in a dozen clusters. Nothing is read
+from the host and no tracing starts, so it runs anywhere and looks the same
+every time. Each cluster is a tinted nebula with its name beside it. Thin
+curved threads are shared pipes, sockets and files; where bytes move, the
+thread turns into a string of beads and bright dots run along it toward the
+reader, whose star flashes as they land. Pink marks a deleted file that is
+still open. **P** freezes the picture; hover a star, dot or ring for numbers.
+`--galaxy-demo 1024` shows how a crowd thins out, and `60:idle` a galaxy at rest.
+
+For the real thing, on processes you own (`E` stops tracing):
+
+```sh
+sudo -E xodb --overview --panel galaxy --graph-pid PID --graph-pid PID2
+```
+
+The two processes appear as stars; a pipe or socket between them is a thread,
+and impulses follow their traffic. Without `--graph-pid` the galaxy covers the
+host: press **C** to unfold cgroups into process stars. See
+[Overview](OVERVIEW.md#reading-the-galaxy) for how to read it and its caps.

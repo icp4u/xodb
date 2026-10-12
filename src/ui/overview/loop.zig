@@ -69,6 +69,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     view.font_path = o.font;
     view.redact = o.redact;
     view.paused = o.paused;
+    view.graph.demo = o.galaxy_demo;
+    view.graph.demo_idle = o.galaxy_demo_idle;
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
     if (o.attach_exe) {

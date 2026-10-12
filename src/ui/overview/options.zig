@@ -26,6 +26,7 @@ pub const usage =
     \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
     \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
+    \\  --galaxy-demo N[:idle]  FD Galaxy with N synthetic processes (1-1024); reads and traces nothing
     \\  --pause         start paused (replay: show the last frame with full history)
     \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
@@ -45,6 +46,8 @@ pub const Options = struct {
     files_start: u64 = 0,
     graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
     graph_count: usize = 0,
+    galaxy_demo: u32 = 0,
+    galaxy_demo_idle: bool = false,
     look: ?vw.memmap.Look = null,
     memmap_pid: ?i32 = null,
     memmap_start: u64 = 0,
@@ -78,7 +81,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--vk-device" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -102,6 +105,12 @@ pub fn parse(args: []const [:0]const u8) !Options {
                 o.graph_pids[o.graph_count] = pid;
                 o.graph_count += 1;
             }
+        }
+        if (std.mem.eql(u8, arg, "--galaxy-demo")) {
+            const idle = std.mem.endsWith(u8, value, ":idle");
+            o.galaxy_demo = std.fmt.parseInt(u32, value[0 .. value.len - if (idle) @as(usize, 5) else 0], 10) catch return error.InvalidGalaxyDemo;
+            if (o.galaxy_demo == 0 or o.galaxy_demo > 1024) return error.InvalidGalaxyDemo;
+            o.galaxy_demo_idle = idle;
         }
         if (std.mem.eql(u8, arg, "--files-pid")) {
             const pid = try std.fmt.parseInt(i32, value, 10);
@@ -143,6 +152,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
         if (o.replay != null or (o.panel != null and o.panel.? != .files)) return error.InvalidFilesIdentity;
         o.panel = .files;
     }
+    if (o.galaxy_demo != 0) {
+        if (o.graph_count > 0 or (o.panel != null and o.panel.? != .galaxy)) return error.InvalidGalaxyDemo;
+        o.panel = .galaxy;
+    }
     if (o.graph_count > 0) {
         if (o.replay != null or (o.panel != null and o.panel.? != .graph and o.panel.? != .galaxy and o.panel.? != .inheritance and o.panel.? != .treemap)) return error.InvalidGraphScope;
         if (o.panel == null) o.panel = .galaxy;
@@ -162,4 +175,8 @@ test "overview options reject debugger targets and bad values" {
     try std.testing.expectError(error.UnknownOverviewTheme, parse(&.{ "xodb", "--overview", "--theme", "neon" }));
     try std.testing.expectError(error.InvalidOverviewInterval, parse(&.{ "xodb", "--overview", "--interval-ms", "10" }));
     try std.testing.expectError(error.UnknownOverviewPanel, parse(&.{ "xodb", "--overview", "--panel", "flight" }));
+    const demo = try parse(&.{ "xodb", "--overview", "--galaxy-demo", "600:idle" });
+    try std.testing.expect(demo.galaxy_demo == 600 and demo.galaxy_demo_idle and demo.panel.? == .galaxy);
+    for ([_][:0]const u8{ "0", "1025", "idle", "7:busy" }) |bad| try std.testing.expectError(error.InvalidGalaxyDemo, parse(&.{ "xodb", "--overview", "--galaxy-demo", bad }));
+    try std.testing.expectError(error.InvalidGalaxyDemo, parse(&.{ "xodb", "--overview", "--galaxy-demo", "9", "--panel", "graph" }));
 }

@@ -99,6 +99,8 @@ pub const Session = struct {
     language_tabs: @import("language_tabs.zig").State = .{},
     language_bindings: @import("../language/runtime_binding.zig").State = .{},
     language_watches: @import("language_watches.zig").State = .{},
+    /// Cooperative Redot/Godot scene debugger peer for an owned launch.
+    redot: @import("../redot/protocol.zig").Adapter = .{},
     maps_epoch: u64 = 0,
     gdb_map: @import("gdb_images.zig").Map = .{},
     maps_generation: u64 = std.math.maxInt(u64),
@@ -861,6 +863,7 @@ pub const Session = struct {
         self.launch_argv = saved;
     }
     pub fn restart(self: *Session) !void {
+        if (self.redot.state != .off) return error.RedotDebuggerNeedsFreshLaunch;
         if (self.observation_archive) |job| if (!job.done.load(.acquire)) return error.ObservationArchiveBusy;
         if (self.observations.busy()) {
             self.observations.stop(.target_ended);
@@ -1256,6 +1259,7 @@ pub const Session = struct {
             self.observations.poll(false, .collector_error);
             return err;
         };
+        self.redot.poll(self.target.snapshot().pid);
         self.pollAllocations();
         self.pollObservations();
         if (self.process_tree) |tree| tree.admit(self);
@@ -2138,6 +2142,7 @@ pub const Session = struct {
         self.language_watches.deinit();
         self.language_tabs.deinit();
         self.language_bindings.deinit();
+        self.redot.deinit();
         self.metadata.deinit();
         if (self.target.isRemote()) self.modules.drainRemoteReaders();
         self.static_analysis.deinit();

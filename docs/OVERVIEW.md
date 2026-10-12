@@ -27,7 +27,7 @@ samples the whole system with the bounded, unprivileged collector
 | FD Treemap | Literal sampled paths; area counts open handles, colour shows sampled IO, capped/unknown paths remain explicit |
 | FD Graph | Processes and cgroups linked through shared files, pipes and proved UNIX socket peers |
 | Parent/Child FDs | Sampled matching descriptors and close-on-exec flags; origin stays unproved |
-| FD Galaxy | Descriptor counts orbiting their processes or cgroups, colored by kind, with deleted holders highlighted |
+| FD Galaxy | Processes as stars in nebulae (one per cgroup or application), shared descriptors as threads between them, measured bytes as impulses along the threads; deleted-but-open holders in pink |
 
 Keys: `1`–`9`, `0`, Tab/Shift+Tab switch panels; arrows, Page Up/Down, Home/End
 move; Left/Right fold the tree; `/` search; `s` next sort, `r` reverse; `v`
@@ -110,6 +110,35 @@ also remains in effect when drilling into Files. It also filters every tracepoin
 to that scope's threads at capture start; threads created later need a new
 capture. An invalid or empty explicit scope refuses instead of capturing
 unrelated processes.
+
+### Reading the galaxy
+
+| You see | It means |
+|---|---|
+| A bright square with a cloud around it | A process (or, folded, a cgroup). The cloud grows with its descriptor count; it is texture, not one dot per descriptor |
+| Coloured dots close to a star | Its descriptors by kind (hover for counts and rates; click for holders) |
+| Clouds of one hue with a bold name | A cluster: processes of one cgroup. On a host whose cgroups say little, processes that share a name cluster instead |
+| A thin curved thread | A descriptor two stars share: a pipe, a socket and its proved UNIX peer, or the same inode. Bundles fan out, so many threads read as a web |
+| A small ring where threads meet | A descriptor with three or more holders |
+| A beaded thread with bright dots running along it | Bytes measured on that descriptor. Dots run from the writer toward the reader; more and faster dots mean a higher rate (steps of the logarithm). The star they reach flashes |
+| Pink star, dot or label | A deleted file that is still open |
+| Dim star | Cached or denied data |
+
+A scope small enough to show every process starts unfolded; `C` folds it into
+cgroups and back. Labels go to clusters, the star under the pointer and the
+busiest few; everything else is in the hover text. Impulses need tracing: with
+polling only, threads stay still. `P` freezes the picture. The galaxy redraws
+only while an impulse is moving, so an idle one costs a frame per sample.
+
+Work per frame is capped: 192 threads drawn (busiest and heaviest first; the
+rest are counted in the "links omitted" line), 320 impulses, 22,000 cloud
+points, 7,000 web segments and 14 labels. Above a few hundred stars the
+per-star detail thins out and the clusters remain. The Win95 look draws the
+same stars, threads and labels without clouds or glow.
+
+`xodb --overview --galaxy-demo 150` shows a synthetic galaxy of 150 processes
+(1 to 1024; add `:idle` for one with no traffic). It reads no descriptors and
+starts no tracing; it is there for demonstrations and tests.
 
 Cgroup grouping retains the last observed membership when a scan carries an
 older process row forward. Groups with cached members are dimmed; the summary

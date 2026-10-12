@@ -34,6 +34,7 @@ pub const inputs = [_]Catalog{
     .{ .name = "src/mcp/overview_tools.json", .text = @embedFile("overview_tools.json"), .group = .native },
     .{ .name = "src/mcp/fd_tools.json", .text = @embedFile("fd_tools.json"), .group = .native },
     .{ .name = "src/mcp/memstat_tools.json", .text = @embedFile("memstat_tools.json"), .group = .native },
+    .{ .name = "src/mcp/redot_tools.json", .text = @embedFile("redot_tools.json"), .group = .native },
     .{ .name = "src/mcp/imported_tools.json", .text = @embedFile("imported_tools.json"), .group = .imported },
     .{ .name = "src/mcp/session_tools.json", .text = @embedFile("session_tools.json"), .group = .session },
 };
@@ -81,7 +82,7 @@ pub fn join(comptime fragments: []const Catalog) []const u8 {
     };
 }
 
-pub const native_definitions = join(inputs[0..7]);
+pub const native_definitions = join(inputs[0..8]);
 pub const overview_definitions = join(inputs[4..7]);
 
 pub fn validateInputs(a: std.mem.Allocator, failure: *?Failure) !void {

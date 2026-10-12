@@ -73,7 +73,8 @@ const Source = struct {
                 if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ self.collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
             }
         }
-        if (view.panel == .graph or view.panel == .galaxy or view.panel == .inheritance) {
+        // A synthetic galaxy reads no descriptors and starts no tracing.
+        if (view.graph.demo == 0 and (view.panel == .graph or view.panel == .galaxy or view.panel == .inheritance)) {
             if (view.graph.refresh(self.collector, current, view.paused, view.panel != .inheritance) catch |err| blk: {
                 view.setStatus("Graph update failed: {s}", .{@errorName(err)}, current);
                 break :blk false;

@@ -1534,6 +1534,10 @@ pub fn spark(ctx: Ctx, rect: Rect, ring: *const h.Ring, max: f32, color: Color, 
     for (1..n + 1) |i| if (pts[i - 1] != null and pts[i] != null) try ctx.line(pts[i - 1].?, pts[i].?, 1.5, color);
 }
 
+test {
+    _ = @import("galaxy.zig");
+}
+
 test "panel groups always include the sidebar's whole-system groups" {
     var v = try View.init(std.testing.allocator);
     defer v.deinit();

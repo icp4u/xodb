@@ -65,6 +65,7 @@ pub const Workspace = struct {
     stop_capture: @import("../model/stop_view.zig").Capture = .{},
     stop_view: @import("../model/stop_view.zig").View = .{},
     process_panel: @import("processes.zig").Panel = .{},
+    redot_panel: @import("redot.zig").Panel = .{},
     process_capture: @import("../model/process_view.zig").Capture = .{},
     allocation_panel: @import("allocations.zig").Panel = .{},
     allocation_capture: @import("../model/allocation_view.zig").Capture = .{},
@@ -280,6 +281,7 @@ pub const Workspace = struct {
         }
     }
     pub fn activeEditor(self: *Workspace, context: anytype) ?*watch_ui.Editor {
+        if (self.redot_panel.open) return null;
         const remote = @TypeOf(context) != *Session;
         const session = if (remote) {} else context;
         if (remote) self.language_panel.syncEditorView(context.language) else self.language_panel.syncEditor(session);
@@ -310,6 +312,7 @@ pub const Workspace = struct {
         if (remote) context.scopeInput(self, w) else self.sharedScopeInput(w, session);
         self.clipboardFocus(w, context);
         defer self.clipboardFocus(w, context);
+        if (!remote and self.redot_panel.open) return self.redot_panel.input(w, &session.redot);
         if (self.logical_frames.open) {
             if (remote) {
                 if (self.logical_frames.inputPrepared(w)) |action| context.send(self, .{ .logical_frames = action });
@@ -535,6 +538,11 @@ pub const Workspace = struct {
                         continue;
                     }
                     const code = binding(event);
+                    if (!remote and event.kind == .press and event.plain() and event.shortcut == 'u') {
+                        self.redot_panel.show(&session.redot);
+                        w.dirty = true;
+                        return self.input(w, context);
+                    }
                     if (code == 0) continue;
                     self.step(w, context, false, code);
                     if (code == 18 and self.language_panel.editor.open) self.language_panel.editor_watch = event.mods.shift;
@@ -1896,6 +1904,7 @@ pub const Workspace = struct {
         try self.runtime_type_panel.prepare(session, height);
         try self.static_panel.prepare(session, tid, self.selected_frame);
         try self.drawPrepared(r, font, w, self.prepared.value, @import("../model/workspace_view.zig").capture(session), @import("../model/language_view.zig").header(session), session.target.core != null);
+        try self.redot_panel.draw(r, font, @floatFromInt(w.width), @floatFromInt(w.height), session.redot.snapshot());
     }
     pub fn timelineBounds(self: *const Workspace, w: *const Window) gpu.Rect {
         const height: f32 = @floatFromInt(w.height);

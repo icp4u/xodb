@@ -31,6 +31,9 @@ pub const State = struct {
     group_path: [4096]u8 = undefined,
     group_len: usize = 0,
     collapse: bool = true,
+    /// Until C is pressed, a scope small enough to show every process is not folded.
+    collapse_auto: bool = true,
+    folded: bool = true,
     max_stars: u32 = 64,
     dirty: bool = true,
     poll_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
@@ -38,6 +41,12 @@ pub const State = struct {
     peer_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
     peer_reason: ?[]const u8 = null,
     owner_cpu_ns: u64 = 0,
+    /// Synthetic galaxy (`--galaxy-demo`): star count, 0 for the live graph.
+    demo: u32 = 0,
+    demo_idle: bool = false,
+    /// The galaxy's animation clock (frozen while paused) and when its last impulse fades.
+    clock: u64 = 0,
+    impulse_until: u64 = 0,
     pub fn deinit(self: *State) void {
         c.xrt_fdinherit_free(self.inheritance);
         self.inheritance = null;
@@ -143,6 +152,7 @@ pub const State = struct {
         if (!self.events_enabled) self.stopCapture();
     }
     pub fn flowing(self: *const State, now: u64) bool {
+        if (now < self.impulse_until) return true;
         const metrics = self.metrics orelse return false;
         return self.flow_running and metrics.last_ns != 0 and now -| metrics.last_ns < 700_000_000;
     }
@@ -168,11 +178,12 @@ pub const State = struct {
             };
             if (group == 0) self.group_len = 0;
         }
+        self.folded = self.collapse and (!self.collapse_auto or g.processes > self.max_stars);
         const options = c.struct_xrt_fdgraph_project_options{
             .max_stars = self.max_stars,
             .max_particles = 1024,
             .focus_process = selected,
-            .collapse_cgroups = @intFromBool(self.collapse and group == 0),
+            .collapse_cgroups = @intFromBool(self.folded and group == 0),
             .focus_group = group,
         };
         var projection: ?*c.struct_xrt_fdgraph_projection = null;

@@ -67,8 +67,27 @@ try:
     check('redacted galaxy has a visible title','descriptor galaxy' in galaxy)
     check('scan omissions are visible',all(word in galaxy for word in ('unscanned','gone','capped','unmatched')))
     check('membership freshness is visible',all(word in galaxy for word in ('fresh','cached','unknown')))
-    d.keys('tap',46) # C: expand cgroup groups to process stars
-    time.sleep(.1)
+    # A scope this small is shown unfolded: one star per process, joined by
+    # threads for the pipe, socket pair and deleted file the two share.
+    def stars():
+        found=re.findall(pattern,Path(d.log).read_text(errors='replace'))
+        return int(found[-1][4]) if found else 0
+    def frames():
+        return [dict(pair.split('=') for pair in line.split()) for line in re.findall(r'galaxy-frame (.*)',Path(d.log).read_text(errors='replace'))]
+    def until(fn,label,seconds=20):
+        end=time.monotonic()+seconds*h.load_scale()
+        while not fn():
+            assert d.alive() and time.monotonic()<end,label
+            time.sleep(.05)
+    check('small scope starts unfolded, one star per process',stars()==2)
+    until(lambda:any(f['stars']=='2' and int(f['strands'])>0 and f['drawn']==f['strands'] for f in frames()),'threads between the two owned stars')
+    check('shared descriptors are drawn as threads between the stars',True)
+    check('an untraced galaxy has no impulses and is not animating',all(f['impulses']=='0' and f['moving']=='0' for f in frames()))
+    d.keys('tap',46) # C: fold the two processes into their cgroup
+    until(lambda:stars()==1,'C folds processes into one cgroup star')
+    d.keys('tap',46) # C: back to process stars
+    until(lambda:stars()==2,'C unfolds the cgroup')
+    check('C folds and unfolds cgroups',True)
     d.keys('tap',34) # G: shared topology
     check('graph view renders', 'shared files' in h.ocr_until(d,'graph',lambda t:'shared files' in t))
     # The two process stars sit at the top and bottom of the circle. Focus the
