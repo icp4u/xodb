@@ -51,8 +51,8 @@ struct xsvc_state {
 };
 
 /* Linux pathname AF_UNIX only: absolute, nonempty, shorter than sun_path.
- * Refuses all existing entries. Creates mode 0600, nonblocking/CLOEXEC; accepts
- * only the effective UID captured at open. Caller supplies an owned directory.
+ * Refuses all existing entries. Creates mode 0600, nonblocking/CLOEXEC; the
+ * socket's file permissions are the access check. Caller supplies the directory.
  * NULL reports errno. No umask change or stale-socket removal is performed. */
 struct xsvc *xsvc_open(const char *path);
 /* In a fork child, closes inherited descriptors without unlinking the parent's

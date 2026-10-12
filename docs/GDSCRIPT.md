@@ -218,7 +218,7 @@ costs 17 to 26 ms and 340 to 530 reads (about 8 to 12 KB); an expression 2 to
 | A debug-enabled engine: an editor build or a `template_debug` export template | Only these keep the script call stack | `GDScriptCallStackNotTracked` |
 | DWARF in that engine binary (`debug_symbols=yes` when building it) | Every offset is read from the binary's own type descriptions | `GDScriptDwarfUnavailable` |
 | Its symbol table | The engine is recognised by `GDScriptLanguage::singleton` and the thread-local `GDScriptLanguage::_call_stack` | No GDScript tab; `GDScriptRuntimeUnavailable` |
-| Room for the image: `--image-limit` and `--image-total-limit` | An engine with DWARF is about 1 to 1.5 GB; the defaults are 256 MiB an image | `GDScriptImageBudgetExceeded`, with the values to rerun with ([large images](LARGE_IMAGES.md)) |
+| Room for the image: `--image-limit` and `--image-total-limit` | An engine with DWARF is about 1 to 1.5 GB; the defaults are 1 GiB an image and 4 GiB in all | `GDScriptImageBudgetExceeded`, with the values to rerun with ([large images](LARGE_IMAGES.md)) |
 | x86-64 Linux, the engine as the main executable | The call stack is found through the thread pointer and the executable's static thread-local block | `GDScriptArchitectureUnsupported`, `GDScriptRuntimeUnavailable` |
 
 `scripts/demo-redot` works the two image options out from the engine's size.

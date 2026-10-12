@@ -8,8 +8,8 @@ const mib = 1024 * 1024;
 /// values are the user's to choose (--image-limit, --image-total-limit).
 pub const min_limit: u64 = mib;
 pub const max_limit: u64 = if (@sizeOf(usize) >= 8) 1 << 40 else 1 << 31;
-pub var per_image_limit: usize = 256 * mib;
-pub var total_limit: usize = 1024 * mib;
+pub var per_image_limit: usize = 1024 * mib;
+pub var total_limit: usize = if (@sizeOf(usize) >= 8) 4096 * mib else 2048 * mib;
 /// Whole-file transfers from a runtime agent keep the agent's fixed cap.
 pub const remote_image_limit: usize = 256 * mib;
 /// Null keeps the default. Values are bytes.
@@ -68,8 +68,8 @@ pub const Refusal = struct {
         const want = @max(@max(pool *| 2, pool +| per_image_limit), total_limit +| 1);
         return @min(want / gib + @intFromBool(want % gib != 0), max_limit / gib);
     }
-    /// "PATH is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M
-    /// --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes"
+    /// "PATH is 3000 MiB; image budget 1024 MiB; rerun with --image-limit 3200M
+    /// --image-total-limit 7G or set symbols.image_bytes and symbols.image_total_bytes"
     pub fn write(self: Refusal, buffer: []u8, path: []const u8) []const u8 {
         var name: [path_text]u8 = undefined;
         const path_name = printable(&name, path, path_text);
@@ -150,7 +150,7 @@ pub fn refusal(size: u64) Refusal {
 /// executable uses the per-image limit). All sweeps together hold at most
 /// `sweepLimit`: half the total, and
 /// never the last per-image budget of it, which a stack frame may need.
-pub const sweep_image_limit: usize = 256 * mib;
+pub const sweep_image_limit: usize = 1024 * mib;
 var swept = std.atomic.Value(usize).init(0);
 pub fn sweepLimit() usize {
     return @min(total_limit / 2, total_limit -| per_image_limit);
@@ -318,10 +318,13 @@ pub fn bootIdTarget(target: ?*const @import("../target/runtime.zig").c.struct_xr
 
 test "image budgets parse sizes, refuse nonsense and say what to raise" {
     const gib = 1024 * mib;
-    // The defaults: larger budgets are the user's choice.
-    try std.testing.expectEqual(@as(usize, 256 * mib), per_image_limit);
-    try std.testing.expectEqual(@as(usize, 1024 * mib), total_limit);
-    try std.testing.expectEqual(@as(usize, 512 * mib), sweepLimit());
+    // The defaults admit an ordinary debug build (a 321 MiB executable and
+    // a 455 MiB library, say); larger budgets are the user's choice.
+    try std.testing.expectEqual(@as(usize, gib), per_image_limit);
+    try std.testing.expectEqual(@as(usize, 4 * gib), total_limit);
+    try std.testing.expectEqual(@as(usize, 2 * gib), sweepLimit());
+    try std.testing.expectEqual(@as(usize, gib), sweep_image_limit);
+    for ([_]usize{ 321 * mib, 455 * mib, gib }) |size| release(try reserve(size));
     try std.testing.expectEqual(@as(u64, 268435456), try parseSize("268435456"));
     try std.testing.expectEqual(@as(u64, 256 * mib), try parseSize("256M"));
     try std.testing.expectEqual(@as(u64, 2 * gib), try parseSize("2g"));
@@ -335,6 +338,12 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
     const start = used();
     // The sentence names the option and a value that admits the image; the
     // suggestion parses, and is within the accepted range.
+    try std.testing.expectEqualStrings("/opt/game/engine is 1500 MiB; image budget 1024 MiB; rerun with --image-limit 1600M or set symbols.image_bytes", refusal(1500 * mib).write(&text, "/opt/game/engine"));
+    try std.testing.expectEqualStrings("/opt/game/engine is 3000 MiB; image budget 1024 MiB; rerun with --image-limit 3200M --image-total-limit 7G or set symbols.image_bytes and symbols.image_total_bytes", refusal(3000 * mib).write(&text, "/opt/game/engine"));
+    try std.testing.expectEqualStrings("/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 4096 MiB total image budget; rerun with --image-total-limit 5G or set symbols.image_total_bytes", (Refusal{ .size = 300 * mib, .limit = 120 * mib, .which = .total, .left = 120 * mib }).write(&text, "/opt/game/libphysics.so"));
+    try std.testing.expectEqualStrings("/opt/app/libhuge.so is 1500 MiB; a search of every mapped image reads at most 1024 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it", (Refusal{ .size = 1500 * mib, .limit = 0, .which = .sweep }).write(&text, "/opt/app/libhuge.so"));
+    try std.testing.expectEqualStrings("/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 2048 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 5G or set symbols.image_total_bytes; a stack frame in the image loads it; if a stopped capture holds images, use release_profile before searching again", (Refusal{ .size = mib, .limit = 0, .which = .sweep }).write(&text, "/usr/lib/libz.so.1"));
+    try configure(256 * mib, gib); // smaller budgets, for the sentences below
     try std.testing.expectEqualStrings("/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes", refusal(1052237576).write(&text, "/opt/game/engine"));
     try std.testing.expectEqualStrings("/lib/c.so is 300 MiB; image budget 256 MiB; rerun with --image-limit 400M or set symbols.image_bytes", refusal(300 * mib).write(&text, "/lib/c.so"));
     try std.testing.expect(1100 * mib >= 1052237576 + 1052237576 / 20 and try parseSize("1100M") <= max_limit);
@@ -345,9 +354,9 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
         try std.testing.expectError(error.InvalidImageBudget, configure(bad, null));
         try std.testing.expectError(error.InvalidImageBudget, configure(null, bad));
     }
-    try std.testing.expectEqual(saved[0], per_image_limit); // a refused value changes nothing
+    try std.testing.expectEqual(@as(usize, 256 * mib), per_image_limit); // a refused value changes nothing
     try configure(2 * gib, null); // one value leaves the other alone
-    try std.testing.expectEqual(saved[1], total_limit);
+    try std.testing.expectEqual(@as(usize, gib), total_limit);
     try std.testing.expectEqual(@as(usize, 0), sweepLimit()); // nothing is left over a frame's image
     try configure(2 * gib, 8 * gib);
     try std.testing.expectEqual(@as(usize, 4 * gib), sweepLimit());
@@ -380,7 +389,7 @@ test "image budgets parse sizes, refuse nonsense and say what to raise" {
     releaseSweep(a);
     releaseSweep(b);
     try std.testing.expectEqual(swept_before, sweepLeft());
-    try std.testing.expectEqualStrings("/lib/s.so is 300 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it", (Refusal{ .size = 300 * mib, .limit = 32 * mib, .which = .sweep }).write(&text, "/lib/s.so"));
+    try std.testing.expectEqualStrings("/lib/s.so is 1100 MiB; a search of every mapped image reads at most 1024 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it", (Refusal{ .size = 1100 * mib, .limit = 32 * mib, .which = .sweep }).write(&text, "/lib/s.so"));
     // 20 of the 32 MiB are held and 30 more are wanted: 50 MiB for sweeps is a total of 114 MiB (64 are a frame's).
     try std.testing.expectEqualStrings("/lib/t.so is 30 MiB; 12 MiB left of the 32 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 1G or set symbols.image_total_bytes; a stack frame in the image loads it; if a stopped capture holds images, use release_profile before searching again", (Refusal{ .size = 30 * mib, .limit = 12 * mib, .which = .sweep }).write(&text, "/lib/t.so"));
     try configure(256 * mib, 512 * mib);

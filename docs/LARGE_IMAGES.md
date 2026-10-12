@@ -9,8 +9,8 @@ budgets bound those copies:
 
 | Budget | Default | Option | Preference |
 | --- | --- | --- | --- |
-| One image | 256 MiB | `--image-limit SIZE` | `symbols.image_bytes` |
-| All images in the xodb process | 1 GiB | `--image-total-limit SIZE` | `symbols.image_total_bytes` |
+| One image | 1 GiB | `--image-limit SIZE` | `symbols.image_bytes` |
+| All images in the xodb process | 4 GiB | `--image-total-limit SIZE` | `symbols.image_total_bytes` |
 
 `SIZE` is bytes, or a whole number with `K`, `M` or `G` (`256M`, `4G`); the
 preferences take bytes. Values from 1 MiB to 1 TiB are accepted (2 GiB at most
@@ -19,19 +19,20 @@ command line wins over the preferences file. An image must fit both its own
 budget and what is left of the total. The budgets are caps, not allocations:
 memory is used only for images that are actually read, one copy each.
 
-The defaults are small on purpose. The files a debugged process maps are the
-process's to choose, and a budget is what xodb will read of them without
-being asked. Larger budgets are opt-in: a 1 GB executable with DWARF costs
-about 1 GB of resident memory once a stack through it is shown, and that is a
-choice for whoever runs the debugger. The preferences file is the user's own
-and is trusted with it.
+The defaults admit an ordinary debug build (an executable or library of a
+few hundred MiB with DWARF) without any option. The files a debugged process
+maps are the process's to choose, and a budget is what xodb will read of them
+without being asked: an image costs about its size in resident memory once a
+stack through it is shown. Larger budgets are opt-in, and smaller ones can be
+set the same way on a host short of memory. The preferences file is the user's
+own and is trusted with it.
 
 When an image does not fit, xodb says which and why, and what to rerun with
 for that image, in the same words everywhere:
 
 ```
-/opt/game/engine is 1004 MiB; image budget 256 MiB; rerun with --image-limit 1100M --image-total-limit 3G or set symbols.image_bytes and symbols.image_total_bytes
-/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 1024 MiB total image budget; rerun with --image-total-limit 2G or set symbols.image_total_bytes
+/opt/game/engine is 3000 MiB; image budget 1024 MiB; rerun with --image-limit 3200M --image-total-limit 7G or set symbols.image_bytes and symbols.image_total_bytes
+/opt/game/libphysics.so is 300 MiB; 120 MiB left of the 4096 MiB total image budget; rerun with --image-total-limit 5G or set symbols.image_total_bytes
 ```
 
 The suggested per-image value is the image's size plus 5%, rounded up to a
@@ -257,9 +258,10 @@ bound follows from the reason, in one place (`Modules.allowance`):
 
 A search of every image reads an already held image at no extra cost. Every
 new image, **including the main executable**, counts against the sweep share:
-`min(total / 2, total - per_image)`. At defaults that is 512 MiB; with
+`min(total / 2, total - per_image)`. At defaults that is 2 GiB; with
 `--image-limit 2G --image-total-limit 8G` it is 4 GiB. The main executable may
-be as large as the per-image budget; other new images may be at most 256 MiB.
+be as large as the per-image budget; other new images may be at most 1 GiB
+(and no larger than the per-image budget).
 Derived copies and inflated debug sections opened for a source search also
 count against the share.
 
@@ -291,8 +293,8 @@ never taken for an answer about images that were not read:
   the Modules list names them.
 
 ```
-/opt/app/libhuge.so is 1023 MiB; a search of every mapped image reads at most 256 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it
-/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 512 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 2G or set symbols.image_total_bytes; a stack frame in the image loads it
+/opt/app/libhuge.so is 1500 MiB; a search of every mapped image reads at most 1024 MiB of an image that is not loaded; raise --image-limit if needed, then a stack frame in the image can load it
+/usr/lib/libz.so.1 is 1 MiB; 0 MiB left of the 2048 MiB of the total image budget that searches of every mapped image may hold; rerun with --image-total-limit 5G or set symbols.image_total_bytes; a stack frame in the image loads it
 ```
 
 To search a skipped image, show a stack with a frame in it (it is then held,
@@ -327,12 +329,12 @@ large optimised program as well (`Vector::size()` in a 1.3 GB game engine
 does); give an address or a symbol for such a line.
 
 A core is searched the same way, and has no main executable for this
-purpose: every image of a core over 256 MiB is searched for a line only once
+purpose: every image of a core over 1 GiB is searched for a line only once
 a stack frame has loaded it.
 
 Through a runtime agent the main executable is not told apart in a search
-either: it counts as any other image there, within the same 256 MiB and the
-same share of the total. Separate file transfers can have distinct snapshot
+either: it counts as any other image there, within the same 1 GiB and the
+same share of the total (and the agent's 256 MiB transfer cap). Separate file transfers can have distinct snapshot
 identities, so two agent readers can require separate copies of one target
 file. Release the earlier capture, or restart to release a line reader,
 before testing a fresh capture at a full sweep share. Caller frames use

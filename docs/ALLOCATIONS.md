@@ -170,7 +170,7 @@ explicit; successful allocator pairing and lifetime totals do not imply complete
 caller coverage. Frame pointers are required for reliable deeper callers. This
 version does not reconstruct allocation stacks using DWARF. Symbols come from
 immutable ELF snapshots taken while the selected target is stopped, with the
-existing image budgets (by default 256 MiB per image, 1 GiB in total). Unavailable images leave
+existing image budgets (by default 1 GiB per image, 4 GiB in total). Unavailable images leave
 raw addresses. Executable mapping events end collection, except a nonoverlapping
 kernel `[uprobes]` trampoline created by the probes themselves; unobserved unmaps,
 remaps and JIT changes remain attribution limits.

@@ -214,8 +214,7 @@ int xsvc_accept(struct xsvc *s, uint64_t now, struct xsvc_peer *out)
     struct ucred credentials;
     socklen_t size = sizeof(credentials);
     if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &credentials, &size) < 0 ||
-        size != sizeof(credentials) || credentials.uid != s->uid ||
-        s->peer_count == XSVC_MAX_PEERS) {
+        size != sizeof(credentials) || s->peer_count == XSVC_MAX_PEERS) {
         close(fd);
         return 0;
     }

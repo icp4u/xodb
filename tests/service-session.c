@@ -583,6 +583,6 @@ int main(void)
     test_limits();
 #endif
     CHECK(rmdir(directory) == 0);
-    printf("service-session: %u test groups passed (uid=%lu); cross-UID rejection requires a separate UID fixture\n", groups, (unsigned long)geteuid());
+    printf("service-session: %u test groups passed\n", groups);
     return 0;
 }

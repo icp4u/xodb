@@ -148,9 +148,9 @@ try:
         session = client.stopped('breakpoint', seconds=60)
     client.tool('detach', generation=client.session()['generation']); client.close(); client = None
 
-    # 2. Default budgets: the engine image does not fit, and the refusal says so.
+    # 2. A budget the engine image does not fit: the refusal says so.
     if engine.stat().st_size > 256 << 20:
-        client = Client('control', None, options=['--attach', str(pid)], reply_seconds=120)
+        client = Client('control', None, options=['--image-limit', '256M', '--attach', str(pid)], reply_seconds=120)
         generation = client.stopped(seconds=120)['generation']
         stack, why = language_stack(client, tid=pid, generation=generation)
         check(stack is None and why[0] == 'GDScriptImageBudgetExceeded' and len(why) == 2, (stack, why))

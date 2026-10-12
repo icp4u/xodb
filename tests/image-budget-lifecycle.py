@@ -93,7 +93,7 @@ a.opt = ['--runtime-agent', str(Path(a.agent).resolve())] if a.agent else []
 a.reply = 90
 a.junk_cap = 40
 PER, TOTAL = a.per * MIB, a.total * MIB
-if (a.per, a.total) != (256, 1024): a.opt += ['--image-limit', f'{a.per}M', '--image-total-limit', f'{a.total}M']
+a.opt += ['--image-limit', f'{a.per}M', '--image-total-limit', f'{a.total}M']
 made = []
 def build():
     (w / 'phase.c').write_text(PHASE); (w / 'honest.c').write_text(HONEST)

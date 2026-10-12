@@ -290,8 +290,8 @@ have matching executable placement. Each successful step reports
 `windows_unwind`, `windows_leaf` or `windows_epilog`. Missing bytes, unsupported
 records and unverified mappings terminate a partial result.
 
-PE and ELF snapshots share the 256-image, 256 MiB per-file and 1 GiB total file
-budgets. PE parser allocations have a separate 256 MiB retained cap. These limits
+PE and ELF snapshots share the 256-image bound and the total image budget
+(4 GiB by default); a PE file is read up to 256 MiB. PE parser allocations have a separate 256 MiB retained cap. These limits
 do not preallocate storage. Capture opening is synchronous, as for existing ELF
 snapshots. Header/unwind comparison does not establish byte-for-byte loaded code
 identity: recorded epilogue inspection uses the original file, and in-place code

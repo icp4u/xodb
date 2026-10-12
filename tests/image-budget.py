@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Full-image budgets: an image above the default 256 MiB is refused with a
+"""Full-image budgets: the defaults (1 GiB an image, 4 GiB in all) admit an
+ordinary large image. An image above the budget is refused with a
 reply that names the image, its size, the budget and the option to rerun with;
 rerun with exactly that, it loads and symbolises. The same for a budget set by
 option or config file, and for the total.
@@ -17,8 +18,8 @@ import time
 from client import Client
 
 MIB = 1 << 20
-SIZE = 257 * MIB  # just above the default per-image budget
-DEFAULTS = {'image_limit': 256 * MIB, 'total_limit': 1024 * MIB}
+SIZE = 257 * MIB  # just above the 256 MiB budget the refusals below ask for
+DEFAULTS = {'image_limit': 1024 * MIB, 'total_limit': 4096 * MIB}
 LIBRARY = '''
 #include <unistd.h>
 __attribute__((noinline)) int big_wait(int fd) {
@@ -132,11 +133,17 @@ def main():
         assert target.stdout.readline() == 'ready\n', target.stderr.read()
         tid = target.pid; attach = ['--attach', str(tid)]
 
-        # Default budgets: 256 MiB an image, 1 GiB in all, and the refusal
-        # says what to rerun with for this image.
+        # Default budgets: 1 GiB an image, 4 GiB in all; this image loads.
         client = Client('control', None, options=attach)
         figures = client.inspect('list_modules', limit=1)['image_bytes']
         assert {k: figures[k] for k in DEFAULTS} == DEFAULTS, figures
+        found = stack(client, client.stopped(), tid)
+        assert found['image_budget'] is None and any(f['symbol'] == 'big_wait' for f in found['frames']), found
+        assert b'module budget' not in close(client); client = None
+
+        # A smaller budget on the command line: the refusal says what to
+        # rerun with for this image.
+        client = Client('control', None, options=[*attach, '--image-limit', '256M'])
         notice = refused(client, tid, library, 'image budget 256 MiB', ('--image-limit', 'symbols.image_bytes'))
         err = close(client); client = None
         assert err.count(b'module budget:') == 1 and notice.encode() in err, err
@@ -161,20 +168,15 @@ def main():
         result['advised'] = {'options': advice.group(1), 'frames': [f['symbol'] for f in found['frames']], 'seconds': round(time.monotonic() - t0, 3), 'rss_bytes': rss, 'image_bytes': SIZE}
         assert b'module budget' not in close(client); client = None
 
-        # The same value given on the command line: the same words.
-        client = Client('control', None, options=[*attach, '--image-limit', '256M'])
+        # Set in the config file: the same words. Raised there: it loads.
+        (w/'low.json').write_text(json.dumps({'symbols': {'image_bytes': 256 * MIB}}))
+        client = Client('control', None, options=[*attach, '--config', str(w/'low.json')])
         assert refused(client, tid, library, 'image budget 256 MiB', ('--image-limit', 'symbols.image_bytes')) == notice
         close(client); client = None
-
-        # Raised in the config file: it loads. Set in the file to the default: the same words.
         (w/'high.json').write_text(json.dumps({'symbols': {'image_bytes': 300 * MIB}}))
         client = Client('control', None, options=[*attach, '--config', str(w/'high.json')])
         found = stack(client, client.stopped(), tid)
         assert found['image_budget'] is None and any(f['symbol'] == 'big_wait' for f in found['frames']), found
-        close(client); client = None
-        (w/'low.json').write_text(json.dumps({'symbols': {'image_bytes': 256 * MIB}}))
-        client = Client('control', None, options=[*attach, '--config', str(w/'low.json')])
-        assert refused(client, tid, library, 'image budget 256 MiB', ('--image-limit', 'symbols.image_bytes')) == notice
         close(client); client = None
 
         # The command line wins over the file.
@@ -206,7 +208,7 @@ def main():
         library.unlink(missing_ok=True)
         result['elapsed_seconds'] = round(time.monotonic() - started, 3)
         (w/'results.json').write_text(json.dumps(result, indent=2) + '\n')
-    print(f"image budget: defaults are 256 MiB an image and 1 GiB in all; a {SIZE // MIB} MiB image is refused with: {result['option'].replace(str(w), '.')}; "
+    print(f"image budget: defaults are 1 GiB an image and 4 GiB in all and load a {SIZE // MIB} MiB image; with --image-limit 256M it is refused with: {result['option'].replace(str(w), '.')}; "
           f"rerun with {result['advised']['options']} it loads and symbolises ({result['advised']['rss_bytes'] >> 20} MiB resident)")
 
 

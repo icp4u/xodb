@@ -30,8 +30,10 @@ control, obtain the current generation with `get_session`, then call `continue` 
 The socket is the MCP endpoint; do not add `--mcp`.
 
 The socket path must be absolute, in a private directory. xodb creates a mode 0600
-Unix socket and accepts clients with the same effective UID, up to eight
-connections. Keep the directory mode 0700. These permissions grant access to the
+Unix socket and accepts up to eight connections. The socket's file permissions
+are the access check: to let another local account in (an agent under its own
+user, say), `chmod` or `chgrp` the socket and its directory for that account.
+Otherwise keep the directory mode 0700. These permissions grant access to the
 shared debugger state; the controller lease coordinates clients within that
 access. The bridge does not add a separate authentication protocol.
 

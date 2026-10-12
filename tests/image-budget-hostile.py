@@ -26,8 +26,8 @@ is written to disk; the debugger still reads what the headers claim.
   mappings a file mapped thousands of times is still placed and named; only
            real work is refused, and the refusal is listed
   refused  a symbols-only view refused after its reader finished stays refused
-  defaults 256 MiB an image and 1 GiB in all unless asked; the refusal says
-           what to rerun with, and rerun with exactly that the image loads
+  defaults 1 GiB an image and 4 GiB in all unless asked; with less, the refusal
+           says what to rerun with, and rerun with exactly that the image loads
   optin    with larger budgets asked for, a 1 GiB image loads
   starve   a search for a source line reads every mapped image, but never so
            much that the frame the thread is stopped in cannot load; what it
@@ -41,8 +41,9 @@ is written to disk; the debugger still reads what the headers claim.
            and nothing else
   restore  a saved breakpoint is restored after a restart by reading the one
            image it is in
-Cases run with the default budgets unless they say otherwise; OPTIN is the
-larger pair a user may ask for.
+Cases run with SMALL budgets (256 MiB an image, 1 GiB in all) unless they say
+otherwise, so that 300 MiB images stand for large ones; OPTIN is the larger
+pair a user may ask for.
 --wrong-result expects the lookup to read every image and must fail."""
 import argparse
 import ctypes
@@ -59,6 +60,7 @@ from helpers.input import load_scale
 
 MIB = 1 << 20
 BIG = 300 * MIB
+SMALL = ('--image-limit', '256M', '--image-total-limit', '1G')
 OPTIN = ('--image-limit', '2G', '--image-total-limit', '8G')
 SHF_COMPRESSED = 0x800
 HOST = r'''
@@ -134,13 +136,13 @@ def oversized_symbols(source, path, size=BIG):
 
 class Run:
     """One target and one debugger attached to it."""
-    def __init__(self, w, program, libs, options=(), env=None):
+    def __init__(self, w, program, libs, options=(), env=None, budget=SMALL):
         self.target = subprocess.Popen([str(program), *map(str, libs)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, bufsize=1, env={**os.environ, **(env or {})})
         self.client = None
         try:
             assert self.target.stdout.readline() == 'ready\n', self.target.stderr.read()
             self.tid = self.target.pid
-            self.client = Client('control', None, options=['--attach', str(self.tid), *options], reply_seconds=30)
+            self.client = Client('control', None, options=[*budget, '--attach', str(self.tid), *options], reply_seconds=30)  # a later option wins
             self.session = self.client.stopped(seconds=30)
         except BaseException:
             self.kill(); raise
@@ -479,7 +481,7 @@ def container(w, a, result):
         archive = run/(label + '.apk')
         files = [(n + '.so', run/(n + '.so')) for n in ('left', 'right')]
         offsets = sparse_apk(archive, files, size) if size else apk['pack'](archive, files)
-        c = Client('control', str(run/'loader'), args=[str(archive), *map(str, offsets)], options=('--break', 'fixture_ready'), reply_seconds=30)
+        c = Client('control', str(run/'loader'), args=[str(archive), *map(str, offsets)], options=(*SMALL, '--break', 'fixture_ready'), reply_seconds=30)
         try:
             c.continue_initial_stop(); c.stopped('breakpoint', seconds=30)
             def find(name):
@@ -520,9 +522,9 @@ def core(w, a, result):
             if p.poll() is None: os.killpg(p.pid, 9); p.wait()
     assert dump.exists(), (w/'co.gdb.txt').read_text()
     try:
-        # Default budgets. A name that is nowhere: the small images are read
+        # Small budgets. A name that is nowhere: the small images are read
         # and searched, the large one is not.
-        c = Client('observe', None, options=('--core', str(dump)), reply_seconds=30)
+        c = Client('observe', None, options=(*SMALL, '--core', str(dump)), reply_seconds=30)
         try:
             errors(c.tool('find_symbol', name='xodb_no_such_symbol')['result'])
             refusals = [f.get('detail') or '' for f in load_failures(c) if f['path'].endswith('/co.so')]
@@ -537,7 +539,7 @@ def core(w, a, result):
             holds(c, 0, 256 * MIB - 1)
             answer = reply['structuredContent']
             assert answer['status'] == 'no_selection' and answer.get('images_not_searched', 0) >= 1 and '/co.so is 300 MiB' in answer['image_budget'], answer
-            # The frame the thread stopped in does not fit the default budget, and
+            # The frame the thread stopped in does not fit the budget, and
             # the reply says so at the top, with what to rerun with.
             session = c.session()
             found = c.inspect('get_stack', generation=session['generation'], tid=session['threads'][0]['tid'])
@@ -834,13 +836,21 @@ def defaults(w, a, result):
     for lib in (one, two): lib.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(lib, BIG)
     advice = re.compile(r'; rerun with ((?:--image-(?:total-)?limit \d+[MG] ?)+) or set symbols\.image_(?:total_)?bytes')
     try:
-        # Nothing asked for: 256 MiB an image, 1 GiB in all, and a 300 MiB image is refused unread.
-        options, said = {}, []
+        # Nothing asked for: 1 GiB an image, 4 GiB in all, and both 300 MiB images load.
+        r = Run(w, w/'host', [one, two], env={'CHAIN': '1'}, budget=())
+        try:
+            figures = r.modules().get('image_bytes')
+            assert figures and figures['image_limit'] == 1024 * MIB and figures['total_limit'] == 4096 * MIB, figures
+            found = r.stack()
+            assert all(named(found, name) and named(found, name)['source'] for name in ('probe_wait', 'probe_call')) and found.get('image_budget') is None, found
+            r.close()
+        finally:
+            r.kill()
+        # With less asked for, a 300 MiB image is refused unread.
+        options, said = dict(zip(SMALL[::2], SMALL[1::2])), []
         for attempt in range(4):
-            r = Run(w, w/'host', [one, two], options=[x for pair in options.items() for x in pair], env={'CHAIN': '1'})
+            r = Run(w, w/'host', [one, two], options=[x for pair in options.items() for x in pair], env={'CHAIN': '1'}, budget=())
             try:
-                figures = r.modules().get('image_bytes')
-                if attempt == 0 and figures: assert figures['image_limit'] == 256 * MIB and figures['total_limit'] == 1024 * MIB, figures
                 found = r.stack()
                 loaded = [name for name in ('probe_wait', 'probe_call') if named(found, name) and named(found, name)['source']]
                 r.holds(len(loaded) * BIG, len(loaded) * BIG + MIB)  # a refused image is not read; the small executable is
@@ -859,7 +869,7 @@ def defaults(w, a, result):
                 r.kill()
         else:
             raise AssertionError(f'following the refusals did not load both images: {said}')
-        # Both images fit after the per-image advice at the default total.
+        # Both images fit after the per-image advice at that total.
         assert said and 'image budget 256 MiB; rerun with --image-limit 400M' in said[0] and len(said) == 1, said
         result['defaults'] = {'refusals': said, 'options': options}
     finally:
@@ -902,9 +912,9 @@ def junk(w, prefix, each, total):
 def starved(w, a, result, key, capture):
     result[key] = {}
     line = HOST.split('\n').index(next(l for l in HOST.split('\n') if 'int exe_marker(int n)' in l)) + 1
-    for label, options, image, total in (('defaults', (), 256 * MIB, 1024 * MIB), ('optin', OPTIN, 2 << 30, 8 << 30)):
+    for label, options, image, total in (('small', SMALL, 256 * MIB, 1024 * MIB), ('optin', OPTIN, 2 << 30, 8 << 30)):
         honest = w/f'{key}_honest.so'; honest.write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(honest, MIB)
-        libs = junk(w, key + '_junk', min(1023 * MIB, image), total)
+        libs = junk(w, key + '_junk', min(1025 * MIB, image), total)  # at most the budget, or just over what a search reads of one image
         assert sum(lib.stat().st_size for lib in libs) > total  # the probe mapped more than the whole total
         share = min(total // 2, total - image)
         try:
@@ -1048,7 +1058,7 @@ def views(w, a, result):
     for i in range(4): libs.append(w/f'vw{i}.so'); libs[-1].write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(libs[-1], BIG)
     result['views'] = {}
     try:
-        for label, options, expected in (('defaults', (), 0), ('optin', OPTIN, BIG)):
+        for label, options, expected in (('small', SMALL, 0), ('optin', OPTIN, BIG)):
             r = Run(w, program, [w/'lk_ok.so', *libs], options=options)
             try:
                 answers = {}
@@ -1078,7 +1088,7 @@ def restore(w, a, result):
     for i in range(4): libs.append(w/f'rs{i}.so'); libs[-1].write_bytes((w/'lk_ok.so').read_bytes()); os.truncate(libs[-1], BIG)
     result['restore'] = {}
     try:
-        for label, options in (('defaults', ()), ('optin', OPTIN)):
+        for label, options in (('small', SMALL), ('optin', OPTIN)):
             c = Client('control', str(w/'host'), args=[str(lib) for lib in libs], options=(*options, '--break', 'exe_marker'), reply_seconds=30)
             try:
                 c.continue_initial_stop(); c.stopped('breakpoint', seconds=30)
@@ -1094,12 +1104,12 @@ def restore(w, a, result):
                 c.inspect('continue', generation=c.session()['generation'])
                 c.stopped('breakpoint', seconds=30)  # at exe_marker again: the libraries are open
                 probe = next(b for b in c.inspect('get_breakpoints')['breakpoints'] if b['id'] == saved)
-                if options:
+                if options is OPTIN:
                     # Restored in the new process, by reading the one library it is in.
                     assert not probe['pending'] and probe['address'], probe
                     held = holds(c, BIG, BIG + MIB)
                 else:
-                    # Over the default budget the image is not read, and the breakpoint waits.
+                    # Over the small budget the image is not read, and the breakpoint waits.
                     assert probe['pending'], probe
                     held = holds(c, 0, MIB)
                 result['restore'][label] = {'pending': probe['pending'], 'held_bytes': held}

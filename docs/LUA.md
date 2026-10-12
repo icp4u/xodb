@@ -78,7 +78,8 @@ DWARF work steps, returning `LuaDwarfUnitLimit` or `LuaDwarfWorkLimit` when
 exhausted. A work step is not a compilation unit; complex C++ units can exhaust
 the budget well below the unit limit. Symbol identity checks inspect at most
 1 million symbol entries and otherwise return `LuaSymbolWorkLimit`. The current
-module snapshot also limits an executable to 256 MiB. Large embedded hosts can
+module snapshot also limits an executable to the per-image budget (1 GiB by
+default). Larger embedded hosts can
 therefore be refused before any Lua value is inspected; these profiles do not
 yet provide ranged DWARF loading for larger files.
 

@@ -146,7 +146,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--source-map FROM=TO substitutes absolute source directory prefixes (repeatable; server paths).
                 \\--debug-file FILE explicitly supplies a build-ID-matched debug ELF (repeatable; server path).
                 \\--image-limit SIZE and --image-total-limit SIZE bound full ELF images read for code, source and types
-                \\  (bytes, or K/M/G; default 256M per image and 1G in total; a refused image says what to raise).
+                \\  (bytes, or K/M/G; default 1G per image and 4G in total; a refused image says what to raise).
                 \\--break SYMBOL is repeatable (up to 64): symbols install in order; duplicates share a breakpoint.
                 \\Unloaded glibc library symbols remain pending without dropping other --break requests.
                 \\--follow-forks follows x86-64 process creation; --process-limit N bounds retained processes (1..1024, default 32).
