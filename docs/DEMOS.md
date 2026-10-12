@@ -1,5 +1,24 @@
 # Short demo walkthroughs
 
+## Pseudo-C beside a live stop
+
+```sh
+XODB_STATIC_ANALYSIS=/path/to/owned/ghx-build scripts/demo-decompile
+```
+
+The launcher builds `tests/fixtures/semq/qx.c` from source with gcc `-O2` and
+DWARF, then stops at `qx_alloc`. Press **Space**, then **D**. The middle pane
+shows the retained worker pseudo-C beside the real source, with syntax colours,
+the current instruction, breakpoints, and current DWARF values where a pseudo
+name can be matched. Click a pseudo-C line to select its exact exported PCs;
+the source follows only when the line table maps one of those PCs. **D** returns
+to assembly and **S** opens the slice/control questions for the selection.
+
+MCP `decompile_function` returns the same text, signature, qualification and
+artifact id. `get_decomp_mapping` reads that cached artifact by exact token
+range, pseudo-C line, or runtime PC. The output is the worker's qualified
+static reconstruction, not verified source and not an observed execution.
+
 ## Emacs: Lisp and C at the same stop
 
 Run `./scripts/demo-emacs` with a supported debug Emacs 31.1. Press **Space**,
@@ -50,6 +69,14 @@ to inspect its script, inventory and Node2D properties; select **Arena**, then
 **S** to see its `tree_exiting` Signal value. **R** refreshes the retained
 snapshot. This cooperative view needs the game running; the pane labels its
 source. See [the engine-view controls and limits](GDSCRIPT.md#engine-scene-tree-and-object-inspector).
+
+For frame time → script → native code, run
+`REDOT=path/to/engine scripts/demo-redot time`, then **U**, **T**, **F**.
+Select **Slow** and click **burn**: an observed owner ID and native stack sit
+below the selected frame's engine timings. The demo records explicit stop
+samples, which perturb wall time; the warning and sampled bars are visible.
+Two light nodes share a script to demonstrate why script time is not per-node
+time. See [sampling sources and limits](GDSCRIPT.md#frame-time-scripts-and-native-code).
 
 ## Memory: defrag to Gibson
 

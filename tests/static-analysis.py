@@ -125,9 +125,9 @@ def absent():
     try:
         entry = symbol(c, 'qx_alloc')
         listed = {t['name']: t for t in c.call('tools/list')['result']['tools']}
-        names = ('analyze_function', 'slice_value', 'control_dependencies', 'cancel_static_analysis')
-        check('absent: private headless observe keeps target-read-only jobs with declared shared access', all(n in listed and listed[n]['annotations']['xodbSessionAccess'] == ('observer' if n == 'cancel_static_analysis' else 'controller') and listed[n]['annotations']['readOnlyHint'] for n in names), sorted(listed)[:5])
-        for name, args in (('analyze_function', {'address': hex(entry)}), ('slice_value', {'pc': hex(entry), 'input': 0}), ('control_dependencies', {'pc': hex(entry)}), ('slice_value', {'file': 'qx.c', 'line': 14})):
+        names = ('analyze_function', 'decompile_function', 'get_decomp_mapping', 'slice_value', 'control_dependencies', 'cancel_static_analysis')
+        check('absent: private headless observe keeps target-read-only jobs with declared shared access', all(n in listed and listed[n]['annotations']['xodbSessionAccess'] == ('observer' if n in ('cancel_static_analysis', 'get_decomp_mapping') else 'controller') and listed[n]['annotations']['readOnlyHint'] for n in names), sorted(listed)[:5])
+        for name, args in (('analyze_function', {'address': hex(entry)}), ('decompile_function', {'address': hex(entry)}), ('slice_value', {'pc': hex(entry), 'input': 0}), ('control_dependencies', {'pc': hex(entry)}), ('slice_value', {'file': 'qx.c', 'line': 14})):
             r = tool(c, name, **args)
             check(f'absent: {name} {sorted(args)} is typed unavailable', r.get('status') == 'unavailable' and r['static_analysis']['reason'] == 'not_configured' and 'build_ghidra.sh' in r['static_analysis']['how_to_build'], r)
         r = tool(c, 'cancel_static_analysis', job_id=1)
@@ -239,6 +239,15 @@ def demo():
             check(f'{build}: identity is the session image and trust is never upgraded', an['trust']['verified_semantics'] is False and an['trust']['result_trust'] == 'graph_' + an['qualification']['level'] and len(an['image']['sha256']) == 64 and an['function'] == 'qx_alloc', an['trust'])
             again = tool(c, 'analyze_function', address=hex(entry + 1))
             check(f'{build}: cached by artifact_id', again.get('status') == 'completed' and again['analysis']['artifact_id'] == an['artifact_id'])
+            decomp = tool(c, 'decompile_function', address=hex(entry + 1))
+            check(f'{build}: pseudo-C is the cached worker document', decomp.get('status') == 'completed' and decomp.get('artifact_id') == an['artifact_id'] and 'qx_alloc' in decomp.get('signature', '') and 'malloc' in decomp.get('text', ''), decomp)
+            mapped = tool(c, 'get_decomp_mapping', artifact_id=an['artifact_id'], rows=512)
+            exact = [row for row in mapped.get('tokens', []) if row.get('pc')]
+            check(f'{build}: token mappings carry exact runtime PCs and source rows', mapped.get('status') == 'completed' and exact and mapped.get('runtime_pcs') and mapped.get('source_rows') and 'nearest' in mapped.get('mapping_rule', ''), mapped)
+            one_pc = tool(c, 'get_decomp_mapping', artifact_id=an['artifact_id'], pc=exact[0]['pc'])
+            check(f'{build}: runtime-PC lookup returns only exact token links', one_pc.get('tokens') and all(row.get('pc') == exact[0]['pc'] for row in one_pc['tokens']), one_pc)
+            two = tool(c, 'get_decomp_mapping', artifact_id=an['artifact_id'], line=1, pc=exact[0]['pc'])
+            check(f'{build}: two mapping selectors are refused and the session survives', two.get('_protocol_error') == 'InvalidArguments' and tool(c, 'get_decomp_mapping', artifact_id=an['artifact_id'], line=1).get('status') == 'completed', two)
             malloc = [x for x in an['calls'] if x['name'] == 'malloc']
             if not check(f'{build}: the export names the malloc call', len(malloc) == 1, an['calls']): continue
             pc = malloc[0]['address']

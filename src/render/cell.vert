@@ -10,14 +10,17 @@ layout(location=1) flat out vec4 cell_fill;
 layout(location=2) flat out vec4 cell_accent;
 layout(location=3) flat out vec4 cell_overlay;
 layout(location=4) flat out uint cell_kind;
-layout(push_constant) uniform View { vec2 size; } view;
+layout(push_constant) uniform View { vec2 size; float zoom; float opacity; vec2 shift; } view;
 const vec2 corners[6] = vec2[](vec2(0, 0), vec2(1, 0), vec2(1, 1), vec2(0, 0), vec2(1, 1), vec2(0, 1));
 void main() {
-    vec2 p = rect.xy + corners[gl_VertexIndex] * rect.zw;
+    vec2 p = (rect.xy + corners[gl_VertexIndex] * rect.zw) * view.zoom + view.shift;
     gl_Position = vec4(p / view.size * 2.0 - 1.0, 0.0, 1.0);
-    cell_rect = rect;
+    cell_rect = vec4(rect.xy * view.zoom + view.shift, rect.zw * view.zoom);
     cell_fill = fill;
     cell_accent = accent;
     cell_overlay = overlay;
+    cell_fill.a *= view.opacity;
+    cell_accent.a *= view.opacity;
+    cell_overlay.a *= view.opacity;
     cell_kind = kind;
 }

@@ -14,6 +14,8 @@
 #                                                    locals and members
 #   REDOT=ENGINE scripts/demo-redot scene            cooperative scene tree and
 #                                                    object inspector (U)
+#   REDOT=ENGINE scripts/demo-redot time             frame/script/native samples
+#                                                    (U then T; stops affect timing)
 #
 # REDOT is the engine binary: a debug-enabled build with DWARF (an editor or a
 # template_debug binary built with debug_symbols=yes). GODOT is accepted too.
@@ -127,6 +129,13 @@ fi
 
 fixture=tests/fixtures/redot
 scene=false
+timing=false
+if [[ "${1-}" == time ]]; then
+    scene=true
+    timing=true
+    fixture=tests/fixtures/redot-time
+    shift
+fi
 if [[ "${1-}" == scene ]]; then
     scene=true
     fixture=tests/fixtures/redot-values
@@ -183,7 +192,7 @@ total=$(( each * 2 > 512 ? each * 2 : 512 ))
 if $scene; then
     # Continue the owned launch until the game reports a scene, then leave
     # execution under GUI control.
-    exec python3 scripts/helpers/redot-scene-demo.py "$xodb" --session-socket "$socket" --image-limit "${each}M" --image-total-limit "${total}M" "$@" -- "$engine" --headless --path "$project"
+    REDOT_TIME=$timing exec python3 scripts/helpers/redot-scene-demo.py "$xodb" --session-socket "$socket" --image-limit "${each}M" --image-total-limit "${total}M" "$@" -- "$engine" --headless --path "$project"
 fi
 
 "$engine" --headless --path "$project" >"$session_dir/game.log" 2>&1 </dev/null &

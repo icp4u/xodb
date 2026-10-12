@@ -24,9 +24,12 @@ pub const Cell = extern struct { rect: [4]f32, fill: [4]u8, accent: [4]u8, overl
 pub const cell_capacity = 65536 + 8192;
 const cell_offset = vertex_bytes + fonts.atlas_size * fonts.atlas_size;
 /// Mapped storage size, also used by CPU-side renderer tests.
-pub const buffer_bytes = cell_offset + cell_capacity * @sizeOf(Cell);
+const cloud_vertex_offset = cell_offset + cell_capacity * @sizeOf(Cell);
+const cloud_vertex_bytes = 4 * 1024 * 1024;
+const cloud_cell_offset = cloud_vertex_offset + cloud_vertex_bytes;
+pub const buffer_bytes = cloud_cell_offset + 22000 * @sizeOf(Cell);
 /// A run of cells drawn after the vertices recorded before it, clipped to `clip`.
-const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect };
+const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect, cloud: bool = false, additive: bool = false, transform: [4]f32 = .{ 1, 1, 0, 0 } };
 fn info(comptime T: type, kind: c.VkStructureType) T {
     var v = std.mem.zeroes(T);
     v.sType = kind;
@@ -93,6 +96,9 @@ pub const Renderer = struct {
     swap: c.VkSwapchainKHR = null,
     format: c.VkFormat = c.VK_FORMAT_B8G8R8A8_UNORM,
     extent: c.VkExtent2D = .{ .width = 0, .height = 0 },
+    ui_width: f32 = 0,
+    ui_height: f32 = 0,
+    ui_scale: f32 = 1,
     count: u32 = 0,
     images: std.ArrayList(c.VkImage) = .empty,
     views: []c.VkImageView = &.{},
@@ -102,6 +108,11 @@ pub const Renderer = struct {
     pass_format: c.VkFormat = c.VK_FORMAT_UNDEFINED,
     pipeline: c.VkPipeline = null,
     cell_pipeline: c.VkPipeline = null,
+    glow_pipeline: c.VkPipeline = null,
+    glow_cell_pipeline: c.VkPipeline = null,
+    cloud_signature: u64 = 0,
+    cloud_vertices: u32 = 0,
+    cloud_cells: u32 = 0,
     layout: c.VkPipelineLayout = null,
     descriptor_layout: c.VkDescriptorSetLayout = null,
     descriptor_pool: c.VkDescriptorPool = null,
@@ -179,7 +190,8 @@ pub const Renderer = struct {
         try self.createBuffer();
         try self.createAtlas();
         try self.createDescriptors();
-        try self.createSwap(window.width, window.height);
+        const scale = try @import("../platform/window.zig").validateScale(window.scale());
+        try self.createSwap(@import("../platform/window.zig").deviceExtent(window.width, scale), @import("../platform/window.zig").deviceExtent(window.height, scale));
     }
     /// The instance, with two optional extensions when the loader has them:
     /// device DRM nodes (to find the display GPU) and loader messages (to hear
@@ -438,7 +450,7 @@ pub const Renderer = struct {
         write.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         write.pImageInfo = &image;
         c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
-        const push = c.VkPushConstantRange{ .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 8 };
+        const push = c.VkPushConstantRange{ .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 24 };
         var pipeline_layout = info(c.VkPipelineLayoutCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
         pipeline_layout.setLayoutCount = 1;
         pipeline_layout.pSetLayouts = &self.descriptor_layout;
@@ -503,9 +515,13 @@ pub const Renderer = struct {
         if (self.pass != null and self.pass_format != self.format) {
             c.vkDestroyPipeline(self.device, self.pipeline, null);
             c.vkDestroyPipeline(self.device, self.cell_pipeline, null);
+            c.vkDestroyPipeline(self.device, self.glow_pipeline, null);
+            c.vkDestroyPipeline(self.device, self.glow_cell_pipeline, null);
             c.vkDestroyRenderPass(self.device, self.pass, null);
             self.pipeline = null;
             self.cell_pipeline = null;
+            self.glow_pipeline = null;
+            self.glow_cell_pipeline = null;
             self.pass = null;
         }
         if (self.pass == null) try self.createPass();
@@ -571,7 +587,8 @@ pub const Renderer = struct {
             .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "half") },
             .{ .location = 5, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = @offsetOf(Vertex, "shape") },
         };
-        self.pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs);
+        self.pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs, false);
+        self.glow_pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs, true);
         const cell_vert align(4) = @embedFile("cell_vert_spv").*;
         const cell_frag align(4) = @embedFile("cell_frag_spv").*;
         const cell_binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Cell), .inputRate = c.VK_VERTEX_INPUT_RATE_INSTANCE };
@@ -582,9 +599,10 @@ pub const Renderer = struct {
             .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "overlay") },
             .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32_UINT, .offset = @offsetOf(Cell, "kind") },
         };
-        self.cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs);
+        self.cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs, false);
+        self.glow_cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs, true);
     }
-    fn makePipeline(self: *Renderer, vert_bytes: []const u8, frag_bytes: []const u8, binding: c.VkVertexInputBindingDescription, attrs: []const c.VkVertexInputAttributeDescription) !c.VkPipeline {
+    fn makePipeline(self: *Renderer, vert_bytes: []const u8, frag_bytes: []const u8, binding: c.VkVertexInputBindingDescription, attrs: []const c.VkVertexInputAttributeDescription, additive: bool) !c.VkPipeline {
         const vert = try self.shader(vert_bytes);
         defer c.vkDestroyShaderModule(self.device, vert, null);
         const frag = try self.shader(frag_bytes);
@@ -615,7 +633,7 @@ pub const Renderer = struct {
         var blend_attachment = std.mem.zeroes(c.VkPipelineColorBlendAttachmentState);
         blend_attachment.blendEnable = c.VK_TRUE;
         blend_attachment.srcColorBlendFactor = c.VK_BLEND_FACTOR_SRC_ALPHA;
-        blend_attachment.dstColorBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        blend_attachment.dstColorBlendFactor = if (additive) c.VK_BLEND_FACTOR_ONE else c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
         blend_attachment.colorBlendOp = c.VK_BLEND_OP_ADD;
         blend_attachment.srcAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE;
         blend_attachment.dstAlphaBlendFactor = c.VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
@@ -669,6 +687,8 @@ pub const Renderer = struct {
             self.destroySwap();
             if (self.pipeline != null) c.vkDestroyPipeline(self.device, self.pipeline, null);
             if (self.cell_pipeline != null) c.vkDestroyPipeline(self.device, self.cell_pipeline, null);
+            if (self.glow_pipeline != null) c.vkDestroyPipeline(self.device, self.glow_pipeline, null);
+            if (self.glow_cell_pipeline != null) c.vkDestroyPipeline(self.device, self.glow_cell_pipeline, null);
             if (self.pass != null) c.vkDestroyRenderPass(self.device, self.pass, null);
             if (self.swap != null) c.vkDestroySwapchainKHR(self.device, self.swap, null);
             c.vkDestroyPipelineLayout(self.device, self.layout, null);
@@ -692,7 +712,7 @@ pub const Renderer = struct {
     }
     /// False means no frame can be drawn yet. Keep pumping the event loop and
     /// do not overwrite mapped vertices or reset commands until the fence signals.
-    pub fn begin(self: *Renderer, width: u32, height: u32) !bool {
+    pub fn begin(self: *Renderer, width: u32, height: u32, scale: f32) !bool {
         if (self.window) |window| if (!window.frameReady()) {
             self.compositor_wait.pending("compositor frame callback");
             return false;
@@ -707,16 +727,24 @@ pub const Renderer = struct {
         self.fence_wait.complete("frame fence");
         if (self.scene_gpu) |*scene_gpu| scene_gpu.timerRead();
         self.scene_requested = false;
-        if (width != self.extent.width or height != self.extent.height) {
+        self.ui_width = @floatFromInt(width);
+        self.ui_height = @floatFromInt(height);
+        self.ui_scale = try @import("../platform/window.zig").validateScale(scale);
+        const physical_width = @import("../platform/window.zig").deviceExtent(width, self.ui_scale);
+        const physical_height = @import("../platform/window.zig").deviceExtent(height, self.ui_scale);
+        if (physical_width != self.extent.width or physical_height != self.extent.height) {
             try check(c.vkDeviceWaitIdle(self.device));
             self.destroySwap();
-            try self.createSwap(width, height);
+            try self.createSwap(physical_width, physical_height);
         }
         self.vertices = 0;
         self.cells_used = 0;
         self.batch_count = 0;
-        self.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(self.extent.width), .h = @floatFromInt(self.extent.height) };
+        self.clip = self.fullClip();
         return true;
+    }
+    pub fn fullClip(self: *const Renderer) Rect {
+        return .{ .x = 0, .y = 0, .w = self.ui_width, .h = self.ui_height };
     }
     /// Record one clipped scene at the current UI layer. Call only after begin
     /// returns true; returned instance writers remain valid until the next reserve.
@@ -726,8 +754,8 @@ pub const Renderer = struct {
         for (view_projection) |v| if (!std.math.isFinite(v)) return error.InvalidSceneMatrix;
         const x0 = @max(0, @max(self.clip.x, bounds.x));
         const y0 = @max(0, @max(self.clip.y, bounds.y));
-        const x1 = @min(@as(f32, @floatFromInt(self.extent.width)), @min(self.clip.x + self.clip.w, bounds.x + bounds.w));
-        const y1 = @min(@as(f32, @floatFromInt(self.extent.height)), @min(self.clip.y + self.clip.h, bounds.y + bounds.h));
+        const x1 = @min(self.ui_width, @min(self.clip.x + self.clip.w, bounds.x + bounds.w));
+        const y1 = @min(self.ui_height, @min(self.clip.y + self.clip.h, bounds.y + bounds.h));
         if (x1 <= x0 or y1 <= y0) return null;
         const now = Wait.now();
         if (self.scene_retry.waiting(now)) |err| return err;
@@ -746,8 +774,13 @@ pub const Renderer = struct {
         };
         self.scene_retry = .{};
         out.stats = .{ .gpu_ns = out.stats.gpu_ns };
-        out.bounds = .{ .x = x0, .y = y0, .w = x1 - x0, .h = y1 - y0 };
+        const px0 = @floor(x0 * self.ui_scale);
+        const py0 = @floor(y0 * self.ui_scale);
+        const px1 = @ceil(x1 * self.ui_scale);
+        const py1 = @ceil(y1 * self.ui_scale);
+        out.bounds = .{ .x = px0, .y = py0, .w = px1 - px0, .h = py1 - py0 };
         out.push.view_projection = view_projection;
+        out.push.scale = self.ui_scale;
         self.scene_at = self.vertices;
         self.scene_after_batches = self.batch_count;
         self.scene_requested = true;
@@ -768,11 +801,11 @@ pub const Renderer = struct {
             const g = font.glyph(run.glyphs[i].codepoint) catch try font.glyph(0);
             glyphs.set(first + i, .{
                 .anchor = .{ anchor[0], anchor[1], anchor[2], 1 },
-                .rect = .{ @round(pen + @as(f32, @floatFromInt(pos.x_offset)) / 64 + @as(f32, @floatFromInt(g.left))), @round(offset[1] + 16 - @as(f32, @floatFromInt(g.top)) - @as(f32, @floatFromInt(pos.y_offset)) / 64), @floatFromInt(g.w), @floatFromInt(g.h) },
+                .rect = .{ deviceSnap(self, pen + fontMetric(font, pos.x_offset) + glyphMetric(font, g.left)), deviceSnap(self, offset[1] + 16 - glyphMetric(font, g.top) - fontMetric(font, pos.y_offset)), glyphMetric(font, g.w), glyphMetric(font, g.h) },
                 .uv = .{ @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, @as(f32, @floatFromInt(g.h)) / fonts.atlas_size },
                 .color = color,
             });
-            pen += @as(f32, @floatFromInt(pos.x_advance)) / 64;
+            pen += fontMetric(font, pos.x_advance);
         }
     }
     fn sceneComposite(self: *Renderer) void {
@@ -781,7 +814,7 @@ pub const Renderer = struct {
         const offset: u64 = 0;
         c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
         c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
-        const size = [2]f32{ @floatFromInt(self.extent.width), @floatFromInt(self.extent.height) };
+        const size = [6]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0 };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
         const clip = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent };
         c.vkCmdSetScissor(self.command, 0, 1, &clip);
@@ -845,6 +878,32 @@ pub const Renderer = struct {
         defer self.cells_used += @intCast(n);
         return all[self.cells_used..][0..n];
     }
+
+    /// Retain static galaxy geometry in a separate mapped region. begin() has
+    /// waited for the single in-flight fence; subsequent frames need no upload.
+    /// The transient vertices since `first` must contain only cloud geometry.
+    pub fn retainCloud(self: *Renderer, first: usize, points: []const Cell, signature: u64) !void {
+        const count = self.vertices - first;
+        const bytes = count * @sizeOf(Vertex);
+        if (bytes > cloud_vertex_bytes or points.len > 22000) return error.VertexBufferFull;
+        const mapped: [*]u8 = @ptrCast(self.mapped.?);
+        @memcpy(mapped[cloud_vertex_offset..][0..bytes], mapped[first * @sizeOf(Vertex) ..][0..bytes]);
+        @memcpy(mapped[cloud_cell_offset..][0 .. points.len * @sizeOf(Cell)], std.mem.sliceAsBytes(points));
+        self.vertices = first;
+        self.cloud_vertices = @intCast(count);
+        self.cloud_cells = @intCast(points.len);
+        self.cloud_signature = signature;
+    }
+    pub fn glowingCells(self: *Renderer, n: usize) ![]Cell {
+        const points = try self.cells(n);
+        if (n > 0) self.batches[self.batch_count - 1].additive = true;
+        return points;
+    }
+    pub fn cloud(self: *Renderer, transform: [4]f32, additive: bool) !void {
+        if (self.batch_count == self.batches.len) return error.VertexBufferFull;
+        self.batches[self.batch_count] = .{ .at = self.vertices, .first = 0, .count = self.cloud_cells, .clip = self.clip, .cloud = true, .additive = additive, .transform = transform };
+        self.batch_count += 1;
+    }
     /// Fraction of this frame's vertex buffer already used (0..1).
     pub fn used(self: *const Renderer) f32 {
         return @as(f32, @floatFromInt(self.vertices * @sizeOf(Vertex))) / vertex_bytes;
@@ -877,16 +936,25 @@ pub const Renderer = struct {
         };
         return .{ .glyphs = glyphs, .positions = positions, .count = count };
     }
+    fn fontMetric(font: *const fonts.Font, value: anytype) f32 {
+        return @as(f32, @floatFromInt(value)) / 64 / font.raster_scale;
+    }
+    fn glyphMetric(font: *const fonts.Font, value: anytype) f32 {
+        return @as(f32, @floatFromInt(value)) / font.raster_scale;
+    }
+    fn deviceSnap(self: *const Renderer, value: f32) f32 {
+        return @round(value * self.ui_scale) / self.ui_scale;
+    }
     /// Draws one shaped glyph and returns the pen position after it.
     fn glyphAt(self: *Renderer, font: *fonts.Font, id: u32, pos: c.hb_glyph_position_t, pen: f32, y: f32, color: Color) !f32 {
-        const next = pen + @as(f32, @floatFromInt(pos.x_advance)) / 64;
+        const next = pen + fontMetric(font, pos.x_advance);
         // Report degradation once and use the reserved missing-glyph box.
         const g = font.glyph(id) catch |err| fallback: {
             if (!font.degraded) std.debug.print("Text rendering degraded: {s}; using missing-glyph boxes\n", .{@errorName(err)});
             font.degraded = true;
             break :fallback font.glyph(0) catch return next;
         };
-        try self.quad(.{ .x = @round(pen + @as(f32, @floatFromInt(pos.x_offset)) / 64 + @as(f32, @floatFromInt(g.left))), .y = @round(y + 16 - @as(f32, @floatFromInt(g.top)) - @as(f32, @floatFromInt(pos.y_offset)) / 64), .w = @floatFromInt(g.w), .h = @floatFromInt(g.h) }, .{ .x = @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, .y = @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, .w = @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, .h = @as(f32, @floatFromInt(g.h)) / fonts.atlas_size }, color);
+        try self.quad(.{ .x = deviceSnap(self, pen + fontMetric(font, pos.x_offset) + glyphMetric(font, g.left)), .y = deviceSnap(self, y + 16 - glyphMetric(font, g.top) - fontMetric(font, pos.y_offset)), .w = glyphMetric(font, g.w), .h = glyphMetric(font, g.h) }, .{ .x = @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, .y = @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, .w = @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, .h = @as(f32, @floatFromInt(g.h)) / fonts.atlas_size }, color);
         return next;
     }
     pub fn text(self: *Renderer, font: *fonts.Font, x: f32, y: f32, str: []const u8, color: Color) !void {
@@ -899,7 +967,7 @@ pub const Renderer = struct {
         const run = shapeRun(font, str);
         var advance: i32 = 0;
         for (0..run.count) |i| advance += run.positions[i].x_advance;
-        return @as(f32, @floatFromInt(advance)) / 64;
+        return fontMetric(font, advance);
     }
     /// Draws `str` in at most `width` pixels. An overflowing run ends in three dots,
     /// each at half the alpha of the one before (after RAD Debugger's truncation).
@@ -908,14 +976,14 @@ pub const Renderer = struct {
         if (dot.count != 1) return self.text(font, x, y, str, color);
         const dot_id = dot.glyphs[0].codepoint;
         const dot_pos = dot.positions[0];
-        const dots = 3 * @as(f32, @floatFromInt(dot_pos.x_advance)) / 64;
+        const dots = 3 * fontMetric(font, dot_pos.x_advance);
         const run = shapeRun(font, str);
         var total: i32 = 0;
         for (0..run.count) |i| total += run.positions[i].x_advance;
-        const fits = @as(f32, @floatFromInt(total)) / 64 <= width;
+        const fits = fontMetric(font, total) <= width;
         var pen = x;
         for (0..run.count) |i| {
-            if (!fits and pen + @as(f32, @floatFromInt(run.positions[i].x_advance)) / 64 + dots > x + width) break;
+            if (!fits and pen + fontMetric(font, run.positions[i].x_advance) + dots > x + width) break;
             pen = try self.glyphAt(font, run.glyphs[i].codepoint, run.positions[i], pen, y, color);
         }
         if (fits or dots > width) return;
@@ -992,7 +1060,7 @@ pub const Renderer = struct {
         const offset: u64 = 0;
         c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
         c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
-        const size = [2]f32{ @floatFromInt(self.extent.width), @floatFromInt(self.extent.height) };
+        const size = [6]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0 };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
         var drawn: usize = 0;
         var scene_drawn = false;
@@ -1005,17 +1073,26 @@ pub const Renderer = struct {
             }
             if (b.at > drawn) c.vkCmdDraw(self.command, @intCast(b.at - drawn), 1, @intCast(drawn), 0);
             drawn = b.at;
-            const x0: i32 = @intFromFloat(@max(0, @floor(b.clip.x)));
-            const y0: i32 = @intFromFloat(@max(0, @floor(b.clip.y)));
-            const x1: i32 = @intFromFloat(@max(0, @min(size[0], @ceil(b.clip.x + b.clip.w))));
-            const y1: i32 = @intFromFloat(@max(0, @min(size[1], @ceil(b.clip.y + b.clip.h))));
+            const x0: i32 = @intFromFloat(@max(0, @floor(b.clip.x * self.ui_scale)));
+            const y0: i32 = @intFromFloat(@max(0, @floor(b.clip.y * self.ui_scale)));
+            const x1: i32 = @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(self.extent.width)), @ceil((b.clip.x + b.clip.w) * self.ui_scale))));
+            const y1: i32 = @intFromFloat(@max(0, @min(@as(f32, @floatFromInt(self.extent.height)), @ceil((b.clip.y + b.clip.h) * self.ui_scale))));
             if (x1 <= x0 or y1 <= y0) continue;
             const clip = c.VkRect2D{ .offset = .{ .x = x0, .y = y0 }, .extent = .{ .width = @intCast(x1 - x0), .height = @intCast(y1 - y0) } };
             c.vkCmdSetScissor(self.command, 0, 1, &clip);
-            c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.cell_pipeline);
-            const cells_at: u64 = cell_offset;
+            if (b.cloud) {
+                const transformed = [6]f32{ size[0], size[1], b.transform[0], b.transform[1], b.transform[2], b.transform[3] };
+                c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(transformed)), &transformed);
+                c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (b.additive) self.glow_pipeline else self.pipeline);
+                const cloud_at: u64 = cloud_vertex_offset;
+                c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &cloud_at);
+                c.vkCmdDraw(self.command, self.cloud_vertices, 1, 0, 0);
+            }
+            c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (b.additive) self.glow_cell_pipeline else self.cell_pipeline);
+            const cells_at: u64 = if (b.cloud) cloud_cell_offset else cell_offset;
             c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &cells_at);
             c.vkCmdDraw(self.command, 6, b.count, 0, b.first);
+            if (b.cloud) c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
             c.vkCmdSetScissor(self.command, 0, 1, &scissor);
             c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
             c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
@@ -1092,6 +1169,26 @@ fn reportSlowCall(name: []const u8, started: u64) void {
 }
 
 // Fast component lane: HarfBuzz returns null positions for an empty buffer.
+test "retained cloud survives transient reuse and carries its own transform and blend" {
+    const bytes = try std.testing.allocator.alignedAlloc(u8, .@"16", buffer_bytes);
+    defer std.testing.allocator.free(bytes);
+    var renderer = Renderer{ .mapped = bytes.ptr, .clip = .{ .x = 0, .y = 0, .w = 100, .h = 100 } };
+    try renderer.rect(.{ .x = 2, .y = 3, .w = 4, .h = 5 }, .{ 1, 0, 0, 1 });
+    const cell = Cell{ .rect = .{ 2, 3, 1, 1 }, .fill = .{ 255, 0, 0, 255 }, .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+    try renderer.retainCloud(0, &.{cell}, 7);
+    try std.testing.expectEqual(@as(usize, 0), renderer.vertices);
+    try std.testing.expectEqual(@as(u32, 6), renderer.cloud_vertices);
+    try std.testing.expectEqual(@as(u64, 7), renderer.cloud_signature);
+    try renderer.rect(.{ .x = 20, .y = 30, .w = 4, .h = 5 }, .{ 0, 1, 0, 1 });
+    const retained: *const Vertex = @ptrCast(@alignCast(bytes.ptr + cloud_vertex_offset));
+    try std.testing.expectEqual([2]f32{ 2, 3 }, retained.position);
+    try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cell), bytes[cloud_cell_offset..][0..@sizeOf(Cell)]);
+    try renderer.cloud(.{ 1.5, 1, 10, 20 }, true);
+    const batch = renderer.batches[0];
+    try std.testing.expect(batch.cloud and batch.additive and batch.at == 6 and batch.count == 1);
+    try std.testing.expectEqual([4]f32{ 1.5, 1, 10, 20 }, batch.transform);
+}
+
 test "empty text is safe with the bitmap font" {
     const a = std.testing.allocator;
     const font = try a.create(fonts.Font);
@@ -1102,6 +1199,32 @@ test "empty text is safe with the bitmap font" {
     var renderer = Renderer{};
     try std.testing.expectEqual(@as(f32, 0), renderer.measure(font, ""));
     try renderer.text(font, 0, 0, "", .{ 1, 1, 1, 1 });
+    try std.testing.expectEqual(@as(f32, 32), renderer.measure(font, "xodb"));
+}
+
+test "scaled faces retain UI-unit text metrics and bitmap faces retain their raster" {
+    const a = std.testing.allocator;
+    const font = try a.create(fonts.Font);
+    defer a.destroy(font);
+    font.* = .{};
+    try font.initMode(@import("build_options").font_path ++ "", false);
+    defer font.deinit();
+    var renderer = Renderer{};
+    const one = renderer.measure(font, "xodb workspace");
+    const glyph_one = try font.glyph(c.FT_Get_Char_Index(font.face, 'x'));
+    inline for (.{ 1.5, 2.0 }) |scale| {
+        try std.testing.expect(try font.setScale(scale));
+        const width = renderer.measure(font, "xodb workspace");
+        try std.testing.expect(@abs(width - one) < one * 0.15);
+        const glyph = try font.glyph(c.FT_Get_Char_Index(font.face, 'x'));
+        try std.testing.expect(glyph.h >= glyph_one.h);
+        try std.testing.expectEqual(@as(f32, scale), font.raster_scale);
+    }
+    font.deinit();
+    font.* = .{};
+    try font.initRetro();
+    try std.testing.expect(try font.setScale(2));
+    try std.testing.expectEqual(@as(f32, 1), font.raster_scale);
     try std.testing.expectEqual(@as(f32, 32), renderer.measure(font, "xodb"));
 }
 

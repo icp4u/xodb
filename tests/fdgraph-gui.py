@@ -82,7 +82,8 @@ try:
     check('small scope starts unfolded, one star per process',stars()==2)
     until(lambda:any(f['stars']=='2' and int(f['strands'])>0 and f['drawn']==f['strands'] for f in frames()),'threads between the two owned stars')
     check('shared descriptors are drawn as threads between the stars',True)
-    check('an untraced galaxy has no impulses and is not animating',all(f['impulses']=='0' and f['moving']=='0' for f in frames()))
+    until(lambda:frames()[-1]['moving']=='0','layout easing settles without traffic')
+    check('an untraced galaxy has no impulses and settles to idle',all(f['impulses']=='0' for f in frames()) and frames()[-1]['moving']=='0')
     d.keys('tap',46) # C: fold the two processes into their cgroup
     until(lambda:stars()==1,'C folds processes into one cgroup star')
     d.keys('tap',46) # C: back to process stars

@@ -71,6 +71,14 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     view.paused = o.paused;
     view.graph.demo = o.galaxy_demo;
     view.graph.demo_idle = o.galaxy_demo_idle;
+    const preferences = if (o.config) |path| @import("../../preferences.zig").load(gpa, path) catch |err| {
+        std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
+        return err;
+    } else @import("../../preferences.zig").Preferences{};
+    view.graph.look = preferences.galaxy;
+    view.graph.max_stars = view.graph.look.max_stars;
+    view.graph.collapse = !view.graph.look.unfold;
+    view.graph.collapse_auto = false;
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
     if (o.attach_exe) {
@@ -85,7 +93,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     view.source_label = if (live) "live" else "REPLAY";
     view.owns_samples = live;
 
-    var window = Window{ .own_frame = view.pal().win95 };
+    const ui_scale: ?f32 = if (o.ui_scale) |scale| scale else preferences.appearance.ui_scale;
+    var window = Window{ .own_frame = view.pal().win95, .scale_override = ui_scale };
     try window.init();
     defer window.deinit();
     window.setTitle("xodb overview");
@@ -174,7 +183,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
 }
 
 fn frame(r: *Renderer, font: *Font, view: *vw.View, window: *Window, t: u64) !bool {
-    if (!try r.begin(window.width, window.height)) return false;
+    _ = try font.setScale(window.scale());
+    if (!try r.begin(window.width, window.height, window.scale())) return false;
     view.frame(r, font, window, t) catch |err| {
         // A partial frame is safe to present; report and continue.
         view.setStatus("Draw failed: {s}", .{@errorName(err)}, t);

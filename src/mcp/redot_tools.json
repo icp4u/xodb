@@ -28,5 +28,23 @@
       "additionalProperties": false
     },
     "annotations": { "readOnlyHint": true, "xodbSessionAccess": "observer" }
+  },
+  {
+    "name": "set_redot_profiling",
+    "description": "Start or stop the cooperative engine frame/function profiler. Starting clears retained timing and native samples; stopping retains them. Does not resume the target.",
+    "inputSchema": {"type":"object","properties":{"enabled":{"type":"boolean"},"generation":{"type":"integer","minimum":0},"process_id":{"type":"integer","minimum":1,"maximum":1024}},"required":["enabled","generation"],"additionalProperties":false},
+    "annotations":{"readOnlyHint":false,"xodbSessionAccess":"controller"}
+  },
+  {
+    "name": "get_redot_profile",
+    "description": "Read bounded frame timings, select a process frame, and drill down through script costs to native/script stop samples joined by the engine frame number. Shared script timing is not per-node timing.",
+    "inputSchema":{"type":"object","properties":{"start":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":256},"frame_number":{"type":"integer","minimum":0},"process_id":{"type":"integer","minimum":1,"maximum":1024}},"additionalProperties":false},
+    "annotations":{"readOnlyHint":true,"xodbSessionAccess":"observer"}
+  },
+  {
+    "name": "capture_redot_sample",
+    "description": "Retain the current stopped native/script stack with process/physics frame counters and owner object IDs read through DWARF. Does not interrupt or resume; explicit stop sampling perturbs engine wall timings.",
+    "inputSchema":{"type":"object","properties":{"generation":{"type":"integer","minimum":0},"tid":{"type":"integer","minimum":1},"process_id":{"type":"integer","minimum":1,"maximum":1024}},"required":["generation"],"additionalProperties":false},
+    "annotations":{"readOnlyHint":true,"xodbSessionAccess":"observer"}
   }
 ]

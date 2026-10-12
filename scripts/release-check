@@ -25,9 +25,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # name globs). `release-check affected` runs the steps of every row that a
 # changed file matches. A step also covers the test scripts in its own argv.
 # A file that matches nothing selects the full gui tier.
-LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-live-display')
+LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
-    (('src/redot/*', 'src/mcp/redot*', 'src/ui/redot.zig', 'scripts/helpers/redot*'), ('redot-protocol*',)),
+    (('src/render/*', 'src/platform/*', 'src/ui/overview/*', 'tests/ui-scale-gui.py'), ('gui-galaxy-scale',)),
+    (('tests/thread-language-tabs.py', 'tests/fixtures/thread-interpreters.c'), ('language-thread-tabs*', 'gui-language-thread-tabs')),
+    (('src/redot/*', 'src/mcp/redot*', 'src/ui/redot*.zig', 'scripts/helpers/redot*', 'tests/fixtures/redot-time/*'), ('redot-*',)),
     (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
     (('src/model/remote_worker.zig', 'tests/helpers/agent_proxy.py', 'src/runtime/remote_perf.c'), ('remote-exit-export*', 'remote-broken-exit', 'remote-startup*')),
     (('src/target/runtime.zig', 'src/runtime/remote.c', 'tests/helpers/agent_proxy.py'), ('remote-unknown', 'remote-broken-exit', 'remote-startup*')),
@@ -78,7 +80,8 @@ COVERS = (
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
-    (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/static_view.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig'),
+    (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/static_view.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig',
+      'src/semq/host.zig', 'scripts/demo-decompile'),
      ('static-analysis', 'gui-static-analysis')),
     (('src/mcp/observation.zig', 'src/mcp/associations.zig', 'src/mcp/probes.zig', 'src/model/probes.zig',
       'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/model/invocation_view.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
@@ -108,8 +111,8 @@ COVERS = (
      ('m1-*', 'breakpoint-policy', 'run-control', 'repeated-break', 'restart-pending', 'core-debugging', 'memory-registers',
       'source-blocks', 'stale-interrupt', 'fork-release*', 'm2-robustness',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
-    (('src/render/*', 'src/platform/*'),
-     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'hidden-window', 'acquire-timeout',
+    (('src/render/*', 'src/platform/*', 'src/preferences.zig', 'tests/ui-scale-gui.py'),
+     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-ui-scale', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'platform-cocoa*', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
      ('gdb-debugserver*', 'macos-debugserver')),
@@ -121,7 +124,7 @@ COVERS = (
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
-    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes',
+    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-galaxy-scale',
     'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-evidence',
     'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile', 'gui-fdgalaxy',
 }
@@ -137,6 +140,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'redot-time-demo-gui',
     'remote-unknown-matrix', 'remote-startup-matrix',
     'gui-remote-publication', 'gui-owner-*',
     'image-budget-lifecycle*', 'image-budget-regressions*', 'image-budget-torch',
@@ -236,9 +240,15 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         # The interface with no window system behind src/platform/window.zig: nothing else may name one.
         steps.append(('platform-null', ['scripts/build', 'app', '-Dplatform=null', '-Doptimize=' + optimize,
                       '-p', '.work/platform-null'], 600, dict(kind='build')))
+        steps.append(('platform-cocoa', ['scripts/build', 'app', '-Dplatform=cocoa', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-cocoa'], 600, dict(kind='build')))
+        steps.append(('platform-cocoa-tests', ['scripts/build', 'test-cocoa', '-Dplatform=cocoa', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-cocoa'], 900, dict(kind='build')))
     if not headless and tier == 'periodic':
         steps.append(('platform-null-tests', ['scripts/build', 'test', '-Dplatform=null', '-Doptimize=' + optimize,
                       '-p', '.work/platform-null'], 900, dict(kind='build')))
+        steps.append(('platform-cocoa-tests', ['scripts/build', 'test-cocoa', '-Dplatform=cocoa', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-cocoa'], 900, dict(kind='build')))
     if tier == 'periodic':
         steps.append(('catalog-build', [sys.executable, '-B', 'tests/catalog-build.py', '--work', '.work/catalog-build'], 600))
     if tier == 'periodic' and go:
@@ -465,6 +475,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('language-tabs-agent', [sys.executable, '-B', 'tests/language-tabs.py', '--work', '.work/la', '--agent', 'zig-out/bin/xodb-agent', *language_args], 900 if node else 300))
         if perl:
             for remote in (False, True):
+                thread_label = 'language-thread-tabs' + ('-agent' if remote else '')
+                steps.append((thread_label, [sys.executable, '-B', 'tests/thread-language-tabs.py', '--perl', perl,
+                              '--work', '.work/'+thread_label,
+                              *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
                 label = 'runtime-binding' + ('-agent' if remote else '')
                 steps.append((label, [sys.executable, '-B', 'tests/runtime-binding.py', '--perl', perl,
                               '--work', '.work/'+label,
@@ -567,6 +581,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
         if redot:
             steps.append(('redot-protocol', [sys.executable, '-B', 'tests/redot-protocol.py', '--redot', redot, '--work', '.work/rdp'], 60))
+            steps.append(('redot-time', [sys.executable, '-B', 'tests/redot-time.py', '--redot', redot, '--work', '.work/rdt'], 90))
             # A Godot 4 / Redot engine with DWARF: about a gigabyte read once per xodb.
             steps.append(('gdscript-stack', [sys.executable, '-B', 'tests/gdscript-stack.py', '--redot', redot, '--strace', '--work', '.work/gds'], 600))
             steps.append(('gdscript-demo', [sys.executable, '-B', 'tests/gdscript-demo.py', '--redot', redot, '--work', '.work/gdd'], 600))
@@ -615,6 +630,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('vulkan-enumeration', ['tests/vulkan-enumeration.py']),
             ('vulkan-device', ['tests/vulkan-device.py']),
             ('gui-themes', ['tests/themes.py']),
+            ('gui-ui-scale', ['tests/ui-scale-gui.py']),
+            ('gui-galaxy-scale', ['tests/ui-scale-gui.py', '--galaxy']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),
             ('gui-remote-close', ['tests/remote-owner-gui.py', '--close-held']),
@@ -663,6 +680,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('wayland-read-race', ['tests/wayland-read-race.py', '--attach-fixture']),
         ):
             steps.append((name, [sys.executable, '-B', *args], 180 if name == 'gui-remote-publication' else 900 if name == 'gui-language-tabs' and node else 300 if name == 'gui-language-tabs' and gui_language_args else 90))
+        if perl:
+            steps.append(('gui-language-thread-tabs', [sys.executable, '-B', 'tests/thread-language-tabs.py', '--gui', '--perl', perl, '--work', '.work/tlt'], 90))
         if python and perl:
             for remote in (False, True):
                 label = 'gui-runtime-binding' + ('-agent' if remote else '')
@@ -713,6 +732,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if redot:
             steps.append(('redot-protocol-gui', [sys.executable, '-B', 'tests/redot-protocol-gui.py', '--redot', redot, '--work', '.work/rdg'], 90))
+            steps.append(('redot-time-gui', [sys.executable, '-B', 'tests/redot-time-gui.py', '--redot', redot, '--work', '.work/rtg'], 90))
+            steps.append(('redot-time-demo-gui', [sys.executable, '-B', 'tests/redot-time-gui.py', '--demo', '--redot', redot, '--work', '.work/rtd'], 90))
             steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))
             steps.append(('gdscript-values-gui', [sys.executable, '-B', 'tests/gdscript-values-gui.py', '--redot', redot, '--work', '.work/gdvg'], 600))
             steps.append(('gui-owner-gdscript-limit', [sys.executable, '-B', 'tests/gdscript-remote-limit-gui.py', '--redot', redot, '--work', '.work/gdl'], 300))
@@ -1253,7 +1274,7 @@ def main(argv=None):
         print('\n'.join(decisions), file=sys.stderr if args.list else sys.stdout, flush=True)
     if args.capstone == 'vendored':
         for step in steps:
-            if step.name in ('build-tests', 'platform-null', 'platform-null-tests'):
+            if step.name in ('build-tests', 'platform-null', 'platform-null-tests', 'platform-cocoa', 'platform-cocoa-tests'):
                 step.argv.append('-Dcapstone=vendored')
     try:
         if args.only or args.start:

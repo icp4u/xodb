@@ -356,6 +356,11 @@ Memory Map retains its separate `t` binding for its map look; use View > Next
 theme to cycle the outer skin there. Redaction is still one-way, confirmations
 still require a fresh activation, and unavailable data retains its reason.
 
+The overview follows the compositor's HiDPI scale. `--ui-scale N` overrides it;
+`--config FILE` can provide `appearance.ui_scale`, with the command line taking
+precedence. Layout and mouse coordinates remain in logical UI units at 1x,
+fractional and integer scales.
+
 
 ## Replay
 
@@ -726,3 +731,24 @@ districts is labelled. A dim opaque core under each measured tower's
 translucent shell keeps neighbouring buildings distinguishable. CPU
 layout storage is freed when the look or panel is hidden; the scene layer
 retires its GPU buffers and attachments after the frame fence.
+
+## Galaxy look preferences
+
+The descriptor galaxy starts unfolded with a 512-star budget (`+`/`-` changes
+it, up to 1024; `C` folds groups). Hover a cloud to ease the camera toward its
+cluster; leave the field to return. Hover a thread for directional byte rates
+and outlined endpoint tags. Unmeasured traffic is never animated as measured.
+
+`xodb --overview --config look.json --galaxy-demo 150` loads the explicit
+preferences file; no file is discovered or written implicitly. The `galaxy`
+object accepts `additive` (default true), `cloud_size` (0.5–3, default 1.6),
+`brightness` (0.1–2, default 0.85), `camera_zoom` (1–2.5, default 1.35),
+`easing_ms` (50–2000, default 450), `max_stars` (8–1024, default 512), and
+`unfold` (default true). A zoom of 1 keeps scale fixed while still easing the
+cluster to the centre. See `config/preferences.example.json`.
+
+Cloud points and fibres are retained in GPU storage: impulse animation and
+camera transforms do not rebuild them. Layout, appearance and focus changes
+invalidate the retained cloud. Layout positions ease by process/group identity;
+new identities appear at their new position. The classic skin keeps its plain
+rendering. Additive blending affects clouds and thread beads/tails, not text or other panes.

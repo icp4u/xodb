@@ -3,7 +3,7 @@ const std = @import("std");
 const Session = @import("session.zig").Session;
 const host = @import("../semq/host.zig");
 const answer = @import("../semq/answer.zig");
-pub const Mode = enum { slice, controls };
+pub const Mode = enum { decompile, slice, controls };
 pub const Phase = enum { functions, questions, answer };
 /// A source line carries every line-table row and every function those rows
 /// fall in; with more than one function the user chooses, nothing is picked.
@@ -13,6 +13,19 @@ const max_rows = 64;
 const max_functions = 16;
 pub const Question = struct { op: u32, input: ?u32, label: []const u8 };
 pub const Row = struct { address: ?u64, certainty: []const u8, label: []const u8 };
+pub const PseudoSite = struct { path: []const u8, line: u32 };
+pub const PseudoToken = struct {
+    index: u32,
+    line: u32,
+    col: u32,
+    kind: []const u8,
+    text: []const u8,
+    op: ?u32 = null,
+    link_pc: ?u64 = null,
+    pc: ?u64 = null,
+    source: ?PseudoSite = null,
+    parameter: ?u32 = null,
+};
 
 const State = struct {
     open: bool = false,
@@ -264,6 +277,19 @@ pub const View = struct {
     summary: []const u8 = "",
     parameters: []const u8 = "",
     observed: []const u8 = "",
+    pseudocode: []const u8 = "",
+    signature: []const u8 = "",
+    pseudo_language: []const u8 = "",
+    pseudo_printer: []const u8 = "",
+    pseudo_token_status: []const u8 = "",
+    pseudo_map_status: []const u8 = "",
+    pseudo_qualification: []const u8 = "",
+    pseudo_reasons: []const u8 = "",
+    pseudo_tokens: []const PseudoToken = &.{},
+    pseudo_cut: bool = false,
+    /// Runtime bounds of the function a ready view describes.
+    function_entry: u64 = 0,
+    function_size: u64 = 0,
     message: []const u8 = "",
     questions: []const Question = &.{},
     rows: []const Row = &.{},
@@ -331,7 +357,10 @@ pub const Capture = struct {
                 "No code in the images searched; some are over the image budget (Modules lists them)"
             else
                 @errorName(err);
-            self.value.?.detail = "Static analysis needs function bounds from the session's symbols (ELF or DWARF)";
+            self.value.?.detail = if (err == error.FunctionTooLarge)
+                "The function is over the 1 MiB analysis limit"
+            else
+                "Static analysis needs function bounds from the session's symbols (ELF or DWARF)";
         };
         self.answers = self.state.answers;
         self.value.?.answers = self.answers;
@@ -416,6 +445,38 @@ pub const Capture = struct {
             },
             .ready => |analysis| {
                 view.status = .ready;
+                var reasons: std.ArrayList(u8) = .empty;
+                for (analysis.reasons) |reason| try reasons.print(a, "{s} ", .{reason.code});
+                view.unreliable = std.mem.eql(u8, analysis.level, "unreliable");
+                view.qualification = try std.fmt.allocPrint(a, "result_trust graph_{s}   verified_semantics no   qualification {s}: {s}", .{ analysis.level, analysis.level, reasons.items });
+                view.detail = try std.fmt.allocPrint(a, "{s}  0x{x}+{d}  ({s})   artifact {s}   image sha256 {s}", .{ analysis.function.name, analysis.function.runtime(analysis.function.key.entry), analysis.function.key.size, analysis.function.bounds_source, analysis.artifact_id, analysis.function.key.image_sha256[0..16] });
+                view.artifact = analysis.artifact_id;
+                view.function_entry = analysis.function.runtime(analysis.function.key.entry);
+                view.function_size = analysis.function.key.size;
+                if (request.mode == .decompile) {
+                    const document = analysis.pseudocode;
+                    const text_len = @min(document.text.len, 2 << 20);
+                    const token_count = @min(document.tokens.len, 32 * 1024);
+                    const tokens = try a.alloc(PseudoToken, token_count);
+                    for (document.tokens[0..token_count], tokens) |token, *out| {
+                        const pc = if (token.pc) |link| analysis.function.runtime(link) else null;
+                        const source: ?PseudoSite = if (pc) |runtime| if (session.sourceAt(a, runtime) catch null) |site| .{ .path = site.path, .line = site.line } else null else null;
+                        out.* = .{ .index = token.index, .line = token.line, .col = token.col, .kind = token.kind, .text = token.text, .op = token.op, .link_pc = token.pc, .pc = pc, .source = source, .parameter = token.parameter };
+                    }
+                    view.title = try std.fmt.allocPrint(a, "Pseudo-C for {s}", .{analysis.function.name});
+                    view.pseudocode = document.text[0..text_len];
+                    view.signature = document.signature;
+                    view.pseudo_language = document.language;
+                    view.pseudo_printer = document.printer;
+                    view.pseudo_token_status = document.token_status;
+                    view.pseudo_map_status = document.address_map_status;
+                    view.pseudo_qualification = try std.fmt.allocPrint(a, "qualification {s} / result_trust graph_{s}", .{ analysis.level, analysis.level });
+                    view.pseudo_reasons = try std.fmt.allocPrint(a, "reasons {s}", .{reasons.items});
+                    view.pseudo_tokens = tokens;
+                    view.pseudo_cut = text_len != document.text.len or token_count != document.tokens.len;
+                    view.phase = .questions;
+                    return;
+                }
                 if (state.artifact_len == 0 or !std.mem.eql(u8, state.artifact[0..state.artifact_len], analysis.artifact_id)) {
                     _ = state.arena.reset(.retain_capacity);
                     state.phase = .questions;
@@ -435,11 +496,6 @@ pub const Capture = struct {
                         state.selected = index;
                     }
                 } else state.phase = .questions;
-                var reasons: std.ArrayList(u8) = .empty;
-                for (analysis.reasons) |reason| try reasons.print(a, "{s} ", .{reason.code});
-                view.unreliable = std.mem.eql(u8, analysis.level, "unreliable");
-                view.qualification = try std.fmt.allocPrint(a, "result_trust graph_{s}   verified_semantics no   qualification {s}: {s}", .{ analysis.level, analysis.level, reasons.items });
-                view.detail = try std.fmt.allocPrint(a, "{s}  0x{x}+{d}  ({s})   artifact {s}   image sha256 {s}", .{ analysis.function.name, analysis.function.runtime(analysis.function.key.entry), analysis.function.key.size, analysis.function.bounds_source, analysis.artifact_id, analysis.function.key.image_sha256[0..16] });
                 view.title = switch (state.target) {
                     .pc => |pc| try std.fmt.allocPrint(a, "Instruction 0x{x}: choose a question (Up/Down, Return)", .{pc}),
                     .line => |line| try std.fmt.allocPrint(a, "{s}:{d}: choose a question (Up/Down, Return)", .{ std.fs.path.basename(line.path), line.line }),
@@ -487,19 +543,25 @@ test "static publications retain questions and answers after owner arenas retire
     questions[0] = .{ .op = 7, .input = 1, .label = label };
     const rows = try a.alloc(Row, 1);
     rows[0] = .{ .address = 0x1000, .certainty = "direct", .label = try a.dupe(u8, "param 0 (DI)") };
+    const pseudo = try a.alloc(PseudoToken, 1);
+    pseudo[0] = .{ .index = 4, .line = 7, .col = 2, .kind = try a.dupe(u8, "variable"), .text = try a.dupe(u8, "count"), .pc = 0x1000, .source = .{ .path = try a.dupe(u8, "/owned/qx.c"), .line = 14 } };
     const publication = try boundary.Publication.create(std.testing.allocator, .{
         .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 42, .start_ticks = 1, .image_epoch = 0, .generation = 1 },
         .revision = 1,
         .taken_ns = 1,
         .status = .ready,
-        .static_analysis = .{ .request = .{ .origin = .{ .pc = 0x1000 } }, .phase = .answer, .status = .ready, .questions = questions, .rows = rows, .heading = label },
+        .static_analysis = .{ .request = .{ .origin = .{ .pc = 0x1000 } }, .phase = .answer, .status = .ready, .questions = questions, .rows = rows, .heading = label, .pseudocode = try a.dupe(u8, "count += 1;"), .pseudo_tokens = pseudo },
     });
     defer publication.destroy();
     @memset(label, 'x');
     rows[0].address = 0;
+    pseudo[0].pc = 0;
     arena.deinit();
     const view = publication.value.static_analysis.?;
     try std.testing.expectEqualStrings("What feeds this value?", view.questions[0].label);
     try std.testing.expectEqualStrings("param 0 (DI)", view.rows[0].label);
     try std.testing.expectEqual(@as(?u64, 0x1000), view.rows[0].address);
+    try std.testing.expectEqualStrings("count += 1;", view.pseudocode);
+    try std.testing.expectEqual(@as(?u64, 0x1000), view.pseudo_tokens[0].pc);
+    try std.testing.expectEqualStrings("/owned/qx.c", view.pseudo_tokens[0].source.?.path);
 }

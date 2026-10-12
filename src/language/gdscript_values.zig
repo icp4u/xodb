@@ -1192,7 +1192,7 @@ const Fake = struct {
 };
 /// A template_debug layout: type at 0, data at 8, engine enumerator values.
 fn testLayout() Layout {
-    var layout = Layout{ .level_size = 48, .offsets = .{ 0, 8, 16, 24, 32, 40, 0, 8, 0xf0, 0x3b8, 8, 0x1b4, 0x1b0, 8, 0, 0 }, .block = .{ .below = 0xa30, .size = 0xa28 }, .call_stack = 0xe8, .call_stack_size = 0xe0, .singleton = 0, .units = 1 };
+    var layout = Layout{ .level_size = 48, .offsets = .{ 0, 8, 16, 24, 32, 40, 0, 8, 0xf0, 0x3b8, 8, 0x1b4, 0x1b0, 8, 0, 0, null, null, null }, .block = .{ .below = 0xa30, .size = 0xa28 }, .call_stack = 0xe8, .call_stack_size = 0xe0, .singleton = 0, .units = 1 };
     const offsets = [field_count]u32{ 0, 8, 0, 8, 0x10, 0x20, 0x34, 0, 0x10, 0x28, 0, 4, 8, 0x10, 0, 0, 0x18, 8, 0, 0x10, 0x18, 0x60, 0x70, 0xe0, 0x1e8, 0x150, 0, 0x10, 0x20, 0x38, 0x18, 0, 0, 8, 0xfc, 0x104, 0x170, 0xa0, 0x1e0, 0x48, 0x18 };
     for (offsets, &layout.value_offsets) |offset, *out| out.* = offset;
     layout.value_sizes = .{ 24, 4, 16, 64, 128, 64, 24, 24, 48, 48, 152, 312, 800, 8, 64, 32, 16, 16, 1144, 1088, 112 };

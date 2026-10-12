@@ -21,6 +21,7 @@ const std = @import("std");
 const vk = @import("../c_ui.zig").api;
 const backend = switch (@import("build_options").platform) {
     .wayland => @import("wayland.zig"),
+    .cocoa => @import("cocoa.zig"),
     .null => @import("null.zig"),
 };
 pub const Window = backend.Window;
@@ -29,6 +30,18 @@ pub const Keyboard = backend.Keyboard;
 pub const Cursor = enum { default, col_resize };
 pub const CloseReason = enum { none, compositor_close, quit_key };
 pub const Edge = enum { top, bottom, left, right, top_left, top_right, bottom_left, bottom_right };
+pub const min_ui_scale: f32 = 0.5;
+pub const max_ui_scale: f32 = 4;
+
+pub fn validateScale(value: f32) !f32 {
+    if (!std.math.isFinite(value) or value < min_ui_scale or value > max_ui_scale) return error.InvalidUiScale;
+    return value;
+}
+
+pub fn deviceExtent(logical: u32, scale: f32) u32 {
+    const pixels = @ceil(@as(f64, @floatFromInt(logical)) * @as(f64, scale));
+    return @max(1, @as(u32, @intFromFloat(@min(pixels, std.math.maxInt(u32)))));
+}
 
 /// Plain-text clipboard. A paste is asynchronous: `clipRequest` starts one for
 /// the editor named by `clipFocus`, `clipTake` returns it once. `primary`
@@ -41,10 +54,11 @@ pub const clip = struct {
 
 comptime {
     for (.{
-        .{ "width", u32 },      .{ "height", u32 },               .{ "dirty", bool },
-        .{ "closing", bool },   .{ "close_reason", CloseReason }, .{ "pointer_x", f32 },
-        .{ "pointer_y", f32 },  .{ "mouse_down", bool },          .{ "scroll", i32 },
-        .{ "maximized", bool }, .{ "own_frame", bool },           .{ "input", Keyboard },
+        .{ "width", u32 },           .{ "height", u32 },               .{ "dirty", bool },
+        .{ "closing", bool },        .{ "close_reason", CloseReason }, .{ "pointer_x", f32 },
+        .{ "pointer_y", f32 },       .{ "mouse_down", bool },          .{ "scroll", i32 },
+        .{ "maximized", bool },      .{ "own_frame", bool },           .{ "input", Keyboard },
+        .{ "scale_override", ?f32 },
     }) |field| if (@FieldType(Window, field[0]) != field[1]) @compileError("platform Window." ++ field[0]);
     for (.{
         "init",        "deinit",       "pump",        "pumpDuringClose", "scale",
@@ -64,4 +78,15 @@ comptime {
 
 test {
     _ = backend;
+}
+
+test "UI scales are bounded and device extents round outward" {
+    try std.testing.expectEqual(@as(f32, 0.5), try validateScale(0.5));
+    try std.testing.expectEqual(@as(f32, 4), try validateScale(4));
+    try std.testing.expectError(error.InvalidUiScale, validateScale(0.49));
+    try std.testing.expectError(error.InvalidUiScale, validateScale(4.01));
+    try std.testing.expectError(error.InvalidUiScale, validateScale(std.math.nan(f32)));
+    try std.testing.expectEqual(@as(u32, 1920), deviceExtent(1280, 1.5));
+    try std.testing.expectEqual(@as(u32, 2), deviceExtent(1, 1.5));
+    try std.testing.expectEqual(std.math.maxInt(u32), deviceExtent(std.math.maxInt(u32), 4));
 }

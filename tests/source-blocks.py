@@ -24,7 +24,11 @@ for mode in (['baseline'] if options.baseline else [])+['short','long','middle',
         if mode=='watch':
             address=c.inspect('evaluate_expression',tid=tid,expression='&step_value')['value']['display']
             c.action('set_watchpoint',address=address,length=4)
-        start=time.monotonic();c.action('step_source',tid=tid);stopped=c.stopped();elapsed=time.monotonic()-start
+        # Threads single-step the 1,024-NOP line: batching stays off while another
+        # thread is live. Quiet that row is about 2.5s. A full gate has crossed
+        # the 5s stop wait on the last resume, with source_stepping still set
+        # and no step diagnostic. The longer deadline is only a wait ceiling.
+        start=time.monotonic();c.action('step_source',tid=tid);stopped=c.stopped(seconds=20 if mode=='threads' else 5);elapsed=time.monotonic()-start
         assert not stopped['source_stepping'] and stopped['step_diagnostic'] is None,stopped
         thread=next(t for t in stopped['threads'] if t['tid']==tid)
         if mode=='watch':assert thread['reason']=='watchpoint',thread

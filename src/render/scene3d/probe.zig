@@ -57,7 +57,8 @@ pub fn main(args: []const [:0]const u8) !void {
                 else => {},
             }
         }
-        if (!try renderer.begin(window.width, window.height)) continue;
+        _ = try font.setScale(window.scale());
+        if (!try renderer.begin(window.width, window.height, window.scale())) continue;
         if (zero_extent) {
             zero_extent = false;
             if (renderer.scene_gpu) |*gpu| {

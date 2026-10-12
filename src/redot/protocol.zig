@@ -51,7 +51,9 @@ pub const Property = struct {
     hint_string: []const u8,
     usage: u64,
     display: []const u8,
+    children: []const Child = &.{},
 };
+pub const Child = struct { label: []const u8, display: []const u8, depth: u8 };
 
 pub const Signal = struct { property: []const u8, display: []const u8 };
 
@@ -64,6 +66,7 @@ pub const Object = struct {
 };
 
 pub const Snapshot = struct {
+    profiler: *const @import("profiler.zig").State,
     state: State,
     diagnostic: ?[]const u8,
     revision: u64,
@@ -79,7 +82,7 @@ pub const Snapshot = struct {
 
 const Pair = struct { key: Value, value: Value };
 const NamedNumbers = struct { name: []const u8, values: []const f64 };
-const Value = union(enum) {
+pub const Value = union(enum) {
     nil,
     boolean: bool,
     integer: i64,
@@ -98,6 +101,7 @@ const Value = union(enum) {
 };
 
 pub const Adapter = struct {
+    profiler: @import("profiler.zig").State = .{},
     listener: c_int = -1,
     connection: c_int = -1,
     state: State = .off,
@@ -149,6 +153,7 @@ pub const Adapter = struct {
 
     pub fn snapshot(self: *const Adapter) Snapshot {
         return .{
+            .profiler = &self.profiler,
             .state = self.state,
             .diagnostic = self.diagnostic,
             .revision = self.revision,
@@ -269,21 +274,39 @@ pub const Adapter = struct {
         self.transmit_start = 0;
     }
 
-    const Request = enum { scene, object };
+    pub fn profiling(self: *Adapter, enabled: bool) !void {
+        try self.requireReady();
+        try self.queue(if (enabled) .profile_start else .profile_stop, 0);
+        if (enabled) self.profiler.deinit();
+        self.profiler.enabled = enabled;
+        self.revision +%= 1;
+    }
+
+    const Request = enum { scene, object, profile_start, profile_stop };
     fn queue(self: *Adapter, request: Request, object_id: u64) !void {
         if (self.transmit.items.len > 64 * 1024) return error.RedotDebuggerRequestLimit;
         var payload: std.ArrayList(u8) = .empty;
         defer payload.deinit(std.heap.page_allocator);
         try encodeArrayHeader(&payload, 3);
-        try encodeString(&payload, if (request == .scene) "scene:request_scene_tree" else "scene:inspect_objects");
+        try encodeString(&payload, switch (request) {
+            .scene => "scene:request_scene_tree",
+            .object => "scene:inspect_objects",
+            .profile_start, .profile_stop => "profiler:servers",
+        });
         try encodeInteger(&payload, self.peer_thread);
         if (request == .scene) {
             try encodeArrayHeader(&payload, 0);
-        } else {
+        } else if (request == .object) {
             try encodeArrayHeader(&payload, 2);
             try encodeArrayHeader(&payload, 1);
             try encodeInteger(&payload, @bitCast(object_id));
             try encodeBool(&payload, false);
+        } else {
+            try encodeArrayHeader(&payload, 2);
+            try encodeBool(&payload, request == .profile_start);
+            try encodeArrayHeader(&payload, 2);
+            try encodeInteger(&payload, 256);
+            try encodeBool(&payload, true);
         }
         if (payload.items.len > maximum_message) return error.RedotDebuggerMessageLimit;
         var prefix: [4]u8 = undefined;
@@ -314,6 +337,15 @@ pub const Adapter = struct {
             return;
         }
         if (self.state != .ready) return;
+        if (std.mem.eql(u8, name, "servers:function_signature")) {
+            try self.profiler.signature(data);
+            return;
+        }
+        if (std.mem.eql(u8, name, "servers:profile_frame")) {
+            try self.profiler.receive(data);
+            self.revision +%= 1;
+            return;
+        }
         if (std.mem.eql(u8, name, "scene:scene_tree")) try self.receiveScene(data) else if (std.mem.eql(u8, name, "scene:inspect_objects") or std.mem.eql(u8, name, "scene:inspect_object")) try self.receiveObject(name, data) else if (std.mem.eql(u8, name, "remote_selection_invalidated")) {
             self.object = .{};
             self.object_pending = false;
@@ -382,6 +414,7 @@ pub const Adapter = struct {
         var properties: std.ArrayList(Property) = .empty;
         var signals: std.ArrayList(Signal) = .empty;
         var script_path: ?[]const u8 = null;
+        var child_budget: usize = 512;
         for (data[2].array) |entry| {
             if (entry != .array or entry.array.len != 6) return error.RedotDebuggerMalformedObject;
             const property_name = stringValue(entry.array[0]) orelse return error.RedotDebuggerMalformedObject;
@@ -393,7 +426,9 @@ pub const Adapter = struct {
             const display = try displayValue(a, entry.array[5], 0);
             const type_name = variantName(@intCast(kind));
             const saved_name = try a.dupe(u8, property_name);
-            try properties.append(a, .{ .name = saved_name, .variant_type = type_name, .hint = hint, .hint_string = try a.dupe(u8, hint_string), .usage = @intCast(usage), .display = display });
+            var children: std.ArrayList(Child) = .empty;
+            try childRows(a, entry.array[5], &children, 0, &child_budget);
+            try properties.append(a, .{ .name = saved_name, .variant_type = type_name, .hint = hint, .hint_string = try a.dupe(u8, hint_string), .usage = @intCast(usage), .display = display, .children = try children.toOwnedSlice(a) });
             if ((std.mem.eql(u8, property_name, "script") or std.mem.endsWith(u8, property_name, "/script")) and entry.array[5] == .string and looksLikeScript(entry.array[5].string)) script_path = try a.dupe(u8, entry.array[5].string);
             if (entry.array[5] == .signal) try signals.append(a, .{ .property = saved_name, .display = display });
         }
@@ -417,6 +452,7 @@ pub const Adapter = struct {
     }
 
     pub fn deinit(self: *Adapter) void {
+        self.profiler.deinit();
         if (self.connection >= 0) _ = c.close(self.connection);
         if (self.listener >= 0) _ = c.close(self.listener);
         self.receive.deinit(std.heap.page_allocator);
@@ -427,6 +463,28 @@ pub const Adapter = struct {
         self.* = undefined;
     }
 };
+
+fn childRows(a: std.mem.Allocator, value: Value, rows: *std.ArrayList(Child), depth: u8, budget: *usize) !void {
+    if (depth >= 8 or budget.* == 0) return;
+    switch (value) {
+        .array, .packed_array => {
+            const items = if (value == .array) value.array else value.packed_array.head;
+            for (items[0..@min(items.len, 64)], 0..) |item, index| {
+                if (budget.* == 0) break;
+                budget.* -= 1;
+                try rows.append(a, .{ .label = try std.fmt.allocPrint(a, "[{d}]", .{index}), .display = try displayValue(a, item, 0), .depth = depth });
+                try childRows(a, item, rows, depth + 1, budget);
+            }
+        },
+        .dictionary => |pairs| for (pairs[0..@min(pairs.len, 64)]) |pair| {
+            if (budget.* == 0) break;
+            budget.* -= 1;
+            try rows.append(a, .{ .label = try displayValue(a, pair.key, 0), .display = try displayValue(a, pair.value, 0), .depth = depth });
+            try childRows(a, pair.value, rows, depth + 1, budget);
+        },
+        else => {},
+    }
+}
 
 fn integerValue(value: Value) ?i64 {
     return if (value == .integer) value.integer else null;

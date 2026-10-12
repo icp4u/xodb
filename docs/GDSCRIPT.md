@@ -302,6 +302,12 @@ Click a node (or use arrows) to see its script and properties, including
 engine properties such as a Node2D's `position`. **Tab** changes keyboard
 focus, the wheel scrolls either pane, **P** shows properties, **S** shows
 Signal-valued properties, **R** refreshes, and **U** or **Esc** closes.
+Properties use one line each, with script members first and engine category
+placeholders hidden. **/** captures a filter (Enter/Esc finishes editing).
+Click a container row to expand its retained nested entries. Expansion is
+bounded: 512 child rows per object, 64 entries per container, eight levels;
+packed arrays still retain only their first eight entries. Long scalars remain
+bounded previews, not editable or arbitrarily fetchable target memory.
 
 The header says **ENGINE DEBUGGER PROTOCOL / cooperative**: these are retained
 snapshots reported by the running engine. This view needs a responsive debug
@@ -319,8 +325,9 @@ xodb supplies `--remote-debug` with a loopback ephemeral port, accepts one
 peer, and checks its announced PID against the owned launch. Do not supply a
 second `--remote-debug` option. The engine protocol has no authentication;
 the PID check is a consistency check, not protection against another local
-process impersonating the engine. Only scene and inspection requests are
-sent; no property setters, evaluation or method-call commands are exposed.
+process impersonating the engine. Only scene/inspection requests and explicit
+profiler start/stop requests are sent; no property setters, evaluation or
+method-call commands are exposed.
 The engine itself handles inspection, which can invoke a project's property
 getters. Arbitrary attach, remote-agent sessions, and automatic reconnect or
 restart are not supported yet; restart this xodb launch to reconnect.
@@ -343,6 +350,68 @@ The tested Redot 26.2 / Godot 4.5 protocol does not enumerate declared signals
 or connections. The signals pane shows only properties whose value is a
 Signal (for example the demo Arena's `v_signal = tree_exiting`), and states
 that limitation. Signal connection graphs remain future work.
+
+## Frame time, scripts and native code
+
+```sh
+REDOT=/path/to/engine scripts/demo-redot time
+```
+
+The demo contains `Slow`, which runs `burn` and calls native engine code, plus
+two light nodes sharing one script. It warms debug metadata, records engine
+timings alongside twelve explicitly stopped native/script samples, stops the
+profiler, releases its temporary control lease and leaves the game running.
+Press **U**, **T**. Click a timeline bar or press **F** for the slowest retained
+frame; **L** returns to the latest frame and Left/Right steps through frames.
+Select Slow in the tree to see its script cost. Click `burn` in the function
+list to see its native sample; Up/Down browses functions when that pane has focus.
+
+The engine provides process-frame numbers, process/physics/script times,
+physics step duration, server/function timings, function call counts, and
+self/inclusive/internal times. Values are milliseconds, not CPU percentages.
+The history retains 256 process frames. Physics time belongs to each process
+frame; this is not a separate record of every individual physics tick.
+
+Native samples are a distinct source: stopped memory, with the engine's
+process-frame and physics-frame counters read using DWARF. The existing
+GDScript reader supplies the owner object ID and proves each `CallLevel` lies
+inside its native frame. The UI joins by that process-frame number, not by
+TCP arrival time. At most 128 native samples are retained. A function/frame
+without a matching sample says so instead of borrowing another frame's stack.
+
+**Sampling pauses perturb these wall timings.** Amber bars contain stopped
+samples; blue bars have protocol timing only; the selected bar is green,
+with an amber cap if it was stop-sampled. A stop lands in whatever was running,
+so that function's time (for example a short `OS.delay_msec`) is inflated by
+the whole pause. The inspector shows the time
+spent reading a sample (not the entire stop/resume interval). This first native
+join is intrusive stop sampling, not perf-event user-stack reconstruction or
+a statistically valid estimate of CPU cost per node. The ordinary native
+profiler remains independent. Debug-symbol loading can map the whole engine
+image; allow sufficient image budget and memory for a debug build.
+
+Function timing is script-wide. If several nodes use one script, xodb does
+not divide its cost or claim each node incurred the full cost. MCP reports
+the number of script instances in the retained scene; even a unique script
+association is distinct from an owner ID observed in a native/script sample.
+
+MCP:
+
+- `set_redot_profiling(enabled, generation)` requires controller scope (and
+  the shared control lease). Starting clears retained frames/samples; stopping
+  keeps them. It does not resume a paused target.
+- `get_redot_profile(start, limit, frame_number)` is observer-readable. It
+  returns a frame page, selected frame's functions/servers, up to 512 node
+  script-cost associations, and native samples from that exact frame.
+- `capture_redot_sample(generation, tid)` reads and retains the current stopped
+  stack, counters and owner IDs. It never interrupts or resumes. The demo uses
+  the normal controller-only interrupt/continue tools around these reads;
+  unexpected breakpoints or signals are left stopped.
+
+No new runtime is required for protocol timings; native joins require the
+debug engine's DWARF and the same local owned launch as the scene inspector.
+Declared signal/connection graphs, nonintrusive perf-to-script joins, and
+per-instance time accounting remain follow-ups.
 
 ## Limits
 

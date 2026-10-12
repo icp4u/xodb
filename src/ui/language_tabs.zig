@@ -401,7 +401,9 @@ pub const Panel = struct {
         const logical = state.logical_selection;
         const entry = &state.entries[@intFromEnum(state.selected) - 2];
         var y = self.content_y;
-        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, entry.version, theme.neutral);
+        var version_text: [256]u8 = undefined;
+        const version = if (entry.thread) |tid| std.fmt.bufPrint(&version_text, "{s} · thread {d}", .{ entry.version, tid }) catch entry.version else entry.version;
+        try self.drawText(r, font, rect.x + 12, y, rect.w - 24, version, theme.neutral);
         y += 23;
         try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis), theme.weak);
         if (entry.proof_generation == null or entry.proof_generation.? != state.generation or entry.reason != null) {

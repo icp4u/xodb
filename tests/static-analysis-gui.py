@@ -5,7 +5,9 @@ usage: static-analysis-gui.py [PREFIX]   (PREFIX holds bin/xodb; default zig-out
 XODB_STATIC_ANALYSIS=DIR names a built native Ghidra worker (tools/ghx). Without
 it only the worker-absent panel is checked and the slice steps report "skip".
 
-Owned fixture: tests/fixtures/semq/qx.c built with gcc -O2. Checks: the panel
+Owned fixture: tests/fixtures/semq/qx.c built with gcc -O2. Checks: D opens a
+syntax-coloured pseudo-C pane with the stopped instruction, exact line/PC
+selection and the same retained text as MCP. The S panel
 opens with its static banner and a typed "unavailable" result without a worker;
 with one, S on the stopped PC starts the shared analysis job, a click on the
 `call malloc` row then S, Return answers "what feeds malloc's size": count and
@@ -20,7 +22,8 @@ from pathlib import Path
 root = Path(__file__).resolve().parents[1]; os.chdir(root)
 spec = importlib.util.spec_from_file_location('input_repro', root / 'tests/helpers/input.py')
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
-work = root / '.work' / ('input-static-' + str(time.time_ns())[-10:]); work.mkdir(parents=True)
+work_base = Path(os.environ.get('XODB_TEST_TMPDIR', root)) / '.work'  # the input helper only runs under a .work directory
+work = work_base / ('input-static-' + str(time.time_ns())[-10:]); work.mkdir(parents=True)
 h.WORK = str(work)
 for name in ('tmp', 'cache', 'cache/mesa', 'cache/nvidia'): (work / name).mkdir(parents=True, exist_ok=True)
 for xml, stem in ((h.VPTR, 'virtual-pointer'), (h.VKBD, 'virtual-keyboard')):
@@ -95,11 +98,26 @@ try:
         check('S started the analysis job shared with MCP', r['status'] == 'completed' and d.tool('cancel_static_analysis', job_id=1)['job']['state'] == 'completed', r.get('status'))
         time.sleep(.3); d.shot('04-pc-questions')
         d.keys('tap', 1); time.sleep(.2)
+        # The headline view: one D beside source, using the exact cached text.
+        assembly = d.shot('04a-assembly')
+        d.keys('tap', 32); time.sleep(.6)
+        pseudo = d.shot('04b-pseudo-c')
+        decomp = d.tool('decompile_function', address=hex(entry))
+        check('D opens pseudo-C beside source at 1280x800', h.differs(assembly, pseudo, '400x520+614+92') and decomp.get('status') == 'completed' and 'qx_alloc' in decomp.get('signature', ''), decomp.get('signature'))
+        check('GUI and MCP share the retained pseudo-C artifact', decomp.get('artifact_id') == r['analysis']['artifact_id'] and 'malloc' in decomp.get('text', ''), decomp.get('artifact_id'))
+        mapping = d.tool('get_decomp_mapping', artifact_id=decomp['artifact_id'], line=10)
+        before_nav = len([l for l in open(d.log, errors='replace') if l.startswith('static navigate: ')])
+        d.keys('click', 820, 413); time.sleep(.5)
+        navigated = [int(l.split()[2], 16) for l in open(d.log, errors='replace') if l.startswith('static navigate: ')][before_nav:]
+        check('clicking a pseudo-C line selects only its exported PCs', navigated and navigated[-1] in {int(x, 16) for x in mapping.get('runtime_pcs', [])}, (navigated, mapping.get('runtime_pcs')))
+        d.keys('tap', 32); time.sleep(.3)
         # 3. Click the `call malloc` row, S, Return: what feeds malloc's size?
         listing = d.tool('disassemble', address=hex(entry))['instructions']
         index = next(i for i, x in enumerate(listing) if x['mnemonic'].startswith('call'))
         call_pc = int(listing[index]['address'], 16)
-        d.keys('click', 820, 136 + 23 * index + 10); time.sleep(.3)
+        # Line 10's first exact mapping is this malloc call; D restored assembly
+        # with that mapped set selected, so no screen-coordinate guess is needed.
+        check('pseudo-C selection carried the malloc PC back to assembly', navigated[-1] == call_pc, (hex(navigated[-1]), hex(call_pc)))
         d.shot('05-call-selected')
         d.keys('tap', 31); time.sleep(.5)
         d.shot('06-call-questions')

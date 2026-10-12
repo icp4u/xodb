@@ -1,6 +1,6 @@
 #version 450
 layout(set=0,binding=0) uniform sampler2D atlas;
-layout(push_constant) uniform Push { mat4 vp; vec2 viewport; float mode; float exposure; } pc;
+layout(push_constant) uniform Push { mat4 vp; vec2 viewport; float mode; float exposure; float scale; } pc;
 layout(location=0) in vec4 color;
 layout(location=1) in vec3 normal;
 layout(location=2) in vec2 uv;

@@ -57,6 +57,7 @@ pub const Window = struct {
     pointer_y: f32 = 0,
     mouse_down: bool = false,
     scroll: i32 = 0,
+    scale_override: ?f32 = null,
 
     pub fn init(_: *Window) !void {
         return error.NoDisplay;
@@ -75,8 +76,8 @@ pub const Window = struct {
     }
     pub fn beginMove(_: *Window) void {}
     pub fn beginResize(_: *Window, _: platform.Edge) void {}
-    pub fn scale(_: *const Window) f32 {
-        return 1;
+    pub fn scale(self: *const Window) f32 {
+        return self.scale_override orelse 1;
     }
     pub const vk_surface_extension: [*:0]const u8 = "VK_EXT_headless_surface";
     pub fn createSurface(_: *Window, _: vk.VkInstance, _: *vk.VkSurfaceKHR) vk.VkResult {

@@ -84,7 +84,20 @@ try:
                 assert demo.poll() is None,(work/'demo.log').read_text()
                 time.sleep(.1)
             assert socket.exists(),(work/'demo.log').read_text()
-            time.sleep(.5)
+            # A listening session socket precedes Vulkan initialization and the
+            # first mapped window. Wait for this private compositor's replacement
+            # window before sending Space; an early key can be lost entirely.
+            def views(node):
+                yield node
+                for child in node.get('nodes', []) + node.get('floating_nodes', []):
+                    yield from views(child)
+            deadline=time.monotonic()+30*h.load_scale()
+            while True:
+                assert demo.poll() is None,(work/'demo.log').read_text()
+                state=subprocess.run(['swaymsg','-r','-t','get_tree'],env=d.env,capture_output=True,text=True,timeout=10)
+                if state.returncode==0 and any(v.get('app_id')=='xodb' and v.get('pid')!=d.app.pid and v.get('focused') and v.get('visible') for v in views(json.loads(state.stdout))):break
+                assert time.monotonic()<deadline,(work/'demo.log').read_text()
+                time.sleep(.03)
             outputs=[]
             for iteration in range(2):
                 d.keys('tap',57)  # Space: reach the next native probe.

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Run the scene demo, then leave the GUI and shared observers in charge."""
 import json
+import os
 import select
 import signal
 import socket
@@ -57,6 +58,10 @@ def main():
         tool('claim_session_control', ttl_ms=60000)
         try:
             start_scene(tool)
+            if os.environ.get('REDOT_TIME') == 'true':
+                from redot_time import sample_time
+                sample_time(tool)
+                print('Time ready. Press U then T: F slowest frame; click a function for its native sample. Stops perturb wall timing.', file=sys.stderr)
             print('Scene ready. Press U: select a node, P properties, S signal values, R refresh.', file=sys.stderr)
         except Exception as error:
             print('Scene startup: ' + str(error) + '. Use O / Continue in the GUI.', file=sys.stderr)

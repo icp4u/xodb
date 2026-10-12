@@ -145,6 +145,19 @@ watches expose the observation's `runtime.identity` and generation separately
 from their existing frame-lifetime explanation in `identity`. A watch without a
 recoverable canonical frame retains its previous sample as history.
 
+When two Python or Perl runtime images are executing, selecting a stopped
+native thread (the thread list, or MCP `select_native_frame`) scopes that
+language tab to the interpreter proven on that thread. The tab shows its
+runtime version and thread ID, and `get_language_tabs` carries a nullable
+`thread` on the scoped entry. Switching threads clears the previous tab
+identity before the replacement is published. A thread running neither
+interpreter keeps a selectable tab with an explicit no-frames reason, not
+another thread's build ID. Before any thread has been selected the process
+tab still reports the ambiguity; afterwards the scope stays on the last
+selected thread across later stops until another thread is selected. Once
+only one image is still executing, the ordinary process-wide tab returns.
+This changes presentation scope only, not runtime identity or witness policy.
+
 `get_language_tabs` reads this state; a controller holding the
 shared-session lease uses `select_language_tab` with `generation` and `tab`.
 Tab selection does not change registers or resume the target. The cycle goes
@@ -360,6 +373,7 @@ What it does **not** do:
 | Compare JavaScript context values | `./scripts/demo-node` | **Space**, **JS**, select **inspect**, click **round** under **CONTEXT STORAGE**, then **W**. Continue with **Space** and inspect **V**; lexical visibility and activation lifetime remain unproved. |
 | Inside Node.js | `./scripts/demo-node` | **Space**, **E** `value`, **Return**; keep pressing **Space** for numbers, strings, arrays, objects, a class and a function. `./scripts/demo-node stack` prints the physical JavaScript frames. |
 | Profile | **P** in the GUI on any program | flame graph of where time goes |
+| Pseudo-C beside a stopped function | `XODB_STATIC_ANALYSIS=DIR ./scripts/demo-decompile` | **Space**, then **D**: retained pseudo-C beside source; click a pseudo line for its exact PC set, **D** returns to assembly, **S** asks semantic questions. [Walkthrough](DEMOS.md#pseudo-c-beside-a-live-stop) |
 | What feeds malloc's size? | `xodb --static-analysis DIR -- ./qx` (qx from `tests/fixtures/semq/qx.c`, DIR a built `tools/ghx` worker), stop in `qx_alloc` | click the `call` row, **S**, **Return**: `count` and `size` feed it, `flag` is irrelevant; **Tab** shows the `count > 4096` guard |
 | Live open files | start the owned workloads in [LSOF_TOP.md](LSOF_TOP.md#try-it), then `xodb --lsof-top --redact --pid PIDS` | **1** files advancing, **3** the leaker growing, **4** the deleted file's pinned bytes, **Enter** on any row to drill in |
 | THP defrag, live | `cc -O2 -o ~/tmp/mdf tests/memdefrag-fixture.c && ~/tmp/mdf`, then `xodb --overview --memmap-pid PID --redact` (or `xodb --memdefrag --pid PID`) | type `collapse` into the fixture four times: cells turn dark blue with a white ring and **% Complete** climbs; `split` draws one red-edged cell. **t** cycles Win9x, DOS, modern and deep |
@@ -402,6 +416,19 @@ retains its session and owned targets.
 
 `llvmpipe` draws on the CPU and reaches any display, so `--vk-device llvmpipe` is a slow but safe
 way to get a picture while a driver is broken.
+
+## HiDPI and UI scale
+
+xodb normally takes its device-pixel scale from the compositor, including
+fractional Wayland scales such as 1.5. Layout, clipping and pointer hit testing
+remain in window UI units; swapchain images, font rasters and 3D overlays use
+the scaled device extent. Moving a window between differently scaled outputs
+updates the backing resolution and font atlas.
+
+`--ui-scale N` overrides the reported scale for that run, from 0.5 through 4.
+`appearance.ui_scale` in an explicitly loaded [preferences](PREFERENCES.md)
+file supplies the same setting; the CLI wins. Both work in the debugger,
+remote GUI and `--overview`. Omit both to follow the compositor.
 
 ## Where to go next
 

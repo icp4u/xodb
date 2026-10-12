@@ -73,13 +73,33 @@ pub const Languages = struct {
         }
     }
 };
+pub const Galaxy = struct {
+    additive: bool = true,
+    cloud_size: f32 = 1.6,
+    brightness: f32 = 0.85,
+    camera_zoom: f32 = 1.35,
+    easing_ms: f32 = 450,
+    max_stars: u32 = 512,
+    unfold: bool = true,
+    pub fn validate(self: Galaxy) !void {
+        inline for (.{ .{ self.cloud_size, 0.5, 3.0 }, .{ self.brightness, 0.1, 2.0 }, .{ self.camera_zoom, 1.0, 2.5 }, .{ self.easing_ms, 50.0, 2000.0 } }) |range| {
+            if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGalaxyLook;
+        }
+        if (self.max_stars < 8 or self.max_stars > 1024) return error.InvalidGalaxyLook;
+    }
+};
 pub const Preferences = struct {
     wine: struct { hide_internal_threads: bool = false } = .{},
     profile: Profile = .{},
     allocations: @import("profile/allocation_live.zig").Config = .{},
     symbols: Symbols = .{},
-    appearance: struct { theme: ThemePath = .{} } = .{},
+    appearance: struct {
+        theme: ThemePath = .{},
+        /// Device pixels per UI unit. Null follows the window system.
+        ui_scale: ?f32 = null,
+    } = .{},
     languages: Languages = .{},
+    galaxy: Galaxy = .{},
 };
 
 /// CLI wins. File references in preferences are relative to that config file.
@@ -98,10 +118,12 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     defer parsed.deinit();
     try parsed.value.profile.config().validate();
     try parsed.value.allocations.validate();
+    try parsed.value.galaxy.validate();
     if (parsed.value.symbols.auto_file_bytes == 0 or parsed.value.symbols.auto_file_bytes > 256 * 1024 * 1024 or parsed.value.symbols.auto_total_bytes == 0 or parsed.value.symbols.auto_total_bytes > 512 * 1024 * 1024) return error.InvalidSymbolBudget;
     for ([_]?u64{ parsed.value.symbols.image_bytes, parsed.value.symbols.image_total_bytes }) |value| if (value) |n| {
         if (n < snapshot.min_limit or n > snapshot.max_limit) return error.InvalidImageBudget;
     };
+    if (parsed.value.appearance.ui_scale) |scale| _ = @import("platform/window.zig").validateScale(scale) catch return error.InvalidUiScale;
     return parsed.value;
 }
 pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
@@ -124,6 +146,13 @@ pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
     }
     return error.PreferencesTooLarge;
 }
+test "galaxy look preferences retain defaults and accept deliberate overrides" {
+    const defaults = try parse(std.testing.allocator, "{}");
+    try std.testing.expect(defaults.galaxy.unfold and defaults.galaxy.additive and defaults.galaxy.max_stars == 512);
+    const custom = try parse(std.testing.allocator, "{\"galaxy\":{\"cloud_size\":2,\"brightness\":0.5,\"camera_zoom\":1,\"easing_ms\":800,\"max_stars\":128,\"unfold\":false,\"additive\":false}}");
+    try std.testing.expect(custom.galaxy.cloud_size == 2 and custom.galaxy.brightness == 0.5 and custom.galaxy.camera_zoom == 1 and !custom.galaxy.unfold and !custom.galaxy.additive);
+}
+
 test "language views default on, turn off one at a time or all at once, and refuse unknown keys" {
     const a = std.testing.allocator;
     const defaults = try parse(a, "{}");
@@ -218,6 +247,18 @@ test "theme preferences own their path and resolve against config with CLI prece
     try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"\"}}"));
     try std.testing.expectError(error.UnknownField, parse(a, "{\"appearance\":{\"thme\":\"x\"}}"));
     try std.testing.expectError(error.InvalidCharacter, parse(a, "{\"appearance\":{\"theme\":\"a\\u0000b\"}}"));
+}
+
+test "UI scale preference follows the compositor by default and is bounded" {
+    const a = std.testing.allocator;
+    try std.testing.expectEqual(@as(?f32, null), (try parse(a, "{}")).appearance.ui_scale);
+    inline for (.{ 1.0, 1.5, 2.0 }) |scale| {
+        var buffer: [64]u8 = undefined;
+        const json = try std.fmt.bufPrint(&buffer, "{{\"appearance\":{{\"ui_scale\":{d}}}}}", .{scale});
+        try std.testing.expectEqual(@as(?f32, scale), (try parse(a, json)).appearance.ui_scale);
+    }
+    for ([_][]const u8{ "{\"appearance\":{\"ui_scale\":0.49}}", "{\"appearance\":{\"ui_scale\":4.01}}" }) |json|
+        try std.testing.expectError(error.InvalidUiScale, parse(a, json));
 }
 
 test "image budget preferences default to unset and refuse values outside the range" {

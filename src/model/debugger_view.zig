@@ -9,7 +9,7 @@ const info = @import("../debug/info.zig");
 const disasm = @import("disassembly.zig");
 const cfg = @import("control_flow.zig");
 
-pub const LocalRow = struct { name: []const u8, value: model.ValueSummary };
+pub const LocalRow = struct { name: []const u8, value: model.ValueSummary, parameter: bool = false };
 pub const Request = struct {
     tid: i32,
     frame: usize = 0,
@@ -235,6 +235,7 @@ pub const Capture = struct {
         const a = self.arena.allocator();
         self.value.frames = session.stack(a, request.tid, 64) catch &.{};
         if (self.value.frames.len > 0) {
+            session.language_tabs.followThread(request.tid);
             self.value.selected_frame = @min(request.frame, self.value.frames.len - 1);
             if (session.language_tabs.native_selection == null and session.language_tabs.logical_selection == null) {
                 session.language_tabs.native_selection = .{ .generation = self.value.snapshot.generation, .tid = request.tid, .frame = self.value.selected_frame };
@@ -260,7 +261,7 @@ pub const Capture = struct {
         var rows: std.ArrayList(LocalRow) = .empty;
         for (variables) |v| {
             const summary = session.summarize(a, v.value) catch continue;
-            rows.append(a, .{ .name = v.name, .value = summary }) catch {};
+            rows.append(a, .{ .name = v.name, .value = summary, .parameter = v.parameter }) catch {};
             if (@import("../language/go_values.zig").supported(v.value.type)) continue;
             const is_pointer = v.value.type.kind == .pointer;
             const structure = if (is_pointer) v.value.type.child orelse continue else v.value.type;

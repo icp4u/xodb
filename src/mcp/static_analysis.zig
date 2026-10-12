@@ -1,5 +1,5 @@
-//! MCP surface of in-debugger static analysis (src/semq/host.zig). All four
-//! tools are observer reads: they never touch the target; the worker is a
+//! MCP surface of in-debugger static analysis (src/semq/host.zig). These
+//! tools never touch the target; the worker is a
 //! separate supervised process tree. Answers are static possibilities with the
 //! producer's qualification; observed values come back in a separate field.
 const std = @import("std");
@@ -12,7 +12,7 @@ const Allocator = std.mem.Allocator;
 pub const definitions = @embedFile("static_tools.json");
 
 pub fn handles(name: []const u8) bool {
-    for ([_][]const u8{ "analyze_function", "slice_value", "control_dependencies", "cancel_static_analysis" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
+    for ([_][]const u8{ "analyze_function", "decompile_function", "get_decomp_mapping", "slice_value", "control_dependencies", "cancel_static_analysis" }) |candidate| if (std.mem.eql(u8, name, candidate)) return true;
     return false;
 }
 
@@ -24,7 +24,7 @@ fn hexWords(a: Allocator, value: *V) !void {
             var iterator = object.iterator();
             while (iterator.next()) |entry| {
                 const key = entry.key_ptr.*;
-                const word = for ([_][]const u8{ "address", "link_address", "offset", "pc", "entry", "link_entry", "target" }) |name| {
+                const word = for ([_][]const u8{ "address", "link_address", "link_pc", "offset", "pc", "entry", "link_entry", "target" }) |name| {
                     if (std.mem.eql(u8, key, name)) break true;
                 } else false;
                 const n: ?u64 = if (!word) null else switch (entry.value_ptr.*) {
@@ -133,6 +133,20 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
             .analysis => |analysis| out(a, .{ .status = "completed", .analysis = try summary(a, analysis) }),
         };
     }
+    if (std.mem.eql(u8, name, "decompile_function")) {
+        try wire.fields(args, &.{ "address", "symbol", "retry", "deadline_ms" });
+        const address = try functionAddress(session, args) orelse return error.InvalidArguments;
+        return switch (try analysisAt(a, session, address, try options(session, args))) {
+            .status => |v| v,
+            .analysis => |analysis| decompile(a, analysis),
+        };
+    }
+    if (std.mem.eql(u8, name, "get_decomp_mapping")) {
+        try wire.fields(args, &.{ "artifact_id", "token_start", "token_end", "line", "pc", "rows" });
+        const artifact = try text(args, "artifact_id") orelse return error.InvalidArguments;
+        const analysis = session.static_analysis.find(artifact) orelse return out(a, .{ .status = "not_cached", .artifact_id = artifact, .reason = "the artifact is not in this session's bounded analysis cache; call decompile_function first" });
+        return decompMapping(a, session, analysis, args);
+    }
     const is_slice = std.mem.eql(u8, name, "slice_value");
     try wire.fields(args, if (is_slice)
         &.{ "address", "symbol", "pc", "file", "line", "op", "opcode", "input", "data_only", "tid", "frame", "rows", "max_ms", "deadline_ms" }
@@ -210,6 +224,85 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
     return out(a, .{ .status = "completed", .analysis = brief, .candidate = found[0], .controls = try answer.controls(a, session, analysis, chosen, limits) });
 }
 
+fn decompile(a: Allocator, analysis: *host.Analysis) !V {
+    const Reason = struct { code: []const u8, level: []const u8, detail: []const u8, address: ?u64 };
+    const reasons = try a.alloc(Reason, analysis.reasons.len);
+    for (analysis.reasons, reasons) |reason, *row| row.* = .{ .code = reason.code, .level = reason.level, .detail = reason.detail, .address = if (reason.address) |pc| analysis.function.runtime(pc) else null };
+    const document = analysis.pseudocode;
+    return out(a, .{
+        .status = "completed",
+        .text = document.text,
+        .signature = document.signature,
+        .language = document.language,
+        .printer = document.printer,
+        .qualification = .{ .level = analysis.level, .reasons = reasons },
+        .token_status = document.token_status,
+        .address_map_status = document.address_map_status,
+        .artifact_id = analysis.artifact_id,
+        .function = .{ .name = analysis.function.name, .entry = analysis.function.runtime(analysis.function.key.entry), .size = analysis.function.key.size, .module = analysis.function.module_path },
+    });
+}
+
+fn decompMapping(a: Allocator, session: *Session, analysis: *host.Analysis, args: V) !V {
+    const start_given = args.object.get("token_start") != null;
+    const end_given = args.object.get("token_end") != null;
+    const line_given = args.object.get("line") != null;
+    const pc = try hex(args, "pc");
+    const selectors = @as(u8, @intFromBool(start_given or end_given)) + @intFromBool(line_given) + @intFromBool(pc != null);
+    if (selectors > 1 or start_given != end_given) return error.InvalidArguments;
+    const start = if (start_given) try wire.number(args, "token_start", null) else 0;
+    const end = if (end_given) try wire.number(args, "token_end", null) else std.math.maxInt(u64);
+    const line = if (line_given) try wire.number(args, "line", null) else 0;
+    const limit: usize = @intCast(@min(try wire.number(args, "rows", 256), 512));
+    if (limit == 0 or start >= end or line > std.math.maxInt(u32)) return error.InvalidArguments;
+    const Site = struct { path: []const u8, line: u32 };
+    const Row = struct { token: u32, line: u32, col: u32, kind: []const u8, text: []const u8, op: ?u32, link_pc: ?u64, pc: ?u64, source: ?Site };
+    const SourceRow = struct { path: []const u8, line: u32, pc: u64 };
+    var rows: std.ArrayList(Row) = .empty;
+    var pcs: std.ArrayList(u64) = .empty;
+    var sources: std.ArrayList(SourceRow) = .empty;
+    var total: usize = 0;
+    for (analysis.pseudocode.tokens) |token| {
+        const runtime = if (token.pc) |link| analysis.function.runtime(link) else null;
+        const selected = if (pc) |wanted| runtime == wanted else if (line_given) token.line == line else if (start_given) token.index >= start and token.index < end else true;
+        if (!selected) continue;
+        total += 1;
+        if (rows.items.len >= limit) continue;
+        const source: ?Site = if (runtime) |at| if (session.sourceAt(a, at) catch null) |site| .{ .path = site.path, .line = site.line } else null else null;
+        try rows.append(a, .{ .token = token.index, .line = token.line, .col = token.col, .kind = token.kind, .text = token.text, .op = token.op, .link_pc = token.pc, .pc = runtime, .source = source });
+        if (runtime) |at| {
+            var known_pc = false;
+            for (pcs.items) |known| if (known == at) {
+                known_pc = true;
+                break;
+            };
+            if (!known_pc) try pcs.append(a, at);
+            if (source) |site| {
+                var known_source = false;
+                for (sources.items) |known| if (known.pc == at and known.line == site.line and std.mem.eql(u8, known.path, site.path)) {
+                    known_source = true;
+                    break;
+                };
+                if (!known_source) try sources.append(a, .{ .path = site.path, .line = site.line, .pc = at });
+            }
+        }
+    }
+    const pc_text = try a.alloc([]const u8, pcs.items.len);
+    for (pcs.items, pc_text) |at, *text_pc| text_pc.* = try std.fmt.allocPrint(a, "0x{x}", .{at});
+    return out(a, .{
+        .status = "completed",
+        .artifact_id = analysis.artifact_id,
+        .function = analysis.function.name,
+        .selection = if (pc != null) "runtime_pc_exact" else if (line_given) "pseudocode_line_exact" else if (start_given) "token_range_half_open" else "all_tokens",
+        .tokens = rows.items,
+        .tokens_total = total,
+        .tokens_cut = total > rows.items.len,
+        .runtime_pcs = pc_text,
+        .source_rows = sources.items,
+        .mapping_rule = "only worker-exported token links are returned; unmapped syntax stays unmapped and no nearest instruction is guessed",
+    });
+}
+
 fn functionAddress(session: *Session, args: V) !?u64 {
     const address = try hex(args, "address");
     const symbol = try text(args, "symbol");
@@ -229,7 +322,7 @@ test "static starters require controller while cached reads remain observers" {
         const annotations = definition.object.get("annotations").?;
         try std.testing.expect(annotations.object.get("readOnlyHint").?.bool);
         const name = definition.object.get("name").?.string;
-        const starter = std.mem.eql(u8, name, "analyze_function") or std.mem.eql(u8, name, "slice_value") or std.mem.eql(u8, name, "control_dependencies");
+        const starter = std.mem.eql(u8, name, "analyze_function") or std.mem.eql(u8, name, "decompile_function") or std.mem.eql(u8, name, "slice_value") or std.mem.eql(u8, name, "control_dependencies");
         try std.testing.expectEqualStrings(if (starter) "controller" else "observer", annotations.object.get("xodbSessionAccess").?.string);
     }
 }

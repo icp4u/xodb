@@ -1,7 +1,8 @@
 {
   "wine": { "hide_internal_threads": false },
   "appearance": {
-    "theme": "builtin:dark"
+    "theme": "builtin:dark",
+    "ui_scale": 1.5
   },
   "profile": {
     "duration_ms": 60000,
@@ -22,6 +23,15 @@
     "duration_ms": 60000,
     "record_limit": 32768,
     "memory_limit": 33554432
+  },
+  "galaxy": {
+    "additive": true,
+    "cloud_size": 1.6,
+    "brightness": 0.85,
+    "camera_zoom": 1.35,
+    "easing_ms": 450,
+    "max_stars": 512,
+    "unfold": true
   },
   "languages": {
     "enabled": true,

@@ -38,6 +38,87 @@
     }
   },
   {
+    "name": "decompile_function",
+    "description": "Return the retained pseudo-C document for the function containing an address (or symbol): exact text, signature, producer qualification and reasons, and artifact id. It uses the same supervised, asynchronous per-function analysis and cache as analyze_function; poll while status is running. Static possibilities, not verified semantics.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "address": {
+          "type": "string",
+          "description": "Runtime address (hex) inside the function."
+        },
+        "symbol": {
+          "type": "string",
+          "description": "Function symbol."
+        },
+        "retry": {
+          "type": "boolean",
+          "description": "Start a new job after a failed or cancelled one."
+        },
+        "deadline_ms": {
+          "type": "integer",
+          "minimum": 100,
+          "maximum": 600000
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "controller"
+    }
+  },
+  {
+    "name": "get_decomp_mapping",
+    "description": "Read exact mappings from a cached pseudo-C artifact. Select one runtime pc, one pseudo-C line, or a half-open token range; with no selector returns the first bounded page. Returns token positions, exported runtime PCs, and debugger source rows. Unmapped tokens remain unmapped and no nearest instruction is guessed. This never starts a worker.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "artifact_id": {
+          "type": "string"
+        },
+        "token_start": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "token_end": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "line": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "pc": {
+          "type": "string"
+        },
+        "rows": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 512
+        },
+        "process_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1024
+        }
+      },
+      "required": [
+        "artifact_id"
+      ],
+      "additionalProperties": false
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
     "name": "slice_value",
     "description": "What feeds this value? Select an op by pc, source file+line or op id, and an input index (omit input for the op's output; a CALL's argument k is input k+1). A source line selects the ops at any of its line-table rows, including code inlined into a caller; a line in several functions returns status ambiguous with the functions, and rows without an exported op return no_selection with reason inlined_no_direct_op or no_op_at_line_rows. An ambiguous selection returns candidates, never a guess. Returns per-parameter relevance (direct, possible, control, irrelevant, unknown), contributing values with instruction and source citations, boundaries and limits. With tid (and frame) at a stop inside the function, observed_now lists the frame's DWARF parameter values separately. Static possibilities, not an observed execution: answers keep the producer's qualification and say result_trust and verified_semantics=false. Without the opt-in worker the result is status unavailable with how to build it.",
     "inputSchema": {

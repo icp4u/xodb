@@ -1,0 +1,11 @@
+config_version=5
+
+[application]
+config/name="Frame Time Lab"
+run/main_scene="res://arena.tscn"
+
+[rendering]
+renderer/rendering_method="gl_compatibility"
+
+[debug]
+settings/gdscript/always_track_local_variables=true

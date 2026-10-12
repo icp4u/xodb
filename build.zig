@@ -13,10 +13,14 @@ pub fn build(b: *std.Build) void {
     portable_query.cpu_features_add = .empty;
     portable_query.cpu_features_sub = .empty;
     const portable_target = b.resolveTargetQuery(portable_query);
-    const gui = b.option(bool, "gui", "Build the Wayland/Vulkan interface (disable for headless MCP)") orelse true;
+    const gui = b.option(bool, "gui", "Build the graphical Vulkan interface (disable for headless MCP)") orelse true;
     // The window system behind src/platform/window.zig. null has no display: it runs the unit tests.
-    const Platform = enum { wayland, null };
-    const platform = b.option(Platform, "platform", "Window system backend for the interface") orelse if (target.result.os.tag == .linux) Platform.wayland else .null;
+    const Platform = enum { wayland, cocoa, null };
+    const platform = b.option(Platform, "platform", "Window system backend for the interface") orelse switch (target.result.os.tag) {
+        .linux => Platform.wayland,
+        .macos => Platform.cocoa,
+        else => Platform.null,
+    };
     const capstone_link = b.option(enum { system, vendored }, "capstone", "Link system Capstone, or the private static prefix from scripts/build-capstone") orelse .system;
     const font_path = b.option([]const u8, "font-path", "Default GUI font (runtime --font overrides this)") orelse "/usr/share/fonts/TTF/DejaVuSansMono.ttf";
     const module = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -113,7 +117,26 @@ pub fn build(b: *std.Build) void {
         module.addIncludePath(dmabuf_header.addOutputFileArg("linux-dmabuf-v1-client-protocol.h").dirname());
         const dmabuf_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", dmabuf_xml });
         module.addCSourceFile(.{ .file = dmabuf_code.addOutputFileArg("linux-dmabuf-v1.c"), .flags = &.{} });
+        // Fractional scale supplies device pixels per logical surface unit;
+        // viewporter presents the correspondingly larger Vulkan buffer at the
+        // compositor's logical surface size.
+        for ([_][]const u8{
+            "/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml",
+            "/usr/share/wayland-protocols/stable/viewporter/viewporter.xml",
+        }) |xml| {
+            const scale_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", xml });
+            module.addIncludePath(scale_header.addOutputFileArg(b.fmt("{s}-client-protocol.h", .{std.fs.path.stem(xml)})).dirname());
+            const scale_code = b.addSystemCommand(&.{ "wayland-scanner", "private-code", xml });
+            module.addCSourceFile(.{ .file = scale_code.addOutputFileArg(b.fmt("{s}.c", .{std.fs.path.stem(xml)})), .flags = &.{} });
+        }
         for ([_][]const u8{ "wayland-client", "xkbcommon" }) |lib| module.linkSystemLibrary(lib, .{});
+    }
+    if (gui and platform == .cocoa) {
+        // This C ABI is the boundary for the future Objective-C/AppKit shim.
+        // The checked-in native stub makes the whole GUI compile on Linux and
+        // refuses at open time; replace it only once a Mac lane can exercise it.
+        module.addIncludePath(b.path("src/platform"));
+        module.addCSourceFile(.{ .file = b.path("src/platform/cocoa_stub.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     if (gui) {
         for ([_][]const u8{ "vulkan", "freetype2", "harfbuzz" }) |lib| module.linkSystemLibrary(lib, .{});
@@ -187,6 +210,13 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fd_fixture);
     const tests = b.addTest(.{ .root_module = module });
     tests.step.dependOn(catalog_check);
+    const cocoa_contract_tests = b.addTest(.{
+        .name = "xodb-cocoa-contract-test",
+        .root_module = module,
+        .filters = &.{ "Cocoa", "translated input" },
+    });
+    cocoa_contract_tests.step.dependOn(catalog_check);
+    b.step("test-cocoa", "Test the Cocoa platform contract and native stub").dependOn(&b.addRunArtifact(cocoa_contract_tests).step);
     const remote_lifecycle_tests = b.addTest(.{ .name = "xodb-remote-lifecycle-test", .root_module = module, .filters = &.{ "silent saturated queue", "late old completion", "process identity compares start", "publications retain nested strings" } });
     b.installArtifact(remote_lifecycle_tests);
     b.step("remote-lifecycle", "Test remote queue shutdown and stale incarnation refusal").dependOn(&b.addRunArtifact(remote_lifecycle_tests).step);
@@ -194,11 +224,13 @@ pub fn build(b: *std.Build) void {
         // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
         exe.use_llvm = true;
         tests.use_llvm = true;
+        cocoa_contract_tests.use_llvm = true;
         remote_lifecycle_tests.use_llvm = true;
         // libcapstone.a is linked statically. A search path must not become a
         // RUNPATH; that would record the build tree in the binary.
         exe.each_lib_rpath = false;
         tests.each_lib_rpath = false;
+        cocoa_contract_tests.each_lib_rpath = false;
         remote_lifecycle_tests.each_lib_rpath = false;
     }
     const runtime_tests = b.addExecutable(.{ .name = "xodb-runtime-memory-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });

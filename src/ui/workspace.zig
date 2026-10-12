@@ -226,7 +226,7 @@ pub const Workspace = struct {
             keys.sym.down => 108,
             'a' => 30,
             'w' => 17,
-            'd' => if (event.mods.shift) 32 else 0,
+            'd' => if (event.mods.shift) 32 else 49,
             'g' => 34,
             'h' => 35,
             'p' => 25,
@@ -336,6 +336,15 @@ pub const Workspace = struct {
             w.mouse_down = down;
         }
         var scroll = w.scroll;
+        const decompile_rows = self.static_panel.decompile_rows;
+        if (self.static_panel.decompile_open and scroll != 0 and decompile_rows.count > 0 and
+            w.pointer_x >= decompile_rows.x and w.pointer_x < decompile_rows.x + decompile_rows.w and
+            w.pointer_y >= decompile_rows.y - 2 and w.pointer_y < decompile_rows.y - 2 + @as(f32, @floatFromInt(decompile_rows.count)) * 23)
+        {
+            self.static_panel.wheelDecompile(scroll);
+            scroll = 0;
+            w.dirty = true;
+        }
         if (self.process_panel.open and scroll != 0 and (if (remote) true else session.process_tree != null)) {
             self.process_panel.wheel(scroll);
             scroll = 0;
@@ -659,6 +668,7 @@ pub const Workspace = struct {
     /// A line keeps all its line-table rows and every function they fall in;
     /// the panel asks which function when there is more than one.
     fn openStatic(self: *Workspace, w: *Window, context: anytype) void {
+        self.static_panel.hideDecompile();
         if (@TypeOf(context) != *Session) {
             if (self.static_from_line) if (self.cursor_line) |line| {
                 const origin = @import("../model/static_view.zig").Origin.source(self.source_path, line) catch |err| {
@@ -710,6 +720,22 @@ pub const Workspace = struct {
             };
             self.static_panel.show(.{ .pc = pc });
         }
+    }
+    /// D: show the worker's retained pseudo-C for the function at the stopped
+    /// PC (the selected instruction when nothing is stopped).  The analysis is the same cached artifact used by S and MCP.
+    fn toggleDecompile(self: *Workspace) void {
+        if (self.static_panel.decompile_open) {
+            self.static_panel.hideDecompile();
+            self.status = "Assembly pane restored";
+            return;
+        }
+        const pc = (if (self.regs) |regs| linux.programCounter(regs) catch null else null) orelse self.assembly_cursor orelse {
+            self.status = "Pause or select an instruction before opening pseudo-C";
+            return;
+        };
+        self.show_flow = false;
+        self.static_panel.showDecompile(.{ .pc = pc });
+        self.status = "Preparing pseudo-C; D returns to assembly";
     }
     /// With XODB_INPUT_TRACE, each static answer is logged once for GUI tests.
     pub fn traceStatic(self: *Workspace, w: *Window) void {
@@ -905,6 +931,12 @@ pub const Workspace = struct {
             w.dirty = true;
             return;
         }
+        if (code == 49 and !self.show_profile) {
+            self.static_panel.open = false;
+            self.toggleDecompile();
+            w.dirty = true;
+            return;
+        }
         if (code == 23 and !self.show_profile) {
             self.stop_panel.open = false;
             self.probes_panel.open = false;
@@ -1035,6 +1067,7 @@ pub const Workspace = struct {
         }
         if (code == 34) {
             self.show_profile = false;
+            self.static_panel.hideDecompile();
             self.show_flow = !self.show_flow;
             w.dirty = true;
         }
@@ -1279,8 +1312,14 @@ pub const Workspace = struct {
             self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints, S static slice";
             w.dirty = true;
         }
+        if (click and !self.show_profile and self.static_panel.decompile_open and self.static_panel.selectDecompileAt(w.pointer_x, w.pointer_y)) {
+            self.followStatic(w);
+            self.status = if (self.static_panel.decompile_pcs.items.len > 0) "Pseudo-C line selected; exact mapped instructions and source selected" else "Pseudo-C line has no exported instruction mapping";
+            w.dirty = true;
+            click = false;
+        }
         const rows = self.assembly_rows;
-        if (click and !self.show_profile and !self.show_flow and rows.count > 0 and w.pointer_x >= rows.x and w.pointer_x < rows.x + rows.w and w.pointer_y >= rows.y - 2 and w.pointer_y < rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * 23) {
+        if (click and !self.show_profile and !self.show_flow and !self.static_panel.decompile_open and rows.count > 0 and w.pointer_x >= rows.x and w.pointer_x < rows.x + rows.w and w.pointer_y >= rows.y - 2 and w.pointer_y < rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * 23) {
             const index: usize = @intFromFloat((w.pointer_y - rows.y + 2) / 23);
             if (index < self.instruction_count) {
                 self.assembly_cursor = self.instructions[index].address;
@@ -1799,7 +1838,7 @@ pub const Workspace = struct {
         try r.textFit(font, x, y, width, s, color);
     }
     fn pane(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, name: []const u8, detail: []const u8) !void {
-        r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(r.extent.width), .h = @floatFromInt(r.extent.height) };
+        r.clip = r.fullClip();
         try style.shadow(r, rect, 8, 0.6);
         try style.box(r, rect, theme.surface, theme.border, @splat(8));
         try r.shape(.{ .x = rect.x + 1, .y = rect.y + 1, .w = rect.w - 2, .h = 33 }, theme.header, .{ .radii = .{ 7, 7, 0, 0 } });
@@ -2083,7 +2122,9 @@ pub const Workspace = struct {
             }
             if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
         }
-        if (self.show_flow) {
+        if (self.static_panel.decompile_open) {
+            try self.drawPseudoC(r, font, left, right, bottom, body_y, thread_color);
+        } else if (self.show_flow) {
             try pane(r, font, .{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 }, "CONTROL FLOW", "G assembly");
             try self.flow.draw(r, font, r.clip, if (self.regs) |regs| linux.programCounter(regs) catch null else null);
         } else {
@@ -2107,7 +2148,12 @@ pub const Workspace = struct {
                 const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
                 if (y + 20 > bottom - 10) break;
                 self.assembly_rows.count = i + 1;
-                if (self.assembly_cursor == inst.address and !self.static_from_line) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
+                var pseudo_selected = false;
+                for (self.static_panel.decompile_pcs.items) |pc| if (pc == inst.address) {
+                    pseudo_selected = true;
+                    break;
+                };
+                if ((self.assembly_cursor == inst.address and !self.static_from_line) or pseudo_selected) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
                 if (current_pc != null and inst.address == current_pc.?) {
                     try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
                     try r.text(font, left + 8, y, "\u{25b6}", thread_color);
@@ -2118,6 +2164,134 @@ pub const Workspace = struct {
                 try r.textFit(font, left + 156 + @max(58, r.measure(font, mnemonic) + 10), y, right - left - 6 - 156 - 70, std.mem.sliceTo(@as([]const u8, &inst.operands), 0), theme.text);
             }
         }
+    }
+
+    fn pseudoColor(kind: []const u8) gpu.Color {
+        if (std.mem.eql(u8, kind, "type")) return theme.neutral;
+        if (std.mem.eql(u8, kind, "funcname")) return theme.good;
+        if (std.mem.eql(u8, kind, "op")) return theme.warm;
+        if (std.mem.eql(u8, kind, "syntax")) return theme.weak;
+        return theme.text;
+    }
+
+    fn drawPseudoC(self: *Workspace, r: *gpu.Renderer, font: *Font, left: f32, right: f32, bottom: f32, body_y: f32, thread_color: gpu.Color) !void {
+        const rect = gpu.Rect{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 };
+        try pane(r, font, rect, "PSEUDO-C", "D assembly / S queries");
+        const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
+        // The pane follows the stop: a new stop drops the old selection, and
+        // one outside the shown function reopens the pane there.
+        if (current_pc) |pc| if (self.static_panel.decompile_stop != pc) {
+            if (self.static_panel.decompile_stop != null) self.assembly_cursor = null;
+            self.static_panel.decompile_stop = pc;
+            const shown = self.static_panel.decompileView();
+            if (shown == null or shown.?.status != .ready or pc -% shown.?.function_entry >= shown.?.function_size) self.static_panel.showDecompile(.{ .pc = pc });
+        };
+        const view = self.static_panel.decompileView() orelse {
+            try r.textFit(font, left + 16, body_y + 55, rect.w - 28, "Preparing pseudo-C…", theme.weak);
+            self.static_panel.decompile_rows = .{};
+            return;
+        };
+        if (view.status != .ready) {
+            try r.textFit(font, left + 16, body_y + 53, rect.w - 28, view.title, if (view.status == .pending) theme.text else theme.breakpoint);
+            try r.textFit(font, left + 16, body_y + 79, rect.w - 28, view.detail, theme.weak);
+            self.static_panel.decompile_rows = .{};
+            if (view.status == .pending) self.animating = true;
+            return;
+        }
+        try r.textFit(font, left + 14, body_y + 39, rect.w - 24, view.pseudo_qualification, if (view.unreliable) theme.breakpoint else theme.weak);
+        try r.textFit(font, left + 14, body_y + 58, rect.w - 24, if (view.pseudo_cut) "pane document capped" else if (!std.mem.eql(u8, view.pseudo_token_status, "ok")) "token map incomplete: some text has no colours or PCs" else view.pseudo_reasons, if (view.pseudo_cut or !std.mem.eql(u8, view.pseudo_token_status, "ok")) theme.warm else theme.weak);
+        var observed: [384]u8 = undefined;
+        const observed_prefix = "observed now";
+        @memcpy(observed[0..observed_prefix.len], observed_prefix);
+        var observed_len: usize = observed_prefix.len;
+        var observed_count: usize = 0;
+        for (self.locals) |local| if (local.parameter and local.value.availability == .available and observed_count < 6) {
+            const written = std.fmt.bufPrint(observed[observed_len..], "  {s}={s}", .{ local.name, local.value.display }) catch break;
+            observed_len += written.len;
+            observed_count += 1;
+        };
+        if (observed_count > 0) try r.textFit(font, left + 14, body_y + 77, rect.w - 24, observed[0..observed_len], theme.thread_main);
+        var lines = std.mem.splitScalar(u8, view.pseudocode, '\n');
+        var line_number: u32 = 1;
+        const first = self.static_panel.decompile_first;
+        const start_y = body_y + 105;
+        var shown: usize = 0;
+        self.static_panel.syncDecompilePC(self.assembly_cursor orelse current_pc);
+        while (lines.next()) |line| : (line_number += 1) {
+            if (line_number < first) continue;
+            const y = start_y + @as(f32, @floatFromInt(shown)) * 23;
+            if (y + 20 > bottom - 10) break;
+            shown += 1;
+            const row = gpu.Rect{ .x = left + 4, .y = y - 2, .w = rect.w - 6, .h = 23 };
+            var current = false;
+            var breakpoint = false;
+            for (view.pseudo_tokens) |token| if (token.line == line_number) {
+                if (token.pc == current_pc) current = true;
+                if (token.source) |site| {
+                    if (std.mem.eql(u8, site.path, self.source_path) and std.mem.indexOfScalar(u32, self.breakpoint_lines, site.line) != null) breakpoint = true;
+                }
+            };
+            if (breakpoint) try r.rect(row, style.fade(theme.breakpoint, 0.11));
+            if (self.static_panel.decompile_line == line_number) try style.focus(r, row, 2, 1);
+            if (current) {
+                try style.threadLine(r, row, thread_color, self.alive, 16);
+                try r.text(font, left + 8, y, "\u{25b6}", thread_color);
+            } else if (breakpoint) try style.disc(r, left + 14, y + 9.5, 4, theme.breakpoint);
+            try label(r, font, left + 23, y, if (current) thread_color else theme.weak, "{d: >3}", .{line_number});
+
+            // One exact live-value annotation per row. Reserve its column
+            // before drawing code so the static text and observed value never
+            // paint over one another.
+            var annotation: ?LocalRow = null;
+            for (view.pseudo_tokens) |token| if (token.line == line_number and std.mem.eql(u8, token.kind, "variable")) {
+                if (token.parameter) |wanted| {
+                    var ordinal: u32 = 0;
+                    for (self.locals) |local| if (local.parameter) {
+                        if (ordinal == wanted) {
+                            annotation = local;
+                            break;
+                        }
+                        ordinal += 1;
+                    };
+                } else for (self.locals) |local| if (std.mem.eql(u8, local.name, token.text)) {
+                    annotation = local;
+                    break;
+                };
+                if (annotation != null) break;
+            };
+            var note: [192]u8 = undefined;
+            var note_text: []const u8 = "";
+            var note_w: f32 = 0;
+            if (annotation) |local| if (local.value.availability == .available) {
+                note_text = std.fmt.bufPrint(&note, "{s} = {s}", .{ local.name, local.value.display }) catch "";
+                note_w = @min(rect.w * 0.30, r.measure(font, note_text) + 10);
+                // The code comes first: a value that would cut it stays on the "observed now" row.
+                if (left + 62 + r.measure(font, line) > right - 24 - note_w) note_text = "";
+            };
+            const note_x = right - 8 - note_w;
+            const code_right = if (note_text.len > 0) note_x - 8 else right - 8;
+            var x = left + 62;
+            var col: usize = 0;
+            for (view.pseudo_tokens) |token| if (token.line == line_number) {
+                const token_col: usize = token.col;
+                if (token_col < col or token_col > line.len) continue;
+                if (token_col > col) {
+                    const gap = line[col..token_col];
+                    try r.textFit(font, x, y, @max(0, code_right - x), gap, theme.text);
+                    x += r.measure(font, gap);
+                }
+                if (x < code_right) try r.textFit(font, x, y, code_right - x, token.text, pseudoColor(token.kind));
+                x += r.measure(font, token.text);
+                col = @min(line.len, token_col + token.text.len);
+            };
+            if (col < line.len and x < code_right) try r.textFit(font, x, y, code_right - x, line[col..], theme.text);
+            if (note_text.len > 0) {
+                try r.rect(.{ .x = note_x - 4, .y = y - 1, .w = note_w + 4, .h = 20 }, style.fade(theme.thread_main, 0.16));
+                try r.textFit(font, note_x, y, note_w, note_text, theme.thread_main);
+            }
+        }
+        self.static_panel.decompile_rows = .{ .x = rect.x, .y = start_y, .w = rect.w, .count = shown };
+        if (shown == 0) try r.textFit(font, left + 16, start_y, rect.w - 28, if (view.pseudocode.len == 0) "The worker returned no pseudo-C text" else "No pseudo-C rows in this viewport", theme.weak);
     }
     /// Pure locals/register painting. Language inspection is prepared separately.
     pub fn drawNativeValues(self: *Workspace, r: *gpu.Renderer, font: *Font, side: gpu.Rect, content_y: f32, bottom: f32, tab: @import("../model/language_tabs.zig").Tab, thread_color: gpu.Color) !void {

@@ -50,18 +50,22 @@ class Display:
     # A test of a very large image (a first read of a gigabyte) raises this.
     reply_seconds = 5
 
-    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True, binary=None, output_size=(1280, 800)):
+    def __init__(self, tree, args, trace=True, wayland_debug=False, hide_cursor=True, stdio=True, binary=None, output_size=(1280, 800), output_scale=1.0):
         Display.count = getattr(Display, "count", 0) + 1
         self.tree = tree
         self.width, self.height = output_size
         assert self.width > 0 and self.height > 0
+        self.output_scale = float(output_scale)
+        assert 0.5 <= self.output_scale <= 4.0
+        self.physical_width = round(self.width * self.output_scale)
+        self.physical_height = round(self.height * self.output_scale)
         self.dir = os.path.join(WORK, f"run-{Display.count:02d}")
         self.runtime = os.path.join(WORK, "rt", str(Display.count))  # short: the Sway socket must fit in sun_path
         os.makedirs(self.dir)
         os.makedirs(self.runtime, mode=0o700)
         config = os.path.join(self.dir, "sway.conf")
         with open(config, "w") as f:
-            f.write(f"xwayland disable\noutput HEADLESS-1 mode {self.width}x{self.height}\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\n" + ("seat seat0 hide_cursor 100\n" if hide_cursor else ""))
+            f.write(f"xwayland disable\noutput HEADLESS-1 mode {self.physical_width}x{self.physical_height} scale {self.output_scale:g}\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\n" + ("seat seat0 hide_cursor 100\n" if hide_cursor else ""))
         env = dict(os.environ)
         for key in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS"):
             env.pop(key, None)

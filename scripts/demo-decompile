@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Owned pseudo-C demo.  The fixture is built from repository source and the
+# decompiler is the opt-in native worker selected by XODB_STATIC_ANALYSIS.
+set -euo pipefail
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cd "$root"
+
+toolchain=${XODB_STATIC_ANALYSIS:-}
+if [[ -z "$toolchain" || ! -x "$toolchain/ghx_worker" || ! -x "$toolchain/ghx_supervise" ]]; then
+    cat >&2 <<'NEED'
+Set XODB_STATIC_ANALYSIS to a built native worker directory.  Build one with:
+  sh tools/ghx/build_ghidra.sh GHIDRA_CHECKOUT DIR
+  make -C tools/ghx GHIDRA_CPP=DIR/ghidra-src/Ghidra/Features/Decompiler/src/decompile/cpp OUT=DIR
+NEED
+    exit 1
+fi
+
+work=${XODB_DECOMP_WORK:-.work/demo-decompile}
+mkdir -p "$work"
+sh tests/fixtures/semq/build_fixtures.sh "$work/fixtures"
+if [[ -x ./zig-out/bin/xodb ]]; then
+    xodb=./zig-out/bin/xodb
+elif command -v xodb >/dev/null 2>&1; then
+    xodb=$(command -v xodb)
+else
+    printf '%s\n' 'Build xodb first (`zig build -Doptimize=ReleaseSafe`).' >&2
+    exit 1
+fi
+
+cat <<'WALK'
+Owned fixture: tests/fixtures/semq/qx.c, gcc -O2 with DWARF.
+  1. Space runs to qx_alloc.
+  2. D opens retained pseudo-C beside source. D returns to assembly.
+  3. Click a pseudo-C row: only its exported PC set is selected; source follows
+     when the DWARF line table has a row. Current PC and breakpoints stay marked.
+  4. S asks the existing slice/control questions for the selected instruction.
+
+The pane and MCP decompile_function return the same cached artifact.  The text
+is static, qualified output; live parameter/local values are shown separately.
+WALK
+exec "$xodb" --static-analysis "$toolchain" --source tests/fixtures/semq/qx.c --break qx_alloc "$@" -- "$work/fixtures/qx-gcc-O2"

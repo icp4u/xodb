@@ -13,6 +13,7 @@ pub const Target = prepared.Target;
 pub const Input = struct { handled: bool = true, cancel: ?u64 = null };
 pub const Panel = struct {
     open: bool = false,
+    decompile_open: bool = false,
     mode: prepared.Mode = .slice,
     phase: prepared.Phase = .questions,
     origin: prepared.Origin = .{ .pc = 0 },
@@ -39,13 +40,23 @@ pub const Panel = struct {
     view: ?prepared.View = null,
     native: ?*prepared.Capture = null,
     choose_pending: bool = false,
+    decompile_line: u32 = 0,
+    /// The PC the pane last followed; a click on a pseudo-C line stays put until this changes.
+    decompile_synced: ?u64 = null,
+    /// The stop PC the pane last saw, so a stop in another function reopens it there.
+    decompile_stop: ?u64 = null,
+    decompile_first: u32 = 1,
+    decompile_rows: struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, count: usize = 0 } = .{},
+    decompile_pcs: std.ArrayList(u64) = .empty,
     pub fn deinit(self: *Panel) void {
+        self.decompile_pcs.deinit(std.heap.page_allocator);
         if (self.native) |capture| {
             capture.deinit();
             std.heap.page_allocator.destroy(capture);
         }
     }
     pub fn show(self: *Panel, target: Target) void {
+        if (self.mode == .decompile) self.mode = .slice;
         const origin: prepared.Origin = switch (target) {
             .pc => |pc| .{ .pc = pc },
             .line => |line| prepared.Origin.source(line.path, line.line) catch |err| {
@@ -57,6 +68,7 @@ pub const Panel = struct {
         self.showOrigin(origin);
     }
     pub fn showOrigin(self: *Panel, origin: prepared.Origin) void {
+        if (self.mode == .decompile) self.mode = .slice;
         self.open = true;
         self.navigate = null;
         if (std.meta.eql(self.origin, origin) and self.view != null) return;
@@ -71,12 +83,31 @@ pub const Panel = struct {
         self.phase = .questions;
         self.message_len = 0;
     }
+    pub fn showDecompile(self: *Panel, origin: prepared.Origin) void {
+        self.decompile_open = true;
+        self.mode = .decompile;
+        self.navigate = null;
+        if (std.meta.eql(self.origin, origin) and self.view != null and self.view.?.request.mode == .decompile) return;
+        self.origin = origin;
+        self.view = null;
+        self.chosen = null;
+        self.question = null;
+        self.decompile_line = 0;
+        self.decompile_synced = null;
+        self.decompile_first = 1;
+        self.decompile_pcs.clearRetainingCapacity();
+    }
+    pub fn hideDecompile(self: *Panel) void {
+        self.decompile_open = false;
+        self.decompile_stop = null;
+        if (!self.open) self.view = null;
+    }
     fn say(self: *Panel, text: []const u8) void {
         self.message_len = @min(text.len, self.message.len);
         @memcpy(self.message[0..self.message_len], text[0..self.message_len]);
     }
     pub fn request(self: *const Panel, tid: i32, frame: usize) ?prepared.Request {
-        if (!self.open) return null;
+        if (!self.open and !self.decompile_open) return null;
         return .{ .origin = self.origin, .mode = self.mode, .chosen = self.chosen, .question = self.question, .retry = self.retry, .tid = tid, .frame = frame };
     }
     pub fn present(self: *Panel, value: ?prepared.View) void {
@@ -107,6 +138,12 @@ pub const Panel = struct {
         self.running = v.status == .pending;
         self.answers = v.answers;
         self.selected = @min(self.selected, self.count() -| 1);
+        if (v.request.mode == .decompile and self.decompile_line == 0) {
+            for (v.pseudo_tokens) |token| if (token.pc != null) {
+                self.decompile_line = token.line;
+                break;
+            };
+        }
         if (self.choose_pending and self.count() > 0) {
             self.choose_pending = false;
             self.choose();
@@ -227,7 +264,7 @@ pub const Panel = struct {
         return .{};
     }
     pub fn prepare(self: *Panel, session: *Session, tid: i32, frame: usize) !void {
-        if (!self.open) return;
+        if (!self.open and !self.decompile_open) return;
         if (self.native == null) {
             const capture = try std.heap.page_allocator.create(prepared.Capture);
             capture.* = .{};
@@ -299,6 +336,66 @@ pub const Panel = struct {
         }
         try self.footer(r, font, b);
     }
+
+    pub fn decompileView(self: *const Panel) ?prepared.View {
+        const view = self.view orelse return null;
+        if (!self.decompile_open or view.request.mode != .decompile) return null;
+        return view;
+    }
+
+    /// Select the exact exported mappings on a pseudo-C line.  Empty lines
+    /// select no instruction; there is deliberately no nearest-PC fallback.
+    pub fn selectDecompileLine(self: *Panel, line: u32) void {
+        self.decompile_line = line;
+        self.decompile_pcs.clearRetainingCapacity();
+        const view = self.decompileView() orelse return;
+        for (view.pseudo_tokens) |token| if (token.line == line) if (token.pc) |pc| {
+            var known = false;
+            for (self.decompile_pcs.items) |seen| if (seen == pc) {
+                known = true;
+                break;
+            };
+            if (!known) self.decompile_pcs.append(std.heap.page_allocator, pc) catch return;
+        };
+        self.navigate = if (self.decompile_pcs.items.len > 0) self.decompile_pcs.items[0] else null;
+    }
+
+    pub fn selectDecompileAt(self: *Panel, x: f32, y: f32) bool {
+        const rows = self.decompile_rows;
+        if (!self.decompile_open or rows.count == 0 or x < rows.x or x >= rows.x + rows.w or y < rows.y - 2 or y >= rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * 23) return false;
+        self.selectDecompileLine(self.decompile_first + @as(u32, @intFromFloat((y - rows.y + 2) / 23)));
+        return true;
+    }
+
+    pub fn syncDecompilePC(self: *Panel, pc: ?u64) void {
+        const wanted = pc orelse return;
+        const view = self.decompileView() orelse return;
+        if (view.status != .ready or self.decompile_synced == wanted) return;
+        self.decompile_synced = wanted;
+        // A PC printed on several lines keeps the line the user clicked.
+        if (std.mem.indexOfScalar(u64, self.decompile_pcs.items, wanted) != null) return;
+        for (view.pseudo_tokens) |token| if (token.pc == wanted) {
+            if (self.decompile_line != token.line) {
+                self.selectDecompileLine(token.line);
+                self.navigate = null;
+                const visible: u32 = @intCast(self.decompile_rows.count);
+                if (visible > 0) {
+                    if (token.line < self.decompile_first) self.decompile_first = token.line;
+                    if (token.line >= self.decompile_first + visible) self.decompile_first = token.line - visible + 1;
+                }
+            }
+            return;
+        };
+    }
+
+    pub fn wheelDecompile(self: *Panel, amount: i32) void {
+        const view = self.decompileView() orelse return;
+        if (view.pseudocode.len == 0 or self.decompile_rows.count == 0) return;
+        const total: u32 = @intCast(std.mem.count(u8, view.pseudocode, "\n") + @intFromBool(view.pseudocode[view.pseudocode.len - 1] != '\n'));
+        const visible: u32 = @intCast(self.decompile_rows.count);
+        const last_first = if (total > visible) total - visible + 1 else 1;
+        self.decompile_first = @intCast(std.math.clamp(@as(i64, self.decompile_first) + amount, 1, @as(i64, last_first)));
+    }
     fn list(self: *Panel, r: *gpu.Renderer, font: *Font, x: f32, y: f32, w: f32, b: gpu.Rect) !void {
         self.list_y = y;
         const n = self.count();
@@ -353,4 +450,47 @@ test "static navigation rejects an earlier mode and retains Return until questio
     try std.testing.expect(panel.question.?.input == null);
     panel.present(old);
     try std.testing.expectEqual(@as(u32, 8), panel.question.?.op);
+}
+
+test "pseudo-C lines select exported PCs exactly and leave unmapped lines empty" {
+    var panel: Panel = .{};
+    panel.showDecompile(.{ .pc = 0x1000 });
+    const tokens = [_]prepared.PseudoToken{
+        .{ .index = 0, .line = 4, .col = 2, .kind = "variable", .text = "a", .pc = 0x1010 },
+        .{ .index = 1, .line = 4, .col = 4, .kind = "op", .text = "+", .pc = 0x1020 },
+        .{ .index = 2, .line = 4, .col = 6, .kind = "variable", .text = "b", .pc = 0x1010 },
+        .{ .index = 3, .line = 5, .col = 0, .kind = "syntax", .text = "}" },
+    };
+    panel.present(.{ .request = panel.request(1, 0).?, .status = .ready, .pseudocode = "\n\n\n  a + b\n}", .pseudo_tokens = &tokens });
+    panel.selectDecompileLine(4);
+    try std.testing.expectEqual(@as(usize, 2), panel.decompile_pcs.items.len);
+    try std.testing.expectEqual(@as(u64, 0x1010), panel.decompile_pcs.items[0]);
+    try std.testing.expectEqual(@as(u64, 0x1020), panel.decompile_pcs.items[1]);
+    try std.testing.expectEqual(@as(?u64, 0x1010), panel.navigate);
+    panel.selectDecompileLine(5);
+    try std.testing.expectEqual(@as(usize, 0), panel.decompile_pcs.items.len);
+    try std.testing.expectEqual(@as(?u64, null), panel.navigate);
+}
+
+test "a clicked pseudo-C line is kept when its PC is also printed on an earlier line" {
+    var panel: Panel = .{};
+    defer panel.deinit();
+    panel.showDecompile(.{ .pc = 0x1000 });
+    const tokens = [_]prepared.PseudoToken{
+        .{ .index = 0, .line = 1, .col = 0, .kind = "variable", .text = "a", .pc = 0x1010 },
+        .{ .index = 1, .line = 2, .col = 0, .kind = "variable", .text = "b", .pc = 0x1010 },
+        .{ .index = 2, .line = 3, .col = 0, .kind = "syntax", .text = "}" },
+        .{ .index = 3, .line = 4, .col = 0, .kind = "variable", .text = "c", .pc = 0x1020 },
+    };
+    panel.present(.{ .request = panel.request(1, 0).?, .status = .ready, .pseudocode = "a\nb\n}\nc", .pseudo_tokens = &tokens });
+    panel.syncDecompilePC(0x1020);
+    try std.testing.expectEqual(@as(u32, 4), panel.decompile_line);
+    panel.selectDecompileLine(2);
+    panel.syncDecompilePC(0x1010);
+    try std.testing.expectEqual(@as(u32, 2), panel.decompile_line);
+    panel.selectDecompileLine(3);
+    panel.syncDecompilePC(0x1010);
+    try std.testing.expectEqual(@as(u32, 3), panel.decompile_line);
+    panel.syncDecompilePC(0x1020);
+    try std.testing.expectEqual(@as(u32, 4), panel.decompile_line);
 }

@@ -250,7 +250,7 @@ investigations. [Shared-session commands and examples](docs/SHARED_SESSIONS.md).
 - Fixed 1,024-thread / 4,096-event capacities per process; old events expire.
   Source files are capped at 1 MiB.
 - [Startup colors and presets](docs/THEMES.md); one adjustable divider, no saved layouts, docking or theme editor yet.
-  Text starts at 16px; scaling and accessibility need real work.
+  Text starts at 16 UI units; independent text-size and accessibility controls still need work.
 - No reverse execution, replay, decompiler, or GPU tracing.
   [Syscall timing](docs/SYSCALL_TIMING.md) is opt-in for selected x86-64 threads;
   [core debugging](docs/CORE_DEBUGGING.md) is read-only.
@@ -262,7 +262,7 @@ initial feature snapshot.
 
 ## What's next
 
-- Skinnable, flexible display: font scaling, skin controls and pane layouts you can save; startup themes are available.
+- Skinnable, flexible display: text-size controls, skin controls and pane layouts you can save; startup themes and HiDPI backing scale are available.
 - AArch64 feature coverage: precise multi-watch attribution, modern ARM
   validation, profiling, native ARM GUI.
 - More architectures, and the hardware or emulation to actually validate them.

@@ -88,6 +88,30 @@ pub const Function = struct {
 
 pub const Reason = struct { code: []const u8, level: []const u8, detail: []const u8, address: ?u64 };
 
+/// The native worker's printed document.  Positions and addresses are kept
+/// exactly as exported: lines are 1-based, columns are byte offsets, and pc is
+/// a link-time address.  A missing pc is meaningful; consumers must never
+/// invent a nearest instruction for it.
+pub const PseudoToken = struct {
+    index: u32,
+    line: u32,
+    col: u32,
+    kind: []const u8,
+    text: []const u8,
+    op: ?u32 = null,
+    pc: ?u64 = null,
+    parameter: ?u32 = null,
+};
+pub const PseudoDocument = struct {
+    language: []const u8 = "c",
+    printer: []const u8 = "",
+    text: []const u8 = "",
+    signature: []const u8 = "",
+    token_status: []const u8 = "unavailable",
+    address_map_status: []const u8 = "unavailable",
+    tokens: []const PseudoToken = &.{},
+};
+
 /// A completed export, converted and loaded once; cached by artifact_id.
 pub const Analysis = struct {
     arena: std.heap.ArenaAllocator,
@@ -97,6 +121,7 @@ pub const Analysis = struct {
     schema_version: []const u8,
     level: []const u8,
     reasons: []const Reason,
+    pseudocode: PseudoDocument = .{},
     graph: c.struct_xsq_graph = std.mem.zeroes(c.struct_xsq_graph),
     func: u32 = 0,
     export_path: []const u8,
@@ -233,6 +258,7 @@ pub const Job = struct {
             try reasons.append(keep, .{ .code = try keep.dupe(u8, str(r, "code") orelse "?"), .level = try keep.dupe(u8, str(r, "level") orelse "?"), .detail = try keep.dupe(u8, str(r, "detail") orelse ""), .address = address });
         };
         analysis.reasons = reasons.items;
+        analysis.pseudocode = try pseudoDocument(keep, doc);
         self.analysis = analysis;
     }
     /// The export must describe the bytes the session holds and the function
@@ -273,6 +299,78 @@ fn str(v: std.json.Value, key: []const u8) ?[]const u8 {
     if (v != .object) return null;
     const x = v.object.get(key) orelse return null;
     return if (x == .string) x.string else null;
+}
+
+fn number(v: std.json.Value, key: []const u8) ?i64 {
+    if (v != .object) return null;
+    const x = v.object.get(key) orelse return null;
+    return if (x == .integer) x.integer else null;
+}
+
+fn hexField(v: std.json.Value, key: []const u8) ?u64 {
+    const text = str(v, key) orelse return null;
+    if (!std.mem.startsWith(u8, text, "0x")) return null;
+    return std.fmt.parseInt(u64, text[2..], 16) catch null;
+}
+
+fn idNumber(text: ?[]const u8, prefix: []const u8) ?u32 {
+    const value = text orelse return null;
+    if (!std.mem.startsWith(u8, value, prefix)) return null;
+    return std.fmt.parseInt(u32, value[prefix.len..], 10) catch null;
+}
+
+fn signature(text: []const u8) []const u8 {
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len != 0) return trimmed;
+    }
+    return "";
+}
+
+fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
+    const pseudo = if (root == .object) root.object.get("pseudocode") orelse return .{} else return .{};
+    if (pseudo != .object) return .{};
+    const function = root.object.get("function") orelse std.json.Value.null;
+    const prototype = if (function == .object) function.object.get("prototype") orelse std.json.Value.null else std.json.Value.null;
+    const params = if (prototype == .object) prototype.object.get("params") orelse std.json.Value.null else std.json.Value.null;
+    var parameter_names: std.StringHashMapUnmanaged(u32) = .empty;
+    defer parameter_names.deinit(a);
+    if (params == .array) for (params.array.items) |param| {
+        const name = str(param, "name") orelse continue;
+        const index = number(param, "index") orelse continue;
+        if (index < 0 or index > std.math.maxInt(u32)) continue;
+        const found = try parameter_names.getOrPut(a, name);
+        if (!found.found_existing) found.value_ptr.* = @intCast(index);
+    };
+    var tokens: std.ArrayList(PseudoToken) = .empty;
+    if (pseudo.object.get("tokens")) |list| if (list == .array) for (list.array.items) |token| {
+        const line = number(token, "line") orelse continue;
+        const col = number(token, "col") orelse continue;
+        const index = number(token, "i") orelse continue;
+        if (line <= 0 or col < 0 or index < 0 or line > std.math.maxInt(u32) or col > std.math.maxInt(u32) or index > std.math.maxInt(u32)) continue;
+        const token_text = str(token, "text") orelse "";
+        try tokens.append(a, .{
+            .index = @intCast(index),
+            .line = @intCast(line),
+            .col = @intCast(col),
+            .kind = try a.dupe(u8, str(token, "kind") orelse "text"),
+            .text = try a.dupe(u8, token_text),
+            .op = idNumber(str(token, "op"), "op:"),
+            .pc = hexField(token, "pc"),
+            .parameter = parameter_names.get(token_text),
+        });
+    };
+    const text = try a.dupe(u8, str(pseudo, "text") orelse "");
+    return .{
+        .language = try a.dupe(u8, str(pseudo, "language") orelse "c"),
+        .printer = try a.dupe(u8, str(pseudo, "printer") orelse ""),
+        .text = text,
+        .signature = try a.dupe(u8, signature(text)),
+        .token_status = try a.dupe(u8, str(pseudo, "token_status") orelse "unavailable"),
+        .address_map_status = try a.dupe(u8, str(pseudo, "address_map_status") orelse "unavailable"),
+        .tokens = tokens.items,
+    };
 }
 
 /// Request fields are TAB separated; a symbol name is only a label.
@@ -591,6 +689,23 @@ test "worker discovery names the missing piece" {
     defer arena.deinit();
     try std.testing.expectEqualStrings("not_configured", (try discover(arena.allocator(), null)).unavailable.reason);
     try std.testing.expectEqualStrings("supervisor_missing", (try discover(arena.allocator(), "/nonexistent-static-analysis")).unavailable.reason);
+}
+
+test "worker pseudo-C is retained with exact token positions and links" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("adapter_fixture.json"), .{});
+    const document = try pseudoDocument(a, root);
+    try std.testing.expect(std.mem.startsWith(u8, document.signature, "xunknown1 * qx_alloc("));
+    try std.testing.expect(std.mem.indexOf(u8, document.text, "malloc") != null);
+    try std.testing.expectEqualStrings("ok", document.token_status);
+    const parameter = for (document.tokens) |token| {
+        if (std.mem.eql(u8, token.text, "param_1") and token.pc == 0x4012e6) break token;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u32, 7), parameter.line);
+    try std.testing.expectEqual(@as(u32, 15), parameter.col);
+    try std.testing.expectEqual(@as(?u32, 0), parameter.parameter);
 }
 
 test "cancel: own jobs, or any job only with control" {

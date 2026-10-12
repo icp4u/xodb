@@ -16,6 +16,10 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
     std.debug.print("xodb: {s} {s}: expected a size from 1M to {d}G (bytes, or a whole number with K, M or G)\n", .{ option, value, snapshot.max_limit >> 30 });
     return err;
 }
+fn parseUiScale(value: []const u8) !f32 {
+    const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;
+    return @import("platform/window.zig").validateScale(scale);
+}
 fn onSignal(signal: c_int) callconv(.c) void {
     quitting = signal;
 }
@@ -62,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     var config_path: ?[:0]const u8 = null;
     var languages_off = @import("preferences.zig").Languages{};
     var theme_path: ?[:0]const u8 = null;
+    var ui_scale_cli: ?f32 = null;
     var headless = !build_options.gui;
     var mcp = false;
     var session_socket: ?[:0]const u8 = null;
@@ -142,6 +147,7 @@ pub fn main(init: std.process.Init) !void {
                 \\A opens allocations; P in that panel starts/stops capture on the selected thread.
                 \\--theme FILE|builtin:dark|builtin:light|builtin:contrast|builtin:vga selects the GUI theme at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
+                \\--ui-scale N sets device pixels per UI unit (0.5..4); otherwise appearance.ui_scale or the compositor wins.
                 \\--language-off NAME|all turns a language view off, as "languages" in the preferences does; repeatable.
                 \\--wine-threads show|hide controls Wine-internal name hints (default show); H toggles in the GUI.
                 \\--attach-exe opens the process picker with an editable .exe filter; Enter confirms attach.
@@ -185,7 +191,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
                 \\Graph/galaxy default: LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
-                \\--static-analysis DIR enables static slices (S in the GUI; analyze_function over MCP) with the
+                \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\
             , .{});
@@ -193,7 +199,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--language-off") or std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
+        } else if (std.mem.eql(u8, arg, "--language-off") or std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--ui-scale") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--wine-threads")) hide_wine_threads = if (std.mem.eql(u8, args[i], "hide")) true else if (std.mem.eql(u8, args[i], "show")) false else return error.InvalidWineThreadVisibility;
@@ -254,6 +260,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--source")) source = args[i];
             if (std.mem.eql(u8, arg, "--font")) font_path = args[i];
             if (std.mem.eql(u8, arg, "--theme")) theme_path = args[i];
+            if (std.mem.eql(u8, arg, "--ui-scale")) ui_scale_cli = try parseUiScale(args[i]);
             if (std.mem.eql(u8, arg, "--attach")) attach = try std.fmt.parseInt(i32, args[i], 10);
             if (std.mem.eql(u8, arg, "--frames")) frames = try std.fmt.parseInt(u64, args[i], 10);
         } else return error.UnknownArgument;
@@ -298,6 +305,7 @@ pub fn main(init: std.process.Init) !void {
         if (err == error.InvalidImageBudget) std.debug.print("xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
         return err;
     } else @import("preferences.zig").Preferences{};
+    const ui_scale = ui_scale_cli orelse preferences.appearance.ui_scale;
     // Off in either place is off.
     var languages = preferences.languages;
     inline for (@typeInfo(@TypeOf(languages)).@"struct".fields) |field| @field(languages, field.name) = @field(languages, field.name) and @field(languages_off, field.name);
@@ -336,7 +344,7 @@ pub fn main(init: std.process.Init) !void {
                 break :blk .{ .ssh = .{ .host = ssh.?, .args = remote_args.items } };
             };
             const remote_label = try std.fmt.allocPrint(a, "{s} {s}", .{ if (connect != null) "TCP" else "SSH", connect orelse ssh.? });
-            try @import("ui/remote.zig").run(endpoint, remote_label, font_path, frames, &quitting, startup_started);
+            try @import("ui/remote.zig").run(endpoint, remote_label, font_path, ui_scale, frames, &quitting, startup_started);
             return;
         } else return error.GuiNotBuilt;
     }
@@ -497,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
     if (comptime build_options.gui) {
-        var window = Window{};
+        var window = Window{ .scale_override = ui_scale };
         try window.init();
         defer window.deinit();
         var renderer = Renderer{};
@@ -1015,7 +1023,8 @@ fn vkList() !void {
 }
 fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, context: anytype) !bool {
     var started = linux.now();
-    if (!try renderer.begin(window.width, window.height)) return false;
+    _ = try font.setScale(window.scale());
+    if (!try renderer.begin(window.width, window.height, window.scale())) return false;
     reportSlow("Vulkan frame begin", started);
     started = linux.now();
     (if (@TypeOf(context) == *Session) workspace.draw(renderer, font, window, context) else context.draw(workspace, renderer, font, window)) catch |err| {

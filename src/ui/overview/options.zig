@@ -6,6 +6,7 @@ const vw = @import("view.zig");
 
 pub const usage =
     \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
+    \\               [--ui-scale N] [--config FILE]
     \\               [--look win95|win9x|dos|modern|deep|gibson] [--memmap-pid N [--memmap-start-ticks N]]
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
@@ -14,6 +15,8 @@ pub const usage =
     \\  --replay FILE   collector JSON (one snapshot, or one per line) instead of the live system
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
+    \\  --ui-scale N   device pixels per UI unit, 0.5..4 (otherwise config or compositor)
+    \\  --config FILE  load UI scale and galaxy look from provisional JSON preferences
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
     \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance or treemap
     \\  Graph/galaxy/treemap starts LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
@@ -41,6 +44,8 @@ pub const Options = struct {
     mcp: bool = false,
     redact: bool = false,
     theme: ?[]const u8 = null,
+    config: ?[:0]const u8 = null,
+    ui_scale: ?f32 = null,
     panel: ?vw.Panel = null,
     files_pid: ?i32 = null,
     files_start: u64 = 0,
@@ -81,7 +86,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device" };
+        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {
@@ -91,6 +96,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
         i += 1;
         if (i == args.len) return error.MissingArgument;
         const value = args[i];
+        if (std.mem.eql(u8, arg, "--config")) o.config = value;
+        if (std.mem.eql(u8, arg, "--ui-scale")) {
+            const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;
+            o.ui_scale = try @import("../../platform/window.zig").validateScale(scale);
+        }
         if (std.mem.eql(u8, arg, "--replay")) o.replay = value;
         if (std.mem.eql(u8, arg, "--session-socket")) o.session_socket = value;
         if (std.mem.eql(u8, arg, "--theme")) {
@@ -175,6 +185,10 @@ test "overview options reject debugger targets and bad values" {
     try std.testing.expectError(error.UnknownOverviewTheme, parse(&.{ "xodb", "--overview", "--theme", "neon" }));
     try std.testing.expectError(error.InvalidOverviewInterval, parse(&.{ "xodb", "--overview", "--interval-ms", "10" }));
     try std.testing.expectError(error.UnknownOverviewPanel, parse(&.{ "xodb", "--overview", "--panel", "flight" }));
+    const scale = try parse(&.{ "xodb", "--overview", "--config", "prefs.json", "--ui-scale", "1.5" });
+    try std.testing.expectEqual(@as(?f32, 1.5), scale.ui_scale);
+    try std.testing.expectEqualStrings("prefs.json", scale.config.?);
+    for ([_][:0]const u8{ "0.49", "4.01", "nan" }) |bad| try std.testing.expectError(error.InvalidUiScale, parse(&.{ "xodb", "--overview", "--ui-scale", bad }));
     const demo = try parse(&.{ "xodb", "--overview", "--galaxy-demo", "600:idle" });
     try std.testing.expect(demo.galaxy_demo == 600 and demo.galaxy_demo_idle and demo.panel.? == .galaxy);
     for ([_][:0]const u8{ "0", "1025", "idle", "7:busy" }) |bad| try std.testing.expectError(error.InvalidGalaxyDemo, parse(&.{ "xodb", "--overview", "--galaxy-demo", bad }));

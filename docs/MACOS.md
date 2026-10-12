@@ -159,3 +159,27 @@ Linux-only include in a shared header fails the build. The ptrace backend,
 perf, `/proc` readers and ELF loading are not part of the set. On macOS a
 sealed in-memory file does not exist, so fetching a remote file through the
 agent wire reports the file as unavailable there.
+
+## Cocoa desktop backend groundwork
+
+The window-system boundary now accepts `-Dplatform=cocoa`. On Linux this builds
+the complete GUI against `src/platform/cocoa.zig` and a native stub:
+
+```sh
+scripts/build app -Dplatform=cocoa -Doptimize=ReleaseSafe
+scripts/build test-cocoa -Dplatform=cocoa -Doptimize=ReleaseSafe
+```
+
+The stub deliberately returns `CocoaUnavailable` before creating a window. Its
+purpose is to keep the Cocoa contract compiling while no Mac is reachable. The
+contract already covers logical window size and backing scale, translated key
+and text events, pointer and scroll events, title and window actions, the
+synchronous macOS clipboard shape, FIFO frame pacing, and a
+`VK_EXT_metal_surface` creation hook. `cocoa_shim.h` is the stable C boundary
+for the Objective-C/AppKit implementation.
+
+This is groundwork, not a usable Mac application. The AppKit implementation,
+MoltenVK/static dependency build, application bundle, live resize callback,
+`NSTextInputClient`, Command-key policy, and on-screen Mac test lane still need
+a Mac that can open windows. The remote debugserver client described above is
+independent and remains usable from Linux.

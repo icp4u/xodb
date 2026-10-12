@@ -24,7 +24,7 @@ pub fn key(v: *vw.View, event: Input) bool {
             return true;
         },
         '+', '=' => {
-            v.graph.max_stars = @min(128, v.graph.max_stars * 2);
+            v.graph.max_stars = @min(1024, v.graph.max_stars * 2);
             v.graph.dirty = true;
             return true;
         },

@@ -31,8 +31,8 @@ const max_reads = max_chain + 1 + max_frames * 16 + 16;
 const dwarf_work = 1 << 25;
 
 pub const values = @import("gdscript_values.zig");
-pub const Field = enum(u8) { level_stack, level_function, level_instance, level_ip, level_line, level_prev, function_name, function_source, function_script, script_path, instance_owner_id, language_track, language_max, name_string, string_name_data, string_data };
-const stack_type_names = [_][*:0]const u8{ "GDScriptLanguage::CallLevel", "GDScriptFunction", "GDScript", "GDScriptInstance", "GDScriptLanguage", "StringName::_Data", "StringName", "String" };
+pub const Field = enum(u8) { level_stack, level_function, level_instance, level_ip, level_line, level_prev, function_name, function_source, function_script, script_path, instance_owner_id, language_track, language_max, name_string, string_name_data, string_data, engine_process_frames, engine_physics_frames, engine_in_physics };
+const stack_type_names = [_][*:0]const u8{ "GDScriptLanguage::CallLevel", "GDScriptFunction", "GDScript", "GDScriptInstance", "GDScriptLanguage", "StringName::_Data", "StringName", "String", "Engine" };
 fn want(owner: u8, name: [*:0]const u8, kind: c_uint, width: u8, optional: bool) c.struct_xdt_field {
     return .{ .owner = owner, .name = name, .kind = @intCast(kind), .width = width, .optional = @intFromBool(optional) };
 }
@@ -54,6 +54,9 @@ const stack_wanted = [_]c.struct_xdt_field{
     want(5, "name", c.XDT_ANY, 8, false),
     want(6, "_data", c.XDT_POINTER, 8, false),
     want(7, "_cowdata", c.XDT_ANY, 8, false),
+    want(8, "_process_frames", c.XDT_UNSIGNED, 8, true),
+    want(8, "_physics_frames", c.XDT_UNSIGNED, 8, true),
+    want(8, "_in_physics", c.XDT_BOOLEAN, 1, true),
 };
 comptime {
     std.debug.assert(stack_wanted.len == @typeInfo(Field).@"enum".fields.len);
@@ -82,6 +85,7 @@ pub const Layout = struct {
     call_stack_size: u64,
     /// Runtime address of `GDScriptLanguage::singleton`.
     singleton: u64,
+    engine_singleton: ?u64 = null,
     units: u64,
     pub fn at(self: *const Layout, field: Field) u32 {
         return self.offsets[@intFromEnum(field)].?;
@@ -363,7 +367,7 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     const call_stack = try tlsObject(module, block, call_stack_symbol, 8);
     const call_stack_size = try tlsObject(module, block, call_stack_size_symbol, 4);
     const debug = module.debugInfo() catch |err| return if (err == error.DebugMetadataPending) err else error.GDScriptDwarfUnavailable;
-    const schema = c.struct_xdt_schema{ .types = @ptrCast(&type_names), .fields = &wanted, .type_count = type_names.len, .field_count = wanted.len, .optional_types = ((@as(u64, 1) << values.type_names.len) - 1) << stack_type_names.len };
+    const schema = c.struct_xdt_schema{ .types = @ptrCast(&type_names), .fields = &wanted, .type_count = type_names.len, .field_count = wanted.len, .optional_types = (((@as(u64, 1) << values.type_names.len) - 1) << stack_type_names.len) | (1 << 8) };
     var slots: [wanted.len]c.struct_xdt_slot = undefined;
     var sizes: [type_names.len]u32 = undefined;
     comptime std.debug.assert(wanted.len <= c.XDT_MAX_FIELDS and type_names.len <= c.XDT_MAX_TYPES);
@@ -380,6 +384,9 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
         return error.GDScriptLayoutUnsupported;
     }
     var layout = Layout{ .level_size = sizes[0], .offsets = undefined, .block = block, .call_stack = call_stack, .call_stack_size = call_stack_size, .singleton = try module.runtimeAddress(singleton.value), .units = stats.units };
+    if (module.symbols().findSymbol("_ZN6Engine9singletonE")) |engine| {
+        if (engine.hasAddress() and engine.size == 8) layout.engine_singleton = try module.runtimeAddress(engine.value);
+    }
     for (slots[0..stack_wanted.len], &layout.offsets) |slot, *offset| offset.* = if (slot.present != 0) slot.offset else null;
     for (slots[stack_wanted.len..][0..values.field_count], &layout.value_offsets) |slot, *offset| offset.* = if (slot.present != 0) slot.offset else null;
     for (slots[stack_wanted.len + values.field_count ..], &layout.kinds) |slot, *kind| kind.* = if (slot.present != 0) slot.offset else null;
@@ -392,6 +399,20 @@ pub fn profile(session: *model.Session, module: *Module) !*const Layout {
     layout.build_id_len = @intCast(id.len);
     module.gdscript_layout = layout;
     return &module.gdscript_layout.?;
+}
+pub const FrameCounters = struct { process: u64, physics: u64, in_physics: bool };
+pub fn frameCounters(session: *model.Session) !FrameCounters {
+    const layout = try profile(session, try runtimeModule(session));
+    var memory = Memory{ .context = session, .readFn = sessionRead };
+    const pointer = layout.engine_singleton orelse return error.RedotFrameCounterUnavailable;
+    const engine = memory.word(pointer) orelse return error.RedotFrameCounterUnreadable;
+    if (engine == 0) return error.RedotFrameCounterUnavailable;
+    const process = layout.offsets[@intFromEnum(Field.engine_process_frames)] orelse return error.RedotFrameCounterUnavailable;
+    const physics = layout.offsets[@intFromEnum(Field.engine_physics_frames)] orelse return error.RedotFrameCounterUnavailable;
+    const inside = layout.offsets[@intFromEnum(Field.engine_in_physics)] orelse return error.RedotFrameCounterUnavailable;
+    var flag: [1]u8 = undefined;
+    if (!memory.read(engine +% inside, &flag) or flag[0] > 1) return error.RedotFrameCounterUnreadable;
+    return .{ .process = memory.word(engine +% process) orelse return error.RedotFrameCounterUnreadable, .physics = memory.word(engine +% physics) orelse return error.RedotFrameCounterUnreadable, .in_physics = flag[0] != 0 };
 }
 const Language = struct { address: u64, limit: u32 };
 /// The language singleton's own switches. A build that does not track the
@@ -520,6 +541,10 @@ fn join(levels: []const Level, level_size: u64, depth: usize, ranges: []const Ra
 }
 
 pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
+    return stackWithNative(session, a, tid, first, null);
+}
+/// Reuse an unwind from the same stopped generation for a joined sample.
+pub fn stackWithNative(session: *model.Session, a: A, tid: i32, first: usize, native_input: ?[]const model.Frame) !Stack {
     try session.languages.require(.gdscript);
     if (first != 0) return error.InvalidFrame;
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
@@ -528,7 +553,7 @@ pub fn stack(session: *model.Session, a: A, tid: i32, first: usize) !Stack {
     const layout = try profile(session, module);
     var memory = Memory{ .context = session, .readFn = sessionRead };
     const lang = try language(&memory, layout);
-    const native = try session.stack(a, tid, 64);
+    const native = native_input orelse try session.stack(a, tid, 64);
     if (native.len == 0) return error.InvalidFrame;
     const registers = try session.target.registers(tid);
     const pointer = registers.named("fs_base") orelse return error.GDScriptThreadPointerUnavailable;
@@ -726,7 +751,7 @@ const Fake = struct {
 const test_layout = Layout{
     .level_size = 48,
     // stack, function, instance, ip, line, prev; name, source, _script; path; owner_id; track, max; _Data.name; _data; _cowdata
-    .offsets = .{ 0, 8, 16, 24, 32, 40, 0, 8, 0xf0, 0x3b8, 8, 0x1b4, 0x1b0, 8, 0, 0 },
+    .offsets = .{ 0, 8, 16, 24, 32, 40, 0, 8, 0xf0, 0x3b8, 8, 0x1b4, 0x1b0, 8, 0, 0, null, null, null },
     .block = .{ .below = 0xa30, .size = 0xa28 },
     .call_stack = 0xe8,
     .call_stack_size = 0xe0,

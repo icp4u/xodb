@@ -416,7 +416,7 @@ fn sameFile(path: []const u8, provided: []const u8) bool {
     return std.mem.eql(u8, std.fs.path.basename(path), std.fs.path.basename(provided));
 }
 fn pane(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, title: []const u8, detail: []const u8) !void {
-    r.clip = .{ .x = 0, .y = 0, .w = @floatFromInt(r.extent.width), .h = @floatFromInt(r.extent.height) };
+    r.clip = r.fullClip();
     try style.box(r, rect, theme.surface, theme.border, @splat(5));
     try r.textFit(font, rect.x + 12, rect.y + 9, rect.w * 0.60, title, theme.neutral);
     try r.textFit(font, rect.x + rect.w * 0.62, rect.y + 9, rect.w * 0.36 - 8, detail, theme.weak);
@@ -427,14 +427,14 @@ fn formatted(r: *gpu.Renderer, font: *Font, x: f32, y: f32, width: f32, color: g
     const text = std.fmt.bufPrint(&buffer, format, args) catch "[text too long]";
     try r.textFit(font, x, y, width, text, color);
 }
-pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8, max_frames: u64, quitting: *volatile transport.c.sig_atomic_t, startup_started: u64) !void {
+pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8, ui_scale: ?f32, max_frames: u64, quitting: *volatile transport.c.sig_atomic_t, startup_started: u64) !void {
     const a = std.heap.page_allocator;
     const client = try a.create(remote.Client);
     defer a.destroy(client);
     client.* = .{ .endpoint = endpoint };
     try client.start();
     defer client.deinit();
-    var window = Window{};
+    var window = Window{ .scale_override = ui_scale };
     try window.init();
     defer window.deinit();
     var renderer = gpu.Renderer{};
@@ -483,7 +483,8 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     std.debug.print("xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
 }
 fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, client: *remote.Client, label: []const u8) !bool {
-    if (!try r.begin(window.width, window.height)) return false;
+    _ = try font.setScale(window.scale());
+    if (!try r.begin(window.width, window.height, window.scale())) return false;
     try workspace.draw(r, font, window, client, label);
     return r.end(font);
 }

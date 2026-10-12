@@ -34,7 +34,8 @@ pub const State = struct {
     /// Until C is pressed, a scope small enough to show every process is not folded.
     collapse_auto: bool = true,
     folded: bool = true,
-    max_stars: u32 = 64,
+    max_stars: u32 = 512,
+    look: @import("../../preferences.zig").Galaxy = .{},
     dirty: bool = true,
     poll_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
     graph_status: c.enum_xrt_status = c.XRT_STALE_SNAPSHOT,
@@ -181,7 +182,7 @@ pub const State = struct {
         self.folded = self.collapse and (!self.collapse_auto or g.processes > self.max_stars);
         const options = c.struct_xrt_fdgraph_project_options{
             .max_stars = self.max_stars,
-            .max_particles = 1024,
+            .max_particles = @max(1024, self.max_stars * c.XRT_FD_KINDS),
             .focus_process = selected,
             .collapse_cgroups = @intFromBool(self.folded and group == 0),
             .focus_group = group,
@@ -234,7 +235,7 @@ pub const State = struct {
             const group = self.cgroup(s.sample_node);
             self.group_len = @min(group.len, self.group_path.len);
             @memcpy(self.group_path[0..self.group_len], group[0..self.group_len]);
-        } else self.max_stars = @min(128, self.max_stars * 2);
+        } else self.max_stars = @min(1024, self.max_stars * 2);
         self.dirty = true;
     }
     pub fn all(self: *State) void {

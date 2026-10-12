@@ -380,7 +380,8 @@ name exits 2 before any worker starts.
 
 # In the debugger
 
-xodb can ask these questions about a function of a live or core session:
+xodb retains the worker's pseudo-C document for a function of a live or core
+session and can ask these questions about it:
 "what feeds this value?" (a slice) and "what controls this branch or
 operation?" (control dependences). Every answer is labelled *static
 possibilities, not an observed execution*, keeps the producer's
@@ -428,7 +429,8 @@ process is started.
    with the xsq budgets. Worker refusals (`worker_refused` with the export's
    error code) and adapter refusals (`adapter_refused`, for example the PIC
    call-to-branch case) are kept as typed failures.
-5. Completed analyses are cached in memory by `artifact_id` for the session
+5. The pseudo-C text, token positions and exported token-to-PC links are kept
+   in the completed analysis alongside the graph. Completed analyses are cached in memory by `artifact_id` for the session
    (16 at most); the scratch directory (`$TMPDIR/xodb-static-<pid>-*`) is
    removed when the session ends. A later xodb with the worker enabled removes
    such directories of this user whose creating process no longer exists.
@@ -454,12 +456,15 @@ op's output is sliced.
 | Tool | Answers |
 |---|---|
 | `analyze_function` (`address` or `symbol`) | job status, then the summary: bounds and their source, image identity, qualification reasons, parameters, calls. Poll with the same arguments. |
+| `decompile_function` (`address` or `symbol`) | the exact retained pseudo-C text, signature, qualification and reasons, token/map status, and artifact id. It starts or polls the same per-function job as `analyze_function`. |
+| `get_decomp_mapping` (`artifact_id`; optional exact `pc`, pseudo-C `line`, or half-open `token_start`+`token_end`) | cached token positions and their exported runtime PCs and debugger source rows. Tokens without a worker PC stay unmapped; no nearest instruction is guessed. |
 | `slice_value` (`pc`, `file`+`line` or `op`; `input`, `data_only`) | per-parameter relevance (`direct`, `possible`, `control`, `irrelevant`, `unknown`; `irrelevant` only for an exhaustive slice), contributing values with defining and reading ops, instruction citations with source lines, boundaries, limits |
 | `control_dependencies` (same selection) | branches deciding whether the op runs, the edge, `direct`/`transitive`, and which parameters feed each direct condition |
 | `cancel_static_analysis` (`job_id`) | stops the running job |
 
-All four are observer reads (`xodbSessionAccess: observer`): they never touch
-the target. Any client may start an analysis; `cancel_static_analysis` stops
+All six are read-only with respect to the target. Tools that can start the
+retained host job require controller access; `get_decomp_mapping` and
+`cancel_static_analysis` are observer calls. `cancel_static_analysis` stops
 only a job that client started, unless it holds control (the shared
 controller lease, or a control-scope stdio client). Jobs started from the GUI
 are cancelled by the human (**X**) or the controller
@@ -469,6 +474,17 @@ With `tid` (and `frame`) at a stop inside the function, `slice_value` adds
 answer and never merged into it.
 
 ## GUI
+
+At a stopped instruction, press **D** to replace the assembly column with the
+cached pseudo-C document beside source. The pane shows the asynchronous worker
+state, qualification and reason codes, and colours the worker's token kinds.
+The current PC and source breakpoints remain marked, and the pane follows the
+stop into another function. Clicking a pseudo-C line
+selects exactly the PCs exported on that line (an unmapped line selects none),
+and source follows only through an exact DWARF row. **D** returns to assembly,
+where every PC in the selected set is highlighted. Current DWARF parameters
+and locals appear as separate annotations when a pseudo name or parameter
+position can be matched; they never rewrite the static text.
 
 Click an assembly row or a source line (or use the current instruction) and
 press **S**. A line with code in several functions first lists them; choose
@@ -484,7 +500,8 @@ static rows.
 ## Limits
 
 x86-64 ELF only; one function at a time; no whole-program or interprocedural
-analysis; no type recovery. Parameters are the decompiler's inferred prototype
+analysis; no decompiler type feed, rename/comment persistence, stripped-binary
+function discovery, PE/Mach-O input, or arm64 input yet. Parameters are the decompiler's inferred prototype
 matched by ABI storage, and a parameter with no input varnode is not listed. The
 cache does not outlive the session. Source citations need DWARF line tables in
 the session.

@@ -16,6 +16,8 @@ pub const c = @cImport({
     @cInclude("xdg-decoration-unstable-v1-client-protocol.h");
     @cInclude("cursor-shape-v1-client-protocol.h");
     @cInclude("linux-dmabuf-v1-client-protocol.h");
+    @cInclude("fractional-scale-v1-client-protocol.h");
+    @cInclude("viewporter-client-protocol.h");
     @cInclude("vulkan/vulkan.h");
 });
 const vk = @import("../c_ui.zig").api;
@@ -24,6 +26,20 @@ const Cursor = platform.Cursor;
 const clip = platform.clip;
 const Node = @import("../render/vk_select.zig").Node;
 pub const Keyboard = @import("xkb.zig").Keyboard;
+const max_outputs = 16;
+const Output = struct {
+    owner: ?*Window = null,
+    proxy: ?*c.wl_output = null,
+    name: u32 = 0,
+    scale: i32 = 1,
+    entered: bool = false,
+    fn destroy(self: *Output) void {
+        if (self.proxy) |output| {
+            if (c.wl_output_get_version(output) >= c.WL_OUTPUT_RELEASE_SINCE_VERSION) c.wl_output_release(output) else c.wl_output_destroy(output);
+        }
+        self.* = .{};
+    }
+};
 
 pub const Window = struct {
     display: *c.wl_display = undefined,
@@ -45,6 +61,14 @@ pub const Window = struct {
     keyboard: ?*c.wl_keyboard = null,
     pointer: ?*c.wl_pointer = null,
     surface: *c.wl_surface = undefined,
+    surface_ready: bool = false,
+    viewporter: ?*c.wp_viewporter = null,
+    viewport: ?*c.wp_viewport = null,
+    fractional_manager: ?*c.wp_fractional_scale_manager_v1 = null,
+    fractional: ?*c.wp_fractional_scale_v1 = null,
+    fractional_preferred: u32 = 0,
+    surface_preferred: i32 = 0,
+    outputs: [max_outputs]Output = @splat(.{}),
     xdg: ?*c.xdg_surface = null,
     top: ?*c.xdg_toplevel = null,
     decoration: ?*c.zxdg_toplevel_decoration_v1 = null,
@@ -70,6 +94,10 @@ pub const Window = struct {
     mouse_down: bool = false,
     scroll: i32 = 0,
     scroll_remainder: i32 = 0,
+    /// Explicit CLI/config choice. Null follows the compositor.
+    scale_override: ?f32 = null,
+    effective_scale: f32 = 1,
+    traced_reported_scale: f32 = 0,
 
     // Call on the final address: Wayland listeners retain this pointer.
     pub fn init(self: *Window) !void {
@@ -85,6 +113,14 @@ pub const Window = struct {
         if (c.wl_display_roundtrip(self.display) < 0) return error.WaylandDisconnected;
         if (self.compositor == null or self.wm == null) return error.WaylandGlobalsMissing;
         self.surface = c.wl_compositor_create_surface(self.compositor) orelse return error.SurfaceFailed;
+        self.surface_ready = true;
+        _ = c.wl_surface_add_listener(self.surface, &wl_surface_listener, self);
+        if (self.viewporter) |manager| self.viewport = c.wp_viewporter_get_viewport(manager, self.surface);
+        if (self.fractional_manager) |manager| if (self.viewport != null) {
+            self.fractional = c.wp_fractional_scale_manager_v1_get_fractional_scale(manager, self.surface);
+            _ = c.wp_fractional_scale_v1_add_listener(self.fractional, &fractional_listener, self);
+        };
+        self.applyScale();
         self.xdg = c.xdg_wm_base_get_xdg_surface(self.wm, self.surface);
         _ = c.xdg_surface_add_listener(self.xdg, &surface_listener, self);
         self.top = c.xdg_surface_get_toplevel(self.xdg);
@@ -115,11 +151,17 @@ pub const Window = struct {
     pub fn deinit(self: *Window) void {
         self.cancelFrame();
         self.dropSeat();
+        if (self.fractional) |v| c.wp_fractional_scale_v1_destroy(v);
+        if (self.viewport) |v| c.wp_viewport_destroy(v);
         if (self.cursor_shapes) |v| c.wp_cursor_shape_manager_v1_destroy(v);
         if (self.decoration) |v| c.zxdg_toplevel_decoration_v1_destroy(v);
         if (self.top) |v| c.xdg_toplevel_destroy(v);
         if (self.xdg) |v| c.xdg_surface_destroy(v);
         c.wl_surface_destroy(self.surface);
+        self.surface_ready = false;
+        for (&self.outputs) |*output| output.destroy();
+        if (self.fractional_manager) |v| c.wp_fractional_scale_manager_v1_destroy(v);
+        if (self.viewporter) |v| c.wp_viewporter_destroy(v);
         if (self.wm) |v| c.xdg_wm_base_destroy(v);
         if (self.decoration_manager) |v| c.zxdg_decoration_manager_v1_destroy(v);
         if (self.compositor) |v| c.wl_compositor_destroy(v);
@@ -211,9 +253,46 @@ pub const Window = struct {
             .bottom_right => c.XDG_TOPLEVEL_RESIZE_EDGE_BOTTOM_RIGHT,
         });
     }
-    /// One buffer pixel per UI unit: no buffer scale is negotiated.
-    pub fn scale(_: *const Window) f32 {
-        return 1;
+    pub fn scale(self: *const Window) f32 {
+        return self.effective_scale;
+    }
+    fn reportedScale(self: *const Window) f32 {
+        if (self.fractional_preferred > 0) return @as(f32, @floatFromInt(self.fractional_preferred)) / 120;
+        if (self.surface_preferred > 0) return @floatFromInt(self.surface_preferred);
+        var result: i32 = 1;
+        for (self.outputs) |output| if (output.proxy != null and output.entered) {
+            result = @max(result, output.scale);
+        };
+        return @floatFromInt(result);
+    }
+    fn applyScale(self: *Window) void {
+        const reported = self.reportedScale();
+        const requested = self.scale_override orelse reported;
+        const bounded = std.math.clamp(requested, platform.min_ui_scale, platform.max_ui_scale);
+        const surface_version = if (self.surface_ready) c.wl_proxy_get_version(@ptrCast(self.surface)) else 0;
+        const next = if (self.viewport != null)
+            bounded
+        else if (surface_version >= c.WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION)
+            @ceil(bounded)
+        else
+            1;
+        if (self.surface_ready) {
+            if (self.viewport) |viewport| {
+                if (surface_version >= c.WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) c.wl_surface_set_buffer_scale(self.surface, 1);
+                c.wp_viewport_set_destination(viewport, @intCast(self.width), @intCast(self.height));
+            } else if (surface_version >= c.WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
+                c.wl_surface_set_buffer_scale(self.surface, @intFromFloat(next));
+            }
+        }
+        const changed = @abs(next - self.effective_scale) >= 0.001;
+        if (changed) {
+            self.effective_scale = next;
+            self.dirty = true;
+        }
+        if (self.input.trace and (self.traced_reported_scale == 0 or changed or @abs(reported - self.traced_reported_scale) >= 0.001)) {
+            std.debug.print("ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ next, reported, if (self.scale_override != null) "yes" else "no" });
+            self.traced_reported_scale = reported;
+        }
     }
     pub const vk_surface_extension: [*:0]const u8 = "VK_KHR_wayland_surface";
     pub fn createSurface(self: *Window, instance: vk.VkInstance, surface: *vk.VkSurfaceKHR) vk.VkResult {
@@ -319,7 +398,7 @@ fn window(data: ?*anyopaque) *Window {
 fn global(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*c]const u8, version: u32) callconv(.c) void {
     const w = window(data);
     const s = std.mem.span(interface);
-    if (std.mem.eql(u8, s, "wl_compositor")) w.compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 4)));
+    if (std.mem.eql(u8, s, "wl_compositor")) w.compositor = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_compositor_interface, @min(version, 6)));
     if (std.mem.eql(u8, s, "xdg_wm_base")) {
         w.wm = @ptrCast(c.wl_registry_bind(registry, name, &c.xdg_wm_base_interface, 1));
         _ = c.xdg_wm_base_add_listener(w.wm, &wm_listener, w);
@@ -336,10 +415,22 @@ fn global(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*
         w.cursor_shapes = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_cursor_shape_manager_v1_interface, 1));
         w.attachCursor();
     }
+    if (std.mem.eql(u8, s, "wp_viewporter")) w.viewporter = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_viewporter_interface, 1));
+    if (std.mem.eql(u8, s, "wp_fractional_scale_manager_v1")) w.fractional_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_fractional_scale_manager_v1_interface, 1));
+    if (std.mem.eql(u8, s, "wl_output")) for (&w.outputs) |*output| if (output.proxy == null) {
+        output.* = .{ .owner = w, .proxy = @ptrCast(c.wl_registry_bind(registry, name, &c.wl_output_interface, @min(version, 4))), .name = name };
+        _ = c.wl_output_add_listener(output.proxy, &output_listener, output);
+        break;
+    };
 }
 fn removed(data: ?*anyopaque, _: ?*c.wl_registry, name: u32) callconv(.c) void {
     const w = window(data);
     if (w.seat != null and name == w.seat_name) w.dropSeat();
+    for (&w.outputs) |*output| if (output.proxy != null and output.name == name) {
+        output.destroy();
+        w.applyScale();
+        break;
+    };
 }
 fn ping(_: ?*anyopaque, wm: ?*c.xdg_wm_base, serial: u32) callconv(.c) void {
     c.xdg_wm_base_pong(wm, serial);
@@ -358,6 +449,7 @@ fn resized(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, stat
     w.maximized = hasState(list, c.XDG_TOPLEVEL_STATE_MAXIMIZED);
     if (width > 0) w.width = @intCast(width);
     if (height > 0) w.height = @intCast(height);
+    w.applyScale();
     w.dirty = true;
 }
 fn closed(data: ?*anyopaque, _: ?*c.xdg_toplevel) callconv(.c) void {
@@ -444,9 +536,49 @@ fn frame(_: ?*anyopaque, _: ?*c.wl_pointer) callconv(.c) void {}
 fn axisSource(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32) callconv(.c) void {}
 fn axisStop(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: u32) callconv(.c) void {}
 fn axisDiscrete(_: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: i32) callconv(.c) void {}
+fn surfaceEnter(data: ?*anyopaque, _: ?*c.wl_surface, entered: ?*c.wl_output) callconv(.c) void {
+    const w = window(data);
+    for (&w.outputs) |*output| if (output.proxy == entered) {
+        output.entered = true;
+        w.applyScale();
+        return;
+    };
+}
+fn surfaceLeave(data: ?*anyopaque, _: ?*c.wl_surface, left: ?*c.wl_output) callconv(.c) void {
+    const w = window(data);
+    for (&w.outputs) |*output| if (output.proxy == left) {
+        output.entered = false;
+        w.applyScale();
+        return;
+    };
+}
+fn preferredBufferScale(data: ?*anyopaque, _: ?*c.wl_surface, factor: i32) callconv(.c) void {
+    const w = window(data);
+    if (factor > 0) w.surface_preferred = factor;
+    w.applyScale();
+}
+fn preferredBufferTransform(_: ?*anyopaque, _: ?*c.wl_surface, _: u32) callconv(.c) void {}
+fn fractionalPreferred(data: ?*anyopaque, _: ?*c.wp_fractional_scale_v1, factor: u32) callconv(.c) void {
+    const w = window(data);
+    if (factor > 0) w.fractional_preferred = factor;
+    w.applyScale();
+}
+fn outputGeometry(_: ?*anyopaque, _: ?*c.wl_output, _: i32, _: i32, _: i32, _: i32, _: i32, _: [*c]const u8, _: [*c]const u8, _: i32) callconv(.c) void {}
+fn outputMode(_: ?*anyopaque, _: ?*c.wl_output, _: u32, _: i32, _: i32, _: i32) callconv(.c) void {}
+fn outputDone(_: ?*anyopaque, _: ?*c.wl_output) callconv(.c) void {}
+fn outputScale(data: ?*anyopaque, _: ?*c.wl_output, factor: i32) callconv(.c) void {
+    const output: *Output = @ptrCast(@alignCast(data.?));
+    output.scale = @max(1, factor);
+    if (output.owner) |w| w.applyScale();
+}
+fn outputName(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
+fn outputDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
 const registry_listener = c.wl_registry_listener{ .global = global, .global_remove = removed };
 const wm_listener = c.xdg_wm_base_listener{ .ping = ping };
 const surface_listener = c.xdg_surface_listener{ .configure = configured };
+const wl_surface_listener = c.wl_surface_listener{ .enter = surfaceEnter, .leave = surfaceLeave, .preferred_buffer_scale = preferredBufferScale, .preferred_buffer_transform = preferredBufferTransform };
+const fractional_listener = c.wp_fractional_scale_v1_listener{ .preferred_scale = fractionalPreferred };
+const output_listener = c.wl_output_listener{ .geometry = outputGeometry, .mode = outputMode, .done = outputDone, .scale = outputScale, .name = outputName, .description = outputDescription };
 // The compositor has the last word and the content does not adapt to it. The
 // following xdg_surface.configure acknowledges this mode along with the surface state.
 fn decorationConfigured(data: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, mode: u32) callconv(.c) void {

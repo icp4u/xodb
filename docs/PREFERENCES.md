@@ -35,6 +35,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | --- | --- | --- |
 | wine.hide_internal_threads | false | Hide advisory Wine internal thread names in the GUI; selected and faulting threads stay visible, and MCP still lists every thread |
 | appearance.theme | builtin:dark | GUI theme preset or file relative to these preferences; CLI --theme wins |
+| appearance.ui_scale | compositor | Device pixels per UI unit, 0.5–4; CLI `--ui-scale` wins, and omitting both follows the window system |
 | profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |
 | profile.sample_limit | 16384 | Maximum retained samples, 1–65536; the independent 32 MiB sample store may fill earlier |
@@ -53,6 +54,13 @@ and pass its path. This keeps location, merging and persistence choices open.
 | languages.python, .perl, .lua, .javascript, .ruby, .go, .elisp, .gdscript | true | false turns that language view off: no runtime search, no file read and no target memory read on its behalf. CLI --language-off NAME or all also turns it off |
 | symbols.image_bytes | 1073741824 | Largest ELF image read in full for source, types and names, 1 MiB–1 TiB; CLI --image-limit wins |
 | symbols.image_total_bytes | 4294967296 | All full images held by the xodb process: every debugged process, capture, debug file and inflated debug section together; 1 MiB–1 TiB; CLI --image-total-limit wins |
+| galaxy.additive | true | Descriptor galaxy clouds and thread beads add their light where they overlap; false keeps plain alpha blending. The galaxy keys are read only by `xodb --overview --config FILE` |
+| galaxy.cloud_size | 1.6 | Cloud spread around each star and cluster, 0.5–3 |
+| galaxy.brightness | 0.85 | Cloud brightness, 0.1–2 |
+| galaxy.camera_zoom | 1.35 | Zoom when the pointer rests on a cluster, 1–2.5; 1 only centres it |
+| galaxy.easing_ms | 450 | Camera and layout settling time, 50–2000 ms |
+| galaxy.max_stars | 512 | Starting star budget, 8–1024; `+`/`-` change it while running |
+| galaxy.unfold | true | Start with one star per process; false starts folded into groups |
 
 Duration accepts an unsigned 32-bit value (up to 4,294,967,295 ms, about 49 days).
 There is no separate one-minute ceiling. A deadline includes time paused in the
@@ -74,6 +82,13 @@ All settings are optional. Omitted fields use built-in defaults. Unknown fields,
 duplicate keys, invalid values and malformed JSON fail startup with the path and
 error on stderr. Files must be regular files, at most 64 KiB; FIFO paths fail
 without waiting for a writer. JSON comments are not supported.
+
+`appearance.ui_scale` controls backing resolution while layout and pointer hit
+testing stay in UI units. On Wayland, xodb follows fractional output scale and
+updates when the window moves between outputs. Use `--ui-scale N` for a one-run
+override; the same option and preference work in `--overview` and remote GUI
+windows. A scale change re-rasterizes scalable fonts; the Win95 bitmap face is
+kept at its native raster and enlarged cleanly.
 
 ## Defaults and active captures
 
@@ -139,7 +154,7 @@ see [allocation tracing](ALLOCATIONS.md).
 
 These are areas to consider, not accepted keys or committed behavior:
 
-- **appearance**: font, text size, colors, pane sizing and compact layouts.
+- **appearance**: text size, pane sizing and compact layouts.
   See the [skins and look and feel sketch](SKINS_PROPOSAL.md) for proposed keys
   and examples; these are not accepted by the current parser.
 - **input**: shortcuts and navigation repeat behavior; keep the user's existing

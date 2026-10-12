@@ -22,8 +22,9 @@ pub fn title(tab: Tab) []const u8 {
         .gdscript => "GDScript",
     };
 }
-pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8, identity: ?@import("../language/runtime_binding.zig").Identity = null };
+pub const Description = struct { version: []const u8, build_id: []const u8, basis: []const u8, identity: ?@import("../language/runtime_binding.zig").Identity = null, thread: ?i32 = null };
 const Entry = struct {
+    thread: ?i32 = null,
     identity: ?@import("../language/runtime_binding.zig").Identity = null,
     present: bool = false,
     checked: bool = false,
@@ -38,6 +39,7 @@ const Entry = struct {
 pub const State = struct {
     enabled: bool = false,
     selected: Tab = .native,
+    follow_tid: ?i32 = null,
     native_selection: ?selection.Native = null,
     logical_selection: ?selection.Logical = null,
     offers: selection.Offers = .{},
@@ -55,6 +57,15 @@ pub const State = struct {
     loaded_images: usize = 0,
     pub fn deinit(self: *State) void {
         self.cache.deinit();
+    }
+    /// Presentation scope only. Do not retain another thread's runtime identity
+    /// while an ambiguous process is being resolved for the new selection.
+    pub fn followThread(self: *State, tid: i32) void {
+        if (tid <= 0 or self.follow_tid == tid) return;
+        self.follow_tid = tid;
+        for (self.entries[0..2]) |*entry| entry.* = .{ .present = entry.present, .found = entry.found };
+        self.next = 0;
+        self.revision +%= 1;
     }
     pub fn syncSelection(self: *State, generation: u64) void {
         if (self.cache.key) |key| if (key.generation != generation) {
@@ -222,9 +233,20 @@ pub const State = struct {
             7 => @import("../language/gdscript.zig").describe(session, a),
             else => unreachable,
         };
-        const d = description catch |err| {
+        const scoped: anyerror!Description = description catch |err| blk: {
+            if (err == error.PythonRuntimeAmbiguous or err == error.PerlValueRuntimeAmbiguous) {
+                if (self.follow_tid) |tid| break :blk threadDescription(session, tid, self.next);
+            }
+            break :blk err;
+        };
+        const d = scoped catch |err| {
             if (pending(err)) {
                 entry.reason = @errorName(err);
+                return;
+            }
+            if (self.follow_tid != null and (err == error.PythonInterpreterFrameUnavailable or err == error.PerlInterpreterFrameUnavailable)) {
+                entry.* = .{ .present = true, .found = true, .thread = self.follow_tid };
+                self.finish(@errorName(err));
                 return;
             }
             // No image defines the runtime anchor: an unexaminable mapping is
@@ -264,6 +286,7 @@ pub const State = struct {
         entry.present = true;
         entry.found = true;
         entry.identity = d.identity;
+        entry.thread = d.thread;
         entry.proof_generation = if (d.identity == .unwitnessed) null else snapshot.generation;
         self.finish(if (d.identity == .unwitnessed) "RuntimeNotSeenExecuting" else null);
     }
@@ -275,7 +298,7 @@ pub const State = struct {
         self.revision +%= 1;
     }
     pub fn jsonStringify(self: State, writer: anytype) !void {
-        const Item = struct { identity: ?@import("../language/runtime_binding.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
+        const Item = struct { thread: ?i32 = null, identity: ?@import("../language/runtime_binding.zig").Identity = null, tab: Tab, title: []const u8, visible: bool, status: []const u8, reason: ?[]const u8, version: ?[]const u8, build_id: ?[]const u8, basis: ?[]const u8, proof_generation: ?u64 };
         var items: [order.len]Item = undefined;
         for (order, 0..) |tab, i| {
             items[i] = .{ .tab = tab, .title = title(tab), .visible = self.visible(tab), .status = "ready", .reason = null, .version = null, .build_id = null, .basis = null, .proof_generation = null };
@@ -283,6 +306,7 @@ pub const State = struct {
                 const entry = &self.entries[i - 2];
                 items[i].status = if (!self.enabled) "not_requested" else if (!entry.checked) "pending" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "RuntimeNotDetected")) "absent" else if (entry.reason != null and std.mem.eql(u8, entry.reason.?, "LanguageDisabled")) "disabled" else if (entry.identity == .unwitnessed) "unwitnessed" else if (entry.reason != null) "unavailable" else "ready";
                 items[i].identity = entry.identity;
+                items[i].thread = entry.thread;
                 items[i].reason = entry.reason;
                 items[i].version = if (entry.present) entry.version.slice() else null;
                 items[i].build_id = if (entry.present) entry.build_id.slice() else null;
@@ -293,10 +317,30 @@ pub const State = struct {
         try writer.write(.{ .native_selection = self.native_selection, .logical_selection = self.logical_selection, .offers = self.offers, .selected = self.selected, .revision = self.revision, .generation = if (self.generation == std.math.maxInt(u64)) null else @as(?u64, self.generation), .image_epoch = if (self.epoch == std.math.maxInt(u64)) null else @as(?u64, self.epoch), .complete = self.next == self.entries.len, .tabs = items });
     }
 };
+fn threadDescription(session: *Session, tid: i32, index: usize) !Description {
+    inline for (.{ Tab.python, Tab.perl }, 0..) |language, i| if (index == i) {
+        const stack = try selection.cachedRead(language, session, tid);
+        if (stack.segments.len == 0) return @import("../language/runtime_binding.zig").noFrame(if (language == .python) .python else .perl);
+        const runtime = stack.segments[0].runtime;
+        return .{ .version = runtime.version, .build_id = runtime.build_id, .basis = "selected-thread interpreter frames; several runtime images loaded", .identity = stack.identity, .thread = tid };
+    };
+    return error.InvalidLanguage;
+}
 fn pending(err: anyerror) bool {
     return err == error.SymbolDiscoveryPending or err == error.SymbolDiscoveryBudgetExceeded or
         err == error.DebugMetadataPending or err == error.JavaScriptMetadataPending or err == error.JavaScriptDwarfPending;
 }
+test "thread scope invalidates identity without hiding an already selected tab" {
+    var state = State{ .enabled = true, .selected = .python, .follow_tid = 10, .next = 8 };
+    state.entries[0] = .{ .present = true, .checked = true, .found = true, .identity = .witnessed, .thread = 10, .proof_generation = 7 };
+    state.followThread(20);
+    try std.testing.expect(state.visible(.python) and state.selected == .python and state.next == 0);
+    try std.testing.expect(state.entries[0].identity == null and state.entries[0].thread == null and state.entries[0].proof_generation == null and !state.entries[0].checked);
+    const revision = state.revision;
+    state.followThread(20);
+    try std.testing.expectEqual(revision, state.revision);
+}
+
 test "tab selection belongs to each process and cycles only detected runtimes" {
     var first = State{};
     var second = State{};

@@ -1,6 +1,9 @@
 const std = @import("std");
 const c = @import("../c_ui.zig").api;
-pub const atlas_size = 1024;
+/// A 2x face has roughly four times the atlas area of the old 16-pixel face.
+/// Keep the same glyph ceiling without making ordinary HiDPI source text fail
+/// early with GlyphAtlasFull.
+pub const atlas_size = 2048;
 pub const Glyph = struct { id: u32, x: u32, y: u32, w: u32, h: u32, left: i32, top: i32 };
 pub const Font = struct {
     library: c.FT_Library = null,
@@ -18,6 +21,11 @@ pub const Font = struct {
     degraded: bool = false,
     pixel: bool = false,
     retro: bool = false,
+    /// Requested device pixels per UI unit and the scale at which this face
+    /// was rasterized. The fixed bitmap face stays at a 1x raster and is
+    /// enlarged by the renderer; scalable faces use the requested scale.
+    scale: f32 = 1,
+    raster_scale: f32 = 1,
     pub fn init(self: *Font, path: [:0]const u8) !void {
         return self.initMode(path, false);
     }
@@ -52,23 +60,53 @@ pub const Font = struct {
     /// Build the replacement before releasing the active atlas. Call between frames.
     pub fn selectOverview(self: *Font, gpa: std.mem.Allocator, path: [:0]const u8, retro: bool) !void {
         if (self.retro == retro) return;
+        const scale = self.scale;
         const next = try gpa.create(Font);
         defer gpa.destroy(next);
         next.* = .{};
         if (retro) try next.initRetro() else try next.initMode(path, false);
+        errdefer next.deinit();
+        _ = try next.setScale(scale);
         self.deinit();
         self.* = next.*;
     }
     fn prepare(self: *Font) !void {
-        if (c.FT_Set_Pixel_Sizes(self.face, 0, 16) != 0) return error.FontSizeFailed;
-        self.hb = c.hb_ft_font_create_referenced(self.face) orelse return error.FontShapeFailed;
-        errdefer c.hb_font_destroy(self.hb);
-        if (self.pixel) c.hb_ft_font_set_load_flags(self.hb, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME);
-        self.buffer = c.hb_buffer_create() orelse return error.FontShapeFailed;
-        errdefer c.hb_buffer_destroy(self.buffer);
+        try self.configure(1);
+    }
+    fn configure(self: *Font, requested: f32) !void {
+        const raster: f32 = if (self.retro) 1 else requested;
+        const pixels: u32 = @intFromFloat(@round(16 * raster));
+        if (c.FT_Set_Pixel_Sizes(self.face, 0, pixels) != 0) return error.FontSizeFailed;
+        const hb = c.hb_ft_font_create_referenced(self.face) orelse return error.FontShapeFailed;
+        errdefer c.hb_font_destroy(hb);
+        if (self.pixel) c.hb_ft_font_set_load_flags(hb, c.FT_LOAD_TARGET_MONO | c.FT_LOAD_MONOCHROME);
+        const buffer = c.hb_buffer_create() orelse return error.FontShapeFailed;
+        errdefer c.hb_buffer_destroy(buffer);
+        if (self.buffer != null) c.hb_buffer_destroy(self.buffer);
+        if (self.hb != null) c.hb_font_destroy(self.hb);
+        self.hb = hb;
+        self.buffer = buffer;
+        self.scale = requested;
+        self.raster_scale = raster;
+        @memset(&self.pixels, 0);
+        @memset(&self.slots, 0);
+        self.count = 0;
+        self.x = 2;
+        self.y = 2;
+        self.row_height = 0;
+        self.degraded = false;
+        self.dirty = true;
         self.pixels[0] = 255;
         // Reserve the missing-glyph box before source text can fill the cache.
         _ = try self.glyph(0);
+    }
+    /// Rebuilds glyph metrics and the atlas when the window moves between
+    /// outputs. Layout remains in UI units; only raster detail changes.
+    pub fn setScale(self: *Font, requested: f32) !bool {
+        const scale = try @import("../platform/window.zig").validateScale(requested);
+        if (@abs(scale - self.scale) < 0.001) return false;
+        try self.configure(scale);
+        return true;
     }
     pub fn deinit(self: *Font) void {
         c.hb_buffer_destroy(self.buffer);

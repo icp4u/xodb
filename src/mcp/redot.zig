@@ -4,7 +4,7 @@ const Session = @import("../model/session.zig").Session;
 const Value = std.json.Value;
 
 pub fn handles(name: []const u8) bool {
-    return std.mem.eql(u8, name, "get_redot_scene_tree") or std.mem.eql(u8, name, "inspect_redot_object");
+    return @import("redot_profile.zig").handles(name) or std.mem.eql(u8, name, "get_redot_scene_tree") or std.mem.eql(u8, name, "inspect_redot_object");
 }
 
 fn asValue(a: std.mem.Allocator, value: anytype) !Value {
@@ -65,6 +65,7 @@ const Object = struct {
 };
 
 pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Value) !Value {
+    if (@import("redot_profile.zig").handles(name)) return @import("redot_profile.zig").call(a, session, name, args);
     const snapshot = session.redot.snapshot();
     if (std.mem.eql(u8, name, "get_redot_scene_tree")) {
         try fields(args, &.{ "start", "limit", "refresh" });

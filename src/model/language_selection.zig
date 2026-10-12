@@ -200,6 +200,7 @@ pub fn selectNative(session: *model.Session, tid: i32, frame: usize) !void {
     const native = native_storage[0..borrowed_native.len];
     @memcpy(native, borrowed_native);
     if (frame >= native.len) return error.InvalidFrame;
+    session.language_tabs.followThread(tid);
     var offers = Offers{};
     inline for (.{ Tab.python, Tab.perl, Tab.lua, Tab.javascript, Tab.ruby, Tab.go, Tab.elisp, Tab.gdscript }) |language| {
         if (session.language_tabs.visible(language)) {
@@ -262,6 +263,7 @@ fn fromStack(session: *model.Session, language: Tab, tid: i32, stack: anytype, s
     try session.target.expectGeneration(generation);
     const state = &session.language_tabs;
     state.logical_selection = selected;
+    state.followThread(tid);
     state.offers = .{};
     state.selected = language;
     if (anchor) |index| state.native_selection = .{ .generation = generation, .tid = tid, .frame = index };
