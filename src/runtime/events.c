@@ -1,6 +1,8 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include <sched.h>
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 
 /* Wait only on TIDs learned through launch, attach or kernel birth events.
  * Other subsystems may own traced children of this same debugger process. */
@@ -51,6 +53,31 @@ static enum xrt_status restore_child_probes(struct xrt_target *t, int32_t child,
             return status;
     }
     return XRT_OK;
+}
+/* Wait for a traced child to stop. 1: stopped. 0: it died and was collected,
+ * or is not ours to wait for. -1: no stop within two seconds. A new child
+ * cannot run userspace before its first stop, so this normally takes
+ * microseconds; the bound keeps a starved or frozen child from hanging the
+ * debugger. Never waits on pid 0: that would take any child's status. */
+static int settle_child(int32_t child)
+{
+    if (child <= 0)
+        return 0;
+    const uint64_t deadline = xrt_now() + UINT64_C(2000000000);
+    for (unsigned spin = 0;; ++spin) {
+        int status = 0;
+        const pid_t got = waitpid(child, &status, __WALL | WNOHANG);
+        if (got == child)
+            return WIFSTOPPED(status) ? 1 : 0;
+        if (got < 0 && errno != EINTR)
+            return 0;
+        if (xrt_now() >= deadline)
+            return -1;
+        if (spin < 64)
+            sched_yield();
+        else
+            usleep(200);
+    }
 }
 /* x86 can adopt a birth. Every other row refuses process following, so a held
  * child would leave continue and step stuck on PROCESS_BIRTH_PENDING. */
@@ -133,11 +160,23 @@ void xrt_drop_vfork_hold(struct xrt_target *t)
     if (!t)
         return;
     const int32_t child = t->vfork_hold;
+    const int released = t->vfork_release;
     t->vfork_hold = 0;
     t->vfork_release = 0;
+    memset(t->vfork_waiting, 0, sizeof(t->vfork_waiting));
     t->vfork_hold_detach = 0;
     if (child <= 0)
         return;
+    /* A released child only borrowed the image, whose traps are lifted. It
+     * is not ours to kill: let it go, in a stop now or at the interrupt. */
+    if (released) {
+        if (xrt_trace(PTRACE_DETACH, child, 0, 0) == XRT_OK)
+            return;
+        xrt_trace(PTRACE_INTERRUPT, child, 0, 0);
+        const int stopped = settle_child(child);
+        if (!stopped || (stopped > 0 && xrt_trace(PTRACE_DETACH, child, 0, 0) == XRT_OK))
+            return;
+    }
     kill(child, SIGKILL);
     for (;;) {
         int status = 0;
@@ -229,6 +268,10 @@ static enum xrt_status poll(struct xrt_target *t)
             i = 0;
             /* exec invalidates the entire old image; never restore its bytes. */
             t->breakpoint_count = 0;
+            /* A thread that was waiting in vfork is gone with the old image,
+             * and so is its VFORK_DONE. Let any borrowing child go. */
+            if (t->vfork_release)
+                xrt_drop_vfork_hold(t);
             memset(t->watchpoints, 0, sizeof(t->watchpoints));
             t->stepping = false;
             t->inherited_rearm = false;
@@ -246,9 +289,35 @@ static enum xrt_status poll(struct xrt_target *t)
             TRY(xrt_trace(PTRACE_GETEVENTMSG, tid, 0, (uintptr_t)&child));
         if (kind == PTRACE_EVENT_FORK || kind == PTRACE_EVENT_VFORK ||
             (kind == PTRACE_EVENT_CLONE && !xrt_traced_member((int32_t)child, t->pid))) {
-            if (row_cannot_follow(t)) {
+            /* Not following: make the child safe and let it go, so a program
+             * that spawns a helper runs without anyone resolving the birth. */
+            int release = row_cannot_follow(t);
+            int shared = kind == PTRACE_EVENT_VFORK;
+            if (!release && !t->follow_processes) {
+                /* The event kind does not say whether memory is shared. A
+                 * shared clone that is not a vfork, or a failed comparison,
+                 * stays held as before. */
+                const long same = syscall(SYS_kcmp, tid, (int32_t)child, 1, 0UL, 0UL);
+                release = same > 0 || (same == 0 && shared);
+                shared = same == 0;
+            }
+            /* A bounded number of children may borrow the image at once. */
+            if (release && shared &&
+                t->vfork_release == sizeof(t->vfork_waiting) / sizeof(t->vfork_waiting[0]))
+                release = 0;
+            /* The child is ptrace-stopped before its first instruction but
+             * may not have reached that stop yet. Collect it before touching
+             * it. If it was killed first there is nothing to do. With no stop
+             * in time it is held like any unfollowed birth used to be. */
+            const int settled = release ? settle_child((int32_t)child) : 0;
+            if (settled < 0)
+                release = 0;
+            if (release) {
                 const int stepping_here = t->stepping && t->step.tid == tid;
-                const int shared = kind == PTRACE_EVENT_VFORK;
+                const int alive = settled > 0;
+                if (alive)
+                    xrt_target_event(t, XRT_EVENT_PROCESS_RELEASED, (int32_t)child, tid);
+                shared = shared && alive;
                 if (shared) {
                     /* The child shares this image and starts stopped. Lift every
                      * trap so a user breakpoint or a successor plant cannot kill
@@ -257,10 +326,28 @@ static enum xrt_status poll(struct xrt_target *t)
                      * puts the traps back. A software step then hits its
                      * successor with the real child pid. */
                     TRY(rewrite_patched(t, 0));
-                    t->vfork_hold = (int32_t)child;
-                    t->vfork_release = 1;
-                    t->vfork_hold_detach = 0;
-                    const enum xrt_status ran = xrt_trace(PTRACE_CONT, (int32_t)child, 0, 0);
+                    /* The borrower's own children and its exec are not ours:
+                     * without options nothing it starts is attached to us. */
+                    xrt_trace(PTRACE_SETOPTIONS, (int32_t)child, 0, 0);
+                    for (size_t w = 0; w < sizeof(t->vfork_waiting) / sizeof(t->vfork_waiting[0]); ++w)
+                        if (!t->vfork_waiting[w]) {
+                            t->vfork_waiting[w] = tid;
+                            break;
+                        }
+                    ++t->vfork_release;
+                    enum xrt_status ran;
+                    if (t->vfork_hold) {
+                        /* Threads may spawn at the same time. One borrower is
+                         * kept traced to absorb a stray trap; the image is
+                         * already clean, so a later one is let go at once. */
+                        ran = xrt_trace(PTRACE_DETACH, (int32_t)child, 0, 0);
+                        if (ran == XRT_PROCESS_GONE && t->reap_count < 2048)
+                            xrt_remember_reap(t, (int32_t)child);
+                    } else {
+                        t->vfork_hold = (int32_t)child;
+                        t->vfork_hold_detach = 0;
+                        ran = xrt_trace(PTRACE_CONT, (int32_t)child, 0, 0);
+                    }
                     if (ran != XRT_OK && ran != XRT_PROCESS_GONE)
                         return ran;
                     t->threads[i].signal = 0;
@@ -274,8 +361,17 @@ static enum xrt_status poll(struct xrt_target *t)
                     continue;
                 }
                 /* Separate address space. The parent's traps stay where they are. */
-                TRY(restore_child_probes(t, (int32_t)child, 1));
-                TRY(xrt_trace(PTRACE_DETACH, (int32_t)child, 0, 0));
+                if (alive) {
+                    enum xrt_status gone = restore_child_probes(t, (int32_t)child, 1);
+                    if (gone == XRT_OK)
+                        gone = xrt_trace(PTRACE_DETACH, (int32_t)child, 0, 0);
+                    /* Killed while stopped: only its tracer can collect it, and
+                     * until then its parent's wait would not see it. */
+                    if (gone == XRT_PROCESS_GONE && t->reap_count < 2048)
+                        xrt_remember_reap(t, (int32_t)child);
+                    else if (gone != XRT_OK && gone != XRT_PROCESS_GONE)
+                        return gone;
+                }
                 t->threads[i].signal = 0;
                 if (stepping_here || t->want_run) {
                     /* A hardware step is still one instruction. CONT would run
@@ -336,12 +432,21 @@ static enum xrt_status poll(struct xrt_target *t)
         if (kind == PTRACE_EVENT_VFORK_DONE) {
             t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_VFORK_DONE;
-            if (t->vfork_release) {
-                /* The child has exec'd or exited, so this image is the parent's
-                 * alone. Put back every probe the record still calls patched,
-                 * then detach the child before userspace runs. */
-                TRY(rewrite_patched(t, 1));
-                t->vfork_release = 0;
+            size_t owed = 0;
+            while (owed < sizeof(t->vfork_waiting) / sizeof(t->vfork_waiting[0]) &&
+                   t->vfork_waiting[owed] != tid)
+                ++owed;
+            if (owed < sizeof(t->vfork_waiting) / sizeof(t->vfork_waiting[0])) {
+                /* This thread's child has exec'd or exited. Once no child
+                 * borrows the image it is the parent's alone: put back every
+                 * probe the record still calls patched. The traced child is
+                 * detached before userspace runs; if it is another thread's it
+                 * keeps the clean image until that thread's own VFORK_DONE. */
+                t->vfork_waiting[owed] = 0;
+                if (t->vfork_release)
+                    --t->vfork_release;
+                if (!t->vfork_release)
+                    TRY(rewrite_patched(t, 1));
                 TRY(xrt_detach_held_vfork(t));
                 const int stepping_here = t->stepping && t->step.tid == tid;
                 if (stepping_here || t->want_run) {
@@ -422,6 +527,16 @@ static enum xrt_status poll(struct xrt_target *t)
             t->threads[i].state = XRT_RUNNING;
             continue;
         }
+        /* A child that exited is not a reason to stop its parent. Like gdb's
+         * default, deliver SIGCHLD and keep running. A step in progress on
+         * this thread still stops, so the signal is never dropped. */
+        if (kind == 0 && sig == SIGCHLD && t->want_run && !step_here) {
+            TRY(xrt_trace(PTRACE_CONT, tid, 0, SIGCHLD));
+            t->threads[i].signal = 0;
+            t->threads[i].reason = XRT_STOP_NONE;
+            t->threads[i].state = XRT_RUNNING;
+            continue;
+        }
         t->threads[i].signal = kind == 0 ? sig : 0;
         t->threads[i].reason = kind == PTRACE_EVENT_EXEC   ? XRT_STOP_EXEC
                                : kind == PTRACE_EVENT_STOP ? XRT_STOP_INTERRUPT
@@ -473,7 +588,15 @@ static enum xrt_status poll(struct xrt_target *t)
             /* x86 #DB can carry both BS (single-step) and B0..B3 (watch).
              * Linux reports TRAP_TRACE in that case: si_code alone must not
              * discard the watch evidence or resume past a user watchpoint. */
-            const bool stepped = t->stepping && t->step.tid == tid && info.code == TRAP_TRACE;
+            /* x86 reports a hardware step that ends in the kernel (the
+             * instruction was a syscall, or the step resumed a fork event
+             * stop) as TRAP_BRKPT at syscall exit. A real int3 arrives as
+             * SI_KERNEL, and the exec entry case was taken above, so here the
+             * code means the stepped instruction has completed. */
+            const bool step_trap =
+                info.code == TRAP_TRACE || (t->arch->machine == XRT_X86_64 && !t->step.software &&
+                                            info.code == TRAP_BRKPT);
+            const bool stepped = t->stepping && t->step.tid == tid && step_trap;
             bool armed = false;
             for (size_t b = 0; b < 4; ++b)
                 armed |= t->watchpoints[b].present;
@@ -490,7 +613,7 @@ static enum xrt_status poll(struct xrt_target *t)
                     t->events[t->event_count - 1].pc = pc;
                     t->events[t->event_count - 1].pc_known = 1;
                 }
-            } else if (t->stepping && t->step.tid == tid && info.code == TRAP_TRACE) {
+            } else if (stepped) {
                 const bool stop_after = t->step.stop_after, watch = t->step.has_watch;
                 t->threads[i].signal = 0;
                 TRY(xrt_finish_step(t, true));

@@ -23,17 +23,20 @@ try:
     d.keys('tap',57)
     assert d.stopped('breakpoint')
     d.tool('set_breakpoint',generation=d.session()['generation'],symbol='tree_child')
-    d.keys('tap',57)
+    # Following is off by default and would release the child. F turns it on
+    # for the stopped parent; the child is then admitted at its birth.
+    d.keys('tap',24);d.shot('00-following-off')
+    d.keys('tap',33)
     deadline=time.monotonic()+5
-    while d.tool('get_processes')['processes'][0]['admission_error']!='ProcessFollowingDisabled':
+    while not d.tool('get_processes')['processes'][0]['following']:
         assert time.monotonic()<deadline
         time.sleep(.01)
-    d.keys('tap',24);d.shot('00-following-off-held')
-    d.keys('tap',33) # F adopts the held child; parent remains stopped.
+    d.keys('tap',24,'tap',57)
     deadline=time.monotonic()+5
     while d.tool('get_processes')['total']<2:
         assert time.monotonic()<deadline
         time.sleep(.01)
+    d.keys('tap',24)
     d.shot('01-processes-wide')
     d.keys('tap',108,'tap',28)
     assert d.tool('get_processes')['gui_process_id']==2

@@ -87,7 +87,7 @@ static void event(struct xrt_codec *c, struct xrt_event *e)
     U64(e->sequence);
     U64(e->time_ns);
     i32(c, &e->tid);
-    ENUM(e->kind, XRT_EVENT_PROCESS_SEPARATED);
+    ENUM(e->kind, XRT_EVENT_PROCESS_RELEASED);
     i64(c, &e->detail);
     uint64_t pc = 0;
     uint8_t known = 0;

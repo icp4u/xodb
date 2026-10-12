@@ -10,6 +10,7 @@ pub const Row = struct {
     following: bool,
     shared_vm: bool,
     held: usize,
+    released: usize = 0,
     diagnostic: ?[]const u8,
 };
 pub const View = struct {
@@ -55,6 +56,7 @@ pub const Capture = struct {
                 .following = state.follow_processes,
                 .shared_vm = target.sharedVm(),
                 .held = state.birth_count,
+                .released = entry.released,
                 .diagnostic = if (diagnostic) |text| try self.arena.allocator().dupe(u8, text) else null,
             };
         }

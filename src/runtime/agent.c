@@ -310,7 +310,7 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
         xrt_target_invalidate(t);
         return XRT_OK;
     case XRT_RPC_EVENT:
-        if (args[0] > XRT_EVENT_PROCESS_SEPARATED || args[1] > INT32_MAX)
+        if (args[0] > XRT_EVENT_PROCESS_RELEASED || args[1] > INT32_MAX)
             return XRT_INVALID_ARGUMENT;
         {
             int64_t detail;

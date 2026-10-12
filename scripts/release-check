@@ -43,7 +43,8 @@ COVERS = (
     (('src/model/macho_images.zig', 'src/model/gdb_images.zig', 'src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'tests/macos-names*.py', 'tests/fixtures/macos-names/*'), ('macos-names*', 'macos-debug*', 'gui-macos-names', 'gui-macos-debug', 'macos-views*', 'gui-macos-views', 'gdb-debugserver*')),
     (('src/binary/macho*', 'src/mcp/macho*', 'tests/macho*', 'tests/helpers/macho_fixture.py', 'tests/fixtures/macho/*'), ('macho-*', 'macos-debug*', 'macos-names*', 'gui-macos-names', 'gui-macos-debug')),
     (('src/runtime/mapped_file.c', 'src/runtime/file_view.c', 'src/runtime/files.c', 'src/runtime/family.c'),
-     ('runtime-host', 'runtime-agent', 'shared-processes', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
+     ('runtime-host', 'runtime-agent', 'shared-processes', 'fork-release*', 'mapping-identity', 'module-*', 'pe-*', 'pdb-*', 'image-budget-hostile')),
+    (('src/model/process_*', 'src/ui/processes.zig', 'tests/fixtures/process-tree.c', 'tests/process-tree.py', 'tests/process-gui.py'), ('fork-release*', 'm2-robustness', 'shared-processes*')),
     (('tests/fixtures/elf/unwind.S',), ('frame-archive', 'm2-archive')),
     (('tests/fixtures/unwind-realigned.c',), ('unwind-realigned*',)),
     (('src/debug/demangle.*', 'tests/demangle-names.*', 'tests/fixtures/stack-symbol-names.cc'), ('demangle-names', 'stack-symbol-names*')),
@@ -104,7 +105,7 @@ COVERS = (
       'src/runtime/events.c', 'src/runtime/xstate.c', 'src/runtime/loader.c', 'src/runtime/xrt_target.h', 'src/runtime/xrt_process.h',
       'src/runtime/xrt_arch.h', 'src/runtime/xrt_xstate.h', 'src/runtime/xrt_loader.h', 'src/ui/stop.zig', 'src/ui/watch*'),
      ('m1-*', 'breakpoint-policy', 'run-control', 'repeated-break', 'restart-pending', 'core-debugging', 'memory-registers',
-      'source-blocks', 'stale-interrupt',
+      'source-blocks', 'stale-interrupt', 'fork-release*', 'm2-robustness',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*'),
      ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'hidden-window', 'acquire-timeout',
@@ -445,12 +446,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
-                     'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt',
+                     'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release',
                      'comparison', 'scheduling-decode', 'observation-experiments',
                      'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
-        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges'):
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges', 'fork-release'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):

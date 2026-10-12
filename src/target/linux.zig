@@ -151,7 +151,7 @@ pub const Event = struct {
     sequence: u64,
     time_ns: u64,
     tid: c.pid_t,
-    kind: enum { launch, attach, thread_start, thread_exiting, stop, continued, exit, detach, breakpoint_set, breakpoint_removed, breakpoint_hit, watchpoint_set, watchpoint_removed, watchpoint_hit, step_started, step_complete, memory_written, register_written, agent_action, image_replaced, process_birth, process_separated },
+    kind: enum { launch, attach, thread_start, thread_exiting, stop, continued, exit, detach, breakpoint_set, breakpoint_removed, breakpoint_hit, watchpoint_set, watchpoint_removed, watchpoint_hit, step_started, step_complete, memory_written, register_written, agent_action, image_replaced, process_birth, process_separated, process_released },
     detail: i64 = 0,
     pc: u64 = 0,
     pc_known: bool = false,

@@ -38,7 +38,6 @@ for mode in ('thread', 'fork', 'burst', 'limit'):
         client.action('continue')
         deadline = time.monotonic() + 8
         latencies = []
-        followed_child = False
         while True:
             started = time.monotonic()
             capture = client.inspect('get_profile')['capture']
@@ -46,31 +45,8 @@ for mode in ('thread', 'fork', 'burst', 'limit'):
             latencies.append(time.monotonic() - started)
             if state['state'] == 'stopped':
                 if any(t['reason'] == 'breakpoint' for t in state['threads']): break
-                if mode == 'fork' and not followed_child:
-                    # Following defaults off: hold the newborn until the client
-                    # explicitly adopts it. The parent's capture must already
-                    # have stopped at the process-scope boundary.
-                    tree = client.inspect('get_processes')
-                    parent = tree['processes'][0]
-                    if parent['admission_error'] != 'ProcessFollowingDisabled':
-                        assert time.monotonic() < deadline, tree
-                        time.sleep(.005)
-                        continue
-                    assert parent['pending_count'] == 1, tree
-                    capture = client.inspect('get_profile')['capture']
-                    assert capture['status'] == 'thread_scope_changed', capture
-                    client.action('set_process_following', enabled=True)
-                    tree = client.inspect('get_processes')
-                    while tree['total'] == 1:
-                        assert time.monotonic() < deadline, tree
-                        time.sleep(.005)
-                        tree = client.inspect('get_processes')
-                    assert tree['total'] == 2, tree
-                    child = tree['processes'][1]
-                    client.inspect('continue', process_id=child['process_id'],
-                                   generation=child['generation'])
-                    followed_child = True
-                # The fork case may stop for SIGCHLD. Deliver the pending signal.
+                # Following defaults off: the newborn is released without a
+                # stop, and its SIGCHLD is delivered without one.
                 client.action('continue')
             assert state['state'] != 'exited' and time.monotonic() < deadline, state
             time.sleep(.005)

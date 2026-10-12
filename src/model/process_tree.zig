@@ -13,6 +13,9 @@ pub const Entry = struct {
     last_generation: u64 = 0,
     failed_generation: ?u64 = null,
     admission_error: ?[]const u8 = null,
+    /// Children let go because this process was not being followed.
+    released: usize = 0,
+    event_sequence: u64 = 0,
 };
 pub const Tree = struct {
     entries: [maximum]Entry = undefined,
@@ -115,6 +118,15 @@ pub const Tree = struct {
             if (entry.last_generation != entry.session.target.snapshot().generation) {
                 self.revision += 1;
                 entry.last_generation = entry.session.target.snapshot().generation;
+                const events = entry.session.target.eventSlice();
+                var at = events.len;
+                while (at > 0 and events[at - 1].sequence > entry.event_sequence) at -= 1;
+                for (events[at..]) |event| if (event.kind == .process_released) {
+                    entry.released += 1;
+                    // One hint per process; every release is in its event log.
+                    if (entry.released == 1) std.debug.print("xodb: process #{d} child pid={d} released (not following; --follow-forks or F to follow)\n", .{ entry.id, event.tid });
+                };
+                if (events.len > 0) entry.event_sequence = events[events.len - 1].sequence;
             }
         }
     }

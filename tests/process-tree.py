@@ -94,20 +94,16 @@ for mode in ('fork','vfork-exec','vfork-detach','limit','clone-vm','owned-close'
         c.close()
         (run/(mode+'.json')).write_text(json.dumps(c.transcript,indent=2))
         (run/(mode+'.stderr')).write_bytes(c.p.stderr.read())
-# Following off still holds the child before inherited traps can execute.
-# Enable following at that stop, then release both through ordinary controls.
+# Following off releases the child with its inherited trap removed: nothing is
+# held or admitted, and the parent runs on. tests/fork-release.py is the gated check.
 c=Client('control',fixture,options=('--break','tree_ready'))
 try:
     action(c,'continue');stopped(c,1,'breakpoint')
     action(c,'set_breakpoint',symbol='tree_child')
     action(c,'continue')
-    tree=wait(c,lambda t:t['processes'][0]['admission_error']=='ProcessFollowingDisabled')
-    assert tree['total']==1 and tree['processes'][0]['pending_count']==1,tree
-    assert snap(c)['state']=='stopped'
-    action(c,'set_process_following',enabled=True)
-    wait(c,lambda t:t['total']==2)
-    action(c,'continue',2);stopped(c,2,'breakpoint')
-    finish(c)
+    tree=finish(c)
+    assert tree['total']==1 and tree['processes'][0]['pending_count']==0 and tree['processes'][0]['admission_error'] is None,tree
+    assert [e['kind'] for e in c.inspect('query_events')['events']].count('process_released')==1
 finally:
     c.close()
     (run/'following-off.json').write_text(json.dumps(c.transcript,indent=2))

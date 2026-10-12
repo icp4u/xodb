@@ -315,6 +315,7 @@ enum xrt_status xrt_target_detach(struct xrt_target *t)
      * parent is released, or the parent stays blocked in the kernel. */
     TRY(xrt_detach_held_vfork(t));
     t->vfork_release = 0;
+    memset(t->vfork_waiting, 0, sizeof(t->vfork_waiting));
     /* Restore a half-planted trap before this process is released. */
     if (t->plant_cleanup.active &&
         (t->state != XRT_STOPPED || xrt_target_retry_plant_cleanup(t) != XRT_OK))

@@ -72,12 +72,15 @@ struct xrt_target {
     struct xrt_watchpoint birth_watchpoints[4];
     uint64_t birth_next_probe_id;
     struct xrt_target *vfork_parent, *vfork_children[XRT_MAX_THREADS];
-    /* Non-x86 shared vfork. The child stays traced until VFORK_DONE.
-     * release means the shared image currently holds original bytes while the
-     * breakpoint records still say patched. hold_detach asks the next child
-     * stop to detach rather than resume. */
+    /* Released shared vfork. One child stays traced until a VFORK_DONE.
+     * release counts the children still borrowing the image: while it is
+     * nonzero the image holds original bytes and the breakpoint records still
+     * say patched. waiting names their parent threads, each owed a
+     * VFORK_DONE. hold_detach asks the next child stop to detach rather than
+     * resume. */
     int32_t vfork_hold;
     uint8_t vfork_release, vfork_hold_detach;
+    int32_t vfork_waiting[8];
     int32_t reap_tids[2048];
     size_t reap_count;
     enum xrt_state state;

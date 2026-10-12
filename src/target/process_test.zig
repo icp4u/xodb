@@ -319,3 +319,87 @@ test "partial family detach blocks resume until trap restoration can complete" {
     try std.testing.expect(c.WIFEXITED(status));
     try std.testing.expectEqual(@as(i32, 0), c.WEXITSTATUS(status));
 }
+
+test "following off releases fork, vfork and exec children and the parent runs on" {
+    try @import("../test_support.zig").requireLive();
+    if (linux.architecture != .x86_64) return error.SkipZigTest;
+    for ([_][:0]const u8{ "fork", "fork-exec", "vfork", "vfork-exec", "system" }) |mode| {
+        const parent = try create();
+        defer destroy(parent);
+        var modules = Modules.init(std.testing.allocator);
+        defer modules.deinit();
+        try parent.launch(&.{ fixture(), mode });
+        try std.testing.expect(!parent.snapshot().follow_processes);
+        try modules.refresh(parent.snapshot().pid);
+        const inherited = (try modules.findSymbol("tree_child")).address;
+        const done = (try modules.findSymbol("tree_done")).address;
+        _ = try parent.setBreakpoint(inherited, false);
+        _ = try parent.setBreakpoint(done, false);
+        // One continue: no stop for the birth or for the child's SIGCHLD.
+        try parent.continueExecution();
+        try parent.waitStopped();
+        try std.testing.expectEqual(linux.State.stopped, parent.snapshot().state);
+        try std.testing.expectEqual(@as(usize, 0), parent.snapshot().birth_count);
+        try std.testing.expectEqual(bp.StopReason.breakpoint, parent.threadSlice()[0].reason);
+        try std.testing.expectEqual(done, parent.threadSlice()[0].breakpoint_address);
+        try std.testing.expect(!parent.sharedVm());
+        // The parent's own trap survived the child, shared memory or not.
+        try std.testing.expectEqual(@as(u8, 0xcc), try rawByte(parent.snapshot().pid, inherited));
+        var released: usize = 0;
+        for (parent.eventSlice()) |event| if (event.kind == .process_released) {
+            try std.testing.expect(event.tid != parent.snapshot().pid);
+            released += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 1), released);
+        // The fixture returns its child's status: a trap death would be 93.
+        try toExit(parent);
+    }
+}
+
+test "following off: a step over the fork instruction releases the child, with no held birth" {
+    try @import("../test_support.zig").requireLive();
+    if (linux.architecture != .x86_64) return error.SkipZigTest;
+    // The parent is killed below while stopped, so its released child is
+    // reaped here rather than left to the outer test runner.
+    var previous: c_int = 0;
+    try std.testing.expectEqual(@as(c_int, 0), c.prctl(c.PR_GET_CHILD_SUBREAPER, &previous, @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)));
+    try std.testing.expectEqual(@as(c_int, 0), c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, 1), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0)));
+    defer _ = c.prctl(c.PR_SET_CHILD_SUBREAPER, @as(c_ulong, @intCast(previous)), @as(c_ulong, 0), @as(c_ulong, 0), @as(c_ulong, 0));
+    const parent = try create();
+    defer destroy(parent);
+    var modules = Modules.init(std.testing.allocator);
+    defer modules.deinit();
+    try parent.launch(&.{ fixture(), "step" });
+    try modules.refresh(parent.snapshot().pid);
+    _ = try parent.setBreakpoint((try modules.findSymbol("tree_fork_instruction")).address, false);
+    _ = try parent.setBreakpoint((try modules.findSymbol("tree_child")).address, false);
+    try parent.continueExecution();
+    try parent.waitStopped();
+    try std.testing.expectEqual(bp.StopReason.breakpoint, parent.threadSlice()[0].reason);
+    try parent.singleStep(parent.snapshot().pid);
+    try parent.waitStopped();
+    // The step over the syscall instruction completes as a step, and the
+    // birth neither held the parent nor kept the child.
+    try std.testing.expectEqual(linux.State.stopped, parent.snapshot().state);
+    try std.testing.expectEqual(bp.StopReason.single_step, parent.threadSlice()[0].reason);
+    try std.testing.expectEqual(@as(usize, 0), parent.snapshot().birth_count);
+    var released: i32 = 0;
+    for (parent.eventSlice()) |event| {
+        if (event.kind == .process_released) released = event.tid;
+    }
+    try std.testing.expect(released != 0);
+    parent.deinit();
+    // The child ran through the inherited breakpoint on its own and exited 0.
+    var status: c_int = 0;
+    const deadline = linux.now() + 3_000_000_000;
+    while (c.waitpid(released, &status, c.WNOHANG) != released) {
+        if (linux.now() >= deadline) {
+            _ = c.kill(released, c.SIGKILL);
+            _ = c.waitpid(released, &status, 0);
+            return error.ReleasedChildExitTimeout;
+        }
+        _ = c.usleep(1000);
+    }
+    try std.testing.expect(c.WIFEXITED(status));
+    try std.testing.expectEqual(@as(i32, 0), c.WEXITSTATUS(status));
+}

@@ -8,9 +8,9 @@ Backend cleanup and child-transfer foundations are already checked in.
 
 - Opt-in x86-64 fork/vfork following: CLI `--follow-forks`, or the GUI
   **Processes (O)** panel's **Follow (F)** control on a stopped process.
-- Even with following disabled, x86 process creation stops safely with
-  `ProcessFollowingDisabled`; enable following or explicitly detach the family.
-  This prevents untraced children from executing inherited software traps.
+- With following disabled, a new child is released with inherited software
+  traps removed and the parent runs on (see [Process trees](PROCESS_TREES.md)).
+  As first adopted, creation stopped with `ProcessFollowingDisabled` instead.
 - New children stop for inspection. They inherit following, software/hardware
   probes and conditional/logpoint policies. Each gets an independent session,
   symbols, frame selection, memory inspection, capture and GUI workspace.

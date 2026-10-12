@@ -2,10 +2,48 @@
 
 Adopted with a default of 32 retained sessions and a configurable ceiling of
 1,024; see [design and review](M2_PROCESS_TREE_PROPOSAL.md).
-Following is opt-in and currently supported on Linux x86-64. Process creation
-is held even with following off: inherited software traps must not execute in
-an untraced child. `ProcessFollowingDisabled` means enable **Follow (F)** in
-the process panel or choose **Detach family**. It does not mean a kernel failure.
+Following is opt-in and currently supported on Linux x86-64.
+
+## Following off (the default)
+
+A program that forks, vforks or spawns a helper (`popen`, `system`,
+`posix_spawn`, a crash dialog, a shader compiler) just keeps running. Each new
+child process is made safe and released, and the parent resumes on its own:
+
+| The child is a | What xodb does |
+| --- | --- |
+| fork (own copy of memory) | Puts the original instructions back in the child's copy, wherever the parent has a breakpoint or a step trap, then detaches it. The parent's breakpoints are untouched. |
+| vfork or `posix_spawn` (borrows the parent's memory) | Takes the breakpoints out of the shared memory, lets the child run, and puts them back when the child execs or exits. Only then is the child detached and the parent resumed. |
+
+- Each release adds a `process_released` row to the event log (thread = the
+  child's PID, detail = the forking thread). The process panel row counts them
+  as `released N`. The first one per process also prints one line on stderr:
+  `xodb: process #1 child pid=N released (not following; --follow-forks or F to follow)`.
+- A released child is not debugged: its breakpoints do not stop it, and it is
+  not killed when xodb closes.
+- While a vfork child borrows the parent's memory, the parent's breakpoints are
+  out for every thread of the parent. A thread that runs through one in that
+  window (normally a few milliseconds, until the child's exec) is not stopped.
+- The parent is not stopped for the child's `SIGCHLD` either: it is delivered
+  and the program runs on (with following on or off). A thread that is in the
+  middle of a step still stops on it. That includes the hidden step a Continue
+  takes to leave a breakpoint, so a Continue right after a child exited can
+  stop once more with `SIGCHLD`; Continue again.
+- A step across the creating call releases the child the same way.
+- Threads may spawn at the same time: up to eight children can borrow the
+  parent's memory at once, and the breakpoints go back when the last of them
+  has exec'd or exited.
+- If the process exits or execs while a vfork child is still out, that child
+  is detached and runs on.
+- Still held, as before: a clone that shares memory without being a vfork, a
+  ninth vfork child while eight are still out, a child whose memory sharing
+  cannot be determined, and a child that does not report its first stop within
+  two seconds. Those report `ProcessFollowingDisabled`; enable
+  **Follow (F)** in the process panel or choose **Detach family**.
+
+To debug the children, turn following on before the program creates them:
+`--follow-forks`, or **F** in the process panel while the process is stopped.
+The rest of this page describes following on.
 
 ## Launch and select
 
@@ -15,7 +53,8 @@ the process panel or choose **Detach family**. It does not mean a kernel failure
 ```
 
 - Continue to `tree_ready`, then continue again to the fork.
-- **O / Processes** opens the process list. Both parent and child are held.
+- **O / Processes** opens the process list. With following on, both parent
+  and child are held.
 - Click a row or use arrows and Enter to switch the GUI. The header names
   the selected debugger process ID and PID.
 - Continue, pause, stepping, registers, stack, expressions, hardware watches,

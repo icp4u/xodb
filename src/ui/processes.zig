@@ -140,10 +140,11 @@ pub const Panel = struct {
         for (self.view.rows[self.first..][0..self.visible], self.first..) |row, i| {
             const y = b.y + 112 + @as(f32, @floatFromInt(i - self.first)) * 28;
             if (i == self.cursor) try style.focus(r, .{ .x = b.x + 8, .y = y - 2, .w = b.w - 16, .h = 26 }, 4, 1);
-            try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.bufPrint(&buffer, "#{d}  PID {d}  {s}  parent {any}  /  {s}{s}  held {d}", .{ row.stamp.process, row.stamp.pid, @tagName(row.state), row.parent, if (row.following) "follow" else "fixed", if (row.shared_vm) " / shared VM" else "", row.held }), if (i == self.cursor) theme.text else theme.weak);
+            try r.textFit(font, b.x + 14, y, b.w - 28, try std.fmt.bufPrint(&buffer, "#{d}  PID {d}  {s}  parent {any}  /  {s}{s}  held {d}  released {d}", .{ row.stamp.process, row.stamp.pid, @tagName(row.state), row.parent, if (row.following) "follow" else "fixed", if (row.shared_vm) " / shared VM" else "", row.held, row.released }), if (i == self.cursor) theme.text else theme.weak);
         }
-        try r.textFit(font, b.x + 14, b.y + b.h - 78, b.w - 28, try std.fmt.bufPrint(&buffer, "Row #{d}: {s}", .{ current.stamp.process, current.diagnostic orelse "Children stop for inspection; controls apply to the highlighted row." }), theme.text);
+        const hint: []const u8 = if (current.following) "Children stop for inspection; controls apply to the highlighted row." else "Not following: new children are released and run on their own. F follows them.";
+        try r.textFit(font, b.x + 14, b.y + b.h - 78, b.w - 28, try std.fmt.bufPrint(&buffer, "Row #{d}: {s}", .{ current.stamp.process, current.diagnostic orelse hint }), theme.text);
         try r.textFit(font, b.x + 14, b.y + b.h - 52, b.w - 28, "Detach family releases shared-vfork members and pending children.", theme.weak);
-        try r.textFit(font, b.x + 14, b.y + b.h - 28, b.w - 28, if (self.message.len > 0) self.message else "Independent fork children stay attached. Process slots include exited sessions.", theme.weak);
+        try r.textFit(font, b.x + 14, b.y + b.h - 28, b.w - 28, if (self.message.len > 0) self.message else "Followed fork children stay attached. Process slots include exited sessions.", theme.weak);
     }
 };

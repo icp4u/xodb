@@ -1154,7 +1154,7 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
     if (call->value) *call->value = 0;
     if (call->op == XRT_RPC_INVALIDATE) { ++t->generation; return XRT_OK; }
     if (call->op == XRT_RPC_EVENT) {
-        if (call->args[0] > XRT_EVENT_PROCESS_SEPARATED) return XRT_INVALID_ARGUMENT;
+        if (call->args[0] > XRT_EVENT_PROCESS_RELEASED) return XRT_INVALID_ARGUMENT;
         event(t, (enum xrt_event_kind)call->args[0], (int32_t)call->args[1], (int64_t)call->args[2]);
         return XRT_OK;
     }
