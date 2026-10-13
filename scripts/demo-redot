@@ -26,7 +26,9 @@ demo_root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 cd "$demo_root"
 # A private per-user directory holds the shared-session socket and the game's output.
 session_dir="${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/xodb-demo-redot-$(id -u)"
-socket="$session_dir/session.sock"
+# XODB_DEMO_SOCKET=PATH puts the socket elsewhere, for example where a helper
+# you chmod it for can reach it; XODB_DEMO_SCOPE=mutate widens its MCP scope.
+socket="${XODB_DEMO_SOCKET:-$session_dir/session.sock}"
 
 if [[ "${1-}" == stack || "${1-}" == locals ]]; then
     if [[ ! -S "$socket" ]]; then

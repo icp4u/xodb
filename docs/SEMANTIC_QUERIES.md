@@ -388,10 +388,20 @@ possibilities, not an observed execution*, keeps the producer's
 qualification unchanged (`result_trust: graph_<level>`,
 `verified_semantics: false`), and cites instructions and source lines.
 
-## Enabling the worker
+## Enabling a producer
 
-The worker is opt-in and separate from the target and its agent. Build it once
-into one directory and pass that directory to xodb:
+The broad-format producer is the persistent Ghidra JVM sidecar. Set
+`GHIDRA_HOME` and ensure a JDK is on `PATH`; the first request starts it on
+demand. See [Persistent Ghidra sidecar protocol](GHIDRA_SIDECAR.md) for its
+lifecycle, wire format, cache, memory controls and security checks.
+
+```sh
+GHIDRA_HOME=/path/to/ghidra scripts/demo-decompile
+scripts/ghidra-sidecar status
+```
+
+The no-JVM worker remains an opt-in x86-64 ELF fallback. Build it once into
+one directory and pass that directory to xodb:
 
 ```sh
 sh tools/ghx/build_ghidra.sh GHIDRA_CHECKOUT DIR
@@ -399,8 +409,9 @@ make -C tools/ghx GHIDRA_CPP=DIR/ghidra-src/Ghidra/Features/Decompiler/src/decom
 xodb --static-analysis DIR -- ./program      # or XODB_STATIC_ANALYSIS=DIR
 ```
 
-xodb checks for `DIR/ghx_supervise`, `DIR/ghx_worker` and the x86-64 SLEIGH
-specification under `DIR/ghidra-src`. Without them every tool answers
+When no sidecar is configured, xodb checks for `DIR/ghx_supervise`,
+`DIR/ghx_worker` and the x86-64 SLEIGH specification under
+`DIR/ghidra-src`. Without either producer every tool answers
 `status: unavailable` with a `reason` (`not_configured`,
 `supervisor_missing`, `worker_missing`, `sleigh_missing`,
 `unsupported_architecture`) and the build commands; nothing crashes and no

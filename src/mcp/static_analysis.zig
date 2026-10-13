@@ -63,9 +63,9 @@ fn flag(args: V, key: []const u8) !bool {
     return if (v == .bool) v.bool else error.InvalidArguments;
 }
 
-pub fn jobValue(job: *host.Job) struct { id: u64, state: []const u8, function: []const u8, entry: u64, size: u64, elapsed_ms: u64, deadline_ms: u32, cancel_requested: bool, failure: ?host.Failure } {
+pub fn jobValue(job: *host.Job) struct { id: u64, state: []const u8, producer: []const u8, progress: []const u8, function: []const u8, entry: u64, size: u64, elapsed_ms: u64, deadline_ms: u32, cancel_requested: bool, failure: ?host.Failure } {
     const state: []const u8 = if (job.running()) "running" else if (job.failure) |f| (if (std.mem.eql(u8, f.code, "cancelled")) "cancelled" else "failed") else "completed";
-    return .{ .id = job.id, .state = state, .function = job.function.name, .entry = job.function.runtime(job.function.key.entry), .size = job.function.key.size, .elapsed_ms = job.elapsedMs(), .deadline_ms = job.deadline_ms, .cancel_requested = job.cancelRequested(), .failure = if (job.running()) null else job.failure };
+    return .{ .id = job.id, .state = state, .producer = if (job.producer_kind == .sidecar) "ghidra_java_sidecar" else "ghidra_native_decompiler", .progress = job.progress(), .function = job.function.name, .entry = job.function.runtime(job.function.key.entry), .size = job.function.key.size, .elapsed_ms = job.elapsedMs(), .deadline_ms = job.deadline_ms, .cancel_requested = job.cancelRequested(), .failure = if (job.running()) null else job.failure };
 }
 
 fn summary(a: Allocator, analysis: *host.Analysis) !V {
@@ -94,7 +94,7 @@ fn summary(a: Allocator, analysis: *host.Analysis) !V {
         .bounds_source = analysis.function.bounds_source,
         .module = analysis.function.module_path,
         .image = .{ .sha256 = &analysis.function.key.image_sha256, .build_id = analysis.function.build_id, .basis = "SHA-256 of the session's own snapshot of the mapped image; the worker read exactly these bytes" },
-        .producer = .{ .schema_version = analysis.schema_version, .contract = analysis.contract, .worker_ms = analysis.worker_ms },
+        .producer = .{ .name = analysis.producer_name, .version = analysis.producer_version, .schema_version = analysis.schema_version, .contract = analysis.contract, .worker_ms = analysis.worker_ms },
         .qualification = .{ .level = analysis.level, .reasons = reasons },
         .trust = t,
         .graph = .{ .blocks = f.block_count, .ops = f.op_count, .varnodes = f.vn_count, .cfg_incomplete = f.cfg_incomplete != 0 },
@@ -235,6 +235,7 @@ fn decompile(a: Allocator, analysis: *host.Analysis) !V {
         .signature = document.signature,
         .language = document.language,
         .printer = document.printer,
+        .producer = .{ .name = analysis.producer_name, .version = analysis.producer_version },
         .qualification = .{ .level = analysis.level, .reasons = reasons },
         .token_status = document.token_status,
         .address_map_status = document.address_map_status,

@@ -85,9 +85,13 @@ if args.galaxy:
                 check(label + ' cloud field rendered', len(set(field.get_flattened_data())) > 100)
             text = Path(d.log).read_text()
             point = re.findall(r'galaxy-cluster x=([\d.-]+) y=([\d.-]+)', text)[-1]
+            count = len(looks(text))
             d.keys('m', *(round(float(v)) for v in point))
+            until(lambda text: len(looks(text)) > count)
+            check(label + ' hover leaves camera still', all(float(row['zoom']) == 1 and row['camera'] == '0' for row in looks(Path(d.log).read_text())[count:]))
+            d.keys('click', *(round(float(v)) for v in point))
             until(lambda text: looks(text) and float(looks(text)[-1]['zoom']) > 1.1)
-            check(label + ' logical hover reaches cluster camera', True)
+            check(label + ' logical click selects cluster camera', True)
             overlaps = re.findall(r'overview layout .*panel=galaxy overlaps=(\d+)', Path(d.log).read_text())
             check(label + ' galaxy layout has no label overlap', bool(overlaps) and all(int(v) == 0 for v in overlaps))
             if args.evidence:

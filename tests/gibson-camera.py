@@ -15,6 +15,7 @@ p = argparse.ArgumentParser()
 p.add_argument('--wrong-result', action='store_true')
 p.add_argument('--wrong-idle-result', action='store_true')
 p.add_argument('--binary')
+p.add_argument('--flight-only', action='store_true')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -136,57 +137,86 @@ try:
     d.procs.append(keeper)
     ready(keeper)
     until(lambda r: int(r['towers']) > 0, 'city populated')
-    report['before_motion'] = usage()
-    zero = travel([17], 0, 250_000_000)
-    fast = travel([17], 120, 500_000_000)
-    diagonal = travel([17, 32], 0, 250_000_000)
-    report['motion'] = [zero, fast, diagonal]
-    report['after_motion'] = usage()
-    check('distance follows held time independently of key repeat', abs(fast['speed']/zero['speed'] - (2 if a.wrong_result else 1)) < .05)
-    check('longer hold advances proportionally', fast['seconds'] > zero['seconds'] * 1.4 and abs(fast['distance']/zero['distance'] - fast['seconds']/zero['seconds']) < .1)
-    check('W and D combine', abs(diagonal['speed']/zero['speed'] - math.sqrt(2)) < .05)
-    proc, first = press([17, 32], 0)
-    until(lambda r: int(r['frame']) > int(first['frame']) + 3, 'movement before focus loss')
-    sway('workspace number 2')
-    deadline = time.monotonic() + 10 * h.load_scale()
-    while time.monotonic() < deadline and not (rows('xodb: gibson input ') and rows('xodb: gibson input ')[-1]['focused'] == 'false'):
-        time.sleep(.01)
-    focus = rows('xodb: gibson input ')[-1]
-    check('compositor focus loss reached the camera', focus['focused'] == 'false')
-    sway('workspace number 1')
-    after = until(lambda r: r['focused'] == 'true' and int(r['now']) > int(focus['now']), 'focus restored')
-    check('focus loss cancels movement immediately', pan(after) == pan(focus) and after['moving'] == 'false')
-    release(proc)
-    send('m', 7, 7, 'm', 8, 8)
-    check('focus return does not resurrect held keys', pan(latest()) == pan(focus))
-    send('tap', 19)  # reset and start a bounded flythrough
-    orbit = until(lambda r: r['auto'] == 'true', 'auto orbit starts')
-    initial_deadline = int(orbit['auto_until'])
-    until(lambda r: int(r['now']) >= initial_deadline - 4_000_000_000, 'interaction after view start')
-    send('tap', 35)  # H changes the height encoding, without taking manual control.
-    changed = until(lambda r: r['height'] != orbit['height'], 'height interaction reached the view')
-    check('interaction renews the orbit deadline', (int(changed['auto_until']) == initial_deadline) if a.wrong_idle_result else (int(changed['auto_until']) > initial_deadline))
-    orbit = changed
-    report['idle_deadlines'] = dict(initial=initial_deadline, renewed=int(orbit['auto_until']))
-    deadline = time.monotonic() + 8 * h.load_scale()
-    while time.monotonic() < deadline and time.monotonic_ns() < int(orbit['auto_until']) + 100_000_000:
-        time.sleep(.02)
-    send('m', 9, 9)
-    idle = until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'idle orbit stops')
-    report['idle_before'] = usage()
-    before = len(rows())
-    send('m', 10, 10, 'm', 11, 11)
-    check('idle orbit preserves its final pose', all(latest()[k] == idle[k] for k in ('yaw','pitch','zoom','pan_x','pan_z')))
-    check('idle camera renders only requested repaints', len(rows()) - before <= 3)
-    report['idle_after'] = usage()
-    send('m', int(float(idle['x']) + float(idle['w']) / 2), int(float(idle['y']) + float(idle['h']) / 2))
-    resumed = until(lambda r: r['auto'] == 'true' and int(r['auto_until']) > int(orbit['auto_until']) and r['yaw'] != idle['yaw'], 'pointer resumes idle orbit')
-    check('pointer interaction resumes paused auto mode', int(resumed['auto_until']) > int(orbit['auto_until']))
-    send('tap', 33)  # F explicitly disables the running orbit.
-    disabled = until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'explicit orbit off')
-    send('tap', 35)
-    manual = until(lambda r: r['height'] != disabled['height'], 'interaction after explicit orbit off')
-    check('interaction preserves explicit manual mode', manual['auto'] == 'false' and manual['moving'] == 'false')
+    if not a.flight_only:
+        report['before_motion'] = usage()
+        zero = travel([17], 0, 250_000_000)
+        fast = travel([17], 120, 500_000_000)
+        diagonal = travel([17, 32], 0, 250_000_000)
+        report['motion'] = [zero, fast, diagonal]
+        report['after_motion'] = usage()
+        check('distance follows held time independently of key repeat', abs(fast['speed']/zero['speed'] - (2 if a.wrong_result else 1)) < .05)
+        check('longer hold advances proportionally', fast['seconds'] > zero['seconds'] * 1.4 and abs(fast['distance']/zero['distance'] - fast['seconds']/zero['seconds']) < .1)
+        check('W and D combine', abs(diagonal['speed']/zero['speed'] - math.sqrt(2)) < .05)
+        proc, first = press([17, 32], 0)
+        until(lambda r: int(r['frame']) > int(first['frame']) + 3, 'movement before focus loss')
+        sway('workspace number 2')
+        deadline = time.monotonic() + 10 * h.load_scale()
+        while time.monotonic() < deadline and not (rows('xodb: gibson input ') and rows('xodb: gibson input ')[-1]['focused'] == 'false'):
+            time.sleep(.01)
+        focus = rows('xodb: gibson input ')[-1]
+        check('compositor focus loss reached the camera', focus['focused'] == 'false')
+        sway('workspace number 1')
+        after = until(lambda r: r['focused'] == 'true' and int(r['now']) > int(focus['now']), 'focus restored')
+        check('focus loss cancels movement immediately', pan(after) == pan(focus) and after['moving'] == 'false')
+        release(proc)
+        send('m', 7, 7, 'm', 8, 8)
+        check('focus return does not resurrect held keys', pan(latest()) == pan(focus))
+        send('tap', 19)  # reset and start a bounded flythrough
+        orbit = until(lambda r: r['auto'] == 'true', 'auto orbit starts')
+        initial_deadline = int(orbit['auto_until'])
+        until(lambda r: int(r['now']) >= initial_deadline - 4_000_000_000, 'interaction after view start')
+        send('tap', 35)  # H changes the height encoding, without taking manual control.
+        changed = until(lambda r: r['height'] != orbit['height'], 'height interaction reached the view')
+        check('interaction renews the orbit deadline', (int(changed['auto_until']) == initial_deadline) if a.wrong_idle_result else (int(changed['auto_until']) > initial_deadline))
+        orbit = changed
+        report['idle_deadlines'] = dict(initial=initial_deadline, renewed=int(orbit['auto_until']))
+        deadline = time.monotonic() + 8 * h.load_scale()
+        while time.monotonic() < deadline and time.monotonic_ns() < int(orbit['auto_until']) + 100_000_000:
+            time.sleep(.02)
+        send('m', 9, 9)
+        idle = until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'idle orbit stops')
+        report['idle_before'] = usage()
+        before = len(rows())
+        send('m', 10, 10, 'm', 11, 11)
+        check('idle orbit preserves its final pose', all(latest()[k] == idle[k] for k in ('yaw','pitch','zoom','pan_x','pan_z')))
+        check('idle camera renders only requested repaints', len(rows()) - before <= 3)
+        report['idle_after'] = usage()
+        send('m', int(float(idle['x']) + float(idle['w']) / 2), int(float(idle['y']) + float(idle['h']) / 2))
+        resumed = until(lambda r: r['auto'] == 'true' and int(r['auto_until']) > int(orbit['auto_until']) and r['yaw'] != idle['yaw'], 'pointer resumes idle orbit')
+        check('pointer interaction resumes paused auto mode', int(resumed['auto_until']) > int(orbit['auto_until']))
+        send('tap', 17)  # Movement takes manual control of the running orbit.
+        disabled = until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'explicit orbit off')
+        send('tap', 35)
+        manual = until(lambda r: r['height'] != disabled['height'], 'interaction after explicit orbit off')
+        check('interaction preserves explicit manual mode', manual['auto'] == 'false' and manual['moving'] == 'false')
+    else:
+        send('tap', 17)
+        until(lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'manual camera before flight')
+        saved = latest()
+        report['before_flight'] = usage()
+        flight_started = time.monotonic()
+        send('tap', 33)  # Manual -> orbit.
+        until(lambda r: r['auto'] == 'true', 'F enters orbit')
+        send('tap', 33)  # Orbit -> real avenue flight.
+        until(lambda r: rows('xodb: gibson-flight ') and rows('xodb: gibson-flight ')[-1]['on'] == 'true', 'flight starts')
+        saved = latest()  # Exact camera retained at flight entry, after orbit.
+        until(lambda r: int(rows('xodb: gibson-flight ')[-1]['corners']) >= 2, 'flight crosses intersections')
+        path = [r for r in rows('xodb: gibson-flight ') if r['on'] == 'true']
+        report['after_flight'] = usage()
+        report['flight_seconds'] = time.monotonic() - flight_started
+        report['flight_core_percent'] = 100 * (report['after_flight']['cpu_seconds'] - report['before_flight']['cpu_seconds']) / report['flight_seconds']
+        check('street flight travels below rooftops through integer avenues', len(path) > 3 and all(float(r['y']) < 3 and min(abs(float(r['x'])-round(float(r['x']))), abs(float(r['z'])-round(float(r['z'])))) < .00001 for r in path))
+        check('flight advances instead of orbiting in place', math.dist((float(path[0]['x']), float(path[0]['z'])), (float(path[-1]['x']), float(path[-1]['z']))) > 1)
+        send('tap', 106)  # Right queues a manual turn at the next safe intersection.
+        until(lambda r: rows('xodb: gibson-flight ')[-1]['automatic'] == 'false', 'manual flight steering')
+        send('tap', 33)
+        until(lambda r: rows('xodb: gibson-flight ')[-1]['returning'] == 'false' and rows('xodb: gibson-flight ')[-1]['on'] == 'false', 'return flight settles')
+        returned = latest()
+        check('leaving flight restores the previous camera', all(returned[k] == saved[k] for k in ('yaw','pitch','zoom','pan_x','pan_z')))
+        mark = len(rows())
+        send('m', 12, 12, 'm', 13, 13)
+        check('leaving flight restores idle repaints', latest()['moving'] == 'false' and len(rows())-mark <= 3)
+        report['flight_path'] = path
 finally:
     if d:
         d.close()

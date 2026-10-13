@@ -48,6 +48,9 @@ pub const State = struct {
     /// The galaxy's animation clock (frozen while paused) and when its last impulse fades.
     clock: u64 = 0,
     impulse_until: u64 = 0,
+    motion_until: u64 = 0,
+    layout_only: bool = false,
+    camera_cluster: ?u64 = null,
     pub fn deinit(self: *State) void {
         c.xrt_fdinherit_free(self.inheritance);
         self.inheritance = null;
@@ -153,7 +156,7 @@ pub const State = struct {
         if (!self.events_enabled) self.stopCapture();
     }
     pub fn flowing(self: *const State, now: u64) bool {
-        if (now < self.impulse_until) return true;
+        if (now < self.impulse_until or now < self.motion_until) return true;
         const metrics = self.metrics orelse return false;
         return self.flow_running and metrics.last_ns != 0 and now -| metrics.last_ns < 700_000_000;
     }
@@ -182,7 +185,7 @@ pub const State = struct {
         self.folded = self.collapse and (!self.collapse_auto or g.processes > self.max_stars);
         const options = c.struct_xrt_fdgraph_project_options{
             .max_stars = self.max_stars,
-            .max_particles = @max(1024, self.max_stars * c.XRT_FD_KINDS),
+            .max_particles = @import("galaxy_descriptors.zig").projectionDetailBudget(self.max_stars),
             .focus_process = selected,
             .collapse_cgroups = @intFromBool(self.folded and group == 0),
             .focus_group = group,
@@ -239,6 +242,7 @@ pub const State = struct {
         self.dirty = true;
     }
     pub fn all(self: *State) void {
+        self.camera_cluster = null;
         self.focus = null;
         self.group_len = 0;
         self.dirty = true;

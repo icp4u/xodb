@@ -90,6 +90,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     if (o.files_pid) |pid| view.files.scope(.{ .pid = pid, .start = o.files_start });
     if (o.look) |look| view.memmap.look = look;
     if (live) try source.prepare(view);
+    // After prepare: opening the --memmap-pid target resets the city state.
+    view.memmap.city.start_flight = o.gibson_flight;
     view.source_label = if (live) "live" else "REPLAY";
     view.owns_samples = live;
 
@@ -127,7 +129,7 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     var last_frame: u64 = 0;
     while (!window.closing and quitting == 0) {
         const t = now();
-        const frame_gap: u64 = if (view.panel == .files) 66_000_000 else 33_000_000;
+        const frame_gap: u64 = if (view.panel == .galaxy and view.graph.layout_only) 100_000_000 else if (view.panel == .files) 66_000_000 else 33_000_000;
         // Eases redraw at 30 fps; idle waits for the next sample or input.
         const idle_cap: u64 = if (live and source.serving()) 20 else if (view.panel == .memory_map) view.memmap.waitMs(t) else 250;
         const wait_ms: i32 = if (window.dirty) 4 else if (view.animating(t)) @intCast(@max(1, (last_frame + frame_gap -| t) / 1_000_000)) else @intCast(@min(idle_cap, (next_sample -| t) / 1_000_000 + 1));

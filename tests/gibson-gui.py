@@ -18,6 +18,7 @@ from PIL import Image, ImageChops
 
 p = argparse.ArgumentParser()
 p.add_argument('--binary')
+p.add_argument('--flight-only', action='store_true')
 p.add_argument('--evidence', action='store_true')
 a = p.parse_args()
 root = Path(__file__).resolve().parents[1]
@@ -149,7 +150,7 @@ def periodic():
         capture(f'fly-{i:02d}')
         fly.append(latest())
     check('flythrough changes camera from real sample', len({r['yaw'] for r in fly}) > 1 and all(int(r['towers']) == len(visible) for r in fly))
-    key(33, lambda r: r['auto'] == 'false', 'freeze camera for collapse oracle')
+    key(17, lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'freeze camera for collapse oracle')
     send('tap', 25)
     until(lambda r: int(r['seq']) == frames[1]['memory_map']['sequence'], 'preceding page sample')
     until(lambda r: int(r['seq']) == expected['sequence'] and float(r['ease']) < .8, 'actual collapse transition')
@@ -218,87 +219,110 @@ def periodic():
             target.wait(timeout=5 * h.load_scale())
 
 try:
-    d = display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map',
-                  '--pause', '--frames', '100000', '--replay', str(replay)], stdio=False, trace=False, binary=a.binary, output_size=(1280, 720))
-    row = until(lambda r: int(r['towers']) > 0 and float(r['ease']) == 1, 'city populated')
-    check('one tower per measured or unmeasured mapped cell; compressed gaps omitted', int(row['towers']) == len(visible))
-    check('fixture exercises unknown, collapse and split', all(int(row[k]) > 0 for k in ('unknown', 'partial', 'collapsed', 'split')))
-    check('GPU timestamp proves 3D commands were submitted', row['gpu_ns'] != 'null')
-    check('district labels are present before redaction', int(row['labels']) > 0)
-    key(33, lambda r: r['auto'] == 'false', 'manual camera')  # f
-    baseline = capture('angle-1')
-    check('city has cyan and magenta towers', has_city(baseline))
-    check('planted blank-city image is rejected', not has_city(Image.new('RGB', baseline.size)))
-    yaw = float(latest()['yaw'])
-    key(106, lambda r: float(r['yaw']) > yaw, 'arrow camera')
-    angle2 = capture('angle-2')
-    check('camera changes rendered city', ImageChops.difference(baseline, angle2).getbbox() is not None)
-    yaw = float(latest()['yaw'])
-    row = latest()
-    x, y = float(row['x'])+float(row['w'])/2, float(row['y'])+float(row['h'])/2
-    send('fastdrag', int(x), int(y), int(x+90), int(y+20))
-    until(lambda r: float(r['yaw']) < yaw, 'drag camera')
-    capture('angle-3')
-    check('drag preserves selection', latest()['selected'] == 'null')
-    zoom = float(latest()['zoom'])
-    send('scroll', int(x), int(y), -2)
-    until(lambda r: float(r['zoom']) < zoom, 'wheel dolly')
-    check('wheel changes camera zoom', float(latest()['zoom']) < zoom)
-    key(19, lambda r: r['auto'] == 'true', 'resume flythrough')
-    key(17, lambda r: r['auto'] == 'false', 'W enters manual movement')
-    check('WASD takes camera control', latest()['auto'] == 'false')
-    key(35, lambda r: r['height'] == 'huge', 'THP height')
-    key(35, lambda r: r['height'] == 'swapped', 'swap height')
-    key(35, lambda r: r['height'] == 'resident', 'present height')
-    key(46, lambda r: r['colour'] == 'district', 'district encoding')
-    check('height and colour controls retain known states', int(latest()['unknown']) > 0)
-    key(46, lambda r: r['colour'] == 'backing', 'backing encoding')
-    # Reset to a stable overview, then pick a visible tower using screen points.
-    key(19, lambda r: r['auto'] == 'true' and float(r['zoom']) == 1, 'reset camera')
-    key(33, lambda r: r['auto'] == 'false', 'freeze camera')
-    row = latest()
-    for dy in (0.5, 0.6, 0.4, 0.7):
-        for dx in (0.5, 0.4, 0.6, 0.3, 0.7):
-            send('click', int(float(row['x'])+float(row['w'])*dx), int(float(row['y'])+float(row['h'])*dy))
-            # Every click dirties the frame, even if it misses.
-            frame = int(latest()['frame'])
-            until(lambda r: int(r['frame']) > frame, 'pick repaint')
+    if not a.flight_only:
+        d = display(str(root), ['--overview', '--look', 'gibson', '--panel', 'memory_map',
+                      '--pause', '--frames', '100000', '--replay', str(replay)], stdio=False, trace=False, binary=a.binary, output_size=(1280, 720))
+        row = until(lambda r: int(r['towers']) > 0 and float(r['ease']) == 1, 'city populated')
+        check('one tower per measured or unmeasured mapped cell; compressed gaps omitted', int(row['towers']) == len(visible))
+        check('fixture exercises unknown, collapse and split', all(int(row[k]) > 0 for k in ('unknown', 'partial', 'collapsed', 'split')))
+        check('GPU timestamp proves 3D commands were submitted', row['gpu_ns'] != 'null')
+        check('district labels are present before redaction', int(row['labels']) > 0)
+        key(17, lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'manual camera')
+        baseline = capture('angle-1')
+        check('city has cyan and magenta towers', has_city(baseline))
+        check('planted blank-city image is rejected', not has_city(Image.new('RGB', baseline.size)))
+        yaw = float(latest()['yaw'])
+        key(106, lambda r: float(r['yaw']) > yaw, 'arrow camera')
+        angle2 = capture('angle-2')
+        check('camera changes rendered city', ImageChops.difference(baseline, angle2).getbbox() is not None)
+        yaw = float(latest()['yaw'])
+        row = latest()
+        x, y = float(row['x'])+float(row['w'])/2, float(row['y'])+float(row['h'])/2
+        send('fastdrag', int(x), int(y), int(x+90), int(y+20))
+        until(lambda r: float(r['yaw']) < yaw, 'drag camera')
+        capture('angle-3')
+        check('drag preserves selection', latest()['selected'] == 'null')
+        zoom = float(latest()['zoom'])
+        send('scroll', int(x), int(y), -2)
+        until(lambda r: float(r['zoom']) < zoom, 'wheel dolly')
+        check('wheel changes camera zoom', float(latest()['zoom']) < zoom)
+        key(19, lambda r: r['auto'] == 'true', 'resume flythrough')
+        key(17, lambda r: r['auto'] == 'false', 'W enters manual movement')
+        check('WASD takes camera control', latest()['auto'] == 'false')
+        key(35, lambda r: r['height'] == 'huge', 'THP height')
+        key(35, lambda r: r['height'] == 'swapped', 'swap height')
+        key(35, lambda r: r['height'] == 'resident', 'present height')
+        key(46, lambda r: r['colour'] == 'district', 'district encoding')
+        check('height and colour controls retain known states', int(latest()['unknown']) > 0)
+        key(46, lambda r: r['colour'] == 'backing', 'backing encoding')
+        # Reset to a stable overview, then pick a visible tower using screen points.
+        key(19, lambda r: r['auto'] == 'true' and float(r['zoom']) == 1, 'reset camera')
+        key(17, lambda r: r['auto'] == 'false' and r['moving'] == 'false', 'freeze camera')
+        row = latest()
+        for dy in (0.5, 0.6, 0.4, 0.7):
+            for dx in (0.5, 0.4, 0.6, 0.3, 0.7):
+                send('click', int(float(row['x'])+float(row['w'])*dx), int(float(row['y'])+float(row['h'])*dy))
+                # Every click dirties the frame, even if it misses.
+                frame = int(latest()['frame'])
+                until(lambda r: int(r['frame']) > frame, 'pick repaint')
+                if latest()['selected'] != 'null':
+                    break
             if latest()['selected'] != 'null':
                 break
-        if latest()['selected'] != 'null':
-            break
-    check('ray selects an actual sampled address', latest()['selected'] != 'null' and int(latest()['selected']) in {c['start'] for c in visible})
-    capture('selected')
-    key(1, lambda r: r['selected'] == 'null', 'escape clears selection')
-    send('tap', 24)  # O: picker
-    def picker():
-        rows = re.findall(r'gibson picker selected=(\d+) rows=(\d+)', '\n'.join(h.complete_lines(d.log)))
-        return tuple(map(int, rows[-1])) if rows else None
-    until(lambda r: picker() is not None, 'picker opens')
-    selected, count = picker()
-    destination = selected+1 if selected+1 < count else selected-1
-    send('tap', 108 if destination > selected else 103)
-    until(lambda r: picker()[0] == destination, 'picker keyboard selection survives repaint')
-    check('process picker keeps keyboard navigation', picker()[0] == destination)
-    frame = int(latest()['frame'])
-    send('tap', 1)
-    until(lambda r: int(r['frame']) > frame, 'picker Escape returns to city')
-    key(45, lambda r: r['redacted'] == 'true', 'redaction')
-    capture('redacted')
-    check('redaction keeps geometry', int(latest()['towers']) == len(visible))
-    check('redaction removes all billboard glyphs', int(latest()['labels']) == 0)
-    log = Path(d.log).read_text()
-    overlaps = re.findall(r'overview layout .*panel=memory_map overlaps=(\d+)', log)
-    check('city labels do not overlap', bool(overlaps) and all(int(n) == 0 for n in overlaps))
-    for width, height in ((800,600), (240,160), (1920,1080), (1280,720)):
-        subprocess.run(['swaymsg', '-t', 'command', f'output HEADLESS-1 mode {width}x{height}'], env=d.env,
-                       check=True, stdout=subprocess.DEVNULL, timeout=10 * h.load_scale())
-        until(lambda r: f'layout {width}x{height} panel=memory_map ' in Path(d.log).read_text(), 'resize repaint')
-    until(lambda r: float(r['h']) > 0, 'restored GPU field')
-    capture('resized')
-    check('GPU city survives tiny and full-size output changes', d.alive())
-    evidence['log'] = str(Path(d.log).relative_to(root))
-    close()
+        check('ray selects an actual sampled address', latest()['selected'] != 'null' and int(latest()['selected']) in {c['start'] for c in visible})
+        capture('selected')
+        key(1, lambda r: r['selected'] == 'null', 'escape clears selection')
+        send('tap', 24)  # O: picker
+        def picker():
+            rows = re.findall(r'gibson picker selected=(\d+) rows=(\d+)', '\n'.join(h.complete_lines(d.log)))
+            return tuple(map(int, rows[-1])) if rows else None
+        until(lambda r: picker() is not None, 'picker opens')
+        selected, count = picker()
+        destination = selected+1 if selected+1 < count else selected-1
+        send('tap', 108 if destination > selected else 103)
+        until(lambda r: picker()[0] == destination, 'picker keyboard selection survives repaint')
+        check('process picker keeps keyboard navigation', picker()[0] == destination)
+        frame = int(latest()['frame'])
+        send('tap', 1)
+        until(lambda r: int(r['frame']) > frame, 'picker Escape returns to city')
+        key(45, lambda r: r['redacted'] == 'true', 'redaction')
+        capture('redacted')
+        check('redaction keeps geometry', int(latest()['towers']) == len(visible))
+        check('redaction removes all billboard glyphs', int(latest()['labels']) == 0)
+        log = Path(d.log).read_text()
+        overlaps = re.findall(r'overview layout .*panel=memory_map overlaps=(\d+)', log)
+        check('city labels do not overlap', bool(overlaps) and all(int(n) == 0 for n in overlaps))
+        for width, height in ((800,600), (240,160), (1920,1080), (1280,720)):
+            subprocess.run(['swaymsg', '-t', 'command', f'output HEADLESS-1 mode {width}x{height}'], env=d.env,
+                           check=True, stdout=subprocess.DEVNULL, timeout=10 * h.load_scale())
+            until(lambda r: f'layout {width}x{height} panel=memory_map ' in Path(d.log).read_text(), 'resize repaint')
+        until(lambda r: float(r['h']) > 0, 'restored GPU field')
+        capture('resized')
+        check('GPU city survives tiny and full-size output changes', d.alive())
+        evidence['log'] = str(Path(d.log).relative_to(root))
+        close()
+    if a.flight_only:
+        d = display(str(root), ['--overview', '--gibson-flight', '--pause', '--replay', str(replay)],
+                    stdio=False, trace=False, binary=a.binary, output_size=(1280,720))
+        def flight_row():
+            lines = [line for line in h.complete_lines(d.log) if line.startswith('xodb: gibson-flight ')]
+            return dict(re.findall(r'(\w+)=([^ ]+)', lines[-1])) if lines else {}
+        until(lambda r: flight_row().get('on') == 'true' and int(flight_row().get('faces', 0)) > 0, 'start option enters signed avenue')
+        check('near towers have world-face signs within the glyph budget', 0 < int(latest()['labels']) <= 3072 and int(flight_row()['faces']) > 0)
+        check('distant towers are excluded from the sign set', int(flight_row()['far']) > 0)
+        capture('flight-signs')
+        send('tap', 33)
+        until(lambda r: flight_row().get('returning') == 'false' and flight_row().get('on') == 'false', 'flight returns')
+        send('tap', 17)  # Explicit manual overview, so pointer input cannot restart orbit.
+        until(lambda r: r['moving'] == 'false', 'returned overview idle')
+        row = latest()
+        send('scroll', int(float(row['x'])+float(row['w'])/2), int(float(row['y'])+float(row['h'])/2), 20)
+        until(lambda r: int(flight_row()['faces']) == 0, 'distant overview has no face text')
+        check('far camera has no tower-face glyphs', int(flight_row()['faces']) == 0)
+        frame = int(latest()['frame'])
+        send('m', 4, 4, 'm', 5, 5)
+        check('flight off does not keep requesting animation', latest()['moving'] == 'false' and int(latest()['frame'])-frame <= 3)
+        close()
     if a.evidence: periodic()
 finally:
     close()

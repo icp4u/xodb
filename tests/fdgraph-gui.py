@@ -48,7 +48,6 @@ def check(label,truth):
     assert truth,label
 try:
     pids=json.loads(fixture.stdout.readline());check('fixture has two owned children',len(pids)==2)
-    expected=sum(len(list(Path(f'/proc/{pid}/fd').iterdir())) for pid in pids)
     os.environ['XODB_OVERVIEW_AUDIT']='1';os.environ['XODB_OVERVIEW_LAYOUT']='1'
     options=['--overview','--panel','galaxy','--redact']
     for pid in pids:options+=['--graph-pid',str(pid)]
@@ -60,6 +59,9 @@ try:
         if rows and int(rows[-1][0])>=2:break
         if not d.alive() or time.monotonic()>end:raise RuntimeError(text[-3000:])
         time.sleep(.05)
+    # Take the independent fd inventory after the fixture has reached its wait;
+    # immediately after fork a child may still own the control pipe's write end.
+    expected=sum(len(list(Path(f'/proc/{pid}/fd').iterdir())) for pid in pids)
     last=tuple(map(int,rows[-1]));check('actual collector scope excludes all other processes',last[1]==2 and last[6]==2)
     check('two complete snapshots preserve every fixture descriptor',last[2]==expected)
     check('UNIX socketpair link is present after metadata cache refresh',last[3]==1)
@@ -82,8 +84,7 @@ try:
     check('small scope starts unfolded, one star per process',stars()==2)
     until(lambda:any(f['stars']=='2' and int(f['strands'])>0 and f['drawn']==f['strands'] for f in frames()),'threads between the two owned stars')
     check('shared descriptors are drawn as threads between the stars',True)
-    until(lambda:frames()[-1]['moving']=='0','layout easing settles without traffic')
-    check('an untraced galaxy has no impulses and settles to idle',all(f['impulses']=='0' for f in frames()) and frames()[-1]['moving']=='0')
+    check('an idle untraced galaxy never requests animation',all(f['impulses']=='0' and f['moving']=='0' for f in frames()))
     d.keys('tap',46) # C: fold the two processes into their cgroup
     until(lambda:stars()==1,'C folds processes into one cgroup star')
     d.keys('tap',46) # C: back to process stars

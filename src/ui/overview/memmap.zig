@@ -225,7 +225,7 @@ pub const State = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const State, now: u64) bool {
-        if (self.look == .gibson) return self.city.camera.animating(now) or self.ease(now) < 1;
+        if (self.look == .gibson) return (self.city.camera.active and self.city.flight.active()) or self.city.camera.animating(now) or self.ease(now) < 1;
         return (self.ease(now) < 1 and (!self.viewport() or self.deep.changed())) or (self.look == .modern and self.deep.nav.active);
     }
     /// The DOS look blinks changed cells: redraw at the VGA blink rate.

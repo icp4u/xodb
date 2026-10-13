@@ -16,8 +16,9 @@ def start_scene(tool, seconds=30):
         if state['state'] == 'stopped':
             for thread in state['threads']:
                 reason = thread['reason']
-                # A helper's exit can stop the step that leaves the launch stop.
-                if reason == 'signal' and thread['signal'] == 17:  # SIGCHLD
+                # A helper's exit can stop the step that leaves the launch stop,
+                # and opening the GUI can resize the terminal the game shares.
+                if reason == 'signal' and thread['signal'] in (17, 28):  # SIGCHLD, SIGWINCH
                     continue
                 if reason not in ('none', 'exec', 'interrupt'):
                     raise RuntimeError('Startup stopped for inspection: ' + str((reason, thread['signal'])))

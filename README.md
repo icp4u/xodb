@@ -251,7 +251,7 @@ investigations. [Shared-session commands and examples](docs/SHARED_SESSIONS.md).
   Source files are capped at 1 MiB.
 - [Startup colors and presets](docs/THEMES.md); one adjustable divider, no saved layouts, docking or theme editor yet.
   Text starts at 16 UI units; independent text-size and accessibility controls still need work.
-- No reverse execution, replay, decompiler, or GPU tracing.
+- No reverse execution, replay, or GPU tracing. Pseudo-C is available through the optional persistent Ghidra sidecar or native x86-64 ELF worker.
   [Syscall timing](docs/SYSCALL_TIMING.md) is opt-in for selected x86-64 threads;
   [core debugging](docs/CORE_DEBUGGING.md) is read-only.
 - **License: GPLv3** System dependencies and their observed licenses

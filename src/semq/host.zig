@@ -11,6 +11,7 @@ const std = @import("std");
 const libc = @import("../c.zig").api;
 const Session = @import("../model/session.zig").Session;
 const adapter = @import("adapter.zig");
+const sidecar = @import("ghidra_sidecar.zig");
 pub const c = @cImport({
     @cInclude("xsq.h");
     @cInclude("xsq_report.h");
@@ -20,7 +21,7 @@ const Allocator = std.mem.Allocator;
 const page = std.heap.page_allocator;
 
 pub const banner = "static possibilities, not an observed execution";
-pub const how_to_build = "static analysis is opt-in: build the native Ghidra worker with `sh tools/ghx/build_ghidra.sh GHIDRA_CHECKOUT DIR && make -C tools/ghx GHIDRA_CPP=DIR/ghidra-src/Ghidra/Features/Decompiler/src/decompile/cpp OUT=DIR`, then start xodb with `--static-analysis DIR` (or XODB_STATIC_ANALYSIS=DIR)";
+pub const how_to_build = "set GHIDRA_HOME to a Ghidra installation with a JDK on PATH; xodb starts scripts/ghidra-sidecar on demand. The no-JVM x86-64 fallback is built with `sh tools/ghx/build_ghidra.sh GHIDRA_CHECKOUT DIR && make -C tools/ghx GHIDRA_CPP=DIR/ghidra-src/Ghidra/Features/Decompiler/src/decompile/cpp OUT=DIR`, then selected with `--static-analysis DIR`.";
 pub const default_deadline_ms: u32 = 60_000;
 pub const max_deadline_ms: u32 = 600_000;
 const max_function_bytes: u64 = 1 << 20;
@@ -87,6 +88,7 @@ pub const Function = struct {
 };
 
 pub const Reason = struct { code: []const u8, level: []const u8, detail: []const u8, address: ?u64 };
+pub const ProducerKind = enum { native, sidecar };
 
 /// The native worker's printed document.  Positions and addresses are kept
 /// exactly as exported: lines are 1-based, columns are byte offsets, and pc is
@@ -121,6 +123,9 @@ pub const Analysis = struct {
     schema_version: []const u8,
     level: []const u8,
     reasons: []const Reason,
+    producer_kind: ProducerKind,
+    producer_name: []const u8,
+    producer_version: []const u8,
     pseudocode: PseudoDocument = .{},
     graph: c.struct_xsq_graph = std.mem.zeroes(c.struct_xsq_graph),
     func: u32 = 0,
@@ -139,11 +144,16 @@ pub const Job = struct {
     id: u64,
     arena: std.heap.ArenaAllocator,
     function: Function,
-    toolchain: Toolchain,
+    producer_kind: ProducerKind = .native,
+    toolchain: ?Toolchain = null,
+    sidecar_socket: [:0]const u8 = "",
+    sidecar_starter: ?[:0]const u8 = null,
     image_path: [:0]const u8,
     outdir: [:0]const u8,
     deadline_ms: u32,
     cancel: *c.struct_xsq_cancel,
+    stop: std.atomic.Value(bool) = .init(false),
+    stage: std.atomic.Value(sidecar.Stage) = .init(.queued),
     thread: ?std.Thread = null,
     done: std.atomic.Value(bool) = .init(false),
     started_ms: u64,
@@ -155,10 +165,14 @@ pub const Job = struct {
         return !self.done.load(.acquire);
     }
     pub fn requestCancel(self: *Job) void {
+        self.stop.store(true, .release);
         c.xsq_cancel_request(self.cancel);
     }
     pub fn cancelRequested(self: *Job) bool {
-        return c.xsq_cancel_requested(self.cancel) != 0;
+        return self.stop.load(.acquire) or c.xsq_cancel_requested(self.cancel) != 0;
+    }
+    pub fn progress(self: *const Job) []const u8 {
+        return sidecar.stageText(self.stage.load(.acquire));
     }
     pub fn elapsedMs(self: *Job) u64 {
         return (if (self.done.load(.acquire)) self.finished_ms else nowMs()) -| self.started_ms;
@@ -179,45 +193,73 @@ pub const Job = struct {
     }
     fn run(self: *Job) void {
         self.work() catch |err| if (self.failure == null) self.fail("host_error", "{s}", .{@errorName(err)});
+        if (self.failure != null) self.stage.store(.failed, .release);
         self.finished_ms = nowMs();
         self.done.store(true, .release);
     }
     fn work(self: *Job) !void {
         const a = self.arena.allocator();
         if (libc.mkdir(self.outdir.ptr, 0o700) != 0) return self.fail("host_error", "cannot create the job directory", .{});
-        const line = try std.fmt.allocPrintSentinel(a, "DECOMPILE\tid=f\telf={s}\tentry=0x{x}\tsize=0x{x}\tname={s}", .{ self.image_path, self.function.key.entry, self.function.key.size, safeName(a, self.function.name) }, 0);
-        const request = c.struct_xghx_request{ .supervisor = self.toolchain.supervisor.ptr, .worker = self.toolchain.worker.ptr, .sleighhome = self.toolchain.sleigh.ptr, .outdir = self.outdir.ptr, .line = line.ptr, .deadline_ms = self.deadline_ms, .grace_ms = 250, .memory_mb = 4096 };
-        var outcome: c.struct_xghx_outcome = undefined;
-        const status = c.xghx_run(&request, self.cancel, &outcome);
-        const worker_status = std.mem.sliceTo(&outcome.status, 0);
-        const detail = std.mem.sliceTo(&outcome.detail, 0);
-        const pid: ?i64 = if (outcome.worker_pid > 0) outcome.worker_pid else null;
-        switch (status) {
-            c.XGHX_RESULT => {},
-            c.XGHX_CANCELLED => {
-                self.failure = .{ .code = "cancelled", .detail = "cancelled; the supervisor and its worker were stopped and reaped", .worker_pid = pid };
+        var export_path: []const u8 = undefined;
+        var bytes: []const u8 = undefined;
+        var worker_ms: f64 = 0;
+        if (self.producer_kind == .native) {
+            self.stage.store(.analyzing, .release);
+            const toolchain = self.toolchain.?;
+            const line = try std.fmt.allocPrintSentinel(a, "DECOMPILE\tid=f\telf={s}\tentry=0x{x}\tsize=0x{x}\tname={s}", .{ self.image_path, self.function.key.entry, self.function.key.size, safeName(a, self.function.name) }, 0);
+            const request = c.struct_xghx_request{ .supervisor = toolchain.supervisor.ptr, .worker = toolchain.worker.ptr, .sleighhome = toolchain.sleigh.ptr, .outdir = self.outdir.ptr, .line = line.ptr, .deadline_ms = self.deadline_ms, .grace_ms = 250, .memory_mb = 4096 };
+            var outcome: c.struct_xghx_outcome = undefined;
+            const status = c.xghx_run(&request, self.cancel, &outcome);
+            const worker_status = std.mem.sliceTo(&outcome.status, 0);
+            const detail = std.mem.sliceTo(&outcome.detail, 0);
+            const pid: ?i64 = if (outcome.worker_pid > 0) outcome.worker_pid else null;
+            switch (status) {
+                c.XGHX_RESULT => {},
+                c.XGHX_CANCELLED => {
+                    self.failure = .{ .code = "cancelled", .detail = "cancelled; the supervisor and its worker were stopped and reaped", .worker_pid = pid };
+                    return;
+                },
+                c.XGHX_HOST_DEADLINE => {
+                    self.failure = .{ .code = "worker_timeout", .detail = try std.fmt.allocPrint(a, "the supervisor exceeded the host bound of {d} ms and was stopped", .{self.deadline_ms}), .worker_pid = pid };
+                    return;
+                },
+                c.XGHX_SPAWN_FAILED => return self.fail("supervisor_failed", "could not start ghx_supervise (errno {d})", .{outcome.@"error"}),
+                else => {
+                    self.failure = .{ .code = "supervisor_failed", .detail = try std.fmt.allocPrint(a, "ghx_supervise ended without a result (wait status {d})", .{outcome.supervisor_status}), .worker_pid = pid };
+                    return;
+                },
+            }
+            if (!std.mem.eql(u8, worker_status, "ok")) {
+                const code: []const u8 = if (std.mem.eql(u8, worker_status, "timeout")) "worker_timeout" else if (std.mem.eql(u8, worker_status, "worker_died")) "worker_died" else if (std.mem.eql(u8, worker_status, "cancelled")) "cancelled" else if (std.mem.eql(u8, worker_status, "error")) "worker_refused" else "worker_failed";
+                var text: []const u8 = try a.dupe(u8, detail);
+                if (refusal(a, std.mem.sliceTo(&outcome.file, 0))) |cause| text = cause;
+                self.failure = .{ .code = code, .detail = text, .worker_status = try a.dupe(u8, worker_status), .worker_pid = pid };
                 return;
-            },
-            c.XGHX_HOST_DEADLINE => {
-                self.failure = .{ .code = "worker_timeout", .detail = try std.fmt.allocPrint(a, "the supervisor exceeded the host bound of {d} ms and was stopped", .{self.deadline_ms}), .worker_pid = pid };
+            }
+            export_path = try a.dupe(u8, std.mem.sliceTo(&outcome.file, 0));
+            bytes = readFile(a, export_path, max_export_bytes) catch |err| return self.fail("export_unreadable", "{s}", .{@errorName(err)});
+            worker_ms = outcome.ms;
+        } else {
+            var sidecar_failure: sidecar.Failure = undefined;
+            const outcome = sidecar.run(a, .{
+                .socket_path = self.sidecar_socket,
+                .starter = self.sidecar_starter,
+                .image_path = self.image_path,
+                .sha256 = &self.function.key.image_sha256,
+                .entry = self.function.key.entry,
+                .size = self.function.key.size,
+                .build_id = self.function.build_id,
+                .deadline_ms = self.deadline_ms,
+            }, &self.stop, &self.stage, &sidecar_failure) catch |err| {
+                if (err == error.SidecarFailed) self.failure = .{ .code = sidecar_failure.code, .detail = sidecar_failure.detail } else self.fail("sidecar_failed", "{s}", .{@errorName(err)});
                 return;
-            },
-            c.XGHX_SPAWN_FAILED => return self.fail("supervisor_failed", "could not start ghx_supervise (errno {d})", .{outcome.@"error"}),
-            else => {
-                self.failure = .{ .code = "supervisor_failed", .detail = try std.fmt.allocPrint(a, "ghx_supervise ended without a result (wait status {d})", .{outcome.supervisor_status}), .worker_pid = pid };
-                return;
-            },
+            };
+            export_path = try std.fmt.allocPrint(a, "{s}/sidecar-export.json", .{self.outdir});
+            const export_z = try a.dupeZ(u8, export_path);
+            try writeFile(export_z, outcome.document);
+            bytes = outcome.document;
+            worker_ms = outcome.elapsed_ms;
         }
-        if (!std.mem.eql(u8, worker_status, "ok")) {
-            const code: []const u8 = if (std.mem.eql(u8, worker_status, "timeout")) "worker_timeout" else if (std.mem.eql(u8, worker_status, "worker_died")) "worker_died" else if (std.mem.eql(u8, worker_status, "cancelled")) "cancelled" else if (std.mem.eql(u8, worker_status, "error")) "worker_refused" else "worker_failed";
-            var text: []const u8 = try a.dupe(u8, detail);
-            // The result file names the cause (entry_unmapped, instruction_refused, a crash, ...).
-            if (refusal(a, std.mem.sliceTo(&outcome.file, 0))) |cause| text = cause;
-            self.failure = .{ .code = code, .detail = text, .worker_status = try a.dupe(u8, worker_status), .worker_pid = pid };
-            return;
-        }
-        const export_path = try a.dupe(u8, std.mem.sliceTo(&outcome.file, 0));
-        const bytes = readFile(a, export_path, max_export_bytes) catch |err| return self.fail("export_unreadable", "{s}", .{@errorName(err)});
         if (self.cancelRequested()) return self.fail("cancelled", "cancelled after the export", .{});
         const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .max_value_len = max_export_bytes }) catch |err| return self.fail("export_unreadable", "{s}", .{@errorName(err)});
         try self.admit(a, doc);
@@ -228,7 +270,7 @@ pub const Job = struct {
             .xsg => |text| text,
         };
         const analysis = try page.create(Analysis);
-        analysis.* = .{ .arena = .init(page), .function = undefined, .artifact_id = "", .contract = "", .schema_version = "", .level = "", .reasons = &.{}, .export_path = "", .worker_ms = outcome.ms };
+        analysis.* = .{ .arena = .init(page), .function = undefined, .artifact_id = "", .contract = "", .schema_version = "", .level = "", .reasons = &.{}, .producer_kind = self.producer_kind, .producer_name = "", .producer_version = "", .export_path = "", .worker_ms = worker_ms };
         errdefer {
             analysis.destroy();
             page.destroy(analysis);
@@ -250,6 +292,9 @@ pub const Job = struct {
         analysis.contract = try keep.dupe(u8, str(doc, "contract") orelse "");
         analysis.schema_version = try keep.dupe(u8, str(doc, "schema_version") orelse "");
         analysis.export_path = try keep.dupe(u8, export_path);
+        const producer_doc = if (doc.object.get("producer")) |v| v else std.json.Value.null;
+        analysis.producer_name = try keep.dupe(u8, str(producer_doc, "kind") orelse if (self.producer_kind == .sidecar) "ghidra_java_sidecar" else "ghidra_native_decompiler");
+        analysis.producer_version = try keep.dupe(u8, str(producer_doc, "worker_version") orelse "unknown");
         const q = if (doc.object.get("qualification")) |v| v else std.json.Value.null;
         analysis.level = try keep.dupe(u8, str(q, "level") orelse "unknown");
         var reasons: std.ArrayList(Reason) = .empty;
@@ -259,6 +304,7 @@ pub const Job = struct {
         };
         analysis.reasons = reasons.items;
         analysis.pseudocode = try pseudoDocument(keep, doc);
+        self.stage.store(.ready, .release);
         self.analysis = analysis;
     }
     /// The export must describe the bytes the session holds and the function
@@ -522,8 +568,8 @@ pub const State = struct {
         return null;
     }
 
-    fn cached(self: *State, key: Key) ?*Analysis {
-        for (self.analyses.items) |analysis| if (analysis.function.key.eql(key)) return analysis;
+    fn cached(self: *State, key: Key, producer_kind: ProducerKind) ?*Analysis {
+        for (self.analyses.items) |analysis| if (analysis.producer_kind == producer_kind and analysis.function.key.eql(key)) return analysis;
         return null;
     }
 
@@ -593,35 +639,39 @@ pub const State = struct {
     /// The analysis of the function at `address`: cached, running, failed or
     /// newly started. One analysis runs at a time per session.
     pub fn request(self: *State, a: Allocator, session: *Session, address: u64, options: Options) !Status {
-        switch (try discover(a, self.toolchain_dir)) {
-            .unavailable => |u| return .{ .unavailable = u },
+        const use_sidecar = try sidecar.selected(a);
+        const producer_kind: ProducerKind = if (use_sidecar) .sidecar else .native;
+        if (!use_sidecar) switch (try discover(a, self.toolchain_dir)) {
+            .unavailable => |u| return .{ .unavailable = .{ .reason = u.reason, .detail = "Ghidra sidecar is not configured (set GHIDRA_HOME); the native worker is also unavailable" } },
             .ready => {},
-        }
-        if (session.target.arch() != .x86_64) return .{ .unavailable = .{ .reason = "unsupported_architecture", .detail = "the native worker exports x86-64 only" } };
+        };
+        if (!use_sidecar and session.target.arch() != .x86_64) return .{ .unavailable = .{ .reason = "unsupported_architecture", .detail = "the native worker exports x86-64 only; configure the Ghidra sidecar for this architecture" } };
         const function = try self.resolve(a, session, address);
         self.poll();
-        if (self.cached(function.key)) |analysis| return .{ .ready = analysis };
+        if (self.cached(function.key, producer_kind)) |analysis| return .{ .ready = analysis };
         if (self.job) |job| {
-            if (job.function.key.eql(function.key)) {
+            if (job.producer_kind == producer_kind and job.function.key.eql(function.key)) {
                 if (job.running()) return .{ .running = job };
                 if (job.failure != null and !options.retry) return .{ .failed = job };
             } else if (job.running()) return error.StaticAnalysisBusy;
         }
-        return .{ .running = try self.start(session, function, options) };
+        return .{ .running = try self.start(session, function, producer_kind, options) };
     }
 
-    fn start(self: *State, session: *Session, function: Function, options: Options) !*Job {
-        const toolchain = switch (try discover(page, self.toolchain_dir)) {
+    fn start(self: *State, session: *Session, function: Function, producer_kind: ProducerKind, options: Options) !*Job {
+        const toolchain: ?Toolchain = if (producer_kind == .native) switch (try discover(page, self.toolchain_dir)) {
             .ready => |t| t,
             .unavailable => return error.StaticAnalysisUnavailable,
-        };
+        } else null;
         const dir = try self.privateDir();
-        const image_path = try std.fmt.allocPrintSentinel(page, "{s}/image-{s}.elf", .{ dir, &function.key.image_sha256 }, 0);
+        const module = try session.modules.at(function.runtime(function.key.entry));
+        if (!std.mem.eql(u8, &self.identity(module), &function.key.image_sha256)) return error.BinaryChangedDuringRead;
+        const original = try page.dupeZ(u8, function.module_path);
+        defer page.free(original);
+        const image_path = if (producer_kind == .sidecar and present(original)) try page.dupeZ(u8, function.module_path) else try std.fmt.allocPrintSentinel(page, "{s}/image-{s}.image", .{ dir, &function.key.image_sha256 }, 0);
         defer page.free(image_path);
         if (!present(image_path)) {
             // The worker reads exactly the bytes this session holds for the module.
-            const module = try session.modules.at(function.runtime(function.key.entry));
-            if (!std.mem.eql(u8, &self.identity(module), &function.key.image_sha256)) return error.BinaryChangedDuringRead;
             const temporary = try std.fmt.allocPrintSentinel(page, "{s}/.image-{s}.tmp", .{ dir, &function.key.image_sha256 }, 0);
             defer page.free(temporary);
             _ = libc.unlink(temporary.ptr);
@@ -637,11 +687,15 @@ pub const State = struct {
         errdefer c.xghx_cancel_free(flag);
         const job = try page.create(Job);
         errdefer page.destroy(job);
-        job.* = .{ .id = self.next_job, .arena = .init(page), .cancel = flag, .function = undefined, .toolchain = undefined, .image_path = undefined, .outdir = undefined, .deadline_ms = std.math.clamp(options.deadline_ms, 100, max_deadline_ms), .started_ms = nowMs(), .owner = options.owner };
+        job.* = .{ .id = self.next_job, .arena = .init(page), .cancel = flag, .function = undefined, .producer_kind = producer_kind, .image_path = undefined, .outdir = undefined, .deadline_ms = std.math.clamp(options.deadline_ms, 100, max_deadline_ms), .started_ms = nowMs(), .owner = options.owner };
         errdefer job.arena.deinit();
         const a = job.arena.allocator();
         job.function = try function.dupe(a);
-        job.toolchain = .{ .dir = try a.dupe(u8, toolchain.dir), .supervisor = try a.dupeZ(u8, toolchain.supervisor), .worker = try a.dupeZ(u8, toolchain.worker), .sleigh = try a.dupeZ(u8, toolchain.sleigh) };
+        if (toolchain) |native| job.toolchain = .{ .dir = try a.dupe(u8, native.dir), .supervisor = try a.dupeZ(u8, native.supervisor), .worker = try a.dupeZ(u8, native.worker), .sleigh = try a.dupeZ(u8, native.sleigh) };
+        if (producer_kind == .sidecar) {
+            job.sidecar_socket = try sidecar.socketPath(a);
+            job.sidecar_starter = try sidecar.starterPath(a);
+        }
         job.image_path = try a.dupeZ(u8, image_path);
         job.outdir = try std.fmt.allocPrintSentinel(a, "{s}/job-{d}", .{ dir, self.next_job }, 0);
         job.thread = try std.Thread.spawn(.{}, Job.run, .{job});

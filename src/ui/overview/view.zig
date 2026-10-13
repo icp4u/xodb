@@ -146,7 +146,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { classic: win95.Action, classic_page: i32, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
+    pub const Action = union(enum) { classic: win95.Action, classic_page: i32, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_cluster: u64, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -847,6 +847,7 @@ pub const View = struct {
             .treemap_up => self.treemap.up(),
             .treemap_holder => @import("treemap_panel.zig").holder(self),
             .graph_star => |index| self.graph.focusStar(index),
+            .graph_cluster => |cluster_key| self.graph.camera_cluster = if (self.graph.camera_cluster == cluster_key) null else cluster_key,
             .graph_resource => |node| @import("graph_panel.zig").openResource(self, node),
             .graph_all => self.graph.all(),
             .graph_files => if (self.graph.focus) |id| {
@@ -1319,7 +1320,7 @@ pub const View = struct {
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
-            const hints = if (self.panel == .memory_map and self.memmap.look == .gibson) "WASD move  drag orbit  wheel zoom  f fly  r reset  h height  c colour  g legend  click details  o process" else if (self.panel == .memory_map and self.memmap.look == .modern and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  p pause" else if (self.panel == .memory_map and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
+            const hints = if (self.panel == .memory_map and self.memmap.look == .gibson) "WASD move  drag orbit  wheel zoom  f orbit/flight  r reset  h height  c colour  g legend  click details  o process" else if (self.panel == .memory_map and self.memmap.look == .modern and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  p pause" else if (self.panel == .memory_map and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
             try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
         }
     }

@@ -242,7 +242,7 @@ pub const Gpu = struct {
         self.point_pipeline = try pipeline(self.ctx, desc);
         desc.vert = &glyph;
         desc.stride = @sizeOf(types.Glyph);
-        desc.attributes = 4;
+        desc.attributes = 6;
         desc.additive = false;
         self.glyph_pipeline = try pipeline(self.ctx, desc);
         self.blur_pipeline = try pipeline(self.ctx, .{ .vert = &post, .frag = &blur, .pass = self.post_pass, .layout = self.post_layout, .blend = false });
@@ -494,7 +494,7 @@ fn pipeline(ctx: Context, desc: Pipeline) !c.VkPipeline {
     stages[1].module = frag;
     stages[1].pName = "main";
     const binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = desc.stride, .inputRate = c.VK_VERTEX_INPUT_RATE_INSTANCE };
-    var attrs: [4]c.VkVertexInputAttributeDescription = undefined;
+    var attrs: [6]c.VkVertexInputAttributeDescription = undefined;
     for (&attrs, 0..) |*attr, i| attr.* = .{ .location = @intCast(i), .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @intCast(i * 16) };
     var vertex = info(c.VkPipelineVertexInputStateCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO);
     vertex.vertexBindingDescriptionCount = if (desc.stride > 0) 1 else 0;

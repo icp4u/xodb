@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+# Start, inspect, or stop xodb's per-user persistent Ghidra JVM sidecar.
+set -euo pipefail
+umask 077
+
+usage() {
+    echo "usage: scripts/ghidra-sidecar start|status|stop" >&2
+    exit 2
+}
+
+[[ $# == 1 ]] || usage
+action=$1
+[[ $action == start || $action == status || $action == stop ]] || usage
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+source_file=$script_dir/../tools/ghx/sidecar/XodbGhidraSidecar.java
+ctl=$script_dir/helpers/ghidra_sidecar_ctl.py
+uid=$(id -u)
+runtime_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/xodb-$uid}
+socket=${XODB_GHIDRA_SOCKET:-$runtime_dir/.xodb.ghidra.s}
+lock=$socket.lock
+cache_dir=${XODB_GHIDRA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/xodb/ghidra-sidecar}
+state_dir=${XODB_GHIDRA_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/xodb/ghidra-sidecar}
+log=$state_dir/sidecar.log
+pid_file=$state_dir/sidecar.pid
+
+mkdir -p -- "$runtime_dir" "$cache_dir" "$state_dir"
+chmod 0700 -- "$runtime_dir" "$cache_dir" "$state_dir"
+
+hello() {
+    "$ctl" hello "$socket" --timeout 2 2>/dev/null
+}
+
+socket_is_ours() {
+    [[ ! -e $socket && ! -L $socket ]] && return 0
+    local owner
+    owner=$(stat -c %u -- "$socket" 2>/dev/null || echo -1)
+    [[ $owner == "$uid" ]] || {
+        echo "ghidra-sidecar: refusing endpoint owned by uid $owner: $socket" >&2
+        return 1
+    }
+}
+
+stop_recorded() {
+    [[ -f $pid_file ]] || return 1
+    local pid owner command
+    read -r pid <"$pid_file"
+    [[ $pid =~ ^[1-9][0-9]*$ && -d /proc/$pid ]] || return 1
+    owner=$(stat -c %u -- "/proc/$pid" 2>/dev/null || echo -1)
+    [[ $owner == "$uid" ]] || return 1
+    command=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    [[ $command == *XodbGhidraSidecar* ]] || return 1
+    kill "$pid" 2>/dev/null || return 1
+    for _ in {1..100}; do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.02; done
+    return 1
+}
+
+# After an acknowledged shutdown the JVM still closes its project; "stopped"
+# means the recorded process is gone, not only that its socket is.
+wait_recorded_exit() {
+    [[ -f $pid_file ]] || return 0
+    local pid
+    read -r pid <"$pid_file"
+    [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
+    local command
+    command=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    # An exiting process has an empty command line; any other name is not ours.
+    [[ -z $command || $command == *XodbGhidraSidecar* ]] || return 0
+    for _ in {1..250}; do
+        [[ -d /proc/$pid ]] || return 0
+        # Exited but not yet reaped by its parent: stopped all the same.
+        grep -qs '^State:[[:space:]]*Z' "/proc/$pid/status" && return 0
+        sleep 0.02
+    done
+    return 1
+}
+
+case $action in
+status)
+    [[ -e $socket ]] || { echo "ghidra-sidecar: not running (no socket at $socket)" >&2; exit 2; }
+    "$ctl" status "$socket" --timeout 2
+    exit $?
+    ;;
+stop)
+    socket_is_ours || exit 1
+    # Stopping what is not running is a success, so stop is idempotent.
+    if [[ ! -e $socket && ! -L $socket ]]; then
+        if stop_recorded; then echo "ghidra-sidecar: stopped the recorded sidecar"; else echo "ghidra-sidecar: not running"; fi
+        exit 0
+    fi
+    if "$ctl" shutdown "$socket" --timeout 2 || stop_recorded; then
+        for _ in {1..100}; do [[ ! -S $socket ]] && break; sleep 0.02; done
+        if [[ -S $socket ]]; then
+            socket_is_ours || exit 1
+            rm -f -- "$socket"
+        fi
+        wait_recorded_exit || { echo "ghidra-sidecar: the sidecar acknowledged shutdown but is still exiting" >&2; exit 1; }
+        exit 0
+    fi
+    echo "ghidra-sidecar: no owned answering or recorded sidecar at $socket" >&2
+    exit 1
+    ;;
+esac
+
+# xodb starts this script with stderr discarded; keep the reason for a failed
+# start (missing Ghidra or JDK, compile errors) in the log its message names.
+[[ /dev/stderr -ef /dev/null ]] && exec 2>>"$log"
+exec 9>"$lock"
+flock 9
+if hello; then
+    echo "ghidra-sidecar: already running at $socket"
+    exit 0
+fi
+
+# Replace one stale or incompatible endpoint while holding the start lock.
+if [[ -S $socket ]]; then
+    socket_is_ours || exit 1
+    "$ctl" shutdown "$socket" --timeout 2 >/dev/null 2>&1 || stop_recorded || true
+    for _ in {1..50}; do [[ ! -S $socket ]] && break; sleep 0.02; done
+fi
+if [[ -e $socket || -L $socket ]]; then
+    socket_is_ours || exit 1
+    rm -f -- "$socket"
+fi
+
+ghidra_home=${XODB_GHIDRA_HOME:-${GHIDRA_HOME:-}}
+if [[ -z $ghidra_home ]]; then
+    if command -v analyzeHeadless >/dev/null 2>&1; then
+        ghidra_home=$(CDPATH= cd -- "$(dirname -- "$(command -v analyzeHeadless)")/.." && pwd)
+    else
+        echo "ghidra-sidecar: Ghidra is missing; set GHIDRA_HOME or XODB_GHIDRA_HOME" >&2
+        exit 4
+    fi
+fi
+[[ -d $ghidra_home/Ghidra && -x $ghidra_home/support/analyzeHeadless ]] || {
+    echo "ghidra-sidecar: $ghidra_home is not a Ghidra installation; set GHIDRA_HOME or XODB_GHIDRA_HOME" >&2
+    exit 4
+}
+# GHIDRA_HOME is often a symlink; find does not descend into one.
+ghidra_home=$(CDPATH= cd -- "$ghidra_home" && pwd -P)
+java=${JAVA_HOME:+$JAVA_HOME/bin/}java
+javac=${JAVA_HOME:+$JAVA_HOME/bin/}javac
+command -v "$java" >/dev/null 2>&1 || { echo "ghidra-sidecar: JDK is missing; set JAVA_HOME or put java on PATH" >&2; exit 4; }
+command -v "$javac" >/dev/null 2>&1 || { echo "ghidra-sidecar: JDK compiler is missing; set JAVA_HOME or put javac on PATH" >&2; exit 4; }
+
+classpath_file=$cache_dir/classpath
+find "$ghidra_home" -type f -name '*.jar' -print | LC_ALL=C sort | paste -sd: - >"$classpath_file.tmp"
+mv -f -- "$classpath_file.tmp" "$classpath_file"
+classpath=$(cat -- "$classpath_file")
+classes=$cache_dir/classes
+class=$classes/XodbGhidraSidecar.class
+if [[ ! -f $class || $source_file -nt $class ]]; then
+    mkdir -p -- "$classes.tmp"
+    "$javac" -proc:none -cp "$classpath" -d "$classes.tmp" "$source_file"
+    rm -rf -- "$classes"
+    mv -- "$classes.tmp" "$classes"
+fi
+
+# Ghidra rejects a project path containing a dot-prefixed component.  The
+# project remains physically in the cache; this private runtime alias only
+# gives ProjectLocator an acceptable spelling for it.
+alias_root=/tmp/xodb-$uid
+mkdir -p -- "$alias_root"
+chmod 0700 -- "$alias_root"
+alias_id=$(printf '%s' "$cache_dir" | cksum | awk '{print $1}')
+project_alias=$alias_root/ghidra-cache-$alias_id
+if [[ -L $project_alias ]]; then
+    [[ $(readlink -f -- "$project_alias") == $(readlink -f -- "$cache_dir") ]] || rm -f -- "$project_alias"
+elif [[ -e $project_alias ]]; then
+    echo "ghidra-sidecar: cache alias is not a symlink: $project_alias" >&2
+    exit 1
+fi
+[[ -L $project_alias ]] || ln -s -- "$cache_dir" "$project_alias"
+
+xms=${XODB_GHIDRA_XMS:-128m}
+xmx=${XODB_GHIDRA_XMX:-4g}
+softmax=${XODB_GHIDRA_SOFT_MAX:-768m}
+# Generational ZGC keeps resident size equal to real use (the older mode maps
+# the heap several times), and the periodic collection plus short uncommit
+# delay hand an idle heap back within minutes.
+# Extra JVM options, split on spaces; they follow the defaults and so win.
+read -r -a java_opts <<<"${XODB_GHIDRA_JAVA_OPTS:-}"
+tmp_dir=$cache_dir/tmp
+mkdir -p -- "$tmp_dir"
+# The JVM must not inherit the start lock (fd 9), or every later start blocks.
+nohup setsid "$java" -Duser.home="$cache_dir/home" -Djava.awt.headless=true -Djava.io.tmpdir="$tmp_dir" \
+    -Xms"$xms" -Xmx"$xmx" -XX:+UseZGC -XX:+ZGenerational -XX:SoftMaxHeapSize="$softmax" \
+    -XX:ZCollectionInterval=60 -XX:ZUncommitDelay=60 "${java_opts[@]}" \
+    -cp "$classes:$classpath" XodbGhidraSidecar "$socket" "$project_alias" "$log" \
+    >>"$log" 2>&1 </dev/null 9>&- &
+pid=$!
+printf '%s\n' "$pid" >"$pid_file"
+if "$ctl" wait "$socket" --timeout "${XODB_GHIDRA_START_TIMEOUT:-45}"; then
+    echo "ghidra-sidecar: started pid $pid at $socket; log $log"
+    exit 0
+fi
+if kill -0 "$pid" 2>/dev/null; then kill "$pid" 2>/dev/null || true; fi
+echo "ghidra-sidecar: failed to start; see $log" >&2
+exit 1

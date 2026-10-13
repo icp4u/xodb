@@ -398,7 +398,7 @@ fn fixtureAnalysis(a: Allocator) !*host.Analysis {
     const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("adapter_fixture.json"), .{});
     const xsg = (try @import("adapter.zig").convert(a, doc, "00")).xsg;
     const analysis = try a.create(host.Analysis);
-    analysis.* = .{ .arena = .init(std.heap.page_allocator), .function = .{ .key = .{ .image_sha256 = @splat('0'), .entry = 0x4012e0, .size = 0x5b }, .name = "qx_alloc", .module_id = 1, .module_path = "/fixtures/qx-gcc-O2", .bias = 0, .bounds_source = "elf_symbol", .build_id = null }, .artifact_id = "fixture", .contract = "", .schema_version = "0.4.1", .level = "qualified", .reasons = &.{.{ .code = "tail_call_inferred", .level = "qualified", .detail = "", .address = null }}, .export_path = "", .worker_ms = 0 };
+    analysis.* = .{ .arena = .init(std.heap.page_allocator), .function = .{ .key = .{ .image_sha256 = @splat('0'), .entry = 0x4012e0, .size = 0x5b }, .name = "qx_alloc", .module_id = 1, .module_path = "/fixtures/qx-gcc-O2", .bias = 0, .bounds_source = "elf_symbol", .build_id = null }, .artifact_id = "fixture", .contract = "", .schema_version = "0.4.1", .level = "qualified", .reasons = &.{.{ .code = "tail_call_inferred", .level = "qualified", .detail = "", .address = null }}, .producer_kind = .native, .producer_name = "ghidra_native_decompiler", .producer_version = "fixture", .export_path = "", .worker_ms = 0 };
     var b = c.struct_xsq_load_budget{ .max_bytes = 0, .cancel = null };
     try std.testing.expect(c.xsq_load_buffer_budget(xsg.ptr, xsg.len, &b, &analysis.graph) == c.XSQ_OK);
     return analysis;

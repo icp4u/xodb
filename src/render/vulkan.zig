@@ -27,9 +27,11 @@ const cell_offset = vertex_bytes + fonts.atlas_size * fonts.atlas_size;
 const cloud_vertex_offset = cell_offset + cell_capacity * @sizeOf(Cell);
 const cloud_vertex_bytes = 4 * 1024 * 1024;
 const cloud_cell_offset = cloud_vertex_offset + cloud_vertex_bytes;
-pub const buffer_bytes = cloud_cell_offset + 22000 * @sizeOf(Cell);
+const cloud_stride = cloud_vertex_bytes + 22000 * @sizeOf(Cell);
+pub const CloudSlot = u1;
+pub const buffer_bytes = cloud_vertex_offset + 2 * cloud_stride;
 /// A run of cells drawn after the vertices recorded before it, clipped to `clip`.
-const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect, cloud: bool = false, additive: bool = false, transform: [4]f32 = .{ 1, 1, 0, 0 } };
+const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect, cloud: ?CloudSlot = null, additive: bool = false, transform: [4]f32 = .{ 1, 1, 0, 0 } };
 fn info(comptime T: type, kind: c.VkStructureType) T {
     var v = std.mem.zeroes(T);
     v.sType = kind;
@@ -110,9 +112,9 @@ pub const Renderer = struct {
     cell_pipeline: c.VkPipeline = null,
     glow_pipeline: c.VkPipeline = null,
     glow_cell_pipeline: c.VkPipeline = null,
-    cloud_signature: u64 = 0,
-    cloud_vertices: u32 = 0,
-    cloud_cells: u32 = 0,
+    /// Independent retained regions: views explicitly own a slot, so drawing
+    /// a second graph cannot overwrite an earlier batch in the same frame.
+    clouds: [2]struct { signature: u64 = 0, vertices: u32 = 0, cells: u32 = 0 } = @splat(.{}),
     layout: c.VkPipelineLayout = null,
     descriptor_layout: c.VkDescriptorSetLayout = null,
     descriptor_pool: c.VkDescriptorPool = null,
@@ -789,6 +791,13 @@ pub const Renderer = struct {
     /// Screen-sized glyphs anchored in world space, using the ordinary shaped
     /// glyph cache and atlas. The GPU projects the anchor and depth-tests them.
     pub fn sceneText(self: *Renderer, font: *fonts.Font, anchor: [3]f32, offset: [2]f32, str: []const u8, color: Color) !void {
+        return self.sceneTextBasis(font, anchor, offset, str, color, null);
+    }
+    /// World-space glyph quads on a surface, with one world vector per font pixel.
+    pub fn sceneSurfaceText(self: *Renderer, font: *fonts.Font, anchor: [3]f32, right: [3]f32, down: [3]f32, str: []const u8, color: Color) !void {
+        return self.sceneTextBasis(font, anchor, .{ 0, 0 }, str, color, .{ right, down });
+    }
+    fn sceneTextBasis(self: *Renderer, font: *fonts.Font, anchor: [3]f32, offset: [2]f32, str: []const u8, color: Color, basis: ?[2][3]f32) !void {
         if (!self.scene_requested) return error.SceneNotRecorded;
         if (str.len > 4096) return error.SceneTextLimit;
         const run = shapeRun(font, str);
@@ -800,7 +809,9 @@ pub const Renderer = struct {
             const pos = run.positions[i];
             const g = font.glyph(run.glyphs[i].codepoint) catch try font.glyph(0);
             glyphs.set(first + i, .{
-                .anchor = .{ anchor[0], anchor[1], anchor[2], 1 },
+                .anchor = .{ anchor[0], anchor[1], anchor[2], if (basis == null) 1 else 0 },
+                .right = if (basis) |b| .{ b[0][0], b[0][1], b[0][2], 0 } else @splat(0),
+                .down = if (basis) |b| .{ b[1][0], b[1][1], b[1][2], 0 } else @splat(0),
                 .rect = .{ deviceSnap(self, pen + fontMetric(font, pos.x_offset) + glyphMetric(font, g.left)), deviceSnap(self, offset[1] + 16 - glyphMetric(font, g.top) - fontMetric(font, pos.y_offset)), glyphMetric(font, g.w), glyphMetric(font, g.h) },
                 .uv = .{ @as(f32, @floatFromInt(g.x)) / fonts.atlas_size, @as(f32, @floatFromInt(g.y)) / fonts.atlas_size, @as(f32, @floatFromInt(g.w)) / fonts.atlas_size, @as(f32, @floatFromInt(g.h)) / fonts.atlas_size },
                 .color = color,
@@ -882,26 +893,25 @@ pub const Renderer = struct {
     /// Retain static galaxy geometry in a separate mapped region. begin() has
     /// waited for the single in-flight fence; subsequent frames need no upload.
     /// The transient vertices since `first` must contain only cloud geometry.
-    pub fn retainCloud(self: *Renderer, first: usize, points: []const Cell, signature: u64) !void {
+    pub fn retainCloud(self: *Renderer, slot: CloudSlot, first: usize, points: []const Cell, signature: u64) !void {
         const count = self.vertices - first;
         const bytes = count * @sizeOf(Vertex);
         if (bytes > cloud_vertex_bytes or points.len > 22000) return error.VertexBufferFull;
         const mapped: [*]u8 = @ptrCast(self.mapped.?);
-        @memcpy(mapped[cloud_vertex_offset..][0..bytes], mapped[first * @sizeOf(Vertex) ..][0..bytes]);
-        @memcpy(mapped[cloud_cell_offset..][0 .. points.len * @sizeOf(Cell)], std.mem.sliceAsBytes(points));
+        const offset = @as(usize, slot) * cloud_stride;
+        @memcpy(mapped[cloud_vertex_offset + offset ..][0..bytes], mapped[first * @sizeOf(Vertex) ..][0..bytes]);
+        @memcpy(mapped[cloud_cell_offset + offset ..][0 .. points.len * @sizeOf(Cell)], std.mem.sliceAsBytes(points));
         self.vertices = first;
-        self.cloud_vertices = @intCast(count);
-        self.cloud_cells = @intCast(points.len);
-        self.cloud_signature = signature;
+        self.clouds[slot] = .{ .vertices = @intCast(count), .cells = @intCast(points.len), .signature = signature };
     }
     pub fn glowingCells(self: *Renderer, n: usize) ![]Cell {
         const points = try self.cells(n);
         if (n > 0) self.batches[self.batch_count - 1].additive = true;
         return points;
     }
-    pub fn cloud(self: *Renderer, transform: [4]f32, additive: bool) !void {
+    pub fn cloud(self: *Renderer, slot: CloudSlot, transform: [4]f32, additive: bool) !void {
         if (self.batch_count == self.batches.len) return error.VertexBufferFull;
-        self.batches[self.batch_count] = .{ .at = self.vertices, .first = 0, .count = self.cloud_cells, .clip = self.clip, .cloud = true, .additive = additive, .transform = transform };
+        self.batches[self.batch_count] = .{ .at = self.vertices, .first = 0, .count = self.clouds[slot].cells, .clip = self.clip, .cloud = slot, .additive = additive, .transform = transform };
         self.batch_count += 1;
     }
     /// Fraction of this frame's vertex buffer already used (0..1).
@@ -1080,19 +1090,19 @@ pub const Renderer = struct {
             if (x1 <= x0 or y1 <= y0) continue;
             const clip = c.VkRect2D{ .offset = .{ .x = x0, .y = y0 }, .extent = .{ .width = @intCast(x1 - x0), .height = @intCast(y1 - y0) } };
             c.vkCmdSetScissor(self.command, 0, 1, &clip);
-            if (b.cloud) {
+            if (b.cloud) |slot| {
                 const transformed = [6]f32{ size[0], size[1], b.transform[0], b.transform[1], b.transform[2], b.transform[3] };
                 c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(transformed)), &transformed);
                 c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (b.additive) self.glow_pipeline else self.pipeline);
-                const cloud_at: u64 = cloud_vertex_offset;
+                const cloud_at: u64 = cloud_vertex_offset + @as(u64, slot) * cloud_stride;
                 c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &cloud_at);
-                c.vkCmdDraw(self.command, self.cloud_vertices, 1, 0, 0);
+                c.vkCmdDraw(self.command, self.clouds[slot].vertices, 1, 0, 0);
             }
             c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (b.additive) self.glow_cell_pipeline else self.cell_pipeline);
-            const cells_at: u64 = if (b.cloud) cloud_cell_offset else cell_offset;
+            const cells_at: u64 = if (b.cloud) |slot| cloud_cell_offset + @as(u64, slot) * cloud_stride else cell_offset;
             c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &cells_at);
             c.vkCmdDraw(self.command, 6, b.count, 0, b.first);
-            if (b.cloud) c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
+            if (b.cloud != null) c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
             c.vkCmdSetScissor(self.command, 0, 1, &scissor);
             c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
             c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
@@ -1175,18 +1185,27 @@ test "retained cloud survives transient reuse and carries its own transform and 
     var renderer = Renderer{ .mapped = bytes.ptr, .clip = .{ .x = 0, .y = 0, .w = 100, .h = 100 } };
     try renderer.rect(.{ .x = 2, .y = 3, .w = 4, .h = 5 }, .{ 1, 0, 0, 1 });
     const cell = Cell{ .rect = .{ 2, 3, 1, 1 }, .fill = .{ 255, 0, 0, 255 }, .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
-    try renderer.retainCloud(0, &.{cell}, 7);
+    try renderer.retainCloud(0, 0, &.{cell}, 7);
     try std.testing.expectEqual(@as(usize, 0), renderer.vertices);
-    try std.testing.expectEqual(@as(u32, 6), renderer.cloud_vertices);
-    try std.testing.expectEqual(@as(u64, 7), renderer.cloud_signature);
+    try std.testing.expectEqual(@as(u32, 6), renderer.clouds[0].vertices);
+    try std.testing.expectEqual(@as(u64, 7), renderer.clouds[0].signature);
     try renderer.rect(.{ .x = 20, .y = 30, .w = 4, .h = 5 }, .{ 0, 1, 0, 1 });
     const retained: *const Vertex = @ptrCast(@alignCast(bytes.ptr + cloud_vertex_offset));
     try std.testing.expectEqual([2]f32{ 2, 3 }, retained.position);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cell), bytes[cloud_cell_offset..][0..@sizeOf(Cell)]);
-    try renderer.cloud(.{ 1.5, 1, 10, 20 }, true);
+    try renderer.cloud(0, .{ 1.5, 1, 10, 20 }, true);
     const batch = renderer.batches[0];
-    try std.testing.expect(batch.cloud and batch.additive and batch.at == 6 and batch.count == 1);
+    try std.testing.expect(batch.cloud == 0 and batch.additive and batch.at == 6 and batch.count == 1);
     try std.testing.expectEqual([4]f32{ 1.5, 1, 10, 20 }, batch.transform);
+    try renderer.rect(.{ .x = 40, .y = 30, .w = 4, .h = 5 }, .{ 0, 0, 1, 1 });
+    try renderer.retainCloud(1, 6, &.{cell}, 9);
+    try renderer.cloud(1, .{ 1, 1, 0, 0 }, false);
+    try std.testing.expectEqual([2]f32{ 2, 3 }, retained.position);
+    const second: *const Vertex = @ptrCast(@alignCast(bytes.ptr + cloud_vertex_offset + cloud_stride));
+    try std.testing.expectEqual([2]f32{ 40, 30 }, second.position);
+    try std.testing.expectEqual(@as(u64, 7), renderer.clouds[0].signature);
+    try std.testing.expectEqual(@as(u64, 9), renderer.clouds[1].signature);
+    try std.testing.expect(renderer.batches[0].cloud == 0 and renderer.batches[1].cloud == 1);
 }
 
 test "empty text is safe with the bitmap font" {

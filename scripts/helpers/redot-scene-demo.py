@@ -16,7 +16,7 @@ def main():
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, interrupted)
     path = sys.argv[sys.argv.index('--session-socket') + 1]
-    child = subprocess.Popen([sys.argv[1], '--agent-scope', 'control', '--redot-debugger', *sys.argv[2:]], stdin=subprocess.DEVNULL)
+    child = subprocess.Popen([sys.argv[1], '--agent-scope', os.environ.get('XODB_DEMO_SCOPE', 'control'), '--redot-debugger', *sys.argv[2:]], stdin=subprocess.DEVNULL)
     connection = socket.socket(socket.AF_UNIX)
     stream = None
     sequence = 0

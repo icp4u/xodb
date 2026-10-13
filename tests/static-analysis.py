@@ -33,6 +33,7 @@ built here. Cases:
 import argparse, importlib.util, json, os, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 root = Path(__file__).resolve().parents[1]; os.chdir(root)
+os.environ['XODB_GHIDRA_SIDECAR'] = 'off'  # native-worker test: never select or start a Ghidra sidecar
 sys.path.insert(0, str(root / 'tests'))
 from client import Client
 

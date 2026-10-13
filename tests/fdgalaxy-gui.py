@@ -92,12 +92,16 @@ try:
     overlaps=re.findall(r'overview layout .*panel=galaxy overlaps=(\d+)',Path(d.log).read_text(errors='replace'))
     check('labels do not overlap each other or the text rows',bool(overlaps) and all(int(n)==0 for n in overlaps))
 
+    count=len(looks())
     d.keys('m',*point('cluster'))
-    until(lambda:float(looks()[-1]['zoom'])>1.05,'hover camera zoom')
+    until(lambda:len(looks())>count,'hover frame')
+    check('hover does not move the cloud under the pointer',all(float(row['zoom'])==1 and row['camera']=='0' for row in looks()[count:]))
+    d.keys('click',*point('cluster'))
+    until(lambda:float(looks()[-1]['zoom'])>1.05,'selected camera zoom')
     until(lambda:looks()[-1]['camera']=='0','camera settles')
     d.shot('camera')
     check('camera eases through intermediate zooms',len({f['zoom'] for f in looks() if 1<float(f['zoom'])<1.3})>1)
-    d.keys('m',220,740) # inside the app, outside the cloud field
+    d.keys('click',*point('cluster')) # toggle explicit selection off
     until(lambda:looks()[-1]['camera']=='0' and float(looks()[-1]['zoom'])==1,'camera returns')
     d.keys('m',*point('thread'))
     until(lambda:looks()[-1]['thread']!='4294967295','hoverable thread')

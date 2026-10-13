@@ -20,6 +20,7 @@ caller offers that caller's ops and answers.
 import importlib.util, json, os, subprocess, sys, time
 from pathlib import Path
 root = Path(__file__).resolve().parents[1]; os.chdir(root)
+os.environ['XODB_GHIDRA_SIDECAR'] = 'off'  # native-worker test: never select or start a Ghidra sidecar
 spec = importlib.util.spec_from_file_location('input_repro', root / 'tests/helpers/input.py')
 h = importlib.util.module_from_spec(spec); spec.loader.exec_module(h)
 work_base = Path(os.environ.get('XODB_TEST_TMPDIR', root)) / '.work'  # the input helper only runs under a .work directory

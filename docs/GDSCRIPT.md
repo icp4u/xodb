@@ -302,6 +302,15 @@ Click a node (or use arrows) to see its script and properties, including
 engine properties such as a Node2D's `position`. **Tab** changes keyboard
 focus, the wheel scrolls either pane, **P** shows properties, **S** shows
 Signal-valued properties, **R** refreshes, and **U** or **Esc** closes.
+**G** opens the scene galaxy on the same snapshot: nodes are stars, scene/script
+identities are clusters, and parent-child relations are directed threads. Click
+a star to return to its object inspector, or **G** to return to the tree. Hover
+does not move the camera; cluster-centre clicks explicitly focus the view.
+The view shows up to 1024 nodes and reports any omitted tail. Signal connections
+and emissions are unavailable from this protocol, explicitly labelled, and never
+inferred from topology or Signal-valued properties. Static scene edges do not
+produce activity impulses. **R** requests a fresh engine snapshot; no target
+reads or protocol requests happen while drawing.
 Properties use one line each, with script members first and engine category
 placeholders hidden. **/** captures a filter (Enter/Esc finishes editing).
 Click a container row to expand its retained nested entries. Expansion is

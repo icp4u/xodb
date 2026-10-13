@@ -281,6 +281,7 @@ pub const View = struct {
     signature: []const u8 = "",
     pseudo_language: []const u8 = "",
     pseudo_printer: []const u8 = "",
+    pseudo_producer: []const u8 = "",
     pseudo_token_status: []const u8 = "",
     pseudo_map_status: []const u8 = "",
     pseudo_qualification: []const u8 = "",
@@ -433,8 +434,10 @@ pub const Capture = struct {
             .running => |job| {
                 view.status = .pending;
                 view.job_id = job.id;
-                view.title = try std.fmt.allocPrint(a, "Analysing {s} (0x{x}, {d} bytes) with the supervised Ghidra worker: {d} ms of {d} ms", .{ job.function.name, job.function.runtime(job.function.key.entry), job.function.key.size, job.elapsedMs(), job.deadline_ms });
-                view.detail = "The worker is a separate process tree, never the target; X cancels it";
+                // Stage and elapsed time lead: the pane is narrow and cuts the tail.
+                const elapsed = job.elapsedMs();
+                view.title = try std.fmt.allocPrint(a, "{s} {d}.{d} s of {d} s: {s} (0x{x}, {d} bytes)", .{ job.progress(), elapsed / 1000, elapsed % 1000 / 100, job.deadline_ms / 1000, job.function.name, job.function.runtime(job.function.key.entry), job.function.key.size });
+                view.detail = if (job.producer_kind == .sidecar) "Persistent Ghidra JVM sidecar; the debugger stays usable and X cancels this request" else "The native worker is a separate process tree, never the target; X cancels it";
             },
             .failed => |job| {
                 view.status = .failed;
@@ -468,9 +471,10 @@ pub const Capture = struct {
                     view.signature = document.signature;
                     view.pseudo_language = document.language;
                     view.pseudo_printer = document.printer;
+                    view.pseudo_producer = try std.fmt.allocPrint(a, "{s} {s}", .{ analysis.producer_name, analysis.producer_version });
                     view.pseudo_token_status = document.token_status;
                     view.pseudo_map_status = document.address_map_status;
-                    view.pseudo_qualification = try std.fmt.allocPrint(a, "qualification {s} / result_trust graph_{s}", .{ analysis.level, analysis.level });
+                    view.pseudo_qualification = try std.fmt.allocPrint(a, "{s}   qualification {s} / result_trust graph_{s}", .{ view.pseudo_producer, analysis.level, analysis.level });
                     view.pseudo_reasons = try std.fmt.allocPrint(a, "reasons {s}", .{reasons.items});
                     view.pseudo_tokens = tokens;
                     view.pseudo_cut = text_len != document.text.len or token_count != document.tokens.len;

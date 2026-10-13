@@ -169,7 +169,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const clip = ctx.r.clip;
     // Clouds may drift under the text rows; labels may not (see `rows`).
     ctx.r.clip = draw.intersect(clip, rect);
-    const counts = galaxy.render(v, ctx, field, body, rows[0..row_count], now) catch |err| {
+    const counts = @import("galaxy_descriptors.zig").render(v, ctx, field, body, rows[0..row_count], now) catch |err| {
         ctx.r.clip = clip;
         return err;
     };

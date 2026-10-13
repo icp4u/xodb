@@ -27,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
-    (('src/render/*', 'src/platform/*', 'src/ui/overview/*', 'tests/ui-scale-gui.py'), ('gui-galaxy-scale',)),
+    (('src/render/*', 'src/platform/*', 'src/ui/overview/*', 'tests/ui-scale-gui.py'), ('gui-galaxy-scale', 'gui-galaxy-churn')),
     (('tests/thread-language-tabs.py', 'tests/fixtures/thread-interpreters.c'), ('language-thread-tabs*', 'gui-language-thread-tabs')),
     (('src/redot/*', 'src/mcp/redot*', 'src/ui/redot*.zig', 'scripts/helpers/redot*', 'tests/fixtures/redot-time/*'), ('redot-*',)),
     (('src/debug/macho*', 'tests/macos-debug*', 'tests/macos-dwarf*', 'tests/macos-object*', 'tests/macos-unwind*', 'src/model/image_label.zig'), ('macos-debug*', 'macos-dwarf*', 'macos-unwind*', 'macos-names*', 'gui-macos-debug', 'proton-metadata*', 'pe-*', 'pdb-*')),
@@ -81,8 +81,9 @@ COVERS = (
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
     (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/static_view.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig',
-      'src/semq/host.zig', 'scripts/demo-decompile'),
-     ('static-analysis', 'gui-static-analysis')),
+      'src/semq/host.zig', 'src/semq/answer.zig', 'src/semq/ghidra_sidecar.zig', 'scripts/demo-decompile', 'scripts/ghidra-sidecar',
+      'scripts/helpers/ghidra_sidecar_ctl.py', 'tools/ghx/sidecar/*', 'tests/ghidra-sidecar*.py'),
+     ('static-analysis', 'ghidra-sidecar*', 'gui-static-analysis')),
     (('src/mcp/observation.zig', 'src/mcp/associations.zig', 'src/mcp/probes.zig', 'src/model/probes.zig',
       'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/model/invocation_view.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
     (('src/profile/*', 'src/mcp/profile.zig', 'src/mcp/sampled_stack.zig', 'src/mcp/archive.zig', 'src/mcp/comparison.zig',
@@ -124,8 +125,8 @@ COVERS = (
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
-    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-galaxy-scale',
-    'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-evidence',
+    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-galaxy-scale', 'gui-galaxy-churn',
+    'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-flight', 'gui-gibson-signs', 'gui-gibson-evidence',
     'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile', 'gui-fdgalaxy',
 }
 
@@ -456,7 +457,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release',
                      'comparison', 'scheduling-decode', 'observation-experiments',
                      'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
@@ -698,6 +699,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-files-selection', [sys.executable, '-B', 'tests/files-selection-gui.py'], 180))
         steps.append(('gui-fdgraph', [sys.executable, '-B', 'tests/fdgraph-gui.py', '--work-dir', '.work/fg'], 120))
         steps.append(('gui-fdgalaxy', [sys.executable, '-B', 'tests/fdgalaxy-gui.py', '--work-dir', '.work/fx'], 60))
+        steps.append(('gui-galaxy-churn', [sys.executable, '-B', 'tests/galaxy-churn-gui.py', '--work-dir', '.work/gc'], 60))
         steps.append(('gui-fdinherit', [sys.executable, '-B', 'tests/fdinherit-gui.py', '--work-dir', '.work/fi'], 120))
         steps.append(('gui-fdtreemap', [sys.executable, '-B', 'tests/fdtreemap-gui.py', '--work-dir', '.work/ft'], 120))
         steps.append(('gui-fdflow-denied', [sys.executable, '-B', 'tests/fdflow-gui.py', '--work-dir', '.work/ff', '--expect-denied'], 120))
@@ -709,6 +711,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-deepmap-evidence', [sys.executable, '-B', 'tests/deepmap-gui.py', '--evidence'], 120))
         steps.append(('gui-gibson', [sys.executable, '-B', 'tests/gibson-gui.py'], 60))
         steps.append(('gui-gibson-camera', [sys.executable, '-B', 'tests/gibson-camera.py'], 60))
+        steps.append(('gui-gibson-flight', [sys.executable, '-B', 'tests/gibson-camera.py', '--flight-only'], 60))
+        steps.append(('gui-gibson-signs', [sys.executable, '-B', 'tests/gibson-gui.py', '--flight-only'], 60))
         steps.append(('gui-gibson-evidence', [sys.executable, '-B', 'tests/gibson-gui.py', '--evidence'], 120))
         steps.append(('gui-scene3d', [sys.executable, '-B', 'tests/scene3d-gui.py'], 60))
         steps.append(('gui-scene3d-evidence', [sys.executable, '-B', 'tests/scene3d-gui.py', '--evidence'], 120))
@@ -732,6 +736,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-gui', [sys.executable, '-B', 'tests/go-gui.py', '--go', go, '--work', '.work/gog'], 180))
         if redot:
             steps.append(('redot-protocol-gui', [sys.executable, '-B', 'tests/redot-protocol-gui.py', '--redot', redot, '--work', '.work/rdg'], 90))
+            steps.append(('redot-galaxy-gui', [sys.executable, '-B', 'tests/redot-galaxy-gui.py', '--redot', redot, '--work', '.work/rgx'], 90))
             steps.append(('redot-time-gui', [sys.executable, '-B', 'tests/redot-time-gui.py', '--redot', redot, '--work', '.work/rtg'], 90))
             steps.append(('redot-time-demo-gui', [sys.executable, '-B', 'tests/redot-time-gui.py', '--demo', '--redot', redot, '--work', '.work/rtd'], 90))
             steps.append(('gdscript-gui', [sys.executable, '-B', 'tests/gdscript-gui.py', '--redot', redot, '--work', '.work/gdg'], 600))

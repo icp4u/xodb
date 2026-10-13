@@ -3,12 +3,13 @@
 ## Pseudo-C beside a live stop
 
 ```sh
-XODB_STATIC_ANALYSIS=/path/to/owned/ghx-build scripts/demo-decompile
+GHIDRA_HOME=/path/to/ghidra scripts/demo-decompile
+# or: XODB_STATIC_ANALYSIS=/path/to/owned/ghx-build scripts/demo-decompile
 ```
 
 The launcher builds `tests/fixtures/semq/qx.c` from source with gcc `-O2` and
 DWARF, then stops at `qx_alloc`. Press **Space**, then **D**. The middle pane
-shows the retained worker pseudo-C beside the real source, with syntax colours,
+shows retained Ghidra pseudo-C beside the real source, with syntax colours,
 the current instruction, breakpoints, and current DWARF values where a pseudo
 name can be matched. Click a pseudo-C line to select its exact exported PCs;
 the source follows only when the line table maps one of those PCs. **D** returns
@@ -67,7 +68,10 @@ For the engine's own scene view, run
 `REDOT=path/to/engine scripts/demo-redot scene`. Press **U**, select **Player**
 to inspect its script, inventory and Node2D properties; select **Arena**, then
 **S** to see its `tree_exiting` Signal value. **R** refreshes the retained
-snapshot. This cooperative view needs the game running; the pane labels its
+snapshot. Press **G** for the scene galaxy; click the **Player** star to land
+back in that object's inspector. Parent-child threads are real scene topology;
+the view explicitly labels signal connections/emissions as unavailable.
+This cooperative view needs the game running; the pane labels its
 source. See [the engine-view controls and limits](GDSCRIPT.md#engine-scene-tree-and-object-inspector).
 
 For frame time → script → native code, run

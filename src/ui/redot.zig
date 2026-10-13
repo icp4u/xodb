@@ -26,6 +26,8 @@ pub const Panel = struct {
     signals: bool = false,
     time: bool = false,
     time_panel: @import("redot_time.zig").Panel = .{},
+    galaxy_open: bool = false,
+    galaxy: ?*@import("redot_galaxy.zig").View = null,
     filtering: bool = false,
     filter: [128]u8 = @splat(0),
     filter_len: usize = 0,
@@ -36,6 +38,25 @@ pub const Panel = struct {
     visible: usize = 1,
     message: []const u8 = "",
     bounds: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+
+    pub fn deinit(self: *Panel) void {
+        if (self.galaxy) |view| std.heap.page_allocator.destroy(view);
+        self.galaxy = null;
+    }
+    pub fn moving(self: *const Panel) bool {
+        return self.open and self.galaxy_open and self.galaxy != null and self.galaxy.?.moving;
+    }
+    fn toggleGalaxy(self: *Panel) void {
+        if (self.galaxy == null) {
+            const view = std.heap.page_allocator.create(@import("redot_galaxy.zig").View) catch {
+                self.message = "Could not allocate the scene galaxy";
+                return;
+            };
+            view.* = .{};
+            self.galaxy = view;
+        }
+        self.galaxy_open = !self.galaxy_open;
+    }
 
     fn matchesProperty(self: *const Panel, property: protocol.Property) bool {
         const needle = self.filter[0..self.filter_len];
@@ -57,6 +78,7 @@ pub const Panel = struct {
 
     pub fn show(self: *Panel, adapter: *protocol.Adapter) void {
         self.open = true;
+        self.galaxy_open = false;
         self.message = "";
         adapter.requestScene() catch |err| {
             self.message = @errorName(err);
@@ -81,9 +103,10 @@ pub const Panel = struct {
         }
     }
     pub fn input(self: *Panel, w: *Window, adapter: *protocol.Adapter) void {
+        if (self.galaxy) |view| view.pointer = .{ w.pointer_x, w.pointer_y };
         if (w.scroll != 0) {
             self.inspector_focus = w.pointer_x >= self.bounds.x + self.bounds.w * 0.38;
-            self.wheel(adapter, w.scroll);
+            if (!self.galaxy_open) self.wheel(adapter, w.scroll);
             w.scroll = 0;
             w.dirty = true;
         }
@@ -105,6 +128,20 @@ pub const Panel = struct {
                 continue;
             }
             if (self.time and self.time_panel.input(event, &adapter.profiler, self.inspector_focus)) continue;
+            if (self.galaxy_open and event.kind == .button_press and event.code == 272) {
+                if (self.galaxy.?.select(event.x, event.y)) |id| {
+                    for (adapter.nodes, 0..) |node, i| if (node.object_id == id) {
+                        self.cursor = i;
+                        self.select(adapter);
+                        self.galaxy_open = false;
+                        self.signals = false;
+                        self.time = false;
+                        self.inspector_focus = true;
+                        break;
+                    };
+                }
+                continue;
+            }
             if (event.kind == .button_press and event.code == 272) {
                 const b = self.bounds;
                 self.inspector_focus = event.x >= b.x + b.w * 0.38;
@@ -130,17 +167,25 @@ pub const Panel = struct {
                 0xff55 => self.wheel(adapter, -@as(i32, @intCast(self.visible))),
                 0xff56 => self.wheel(adapter, @intCast(self.visible)),
                 keys.sym.tab => self.inspector_focus = !self.inspector_focus,
+                'g' => {
+                    self.time = false;
+                    self.filtering = false;
+                    self.toggleGalaxy();
+                },
                 's', 'p' => {
+                    self.galaxy_open = false;
                     self.time = false;
                     self.signals = event.shortcut == 's';
                     self.property_first = 0;
                     self.inspector_focus = true;
                 },
                 't' => {
+                    self.galaxy_open = false;
                     self.time = !self.time;
                     self.inspector_focus = true;
                 },
                 '/' => {
+                    self.galaxy_open = false;
                     self.filtering = true;
                     self.time = false;
                     self.signals = false;
@@ -167,8 +212,13 @@ pub const Panel = struct {
         const right = b.x + left + 16;
         const rw = b.w - left - 30;
         var buffer: [1024]u8 = undefined;
-        try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "REDOT / GODOT   U / Esc close   R refresh   Tab focus   P properties   S signals   T time   / filter", theme.text);
+        try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "REDOT / GODOT   U / Esc close   R refresh   G galaxy   P properties   S signals   T time   / filter", theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, try std.fmt.bufPrint(&buffer, "ENGINE DEBUGGER PROTOCOL / cooperative   {s}{s}   tree #{d}   object #{d}", .{ @tagName(view.state), if (view.scene_pending or view.object_pending) " / awaiting engine" else "", view.scene_revision, view.object_revision }), theme.weak);
+        if (self.galaxy_open) {
+            self.galaxy.?.selected_node = if (self.cursor < view.nodes.len) view.nodes[self.cursor].object_id else null;
+            try self.galaxy.?.render(r, font, b, view);
+            return;
+        }
         try r.rect(.{ .x = b.x + left, .y = b.y + 68, .w = 1, .h = @max(0, b.h - 112) }, theme.border);
         try r.textFit(font, b.x + 14, b.y + 72, left - 28, try std.fmt.bufPrint(&buffer, "SCENE TREE / {d} nodes{s}", .{ view.nodes.len, if (!self.inspector_focus) " / focused" else "" }), theme.good);
         self.visible = @intFromFloat(@max(1, (b.h - 158) / 28));

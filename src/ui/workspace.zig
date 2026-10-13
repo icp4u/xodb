@@ -170,6 +170,7 @@ pub const Workspace = struct {
 
     const LocalRow = debugger_view.LocalRow;
     pub fn deinit(self: *Workspace) void {
+        self.redot_panel.deinit();
         self.language_panel.deinit();
         self.runtime_type_panel.deinit();
         self.logical_frames.deinit();
@@ -1944,6 +1945,7 @@ pub const Workspace = struct {
         try self.static_panel.prepare(session, tid, self.selected_frame);
         try self.drawPrepared(r, font, w, self.prepared.value, @import("../model/workspace_view.zig").capture(session), @import("../model/language_view.zig").header(session), session.target.core != null);
         try self.redot_panel.draw(r, font, @floatFromInt(w.width), @floatFromInt(w.height), session.redot.snapshot());
+        self.animating = self.animating or self.redot_panel.moving();
     }
     pub fn timelineBounds(self: *const Workspace, w: *const Window) gpu.Rect {
         const height: f32 = @floatFromInt(w.height);

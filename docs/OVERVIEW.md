@@ -709,13 +709,28 @@ header keeps the publication age, refresh cadence, pending state, truncation
 and count of unknown and partial towers visible.
 
 **WASD** moves the camera, mouse drag and arrows orbit, the wheel or **+/-**
-zooms, **F** toggles automatic orbit and dolly, and **R** resets the camera.
+zooms, **F** cycles manual → automatic orbit → flight → manual, and **R** resets
+the camera to its original orbit.
 Held movement, arrow and zoom keys combine and ease over frame time; they do
 not depend on keyboard repeat. Releasing eases to rest; focus loss stops
 immediately and clears held keys. Automatic orbit pauses five seconds after
 the last key, click or pointer movement over the city, and the next one
 resumes it. Movement keys, drag and the wheel take manual control instead,
-and **F** switches orbit off until **F** or **R** starts it again.
+and F advances to the next camera mode. The title line names the current mode.
+
+The flight mode is street-level (or start directly with `--gibson-flight`). Auto-flight
+visits the largest district first, then tours the grid avenues. Arrows or a
+mouse drag take manual control: left/right queue turns at the next intersection;
+up/down change altitude, **+/-** adjust speed. Turns stay on safe integer avenues
+between tower footprints, with a slight camera bank. F again rises above the
+roofs and eases back to the saved pose in manual mode, with no idle animation.
+Flight pauses when the city loses input focus. R leaves flight and resets.
+
+Near towers carry world-space mapping-name signage, size near the base, and
+protection/residency/change facts on the adjacent camera-facing face. Unknown
+dirty data remains `?`. Signs fade with distance; at most 24 towers and 3072
+glyphs are considered, with no new per-frame collection allocation. Redaction
+removes both the face signs and floating district labels.
 These controls are local to Gibson: **D** moves right. Click a tower for the
 same block detail text as the 2D views; **Esc** clears the selection. **O**
 chooses a process. Selection is stored by address and cleared on process
@@ -735,8 +750,9 @@ retires its GPU buffers and attachments after the frame fence.
 ## Galaxy look preferences
 
 The descriptor galaxy starts unfolded with a 512-star budget (`+`/`-` changes
-it, up to 1024; `C` folds groups). Hover a cloud to ease the camera toward its
-cluster; leave the field to return. Hover a thread for directional byte rates
+it, up to 1024; `C` folds groups). Click a cloud centre to ease the camera toward
+its cluster; click the centre again to return. Hover never moves the camera.
+Hover a thread for directional byte rates
 and outlined endpoint tags. Unmeasured traffic is never animated as measured.
 
 `xodb --overview --config look.json --galaxy-demo 150` loads the explicit
@@ -749,6 +765,22 @@ cluster to the centre. See `config/preferences.example.json`.
 
 Cloud points and fibres are retained in GPU storage: impulse animation and
 camera transforms do not rebuild them. Layout, appearance and focus changes
-invalidate the retained cloud. Layout positions ease by process/group identity;
+invalidate the retained cloud. Layout positions ease by process/group identity
+in one bounded 100 ms transition per publication, at most 10 fps without camera
+motion or traffic. Sub-pixel and off-screen moves settle immediately. The old
+cloud is retained through that transition and replaced only once it settles;
 new identities appear at their new position. The classic skin keeps its plain
 rendering. Additive blending affects clouds and thread beads/tails, not text or other panes.
+
+The galaxy's bounded data model lives in `galaxy_model.zig`: stable node and
+cluster identities, weighted edges, directional interval pulses, optional parent
+clusters and detail points. Descriptor collection, kind colours, labels and
+selection routing live in `galaxy_descriptors.zig`; the renderer consumes a model
+and view-local motion state through adapter callbacks. The descriptor and seeded
+demo sources use the same adapter. Extracting this boundary does not change the
+layout, capacities or look.
+
+Two explicit retained-cloud slots let separate graph views queue geometry in one
+frame without overwriting each other. Each slot retains the existing 4 MiB vertex
+and 22,000-cell capacity; the second adds about 4.7 MiB of mapped renderer storage.
+Views must own different slots when they can appear together.
