@@ -924,6 +924,9 @@ pub const Session = struct {
         if (self.target.core != null) return;
         if (self.target.snapshot().state == .stopped and self.maps_generation != self.target.snapshot().generation) {
             if (self.maps_epoch != self.target.snapshot().image_epoch) {
+                // The eager importer may be reading an immutable module
+                // snapshot. Stop it before this epoch releases those bytes.
+                self.static_analysis.cancelWarmup();
                 const next_id = self.modules.next_id;
                 self.modules.deinit();
                 self.modules = Modules.init(std.heap.page_allocator);
@@ -1227,6 +1230,9 @@ pub const Session = struct {
         self.modules.discoverPe();
     }
     pub fn poll(self: *Session) !void {
+        // Declared first so it runs after the other deferred pollers, including
+        // the map refresh that discovers newly loaded images.
+        defer self.static_analysis.maintain(self);
         defer if (self.gdb_map.symbols.poll()) {
             self.metadata.revision +|= 1;
         };

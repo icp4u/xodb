@@ -3,6 +3,10 @@
 #include <sys/ptrace.h>
 #include "loongarch_step.h"
 
+int xrt_image_borrowed(const struct xrt_target *t)
+{
+    return t && t->vfork_release != 0;
+}
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address)
 {
     for (size_t i = 0; i < t->breakpoint_count; ++i)
@@ -300,7 +304,10 @@ enum xrt_status xrt_target_breakpoint_set(struct xrt_target *t, uint64_t address
     uint8_t original[4];
     struct xrt_probe_encoding encoding;
     TRY(prepare_probe(t, address, original, &encoding));
-    TRY(xrt_target_commit_plant(t, address, &encoding, original));
+    /* The record stays patched. VFORK_DONE writes the bytes once the child
+     * no longer shares the image. */
+    if (!xrt_image_borrowed(t))
+        TRY(xrt_target_commit_plant(t, address, &encoding, original));
     struct xrt_breakpoint p = {.id = t->next_probe_id, .enabled = true, .temporary = temporary};
     store_encoding(&p, address, original, &encoding, true);
     ++t->next_probe_id;
@@ -385,7 +392,7 @@ enum xrt_status xrt_target_breakpoint_resolve(struct xrt_target *t, uint64_t id,
     uint8_t original[4];
     struct xrt_probe_encoding encoding;
     TRY(prepare_probe(t, address, original, &encoding));
-    if (p->enabled)
+    if (p->enabled && !xrt_image_borrowed(t))
         TRY(xrt_target_commit_plant(t, address, &encoding, original));
     store_encoding(p, address, original, &encoding, p->enabled);
     ++t->generation;
@@ -434,7 +441,10 @@ enum xrt_status xrt_target_breakpoint_enable(struct xrt_target *t, uint64_t id, 
     struct xrt_breakpoint *p = &t->breakpoints[i];
     if (p->enabled == enabled)
         return XRT_OK;
-    if (!p->pending)
+    /* Enabling writes the trap. While a child borrows the image, mark the
+     * record and leave the bytes until VFORK_DONE. Disabling writes the
+     * original instruction, which is already what the shared image holds. */
+    if (!p->pending && !(enabled && xrt_image_borrowed(t)))
         TRY(xrt_target_commit_owned(t, p->address, enabled ? p->planted : p->original,
                                     enabled ? p->original : p->planted, p->width));
     p->enabled = enabled;
@@ -617,6 +627,8 @@ static enum xrt_status ppc_atomic_restore(struct xrt_target *t, struct xrt_step 
 }
 static enum xrt_status ppc_atomic_plant(struct xrt_target *t, struct xrt_step *step)
 {
+    if (xrt_image_borrowed(t))
+        return XRT_UNSUPPORTED_CONTROL;
     uint8_t kept = 0;
     uint8_t i;
     for (i = 0; i < step->atomic_count; ++i) {
@@ -689,6 +701,11 @@ static void restore_rearm(struct xrt_target *t, uint64_t rearm)
     if (b < 0 || t->breakpoints[b].patched)
         return;
     struct xrt_breakpoint *p = &t->breakpoints[b];
+    if (xrt_image_borrowed(t)) {
+        p->patched = true;
+        xrt_sync_shared_patch(t, rearm, true);
+        return;
+    }
     if (xrt_target_commit_owned(t, p->address, p->planted, p->original, p->width) == XRT_OK) {
         p->patched = true;
         xrt_sync_shared_patch(t, rearm, true);
@@ -741,6 +758,8 @@ enum xrt_status xrt_software_plant(struct xrt_target *t, const uint64_t *pcs, ui
 {
     if (!t || !pcs || !ids || !owned || !count || count > 2)
         return XRT_INVALID_ARGUMENT;
+    if (xrt_image_borrowed(t))
+        return XRT_UNSUPPORTED_CONTROL;
     ids[0] = ids[1] = 0;
     owned[0] = owned[1] = 0;
     for (uint8_t i = 0; i < count; ++i) {
@@ -775,6 +794,9 @@ static enum xrt_status loongarch_software_begin(struct xrt_target *t, int32_t ti
 {
     TRY(xrt_target_settle_plant_cleanup(t, 0));
     TRY(xrt_rearm_inherited(t));
+    /* Successor traps would be written into the borrowed image. */
+    if (xrt_image_borrowed(t))
+        return XRT_UNSUPPORTED_CONTROL;
     if (t->state != XRT_STOPPED || t->stepping)
         return XRT_NOT_STOPPED;
     TRY(xrt_ensure_watches(t));
@@ -947,6 +969,8 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
     uint64_t rearm = 0;
     struct xrt_step atomic = {0};
     const int use_atomic = ppc_atomic_plan(t, tid, pc, &atomic);
+    if (use_atomic && xrt_image_borrowed(t))
+        return XRT_UNSUPPORTED_CONTROL;
     const int b = xrt_breakpoint_at(t, pc);
     if (b >= 0 && t->breakpoints[b].enabled) {
         struct xrt_breakpoint *p = &t->breakpoints[b];
@@ -960,9 +984,12 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
         const enum xrt_status planted = ppc_atomic_plant(t, &atomic);
         if (planted != XRT_OK) {
             (void)ppc_atomic_restore(t, &atomic);
-            if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address,
-                                               t->breakpoints[b].planted,
-                                               t->breakpoints[b].width) == XRT_OK) {
+            if (rearm && xrt_image_borrowed(t)) {
+                t->breakpoints[b].patched = true;
+                xrt_sync_shared_patch(t, rearm, true);
+            } else if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address,
+                                                      t->breakpoints[b].planted,
+                                                      t->breakpoints[b].width) == XRT_OK) {
                 t->breakpoints[b].patched = true;
                 xrt_sync_shared_patch(t, rearm, true);
             } else if (rearm) {
@@ -981,8 +1008,11 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
                   (uintptr_t)t->threads[i].signal);
     if (status != XRT_OK) {
         (void)ppc_atomic_restore(t, &atomic);
-        if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
-                                           t->breakpoints[b].width) == XRT_OK) {
+        if (rearm && xrt_image_borrowed(t)) {
+            t->breakpoints[b].patched = true;
+            xrt_sync_shared_patch(t, rearm, true);
+        } else if (rearm && xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                                  t->breakpoints[b].width) == XRT_OK) {
             t->breakpoints[b].patched = true;
             xrt_sync_shared_patch(t, rearm, true);
         }
@@ -1023,6 +1053,7 @@ enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed)
 {
     if (!t->stepping)
         return XRT_OK;
+    xrt_requeue_parked(t);
     const struct xrt_step step = t->step;
     uint8_t ai;
     for (ai = 0; ai < step.atomic_count; ++ai) {
@@ -1057,13 +1088,17 @@ enum xrt_status xrt_finish_step(struct xrt_target *t, bool completed)
         for (size_t i = 0; i < t->thread_count; ++i)
             live |= t->threads[i].state != XRT_EXITED;
         if (live) {
-            if (step.software) {
-                TRY(xrt_target_settle_plant_cleanup(t, 0));
-                TRY(xrt_target_commit_owned(t, t->breakpoints[b].address, t->breakpoints[b].planted,
-                                            t->breakpoints[b].original, t->breakpoints[b].width));
-            } else
-                TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
-                                          t->breakpoints[b].width));
+            /* The step lifted this probe. Put the record back now, and the
+             * bytes only when no child still shares the image. */
+            if (!xrt_image_borrowed(t)) {
+                if (step.software) {
+                    TRY(xrt_target_settle_plant_cleanup(t, 0));
+                    TRY(xrt_target_commit_owned(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                                t->breakpoints[b].original, t->breakpoints[b].width));
+                } else
+                    TRY(xrt_patch_instruction(t, t->breakpoints[b].address, t->breakpoints[b].planted,
+                                              t->breakpoints[b].width));
+            }
             t->breakpoints[b].patched = true;
             xrt_sync_shared_patch(t, step.rearm, true);
         }

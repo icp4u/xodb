@@ -6,7 +6,33 @@ Samples deliberately perturb wall time: no claim of per-node CPU accounting.
 import time
 
 
+def capture_status(tool, phase, completed=0, total=12, diagnostic=''):
+    return tool('set_redot_capture_status', generation=tool('get_session')['generation'],
+                phase=phase, completed=completed, total=total, diagnostic=diagnostic)
+
+
 def sample_time(tool, samples=12):
+    completed = 0
+
+    def progress(count):
+        nonlocal completed
+        completed = count
+        capture_status(tool, 'sampling', count, samples)
+
+    progress(0)
+    try:
+        collected = _sample_time(tool, samples, progress)
+        capture_status(tool, 'ready', len(collected), samples)
+        return collected
+    except Exception as error:
+        try:
+            capture_status(tool, 'failed', completed, samples, str(error))
+        except Exception:
+            pass  # Keep the original failure if the session itself disappeared.
+        raise
+
+
+def _sample_time(tool, samples, progress):
     deadline = time.monotonic() + 30
 
     def stopped():
@@ -53,9 +79,10 @@ def sample_time(tool, samples=12):
         tool('interrupt', generation=tool('get_session')['generation'])
         sample = capture()
         collected.append(sample)
+        progress(len(collected))
         tool('continue', generation=tool('get_session')['generation'])
-    if not collected:
-        raise RuntimeError('No native samples collected')
+    if len(collected) != samples:
+        raise RuntimeError(f'Sampling stopped: {len(collected)} of {samples} native samples collected')
     while time.monotonic() < deadline:
         profile = tool('get_redot_profile', frame_number=collected[-1]['frame_number'])
         if profile['selected'] is not None:

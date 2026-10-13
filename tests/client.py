@@ -7,6 +7,8 @@ import time
 from pathlib import Path
 from helpers.exact import assert_reply_exact
 from helpers.tasks import children as task_children
+# Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
+os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
 class Client:
     reply_seconds = 5  # subclasses that build their own process skip __init__

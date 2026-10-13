@@ -7,7 +7,9 @@
 #include <sys/mman.h>
 #include <sys/ptrace.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/sysmacros.h>
+#include <sys/uio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -22,6 +24,17 @@
 static struct xrt_target *target;
 static pid_t child;
 static volatile uint64_t watched;
+/* The vfork child runs borrow_marker while it still shares the image. */
+static volatile int borrow_go;
+static volatile unsigned borrow_value;
+__attribute__((noinline)) static void borrow_marker(void)
+{
+    borrow_value++;
+    __asm__ volatile("" ::: "memory");
+    borrow_value++;
+}
+static volatile sig_atomic_t winch_hits;
+static volatile sig_atomic_t urg_hits;
 static uint8_t data[8] = {1, 2, 3, 4, 5, 6, 7, 8};
 #if defined(__x86_64__)
 /* Exactly one write at the breakpoint address: step and hardware-watch bits
@@ -37,6 +50,20 @@ __attribute__((noinline)) static void marker(void)
     __asm__ volatile("" ::: "memory");
 }
 #endif
+__attribute__((noinline)) static void hold_hit(void)
+{
+    __asm__ volatile("" ::: "memory");
+}
+static void on_winch(int sig)
+{
+    (void)sig;
+    ++winch_hits;
+}
+static void on_urg(int sig)
+{
+    (void)sig;
+    ++urg_hits;
+}
 static void cleanup(void)
 {
     if (target) {
@@ -799,11 +826,313 @@ static void adopted_child(void)
     xrt_target_destroy(target);
     target = NULL;
 }
+/* Not named raw_mem: the LoongArch step fixture already has that helper. */
+static int raw_read(pid_t pid, uint64_t address, void *buf, size_t n)
+{
+    struct iovec local = {.iov_base = buf, .iov_len = n};
+    struct iovec remote = {.iov_base = (void *)(uintptr_t)address, .iov_len = n};
+    return process_vm_readv(pid, &local, 1, &remote, 1, 0) == (ssize_t)n;
+}
+/* A plant while vfork_release is nonzero must not write the trap. The child
+ * shares the image and runs the real instruction; VFORK_DONE writes the bytes. */
+static void plant_while_borrowed(void)
+{
+    int gate[2];
+    CHECK(pipe(gate) == 0);
+    const pid_t parent = getpid();
+    child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            _exit(1);
+        close(gate[1]);
+        char byte;
+        if (read(gate[0], &byte, 1) != 1)
+            _exit(2);
+        close(gate[0]);
+        const pid_t grand = vfork();
+        if (grand < 0)
+            _exit(90);
+        if (!grand) {
+            while (!borrow_go) {
+            }
+            borrow_marker();
+            if (borrow_value != 2)
+                _exit(94);
+            execl("/bin/true", "true", (char *)0);
+            _exit(91);
+        }
+        /* Reap that exec here. The gate counts a grandchild still in this
+         * process group when the test exits as a leaked process. */
+        while (waitpid(grand, NULL, 0) < 0) {
+            if (errno != EINTR)
+                _exit(92);
+        }
+        _exit(0);
+    }
+    close(gate[0]);
+    target = xrt_target_create();
+    CHECK(target);
+    OK(xrt_target_attach(target, child));
+    CHECK(view().state == XRT_STOPPED && !target->follow_processes);
+    CHECK(write(gate[1], "x", 1) == 1);
+    close(gate[1]);
+    /* The vfork event is the stop. Continue starts the child, then a stop is
+     * already requested, so the handler leaves the parent parked in the event
+     * with the image borrowed instead of running it into the kernel wait. */
+    OK(xrt_target_continue(target));
+    target->want_run = false;
+    const uint64_t deadline = xrt_now() + UINT64_C(3000000000);
+    while (!target->vfork_release) {
+        CHECK(xrt_now() < deadline);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED && !target->vfork_release) {
+            OK(xrt_target_continue(target));
+            target->want_run = false;
+        }
+        usleep(1000);
+    }
+    CHECK(view().state == XRT_STOPPED && target->vfork_release == 1);
+    const struct xrt_arch *arch = xrt_arch_native();
+    const uint64_t address = (uintptr_t)borrow_marker;
+    uint8_t before[4], during[4], after[4];
+    CHECK(raw_read(child, address, before, arch->trap_size));
+    uint64_t id = 0;
+    OK(xrt_target_breakpoint_set(target, address, false, &id));
+    CHECK(view().breakpoint_count >= 1 && view().breakpoints[0].patched);
+    CHECK(raw_read(child, address, during, arch->trap_size));
+    CHECK(memcmp(before, during, arch->trap_size) == 0);
+    const int go = 1;
+    struct iovec local = {.iov_base = (void *)&go, .iov_len = sizeof(go)};
+    struct iovec remote = {.iov_base = (void *)&borrow_go, .iov_len = sizeof(borrow_go)};
+    CHECK(process_vm_writev(child, &local, 1, &remote, 1, 0) == (ssize_t)sizeof(go));
+    /* The parent is still in the vfork stop. Continuing it lets the kernel
+     * report VFORK_DONE, which writes the recorded trap. */
+    OK(xrt_target_continue(target));
+    target->want_run = false;
+    while (target->vfork_release) {
+        CHECK(xrt_now() < deadline);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED && target->vfork_release) {
+            OK(xrt_target_continue(target));
+            target->want_run = false;
+        }
+        usleep(1000);
+    }
+    CHECK(view().state == XRT_STOPPED);
+    CHECK(raw_read(child, address, after, arch->trap_size));
+    CHECK(memcmp(after, arch->trap, arch->trap_size) == 0);
+    unsigned value = 0;
+    CHECK(raw_read(child, (uintptr_t)&borrow_value, &value, sizeof(value)));
+    CHECK(value == 2);
+    OK(xrt_target_continue(target));
+    wait_exit();
+    CHECK(view().events[view().event_count - 1].detail == 0);
+    xrt_target_destroy(target);
+    target = NULL;
+    child = 0;
+    const uint64_t reap = xrt_now() + UINT64_C(1000000000);
+    for (;;) {
+        const pid_t got = waitpid(-1, NULL, WNOHANG);
+        if (got == 0 || (got < 0 && errno == ECHILD))
+            break;
+        CHECK(got > 0 || errno == EINTR);
+        CHECK(xrt_now() < reap);
+    }
+}
+static int child_counter(pid_t pid, const volatile sig_atomic_t *slot)
+{
+    sig_atomic_t value = -1;
+    size_t count = 0;
+    OK(xrt_memory_read(pid, (uintptr_t)slot, &value, sizeof value, &count));
+    CHECK(count == sizeof value);
+    return (int)value;
+}
+/* Asleep inside read(2), from the kernel's own record of the task. */
+static int child_in_read(pid_t pid)
+{
+    char path[64], text[256];
+    long number = -1;
+    char state = 0;
+    snprintf(path, sizeof path, "/proc/%d/syscall", (int)pid);
+    FILE *f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (fscanf(f, "%ld", &number) != 1)
+        number = -1;
+    fclose(f);
+    snprintf(path, sizeof path, "/proc/%d/stat", (int)pid);
+    f = fopen(path, "r");
+    if (!f)
+        return 0;
+    if (fgets(text, sizeof text, f)) {
+        const char *end = strrchr(text, ')');
+        if (end && end[1] == ' ')
+            state = end[2];
+    }
+    fclose(f);
+    return number == SYS_read && state == 'S';
+}
+static void expect_breakpoint(unsigned hits)
+{
+    const struct xrt_target_view got = view();
+    if (got.thread_count < 1 || got.threads[0].reason != XRT_STOP_BREAKPOINT ||
+        got.breakpoint_count < 1 || got.breakpoints[0].hit_count != hits) {
+        fprintf(stderr, "stop reason %d signal %d hits %llu\n",
+                got.thread_count ? (int)got.threads[0].reason : -1,
+                got.thread_count ? got.threads[0].signal : -1,
+                got.breakpoint_count ? (unsigned long long)got.breakpoints[0].hit_count : 0ULL);
+    }
+    CHECK(got.threads[0].reason == XRT_STOP_BREAKPOINT && got.breakpoints[0].hit_count == hits);
+}
+/* SIGWINCH is queued while stopped at a breakpoint, so the hidden step reports
+ * it. SIGURG and a second SIGWINCH arrive while the child is running. A later
+ * SIGURG is queued at the next breakpoint and must be delivered by that step.
+ * The child reaches the following breakpoint only after the handlers have run. */
+static void ignored_signals(void)
+{
+    int gate[2], again[2];
+    CHECK(pipe(gate) == 0 && pipe(again) == 0);
+    const pid_t parent = getpid();
+    child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = on_winch;
+        if (sigaction(SIGWINCH, &action, NULL) != 0)
+            _exit(3);
+        action.sa_handler = on_urg;
+        if (sigaction(SIGURG, &action, NULL) != 0)
+            _exit(4);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            _exit(1);
+        close(gate[1]);
+        char byte;
+        if (read(gate[0], &byte, 1) != 1)
+            _exit(2);
+        close(gate[0]);
+        hold_hit();
+        while (winch_hits < 2 || urg_hits < 1)
+            pause();
+        hold_hit();
+        while (urg_hits < 2 || winch_hits < 3)
+            pause();
+        hold_hit();
+        while (winch_hits < 4)
+            pause();
+        /* With SA_RESTART the kernel restarts this read after the handler. */
+        action.sa_handler = on_winch;
+        action.sa_flags = SA_RESTART;
+        if (sigaction(SIGWINCH, &action, NULL) != 0)
+            _exit(5);
+        close(again[1]);
+        const ssize_t got = read(again[0], &byte, 1);
+        _exit(got == 1 && winch_hits == 5 && urg_hits == 2 ? 29 : 30);
+    }
+    close(gate[0]);
+    close(again[0]);
+    target = xrt_target_create();
+    CHECK(target);
+    OK(xrt_target_attach(target, child));
+    uint64_t bp = 0;
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)hold_hit, false, &bp));
+    CHECK(write(gate[1], "x", 1) == 1);
+    close(gate[1]);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    expect_breakpoint(1);
+    CHECK(kill(child, SIGWINCH) == 0);
+    OK(xrt_target_continue(target));
+    const uint64_t deadline = xrt_now() + UINT64_C(3000000000);
+    int sent_running = 0;
+    for (;;) {
+        CHECK(xrt_now() < deadline);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED) {
+            expect_breakpoint(2);
+            sig_atomic_t winch = 0, urg = 0;
+            size_t count = 0;
+            OK(xrt_target_read(target, (uintptr_t)&winch_hits, &winch, sizeof winch, &count));
+            CHECK(count == sizeof winch && winch == 2);
+            OK(xrt_target_read(target, (uintptr_t)&urg_hits, &urg, sizeof urg, &count));
+            CHECK(count == sizeof urg && urg == 1);
+            break;
+        }
+        if (!sent_running && child_counter(child, &winch_hits) >= 1) {
+            CHECK(kill(child, SIGURG) == 0);
+            CHECK(kill(child, SIGWINCH) == 0);
+            sent_running = 1;
+        }
+        usleep(1000);
+    }
+    /* Two different signals queued for one hidden step. The step reports
+     * them one after the other before its instruction retires; both handlers
+     * must still run. */
+    CHECK(kill(child, SIGURG) == 0);
+    CHECK(kill(child, SIGWINCH) == 0);
+    OK(xrt_target_continue(target));
+    for (;;) {
+        CHECK(xrt_now() < deadline);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED) {
+            expect_breakpoint(3);
+            sig_atomic_t winch = 0, urg = 0;
+            size_t count = 0;
+            OK(xrt_target_read(target, (uintptr_t)&winch_hits, &winch, sizeof winch, &count));
+            CHECK(count == sizeof winch && winch == 3);
+            OK(xrt_target_read(target, (uintptr_t)&urg_hits, &urg, sizeof urg, &count));
+            CHECK(count == sizeof urg && urg == 2);
+            break;
+        }
+        usleep(1000);
+    }
+    /* A requested step with a signal queued stops as a step, off the
+     * breakpoint, and the signal is delivered by that step or the resume. */
+    struct xrt_registers regs;
+    uint64_t before_pc = 0, after_pc = 0;
+    OK(xrt_target_registers(target, child, &regs));
+    OK(xrt_registers_pc(&regs, &before_pc));
+    CHECK(kill(child, SIGWINCH) == 0);
+    OK(xrt_target_step(target, child));
+    OK(xrt_target_wait_stopped(target));
+    CHECK(view().state == XRT_STOPPED && view().threads[0].reason == XRT_STOP_SINGLE_STEP);
+    CHECK(view().breakpoints[0].hit_count == 3);
+    OK(xrt_target_registers(target, child, &regs));
+    OK(xrt_registers_pc(&regs, &after_pc));
+    CHECK(after_pc != before_pc);
+    OK(xrt_target_breakpoint_remove(target, bp));
+    OK(xrt_target_continue(target));
+    /* The child blocks in read with SA_RESTART set. A signal there runs the
+     * handler and the read goes on waiting: no stop, and no EINTR. */
+    const uint64_t blocked = xrt_now() + UINT64_C(3000000000);
+    while (child_counter(child, &winch_hits) != 4 || !child_in_read(child)) {
+        CHECK(xrt_now() < blocked);
+        OK(xrt_target_poll(target));
+        CHECK(view().state == XRT_RUNNING);
+        usleep(1000);
+    }
+    CHECK(kill(child, SIGWINCH) == 0);
+    while (child_counter(child, &winch_hits) != 5 || !child_in_read(child)) {
+        CHECK(xrt_now() < blocked);
+        OK(xrt_target_poll(target));
+        CHECK(view().state == XRT_RUNNING);
+        usleep(1000);
+    }
+    CHECK(write(again[1], "x", 1) == 1);
+    close(again[1]);
+    wait_exit();
+    CHECK(view().events[view().event_count - 1].detail == 29);
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+    child = 0;
+    xrt_target_destroy(target);
+    target = NULL;
+}
 static void detach_owed_cleanup(void)
 {
     target = xrt_target_create();
     CHECK(target);
-    const char *argv[] = {"/proc/self/exe", "--fixture", NULL};
+    const char *argv[] = {"/proc/self/exe", "--fixture-hold", NULL};
     OK(xrt_target_launch(target, argv));
     const int32_t pid = view().pid;
     struct xrt_registers regs;
@@ -820,6 +1149,9 @@ static void detach_owed_cleanup(void)
     target->plant_cleanup.width = 1;
     memset(target->plant_cleanup.original, 0, 4);
     target->plant_cleanup.original[0] = orig;
+    /* After the detach nothing else owns the held fixture. A failed check
+     * below must still kill and reap it. */
+    child = pid;
     OK(xrt_target_detach(target));
     CHECK(!target->plant_cleanup.active && !target->pid);
     count = 0;
@@ -830,6 +1162,7 @@ static void detach_owed_cleanup(void)
     kill(pid, SIGKILL);
     while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {
     }
+    child = 0;
 }
 
 #if defined(__loongarch__)
@@ -1092,6 +1425,12 @@ int main(int argc, char **argv)
      * Only the synthetic tracee skips exit handlers; the controller does not. */
     if (argc == 2 && strcmp(argv[1], "--fixture") == 0)
         _exit(17);
+    /* detach_owed_cleanup reads the restored byte after detach resumes us.
+     * Exiting here races that read under load. */
+    if (argc == 2 && strcmp(argv[1], "--fixture-hold") == 0) {
+        for (;;)
+            pause();
+    }
     if (argc == 2 && strcmp(argv[1], "--adopt") == 0) {
         const pid_t kid = fork();
         if (kid < 0)
@@ -1122,6 +1461,8 @@ int main(int argc, char **argv)
     attach_probes(false);
     attach_probes(true);
     adopted_child();
+    plant_while_borrowed();
+    ignored_signals();
     detach_owed_cleanup();
     loong_live();
     puts("C target: launch, restart, attach, stepping, breakpoint overlays/rearm, watches, "

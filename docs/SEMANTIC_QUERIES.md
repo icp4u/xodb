@@ -267,6 +267,13 @@ byte of one PF_X PT_LOAD and, with `bounds=strict`, inside
 `[entry, entry+size)`. The decoder's 16-byte prefetch may be zero-padded past a
 segment end; padding is never exported.
 
+The native producer also decodes a gap of at most 16 bytes from the requested
+function entry to the first decompiler block as `discovery: "entry_prefix"`.
+The adapter folds that gap into the first block only when it is covered
+contiguously by exact known landing-pad encodings (`endbr32`/`endbr64`, or an
+effect-free AArch64 `bti`/`paciasp`/`pacibsp`) whose raw and high p-code lists
+are both empty. Empty p-code by itself is not admission evidence.
+
 - `refused`: no bytes or p-code; listed in `instruction_admission.refused[]`
   and qualified `instruction_refused_<reason>` (unreliable); the path is cut
   there. Reasons: `not_file_backed_executable` (suffix past the segment, gap,

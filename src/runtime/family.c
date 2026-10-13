@@ -236,7 +236,8 @@ enum xrt_status xrt_rearm_inherited(struct xrt_target *t)
         struct xrt_breakpoint *probe = &t->breakpoints[i];
         if (!probe->enabled || probe->pending || probe->patched || !probe->width)
             continue;
-        TRY(xrt_patch_instruction(t, probe->address, probe->planted, probe->width));
+        if (!xrt_image_borrowed(t))
+            TRY(xrt_patch_instruction(t, probe->address, probe->planted, probe->width));
         probe->patched = true;
     }
     t->inherited_rearm = false;
@@ -264,7 +265,10 @@ enum xrt_status xrt_separate_vfork(struct xrt_target *t)
         if (!probe->enabled || probe->pending || probe->patched || !probe->width ||
             parent->state != XRT_STOPPED)
             continue;
-        TRY(xrt_patch_instruction(parent, probe->address, probe->planted, probe->width));
+        /* Another child may still share this image. Mark the record; its
+         * VFORK_DONE writes the bytes. */
+        if (!xrt_image_borrowed(parent))
+            TRY(xrt_patch_instruction(parent, probe->address, probe->planted, probe->width));
         probe->patched = true;
         xrt_sync_shared_patch(t, probe->id, true);
     }

@@ -19,39 +19,17 @@ const Presentation = struct {
     max_stars: u32 = model.max_stars,
     collapse: bool = false,
 };
-const Hit = struct { rect: draw.Rect, node: ?u64 = null, cluster: ?u64 = null };
 pub const View = struct {
     state: galaxy.State = .{ .cloud_slot = 1 },
     presentation: Presentation = .{},
     pointer: [2]f32 = .{ -1, -1 },
-    selected_cluster: ?u64 = null,
     /// The inspector's node, ringed so the tree and the galaxy agree.
     selected_node: ?u64 = null,
     revision: ?u64 = null,
-    hits: [model.max_stars + model.max_clusters]Hit = undefined,
-    hit_count: usize = 0,
     hover: [384]u8 = undefined,
     hover_len: usize = 0,
     omitted: usize = 0,
     moving: bool = false,
-
-    pub fn select(self: *View, x: f32, y: f32) ?u64 {
-        var i = self.hit_count;
-        while (i > 0) {
-            i -= 1;
-            const hit = self.hits[i];
-            // The same rule the renderer uses to lift the pointer's star, so a
-            // click picks the star whose label is showing, not a neighbour.
-            if (hit.node) |id| if (@abs(x - hit.rect.x - hit.rect.w / 2) < 12 and @abs(y - hit.rect.y - hit.rect.h / 2) < 12) return id;
-        }
-        for (self.hits[0..self.hit_count]) |hit| {
-            const key = hit.cluster orelse continue;
-            if (!draw.inside(hit.rect, x, y)) continue;
-            self.selected_cluster = if (self.selected_cluster == key) null else key;
-            break;
-        }
-        return null;
-    }
 
     pub fn render(self: *View, r: *gpu.Renderer, font: *Font, bounds: gpu.Rect, snapshot: protocol.Snapshot) !void {
         if (self.revision != snapshot.scene_revision) {
@@ -65,7 +43,6 @@ pub const View = struct {
         var ts: c.struct_timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
         self.presentation.clock = @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
-        self.hit_count = 0;
         self.hover_len = 0;
         var host = Host{ .view = self, .graph = &self.presentation, .pointer = self.pointer };
         const ctx = draw.Ctx{ .r = r, .font = font, .p = &palette.all[0] };
@@ -74,18 +51,21 @@ pub const View = struct {
         const old_clip = r.clip;
         r.clip = draw.intersect(old_clip, field);
         defer r.clip = old_clip;
-        const counts = try galaxy.renderModel(&host, &self.state, ctx, field, body, &.{}, self.selected_cluster, self.presentation.clock);
+        const counts = try galaxy.renderModel(&host, &self.state, ctx, field, body, &.{}, null, self.presentation.clock);
         self.moving = counts.moving;
         var chosen: ?model.Node = null;
         if (self.selected_node) |id| for (self.state.scene.stars[0..self.state.scene.star_count]) |star| if (star.seed == id) {
             chosen = star;
-            try r.shape(.{ .x = star.at[0] - 9, .y = star.at[1] - 9, .w = 18, .h = 18 }, palette.all[0].ok, .{ .radii = @splat(9), .border = 2 });
+            const selection = self.state.motion.navigation.selection;
+            if (selection == null or selection.? != .node or selection.?.node != id)
+                try r.shape(.{ .x = star.at[0] - 9, .y = star.at[1] - 9, .w = 18, .h = 18 }, palette.all[0].ok, .{ .radii = @splat(9), .border = 2 });
             break;
         };
         r.clip = old_clip;
         var buffer: [256]u8 = undefined;
-        try r.textFit(font, bounds.x + 14, bounds.y + 72, bounds.w - 28, try std.fmt.bufPrint(&buffer, "SCENE GALAXY / {d} nodes / {d} clusters / {d} parent-child threads / {d} omitted", .{ counts.stars, counts.clusters, counts.strands, self.omitted }), palette.all[0].ok);
-        try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 92, bounds.w - 28, "Click a node to inspect it. G returns to the tree. R refreshes the engine snapshot.", palette.all[0].text);
+        const navigation = &self.state.motion.navigation;
+        try r.textFit(font, bounds.x + 14, bounds.y + 72, bounds.w - 28, try std.fmt.bufPrint(&buffer, "SCENE GALAXY{s} / {d} nodes / {d} clusters / {d} parent-child threads / {d} omitted", .{ if (navigation.tour) " / TOUR" else "", counts.stars, counts.clusters, counts.strands, self.omitted }), palette.all[0].ok);
+        try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 92, bounds.w - 28, if (navigation.help) @import("overview/galaxy_camera.zig").hints else "Click selects / Enter frames. G tree / P inspector / R refresh / ? navigation. S pans, not signals.", palette.all[0].text);
         try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 68, bounds.w - 28, "Signal connections / emissions: unavailable from this engine protocol; no signal activity is inferred.", palette.all[0].warn);
         if (self.hover_len == 0) if (chosen) |star| {
             const text = std.fmt.bufPrint(&self.hover, "Ringed: {s} / object #{d} / selected in the inspector", .{ star.label(), star.seed }) catch "";
@@ -143,18 +123,10 @@ const Host = struct {
     pub fn junctionName(_: *Host) []const u8 {
         return "scene junction";
     }
-    pub fn clusterHit(self: *Host, rect: draw.Rect, key: u64) void {
-        if (self.view.hit_count == self.view.hits.len) return;
-        self.view.hits[self.view.hit_count] = .{ .rect = rect, .cluster = key };
-        self.view.hit_count += 1;
-    }
-    pub fn nodeHit(self: *Host, rect: draw.Rect, node: model.Node, _: u32, _: bool, audit: bool) void {
-        if (self.view.hit_count < self.view.hits.len) {
-            self.view.hits[self.view.hit_count] = .{ .rect = rect, .node = node.seed };
-            self.view.hit_count += 1;
-        }
+    pub fn clusterHit(_: *Host, _: draw.Rect, _: u64) void {}
+    pub fn nodeHit(self: *Host, _: draw.Rect, node: model.Node, _: u32, _: bool, audit: bool) void {
         if (@abs(self.pointer[0] - node.at[0]) < 12 and @abs(self.pointer[1] - node.at[1]) < 12) {
-            const text = std.fmt.bufPrint(&self.view.hover, "{s} / object #{d} / click to inspect", .{ node.label(), node.seed }) catch "";
+            const text = std.fmt.bufPrint(&self.view.hover, "{s} / object #{d} / click selects; P inspects", .{ node.label(), node.seed }) catch "";
             self.view.hover_len = text.len;
         }
         if (audit) std.debug.print("xodb: redot-galaxy-node id={d} x={d:.1} y={d:.1}\n", .{ node.seed, node.at[0], node.at[1] });
@@ -200,22 +172,19 @@ test "scene adapter preserves object identity, parents and static provenance" {
     try std.testing.expectEqual(@as(u32, 0), scene.strand_count);
 }
 
-test "a click picks the star the renderer lifts, else toggles a cluster centre" {
-    const view = try std.testing.allocator.create(View);
-    defer std.testing.allocator.destroy(view);
-    view.* = .{};
-    view.hits[0] = .{ .rect = .{ .x = 88, .y = 88, .w = 24, .h = 24 }, .cluster = 5 };
-    view.hit_count = 1;
-    try std.testing.expectEqual(@as(?u64, null), view.select(100, 100));
-    try std.testing.expectEqual(@as(?u64, 5), view.selected_cluster);
-    try std.testing.expectEqual(@as(?u64, null), view.select(100, 100));
-    try std.testing.expectEqual(@as(?u64, null), view.selected_cluster);
+test "shared galaxy picking matches the lifted star in a dense scene" {
+    const scene = try std.testing.allocator.create(model.Scene);
+    defer std.testing.allocator.destroy(scene);
+    scene.* = .{};
+    scene.clusters[0] = .{ .key = 5, .at = .{ 100, 100 }, .r = 12 };
+    scene.cluster_count = 1;
+    const camera = @import("overview/galaxy_camera.zig").Camera;
+    try std.testing.expectEqual(@as(u64, 5), camera.pick(scene, .{ 100, 100 }).?.cluster);
     // Stars centred at x=100 and x=113: a click at 100 is in both 28 px boxes
     // but only the first star is within the 12 px the renderer highlights.
-    view.hits[1] = .{ .rect = .{ .x = 86, .y = 86, .w = 28, .h = 28 }, .node = 1 };
-    view.hits[2] = .{ .rect = .{ .x = 99, .y = 86, .w = 28, .h = 28 }, .node = 2 };
-    view.hit_count = 3;
-    try std.testing.expectEqual(@as(?u64, 1), view.select(100, 100));
-    try std.testing.expectEqual(@as(?u64, 2), view.select(110, 100));
-    try std.testing.expectEqual(@as(?u64, null), view.selected_cluster);
+    scene.stars[0] = .{ .seed = 1, .at = .{ 100, 100 } };
+    scene.stars[1] = .{ .seed = 2, .at = .{ 113, 100 } };
+    scene.star_count = 2;
+    try std.testing.expectEqual(@as(u64, 1), camera.pick(scene, .{ 100, 100 }).?.node);
+    try std.testing.expectEqual(@as(u64, 2), camera.pick(scene, .{ 110, 100 }).?.node);
 }

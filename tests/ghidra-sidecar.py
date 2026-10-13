@@ -5,6 +5,7 @@ The fake speaks the real JSON-line and framed-document protocol. It uses the
 owned qx fixture and checked-in adapter export, so completed replies pass the
 same identity admission and xsg adapter as a Ghidra reply.
 """
+import ctypes
 import fcntl
 import hashlib
 import json
@@ -20,8 +21,8 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCER = "ghidra-jvm-sidecar-0.1.0"
-CAPS = ["open_image", "decompile", "cancel", "status", "shutdown", "hints", "xsg", "pseudocode"]
+PRODUCER = "ghidra-jvm-sidecar-0.1.2"
+CAPS = ["prime", "open_image", "decompile", "cancel", "status", "shutdown", "hints", "xsg", "pseudocode"]
 
 
 def exchange(path, request, timeout=2):
@@ -37,7 +38,7 @@ def expected(reply):
     return (reply.get("state") == "ready" and reply.get("protocol") == 1 and
             reply.get("schema") == 1 and reply.get("producer") == PRODUCER and
             reply.get("uid") == os.getuid() and reply.get("healthy") is True and
-            set(CAPS) - {"hints"} <= set(reply.get("capabilities", ())))
+            set(CAPS) - {"hints", "prime"} <= set(reply.get("capabilities", ())))
 
 
 def serve():
@@ -68,12 +69,23 @@ def serve():
                 line = conn.makefile("rb").readline(1 << 20)
                 request = json.loads(line)
                 verb = request.get("verb")
+                requests = os.environ.get("FAKE_GHIDRA_REQUESTS")
+                if requests:
+                    with open(requests, "a") as log: log.write(json.dumps(request, separators=(",", ":")) + "\n")
                 if verb == "hello":
                     send(conn, {"id": request.get("id"), "state": "ready",
                                 "protocol": 999 if mode == "wrong" else 1, "schema": 1,
                                 "producer": PRODUCER, "ghidra_version": "fake-owned-fixture",
-                                "uid": os.getuid(), "healthy": True, "capabilities": CAPS,
+                                "uid": os.getuid(), "healthy": True,
+                                "capabilities": [cap for cap in CAPS if cap != "prime" or mode != "no_prime"],
                                 "log": os.environ.get("FAKE_GHIDRA_LOG", "fake-sidecar.log")})
+                elif verb == "prime" and mode == "no_prime":
+                    send(conn, {"id": request.get("id"), "state": "failed", "code": "unknown_verb", "detail": "prime"})
+                elif verb == "prime":
+                    send(conn, {"id": request.get("id"), "state": "ready", "progress": "ready"})
+                elif verb == "open_image" and mode == "warm_hang" and request.get("id") == "xodb-warm-open":
+                    send(conn, {"id": request.get("id"), "state": "pending",
+                                "job": "warm:hang", "progress": "analyzing"})
                 elif verb == "open_image":
                     try:
                         actual = hashlib.sha256(Path(request["path"]).read_bytes()).hexdigest()
@@ -97,6 +109,9 @@ def serve():
                 elif verb == "status" and mode == "hang" and request.get("job") == "fake:hang":
                     send(conn, {"id": request.get("id"), "state": "pending",
                                 "job": "fake:hang", "progress": "decompiling"})
+                elif verb == "status" and mode == "warm_hang" and request.get("job") == "warm:hang":
+                    send(conn, {"id": request.get("id"), "state": "pending",
+                                "job": "warm:hang", "progress": "analyzing"})
                 elif verb == "status":
                     send(conn, {"id": request.get("id"), "state": "ready", "healthy": True,
                                 "heap_used": 0, "images_open": 1, "queue": 0})
@@ -176,6 +191,10 @@ os.chdir(ROOT)
 sys.path.insert(0, str(ROOT / "tests"))
 from client import Client
 
+# Launch prestart is detached. Adopt its short-lived starter so this test,
+# rather than the release runner, reaps every process that it creates.
+ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
+
 work = Path(tempfile.mkdtemp(prefix="xodb-ghs-", dir=os.environ.get("XODB_TEST_TMPDIR")))
 fixture_dir = work / "qx"
 subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
@@ -235,8 +254,8 @@ def poll_decompile(client, retry=False):
         time.sleep(.03)
 
 
-def client():
-    value = Client("observe", str(fixture))
+def client(options=()):
+    value = Client("observe", str(fixture), options=options)
     wait_stopped(value)
     return value
 
@@ -254,6 +273,7 @@ def configure(name, mode="correct"):
                       FAKE_GHIDRA_MODE=mode, FAKE_GHIDRA_PAYLOAD=str(payload),
                       FAKE_GHIDRA_COUNT=str(case / "starts"), FAKE_GHIDRA_PID=str(case / "pid"),
                       FAKE_GHIDRA_CANCELLED=str(case / "cancelled"), FAKE_GHIDRA_LOG=str(case / "sidecar.log"))
+    os.environ["FAKE_GHIDRA_REQUESTS"] = str(case / "requests")
     return case
 
 
@@ -276,10 +296,80 @@ def completed(case):
     finally: close(value)
 
 
-# No endpoint: xodb invokes the configured starter and consumes its document.
+# No endpoint: xodb starts at launch, primes the target architecture, imports
+# the mapped executable, then consumes the same sidecar's document.
 case = configure("absent")
-completed("absent socket starts the sidecar and admits its framed export")
+value = client()
+deadline = time.monotonic() + 10
+requests = []
+while time.monotonic() < deadline:
+    requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
+    verbs = [request.get("verb") for request in requests]
+    if "prime" in verbs and "open_image" in verbs: break
+    time.sleep(.02)
+record("configured sidecar starts before the first decompile request", (case / "starts").exists() and
+       (case / "starts").read_text().splitlines() == ["start"])
+prime = next((request for request in requests if request.get("verb") == "prime"), {})
+verbs = [request.get("verb") for request in requests]
+prime_at = verbs.index("prime") if "prime" in verbs else len(verbs)
+open_at = verbs.index("open_image") if "open_image" in verbs else len(verbs)
+record("target architecture is primed before the first image opens", prime.get("architecture") == "x86_64" and
+       prime_at < open_at, requests)
+record("the mapped executable is imported before pseudo-C is requested", any(request.get("verb") == "open_image" and
+       Path(request.get("path", "")) == fixture for request in requests), requests)
+record("eager imports are marked as background work", any(request.get("id") == "xodb-warm-open" and
+       request.get("background") is True for request in requests), requests)
+try:
+    result = poll_decompile(value)
+    record("launch-warmed sidecar admits its framed export", result.get("status") == "completed" and
+           result.get("producer", {}).get("name") == "ghidra_java_sidecar" and "qx_alloc" in result.get("signature", ""), result)
+finally: close(value)
 record("absent socket starts one sidecar", (case / "starts").read_text().splitlines() == ["start"])
+stop_server()
+
+# The CLI opt-out suppresses both launch and target warmup, while an explicit
+# pseudo-C request retains the on-demand behavior.
+case = configure("prestart-off")
+value = client(("--no-ghidra-prestart",))
+record("--no-ghidra-prestart leaves the sidecar idle", not (case / "starts").exists())
+try:
+    result = poll_decompile(value)
+    record("prestart opt-out keeps on-demand pseudo-C", result.get("status") == "completed", result)
+finally: close(value)
+stop_server()
+
+# A sidecar from before priming existed keeps serving: it is neither replaced
+# nor asked twice, and images are still imported ahead of the request.
+case = configure("no-prime", "no_prime")
+value = client()
+deadline = time.monotonic() + 10
+requests = []
+while time.monotonic() < deadline:
+    requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
+    if any(request.get("verb") == "open_image" for request in requests): break
+    time.sleep(.02)
+try:
+    result = poll_decompile(value)
+    record("a sidecar without prime is kept and still imports and answers", result.get("status") == "completed" and
+           (case / "starts").read_text().splitlines() == ["start"] and
+           any(request.get("verb") == "open_image" for request in requests) and
+           sum(request.get("verb") == "prime" for request in requests) == 1, requests)
+finally: close(value)
+stop_server()
+
+# An interactive request cancels a background image analysis before entering
+# the sidecar's single Ghidra queue.
+case = configure("warm-cancel", "warm_hang")
+value = client()
+deadline = time.monotonic() + 10
+while time.monotonic() < deadline:
+    if (case / "requests").exists() and any(json.loads(line).get("job") == "warm:hang" for line in (case / "requests").read_text().splitlines()): break
+    time.sleep(.02)
+try:
+    result = poll_decompile(value)
+    record("interactive pseudo-C cancels queued background import", result.get("status") == "completed" and
+           (case / "cancelled").exists() and (case / "cancelled").read_text() == "warm:hang", result)
+finally: close(value)
 stop_server()
 
 # A refused-connect Unix socket file is replaced under the starter lock.
@@ -363,5 +453,16 @@ for process in managed_processes:
     try: process.wait(timeout=2)
     except subprocess.TimeoutExpired:
         process.terminate(); process.wait(timeout=2)
+deadline = time.monotonic() + 5
+while True:
+    try:
+        pid, _ = os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        break
+    if pid > 0:
+        continue
+    if time.monotonic() >= deadline:
+        raise AssertionError("a detached fake-sidecar starter is still running")
+    time.sleep(.02)
 print(f"Summary: {sum(results)}/{len(results)} passed; work {work}")
 raise SystemExit(0 if all(results) else 1)

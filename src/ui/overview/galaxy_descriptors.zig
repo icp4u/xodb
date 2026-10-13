@@ -260,6 +260,9 @@ fn descriptorColor(p: *const Palette, kind: u32) Color {
     };
 }
 var state: galaxy.State = .{};
+pub fn navigation() *galaxy.State {
+    return &state;
+}
 pub fn render(v: *vw.View, ctx: draw.Ctx, field: draw.Rect, body: draw.Rect, reserved: []const draw.Rect, now: u64) !model.Counts {
     const st = &v.graph;
     if (!v.paused or st.clock == 0) st.clock = now;

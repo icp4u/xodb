@@ -189,6 +189,35 @@ void xrt_drop_vfork_hold(struct xrt_target *t)
             xrt_trace(PTRACE_CONT, child, 0, (uintptr_t)SIGKILL);
     }
 }
+/* Default action is ignore. No per-signal stop request exists; this predicate
+ * is where one would go. */
+static const int ignored_signals[] = {SIGCHLD, SIGWINCH, SIGURG};
+static int default_ignored(int sig)
+{
+    return sig == SIGCHLD || sig == SIGWINCH || sig == SIGURG;
+}
+/* The thread record carries one signal for the resume. When the stepped
+ * thread reports another before its instruction retires, the earlier one
+ * would be overwritten and never delivered. Park it for the end of the step. */
+static void park_signal(struct xrt_target *t, int32_t tid, int held, int incoming)
+{
+    if (!t->stepping || t->step.tid != tid || held == incoming)
+        return;
+    for (size_t k = 0; k < sizeof ignored_signals / sizeof ignored_signals[0]; ++k)
+        if (ignored_signals[k] == held)
+            t->step.parked |= (uint8_t)(1u << k);
+}
+void xrt_requeue_parked(struct xrt_target *t)
+{
+    const uint8_t parked = t->step.parked;
+    t->step.parked = 0;
+    /* The thread is in a ptrace stop, so these stay pending until it is
+     * resumed and are then reported like any other arrival. A thread that
+     * has exited takes nothing. */
+    for (size_t k = 0; k < sizeof ignored_signals / sizeof ignored_signals[0]; ++k)
+        if (parked & (1u << k))
+            (void)syscall(SYS_tgkill, (pid_t)t->pid, (pid_t)t->step.tid, ignored_signals[k]);
+}
 static enum xrt_status poll(struct xrt_target *t)
 {
     int held_spins = 0;
@@ -503,7 +532,8 @@ static enum xrt_status poll(struct xrt_target *t)
         if (kind == PTRACE_EVENT_STOP && sig == SIGTRAP && t->stepping && t->step.tid == tid &&
             !t->step.interrupted && !t->step.software) {
             TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
-            t->threads[i].signal = 0;
+            if (!default_ignored(t->threads[i].signal))
+                t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_NONE;
             t->threads[i].state = XRT_RUNNING;
             continue;
@@ -515,29 +545,72 @@ static enum xrt_status poll(struct xrt_target *t)
             t->threads[i].state = XRT_RUNNING;
             continue;
         }
-        /* Go preempts goroutines with SIGURG many times a second. Like gdb's
-         * default (nostop, noprint, pass), deliver it without a user stop. A
-         * hardware-stepped thread drops it: delivery would step into the
-         * handler, and the Go runtime simply retries the preemption. */
+        /* SIGCHLD, SIGWINCH and SIGURG are ignored by default. Deliver them
+         * and keep running, including a step and the hidden step a Continue
+         * takes off a breakpoint. A peer of the stepped thread is resumed the
+         * same way, so its signal does not cancel the step. No per-signal
+         * stop request exists; this guard is where one would go. An idle stop
+         * that is not a step still reports the signal. */
         const bool step_here = t->stepping && t->step.tid == tid;
-        if (kind == 0 && sig == SIGURG && (step_here ? !t->step.software : t->want_run)) {
-            TRY(xrt_trace(step_here ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, step_here ? 0 : SIGURG));
+        if (kind == 0 && default_ignored(sig) && (step_here || t->want_run || t->stepping)) {
+            int advanced = 0;
+            uint64_t pc = 0;
+            /* A hardware step that already retired its instruction reports
+             * the pending signal with the PC moved. Finishing another
+             * single-step would skip one more instruction. A stop still at
+             * the stepped PC has not retired it. */
+            if (step_here && !t->step.software && t->step.exec_entry_pc) {
+                struct xrt_registers regs;
+                if (xrt_target_registers(t, tid, &regs) == XRT_OK &&
+                    xrt_registers_pc(&regs, &pc) == XRT_OK && pc != t->step.exec_entry_pc)
+                    advanced = 1;
+            }
+            if (advanced) {
+                const bool stop_after = t->step.stop_after;
+                park_signal(t, tid, t->threads[i].signal, sig);
+                t->threads[i].signal = sig;
+                TRY(xrt_finish_step(t, true));
+                t->threads[i].reason = XRT_STOP_SINGLE_STEP;
+                t->threads[i].breakpoint_address = 0;
+                xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
+                t->events[t->event_count - 1].pc = pc;
+                t->events[t->event_count - 1].pc_known = 1;
+                if (!stop_after) {
+                    t->threads[i].reason = XRT_STOP_NONE;
+                    t->state = XRT_STOPPED;
+                    TRY(xrt_target_continue(t));
+                    continue;
+                }
+                TRY(xrt_stop_peers(t));
+                continue;
+            }
+            if (step_here && !t->step.software) {
+                /* The instruction has not retired, and the signal is already
+                 * dequeued. Single-step with zero so delivery does not enter
+                 * the handler. The step trap keeps this signal and injects it
+                 * on the resume; injecting it here would single-step into the
+                 * handler and then hit the same breakpoint again. A signal
+                 * already held from an earlier report of this step is parked. */
+                park_signal(t, tid, t->threads[i].signal, sig);
+                t->threads[i].signal = sig;
+                TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
+                t->threads[i].reason = XRT_STOP_NONE;
+                t->threads[i].state = XRT_RUNNING;
+                continue;
+            }
+            TRY(xrt_trace(PTRACE_CONT, tid, 0, (uintptr_t)sig));
             t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_NONE;
             t->threads[i].state = XRT_RUNNING;
             continue;
         }
-        /* A child that exited is not a reason to stop its parent. Like gdb's
-         * default, deliver SIGCHLD and keep running. A step in progress on
-         * this thread still stops, so the signal is never dropped. */
-        if (kind == 0 && sig == SIGCHLD && t->want_run && !step_here) {
-            TRY(xrt_trace(PTRACE_CONT, tid, 0, SIGCHLD));
-            t->threads[i].signal = 0;
-            t->threads[i].reason = XRT_STOP_NONE;
-            t->threads[i].state = XRT_RUNNING;
-            continue;
+        /* A hardware step may already be holding an ignore-default signal
+         * while this SIGTRAP retires the instruction. Keep it. */
+        if (!(kind == 0 && sig == SIGTRAP && t->stepping && t->step.tid == tid &&
+              default_ignored(t->threads[i].signal))) {
+            park_signal(t, tid, t->threads[i].signal, kind == 0 ? sig : 0);
+            t->threads[i].signal = kind == 0 ? sig : 0;
         }
-        t->threads[i].signal = kind == 0 ? sig : 0;
         t->threads[i].reason = kind == PTRACE_EVENT_EXEC   ? XRT_STOP_EXEC
                                : kind == PTRACE_EVENT_STOP ? XRT_STOP_INTERRUPT
                                                            : XRT_STOP_SIGNAL;
@@ -578,7 +651,8 @@ static enum xrt_status poll(struct xrt_target *t)
                     if (m68k_delayed)
                         t->step.exec_entry_pc = 0;
                     TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
-                    t->threads[i].signal = 0;
+                    if (!default_ignored(t->threads[i].signal))
+                        t->threads[i].signal = 0;
                     t->threads[i].reason = XRT_STOP_NONE;
                     t->threads[i].state = XRT_RUNNING;
                     continue;
@@ -603,7 +677,8 @@ static enum xrt_status poll(struct xrt_target *t)
             if (info.code == 4 || (t->arch->machine == XRT_X86_64 && stepped && armed))
                 TRY(xrt_watch_trap(t, tid, pc, &info, &watch_hit));
             if (watch_hit) {
-                t->threads[i].signal = 0;
+                if (!default_ignored(t->threads[i].signal))
+                    t->threads[i].signal = 0;
                 t->threads[i].reason = XRT_STOP_WATCHPOINT;
                 if (t->stepping)
                     TRY(xrt_finish_step(t, stepped));
@@ -615,7 +690,10 @@ static enum xrt_status poll(struct xrt_target *t)
                 }
             } else if (stepped) {
                 const bool stop_after = t->step.stop_after, watch = t->step.has_watch;
-                t->threads[i].signal = 0;
+                /* A hardware step holds an ignore-default signal here until
+                 * this trap. Clearing it would drop the handler. */
+                if (!default_ignored(t->threads[i].signal))
+                    t->threads[i].signal = 0;
                 TRY(xrt_finish_step(t, true));
                 t->threads[i].reason = watch ? XRT_STOP_WATCHPOINT : XRT_STOP_SINGLE_STEP;
                 t->threads[i].breakpoint_address = 0;
@@ -632,7 +710,8 @@ static enum xrt_status poll(struct xrt_target *t)
                 uint64_t trap_pc;
                 if (t->stepping && t->step.tid == tid && xrt_atomic_step_exit(t, pc)) {
                     const bool stop_after = t->step.stop_after;
-                    t->threads[i].signal = 0;
+                    if (!default_ignored(t->threads[i].signal))
+                        t->threads[i].signal = 0;
                     TRY(xrt_finish_step(t, true));
                     t->threads[i].reason = XRT_STOP_SINGLE_STEP;
                     t->threads[i].breakpoint_address = 0;

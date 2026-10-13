@@ -549,6 +549,11 @@ pub const Workspace = struct {
                     }
                     const code = binding(event);
                     if (!remote and event.kind == .press and event.plain() and event.shortcut == 'u') {
+                        if (session.redot.state == .off) {
+                            self.status = "Scene inspector requires --redot-debugger";
+                            w.dirty = true;
+                            continue;
+                        }
                         self.redot_panel.show(&session.redot);
                         w.dirty = true;
                         return self.input(w, context);
@@ -2724,6 +2729,24 @@ test "shared F8 precedes imported input and consumes only plain presses" {
     try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
     try std.testing.expectEqual(@as(usize, 2), session.audit_count);
     try std.testing.expect(workspace.shared_scope_changed);
+}
+
+test "unavailable Redot pane leaves ordinary input ownership unchanged" {
+    var session = Session{ .id = 1, .agent_scope = .control };
+    defer session.deinit();
+    var workspace = Workspace{};
+    defer workspace.deinit();
+    var w = Window{};
+    w.input.count = 5;
+    for ([_]u32{ 'q', 'u', 'i', 't', keys.sym.f8 }, 0..) |shortcut, i|
+        w.input.queue[i] = .{ .kind = .press, .shortcut = shortcut };
+    const before = session.target.snapshot().state;
+    workspace.input(&w, &session);
+    try std.testing.expect(!workspace.redot_panel.open);
+    try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
+    try std.testing.expectEqual(@as(usize, 1), session.audit_count);
+    try std.testing.expectEqual(before, session.target.snapshot().state);
+    try std.testing.expectEqual(@as(usize, 0), w.input.count);
 }
 
 test "shared F8 bypasses a modal editor without double toggling normal input" {

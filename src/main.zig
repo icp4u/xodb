@@ -63,6 +63,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
+    var no_ghidra_prestart = false;
     var config_path: ?[:0]const u8 = null;
     var languages_off = @import("preferences.zig").Languages{};
     var theme_path: ?[:0]const u8 = null;
@@ -193,10 +194,11 @@ pub fn main(init: std.process.Init) !void {
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
+                \\--no-ghidra-prestart leaves the configured Ghidra sidecar idle until pseudo-C is requested.
                 \\
             , .{});
             return;
-        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
+        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
         } else if (std.mem.eql(u8, arg, "--language-off") or std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--ui-scale") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
@@ -306,6 +308,7 @@ pub fn main(init: std.process.Init) !void {
         return err;
     } else @import("preferences.zig").Preferences{};
     const ui_scale = ui_scale_cli orelse preferences.appearance.ui_scale;
+    const ghidra_prestart = preferences.decompiler.prestart and !no_ghidra_prestart;
     // Off in either place is off.
     var languages = preferences.languages;
     inline for (@typeInfo(@TypeOf(languages)).@"struct".fields) |field| @field(languages, field.name) = @field(languages, field.name) and @field(languages_off, field.name);
@@ -317,6 +320,9 @@ pub fn main(init: std.process.Init) !void {
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
     std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
+    // Saved profiles, captures and observations have no code to decompile.
+    const archive_viewer = open_profile != null or open_capture != null or open_observation != null or browse_observation != null;
+    if (!remote_gui and !archive_viewer and ghidra_prestart) @import("semq/ghidra_sidecar.zig").prestart();
     if (remote_gui) {
         if (comptime build_options.gui) {
             var remote_args: std.ArrayList([:0]const u8) = .empty;
@@ -329,6 +335,7 @@ pub fn main(init: std.process.Init) !void {
                     if (!@field(languages, field.name)) try remote_args.appendSlice(a, &.{ "--language-off", field.name });
                 }
                 if (source) |path| try remote_args.appendSlice(a, &.{ "--source", path });
+                if (!ghidra_prestart) try remote_args.append(a, "--no-ghidra-prestart");
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
                 for (debug_files.items) |path| try remote_args.appendSlice(a, &.{ "--debug-file", path });
@@ -370,6 +377,7 @@ pub fn main(init: std.process.Init) !void {
     }
     if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
     session.static_analysis.toolchain_dir = static_analysis;
+    session.static_analysis.warmup_enabled = ghidra_prestart;
     if (static_analysis != null) {
         const swept = @import("semq/host.zig").sweepStale();
         if (swept > 0) std.debug.print("xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
@@ -517,7 +525,7 @@ pub fn main(init: std.process.Init) !void {
         defer font.deinit();
         var workspaces: [@import("model/process_tree.zig").maximum]?*Workspace = @splat(null);
         workspaces[0] = try a.create(Workspace);
-        workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
+        workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
         var workspace = workspaces[0].?;
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
@@ -591,7 +599,7 @@ pub fn main(init: std.process.Init) !void {
                     entry.* = null;
                 };
                 workspaces[0] = first_workspace;
-                workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
+                workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
                 session.* = Session.init();
                 remote_destroyed = false;
                 session.persistent.cancel = &quitting;
@@ -602,6 +610,7 @@ pub fn main(init: std.process.Init) !void {
                 session.allocation_helper = allocation_helper;
                 if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
                 session.static_analysis.toolchain_dir = static_analysis;
+                session.static_analysis.warmup_enabled = ghidra_prestart;
                 session.debug_files.automatic = preferences.symbols.automatic;
                 session.debug_files.auto_file_limit = preferences.symbols.auto_file_bytes;
                 session.debug_files.auto_total_limit = preferences.symbols.auto_total_bytes;
@@ -644,7 +653,7 @@ pub fn main(init: std.process.Init) !void {
             const active = tree.active();
             if (workspaces[tree.selected] == null) {
                 workspaces[tree.selected] = try a.create(Workspace);
-                workspaces[tree.selected].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads } };
+                workspaces[tree.selected].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
             }
             workspace = workspaces[tree.selected].?;
             if (active.process_id != last_process) {
@@ -718,7 +727,8 @@ pub fn main(init: std.process.Init) !void {
             const allocations_changed = active.allocations.serial != last_allocation_serial or allocation_state != last_allocation_state or
                 (if (active.allocations.capture) |capture| capture.revision != last_allocation_revision and current -| last_frame >= 250_000_000 else false);
             const profile_changed = if (active.profile) |capture| (capture.id != last_profile_id or capture.revision != last_profile_revision) and current -| last_frame >= 250_000_000 else false;
-            if ((if (active.imported) |state| state.serial != last_import_serial else false) or active.recorded_views.serial != last_view_serial or allocations_changed or profile_changed or window.dirty or workspace.animating or active.target.snapshot().generation != last_generation or frames > 0 or current - last_frame > 1_000_000_000) {
+            const animation_due = workspace.animating and (!workspace.redot_panel.moving() or current -| last_frame >= 33_333_334);
+            if ((if (active.imported) |state| state.serial != last_import_serial else false) or active.recorded_views.serial != last_view_serial or allocations_changed or profile_changed or window.dirty or animation_due or active.target.snapshot().generation != last_generation or frames > 0 or current - last_frame > 1_000_000_000) {
                 if (current < recovery.retry_at) continue;
                 if (!recovery.ready) {
                     phase_started = linux.now();

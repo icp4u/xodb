@@ -68,6 +68,7 @@ try:
     galaxy=h.ocr_until(d,'galaxy',lambda t:'descriptor galaxy' in t)
     check('redacted galaxy has a visible title','descriptor galaxy' in galaxy)
     check('scan omissions are visible',all(word in galaxy for word in ('unscanned','gone','capped','unmatched')))
+    galaxy=h.ocr_until(d,'galaxy-freshness',lambda t:all(word in t for word in ('fresh','cached','unknown')))
     check('membership freshness is visible',all(word in galaxy for word in ('fresh','cached','unknown')))
     # A scope this small is shown unfolded: one star per process, joined by
     # threads for the pipe, socket pair and deleted file the two share.

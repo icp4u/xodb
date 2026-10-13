@@ -1,4 +1,4 @@
-//! In-process port of scripts/semq/c01_to_xsg.py (adapter 0.3.0) for the
+//! In-process port of scripts/semq/c01_to_xsg.py (adapter 0.3.1) for the
 //! debugger host: one `xodb.ghidra.function_graph` 0.4.x export becomes xsg v1
 //! text, byte for byte what the Python adapter writes without `--elf`. The
 //! mapping decisions are documented in docs/SEMANTIC_QUERIES.md; a refusal
@@ -6,14 +6,14 @@
 const std = @import("std");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
-pub const version = "0.3.0";
+pub const version = "0.3.1";
 
 pub const Result = union(enum) { xsg: []u8, refused: []const u8 };
 
 const aliases = [_][2][]const u8{
-    .{ "BUILD", "MULTIEQUAL" },          .{ "DELAY_SLOT", "INDIRECT" },          .{ "LABEL", "PTRADD" },
-    .{ "CROSSBUILD", "PTRSUB" },         .{ "INT2FLOAT", "FLOAT_INT2FLOAT" },    .{ "FLOAT2FLOAT", "FLOAT_FLOAT2FLOAT" },
-    .{ "TRUNC", "FLOAT_TRUNC" },         .{ "CEIL", "FLOAT_CEIL" },              .{ "FLOOR", "FLOAT_FLOOR" },
+    .{ "BUILD", "MULTIEQUAL" },  .{ "DELAY_SLOT", "INDIRECT" },       .{ "LABEL", "PTRADD" },
+    .{ "CROSSBUILD", "PTRSUB" }, .{ "INT2FLOAT", "FLOAT_INT2FLOAT" }, .{ "FLOAT2FLOAT", "FLOAT_FLOAT2FLOAT" },
+    .{ "TRUNC", "FLOAT_TRUNC" }, .{ "CEIL", "FLOAT_CEIL" },           .{ "FLOOR", "FLOAT_FLOOR" },
     .{ "ROUND", "FLOAT_ROUND" },
 };
 const space_classes = [_][2][]const u8{
@@ -115,6 +115,81 @@ fn hasFlag(v: Value, name: []const u8) bool {
     return false;
 }
 
+const EntryPad = struct { block_id: []const u8, block_start: u64 };
+
+fn emptyArray(object: Value, key: []const u8) bool {
+    const value = Converter.opt(object, key) orelse return false;
+    return value == .array and value.array.items.len == 0;
+}
+
+/// Ghidra deliberately emits no p-code for these control-flow landing pads
+/// (its default AArch64 context hides pointer authentication everywhere).
+/// Match both the decoded mnemonic and the exact instruction bytes: an
+/// arbitrary instruction with an empty p-code list must not gain admission.
+fn knownEntryPad(processor: []const u8, mnemonic: []const u8, bytes: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(processor, "x86")) {
+        return (std.ascii.eqlIgnoreCase(mnemonic, "ENDBR64") and std.mem.eql(u8, bytes, "f30f1efa")) or
+            (std.ascii.eqlIgnoreCase(mnemonic, "ENDBR32") and std.mem.eql(u8, bytes, "f30f1efb"));
+    }
+    if (!std.ascii.eqlIgnoreCase(processor, "AARCH64")) return false;
+    if (std.ascii.eqlIgnoreCase(mnemonic, "PACIASP"))
+        return std.mem.eql(u8, bytes, "3f2303d5") or std.mem.eql(u8, bytes, "d503233f");
+    if (std.ascii.eqlIgnoreCase(mnemonic, "PACIBSP"))
+        return std.mem.eql(u8, bytes, "7f2303d5") or std.mem.eql(u8, bytes, "d503237f");
+    if (!std.ascii.eqlIgnoreCase(mnemonic, "BTI")) return false;
+    return for ([_][]const u8{
+        "1f2403d5", "5f2403d5", "9f2403d5", "df2403d5",
+        "d503241f", "d503245f", "d503249f", "d50324df",
+    }) |encoding| {
+        if (std.mem.eql(u8, bytes, encoding)) break true;
+    } else false;
+}
+
+/// If the decompiler's first basic block begins after the function identity,
+/// admit that gap only when producer evidence covers every byte with known
+/// landing pads and both raw and high p-code say they have no graph effect.
+fn entryPad(k: *Converter, doc: Value, lang: Value, blocks: []Value, entry: u64) !?EntryPad {
+    var first: ?EntryPad = null;
+    for (blocks) |block| {
+        const start = try k.hex(try k.get(block, "start"), "block");
+        if (start <= entry) return null;
+        if (first == null or start < first.?.block_start)
+            first = .{ .block_id = try k.str(block, "id"), .block_start = start };
+    }
+    const target = first orelse return null;
+    if (target.block_start - entry > 16) return null;
+    const list = Converter.opt(doc, "instructions") orelse return null;
+    if (list != .array) return null;
+    const processor = Converter.opt(lang, "processor") orelse return null;
+    if (processor != .string) return null;
+    var cursor = entry;
+    while (cursor < target.block_start) {
+        var found: ?Value = null;
+        for (list.array.items) |instruction| {
+            const encoded = Converter.opt(instruction, "addr") orelse continue;
+            if (encoded != .string or !std.mem.startsWith(u8, encoded.string, "0x")) continue;
+            const at = std.fmt.parseInt(u64, encoded.string[2..], 16) catch continue;
+            if (at != cursor) continue;
+            if (found != null) return null;
+            found = instruction;
+        }
+        const instruction = found orelse return null;
+        const length_value = Converter.opt(instruction, "length") orelse return null;
+        if (length_value != .integer or length_value.integer <= 0 or length_value.integer > 16) return null;
+        const length: u64 = @intCast(length_value.integer);
+        if (length > target.block_start - cursor) return null;
+        const bytes = Converter.opt(instruction, "bytes") orelse return null;
+        const mnemonic = Converter.opt(instruction, "mnemonic") orelse return null;
+        const admission = Converter.opt(instruction, "admission") orelse return null;
+        if (bytes != .string or mnemonic != .string or admission != .string or
+            !std.mem.eql(u8, admission.string, "admitted") or bytes.string.len != length * 2 or
+            !emptyArray(instruction, "raw_pcode") or !emptyArray(instruction, "high_ops") or
+            !knownEntryPad(processor.string, mnemonic.string, bytes.string)) return null;
+        cursor += length;
+    }
+    return if (cursor == target.block_start) target else null;
+}
+
 /// Converts one export; the input SHA-256 (hex) goes into the `source` line.
 /// Every allocation comes from `a` (an arena); a refusal carries its reason.
 pub fn convert(a: Allocator, doc: Value, source_sha256: []const u8) !Result {
@@ -212,15 +287,20 @@ fn run(k: *Converter, doc: Value, source_sha256: []const u8) ![]u8 {
 
     const entry = try k.hex(try k.get(func, "entry"), "function.entry");
     const blocks = try k.array(doc, "blocks");
+    var entry_pad: ?EntryPad = null;
     for (blocks) |b| {
         if (try k.hex(try k.get(b, "start"), "block") == entry) break;
     } else {
-        var warnings: std.ArrayList(u8) = .empty;
-        if (Converter.opt(func, "warnings")) |w| if (w == .array) for (w.array.items, 0..) |item, i| {
-            if (i > 0) try warnings.appendSlice(a, "; ");
-            if (Converter.opt(item, "text")) |t| if (t == .string) try warnings.appendSlice(a, t.string);
-        };
-        return k.refuse("no block starts at function entry 0x{x}; decompiler warnings: {s}", .{ entry, warnings.items[0..@min(600, warnings.items.len)] });
+        entry_pad = try entryPad(k, doc, lang, blocks, entry);
+        if (entry_pad == null) {
+            var warnings: std.ArrayList(u8) = .empty;
+            if (Converter.opt(func, "warnings")) |w| if (w == .array) for (w.array.items, 0..) |item, i| {
+                if (i > 0) try warnings.appendSlice(a, "; ");
+                if (Converter.opt(item, "text")) |t| if (t == .string) try warnings.appendSlice(a, t.string);
+            };
+            return k.refuse("no block starts at function entry 0x{x}; decompiler warnings: {s}", .{ entry, warnings.items[0..@min(600, warnings.items.len)] });
+        }
+        try notes.append(a, try std.fmt.allocPrint(a, "entry landing pad [0x{x},0x{x}) folded into first block", .{ entry, entry_pad.?.block_start }));
     }
     if (Converter.opt(func, "instructions_outside_declared_bounds")) |outside| if (outside == .array and outside.array.items.len > 0)
         try notes.append(a, try std.fmt.allocPrint(a, "{d} instructions outside declared bounds (bounds_policy={s}); results may cite them", .{ outside.array.items.len, try pyStr(a, if (func == .object) func.object.get("bounds_policy") else null) }));
@@ -236,7 +316,9 @@ fn run(k: *Converter, doc: Value, source_sha256: []const u8) ![]u8 {
     var op_block: std.StringHashMapUnmanaged(Place) = .empty;
     for (blocks) |b| {
         const id = try k.str(b, "id");
-        try out.append(a, try std.fmt.allocPrint(a, "block {d} 0x{x}", .{ try k.num(try k.get(b, "id"), "bb:"), try k.hex(try k.get(b, "start"), id) }));
+        const exported_start = try k.hex(try k.get(b, "start"), id);
+        const start = if (entry_pad != null and std.mem.eql(u8, id, entry_pad.?.block_id)) entry else exported_start;
+        try out.append(a, try std.fmt.allocPrint(a, "block {d} 0x{x}", .{ try k.num(try k.get(b, "id"), "bb:"), start }));
         for (try k.array(b, "ops"), 0..) |op_id, seq| {
             if (op_id != .string) return k.refuse("TypeError: block op id", .{});
             if (op_block.contains(op_id.string)) return k.refuse("op {s} listed in two blocks", .{op_id.string});
@@ -396,4 +478,77 @@ test "adapter refusals keep their cause" {
     var doc = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
     try doc.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x1" });
     try std.testing.expect(std.mem.startsWith(u8, (try convert(a, doc, "00")).refused, "no block starts at function entry 0x1"));
+}
+
+test "known no-pcode entry pads extend the first block to the function identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var x86 = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try x86.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012dc" });
+    const endbr = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"f30f1efa","mnemonic":"ENDBR64","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try x86.object.getPtr("instructions").?.array.insert(0, endbr);
+    const x86_result = try convert(a, x86, "00");
+    try std.testing.expect(std.mem.indexOf(u8, x86_result.xsg, "function 1 qx_alloc entry=0x4012dc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x86_result.xsg, "block 0 0x4012dc") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x86_result.xsg, "entry landing pad [0x4012dc,0x4012e0) folded into first block") != null);
+
+    var arm = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try arm.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012d8" });
+    try arm.object.getPtr("language").?.object.put(a, "processor", .{ .string = "AARCH64" });
+    const bti = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012d8","addr":"0x4012d8","length":4,"admission":"admitted","bytes":"5f2403d5","mnemonic":"bti","raw_pcode":[],"high_ops":[]}
+    , .{});
+    const paciasp = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"3f2303d5","mnemonic":"paciasp","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try arm.object.getPtr("instructions").?.array.insert(0, paciasp);
+    try arm.object.getPtr("instructions").?.array.insert(0, bti);
+    const arm_result = try convert(a, arm, "00");
+    try std.testing.expect(std.mem.indexOf(u8, arm_result.xsg, "function 1 qx_alloc entry=0x4012d8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, arm_result.xsg, "block 0 0x4012d8") != null);
+
+    var b_key = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try b_key.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012dc" });
+    try b_key.object.getPtr("language").?.object.put(a, "processor", .{ .string = "AARCH64" });
+    const pacibsp = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"7f2303d5","mnemonic":"pacibsp","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try b_key.object.getPtr("instructions").?.array.insert(0, pacibsp);
+    try std.testing.expect(std.mem.indexOf(u8, (try convert(a, b_key, "00")).xsg, "block 0 0x4012dc") != null);
+}
+
+test "empty p-code alone does not make an entry instruction safe" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+
+    var nop = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try nop.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012df" });
+    const instruction = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012df","addr":"0x4012df","length":1,"admission":"admitted","bytes":"90","mnemonic":"NOP","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try nop.object.getPtr("instructions").?.array.insert(0, instruction);
+    try std.testing.expect(std.mem.startsWith(u8, (try convert(a, nop, "00")).refused, "no block starts at function entry"));
+
+    var effect = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try effect.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012dc" });
+    const active = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"f30f1efa","mnemonic":"ENDBR64","raw_pcode":[{"opcode":"CALLOTHER"}],"high_ops":[]}
+    , .{});
+    try effect.object.getPtr("instructions").?.array.insert(0, active);
+    try std.testing.expect(std.mem.startsWith(u8, (try convert(a, effect, "00")).refused, "no block starts at function entry"));
+
+    // An AArch64 NOP is a hint with no p-code too, but it is not a landing pad.
+    var hint = try std.json.parseFromSliceLeaky(Value, a, @embedFile("adapter_fixture.json"), .{});
+    try hint.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012dc" });
+    try hint.object.getPtr("language").?.object.put(a, "processor", .{ .string = "AARCH64" });
+    const arm_nop = try std.json.parseFromSliceLeaky(Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"1f2003d5","mnemonic":"nop","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try hint.object.getPtr("instructions").?.array.insert(0, arm_nop);
+    try std.testing.expect(std.mem.startsWith(u8, (try convert(a, hint, "00")).refused, "no block starts at function entry"));
 }

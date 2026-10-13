@@ -4,10 +4,12 @@ from datetime import datetime
 import json, os, subprocess, time
 from pathlib import Path
 from client import Client
+from helpers.orphans import adopt, reap
+adopt()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 run = root / '.work' / ('process-tree-' + datetime.now().strftime('%Y%m%dT%H%M%S%f'))
-run.mkdir()
+run.mkdir(parents=True)
 fixture = os.environ.get('XODB_PROCESS_FIXTURE', str(root / 'zig-out/bin/xodb-process-fixture'))
 def check_error(c, name, expected, **args):
     value = c.tool(name, **args)
@@ -144,4 +146,5 @@ try:
         check_error(c,name,'AgentScopeDenied',generation=generation,**extra)
     assert c.inspect('get_processes')['total']==1
 finally:c.close()
+assert reap(), 'a process started by the fixtures is still running'
 print('Process-tree MCP: fork, vfork/exec, policy inheritance, scope, limits, explicit detach, owned cleanup:',run.relative_to(root))

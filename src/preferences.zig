@@ -81,11 +81,20 @@ pub const Galaxy = struct {
     easing_ms: f32 = 450,
     max_stars: u32 = 512,
     unfold: bool = true,
+    pan_speed: f32 = 340,
+    zoom_speed: f32 = 1.2,
+    rotate_speed: f32 = 0.45,
+    tour_seconds: f32 = 5,
+    tour_drift: bool = true,
+    tour_drift_speed: f32 = 0.025,
     pub fn validate(self: Galaxy) !void {
         inline for (.{ .{ self.cloud_size, 0.5, 3.0 }, .{ self.brightness, 0.1, 2.0 }, .{ self.camera_zoom, 1.0, 2.5 }, .{ self.easing_ms, 50.0, 2000.0 } }) |range| {
             if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGalaxyLook;
         }
         if (self.max_stars < 8 or self.max_stars > 1024) return error.InvalidGalaxyLook;
+        inline for (.{ .{ self.pan_speed, 20.0, 2000.0 }, .{ self.zoom_speed, 1.01, 2.0 }, .{ self.rotate_speed, 0.01, 3.0 }, .{ self.tour_seconds, 1.0, 60.0 }, .{ self.tour_drift_speed, 0.0, 0.3 } }) |range| {
+            if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGalaxyLook;
+        }
     }
 };
 pub const Preferences = struct {
@@ -99,6 +108,7 @@ pub const Preferences = struct {
         ui_scale: ?f32 = null,
     } = .{},
     languages: Languages = .{},
+    decompiler: struct { prestart: bool = true } = .{},
     galaxy: Galaxy = .{},
 };
 
@@ -173,6 +183,11 @@ test "language views default on, turn off one at a time or all at once, and refu
     try cli.turnOff("all");
     try std.testing.expect(!cli.on(.go));
     try std.testing.expectError(error.UnknownLanguage, cli.turnOff("cobol"));
+}
+
+test "Ghidra eager startup defaults on and can be disabled" {
+    try std.testing.expect((try parse(std.testing.allocator, "{}")).decompiler.prestart);
+    try std.testing.expect(!(try parse(std.testing.allocator, "{\"decompiler\":{\"prestart\":false}}")).decompiler.prestart);
 }
 
 test "preferences partial defaults, custom and unlimited durations, typo and type errors" {

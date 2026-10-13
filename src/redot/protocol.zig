@@ -277,7 +277,11 @@ pub const Adapter = struct {
     pub fn profiling(self: *Adapter, enabled: bool) !void {
         try self.requireReady();
         try self.queue(if (enabled) .profile_start else .profile_stop, 0);
-        if (enabled) self.profiler.deinit();
+        if (enabled) {
+            const capture = self.profiler.capture;
+            self.profiler.deinit();
+            if (capture.phase == .sampling) self.profiler.capture = capture;
+        }
         self.profiler.enabled = enabled;
         self.revision +%= 1;
     }

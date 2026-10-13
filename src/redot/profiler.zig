@@ -5,6 +5,26 @@ const Value = @import("protocol.zig").Value;
 const a = std.heap.page_allocator;
 pub const frame_limit = 256;
 pub const sample_limit = 128;
+/// Progress reported by the explicit sampling client, not inferred from frames.
+pub const Capture = struct {
+    pub const Phase = enum { idle, sampling, ready, failed };
+    phase: Phase = .idle,
+    completed: u32 = 0,
+    total: u32 = 0,
+    message: [512]u8 = @splat(0),
+    message_len: usize = 0,
+
+    pub fn diagnostic(self: *const Capture) []const u8 {
+        return self.message[0..self.message_len];
+    }
+    pub fn set(self: *Capture, phase: Phase, completed: u32, total: u32, message: []const u8) void {
+        self.* = .{ .phase = phase, .completed = completed, .total = total };
+        var n = @min(message.len, self.message.len);
+        while (n < message.len and n > 0 and message[n] & 0xc0 == 0x80) n -= 1;
+        @memcpy(self.message[0..n], message[0..n]);
+        self.message_len = n;
+    }
+};
 pub const Function = struct { signature: []const u8, calls: u64, self_ms: f64, total_ms: f64, internal_ms: f64 };
 pub const Server = struct { server: []const u8, function: []const u8, ms: f64 };
 pub const Frame = struct {
@@ -47,6 +67,7 @@ pub fn Owned(comptime T: type) type {
     };
 }
 pub const State = struct {
+    capture: Capture = .{},
     enabled: bool = false,
     revision: u64 = 0,
     signatures: std.AutoHashMapUnmanaged(u64, []const u8) = .empty,
@@ -151,6 +172,19 @@ fn milliseconds(value: Value) !f64 {
 pub fn scriptPath(signature_: []const u8) ?[]const u8 {
     const end = std.mem.indexOf(u8, signature_, "::") orelse return null;
     return signature_[0..end];
+}
+
+test "capture progress and bounded startup diagnostic" {
+    var capture = Capture{};
+    capture.set(.sampling, 3, 12, "");
+    try std.testing.expectEqual(Capture.Phase.sampling, capture.phase);
+    try std.testing.expectEqual(@as(u32, 3), capture.completed);
+    try std.testing.expectEqual(@as(u32, 12), capture.total);
+    const message = "x" ** 511 ++ "\u{e9}";
+    capture.set(.failed, 3, 12, message);
+    try std.testing.expectEqual(@as(usize, 511), capture.diagnostic().len);
+    capture.set(.ready, 12, 12, "");
+    try std.testing.expectEqualStrings("", capture.diagnostic());
 }
 
 test "engine frame times keep units signatures and bounded history" {

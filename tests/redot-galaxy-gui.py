@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import shutil
 import subprocess
 import sys
@@ -58,6 +59,11 @@ try:
                   str(Path(a.redot).resolve()), '--headless', '--path', str(work / 'project')],
                   binary=str(a.binary.resolve()) if a.binary else None)
     scene = start_scene(d.tool)
+    keeper = subprocess.Popen([h.HELPER, str(d.width), str(d.height), 'layout', 'us', 'barrier'],
+                              env=d.env, stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    d.procs.append(keeper)
+    if not select.select([keeper.stdout], [], [], 10 * h.load_scale())[0] or keeper.stdout.readline() != b'ready\n':
+        raise AssertionError('private keyboard barrier not reached')
     player = next(node for node in scene['nodes'] if node['name'] == 'Player')
     d.keys('tap', 22)  # U inspector
     d.keys('tap', 34)  # G galaxy
@@ -74,16 +80,30 @@ try:
     until(lambda: len(rows('galaxy-look')) > before)
     check('hover never moves the selected scene node', all(float(row['zoom']) == 1 and row['camera'] == '0' for row in rows('galaxy-look')[before:]))
     d.keys('click', round(float(point['x'])), round(float(point['y'])))
+    until(lambda: rows('redot-galaxy')[-1]['selected'] == player['object_id'])
+    check('single click selects without leaving or moving the galaxy', rows('galaxy-look')[-1]['camera'] == '0')
+    d.keys('tap', 25)  # P opens the selected object's inspector.
     selected = h.ocr_until(d, 'picked-node', lambda text: 'object inspector' in text and 'player.gd' in text and player['object_id'] in text)
-    check('actual node click opens matching object and script', player['object_id'] in selected)
+    check('actual node click then P opens matching object and script', player['object_id'] in selected)
     count = len(rows('redot-galaxy'))
     d.keys('tap', 34)
     until(lambda: len(rows('redot-galaxy')) > count)
     check('the inspector selection is ringed in the galaxy', rows('redot-galaxy')[-1]['selected'] == player['object_id'])
+    d.keys('tap', 106)  # Same carousel as the descriptor galaxy.
+    until(lambda: rows('galaxy-pick')[-1]['cluster'] != '0' and rows('galaxy-look')[-1]['camera'] == '0')
+    check('Redot shares explicit carousel framing', float(rows('galaxy-look')[-1]['zoom']) > 1)
+    pose_keys = ('zoom', 'shift_x', 'shift_y', 'rotation')
+    pose = tuple(rows('galaxy-look')[-1][key] for key in pose_keys)
     old_revision = int(rows('redot-galaxy')[-1]['revision'])
     d.keys('tap', 19)  # R refresh
     until(lambda: int(rows('redot-galaxy')[-1]['revision']) > old_revision)
     check('refresh retains a real scene graph with no invented impulses', rows('redot-galaxy')[-1]['nodes'] == '5' and rows('redot-galaxy')[-1]['impulses'] == '0')
+    check('refresh cannot retarget the framed camera', tuple(rows('galaxy-look')[-1][key] for key in pose_keys) == pose and rows('galaxy-look')[-1]['camera'] == '0')
+    d.keys('tap', 24)  # O tour.
+    until(lambda: rows('galaxy-look')[-1]['tour'] == '1' and rows('galaxy-look')[-1]['camera'] == '1')
+    d.keys('tap', 102)  # Home stops the tour and fits.
+    until(lambda: rows('galaxy-look')[-1]['tour'] == '0' and rows('galaxy-look')[-1]['camera'] == '0')
+    check('Redot shares tour and Home fit', float(rows('galaxy-look')[-1]['zoom']) == 1 and float(rows('galaxy-look')[-1]['rotation']) == 0)
     d.keys('tap', 34)
     h.ocr_until(d, 'tree-again', lambda text: 'scene tree' in text and 'object inspector' in text)
     check('G returns to the existing tree and inspector', True)

@@ -31,6 +31,7 @@ pub const usage =
     \\  --session-socket PATH  share this live cache with observer-only MCP clients
     \\  --mcp           serve observer-only MCP on stdin/stdout alongside the live view
     \\  --galaxy-demo N[:idle]  FD Galaxy with N synthetic processes (1-1024); reads and traces nothing
+    \\  --galaxy-tour   start the galaxy's explicit camera tour (O stops; any control takes over)
     \\  --pause         start paused (replay: show the last frame with full history)
     \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
@@ -54,6 +55,7 @@ pub const Options = struct {
     graph_count: usize = 0,
     galaxy_demo: u32 = 0,
     galaxy_demo_idle: bool = false,
+    galaxy_tour: bool = false,
     look: ?vw.memmap.Look = null,
     gibson_flight: bool = false,
     memmap_pid: ?i32 = null,
@@ -72,6 +74,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
     while (i < args.len) : (i += 1) {
         const arg = args[i];
         if (std.mem.eql(u8, arg, "--overview")) continue;
+        if (std.mem.eql(u8, arg, "--galaxy-tour")) {
+            o.galaxy_tour = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--gibson-flight")) {
             o.gibson_flight = true;
             continue;
@@ -170,6 +176,10 @@ pub fn parse(args: []const [:0]const u8) !Options {
     }
     if (o.galaxy_demo != 0) {
         if (o.graph_count > 0 or (o.panel != null and o.panel.? != .galaxy)) return error.InvalidGalaxyDemo;
+        o.panel = .galaxy;
+    }
+    if (o.galaxy_tour) {
+        if (o.panel != null and o.panel.? != .galaxy) return error.InvalidGalaxyTour;
         o.panel = .galaxy;
     }
     if (o.graph_count > 0) {

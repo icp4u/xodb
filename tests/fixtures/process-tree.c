@@ -15,6 +15,8 @@ volatile unsigned tree_value;
 __attribute__((noinline)) void tree_ready(void) { __asm__ volatile("" ::: "memory"); }
 __attribute__((noinline)) void tree_done(void) { __asm__ volatile("" ::: "memory"); }
 __attribute__((noinline)) void tree_child(void) { tree_value++; __asm__ volatile("" ::: "memory"); tree_value++; }
+/* Parent and child both call this immediately after fork, before the parent waits. */
+__attribute__((noinline)) void tree_burst_hit(void) { __asm__ volatile("" ::: "memory"); }
 #if defined(__x86_64__)
 __attribute__((naked,noinline)) long tree_raw_fork(void) {
     __asm__ volatile("mov $57, %eax; .globl tree_fork_instruction; tree_fork_instruction: syscall; ret");
@@ -67,6 +69,14 @@ int main(int argc, char **argv) {
         return 98;
     }
     if(!strcmp(mode,"system")){int s=system("exit 0");tree_done();return WIFEXITED(s)?WEXITSTATUS(s):93;}
+    if(!strcmp(mode,"fork-burst")){
+        char *end=0;long n=argc>2?strtol(argv[2],&end,10):200;
+        if(n<1||n>1000||(end&&*end))return 90;
+        pid_t ids[1000];
+        for(long i=0;i<n;i++){ids[i]=fork();if(ids[i]<0)return 90;if(ids[i]==0){tree_burst_hit();_exit(0);}tree_burst_hit();}
+        for(long i=0;i<n;i++)if(tree_wait(ids[i]))return 92;
+        tree_done();return 0;
+    }
     pid_t child=!strcmp(mode,"clone-vm")?clone(clone_child,clone_stack+sizeof clone_stack,CLONE_VM|SIGCHLD,0):!strncmp(mode,"vfork",5)?vfork():!strcmp(mode,"step")?(pid_t)tree_raw_fork():fork();
     if(child<0)return 90;
     if(child==0){

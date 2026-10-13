@@ -31,7 +31,7 @@ const cloud_stride = cloud_vertex_bytes + 22000 * @sizeOf(Cell);
 pub const CloudSlot = u1;
 pub const buffer_bytes = cloud_vertex_offset + 2 * cloud_stride;
 /// A run of cells drawn after the vertices recorded before it, clipped to `clip`.
-const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect, cloud: ?CloudSlot = null, additive: bool = false, transform: [4]f32 = .{ 1, 1, 0, 0 } };
+const CellBatch = struct { at: usize, first: u32, count: u32, clip: Rect, cloud: ?CloudSlot = null, additive: bool = false, transform: [6]f32 = .{ 1, 1, 0, 0, 1, 0 } };
 fn info(comptime T: type, kind: c.VkStructureType) T {
     var v = std.mem.zeroes(T);
     v.sType = kind;
@@ -452,7 +452,7 @@ pub const Renderer = struct {
         write.descriptorType = c.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
         write.pImageInfo = &image;
         c.vkUpdateDescriptorSets(self.device, 1, &write, 0, null);
-        const push = c.VkPushConstantRange{ .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 24 };
+        const push = c.VkPushConstantRange{ .stageFlags = c.VK_SHADER_STAGE_VERTEX_BIT, .offset = 0, .size = 32 };
         var pipeline_layout = info(c.VkPipelineLayoutCreateInfo, c.VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO);
         pipeline_layout.setLayoutCount = 1;
         pipeline_layout.pSetLayouts = &self.descriptor_layout;
@@ -825,7 +825,7 @@ pub const Renderer = struct {
         const offset: u64 = 0;
         c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
         c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
-        const size = [6]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0 };
+        const size = [8]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0, 1, 0 };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
         const clip = c.VkRect2D{ .offset = .{ .x = 0, .y = 0 }, .extent = self.extent };
         c.vkCmdSetScissor(self.command, 0, 1, &clip);
@@ -909,7 +909,7 @@ pub const Renderer = struct {
         if (n > 0) self.batches[self.batch_count - 1].additive = true;
         return points;
     }
-    pub fn cloud(self: *Renderer, slot: CloudSlot, transform: [4]f32, additive: bool) !void {
+    pub fn cloud(self: *Renderer, slot: CloudSlot, transform: [6]f32, additive: bool) !void {
         if (self.batch_count == self.batches.len) return error.VertexBufferFull;
         self.batches[self.batch_count] = .{ .at = self.vertices, .first = 0, .count = self.clouds[slot].cells, .clip = self.clip, .cloud = slot, .additive = additive, .transform = transform };
         self.batch_count += 1;
@@ -1070,7 +1070,7 @@ pub const Renderer = struct {
         const offset: u64 = 0;
         c.vkCmdBindVertexBuffers(self.command, 0, 1, &self.buffer, &offset);
         c.vkCmdBindDescriptorSets(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, self.layout, 0, 1, &self.descriptor, 0, null);
-        const size = [6]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0 };
+        const size = [8]f32{ self.ui_width, self.ui_height, 1, 1, 0, 0, 1, 0 };
         c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(size)), &size);
         var drawn: usize = 0;
         var scene_drawn = false;
@@ -1091,7 +1091,7 @@ pub const Renderer = struct {
             const clip = c.VkRect2D{ .offset = .{ .x = x0, .y = y0 }, .extent = .{ .width = @intCast(x1 - x0), .height = @intCast(y1 - y0) } };
             c.vkCmdSetScissor(self.command, 0, 1, &clip);
             if (b.cloud) |slot| {
-                const transformed = [6]f32{ size[0], size[1], b.transform[0], b.transform[1], b.transform[2], b.transform[3] };
+                const transformed = [8]f32{ size[0], size[1], b.transform[0], b.transform[1], b.transform[2], b.transform[3], b.transform[4], b.transform[5] };
                 c.vkCmdPushConstants(self.command, self.layout, c.VK_SHADER_STAGE_VERTEX_BIT, 0, @sizeOf(@TypeOf(transformed)), &transformed);
                 c.vkCmdBindPipeline(self.command, c.VK_PIPELINE_BIND_POINT_GRAPHICS, if (b.additive) self.glow_pipeline else self.pipeline);
                 const cloud_at: u64 = cloud_vertex_offset + @as(u64, slot) * cloud_stride;
@@ -1193,13 +1193,13 @@ test "retained cloud survives transient reuse and carries its own transform and 
     const retained: *const Vertex = @ptrCast(@alignCast(bytes.ptr + cloud_vertex_offset));
     try std.testing.expectEqual([2]f32{ 2, 3 }, retained.position);
     try std.testing.expectEqualSlices(u8, std.mem.asBytes(&cell), bytes[cloud_cell_offset..][0..@sizeOf(Cell)]);
-    try renderer.cloud(0, .{ 1.5, 1, 10, 20 }, true);
+    try renderer.cloud(0, .{ 1.5, 1, 10, 20, 0, 1 }, true);
     const batch = renderer.batches[0];
     try std.testing.expect(batch.cloud == 0 and batch.additive and batch.at == 6 and batch.count == 1);
-    try std.testing.expectEqual([4]f32{ 1.5, 1, 10, 20 }, batch.transform);
+    try std.testing.expectEqual([6]f32{ 1.5, 1, 10, 20, 0, 1 }, batch.transform);
     try renderer.rect(.{ .x = 40, .y = 30, .w = 4, .h = 5 }, .{ 0, 0, 1, 1 });
     try renderer.retainCloud(1, 6, &.{cell}, 9);
-    try renderer.cloud(1, .{ 1, 1, 0, 0 }, false);
+    try renderer.cloud(1, .{ 1, 1, 0, 0, 1, 0 }, false);
     try std.testing.expectEqual([2]f32{ 2, 3 }, retained.position);
     const second: *const Vertex = @ptrCast(@alignCast(bytes.ptr + cloud_vertex_offset + cloud_stride));
     try std.testing.expectEqual([2]f32{ 40, 30 }, second.position);

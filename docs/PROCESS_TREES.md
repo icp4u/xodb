@@ -24,11 +24,16 @@ child process is made safe and released, and the parent resumes on its own:
 - While a vfork child borrows the parent's memory, the parent's breakpoints are
   out for every thread of the parent. A thread that runs through one in that
   window (normally a few milliseconds, until the child's exec) is not stopped.
-- The parent is not stopped for the child's `SIGCHLD` either: it is delivered
-  and the program runs on (with following on or off). A thread that is in the
-  middle of a step still stops on it. That includes the hidden step a Continue
-  takes to leave a breakpoint, so a Continue right after a child exited can
-  stop once more with `SIGCHLD`; Continue again.
+  A breakpoint set, enabled, or re-armed in that window is recorded and written
+  back with the others when the last borrowing child execs or exits. A software
+  step, which would plant a new trap, is refused until then.
+- The parent is not stopped for the child's `SIGCHLD`: it is delivered and the
+  program runs on, with following on or off. A step in progress finishes and
+  the signal is passed on, including the hidden step a Continue takes to leave
+  a breakpoint and a peer thread while another thread steps. `SIGWINCH` and
+  `SIGURG` are delivered the same way, because their default action is to
+  ignore the signal. No per-signal stop request exists. An idle stop that is
+  not a step still reports the signal.
 - A step across the creating call releases the child the same way.
 - Threads may spawn at the same time: up to eight children can borrow the
   parent's memory at once, and the breakpoints go back when the last of them

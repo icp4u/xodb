@@ -81,6 +81,7 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     view.graph.collapse_auto = false;
     if (o.theme) |t| view.palette = themes.find(t).?;
     if (o.panel) |p| view.show(p);
+    if (o.galaxy_tour) @import("galaxy_descriptors.zig").navigation().motion.navigation.tour = true;
     if (o.attach_exe) {
         view.show(.processes);
         @memcpy(view.search[0..4], ".exe");

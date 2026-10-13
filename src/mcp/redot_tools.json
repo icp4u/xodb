@@ -36,6 +36,12 @@
     "annotations":{"readOnlyHint":false,"xodbSessionAccess":"controller"}
   },
   {
+    "name": "set_redot_capture_status",
+    "description": "Publish explicit sampling-client progress or a startup failure for the Time pane. Does not start profiling, interrupt, or resume the target. Diagnostic text is capped at 512 bytes.",
+    "inputSchema":{"type":"object","properties":{"phase":{"type":"string","enum":["idle","sampling","ready","failed"]},"completed":{"type":"integer","minimum":0,"maximum":128},"total":{"type":"integer","minimum":0,"maximum":128},"diagnostic":{"type":"string"},"generation":{"type":"integer","minimum":0},"process_id":{"type":"integer","minimum":1,"maximum":1024}},"required":["phase","generation"],"additionalProperties":false},
+    "annotations":{"readOnlyHint":false,"xodbSessionAccess":"controller"}
+  },
+  {
     "name": "get_redot_profile",
     "description": "Read bounded frame timings, select a process frame, and drill down through script costs to native/script stop samples joined by the engine frame number. Shared script timing is not per-node timing.",
     "inputSchema":{"type":"object","properties":{"start":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":256},"frame_number":{"type":"integer","minimum":0},"process_id":{"type":"integer","minimum":1,"maximum":1024}},"additionalProperties":false},

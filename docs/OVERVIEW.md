@@ -102,8 +102,9 @@ on that display. xodb's overview does not save preferences or history into
 `--session-socket` creates the socket requested by the caller.
 
 Press `G` for the graph, `Y` for the galaxy, `C` to fold or expand observed cgroups,
-and `+`/`-` to change detail. Click a process or cgroup to focus; `Esc` returns
-to the whole graph. `L` opens a focused process in Files, and clicking a shared
+and `+`/`-` to change detail. In the graph, click a process or cgroup to focus;
+in the galaxy, click selects and Return frames. `Esc` returns to the whole graph.
+`L` opens a selected process in Files. In either view, clicking a shared
 resource opens its holders there. For an owned demo process, repeat
 `--graph-pid PID` to restrict the actual descriptor collector; that restriction
 also remains in effect when drilling into Files. It also filters every tracepoint
@@ -750,8 +751,8 @@ retires its GPU buffers and attachments after the frame fence.
 ## Galaxy look preferences
 
 The descriptor galaxy starts unfolded with a 512-star budget (`+`/`-` changes
-it, up to 1024; `C` folds groups). Click a cloud centre to ease the camera toward
-its cluster; click the centre again to return. Hover never moves the camera.
+it, up to 1024; `C` folds groups). Click a star or cloud to select it; double-click
+or Return eases the camera to frame it. Hover and data refresh never move the camera.
 Hover a thread for directional byte rates
 and outlined endpoint tags. Unmeasured traffic is never animated as measured.
 
@@ -760,8 +761,26 @@ preferences file; no file is discovered or written implicitly. The `galaxy`
 object accepts `additive` (default true), `cloud_size` (0.5–3, default 1.6),
 `brightness` (0.1–2, default 0.85), `camera_zoom` (1–2.5, default 1.35),
 `easing_ms` (50–2000, default 450), `max_stars` (8–1024, default 512), and
-`unfold` (default true). A zoom of 1 keeps scale fixed while still easing the
-cluster to the centre. See `config/preferences.example.json`.
+`unfold` (default true). `camera_zoom` is the minimum cluster framing zoom;
+stars frame at three times that value. See `config/preferences.example.json`.
+
+The descriptor and Redot scene galaxies share navigation: hold `WASD` to pan
+(`S` overrides sorting), wheel to zoom about the pointer, or drag empty space.
+Left/Right frame clusters in descending activity, then size order; ties use
+stable identities. Hold comma/period to rotate about the field centre; labels
+stay upright. `H`/Home fits all and clears rotation. Esc backs out, then fits.
+`O` toggles an automatic carousel that glides between clusters; any other key
+or pointer input stops it, while losing window focus does not.
+`--galaxy-tour` starts an overview galaxy tour for recording. `?` shows the
+navigation footer again. `q` still quits. Redot `P` opens the selected object's
+inspector; a single click stays in the galaxy.
+
+Navigation preferences in the same `galaxy` object are `pan_speed` (20–2000 UI
+units/s, default 340), `zoom_speed` (1.01–2 per wheel notch, default 1.2),
+`rotate_speed` (0.01–3 radians/s, default 0.45), `tour_seconds` (1–60, default 5),
+`tour_drift` (default true) and `tour_drift_speed` (0–0.3 radians/s, default 0.025).
+Tour drift is a presentation effect, not measured activity. Camera movement is
+capped at 30 fps and stops requesting frames when the eased target is reached.
 
 Cloud points and fibres are retained in GPU storage: impulse animation and
 camera transforms do not rebuild them. Layout, appearance and focus changes

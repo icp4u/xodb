@@ -35,6 +35,9 @@ struct xrt_step {
      * at a successor keeps probe_owned clear. */
     uint8_t software, successor_count, probe_owned[2];
     uint64_t successor_pc[2], probe_id[2];
+    /* Ignore-default signals taken off the queue during this step, beyond the
+     * one the thread record carries. The end of the step queues them again. */
+    uint8_t parked;
 };
 /* One unpublished plant. original holds the full prepared image, not only the
  * bytes a short rollback managed to restore. */
@@ -75,9 +78,10 @@ struct xrt_target {
     /* Released shared vfork. One child stays traced until a VFORK_DONE.
      * release counts the children still borrowing the image: while it is
      * nonzero the image holds original bytes and the breakpoint records still
-     * say patched. waiting names their parent threads, each owed a
-     * VFORK_DONE. hold_detach asks the next child stop to detach rather than
-     * resume. */
+     * say patched. A plant or re-arm in that window marks the record only;
+     * the last VFORK_DONE writes the bytes. waiting names their parent
+     * threads, each owed a VFORK_DONE. hold_detach asks the next child stop
+     * to detach rather than resume. */
     int32_t vfork_hold;
     uint8_t vfork_release, vfork_hold_detach;
     int32_t vfork_waiting[8];
@@ -114,6 +118,10 @@ enum xrt_status xrt_target_file_owner(struct xrt_target *, const struct xrt_file
         int *, struct xrt_file_identity *, enum xrt_file_source *);
 int xrt_breakpoint_index(const struct xrt_target *t, uint64_t id);
 int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address);
+/* Nonzero while a released vfork child borrows this image. */
+int xrt_image_borrowed(const struct xrt_target *t);
+/* Queue the step thread's parked signals again. The step is ending. */
+void xrt_requeue_parked(struct xrt_target *t);
 enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn);
 enum xrt_status xrt_memory_mutation_allowed(const struct xrt_target *t);
 enum xrt_status xrt_execution_allowed(const struct xrt_target *t);

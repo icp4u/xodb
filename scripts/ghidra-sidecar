@@ -149,9 +149,14 @@ mv -f -- "$classpath_file.tmp" "$classpath_file"
 classpath=$(cat -- "$classpath_file")
 classes=$cache_dir/classes
 class=$classes/XodbGhidraSidecar.class
-if [[ ! -f $class || $source_file -nt $class ]]; then
+# Compiled classes are reused only for the source they were built from: a
+# file's time does not say so after an install that keeps older timestamps.
+stamp=$(cksum <"$source_file")
+if [[ ! -f $class || ! -f $classes/source.cksum || $(<"$classes/source.cksum") != "$stamp" ]]; then
+    rm -rf -- "$classes.tmp"
     mkdir -p -- "$classes.tmp"
     "$javac" -proc:none -cp "$classpath" -d "$classes.tmp" "$source_file"
+    printf '%s\n' "$stamp" >"$classes.tmp/source.cksum"
     rm -rf -- "$classes"
     mv -- "$classes.tmp" "$classes"
 fi

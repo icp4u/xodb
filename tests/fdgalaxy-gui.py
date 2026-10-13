@@ -97,11 +97,12 @@ try:
     until(lambda:len(looks())>count,'hover frame')
     check('hover does not move the cloud under the pointer',all(float(row['zoom'])==1 and row['camera']=='0' for row in looks()[count:]))
     d.keys('click',*point('cluster'))
+    d.keys('tap',28) # Return explicitly frames the selected star/cluster.
     until(lambda:float(looks()[-1]['zoom'])>1.05,'selected camera zoom')
     until(lambda:looks()[-1]['camera']=='0','camera settles')
     d.shot('camera')
     check('camera eases through intermediate zooms',len({f['zoom'] for f in looks() if 1<float(f['zoom'])<1.3})>1)
-    d.keys('click',*point('cluster')) # toggle explicit selection off
+    d.keys('tap',102) # Home fits all and clears selection.
     until(lambda:looks()[-1]['camera']=='0' and float(looks()[-1]['zoom'])==1,'camera returns')
     d.keys('m',*point('thread'))
     until(lambda:looks()[-1]['thread']!='4294967295','hoverable thread')

@@ -65,9 +65,15 @@ pub const Panel = struct {
     pub fn draw(self: *Panel, r: *gpu.Renderer, font: *Font, b: gpu.Rect, state: *const p.State, node: ?protocol.Node) !void {
         const theme = style.theme;
         var text: [1024]u8 = undefined;
-        try r.textFit(font, b.x, b.y, b.w, "FRAME TIME / click bar  F slowest  L latest  Left/Right frame", theme.good);
+        const capture = &state.capture;
+        const status: ?[]const u8 = switch (capture.phase) {
+            .sampling => try std.fmt.bufPrint(&text, "Sampling... {d} of {d}", .{ capture.completed, capture.total }),
+            .failed => try std.fmt.bufPrint(&text, "Scene startup: {s}", .{capture.diagnostic()}),
+            else => null,
+        };
+        try r.textFit(font, b.x, b.y, b.w, if (state.count > 0) status orelse "FRAME TIME / click bar  F slowest  L latest  Left/Right frame" else "FRAME TIME", if (capture.phase == .failed) theme.warm else theme.good);
         const frame = self.selected(state) orelse {
-            try r.textFit(font, b.x, b.y + 35, b.w, "Start with demo-redot time or MCP set_redot_profiling.", theme.text);
+            try r.textFit(font, b.x, b.y + 35, b.w, status orelse if (state.enabled) "Sampling... waiting for engine frames." else "Start with demo-redot time or MCP set_redot_profiling.", theme.text);
             return;
         };
         self.plot = .{ .x = b.x, .y = b.y + 30, .w = b.w, .h = 78 };

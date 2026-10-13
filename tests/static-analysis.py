@@ -30,7 +30,7 @@ built here. Cases:
             call-to-branch case stays an adapter refusal; no symbols at all is a
             typed bounds refusal
 """
-import argparse, importlib.util, json, os, signal, subprocess, sys, tempfile, time
+import argparse, importlib.util, json, os, re, signal, subprocess, sys, tempfile, time
 from pathlib import Path
 root = Path(__file__).resolve().parents[1]; os.chdir(root)
 os.environ['XODB_GHIDRA_SIDECAR'] = 'off'  # native-worker test: never select or start a Ghidra sidecar
@@ -325,6 +325,21 @@ def stripped():
         close(c)
 
 
+def entrypads():
+    image = qx / 'qx-gcc-cet-O2'
+    disassembly = subprocess.run(['objdump', '-d', str(image)], check=True, capture_output=True, text=True, timeout=60).stdout
+    check('CET fixture: qx_alloc begins with endbr64', re.search(r'<qx_alloc>:\n(?:\s+.*\n){0,2}\s*[0-9a-f]+:\s+f3 0f 1e fa\s+endbr64', disassembly) is not None)
+    c, _ = client(image, '--static-analysis', A.toolchain)
+    try:
+        entry = symbol(c, 'qx_alloc')
+        r = poll(c, 'analyze_function', address=hex(entry))
+        check('CET fixture: native worker graph admits the no-pcode entry pad', r.get('status') == 'completed' and r.get('analysis', {}).get('function') == 'qx_alloc', r)
+        pseudo = tool(c, 'decompile_function', address=hex(entry))
+        check('CET fixture: native worker pseudo-C is available at the function identity', pseudo.get('status') == 'completed' and 'qx_alloc' in pseudo.get('signature', '') and 'malloc' in pseudo.get('text', ''), pseudo)
+    finally:
+        close(c)
+
+
 # ---- source lines: several functions, inlined code --------------------------------------
 def marker(path, name):
     return next(i + 1 for i, l in enumerate(open(path).read().splitlines()) if '/* ' + name in l)
@@ -436,10 +451,12 @@ run('ownership', ownership)
 if A.toolchain:
     run('demo', demo)
     run('stripped', stripped)
+    run('entrypads', entrypads)
     run('lines', lines)
 else:
     record('demo', 'skip', 'no --toolchain / XODB_STATIC_ANALYSIS: native worker not built')
     record('stripped', 'skip', 'no --toolchain / XODB_STATIC_ANALYSIS: native worker not built')
+    record('entrypads', 'skip', 'no --toolchain / XODB_STATIC_ANALYSIS: native worker not built')
     record('lines', 'skip', 'no --toolchain / XODB_STATIC_ANALYSIS: native worker not built')
 counts = {k: sum(r['outcome'] == k for r in results) for k in ('pass', 'fail', 'skip', 'note')}
 if A.out: Path(A.out).write_text(json.dumps({'counts': counts, 'results': results}, indent=1) + '\n')

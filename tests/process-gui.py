@@ -3,10 +3,12 @@
 from datetime import datetime
 import importlib.util,json,os,subprocess,sys,time
 from pathlib import Path
+from helpers.orphans import adopt, reap
+adopt()
 root=Path(__file__).resolve().parents[1];os.chdir(root)
 spec=importlib.util.spec_from_file_location('input_repro',root/'tests/helpers/input.py')
 h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
-work=root/'.work'/('input-functional-'+str(time.time_ns())[-10:]);work.mkdir()
+work=root/'.work'/('input-functional-'+str(time.time_ns())[-10:]);work.mkdir(parents=True)
 h.WORK=str(work)
 for name in ('tmp','cache','cache/mesa','cache/nvidia'): (work/name).mkdir(parents=True,exist_ok=True)
 for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
@@ -69,3 +71,4 @@ try:
     print('Private GUI: process selection, independent control, root-default MCP and global scope, both sizes:',work.relative_to(root))
 finally:
     if d:d.close()
+    assert reap(),'a process started by the private display is still running'

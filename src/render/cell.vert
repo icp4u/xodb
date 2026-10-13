@@ -10,10 +10,11 @@ layout(location=1) flat out vec4 cell_fill;
 layout(location=2) flat out vec4 cell_accent;
 layout(location=3) flat out vec4 cell_overlay;
 layout(location=4) flat out uint cell_kind;
-layout(push_constant) uniform View { vec2 size; float zoom; float opacity; vec2 shift; } view;
+layout(push_constant) uniform View { vec2 size; float zoom; float opacity; vec2 shift; vec2 rotation; } view;
 const vec2 corners[6] = vec2[](vec2(0, 0), vec2(1, 0), vec2(1, 1), vec2(0, 0), vec2(1, 1), vec2(0, 1));
 void main() {
-    vec2 p = (rect.xy + corners[gl_VertexIndex] * rect.zw) * view.zoom + view.shift;
+    mat2 turn = mat2(view.rotation.x, view.rotation.y, -view.rotation.y, view.rotation.x);
+    vec2 p = turn * (rect.xy + corners[gl_VertexIndex] * rect.zw) * view.zoom + view.shift;
     gl_Position = vec4(p / view.size * 2.0 - 1.0, 0.0, 1.0);
     cell_rect = vec4(rect.xy * view.zoom + view.shift, rect.zw * view.zoom);
     cell_fill = fill;

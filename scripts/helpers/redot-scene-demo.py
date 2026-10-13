@@ -39,7 +39,9 @@ def main():
         response = call('tools/call', dict(name=name, arguments=arguments))
         result = response.get('result', {})
         if 'error' in response or result.get('isError'):
-            raise RuntimeError(str(response))
+            problem = response.get('error', {}).get('message') or '; '.join(
+                item.get('text', '') for item in result.get('content', []))
+            raise RuntimeError(problem or str(response))
         return result['structuredContent']
 
     try:
@@ -56,14 +58,24 @@ def main():
         call('initialize', dict(protocolVersion='2025-06-18', capabilities={}, clientInfo=dict(name='redot-scene-demo', version='1')))
         stream.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
         tool('claim_session_control', ttl_ms=60000)
+        timing = os.environ.get('REDOT_TIME') == 'true'
+        sampling = False
         try:
+            if timing:
+                from redot_time import capture_status, sample_time
+                capture_status(tool, 'sampling')
             start_scene(tool)
-            if os.environ.get('REDOT_TIME') == 'true':
-                from redot_time import sample_time
+            if timing:
+                sampling = True
                 sample_time(tool)
                 print('Time ready. Press U then T: F slowest frame; click a function for its native sample. Stops perturb wall timing.', file=sys.stderr)
             print('Scene ready. Press U: select a node, P properties, S signal values, R refresh.', file=sys.stderr)
         except Exception as error:
+            if timing and not sampling:
+                try:
+                    capture_status(tool, 'failed', diagnostic=str(error))
+                except Exception:
+                    pass  # A disconnected debugger cannot display the failure.
             print('Scene startup: ' + str(error) + '. Use O / Continue in the GUI.', file=sys.stderr)
         tool('release_session_control')
         stream.close()

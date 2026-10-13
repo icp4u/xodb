@@ -1,10 +1,10 @@
 xsg 1
-# adapter c01_to_xsg 0.3.0 from xodb.ghidra.function_graph 0.4.1 artifact fg2-3ff0a4264db9ba7b11052e69fb54c4f8816da58639244a089570054172eb7a1f
+# adapter c01_to_xsg 0.3.1 from xodb.ghidra.function_graph 0.4.1 artifact fg2-3ff0a4264db9ba7b11052e69fb54c4f8816da58639244a089570054172eb7a1f
 # producer ghidra_native_decompiler 0.4.1 ghidra a462673d2f1543d153c61d10bcd6c68f85555194 java=False
 # note: readonly ranges from the export's non-writable PT_LOAD segments
 image sha256=b9efa38521bfcb8ec718f6fece757492fda88cb7134e1fb0688a32fce7800115 build_id=75eb36c93511562dc80517a01109ba2667fe21b9 name=qx-gcc-O2
 spec language=x86:LE:64:default compiler=gcc addr_bytes=8
-producer xsq-c01-adapter 0.3.0
+producer xsq-c01-adapter 0.3.1
 source kind=c01-function-graph-0.4.1 sha256=763c36b8e93c61967812719832b1aba5445a04d6b5c854854233d76b4a7b9f05
 qualification level=qualified reasons=tail_call_inferred,unknown_call_semantics artifact=fg2-3ff0a4264db9ba7b11052e69fb54c4f8816da58639244a089570054172eb7a1f
 space 0 const constant

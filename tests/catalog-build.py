@@ -66,7 +66,7 @@ def build(label, target, expected, diagnostic=None):
 
 build('valid', 'check-catalog', 0)
 catalogs = sorted((tree/'src/mcp').glob('*_tools.json'))
-assert len(catalogs) == 9, 'update the catalog coverage when adding a publication fragment'
+assert len(catalogs) == 10, 'update the catalog coverage when adding a publication fragment'
 for index, path in enumerate(catalogs):
     original = path.read_bytes()
     try:

@@ -14,7 +14,7 @@ func burn():
             checksum = (checksum + index) % 100000
     # A real native call under the script, visible in a stopped native sample.
     OS.delay_msec(6)
-    if frame_number < 160:
+    if OS.get_environment("XODB_REDOT_TIME_ORACLE") == "1" and frame_number < 160:
         print("ORACLE frame ", JSON.stringify({"process": frame_number, "physics": Engine.get_physics_frames(), "owner": get_instance_id(), "function": "burn"}))
 
 func _physics_process(_delta):

@@ -366,12 +366,101 @@ fn idNumber(text: ?[]const u8, prefix: []const u8) ?u32 {
 }
 
 fn signature(text: []const u8) []const u8 {
-    var lines = std.mem.splitScalar(u8, text, '\n');
-    while (lines.next()) |line| {
-        const trimmed = std.mem.trim(u8, line, " \t\r");
-        if (trimmed.len != 0) return trimmed;
+    var rows = Rows{ .lines = std.mem.splitScalar(u8, text, '\n') };
+    while (rows.next()) |row| {
+        const trimmed = std.mem.trim(u8, row.text, " \t\r");
+        if (trimmed.len != 0 and !row.comment) return trimmed;
     }
     return "";
+}
+
+/// Pseudo-C lines with whether each holds nothing but comment text. A block
+/// comment's later lines carry no marker of their own, so this keeps state.
+const Rows = struct {
+    lines: std.mem.SplitIterator(u8, .scalar),
+    open: bool = false,
+
+    const Row = struct { text: []const u8, comment: bool };
+
+    fn next(self: *Rows) ?Row {
+        const line = self.lines.next() orelse return null;
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!self.open and !std.mem.startsWith(u8, trimmed, "/*")) return .{ .text = line, .comment = std.mem.startsWith(u8, trimmed, "//") };
+        const from: usize = if (self.open) 0 else 2;
+        const close = std.mem.indexOfPos(u8, trimmed, from, "*/") orelse {
+            self.open = true;
+            return .{ .text = line, .comment = true };
+        };
+        self.open = false;
+        return .{ .text = line, .comment = std.mem.trim(u8, trimmed[close + 2 ..], " \t\r").len == 0 };
+    }
+};
+
+fn textLine(text: []const u8, wanted: u32) ?[]const u8 {
+    if (wanted == 0) return null;
+    var lines = std.mem.splitScalar(u8, text, '\n');
+    var line: u32 = 1;
+    while (lines.next()) |row| : (line += 1) if (line == wanted) return row;
+    return null;
+}
+
+fn normalizePseudoTokens(a: Allocator, text: []const u8, tokens: *std.ArrayList(PseudoToken)) !void {
+    // A partial Ghidra markup alignment must never repaint different token text
+    // on top of the authoritative pseudo-C line. Keep only exact spans.
+    var kept: usize = 0;
+    for (tokens.items) |token| {
+        const line = textLine(text, token.line) orelse continue;
+        const col: usize = token.col;
+        if (col > line.len or token.text.len > line.len - col or !std.mem.eql(u8, line[col .. col + token.text.len], token.text)) continue;
+        tokens.items[kept] = token;
+        kept += 1;
+    }
+    tokens.shrinkRetainingCapacity(kept);
+
+    // Per line (1-based): comment-only, or blank.
+    var skip: std.ArrayList(bool) = .empty;
+    defer skip.deinit(a);
+    var comment: std.ArrayList(bool) = .empty;
+    defer comment.deinit(a);
+    try skip.append(a, true);
+    try comment.append(a, false);
+    var rows = Rows{ .lines = std.mem.splitScalar(u8, text, '\n') };
+    while (rows.next()) |row| {
+        try comment.append(a, row.comment);
+        try skip.append(a, row.comment or std.mem.trim(u8, row.text, " \t\r").len == 0);
+    }
+
+    const Orphan = struct { pc: u64, line: u32 };
+    var orphans: std.ArrayList(Orphan) = .empty;
+    defer orphans.deinit(a);
+    for (tokens.items) |*token| {
+        if (token.line >= comment.items.len or !comment.items[token.line] or token.pc == null) continue;
+        const pc = token.pc.?;
+        var remembered = false;
+        for (orphans.items) |old| if (old.pc == pc) {
+            remembered = true;
+            break;
+        };
+        if (!remembered) try orphans.append(a, .{ .pc = pc, .line = token.line });
+        token.pc = null;
+    }
+    // Ghidra attaches an entry PC to its generated comment. Move that marker
+    // to the first following code row, unless a real token already carries it.
+    for (orphans.items) |orphan| {
+        var already_mapped = false;
+        for (tokens.items) |token| if (token.pc == orphan.pc) {
+            already_mapped = true;
+            break;
+        };
+        if (already_mapped) continue;
+        var candidate: ?usize = null;
+        for (tokens.items, 0..) |token, index| {
+            if (token.line <= orphan.line or token.pc != null) continue;
+            if (token.line >= skip.items.len or skip.items[token.line]) continue;
+            if (candidate == null or token.line < tokens.items[candidate.?].line) candidate = index;
+        }
+        if (candidate) |index| tokens.items[index].pc = orphan.pc;
+    }
 }
 
 fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
@@ -408,6 +497,7 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
         });
     };
     const text = try a.dupe(u8, str(pseudo, "text") orelse "");
+    try normalizePseudoTokens(a, text, &tokens);
     return .{
         .language = try a.dupe(u8, str(pseudo, "language") orelse "c"),
         .printer = try a.dupe(u8, str(pseudo, "printer") orelse ""),
@@ -516,17 +606,174 @@ pub fn mayCancel(owner: Owner, requester: Requester) bool {
 }
 
 const Hashed = struct { module_id: u64, ptr: usize, len: usize, sha: [64]u8 };
+const max_warm_images = 8;
+/// A cancelled background import that ran at least this long counts as wasted.
+const warm_waste_ms = 2000;
+
+const WarmImage = struct {
+    module_id: u64,
+    path: [:0]const u8,
+    snapshot_path: [:0]const u8,
+    mapping: ?[]const u8,
+    size: usize,
+    use_original: bool,
+};
+const WarmCandidate = struct { id: u64, path: []const u8, mapping: ?[]const u8, size: usize, file_offset: u64 };
+
+const Warmup = struct {
+    arena: std.heap.ArenaAllocator = .init(page),
+    endpoint: sidecar.Endpoint = undefined,
+    architecture: ?@import("../target/arch.zig").Arch = null,
+    images: []const WarmImage = &.{},
+    cancel: std.atomic.Value(bool) = .init(false),
+    stage: std.atomic.Value(sidecar.Stage) = .init(.queued),
+    attempted: std.atomic.Value(usize) = .init(0),
+    /// Priming ran to an answer, good or bad; a cancelled one is asked again.
+    prime_ok: std.atomic.Value(bool) = .init(false),
+    /// The sidecar could not be reached or started; asking again per image
+    /// would only run the starter again.
+    unusable: std.atomic.Value(bool) = .init(false),
+    /// A cancelled import had already cost the sidecar real work.
+    wasted: std.atomic.Value(bool) = .init(false),
+    done: std.atomic.Value(bool) = .init(false),
+    thread: ?std.Thread = null,
+
+    fn sidecarGone(err: anyerror, failure: *const sidecar.Failure) bool {
+        return err == error.SidecarFailed and std.mem.startsWith(u8, failure.code, "sidecar_");
+    }
+
+    fn run(self: *Warmup) void {
+        _ = libc.nice(10);
+        defer self.done.store(true, .release);
+        const a = self.arena.allocator();
+        if (self.architecture) |arch| {
+            var failure: sidecar.Failure = undefined;
+            if (sidecar.prime(a, self.endpoint, @tagName(arch), &self.cancel, &self.stage, &failure)) {
+                self.prime_ok.store(true, .release);
+            } else |err| {
+                // A sidecar without the verb, or without this architecture,
+                // still imports images.
+                if (self.cancel.load(.acquire)) return;
+                if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
+                self.prime_ok.store(true, .release);
+            }
+        }
+        for (self.images, 0..) |image, index| {
+            if (self.cancel.load(.acquire)) return;
+            const sha = if (image.mapping) |mapping| hashWarmBytes(mapping, &self.cancel) catch return else hashWarmFile(image.path, &self.cancel) catch {
+                if (self.cancel.load(.acquire)) return;
+                self.attempted.store(index + 1, .release);
+                continue;
+            };
+            const path = if (image.use_original) image.path else blk: {
+                writeWarmSnapshot(image.snapshot_path, image.mapping.?, &self.cancel) catch {
+                    // A snapshot that cannot be written is not asked for again at every poll.
+                    if (self.cancel.load(.acquire)) return;
+                    self.attempted.store(index + 1, .release);
+                    continue;
+                };
+                break :blk image.snapshot_path;
+            };
+            var failure: sidecar.Failure = undefined;
+            const begun = nowMs();
+            sidecar.openImage(a, self.endpoint, path, &sha, &self.cancel, &self.stage, &failure) catch |err| {
+                if (self.cancel.load(.acquire)) {
+                    if (nowMs() - begun >= warm_waste_ms) self.wasted.store(true, .release);
+                    return;
+                }
+                if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
+                self.attempted.store(index + 1, .release);
+                continue;
+            };
+            self.attempted.store(index + 1, .release);
+        }
+    }
+
+    fn destroy(self: *Warmup) void {
+        self.cancel.store(true, .release);
+        if (self.thread) |thread| thread.join();
+        self.thread = null;
+        var arena = self.arena;
+        arena.deinit();
+        page.destroy(self);
+    }
+};
+
+fn hashWarmBytes(bytes: []const u8, cancel: *const std.atomic.Value(bool)) ![64]u8 {
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (cancel.load(.acquire)) return error.Cancelled;
+        const end = @min(bytes.len, offset + (1 << 20));
+        digest.update(bytes[offset..end]);
+        offset = end;
+    }
+    var result: [32]u8 = undefined;
+    digest.final(&result);
+    return std.fmt.bytesToHex(result, .lower);
+}
+
+fn hashWarmFile(path: [:0]const u8, cancel: *const std.atomic.Value(bool)) ![64]u8 {
+    const fd = libc.open(path.ptr, libc.O_RDONLY | libc.O_CLOEXEC | libc.O_NOFOLLOW);
+    if (fd < 0) return error.ImageSnapshotReadFailed;
+    defer _ = libc.close(fd);
+    var stat: libc.struct_stat = undefined;
+    if (libc.fstat(fd, &stat) != 0 or stat.st_mode & libc.S_IFMT != libc.S_IFREG) return error.ImageSnapshotReadFailed;
+    var digest = std.crypto.hash.sha2.Sha256.init(.{});
+    var buffer: [64 * 1024]u8 = undefined;
+    while (true) {
+        if (cancel.load(.acquire)) return error.Cancelled;
+        const count = libc.read(fd, &buffer, buffer.len);
+        if (count < 0 and std.c._errno().* == libc.EINTR) continue;
+        if (count < 0) return error.ImageSnapshotReadFailed;
+        if (count == 0) break;
+        digest.update(buffer[0..@intCast(count)]);
+    }
+    var result: [32]u8 = undefined;
+    digest.final(&result);
+    return std.fmt.bytesToHex(result, .lower);
+}
+
+fn writeWarmSnapshot(path: [:0]const u8, bytes: []const u8, cancel: *const std.atomic.Value(bool)) !void {
+    if (present(path)) return;
+    const fd = libc.open(path.ptr, libc.O_WRONLY | libc.O_CREAT | libc.O_EXCL | libc.O_CLOEXEC, @as(c_uint, 0o600));
+    if (fd < 0) return error.ImageSnapshotWriteFailed;
+    defer _ = libc.close(fd);
+    var complete = false;
+    defer {
+        if (!complete) _ = libc.unlink(path.ptr);
+    }
+    var done: usize = 0;
+    while (done < bytes.len) {
+        if (cancel.load(.acquire)) return error.Cancelled;
+        const end = @min(bytes.len, done + (1 << 20));
+        const n = libc.write(fd, bytes[done..end].ptr, end - done);
+        if (n <= 0) return error.ImageSnapshotWriteFailed;
+        done += @intCast(n);
+    }
+    complete = true;
+}
 
 pub const State = struct {
     toolchain_dir: ?[]const u8 = null,
+    warmup_enabled: bool = true,
     dir: ?[:0]u8 = null,
     hashed: [8]?Hashed = @splat(null),
     hash_next: usize = 0,
     analyses: std.ArrayList(*Analysis) = .empty,
     job: ?*Job = null,
+    warmup: ?*Warmup = null,
+    prime_attempted: ?@import("../target/arch.zig").Arch = null,
+    warm_seen: [64]u64 = @splat(0),
+    warm_seen_count: usize = 0,
+    /// The first image ever queued: the main executable. Never given up.
+    warm_main: ?u64 = null,
+    /// The image whose import was last cancelled after real work.
+    warm_struck: ?u64 = null,
     next_job: u64 = 1,
 
     pub fn deinit(self: *State) void {
+        self.cancelWarmup();
         if (self.job) |job| {
             job.destroy();
             page.destroy(job);
@@ -542,6 +789,161 @@ pub const State = struct {
             page.free(dir);
             self.dir = null;
         }
+    }
+
+    fn sawWarmImage(self: *const State, id: u64) bool {
+        for (self.warm_seen[0..self.warm_seen_count]) |seen| if (seen == id) return true;
+        return false;
+    }
+
+    fn markWarmSeen(self: *State, id: u64) void {
+        if (self.sawWarmImage(id) or self.warm_seen_count == self.warm_seen.len) return;
+        self.warm_seen[self.warm_seen_count] = id;
+        self.warm_seen_count += 1;
+    }
+
+    /// Joins a finished or cancelled worker and keeps what it learned.
+    fn reapWarmup(self: *State) void {
+        const warm = self.warmup orelse return;
+        warm.cancel.store(true, .release);
+        if (warm.thread) |thread| thread.join();
+        warm.thread = null;
+        const attempted = @min(warm.attempted.load(.acquire), warm.images.len);
+        for (warm.images[0..attempted]) |image| self.markWarmSeen(image.module_id);
+        if (warm.architecture) |arch| if (warm.prime_ok.load(.acquire)) {
+            self.prime_attempted = arch;
+        };
+        // An import restarts from nothing after a cancel. One that was twice
+        // cancelled after real work is left to an explicit request, so short
+        // stops cannot keep the sidecar busy for no result.
+        if (warm.wasted.load(.acquire) and attempted < warm.images.len) {
+            const id = warm.images[attempted].module_id;
+            if (self.warm_main != id) {
+                if (self.warm_struck == id) self.markWarmSeen(id) else self.warm_struck = id;
+            }
+        }
+        if (warm.unusable.load(.acquire)) self.warmup_enabled = false;
+        warm.destroy();
+        self.warmup = null;
+    }
+
+    fn harvestWarmup(self: *State) void {
+        const warm = self.warmup orelse return;
+        if (warm.done.load(.acquire)) self.reapWarmup();
+    }
+
+    pub fn cancelWarmup(self: *State) void {
+        self.reapWarmup();
+    }
+
+    /// Starts only bounded background work. The owner calls this after its
+    /// normal target poll, so startup, priming and imports never delay it.
+    pub fn maintain(self: *State, session: *Session) void {
+        self.harvestWarmup();
+        const snapshot = session.target.snapshot();
+        // Resume only flips the cancellation flag. Joining here would put
+        // sidecar I/O on the debugger's execution path; a later poll harvests
+        // the worker after it has cancelled its queued Ghidra job.
+        if (self.warmup) |warm| if (snapshot.state != .stopped) {
+            warm.cancel.store(true, .release);
+            return;
+        };
+        if (!self.warmup_enabled or self.warmup != null) return;
+        if (snapshot.pid == 0) return;
+        if (snapshot.state != .stopped) return;
+        var select_arena = std.heap.ArenaAllocator.init(page);
+        defer select_arena.deinit();
+        if (!(sidecar.selected(select_arena.allocator()) catch false)) return;
+        const arch = session.target.arch();
+        const need_prime = self.prime_attempted == null or self.prime_attempted.? != arch;
+        if (!need_prime and self.warm_seen_count == self.warm_seen.len) return;
+        if (self.job) |job| if (job.running()) return;
+        var selected_images: [max_warm_images]WarmCandidate = undefined;
+        var count: usize = 0;
+        // Mapped executable files are available before xodb needs their symbol
+        // images. Hashing them in this worker lets the main executable start
+        // importing immediately after the first map refresh.
+        // Only for a target on this host: a remote target's paths name other
+        // files here, or none.
+        if (!session.target.isRemote()) for (session.modules.regions.items) |region| {
+            if (count == selected_images.len) break;
+            if (region.permissions[2] != 'x' or region.inode == 0 or !std.fs.path.isAbsolute(region.path)) continue;
+            var hash = std.hash.Wyhash.init(0x676869647261);
+            std.hash.autoHash(&hash, region.inode);
+            std.hash.autoHash(&hash, region.device_major);
+            std.hash.autoHash(&hash, region.device_minor);
+            hash.update(region.path);
+            const id = hash.final() | (@as(u64, 1) << 63);
+            if (self.sawWarmImage(id)) continue;
+            var duplicate = false;
+            for (selected_images[0..count]) |old| if (old.id == id) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            selected_images[count] = .{ .id = id, .path = region.path, .mapping = null, .size = @intCast(region.end -| region.start), .file_offset = 0 };
+            count += 1;
+        };
+        // A remote target's path is not normally present on this host. Once
+        // xodb has loaded its immutable snapshot, queue that exact byte slice.
+        for (session.modules.loaded.items) |module| {
+            if (count == selected_images.len or self.sawWarmImage(module.id)) continue;
+            var duplicate = false;
+            for (selected_images[0..count]) |old| if (std.mem.eql(u8, old.path, module.path)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            selected_images[count] = .{ .id = module.id, .path = module.path, .mapping = module.mapping, .size = module.mapping.len, .file_offset = module.file_offset };
+            count += 1;
+        }
+        if (!need_prime and count == 0) return;
+        if (self.warm_main == null and count > 0) self.warm_main = selected_images[0].id;
+        // The first executable mapping of a normal launch is the main image:
+        // it stays first. Everything else goes smallest first, in every batch.
+        const pinned: usize = if (count > 0 and self.warm_main == selected_images[0].id) 1 else 0;
+        if (count - pinned > 1) std.mem.sort(WarmCandidate, selected_images[pinned..count], {}, struct {
+            fn less(_: void, left: WarmCandidate, right: WarmCandidate) bool {
+                return left.size < right.size;
+            }
+        }.less);
+        const warm = page.create(Warmup) catch return;
+        warm.* = .{};
+        const a = warm.arena.allocator();
+        warm.endpoint = .{ .socket_path = sidecar.socketPath(a) catch {
+            warm.destroy();
+            return;
+        }, .starter = sidecar.starterPath(a) catch null, .deadline_ms = default_deadline_ms };
+        warm.architecture = if (need_prime) arch else null;
+        if (count > 0) {
+            const images = a.alloc(WarmImage, count) catch {
+                warm.destroy();
+                return;
+            };
+            for (selected_images[0..count], images) |candidate, *image| image.* = .{
+                .module_id = candidate.id,
+                .path = a.dupeZ(u8, candidate.path) catch {
+                    warm.destroy();
+                    return;
+                },
+                .snapshot_path = std.fmt.allocPrintSentinel(a, "{s}/warm-{d}.image", .{ self.privateDir() catch {
+                    warm.destroy();
+                    return;
+                }, candidate.id }, 0) catch {
+                    warm.destroy();
+                    return;
+                },
+                .mapping = candidate.mapping,
+                .size = candidate.size,
+                .use_original = candidate.mapping == null,
+            };
+            warm.images = images;
+        }
+        warm.thread = std.Thread.spawn(.{}, Warmup.run, .{warm}) catch {
+            warm.destroy();
+            return;
+        };
+        self.warmup = warm;
     }
 
     /// Adopts a finished job's analysis into the cache (owner thread).
@@ -655,6 +1057,7 @@ pub const State = struct {
                 if (job.failure != null and !options.retry) return .{ .failed = job };
             } else if (job.running()) return error.StaticAnalysisBusy;
         }
+        self.cancelWarmup();
         return .{ .running = try self.start(session, function, producer_kind, options) };
     }
 
@@ -760,6 +1163,37 @@ test "worker pseudo-C is retained with exact token positions and links" {
     try std.testing.expectEqual(@as(u32, 7), parameter.line);
     try std.testing.expectEqual(@as(u32, 15), parameter.col);
     try std.testing.expectEqual(@as(?u32, 0), parameter.parameter);
+}
+
+test "pseudo-C drops disagreeing spans and moves comment PCs to code" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"function":{"prototype":{"params":[]}},"pseudocode":{"text":"int f(void)\n  /* Unresolved local var */\n  return 0;\n","token_status":"partial_alignment","tokens":[{"i":0,"line":1,"col":0,"kind":"type","text":"wrong"},{"i":1,"line":1,"col":4,"kind":"funcname","text":"f"},{"i":2,"line":2,"col":2,"kind":"comment","text":"/* Unresolved local var */","pc":"0x1000"},{"i":3,"line":3,"col":2,"kind":"syntax","text":"return"}]}}
+    , .{});
+    const document = try pseudoDocument(a, root);
+    try std.testing.expectEqualStrings("int f(void)", document.signature);
+    try std.testing.expectEqual(@as(usize, 3), document.tokens.len);
+    try std.testing.expectEqual(@as(?u64, null), document.tokens[1].pc);
+    try std.testing.expectEqual(@as(?u64, 0x1000), document.tokens[2].pc);
+    try std.testing.expectEqualStrings("return", document.tokens[2].text);
+}
+
+test "pseudo-C block comments spanning lines hold no PC, and code after one does" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Ghidra's second and later comment lines start with plain text.
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"function":{"prototype":{"params":[]}},"pseudocode":{"text":"\n/* note\n   more */\nint f(void)\n{\n  /* Unresolved local var: a\n     Unresolved local var: b */\n  *p = 1; /* kept */\n}\n","token_status":"ok","tokens":[{"i":0,"line":4,"col":4,"kind":"funcname","text":"f"},{"i":1,"line":6,"col":2,"kind":"comment","text":"/* Unresolved local var: a","pc":"0x1000"},{"i":2,"line":7,"col":5,"kind":"comment","text":"Unresolved local var: b */","pc":"0x1000"},{"i":3,"line":8,"col":2,"kind":"op","text":"*"},{"i":4,"line":8,"col":3,"kind":"var","text":"p","pc":"0x1004"}]}}
+    , .{});
+    const document = try pseudoDocument(a, root);
+    try std.testing.expectEqualStrings("int f(void)", document.signature);
+    try std.testing.expectEqual(@as(?u64, null), document.tokens[1].pc);
+    try std.testing.expectEqual(@as(?u64, null), document.tokens[2].pc);
+    try std.testing.expectEqual(@as(?u64, 0x1000), document.tokens[3].pc);
+    try std.testing.expectEqual(@as(?u64, 0x1004), document.tokens[4].pc);
 }
 
 test "cancel: own jobs, or any job only with control" {

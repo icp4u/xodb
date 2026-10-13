@@ -61,8 +61,8 @@ for mode in ('fork', 'fork-exec', 'vfork', 'vfork-exec', 'system'):
         (run / (mode + '.stderr')).write_bytes(stderr)
     assert stderr.count(b'released (not following; --follow-forks or F to follow)') == 1, stderr
     assert b'held' not in stderr, stderr
-def events(c, kind):
-    found, after = [], 0
+def events(c, kind, after=0):
+    found = []
     while True:
         page = c.inspect('query_events', after=after)
         found += [e for e in page['events'] if e['kind'] == kind]
@@ -130,6 +130,36 @@ if platform.machine() == 'x86_64':
             finish(c, mode)
         finally:
             if c.p.poll() is None: c.close()
+# Continue off a breakpoint the parent hits on the call right after fork,
+# while that child is exiting. SIGCHLD lands in the hidden step. None of those
+# is a user stop, and the step still reaches the next breakpoint.
+burst_count = int(os.environ.get('XODB_FORK_BURST', '32'))
+assert 1 <= burst_count <= 1000
+c = Client('control', fixture, args=('fork-burst', str(burst_count)), options=('--break', 'tree_burst_hit'))
+try:
+    s = to_breakpoint(c)
+    done = action(c, 'set_breakpoint', symbol='tree_done')['id']
+    hits = 0
+    last_hit = events(c, 'breakpoint_hit')[-1]
+    for _ in range(burst_count + 1):
+        action(c, 'continue')
+        s = settled(c, ('stopped', 'exited'))
+        assert not any(t['reason'] == 'signal' for t in s.get('threads', ())), s
+        if s['state'] == 'exited':
+            break
+        assert any(t['reason'] == 'breakpoint' for t in s['threads']), s
+        hits += 1
+        new_hits = events(c, 'breakpoint_hit', last_hit['sequence'])
+        assert len(new_hits) == 1, new_hits
+        last_hit = new_hits[0]
+        if last_hit['detail'] == done:
+            break
+    # The first burst breakpoint was consumed above; the final hit is tree_done.
+    assert hits == burst_count and last_hit['detail'] == done, last_hit
+    assert len(events(c, 'process_released')) == burst_count, events(c, 'process_released')
+    finish(c, 'fork-burst')
+finally:
+    if c.p.poll() is None: c.close()
 # A genuine admission failure still holds the child.
 c = Client('control', fixture, args=('fork',), options=('--follow-forks', '--process-limit', '1', '--break', 'tree_ready'))
 try:

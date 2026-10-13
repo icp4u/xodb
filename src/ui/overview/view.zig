@@ -345,6 +345,7 @@ pub const View = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const View, now: u64) bool {
+        if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().motion.navigation.active) return true;
         return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now));
     }
 
@@ -369,12 +370,18 @@ pub const View = struct {
 
     pub fn input(self: *View, w: *Window, now: u64) void {
         defer self.windowActions(w);
+        const galaxy_state = @import("galaxy_descriptors.zig").navigation();
+        const camera = &galaxy_state.motion.navigation;
+        defer if (camera.controls(&w.input, self.galaxyMap() and !self.searching)) {
+            w.dirty = true;
+        };
         defer if (memmap.gibson.heldInput(self, &w.input, self.gibsonMap() and !self.searching, now)) {
             w.dirty = true;
         };
         if (!self.gibsonMap()) self.memmap.city.drag = null;
         if (w.pointer_x != self.pointer[0] or w.pointer_y != self.pointer[1]) {
             self.pointer = .{ w.pointer_x, w.pointer_y };
+            if (self.galaxyMap()) camera.pointer(self.pointer);
             if (draw.inside(self.memmap.city.field, w.pointer_x, w.pointer_y)) self.cameraInteraction(now);
             w.dirty = true;
             if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self) else if (self.gibsonMap()) memmap.gibson.motion(self);
@@ -387,7 +394,9 @@ pub const View = struct {
         while (w.input.next()) |event| {
             switch (event.kind) {
                 .press, .repeat => {
-                    w.dirty = true;
+                    // A held navigation key already has the camera's 30 fps
+                    // deadline; its repeats must not add frames on top.
+                    if (event.kind == .press or !(self.galaxyMap() and camera.active)) w.dirty = true;
                     const was_pending = self.pending_action != null;
                     self.key(event, now);
                     self.cameraInteraction(now);
@@ -402,12 +411,14 @@ pub const View = struct {
                     // The deep map's field and minimap take presses (drag, select, jump).
                     if (event.code == 272) {
                         const unobscured = self.pending_action == null and self.classic_menu == null and !self.classic_about;
-                        const taken = unobscured and ((self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)));
+                        const taken = unobscured and ((self.galaxyMap() and !self.galaxyResource(event.x, event.y) and camera.press(&galaxy_state.scene, .{ event.x, event.y }, now)) or (self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)));
                         if (!taken) self.click(event.x, event.y, now);
                         self.cameraInteraction(now);
                     }
                 },
                 .button_release => if (event.code == 272) {
+                    camera.pointer(.{ event.x, event.y });
+                    camera.drag = null;
                     if (self.classic_scroll != null) {
                         self.pointer = .{ event.x, event.y };
                         win95.drag(self);
@@ -445,10 +456,26 @@ pub const View = struct {
     fn deepMap(self: *const View) bool {
         return self.panel == .memory_map and self.memmap.viewport() and !self.memmap.legend and !self.memmap.picker_open;
     }
+    fn galaxyMap(self: *const View) bool {
+        return self.panel == .galaxy and self.classic_menu == null and !self.classic_about and self.pending_action == null;
+    }
+    /// A shared resource under the pointer keeps its click (open holders),
+    /// unless a star is the nearer target; everything else is the camera's.
+    fn galaxyResource(self: *const View, x: f32, y: f32) bool {
+        const state = @import("galaxy_descriptors.zig").navigation();
+        if (@import("galaxy_camera.zig").Camera.pick(&state.scene, .{ x, y })) |picked| if (picked == .node) return false;
+        var i = self.hit_count;
+        while (i > 0) {
+            i -= 1;
+            if (draw.inside(self.hits[i].rect, x, y)) return self.hits[i].action == .graph_resource;
+        }
+        return false;
+    }
     fn gibsonMap(self: *const View) bool {
         return self.panel == .memory_map and self.memmap.look == .gibson and !self.memmap.picker_open and self.classic_menu == null and !self.classic_about and self.pending_action == null;
     }
     fn wheel(self: *View, lines: i32) void {
+        if (self.galaxyMap()) return @import("galaxy_descriptors.zig").navigation().motion.navigation.wheel(lines, self.pointer, self.graph.look);
         if (self.gibsonMap()) {
             self.memmap.city.camera.wheel(lines);
             return;
@@ -583,6 +610,11 @@ pub const View = struct {
         }
     }
     pub fn show(self: *View, panel: Panel) void {
+        if (panel == .galaxy) {
+            const camera = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
+            camera.help = true;
+            camera.help_until = 0;
+        }
         if (self.panel == .memory_map and panel != .memory_map) self.memmap.hide();
         self.classic_menu = null;
         self.classic_scroll = null;

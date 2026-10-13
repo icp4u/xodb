@@ -16,7 +16,8 @@ pub fn build(b: *std.Build) void {
     const gui = b.option(bool, "gui", "Build the graphical Vulkan interface (disable for headless MCP)") orelse true;
     // The window system behind src/platform/window.zig. null has no display: it runs the unit tests.
     const Platform = enum { wayland, cocoa, null };
-    const platform = b.option(Platform, "platform", "Window system backend for the interface") orelse switch (target.result.os.tag) {
+    const requested_platform = b.option(Platform, "platform", "Window system backend for the interface");
+    const platform = if (!gui) Platform.null else requested_platform orelse switch (target.result.os.tag) {
         .linux => Platform.wayland,
         .macos => Platform.cocoa,
         else => Platform.null,

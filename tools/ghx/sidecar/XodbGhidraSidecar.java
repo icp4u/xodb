@@ -16,26 +16,38 @@ import java.util.concurrent.atomic.AtomicBoolean;
 import com.google.gson.*;
 import com.sun.security.auth.module.UnixSystem;
 import ghidra.GhidraApplicationLayout;
+import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.*;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
 import ghidra.app.decompiler.component.DecompilerUtils;
+import ghidra.app.util.bin.ByteProvider;
+import ghidra.app.util.bin.FileByteProvider;
+import ghidra.app.util.bin.format.elf.ElfException;
+import ghidra.app.util.bin.format.elf.ElfHeader;
+import ghidra.app.util.importer.ProgramLoader;
+import ghidra.app.util.opinion.ElfLoader;
+import ghidra.app.util.opinion.LoadResults;
 import ghidra.base.project.GhidraProject;
 import ghidra.framework.Application;
 import ghidra.framework.HeadlessGhidraApplicationConfiguration;
 import ghidra.framework.options.Options;
+import ghidra.program.database.ProgramDB;
 import ghidra.program.model.address.*;
 import ghidra.program.model.data.*;
-import ghidra.program.model.lang.Register;
+import ghidra.program.model.lang.*;
 import ghidra.program.model.listing.*;
+import ghidra.program.model.mem.MemoryAccessException;
+import ghidra.program.model.mem.MemoryBlock;
 import ghidra.program.model.pcode.*;
-import ghidra.program.model.symbol.Reference;
+import ghidra.program.model.symbol.*;
+import ghidra.program.util.DefaultLanguageService;
 import ghidra.util.task.TaskMonitor;
 import ghidra.util.task.TaskMonitorAdapter;
 
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.0";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.2";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -62,6 +74,8 @@ public final class XodbGhidraSidecar {
         volatile String progress = "queued";
         volatile String code;
         volatile String detail;
+        // Imported ahead of any request; may not take the slots kept for requests.
+        volatile boolean background;
         Image(String sha, String path) { this.sha = sha; this.path = path; }
     }
     static final class Work {
@@ -152,6 +166,7 @@ public final class XodbGhidraSidecar {
         switch (verb) {
             case "hello" -> hello(out, id);
             case "status" -> status(out, id, text(request, "job", null));
+            case "prime" -> prime(request, out, id);
             case "open_image" -> openImage(request, out, id);
             case "decompile" -> decompile(request, out, id);
             case "cancel" -> cancel(out, id, text(request, "job", ""));
@@ -171,9 +186,81 @@ public final class XodbGhidraSidecar {
         r.addProperty("healthy", !stopping.get());
         r.addProperty("log", logPath.toString());
         JsonArray caps = new JsonArray();
-        for (String c : new String[]{"open_image", "decompile", "cancel", "status", "shutdown", "hints_reserved", "xsg", "pseudocode", "variables", "types", "function_index"}) caps.add(c);
+        for (String c : new String[]{"prime", "open_image", "decompile", "cancel", "status", "shutdown", "hints_reserved", "xsg", "pseudocode", "variables", "types", "function_index"}) caps.add(c);
         r.add("capabilities", caps);
         send(out, r, null);
+    }
+
+    void prime(JsonObject q, OutputStream out, String id) throws Exception {
+        String architecture = required(q, "architecture");
+        String jobId = "prime:" + architecture;
+        Work work = jobs.computeIfAbsent(jobId, key -> {
+            Work made = new Work(key);
+            made.future = ghidra.submit(() -> primeArchitecture(architecture, made));
+            return made;
+        });
+        sendWork(out, id, work);
+    }
+
+    void primeArchitecture(String architecture, Work work) {
+        ProgramDB program = null;
+        Object consumer = new Object();
+        try {
+            work.progress = "loading language";
+            PrimeSpec spec = PrimeSpec.forArchitecture(architecture);
+            Language language = DefaultLanguageService.getLanguageService().getLanguage(new LanguageID(spec.language));
+            CompilerSpec compiler = language.getCompilerSpecByID(new CompilerSpecID(spec.compiler));
+            program = new ProgramDB("xodb-prime-" + architecture, language, compiler, consumer);
+            int transaction = program.startTransaction("prime decompiler");
+            Function function;
+            try {
+                Address start = program.getAddressFactory().getDefaultAddressSpace().getAddress(0x1000);
+                MemoryBlock block = program.getMemory().createInitializedBlock("text", start, spec.code.length, (byte)0, work.monitor, false);
+                block.setRead(true); block.setExecute(true);
+                program.getMemory().setBytes(start, spec.code);
+                DisassembleCommand disassemble = new DisassembleCommand(start, new AddressSet(start, start.add(spec.code.length - 1)), true);
+                disassemble.enableCodeAnalysis(false);
+                if (!disassemble.applyTo(program, work.monitor)) throw new Failure("prime_disassembly_failed", architecture + ": " + disassemble.getStatusMsg());
+                function = program.getFunctionManager().createFunction("xodb_prime", start, new AddressSet(start, start.add(spec.code.length - 1)), SourceType.ANALYSIS);
+                program.endTransaction(transaction, true);
+            } catch (Throwable error) {
+                program.endTransaction(transaction, false);
+                throw error;
+            }
+            work.progress = "decompiling";
+            DecompInterface decompiler = new DecompInterface();
+            try {
+                decompiler.toggleSyntaxTree(true);
+                decompiler.toggleCCode(true);
+                decompiler.setSimplificationStyle("decompile");
+                if (!decompiler.openProgram(program)) throw new Failure("prime_decompiler_open_failed", decompiler.getLastMessage());
+                DecompileResults result = decompiler.decompileFunction(function, 10, work.monitor);
+                if (!result.decompileCompleted()) throw new Failure("prime_decompile_failed", result.getErrorMessage());
+            } finally { decompiler.dispose(); }
+            work.progress = "ready";
+            work.state = "ready";
+        } catch (Throwable error) { failed(work, error); }
+        finally { if (program != null) program.release(consumer); }
+    }
+
+    static final class PrimeSpec {
+        final String language;
+        final String compiler;
+        final byte[] code;
+        PrimeSpec(String language, String compiler, int... code) {
+            this.language = language; this.compiler = compiler; this.code = new byte[code.length];
+            for (int i = 0; i < code.length; i++) this.code[i] = (byte)code[i];
+        }
+        static PrimeSpec forArchitecture(String architecture) throws Failure {
+            return switch (architecture) {
+                case "x86_64" -> new PrimeSpec("x86:LE:64:default", "gcc", 0x31, 0xc0, 0xc3);
+                case "aarch64" -> new PrimeSpec("AARCH64:LE:64:v8A", "default", 0x00, 0x00, 0x80, 0xd2, 0xc0, 0x03, 0x5f, 0xd6);
+                case "m68k" -> new PrimeSpec("68000:BE:32:default", "default", 0x70, 0x00, 0x4e, 0x75);
+                case "ppc64le" -> new PrimeSpec("PowerPC:LE:64:default", "default", 0x00, 0x00, 0x60, 0x38, 0x20, 0x00, 0x80, 0x4e);
+                case "loongarch64" -> new PrimeSpec("Loongarch:LE:64:lp64d", "default", 0x04, 0x00, 0x80, 0x02, 0x20, 0x00, 0x00, 0x4c);
+                default -> throw new Failure("prime_unsupported_architecture", architecture);
+            };
+        }
     }
 
     void status(OutputStream out, String id, String jobId) throws Exception {
@@ -210,7 +297,16 @@ public final class XodbGhidraSidecar {
             sendFailure(out, id, "queue_full", "retained job limit reached; restart the sidecar");
             return;
         }
-        Image image = images.compute(sha, (key, old) -> old == null || old.state.equals("failed") ? new Image(key, path) : old);
+        boolean background = q.has("background") && q.get("background").isJsonPrimitive() && q.get("background").getAsBoolean();
+        // Eager imports stop at half the limit: the rest is for images a user asks about.
+        if (background && !images.containsKey(sha) && images.size() >= maxImages / 2) {
+            sendFailure(out, id, "cache_reserved", "background imports stop at half of the image limit " + maxImages);
+            return;
+        }
+        Image image = images.compute(sha, (key, old) -> {
+            if (old != null && !old.state.equals("failed")) { if (!background) old.background = false; return old; }
+            Image made = new Image(key, path); made.background = background; return made;
+        });
         Work work = jobs.compute(jobId, (key, old) -> old == null || old.state.equals("failed") ? startImport(image, key) : old);
         sendWork(out, id, work);
     }
@@ -227,12 +323,20 @@ public final class XodbGhidraSidecar {
             String actual = sha256(Paths.get(image.path));
             if (!actual.equals(image.sha)) throw new Failure("image_identity_mismatch", "expected " + image.sha + ", got " + actual);
             work.monitor.checkCanceled();
-            if (project.getProjectData().getFile("/" + image.sha) == null) {
-                if (project.getRootFolder().getFiles().length >= maxImages)
+            boolean cached = project.getProjectData().getFile("/" + image.sha) != null;
+            if (!cached || !cachedAtLinkedBase(image.sha)) {
+                if (!cached && project.getRootFolder().getFiles().length >= maxImages)
                     throw new Failure("cache_full", "project image limit " + maxImages + "; raise XODB_GHIDRA_MAX_IMAGES or delete the private cache");
+                if (!cached && image.background && project.getRootFolder().getFiles().length >= maxImages / 2)
+                    throw new Failure("cache_reserved", "background imports stop at half of the image limit " + maxImages);
                 work.progress = image.progress = "importing";
-                Program program = project.importProgram(new File(image.path));
-                if (program == null) throw new Failure("import_failed", "Ghidra found no loader for the image");
+                Program program = load(new File(image.path));
+                if (!atLinkedBase(program)) {
+                    program.release(project);
+                    throw new Failure("import_failed", "Ghidra did not load the image at its linked base");
+                }
+                int tx = program.startTransaction("xodb import");
+                boolean saved = false;
                 try {
                     work.progress = image.progress = "analyzing";
                     trimAnalysis(program);
@@ -241,8 +345,13 @@ public final class XodbGhidraSidecar {
                     manager.reAnalyzeAll(null);
                     manager.startAnalysis(work.monitor);
                     work.monitor.checkCanceled();
+                    program.endTransaction(tx, true); tx = -1;
                     project.saveAs(program, "/", image.sha, true);
-                } finally { project.close(program); }
+                    saved = true;
+                } finally {
+                    if (tx >= 0) program.endTransaction(tx, false);
+                    if (saved) project.close(program); else program.release(project);
+                }
             }
             image.state = work.state = "ready";
             image.progress = work.progress = "ready";
@@ -252,6 +361,34 @@ public final class XodbGhidraSidecar {
             image.code = work.code;
             image.detail = work.detail;
         }
+    }
+
+    // xodb asks about link addresses (runtime address minus load bias). Ghidra
+    // moves a position-independent ELF, executable or library, to a default
+    // base of its own unless told the base to use; loading at the linked base
+    // keeps every address in the program, relocated data included, a link
+    // address. Other formats have no such loader option and load as before.
+    Program load(File file) throws Exception {
+        ProgramLoader.Builder builder = ProgramLoader.builder().source(file).project(project.getProject());
+        try (ByteProvider bytes = new FileByteProvider(file, null, AccessMode.READ)) {
+            ElfHeader elf = new ElfHeader(bytes, null);
+            elf.parse();
+            builder.addLoaderArg("-loader-imagebase", Long.toHexString(elf.getImageBase()));
+        } catch (ElfException notElf) {}
+        try (LoadResults<Program> loaded = builder.load()) { return loaded.getPrimaryDomainObject(project); }
+    }
+
+    static boolean atLinkedBase(Program program) {
+        Long linked = ElfLoader.getElfOriginalImageBase(program);
+        return linked == null || linked == program.getImageBase().getOffset();
+    }
+
+    // A project written by a sidecar older than 0.1.1 holds position-independent
+    // images at Ghidra's base; such an import is replaced, never answered from.
+    boolean cachedAtLinkedBase(String sha) throws Exception {
+        Program program = project.openProgram("/", sha, true);
+        try { return atLinkedBase(program); }
+        finally { project.close(program); }
     }
 
     void decompile(JsonObject q, OutputStream out, String id) throws Exception {
@@ -411,6 +548,10 @@ public final class XodbGhidraSidecar {
         doc.add("address_spaces", addressSpaces(program));
         doc.add("function", function(program, fn, request));
         doc.add("qualification", qualification());
+        doc.add("instructions", instructions(program, fn, high));
+        JsonObject admission = new JsonObject();
+        admission.addProperty("rule", "Ghidra listing instructions in the project function body; bytes are read from program memory and p-code is emitted by the selected language");
+        admission.add("refused", new JsonArray()); doc.add("instruction_admission", admission);
         doc.add("high_pcode", highPcode(program, high));
         doc.add("blocks", blocks(high));
         doc.add("calls", calls(program, high));
@@ -464,6 +605,31 @@ public final class XodbGhidraSidecar {
 
     JsonObject qualification() {
         JsonObject q = new JsonObject(); q.addProperty("level", "qualified"); q.addProperty("note", "Ghidra project analysis; status ok is not semantic verification"); q.add("reasons", new JsonArray()); return q;
+    }
+
+    JsonArray instructions(Program program, Function fn, HighFunction high) throws MemoryAccessException {
+        Map<Long, JsonArray> highByPc = new HashMap<>();
+        for (Iterator<PcodeOpAST> it = high.getPcodeOps(); it.hasNext();) {
+            PcodeOpAST op = it.next();
+            highByPc.computeIfAbsent(op.getSeqnum().getTarget().getOffset(), unused -> new JsonArray()).add(opid(op));
+        }
+        JsonArray rows = new JsonArray();
+        InstructionIterator it = program.getListing().getInstructions(fn.getBody(), true);
+        while (it.hasNext()) {
+            Instruction instruction = it.next(); long address = instruction.getAddress().getOffset();
+            JsonObject row = new JsonObject(); row.addProperty("id", "insn:" + hx(address));
+            row.addProperty("addr", hx(address)); row.addProperty("length", instruction.getLength());
+            row.addProperty("discovery", "ghidra_project_function"); row.addProperty("admission", "admitted");
+            row.addProperty("bytes", hex(instruction.getBytes())); row.addProperty("mnemonic", instruction.getMnemonicString());
+            row.addProperty("operands", instruction.toString());
+            JsonArray raw = new JsonArray(); int index = 0;
+            for (PcodeOp op : instruction.getPcode()) {
+                JsonObject effect = new JsonObject(); effect.addProperty("id", "raw:" + hx(address) + ":" + index++);
+                effect.addProperty("opcode", op.getMnemonic()); raw.add(effect);
+            }
+            row.add("raw_pcode", raw); row.add("high_ops", highByPc.getOrDefault(address, new JsonArray())); rows.add(row);
+        }
+        return rows;
     }
 
     JsonObject highPcode(Program program, HighFunction high) {

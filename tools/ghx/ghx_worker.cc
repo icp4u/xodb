@@ -53,7 +53,7 @@ extern "C" {
 using namespace ghidra;
 using std::string;
 
-static const char *WORKER_VERSION = "0.4.1";
+static const char *WORKER_VERSION = "0.4.2";
 static const char *SCHEMA = "xodb.ghidra.function_graph";
 static const char *SCHEMA_VERSION = "0.4.1";
 #ifndef GHIDRA_COMMIT
@@ -1054,11 +1054,13 @@ static void decompile_export(const Req &r, J &j, const Inputs &in, double t0, st
 	 * instructions whose p-code was later removed, and zero-p-code ones). */
 	{
 		const BlockGraph &bgc = fd->getBasicBlocks();
+		uintb first_block = ~((uintb)0);
 		for (int4 bi = 0; bi < bgc.getSize(); bi++) {
 			const BlockBasic *bb = (const BlockBasic *)bgc.getBlock(bi);
 			Address st = bb->getStart(), sp = bb->getStop();
 			if (st.isInvalid() || sp.isInvalid() || st.getSpace() != code) continue;
 			uintb a = st.getOffset(), e = sp.getOffset();
+			if (a < first_block) first_block = a;
 			size_t guard = 0;
 			while (a <= e && guard++ < (1u << 20)) {
 				if (!bb->contains(Address(code, a))) { a++; continue; }
@@ -1069,6 +1071,18 @@ static void decompile_export(const Req &r, J &j, const Inputs &in, double t0, st
 		}
 		for (uintb a : insn_addrs)
 			if (!insns.count(a)) lift(a, "pcode_op_address_only");
+		/* ENDBR and some architecture landing pads have no p-code, so the
+		 * decompiler can start its first block after them. Preserve a short,
+		 * fully decoded prefix as instruction evidence; the consumer decides
+		 * which exact no-effect encodings are safe to fold into the block. */
+		if (first_block > r.entry && first_block - r.entry <= 16) {
+			uintb a = r.entry;
+			while (a < first_block) {
+				Insn &in = insns.count(a) ? insns[a] : lift(a, "entry_prefix");
+				if (in.err || in.len <= 0 || (uintb)in.len > first_block - a) break;
+				a += (uintb)in.len;
+			}
+		}
 	}
 
 	/* -------- varnodes */

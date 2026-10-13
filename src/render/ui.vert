@@ -10,9 +10,10 @@ layout(location=1) out vec4 tint;
 layout(location=2) out vec2 sample_position;
 layout(location=3) out vec2 rect_half_size;
 layout(location=4) out vec3 rect_shape;
-layout(push_constant) uniform View { vec2 size; float zoom; float opacity; vec2 shift; } view;
+layout(push_constant) uniform View { vec2 size; float zoom; float opacity; vec2 shift; vec2 rotation; } view;
 void main() {
-    gl_Position = vec4((position * view.zoom + view.shift) / view.size * 2.0 - 1.0, 0.0, 1.0);
+    mat2 turn = mat2(view.rotation.x, view.rotation.y, -view.rotation.y, view.rotation.x);
+    gl_Position = vec4((turn * position * view.zoom + view.shift) / view.size * 2.0 - 1.0, 0.0, 1.0);
     texcoord = uv;
     tint = color;
     tint.a *= view.opacity;

@@ -4,13 +4,30 @@ const wire = @import("profile.zig");
 const profiler = @import("../redot/profiler.zig");
 const Value = std.json.Value;
 pub fn handles(name: []const u8) bool {
-    return std.mem.eql(u8, name, "set_redot_profiling") or std.mem.eql(u8, name, "get_redot_profile") or std.mem.eql(u8, name, "capture_redot_sample");
+    return std.mem.eql(u8, name, "set_redot_capture_status") or std.mem.eql(u8, name, "set_redot_profiling") or std.mem.eql(u8, name, "get_redot_profile") or std.mem.eql(u8, name, "capture_redot_sample");
 }
 fn value(a: std.mem.Allocator, data: anytype) !Value {
     return (try std.json.parseFromSlice(Value, a, try std.json.Stringify.valueAlloc(a, data, .{}), .{ .allocate = .alloc_always })).value;
 }
 pub fn call(a: std.mem.Allocator, session: *Session, name: []const u8, args: Value) !Value {
     const state = &session.redot.profiler;
+    if (std.mem.eql(u8, name, "set_redot_capture_status")) {
+        try wire.fields(args, &.{ "phase", "completed", "total", "diagnostic", "generation" });
+        try session.authorize(.agent, .execution, try wire.number(args, "generation", null));
+        const phase_value = args.object.get("phase") orelse return error.InvalidArguments;
+        if (phase_value != .string) return error.InvalidArguments;
+        const phase = std.meta.stringToEnum(profiler.Capture.Phase, phase_value.string) orelse return error.InvalidArguments;
+        const completed = try wire.number(args, "completed", 0);
+        const total = try wire.number(args, "total", 0);
+        if (completed > total or total > profiler.sample_limit) return error.InvalidArguments;
+        const diagnostic = args.object.get("diagnostic") orelse Value{ .string = "" };
+        if (diagnostic != .string) return error.InvalidArguments;
+        state.capture.set(phase, @intCast(completed), @intCast(total), diagnostic.string);
+        state.revision +%= 1;
+        session.redot.revision +%= 1;
+        session.record(.agent, "set_redot_capture_status");
+        return value(a, .{ .phase = phase, .completed = completed, .total = total });
+    }
     if (std.mem.eql(u8, name, "set_redot_profiling")) {
         try wire.fields(args, &.{ "enabled", "generation" });
         const enabled = args.object.get("enabled") orelse return error.InvalidArguments;

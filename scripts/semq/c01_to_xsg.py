@@ -23,7 +23,7 @@ import os
 import struct
 import sys
 
-ADAPTER_VERSION = "0.3.0"
+ADAPTER_VERSION = "0.3.1"
 
 # Ghidra's native get_opname() returns SLEIGH placeholder spellings for four
 # opcodes and short names for float conversions (opcodes.cc). Map them to the
@@ -164,11 +164,51 @@ def convert(doc, source_sha256, elf=None):
         notes.append("readonly ranges from ELF section headers (non-writable SHF_ALLOC)")
 
     entry = hexval(func["entry"], "function.entry")
+    entry_pad = None
     if not any(hexval(b["start"], b["id"]) == entry for b in doc["blocks"]):
         # e.g. Ghidra "Possible PIC construction ... Changing call to branch":
         # the graph no longer describes code starting at the requested entry.
-        raise AdapterError("no block starts at function entry 0x%x; decompiler warnings: %s" % (
-            entry, "; ".join(w.get("text", "") for w in func.get("warnings", []))[:600]))
+        candidates = [(hexval(b["start"], b["id"]), b["id"]) for b in doc["blocks"]]
+        if candidates and all(start > entry for start, _ in candidates):
+            block_start, block_id = min(candidates)
+            by_address = {}
+            for instruction in doc.get("instructions", []):
+                try:
+                    at = hexval(instruction["addr"], "instruction.addr")
+                except (AdapterError, KeyError, TypeError):
+                    continue
+                by_address.setdefault(at, []).append(instruction)
+            cursor = entry
+            processor = str(lang.get("processor", ""))
+            while cursor < block_start and block_start - entry <= 16:
+                rows = by_address.get(cursor, [])
+                if len(rows) != 1:
+                    break
+                instruction = rows[0]
+                length = instruction.get("length")
+                raw = instruction.get("raw_pcode")
+                high_ops = instruction.get("high_ops")
+                encoding = instruction.get("bytes", "")
+                mnemonic = instruction.get("mnemonic", "").upper()
+                known = ((processor.lower() == "x86" and (mnemonic, encoding) in {
+                            ("ENDBR64", "f30f1efa"), ("ENDBR32", "f30f1efb")}) or
+                         (processor.upper() == "AARCH64" and
+                          ((mnemonic == "PACIASP" and encoding in {"3f2303d5", "d503233f"}) or
+                           (mnemonic == "PACIBSP" and encoding in {"7f2303d5", "d503237f"}) or
+                           (mnemonic == "BTI" and encoding in {
+                               "1f2403d5", "5f2403d5", "9f2403d5", "df2403d5",
+                               "d503241f", "d503245f", "d503249f", "d50324df"}))))
+                if (not isinstance(length, int) or isinstance(length, bool) or length <= 0 or
+                        length > 16 or length > block_start - cursor or len(encoding) != length * 2 or
+                        instruction.get("admission") != "admitted" or raw != [] or high_ops != [] or not known):
+                    break
+                cursor += length
+            if cursor == block_start:
+                entry_pad = (block_id, block_start)
+        if entry_pad is None:
+            raise AdapterError("no block starts at function entry 0x%x; decompiler warnings: %s" % (
+                entry, "; ".join(w.get("text", "") for w in func.get("warnings", []))[:600]))
+        notes.append("entry landing pad [0x%x,0x%x) folded into first block" % (entry, entry_pad[1]))
     outside = func.get("instructions_outside_declared_bounds") or []
     if outside:
         notes.append("%d instructions outside declared bounds (bounds_policy=%s); "
@@ -178,7 +218,8 @@ def convert(doc, source_sha256, elf=None):
     blocks = {b["id"]: b for b in doc["blocks"]}
     op_block = {}
     for b in doc["blocks"]:
-        out.append("block %d 0x%x" % (num(b["id"], "bb:"), hexval(b["start"], b["id"])))
+        start = entry if entry_pad is not None and b["id"] == entry_pad[0] else hexval(b["start"], b["id"])
+        out.append("block %d 0x%x" % (num(b["id"], "bb:"), start))
         for seq, op_id in enumerate(b["ops"]):
             if op_id in op_block:
                 raise AdapterError("op %s listed in two blocks" % op_id)

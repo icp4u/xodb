@@ -35,8 +35,7 @@ UNREGISTERED = {
         ('not gated: needs arguments or fixtures that no step builds', ('cfi-image.py', 'metadata-job.py', 'metadata-image-job.py', 'source-confinement.py', 'observation-association-lifecycle.py', 'observation-saved-associations.py', 'vulkan-leaks.py', 'frame-jit.py', 'jitmap-fixture.py', 'jitmap-perf-crosscheck.py', 'jitmap-runtime-producers.py',)),
         ('not gated: needs output from another test', ('core-gui.py', 'discovery-gui.py', 'syscall-gui.py', 'm2-archive-gui.py', 'm2-limits-gui.py',)),
         ('not gated: passes alone, but its compositor socket path is too long inside a gate snapshot', ('m2-intervals-gui.py', 'm2-preferences-gui.py', 'm2-values-gui.py',)),
-        ('not gated: passes, but leaves a process behind, which the runner reports as a leak', ('process-tree.py',)),
-        ('not gated: fails when run alone', ('allocations-gui.py', 'allocations-live-gui.py', 'process-gui.py', 'fdgraph.py', 'm2-dynamic-threads-gui.py', 'm2-timeline-gui.py', 'm2-values.py', 'process-capacity.py', 'sysstat-live.py', 'runtime-leaks.py', 'simpleperf-tools.py',)),
+        ('not gated: fails when run alone', ('allocations-gui.py', 'allocations-live-gui.py', 'fdgraph.py', 'm2-dynamic-threads-gui.py', 'm2-timeline-gui.py', 'm2-values.py', 'process-capacity.py', 'sysstat-live.py', 'runtime-leaks.py', 'simpleperf-tools.py',)),
     ) for name in names
 }
 
@@ -51,6 +50,15 @@ class RunnerTests(unittest.TestCase):
     def setUpClass(cls):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
         (root / '.work').mkdir(exist_ok=True)
+
+    def test_focused_gui_keeps_headless_app_build(self):
+        selected = gate.select(gate.plan('gui'), only=['gui-debug'])
+        by_name = {step.name: step for step in selected}
+        self.assertIn('headless-app', by_name)
+        self.assertIn('-Dgui=false', by_name['headless-app'].argv)
+        self.assertEqual(by_name['headless-app'].kind, 'build')
+        self.assertIn('headless-app', by_name['build-tests'].needs)
+        self.assertNotIn('headless-app', {step.name for step in gate.plan('portable', headless=True)})
 
     def test_go_native_value_lanes(self):
         for tier in ('quick', 'host', 'gui', 'all', 'periodic'):
@@ -334,9 +342,9 @@ class RunnerTests(unittest.TestCase):
         steps = gate.plan('gui')
         names = [name for name, _, _ in steps]
         picked = [name for name, _, _ in gate.select(steps, ['gui-fdgraph', 'source-paths'])]
-        self.assertEqual(picked, [n for n in names if n in ('build-tests', 'source-paths-build', 'source-paths', 'gui-fdgraph')])
+        self.assertEqual(picked, [n for n in names if n in ('headless-app', 'build-tests', 'source-paths-build', 'source-paths', 'gui-fdgraph')])
         later = [name for name, _, _ in gate.select(steps, start='gui-fdgraph')]
-        self.assertEqual(later, ['build-tests', *names[names.index('gui-fdgraph'):]])
+        self.assertEqual(later, ['headless-app', 'build-tests', *names[names.index('gui-fdgraph'):]])
         self.assertEqual([name for name, _, _ in gate.select(steps, start='build-tests')], names)
         with self.assertRaises(ValueError): gate.select(steps, ['gui-fdgraph', 'no-such-step'])
         with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
@@ -399,10 +407,10 @@ class RunnerTests(unittest.TestCase):
                         <= {step.name for step in gate.plan('periodic-gui') if step.kind == 'gui'})
         records = self.listed('gui', '--records')
         self.assertEqual(records['schema'], 2)
-        self.assertEqual(records['steps'][0], dict(name='build-tests', argv=gate.plan('gui')[0].argv, timeout=600, kind='build',
-                                                   needs=[], paths=[], serial=False, work=[]))
+        self.assertEqual(records['steps'][0], dict(name='headless-app', argv=gate.plan('gui')[0].argv, timeout=600, kind='build',
+                                                   needs=[], paths=[], serial=False, work=['headless-app']))
         vendored = self.listed('gui', '--capstone', 'vendored', '--only', 'gui-fdgraph')
-        self.assertEqual([name for name, _, _ in vendored], ['build-tests', 'gui-fdgraph'])
+        self.assertEqual([name for name, _, _ in vendored], ['headless-app', 'build-tests', 'gui-fdgraph'])
         self.assertEqual(vendored[0][1][-1], '-Dcapstone=vendored')
 
     def test_moved_steps_run_unchanged_in_the_periodic_tiers(self):
@@ -442,8 +450,8 @@ class RunnerTests(unittest.TestCase):
         # affected reaches a moved step through the test script it runs, and only that way.
         steps = [*batch.values(), *moved]
         picked = lambda *changed: [step.name for step in gate.affected(steps, changed, [])[0]]
-        self.assertEqual(picked('tests/memdefrag-gui.py'), ['build-tests', 'release-runner', 'gui-memdefrag-smoke', 'gui-memdefrag'])
-        self.assertEqual(picked('tests/m2-limits.py'), ['build-tests', 'release-runner', 'm2-limits'])
+        self.assertEqual(picked('tests/memdefrag-gui.py'), ['headless-app', 'build-tests', 'release-runner', 'gui-memdefrag-smoke', 'gui-memdefrag'])
+        self.assertEqual(picked('tests/m2-limits.py'), ['headless-app', 'build-tests', 'release-runner', 'm2-limits'])
         self.assertEqual(picked('tests/client.py'), list(batch))
         self.assertFalse({step.name for step in moved} & set(picked('src/memdefrag/map.zig', 'src/language/lua_layout.c', 'src/profile/flame.zig')))
 
@@ -532,7 +540,7 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('no registration changed, so the full gui tier', lines[0])
         self.assertTrue(set(fallback) <= set(names))
         picked, lines = gate.affected(steps, ['scripts/release-check'], fallback, ['m2-flow', 'gui-capture-setup'])
-        self.assertEqual([step.name for step in picked], ['build-tests', 'release-runner', 'm2-flow', 'gui-capture-setup'])
+        self.assertEqual([step.name for step in picked], ['headless-app', 'build-tests', 'release-runner', 'm2-flow', 'gui-capture-setup'])
         self.assertTrue(set(gate.registered_since('HEAD', ())) <= {step.name for step in gate.plan('all')})
         self.assertEqual(gate.registered_since('no-such-revision', ()), [])
         # A mapped file whose steps need a runtime that was not passed is not silently skipped.

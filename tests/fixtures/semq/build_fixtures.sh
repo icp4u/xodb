@@ -21,4 +21,10 @@ for cc in gcc clang; do
 		$cc --version | head -1 > "$bin.compiler"
 	done
 done
-(cd "$out" && sha256sum qx-gcc-O0 qx-gcc-O2 qx-clang-O0 qx-clang-O2 > SHA256SUMS)
+bin=$out/qx-gcc-cet-O2
+(cd "$here" && timeout 120 gcc -O2 -g -Wl,--build-id=sha1 -no-pie -fcf-protection=full \
+	-ffile-prefix-map="$here"=fixtures -o "$bin" qx.c)
+nm -S --defined-only "$bin" | awk 'function c(h) { sub(/^0+/, "", h); return "0x" (h == "" ? "0" : h) }
+	$3 ~ /^[Tt]$/ {print $4, c($1), c($2)}' | LC_ALL=C sort > "$bin.oracle"
+gcc --version | head -1 > "$bin.compiler"
+(cd "$out" && sha256sum qx-gcc-O0 qx-gcc-O2 qx-clang-O0 qx-clang-O2 qx-gcc-cet-O2 > SHA256SUMS)

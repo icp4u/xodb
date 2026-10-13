@@ -72,8 +72,10 @@ comptime {
     for (.{ "next", "button", "tick", "timeoutMs", "mods", "heldShortcut" }) |name|
         if (!@hasDecl(Keyboard, name)) @compileError("platform Keyboard." ++ name);
     // Vulkan: the instance extension the window's surface needs, and the surface.
-    _ = @as([*:0]const u8, Window.vk_surface_extension);
-    _ = @as(*const fn (*Window, vk.VkInstance, *vk.VkSurfaceKHR) vk.VkResult, &Window.createSurface);
+    if (@import("build_options").gui) {
+        _ = @as([*:0]const u8, Window.vk_surface_extension);
+        _ = @as(*const fn (*Window, vk.VkInstance, *vk.VkSurfaceKHR) vk.VkResult, &Window.createSurface);
+    }
 }
 
 test {

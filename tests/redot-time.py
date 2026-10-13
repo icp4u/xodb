@@ -27,14 +27,21 @@ def main():
     project = args.work.resolve() / 'project'
     shutil.copytree(root / 'tests/fixtures/redot-time', project)
     start = time.monotonic()
+    os.environ['XODB_REDOT_TIME_ORACLE'] = '1'
     client = Client('control', str(Path(args.redot).resolve()), ('--headless', '--path', str(project)), ('--redot-debugger', '--image-limit', '1600M', '--image-total-limit', '2G'), reply_seconds=30)
     def usage():
         fields = Path(f'/proc/{client.p.pid}/stat').read_text().rsplit(')', 1)[1].split()
         return dict(cpu_seconds=(int(fields[11])+int(fields[12]))/os.sysconf('SC_CLK_TCK'), rss_bytes=int(fields[21])*os.sysconf('SC_PAGE_SIZE'))
     before = usage()
     try:
+        progress = []
+        def sampling_tool(name, **arguments):
+            if name == 'set_redot_capture_status':
+                progress.append((arguments['phase'], arguments['completed'], arguments['total']))
+            return client.inspect(name, **arguments)
         scene = start_scene(client.inspect)
-        samples = sample_time(client.inspect, 12)
+        samples = sample_time(sampling_tool, 12)
+        assert progress == [('sampling', n, 12) for n in range(13)] + [('ready', 12, 12)], progress
         all_frames = client.inspect('get_redot_profile', limit=256)
         assert all_frames['enabled'] is False and len(all_frames['frames']) > 1, all_frames
         joined = []
@@ -74,6 +81,8 @@ def main():
     try:
         refusal = observer.tool('set_redot_profiling', enabled=True, generation=0)
         assert 'AgentScopeDenied' in str(refusal), refusal
+        refusal = observer.tool('set_redot_capture_status', phase='sampling', generation=0)
+        assert 'AgentScopeDenied' in str(refusal), refusal
     finally:
         observer.close()
     spec = importlib.util.spec_from_file_location('shared', root / 'tests/shared-sessions.py')
@@ -87,6 +96,8 @@ def main():
         owner.claim(ttl_ms=60000)
         start_scene(owner.tool)
         refusal = observer.call('tools/call', dict(name='set_redot_profiling', arguments=dict(enabled=True, generation=owner.session()['generation'])))
+        assert 'ControlLeaseRequired' in str(refusal), refusal
+        refusal = observer.call('tools/call', dict(name='set_redot_capture_status', arguments=dict(phase='sampling', generation=owner.session()['generation'])))
         assert 'ControlLeaseRequired' in str(refusal), refusal
         owner.tool('set_redot_profiling', enabled=True, generation=owner.session()['generation'])
         deadline = time.monotonic() + 10

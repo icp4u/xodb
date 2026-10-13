@@ -24,11 +24,20 @@
     "record_limit": 32768,
     "memory_limit": 33554432
   },
+  "decompiler": {
+    "prestart": true
+  },
   "galaxy": {
     "additive": true,
     "cloud_size": 1.6,
     "brightness": 0.85,
     "camera_zoom": 1.35,
+    "pan_speed": 340,
+    "zoom_speed": 1.2,
+    "rotate_speed": 0.45,
+    "tour_seconds": 5,
+    "tour_drift": true,
+    "tour_drift_speed": 0.025,
     "easing_ms": 450,
     "max_stars": 512,
     "unfold": true

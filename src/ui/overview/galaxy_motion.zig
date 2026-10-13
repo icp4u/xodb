@@ -11,8 +11,7 @@ pub const Motion = struct {
     star_count: usize = 0,
     cluster_count: usize = 0,
     last: u64 = 0,
-    zoom: f32 = 1,
-    shift: [2]f32 = .{ 0, 0 },
+    navigation: @import("galaxy_camera.zig").Camera = .{},
     active: bool = false,
     layout_active: bool = false,
     camera_active: bool = false,
@@ -66,47 +65,55 @@ pub const Motion = struct {
             self.layout_until = if (self.star_count == 0) now else now + 100_000_000;
         }
         const step: f32 = if (now >= self.layout_until) 1 else @min(1, @as(f32, @floatFromInt(now -| previous)) / @as(f32, @floatFromInt(@max(1, self.layout_until -| previous))));
-        const visible = draw.Rect{ .x = (body.x - self.shift[0]) / self.zoom, .y = (body.y - self.shift[1]) / self.zoom, .w = body.w / self.zoom, .h = body.h / self.zoom };
+        var minimum = [2]f32{ std.math.inf(f32), std.math.inf(f32) };
+        var maximum = [2]f32{ -std.math.inf(f32), -std.math.inf(f32) };
+        for ([_][2]f32{ .{ body.x, body.y }, .{ body.x + body.w, body.y }, .{ body.x, body.y + body.h }, .{ body.x + body.w, body.y + body.h } }) |corner| {
+            const world = self.navigation.unproject(corner);
+            for (0..2) |axis| {
+                minimum[axis] = @min(minimum[axis], world[axis]);
+                maximum[axis] = @max(maximum[axis], world[axis]);
+            }
+        }
+        const visible = draw.Rect{ .x = minimum[0], .y = minimum[1], .w = maximum[0] - minimum[0], .h = maximum[1] - minimum[1] };
         self.layout_active = false;
-        settle(s.stars[0..s.star_count], &self.stars, &self.star_count, step, &self.layout_active, visible, 1 / self.zoom, "seed");
-        settle(s.clusters[0..s.cluster_count], &self.clusters, &self.cluster_count, step, &self.layout_active, visible, 1 / self.zoom, "key");
+        settle(s.stars[0..s.star_count], &self.stars, &self.star_count, step, &self.layout_active, visible, 1 / self.navigation.zoom, "seed");
+        settle(s.clusters[0..s.cluster_count], &self.clusters, &self.cluster_count, step, &self.layout_active, visible, 1 / self.navigation.zoom, "key");
         self.active = self.layout_active;
         return t;
     }
-    pub fn camera(self: *Motion, s: anytype, body: draw.Rect, pointer: [2]f32, selected: ?u64, t: f32, prefs: Look) void {
-        var target: ?usize = null;
+    pub fn camera(self: *Motion, s: *const model.Scene, field: draw.Rect, pointer: [2]f32, selected: ?u64, now: u64, prefs: Look) void {
         self.pointer = pointer;
-        if (selected) |key| {
-            for (s.clusters[0..s.cluster_count], 0..) |cl, i| if (cl.key == key) {
-                target = i;
-                break;
-            };
-        }
-        self.focus = if (target) |i| s.clusters[i].key else null;
-        const zoom: f32 = if (target != null) prefs.camera_zoom else 1;
-        const center = [2]f32{ body.x + body.w / 2, body.y + body.h / 2 };
-        const at = if (target) |i| s.clusters[i].at else center;
-        self.camera_active = false;
-        self.zoom = blend(self.zoom, zoom, t, &self.camera_active);
-        for (0..2) |axis| self.shift[axis] = blend(self.shift[axis], center[axis] - at[axis] * zoom, t, &self.camera_active);
+        self.navigation.field = field;
+        self.navigation.update(s, now, prefs);
+        self.focus = selected;
+        if (self.navigation.selection) |selection| switch (selection) {
+            .cluster => |key| self.focus = key,
+            .node => |key| for (s.stars[0..s.star_count]) |star| {
+                if (star.seed == key) {
+                    self.focus = s.clusters[star.cluster].key;
+                    break;
+                }
+            },
+        };
+        self.camera_active = self.navigation.active;
         self.active = self.layout_active or self.camera_active;
     }
-    pub fn transform(self: *const Motion) [4]f32 {
-        return .{ self.zoom, 1, self.shift[0], self.shift[1] };
+    pub fn transform(self: *const Motion) [6]f32 {
+        return self.navigation.transform();
     }
     pub fn project(self: *const Motion, s: anytype) void {
         for (s.stars[0..s.star_count]) |*star| {
             self.point(&star.at);
-            star.r *= self.zoom;
+            star.r *= self.navigation.zoom;
         }
         for (s.clusters[0..s.cluster_count]) |*cl| {
             self.point(&cl.at);
-            cl.r *= self.zoom;
+            cl.r *= self.navigation.zoom;
         }
         for (s.junctions[0..s.junction_count]) |*j| self.point(&j.at);
     }
     fn point(self: *const Motion, at: *[2]f32) void {
-        for (0..2) |axis| at[axis] = at[axis] * self.zoom + self.shift[axis];
+        at.* = self.navigation.project(at.*);
     }
 };
 
@@ -117,23 +124,26 @@ test "an easing step below float resolution lands instead of animating forever" 
     try std.testing.expect(Motion.blend(0, 100, 0.5, &moving) == 50 and moving);
 }
 
-test "hover leaves camera still; selection eases and clearing it returns" {
+test "hover and refreshed selection stay still; explicit frame and fit ease" {
     var camera_state = Motion{};
-    const fake = struct { clusters: [1]Point, cluster_count: usize }{ .clusters = .{.{ .key = 7, .at = .{ 200, 200 }, .r = 80 }}, .cluster_count = 1 };
+    const fake = try std.testing.allocator.create(model.Scene);
+    defer std.testing.allocator.destroy(fake);
+    fake.* = .{};
+    fake.clusters[0] = .{ .key = 7, .at = .{ 200, 200 }, .r = 80 };
+    fake.cluster_count = 1;
     const body = draw.Rect{ .x = 0, .y = 0, .w = 800, .h = 600 };
-    camera_state.camera(&fake, body, .{ 200, 200 }, null, 0.2, .{});
-    try std.testing.expect(camera_state.zoom == 1 and !camera_state.active);
-    camera_state.camera(&fake, body, .{ 200, 200 }, 7, 0.2, .{});
-    try std.testing.expect(camera_state.zoom > 1 and camera_state.zoom < 1.35);
+    camera_state.camera(fake, body, .{ 200, 200 }, null, 1, .{});
+    camera_state.camera(fake, body, .{ 400, 300 }, 7, 30_000_001, .{});
+    try std.testing.expect(camera_state.navigation.zoom == 1 and !camera_state.active);
     try std.testing.expectEqual(@as(?u64, 7), camera_state.focus);
-    const first = camera_state.zoom;
-    camera_state.camera(&fake, body, .{ 200, 200 }, 7, 0.2, .{});
-    try std.testing.expect(camera_state.zoom > first);
-    const zoomed = camera_state.zoom;
-    camera_state.camera(&fake, body, .{ -1, -1 }, null, 0.2, .{});
-    try std.testing.expect(camera_state.zoom < zoomed and camera_state.focus == null);
-    camera_state.camera(&fake, body, .{ -1, -1 }, 7, 0.2, .{});
-    try std.testing.expectEqual(@as(?u64, 7), camera_state.focus);
+    camera_state.navigation.selection = .{ .cluster = 7 };
+    camera_state.navigation.frame(fake);
+    camera_state.camera(fake, body, .{ 200, 200 }, 7, 60_000_001, .{});
+    try std.testing.expect(camera_state.navigation.zoom > 1 and camera_state.active);
+    const zoomed = camera_state.navigation.zoom;
+    camera_state.navigation.fit();
+    camera_state.camera(fake, body, .{ -1, -1 }, null, 90_000_001, .{});
+    try std.testing.expect(camera_state.navigation.zoom < zoomed and camera_state.focus == null);
 }
 
 test "sub-pixel and off-screen layout changes do not request animation" {
@@ -163,7 +173,7 @@ test "camera-hidden layout movement lands without waking the view" {
     const body = draw.Rect{ .x = 0, .y = 0, .w = 800, .h = 600 };
     var motion = Motion{};
     _ = motion.layout(scene, body, 1, .{});
-    motion.zoom = 2;
+    motion.navigation.zoom = 2;
     scene.stars[0].at[0] = 700;
     scene.signature = 2;
     _ = motion.layout(scene, body, 30_000_001, .{});

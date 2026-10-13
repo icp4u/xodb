@@ -80,6 +80,33 @@ def bad_id(d):
 mutate("bad-op-id", bad_id, "bad id")
 mutate("orphan-op", lambda d: h(d)["ops"].append(dict(first(d, "COPY"), id="op:88888")), "is in no block")
 mutate("unknown-space", lambda d: h(d)["varnodes"][0].update(space="nowhere"), "unknown space")
+
+# A producer may omit a control-flow landing pad from high p-code. Exact,
+# contiguous instruction evidence admits the graph and extends its first block
+# to the function identity; an arbitrary no-pcode instruction does not.
+pad = copy.deepcopy(base)
+old_entry = int(pad["function"]["entry"], 16)
+pad_entry = old_entry - 4
+pad["function"]["entry"] = hex(pad_entry)
+pad["instructions"].insert(0, {"id": "insn:" + hex(pad_entry), "addr": hex(pad_entry), "length": 4,
+                               "admission": "admitted", "bytes": "f30f1efa", "mnemonic": "ENDBR64",
+                               "raw_pcode": [], "high_ops": []})
+rc, err, out = convert(pad)
+if rc != 0:
+    fails.append("known entry pad refused: %r" % err.strip()[-200:])
+else:
+    text = open(out).read()
+    first_id = int(min(base["blocks"], key=lambda b: int(b["start"], 16))["id"].split(":")[1])
+    if "function 1 %s entry=0x%x" % (base["function"]["name"], pad_entry) not in text or "block %d 0x%x" % (first_id, pad_entry) not in text:
+        fails.append("known entry pad did not extend the first block")
+
+def unknown_pad(d):
+    old = int(d["function"]["entry"], 16)
+    d["function"]["entry"] = hex(old - 1)
+    d["instructions"].insert(0, {"id": "insn:" + hex(old - 1), "addr": hex(old - 1), "length": 1,
+                                  "admission": "admitted", "bytes": "90", "mnemonic": "NOP",
+                                  "raw_pcode": [], "high_ops": []})
+mutate("unknown-entry-pad", unknown_pad, "no block starts at function entry")
 # --elf must match the export's image hash
 rc, err, _ = convert(base, ["--elf", adapter])
 if rc != 1 or "does not match" not in err:

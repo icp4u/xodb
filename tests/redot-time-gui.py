@@ -15,13 +15,14 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--redot', required=True)
 p.add_argument('--work', type=Path, required=True)
 p.add_argument('--demo', action='store_true', help='Periodic lane: also exercise the public launcher')
+p.add_argument('--status-only', action='store_true', help='Fast lane: empty-pane sampling and startup failure')
 args = p.parse_args()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
 os.umask(0o022)
 sys.path.insert(0, str(root / 'scripts/helpers'))
 from redot_scene import start_scene
-from redot_time import sample_time
+from redot_time import sample_time, capture_status
 
 w = (args.work / '.work/input-time').resolve()
 w.mkdir(parents=True, exist_ok=True)
@@ -43,8 +44,6 @@ began = time.monotonic()
 try:
     d = h.Display(str(root), ['--agent-scope', 'control', '--redot-debugger', '--image-limit', '1600M', '--image-total-limit', '2G', '--', str(Path(args.redot).resolve()), '--headless', '--path', str(w / 'project')])
     scene = start_scene(d.tool)
-    samples = sample_time(d.tool, 8)
-    profile = d.tool('get_redot_profile', limit=256)
     def visible(label, words):
         deadline = time.monotonic() + 10
         while True:
@@ -55,6 +54,17 @@ try:
                 return text
             assert time.monotonic() < deadline, (label, text, d.tail())
             time.sleep(.02)
+    if args.status_only:
+        d.keys('tap', 22, 'tap', 20)  # U T, before any profiler frames arrive.
+        capture_status(d.tool, 'sampling', 3, 12)
+        visible('sampling', ['sampling', '3of12'])
+        capture_status(d.tool, 'failed', 3, 12, 'Owned sample startup stopped')
+        visible('startup-failed', ['scenestartup', 'ownedsamplestartupstopped'])
+        (args.work / 'results.json').write_text(json.dumps(dict(status='pass', seconds=round(time.monotonic()-began, 2)))+'\n')
+        print('Redot time status: sampling progress and startup failure visible without frames')
+        sys.exit(0)
+    samples = sample_time(d.tool, 8)
+    profile = d.tool('get_redot_profile', limit=256)
     target = max((s for s in samples if any(f['name'] == 'burn' and f['reason'] is None and f['native_frame'] is not None for f in s['script']) and any(f['number'] == s['frame_number'] for f in profile['frames'])), key=lambda s: max(f['native_frame'] for f in s['script'] if f['name'] == 'burn' and f['native_frame'] is not None))
     ordinal = next(i for i, f in enumerate(profile['frames']) if f['number'] == target['frame_number'])
     detail = d.tool('get_redot_profile', frame_number=target['frame_number'])
@@ -82,6 +92,7 @@ try:
                 while 'Time ready.' not in (w / 'demo.log').read_text():
                     assert demo.poll() is None and time.monotonic() < deadline, (w / 'demo.log').read_text()
                     time.sleep(.02)
+                assert 'ORACLE frame ' not in (w / 'demo.log').read_text()
                 d.keys('tap', 22, 'tap', 20, 'tap', 33)  # U T F
                 visible('demo-time', ['frametime', 'slow', 'functions'])
             finally:

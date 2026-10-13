@@ -18,6 +18,7 @@ fn clip(text: []const u8, limit: usize) []const u8 {
 }
 
 pub const Panel = struct {
+    look: @import("../preferences.zig").Galaxy = .{},
     open: bool = false,
     cursor: usize = 0,
     first: usize = 0,
@@ -53,9 +54,12 @@ pub const Panel = struct {
                 return;
             };
             view.* = .{};
+            view.presentation.look = self.look;
             self.galaxy = view;
         }
         self.galaxy_open = !self.galaxy_open;
+        self.galaxy.?.state.motion.navigation.help = true;
+        self.galaxy.?.state.motion.navigation.help_until = 0;
     }
 
     fn matchesProperty(self: *const Panel, property: protocol.Property) bool {
@@ -87,6 +91,7 @@ pub const Panel = struct {
     fn select(self: *Panel, adapter: *protocol.Adapter) void {
         self.cursor = @min(self.cursor, adapter.nodes.len -| 1);
         if (adapter.nodes.len == 0) return;
+        if (self.galaxy_open) self.galaxy.?.state.motion.navigation.selection = .{ .node = adapter.nodes[self.cursor].object_id };
         self.property_first = 0;
         self.expanded = null;
         adapter.inspect(adapter.nodes[self.cursor].object_id) catch |err| {
@@ -103,10 +108,18 @@ pub const Panel = struct {
         }
     }
     pub fn input(self: *Panel, w: *Window, adapter: *protocol.Adapter) void {
-        if (self.galaxy) |view| view.pointer = .{ w.pointer_x, w.pointer_y };
+        const now = @import("../target/linux.zig").now();
+        defer if (self.galaxy) |view| {
+            if (view.state.motion.navigation.controls(&w.input, self.galaxy_open and self.open and !self.filtering)) w.dirty = true;
+        };
+        if (self.galaxy) |view| {
+            const point = [2]f32{ w.pointer_x, w.pointer_y };
+            if (self.galaxy_open and !std.meta.eql(view.pointer, point)) view.state.motion.navigation.pointer(point);
+            view.pointer = point;
+        }
         if (w.scroll != 0) {
             self.inspector_focus = w.pointer_x >= self.bounds.x + self.bounds.w * 0.38;
-            if (!self.galaxy_open) self.wheel(adapter, w.scroll);
+            if (self.galaxy_open) self.galaxy.?.state.motion.navigation.wheel(w.scroll, .{ w.pointer_x, w.pointer_y }, self.look) else self.wheel(adapter, w.scroll);
             w.scroll = 0;
             w.dirty = true;
         }
@@ -127,19 +140,39 @@ pub const Panel = struct {
                 }
                 continue;
             }
-            if (self.time and self.time_panel.input(event, &adapter.profiler, self.inspector_focus)) continue;
+            if (self.galaxy_open) {
+                const view = self.galaxy.?;
+                const camera = &view.state.motion.navigation;
+                if (camera.key(&view.state.scene, event)) continue;
+                if (event.kind == .button_release and event.code == 272) {
+                    camera.pointer(.{ event.x, event.y });
+                    camera.drag = null;
+                    continue;
+                }
+                if (event.kind == .press and event.plain() and event.shortcut == keys.sym.escape) {
+                    if (camera.selection != null) camera.fit() else self.galaxy_open = false;
+                    continue;
+                }
+                if (event.kind == .press and event.plain() and event.shortcut == 'q') {
+                    w.closing = true;
+                    return;
+                }
+            }
+            if (self.time and !self.galaxy_open and self.time_panel.input(event, &adapter.profiler, self.inspector_focus)) continue;
             if (self.galaxy_open and event.kind == .button_press and event.code == 272) {
-                if (self.galaxy.?.select(event.x, event.y)) |id| {
+                const view = self.galaxy.?;
+                _ = view.state.motion.navigation.press(&view.state.scene, .{ event.x, event.y }, now);
+                if (view.state.motion.navigation.selection) |selection| if (selection == .node) {
+                    const id = selection.node;
                     for (adapter.nodes, 0..) |node, i| if (node.object_id == id) {
                         self.cursor = i;
                         self.select(adapter);
-                        self.galaxy_open = false;
                         self.signals = false;
                         self.time = false;
                         self.inspector_focus = true;
                         break;
                     };
-                }
+                };
                 continue;
             }
             if (event.kind == .button_press and event.code == 272) {

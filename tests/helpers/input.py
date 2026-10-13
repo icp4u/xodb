@@ -11,6 +11,8 @@ import select
 import signal
 import subprocess
 import time
+# Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
+os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 VPTR = "/usr/share/wlr-protocols/unstable/wlr-virtual-pointer-unstable-v1.xml"

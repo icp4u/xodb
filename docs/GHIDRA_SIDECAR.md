@@ -8,8 +8,8 @@ no-JVM x86-64 ELF producer remains available when the sidecar is not selected.
 ## Starting it
 
 Set `GHIDRA_HOME` to an installed Ghidra directory and put a JDK (`java` and
-`javac`) on `PATH`, or set `JAVA_HOME`. A first pseudo-C request starts the
-sidecar in a background session through the same script used manually:
+`javac`) on `PATH`, or set `JAVA_HOME`. By default xodb starts the sidecar in
+a background session during its own startup, through the same script used manually:
 
 ```sh
 scripts/ghidra-sidecar start
@@ -44,6 +44,17 @@ Configuration:
 | `XODB_GHIDRA_MAX_IMAGES` | `64` | persistent project image limit |
 | `XODB_GHIDRA_MAX_DOCUMENTS` | `1024` | in-memory function document limit |
 | `XODB_GHIDRA_START_TIMEOUT` | `45` | starter wait in seconds |
+
+Set `decompiler.prestart` to `false` in preferences, or pass
+`--no-ghidra-prestart`, to keep the JVM idle until the first pseudo-C request.
+`XODB_GHIDRA_SIDECAR=off` still disables the sidecar completely. Once a target
+architecture is known, xodb sends `prime` before opening an image. It then
+imports the executable and newly seen executable mappings in a bounded,
+smallest-first background queue. Resume and an interactive analysis cancel
+this work before it can delay the debugger. A cancelled import starts again
+from nothing, so a library whose import was twice cancelled after seconds of
+work is left to an explicit request. Background imports stop at half of
+`XODB_GHIDRA_MAX_IMAGES`; the other half is kept for images you ask about.
 
 The cache is private, bounded by image and document counts, and safe to delete
 while the sidecar is stopped. Reaching a limit returns `cache_full`; raise the
@@ -84,13 +95,15 @@ later exchange.
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.0`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.2`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
-`pseudocode`. It also advertises variables, types, function index, and the
+`pseudocode`. It also advertises `prime`, variables, types, function index, and the
 reserved hints direction.
 
-`open_image` carries `path` and lowercase `sha256`. It hashes the file before
+`prime` carries one of xodb's architecture names. It loads that processor
+language and decompiles a tiny scratch function without opening a target
+image. `open_image` carries `path` and lowercase `sha256`. It hashes the file before
 import. The operation is idempotent by SHA-256 and returns progress through
 `hashing`, `importing`, and `analyzing`. Format loaders also find adjacent
 owned debug companions such as a PDB or dSYM. Analysis keeps format/debug,
@@ -99,7 +112,13 @@ unrelated to the exported function document are disabled.
 
 `decompile` carries the same `path` and `sha256`, canonical hexadecimal
 `entry` and `size`, optional GNU `build_id`, and `options` (`default` today).
-The entry may be the start or an address inside the Ghidra function. Documents
+The entry may be the start or an address inside the Ghidra function. Every
+address in a request or a document is a link address: the runtime address
+minus the module's load bias. The sidecar imports an ELF at its linked base,
+not at Ghidra's default base for position-independent code, so a
+position-independent executable or a shared library answers exactly as a
+fixed-address build does. A cached import found at another base (written
+before producer 0.1.1) is replaced on its next `open_image`. Documents
 are immutable and cached by image SHA-256, resolved function entry, options,
 and producer version.
 
@@ -122,6 +141,8 @@ The framed payload is `xodb.ghidra.function_graph` schema `0.4.1`. It contains
 the graph consumed by xsg and the pseudo-C document consumed by the D pane:
 
 - final high-p-code SSA, blocks, edges, calls, and exact token-to-op/PC links;
+- decoded instruction bytes, mnemonics, raw p-code, and high-op links used to
+  account for no-effect landing pads that high p-code omits;
 - pseudo-C text and positioned syntax tokens;
 - variables with name, type, register/stack/temp storage, and PC range;
 - referenced types, function prototype, and calling convention;

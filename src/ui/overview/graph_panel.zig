@@ -7,9 +7,12 @@ const galaxy = @import("galaxy.zig");
 const Input = @import("../../platform/input.zig").Event;
 
 pub fn key(v: *vw.View, event: Input) bool {
+    const state = @import("galaxy_descriptors.zig").navigation();
+    if (v.panel == .galaxy and !v.searching and state.motion.navigation.key(&state.scene, event)) return true;
     if (event.kind != .press or !event.plain()) return false;
     if (event.sym == 0xff1b) {
         v.graph.all();
+        if (v.panel == .galaxy) state.motion.navigation.fit();
         return true;
     }
     switch (event.shortcut) {
@@ -33,10 +36,20 @@ pub fn key(v: *vw.View, event: Input) bool {
             v.graph.dirty = true;
             return true;
         },
-        'l' => if (v.graph.focus) |id| {
-            v.files.scope(.{ .pid = id.pid, .start = id.start });
-            v.show(.files);
-            return true;
+        'l' => {
+            if (v.panel == .galaxy) if (state.motion.navigation.selection) |selected| {
+                if (selected == .node) for (state.scene.stars[0..state.scene.star_count], 0..) |star, i| {
+                    if (star.seed == selected.node) {
+                        v.graph.focusStar(@intCast(i));
+                        break;
+                    }
+                };
+            };
+            if (v.graph.focus) |id| {
+                v.files.scope(.{ .pid = id.pid, .start = id.start });
+                v.show(.files);
+                return true;
+            }
         },
         else => {},
     }
@@ -131,7 +144,8 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const lk = galaxy.look(ctx.p);
     const demo = v.graph.demo != 0;
     if (!lk.plain) try ctx.r.shape(rect, lk.field, .{ .radii = @splat(6) });
-    try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, "Descriptor galaxy", lk.text);
+    const navigation = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
+    try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, if (navigation.tour) "Descriptor galaxy / TOUR" else "Descriptor galaxy", lk.text);
     try ctx.r.shape(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, draw.fade(lk.warn, 0.12), .{ .radii = @splat(5) });
     try ctx.textFit(rect.x + 16, rect.y + 38, rect.w - 32, if (demo) "DEMO · synthetic processes · nothing is read or traced" else bannerText(v, &buffer, &failure_buffer), lk.warn);
     var rows: [8]draw.Rect = undefined;
@@ -179,7 +193,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     if (demo) {
         const text = std.fmt.bufPrint(&buffer, "{d} stars · {d} clusters · {d} threads ({d} drawn) · {d} impulses · synthetic", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, text, lk.dim);
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, "P pause · hover for detail · run without --galaxy-demo for live descriptors", lk.dim);
+        try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (navigation.help) @import("galaxy_camera.zig").hints else "P pause · hover for detail · ? navigation · run without --galaxy-demo for live descriptors", lk.dim);
         return;
     }
     const g = v.graph.graph.?;
@@ -191,7 +205,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         const limit_text = std.fmt.bufPrint(&buffer, "Sampled joins · {d} bytes unattributed · {d} resources / {d} links omitted · {s}", .{ v.graph.flow_unknown, layout.omitted_resources, layout.omitted_links + hidden, if (v.graph.flow_flags != 0) "capture incomplete" else "no capture loss reported" }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links + hidden > 0) lk.warn else lk.dim);
     }
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, "E tracing on/off · C cgroups · +/- detail · Esc all · click expand/holders · L files", lk.dim);
+    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (navigation.help) @import("galaxy_camera.zig").hints else "E tracing · C cgroups · +/- detail · Esc all · click select / Enter frame · L files · ? navigation", lk.dim);
 }
 fn bannerText(v: *vw.View, buffer: []u8, failure_buffer: []u8) []const u8 {
     return if (v.graph.flow_running)

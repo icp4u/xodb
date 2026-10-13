@@ -21,7 +21,7 @@ const Value = std.json.Value;
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 const protocol = 1;
 const schema = 1;
-pub const producer = "ghidra-jvm-sidecar-0.1.0";
+pub const producer = "ghidra-jvm-sidecar-0.1.2";
 const max_line = 1 << 20;
 const max_payload = 64 << 20;
 
@@ -49,6 +49,11 @@ pub const Request = struct {
     entry: u64,
     size: u64,
     build_id: ?[]const u8,
+    deadline_ms: u32,
+};
+pub const Endpoint = struct {
+    socket_path: [:0]const u8,
+    starter: ?[:0]const u8,
     deadline_ms: u32,
 };
 pub const Result = struct { document: []u8, elapsed_ms: f64 };
@@ -226,6 +231,8 @@ fn expectedHello(value: Value) bool {
     if (healthy != .bool or !healthy.bool) return false;
     const capabilities = value.object.get("capabilities") orelse return false;
     if (capabilities != .array) return false;
+    // "prime" is optional: a running sidecar from before it existed keeps
+    // serving, and only misses the warm-up.
     for ([_][]const u8{ "open_image", "decompile", "cancel", "status", "shutdown", "xsg", "pseudocode" }) |needed| {
         var found = false;
         for (capabilities.array.items) |cap| if (cap == .string and std.mem.eql(u8, cap.string, needed)) {
@@ -275,23 +282,43 @@ fn fail(a: Allocator, out: *Failure, code: []const u8, comptime format: []const 
     return error.SidecarFailed;
 }
 
-fn ensure(a: Allocator, request: Request, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
+fn ensure(a: Allocator, endpoint: Endpoint, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
     var seen: []const u8 = "no answering socket";
-    if (hello(a, request.socket_path, cancel, @min(deadline, nowNs() + 2 * std.time.ns_per_s))) |reply| {
+    if (hello(a, endpoint.socket_path, cancel, @min(deadline, nowNs() + 2 * std.time.ns_per_s))) |reply| {
         if (expectedHello(reply)) return;
         seen = try std.json.Stringify.valueAlloc(a, reply, .{});
     } else |_| {}
-    const starter = request.starter orelse return fail(a, failure, "sidecar_unavailable", "Ghidra sidecar is absent ({s}); set GHIDRA_HOME and XODB_GHIDRA_SIDECAR or start scripts/ghidra-sidecar", .{seen});
+    const starter = endpoint.starter orelse return fail(a, failure, "sidecar_unavailable", "Ghidra sidecar is absent ({s}); set GHIDRA_HOME and XODB_GHIDRA_SIDECAR or start scripts/ghidra-sidecar", .{seen});
     stage.store(.starting, .release);
     start(starter, cancel, deadline) catch |err| {
         if (err == error.SidecarNotConfigured) return fail(a, failure, "sidecar_not_configured", "no Ghidra installation or JDK was found: set GHIDRA_HOME (or XODB_GHIDRA_HOME) to a Ghidra directory and JAVA_HOME, or put java and javac on PATH; details in {s}", .{logPath(a)});
         return fail(a, failure, if (err == error.Cancelled) "cancelled" else if (err == error.DeadlineExceeded) "sidecar_timeout" else "sidecar_start_failed", "{s}; expected protocol {d}, schema {d}; initially saw {s}; sidecar log {s}", .{ @errorName(err), protocol, schema, seen, logPath(a) });
     };
-    const reply = hello(a, request.socket_path, cancel, @min(deadline, nowNs() + 3 * std.time.ns_per_s)) catch |err| return fail(a, failure, "sidecar_start_failed", "starter exited successfully but hello failed: {s}; expected protocol {d}, schema {d}; sidecar log {s}", .{ @errorName(err), protocol, schema, logPath(a) });
+    const reply = hello(a, endpoint.socket_path, cancel, @min(deadline, nowNs() + 3 * std.time.ns_per_s)) catch |err| return fail(a, failure, "sidecar_start_failed", "starter exited successfully but hello failed: {s}; expected protocol {d}, schema {d}; sidecar log {s}", .{ @errorName(err), protocol, schema, logPath(a) });
     if (!expectedHello(reply)) {
         const after = try std.json.Stringify.valueAlloc(a, reply, .{});
         return fail(a, failure, "sidecar_protocol_mismatch", "expected protocol {d}, schema {d}, producer {s}, same uid and required capabilities; initially saw {s}; after one restart saw {s}; sidecar log {s}", .{ protocol, schema, producer, seen, after, memberText(reply, "log") orelse logPath(a) });
     }
+}
+
+fn bootThread() void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    if (!(selected(a) catch false)) return;
+    const endpoint = Endpoint{ .socket_path = socketPath(a) catch return, .starter = starterPath(a) catch null, .deadline_ms = 30_000 };
+    var cancel = std.atomic.Value(bool).init(false);
+    var stage = std.atomic.Value(Stage).init(.queued);
+    var failure: Failure = undefined;
+    const deadline = nowNs() + @as(u64, endpoint.deadline_ms) * std.time.ns_per_ms;
+    ensure(a, endpoint, &cancel, deadline, &stage, &failure) catch {};
+}
+
+/// Start or connect to the configured sidecar while the rest of xodb starts.
+/// This worker owns all of its storage and intentionally outlives the caller.
+pub fn prestart() void {
+    const thread = std.Thread.spawn(.{}, bootThread, .{}) catch return;
+    thread.detach();
 }
 
 fn updateStage(reply: Value, stage: *std.atomic.Value(Stage)) void {
@@ -330,7 +357,7 @@ fn waitJob(a: Allocator, path: [:0]const u8, first: Reply, cancel: *const std.at
 pub fn run(a: Allocator, request: Request, cancel: *const std.atomic.Value(bool), stage: *std.atomic.Value(Stage), failure: *Failure) !Result {
     const begun = nowNs();
     const deadline = begun + @as(u64, request.deadline_ms) * std.time.ns_per_ms;
-    try ensure(a, request, cancel, deadline, stage, failure);
+    try ensure(a, .{ .socket_path = request.socket_path, .starter = request.starter, .deadline_ms = request.deadline_ms }, cancel, deadline, stage, failure);
     stage.store(.opening, .release);
     const open_reply = call(a, request.socket_path, .{ .id = "xodb-open", .verb = "open_image", .path = request.image_path, .sha256 = request.sha256, .deadline_ms = request.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else if (err == error.SidecarDied) "sidecar_died" else "sidecar_io_failed", "open_image: {s}", .{@errorName(err)});
     _ = try waitJob(a, request.socket_path, open_reply, cancel, deadline, stage, failure);
@@ -342,6 +369,24 @@ pub fn run(a: Allocator, request: Request, cancel: *const std.atomic.Value(bool)
     const document = ready.payload orelse return fail(a, failure, "sidecar_bad_reply", "ready decompile reply omitted its framed document", .{});
     stage.store(.loading, .release);
     return .{ .document = document, .elapsed_ms = @as(f64, @floatFromInt(nowNs() - begun)) / std.time.ns_per_ms };
+}
+
+pub fn prime(a: Allocator, endpoint: Endpoint, architecture: []const u8, cancel: *const std.atomic.Value(bool), stage: *std.atomic.Value(Stage), failure: *Failure) !void {
+    const deadline = nowNs() + @as(u64, endpoint.deadline_ms) * std.time.ns_per_ms;
+    try ensure(a, endpoint, cancel, deadline, stage, failure);
+    stage.store(.decompiling, .release);
+    const first = call(a, endpoint.socket_path, .{ .id = "xodb-prime", .verb = "prime", .architecture = architecture, .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else "sidecar_io_failed", "prime: {s}", .{@errorName(err)});
+    _ = try waitJob(a, endpoint.socket_path, first, cancel, deadline, stage, failure);
+    stage.store(.ready, .release);
+}
+
+pub fn openImage(a: Allocator, endpoint: Endpoint, image_path: []const u8, sha256: []const u8, cancel: *const std.atomic.Value(bool), stage: *std.atomic.Value(Stage), failure: *Failure) !void {
+    const deadline = nowNs() + @as(u64, endpoint.deadline_ms) * std.time.ns_per_ms;
+    try ensure(a, endpoint, cancel, deadline, stage, failure);
+    stage.store(.opening, .release);
+    const first = call(a, endpoint.socket_path, .{ .id = "xodb-warm-open", .verb = "open_image", .path = image_path, .sha256 = sha256, .background = true, .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else "sidecar_io_failed", "open_image: {s}", .{@errorName(err)});
+    _ = try waitJob(a, endpoint.socket_path, first, cancel, deadline, stage, failure);
+    stage.store(.ready, .release);
 }
 
 test "sidecar stage text is stable for the UI" {

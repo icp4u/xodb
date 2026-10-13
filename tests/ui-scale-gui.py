@@ -90,8 +90,9 @@ if args.galaxy:
             until(lambda text: len(looks(text)) > count)
             check(label + ' hover leaves camera still', all(float(row['zoom']) == 1 and row['camera'] == '0' for row in looks(Path(d.log).read_text())[count:]))
             d.keys('click', *(round(float(v)) for v in point))
+            d.keys('tap', 28)  # Return frames; a single click only selects.
             until(lambda text: looks(text) and float(looks(text)[-1]['zoom']) > 1.1)
-            check(label + ' logical click selects cluster camera', True)
+            check(label + ' logical click and Return frame the selection', True)
             overlaps = re.findall(r'overview layout .*panel=galaxy overlaps=(\d+)', Path(d.log).read_text())
             check(label + ' galaxy layout has no label overlap', bool(overlaps) and all(int(v) == 0 for v in overlaps))
             if args.evidence:

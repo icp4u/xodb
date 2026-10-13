@@ -143,10 +143,11 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
     const st = v.graph;
     const clock = st.clock;
     s.layout(body);
-    const easing = motion.layout(s, body, clock, st.look);
-    const pointer_changed = !std.meta.eql(v.pointer, motion.pointer);
+    _ = motion.layout(s, body, clock, st.look);
+    var pointer_changed = !std.meta.eql(v.pointer, motion.pointer);
     const previous_view = motion.transform();
-    motion.camera(s, body, v.pointer, selected, easing, st.look);
+    motion.camera(s, field, v.pointer, selected, now, st.look);
+    pointer_changed = pointer_changed or !std.meta.eql(previous_view, motion.transform());
     s.settle(clock);
     var counts = Counts{ .stars = s.star_count, .clusters = s.cluster_count, .strands = s.strand_count };
     const audit = c.getenv("XODB_OVERVIEW_AUDIT") != null;
@@ -311,14 +312,9 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             };
             continue;
         }
-        // Hit the geometry under the arriving pointer, before this frame's
-        // camera step. Keep that logical thread while the camera moves it.
-        var a = s.end(strand.a);
-        var b = s.end(strand.b);
-        for (0..2) |axis| {
-            a[axis] = (a[axis] - motion.shift[axis]) / motion.zoom * previous_view[0] + previous_view[axis + 2];
-            b[axis] = (b[axis] - motion.shift[axis]) / motion.zoom * previous_view[0] + previous_view[axis + 2];
-        }
+        // Pick exactly the geometry drawn by this frame, including rotation.
+        const a = s.end(strand.a);
+        const b = s.end(strand.b);
         const mid = control(a, b, strand.seed, strand.b >= max_stars);
         var from = a;
         for (1..25) |part| {
@@ -438,7 +434,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
     st.impulse_until = if (counts.impulses == 0 or v.paused) 0 else if (s.synthetic) now + linger_ns else until;
     st.layout_only = motion.layout_active and !motion.camera_active and counts.impulses == 0;
     st.motion_until = 0;
-    if (motion.active and !v.paused) {
+    if (motion.camera_active or (motion.layout_active and !v.paused)) {
         counts.moving = true;
         st.motion_until = now + 200_000_000;
     }
@@ -451,7 +447,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
         if (!lone and star.r < 7 and particle.alerts == 0 and particle.incoming + particle.outgoing == 0) continue;
         if (ctx.r.used() > 0.88) break;
         const f = @sqrt((@as(f32, @floatFromInt(particle.ordinal)) + 0.5) / @as(f32, @floatFromInt(@max(1, star.particles))));
-        const angle = @as(f32, @floatFromInt(particle.ordinal)) * golden + unit(star.seed >> 8) * std.math.tau;
+        const angle = @as(f32, @floatFromInt(particle.ordinal)) * golden + unit(star.seed >> 8) * std.math.tau + motion.navigation.angle;
         const orbit = if (lone) star.r * 1.3 * f else @max(13, star.r * (0.5 + 0.55 * f));
         const at = [2]f32{ star.at[0] + @cos(angle) * orbit, star.at[1] + @sin(angle) * orbit };
         const flow = particle.incoming + particle.outgoing;
@@ -482,6 +478,9 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             if (star.flash > 0) try glow(ctx, star.at, core * 3 + 16, draw.fade(.{ 1, 1, 1, 1 }, 0.6 * star.flash));
             try ctx.r.shape(.{ .x = @round(star.at[0] - core), .y = @round(star.at[1] - core), .w = @round(core * 2), .h = @round(core * 2) }, color, .{ .radii = @splat(1) });
         }
+        if (motion.navigation.selection) |selection| if (selection == .node and selection.node == star.seed) {
+            try ctx.r.shape(.{ .x = star.at[0] - 10, .y = star.at[1] - 10, .w = 20, .h = 20 }, lk.text, .{ .radii = @splat(10), .border = 1 });
+        };
         const hit = draw.Rect{ .x = star.at[0] - 14, .y = star.at[1] - 14, .w = 28, .h = 28 };
         v.nodeHit(hit, star, @intCast(i), s.synthetic, audit);
     }
@@ -506,16 +505,21 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             }
         }
     }
-    const budget: usize = @intFromFloat(std.math.clamp(body.w * body.h / 52000, 3, max_labels));
+    const budget: usize = @intFromFloat(std.math.clamp(body.w * body.h / 52000 * @sqrt(motion.navigation.zoom), 3, max_labels));
     var name_buffer: [64]u8 = undefined;
     var caption_buffer: [96]u8 = undefined;
     var rate_buffer: [32]u8 = undefined;
-    for (s.clusters[0..s.cluster_count]) |cl| {
-        if (cl.stars < 2 or counts.labels >= budget * 2 / 3 + 1) continue;
+    const selection = motion.navigation.selection;
+    // Reserve the first label for the carousel target, even for singleton
+    // clusters; unlike the cloud's rim, its centre remains visible when framed.
+    for (0..2) |pass| for (s.clusters[0..s.cluster_count]) |cl| {
+        const chosen = selection != null and selection.? == .cluster and selection.?.cluster == cl.key;
+        if (chosen != (pass == 0) or (!chosen and cl.stars < 2) or counts.labels >= budget * 2 / 3 + 1) continue;
         const hue = lk.hues[cl.key % lk.hue_count];
         const caption = v.clusterCaption(cl, &caption_buffer, &rate_buffer);
-        if (try label(ctx, &placed, lk, .{ cl.at[0] + cl.r * 0.55, cl.at[1] - cl.r * 0.75 }, 4, cl.name[0..cl.name_len], caption, if (lk.plain) lk.text else hue, lk.dim)) counts.labels += 1;
-    }
+        const at: [2]f32 = if (chosen) cl.at else .{ cl.at[0] + cl.r * 0.55, cl.at[1] - cl.r * 0.75 };
+        if (try label(ctx, &placed, lk, at, if (chosen) 18 else 4, cl.name[0..cl.name_len], caption, if (lk.plain) lk.text else hue, lk.dim)) counts.labels += 1;
+    };
     var shown: [max_labels]u32 = undefined;
     var shown_count: usize = 0;
     while (counts.labels < budget and shown_count < shown.len) {
@@ -526,6 +530,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             var score: f32 = @floatCast(@log2(1 + star.incoming + star.outgoing) * 8 + @log2(1.0 + @as(f64, @floatFromInt(star.units))));
             if (star.units == 0 and star.incoming + star.outgoing == 0) score = -2;
             if (i == hovered) score += 1e6;
+            if (selection != null and selection.? == .node and selection.?.node == star.seed) score += 2e6;
             if (star.alerts > 0) score += 60;
             if (star.members > 1) score += 40;
             if (s.clusters[star.cluster].stars == 1) score += 20;
@@ -544,6 +549,9 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
         if (try label(ctx, &placed, lk, star.at, @min(star.r * 0.5 + 6, 26), name, caption, if (flagged) lk.hot else if (star.unavailable or star.stale) lk.dim else lk.text, if (flagged) draw.fade(lk.hot, 0.8) else lk.dim)) counts.labels += 1;
     }
     counts.used = ctx.r.used();
-    if (audit) std.debug.print("xodb: galaxy-look builds={d} zoom={d:.4} camera={d} layout={d} thread={d} additive={d} cloud_size={d:.2} max_stars={d} unfolded={d}\n", .{ state.cloud_builds, motion.zoom, @intFromBool(motion.camera_active), @intFromBool(motion.layout_active), hot_thread, @intFromBool(st.look.additive), st.look.cloud_size, st.max_stars, @intFromBool(!st.collapse) });
+    if (audit) std.debug.print("xodb: galaxy-look builds={d} zoom={d:.4} camera={d} layout={d} thread={d} additive={d} cloud_size={d:.2} max_stars={d} unfolded={d} shift_x={d:.4} shift_y={d:.4} rotation={d:.5} tour={d} field_x={d:.1} field_y={d:.1} now={d}\n", .{ state.cloud_builds, motion.navigation.zoom, @intFromBool(motion.camera_active), @intFromBool(motion.layout_active), hot_thread, @intFromBool(st.look.additive), st.look.cloud_size, st.max_stars, @intFromBool(!st.collapse), motion.navigation.shift[0], motion.navigation.shift[1], motion.navigation.angle, @intFromBool(motion.navigation.tour), field.x, field.y, now });
+    if (audit and s.star_count > 0) {
+        std.debug.print("xodb: galaxy-pick anchor={d} x={d:.3} y={d:.3} hovered={d} node={d} cluster={d}\n", .{ s.stars[0].seed, s.stars[0].at[0], s.stars[0].at[1], if (hovered < s.star_count) s.stars[hovered].seed else 0, if (selection != null and selection.? == .node) selection.?.node else 0, if (selection != null and selection.? == .cluster) selection.?.cluster else 0 });
+    }
     return counts;
 }

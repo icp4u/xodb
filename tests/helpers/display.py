@@ -9,6 +9,8 @@ import select
 import subprocess
 import time
 from datetime import datetime
+# Tests never adopt or start the user's Ghidra sidecar; the sidecar tests set their own.
+os.environ.setdefault('XODB_GHIDRA_SIDECAR', 'off')
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
