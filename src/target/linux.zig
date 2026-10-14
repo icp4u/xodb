@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c.zig").api;
 const bp = @import("breakpoints.zig");
 const arm_watch = @import("arm_watch.zig");
@@ -462,7 +463,7 @@ pub const Target = struct {
             self.core = null;
         }
         if (self.handle) |handle| runtime.check(rt.xrt_target_destroy(handle)) catch |err| {
-            std.debug.print("xodb: target cleanup failed: {s}; handle retained\n", .{@errorName(err)});
+            log.err(.runtime, "xodb: target cleanup failed: {s}; handle retained\n", .{@errorName(err)});
             return;
         };
         self.handle = null;

@@ -1,6 +1,7 @@
 //! One ptrace owner thread, stable per-process sessions. UI selection does not
 //! change MCP's default target: requests without process_id always use the root.
 const std = @import("std");
+const log = @import("../log.zig");
 const model = @import("session.zig");
 const linux = @import("../target/linux.zig");
 const A = std.heap.page_allocator;
@@ -113,7 +114,7 @@ pub const Tree = struct {
                 if (entry.session.step_diagnostic == null or !std.mem.eql(u8, entry.session.step_diagnostic.?, diagnostic)) self.revision += 1;
                 entry.session.step_diagnostic = diagnostic;
                 if (entry.last_generation != entry.session.target.snapshot().generation)
-                    std.debug.print("xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.snapshot().pid, @errorName(err) });
+                    log.warn(.session, "xodb: process #{d} pid={d} poll: {s}; target retained\n", .{ entry.id, entry.session.target.snapshot().pid, @errorName(err) });
             };
             if (entry.last_generation != entry.session.target.snapshot().generation) {
                 self.revision += 1;
@@ -124,7 +125,7 @@ pub const Tree = struct {
                 for (events[at..]) |event| if (event.kind == .process_released) {
                     entry.released += 1;
                     // One hint per process; every release is in its event log.
-                    if (entry.released == 1) std.debug.print("xodb: process #{d} child pid={d} released (not following; --follow-forks or F to follow)\n", .{ entry.id, event.tid });
+                    if (entry.released == 1) log.info(.session, "xodb: process #{d} child pid={d} released (not following; --follow-forks or F to follow)\n", .{ entry.id, event.tid });
                 };
                 if (events.len > 0) entry.event_sequence = events[events.len - 1].sequence;
             }
@@ -140,7 +141,7 @@ pub const Tree = struct {
             self.adopt(parent, birth) catch |err| {
                 entry.failed_generation = parent.target.snapshot().generation;
                 entry.admission_error = @errorName(err);
-                std.debug.print("xodb: process #{d} child pid={d} held: {s}\n", .{ parent.process_id, birth.pid, @errorName(err) });
+                log.warn(.session, "xodb: process #{d} child pid={d} held: {s}\n", .{ parent.process_id, birth.pid, @errorName(err) });
                 self.revision += 1;
                 return;
             };
@@ -199,7 +200,7 @@ pub const Tree = struct {
         self.entries[self.count] = .{ .id = child.process_id, .parent = parent.process_id, .session = child, .kind = event.kind };
         self.count += 1;
         self.revision += 1;
-        std.debug.print("xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
+        log.info(.session, "xodb: process #{d} pid={d} {s} from #{d}; stopped for inspection\n", .{ child.process_id, child.target.snapshot().pid, @tagName(event.kind), parent.process_id });
     }
     /// A cancelled remote family has no native vfork links. Each session must
     /// stop its capture/file borrowers before destroying its target handle.
@@ -216,7 +217,7 @@ pub const Tree = struct {
             const child = self.entries[remaining].session;
             child.process_tree = null;
             child.deinit();
-            if (child.target.handle == null) A.destroy(child) else std.debug.print("xodb: remote cleanup still has borrowers; retaining session storage\n", .{});
+            if (child.target.handle == null) A.destroy(child) else log.warn(.session, "xodb: remote cleanup still has borrowers; retaining session storage\n", .{});
         }
         if (self.count > 0) self.root().process_tree = null;
         self.count = 0;
@@ -241,7 +242,7 @@ pub const Tree = struct {
                 // Main is shutting down. Keep storage alive for the root's
                 // final cleanup retry; a leaked shutdown allocation is safer
                 // than destroying a still-linked target.
-                std.debug.print("xodb: process #{d} cleanup incomplete; retaining target storage for final shutdown retry\\n", .{child.process_id});
+                log.warn(.session, "xodb: process #{d} cleanup incomplete; retaining target storage for final shutdown retry\\n", .{child.process_id});
                 continue;
             }
             child.deinit();

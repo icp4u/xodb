@@ -1,5 +1,6 @@
 //! Explicitly synthetic GPU probe, also used by the private GUI regression lane.
 const std = @import("std");
+const log = @import("../../log.zig");
 const Window = @import("../../platform/window.zig").Window;
 const Renderer = @import("../vulkan.zig").Renderer;
 const Font = @import("../font.zig").Font;
@@ -28,7 +29,7 @@ pub fn main(args: []const [:0]const u8) !void {
     var renderer = Renderer{};
     try renderer.init(&window);
     defer renderer.deinit();
-    std.debug.print("scene3d base framebuffers={d}\n", .{renderer.count});
+    log.info(.render, "scene3d base framebuffers={d}\n", .{renderer.count});
     const font = try std.heap.page_allocator.create(Font);
     defer std.heap.page_allocator.destroy(font);
     font.* = .{};
@@ -64,7 +65,7 @@ pub fn main(args: []const [:0]const u8) !void {
             if (renderer.scene_gpu) |*gpu| {
                 try gpu.extent(0, 0, renderer.pass);
                 if (gpu.width != 0 or gpu.height != 0 or gpu.color.image != null or gpu.depth.image != null or gpu.frame != null) return error.ZeroExtentRetainsImages;
-                std.debug.print("scene3d zero_extent images=0\n", .{});
+                log.info(.render, "scene3d zero_extent images=0\n", .{});
             }
         }
         const start = now();
@@ -80,7 +81,7 @@ pub fn main(args: []const [:0]const u8) !void {
             const vp = math.mul(math.perspective(1, bounds.w / bounds.h, 0.1, 1000).?, math.lookAt(.{ 0, 0, 6 }, .{ 0, 0, 0 }, .{ 0, 1, 0 }).?);
             const available = renderer.scene(bounds, vp) catch |err| blk: {
                 if (!retry_scene) return err;
-                std.debug.print("scene3d refused={s} now={d} retry={d}\n", .{ @errorName(err), now(), renderer.scene_retry.next });
+                log.info(.render, "scene3d refused={s} now={d} retry={d}\n", .{ @errorName(err), now(), renderer.scene_retry.next });
                 break :blk null;
             };
             if (available) |scene| {
@@ -124,7 +125,7 @@ pub fn main(args: []const [:0]const u8) !void {
         frame += 1;
         const elapsed = now() - start;
         if (renderer.scene_gpu) |*scene| {
-            std.debug.print("scene3d frame={d} size={d}x{d} boxes={d} glyphs={d} bytes={d} draws={d} submit_wall_ns={d} gpu_ns={?d} reverse={} bloom={d} generation={d}\n", .{ frame, window.width, window.height, scene.stats.boxes, scene.stats.glyphs, scene.stats.allocated_bytes, scene.stats.draw_calls, elapsed, scene.stats.gpu_ns, reverse, bloom, generation });
-        } else std.debug.print("scene3d frame={d} hidden bytes=0\n", .{frame});
+            log.info(.render, "scene3d frame={d} size={d}x{d} boxes={d} glyphs={d} bytes={d} draws={d} submit_wall_ns={d} gpu_ns={?d} reverse={} bloom={d} generation={d}\n", .{ frame, window.width, window.height, scene.stats.boxes, scene.stats.glyphs, scene.stats.allocated_bytes, scene.stats.draw_calls, elapsed, scene.stats.gpu_ns, reverse, bloom, generation });
+        } else log.info(.render, "scene3d frame={d} hidden bytes=0\n", .{frame});
     }
 }

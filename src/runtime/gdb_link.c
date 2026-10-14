@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #include "gdb_link.h"
 #include "host_compat.h"
+#include "xrt_log.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -66,7 +67,7 @@ static void endpoint_notice(int fd)
         }
     }
     if (!loopback)
-        fputs("xodb: GDB connection is non-loopback and has no encryption or authentication; use a trusted connection or SSH port forward.\n", stderr);
+        xrt_log(XRT_LOG_WARN, XRT_LOG_RUNTIME, "xodb: GDB connection is non-loopback and has no encryption or authentication; use a trusted connection or SSH port forward.\n");
 }
 static int ready(struct xrt_gdb_link *l, int fd, short events, uint64_t deadline)
 {

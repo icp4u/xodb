@@ -1,5 +1,6 @@
 //! Keep an initialized GUI session alive through renderer loss and retries.
 const std = @import("std");
+const log = @import("../log.zig");
 pub const Recovery = struct {
     ready: bool = false,
     initialized: bool = false,
@@ -15,7 +16,7 @@ pub const Recovery = struct {
             // a missing device may be temporary (reset or driver reload).
             if (!self.initialized and (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent)) return err;
             self.retry_at = now +| 1_000_000_000;
-            std.debug.print("Renderer initialization failed: {s}; retrying, session retained\n", .{@errorName(err)});
+            log.err(.render, "Renderer initialization failed: {s}; retrying, session retained\n", .{@errorName(err)});
             return false;
         };
         self.ready = true;

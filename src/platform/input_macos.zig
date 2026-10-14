@@ -2,6 +2,7 @@
 //! keyboard layout, committed text, dead-key handling and repeat scheduling;
 //! this module preserves xodb's platform-neutral event and held-key contract.
 const std = @import("std");
+const log = @import("../log.zig");
 const shared = @import("input.zig");
 const Event = shared.Event;
 const Mods = shared.Mods;
@@ -62,7 +63,7 @@ pub const Keyboard = struct {
         return event;
     }
     fn push(self: *Keyboard, event: Event) void {
-        if (self.trace) std.debug.print("input {s} code={d} sym=0x{x} shortcut=0x{x} text=\"{s}\" t={d}\n", .{ @tagName(event.kind), event.code, event.sym, event.shortcut, event.text(), event.time_ms });
+        if (self.trace) log.info(.window, "input {s} code={d} sym=0x{x} shortcut=0x{x} text=\"{s}\" t={d}\n", .{ @tagName(event.kind), event.code, event.sym, event.shortcut, event.text(), event.time_ms });
         if (self.count == shared.capacity) {
             self.dropped += 1;
             return;

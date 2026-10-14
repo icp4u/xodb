@@ -1,5 +1,6 @@
 //! Startup-only themes. Parsing returns owned colors for all GUI views.
 const std = @import("std");
+const log = @import("log.zig");
 const c = @import("c_ui.zig").api;
 pub const Color = [4]f32;
 pub const max_bytes = 64 * 1024;
@@ -283,7 +284,7 @@ pub fn init(selection: ?[:0]const u8) void {
     const selected = selection orelse return;
     var diagnostic = Diagnostic{};
     active = load(std.heap.page_allocator, selected, &diagnostic) catch |err| {
-        std.debug.print("xodb: Theme failed: {s} / {s}; using built-in dark; {s}\n", .{ @errorName(err), diagnostic.text(), selected });
+        log.warn(.render, "xodb: Theme failed: {s} / {s}; using built-in dark; {s}\n", .{ @errorName(err), diagnostic.text(), selected });
         return;
     };
 }

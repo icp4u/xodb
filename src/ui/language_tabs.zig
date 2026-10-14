@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 const TextLayout = @import("overview/draw.zig").Layout;
 const gpu = @import("../render/vulkan.zig");
@@ -301,7 +302,7 @@ pub const Panel = struct {
         self.layout_signature = signature;
         var first: [6][]const u8 = @splat("");
         const overlaps = layout.overlaps(&first);
-        std.debug.print("xodb: language layout tab={s} generation={d} boxes={d} selected_reason={s} overlaps={d} first=\"{s}\"/\"{s}\"\n", .{ @tagName(state.selected), state.generation, layout.count, self.layout_reason, overlaps, first[0], first[1] });
+        log.info(.window, "xodb: language layout tab={s} generation={d} boxes={d} selected_reason={s} overlaps={d} first=\"{s}\"/\"{s}\"\n", .{ @tagName(state.selected), state.generation, layout.count, self.layout_reason, overlaps, first[0], first[1] });
     }
     fn wrapped(self: *Panel, r: *gpu.Renderer, font: *Font, rect: gpu.Rect, y: *f32, text: []const u8, color: gpu.Color) !void {
         var remaining = text;

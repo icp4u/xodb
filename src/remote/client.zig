@@ -1,5 +1,6 @@
 //! One worker owns the transport and RPC stream. The GUI owns taken snapshots.
 const std = @import("std");
+const log = @import("../log.zig");
 const transport = @import("transport.zig");
 const c = transport.c;
 const wire = @import("view.zig");
@@ -74,7 +75,7 @@ pub const Client = struct {
         self.work() catch |err| {
             if (err != error.Cancelled) {
                 self.message(@errorName(err));
-                std.debug.print("xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
+                log.warn(.runtime, "xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
             }
         };
         self.lock();
@@ -126,7 +127,7 @@ pub const Client = struct {
                 _ = rpc.call(mem, "tools/call", args.value) catch |err| blk: {
                     if (err != error.RemoteToolFailed) return err;
                     self.message(std.mem.sliceTo(&rpc.diagnostic, 0));
-                    std.debug.print("xodb: remote action {s} rejected: {s}\n", .{ string(field(args.value, "name")), std.mem.sliceTo(&rpc.diagnostic, 0) });
+                    log.err(.runtime, "xodb: remote action {s} rejected: {s}\n", .{ string(field(args.value, "name")), std.mem.sliceTo(&rpc.diagnostic, 0) });
                     break :blk Value.null;
                 };
                 generation = std.math.maxInt(u64);
@@ -146,7 +147,7 @@ pub const Client = struct {
                     snapshot.deinit();
                     return error.InvalidRemoteView;
                 }
-                std.debug.print("xodb: remote {s} pid={d} state={s} generation={d} tid={d} frame={d} symbol={s} line={d}\n", .{
+                log.info(.runtime, "xodb: remote {s} pid={d} state={s} generation={d} tid={d} frame={d} symbol={s} line={d}\n", .{
                     snapshot.value.architecture,                                                                                                  snapshot.value.pid,                                                                                                                             snapshot.value.state, snapshot.value.generation, snapshot.value.tid, snapshot.value.frame,
                     if (snapshot.value.frame < snapshot.value.frames.len) snapshot.value.frames[snapshot.value.frame].symbol orelse "?" else "?", if (snapshot.value.frame < snapshot.value.frames.len) (if (snapshot.value.frames[snapshot.value.frame].source) |site| site.line else 0) else 0,
                 });

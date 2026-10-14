@@ -1,5 +1,6 @@
 //! Bounded client for xodb's persistent per-user Ghidra JVM sidecar.
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -285,12 +286,14 @@ fn fail(a: Allocator, out: *Failure, code: []const u8, comptime format: []const 
 fn ensure(a: Allocator, endpoint: Endpoint, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
     var seen: []const u8 = "no answering socket";
     if (hello(a, endpoint.socket_path, cancel, @min(deadline, nowNs() + 2 * std.time.ns_per_s))) |reply| {
-        if (expectedHello(reply)) return;
+        if (expectedHello(reply)) return log.debug(.sidecar, "Ghidra sidecar answers on {s}; using it\n", .{endpoint.socket_path});
         seen = try std.json.Stringify.valueAlloc(a, reply, .{});
     } else |_| {}
+    log.debug(.sidecar, "Ghidra sidecar {s}: {s}\n", .{ if (endpoint.starter != null) "start or restart" else "unavailable, no starter", seen });
     const starter = endpoint.starter orelse return fail(a, failure, "sidecar_unavailable", "Ghidra sidecar is absent ({s}); set GHIDRA_HOME and XODB_GHIDRA_SIDECAR or start scripts/ghidra-sidecar", .{seen});
     stage.store(.starting, .release);
     start(starter, cancel, deadline) catch |err| {
+        log.debug(.sidecar, "Ghidra sidecar starter {s} failed: {s}\n", .{ starter, @errorName(err) });
         if (err == error.SidecarNotConfigured) return fail(a, failure, "sidecar_not_configured", "no Ghidra installation or JDK was found: set GHIDRA_HOME (or XODB_GHIDRA_HOME) to a Ghidra directory and JAVA_HOME, or put java and javac on PATH; details in {s}", .{logPath(a)});
         return fail(a, failure, if (err == error.Cancelled) "cancelled" else if (err == error.DeadlineExceeded) "sidecar_timeout" else "sidecar_start_failed", "{s}; expected protocol {d}, schema {d}; initially saw {s}; sidecar log {s}", .{ @errorName(err), protocol, schema, seen, logPath(a) });
     };

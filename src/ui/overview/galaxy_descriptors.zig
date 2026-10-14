@@ -1,5 +1,6 @@
 //! Descriptor and seeded-demo sources for the neutral galaxy model.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const vw = @import("view.zig");
 const fm = @import("files_model.zig");
@@ -331,7 +332,7 @@ const Host = struct {
         const graph = self.v.graph.graph orelse return;
         if (index >= graph.node_count) return;
         const node = graph.nodes[index];
-        std.debug.print("xodb: galaxy-resource node={d} kind={d} device={d} inode={d} x={d:.1} y={d:.1}\n", .{ index, node.kind, node.device, node.inode, hit.x + hit.w / 2, hit.y + hit.h / 2 });
+        log.info(.overview, "xodb: galaxy-resource node={d} kind={d} device={d} inode={d} x={d:.1} y={d:.1}\n", .{ index, node.kind, node.device, node.inode, hit.x + hit.w / 2, hit.y + hit.h / 2 });
     }
     pub fn nodeHit(self: *Host, hit: draw.Rect, star: model.Node, i: u32, synthetic: bool, audit: bool) void {
         if (!synthetic) self.v.hit(hit, .{ .graph_star = @intCast(i) });

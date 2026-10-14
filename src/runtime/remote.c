@@ -7,6 +7,7 @@
 #include "wire_target.h"
 #include "elf_symbols.h"
 #include "xrt_source.h"
+#include "xrt_log.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
@@ -29,7 +30,7 @@ static bool remote_io_allowed(void)
     if (!remote_io_forbidden) return true;
     if (remote_io_violations != UINT32_MAX) ++remote_io_violations;
     if (remote_io_violations == 1)
-        fputs("xodb: remote transport entered from a forbidden presentation thread\n", stderr);
+        xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: remote transport entered from a forbidden presentation thread\n");
     if (remote_io_strict) abort();
     return false;
 }
@@ -176,7 +177,7 @@ static void startup_failure(struct xrt_connection *c)
         c->fd = -1;
     }
     if (!reap(c)) {
-        fprintf(stderr, "xodb: runtime agent startup failed; transport did not exit\n");
+        xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: runtime agent startup failed; transport did not exit\n");
         return;
     }
     if (!c->exit_status_known) return;
@@ -186,14 +187,14 @@ static void startup_failure(struct xrt_connection *c)
                            sig == SIGABRT ? "ABRT" : sig == SIGKILL ? "KILL" :
                            sig == SIGTERM ? "TERM" : sig == SIGBUS ? "BUS" :
                            sig == SIGFPE ? "FPE" : "?";
-        fprintf(stderr, "xodb: runtime agent startup failed: signal %d (SIG%s)%s\n",
+        xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: runtime agent startup failed: signal %d (SIG%s)%s\n",
                 sig, name ? name : "?",
                 sig == SIGILL ? "; agent built for a different CPU?" : "");
     } else if (WIFEXITED(c->exit_status)) {
         int code = WEXITSTATUS(c->exit_status);
         /* SSH/shell transports commonly encode a remote signal as 128 + signo.
          * This is a hint, not proof: a program can also exit with this value. */
-        fprintf(stderr, "xodb: runtime agent startup failed: exit status %d%s\n", code,
+        xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: runtime agent startup failed: exit status %d%s\n", code,
                 code == 128 + SIGILL ? " (possible SIGILL); agent built for a different CPU?" : "");
     }
 }

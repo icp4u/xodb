@@ -1,6 +1,7 @@
 //! Scene snapshot adapter. No target reads, protocol requests or invented flow
 //! occur during drawing; node picks are routed back to the existing inspector.
 const std = @import("std");
+const log = @import("../log.zig");
 const protocol = @import("../redot/protocol.zig");
 const model = @import("overview/galaxy_model.zig");
 const galaxy = @import("overview/galaxy.zig");
@@ -77,7 +78,7 @@ pub const View = struct {
             self.hover_len = text.len;
         };
         if (self.hover_len > 0) try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 44, bounds.w - 28, self.hover[0..self.hover_len], palette.all[0].text);
-        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: redot-galaxy nodes={d} clusters={d} edges={d} impulses={d} omitted={d} moving={d} revision={d} selected={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.impulses, self.omitted, @intFromBool(counts.moving), snapshot.scene_revision, if (chosen) |star| star.seed else 0 });
+        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.redot, "xodb: redot-galaxy nodes={d} clusters={d} edges={d} impulses={d} omitted={d} moving={d} revision={d} selected={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.impulses, self.omitted, @intFromBool(counts.moving), snapshot.scene_revision, if (chosen) |star| star.seed else 0 });
     }
 };
 
@@ -134,7 +135,7 @@ const Host = struct {
             const text = std.fmt.bufPrint(&self.view.hover, "{s} / object #{d} / click selects; P inspects", .{ node.label(), node.seed }) catch "";
             self.view.hover_len = text.len;
         }
-        if (audit) std.debug.print("xodb: redot-galaxy-node id={d} x={d:.1} y={d:.1}\n", .{ node.seed, node.at[0], node.at[1] });
+        if (audit) log.info(.redot, "xodb: redot-galaxy-node id={d} x={d:.1} y={d:.1}\n", .{ node.seed, node.at[0], node.at[1] });
     }
     pub fn junctionHit(_: *Host, _: draw.Rect, _: model.Junction) void {}
     pub fn detailHit(_: *Host, _: draw.Rect, _: model.Detail) void {}

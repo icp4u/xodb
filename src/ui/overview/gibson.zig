@@ -1,5 +1,6 @@
 //! The GPU memory city consumes the same bounded page observations as the 2D map.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const city = @import("city.zig");
 const flight = @import("gibson_flight.zig");
@@ -68,7 +69,7 @@ pub fn heldInput(v: *vw.View, keyboard: *const @import("../../platform/input.zig
         return changed;
     }
     const changed = s.camera.controls(held, active, now, @max(s.layout.width, s.layout.depth));
-    if (changed and v.layout != null) std.debug.print("xodb: gibson input focused={} now={d} pan_x={d:.6} pan_z={d:.6}\n", .{ active, now, s.camera.pan[0], s.camera.pan[1] });
+    if (changed and v.layout != null) log.info(.overview, "xodb: gibson input focused={} now={d} pan_x={d:.6} pan_z={d:.6}\n", .{ active, now, s.camera.pan[0], s.camera.pan[1] });
     return changed;
 }
 
@@ -186,7 +187,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const mp = ms.map();
     try ctx.textFit(inner.x, inner.y + 24, inner.w, "F manual/orbit/flight   V film   arrows/drag steer   +/- speed   R reset   H height   C colour   O process", muted);
     if (ms.picker_open) {
-        if (v.layout != null) std.debug.print("xodb: gibson picker selected={d} rows={d}\n", .{ ms.pick, ms.pick_count + 1 });
+        if (v.layout != null) log.info(.overview, "xodb: gibson picker selected={d} rows={d}\n", .{ ms.pick, ms.pick_count + 1 });
         try ctx.textFit(inner.x, inner.y + 50, inner.w, "Choose process: arrows / Enter / Esc", white);
         const rows: usize = @intFromFloat(@max(0, @floor((inner.h - 80) / 24)));
         const top = if (ms.pick >= rows and rows > 0) ms.pick + 1 - rows else 0;
@@ -269,9 +270,9 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     try ctx.textFit(inner.x, y, inner.w, mm.costText(v, &buffer), muted);
     if (v.layout != null or c.getenv("XODB_MEMMAP_PERF") != null) {
         s.frames += 1;
-        std.debug.print("xodb: gibson-flight on={} returning={} automatic={} x={d:.6} y={d:.6} z={d:.6} bank={d:.4} speed={d:.3} corners={d} faces={d} far={d}\n", .{ s.flight.on, s.flight.returning, s.flight.automatic, s.eye[0], s.eye[1], s.eye[2], s.flight.bank, s.flight.speed, s.flight.corners, s.face_labels, s.far_labels });
-        std.debug.print("xodb: gibson-route visit={d} district={d} two_sided={d} film={} cruise={d:.2} street_names={} facts_alpha={d:.2}\n", .{ s.flight.visits, if (s.layout.districts.items.len > 0) s.flight.visits % s.layout.districts.items.len else 0, s.flight.two_sided, s.flight.film, s.flight.cruise, s.look.street_names, s.look.facts_alpha });
-        std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.orbiting(now), s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now) or (s.camera.active and s.flight.active()), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
+        log.info(.overview, "xodb: gibson-flight on={} returning={} automatic={} x={d:.6} y={d:.6} z={d:.6} bank={d:.4} speed={d:.3} corners={d} faces={d} far={d}\n", .{ s.flight.on, s.flight.returning, s.flight.automatic, s.eye[0], s.eye[1], s.eye[2], s.flight.bank, s.flight.speed, s.flight.corners, s.face_labels, s.far_labels });
+        log.info(.overview, "xodb: gibson-route visit={d} district={d} two_sided={d} film={} cruise={d:.2} street_names={} facts_alpha={d:.2}\n", .{ s.flight.visits, if (s.layout.districts.items.len > 0) s.flight.visits % s.layout.districts.items.len else 0, s.flight.two_sided, s.flight.film, s.flight.cruise, s.look.street_names, s.look.facts_alpha });
+        log.info(.overview, "xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.orbiting(now), s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now) or (s.camera.active and s.flight.active()), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
     }
 }
 fn renderScene(v: *vw.View, ctx: draw.Ctx, map: *const md.Map, field: draw.Rect, vp: math.Mat4, now: u64) !void {

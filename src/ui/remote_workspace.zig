@@ -1,6 +1,7 @@
 //! Frame-thread adapter. Its only live connection is the bounded exchange with
 //! the owner; every pane reads the retained immutable publication.
 const std = @import("std");
+const log = @import("../log.zig");
 const boundary = @import("../model/remote_owner.zig");
 const Worker = @import("../model/remote_worker.zig").Worker;
 const Completion = @import("../model/remote_worker.zig").Completion;
@@ -327,9 +328,9 @@ pub const Frontend = struct {
         }
         workspace.traceStatic(window);
         if (window.input.trace) if (value.static_analysis) |static| if (static.target == .line and static.request.chosen == null) {
-            std.debug.print("static functions:", .{});
-            for (static.target.line.functions) |function| std.debug.print(" {s}", .{function.name});
-            std.debug.print("\n", .{});
+            log.info(.window, "static functions:", .{});
+            for (static.target.line.functions) |function| log.info(.window, " {s}", .{function.name});
+            log.info(.window, "\n", .{});
         };
         window.dirty = true;
     }

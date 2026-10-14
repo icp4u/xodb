@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const vw = @import("view.zig");
 const draw = @import("draw.zig");
@@ -104,7 +105,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         }
         if (tile.kind == c.XRT_FDT_CHILD) v.hit(r, .{ .treemap_node = tile.node });
         v.hover(r, "{s}: {d} handles; {d} measured; {d} stale; {d} deleted; {d} unexpanded; {d} grouped items", .{ label, tile.metric.descriptors, tile.metric.flow_measured, tile.metric.stale, tile.metric.deleted, tile.metric.unexpanded, tile.hidden_items });
-        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: fdtreemap-tile focus={d} index={d} node={d} kind={d} fds={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1}\n", .{ state.focus, index, tile.node, tile.kind, tile.metric.descriptors, r.x, r.y, r.w, r.h });
+        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: fdtreemap-tile focus={d} index={d} node={d} kind={d} fds={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1}\n", .{ state.focus, index, tile.node, tile.kind, tile.metric.descriptors, r.x, r.y, r.w, r.h });
     }
     ctx.r.clip = clip;
     if (layout.count == 0) try ctx.textFit(body.x + 8, body.y + 8, body.w - 16, "No descriptors represented at this path", ctx.p.dim);

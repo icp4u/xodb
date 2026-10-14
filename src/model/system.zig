@@ -1,5 +1,6 @@
 //! One owner-thread collector and cache, borrowed by the view and every MCP peer.
 const std = @import("std");
+const log = @import("../log.zig");
 pub const c = @import("../c_ui.zig").api;
 const a = std.heap.c_allocator;
 const Snapshot = c.struct_xrt_sys_snapshot;
@@ -172,7 +173,7 @@ pub const Collector = struct {
         };
         if (mask & bit(c.XRT_SYS_G_PROCESSES) != 0) self.light = light;
         self.last_mask = mask;
-        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: overview collector opens={d} sequence={d} groups={x} light={} processes_sample_ns={d}\n", .{ self.opens, self.cache.?.sequence, mask, self.light, self.sampled[c.XRT_SYS_G_PROCESSES] });
+        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: overview collector opens={d} sequence={d} groups={x} light={} processes_sample_ns={d}\n", .{ self.opens, self.cache.?.sequence, mask, self.light, self.sampled[c.XRT_SYS_G_PROCESSES] });
         return true;
     }
     fn merge(self: *Collector, mask: u32) void {

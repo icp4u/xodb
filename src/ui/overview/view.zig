@@ -2,6 +2,7 @@
 //! history (ring buffers) and presentation state; samples come from a
 //! Source (live collector or replay). Panels live in panels.zig.
 const std = @import("std");
+const log = @import("../../log.zig");
 const gpu = @import("../../render/vulkan.zig");
 const Font = @import("../../render/font.zig").Font;
 const Window = @import("../../platform/window.zig").Window;
@@ -1121,7 +1122,7 @@ pub const View = struct {
                 break;
             }
         };
-        std.debug.print("xodb: process selection query_pid={d} query_row={d} rows={d} selected_pid={d} start={d}\n", .{
+        log.info(.overview, "xodb: process selection query_pid={d} query_row={d} rows={d} selected_pid={d} start={d}\n", .{
             query_pid, query_row, self.rows.items.len, if (self.selected) |id| id.pid else 0, if (self.selected) |id| id.start else 0,
         });
     }
@@ -1185,7 +1186,7 @@ pub const View = struct {
             const n = l.overlaps(&first);
             if (n != self.layout_reported or self.panel != self.layout_panel or self.layout_size[0] != self.width or self.layout_size[1] != self.height) {
                 self.layout_size = .{ self.width, self.height };
-                std.debug.print("xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\"\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5] });
+                log.info(.overview, "xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\"\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5] });
                 self.layout_reported = n;
                 self.layout_panel = self.panel;
             }

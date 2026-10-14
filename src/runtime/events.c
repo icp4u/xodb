@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
+#include "xrt_log.h"
 #include <sched.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
@@ -321,6 +322,7 @@ static enum xrt_status poll(struct xrt_target *t)
             continue;
         const int sig = WSTOPSIG(status);
         const unsigned kind = (unsigned)status >> 16;
+        xrt_log(XRT_LOG_TRACE, XRT_LOG_RUNTIME, "ptrace stop tid %d: signal %d, event %u\n", (int)tid, sig, kind);
         t->threads[i].state = XRT_STOPPED;
         t->threads[i].interrupt_pending = false;
         if (kind == PTRACE_EVENT_EXIT) {

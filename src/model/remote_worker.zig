@@ -1,6 +1,7 @@
 //! One remote family owner. Frontends exchange owned commands, fixed-size
 //! completions and immutable publications; they never borrow the live Tree.
 const std = @import("std");
+const log = @import("../log.zig");
 const boundary = @import("remote_owner.zig");
 const dispatch = @import("remote_dispatch.zig");
 const Tree = @import("process_tree.zig").Tree;
@@ -276,7 +277,7 @@ pub const Worker = struct {
         // even when an already-dead transport cannot confirm remote cleanup.
         if (root.target.isRemote() and rt.xrt_target_expect(root.target.handle, root.target.snapshot().generation) != rt.XRT_OK)
             rt.xrt_cancel_request(self.cancel);
-        if (self.options.trace) std.debug.print("xodb: remote quiesce poll_error={s}\n", .{root.step_diagnostic orelse "none"});
+        if (self.options.trace) log.info(.runtime, "xodb: remote quiesce poll_error={s}\n", .{root.step_diagnostic orelse "none"});
         if (self.options.shutdown) |shutdown| shutdown.run(shutdown.context) catch |err| {
             self.failure = err;
         };
@@ -508,7 +509,7 @@ pub const Worker = struct {
         } else {
             // Endpoint drops this peer on its next pump. A disconnected shared
             // observer must not stop the family or another client's commands.
-            std.debug.print("xodb: remote session client response failed: {s}\n", .{@errorName(err)});
+            log.err(.runtime, "xodb: remote session client response failed: {s}\n", .{@errorName(err)});
         }
     }
     // Retain normalized request data in fixed owner storage. Neither the

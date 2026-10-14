@@ -2,6 +2,7 @@
 //! the debug engine, a session, MCP or a collector: a live source (run.zig)
 //! is handed in, and without one the overview replays a collector file.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const Window = @import("../../platform/window.zig").Window;
 const Renderer = @import("../../render/vulkan.zig").Renderer;
@@ -43,7 +44,7 @@ fn replay(o: *const Options, path: [:0]const u8, startup_started: u64) !void {
     const gpa = std.heap.c_allocator;
     var source = blk: {
         const bytes = readFile(gpa, path) catch |err| {
-            std.debug.print("xodb: overview replay failed: {s}; {s}\n", .{ @errorName(err), path });
+            log.err(.overview, "xodb: overview replay failed: {s}; {s}\n", .{ @errorName(err), path });
             return err;
         };
         defer gpa.free(bytes);
@@ -72,7 +73,7 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     view.graph.demo = o.galaxy_demo;
     view.graph.demo_idle = o.galaxy_demo_idle;
     const preferences = if (o.config) |path| @import("../../preferences.zig").load(gpa, path) catch |err| {
-        std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
+        log.err(.overview, "xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         return err;
     } else @import("../../preferences.zig").Preferences{};
     view.graph.look = preferences.galaxy;
@@ -172,7 +173,7 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
             font.dirty = true;
         }
         const presented = frame(&renderer, font, view, &window, current) catch |err| {
-            std.debug.print("xodb: overview frame failed: {s}; recreating renderer\n", .{@errorName(err)});
+            log.err(.overview, "xodb: overview frame failed: {s}; recreating renderer\n", .{@errorName(err)});
             recovery.lost(&renderer, current);
             continue;
         };
@@ -184,7 +185,7 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
         if (o.frames > 0 and rendered >= o.frames) break;
     }
     const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else "frame_limit";
-    std.debug.print("xodb: overview {d} frames, {d} samples, clean shutdown (reason={s})\n", .{ rendered, view.samples, reason });
+    log.info(.overview, "xodb: overview {d} frames, {d} samples, clean shutdown (reason={s})\n", .{ rendered, view.samples, reason });
 }
 
 fn frame(r: *Renderer, font: *Font, view: *vw.View, window: *Window, t: u64) !bool {

@@ -2,6 +2,7 @@
 //! The source capture pins immutable ELF/PE bytes until this job is joined. Mutable
 //! arrays, labels and caches belong to the input; published labels are detached.
 const std = @import("std");
+const log = @import("../log.zig");
 const model = @import("capture.zig");
 const flame = @import("flame.zig");
 const modules = @import("../model/modules.zig");
@@ -213,7 +214,7 @@ pub const State = struct {
     fn failed(self: *State, key: Key, err: anyerror) void {
         self.failure = .{ .key = key, .err = err };
         self.serial += 1;
-        std.debug.print("xodb: recorded flame view failed: {s}; capture={d} revision={d}; change filter or explicitly retry\n", .{ @errorName(err), key.capture_id, key.revision });
+        log.err(.profile, "xodb: recorded flame view failed: {s}; capture={d} revision={d}; change filter or explicitly retry\n", .{ @errorName(err), key.capture_id, key.revision });
     }
     pub fn retained(self: *const State, key: Key) bool {
         if (self.failure) |failure| if (failure.key.eql(key)) return true;

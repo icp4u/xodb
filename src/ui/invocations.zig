@@ -1,5 +1,6 @@
 //! Invocation browser input and rendering from immutable owner pages.
 const std = @import("std");
+const log = @import("../log.zig");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const Window = @import("../platform/window.zig").Window;
@@ -51,7 +52,7 @@ pub const View = struct {
     }
     fn note(self: *View, event: []const u8) void {
         if (!self.trace) return;
-        std.debug.print("observation-view {s} list={s} call={?d} record={?d} top={d} rows={d} builds={d}\n", .{ event, @tagName(self.list), self.call, self.record, self.top, self.visible, self.projection_builds });
+        log.info(.window, "observation-view {s} list={s} call={?d} record={?d} top={d} rows={d} builds={d}\n", .{ event, @tagName(self.list), self.call, self.record, self.top, self.visible, self.projection_builds });
     }
     fn cycle(list: List) List {
         return switch (list) {

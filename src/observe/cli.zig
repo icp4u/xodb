@@ -1,5 +1,6 @@
 //! Headless investigation orchestration; shared Session/collector/analysis APIs.
 const std = @import("std");
+const log = @import("../log.zig");
 const Session = @import("../model/session.zig").Session;
 const c = @import("../c.zig").api;
 const recipe = @import("recipe.zig");
@@ -16,7 +17,7 @@ fn awaitArchive(session: *Session, quit: *volatile c.sig_atomic_t, preserve_inte
     try session.poll();
     if (job.err) |err| return err;
     if (job.publication) |publication| if (publication.state != .published) {
-        std.debug.print("xodb: observation archive failed: {s}; {s}\n", .{ publication.error_name orelse "unknown", job.path });
+        log.err(.session, "xodb: observation archive failed: {s}; {s}\n", .{ publication.error_name orelse "unknown", job.path });
         return error.ObservationArchiveNotPublished;
     };
 }

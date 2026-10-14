@@ -417,6 +417,48 @@ retains its session and owned targets.
 `llvmpipe` draws on the CPU and reaches any display, so `--vk-device llvmpipe` is a slow but safe
 way to get a picture while a driver is broken.
 
+## Seeing what xodb is doing
+
+xodb writes its messages to stderr. Each has a level; you choose how much you see.
+
+| Level | Flag | Shows |
+|---|---|---|
+| error | `-qq` | failures only |
+| warn | `-q` | plus things you should act on |
+| info (default) | none | what a normal run prints |
+| debug | `-v` | plus decisions: why a Vulkan device was chosen, frames deferred while the window is hidden, the sidecar starting or restarting, the runtime agent starting and stopping |
+| trace | `-vv` | plus per-event detail: every request the runtime agent serves, every MCP request and reply (method or tool name and size, never the content), every ptrace stop |
+
+| You want | Use |
+|---|---|
+| A quiet run in a script | `xodb -q ...` |
+| To see why something was slow or blank | `xodb -v ...` |
+| Detail from one area only | `xodb --log=render=debug ...` or `--log=agent=trace,sidecar=debug` |
+| The same for every run in this shell | `export XODB_LOG=debug` (a flag on the command line still wins) |
+| The messages in a file, not the terminal | `xodb -v --log-file xodb.log ...` (appended; created readable by you only) |
+
+- `--log=LEVEL` is the level by name: `error`, `warn`, `info`, `debug` or `trace`.
+- `--log=TOPIC=LEVEL[,TOPIC=LEVEL...]` sets it per topic. The topics are `render`, `window`, `runtime`,
+  `agent`, `session`, `mcp`, `sidecar`, `semq`, `overview`, `redot` and `profile`. A plain level and
+  topics can be mixed: `--log=warn,render=debug`.
+- Error, warn and info lines look as they always have (`xodb: message`), so scripts that match them
+  keep working. Debug and trace lines carry the topic and the seconds since xodb started:
+  `xodb[render] +12.345s message`.
+- The processes xodb starts use the same setting: the runtime agent (locally and over SSH), the
+  server behind `--ssh`, and the Ghidra sidecar starter all receive it as `XODB_LOG`.
+- `--log-file FILE` also sets `XODB_LOG_FILE` for those processes, so a local runtime agent appends to
+  the same file. `XODB_LOG_FILE=FILE` in the environment works like the option; the option wins. An
+  agent on another machine (`--runtime-ssh`) cannot write to your file: its lines come back on stderr.
+- A value xodb does not understand is a usage error: it says what it expected and exits with status 2.
+- With `--mcp` on stdio, stdout carries only the protocol at every level.
+- The flags are options of xodb: put them before `--`. Everything after `--` belongs to the program
+  being debugged, and the value of another option is never read as one of them (`--break -v` sets a
+  breakpoint named `-v`). `--lsof-top` and `--memdefrag` are separate terminal programs and do not
+  take them.
+- While a window is hidden, `-v` reports the deferred frames once when they start and once when they
+  resume; a second such pair within ten seconds is left out.
+- `--debug-dir` and `--debug-file` are about debug symbols, not about messages.
+
 ## HiDPI and UI scale
 
 xodb normally takes its device-pixel scale from the compositor, including

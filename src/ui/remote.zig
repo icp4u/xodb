@@ -1,5 +1,6 @@
 //! Remote debugger presentation. Never reads /proc or native registers locally.
 const std = @import("std");
+const log = @import("../log.zig");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const Window = @import("../platform/window.zig").Window;
@@ -469,7 +470,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
             font.dirty = true;
         }
         const presented = drawFrame(&renderer, font, &workspace, &window, client, label) catch |err| {
-            std.debug.print("xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
+            log.err(.runtime, "xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
             recovery.lost(&renderer, now);
             continue;
         };
@@ -480,7 +481,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         rendered += 1;
         if (max_frames != 0 and rendered >= max_frames) break;
     }
-    std.debug.print("xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
+    log.info(.runtime, "xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
 }
 fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, client: *remote.Client, label: []const u8) !bool {
     _ = try font.setScale(window.scale());

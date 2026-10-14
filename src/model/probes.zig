@@ -1,5 +1,6 @@
 //! Bounded breakpoint policy and log evidence, executed by the session owner.
 const std = @import("std");
+const log = @import("../log.zig");
 const bp = @import("../target/breakpoints.zig");
 pub const Text = struct {
     bytes: [512]u8 = undefined,
@@ -131,7 +132,7 @@ pub const Manager = struct {
                 continue;
             };
             rule_.last_error = null;
-            defer if (rule_.last_error) |err| std.debug.print("xodb: breakpoint #{d} tid={d} stopped: {s}\n", .{ rule_.id, event.tid, err });
+            defer if (rule_.last_error) |err| log.warn(.session, "xodb: breakpoint #{d} tid={d} stopped: {s}\n", .{ rule_.id, event.tid, err });
             if (rule_.thread_id) |wanted| {
                 var matches = false;
                 for (target.threadSlice()) |thread| if (thread.tid == event.tid and thread.id == wanted) {

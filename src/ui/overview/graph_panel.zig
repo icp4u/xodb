@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const vw = @import("view.zig");
 const draw = @import("draw.zig");
@@ -60,7 +61,7 @@ pub fn openResource(v: *vw.View, node: u32) void {
     const g = v.graph.graph orelse return;
     if (node >= g.node_count or g.nodes[node].type != c.XRT_FDG_RESOURCE) return;
     const n = g.nodes[node];
-    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: graph-resource-open node={d} device={d} inode={d} holders={d}\n", .{ node, n.device, n.inode, n.holders });
+    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: graph-resource-open node={d} device={d} inode={d} holders={d}\n", .{ node, n.device, n.inode, n.holders });
     if (n.flags & c.XRT_FDG_IDENTITY_UNKNOWN == 0) {
         v.files.all();
         v.files.file_filter = .{ .device = n.device, .inode = n.inode };
@@ -114,7 +115,7 @@ fn drawStar(v: *vw.View, ctx: draw.Ctx, index: u32, at: [2]f32, label_width: f32
 pub fn auditStar(v: *vw.View, index: u32, at: [2]f32) void {
     const s = v.graph.projection.?.stars[index];
     const pid: i32 = if (s.source_node < v.graph.graph.?.processes) v.graph.graph.?.nodes[s.source_node].pid else 0;
-    std.debug.print("xodb: fdgraph-star panel={s} star={d} pid={d} x={d:.1} y={d:.1}\n", .{ @tagName(v.panel), index, pid, at[0], at[1] });
+    log.info(.overview, "xodb: fdgraph-star panel={s} star={d} pid={d} x={d:.1} y={d:.1}\n", .{ @tagName(v.panel), index, pid, at[0], at[1] });
 }
 fn point(rect: draw.Rect, vertex: c.struct_xrt_fdgraph_vertex) [2]f32 {
     return .{ rect.x + vertex.x * rect.w, rect.y + vertex.y * rect.h };
@@ -181,7 +182,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     ctx.r.clip = clip;
     if (@import("galaxy_descriptors.zig").navigation().table.open) return;
     if (c.getenv("XODB_OVERVIEW_AUDIT") != null)
-        std.debug.print("xodb: galaxy-frame stars={d} clusters={d} strands={d} drawn={d} impulses={d} cloud={d} mesh={d} labels={d} moving={d} demo={d} buffer={d:.2} clock={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses, counts.cloud, counts.mesh, counts.labels, @intFromBool(counts.moving), v.graph.demo, counts.used, v.graph.clock });
+        log.info(.overview, "xodb: galaxy-frame stars={d} clusters={d} strands={d} drawn={d} impulses={d} cloud={d} mesh={d} labels={d} moving={d} demo={d} buffer={d:.2} clock={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses, counts.cloud, counts.mesh, counts.labels, @intFromBool(counts.moving), v.graph.demo, counts.used, v.graph.clock });
     if (demo) {
         const text = std.fmt.bufPrint(&buffer, "{d} stars · {d} clusters · {d} threads ({d} drawn) · {d} impulses · synthetic", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, text, lk.dim);

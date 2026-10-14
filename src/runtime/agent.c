@@ -7,6 +7,7 @@
 #include "target_internal.h"
 #include "xrt_source.h"
 #include "source_budget.h"
+#include "xrt_log.h"
 #include <errno.h>
 #include <poll.h>
 #include <stdio.h>
@@ -462,10 +463,13 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
     a->collectors = xrt_agent_perf_create();
     int result = 0;
     uint64_t next_request = 1;
+    const char *ended = "stop signal";
     if (!a->request || !a->reply || !a->extra || !a->collectors) {
         result = 1;
+        ended = "out of memory";
         goto done;
     }
+    xrt_log(XRT_LOG_DEBUG, XRT_LOG_AGENT, "agent pid %ld serving wire version %d\n", (long)getpid(), XRT_WIRE_VERSION);
     while (!stop || !*stop) {
         struct pollfd fd = {.fd = input, .events = POLLIN};
         int ready = poll(&fd, 1, 100);
@@ -473,6 +477,7 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
             if (errno == EINTR)
                 continue;
             result = 1;
+            ended = "poll failed";
             break;
         }
         if (!ready)
@@ -480,17 +485,22 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
         struct xrt_wire_frame f;
         enum xrt_wire_result received =
             xrt_wire_read(input, &f, a->request, XRT_WIRE_MAX_BODY, 10000);
-        if (received == XRT_WIRE_EOF)
+        if (received == XRT_WIRE_EOF) {
+            ended = "end of input";
             break;
+        }
         if (received != XRT_WIRE_OK || f.flags || f.status || f.request != next_request++ ||
             f.size < XRT_RPC_REQUEST_PREFIX) {
             result = 1;
+            ended = "malformed or out-of-sequence request";
             break;
         }
         uint64_t value = 0;
         size_t extra_size = 0;
         struct xrt_target *snapshot = NULL;
         enum xrt_status status = dispatch(a, &f, &value, &extra_size, &snapshot);
+        xrt_log(XRT_LOG_TRACE, XRT_LOG_AGENT, "request %llu op %u target %u: status %d, %zu reply bytes\n",
+                (unsigned long long)f.request, (unsigned)f.op, (unsigned)f.target, (int)status, extra_size);
         struct xrt_codec out = xrt_codec(a->reply, XRT_WIRE_MAX_BODY, false);
         xrt_codec_u64(&out, &value);
         uint32_t extra = (uint32_t)extra_size;
@@ -507,6 +517,7 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
         }
         if (!out.ok) {
             result = 1;
+            ended = "reply does not fit";
             break;
         }
         f.flags = 1;
@@ -514,10 +525,12 @@ int xrt_agent_serve(int input, int output, const volatile sig_atomic_t *stop)
         f.size = (uint32_t)out.at;
         if (xrt_wire_write(output, &f, a->reply, 10000) != XRT_WIRE_OK) {
             result = 1;
+            ended = "reply not written";
             break;
         }
     }
 done:
+    xrt_log(XRT_LOG_DEBUG, XRT_LOG_AGENT, "agent stopping: %s; closing owned targets\n", ended);
     xrt_agent_perf_destroy(a->collectors);
     for (unsigned i = 0; i < 32; ++i)
         if (a->files[i].id)

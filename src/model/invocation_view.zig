@@ -1,5 +1,6 @@
 //! Owner-side ended-observation projection and citation resolution.
 const std = @import("std");
+const log = @import("../log.zig");
 const session_model = @import("session.zig");
 const Session = session_model.Session;
 const model = @import("../observe/capture.zig");
@@ -50,7 +51,7 @@ const State = struct {
     }
     fn note(self: *State, event: []const u8) void {
         if (!self.trace) return;
-        std.debug.print("observation-view {s} list={s} call={?d} record={?d} top={d} rows={d} builds={d}\n", .{ event, @tagName(self.list), self.call, self.record, self.top, self.visible, self.projection_builds });
+        log.info(.session, "observation-view {s} list={s} call={?d} record={?d} top={d} rows={d} builds={d}\n", .{ event, @tagName(self.list), self.call, self.record, self.top, self.visible, self.projection_builds });
     }
     /// Re-resolves the capture and rebuilds the projection only on a key change.
     /// The first sight of a capture requests its comparison once.
@@ -58,7 +59,7 @@ const State = struct {
         const value = capture(session) orelse {
             if (session.observation_archive) |archive| if (archive.done.load(.acquire) and archive.err != null and archive.id != self.failed_open) {
                 self.failed_open = archive.id;
-                if (self.trace) std.debug.print("observation-view open-failed error={s}\n", .{@errorName(archive.err.?)});
+                if (self.trace) log.info(.session, "observation-view open-failed error={s}\n", .{@errorName(archive.err.?)});
             };
             return;
         };
@@ -80,8 +81,8 @@ const State = struct {
             self.seen_job = current.id;
             if (self.trace) {
                 if (current.result) |result| {
-                    std.debug.print("observation-view comparison id={d} threshold={d} total={d} matched={d} complete={d} incomplete={d} fast={d} slow={d}\n", .{ current.id, current.selection.threshold_ns, result.summary.total_calls, result.summary.matched_calls, result.summary.complete_calls, result.summary.incomplete_calls, result.fast.count, result.slow.count });
-                } else std.debug.print("observation-view comparison id={d} failed={s}\n", .{ current.id, if (current.err) |err| @errorName(err) else "unknown" });
+                    log.info(.session, "observation-view comparison id={d} threshold={d} total={d} matched={d} complete={d} incomplete={d} fast={d} slow={d}\n", .{ current.id, current.selection.threshold_ns, result.summary.total_calls, result.summary.matched_calls, result.summary.complete_calls, result.summary.incomplete_calls, result.fast.count, result.slow.count });
+                } else log.info(.session, "observation-view comparison id={d} failed={s}\n", .{ current.id, if (current.err) |err| @errorName(err) else "unknown" });
             }
         };
         const current = job(session, value);

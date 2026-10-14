@@ -1,6 +1,7 @@
 //! Source-neutral galaxy presentation: layout, cloud, edges and activity.
 //! Domain adapters own captions, hover text and selection routing.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const draw = @import("draw.zig");
 const rgb = @import("../../appearance.zig").rgb;
@@ -325,14 +326,14 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
         counts.mesh = state.cached_mesh;
         counts.cloud = ctx.r.clouds[state.cloud_slot].cells;
         try ctx.r.cloud(state.cloud_slot, motion.transform(), st.look.additive);
-        if (audit) std.debug.print("xodb: galaxy-cloud lod={d:.1} max_pixel={d:.3} cells={d}\n", .{ state.cloud_lod, 2 * motion.navigation.zoom / state.cloud_lod, counts.cloud });
+        if (audit) log.info(.overview, "xodb: galaxy-cloud lod={d:.1} max_pixel={d:.3} cells={d}\n", .{ state.cloud_lod, 2 * motion.navigation.zoom / state.cloud_lod, counts.cloud });
     }
 
     motion.project(s);
     for (s.clusters[0..s.cluster_count]) |cl| {
         v.clusterHit(.{ .x = cl.at[0] - 12, .y = cl.at[1] - 12, .w = 24, .h = 24 }, cl.key);
     }
-    if (audit and s.cluster_count > 0) std.debug.print("xodb: galaxy-cluster x={d:.1} y={d:.1}\n", .{ s.clusters[0].at[0], s.clusters[0].at[1] });
+    if (audit and s.cluster_count > 0) log.info(.overview, "xodb: galaxy-cluster x={d:.1} y={d:.1}\n", .{ s.clusters[0].at[0], s.clusters[0].at[1] });
     // The pointer's star lifts its own threads out of the web.
     var hovered: u32 = none;
     for (s.stars[0..s.star_count], 0..) |star, i| {
@@ -385,7 +386,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
         const m = control(a, b, strand.seed, strand.b >= max_stars);
         if (audit and index == s.order[0]) {
             const mid = bezier(a, m, b, 0.5);
-            std.debug.print("xodb: galaxy-thread x={d:.1} y={d:.1}\n", .{ mid[0], mid[1] });
+            log.info(.overview, "xodb: galaxy-thread x={d:.1} y={d:.1}\n", .{ mid[0], mid[1] });
         }
         const dx = b[0] - a[0];
         const dy = b[1] - a[1];
@@ -586,9 +587,9 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
         if (try label(ctx, &placed, lk, star.at, @min(star.r * 0.5 + 6, 26), name, caption, if (flagged) lk.hot else if (star.unavailable or star.stale) lk.dim else lk.text, if (flagged) draw.fade(lk.hot, 0.8) else lk.dim)) counts.labels += 1;
     }
     counts.used = ctx.r.used();
-    if (audit) std.debug.print("xodb: galaxy-look builds={d} zoom={d:.4} camera={d} layout={d} thread={d} additive={d} cloud_size={d:.2} max_stars={d} unfolded={d} shift_x={d:.4} shift_y={d:.4} rotation={d:.5} tour={d} field_x={d:.1} field_y={d:.1} now={d}\n", .{ state.cloud_builds, motion.navigation.zoom, @intFromBool(motion.camera_active), @intFromBool(motion.layout_active), hot_thread, @intFromBool(st.look.additive), st.look.cloud_size, st.max_stars, @intFromBool(!st.collapse), motion.navigation.shift[0], motion.navigation.shift[1], motion.navigation.angle, @intFromBool(motion.navigation.tour), field.x, field.y, now });
+    if (audit) log.info(.overview, "xodb: galaxy-look builds={d} zoom={d:.4} camera={d} layout={d} thread={d} additive={d} cloud_size={d:.2} max_stars={d} unfolded={d} shift_x={d:.4} shift_y={d:.4} rotation={d:.5} tour={d} field_x={d:.1} field_y={d:.1} now={d}\n", .{ state.cloud_builds, motion.navigation.zoom, @intFromBool(motion.camera_active), @intFromBool(motion.layout_active), hot_thread, @intFromBool(st.look.additive), st.look.cloud_size, st.max_stars, @intFromBool(!st.collapse), motion.navigation.shift[0], motion.navigation.shift[1], motion.navigation.angle, @intFromBool(motion.navigation.tour), field.x, field.y, now });
     if (audit and s.star_count > 0) {
-        std.debug.print("xodb: galaxy-pick anchor={d} x={d:.3} y={d:.3} hovered={d} node={d} cluster={d}\n", .{ s.stars[0].seed, s.stars[0].at[0], s.stars[0].at[1], if (hovered < s.star_count) s.stars[hovered].seed else 0, if (selection != null and selection.? == .node) selection.?.node else 0, if (selection != null and selection.? == .cluster) selection.?.cluster else 0 });
+        log.info(.overview, "xodb: galaxy-pick anchor={d} x={d:.3} y={d:.3} hovered={d} node={d} cluster={d}\n", .{ s.stars[0].seed, s.stars[0].at[0], s.stars[0].at[1], if (hovered < s.star_count) s.stars[hovered].seed else 0, if (selection != null and selection.? == .node) selection.?.node else 0, if (selection != null and selection.? == .cluster) selection.?.cluster else 0 });
     }
     return counts;
 }

@@ -7,6 +7,7 @@
 //! nothing is evaluated and values are shown as stale. Evaluation goes through
 //! the same Session paths as MCP `evaluate_expression` and `get_value_children`.
 const std = @import("std");
+const log = @import("../log.zig");
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
 const keys = @import("../platform/input.zig");
@@ -301,7 +302,7 @@ pub const Editor = struct {
                     .unavailable => v.message = "Clipboard has no plain text",
                     else => v.message = "Paste failed; field unchanged",
                 }
-                if (w.input.trace) std.debug.print("editor clipboard result={d} bytes={d} field_bytes={d} cursor={d}\n", .{ @intFromEnum(result.status), result.size, v.text.len, v.at() });
+                if (w.input.trace) log.info(.window, "editor clipboard result={d} bytes={d} field_bytes={d} cursor={d}\n", .{ @intFromEnum(result.status), result.size, v.text.len, v.at() });
                 w.dirty = true;
             } else if (!w.clipPending() and std.mem.eql(u8, v.message, "Pasting...")) {
                 v.message = "Paste cancelled (focus changed)";

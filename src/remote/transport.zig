@@ -1,5 +1,6 @@
 //! A single MCP byte stream. TCP never binds implicitly; SSH owns one child.
 const std = @import("std");
+const log = @import("../log.zig");
 pub const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -148,7 +149,7 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_REUSEADDR, &yes, @sizeOf(c_int));
     if (bind(fd, @ptrCast(&address.storage), address.len) < 0) return error.RemoteBindFailed;
     if (c.listen(fd, 1) < 0) return error.RemoteListenFailed;
-    std.debug.print("xodb: listening on {s}; one client, plaintext TCP without authentication\n", .{endpoint});
+    log.warn(.runtime, "xodb: listening on {s}; one client, plaintext TCP without authentication\n", .{endpoint});
     while (quitting.* == 0) {
         var p = c.pollfd{ .fd = fd, .events = c.POLLIN, .revents = 0 };
         if (c.poll(&p, 1, 50) <= 0) continue;
@@ -158,7 +159,7 @@ pub fn acceptOne(endpoint: []const u8, quitting: *volatile c.sig_atomic_t) !Stre
             return error.RemoteAcceptFailed;
         }
         tuneTcp(client);
-        std.debug.print("xodb: remote client connected; listener closed\n", .{});
+        log.info(.runtime, "xodb: remote client connected; listener closed\n", .{});
         return .{ .fd = client };
     }
     return error.Cancelled;

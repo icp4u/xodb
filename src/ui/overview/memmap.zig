@@ -8,6 +8,7 @@
 //! Data comes from the shared memory observer; rendering copies a bounded
 //! Map under the publication lock and never reads /proc itself.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
@@ -772,13 +773,13 @@ fn audit(g: Grid, first_row: usize, style: u32) void {
     const now_ = [6]f32{ g.area.x, g.area.y, g.pitch, @floatFromInt(g.cols), @floatFromInt(first_row), @floatFromInt(style) };
     if (std.mem.eql(f32, &now_, &audited)) return;
     audited = now_;
-    std.debug.print("xodb: memmap grid x={d:.1} y={d:.1} pitch={d:.1} cols={d} first_row={d} count={d} style={d}\n", .{ g.area.x, g.area.y, g.pitch, g.cols, first_row, g.count, style });
+    log.info(.overview, "xodb: memmap grid x={d:.1} y={d:.1} pitch={d:.1} cols={d} first_row={d} count={d} style={d}\n", .{ g.area.x, g.area.y, g.pitch, g.cols, first_row, g.count, style });
 }
 fn auditText(ox: f32, oy: f32, cw: f32, ch: f32) void {
     const now_ = [6]f32{ ox, oy, cw, ch, 0, 9 };
     if (std.mem.eql(f32, &now_, &audited)) return;
     audited = now_;
-    std.debug.print("xodb: memmap text x={d:.1} y={d:.1} cw={d:.2} ch={d:.2}\n", .{ ox, oy, cw, ch });
+    log.info(.overview, "xodb: memmap text x={d:.1} y={d:.1} cw={d:.2} ch={d:.2}\n", .{ ox, oy, cw, ch });
 }
 
 /// With the layout audit on, the DOS screen's rows are logged when they change,
@@ -791,7 +792,7 @@ fn auditRows(scr: *const dos.Screen) void {
     if (hv == audited_rows) return;
     audited_rows = hv;
     var buf: [400]u8 = undefined;
-    for (0..vga.rows) |y| std.debug.print("xodb: memmap row {d:0>2} {s}\n", .{ y, scr.row(y, &buf) });
+    for (0..vga.rows) |y| log.info(.overview, "xodb: memmap row {d:0>2} {s}\n", .{ y, scr.row(y, &buf) });
 }
 
 // --- Windows 9x ------------------------------------------------------------------------

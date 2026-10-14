@@ -1,8 +1,8 @@
 const std = @import("std");
-const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
+const runtime_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "memory.c", "arch.c", "registers.c", "process.c", "target.c", "probes.c", "loongarch_step.c", "watchpoints.c", "events.c", "family.c", "xstate.c", "perf.c", "perf_cpu.c", "perf_syscalls.c", "perf_allocations.c", "wire.c", "wire_target.c", "agent.c", "remote.c", "files.c", "file_view.c", "symbol_job.c", "loader.c", "elf_symbols.c", "mapped_file.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdscan.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "unix_peer.c", "fdevent.c", "fdevent_decode.c", "fdevent_count.c", "fdactivity.c", "fdflow.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_owner.c", "fdflow_graph.c", "../profile/allocation_broker.c", "source.c", "../binary/object.c", "../debug/dwarf_cursor.c", "../debug/source_paths.c" };
 // The subset of runtime_sources (plus the agent's main) that has no Linux-only
 // dependency; the macos-seam step and `test` compile it for aarch64-macos.
-const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "arch.c", "loongarch_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
+const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "log.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "arch.c", "loongarch_step.c", "wire.c", "wire_target.c", "agent.c", "agent_main.c", "remote.c", "file_view.c", "perf_wire.c", "agent_perf.c", "remote_perf.c", "fdinherit.c", "fdgraph.c", "fdgraph_layout.c", "fdtreemap.c", "fdevent_decode.c", "fdevent_count.c", "fdflow_decode.c", "fdflow_count.c", "fdflow_graph.c" };
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
@@ -398,12 +398,12 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(fd_events);
     const cancel_tests = b.addExecutable(.{ .name = "xodb-remote-cancel-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     cancel_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/wire.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-cancel.c" }) |source|
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/wire.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/log.c", "tests/runtime-cancel.c" }) |source|
         cancel_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = if (std.mem.endsWith(u8, source, "/wire.c")) &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-U_FORTIFY_SOURCE", "-Dread=xrt_test_read" } else if (std.mem.endsWith(u8, source, "/gdb_link.c")) &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-U_FORTIFY_SOURCE", "-Drecv=xrt_test_recv" } else &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(cancel_tests);
     const resolve_tests = b.addExecutable(.{ .name = "xodb-remote-resolve-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     resolve_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-resolve.c" }) |source|
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/log.c", "tests/runtime-resolve.c" }) |source|
         resolve_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(resolve_tests);
     const gdb_packet_tests = b.addExecutable(.{ .name = "xodb-gdb-packet-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
@@ -413,7 +413,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(gdb_packet_tests);
     const gdb_link_tests = b.addExecutable(.{ .name = "xodb-gdb-link-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_link_tests.root_module.addIncludePath(b.path("src/runtime"));
-    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "tests/runtime-gdb-link.c" }) |source|
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/log.c", "tests/runtime-gdb-link.c" }) |source|
         gdb_link_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(gdb_link_tests);
     const gdb_description_tests = b.addExecutable(.{ .name = "xodb-gdb-description-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });

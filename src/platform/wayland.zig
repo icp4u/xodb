@@ -1,6 +1,7 @@
 //! The Wayland backend of window.zig: xdg-shell toplevel, wl_seat input
 //! through xkb.zig, clipboard.c, and the Vulkan surface for both.
 const std = @import("std");
+const log = @import("../log.zig");
 pub const c = @cImport({
     @cUndef("_FORTIFY_SOURCE"); // as in c_ui.zig
     @cDefine("_GNU_SOURCE", "1");
@@ -290,7 +291,7 @@ pub const Window = struct {
             self.dirty = true;
         }
         if (self.input.trace and (self.traced_reported_scale == 0 or changed or @abs(reported - self.traced_reported_scale) >= 0.001)) {
-            std.debug.print("ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ next, reported, if (self.scale_override != null) "yes" else "no" });
+            log.info(.window, "ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ next, reported, if (self.scale_override != null) "yes" else "no" });
             self.traced_reported_scale = reported;
         }
     }
@@ -584,7 +585,7 @@ const output_listener = c.wl_output_listener{ .geometry = outputGeometry, .mode 
 fn decorationConfigured(data: ?*anyopaque, _: ?*c.zxdg_toplevel_decoration_v1, mode: u32) callconv(.c) void {
     const w = window(data);
     w.decoration_mode = mode;
-    if (w.input.trace) std.debug.print("decoration own_frame={} granted={s}\n", .{ w.own_frame, decorationName(mode) });
+    if (w.input.trace) log.info(.window, "decoration own_frame={} granted={s}\n", .{ w.own_frame, decorationName(mode) });
 }
 fn decorationName(mode: u32) []const u8 {
     return switch (mode) {

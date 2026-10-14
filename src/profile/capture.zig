@@ -1,6 +1,7 @@
 //! A bounded, session-owned perf capture with observed mapping history.
 //! Enrollment is explicit at a held newborn stop under the selected scope policy.
 const std = @import("std");
+const log = @import("../log.zig");
 const perf = @import("linux_perf.zig");
 const records = @import("records.zig");
 const modules = @import("../model/modules.zig");
@@ -390,16 +391,16 @@ pub const Capture = struct {
             .collecting, .manual => return,
             else => {},
         }
-        std.debug.print("xodb: profile #{d} stopped: {s}; pid={d} elapsed_ms={d} duration_limit_ms={d} samples={d} sample_limit={d} threads={d} mappings={d} lost={d} unknown={d} ring_bytes={d}; {s}\n", .{ self.id, @tagName(self.status), self.pid, (self.ended_ns.? -| self.started_ns) / 1_000_000, self.config.duration_ms, self.samples.len(), self.config.sample_limit, self.thread_count, self.mapping_events, self.lost_samples, self.unknown_records, self.accepted.ring_data_bytes, self.diagnostic });
+        log.info(.profile, "xodb: profile #{d} stopped: {s}; pid={d} elapsed_ms={d} duration_limit_ms={d} samples={d} sample_limit={d} threads={d} mappings={d} lost={d} unknown={d} ring_bytes={d}; {s}\n", .{ self.id, @tagName(self.status), self.pid, (self.ended_ns.? -| self.started_ns) / 1_000_000, self.config.duration_ms, self.samples.len(), self.config.sample_limit, self.thread_count, self.mapping_events, self.lost_samples, self.unknown_records, self.accepted.ring_data_bytes, self.diagnostic });
         if (self.stop_reason_count > 1) {
-            std.debug.print("xodb: profile #{d} additional stop conditions:", .{self.id});
-            for (self.stop_reasons[1..self.stop_reason_count]) |reason| std.debug.print(" {s}", .{@tagName(reason)});
-            std.debug.print("\n", .{});
+            log.info(.profile, "xodb: profile #{d} additional stop conditions:", .{self.id});
+            for (self.stop_reasons[1..self.stop_reason_count]) |reason| log.info(.profile, " {s}", .{@tagName(reason)});
+            log.info(.profile, "\n", .{});
         }
-        if (self.syscalls.enabled) std.debug.print("xodb: profile #{d} syscalls: retained={d} lost={d} throttles={d} discarded={d} invalid={d}\n", .{ self.id, self.syscalls.items.items.len, self.syscalls.lost, self.syscalls.throttles, self.syscalls.discarded, self.syscalls.invalid });
-        if (self.config.context_switch) std.debug.print("xodb: profile #{d} scheduling: retained={d} discarded={d} invalid={d} storage_bytes={d}\n", .{ self.id, self.switches.retained, self.switches.discarded, self.switches.invalid, self.switches.storageBytes() });
-        if (self.scope_change) |change| std.debug.print("xodb: profile #{d} task creation: pid={d} tid={d} parent_pid={d} parent_tid={d} same_process={}\n", .{ self.id, change.pid, change.tid, change.parent_pid, change.parent_tid, change.pid == self.pid });
-        if (self.failure) |failure| std.debug.print("xodb: profile #{d} collector failure: {s} syscall={s} errno={d} tid={d}; {s}\n", .{ self.id, @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.detail });
+        if (self.syscalls.enabled) log.info(.profile, "xodb: profile #{d} syscalls: retained={d} lost={d} throttles={d} discarded={d} invalid={d}\n", .{ self.id, self.syscalls.items.items.len, self.syscalls.lost, self.syscalls.throttles, self.syscalls.discarded, self.syscalls.invalid });
+        if (self.config.context_switch) log.info(.profile, "xodb: profile #{d} scheduling: retained={d} discarded={d} invalid={d} storage_bytes={d}\n", .{ self.id, self.switches.retained, self.switches.discarded, self.switches.invalid, self.switches.storageBytes() });
+        if (self.scope_change) |change| log.info(.profile, "xodb: profile #{d} task creation: pid={d} tid={d} parent_pid={d} parent_tid={d} same_process={}\n", .{ self.id, change.pid, change.tid, change.parent_pid, change.parent_tid, change.pid == self.pid });
+        if (self.failure) |failure| log.err(.profile, "xodb: profile #{d} collector failure: {s} syscall={s} errno={d} tid={d}; {s}\n", .{ self.id, @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.detail });
     }
     /// Publish the compact sample first, then attach its owned raw state. A
     /// refused sample must not leave an orphan in the separately bounded store.
@@ -432,7 +433,7 @@ pub const Capture = struct {
                 self.noteStop(.decode_error, "sample user-state bounds are invalid");
                 continue;
             };
-            if (!was_exhausted and self.user_state.exhausted) std.debug.print("xodb: profile #{d} stack retention budget reached: used={d} budget={d} first_missing_sample={d}; CPU sampling continues, later stack dumps are not retained; collection overhead continues\n", .{ self.id, self.user_state.used, self.config.user_stack_budget_bytes, self.firstSkippedSample().? });
+            if (!was_exhausted and self.user_state.exhausted) log.warn(.profile, "xodb: profile #{d} stack retention budget reached: used={d} budget={d} first_missing_sample={d}; CPU sampling continues, later stack dumps are not retained; collection overhead continues\n", .{ self.id, self.user_state.used, self.config.user_stack_budget_bytes, self.firstSkippedSample().? });
         }
         if (self.samples.len() == self.samples.max_samples) self.noteStop(.capacity, "sample storage limit reached");
     }

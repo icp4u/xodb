@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 const Window = @import("../platform/window.zig").Window;
 const fonts = @import("font.zig");
@@ -39,7 +40,7 @@ fn info(comptime T: type, kind: c.VkStructureType) T {
 }
 fn check(result: c.VkResult) !void {
     if (result != c.VK_SUCCESS) {
-        std.debug.print("Vulkan result: {d}\n", .{result});
+        log.err(.render, "Vulkan result: {d}\n", .{result});
         return error.VulkanFailed;
     }
 }
@@ -59,11 +60,11 @@ fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime 
         var count: u32 = 0;
         const counted = @call(.auto, query, args ++ .{ &count, null });
         if (counted != c.VK_SUCCESS and counted != c.VK_INCOMPLETE) {
-            std.debug.print("xodb: {s} count failed: {d}\n", .{ label, counted });
+            log.err(.render, "xodb: {s} count failed: {d}\n", .{ label, counted });
             return error.VulkanFailed;
         }
         if (count > 4096) {
-            std.debug.print("xodb: {s} count {d} exceeds enumeration limit 4096\n", .{ label, count });
+            log.err(.render, "xodb: {s} count {d} exceeds enumeration limit 4096\n", .{ label, count });
             return error.VulkanEnumerationLimit;
         }
         if (count == 0) return .empty;
@@ -75,20 +76,18 @@ fn enumerate(comptime T: type, comptime query: anytype, args: anytype, comptime 
         }
         if (result != c.VK_SUCCESS or count > values.len) {
             a.free(values);
-            std.debug.print("xodb: {s} enumeration failed: {d} (count {d})\n", .{ label, result, count });
+            log.err(.render, "xodb: {s} enumeration failed: {d} (count {d})\n", .{ label, result, count });
             return error.VulkanFailed;
         }
         return .{ .items = values[0..count], .capacity = values.len };
     }
-    std.debug.print("xodb: {s} enumeration still incomplete after four attempts\n", .{label});
+    log.err(.render, "xodb: {s} enumeration still incomplete after four attempts\n", .{label});
     return error.VulkanEnumerationUnstable;
 }
 
 pub const Renderer = struct {
     window: ?*Window = null,
-    compositor_wait: Wait = .{},
-    fence_wait: Wait = .{},
-    image_wait: Wait = .{},
+    deferral: Deferral = .{},
     instance: c.VkInstance = null,
     surface: c.VkSurfaceKHR = null,
     physical: c.VkPhysicalDevice = null,
@@ -160,7 +159,12 @@ pub const Renderer = struct {
         self.physical = found.items[choice.index].physical;
         self.family = found.items[choice.index].family;
         self.gpu_name = found.items[choice.index].name;
-        std.debug.print("Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
+        log.info(.render, "Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
+        log.debug(.render, "Vulkan device {d} of {d} chosen: {s}\n", .{ choice.index, found.items.len, switch (choice.why) {
+            .requested => "requested with --vk-device or XODB_VK_DEVICE",
+            .display => "it drives the compositor's display",
+            .ranked => "best kind that can present; the display's device is unknown or unusable",
+        } });
         self.warn(found.items, choice, display);
         const priority: f32 = 1;
         var queue_info = info(c.VkDeviceQueueCreateInfo, c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
@@ -275,7 +279,7 @@ pub const Renderer = struct {
             }
             // One unusable device must not hide another that can present.
             if (!hasExtension(physical, "VK_KHR_swapchain")) {
-                std.debug.print("xodb: Vulkan device {s} lacks VK_KHR_swapchain; skipped\n", .{name});
+                log.warn(.render, "xodb: Vulkan device {s} lacks VK_KHR_swapchain; skipped\n", .{name});
                 try found.append(a, device);
                 continue;
             }
@@ -291,7 +295,7 @@ pub const Renderer = struct {
                 if (self.surface != null) {
                     const queried = c.vkGetPhysicalDeviceSurfaceSupportKHR(physical, @intCast(i), self.surface, &present);
                     if (queried != c.VK_SUCCESS) {
-                        std.debug.print("xodb: Vulkan device {s} queue family {d} surface support query failed: {d}; skipped\n", .{ name, i, queried });
+                        log.warn(.render, "xodb: Vulkan device {s} queue family {d} surface support query failed: {d}; skipped\n", .{ name, i, queried });
                         continue;
                     }
                 }
@@ -319,10 +323,10 @@ pub const Renderer = struct {
         return select.choose(devices, request, display) catch |err| {
             switch (err) {
                 error.NoPresentDevice => return err,
-                error.VulkanDeviceNotFound => std.debug.print("xodb: no Vulkan device matches \"{s}\"; the devices are:\n", .{request.?}),
-                error.VulkanDeviceCannotPresent => std.debug.print("xodb: the Vulkan device requested with \"{s}\" cannot present to this window; the devices are:\n", .{request.?}),
+                error.VulkanDeviceNotFound => log.err(.render, "xodb: no Vulkan device matches \"{s}\"; the devices are:\n", .{request.?}),
+                error.VulkanDeviceCannotPresent => log.err(.render, "xodb: the Vulkan device requested with \"{s}\" cannot present to this window; the devices are:\n", .{request.?}),
             }
-            for (devices, 0..) |device, i| std.debug.print("  {d}  {s}{s}\n", .{ i, device.name, if (device.usable) "" else "  (cannot present)" });
+            for (devices, 0..) |device, i| log.err(.render, "  {d}  {s}{s}\n", .{ i, device.name, if (device.usable) "" else "  (cannot present)" });
             return err;
         };
     }
@@ -339,7 +343,7 @@ pub const Renderer = struct {
         const line = select.warning(&buf, describeAll(found, &described), choice, display, self.failedDriver()) orelse return;
         if (Once.said) return;
         Once.said = true;
-        std.debug.print("{s}\n", .{line});
+        log.warn(.render, "{s}\n", .{line});
     }
     /// `--vk-list`: every device on stdout, with the one xodb would use. Only
     /// with a window can it check presentation and name the display's device.
@@ -362,7 +366,7 @@ pub const Renderer = struct {
             if (n <= 0) break;
             sent += @intCast(n);
         }
-        if (choice) |ch| self.warn(found.items, ch, display) else if (self.failedDriver()) |driver| std.debug.print("xodb: vulkan: driver {s} failed to load\n", .{driver});
+        if (choice) |ch| self.warn(found.items, ch, display) else if (self.failedDriver()) |driver| log.warn(.render, "xodb: vulkan: driver {s} failed to load\n", .{driver});
     }
     fn hasExtension(physical: c.VkPhysicalDevice, comptime wanted: []const u8) bool {
         var extensions = enumerate(c.VkExtensionProperties, c.vkEnumerateDeviceExtensionProperties, .{ physical, @as([*c]const u8, null) }, "vkEnumerateDeviceExtensionProperties") catch return false;
@@ -477,7 +481,7 @@ pub const Renderer = struct {
         if (caps.supportedCompositeAlpha == 0 or caps.minImageCount > 64 or
             caps.minImageExtent.width > caps.maxImageExtent.width or caps.minImageExtent.height > caps.maxImageExtent.height)
         {
-            std.debug.print("xodb: unusable surface capabilities: alpha 0x{x}, min images {d}, extent {d}x{d}..{d}x{d}\n", .{ caps.supportedCompositeAlpha, caps.minImageCount, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width, caps.maxImageExtent.height });
+            log.err(.render, "xodb: unusable surface capabilities: alpha 0x{x}, min images {d}, extent {d}x{d}..{d}x{d}\n", .{ caps.supportedCompositeAlpha, caps.minImageCount, caps.minImageExtent.width, caps.minImageExtent.height, caps.maxImageExtent.width, caps.maxImageExtent.height });
             return error.SurfaceCapabilitiesInvalid;
         }
         self.extent = if (caps.currentExtent.width != std.math.maxInt(u32)) caps.currentExtent else .{
@@ -716,17 +720,15 @@ pub const Renderer = struct {
     /// do not overwrite mapped vertices or reset commands until the fence signals.
     pub fn begin(self: *Renderer, width: u32, height: u32, scale: f32) !bool {
         if (self.window) |window| if (!window.frameReady()) {
-            self.compositor_wait.pending("compositor frame callback");
+            self.deferral.pending("compositor frame callback");
             return false;
         };
-        self.compositor_wait.complete("compositor frame callback");
         const ready = c.vkWaitForFences(self.device, 1, &self.fence, c.VK_TRUE, 0);
         if (ready == c.VK_TIMEOUT) {
-            self.fence_wait.pending("frame fence");
+            self.deferral.pending("frame fence");
             return false;
         }
         try check(ready);
-        self.fence_wait.complete("frame fence");
         if (self.scene_gpu) |*scene_gpu| scene_gpu.timerRead();
         self.scene_requested = false;
         self.ui_width = @floatFromInt(width);
@@ -960,7 +962,7 @@ pub const Renderer = struct {
         const next = pen + fontMetric(font, pos.x_advance);
         // Report degradation once and use the reserved missing-glyph box.
         const g = font.glyph(id) catch |err| fallback: {
-            if (!font.degraded) std.debug.print("Text rendering degraded: {s}; using missing-glyph boxes\n", .{@errorName(err)});
+            if (!font.degraded) log.warn(.render, "Text rendering degraded: {s}; using missing-glyph boxes\n", .{@errorName(err)});
             font.degraded = true;
             break :fallback font.glyph(0) catch return next;
         };
@@ -1013,10 +1015,10 @@ pub const Renderer = struct {
         const acquired = c.vkAcquireNextImageKHR(self.device, self.swap, 0, self.available, null, &image_index);
         reportSlowCall("vkAcquireNextImageKHR", call_started);
         if (acquired == c.VK_TIMEOUT or acquired == c.VK_NOT_READY) {
-            self.image_wait.pending("swapchain image");
+            self.deferral.pending("swapchain image");
             return false;
         }
-        self.image_wait.complete("swapchain image");
+        self.deferral.drawing();
         if (acquired == c.VK_ERROR_OUT_OF_DATE_KHR) {
             self.extent.width = 0;
             return false;
@@ -1150,32 +1152,57 @@ pub const Renderer = struct {
     }
 };
 
-/// Report persistent GPU readiness delays without treating them as device loss.
-const Wait = struct {
+/// A frame is deferred while the compositor's frame callback, the frame fence
+/// or a swapchain image is not ready: the usual cause is a hidden window. One
+/// debug line when a deferral has lasted a second, naming what was awaited,
+/// and one when frames flow again, with how long none was drawn. A throttled
+/// window that draws about once a second stays inside one period. A compositor
+/// that keeps sending slow callbacks to a hidden window can still end and
+/// restart a period whenever xodb's own redraws become sparse, so the pair is
+/// written at most once per `quiet`; a period inside that time says nothing.
+const Deferral = struct {
     since: ?u64 = null,
-    reported: bool = false,
+    hidden: ?u64 = null,
+    resumed: u64 = 0,
+    label: []const u8 = "",
+    said: bool = false,
+    const long = 1_000_000_000;
+    const quiet = 10 * long;
+    fn pending(self: *Deferral, label: []const u8) void {
+        const current = Wait.now();
+        if (self.since == null) self.since = current;
+        if (self.hidden != null or current -| self.since.? < long) return;
+        self.hidden = self.since;
+        self.resumed = 0;
+        self.label = label;
+        self.said = log.every(quiet, .debug, .render, "render {s} not ready for {d} ms; frame deferred, event loop remains active\n", .{ label, (current -| self.since.?) / 1_000_000 });
+    }
+    /// Every gate passed and this frame will be drawn. The period ends with
+    /// the first frame that did not itself wait long.
+    fn drawing(self: *Deferral) void {
+        const since = self.since;
+        self.since = null;
+        const start = self.hidden orelse return;
+        const current = Wait.now();
+        if (since != null and current -| since.? >= long / 2) {
+            self.resumed = current;
+            return;
+        }
+        if (self.said) log.debug(.render, "render {s} ready after {d} ms\n", .{ self.label, (self.resumed -| start) / 1_000_000 });
+        self.hidden = null;
+    }
+};
+const Wait = struct {
     fn now() u64 {
         var ts: c.timespec = undefined;
         _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
         return @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
     }
-    fn pending(self: *Wait, label: []const u8) void {
-        const current = now();
-        if (self.since == null) self.since = current;
-        if (!self.reported and current -| self.since.? >= 1_000_000_000) {
-            std.debug.print("xodb: render {s} not ready for {d} ms; frame deferred, event loop remains active\n", .{ label, (current -| self.since.?) / 1_000_000 });
-            self.reported = true;
-        }
-    }
-    fn complete(self: *Wait, label: []const u8) void {
-        if (self.reported) std.debug.print("xodb: render {s} ready after {d} ms\n", .{ label, (now() -| self.since.?) / 1_000_000 });
-        self.* = .{};
-    }
 };
 
 fn reportSlowCall(name: []const u8, started: u64) void {
     const elapsed = Wait.now() -| started;
-    if (elapsed >= 250_000_000) std.debug.print("xodb: slow Vulkan {s}: {d} ms\n", .{ name, elapsed / 1_000_000 });
+    if (elapsed >= 250_000_000) log.debug(.render, "slow Vulkan {s}: {d} ms\n", .{ name, elapsed / 1_000_000 });
 }
 
 // Fast component lane: HarfBuzz returns null positions for an empty buffer.

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 /// A 2x face has roughly four times the atlas area of the old 16-pixel face.
 /// Keep the same glyph ceiling without making ordinary HiDPI source text fail
@@ -33,7 +34,7 @@ pub const Font = struct {
     pub fn initSelected(self: *Font, path: [:0]const u8, fallback: [:0]const u8) !void {
         const pixel = @import("../appearance.zig").active.font.pixel;
         self.initMode(path, pixel) catch |err| {
-            std.debug.print("xodb: Font failed: {s}; using default font; {s}\n", .{ @errorName(err), path });
+            log.warn(.render, "xodb: Font failed: {s}; using default font; {s}\n", .{ @errorName(err), path });
             self.* = .{};
             try self.initMode(fallback, pixel);
         };

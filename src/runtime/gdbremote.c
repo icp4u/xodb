@@ -5,6 +5,7 @@
 #include "gdb_lldb.h"
 #include "target_internal.h"
 #include "wire_target.h"
+#include "xrt_log.h"
 #include <inttypes.h>
 #include <limits.h>
 #include <stdio.h>
@@ -1142,7 +1143,7 @@ enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct 
     *out = g; return XRT_OK;
 fail:
     free(initial_stop);
-    fprintf(stderr, "xodb: GDB connection failed: %s (status %d)\n", g->info.reason, status);
+    xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: GDB connection failed: %s (status %d)\n", g->info.reason, status);
     xrt_gdb_free(g); return status;
 }
 enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const struct xrt_call *call)

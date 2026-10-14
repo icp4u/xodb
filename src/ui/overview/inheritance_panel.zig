@@ -1,5 +1,6 @@
 //! Parent/child descriptor comparison; all matching and accounting is C-owned.
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const vw = @import("view.zig");
 const draw = @import("draw.zig");
@@ -53,7 +54,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         try ctx.textFit(body.x + 8, y + 24, body.w - 16, label, ctx.p.dim);
         v.hover(hit, "Sampled match only; independently reopened files can match. Click for child {d} fd table.", .{child.pid});
         if (c.getenv("XODB_OVERVIEW_AUDIT") != null)
-            std.debug.print("xodb: fdinherit-row parent={d} child={d} fd={d} flags={d} x={d:.1} y={d:.1}\n", .{ parent.pid, child.pid, fd.fd, r.flags, hit.x + 10, hit.y + 10 });
+            log.info(.overview, "xodb: fdinherit-row parent={d} child={d} fd={d} flags={d} x={d:.1} y={d:.1}\n", .{ parent.pid, child.pid, fd.fd, r.flags, hit.x + 10, hit.y + 10 });
     }
     ctx.r.clip = clip;
     if (rows.count == 0) try ctx.textFit(rect.x + 12, rect.y + 166, rect.w - 24, "No sampled parent/child matches; review missing coverage above", ctx.p.dim);

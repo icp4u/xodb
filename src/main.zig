@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 const build_options = @import("build_options");
 const c = @import("c.zig").api;
 const ProcessTree = @import("model/process_tree.zig").Tree;
@@ -13,8 +14,20 @@ const linux = @import("target/linux.zig");
 const snapshot = @import("binary/snapshot.zig");
 var quitting: c.sig_atomic_t = 0;
 fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerror {
-    std.debug.print("xodb: {s} {s}: expected a size from 1M to {d}G (bytes, or a whole number with K, M or G)\n", .{ option, value, snapshot.max_limit >> 30 });
+    log.err(.session, "xodb: {s} {s}: expected a size from 1M to {d}G (bytes, or a whole number with K, M or G)\n", .{ option, value, snapshot.max_limit >> 30 });
     return err;
+}
+/// The debugger options that are followed by a value. The parser in main and
+/// log.init share the list, so a value is never read as an option.
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+fn named(names: []const []const u8, arg: []const u8) bool {
+    for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
+    return false;
+}
+/// Every parser xodb dispatches to after log.init: the debugger, the overview
+/// and the scene3d probe ("--instances"; its "--frames" is in the other two).
+fn takesValue(arg: []const u8) bool {
+    return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
 }
 fn parseUiScale(value: []const u8) !f32 {
     const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;
@@ -27,22 +40,24 @@ fn onSignal(signal: c_int) callconv(.c) void {
 pub fn main(init: std.process.Init) !void {
     const startup_started = linux.now();
     const a = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(a);
+    const given = try init.minimal.args.toSlice(a);
     // lsof-top is a separate terminal program over the C fd scanner. Only
     // xodb's own options count: a launched program's arguments follow "--".
-    for (args[1..]) |arg| {
+    for (given[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (!std.mem.eql(u8, arg, "--lsof-top")) continue;
-        const argv = try a.alloc(?[*:0]u8, args.len + 1);
-        for (args, 0..) |text, k| argv[k] = @constCast(text.ptr);
-        argv[args.len] = null;
-        std.process.exit(@intCast(c.xodb_lsof_top(@intCast(args.len), @ptrCast(argv.ptr)) & 0xff));
+        const argv = try a.alloc(?[*:0]u8, given.len + 1);
+        for (given, 0..) |text, k| argv[k] = @constCast(text.ptr);
+        argv[given.len] = null;
+        std.process.exit(@intCast(c.xodb_lsof_top(@intCast(given.len), @ptrCast(argv.ptr)) & 0xff));
     }
     // The memory defrag terminal view needs no window and no target.
-    for (args[1..]) |arg| {
+    for (given[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
-        if (std.mem.eql(u8, arg, "--memdefrag")) std.process.exit(@import("memdefrag/tui.zig").main(args));
+        if (std.mem.eql(u8, arg, "--memdefrag")) std.process.exit(@import("memdefrag/tui.zig").main(given));
     }
+    // Everything below logs through log.zig and never sees its options.
+    const args = log.init(try a.dupe([:0]const u8, given), takesValue);
     // Vulkan device choice applies to every window; the list needs no target.
     if (comptime build_options.gui) for (args[1..], 1..) |arg, k| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -195,13 +210,19 @@ pub fn main(init: std.process.Init) !void {
                 \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
                 \\--no-ghidra-prestart leaves the configured Ghidra sidecar idle until pseudo-C is requested.
+                \\-q shows warnings and errors only, -qq errors only; -v adds debug lines (decisions), -vv trace lines
+                \\  (per-event detail). --log=LEVEL names the level (error|warn|info|debug|trace) and
+                \\  --log=TOPIC=LEVEL[,...] sets it per topic: render, window, runtime, agent, session, mcp, sidecar,
+                \\  semq, overview, redot, profile. XODB_LOG takes the same value; the option wins.
+                \\--log-file FILE appends these lines to FILE (created 0600) and leaves stderr quiet; XODB_LOG_FILE=FILE
+                \\  does the same, and is how the processes xodb starts are given the file.
                 \\
             , .{});
             return;
         } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
-        } else if (std.mem.eql(u8, arg, "--language-off") or std.mem.eql(u8, arg, "--wine-threads") or std.mem.eql(u8, arg, "--observe-recipe") or std.mem.eql(u8, arg, "--observation-out") or std.mem.eql(u8, arg, "--open-observation") or std.mem.eql(u8, arg, "--browse-observation") or std.mem.eql(u8, arg, "--observation-threshold-ns") or std.mem.eql(u8, arg, "--static-analysis") or std.mem.eql(u8, arg, "--gdb-remote") or std.mem.eql(u8, arg, "--runtime-agent") or std.mem.eql(u8, arg, "--runtime-ssh") or std.mem.eql(u8, arg, "--ssh-config") or std.mem.eql(u8, arg, "--allocation-helper") or std.mem.eql(u8, arg, "--process-limit") or std.mem.eql(u8, arg, "--core") or std.mem.eql(u8, arg, "--exe") or std.mem.eql(u8, arg, "--debug-dir") or std.mem.eql(u8, arg, "--source-map") or std.mem.eql(u8, arg, "--connect") or std.mem.eql(u8, arg, "--ssh") or std.mem.eql(u8, arg, "--remote-xodb") or std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--listen") or std.mem.eql(u8, arg, "--config") or std.mem.eql(u8, arg, "--source") or std.mem.eql(u8, arg, "--font") or std.mem.eql(u8, arg, "--theme") or std.mem.eql(u8, arg, "--ui-scale") or std.mem.eql(u8, arg, "--expected-start-ticks") or std.mem.eql(u8, arg, "--attach") or std.mem.eql(u8, arg, "--frames") or std.mem.eql(u8, arg, "--vk-device") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--break") or std.mem.eql(u8, arg, "--record") or std.mem.eql(u8, arg, "--profile-out") or std.mem.eql(u8, arg, "--capture-out") or std.mem.eql(u8, arg, "--open-frames") or std.mem.eql(u8, arg, "--open-profile") or std.mem.eql(u8, arg, "--compare-capture") or std.mem.eql(u8, arg, "--open-capture") or std.mem.eql(u8, arg, "--symbols") or std.mem.eql(u8, arg, "--debug-file") or std.mem.eql(u8, arg, "--image-limit") or std.mem.eql(u8, arg, "--image-total-limit")) {
+        } else if (named(&value_options, arg)) {
             i += 1;
             if (i == args.len) return error.MissingArgument;
             if (std.mem.eql(u8, arg, "--wine-threads")) hide_wine_threads = if (std.mem.eql(u8, args[i], "hide")) true else if (std.mem.eql(u8, args[i], "show")) false else return error.InvalidWineThreadVisibility;
@@ -232,7 +253,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--listen")) listen = args[i];
             if (std.mem.eql(u8, arg, "--config")) config_path = args[i];
             if (std.mem.eql(u8, arg, "--language-off")) languages_off.turnOff(args[i]) catch |err| {
-                std.debug.print("xodb: --language-off takes all, python, perl, lua, javascript, ruby, go, elisp or gdscript; not {s}\n", .{args[i]});
+                log.err(.session, "xodb: --language-off takes all, python, perl, lua, javascript, ruby, go, elisp or gdscript; not {s}\n", .{args[i]});
                 return err;
             };
             if (std.mem.eql(u8, arg, "--record")) record_path = args[i];
@@ -303,8 +324,8 @@ pub fn main(init: std.process.Init) !void {
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
-        std.debug.print("xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
-        if (err == error.InvalidImageBudget) std.debug.print("xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
+        log.err(.session, "xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
+        if (err == error.InvalidImageBudget) log.err(.session, "xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
         return err;
     } else @import("preferences.zig").Preferences{};
     const ui_scale = ui_scale_cli orelse preferences.appearance.ui_scale;
@@ -326,9 +347,10 @@ pub fn main(init: std.process.Init) !void {
     if (remote_gui) {
         if (comptime build_options.gui) {
             var remote_args: std.ArrayList([:0]const u8) = .empty;
-            if (connect != null and !std.meta.eql(languages, .{})) std.debug.print("xodb: the server owns the target; language views are turned off where it was started, not here\n", .{});
+            if (connect != null and !std.meta.eql(languages, .{})) log.warn(.session, "xodb: the server owns the target; language views are turned off where it was started, not here\n", .{});
             const endpoint: @import("remote/client.zig").Endpoint = if (connect) |address| .{ .tcp = address } else blk: {
                 try remote_args.appendSlice(a, &.{ remote_xodb, "--headless", "--mcp", "--agent-scope", if (scope_explicit) try a.dupeZ(u8, @tagName(agent_scope)) else "control" });
+                if (log.value()) |setting| try remote_args.appendSlice(a, &.{ "--log", setting });
                 // The server reads the target, so the switches go with it.
                 if (!languages.enabled) try remote_args.appendSlice(a, &.{ "--language-off", "all" });
                 inline for (@typeInfo(@TypeOf(languages).Name).@"enum".fields) |field| {
@@ -373,7 +395,7 @@ pub fn main(init: std.process.Init) !void {
         try redot_launch.appendSlice(a, launch);
         try redot_launch.appendSlice(a, &.{ "--remote-debug", try std.fmt.allocPrintSentinel(a, "tcp://127.0.0.1:{d}", .{port}, 0) });
         launch = redot_launch.items;
-        std.debug.print("xodb: Redot/Godot scene debugger listening on private loopback port {d}; waiting for owned pid\n", .{port});
+        log.info(.redot, "xodb: Redot/Godot scene debugger listening on private loopback port {d}; waiting for owned pid\n", .{port});
     }
     if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
     session.static_analysis.toolchain_dir = static_analysis;
@@ -381,7 +403,7 @@ pub fn main(init: std.process.Init) !void {
     session.static_analysis.eager_library_bytes = preferences.decompiler.eager_library_bytes;
     if (static_analysis != null) {
         const swept = @import("semq/host.zig").sweepStale();
-        if (swept > 0) std.debug.print("xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
+        if (swept > 0) log.info(.session, "xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
     }
     var remote_destroyed = false; // Read only after the remote owner finishes.
     defer if (!remote_destroyed) session.deinit();
@@ -398,7 +420,11 @@ pub fn main(init: std.process.Init) !void {
             if (ssh_config) |path| try remote_transport.appendSlice(a, &.{ "-F", path });
             // Retain a remote shell to translate a signal into 128 + signo.
             // SSH otherwise collapses a directly signalled agent to exit 255.
-            const agent_command = try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" });
+            // SSH does not carry the environment, so the log setting rides in the command.
+            const agent_command = if (log.value()) |setting|
+                try @import("remote/transport.zig").shellCommand(a, &.{ "env", try std.fmt.allocPrintSentinel(a, "XODB_LOG={s}", .{setting}, 0), agent, "--stdio" })
+            else
+                try @import("remote/transport.zig").shellCommand(a, &.{ agent, "--stdio" });
             const command = try std.fmt.allocPrintSentinel(a, "({s}); xodb_status=$?; exit \"$xodb_status\"", .{agent_command}, 0);
             try remote_transport.appendSlice(a, &.{ "--", host, command });
         } else try remote_transport.appendSlice(a, &.{ agent, "--stdio" });
@@ -414,12 +440,12 @@ pub fn main(init: std.process.Init) !void {
     for (source_maps.items) |spec| try session.source_maps.add(spec);
     session.fetch_source = fetch_source;
     for (debug_files.items) |path| session.debug_files.add(path) catch |err| {
-        std.debug.print("xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
-        if (err == error.BinarySnapshotLimit) std.debug.print("xodb: image budget is {d} MiB per image and {d} MiB in total (--image-limit, --image-total-limit)\n", .{ snapshot.per_image_limit >> 20, snapshot.total_limit >> 20 });
+        log.err(.session, "xodb: debug file failed: {s}; {s}\n", .{ @errorName(err), path });
+        if (err == error.BinarySnapshotLimit) log.err(.session, "xodb: image budget is {d} MiB per image and {d} MiB in total (--image-limit, --image-total-limit)\n", .{ snapshot.per_image_limit >> 20, snapshot.total_limit >> 20 });
         return err;
     };
     defer if (!remote_destroyed) exportProfileOnExit(session, profile_out);
-    defer if (!remote_destroyed) if (record_path) |path| session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
+    defer if (!remote_destroyed) if (record_path) |path| session.saveInvestigations(path) catch |err| log.err(.session, "Evidence export failed: {s}\n", .{@errorName(err)});
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
     if (open_profile) |path| try session.openImported(path);
@@ -429,9 +455,9 @@ pub fn main(init: std.process.Init) !void {
         if (attach) |pid| {
             if (expected_start) |ticks| try @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks });
             const started = linux.now();
-            std.debug.print("xodb: attaching to pid={d}\n", .{pid});
+            log.info(.session, "xodb: attaching to pid={d}\n", .{pid});
             session.target.attach(pid) catch |err| {
-                std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
+                log.err(.session, "xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
                 return err;
             };
             if (expected_start) |ticks| @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks }) catch |err| {
@@ -442,7 +468,7 @@ pub fn main(init: std.process.Init) !void {
                 _ = try session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
                 try session.continueExecution(.human);
             }
-            std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
+            log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, session.target.snapshot().thread_count, @tagName(session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
         }
         if (launch.len > 0) try session.launch(launch);
         if (follow_forks) try session.target.setFollowProcesses(true);
@@ -743,7 +769,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 const presented = renderFrame(&renderer, font, workspace, &window, active) catch |err| {
                     workspace.status = @errorName(err);
-                    std.debug.print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
+                    log.err(.render, "Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
                     // A failed submit may leave the frame fence unsignalled. Recreate
                     // the renderer instead of waiting on that fence next frame.
                     recovery.lost(&renderer, current);
@@ -773,7 +799,7 @@ pub fn main(init: std.process.Init) !void {
         }
         const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (mcp and server.closed) "mcp_eof" else if (frames > 0 and rendered >= frames) "frame_limit" else "loop_exit";
         try finishRequestedArchive(session, capture_out);
-        std.debug.print("xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
+        log.info(.session, "xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
     }
 }
 /// The live family belongs exclusively to the worker for this loop's lifetime.
@@ -852,7 +878,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
             renderer.init(window) catch |err| {
                 if (!renderer_started and (err == error.VulkanDeviceNotFound or err == error.VulkanDeviceCannotPresent)) return err;
                 workspace.status = @errorName(err);
-                std.debug.print("Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
+                log.err(.render, "Renderer initialization failed: {s}; retrying, target retained\n", .{@errorName(err)});
                 render_retry = now + std.time.ns_per_s;
                 continue;
             };
@@ -862,7 +888,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         }
         const presented = renderFrame(renderer, font, workspace, window, &frontend) catch |err| {
             workspace.status = @errorName(err);
-            std.debug.print("Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
+            log.err(.render, "Frame failed: {s}; recreating renderer, target retained\n", .{@errorName(err)});
             renderer.deinit();
             renderer_ready = false;
             render_retry = now + std.time.ns_per_s;
@@ -873,17 +899,17 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         if (rendered == 0) @import("startup.zig").report(startup_started, mcp);
         last_frame = now;
         rendered += 1;
-        if (window.input.trace) std.debug.print("xodb: remote frame={d} publication={d} editor={s} preparations={d}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed", owner.preparation_attempts.load(.monotonic) });
+        if (window.input.trace) log.info(.runtime, "xodb: remote frame={d} publication={d} editor={s} preparations={d}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed", owner.preparation_attempts.load(.monotonic) });
         if (frames > 0 and rendered >= frames) break;
     }
     finishRemoteOwner(owner, window);
     if (owner.failure) |err| return err;
     const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (frames > 0 and rendered >= frames) "frame_limit" else "owner_exit";
-    std.debug.print("xodb: {d} frames, remote owner closed (reason={s}, signal={d}); remote target cleanup unconfirmed\n", .{ rendered, reason, quitting });
+    log.warn(.runtime, "xodb: {d} frames, remote owner closed (reason={s}, signal={d}); remote target cleanup unconfirmed\n", .{ rendered, reason, quitting });
     if (reconnect) {
         // Discard input collected while the old owner was quiescing.
         window.input.count = 0;
-        std.debug.print("xodb: remote incarnation={d} retired; no controls replayed\n", .{owner.options.connection});
+        log.info(.runtime, "xodb: remote incarnation={d} retired; no controls replayed\n", .{owner.options.connection});
     }
     return reconnect and !window.closing and quitting == 0;
 }
@@ -928,8 +954,12 @@ const RemoteStartup = struct {
     fn run(context: *anyopaque, cancel: *@import("target/runtime.zig").c.struct_xrt_cancel) !void {
         const self: *RemoteStartup = @ptrCast(@alignCast(context));
         if (self.gdb) |endpoint| {
+            log.debug(.runtime, "connecting to GDB remote stub {s}\n", .{endpoint});
             try self.session.target.connectGdbRemoteCancel(endpoint, cancel);
-        } else try self.session.target.connectRemoteCancel(self.transport, cancel);
+        } else {
+            log.debug(.runtime, "starting runtime agent transport {s} ({d} arguments)\n", .{ self.transport[0], self.transport.len - 1 });
+            try self.session.target.connectRemoteCancel(self.transport, cancel);
+        }
         // A reconnect establishes a new transport only. Never replay attach,
         // launch, breakpoints, resume, or the old session's controller grant.
         if (!self.initial_actions) {
@@ -938,12 +968,12 @@ const RemoteStartup = struct {
         }
         if (self.attach) |pid| {
             const started = linux.now();
-            if (self.report_attach) std.debug.print("xodb: attaching to pid={d}\n", .{pid});
+            if (self.report_attach) log.info(.session, "xodb: attaching to pid={d}\n", .{pid});
             self.session.target.attach(pid) catch |err| {
-                if (self.report_attach) std.debug.print("xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
+                if (self.report_attach) log.err(.session, "xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
                 return err;
             };
-            if (self.report_attach) std.debug.print("xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
+            if (self.report_attach) log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
         }
         if (self.launch.len > 0) try self.session.launch(self.launch);
         if (self.follow) try self.session.target.setFollowProcesses(true);
@@ -971,7 +1001,7 @@ const RemoteShutdown = struct {
         defer self.destroyed.* = true;
         defer self.session.deinit();
         defer self.tree.deinitRemote();
-        defer if (self.record_path) |path| self.session.saveInvestigations(path) catch |err| std.debug.print("Evidence export failed: {s}\n", .{@errorName(err)});
+        defer if (self.record_path) |path| self.session.saveInvestigations(path) catch |err| log.err(.session, "Evidence export failed: {s}\n", .{@errorName(err)});
         defer exportProfileOnExit(self.session, self.profile_out);
         // A startup that failed or was cancelled has nothing to archive: the
         // startup error, not a missing capture, is the result to report.
@@ -984,9 +1014,9 @@ fn exportProfileOnExit(session: *Session, profile_out: ?[:0]const u8) void {
         if (session.profile) |capture| {
             if (capture.collector != null) capture.stop(.manual, linux.now());
             if (@import("profile/export.zig").save(capture, path, .{})) |result| {
-                std.debug.print("xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
-            } else |err| std.debug.print("xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
-        } else std.debug.print("xodb: profile export skipped: no capture; {s}\n", .{path});
+                log.info(.profile, "xodb: exported profile #{d}: {d} samples, {d} bytes to {s}\n", .{ capture.id, result.samples, result.bytes, path });
+            } else |err| log.err(.profile, "xodb: profile export failed: {s}; {s}\n", .{ @errorName(err), path });
+        } else log.warn(.profile, "xodb: profile export skipped: no capture; {s}\n", .{path});
     }
 }
 
@@ -1015,7 +1045,7 @@ fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
             };
         }
         _ = (if (session.profile == null and session.allocations.capture != null) session.saveAllocationArchive(destination) else session.saveArchive(destination)) catch |err| {
-            std.debug.print("xodb: requested archive save failed: {s}; {s}\n", .{ @errorName(err), destination });
+            log.err(.session, "xodb: requested archive save failed: {s}; {s}\n", .{ @errorName(err), destination });
             return err;
         };
         try session.finishArchive();
@@ -1023,7 +1053,7 @@ fn finishRequestedArchive(session: *Session, path: ?[:0]const u8) !void {
 }
 fn reportSlow(phase: []const u8, started: u64) void {
     const elapsed = linux.now() -| started;
-    if (elapsed >= 250_000_000) std.debug.print("xodb: slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
+    if (elapsed >= 250_000_000) log.debug(.window, "slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
 }
 /// With a compositor the list also says which devices present and which is the display's.
 fn vkList() !void {
@@ -1043,7 +1073,7 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
         // Geometry exhaustion or allocation failure can leave a partial frame;
         // presenting it is safe and the next frame reports the error.
         workspace.status = @errorName(err);
-        std.debug.print("Workspace draw failed: {s}; target retained\n", .{@errorName(err)});
+        log.err(.render, "Workspace draw failed: {s}; target retained\n", .{@errorName(err)});
     };
     reportSlow("workspace draw/inspection", started);
     started = linux.now();

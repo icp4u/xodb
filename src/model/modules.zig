@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const runtime_api = @import("../target/runtime.zig");
 const rt = runtime_api.c;
 const c = @import("../c.zig").api;
@@ -532,7 +533,7 @@ pub const Modules = struct {
             return;
         };
         if (err != error.BinarySnapshotLimit and err != error.CompressedDebugBudget)
-            std.debug.print("xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
+            log.warn(.session, "xodb: module unavailable: {s}; {s} at 0x{x}\n", .{ @errorName(err), path, region.start });
     }
     /// DWARF opens lazily after the image was loaded. Record its refusal on
     /// the same surfaces as the initial read, including a source search.
@@ -574,9 +575,9 @@ pub const Modules = struct {
         // even when stderr is suppressed. Identical stops do not print again.
         if (repeated or !budget_throttle.allow(rt.xrt_now())) return;
         if (self.budgetDetail(null)) |detail|
-            std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred; {s}\n", .{ counts.loaded, counts.deferred, detail })
+            log.warn(.session, "xodb: module budget: {d} full images loaded, {d} mapped files deferred; {s}\n", .{ counts.loaded, counts.deferred, detail })
         else
-            std.debug.print("xodb: module budget: {d} full images loaded, {d} mapped files deferred\n", .{ counts.loaded, counts.deferred });
+            log.warn(.session, "xodb: module budget: {d} full images loaded, {d} mapped files deferred\n", .{ counts.loaded, counts.deferred });
     }
     /// The image, its size and the budget for a full image refused at
     /// `address`, or for the first one refused when no address is given.
@@ -842,10 +843,10 @@ pub const Modules = struct {
         module.file_source = source;
         if (self.debug_files) |files| {
             module.debug_file = (if (entry.offset == 0) self.companionFor(region, &image, path) else files.matching(&image)) catch |err| blk: {
-                std.debug.print("xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
+                log.warn(.session, "xodb: debug companion rejected: {s}; {s} offset=0x{x}\n", .{ @errorName(err), path, entry.offset });
                 break :blk null;
             };
-            if (module.debug_file) |file| std.debug.print("xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
+            if (module.debug_file) |file| log.info(.session, "xodb: debug companion {s} matched {s} offset=0x{x}\n", .{ file.path, path, entry.offset });
         }
         try self.loaded.append(self.allocator, module);
         self.snapshot_bytes += mapped.len;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const Modules = @import("modules.zig").Modules;
 const info = @import("../debug/info.zig");
 const loc = @import("../debug/location.zig");
@@ -641,7 +642,7 @@ pub const Session = struct {
             } else {
                 self.allocations.capture = capture;
                 capture.requestAnalysisOwned(false, .{ .owner = job.owner }) catch {};
-                std.debug.print("xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
+                log.info(.session, "xodb: opened allocation archive: {d} records, {d} stacks; {s}\n", .{ capture.store.records.items.len, capture.stacks.entries.items.len, job.path });
             }
             job.allocation_opened = null;
         }
@@ -651,10 +652,10 @@ pub const Session = struct {
             self.dropDerived();
             self.profile = self.artifact.?.capture;
             job.opened = null;
-            std.debug.print("xodb: opened archive: {d} samples, {d} annotations, {d} decoded allocation peak bytes; {s}\n", .{ self.profile.?.samples.len(), opened.source.annotation_count, opened.budget.peak, job.path });
+            log.info(.session, "xodb: opened archive: {d} samples, {d} annotations, {d} decoded allocation peak bytes; {s}\n", .{ self.profile.?.samples.len(), opened.source.annotation_count, opened.budget.peak, job.path });
         }
-        if (job.failure) |err| std.debug.print("xodb: archive {s} failed: {s}; {s}\n", .{ @tagName(job.kind), @errorName(err), job.path });
-        if (job.publication) |result| std.debug.print("xodb: archive {s}: {d} bytes; error={s} cleanup_error={}; {s}\n", .{ @tagName(result.state), result.bytes, result.error_name orelse "none", result.cleanup_error, job.path });
+        if (job.failure) |err| log.err(.session, "xodb: archive {s} failed: {s}; {s}\n", .{ @tagName(job.kind), @errorName(err), job.path });
+        if (job.publication) |result| log.info(.session, "xodb: archive {s}: {d} bytes; error={s} cleanup_error={}; {s}\n", .{ @tagName(result.state), result.bytes, result.error_name orelse "none", result.cleanup_error, job.path });
     }
     pub fn finishArchive(self: *Session) !void {
         const job = self.archive_job orelse return;
@@ -674,8 +675,8 @@ pub const Session = struct {
         };
         return self.openProfile(request) catch |err| {
             self.profile_error = @errorName(err);
-            std.debug.print("xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.snapshot().pid, self.profile_requested_threads });
-            if (self.profile_failure) |failure| std.debug.print("xodb: perf open: {s} syscall={s} errno={d} tid={d} opened_then_closed={d}; {s}\n", .{ @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.opened_then_closed, failure.detail });
+            log.err(.session, "xodb: profile start failed: {s}; pid={d} requested_threads={d}\n", .{ @errorName(err), self.target.snapshot().pid, self.profile_requested_threads });
+            if (self.profile_failure) |failure| log.err(.session, "xodb: perf open: {s} syscall={s} errno={d} tid={d} opened_then_closed={d}; {s}\n", .{ @tagName(failure.kind), failure.syscall, failure.errno, failure.tid, failure.opened_then_closed, failure.detail });
             return err;
         };
     }
@@ -1289,7 +1290,7 @@ pub const Session = struct {
             self.cancelStep();
             self.suppress_probe_resume = true;
             self.step_diagnostic = @errorName(err);
-            std.debug.print("xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
+            log.warn(.session, "xodb: breakpoint relocation stopped: {s}\n", .{@errorName(err)});
             try @import("../target/runtime.zig").propagateUnknownOutcome(err);
         };
         self.memory.poll(self);

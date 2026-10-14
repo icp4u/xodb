@@ -35,6 +35,7 @@ pub const usage =
     \\  --galaxy-tour   start the galaxy's explicit camera tour (O stops; any control takes over)
     \\  --pause         start paused (replay: show the last frame with full history)
     \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
+    \\  -q, -qq, -v, -vv, --log=LEVEL|TOPIC=LEVEL[,...] and --log-file FILE choose what is logged (xodb --help).
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
     \\      B treemap, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
     \\
@@ -67,6 +68,9 @@ pub const Options = struct {
     frames: u64 = 0,
     font: [:0]const u8 = @import("build_options").font_path ++ "",
 };
+
+/// The overview options that are followed by a value.
+pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
 
 /// Parses overview arguments (args[0] is the program). Debugger options are
 /// rejected: the overview has no target.
@@ -105,7 +109,6 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.paused = true;
             continue;
         }
-        const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
         var known = false;
         for (takes) |t| known = known or std.mem.eql(u8, arg, t);
         if (!known) {

@@ -1,6 +1,7 @@
 //! Precise peer of the galaxy. Rows retain model identities; ordering, filtering
 //! and folding are presentation only and never change the source graph.
 const std = @import("std");
+const log = @import("../../log.zig");
 const model = @import("galaxy_model.zig");
 const camera = @import("galaxy_camera.zig");
 const draw = @import("draw.zig");
@@ -374,12 +375,12 @@ pub const Table = struct {
                 };
                 try ctx.textFit(box.x + 8, y + 2, box.w - 16, text, if (selected) ctx.p.accent else ctx.p.text);
             }
-            if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: graph-table-row type={s} index={d} id={d} selected={d} x={d:.1} y={d:.1}\n", .{ @tagName(row), index(row), if (selection(s, row)) |sel| switch (sel) {
+            if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: graph-table-row type={s} index={d} id={d} selected={d} x={d:.1} y={d:.1}\n", .{ @tagName(row), index(row), if (selection(s, row)) |sel| switch (sel) {
                 inline else => |id| id,
             } else 0, @intFromBool(selected), bounds.x + 50, y + 12 });
         }
         try ctx.textFit(bounds.x + 8, bounds.y + bounds.h - 22, bounds.w - 16, if (self.message.len > 0) self.message else hints, ctx.p.dim);
-        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: graph-table rows={d} cursor={d} edges={d} filter={d} folded={d} sort={s} reverse={d}\n", .{ self.count, self.cursor, @intFromBool(self.edges), self.filter_len, self.folded_count, @tagName(self.sort), @intFromBool(self.reverse) });
+        if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: graph-table rows={d} cursor={d} edges={d} filter={d} folded={d} sort={s} reverse={d}\n", .{ self.count, self.cursor, @intFromBool(self.edges), self.filter_len, self.folded_count, @tagName(self.sort), @intFromBool(self.reverse) });
         return .{ .stars = s.star_count, .clusters = s.cluster_count, .strands = s.strand_count };
     }
 };

@@ -1,6 +1,7 @@
 //! Modern memory-map presentation. The sampler and viewport remain in the
 //! shared map model; this module draws actual system activity and VMA history.
 const std = @import("std");
+const log = @import("../../log.zig");
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
 const mm = @import("memmap.zig");
@@ -52,7 +53,7 @@ pub fn ribbons(v: *vw.View, ctx: Ctx, r: Rect) !void {
         hist.audited_ns = map.sampled_ns;
         var points: usize = 0;
         for (hist.ranges.values()) |series| points = @max(points, series.len);
-        std.debug.print("xodb: memmap modern sample={d} history={d} ranges={d} omitted={d}\n", .{ map.sequence, points, hist.ranges.count(), hist.omitted });
+        log.info(.overview, "xodb: memmap modern sample={d} history={d} ranges={d} omitted={d}\n", .{ map.sequence, points, hist.ranges.count(), hist.omitted });
     }
     const focus = v.memmap.deep.selected orelse v.memmap.deep.origin;
     var first: usize = 0;

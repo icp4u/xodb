@@ -98,7 +98,7 @@ try:
         t=threading.Thread(target=relay,args=(client,upstream,'request'),daemon=True);t.start()
         relay(upstream,client,'response');t.join(2)
     proxy_thread=threading.Thread(target=proxy,daemon=True);proxy_thread.start()
-    with (run/'gui.log').open('wb') as log:app=subprocess.Popen([str(binary),'--connect',f'127.0.0.1:{proxy_port}'],env=env,stdout=log,stderr=log)
+    with (run/'gui.log').open('wb') as log:app=subprocess.Popen([str(binary),'--connect',f'127.0.0.1:{proxy_port}',*(['--log=render=debug'] if args.idle_workspace else [])],env=env,stdout=log,stderr=log)
     processes.append(app)
     initial=wait_for(lambda:get_view());pid=initial['pid']
     if args.idle_workspace:

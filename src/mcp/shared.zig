@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const Server = @import("server.zig").Server;
 const Session = @import("../model/session.zig").Session;
 const context = @import("shared_context.zig");
@@ -29,7 +30,7 @@ pub const Endpoint = struct {
     const Client = struct { id: u64, server: *Server, accepted: u64, progressed: u64 };
     pub fn init(path: [:0]const u8, source: ?[:0]const u8) !Endpoint {
         const service = c.xsvc_open(path.ptr) orelse {
-            std.debug.print("xodb: cannot open shared session socket {s}: errno={d}\n", .{ path, std.c._errno().* });
+            log.err(.mcp, "xodb: cannot open shared session socket {s}: errno={d}\n", .{ path, std.c._errno().* });
             return error.SessionSocketUnavailable;
         };
         return .{ .service = service, .source_path = source };
@@ -110,7 +111,7 @@ pub const Endpoint = struct {
             const server = client.server;
             const before = server.transmitted;
             server.pump(root) catch |err| {
-                std.debug.print("xodb: session client #{d} closed: {s}\n", .{ client.id, @errorName(err) });
+                log.info(.mcp, "xodb: session client #{d} closed: {s}\n", .{ client.id, @errorName(err) });
                 self.drop(slot);
                 continue;
             };

@@ -1,6 +1,7 @@
 //! Explicit bounded headless observation recipes. No implicit file discovery,
 //! stdout protocol, signal suppression or mutation of another owner's probes.
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c.zig").api;
 const Session = @import("../model/session.zig").Session;
 const capture = @import("capture.zig");
@@ -164,7 +165,7 @@ fn functionMapping(session: *Session, recipe: *const Recipe, start_address: ?u64
     var found: ?u64 = null;
     session.modules.beginSweep();
     // Say so when the functions were looked for in fewer images than are mapped.
-    defer if (session.modules.skipped().first) |first| std.debug.print("xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
+    defer if (session.modules.skipped().first) |first| log.warn(.session, "xodb: observation recipe: {d} images not searched; {s}\n", .{ session.modules.skipped().count, first });
     for (session.modules.regions.items) |region| {
         if (region.permissions[2] != 'x' or region.inode == 0 or region.path.len == 0 or region.path[0] != '/') continue;
         const module = session.modules.load(region, .sweep) catch continue;

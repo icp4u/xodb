@@ -11,19 +11,21 @@ Zig. Wayland. Vulkan. FreeType/HarfBuzz. No Electron, no webview, no 1990s
 widget toolkit. Dark, dense, keyboard-driven with a huge nod to RAD Debugger's
 visuals (but not a clone- it's linux-first and cross-arch read on)
 
-## ⚠️ The disclaimer you should read first
+## ⚠️ Disclaimer
 
-This is a **challenge project**: 24 hours of work to make a functioning
+This started as a **challenge project**: 24 hours of work to make a functioning
 debugger and a followup week to see how hard it can be productionalized,
 starting **2026-09-30**. I want to find out how much I could do with AI
-in a stupidly short amount of time. **This initial push is an early peek on day
-3.** Don't expect it to be nice for like, at least one more day ok.
+in a stupidly short amount of time. **The 1 week challenge finished on 10/7 but
+I forgot to count what all I had done by then**. You can use it now. It's
+pretty good.
 
 So: it works, there are tests, there's a *lot* of it — and it will absolutely
 fall over in ways a 20-year-old debugger wouldn't. We're fuckin' around and
 making stuff. Mind the edges, read [Current limits](#current-limits).
 
-This is pre-alpha. If it doesn't work, have your agent fix it and send a pr.
+This is still pre-alpha. I reserve the right to break interfaces. If it doesn't
+work, have your agent fix it and send a pr. 
 
 ## Guiding principles
 
@@ -33,7 +35,10 @@ This is pre-alpha. If it doesn't work, have your agent fix it and send a pr.
 - **Linux native in all ways.** ptrace, perf, /proc, pidfd, eBPF, uprobes,
   hardware debug registers. (not all *implemented* yet, mind)
 - **Portable where it counts.** Not glued to x86-64, ELF, DWARF, or 64-bit
-  pointers. AArch64 matters to us and is first class, more coming.
+  pointers. Mach-O and Swift with MacOS. 
+  - GUI: Linux/x86_64 and Linux/Aarch64 - MacOS in the works
+  - Debugger targets: x86_64, aarch64, loongarch64 (龙芯), ppc64le and m68k. debugserver/adb.
+- **Dual Language runtimes:** Ruby, Perl, CPython, Lua, Node/JS, Go, Emacs Lisp, Redot/GDScript, Jai - see [docs](docs/)
 - **Non-PC:** remote debugging (Android especially), planned Lua scriptability
   with `dbg.eval()`, replay, object/causal graphs.
 - **One model, three readers:** human understanding, agent understanding,
@@ -51,7 +56,7 @@ selected block's disassembly, decoded `VALUE` locals, threads, stack, and the
 event timeline.*
 
 Keys, in brief: **F10** step over · **G** graph/asm · **P** profile · **F**
-flames · **E** pinned expression · **Shift+E** live display · **Shift+L** convert selected watch · **V** watch/events · **Tab** locals/registers
+flames · **E** pinned expression · **Shift+E** live display · **Shift+L** convert selected watch · **V** watch/events · **Tab** locals/registers/Language runtimes
 · **J/K** threads · **Shift+D** detach · **F8** grant or yank agent control · **Shift+Q** quit.
 Letter shortcuts follow your active keyboard layout. In text fields, **Ctrl+V**
 pastes, **middle-click** pastes the primary selection, and **Ctrl+C** copies.
@@ -64,6 +69,8 @@ and closing the window. A look that draws its own title bar and window buttons
 Compositors without the protocol (including GNOME) are unchanged.
 
 ## What actually works today
+
+( this is VERY incomplete - browse my media tab on X for current status https://x.com/icpolicy/media )
 
 New here? [Which tool do I reach for?](docs/GUIDE.md) is the plain-language map
 (debugger vs profile vs observation, with demos).
@@ -115,17 +122,60 @@ Zig or GUI libraries. The host GUI/MCP keeps symbols, expressions and profiling
 analysis, including cross-ISA debugging of an m68k target.
 See [C runtime builds, commands and limits](docs/C_RUNTIME.md).
 
-**Remote + ARM64.** The x86-64 workstation GUI drives a headless xodb on an
-AArch64 Jetson over SSH or LAN TCP. ARM64 hardware data watchpoints work through
-MCP. Android: native executables *and* JNI libraries inside a debug APK, over USB.
-([ARM64](docs/ARM64.md) · [remote](docs/REMOTE_DEBUGGING.md) ·
-[Android](docs/ANDROID.md))
+**Dual Language runtimes:** Ruby, Perl, CPython, Lua, Node/JS, Go, Emacs Lisp, Redot/GDScript, Jai - see [docs](docs/)
+
+- Redot: https://x.com/icpolicy/status/2109814211702620260
+- Redot: https://x.com/icpolicy/status/2109718652467728573
+- Redot: https://x.com/icpolicy/status/2109181763608318108
+- Wine: https://x.com/icpolicy/status/2109344883177906301
+- emacs: https://x.com/icpolicy/status/2108953480287440986
+- golang: https://x.com/icpolicy/status/2108692716112765221
+- Ruby/rails: https://x.com/icpolicy/status/2108467525675819081
+- ruby: https://x.com/icpolicy/status/2108447782231228616
+- python: https://x.com/icpolicy/status/2107741869807673843
+- jai: https://x.com/icpolicy/status/2108792793313505397
+
+**Ghidra integration for in-line decompilation** Press 'd' at any stop to
+generate pesudo-C for a function. We sidecar a Ghidra jvm that loads and warms
+caches in parallel so as to keep startups fast. Verified on x86, arm64,
+ppc64le, m68k and LoongArch.
+
+https://x.com/icpolicy/status/2109838187728347196
+https://x.com/icpolicy/status/2109864753174806946
+
+**Remote** The workstation GUI drives a headless xodb on multiple remote
+architectures via SSH/TCP, USB (android) etc. Android: native executables *and*
+JNI libraries inside a debug APK, over USB.  ([ARM64](docs/ARM64.md) · [remote](docs/REMOTE_DEBUGGING.md) · [Android](docs/ANDROID.md))
+
+| Feature | x86-64 | aarch64 | loongarch64 | ppc64le | m68k | macOS (debugserver) | gdbserver / QEMU (RSP) | Android (adb) | Windows x64 under Wine |
+|---|---|---|---|---|---|---|---|---|---|
+| Launch / attach | ✓ | ✓ | ✓ | ✓ | launch | ✓ (stub) | ✓ (stub) | ✓ | ✓ |
+| Software breakpoints, stepping | ✓ | ✓ | ✓ (software step) | ✓ (incl. larx/stcx.) | ✓ | ✓ | ✓ (needs Z0) | ✓ | ✓ |
+| Hardware watchpoints | ✓ (4) | ✓ (4) | – | – | – | ✓ | – | ? | ✓ |
+| Source, locals, expressions | DWARF | DWARF | DWARF | DWARF | DWARF | Mach-O, Swift names | DWARF (host) | DWARF | PE exports, SEH unwind |
+| Disassembly | ✓ | ✓ | Capstone 6 build | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Pseudo-C, Ghidra sidecar | ✓ | ✓ | ✓ (weak) | ✓ | ✓ | – | ? | ? | – |
+| Pseudo-C, native worker | ✓ (ELF) | – | – | – | – | – | – | – | – |
+| CPU profiling, flames | ✓ | – | – | – | – | – | – | – | ✓ (host) |
+| Syscall timing, allocations | ✓ | – | – | – | – | – | – | – | ? |
+| Fork/vfork following | ✓ | – | – | – | – | – | – | – | – |
+| Core dumps | ✓ | – | – | – | – | – | – | – | – |
+| Overview fd flow tracing | ✓ | – | – | – | – | – | – | – | n/a |
+| GUI host | ✓ | ✓ | – | – | – | in progress | n/a | n/a | n/a |
+
+Notes:
+- loongarch64 pseudo-C is weak: no parameter names, and calls through the PLT resolve to the wrong targets.
+- Sidecar on macOS and Wine: Ghidra itself reads Mach-O and PE, but importing a remote Mach-O or a PE image was deferred in DC4.
+- The Wine column is a guess in two places. It is x86-64 native ptrace underneath, so profiling should work via the host, but no doc claims it; that's why it says "(host)". Syscall timing and allocations under Wine are untried.
+- Several x86-64-only rows are table work, not design limits. Fd flow tracing (G22) is one; profiling and syscall timing on aarch64 are listed as remaining work in ARM64.md.
+- Android hardware watchpoints should work, since it's the same arm64 xodb, but nobody has run them on the phone.
+
 
 ## Build and run
 
-The GUI baseline is Linux x86-64, a Wayland session, a working Vulkan driver,
-and **Zig 0.16 or newer**. ARM64 currently uses the headless backend. See
-**[SETUP.md](SETUP.md)** for tracing permissions and headless builds.
+The GUI baseline is Linux x86-64/Aarch64, a Wayland session, a working Vulkan driver,
+and **Zig 0.16 or newer**. See **[SETUP.md](SETUP.md)** for tracing permissions
+and headless builds. Runs great on OmarchyMac.
 
 Install the compiler tools, development headers, shader compiler and default
 font for your distribution. These commands cover the application build;
@@ -154,16 +204,6 @@ sudo dnf install gcc zig pkgconf-pkg-config wayland-devel wayland-protocols-deve
   harfbuzz-devel capstone-devel elfutils-devel elfutils-libelf-devel \
   dejavu-sans-mono-fonts
 XODB_FONT=/usr/share/fonts/dejavu-sans-mono-fonts/DejaVuSansMono.ttf
-```
-
-```sh
-# openSUSE Tumbleweed (pkgconfig capabilities select the development packages)
-sudo zypper install gcc zig pkgconf shaderc dejavu-fonts \
-  'pkgconfig(wayland-client)' 'pkgconfig(wayland-scanner)' \
-  'pkgconfig(wayland-protocols)' 'pkgconfig(xkbcommon)' 'pkgconfig(vulkan)' \
-  'pkgconfig(freetype2)' 'pkgconfig(harfbuzz)' 'pkgconfig(capstone)' \
-  'pkgconfig(libdw)' 'pkgconfig(libelf)'
-XODB_FONT=/usr/share/fonts/truetype/DejaVuSansMono.ttf
 ```
 
 Zig is not pinned to an exact compiler version. **0.16.0** is the last verified
@@ -208,14 +248,17 @@ Ruby frames and named locals with the supported DWARF runtime), `./scripts/demo-
 `key`, the new element and the interpreter's stack through Perl's DWARF), the [M2 flow graph](docs/M2.md), and
 [flame graphs](docs/PROFILING.md).
 
+Repeat for our other supported languages and runtimes: cpython, cruby, decompile, emacs, go, lua, node, perl, python, rails, redot.
 
 ## Agents
 
 Point any MCP client at:
 
 ```text
-zig-out/bin/xodb --headless --mcp -- /absolute/path/to/program
+xodb --headless --mcp -- /absolute/path/to/program
+xodb --session-socket /tmp/xodb.mcp.sock
 ```
+TODO clean up MCP behavior
 
 Drop `--headless` and the GUI and the agent share one live session — same
 threads, same stops, same evidence. MCP `2025-06-18`, newline-delimited
@@ -237,9 +280,6 @@ investigations. [Shared-session commands and examples](docs/SHARED_SESSIONS.md).
 
 ## Current limits
 
-- Native target backends are Linux x86-64 and AArch64. Opt-in x86-64
-  [fork/vfork following](docs/PROCESS_TREES.md) retains 32 process sessions by
-  default, configurable up to 1,024. Job-control workflows remain limited.
 - Basic C/C++ types, no function calls, casts, bitfields, or inheritance.
   [Split DWARF and separate debug files](docs/DEBUG_SYMBOLS.md) are supported
   with documented limits. Signal-frame unwinding remains unsupported.
@@ -264,7 +304,7 @@ initial feature snapshot.
 
 - Skinnable, flexible display: text-size controls, skin controls and pane layouts you can save; startup themes and HiDPI backing scale are available.
 - AArch64 feature coverage: precise multi-watch attribution, modern ARM
-  validation, profiling, native ARM GUI.
+  validation, profiling
 - More architectures, and the hardware or emulation to actually validate them.
 - Your issues and PRs - file 'em please
 

@@ -1,5 +1,6 @@
 //! Import ownership: immutable evidence, a default view, independent GUI/MCP slots.
 const std = @import("std");
+const log = @import("../log.zig");
 const model = @import("imported.zig");
 const Progress = @import("archive_progress.zig").Progress;
 const a = std.heap.page_allocator;
@@ -124,7 +125,7 @@ pub const State = struct {
                 job.profile = null;
                 job.view = null;
             }
-            if (self.failure) |err| std.debug.print("xodb: profile import failed: {s}\n", .{@errorName(err)}) else std.debug.print("xodb: imported {s}: {d} samples, {d} {s}, labels=simpleperf\n", .{ self.profile.?.wire.architecture, self.full.?.samples, self.full.?.total_period, self.profile.?.wire.unit });
+            if (self.failure) |err| log.err(.profile, "xodb: profile import failed: {s}\n", .{@errorName(err)}) else log.info(.profile, "xodb: imported {s}: {d} samples, {d} {s}, labels=simpleperf\n", .{ self.profile.?.wire.architecture, self.full.?.samples, self.full.?.total_period, self.profile.?.wire.unit });
             job.deinit();
             self.load_job = null;
             self.serial += 1;

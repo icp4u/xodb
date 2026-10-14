@@ -10,6 +10,7 @@
 //! split edge); the huge zero page is never THP; NUMA is shown only as the
 //! whole VMA's totals. Cells are one instanced batch (render/cell.vert).
 const std = @import("std");
+const log = @import("../../log.zig");
 const c = @import("../../c_ui.zig").api;
 const draw = @import("draw.zig");
 const vw = @import("view.zig");
@@ -890,7 +891,7 @@ fn details(v: *vw.View, ctx: Ctx, r: Rect, src: *Sources) !void {
         const h = hv.final();
         if (h != audited_detail) {
             audited_detail = h;
-            std.debug.print("xodb: memmap deep detail {s} | {s} | {s}\n", .{ lines[0], lines[1], lines[2] });
+            log.info(.overview, "xodb: memmap deep detail {s} | {s} | {s}\n", .{ lines[0], lines[1], lines[2] });
         }
     }
 }
@@ -1016,7 +1017,7 @@ fn audit(d: *Deep) void {
     const partial = std.fmt.bufPrint(&partial_buf, "partial_frames={d} partial_origin=0x{x} partial_cell={d} partial_pending={d} partial_count={d}", .{
         d.partial.frames, d.partial.origin, d.partial.cell, d.partial.pending, d.partial.count,
     }) catch unreachable;
-    std.debug.print("xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1} nav={d} pulse={d} {s}\n", .{
+    log.info(.overview, "xodb: memmap deep x={d:.1} y={d:.1} pitch={d:.3} cols={d} rows={d} origin=0x{x} cell={d} count={d} pending={d} unknown={d} gap={d} thp={d} mixed={d} anon={d} file={d} zero={d} other={d} changed={d} collapsed={d} split={d} mini={d:.1},{d:.1},{d:.1},{d:.1} box={d:.1}..{d:.1} nav={d} pulse={d} {s}\n", .{
         d.field.x, d.field.y, d.pitch,  d.cols,   d.rows,          d.origin,                   d.cell(),                   d.count(), k.pending, k.unknown, k.gap, k.thp, k.mixed, k.anon, k.file, k.zero, k.other, k.changed, k.collapsed, k.split,
         d.mini.x,  d.mini.y,  d.mini.w, d.mini.h, miniX(d.origin), miniX(d.origin + d.span()), @intFromBool(d.nav.active), d.pulse,   partial,
     });
@@ -1031,7 +1032,7 @@ pub fn perfLine(v: *vw.View, d: *Deep, look: []const u8, cells: usize, now: u64)
     pf.frame_max = @max(pf.frame_max, v.last_frame_ns);
     if (now -| pf.window_start < 1_000_000_000) return;
     const secs = @as(f64, @floatFromInt(now - pf.window_start)) / 1e9;
-    std.debug.print("xodb: memmap perf look={s} frames={d} fps={d:.1} cells={d} frame_cpu_ms_avg={d:.3} frame_cpu_ms_max={d:.3} builds={d} build_ms_avg={d:.3} build_ms_max={d:.3}\n", .{
+    log.info(.overview, "xodb: memmap perf look={s} frames={d} fps={d:.1} cells={d} frame_cpu_ms_avg={d:.3} frame_cpu_ms_max={d:.3} builds={d} build_ms_avg={d:.3} build_ms_max={d:.3}\n", .{
         look,                                                                            pf.frames,                                   @as(f64, @floatFromInt(pf.frames)) / secs, cells,
         @as(f64, @floatFromInt(pf.frame_ns)) / 1e6 / @as(f64, @floatFromInt(pf.frames)), @as(f64, @floatFromInt(pf.frame_max)) / 1e6, pf.builds,                                 if (pf.builds == 0) 0 else @as(f64, @floatFromInt(pf.build_ns)) / 1e6 / @as(f64, @floatFromInt(pf.builds)),
         @as(f64, @floatFromInt(pf.build_max)) / 1e6,

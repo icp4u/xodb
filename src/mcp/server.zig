@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c.zig").api;
 const Session = @import("../model/session.zig").Session;
 const disasm = @import("../model/disassembly.zig");
@@ -133,6 +134,7 @@ pub const Server = struct {
             self.sent = 0;
         }
         if (bytes.len + 1 > self.output.len - self.queued) return error.McpClientNotReading;
+        log.trace(.mcp, "mcp out: {d} bytes\n", .{bytes.len});
         @memcpy(self.output[self.queued..][0..bytes.len], bytes);
         self.queued += bytes.len;
         self.output[self.queued] = '\n';
@@ -683,6 +685,11 @@ pub const Server = struct {
         if (!std.mem.eql(u8, version, "2.0") or method.len == 0 or (id != .null and id != .string and id != .integer)) {
             try self.failure(a, .null, -32600, "Invalid Request");
             return;
+        }
+        // Names and sizes only: a payload can hold target memory.
+        if (log.on(.mcp, .trace)) {
+            const called = string(member(member(request, "params") orelse Value.null, "name")) orelse "";
+            log.trace(.mcp, "mcp in {s}{s}{s}: {d} bytes\n", .{ method[0..@min(method.len, 64)], if (called.len > 0) " " else "", called[0..@min(called.len, 64)], line.len });
         }
         if (member(request, "id") == null) {
             if (std.mem.eql(u8, method, "notifications/initialized") and self.negotiated) self.initialized = true;

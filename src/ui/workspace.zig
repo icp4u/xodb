@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 const gpu = @import("../render/vulkan.zig");
 const Font = @import("../render/font.zig").Font;
@@ -657,13 +658,13 @@ pub const Workspace = struct {
         if (self.show_profile and self.timeline.motion(w.pointer_x, w.pointer_y)) w.dirty = true;
         self.step(w, context, false, 0);
         if (w.input.dropped != self.reported_dropped) {
-            std.debug.print("Input queue dropped {d} events ({d} total)\n", .{ w.input.dropped - self.reported_dropped, w.input.dropped });
+            log.warn(.window, "Input queue dropped {d} events ({d} total)\n", .{ w.input.dropped - self.reported_dropped, w.input.dropped });
             self.reported_dropped = w.input.dropped;
             self.status = "Some input was dropped; try again";
             w.dirty = true;
         }
         if (w.input.keymap_errors != self.reported_keymap_errors) {
-            std.debug.print("Input keymap errors: {d}\n", .{w.input.keymap_errors});
+            log.warn(.window, "Input keymap errors: {d}\n", .{w.input.keymap_errors});
             self.reported_keymap_errors = w.input.keymap_errors;
             self.status = "Keyboard layout unavailable; mouse controls still work";
             w.dirty = true;
@@ -713,9 +714,9 @@ pub const Workspace = struct {
                     return;
                 }
                 if (w.input.trace) {
-                    std.debug.print("static functions:", .{});
-                    for (functions.items) |f| std.debug.print(" {s}", .{f.name});
-                    std.debug.print("\n", .{});
+                    log.info(.window, "static functions:", .{});
+                    for (functions.items) |f| log.info(.window, " {s}", .{f.name});
+                    log.info(.window, "\n", .{});
                 }
                 self.static_panel.show(.{ .line = .{ .path = self.source_path, .line = line, .addresses = addresses, .functions = functions.items } });
                 return;
@@ -748,13 +749,13 @@ pub const Workspace = struct {
         const panel = &self.static_panel;
         if (!w.input.trace or panel.answers == self.static_traced) return;
         self.static_traced = panel.answers;
-        std.debug.print("static answer: {s} | {s} | {s} | rows={d}\n", .{ panel.heading, panel.summary, panel.parameters, panel.rows.len });
-        for (panel.rows) |row| std.debug.print("static row: {s} 0x{x} {s}\n", .{ row.certainty, row.address orelse 0, row.label });
+        log.info(.window, "static answer: {s} | {s} | {s} | rows={d}\n", .{ panel.heading, panel.summary, panel.parameters, panel.rows.len });
+        for (panel.rows) |row| log.info(.window, "static row: {s} 0x{x} {s}\n", .{ row.certainty, row.address orelse 0, row.label });
     }
     /// A chosen static citation browses the assembly and source to it.
     pub fn followStatic(self: *Workspace, w: *Window) void {
         const address = self.static_panel.navigate orelse return;
-        if (w.input.trace) std.debug.print("static navigate: 0x{x}\n", .{address});
+        if (w.input.trace) log.info(.window, "static navigate: 0x{x}\n", .{address});
         self.static_panel.navigate = null;
         self.browse_address = address;
         self.browse_assembly = address;

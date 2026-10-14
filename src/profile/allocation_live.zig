@@ -1,6 +1,7 @@
 //! One process's allocation preparation, collection and finalized evidence.
 //! The session owner publishes workers only against an unchanged stopped target.
 const std = @import("std");
+const log = @import("../log.zig");
 const linux = @import("../target/linux.zig");
 const modules = @import("../model/modules.zig");
 const hooks = @import("allocation_hooks.zig");
@@ -235,7 +236,7 @@ pub const Live = struct {
         }
         self.stopped_ns = linux.now();
         if (reason == .image_changed or reason == .mapping_changed or reason == .scope_changed or reason == .collector_error) self.capture.?.abort(.identity);
-        std.debug.print("xodb: allocation capture {d} stop={s}\n", .{ self.capture.?.identity.capture_id, @tagName(reason) });
+        log.info(.profile, "xodb: allocation capture {d} stop={s}\n", .{ self.capture.?.identity.capture_id, @tagName(reason) });
     }
     fn complete(self: *Live) void {
         self.serial += 1;
@@ -243,7 +244,7 @@ pub const Live = struct {
             self.cleanup = Cleanup.create(collector) catch |err| blk: {
                 // Resource exhaustion still needs deterministic descriptor
                 // cleanup; report the exceptional synchronous fallback.
-                std.debug.print("xodb: allocation cleanup worker failed: {s}; closing synchronously\n", .{@errorName(err)});
+                log.err(.profile, "xodb: allocation cleanup worker failed: {s}; closing synchronously\n", .{@errorName(err)});
                 collector.close();
                 break :blk null;
             };
@@ -296,12 +297,12 @@ pub const Live = struct {
                     self.reason = null;
                     self.stopped_ns = null;
                     self.unread = false;
-                    std.debug.print("xodb: allocation capture {d} started: {d} threads, {d} hooks\n", .{ candidate.identity.capture_id, candidate.thread_count, candidate.hook_count });
+                    log.info(.profile, "xodb: allocation capture {d} started: {d} threads, {d} hooks\n", .{ candidate.identity.capture_id, candidate.thread_count, candidate.hook_count });
                 }
             }
             if (self.err) |err| {
-                std.debug.print("xodb: allocation preparation failed: {s}\n", .{@errorName(err)});
-                if (self.failure) |failure| std.debug.print("xodb: allocations: syscall={s} errno={d} tid={d}; {s}\n", .{ failure.syscall, failure.errno, failure.tid, failure.detail });
+                log.err(.profile, "xodb: allocation preparation failed: {s}\n", .{@errorName(err)});
+                if (self.failure) |failure| log.err(.profile, "xodb: allocations: syscall={s} errno={d} tid={d}; {s}\n", .{ failure.syscall, failure.errno, failure.tid, failure.detail });
             }
         };
         const collector = self.collector orelse return;
@@ -333,7 +334,7 @@ pub const Live = struct {
                     break :blk null;
                 },
                 .mapping_change => |change| blk: {
-                    std.debug.print("xodb: allocation executable mapping changed: {s} prot={d} device={d} inode={d}\n", .{ std.mem.sliceTo(&change.name, 0), change.prot, change.device, change.inode });
+                    log.warn(.profile, "xodb: allocation executable mapping changed: {s} prot={d} device={d} inode={d}\n", .{ std.mem.sliceTo(&change.name, 0), change.prot, change.device, change.inode });
                     capture.abort(.identity);
                     self.stop(.mapping_changed);
                     break :blk null;
@@ -346,7 +347,7 @@ pub const Live = struct {
                             break :blk null;
                         }
                     };
-                    std.debug.print("xodb: allocation probe trampoline [uprobes] at 0x{x}..0x{x}\n", .{ mapping.start, mapping.end });
+                    log.info(.profile, "xodb: allocation probe trampoline [uprobes] at 0x{x}..0x{x}\n", .{ mapping.start, mapping.end });
                     break :blk null;
                 },
                 .rename => null,

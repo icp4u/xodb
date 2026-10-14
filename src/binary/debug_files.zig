@@ -1,5 +1,6 @@
 //! Verified immutable debug companions, explicit or discovered locally.
 const std = @import("std");
+const log = @import("../log.zig");
 const c = @import("../c.zig").api;
 const elf = @import("elf.zig");
 const snapshot = @import("snapshot.zig");
@@ -105,7 +106,7 @@ pub const Files = struct {
     }
     fn attempt(self: *Files, runtime: *const elf.Image, path: [:0]const u8, crc: ?u32) ?*const File {
         return self.candidate(runtime, path, crc) catch |err| {
-            std.debug.print("xodb: automatic debug companion rejected: {s}; {s}\n", .{ @errorName(err), path });
+            log.warn(.session, "xodb: automatic debug companion rejected: {s}; {s}\n", .{ @errorName(err), path });
             return null;
         };
     }
