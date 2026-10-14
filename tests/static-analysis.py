@@ -316,7 +316,10 @@ def stripped():
     try:
         r = poll(c, 'analyze_function', symbol='fx_calls')
         f = r.get('job', {}).get('failure') or {}
-        if r.get('status') == 'failed':
+        if r.get('status') == 'graph_unavailable':
+            # A refused graph is no longer a failed job: the pseudo-C stays, the graph answer is a typed refusal.
+            check('stripped O2 fx_calls: the PIC call-to-branch case stays a refusal', r.get('reason') == 'adapter_refused' and 'no block starts at function entry' in r.get('detail', '') and r.get('decompile_available') is True, r)
+        elif r.get('status') == 'failed':
             check('stripped O2 fx_calls: the PIC call-to-branch case stays a refusal', f.get('code') == 'adapter_refused' and 'no block starts at function entry' in f.get('detail', ''), f)
         else:
             codes = [x['code'] for x in r.get('analysis', {}).get('qualification', {}).get('reasons', [])]
@@ -336,6 +339,11 @@ def entrypads():
         check('CET fixture: native worker graph admits the no-pcode entry pad', r.get('status') == 'completed' and r.get('analysis', {}).get('function') == 'qx_alloc', r)
         pseudo = tool(c, 'decompile_function', address=hex(entry))
         check('CET fixture: native worker pseudo-C is available at the function identity', pseudo.get('status') == 'completed' and 'qx_alloc' in pseudo.get('signature', '') and 'malloc' in pseudo.get('text', ''), pseudo)
+        at_entry = tool(c, 'get_decomp_mapping', artifact_id=pseudo['artifact_id'], pc=hex(entry))
+        check('CET fixture: entry stop maps to the first code line', at_entry.get('tokens') and all(row.get('entry_pad') and row.get('pc') == hex(entry) for row in at_entry['tokens']), at_entry)
+        mapped_line = at_entry['tokens'][0]['line'] if at_entry.get('tokens') else 0
+        from_line = tool(c, 'get_decomp_mapping', artifact_id=pseudo['artifact_id'], line=mapped_line)
+        check('CET fixture: clicking the first code line includes the entry pad', hex(entry) in from_line.get('runtime_pcs', ()) and any(row.get('entry_pad') for row in from_line.get('tokens', ())), from_line)
     finally:
         close(c)
 

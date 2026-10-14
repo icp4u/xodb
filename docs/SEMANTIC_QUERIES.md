@@ -475,7 +475,7 @@ op's output is sliced.
 |---|---|
 | `analyze_function` (`address` or `symbol`) | job status, then the summary: bounds and their source, image identity, qualification reasons, parameters, calls. Poll with the same arguments. |
 | `decompile_function` (`address` or `symbol`) | the exact retained pseudo-C text, signature, qualification and reasons, token/map status, and artifact id. It starts or polls the same per-function job as `analyze_function`. |
-| `get_decomp_mapping` (`artifact_id`; optional exact `pc`, pseudo-C `line`, or half-open `token_start`+`token_end`) | cached token positions and their exported runtime PCs and debugger source rows. Tokens without a worker PC stay unmapped; no nearest instruction is guessed. |
+| `get_decomp_mapping` (`artifact_id`; optional exact `pc`, pseudo-C `line`, or half-open `token_start`+`token_end`) | cached token positions and their exported runtime PCs and debugger source rows. A byte in an adapter-proven entry landing pad maps to the first exported code line and carries `entry_pad: true`; selecting that line includes every pad byte. Other tokens without a worker PC stay unmapped; no nearest instruction is guessed. |
 | `slice_value` (`pc`, `file`+`line` or `op`; `input`, `data_only`) | per-parameter relevance (`direct`, `possible`, `control`, `irrelevant`, `unknown`; `irrelevant` only for an exhaustive slice), contributing values with defining and reading ops, instruction citations with source lines, boundaries, limits |
 | `control_dependencies` (same selection) | branches deciding whether the op runs, the edge, `direct`/`transitive`, and which parameters feed each direct condition |
 | `cancel_static_analysis` (`job_id`) | stops the running job |

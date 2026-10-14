@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[1]
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
+    (('src/semq/adapter*', 'scripts/semq/c01_to_xsg.py', 'tests/semq/test_adapter.py'), ('semq-adapter',)),
     (('src/render/*', 'src/platform/*', 'src/ui/overview/*', 'tests/ui-scale-gui.py'), ('gui-galaxy-scale', 'gui-galaxy-churn')),
     (('tests/thread-language-tabs.py', 'tests/fixtures/thread-interpreters.c'), ('language-thread-tabs*', 'gui-language-thread-tabs')),
     (('src/redot/*', 'src/mcp/redot*', 'src/ui/redot*.zig', 'scripts/helpers/redot*', 'tests/fixtures/redot-time/*'), ('redot-*',)),
@@ -464,11 +465,12 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
                      'comparison', 'scheduling-decode', 'observation-experiments',
                      'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
+        steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
         for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges', 'fork-release'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))

@@ -124,7 +124,12 @@ pub const Preferences = struct {
         ui_scale: ?f32 = null,
     } = .{},
     languages: Languages = .{},
-    decompiler: struct { prestart: bool = true } = .{},
+    decompiler: struct {
+        prestart: bool = true,
+        /// Eagerly import shared libraries no larger than this. The main
+        /// executable is always eligible; larger libraries load on demand.
+        eager_library_bytes: u64 = 1024 * 1024,
+    } = .{},
     galaxy: Galaxy = .{},
     gibson: Gibson = .{},
 };
@@ -152,6 +157,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
         if (n < snapshot.min_limit or n > snapshot.max_limit) return error.InvalidImageBudget;
     };
     if (parsed.value.appearance.ui_scale) |scale| _ = @import("platform/window.zig").validateScale(scale) catch return error.InvalidUiScale;
+    if (parsed.value.decompiler.eager_library_bytes > 1024 * 1024 * 1024) return error.InvalidDecompilerBudget;
     return parsed.value;
 }
 pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
@@ -210,9 +216,14 @@ test "language views default on, turn off one at a time or all at once, and refu
     try std.testing.expectError(error.UnknownLanguage, cli.turnOff("cobol"));
 }
 
-test "Ghidra eager startup defaults on and can be disabled" {
-    try std.testing.expect((try parse(std.testing.allocator, "{}")).decompiler.prestart);
-    try std.testing.expect(!(try parse(std.testing.allocator, "{\"decompiler\":{\"prestart\":false}}")).decompiler.prestart);
+test "Ghidra eager startup and library byte bound are validated" {
+    const defaults = try parse(std.testing.allocator, "{}");
+    try std.testing.expect(defaults.decompiler.prestart);
+    try std.testing.expectEqual(@as(u64, 1024 * 1024), defaults.decompiler.eager_library_bytes);
+    const changed = try parse(std.testing.allocator, "{\"decompiler\":{\"prestart\":false,\"eager_library_bytes\":8388608}}");
+    try std.testing.expect(!changed.decompiler.prestart);
+    try std.testing.expectEqual(@as(u64, 8 * 1024 * 1024), changed.decompiler.eager_library_bytes);
+    try std.testing.expectError(error.InvalidDecompilerBudget, parse(std.testing.allocator, "{\"decompiler\":{\"eager_library_bytes\":1073741825}}"));
 }
 
 test "preferences partial defaults, custom and unlimited durations, typo and type errors" {

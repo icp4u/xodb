@@ -943,6 +943,12 @@ pub const Workspace = struct {
             w.dirty = true;
             return;
         }
+        if ((code == 26 or code == 27) and self.static_panel.decompile_open and !self.show_profile) {
+            self.static_panel.scrollDecompile(if (code == 26) -8 else 8);
+            self.status = "Pseudo-C horizontal scroll";
+            w.dirty = true;
+            return;
+        }
         if (code == 23 and !self.show_profile) {
             self.stop_panel.open = false;
             self.probes_panel.open = false;
@@ -2183,7 +2189,7 @@ pub const Workspace = struct {
 
     fn drawPseudoC(self: *Workspace, r: *gpu.Renderer, font: *Font, left: f32, right: f32, bottom: f32, body_y: f32, thread_color: gpu.Color) !void {
         const rect = gpu.Rect{ .x = left + 2, .y = body_y, .w = right - left - 6, .h = bottom - body_y - 5 };
-        try pane(r, font, rect, "PSEUDO-C", "D assembly / S queries");
+        try pane(r, font, rect, "PSEUDO-C", "D assembly / [ ] horizontal / S queries");
         const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
         // The pane follows the stop: a new stop drops the old selection, and
         // one outside the shown function reopens the pane there.
@@ -2212,7 +2218,19 @@ pub const Workspace = struct {
         @memcpy(observed[0..observed_prefix.len], observed_prefix);
         var observed_len: usize = observed_prefix.len;
         var observed_count: usize = 0;
+        for (view.pseudo_values) |value| {
+            if (observed_count == 6) break;
+            const written = std.fmt.bufPrint(observed[observed_len..], "  {s}={s}", .{ value.name, value.display }) catch break;
+            observed_len += written.len;
+            observed_count += 1;
+        }
         for (self.locals) |local| if (local.parameter and local.value.availability == .available and observed_count < 6) {
+            var duplicate = false;
+            for (view.pseudo_values) |value| if (std.mem.eql(u8, value.name, local.name)) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
             const written = std.fmt.bufPrint(observed[observed_len..], "  {s}={s}", .{ local.name, local.value.display }) catch break;
             observed_len += written.len;
             observed_count += 1;
@@ -2231,6 +2249,9 @@ pub const Workspace = struct {
             shown += 1;
             const row = gpu.Rect{ .x = left + 4, .y = y - 2, .w = rect.w - 6, .h = 23 };
             var current = false;
+            if (view.pseudo_entry_pad) |pad| {
+                if (current_pc) |pc| current = line_number == pad.line and pc >= pad.start and pc < pad.end;
+            }
             var breakpoint = false;
             for (view.pseudo_tokens) |token| if (token.line == line_number) {
                 if (token.pc == current_pc) current = true;
@@ -2249,36 +2270,48 @@ pub const Workspace = struct {
             // One exact live-value annotation per row. Reserve its column
             // before drawing code so the static text and observed value never
             // paint over one another.
-            var annotation: ?LocalRow = null;
+            var annotation_name: ?[]const u8 = null;
+            var annotation_display: []const u8 = "";
             for (view.pseudo_tokens) |token| if (token.line == line_number and std.mem.eql(u8, token.kind, "variable")) {
+                for (view.pseudo_values) |value| if (std.mem.eql(u8, value.name, token.text)) {
+                    annotation_name = value.name;
+                    annotation_display = value.display;
+                    break;
+                };
+                if (annotation_name != null) break;
                 if (token.parameter) |wanted| {
                     var ordinal: u32 = 0;
                     for (self.locals) |local| if (local.parameter) {
                         if (ordinal == wanted) {
-                            annotation = local;
+                            if (local.value.availability == .available) {
+                                annotation_name = local.name;
+                                annotation_display = local.value.display;
+                            }
                             break;
                         }
                         ordinal += 1;
                     };
-                } else for (self.locals) |local| if (std.mem.eql(u8, local.name, token.text)) {
-                    annotation = local;
+                } else for (self.locals) |local| if (std.mem.eql(u8, local.name, token.text) and local.value.availability == .available) {
+                    annotation_name = local.name;
+                    annotation_display = local.value.display;
                     break;
                 };
-                if (annotation != null) break;
+                if (annotation_name != null) break;
             };
             var note: [192]u8 = undefined;
             var note_text: []const u8 = "";
             var note_w: f32 = 0;
-            if (annotation) |local| if (local.value.availability == .available) {
-                note_text = std.fmt.bufPrint(&note, "{s} = {s}", .{ local.name, local.value.display }) catch "";
+            if (annotation_name) |name| {
+                note_text = std.fmt.bufPrint(&note, "{s} = {s}", .{ name, annotation_display }) catch "";
                 note_w = @min(rect.w * 0.30, r.measure(font, note_text) + 10);
                 // The code comes first: a value that would cut it stays on the "observed now" row.
                 if (left + 62 + r.measure(font, line) > right - 24 - note_w) note_text = "";
-            };
+            }
             const note_x = right - 8 - note_w;
             const code_right = if (note_text.len > 0) note_x - 8 else right - 8;
             var x = left + 62;
-            var col: usize = 0;
+            var col = @min(self.static_panel.decompile_column, line.len);
+            while (col < line.len and line[col] & 0xc0 == 0x80) col += 1;
             for (view.pseudo_tokens) |token| if (token.line == line_number) {
                 const token_col: usize = token.col;
                 if (token_col < col or token_col > line.len) continue;

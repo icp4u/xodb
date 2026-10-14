@@ -7,11 +7,12 @@ import java.nio.*;
 import java.nio.channels.*;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.nio.file.attribute.PosixFilePermissions;
 import java.security.MessageDigest;
 import java.util.*;
 import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.*;
 
 import com.google.gson.*;
 import com.sun.security.auth.module.UnixSystem;
@@ -30,6 +31,7 @@ import ghidra.app.util.opinion.LoadResults;
 import ghidra.base.project.GhidraProject;
 import ghidra.framework.Application;
 import ghidra.framework.HeadlessGhidraApplicationConfiguration;
+import ghidra.framework.model.DomainFile;
 import ghidra.framework.options.Options;
 import ghidra.program.database.ProgramDB;
 import ghidra.program.model.address.*;
@@ -47,7 +49,7 @@ import ghidra.util.task.TaskMonitorAdapter;
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.2";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.5";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -57,15 +59,32 @@ public final class XodbGhidraSidecar {
     final Path logPath;
     final long uid = new UnixSystem().getUid();
     final AtomicBoolean stopping = new AtomicBoolean(false);
+    final AtomicInteger connectedClients = new AtomicInteger();
+    final AtomicLong lastRequestNanos = new AtomicLong(System.nanoTime());
     final ExecutorService clients = Executors.newCachedThreadPool();
-    final ExecutorService ghidra = Executors.newSingleThreadExecutor();
+    final ThreadPoolExecutor ghidra = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new PriorityBlockingQueue<>());
+    final ScheduledExecutorService lifetime = Executors.newSingleThreadScheduledExecutor();
     final ConcurrentMap<String, Work> jobs = new ConcurrentHashMap<>();
     final ConcurrentMap<String, Image> images = new ConcurrentHashMap<>();
     final ConcurrentMap<String, byte[]> documents = new ConcurrentHashMap<>();
+    // Only the single Ghidra worker touches this access-ordered pool.
+    final LinkedHashMap<String, OpenProgram> openPrograms = new LinkedHashMap<>(16, .75f, true);
+    final AtomicLong taskSequence = new AtomicLong();
+    final AtomicLong workSequence = new AtomicLong();
+    final AtomicReference<Work> runningBackground = new AtomicReference<>();
+    final AtomicInteger openProgramCount = new AtomicInteger();
+    final AtomicLong projectCacheBytes = new AtomicLong();
+    final HashMap<String, Long> imageLastUsed = new HashMap<>();
     final int maxImages = envInt("XODB_GHIDRA_MAX_IMAGES", 64, 1, 4096);
     final int maxDocuments = envInt("XODB_GHIDRA_MAX_DOCUMENTS", 1024, 1, 65536);
+    final int maxOpenPrograms = envInt("XODB_GHIDRA_MAX_OPEN_PROGRAMS", 8, 1, 64);
+    final long maxCacheBytes = envLong("XODB_GHIDRA_CACHE_BYTES", 2L << 30, 64L << 20, 1L << 40);
+    final double idleMinutes = envDouble("XODB_GHIDRA_IDLE", 30.0, 0.0, 10080.0);
+    final long idleNanos = idleMinutes == 0 ? 0 : Math.max(1, (long)(idleMinutes * 60.0 * 1_000_000_000.0));
     final GhidraProject project;
     ServerSocketChannel listener;
+    Object boundSocketKey;
+    volatile String stopReason = "running";
 
     static final class Image {
         final String sha;
@@ -87,7 +106,52 @@ public final class XodbGhidraSidecar {
         volatile String detail;
         volatile byte[] payload;
         volatile Future<?> future;
+        volatile boolean background;
         Work(String id) { this.id = id; }
+    }
+    static final class PrioritizedTask extends FutureTask<Void> implements Comparable<PrioritizedTask> {
+        final int priority;
+        final long sequence;
+        PrioritizedTask(Runnable run, int priority, long sequence) { super(run, null); this.priority = priority; this.sequence = sequence; }
+        public int compareTo(PrioritizedTask other) {
+            int order = Integer.compare(priority, other.priority);
+            return order != 0 ? order : Long.compare(sequence, other.sequence);
+        }
+    }
+    static final class OpenProgram {
+        final String sha;
+        final Program program;
+        final DecompInterface decompiler;
+        long lastUsedNanos = System.nanoTime();
+        OpenProgram(String sha, Program program, DecompInterface decompiler) { this.sha = sha; this.program = program; this.decompiler = decompiler; }
+    }
+
+    Work makeWork(String key) {
+        return new Work(key + ":" + workSequence.getAndIncrement());
+    }
+
+    Work findWork(String id) {
+        for (Work work : jobs.values()) if (work.id.equals(id)) return work;
+        return null;
+    }
+
+    Future<?> submitGhidra(Work work, boolean background, Runnable action) {
+        work.background = background;
+        PrioritizedTask task = new PrioritizedTask(() -> {
+            if (background) runningBackground.set(work);
+            try { action.run(); }
+            finally { if (background) runningBackground.compareAndSet(work, null); }
+        }, background ? 10 : 0, taskSequence.getAndIncrement());
+        ghidra.execute(task);
+        return task;
+    }
+
+    void preemptBackground() {
+        Work work = runningBackground.get();
+        if (work == null || !work.state.equals("pending")) return;
+        work.monitor.cancel();
+        Future<?> future = work.future;
+        if (future != null) future.cancel(true);
     }
 
     XodbGhidraSidecar(Path socketPath, Path cacheDir, Path logPath) throws Exception {
@@ -102,6 +166,7 @@ public final class XodbGhidraSidecar {
         this.project = Files.exists(parent.resolve(name + ".gpr"))
             ? GhidraProject.openProject(parent.toString(), name, true)
             : GhidraProject.createProject(parent.toString(), name, false);
+        projectCacheBytes.set(cacheUsage());
     }
 
     public static void main(String[] args) throws Exception {
@@ -118,26 +183,69 @@ public final class XodbGhidraSidecar {
         listener = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
         listener.bind(UnixDomainSocketAddress.of(socketPath));
         Files.setPosixFilePermissions(socketPath, PosixFilePermissions.fromString("rw-------"));
+        boundSocketKey = socketKey();
+        lastRequestNanos.set(System.nanoTime());
+        long pollSeconds = Math.max(1, Math.min(60, idleNanos == 0 ? 60 : TimeUnit.NANOSECONDS.toSeconds(idleNanos)));
+        lifetime.scheduleWithFixedDelay(this::checkLifetime, pollSeconds, pollSeconds, TimeUnit.SECONDS);
         try {
             while (!stopping.get()) {
                 SocketChannel channel;
                 try { channel = listener.accept(); }
                 catch (AsynchronousCloseException e) { break; }
-                clients.submit(() -> serve(channel));
+                connectedClients.incrementAndGet();
+                try { clients.submit(() -> serve(channel)); }
+                catch (RejectedExecutionException e) {
+                    connectedClients.decrementAndGet();
+                    try { channel.close(); } catch (Exception ignored) {}
+                    if (!stopping.get()) throw e;
+                }
             }
         } finally {
             stopping.set(true);
             try { listener.close(); } catch (Exception ignored) {}
+            lifetime.shutdownNow();
             clients.shutdownNow();
             ghidra.shutdownNow();
             for (Work work : jobs.values()) work.monitor.cancel();
+            try { ghidra.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+            closeOpenPrograms();
             project.close();
             // Ghidra's helper children (the demangler) must not outlive the sidecar.
             for (ProcessHandle child : ProcessHandle.current().children().toList()) {
                 child.destroyForcibly();
                 try { child.onExit().get(2, TimeUnit.SECONDS); } catch (Exception ignored) {}
             }
-            try { Files.deleteIfExists(socketPath); } catch (Exception ignored) {}
+            try { if (ownsEndpoint()) Files.deleteIfExists(socketPath); } catch (Exception ignored) {}
+        }
+    }
+
+    Object socketKey() throws IOException {
+        return Files.readAttributes(socketPath, BasicFileAttributes.class, LinkOption.NOFOLLOW_LINKS).fileKey();
+    }
+
+    boolean ownsEndpoint() {
+        try {
+            if (!Files.exists(socketPath, LinkOption.NOFOLLOW_LINKS)) return false;
+            Object current = socketKey();
+            return boundSocketKey == null ? current == null : boundSocketKey.equals(current);
+        } catch (Exception ignored) { return false; }
+    }
+
+    void requestStop(String reason) {
+        if (!stopping.compareAndSet(false, true)) return;
+        stopReason = reason;
+        System.err.println("lifetime: stopping: " + reason);
+        try { listener.close(); } catch (Exception ignored) {}
+    }
+
+    void checkLifetime() {
+        try {
+            if (stopping.get()) return;
+            if (!ownsEndpoint()) { requestStop("endpoint_replaced"); return; }
+            if (idleNanos != 0 && connectedClients.get() == 0 && System.nanoTime() - lastRequestNanos.get() >= idleNanos)
+                requestStop("idle");
+        } catch (Throwable error) {
+            System.err.println("lifetime: " + error);
         }
     }
 
@@ -154,10 +262,13 @@ public final class XodbGhidraSidecar {
                 try { handle(request, out); }
                 catch (Failure e) { sendFailure(out, text(request, "id", "?"), e.code, e.getMessage()); }
                 catch (Exception e) { sendFailure(out, text(request, "id", "?"), "request_failed", e.getMessage()); }
+                // A hello is a probe, not use: `scripts/ghidra-sidecar status` sends one
+                // first, and counting it would make every status print an idle time of zero.
+                finally { if (!text(request, "verb", "").equals("hello")) lastRequestNanos.set(System.nanoTime()); }
             }
         } catch (Exception e) {
             if (!stopping.get()) System.err.println("client: " + e);
-        }
+        } finally { connectedClients.decrementAndGet(); }
     }
 
     void handle(JsonObject request, OutputStream out) throws Exception {
@@ -195,8 +306,8 @@ public final class XodbGhidraSidecar {
         String architecture = required(q, "architecture");
         String jobId = "prime:" + architecture;
         Work work = jobs.computeIfAbsent(jobId, key -> {
-            Work made = new Work(key);
-            made.future = ghidra.submit(() -> primeArchitecture(architecture, made));
+            Work made = makeWork(key);
+            made.future = submitGhidra(made, true, () -> primeArchitecture(architecture, made));
             return made;
         });
         sendWork(out, id, work);
@@ -265,7 +376,7 @@ public final class XodbGhidraSidecar {
 
     void status(OutputStream out, String id, String jobId) throws Exception {
         if (jobId != null) {
-            Work work = jobs.get(jobId);
+            Work work = findWork(jobId);
             if (work == null) { sendFailure(out, id, "unknown_job", jobId); return; }
             sendWork(out, id, work);
             return;
@@ -280,6 +391,14 @@ public final class XodbGhidraSidecar {
         r.addProperty("queue", jobs.values().stream().filter(x -> x.state.equals("pending")).count());
         r.addProperty("max_images", maxImages);
         r.addProperty("max_documents", maxDocuments);
+        r.addProperty("documents_cached", documents.size());
+        r.addProperty("open_programs", openProgramCount.get());
+        r.addProperty("max_open_programs", maxOpenPrograms);
+        r.addProperty("cache_bytes", projectCacheBytes.get());
+        r.addProperty("cache_limit_bytes", maxCacheBytes);
+        r.addProperty("idle_seconds", (System.nanoTime() - lastRequestNanos.get()) / 1_000_000_000.0);
+        r.addProperty("idle_limit_seconds", idleNanos == 0 ? 0 : idleNanos / 1_000_000_000.0);
+        r.addProperty("clients_connected", connectedClients.get());
         r.addProperty("pid", ProcessHandle.current().pid());
         send(out, r, null);
     }
@@ -289,15 +408,24 @@ public final class XodbGhidraSidecar {
         String path = required(q, "path");
         if (!sha.matches("[0-9a-f]{64}")) { sendFailure(out, id, "bad_sha256", sha); return; }
         String jobId = "open:" + sha;
-        if (!images.containsKey(sha) && images.size() >= maxImages) {
-            sendFailure(out, id, "cache_full", "image cache limit " + maxImages + "; raise XODB_GHIDRA_MAX_IMAGES or delete the private cache");
-            return;
-        }
         if (!jobs.containsKey(jobId) && jobs.size() >= maxImages + maxDocuments + 128) {
             sendFailure(out, id, "queue_full", "retained job limit reached; restart the sidecar");
             return;
         }
         boolean background = q.has("background") && q.get("background").isJsonPrimitive() && q.get("background").getAsBoolean();
+        if (!background) {
+            preemptBackground();
+            Work oldWork = jobs.get(jobId);
+            Image oldImage = images.get(sha);
+            // An explicit request restarts an import that it just pre-empted;
+            // the old task owns a different Image object and cannot clobber it.
+            if (oldWork != null && oldWork.background && oldWork.state.equals("pending")) {
+                oldWork.monitor.cancel();
+                if (oldWork.future != null) oldWork.future.cancel(true);
+                jobs.remove(jobId, oldWork);
+                if (oldImage != null) images.remove(sha, oldImage);
+            }
+        }
         // Eager imports stop at half the limit: the rest is for images a user asks about.
         if (background && !images.containsKey(sha) && images.size() >= maxImages / 2) {
             sendFailure(out, id, "cache_reserved", "background imports stop at half of the image limit " + maxImages);
@@ -307,13 +435,13 @@ public final class XodbGhidraSidecar {
             if (old != null && !old.state.equals("failed")) { if (!background) old.background = false; return old; }
             Image made = new Image(key, path); made.background = background; return made;
         });
-        Work work = jobs.compute(jobId, (key, old) -> old == null || old.state.equals("failed") ? startImport(image, key) : old);
+        Work work = jobs.compute(jobId, (key, old) -> old == null || old.state.equals("failed") ? startImport(image, key, background) : old);
         sendWork(out, id, work);
     }
 
-    Work startImport(Image image, String key) {
-            Work made = new Work(key);
-            made.future = ghidra.submit(() -> importImage(image, made));
+    Work startImport(Image image, String key, boolean background) {
+            Work made = makeWork(key);
+            made.future = submitGhidra(made, background, () -> importImage(image, made));
             return made;
     }
 
@@ -325,10 +453,10 @@ public final class XodbGhidraSidecar {
             work.monitor.checkCanceled();
             boolean cached = project.getProjectData().getFile("/" + image.sha) != null;
             if (!cached || !cachedAtLinkedBase(image.sha)) {
-                if (!cached && project.getRootFolder().getFiles().length >= maxImages)
-                    throw new Failure("cache_full", "project image limit " + maxImages + "; raise XODB_GHIDRA_MAX_IMAGES or delete the private cache");
+                closeOpenProgram(image.sha);
                 if (!cached && image.background && project.getRootFolder().getFiles().length >= maxImages / 2)
                     throw new Failure("cache_reserved", "background imports stop at half of the image limit " + maxImages);
+                if (!cached) makeProjectSlot(image.sha);
                 work.progress = image.progress = "importing";
                 Program program = load(new File(image.path));
                 if (!atLinkedBase(program)) {
@@ -353,6 +481,8 @@ public final class XodbGhidraSidecar {
                     if (saved) project.close(program); else program.release(project);
                 }
             }
+            imageLastUsed.put(image.sha, System.nanoTime());
+            trimProjectCache(image.sha);
             image.state = work.state = "ready";
             image.progress = work.progress = "ready";
         } catch (Throwable e) {
@@ -391,6 +521,110 @@ public final class XodbGhidraSidecar {
         finally { project.close(program); }
     }
 
+    OpenProgram openProgram(String sha) throws Exception {
+        OpenProgram slot = openPrograms.get(sha);
+        if (slot != null) { slot.lastUsedNanos = System.nanoTime(); imageLastUsed.put(sha, slot.lastUsedNanos); return slot; }
+        while (openPrograms.size() >= maxOpenPrograms) {
+            String oldest = openPrograms.entrySet().iterator().next().getKey();
+            closeOpenProgram(oldest);
+        }
+        Program program = project.openProgram("/", sha, true);
+        if (program == null) throw new Failure("image_not_open", sha);
+        DecompInterface decompiler = new DecompInterface();
+        boolean ready = false;
+        try {
+            DecompileOptions options = new DecompileOptions();
+            options.grabFromProgram(program);
+            options.setMaxWidth(80);
+            decompiler.setOptions(options);
+            decompiler.toggleSyntaxTree(true);
+            decompiler.toggleCCode(true);
+            decompiler.setSimplificationStyle("decompile");
+            if (!decompiler.openProgram(program)) throw new Failure("decompiler_open_failed", decompiler.getLastMessage());
+            slot = new OpenProgram(sha, program, decompiler);
+            openPrograms.put(sha, slot);
+            openProgramCount.incrementAndGet();
+            imageLastUsed.put(sha, System.nanoTime());
+            ready = true;
+            return slot;
+        } finally {
+            if (!ready) { decompiler.dispose(); project.close(program); }
+        }
+    }
+
+    void closeOpenProgram(String sha) {
+        OpenProgram slot = openPrograms.remove(sha);
+        if (slot == null) return;
+        openProgramCount.decrementAndGet();
+        slot.decompiler.dispose();
+        project.close(slot.program);
+    }
+
+    void closeOpenPrograms() {
+        for (String sha : new ArrayList<>(openPrograms.keySet())) closeOpenProgram(sha);
+    }
+
+    long cacheUsage() {
+        long total = 0;
+        for (DomainFile file : project.getRootFolder().getFiles()) {
+            try { total = Math.addExact(total, file.length()); }
+            catch (Exception error) { return Long.MAX_VALUE; }
+        }
+        return total;
+    }
+
+    ArrayList<DomainFile> projectFilesByAge(String keep) {
+        ArrayList<DomainFile> files = new ArrayList<>(Arrays.asList(project.getRootFolder().getFiles()));
+        files.removeIf(file -> file.getName().equals(keep));
+        files.sort(Comparator.comparingLong(file -> imageLastUsed.getOrDefault(file.getName(), file.getLastModifiedTime())));
+        return files;
+    }
+
+    long evictProjectFile(DomainFile file) throws Exception {
+        String sha = file.getName();
+        long bytes = file.length();
+        closeOpenProgram(sha);
+        file.delete();
+        images.remove(sha);
+        jobs.remove("open:" + sha);
+        documents.keySet().removeIf(key -> key.startsWith(sha + ":"));
+        jobs.keySet().removeIf(key -> key.startsWith("decompile:" + sha + ":"));
+        imageLastUsed.remove(sha);
+        return bytes;
+    }
+
+    void makeProjectSlot(String keep) throws Exception {
+        while (project.getRootFolder().getFiles().length >= maxImages) {
+            ArrayList<DomainFile> files = projectFilesByAge(keep);
+            if (files.isEmpty()) throw new Failure("cache_full", "project image limit " + maxImages + " has no evictable entry");
+            evictProjectFile(files.get(0));
+        }
+    }
+
+    void trimProjectCache(String keep) throws Exception {
+        long used = cacheUsage();
+        projectCacheBytes.set(used);
+        if (used <= maxCacheBytes) return;
+        for (DomainFile file : projectFilesByAge(keep)) {
+            long bytes = evictProjectFile(file);
+            used = Math.max(0, used - bytes);
+            if (used <= maxCacheBytes) break;
+        }
+        // A single imported image can itself exceed the configured bound.
+        if (used > maxCacheBytes) {
+            DomainFile file = project.getProjectData().getFile("/" + keep);
+            if (file != null) {
+                closeOpenProgram(keep);
+                file.delete();
+                images.remove(keep);
+                imageLastUsed.remove(keep);
+            }
+            projectCacheBytes.set(cacheUsage());
+            throw new Failure("cache_too_large", "the imported project image exceeds XODB_GHIDRA_CACHE_BYTES=" + maxCacheBytes);
+        }
+        projectCacheBytes.set(cacheUsage());
+    }
+
     void decompile(JsonObject q, OutputStream out, String id) throws Exception {
         String sha = required(q, "sha256");
         long entry = unsignedHex(required(q, "entry"));
@@ -398,6 +632,19 @@ public final class XodbGhidraSidecar {
         String key = sha + ":" + Long.toUnsignedString(entry, 16) + ":" + options;
         byte[] cached = documents.get(key);
         if (cached != null) { send(out, base(id, "ready"), cached); return; }
+        boolean background = q.has("background") && q.get("background").isJsonPrimitive() && q.get("background").getAsBoolean();
+        String jobId = "decompile:" + key;
+        if (!background) {
+            preemptBackground();
+            Work oldWork = jobs.get(jobId);
+            // An explicit request for the function that is currently warming
+            // owns the replacement job; never return that cancelled warm job.
+            if (oldWork != null && oldWork.background && oldWork.state.equals("pending")) {
+                oldWork.monitor.cancel();
+                if (oldWork.future != null) oldWork.future.cancel(true);
+                jobs.remove(jobId, oldWork);
+            }
+        }
         Image image = images.get(sha);
         if (image == null || !image.state.equals("ready")) {
             JsonObject r = base(id, "pending");
@@ -406,7 +653,6 @@ public final class XodbGhidraSidecar {
             send(out, r, null);
             return;
         }
-        String jobId = "decompile:" + key;
         if (!documents.containsKey(key) && documents.size() >= maxDocuments) {
             sendFailure(out, id, "cache_full", "document cache limit " + maxDocuments + "; raise XODB_GHIDRA_MAX_DOCUMENTS or restart the sidecar");
             return;
@@ -415,42 +661,40 @@ public final class XodbGhidraSidecar {
             sendFailure(out, id, "queue_full", "retained job limit reached; restart the sidecar");
             return;
         }
-        Work work = jobs.compute(jobId, (ignored, old) -> old == null || old.state.equals("failed") ? startExport(q, key, jobId) : old);
+        Work work = jobs.compute(jobId, (ignored, old) -> old == null || old.state.equals("failed") ? startExport(q, key, jobId, background) : old);
         sendWork(out, id, work);
     }
 
-    Work startExport(JsonObject q, String key, String jobId) {
-            Work made = new Work(jobId);
+    Work startExport(JsonObject q, String key, String jobId, boolean background) {
+            Work made = makeWork(jobId);
             JsonObject copy = q.deepCopy();
-            made.future = ghidra.submit(() -> export(copy, key, made));
+            made.future = submitGhidra(made, background, () -> export(copy, key, made));
             return made;
     }
 
     void export(JsonObject q, String key, Work work) {
-        Program program = null;
         try {
             work.progress = "opening project image";
             String sha = required(q, "sha256");
-            program = project.openProgram("/", sha, true);
-            if (program == null) throw new Failure("image_not_open", sha);
+            OpenProgram slot = openProgram(sha);
+            Program program = slot.program;
             long entry = unsignedHex(required(q, "entry"));
             Address address = program.getAddressFactory().getDefaultAddressSpace().getAddress(entry);
             Function fn = program.getFunctionManager().getFunctionContaining(address);
             if (fn == null) fn = program.getFunctionManager().getFunctionAt(address);
             if (fn == null) throw new Failure("function_not_found", "no Ghidra function contains " + hx(entry));
             work.progress = "decompiling";
-            byte[] payload = exportDocument(program, fn, q, work.monitor);
+            byte[] payload = exportDocument(slot, fn, q, work.monitor);
             if (payload.length > MAX_PAYLOAD) throw new Failure("document_too_large", Integer.toString(payload.length));
             documents.put(key, payload);
             work.payload = payload;
             work.progress = "ready";
             work.state = "ready";
         } catch (Throwable e) { failed(work, e); }
-        finally { if (program != null) project.close(program); }
     }
 
     void cancel(OutputStream out, String id, String jobId) throws Exception {
-        Work work = jobs.get(jobId);
+        Work work = findWork(jobId);
         if (work == null) { sendFailure(out, id, "unknown_job", jobId); return; }
         work.monitor.cancel();
         if (work.future != null) work.future.cancel(true);
@@ -460,8 +704,7 @@ public final class XodbGhidraSidecar {
 
     void shutdown(OutputStream out, String id) throws Exception {
         send(out, base(id, "ready"), null);
-        stopping.set(true);
-        listener.close();
+        requestStop("shutdown");
     }
 
     void sendWork(OutputStream out, String id, Work work) throws Exception {
@@ -491,6 +734,25 @@ public final class XodbGhidraSidecar {
         } catch (NumberFormatException ignored) { return fallback; }
     }
 
+    static long envLong(String name, long fallback, long low, long high) {
+        try {
+            String value = System.getenv(name);
+            if (value == null || value.isBlank()) return fallback;
+            long parsed = Long.parseLong(value);
+            return Math.max(low, Math.min(high, parsed));
+        } catch (NumberFormatException ignored) { return fallback; }
+    }
+
+    static double envDouble(String name, double fallback, double low, double high) {
+        try {
+            String value = System.getenv(name);
+            if (value == null || value.isBlank()) return fallback;
+            double parsed = Double.parseDouble(value);
+            if (!Double.isFinite(parsed)) return fallback;
+            return Math.max(low, Math.min(high, parsed));
+        } catch (NumberFormatException ignored) { return fallback; }
+    }
+
     static void failed(Work work, Throwable error) {
         Throwable e = error instanceof ExecutionException && error.getCause() != null ? error.getCause() : error;
         work.state = "failed";
@@ -500,24 +762,14 @@ public final class XodbGhidraSidecar {
         System.err.println(work.id + ": " + work.code + ": " + work.detail);
     }
 
-    byte[] exportDocument(Program program, Function fn, JsonObject request, TaskMonitor monitor) throws Exception {
+    byte[] exportDocument(OpenProgram slot, Function fn, JsonObject request, TaskMonitor monitor) throws Exception {
         long t0 = System.nanoTime();
-        DecompInterface di = new DecompInterface();
-        try {
-            DecompileOptions options = new DecompileOptions();
-            options.grabFromProgram(program);
-            options.setMaxWidth(80);
-            di.setOptions(options);
-            di.toggleSyntaxTree(true);
-            di.toggleCCode(true);
-            di.setSimplificationStyle("decompile");
-            if (!di.openProgram(program)) throw new Failure("decompiler_open_failed", di.getLastMessage());
-            int seconds = Math.max(1, Math.min(600, request.has("deadline_ms") ? request.get("deadline_ms").getAsInt() / 1000 : 60));
-            DecompileResults result = di.decompileFunction(fn, seconds, monitor);
-            if (!result.decompileCompleted()) throw new Failure("decompile_failed", result.getErrorMessage());
-            JsonObject doc = graphDocument(program, fn, result, request, t0);
-            return JSON.toJson(doc).getBytes(StandardCharsets.UTF_8);
-        } finally { di.dispose(); }
+        slot.lastUsedNanos = t0;
+        int seconds = Math.max(1, Math.min(600, request.has("deadline_ms") ? request.get("deadline_ms").getAsInt() / 1000 : 60));
+        DecompileResults result = slot.decompiler.decompileFunction(fn, seconds, monitor);
+        if (!result.decompileCompleted()) throw new Failure("decompile_failed", result.getErrorMessage());
+        JsonObject doc = graphDocument(slot.program, fn, result, request, t0);
+        return JSON.toJson(doc).getBytes(StandardCharsets.UTF_8);
     }
 
     JsonObject graphDocument(Program program, Function fn, DecompileResults result, JsonObject request, long t0) throws Exception {
@@ -556,7 +808,7 @@ public final class XodbGhidraSidecar {
         doc.add("blocks", blocks(high));
         doc.add("calls", calls(program, high));
         doc.add("pseudocode", pseudocode(result));
-        doc.add("variables", variables(high, fn));
+        doc.add("variables", variables(program, high, fn));
         doc.add("types", types(high, fn));
         doc.add("function_index", functionIndex(program, fn));
         JsonObject timing = new JsonObject(); timing.addProperty("sidecar_us", (System.nanoTime() - t0) / 1000); doc.add("timing", timing);
@@ -725,8 +977,134 @@ public final class XodbGhidraSidecar {
         return -1;
     }
 
-    JsonArray variables(HighFunction high, Function fn) {
-        JsonArray list=new JsonArray(); for(Iterator<HighSymbol> it=high.getLocalSymbolMap().getSymbols();it.hasNext();){HighSymbol s=it.next();JsonObject v=new JsonObject();v.addProperty("name",s.getName());v.addProperty("type",s.getDataType()==null?"":s.getDataType().getDisplayName());v.addProperty("parameter",s.isParameter());VariableStorage st=s.getStorage();Varnode n=st==null?null:st.getFirstVarnode();if(n!=null){v.addProperty("storage",n.isRegister()?"register":n.getAddress().getAddressSpace().getName().equals("stack")?"stack":"temp");v.addProperty("storage_offset",hx(n.getOffset()));}else v.addProperty("storage","temp");v.addProperty("valid_start",hx(fn.getBody().getMinAddress().getOffset()));v.addProperty("valid_end",hx(fn.getBody().getMaxAddress().getOffset()+1));list.add(v);}return list;
+    JsonArray variables(Program program, HighFunction high, Function fn) {
+        JsonArray list = new JsonArray();
+        for (Iterator<HighSymbol> it = high.getLocalSymbolMap().getSymbols(); it.hasNext();) {
+            HighSymbol symbol = it.next();
+            JsonObject row = new JsonObject();
+            DataType type = symbol.getDataType();
+            row.addProperty("name", symbol.getName());
+            row.addProperty("type", type == null ? "" : type.getDisplayName());
+            row.addProperty("size", Math.max(0, symbol.getSize()));
+            row.addProperty("parameter", symbol.isParameter());
+            VariableStorage storage = symbol.getStorage();
+            Varnode varnode = storage == null ? null : storage.getFirstVarnode();
+            long[] proven = null;
+            if (varnode != null) {
+                row.addProperty("storage", varnode.isRegister() ? "register" : varnode.getAddress().getAddressSpace().getName().equals("stack") ? "stack" : "temp");
+                row.addProperty("storage_offset", hx(varnode.getOffset()));
+                if (varnode.isRegister()) {
+                    Register register = program.getRegister(varnode.getAddress(), varnode.getSize());
+                    if (register != null) {
+                        Register base = register.getBaseRegister();
+                        row.addProperty("register", base.getName());
+                        row.addProperty("register_bit_offset", register.getLeastSignificantBitInBaseRegister());
+                        proven = registerLifetime(program, fn, symbol, varnode, base);
+                    }
+                }
+            } else row.addProperty("storage", "temp");
+            long functionStart = fn.getBody().getMinAddress().getOffset();
+            long functionEnd = fn.getBody().getMaxAddress().getOffset() + 1;
+            Address firstUse = symbol.getPCAddress();
+            long validStart = symbol.isParameter() || firstUse == null ? functionStart : firstUse.getOffset();
+            long lastUse = validStart;
+            HighVariable variable = symbol.getHighVariable();
+            if (variable != null) for (Varnode instance : variable.getInstances()) {
+                Address at = instance.getPCAddress();
+                if (at != null && at.getAddressSpace().equals(program.getAddressFactory().getDefaultAddressSpace()))
+                    lastUse = Math.max(lastUse, at.getOffset());
+                PcodeOp definition = instance.getDef();
+                if (definition != null) lastUse = Math.max(lastUse, definition.getSeqnum().getTarget().getOffset());
+                for (Iterator<PcodeOp> uses = instance.getDescendants(); uses.hasNext();)
+                    lastUse = Math.max(lastUse, uses.next().getSeqnum().getTarget().getOffset());
+            }
+            Instruction lastInstruction = program.getListing().getInstructionContaining(
+                program.getAddressFactory().getDefaultAddressSpace().getAddress(lastUse));
+            long validEnd = lastInstruction == null ? lastUse + 1 : lastInstruction.getMaxAddress().getOffset() + 1;
+            validStart = Math.max(functionStart, Math.min(validStart, functionEnd - 1));
+            validEnd = Math.max(validStart + 1, Math.min(validEnd, functionEnd));
+            // A register row is what xodb overlays with a live value, so its
+            // interval is the proven one, and may be empty. Other storage
+            // keeps the loose first-to-last-use span, which nothing reads as proof.
+            if (proven != null) { validStart = proven[0]; validEnd = proven[1]; }
+            row.addProperty("valid_start", hx(validStart));
+            row.addProperty("valid_end", hx(validEnd));
+            list.add(row);
+        }
+        return list;
+    }
+
+    static boolean opaque(Instruction instruction) {
+        try {
+            for (PcodeOp op : instruction.getPcode()) if (op.getOpcode() == PcodeOp.CALLOTHER) return true;
+            return false;
+        } catch (Exception e) { return true; }
+    }
+
+    static boolean joined(ReferenceManager references, Address at) {
+        for (ReferenceIterator it = references.getReferencesTo(at); it.hasNext();)
+            if (it.next().getReferenceType().isFlow()) return true;
+        return false;
+    }
+
+    static boolean writes(Instruction instruction, Register base) {
+        long low = base.getAddress().getOffset(), high = low + base.getNumBytes();
+        try {
+            for (PcodeOp op : instruction.getPcode()) {
+                Varnode out = op.getOutput();
+                if (out != null && out.isRegister() && out.getOffset() < high && out.getOffset() + out.getSize() > low) return true;
+            }
+            return false;
+        } catch (Exception e) { return true; }
+    }
+
+    /**
+     * The [start, end) stop PCs at which the storage register is proven to
+     * hold the variable. High p-code names values, not places: after copy
+     * propagation a use can sit where the register was long overwritten, so
+     * first-to-last use is not a lifetime. The proof here is straight-line
+     * only. It starts at the function entry for a parameter, or just after
+     * the instruction that wrote the register for a local (a call's return
+     * value, or a plain instruction whose p-code writes it), and runs while
+     * no instruction can change the register and no other path can join:
+     * it ends at the first write, call, branch, user-defined p-code op or
+     * jump target. The instruction that ends it is included, since a stop
+     * there precedes its execution. An unproven variable gets an empty
+     * interval and xodb shows no value for it.
+     */
+    long[] registerLifetime(Program program, Function fn, HighSymbol symbol, Varnode storage, Register base) {
+        Listing listing = program.getListing();
+        ReferenceManager references = program.getReferenceManager();
+        Address entry = fn.getEntryPoint();
+        long none = entry.getOffset();
+        Address start = null;
+        if (symbol.isParameter()) start = entry;
+        else {
+            Address pc = symbol.getPCAddress();
+            HighVariable variable = symbol.getHighVariable();
+            Instruction definer = pc == null ? null : listing.getInstructionAt(pc);
+            if (variable != null && definer != null) for (Varnode instance : variable.getInstances()) {
+                PcodeOp def = instance.getDef();
+                if (def == null || !instance.getAddress().equals(storage.getAddress()) || !def.getSeqnum().getTarget().equals(pc)) continue;
+                int opcode = def.getOpcode();
+                boolean returned = definer.getFlowType().isCall() && (opcode == PcodeOp.CALL || opcode == PcodeOp.CALLIND);
+                boolean computed = definer.getFlowType().isFallthrough() && opcode != PcodeOp.INDIRECT && opcode != PcodeOp.MULTIEQUAL
+                    && writes(definer, base) && !opaque(definer);
+                if (returned || computed) start = definer.getFallThrough();
+                break;
+            }
+        }
+        if (start == null) return new long[] { none, none };
+        long end = start.getOffset();
+        for (Address at = start; at != null && fn.getBody().contains(at);) {
+            Instruction instruction = listing.getInstructionAt(at);
+            if (instruction == null) break;
+            if (!(symbol.isParameter() && at.equals(entry)) && joined(references, at)) break;
+            end = at.getOffset() + 1;
+            if (!instruction.getFlowType().isFallthrough() || writes(instruction, base) || opaque(instruction)) break;
+            at = instruction.getFallThrough();
+        }
+        return new long[] { start.getOffset(), end };
     }
 
     JsonArray types(HighFunction high, Function fn) {

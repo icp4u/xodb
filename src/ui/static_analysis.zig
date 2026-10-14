@@ -46,6 +46,7 @@ pub const Panel = struct {
     /// The stop PC the pane last saw, so a stop in another function reopens it there.
     decompile_stop: ?u64 = null,
     decompile_first: u32 = 1,
+    decompile_column: usize = 0,
     decompile_rows: struct { x: f32 = 0, y: f32 = 0, w: f32 = 0, count: usize = 0 } = .{},
     decompile_pcs: std.ArrayList(u64) = .empty,
     pub fn deinit(self: *Panel) void {
@@ -95,6 +96,7 @@ pub const Panel = struct {
         self.decompile_line = 0;
         self.decompile_synced = null;
         self.decompile_first = 1;
+        self.decompile_column = 0;
         self.decompile_pcs.clearRetainingCapacity();
     }
     pub fn hideDecompile(self: *Panel) void {
@@ -349,6 +351,13 @@ pub const Panel = struct {
         self.decompile_line = line;
         self.decompile_pcs.clearRetainingCapacity();
         const view = self.decompileView() orelse return;
+        if (view.pseudo_entry_pad) |pad| if (pad.line == line) {
+            var pc = pad.start;
+            while (pc < pad.end) : (pc += 1) {
+                self.decompile_pcs.append(std.heap.page_allocator, pc) catch return;
+                if (pc == std.math.maxInt(u64)) break;
+            }
+        };
         for (view.pseudo_tokens) |token| if (token.line == line) if (token.pc) |pc| {
             var known = false;
             for (self.decompile_pcs.items) |seen| if (seen == pc) {
@@ -374,6 +383,18 @@ pub const Panel = struct {
         self.decompile_synced = wanted;
         // A PC printed on several lines keeps the line the user clicked.
         if (std.mem.indexOfScalar(u64, self.decompile_pcs.items, wanted) != null) return;
+        if (view.pseudo_entry_pad) |pad| if (wanted >= pad.start and wanted < pad.end) {
+            if (self.decompile_line != pad.line) {
+                self.selectDecompileLine(pad.line);
+                self.navigate = null;
+                const visible: u32 = @intCast(self.decompile_rows.count);
+                if (visible > 0) {
+                    if (pad.line < self.decompile_first) self.decompile_first = pad.line;
+                    if (pad.line >= self.decompile_first + visible) self.decompile_first = pad.line - visible + 1;
+                }
+            }
+            return;
+        };
         for (view.pseudo_tokens) |token| if (token.pc == wanted) {
             if (self.decompile_line != token.line) {
                 self.selectDecompileLine(token.line);
@@ -395,6 +416,14 @@ pub const Panel = struct {
         const visible: u32 = @intCast(self.decompile_rows.count);
         const last_first = if (total > visible) total - visible + 1 else 1;
         self.decompile_first = @intCast(std.math.clamp(@as(i64, self.decompile_first) + amount, 1, @as(i64, last_first)));
+    }
+
+    pub fn scrollDecompile(self: *Panel, delta: i64) void {
+        const view = self.decompileView() orelse return;
+        var longest: usize = 0;
+        var lines = std.mem.splitScalar(u8, view.pseudocode, '\n');
+        while (lines.next()) |line| longest = @max(longest, line.len);
+        self.decompile_column = @intCast(std.math.clamp(@as(i64, @intCast(self.decompile_column)) + delta, 0, @as(i64, @intCast(longest -| 1))));
     }
     fn list(self: *Panel, r: *gpu.Renderer, font: *Font, x: f32, y: f32, w: f32, b: gpu.Rect) !void {
         self.list_y = y;
@@ -493,4 +522,38 @@ test "a clicked pseudo-C line is kept when its PC is also printed on an earlier 
     try std.testing.expectEqual(@as(u32, 3), panel.decompile_line);
     panel.syncDecompilePC(0x1020);
     try std.testing.expectEqual(@as(u32, 4), panel.decompile_line);
+}
+
+test "entry-pad PCs select the first code line in both directions" {
+    var panel: Panel = .{};
+    defer panel.deinit();
+    panel.showDecompile(.{ .pc = 0x1000 });
+    const tokens = [_]prepared.PseudoToken{
+        .{ .index = 0, .line = 2, .col = 2, .kind = "syntax", .text = "if", .pc = 0x1004 },
+    };
+    panel.present(.{ .request = panel.request(1, 0).?, .status = .ready, .pseudocode = "f\n  if", .pseudo_tokens = &tokens, .pseudo_entry_pad = .{ .start = 0x1000, .end = 0x1004, .line = 2, .token = 0 } });
+    panel.syncDecompilePC(0x1000);
+    try std.testing.expectEqual(@as(u32, 2), panel.decompile_line);
+    panel.selectDecompileLine(2);
+    try std.testing.expectEqual(@as(usize, 5), panel.decompile_pcs.items.len);
+    try std.testing.expectEqual(@as(u64, 0x1000), panel.decompile_pcs.items[0]);
+    try std.testing.expect(std.mem.indexOfScalar(u64, panel.decompile_pcs.items, 0x1003) != null);
+    try std.testing.expect(std.mem.indexOfScalar(u64, panel.decompile_pcs.items, 0x1004) != null);
+    try std.testing.expectEqual(@as(?u64, 0x1000), panel.navigate);
+}
+
+test "pseudo-C horizontal scroll is bounded and resets for another function" {
+    var panel: Panel = .{};
+    defer panel.deinit();
+    panel.showDecompile(.{ .pc = 0x1000 });
+    panel.present(.{ .request = panel.request(1, 0).?, .status = .ready, .pseudocode = "0123456789\nshort" });
+    panel.scrollDecompile(4);
+    try std.testing.expectEqual(@as(usize, 4), panel.decompile_column);
+    panel.scrollDecompile(100);
+    try std.testing.expectEqual(@as(usize, 9), panel.decompile_column);
+    panel.scrollDecompile(-100);
+    try std.testing.expectEqual(@as(usize, 0), panel.decompile_column);
+    panel.scrollDecompile(6);
+    panel.showDecompile(.{ .pc = 0x2000 });
+    try std.testing.expectEqual(@as(usize, 0), panel.decompile_column);
 }

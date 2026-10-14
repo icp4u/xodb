@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Adapter tests on fresh C01-R2 exports: deterministic conversion,
 qualification passthrough, and loud failure on generated malformed variants.
-usage: test_adapter.py ADAPTER EXPORT.json [WRONG_EXPORT.json]
-EXPORT is an ok export of fx-gcc-O0 fx_loop (block layout used below);
-WRONG_EXPORT is a known-wrong stripped -O2 fx_calls export (PIC heuristic)."""
+usage: test_adapter.py [ADAPTER EXPORT.json [WRONG_EXPORT.json]]
+With no arguments the test uses the repository adapter and owned checked-in
+export. WRONG_EXPORT is an optional known-wrong stripped -O2 export."""
 import copy
 import shutil
 import json
@@ -12,8 +12,16 @@ import subprocess
 import sys
 import tempfile
 
-adapter, src = sys.argv[1], sys.argv[2]
-wrong = sys.argv[3] if len(sys.argv) > 3 else None
+repo = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+if len(sys.argv) == 1:
+    adapter = os.path.join(repo, "scripts/semq/c01_to_xsg.py")
+    src = os.path.join(repo, "src/semq/adapter_fixture.json")
+    wrong = None
+elif len(sys.argv) in (3, 4):
+    adapter, src = sys.argv[1], sys.argv[2]
+    wrong = sys.argv[3] if len(sys.argv) == 4 else None
+else:
+    raise SystemExit(__doc__)
 base = json.load(open(src))
 fails = []
 tmp = tempfile.mkdtemp(prefix="xsq-adapter-", dir=os.environ.get("TMPDIR"))
@@ -63,11 +71,11 @@ mutate("raw-kind", lambda d: h(d).update(kind="raw_pcode"), "not decompiler_fina
 mutate("space-type", lambda d: d["address_spaces"][2].update(type="weird"), "unknown address space type")
 mutate("block-unknown-op", lambda d: d["blocks"][0]["ops"].append("op:999999"), "lists unknown op")
 mutate("op-two-blocks", lambda d: d["blocks"][1]["ops"].append(d["blocks"][0]["ops"][0]), "listed in two blocks")
-mutate("pred-no-succ", lambda d: d["blocks"][0]["pred"].append("bb:6"), "no matching succ")
-mutate("succ-no-pred", lambda d: d["blocks"][6]["succ"].append({"to": "bb:0", "slot": 0, "kind": "flow", "flags": []}), "without matching pred")
+mutate("pred-no-succ", lambda d: d["blocks"][0]["pred"].append(d["blocks"][-1]["id"]), "no matching succ")
+mutate("succ-no-pred", lambda d: d["blocks"][-1]["succ"].append({"to": d["blocks"][0]["id"], "slot": 0, "kind": "flow", "flags": []}), "without matching pred")
 mutate("unknown-pred", lambda d: d["blocks"][0]["pred"].append("bb:77"), "unknown predecessor")
 mutate("edge-kind", lambda d: d["blocks"][0]["succ"][0].update(kind="sideways"), "unknown edge kind")
-mutate("unknown-vn", lambda d: first(d, "INT_SLESS")["in"].__setitem__(0, "vn:999999"), "unknown varnode")
+mutate("unknown-vn", lambda d: first(d, "INT_LESS")["in"].__setitem__(0, "vn:999999"), "unknown varnode")
 mutate("free-vn", lambda d: next(v for v in h(d)["varnodes"] if "input" in v["flags"])["flags"].remove("input") or
        next(v for v in h(d)["varnodes"] if v["def"] is None and v["space"] == "register")["flags"].append("free"), "free non-constant")
 mutate("numeric-offset", lambda d: h(d)["varnodes"][0].update(offset=4198932), "canonical hex string")

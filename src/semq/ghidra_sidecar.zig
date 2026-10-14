@@ -21,7 +21,7 @@ const Value = std.json.Value;
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 const protocol = 1;
 const schema = 1;
-pub const producer = "ghidra-jvm-sidecar-0.1.2";
+pub const producer = "ghidra-jvm-sidecar-0.1.5";
 const max_line = 1 << 20;
 const max_payload = 64 << 20;
 
@@ -338,7 +338,7 @@ fn waitJob(a: Allocator, path: [:0]const u8, first: Reply, cancel: *const std.at
             if (cancel.load(.acquire)) return fail(a, failure, "cancelled", "sidecar request cancelled", .{});
             return fail(a, failure, "sidecar_timeout", "sidecar request exceeded its deadline", .{});
         }
-        _ = c.poll(null, 0, 50);
+        _ = c.poll(null, 0, 5);
         reply = call(a, path, .{ .id = "xodb-status", .verb = "status", .job = job, .deadline_ms = 2000 }, cancel, deadline) catch |err| {
             if (err == error.Cancelled) {
                 var sending = std.atomic.Value(bool).init(false);
@@ -387,6 +387,20 @@ pub fn openImage(a: Allocator, endpoint: Endpoint, image_path: []const u8, sha25
     const first = call(a, endpoint.socket_path, .{ .id = "xodb-warm-open", .verb = "open_image", .path = image_path, .sha256 = sha256, .background = true, .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else "sidecar_io_failed", "open_image: {s}", .{@errorName(err)});
     _ = try waitJob(a, endpoint.socket_path, first, cancel, deadline, stage, failure);
     stage.store(.ready, .release);
+}
+
+/// Low-priority decompile used only for bounded stop-time warm-ahead. The
+/// caller has already opened the image; the returned document can seed direct
+/// callees and is retained by the sidecar for the later foreground request.
+pub fn warmDecompile(a: Allocator, endpoint: Endpoint, image_path: []const u8, sha256: []const u8, entry_value: u64, build_id: ?[]const u8, cancel: *const std.atomic.Value(bool), stage: *std.atomic.Value(Stage), failure: *Failure) ![]u8 {
+    const deadline = nowNs() + @as(u64, endpoint.deadline_ms) * std.time.ns_per_ms;
+    try ensure(a, endpoint, cancel, deadline, stage, failure);
+    stage.store(.decompiling, .release);
+    const entry = try std.fmt.allocPrint(a, "0x{x}", .{entry_value});
+    const first = call(a, endpoint.socket_path, .{ .id = "xodb-warm-decompile", .verb = "decompile", .path = image_path, .sha256 = sha256, .entry = entry, .size = "0x0", .build_id = build_id, .options = "default", .background = true, .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else "sidecar_io_failed", "decompile: {s}", .{@errorName(err)});
+    const ready = try waitJob(a, endpoint.socket_path, first, cancel, deadline, stage, failure);
+    stage.store(.ready, .release);
+    return ready.payload orelse return fail(a, failure, "sidecar_bad_reply", "ready warm decompile reply omitted its framed document", .{});
 }
 
 test "sidecar stage text is stable for the UI" {

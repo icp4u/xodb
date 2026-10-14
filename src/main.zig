@@ -378,6 +378,7 @@ pub fn main(init: std.process.Init) !void {
     if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
     session.static_analysis.toolchain_dir = static_analysis;
     session.static_analysis.warmup_enabled = ghidra_prestart;
+    session.static_analysis.eager_library_bytes = preferences.decompiler.eager_library_bytes;
     if (static_analysis != null) {
         const swept = @import("semq/host.zig").sweepStale();
         if (swept > 0) std.debug.print("xodb: removed {d} static analysis scratch director{s} of exited xodb processes\n", .{ swept, if (swept == 1) "y" else "ies" });
@@ -611,6 +612,7 @@ pub fn main(init: std.process.Init) !void {
                 if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
                 session.static_analysis.toolchain_dir = static_analysis;
                 session.static_analysis.warmup_enabled = ghidra_prestart;
+                session.static_analysis.eager_library_bytes = preferences.decompiler.eager_library_bytes;
                 session.debug_files.automatic = preferences.symbols.automatic;
                 session.debug_files.auto_file_limit = preferences.symbols.auto_file_bytes;
                 session.debug_files.auto_total_limit = preferences.symbols.auto_total_bytes;

@@ -5,12 +5,14 @@ The fake speaks the real JSON-line and framed-document protocol. It uses the
 owned qx fixture and checked-in adapter export, so completed replies pass the
 same identity admission and xsg adapter as a Ghidra reply.
 """
+import atexit
 import ctypes
 import fcntl
 import hashlib
 import json
 import os
 import signal
+import shutil
 import socket
 import struct
 import subprocess
@@ -21,7 +23,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCER = "ghidra-jvm-sidecar-0.1.2"
+PRODUCER = "ghidra-jvm-sidecar-0.1.5"
 CAPS = ["prime", "open_image", "decompile", "cancel", "status", "shutdown", "hints", "xsg", "pseudocode"]
 
 
@@ -47,6 +49,8 @@ def serve():
     payload = json.loads(Path(os.environ["FAKE_GHIDRA_PAYLOAD"]).read_text())
     payload["producer"].update(kind="ghidra_java_sidecar", worker="XodbGhidraSidecar",
                                worker_version=PRODUCER, java=True)
+    if mode == "text_only":
+        payload["blocks"] = []
     encoded = json.dumps(payload, separators=(",", ":")).encode()
     stop = threading.Event()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -102,6 +106,9 @@ def serve():
                     if mode in ("die", "hang"):
                         send(conn, {"id": request.get("id"), "state": "pending",
                                     "job": "fake:" + mode, "progress": "decompiling"})
+                    elif mode == "warm_decompile_hang" and request.get("background") is True:
+                        send(conn, {"id": request.get("id"), "state": "pending",
+                                    "job": "warm-decompile:" + str(request.get("entry")), "progress": "decompiling"})
                     else:
                         send(conn, {"id": request.get("id"), "state": "ready", "progress": "ready"}, encoded)
                 elif verb == "status" and mode == "die" and request.get("job") == "fake:die":
@@ -112,6 +119,9 @@ def serve():
                 elif verb == "status" and mode == "warm_hang" and request.get("job") == "warm:hang":
                     send(conn, {"id": request.get("id"), "state": "pending",
                                 "job": "warm:hang", "progress": "analyzing"})
+                elif verb == "status" and mode == "warm_decompile_hang" and str(request.get("job", "")).startswith("warm-decompile:"):
+                    send(conn, {"id": request.get("id"), "state": "pending",
+                                "job": request.get("job"), "progress": "decompiling"})
                 elif verb == "status":
                     send(conn, {"id": request.get("id"), "state": "ready", "healthy": True,
                                 "heap_used": 0, "images_open": 1, "queue": 0})
@@ -140,6 +150,8 @@ def serve():
 
 
 def fake_start():
+    if os.environ.get("FAKE_GHIDRA_MODE") == "start_fail":
+        raise SystemExit(1)
     path = Path(os.environ["XODB_GHIDRA_SOCKET"])
     lock_path = Path(str(path) + ".lock")
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -195,7 +207,11 @@ from client import Client
 # rather than the release runner, reaps every process that it creates.
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
 
+# A native worker in the caller's environment would answer the cases below that
+# expect a typed sidecar failure; the fallback case passes its own explicitly.
+os.environ.pop("XODB_STATIC_ANALYSIS", None)
 work = Path(tempfile.mkdtemp(prefix="xodb-ghs-", dir=os.environ.get("XODB_TEST_TMPDIR")))
+atexit.register(shutil.rmtree, work, True)
 fixture_dir = work / "qx"
 subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
 fixture = fixture_dir / "qx-gcc-O2"
@@ -254,8 +270,8 @@ def poll_decompile(client, retry=False):
         time.sleep(.03)
 
 
-def client(options=()):
-    value = Client("observe", str(fixture), options=options)
+def client(options=(), scope="observe"):
+    value = Client(scope, str(fixture), options=options)
     wait_stopped(value)
     return value
 
@@ -296,8 +312,8 @@ def completed(case):
     finally: close(value)
 
 
-# No endpoint: xodb starts at launch, primes the target architecture, imports
-# the mapped executable, then consumes the same sidecar's document.
+# No endpoint: xodb starts at launch, imports the mapped executable, warms real
+# stack functions, then consumes the same sidecar's document.
 case = configure("absent")
 value = client()
 deadline = time.monotonic() + 10
@@ -305,16 +321,12 @@ requests = []
 while time.monotonic() < deadline:
     requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
     verbs = [request.get("verb") for request in requests]
-    if "prime" in verbs and "open_image" in verbs: break
+    if "open_image" in verbs: break
     time.sleep(.02)
 record("configured sidecar starts before the first decompile request", (case / "starts").exists() and
        (case / "starts").read_text().splitlines() == ["start"])
-prime = next((request for request in requests if request.get("verb") == "prime"), {})
-verbs = [request.get("verb") for request in requests]
-prime_at = verbs.index("prime") if "prime" in verbs else len(verbs)
-open_at = verbs.index("open_image") if "open_image" in verbs else len(verbs)
-record("target architecture is primed before the first image opens", prime.get("architecture") == "x86_64" and
-       prime_at < open_at, requests)
+record("throwaway priming is replaced by real-function warm-ahead",
+       not any(request.get("verb") == "prime" for request in requests), requests)
 record("the mapped executable is imported before pseudo-C is requested", any(request.get("verb") == "open_image" and
        Path(request.get("path", "")) == fixture for request in requests), requests)
 record("eager imports are marked as background work", any(request.get("id") == "xodb-warm-open" and
@@ -338,8 +350,42 @@ try:
 finally: close(value)
 stop_server()
 
-# A sidecar from before priming existed keeps serving: it is neither replaced
-# nor asked twice, and images are still imported ahead of the request.
+# The eager byte preference always admits the main executable but leaves every
+# library to an explicit stop/request when the bound is zero.
+case = configure("eager-bound")
+preferences = case / "preferences.json"
+preferences.write_text('{"decompiler":{"eager_library_bytes":0}}\n')
+value = client(("--config", str(preferences)))
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline:
+    requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
+    if any(request.get("verb") == "open_image" for request in requests): break
+    time.sleep(.02)
+opened = [Path(request.get("path", "")) for request in requests
+          if request.get("verb") == "open_image" and request.get("background") is True]
+record("eager library byte bound keeps the main image eligible and skips libraries",
+       opened and all(path == fixture for path in opened), opened)
+close(value)
+stop_server()
+
+# Pseudo-C survives an adapter refusal; graph-only queries carry the reason.
+case = configure("text-only", "text_only")
+value = client()
+try:
+    result = poll_decompile(value)
+    graph = result.get("graph", {})
+    record("refused graph still returns pseudo-C with its typed reason",
+           result.get("status") == "completed" and "qx_alloc" in result.get("text", "") and
+           graph.get("available") is False and graph.get("reason") == "adapter_refused", result)
+    analysis = tool(value, "analyze_function", symbol="qx_alloc")
+    record("graph queries report graph_unavailable without discarding text",
+           analysis.get("status") == "graph_unavailable" and analysis.get("decompile_available") is True and
+           analysis.get("reason") == "adapter_refused", analysis)
+finally: close(value)
+stop_server()
+
+# A sidecar without the optional compatibility prime capability keeps serving,
+# and images are still imported ahead of the request.
 case = configure("no-prime", "no_prime")
 value = client()
 deadline = time.monotonic() + 10
@@ -353,7 +399,7 @@ try:
     record("a sidecar without prime is kept and still imports and answers", result.get("status") == "completed" and
            (case / "starts").read_text().splitlines() == ["start"] and
            any(request.get("verb") == "open_image" for request in requests) and
-           sum(request.get("verb") == "prime" for request in requests) == 1, requests)
+           not any(request.get("verb") == "prime" for request in requests), requests)
 finally: close(value)
 stop_server()
 
@@ -370,6 +416,31 @@ try:
     record("interactive pseudo-C cancels queued background import", result.get("status") == "completed" and
            (case / "cancelled").exists() and (case / "cancelled").read_text() == "warm:hang", result)
 finally: close(value)
+stop_server()
+
+# Resume cancels low-priority function warm-ahead. The queue is hard bounded
+# even when the fake keeps the first warm decompile pending.
+case = configure("warm-resume", "warm_decompile_hang")
+value = client(scope="control")
+value.action("set_breakpoint", symbol="qx_alloc")
+value.continue_initial_stop()
+value.stopped("breakpoint")
+deadline = time.monotonic() + 10
+warm_requests = []
+while time.monotonic() < deadline:
+    if (case / "requests").exists():
+        logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
+        warm_requests = [request for request in logged if request.get("verb") == "decompile" and request.get("background") is True]
+        if warm_requests: break
+    time.sleep(.02)
+record("warm-ahead queues stack functions at low priority within the hard bound",
+       0 < len(warm_requests) <= 16, warm_requests)
+value.action("continue")
+deadline = time.monotonic() + 5
+while time.monotonic() < deadline and not (case / "cancelled").exists(): time.sleep(.02)
+record("resume cancels a pending warm decompile without waiting on the owner path",
+       (case / "cancelled").exists() and (case / "cancelled").read_text().startswith("warm-decompile:"))
+close(value)
 stop_server()
 
 # A refused-connect Unix socket file is replaced under the starter lock.
@@ -436,6 +507,34 @@ try:
            (case / "cancelled").read_text() == "fake:hang", result)
 finally: close(value)
 stop_server()
+
+# A selected sidecar that cannot start falls back in the same x86-64 request
+# to the configured native worker, and the response names that producer.
+def native_toolchain():
+    directory = work / "native-fallback"
+    (directory / "ghidra-src/Ghidra/Processors/x86/data/languages").mkdir(parents=True)
+    (directory / "ghidra-src/Ghidra/Processors/x86/data/languages/x86-64.sla").write_text("placeholder\n")
+    subprocess.run(["cc", "-std=c11", "-O2", "-D_GNU_SOURCE", "-o", str(directory / "ghx_supervise"),
+                    "tools/ghx/ghx_supervise.c"], check=True, timeout=60)
+    worker = directory / "ghx_worker"
+    worker.write_text("#!/usr/bin/env python3\n" +
+                      "import sys\nfrom pathlib import Path\n" +
+                      f"payload=Path({str(payload)!r}).read_bytes()\n" +
+                      "for line in sys.stdin.buffer:\n"
+                      " ident=next((field[3:] for field in line.decode().strip().split('\\t') if field.startswith('id=')),'f')\n"
+                      " sys.stdout.buffer.write(f'RESULT\\tid={ident}\\tstatus=ok\\tbytes={len(payload)}\\n'.encode()+payload)\n"
+                      " sys.stdout.buffer.flush()\n")
+    worker.chmod(0o755)
+    return directory
+
+case = configure("native-fallback", "start_fail")
+value = client(("--static-analysis", str(native_toolchain())))
+try:
+    result = poll_decompile(value)
+    record("sidecar startup failure falls back to the native worker",
+           result.get("status") == "completed" and result.get("producer", {}).get("name") == "ghidra_native_decompiler" and
+           "qx_alloc" in result.get("text", ""), result)
+finally: close(value)
 
 # A process death between a pending reply and status is typed; debugger lives.
 configure("dies", "die")

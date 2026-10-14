@@ -25,7 +25,8 @@
     "memory_limit": 33554432
   },
   "decompiler": {
-    "prestart": true
+    "prestart": true,
+    "eager_library_bytes": 1048576
   },
   "gibson": {
     "flight_speed": 1.5,

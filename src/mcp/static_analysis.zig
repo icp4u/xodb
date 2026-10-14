@@ -103,6 +103,20 @@ fn summary(a: Allocator, analysis: *host.Analysis) !V {
     });
 }
 
+fn graphUnavailable(a: Allocator, analysis: *host.Analysis) !V {
+    const failure = analysis.graph_failure orelse host.Failure{ .code = "graph_unavailable", .detail = "the export contains pseudo-C but no admitted graph" };
+    return out(a, .{
+        .status = "graph_unavailable",
+        .reason = failure.code,
+        .detail = failure.detail,
+        .artifact_id = analysis.artifact_id,
+        .function = analysis.function.name,
+        .entry = analysis.function.runtime(analysis.function.key.entry),
+        .decompile_available = analysis.pseudocode.text.len != 0,
+        .producer = .{ .name = analysis.producer_name, .version = analysis.producer_version, .worker_ms = analysis.worker_ms },
+    });
+}
+
 const Resolved = union(enum) { status: V, analysis: *host.Analysis };
 
 /// The analysis for `address`, or the status value to return instead.
@@ -130,7 +144,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
         const address = try functionAddress(session, args) orelse return error.InvalidArguments;
         return switch (try analysisAt(a, session, address, try options(session, args))) {
             .status => |v| v,
-            .analysis => |analysis| out(a, .{ .status = "completed", .analysis = try summary(a, analysis) }),
+            .analysis => |analysis| if (analysis.graph_available) out(a, .{ .status = "completed", .analysis = try summary(a, analysis) }) else graphUnavailable(a, analysis),
         };
     }
     if (std.mem.eql(u8, name, "decompile_function")) {
@@ -198,6 +212,7 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
         .status => |v| return v,
         .analysis => |found| found,
     };
+    if (!analysis.graph_available) return graphUnavailable(a, analysis);
     const opcode = try text(args, "opcode");
     const found = try answer.candidates(a, session, analysis, selector, opcode);
     const brief = .{ .artifact_id = analysis.artifact_id, .function = analysis.function.name, .entry = analysis.function.runtime(analysis.function.key.entry), .qualification = analysis.level };
@@ -229,17 +244,24 @@ fn decompile(a: Allocator, analysis: *host.Analysis) !V {
     const reasons = try a.alloc(Reason, analysis.reasons.len);
     for (analysis.reasons, reasons) |reason, *row| row.* = .{ .code = reason.code, .level = reason.level, .detail = reason.detail, .address = if (reason.address) |pc| analysis.function.runtime(pc) else null };
     const document = analysis.pseudocode;
+    const GraphStatus = struct { available: bool, reason: ?[]const u8, detail: ?[]const u8 };
+    const graph_status: GraphStatus = if (analysis.graph_failure) |failure|
+        .{ .available = false, .reason = failure.code, .detail = failure.detail }
+    else
+        .{ .available = true, .reason = null, .detail = null };
     return out(a, .{
         .status = "completed",
         .text = document.text,
         .signature = document.signature,
         .language = document.language,
         .printer = document.printer,
-        .producer = .{ .name = analysis.producer_name, .version = analysis.producer_version },
+        .producer = .{ .name = analysis.producer_name, .version = analysis.producer_version, .worker_ms = analysis.worker_ms },
+        .graph = graph_status,
         .qualification = .{ .level = analysis.level, .reasons = reasons },
         .token_status = document.token_status,
         .address_map_status = document.address_map_status,
         .artifact_id = analysis.artifact_id,
+        .entry_pad = if (document.entry_pad) |pad| .{ .start = analysis.function.runtime(pad.start), .end = analysis.function.runtime(pad.end), .line = pad.line } else null,
         .function = .{ .name = analysis.function.name, .entry = analysis.function.runtime(analysis.function.key.entry), .size = analysis.function.key.size, .module = analysis.function.module_path },
     });
 }
@@ -257,7 +279,7 @@ fn decompMapping(a: Allocator, session: *Session, analysis: *host.Analysis, args
     const limit: usize = @intCast(@min(try wire.number(args, "rows", 256), 512));
     if (limit == 0 or start >= end or line > std.math.maxInt(u32)) return error.InvalidArguments;
     const Site = struct { path: []const u8, line: u32 };
-    const Row = struct { token: u32, line: u32, col: u32, kind: []const u8, text: []const u8, op: ?u32, link_pc: ?u64, pc: ?u64, source: ?Site };
+    const Row = struct { token: u32, line: u32, col: u32, kind: []const u8, text: []const u8, op: ?u32, link_pc: ?u64, pc: ?u64, entry_pad: bool, source: ?Site };
     const SourceRow = struct { path: []const u8, line: u32, pc: u64 };
     var rows: std.ArrayList(Row) = .empty;
     var pcs: std.ArrayList(u64) = .empty;
@@ -270,7 +292,7 @@ fn decompMapping(a: Allocator, session: *Session, analysis: *host.Analysis, args
         total += 1;
         if (rows.items.len >= limit) continue;
         const source: ?Site = if (runtime) |at| if (session.sourceAt(a, at) catch null) |site| .{ .path = site.path, .line = site.line } else null else null;
-        try rows.append(a, .{ .token = token.index, .line = token.line, .col = token.col, .kind = token.kind, .text = token.text, .op = token.op, .link_pc = token.pc, .pc = runtime, .source = source });
+        try rows.append(a, .{ .token = token.index, .line = token.line, .col = token.col, .kind = token.kind, .text = token.text, .op = token.op, .link_pc = token.pc, .pc = runtime, .entry_pad = false, .source = source });
         if (runtime) |at| {
             var known_pc = false;
             for (pcs.items) |known| if (known == at) {
@@ -288,6 +310,40 @@ fn decompMapping(a: Allocator, session: *Session, analysis: *host.Analysis, args
             }
         }
     }
+    if (analysis.pseudocode.entry_pad) |pad| {
+        var representative: ?host.PseudoToken = null;
+        for (analysis.pseudocode.tokens) |candidate| if (candidate.index == pad.token) {
+            representative = candidate;
+            break;
+        };
+        if (representative) |target| {
+            var link_pc = pad.start;
+            while (link_pc < pad.end) : (link_pc += 1) {
+                const runtime = analysis.function.runtime(link_pc);
+                const selected = if (pc) |wanted| runtime == wanted else if (line_given) pad.line == line else if (start_given) target.index >= start and target.index < end else true;
+                if (!selected) continue;
+                total += 1;
+                if (rows.items.len >= limit) continue;
+                const source: ?Site = if (session.sourceAt(a, runtime) catch null) |site| .{ .path = site.path, .line = site.line } else null;
+                try rows.append(a, .{ .token = target.index, .line = pad.line, .col = target.col, .kind = target.kind, .text = target.text, .op = target.op, .link_pc = link_pc, .pc = runtime, .entry_pad = true, .source = source });
+                var known_pc = false;
+                for (pcs.items) |known| if (known == runtime) {
+                    known_pc = true;
+                    break;
+                };
+                if (!known_pc) try pcs.append(a, runtime);
+                if (source) |site| {
+                    var known_source = false;
+                    for (sources.items) |known| if (known.pc == runtime and known.line == site.line and std.mem.eql(u8, known.path, site.path)) {
+                        known_source = true;
+                        break;
+                    };
+                    if (!known_source) try sources.append(a, .{ .path = site.path, .line = site.line, .pc = runtime });
+                }
+                if (link_pc == std.math.maxInt(u64)) break;
+            }
+        }
+    }
     const pc_text = try a.alloc([]const u8, pcs.items.len);
     for (pcs.items, pc_text) |at, *text_pc| text_pc.* = try std.fmt.allocPrint(a, "0x{x}", .{at});
     return out(a, .{
@@ -300,7 +356,7 @@ fn decompMapping(a: Allocator, session: *Session, analysis: *host.Analysis, args
         .tokens_cut = total > rows.items.len,
         .runtime_pcs = pc_text,
         .source_rows = sources.items,
-        .mapping_rule = "only worker-exported token links are returned; unmapped syntax stays unmapped and no nearest instruction is guessed",
+        .mapping_rule = "worker-exported token links are exact; adapter-proven entry-pad bytes map to the first exported code line with entry_pad true; other unmapped syntax stays unmapped and no nearest instruction is guessed",
     });
 }
 

@@ -41,30 +41,40 @@ Configuration:
 | `XODB_GHIDRA_XMX` | `4g` | Java heap ceiling |
 | `XODB_GHIDRA_SOFT_MAX` | `768m` | ZGC soft heap target |
 | `XODB_GHIDRA_JAVA_OPTS` | empty | extra JVM options, split on spaces, placed after the defaults (`-XX:+UseZGC -XX:+ZGenerational -XX:ZCollectionInterval=60 -XX:ZUncommitDelay=60`) |
-| `XODB_GHIDRA_MAX_IMAGES` | `64` | persistent project image limit |
+| `XODB_GHIDRA_MAX_IMAGES` | `64` | persistent project image safety limit; foreground imports evict the least-recently-used image |
 | `XODB_GHIDRA_MAX_DOCUMENTS` | `1024` | in-memory function document limit |
+| `XODB_GHIDRA_MAX_OPEN_PROGRAMS` | `8` | open-program/decompiler pool bound |
+| `XODB_GHIDRA_CACHE_BYTES` | `2147483648` | persistent project byte limit; least-recently-used images are evicted |
+| `XODB_GHIDRA_IDLE` | `30` | idle-exit minutes; fractional values are accepted and `0` disables idle exit |
 | `XODB_GHIDRA_START_TIMEOUT` | `45` | starter wait in seconds |
 
 Set `decompiler.prestart` to `false` in preferences, or pass
 `--no-ghidra-prestart`, to keep the JVM idle until the first pseudo-C request.
 `XODB_GHIDRA_SIDECAR=off` still disables the sidecar completely. Once a target
-architecture is known, xodb sends `prime` before opening an image. It then
-imports the executable and newly seen executable mappings in a bounded,
-smallest-first background queue. Resume and an interactive analysis cancel
+architecture is known, xodb imports the executable and newly seen executable
+mappings in a bounded, smallest-first background queue. At each stop it warms
+stack functions, then their direct callees, then user breakpoint functions,
+with a hard 16-function bound. This real-program warm-ahead replaces the old
+throwaway `prime` request, which measured no faster after decompiler reuse. Resume and an interactive analysis cancel
 this work before it can delay the debugger. A cancelled import starts again
 from nothing, so a library whose import was twice cancelled after seconds of
 work is left to an explicit request. Background imports stop at half of
 `XODB_GHIDRA_MAX_IMAGES`; the other half is kept for images you ask about.
 
-The cache is private, bounded by image and document counts, and safe to delete
-while the sidecar is stopped. Reaching a limit returns `cache_full`; raise the
-matching limit, restart for the in-memory document cache, or delete the
-stopped private cache. stdout and stderr go to `sidecar.log` under the state
+The cache is private and safe to delete while the sidecar is stopped. The
+project is bounded by `XODB_GHIDRA_CACHE_BYTES` and the image safety limit;
+foreground imports evict least-recently-used project images, close their pooled
+decompilers, and drop their documents. In-memory documents retain their own
+count bound. The main executable is always eligible for eager import; libraries
+over `decompiler.eager_library_bytes` (1 MiB by default, so libc is imported when you first stop in it or ask for pseudo-C there) wait for an explicit
+stop or pseudo-C request. stdout and stderr go to `sidecar.log` under the state
 directory; when xodb starts the sidecar, the starter's own errors (no Ghidra,
 no JDK, a compile failure) go there too, and the pane's failure text names
-the file. `status` reports heap use, heap ceiling, open images, queued jobs,
-the configured limits, and pid. The native Ghidra `decompile` child is outside
-the Java heap.
+the file. `status` reports heap use, heap ceiling, open images, queued jobs, open pooled
+programs, project bytes, idle time, connected clients, the configured limits,
+and pid. One `DecompInterface` is retained per pooled program, so uncached
+functions do not spawn a fresh native decompiler. Foreground open/decompile
+requests pre-empt background imports and warm decompiles across clients.
 
 ## Transport and trust boundary
 
@@ -95,15 +105,16 @@ later exchange.
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.2`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.5`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
 `pseudocode`. It also advertises `prime`, variables, types, function index, and the
 reserved hints direction.
 
-`prime` carries one of xodb's architecture names. It loads that processor
-language and decompiles a tiny scratch function without opening a target
-image. `open_image` carries `path` and lowercase `sha256`. It hashes the file before
+`prime` remains as a compatibility verb for older clients. Current xodb warms
+real functions after the target architecture and stack are known, because the
+throwaway-program prime did not improve first-use latency once decompilers were
+pooled. `open_image` carries `path` and lowercase `sha256`. It hashes the file before
 import. The operation is idempotent by SHA-256 and returns progress through
 `hashing`, `importing`, and `analyzing`. Format loaders also find adjacent
 owned debug companions such as a PDB or dSYM. Analysis keeps format/debug,
@@ -131,6 +142,26 @@ queued future. Cancellation is reported as code `cancelled`. `shutdown`
 acknowledges first and then closes the listener and project. xodb never sends
 shutdown merely because an xodb session exits.
 
+## Lifetime
+
+The JVM exits cleanly after 30 minutes with no connected client and no request.
+Set `XODB_GHIDRA_IDLE` to a number of minutes; fractional values are accepted
+for short-lived private runs, and `0` disables idle exit. An open connection
+keeps the sidecar alive regardless of request traffic, but xodb opens one
+connection per request and holds none in between: an xodb that sits at a stop,
+or lets its target run, for longer than the limit finds the sidecar gone and
+starts it again on its next request (a few seconds; the project cache is
+kept). `status` reports `idle_seconds`, `idle_limit_seconds`, and
+`clients_connected`, and the log records why the JVM stopped
+(`lifetime: stopping: idle`, `endpoint_replaced` or `shutdown`).
+
+The sidecar also checks its Unix endpoint periodically. If the path disappears
+or its inode is replaced, the JVM closes its project and exits. Shutdown only
+unlinks the inode the process originally bound, so a replacement endpoint is
+left alone. These rules cover abandoned test/runtime directories without
+changing the persistent project cache; a later start reuses the imported
+programs.
+
 `hints` is reserved and currently returns code `reserved`. A later schema may
 carry debugger-observed indirect targets, runtime/DWARF/PDB types and bounds,
 and user renames into Ghidra. No such facts flow into this milestone.
@@ -144,7 +175,14 @@ the graph consumed by xsg and the pseudo-C document consumed by the D pane:
 - decoded instruction bytes, mnemonics, raw p-code, and high-op links used to
   account for no-effect landing pads that high p-code omits;
 - pseudo-C text and positioned syntax tokens;
-- variables with name, type, register/stack/temp storage, and PC range;
+- variables with name, type, register/stack/temp storage, base-register name,
+  subregister bit offset, and PC range. For a register the range is a proof
+  that a stop PC inside it finds the value in that register: straight-line
+  code from the function entry (a parameter) or from just after the
+  instruction that wrote the register (a local), ending at the first write to
+  the register, call, branch, user-defined p-code op or jump target. An
+  unproven register variable has an empty range. Other storage carries the
+  looser first-to-last-use span;
 - referenced types, function prototype, and calling convention;
 - function bounds, direct callees, callers, and referenced strings.
 
@@ -152,4 +190,17 @@ xodb admits a document only when its image SHA-256, optional GNU build-id, and
 function entry exactly match the stopped session request. The sidecar and
 native worker use separate producer cache keys. The D pane and
 `decompile_function` name the selected producer; `get_decomp_mapping` reads
-the same retained artifact.
+the same retained artifact. When the adapter proves that a short entry gap is
+entirely made of an exact whitelisted landing pad, its bytes map to the first
+exported code line in both directions and are labelled `entry_pad: true`.
+Other gaps remain unmapped.
+
+
+## Pseudo-C behavior
+
+The D pane keeps pseudo-C text even when graph admission fails and shows the
+one-line graph reason; graph-only queries return `graph_unavailable`. If a
+selected sidecar cannot start on x86-64, the same request falls back to the
+configured native worker and the pane names that producer. Register-backed
+sidecar variables are overlaid from the stopped frame only inside their
+exported PC range. `[` and `]` scroll long pseudo-C lines horizontally.

@@ -26,6 +26,33 @@ pub const PseudoToken = struct {
     source: ?PseudoSite = null,
     parameter: ?u32 = null,
 };
+pub const EntryPadMapping = struct {
+    start: u64,
+    end: u64,
+    line: u32,
+    token: u32,
+};
+pub const PseudoValue = struct { name: []const u8, display: []const u8, parameter: bool };
+
+fn livePseudoValue(a: std.mem.Allocator, architecture: @import("../target/arch.zig").Arch, registers: @import("../debug/location.zig").RegisterSet, link_pc: u64, variable: host.PseudoVariable) !?PseudoValue {
+    if (!std.mem.eql(u8, variable.storage, "register") or variable.register == null or variable.size == 0 or variable.size > 8) return null;
+    if (variable.valid_start) |start| if (link_pc < start) return null;
+    if (variable.valid_end) |end| if (link_pc >= end) return null;
+    const lower = try a.dupe(u8, variable.register.?);
+    defer a.free(lower);
+    _ = std.ascii.lowerString(lower, variable.register.?);
+    const register = architecture.registerNumber(lower) orelse return null;
+    const raw = registers[register] orelse return null;
+    const width: u8 = @intCast(variable.size * 8);
+    if (@as(u16, variable.register_bit_offset) + width > 64) return null;
+    const shifted = raw >> @intCast(variable.register_bit_offset);
+    const bits = if (width == 64) shifted else shifted & ((@as(u64, 1) << @intCast(width)) - 1);
+    const display = if (std.mem.indexOf(u8, variable.type_name, "bool") != null)
+        (if (bits == 0) "false" else "true")
+    else
+        try std.fmt.allocPrint(a, "0x{x}", .{bits});
+    return .{ .name = variable.name, .display = display, .parameter = variable.parameter };
+}
 
 const State = struct {
     open: bool = false,
@@ -287,6 +314,8 @@ pub const View = struct {
     pseudo_qualification: []const u8 = "",
     pseudo_reasons: []const u8 = "",
     pseudo_tokens: []const PseudoToken = &.{},
+    pseudo_values: []const PseudoValue = &.{},
+    pseudo_entry_pad: ?EntryPadMapping = null,
     pseudo_cut: bool = false,
     /// Runtime bounds of the function a ready view describes.
     function_entry: u64 = 0,
@@ -474,11 +503,46 @@ pub const Capture = struct {
                     view.pseudo_producer = try std.fmt.allocPrint(a, "{s} {s}", .{ analysis.producer_name, analysis.producer_version });
                     view.pseudo_token_status = document.token_status;
                     view.pseudo_map_status = document.address_map_status;
-                    view.pseudo_qualification = try std.fmt.allocPrint(a, "{s}   qualification {s} / result_trust graph_{s}", .{ view.pseudo_producer, analysis.level, analysis.level });
-                    view.pseudo_reasons = try std.fmt.allocPrint(a, "reasons {s}", .{reasons.items});
+                    if (analysis.graph_failure) |failure| {
+                        view.pseudo_qualification = try std.fmt.allocPrint(a, "{s}   graph unavailable: {s}", .{ view.pseudo_producer, failure.code });
+                        view.pseudo_reasons = try std.fmt.allocPrint(a, "{s}: {s}", .{ failure.code, failure.detail });
+                    } else {
+                        view.pseudo_qualification = try std.fmt.allocPrint(a, "{s}   qualification {s} / result_trust graph_{s}", .{ view.pseudo_producer, analysis.level, analysis.level });
+                        view.pseudo_reasons = try std.fmt.allocPrint(a, "reasons {s}", .{reasons.items});
+                    }
                     view.pseudo_tokens = tokens;
+                    var live_values: std.ArrayList(PseudoValue) = .empty;
+                    if (request.tid != 0) if (session.stack(a, request.tid, request.frame + 1)) |frames| {
+                        if (request.frame < frames.len) {
+                            const frame = frames[request.frame];
+                            const link_pc = frame.lookup_pc -% analysis.function.bias;
+                            if (link_pc -% analysis.function.key.entry < analysis.function.key.size) for (document.variables) |variable| {
+                                const value = (try livePseudoValue(a, frame.architecture, frame.registers, link_pc, variable)) orelse continue;
+                                var duplicate = false;
+                                for (live_values.items) |old| if (std.mem.eql(u8, old.name, value.name)) {
+                                    duplicate = true;
+                                    break;
+                                };
+                                if (!duplicate) try live_values.append(a, value);
+                            };
+                        }
+                    } else |_| {};
+                    view.pseudo_values = live_values.items;
+                    if (document.entry_pad) |pad| view.pseudo_entry_pad = .{
+                        .start = analysis.function.runtime(pad.start),
+                        .end = analysis.function.runtime(pad.end),
+                        .line = pad.line,
+                        .token = pad.token,
+                    };
                     view.pseudo_cut = text_len != document.text.len or token_count != document.tokens.len;
                     view.phase = .questions;
+                    return;
+                }
+                if (!analysis.graph_available) {
+                    const failure = analysis.graph_failure.?;
+                    view.status = .unavailable;
+                    view.title = try std.fmt.allocPrint(a, "Static graph unavailable for {s}: {s}", .{ analysis.function.name, failure.code });
+                    view.detail = failure.detail;
                     return;
                 }
                 if (state.artifact_len == 0 or !std.mem.eql(u8, state.artifact[0..state.artifact_len], analysis.artifact_id)) {
@@ -568,4 +632,52 @@ test "static publications retain questions and answers after owner arenas retire
     try std.testing.expectEqualStrings("count += 1;", view.pseudocode);
     try std.testing.expectEqual(@as(?u64, 0x1000), view.pseudo_tokens[0].pc);
     try std.testing.expectEqualStrings("/owned/qx.c", view.pseudo_tokens[0].source.?.path);
+}
+
+test "pseudo-C live values use base registers, subregister offsets and PC bounds" {
+    const loc = @import("../debug/location.zig");
+    const Arch = @import("../target/arch.zig").Arch;
+    var registers: loc.RegisterSet = @splat(null);
+    registers[Arch.x86_64.registerNumber("rdi").?] = 0x1234_5678_9abc_def0;
+    registers[Arch.x86_64.registerNumber("rax").?] = 0x0000_0000_0000_0100;
+    const value = (try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x1010, .{
+        .name = "count",
+        .type_name = "unsigned int",
+        .size = 4,
+        .parameter = true,
+        .storage = "register",
+        .register = "RDI",
+        .register_bit_offset = 0,
+        .storage_offset = 0,
+        .valid_start = 0x1000,
+        .valid_end = 0x1020,
+    })).?;
+    defer std.testing.allocator.free(value.display);
+    try std.testing.expectEqualStrings("count", value.name);
+    try std.testing.expectEqualStrings("0x9abcdef0", value.display);
+    const flag = (try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x1010, .{
+        .name = "flag",
+        .type_name = "bool",
+        .size = 1,
+        .parameter = false,
+        .storage = "register",
+        .register = "RAX",
+        .register_bit_offset = 8,
+        .storage_offset = 0,
+        .valid_start = 0x1010,
+        .valid_end = 0x1011,
+    })).?;
+    try std.testing.expectEqualStrings("true", flag.display);
+    try std.testing.expect((try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x1020, .{
+        .name = "count",
+        .type_name = "unsigned int",
+        .size = 4,
+        .parameter = true,
+        .storage = "register",
+        .register = "RDI",
+        .register_bit_offset = 0,
+        .storage_offset = 0,
+        .valid_start = 0x1000,
+        .valid_end = 0x1020,
+    })) == null);
 }

@@ -104,6 +104,24 @@ pub const PseudoToken = struct {
     pc: ?u64 = null,
     parameter: ?u32 = null,
 };
+pub const EntryPadMapping = struct {
+    start: u64,
+    end: u64,
+    line: u32,
+    token: u32,
+};
+pub const PseudoVariable = struct {
+    name: []const u8,
+    type_name: []const u8,
+    size: u32,
+    parameter: bool,
+    storage: []const u8,
+    register: ?[]const u8,
+    register_bit_offset: u8,
+    storage_offset: ?u64,
+    valid_start: ?u64,
+    valid_end: ?u64,
+};
 pub const PseudoDocument = struct {
     language: []const u8 = "c",
     printer: []const u8 = "",
@@ -112,6 +130,8 @@ pub const PseudoDocument = struct {
     token_status: []const u8 = "unavailable",
     address_map_status: []const u8 = "unavailable",
     tokens: []const PseudoToken = &.{},
+    variables: []const PseudoVariable = &.{},
+    entry_pad: ?EntryPadMapping = null,
 };
 
 /// A completed export, converted and loaded once; cached by artifact_id.
@@ -127,6 +147,8 @@ pub const Analysis = struct {
     producer_name: []const u8,
     producer_version: []const u8,
     pseudocode: PseudoDocument = .{},
+    graph_available: bool = false,
+    graph_failure: ?Failure = null,
     graph: c.struct_xsq_graph = std.mem.zeroes(c.struct_xsq_graph),
     func: u32 = 0,
     export_path: []const u8,
@@ -197,6 +219,55 @@ pub const Job = struct {
         self.finished_ms = nowMs();
         self.done.store(true, .release);
     }
+    const Export = struct { path: []const u8, bytes: []const u8, worker_ms: f64 };
+    fn nativeExport(self: *Job, a: Allocator) !?Export {
+        self.stage.store(.analyzing, .release);
+        const toolchain = self.toolchain.?;
+        const line = try std.fmt.allocPrintSentinel(a, "DECOMPILE\tid=f\telf={s}\tentry=0x{x}\tsize=0x{x}\tname={s}", .{ self.image_path, self.function.key.entry, self.function.key.size, safeName(a, self.function.name) }, 0);
+        const request = c.struct_xghx_request{ .supervisor = toolchain.supervisor.ptr, .worker = toolchain.worker.ptr, .sleighhome = toolchain.sleigh.ptr, .outdir = self.outdir.ptr, .line = line.ptr, .deadline_ms = self.deadline_ms, .grace_ms = 250, .memory_mb = 4096 };
+        var outcome: c.struct_xghx_outcome = undefined;
+        const status = c.xghx_run(&request, self.cancel, &outcome);
+        const worker_status = std.mem.sliceTo(&outcome.status, 0);
+        const detail = std.mem.sliceTo(&outcome.detail, 0);
+        const pid: ?i64 = if (outcome.worker_pid > 0) outcome.worker_pid else null;
+        switch (status) {
+            c.XGHX_RESULT => {},
+            c.XGHX_CANCELLED => {
+                self.failure = .{ .code = "cancelled", .detail = "cancelled; the supervisor and its worker were stopped and reaped", .worker_pid = pid };
+                return null;
+            },
+            c.XGHX_HOST_DEADLINE => {
+                self.failure = .{ .code = "worker_timeout", .detail = try std.fmt.allocPrint(a, "the supervisor exceeded the host bound of {d} ms and was stopped", .{self.deadline_ms}), .worker_pid = pid };
+                return null;
+            },
+            c.XGHX_SPAWN_FAILED => {
+                self.fail("supervisor_failed", "could not start ghx_supervise (errno {d})", .{outcome.@"error"});
+                return null;
+            },
+            else => {
+                self.failure = .{ .code = "supervisor_failed", .detail = try std.fmt.allocPrint(a, "ghx_supervise ended without a result (wait status {d})", .{outcome.supervisor_status}), .worker_pid = pid };
+                return null;
+            },
+        }
+        if (!std.mem.eql(u8, worker_status, "ok")) {
+            const code: []const u8 = if (std.mem.eql(u8, worker_status, "timeout")) "worker_timeout" else if (std.mem.eql(u8, worker_status, "worker_died")) "worker_died" else if (std.mem.eql(u8, worker_status, "cancelled")) "cancelled" else if (std.mem.eql(u8, worker_status, "error")) "worker_refused" else "worker_failed";
+            var text: []const u8 = try a.dupe(u8, detail);
+            if (refusal(a, std.mem.sliceTo(&outcome.file, 0))) |cause| text = cause;
+            self.failure = .{ .code = code, .detail = text, .worker_status = try a.dupe(u8, worker_status), .worker_pid = pid };
+            return null;
+        }
+        const export_path = try a.dupe(u8, std.mem.sliceTo(&outcome.file, 0));
+        const bytes = readFile(a, export_path, max_export_bytes) catch |err| {
+            self.fail("export_unreadable", "{s}", .{@errorName(err)});
+            return null;
+        };
+        return .{ .path = export_path, .bytes = bytes, .worker_ms = outcome.ms };
+    }
+    fn sidecarStartupFailure(code: []const u8) bool {
+        for ([_][]const u8{ "sidecar_unavailable", "sidecar_not_configured", "sidecar_start_failed", "sidecar_protocol_mismatch", "sidecar_died", "sidecar_io_failed", "sidecar_bad_reply", "sidecar_timeout", "sidecar_failed" }) |candidate|
+            if (std.mem.eql(u8, code, candidate)) return true;
+        return false;
+    }
     fn work(self: *Job) !void {
         const a = self.arena.allocator();
         if (libc.mkdir(self.outdir.ptr, 0o700) != 0) return self.fail("host_error", "cannot create the job directory", .{});
@@ -204,44 +275,13 @@ pub const Job = struct {
         var bytes: []const u8 = undefined;
         var worker_ms: f64 = 0;
         if (self.producer_kind == .native) {
-            self.stage.store(.analyzing, .release);
-            const toolchain = self.toolchain.?;
-            const line = try std.fmt.allocPrintSentinel(a, "DECOMPILE\tid=f\telf={s}\tentry=0x{x}\tsize=0x{x}\tname={s}", .{ self.image_path, self.function.key.entry, self.function.key.size, safeName(a, self.function.name) }, 0);
-            const request = c.struct_xghx_request{ .supervisor = toolchain.supervisor.ptr, .worker = toolchain.worker.ptr, .sleighhome = toolchain.sleigh.ptr, .outdir = self.outdir.ptr, .line = line.ptr, .deadline_ms = self.deadline_ms, .grace_ms = 250, .memory_mb = 4096 };
-            var outcome: c.struct_xghx_outcome = undefined;
-            const status = c.xghx_run(&request, self.cancel, &outcome);
-            const worker_status = std.mem.sliceTo(&outcome.status, 0);
-            const detail = std.mem.sliceTo(&outcome.detail, 0);
-            const pid: ?i64 = if (outcome.worker_pid > 0) outcome.worker_pid else null;
-            switch (status) {
-                c.XGHX_RESULT => {},
-                c.XGHX_CANCELLED => {
-                    self.failure = .{ .code = "cancelled", .detail = "cancelled; the supervisor and its worker were stopped and reaped", .worker_pid = pid };
-                    return;
-                },
-                c.XGHX_HOST_DEADLINE => {
-                    self.failure = .{ .code = "worker_timeout", .detail = try std.fmt.allocPrint(a, "the supervisor exceeded the host bound of {d} ms and was stopped", .{self.deadline_ms}), .worker_pid = pid };
-                    return;
-                },
-                c.XGHX_SPAWN_FAILED => return self.fail("supervisor_failed", "could not start ghx_supervise (errno {d})", .{outcome.@"error"}),
-                else => {
-                    self.failure = .{ .code = "supervisor_failed", .detail = try std.fmt.allocPrint(a, "ghx_supervise ended without a result (wait status {d})", .{outcome.supervisor_status}), .worker_pid = pid };
-                    return;
-                },
-            }
-            if (!std.mem.eql(u8, worker_status, "ok")) {
-                const code: []const u8 = if (std.mem.eql(u8, worker_status, "timeout")) "worker_timeout" else if (std.mem.eql(u8, worker_status, "worker_died")) "worker_died" else if (std.mem.eql(u8, worker_status, "cancelled")) "cancelled" else if (std.mem.eql(u8, worker_status, "error")) "worker_refused" else "worker_failed";
-                var text: []const u8 = try a.dupe(u8, detail);
-                if (refusal(a, std.mem.sliceTo(&outcome.file, 0))) |cause| text = cause;
-                self.failure = .{ .code = code, .detail = text, .worker_status = try a.dupe(u8, worker_status), .worker_pid = pid };
-                return;
-            }
-            export_path = try a.dupe(u8, std.mem.sliceTo(&outcome.file, 0));
-            bytes = readFile(a, export_path, max_export_bytes) catch |err| return self.fail("export_unreadable", "{s}", .{@errorName(err)});
-            worker_ms = outcome.ms;
+            const exported = (try self.nativeExport(a)) orelse return;
+            export_path = exported.path;
+            bytes = exported.bytes;
+            worker_ms = exported.worker_ms;
         } else {
             var sidecar_failure: sidecar.Failure = undefined;
-            const outcome = sidecar.run(a, .{
+            const outcome: ?sidecar.Result = sidecar.run(a, .{
                 .socket_path = self.sidecar_socket,
                 .starter = self.sidecar_starter,
                 .image_path = self.image_path,
@@ -250,25 +290,31 @@ pub const Job = struct {
                 .size = self.function.key.size,
                 .build_id = self.function.build_id,
                 .deadline_ms = self.deadline_ms,
-            }, &self.stop, &self.stage, &sidecar_failure) catch |err| {
+            }, &self.stop, &self.stage, &sidecar_failure) catch |err| fallback: {
+                const code = if (err == error.SidecarFailed) sidecar_failure.code else "sidecar_failed";
+                if (self.toolchain != null and sidecarStartupFailure(code) and !self.cancelRequested()) {
+                    self.producer_kind = .native;
+                    break :fallback null;
+                }
                 if (err == error.SidecarFailed) self.failure = .{ .code = sidecar_failure.code, .detail = sidecar_failure.detail } else self.fail("sidecar_failed", "{s}", .{@errorName(err)});
                 return;
             };
-            export_path = try std.fmt.allocPrint(a, "{s}/sidecar-export.json", .{self.outdir});
-            const export_z = try a.dupeZ(u8, export_path);
-            try writeFile(export_z, outcome.document);
-            bytes = outcome.document;
-            worker_ms = outcome.elapsed_ms;
+            if (outcome) |ready| {
+                export_path = try std.fmt.allocPrint(a, "{s}/sidecar-export.json", .{self.outdir});
+                const export_z = try a.dupeZ(u8, export_path);
+                try writeFile(export_z, ready.document);
+                bytes = ready.document;
+                worker_ms = ready.elapsed_ms;
+            } else {
+                const exported = (try self.nativeExport(a)) orelse return;
+                export_path = exported.path;
+                bytes = exported.bytes;
+                worker_ms = exported.worker_ms;
+            }
         }
         if (self.cancelRequested()) return self.fail("cancelled", "cancelled after the export", .{});
         const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .max_value_len = max_export_bytes }) catch |err| return self.fail("export_unreadable", "{s}", .{@errorName(err)});
         try self.admit(a, doc);
-        var digest: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
-        const converted = switch (try adapter.convert(a, doc, &std.fmt.bytesToHex(digest, .lower))) {
-            .refused => |why| return self.fail("adapter_refused", "{s}", .{why}),
-            .xsg => |text| text,
-        };
         const analysis = try page.create(Analysis);
         analysis.* = .{ .arena = .init(page), .function = undefined, .artifact_id = "", .contract = "", .schema_version = "", .level = "", .reasons = &.{}, .producer_kind = self.producer_kind, .producer_name = "", .producer_version = "", .export_path = "", .worker_ms = worker_ms };
         errdefer {
@@ -276,17 +322,6 @@ pub const Job = struct {
             page.destroy(analysis);
         }
         const keep = analysis.arena.allocator();
-        var budget = c.struct_xsq_load_budget{ .max_bytes = 256 << 20, .cancel = self.cancel };
-        const loaded = c.xsq_load_buffer_budget(converted.ptr, converted.len, &budget, &analysis.graph);
-        if (loaded != c.XSQ_OK) {
-            const err_text = std.mem.sliceTo(&analysis.graph.@"error", 0);
-            if (loaded == c.XSQ_CANCELLED) self.fail("cancelled", "cancelled while loading the graph", .{}) else self.fail("graph_rejected", "{s}: line {d}: {s}", .{ std.mem.span(c.xsq_status_name(loaded)), analysis.graph.error_line, err_text });
-            return error.GraphRejected;
-        }
-        if (analysis.graph.func_count != 1) {
-            self.fail("graph_rejected", "expected one function, got {d}", .{analysis.graph.func_count});
-            return error.GraphRejected;
-        }
         analysis.function = try self.function.dupe(keep);
         analysis.artifact_id = try keep.dupe(u8, str(doc, "artifact_id") orelse "unknown");
         analysis.contract = try keep.dupe(u8, str(doc, "contract") orelse "");
@@ -304,6 +339,40 @@ pub const Job = struct {
         };
         analysis.reasons = reasons.items;
         analysis.pseudocode = try pseudoDocument(keep, doc);
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const converted = switch (try adapter.convert(a, doc, &std.fmt.bytesToHex(digest, .lower))) {
+            .refused => |why| {
+                analysis.graph_failure = .{ .code = "adapter_refused", .detail = try keep.dupe(u8, why) };
+                self.stage.store(.ready, .release);
+                self.analysis = analysis;
+                return;
+            },
+            .xsg => |text| text,
+        };
+        var budget = c.struct_xsq_load_budget{ .max_bytes = 256 << 20, .cancel = self.cancel };
+        const loaded = c.xsq_load_buffer_budget(converted.ptr, converted.len, &budget, &analysis.graph);
+        if (loaded != c.XSQ_OK) {
+            const err_text = std.mem.sliceTo(&analysis.graph.@"error", 0);
+            if (loaded == c.XSQ_CANCELLED) {
+                self.fail("cancelled", "cancelled while loading the graph", .{});
+                return error.GraphRejected;
+            }
+            analysis.graph_failure = .{
+                .code = "graph_rejected",
+                .detail = try std.fmt.allocPrint(keep, "{s}: line {d}: {s}", .{ std.mem.span(c.xsq_status_name(loaded)), analysis.graph.error_line, err_text }),
+            };
+            self.stage.store(.ready, .release);
+            self.analysis = analysis;
+            return;
+        }
+        if (analysis.graph.func_count != 1) {
+            analysis.graph_failure = .{ .code = "graph_rejected", .detail = try std.fmt.allocPrint(keep, "expected one function, got {d}", .{analysis.graph.func_count}) };
+            self.stage.store(.ready, .release);
+            self.analysis = analysis;
+            return;
+        }
+        analysis.graph_available = true;
         self.stage.store(.ready, .release);
         self.analysis = analysis;
     }
@@ -498,6 +567,45 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
     };
     const text = try a.dupe(u8, str(pseudo, "text") orelse "");
     try normalizePseudoTokens(a, text, &tokens);
+    var variables: std.ArrayList(PseudoVariable) = .empty;
+    if (root.object.get("variables")) |list| if (list == .array) for (list.array.items) |variable| {
+        const size = number(variable, "size") orelse 0;
+        if (size < 0 or size > std.math.maxInt(u32)) continue;
+        const parameter = if (variable == .object) if (variable.object.get("parameter")) |value| value == .bool and value.bool else false else false;
+        try variables.append(a, .{
+            .name = try a.dupe(u8, str(variable, "name") orelse ""),
+            .type_name = try a.dupe(u8, str(variable, "type") orelse ""),
+            .size = @intCast(size),
+            .parameter = parameter,
+            .storage = try a.dupe(u8, str(variable, "storage") orelse "temp"),
+            .register = if (str(variable, "register")) |name| try a.dupe(u8, name) else null,
+            .register_bit_offset = @intCast(@min(63, @max(0, number(variable, "register_bit_offset") orelse 0))),
+            .storage_offset = hexField(variable, "storage_offset"),
+            .valid_start = hexField(variable, "valid_start"),
+            .valid_end = hexField(variable, "valid_end"),
+        });
+    };
+    var pad_mapping: ?EntryPadMapping = null;
+    if (adapter.verifiedEntryPad(a, root)) |pad| {
+        // The pad belongs to the line carrying the first mapped instruction
+        // after it. This is an exact mapping only for adapter-proven pads.
+        var first_pc: u64 = std.math.maxInt(u64);
+        var first_token: ?PseudoToken = null;
+        for (tokens.items) |candidate| {
+            const pc = candidate.pc orelse continue;
+            if (pc < pad.end or pc > first_pc) continue;
+            if (pc < first_pc or first_token == null or candidate.line < first_token.?.line) {
+                first_pc = pc;
+                first_token = candidate;
+            }
+        }
+        if (first_token) |target| pad_mapping = .{
+            .start = pad.start,
+            .end = pad.end,
+            .line = target.line,
+            .token = target.index,
+        };
+    }
     return .{
         .language = try a.dupe(u8, str(pseudo, "language") orelse "c"),
         .printer = try a.dupe(u8, str(pseudo, "printer") orelse ""),
@@ -506,6 +614,8 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
         .token_status = try a.dupe(u8, str(pseudo, "token_status") orelse "unavailable"),
         .address_map_status = try a.dupe(u8, str(pseudo, "address_map_status") orelse "unavailable"),
         .tokens = tokens.items,
+        .variables = variables.items,
+        .entry_pad = pad_mapping,
     };
 }
 
@@ -607,6 +717,7 @@ pub fn mayCancel(owner: Owner, requester: Requester) bool {
 
 const Hashed = struct { module_id: u64, ptr: usize, len: usize, sha: [64]u8 };
 const max_warm_images = 8;
+const max_warm_functions = 16;
 /// A cancelled background import that ran at least this long counts as wasted.
 const warm_waste_ms = 2000;
 
@@ -619,17 +730,26 @@ const WarmImage = struct {
     use_original: bool,
 };
 const WarmCandidate = struct { id: u64, path: []const u8, mapping: ?[]const u8, size: usize, file_offset: u64 };
+const WarmFunction = struct {
+    sha256: [64]u8,
+    path: [:0]const u8,
+    snapshot_path: [:0]const u8,
+    mapping: ?[]const u8,
+    entry: u64,
+    build_id: ?[]const u8,
+    /// Stack functions seed direct callees; breakpoint functions do not.
+    seed_callees: bool,
+};
+const WarmFunctionCandidate = struct { sha256: [64]u8, path: []const u8, mapping: ?[]const u8, entry: u64, build_id: ?[]const u8, seed_callees: bool };
 
 const Warmup = struct {
     arena: std.heap.ArenaAllocator = .init(page),
     endpoint: sidecar.Endpoint = undefined,
-    architecture: ?@import("../target/arch.zig").Arch = null,
     images: []const WarmImage = &.{},
+    functions: []const WarmFunction = &.{},
     cancel: std.atomic.Value(bool) = .init(false),
     stage: std.atomic.Value(sidecar.Stage) = .init(.queued),
     attempted: std.atomic.Value(usize) = .init(0),
-    /// Priming ran to an answer, good or bad; a cancelled one is asked again.
-    prime_ok: std.atomic.Value(bool) = .init(false),
     /// The sidecar could not be reached or started; asking again per image
     /// would only run the starter again.
     unusable: std.atomic.Value(bool) = .init(false),
@@ -646,18 +766,6 @@ const Warmup = struct {
         _ = libc.nice(10);
         defer self.done.store(true, .release);
         const a = self.arena.allocator();
-        if (self.architecture) |arch| {
-            var failure: sidecar.Failure = undefined;
-            if (sidecar.prime(a, self.endpoint, @tagName(arch), &self.cancel, &self.stage, &failure)) {
-                self.prime_ok.store(true, .release);
-            } else |err| {
-                // A sidecar without the verb, or without this architecture,
-                // still imports images.
-                if (self.cancel.load(.acquire)) return;
-                if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
-                self.prime_ok.store(true, .release);
-            }
-        }
         for (self.images, 0..) |image, index| {
             if (self.cancel.load(.acquire)) return;
             const sha = if (image.mapping) |mapping| hashWarmBytes(mapping, &self.cancel) catch return else hashWarmFile(image.path, &self.cancel) catch {
@@ -687,6 +795,93 @@ const Warmup = struct {
             };
             self.attempted.store(index + 1, .release);
         }
+        var warmed: [max_warm_functions]struct { sha256: [64]u8, entry: u64 } = undefined;
+        var warmed_count: usize = 0;
+        var stack_docs: [max_warm_functions]?[]const u8 = @splat(null);
+        // Stack functions first, in frame order.
+        for (self.functions, 0..) |function, index| {
+            if (!function.seed_callees or warmed_count == warmed.len or self.cancel.load(.acquire)) continue;
+            const path = self.functionImage(function) catch continue;
+            if (!self.openFunctionImage(function, path)) {
+                if (self.cancel.load(.acquire) or self.unusable.load(.acquire)) return;
+                continue;
+            }
+            var failure: sidecar.Failure = undefined;
+            const document = sidecar.warmDecompile(a, self.endpoint, path, &function.sha256, function.entry, function.build_id, &self.cancel, &self.stage, &failure) catch |err| {
+                if (self.cancel.load(.acquire)) return;
+                if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
+                continue;
+            };
+            warmed[warmed_count] = .{ .sha256 = function.sha256, .entry = function.entry };
+            warmed_count += 1;
+            stack_docs[index] = document;
+        }
+        // Then one level of direct callees from those stack documents.
+        for (self.functions, 0..) |function, index| {
+            const bytes = stack_docs[index] orelse continue;
+            const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{ .max_value_len = max_export_bytes }) catch continue;
+            const function_index = if (doc == .object) doc.object.get("function_index") orelse continue else continue;
+            const direct = if (function_index == .object) function_index.object.get("direct_callees") orelse continue else continue;
+            if (direct != .array) continue;
+            const path = self.functionImage(function) catch continue;
+            for (direct.array.items) |callee| {
+                if (warmed_count == warmed.len or self.cancel.load(.acquire)) break;
+                const entry = hexField(callee, "entry") orelse continue;
+                var seen = false;
+                for (warmed[0..warmed_count]) |old| if (old.entry == entry and std.mem.eql(u8, &old.sha256, &function.sha256)) {
+                    seen = true;
+                    break;
+                };
+                if (seen) continue;
+                var failure: sidecar.Failure = undefined;
+                _ = sidecar.warmDecompile(a, self.endpoint, path, &function.sha256, entry, function.build_id, &self.cancel, &self.stage, &failure) catch |err| {
+                    if (self.cancel.load(.acquire)) return;
+                    if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
+                    continue;
+                };
+                warmed[warmed_count] = .{ .sha256 = function.sha256, .entry = entry };
+                warmed_count += 1;
+            }
+        }
+        // User breakpoints are last.
+        for (self.functions) |function| {
+            if (function.seed_callees or warmed_count == warmed.len or self.cancel.load(.acquire)) continue;
+            var seen = false;
+            for (warmed[0..warmed_count]) |old| if (old.entry == function.entry and std.mem.eql(u8, &old.sha256, &function.sha256)) {
+                seen = true;
+                break;
+            };
+            if (seen) continue;
+            const path = self.functionImage(function) catch continue;
+            if (!self.openFunctionImage(function, path)) {
+                if (self.cancel.load(.acquire) or self.unusable.load(.acquire)) return;
+                continue;
+            }
+            var failure: sidecar.Failure = undefined;
+            _ = sidecar.warmDecompile(a, self.endpoint, path, &function.sha256, function.entry, function.build_id, &self.cancel, &self.stage, &failure) catch |err| {
+                if (self.cancel.load(.acquire)) return;
+                if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
+                continue;
+            };
+            warmed[warmed_count] = .{ .sha256 = function.sha256, .entry = function.entry };
+            warmed_count += 1;
+        }
+    }
+
+    fn functionImage(self: *Warmup, function: WarmFunction) ![]const u8 {
+        if (function.mapping == null) return function.path;
+        try writeWarmSnapshot(function.snapshot_path, function.mapping.?, &self.cancel);
+        return function.snapshot_path;
+    }
+
+    fn openFunctionImage(self: *Warmup, function: WarmFunction, path: []const u8) bool {
+        var failure: sidecar.Failure = undefined;
+        sidecar.openImage(self.arena.allocator(), self.endpoint, path, &function.sha256, &self.cancel, &self.stage, &failure) catch |err| {
+            if (self.cancel.load(.acquire)) return false;
+            if (sidecarGone(err, &failure)) self.unusable.store(true, .release);
+            return false;
+        };
+        return true;
     }
 
     fn destroy(self: *Warmup) void {
@@ -757,17 +952,19 @@ fn writeWarmSnapshot(path: [:0]const u8, bytes: []const u8, cancel: *const std.a
 pub const State = struct {
     toolchain_dir: ?[]const u8 = null,
     warmup_enabled: bool = true,
+    eager_library_bytes: u64 = 1024 * 1024,
     dir: ?[:0]u8 = null,
     hashed: [8]?Hashed = @splat(null),
     hash_next: usize = 0,
     analyses: std.ArrayList(*Analysis) = .empty,
     job: ?*Job = null,
     warmup: ?*Warmup = null,
-    prime_attempted: ?@import("../target/arch.zig").Arch = null,
     warm_seen: [64]u64 = @splat(0),
     warm_seen_count: usize = 0,
+    warm_generation: ?u64 = null,
     /// The first image ever queued: the main executable. Never given up.
     warm_main: ?u64 = null,
+    warm_main_path: ?[]u8 = null,
     /// The image whose import was last cancelled after real work.
     warm_struck: ?u64 = null,
     next_job: u64 = 1,
@@ -784,6 +981,10 @@ pub const State = struct {
             page.destroy(analysis);
         }
         self.analyses.deinit(page);
+        if (self.warm_main_path) |path| {
+            page.free(path);
+            self.warm_main_path = null;
+        }
         if (self.dir) |dir| {
             _ = c.xghx_remove_tree(dir.ptr);
             page.free(dir);
@@ -810,9 +1011,6 @@ pub const State = struct {
         warm.thread = null;
         const attempted = @min(warm.attempted.load(.acquire), warm.images.len);
         for (warm.images[0..attempted]) |image| self.markWarmSeen(image.module_id);
-        if (warm.architecture) |arch| if (warm.prime_ok.load(.acquire)) {
-            self.prime_attempted = arch;
-        };
         // An import restarts from nothing after a cancel. One that was twice
         // cancelled after real work is left to an explicit request, so short
         // stops cannot keep the sidecar busy for no result.
@@ -836,6 +1034,33 @@ pub const State = struct {
         self.reapWarmup();
     }
 
+    fn overEagerBound(self: *State, session: *Session, address: u64) bool {
+        const module = session.modules.at(address) catch return false;
+        if (module.mapping.len <= self.eager_library_bytes) return false;
+        const main = self.warm_main_path orelse return false;
+        return !std.mem.eql(u8, main, module.path);
+    }
+
+    fn addWarmFunction(self: *State, a: Allocator, session: *Session, candidates: *[max_warm_functions]WarmFunctionCandidate, count: *usize, address: u64, seed_callees: bool) void {
+        if (count.* == candidates.len) return;
+        const function = self.resolve(a, session, address) catch return;
+        for (candidates[0..count.*]) |old| if (old.entry == function.key.entry and std.mem.eql(u8, &old.sha256, &function.key.image_sha256)) return;
+        const module = session.modules.at(address) catch return;
+        const local_path = !session.target.isRemote() and blk: {
+            const path_z = a.dupeZ(u8, function.module_path) catch break :blk false;
+            break :blk present(path_z);
+        };
+        candidates[count.*] = .{
+            .sha256 = function.key.image_sha256,
+            .path = function.module_path,
+            .mapping = if (local_path) null else module.mapping,
+            .entry = function.key.entry,
+            .build_id = function.build_id,
+            .seed_callees = seed_callees,
+        };
+        count.* += 1;
+    }
+
     /// Starts only bounded background work. The owner calls this after its
     /// normal target poll, so startup, priming and imports never delay it.
     pub fn maintain(self: *State, session: *Session) void {
@@ -854,9 +1079,8 @@ pub const State = struct {
         var select_arena = std.heap.ArenaAllocator.init(page);
         defer select_arena.deinit();
         if (!(sidecar.selected(select_arena.allocator()) catch false)) return;
-        const arch = session.target.arch();
-        const need_prime = self.prime_attempted == null or self.prime_attempted.? != arch;
-        if (!need_prime and self.warm_seen_count == self.warm_seen.len) return;
+        const need_functions = self.warm_generation == null or self.warm_generation.? != snapshot.generation;
+        if (!need_functions and self.warm_seen_count == self.warm_seen.len) return;
         if (self.job) |job| if (job.running()) return;
         var selected_images: [max_warm_images]WarmCandidate = undefined;
         var count: usize = 0;
@@ -881,7 +1105,15 @@ pub const State = struct {
                 break;
             };
             if (duplicate) continue;
-            selected_images[count] = .{ .id = id, .path = region.path, .mapping = null, .size = @intCast(region.end -| region.start), .file_offset = 0 };
+            var stat: libc.struct_stat = undefined;
+            const path_z = select_arena.allocator().dupeZ(u8, region.path) catch continue;
+            const size: u64 = if (libc.stat(path_z.ptr, &stat) == 0 and stat.st_size >= 0) @intCast(stat.st_size) else region.end -| region.start;
+            const main = self.warm_main == null and count == 0 or self.warm_main == id;
+            if (!main and size > self.eager_library_bytes) {
+                self.markWarmSeen(id);
+                continue;
+            }
+            selected_images[count] = .{ .id = id, .path = region.path, .mapping = null, .size = @intCast(size), .file_offset = 0 };
             count += 1;
         };
         // A remote target's path is not normally present on this host. Once
@@ -894,11 +1126,45 @@ pub const State = struct {
                 break;
             };
             if (duplicate) continue;
+            const main = self.warm_main == null and count == 0 or self.warm_main == module.id;
+            if (!main and module.mapping.len > self.eager_library_bytes) {
+                self.markWarmSeen(module.id);
+                continue;
+            }
             selected_images[count] = .{ .id = module.id, .path = module.path, .mapping = module.mapping, .size = module.mapping.len, .file_offset = module.file_offset };
             count += 1;
         }
-        if (!need_prime and count == 0) return;
-        if (self.warm_main == null and count > 0) self.warm_main = selected_images[0].id;
+        var selected_functions: [max_warm_functions]WarmFunctionCandidate = undefined;
+        var function_count: usize = 0;
+        if (need_functions) {
+            var tid: ?i32 = null;
+            for (session.target.threadSlice()) |thread| if (thread.state == .stopped) {
+                if (tid == null or thread.reason != .none) tid = thread.tid;
+                if (thread.reason != .none) break;
+            };
+            if (tid) |stopped_tid| if (session.stack(select_arena.allocator(), stopped_tid, 8)) |frames| {
+                for (frames, 0..) |frame, index| {
+                    // Nearly every stack ends in libc, and many pass through
+                    // a toolkit: only the stop function itself, or a user
+                    // breakpoint below, may pull in a library over the eager
+                    // bound. The outer frames of one wait for an explicit D.
+                    if (index > 0 and self.overEagerBound(session, frame.lookup_pc)) continue;
+                    self.addWarmFunction(select_arena.allocator(), session, &selected_functions, &function_count, frame.lookup_pc, true);
+                }
+            } else |_| {};
+            for (session.target.breakpointSlice()) |probe| {
+                if (!probe.enabled or probe.pending or probe.internal or probe.temporary) continue;
+                self.addWarmFunction(select_arena.allocator(), session, &selected_functions, &function_count, probe.address, false);
+            }
+            // Symbol/debug discovery can complete later in the same stop.
+            // Retry this generation until at least one function resolves.
+            if (function_count > 0) self.warm_generation = snapshot.generation;
+        }
+        if (count == 0 and function_count == 0) return;
+        if (self.warm_main == null and count > 0) {
+            self.warm_main = selected_images[0].id;
+            self.warm_main_path = page.dupe(u8, selected_images[0].path) catch null;
+        }
         // The first executable mapping of a normal launch is the main image:
         // it stays first. Everything else goes smallest first, in every batch.
         const pinned: usize = if (count > 0 and self.warm_main == selected_images[0].id) 1 else 0;
@@ -914,7 +1180,6 @@ pub const State = struct {
             warm.destroy();
             return;
         }, .starter = sidecar.starterPath(a) catch null, .deadline_ms = default_deadline_ms };
-        warm.architecture = if (need_prime) arch else null;
         if (count > 0) {
             const images = a.alloc(WarmImage, count) catch {
                 warm.destroy();
@@ -938,6 +1203,34 @@ pub const State = struct {
                 .use_original = candidate.mapping == null,
             };
             warm.images = images;
+        }
+        if (function_count > 0) {
+            const functions = a.alloc(WarmFunction, function_count) catch {
+                warm.destroy();
+                return;
+            };
+            for (selected_functions[0..function_count], functions) |candidate, *function| function.* = .{
+                .sha256 = candidate.sha256,
+                .path = a.dupeZ(u8, candidate.path) catch {
+                    warm.destroy();
+                    return;
+                },
+                .snapshot_path = std.fmt.allocPrintSentinel(a, "{s}/warm-f-{s}.image", .{ self.privateDir() catch {
+                    warm.destroy();
+                    return;
+                }, &candidate.sha256 }, 0) catch {
+                    warm.destroy();
+                    return;
+                },
+                .mapping = candidate.mapping,
+                .entry = candidate.entry,
+                .build_id = if (candidate.build_id) |id| a.dupe(u8, id) catch {
+                    warm.destroy();
+                    return;
+                } else null,
+                .seed_callees = candidate.seed_callees,
+            };
+            warm.functions = functions;
         }
         warm.thread = std.Thread.spawn(.{}, Warmup.run, .{warm}) catch {
             warm.destroy();
@@ -1051,21 +1344,35 @@ pub const State = struct {
         const function = try self.resolve(a, session, address);
         self.poll();
         if (self.cached(function.key, producer_kind)) |analysis| return .{ .ready = analysis };
+        // If a configured sidecar could not start, keep serving the native
+        // result for this function instead of retrying the broken endpoint on
+        // every frame. The producer field still says which engine made it.
+        if (producer_kind == .sidecar) if (self.cached(function.key, .native)) |analysis| return .{ .ready = analysis };
         if (self.job) |job| {
-            if (job.producer_kind == producer_kind and job.function.key.eql(function.key)) {
+            if (job.function.key.eql(function.key) and (job.producer_kind == producer_kind or producer_kind == .sidecar and job.producer_kind == .native)) {
                 if (job.running()) return .{ .running = job };
                 if (job.failure != null and !options.retry) return .{ .failed = job };
             } else if (job.running()) return error.StaticAnalysisBusy;
         }
-        self.cancelWarmup();
+        // Foreground work only requests cancellation. The owner thread never
+        // joins a background sidecar call; maintain() harvests it later.
+        if (self.warmup) |warm| warm.cancel.store(true, .release);
         return .{ .running = try self.start(session, function, producer_kind, options) };
     }
 
     fn start(self: *State, session: *Session, function: Function, producer_kind: ProducerKind, options: Options) !*Job {
-        const toolchain: ?Toolchain = if (producer_kind == .native) switch (try discover(page, self.toolchain_dir)) {
-            .ready => |t| t,
-            .unavailable => return error.StaticAnalysisUnavailable,
-        } else null;
+        const toolchain: ?Toolchain = find: {
+            if (producer_kind == .native) break :find switch (try discover(page, self.toolchain_dir)) {
+                .ready => |t| t,
+                .unavailable => return error.StaticAnalysisUnavailable,
+            };
+            if (session.target.arch() != .x86_64) break :find null;
+            const found = discover(page, self.toolchain_dir) catch break :find null;
+            break :find switch (found) {
+                .ready => |t| t,
+                .unavailable => null,
+            };
+        };
         const dir = try self.privateDir();
         const module = try session.modules.at(function.runtime(function.key.entry));
         if (!std.mem.eql(u8, &self.identity(module), &function.key.image_sha256)) return error.BinaryChangedDuringRead;
@@ -1196,6 +1503,31 @@ test "pseudo-C block comments spanning lines hold no PC, and code after one does
     try std.testing.expectEqual(@as(?u64, 0x1004), document.tokens[4].pc);
 }
 
+test "adapter-proven entry pads map to the first exported code line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(std.json.Value, a, @embedFile("adapter_fixture.json"), .{});
+    try root.object.getPtr("function").?.object.put(a, "entry", .{ .string = "0x4012dc" });
+    const endbr = try std.json.parseFromSliceLeaky(std.json.Value, a,
+        \\{"id":"insn:0x4012dc","addr":"0x4012dc","length":4,"admission":"admitted","bytes":"f30f1efa","mnemonic":"ENDBR64","raw_pcode":[],"high_ops":[]}
+    , .{});
+    try root.object.getPtr("instructions").?.array.insert(0, endbr);
+    const document = try pseudoDocument(a, root);
+    const pad = document.entry_pad orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(@as(u64, 0x4012dc), pad.start);
+    try std.testing.expectEqual(@as(u64, 0x4012e0), pad.end);
+    const target = for (document.tokens) |token| {
+        if (token.index == pad.token) break token;
+    } else return error.TestExpectedEqual;
+    try std.testing.expectEqual(pad.line, target.line);
+    try std.testing.expect(target.pc.? >= pad.end);
+
+    root.object.getPtr("instructions").?.array.items[0].object.getPtr("bytes").?.* = .{ .string = "0f1f4000" };
+    try std.testing.expect(adapter.verifiedEntryPad(a, root) == null);
+    try std.testing.expect((try pseudoDocument(a, root)).entry_pad == null);
+}
+
 test "cancel: own jobs, or any job only with control" {
     try std.testing.expect(mayCancel(.human, .human));
     try std.testing.expect(mayCancel(.{ .agent = 7 }, .human));
@@ -1206,4 +1538,21 @@ test "cancel: own jobs, or any job only with control" {
     try std.testing.expect(mayCancel(.human, .{ .agent = .{ .client = 8, .controller = true } }));
     try std.testing.expect(!mayCancel(.human, .{ .agent = .{ .client = null, .controller = false } }));
     try std.testing.expect(mayCancel(.{ .agent = null }, .{ .agent = .{ .client = null, .controller = false } }));
+}
+
+test "sidecar variable metadata retains base register, subregister offset and lifetime" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
+        \\{"pseudocode":{"text":"int f(int count)\\n","tokens":[]},"variables":[{"name":"count","type":"int","size":4,"parameter":true,"storage":"register","register":"RDI","register_bit_offset":8,"storage_offset":"0x20","valid_start":"0x1000","valid_end":"0x1010"}]}
+    , .{});
+    const document = try pseudoDocument(arena.allocator(), root);
+    try std.testing.expectEqual(@as(usize, 1), document.variables.len);
+    const variable = document.variables[0];
+    try std.testing.expectEqualStrings("count", variable.name);
+    try std.testing.expectEqualStrings("RDI", variable.register.?);
+    try std.testing.expectEqual(@as(u8, 8), variable.register_bit_offset);
+    try std.testing.expectEqual(@as(?u64, 0x20), variable.storage_offset);
+    try std.testing.expectEqual(@as(?u64, 0x1000), variable.valid_start);
+    try std.testing.expectEqual(@as(?u64, 0x1010), variable.valid_end);
 }

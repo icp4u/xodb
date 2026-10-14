@@ -166,6 +166,7 @@ pub const Tree = struct {
         child.allocation_helper = parent.allocation_helper;
         child.static_analysis.toolchain_dir = parent.static_analysis.toolchain_dir;
         child.static_analysis.warmup_enabled = parent.static_analysis.warmup_enabled;
+        child.static_analysis.eager_library_bytes = parent.static_analysis.eager_library_bytes;
         child.symbol_files = self.root().symbolFiles();
         child.source_map_owner = self.root().sourceMaps();
         child.fetch_source = self.root().fetch_source;

@@ -116,6 +116,7 @@ fn hasFlag(v: Value, name: []const u8) bool {
 }
 
 const EntryPad = struct { block_id: []const u8, block_start: u64 };
+pub const EntryPadRange = struct { start: u64, end: u64 };
 
 fn emptyArray(object: Value, key: []const u8) bool {
     const value = Converter.opt(object, key) orelse return false;
@@ -188,6 +189,27 @@ fn entryPad(k: *Converter, doc: Value, lang: Value, blocks: []Value, entry: u64)
         cursor += length;
     }
     return if (cursor == target.block_start) target else null;
+}
+
+/// Returns the range admitted by the same exact rule used by convert(). A
+/// document without a gap, or one whose gap is not a proven landing pad, has
+/// no range. Malformed documents are treated the same way here; convert()
+/// remains the authority that reports their refusal.
+pub fn verifiedEntryPad(a: Allocator, doc: Value) ?EntryPadRange {
+    var k = Converter{ .a = a };
+    const lang = Converter.opt(doc, "language") orelse return null;
+    const func = Converter.opt(doc, "function") orelse return null;
+    const blocks_value = Converter.opt(doc, "blocks") orelse return null;
+    if (blocks_value != .array) return null;
+    const entry_value = Converter.opt(func, "entry") orelse return null;
+    const entry = k.hex(entry_value, "function.entry") catch return null;
+    for (blocks_value.array.items) |block| {
+        const start_value = Converter.opt(block, "start") orelse return null;
+        const start = k.hex(start_value, "block") catch return null;
+        if (start == entry) return null;
+    }
+    const pad = entryPad(&k, doc, lang, blocks_value.array.items, entry) catch return null;
+    return if (pad) |p| .{ .start = entry, .end = p.block_start } else null;
 }
 
 /// Converts one export; the input SHA-256 (hex) goes into the `source` line.
