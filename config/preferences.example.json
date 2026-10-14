@@ -27,9 +27,19 @@
   "decompiler": {
     "prestart": true
   },
+  "gibson": {
+    "flight_speed": 1.5,
+    "film_speed": 4.2,
+    "film": false,
+    "street_names": true,
+    "facts": true,
+    "facts_alpha": 0.38
+  },
   "galaxy": {
     "additive": true,
     "cloud_size": 1.6,
+    "cloud_lod": true,
+    "cloud_pixel_limit": 4,
     "brightness": 0.85,
     "camera_zoom": 1.35,
     "pan_speed": 340,

@@ -78,6 +78,18 @@ pub const State = struct {
                 self.flow_demand = self.events_enabled and live;
             }
         }
+        return self.readPublished(ctx, paused);
+    }
+    /// Observer requests inventory only; never starts, stops or renews tracing.
+    pub fn observe(self: *State, owner: *system.Collector) !void {
+        const ctx = try owner.descriptors();
+        const request = c.struct_xrt_fdactivity_request{ .interval_ms = 1000, .poll_all = 1, .graph = 1 };
+        _ = c.xrt_fdactivity_request(ctx, &request);
+        _ = try self.readPublished(ctx, false);
+        // A new projection needs a second copy-only pass for the retained flow.
+        _ = try self.readPublished(ctx, false);
+    }
+    fn readPublished(self: *State, ctx: *c.struct_xrt_fdactivity, paused: bool) !bool {
         var published: c.struct_xrt_fdactivity_view = undefined;
         if (c.xrt_fdactivity_acquire(ctx, &published) == 0) return self.reproject();
         var changed = false;

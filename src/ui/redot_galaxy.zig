@@ -51,6 +51,11 @@ pub const View = struct {
         const old_clip = r.clip;
         r.clip = draw.intersect(old_clip, field);
         defer r.clip = old_clip;
+        if (self.state.table.open) {
+            _ = try self.state.table.render(&self.state.scene, &self.state.motion.navigation, ctx, field);
+            self.moving = false;
+            return;
+        }
         const counts = try galaxy.renderModel(&host, &self.state, ctx, field, body, &.{}, null, self.presentation.clock);
         self.moving = counts.moving;
         var chosen: ?model.Node = null;
@@ -65,7 +70,7 @@ pub const View = struct {
         var buffer: [256]u8 = undefined;
         const navigation = &self.state.motion.navigation;
         try r.textFit(font, bounds.x + 14, bounds.y + 72, bounds.w - 28, try std.fmt.bufPrint(&buffer, "SCENE GALAXY{s} / {d} nodes / {d} clusters / {d} parent-child threads / {d} omitted", .{ if (navigation.tour) " / TOUR" else "", counts.stars, counts.clusters, counts.strands, self.omitted }), palette.all[0].ok);
-        try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 92, bounds.w - 28, if (navigation.help) @import("overview/galaxy_camera.zig").hints else "Click selects / Enter frames. G tree / P inspector / R refresh / ? navigation. S pans, not signals.", palette.all[0].text);
+        try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 92, bounds.w - 28, if (navigation.help) @import("overview/galaxy_camera.zig").hints else "Click selects / Enter frames. V table / G tree / P inspector / R refresh / ? navigation.", palette.all[0].text);
         try r.textFit(font, bounds.x + 14, bounds.y + bounds.h - 68, bounds.w - 28, "Signal connections / emissions: unavailable from this engine protocol; no signal activity is inferred.", palette.all[0].warn);
         if (self.hover_len == 0) if (chosen) |star| {
             const text = std.fmt.bufPrint(&self.hover, "Ringed: {s} / object #{d} / selected in the inspector", .{ star.label(), star.seed }) catch "";

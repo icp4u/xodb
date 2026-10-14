@@ -73,9 +73,24 @@ pub const Languages = struct {
         }
     }
 };
+pub const Gibson = struct {
+    flight_speed: f32 = 1.5,
+    film_speed: f32 = 4.2,
+    film: bool = false,
+    street_names: bool = true,
+    facts: bool = true,
+    facts_alpha: f32 = 0.38,
+    pub fn validate(self: Gibson) !void {
+        inline for (.{ .{ self.flight_speed, 0.4, 5.0 }, .{ self.film_speed, 0.4, 5.0 }, .{ self.facts_alpha, 0.0, 1.0 } }) |range| {
+            if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGibsonLook;
+        }
+    }
+};
 pub const Galaxy = struct {
     additive: bool = true,
     cloud_size: f32 = 1.6,
+    cloud_lod: bool = true,
+    cloud_pixel_limit: f32 = 4,
     brightness: f32 = 0.85,
     camera_zoom: f32 = 1.35,
     easing_ms: f32 = 450,
@@ -92,6 +107,7 @@ pub const Galaxy = struct {
             if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGalaxyLook;
         }
         if (self.max_stars < 8 or self.max_stars > 1024) return error.InvalidGalaxyLook;
+        if (!std.math.isFinite(self.cloud_pixel_limit) or self.cloud_pixel_limit < 1 or self.cloud_pixel_limit > 8) return error.InvalidGalaxyLook;
         inline for (.{ .{ self.pan_speed, 20.0, 2000.0 }, .{ self.zoom_speed, 1.01, 2.0 }, .{ self.rotate_speed, 0.01, 3.0 }, .{ self.tour_seconds, 1.0, 60.0 }, .{ self.tour_drift_speed, 0.0, 0.3 } }) |range| {
             if (!std.math.isFinite(range[0]) or range[0] < range[1] or range[0] > range[2]) return error.InvalidGalaxyLook;
         }
@@ -110,6 +126,7 @@ pub const Preferences = struct {
     languages: Languages = .{},
     decompiler: struct { prestart: bool = true } = .{},
     galaxy: Galaxy = .{},
+    gibson: Gibson = .{},
 };
 
 /// CLI wins. File references in preferences are relative to that config file.
@@ -129,6 +146,7 @@ pub fn parse(a: std.mem.Allocator, bytes: []const u8) !Preferences {
     try parsed.value.profile.config().validate();
     try parsed.value.allocations.validate();
     try parsed.value.galaxy.validate();
+    try parsed.value.gibson.validate();
     if (parsed.value.symbols.auto_file_bytes == 0 or parsed.value.symbols.auto_file_bytes > 256 * 1024 * 1024 or parsed.value.symbols.auto_total_bytes == 0 or parsed.value.symbols.auto_total_bytes > 512 * 1024 * 1024) return error.InvalidSymbolBudget;
     for ([_]?u64{ parsed.value.symbols.image_bytes, parsed.value.symbols.image_total_bytes }) |value| if (value) |n| {
         if (n < snapshot.min_limit or n > snapshot.max_limit) return error.InvalidImageBudget;
@@ -156,6 +174,13 @@ pub fn load(a: std.mem.Allocator, path: [:0]const u8) !Preferences {
     }
     return error.PreferencesTooLarge;
 }
+test "Gibson film and signage preferences validate finite bounded values" {
+    const prefs = try parse(std.testing.allocator, "{\"gibson\":{\"film\":true,\"film_speed\":4.5,\"facts\":false,\"facts_alpha\":0.2}}");
+    try std.testing.expect(prefs.gibson.film and prefs.gibson.film_speed == 4.5 and !prefs.gibson.facts);
+    try std.testing.expectError(error.InvalidGibsonLook, parse(std.testing.allocator, "{\"gibson\":{\"film_speed\":6}}"));
+    try std.testing.expectError(error.InvalidGibsonLook, parse(std.testing.allocator, "{\"gibson\":{\"facts_alpha\":-1}}"));
+}
+
 test "galaxy look preferences retain defaults and accept deliberate overrides" {
     const defaults = try parse(std.testing.allocator, "{}");
     try std.testing.expect(defaults.galaxy.unfold and defaults.galaxy.additive and defaults.galaxy.max_stars == 512);

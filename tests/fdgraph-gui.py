@@ -37,6 +37,7 @@ for i in range(2):
         os.close(control[1]);os.read(control[0],1);os._exit(0)
     children.append(pid)
 os.close(control[0]);print(json.dumps(children),flush=True)
+info=os.fstat(pair[0].fileno());print(json.dumps([info.st_dev,info.st_ino]),flush=True)
 sys.stdin.readline();os.close(control[1])
 for child in children:
     _,status=os.waitpid(child,0);assert status==0
@@ -48,6 +49,7 @@ def check(label,truth):
     assert truth,label
 try:
     pids=json.loads(fixture.stdout.readline());check('fixture has two owned children',len(pids)==2)
+    resource_device,resource_inode=json.loads(fixture.stdout.readline())
     os.environ['XODB_OVERVIEW_AUDIT']='1';os.environ['XODB_OVERVIEW_LAYOUT']='1'
     options=['--overview','--panel','galaxy','--redact']
     for pid in pids:options+=['--graph-pid',str(pid)]
@@ -67,6 +69,7 @@ try:
     check('UNIX socketpair link is present after metadata cache refresh',last[3]==1)
     galaxy=h.ocr_until(d,'galaxy',lambda t:'descriptor galaxy' in t)
     check('redacted galaxy has a visible title','descriptor galaxy' in galaxy)
+    galaxy=h.ocr_until(d,'galaxy-omissions',lambda t:all(word in t for word in ('unscanned','gone','capped','unmatched')))
     check('scan omissions are visible',all(word in galaxy for word in ('unscanned','gone','capped','unmatched')))
     galaxy=h.ocr_until(d,'galaxy-freshness',lambda t:all(word in t for word in ('fresh','cached','unknown')))
     check('membership freshness is visible',all(word in galaxy for word in ('fresh','cached','unknown')))
@@ -86,6 +89,33 @@ try:
     until(lambda:any(f['stars']=='2' and int(f['strands'])>0 and f['drawn']==f['strands'] for f in frames()),'threads between the two owned stars')
     check('shared descriptors are drawn as threads between the stars',True)
     check('an idle untraced galaxy never requests animation',all(f['impulses']=='0' and f['moving']=='0' for f in frames()))
+    # Drive the restored junction hit using a real, owned shared socket inode.
+    # The camera must not swallow it, and Files must retain that exact identity.
+    resource_pattern=(r'galaxy-resource node=(\d+) kind=\d+ device='+str(resource_device)+
+                      r' inode='+str(resource_inode)+r' x=([\d.]+) y=([\d.]+)')
+    until(lambda:re.search(resource_pattern,Path(d.log).read_text(errors='replace')),
+          'owned shared socket has a galaxy hit')
+    resource=re.findall(resource_pattern,Path(d.log).read_text(errors='replace'))[-1]
+    # Subpixel neighbours can round to the same screen pixel. Choose an integer
+    # pixel on this marker whose nearest resource centre is the exact inode.
+    hits={int(n):(float(x),float(y)) for n,x,y in re.findall(
+        r'galaxy-resource node=(\d+) kind=\d+ device=\d+ inode=\d+ x=([\d.]+) y=([\d.]+)',
+        Path(d.log).read_text(errors='replace'))}
+    node=int(resource[0]);cx,cy=hits[node]
+    points=[(x,y) for x in range(round(cx)-3,round(cx)+4) for y in range(round(cy)-3,round(cy)+4)]
+    points.sort(key=lambda p:(p[0]-cx)**2+(p[1]-cy)**2)
+    point=next((p for p in points if min(hits,key=lambda n:((p[0]-hits[n][0])**2+(p[1]-hits[n][1])**2,n))==node),None)
+    assert point is not None,'shared resource has no distinct clickable pixel'
+    d.keys('click',*point)
+    opened=r'graph-resource-open node=\d+ device='+str(resource_device)+r' inode='+str(resource_inode)+r' holders=2'
+    filtered=r'files-resource device='+str(resource_device)+r' inode='+str(resource_inode)+r' rows=([1-9]\d*)'
+    until(lambda:re.search(filtered,Path(d.log).read_text(errors='replace')),
+          'resource click opens the same file holders')
+    audit=Path(d.log).read_text(errors='replace')
+    check('live resource click opens the exact shared inode',bool(re.search(opened,audit)))
+    check('resource holders remain visible',int(re.findall(filtered,audit)[-1])>=2)
+    d.keys('tap',21) # Y: back to the galaxy.
+    h.ocr_until(d,'galaxy-after-holders',lambda t:'descriptor galaxy' in t)
     d.keys('tap',46) # C: fold the two processes into their cgroup
     until(lambda:stars()==1,'C folds processes into one cgroup star')
     d.keys('tap',46) # C: back to process stars

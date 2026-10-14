@@ -69,11 +69,14 @@ fn lobed(seed: u64, angle: f32) f32 {
 const Dust = struct {
     items: []Cell,
     count: usize = 0,
+    detail_scale: f32 = 1,
     fn put(self: *Dust, x: f32, y: f32, extent: f32, color: Color) void {
         if (self.count == self.items.len or color[3] <= 0.01) return;
         var fill: [4]u8 = undefined;
         for (&fill, color) |*out, channel| out.* = @intFromFloat(std.math.clamp(channel, 0, 1) * 255);
-        self.items[self.count] = .{ .rect = .{ @round(x - extent / 2), @round(y - extent / 2), extent, extent }, .fill = fill, .accent = fill, .overlay = fill, .kind = 0 };
+        const small = extent / self.detail_scale;
+        const inset = (extent - small) / 2;
+        self.items[self.count] = .{ .rect = .{ @round(x - extent / 2) + inset, @round(y - extent / 2) + inset, small, small }, .fill = fill, .accent = fill, .overlay = fill, .kind = 0 };
         self.count += 1;
     }
     fn flush(self: *Dust, ctx: draw.Ctx, additive: bool) void {
@@ -126,12 +129,42 @@ fn label(ctx: draw.Ctx, placed: *Placed, lk: Look, at: [2]f32, clear: f32, name:
     return false;
 }
 
+// Fixed point/mesh budgets at every level. Rebuild only when crossing a zoom
+// band, not on each pan/rotation frame; hysteresis avoids boundary flicker.
+fn cloudDetail(zoom: f32, previous: f32, prefs: @import("../../preferences.zig").Galaxy) f32 {
+    if (!prefs.cloud_lod) return 1;
+    var level = previous;
+    while (2 * zoom / level > prefs.cloud_pixel_limit) level *= 2;
+    while (level > 1 and 4 * zoom / level < prefs.cloud_pixel_limit * 0.8) level /= 2;
+    return level;
+}
+
+test "cloud detail bounds magnified dust without changing centers or point budgets" {
+    var level: f32 = 1;
+    for ([_]f32{ 1, 2.01, 4.1, 8.1, 12, 8, 4, 2, 1 }) |zoom| {
+        level = cloudDetail(zoom, level, .{});
+        try std.testing.expect(2 * zoom / level <= 4);
+    }
+    try std.testing.expectEqual(@as(f32, 2), cloudDetail(1.99, 2, .{}));
+    try std.testing.expectEqual(@as(f32, 1), cloudDetail(1.5, 2, .{}));
+    try std.testing.expectEqual(@as(f32, 1), cloudDetail(12, 8, .{ .cloud_lod = false }));
+    var cells: [2]Cell = undefined;
+    var dust = Dust{ .items = &cells };
+    dust.put(10.2, 11.8, 2, .{ 1, 1, 1, 1 });
+    dust.detail_scale = 8;
+    dust.put(10.2, 11.8, 2, .{ 1, 1, 1, 1 });
+    for (0..2) |axis| try std.testing.expectEqual(cells[0].rect[axis] + cells[0].rect[axis + 2] / 2, cells[1].rect[axis] + cells[1].rect[axis + 2] / 2);
+    try std.testing.expectEqual(@as(f32, 0.25), cells[1].rect[2]);
+}
+
 pub const State = struct {
+    table: @import("graph_table.zig").Table = .{},
     cloud_slot: @import("../../render/vulkan.zig").CloudSlot = 0,
     scene: Scene = .{},
     motion: @import("galaxy_motion.zig").Motion = .{},
     cached_mesh: u32 = 0,
     cloud_builds: u64 = 0,
+    cloud_lod: f32 = 1,
     thread_hover: ?struct { seed: u32, a: u16, b: u16 } = null,
 };
 
@@ -153,7 +186,9 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
     const audit = c.getenv("XODB_OVERVIEW_AUDIT") != null;
 
     if (!lk.plain) {
+        const lod = cloudDetail(motion.navigation.zoom, state.cloud_lod, st.look);
         var cloud_hash = std.hash.Wyhash.init(s.signature);
+        cloud_hash.update(std.mem.asBytes(&lod));
         cloud_hash.update(std.mem.asBytes(&lk.hues));
         cloud_hash.update(std.mem.asBytes(&st.look.cloud_size));
         cloud_hash.update(std.mem.asBytes(&st.look.brightness));
@@ -181,7 +216,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             defer ctx.r.clip = saved_clip;
             // Nebulae: a soft haze per cluster, a scatter of faint points denser toward
             // each centre, and fibres of points joined by hair-thin segments.
-            var dust = Dust{ .items = &cloud_cells };
+            var dust = Dust{ .items = &cloud_cells, .detail_scale = lod };
             var total: f32 = 0;
             for (s.clusters[0..s.cluster_count]) |cl| total += cl.weight;
             total = @max(1, total);
@@ -237,7 +272,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
                     const near = [3]?usize{ if (col > 0) at - 1 else null, if (row > 0 and up > 0) at + odd - web_side - 1 else null, if (row > 0 and up < cols) at + odd - web_side else null };
                     for (near, links) |other, chance| if (other) |index| {
                         if (!web_on[index] or chance > 0.82 or counts.mesh == mesh_segments) continue;
-                        try ctx.thin(web[at], web[index], 1, draw.fade(hue, (0.08 + 0.2 * fall) * dimmed));
+                        try ctx.thin(web[at], web[index], 1 / lod, draw.fade(hue, (0.08 + 0.2 * fall) * dimmed));
                         counts.mesh += 1;
                         segments -|= 1;
                     };
@@ -258,7 +293,7 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
                         const dy = to[1] - star.at[1];
                         const fall = 1 - @sqrt(dx * dx + dy * dy) / (reach * 1.35);
                         if (fall <= 0) break;
-                        try ctx.thin(at, to, 1, draw.fade(hue, (0.06 + 0.2 * fall) * dimmed));
+                        try ctx.thin(at, to, 1 / lod, draw.fade(hue, (0.06 + 0.2 * fall) * dimmed));
                         dust.put(to[0], to[1], 1, draw.fade(pale, (0.25 + 0.5 * fall) * dimmed));
                         counts.mesh += 1;
                         at = to;
@@ -285,10 +320,12 @@ pub fn renderModel(v: anytype, state: *State, ctx: draw.Ctx, field: draw.Rect, b
             try ctx.r.retainCloud(state.cloud_slot, first_vertex, dust.items[0..dust.count], signature);
             state.cached_mesh = counts.mesh;
             state.cloud_builds += 1;
+            state.cloud_lod = lod;
         }
         counts.mesh = state.cached_mesh;
         counts.cloud = ctx.r.clouds[state.cloud_slot].cells;
         try ctx.r.cloud(state.cloud_slot, motion.transform(), st.look.additive);
+        if (audit) std.debug.print("xodb: galaxy-cloud lod={d:.1} max_pixel={d:.3} cells={d}\n", .{ state.cloud_lod, 2 * motion.navigation.zoom / state.cloud_lod, counts.cloud });
     }
 
     motion.project(s);

@@ -58,6 +58,7 @@ const Source = struct {
         if (self.launcher.poll()) view.setStatus("Process action failed; check target identity and access", .{}, current);
         const started = vw.threadNs();
         self.collector.redact = view.redact;
+        self.collector.graph_scene = if (view.panel == .galaxy) &@import("galaxy_descriptors.zig").navigation().scene else null;
         if (view.graph.flow_demand and ((view.panel != .graph and view.panel != .galaxy) or view.paused)) view.graph.stopCapture();
         if (view.treemap.flow_demand and (view.panel != .treemap or view.paused)) view.treemap.stopCapture();
         if (view.files.event_authorized and (view.panel != .files or view.paused)) view.files.stopCapture();
@@ -70,6 +71,7 @@ const Source = struct {
             view.files.rebuild(self.gpa, view.redact) catch |err| view.setStatus("Descriptor list failed: {s}", .{@errorName(err)}, current);
             if (changed) {
                 window.dirty = true;
+                if (c.getenv("XODB_OVERVIEW_AUDIT") != null) if (view.files.file_filter) |file| std.debug.print("xodb: files-resource device={d} inode={d} rows={d}\n", .{ file.device, file.inode, view.files.rows.items.len });
                 if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: files collector opens={d} sequence={d} filter_pid={d} start={d} rows={d} mode={s} selected_pid={d} selected_fd={d} row={d} top={d} visible={d}\n", .{ self.collector.fd_opens, if (view.files.snapshot) |snap| snap.sequence else 0, if (view.files.filter) |id| id.pid else 0, if (view.files.filter) |id| id.start else 0, view.files.rows.items.len, @tagName(view.files.mode), if (view.files.selected) |id| id.owner.pid else 0, if (view.files.selected) |id| id.fd else -1, view.files.selected_row, view.files.top, view.files.visible });
             }
         }

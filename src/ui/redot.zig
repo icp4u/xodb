@@ -110,7 +110,7 @@ pub const Panel = struct {
     pub fn input(self: *Panel, w: *Window, adapter: *protocol.Adapter) void {
         const now = @import("../target/linux.zig").now();
         defer if (self.galaxy) |view| {
-            if (view.state.motion.navigation.controls(&w.input, self.galaxy_open and self.open and !self.filtering)) w.dirty = true;
+            if (view.state.motion.navigation.controls(&w.input, self.galaxy_open and self.open and !self.filtering and !view.state.table.open)) w.dirty = true;
         };
         if (self.galaxy) |view| {
             const point = [2]f32{ w.pointer_x, w.pointer_y };
@@ -119,7 +119,7 @@ pub const Panel = struct {
         }
         if (w.scroll != 0) {
             self.inspector_focus = w.pointer_x >= self.bounds.x + self.bounds.w * 0.38;
-            if (self.galaxy_open) self.galaxy.?.state.motion.navigation.wheel(w.scroll, .{ w.pointer_x, w.pointer_y }, self.look) else self.wheel(adapter, w.scroll);
+            if (self.galaxy_open and self.galaxy.?.state.table.open) self.galaxy.?.state.table.wheel(w.scroll) else if (self.galaxy_open) self.galaxy.?.state.motion.navigation.wheel(w.scroll, .{ w.pointer_x, w.pointer_y }, self.look) else self.wheel(adapter, w.scroll);
             w.scroll = 0;
             w.dirty = true;
         }
@@ -143,7 +143,19 @@ pub const Panel = struct {
             if (self.galaxy_open) {
                 const view = self.galaxy.?;
                 const camera = &view.state.motion.navigation;
-                if (camera.key(&view.state.scene, event)) continue;
+                if (view.state.table.clipboard(w, &view.state.scene, event)) continue;
+                if (view.state.table.event(&view.state.scene, camera, event)) {
+                    if (camera.selection) |chosen| if (chosen == .node) for (adapter.nodes, 0..) |node, i| if (node.object_id == chosen.node) {
+                        if (self.cursor != i) {
+                            self.cursor = i;
+                            self.select(adapter);
+                        }
+                        break;
+                    };
+                    continue;
+                }
+                if (event.kind == .button_press) camera.stopTour();
+                if (!view.state.table.open and camera.key(&view.state.scene, event)) continue;
                 if (event.kind == .button_release and event.code == 272) {
                     camera.pointer(.{ event.x, event.y });
                     camera.drag = null;
@@ -159,7 +171,7 @@ pub const Panel = struct {
                 }
             }
             if (self.time and !self.galaxy_open and self.time_panel.input(event, &adapter.profiler, self.inspector_focus)) continue;
-            if (self.galaxy_open and event.kind == .button_press and event.code == 272) {
+            if (self.galaxy_open and !self.galaxy.?.state.table.open and event.kind == .button_press and event.code == 272) {
                 const view = self.galaxy.?;
                 _ = view.state.motion.navigation.press(&view.state.scene, .{ event.x, event.y }, now);
                 if (view.state.motion.navigation.selection) |selection| if (selection == .node) {
@@ -245,7 +257,7 @@ pub const Panel = struct {
         const right = b.x + left + 16;
         const rw = b.w - left - 30;
         var buffer: [1024]u8 = undefined;
-        try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, "REDOT / GODOT   U / Esc close   R refresh   G galaxy   P properties   S signals   T time   / filter", theme.text);
+        try r.textFit(font, b.x + 14, b.y + 10, b.w - 28, if (self.galaxy_open) "REDOT / GODOT   U close   R refresh   G tree   P properties   WASD pan   O tour   ? help" else "REDOT / GODOT   U / Esc close   R refresh   G galaxy   P properties   S signals   T time   / filter", theme.text);
         try r.textFit(font, b.x + 14, b.y + 36, b.w - 28, try std.fmt.bufPrint(&buffer, "ENGINE DEBUGGER PROTOCOL / cooperative   {s}{s}   tree #{d}   object #{d}", .{ @tagName(view.state), if (view.scene_pending or view.object_pending) " / awaiting engine" else "", view.scene_revision, view.object_revision }), theme.weak);
         if (self.galaxy_open) {
             self.galaxy.?.selected_node = if (self.cursor < view.nodes.len) view.nodes[self.cursor].object_id else null;

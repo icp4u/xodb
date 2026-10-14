@@ -90,7 +90,13 @@ static void in_poll(struct task *t)
             assert(n > 0); line[n] = 0;
             char *end;
             long number = strtol(line, &end, 10);
-            if (end != line && number == SYS_poll) return;
+            /* aarch64 Linux has no poll syscall. poll() is ppoll there. */
+#ifdef SYS_poll
+            const long blocked = SYS_poll;
+#else
+            const long blocked = SYS_ppoll;
+#endif
+            if (end != line && number == blocked) return;
         }
         struct pollfd done = {.fd = t->done[0], .events = POLLIN};
         assert(poll(&done, 1, 0) == 0);

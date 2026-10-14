@@ -1165,6 +1165,123 @@ static void detach_owed_cleanup(void)
     child = 0;
 }
 
+#if defined(__PPC64__)
+static unsigned ppc_cell;
+static volatile sig_atomic_t ppc_winch;
+extern char ppc_larx_insn[];
+extern char ppc_larx_done[];
+static void on_ppc_winch(int sig)
+{
+    (void)sig;
+    ++ppc_winch;
+}
+__attribute__((noinline)) static void ppc_larx(void)
+{
+    unsigned tmp;
+    __asm__ volatile(".globl ppc_larx_insn\n"
+                     ".globl ppc_larx_done\n"
+                     "ppc_larx_insn:\n\t"
+                     "lwarx %0, 0, %2\n\t"
+                     "addi %0, %0, 1\n\t"
+                     "stwcx. %0, 0, %2\n\t"
+                     "bne- ppc_larx_insn\n\t"
+                     "ppc_larx_done:\n\t"
+                     "nop\n\t"
+                     : "=&b"(tmp), "+m"(ppc_cell)
+                     : "b"(&ppc_cell)
+                     : "cr0", "memory");
+    (void)tmp;
+}
+/* A breakpoint on lwarx, then SIGWINCH, then Continue. The larx/stcx. step
+ * must finish once: the handler runs, the cell updates, and the larx
+ * breakpoint is not hit again. */
+static void ppc_atomic_signal(void)
+{
+    int gate[2];
+    CHECK(pipe(gate) == 0);
+    const pid_t parent = getpid();
+    child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = on_ppc_winch;
+        if (sigaction(SIGWINCH, &action, NULL) != 0)
+            _exit(3);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            _exit(1);
+        close(gate[1]);
+        char byte;
+        if (read(gate[0], &byte, 1) != 1)
+            _exit(2);
+        close(gate[0]);
+        ppc_larx();
+        _exit(ppc_cell == 1 && ppc_winch == 1 ? 31 : 32);
+    }
+    close(gate[0]);
+    target = xrt_target_create();
+    CHECK(target);
+    OK(xrt_target_attach(target, child));
+    uint64_t larx_bp = 0, done_bp = 0;
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)ppc_larx_insn, false, &larx_bp));
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)ppc_larx_done, false, &done_bp));
+    CHECK(write(gate[1], "x", 1) == 1);
+    close(gate[1]);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    expect_breakpoint(1);
+    CHECK(view().threads[0].breakpoint_address == (uintptr_t)ppc_larx_insn);
+    CHECK(kill(child, SIGWINCH) == 0);
+    OK(xrt_target_continue(target));
+    const uint64_t deadline = xrt_now() + UINT64_C(3000000000);
+    for (;;) {
+        CHECK(xrt_now() < deadline);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED)
+            break;
+        usleep(1000);
+    }
+    const struct xrt_target_view got = view();
+    uint64_t larx_hits = 0;
+    int saw_larx = 0;
+    for (size_t i = 0; i < got.breakpoint_count; ++i)
+        if (got.breakpoints[i].address == (uintptr_t)ppc_larx_insn) {
+            larx_hits = got.breakpoints[i].hit_count;
+            saw_larx = 1;
+        }
+    if (got.thread_count < 1 || got.threads[0].reason != XRT_STOP_BREAKPOINT ||
+        got.threads[0].breakpoint_address != (uintptr_t)ppc_larx_done || !saw_larx ||
+        larx_hits != 1) {
+        fprintf(stderr, "ppc stop reason %d signal %d larx_hits %llu at %llx\n",
+                got.thread_count ? (int)got.threads[0].reason : -1,
+                got.thread_count ? got.threads[0].signal : -1, (unsigned long long)larx_hits,
+                got.thread_count ? (unsigned long long)got.threads[0].breakpoint_address : 0ULL);
+    }
+    CHECK(got.threads[0].reason == XRT_STOP_BREAKPOINT);
+    CHECK(got.threads[0].breakpoint_address == (uintptr_t)ppc_larx_done);
+    CHECK(saw_larx && larx_hits == 1);
+    unsigned cell = 0;
+    sig_atomic_t winch = 0;
+    size_t count = 0;
+    OK(xrt_target_read(target, (uintptr_t)&ppc_cell, &cell, sizeof cell, &count));
+    CHECK(count == sizeof cell && cell == 1);
+    OK(xrt_target_read(target, (uintptr_t)&ppc_winch, &winch, sizeof winch, &count));
+    CHECK(count == sizeof winch && winch == 1);
+    OK(xrt_target_breakpoint_remove(target, larx_bp));
+    OK(xrt_target_breakpoint_remove(target, done_bp));
+    OK(xrt_target_continue(target));
+    wait_exit();
+    CHECK(view().events[view().event_count - 1].detail == 31);
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+    child = 0;
+    xrt_target_destroy(target);
+    target = NULL;
+    puts("C target: ppc64 atomic step signal passed");
+}
+#else
+static void ppc_atomic_signal(void) {}
+#endif
+
 #if defined(__loongarch__)
 extern void loong_b(void);
 extern void loong_b_land(void);
@@ -1419,6 +1536,156 @@ static void loong_live(void)
 static void loong_live(void) {}
 #endif
 
+#if defined(__x86_64__)
+static volatile sig_atomic_t x86_winch;
+static char x86_byte;
+static int x86_read_fd;
+extern char x86_getpid_insn[];
+extern char x86_after_getpid[];
+extern char x86_sys_insn[];
+static void on_x86_winch(int sig)
+{
+    (void)sig;
+    ++x86_winch;
+}
+__attribute__((noinline)) static void x86_syscalls(void)
+{
+    __asm__ volatile("mov $39, %%eax\n\t"
+                     ".globl x86_getpid_insn\n"
+                     "x86_getpid_insn:\n\t"
+                     "syscall\n\t"
+                     ".globl x86_after_getpid\n"
+                     "x86_after_getpid:\n\t"
+                     "nop\n\t"
+                     "mov %[fd], %%edi\n\t"
+                     "lea %[buf], %%rsi\n\t"
+                     "mov $1, %%edx\n\t"
+                     "xor %%eax, %%eax\n\t"
+                     ".globl x86_sys_insn\n"
+                     "x86_sys_insn:\n\t"
+                     "syscall\n\t"
+                     : "+m"(x86_byte)
+                     : [fd] "r"(x86_read_fd), [buf] "m"(x86_byte)
+                     : "rax", "rcx", "r11", "rdi", "rsi", "rdx", "memory");
+}
+static uint64_t breakpoint_hits(uintptr_t address)
+{
+    const struct xrt_target_view got = view();
+    for (size_t i = 0; i < got.breakpoint_count; ++i)
+        if (got.breakpoints[i].address == address)
+            return got.breakpoints[i].hit_count;
+    return UINT64_MAX;
+}
+/* A finished syscall ends the hidden step. A blocking syscall does not: the
+ * entry trap reports the PC already on the next instruction, and a SIGWINCH
+ * with SA_RESTART must not hit that breakpoint a second time. */
+static void x86_syscall_signal(void)
+{
+    int pipefd[2], gate[2];
+    CHECK(pipe(pipefd) == 0 && pipe(gate) == 0);
+    const pid_t parent = getpid();
+    child = fork();
+    CHECK(child >= 0);
+    if (!child) {
+        struct sigaction action;
+        memset(&action, 0, sizeof action);
+        action.sa_handler = on_x86_winch;
+        action.sa_flags = SA_RESTART;
+        if (sigaction(SIGWINCH, &action, NULL) != 0)
+            _exit(3);
+        if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 || getppid() != parent)
+            _exit(1);
+        close(pipefd[1]);
+        close(gate[1]);
+        char go;
+        if (read(gate[0], &go, 1) != 1)
+            _exit(2);
+        close(gate[0]);
+        x86_read_fd = pipefd[0];
+        x86_syscalls();
+        _exit(x86_winch == 1 ? 41 : 42);
+    }
+    close(pipefd[0]);
+    close(gate[0]);
+    target = xrt_target_create();
+    CHECK(target);
+    OK(xrt_target_attach(target, child));
+    uint64_t getpid_bp = 0, after_bp = 0, read_bp = 0;
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)x86_getpid_insn, false, &getpid_bp));
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)x86_after_getpid, false, &after_bp));
+    OK(xrt_target_breakpoint_set(target, (uintptr_t)x86_sys_insn, false, &read_bp));
+    CHECK(write(gate[1], "x", 1) == 1);
+    close(gate[1]);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    expect_breakpoint(1);
+    CHECK(view().threads[0].breakpoint_address == (uintptr_t)x86_getpid_insn);
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    const struct xrt_target_view after = view();
+    if (after.thread_count < 1 || after.threads[0].reason != XRT_STOP_BREAKPOINT ||
+        after.threads[0].breakpoint_address != (uintptr_t)x86_after_getpid ||
+        breakpoint_hits((uintptr_t)x86_getpid_insn) != 1) {
+        fprintf(stderr, "x86 getpid stop reason %d signal %d hits %llu\n",
+                after.thread_count ? (int)after.threads[0].reason : -1,
+                after.thread_count ? after.threads[0].signal : -1,
+                (unsigned long long)breakpoint_hits((uintptr_t)x86_getpid_insn));
+    }
+    CHECK(after.threads[0].reason == XRT_STOP_BREAKPOINT);
+    CHECK(after.threads[0].breakpoint_address == (uintptr_t)x86_after_getpid);
+    CHECK(breakpoint_hits((uintptr_t)x86_getpid_insn) == 1);
+    OK(xrt_target_breakpoint_remove(target, after_bp));
+    OK(xrt_target_continue(target));
+    OK(xrt_target_wait_stopped(target));
+    expect_breakpoint(1);
+    CHECK(view().threads[0].breakpoint_address == (uintptr_t)x86_sys_insn);
+    OK(xrt_target_continue(target));
+    const uint64_t asleep = xrt_now() + UINT64_C(3000000000);
+    while (view().state != XRT_RUNNING || !child_in_read(child)) {
+        CHECK(xrt_now() < asleep);
+        OK(xrt_target_poll(target));
+        CHECK(view().state != XRT_STOPPED);
+        usleep(1000);
+    }
+    CHECK(kill(child, SIGWINCH) == 0);
+    const uint64_t signaled = xrt_now() + UINT64_C(3000000000);
+    for (;;) {
+        CHECK(xrt_now() < signaled);
+        OK(xrt_target_poll(target));
+        CHECK(view().state != XRT_STOPPED);
+        if (child_counter(child, &x86_winch) == 1 && child_in_read(child))
+            break;
+        usleep(1000);
+    }
+    CHECK(breakpoint_hits((uintptr_t)x86_sys_insn) == 1);
+    CHECK(write(pipefd[1], "x", 1) == 1);
+    close(pipefd[1]);
+    const uint64_t done = xrt_now() + UINT64_C(3000000000);
+    while (view().state != XRT_EXITED) {
+        CHECK(xrt_now() < done);
+        OK(xrt_target_poll(target));
+        if (view().state == XRT_STOPPED) {
+            fprintf(stderr, "x86 syscall stop reason %d signal %d hits %llu\n",
+                    view().thread_count ? (int)view().threads[0].reason : -1,
+                    view().thread_count ? view().threads[0].signal : -1,
+                    (unsigned long long)breakpoint_hits((uintptr_t)x86_sys_insn));
+        }
+        CHECK(view().state != XRT_STOPPED);
+        usleep(1000);
+    }
+    CHECK(view().events[view().event_count - 1].detail == 41);
+    CHECK(breakpoint_hits((uintptr_t)x86_sys_insn) == 1);
+    CHECK(breakpoint_hits((uintptr_t)x86_getpid_insn) == 1);
+    CHECK(waitpid(child, NULL, WNOHANG) == -1 && errno == ECHILD);
+    child = 0;
+    xrt_target_destroy(target);
+    target = NULL;
+    puts("C target: x86 syscall step signal passed");
+}
+#else
+static void x86_syscall_signal(void) {}
+#endif
+
 int main(int argc, char **argv)
 {
     /* LeakSanitizer's exit helper cannot ptrace our already-traced fixture.
@@ -1464,6 +1731,8 @@ int main(int argc, char **argv)
     plant_while_borrowed();
     ignored_signals();
     detach_owed_cleanup();
+    ppc_atomic_signal();
+    x86_syscall_signal();
     loong_live();
     puts("C target: launch, restart, attach, stepping, breakpoint overlays/rearm, watches, "
          "generations, cleanup passed");

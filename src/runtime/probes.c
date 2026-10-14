@@ -1028,7 +1028,8 @@ enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_afte
                                 .stop_after = stop_after,
                                 .has_exec_entry = t->threads[i].reason == XRT_STOP_EXEC,
                                 .exec_entry_pc = pc,
-                                .atomic_count = atomic_run ? atomic.atomic_count : 0};
+                                .atomic_count = atomic_run ? atomic.atomic_count : 0,
+                                .atomic_run = atomic_run ? 1 : 0};
     if (atomic_run) {
         memcpy(t->step.atomic_exit, atomic.atomic_exit, sizeof atomic.atomic_exit);
         memcpy(t->step.atomic_original, atomic.atomic_original, sizeof atomic.atomic_original);

@@ -19,18 +19,19 @@ pub fn projectionDetailBudget(stars: u32) u32 {
     return @max(1024, stars * c.XRT_FD_KINDS);
 }
 const LiveNames = struct {
-    v: *vw.View,
+    graph: *const @import("graph_model.zig").State,
+    redact: bool,
     keys: []const u64,
     by_name: []const bool,
     pub fn cluster(self: LiveNames, star: u32, buffer: []u8) []const u8 {
-        const p = self.v.graph.projection.?;
-        const g = self.v.graph.graph.?;
-        const s = self.v.graph.snapshot.?;
+        const p = self.graph.projection.?;
+        const g = self.graph.graph.?;
+        const s = self.graph.snapshot.?;
         const record = p.stars[star];
-        if (self.v.redact) return std.fmt.bufPrint(buffer, "group {x:0>4}", .{self.keys[star] & 0xffff}) catch "";
+        if (self.redact) return std.fmt.bufPrint(buffer, "group {x:0>4}", .{self.keys[star] & 0xffff}) catch "";
         if (self.by_name[star] and record.source_node < g.processes and g.nodes[record.source_node].source_process < s.process_count)
             return std.fmt.bufPrint(buffer, "{s}", .{clip(fm.State.name(@ptrCast(&s.processes[g.nodes[record.source_node].source_process])), buffer.len)}) catch "";
-        const path = self.v.graph.cgroup(if (record.processes > 1) record.sample_node else record.source_node);
+        const path = self.graph.cgroup(if (record.processes > 1) record.sample_node else record.source_node);
         const base = std.fs.path.basename(path);
         return std.fmt.bufPrint(buffer, "{s}", .{clip(if (base.len > 0) base else if (path.len > 0) "root cgroup" else "no cgroup", buffer.len)}) catch "";
     }
@@ -41,8 +42,23 @@ fn clip(text: []const u8, limit: usize) []const u8 {
     return text[0..n];
 }
 
+pub fn starLabel(v: anytype, index: u32, buffer: []u8) []const u8 {
+    const p = v.graph.projection.?;
+    const g = v.graph.graph.?;
+    const s = v.graph.snapshot.?;
+    const star = p.stars[index];
+    if (star.mixed_groups != 0) return std.fmt.bufPrint(buffer, "{d} processes · grouped", .{star.processes}) catch "grouped";
+    if (star.processes > 1) {
+        const group = v.graph.cgroup(star.sample_node);
+        return if (v.redact or group.len == 0) std.fmt.bufPrint(buffer, "cgroup · {d} processes", .{star.processes}) catch "group" else std.fs.path.basename(group);
+    }
+    const node = g.nodes[star.source_node];
+    if (v.redact or node.source_process >= s.process_count) return std.fmt.bufPrint(buffer, "pid {d}", .{node.pid}) catch "process";
+    return fm.State.churnLabel(buffer, fm.State.name(@ptrCast(&s.processes[node.source_process])), node.pid, 24);
+}
+
 /// Fills the scene from the published graph, projection, layout and flow metrics.
-pub fn fromLive(s: *Scene, v: *vw.View) void {
+pub fn fromLive(s: *Scene, v: anytype) void {
     s.reset();
     s.synthetic = false;
     const p = v.graph.projection orelse return;
@@ -78,7 +94,7 @@ pub fn fromLive(s: *Scene, v: *vw.View) void {
             for (S.keys[0..i]) |key| seen = seen or key == S.keys[i];
             if (!seen) groups += 1;
         }
-        _ = s.addStar(.{ .seed = seed, .members = record.processes, .units = record.descriptors, .incoming = flow.read_rate, .outgoing = flow.write_rate, .last_ns = flow.last_ns, .unavailable = record.denied != 0 and record.denied == record.processes, .stale = record.stale != 0 or record.cgroup_stale != 0 }, panel.starLabel(v, @intCast(i), &buffer));
+        _ = s.addStar(.{ .seed = seed, .members = record.processes, .units = record.descriptors, .incoming = flow.read_rate, .outgoing = flow.write_rate, .last_ns = flow.last_ns, .unavailable = record.denied != 0 and record.denied == record.processes, .stale = record.stale != 0 or record.cgroup_stale != 0 }, starLabel(v, @intCast(i), &buffer));
     }
     if (singles > 12 and groups < 3) {
         @memcpy(S.sorted[0..n], S.names[0..n]);
@@ -101,7 +117,7 @@ pub fn fromLive(s: *Scene, v: *vw.View) void {
         const flow = if (metrics) |m| m.particles[i] else zero;
         s.addParticle(.{ .star = @intCast(@min(particle.star, max_stars)), .kind = @intCast(particle.kind), .stale = particle.stale > 0, .units = particle.descriptors, .alerts = particle.deleted, .incoming = flow.read_rate, .outgoing = flow.write_rate, .last_ns = flow.last_ns, .node = particle.source_node });
     }
-    s.group(LiveNames{ .v = v, .keys = S.keys[0..n], .by_name = S.by_name[0..n] });
+    s.group(LiveNames{ .graph = &v.graph, .redact = v.redact, .keys = S.keys[0..n], .by_name = S.by_name[0..n] });
     const l = v.graph.layout orelse return;
     if (l.star_count != p.star_count or l.star_count > max_stars) return;
     // One pass finds each shared descriptor's holders; two holders make a
@@ -268,6 +284,11 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, field: draw.Rect, body: draw.Rect, res
     if (!v.paused or st.clock == 0) st.clock = now;
     const s = &state.scene;
     if (st.demo != 0) demo(s, st.demo, st.demo_idle, st.clock) else fromLive(s, v);
+    if (state.table.open) {
+        st.motion_until = 0;
+        st.impulse_until = 0;
+        return state.table.render(s, &state.motion.navigation, ctx, field);
+    }
     var selected: ?u64 = st.camera_cluster;
     if (selected == null and !s.synthetic) if (st.focus) |id| {
         if (st.projection) |p| if (st.graph) |g| {
@@ -297,17 +318,26 @@ const Host = struct {
     }
     pub fn junctionHit(self: *Host, hit: draw.Rect, junction: model.Junction) void {
         if (junction.node != none) self.v.hit(hit, .{ .graph_resource = junction.node });
+        self.auditResource(hit, junction.node);
         self.v.hover(hit, "{s} · {d} holders shown · read {d:.0} B/s / write {d:.0} B/s · sampled", .{ std.mem.span(c.xrt_fd_kind_name(@intCast(junction.kind))), junction.holders, junction.incoming, junction.outgoing });
     }
     pub fn detailHit(self: *Host, hit: draw.Rect, particle: model.Detail) void {
         if (particle.node != none) self.v.hit(hit, .{ .graph_resource = particle.node });
+        self.auditResource(hit, particle.node);
         self.v.hover(hit, "{s} · {d} fds · read {d:.0} B/s / write {d:.0} B/s · {d} deleted · sampled inode joins", .{ std.mem.span(c.xrt_fd_kind_name(@intCast(particle.kind))), particle.units, particle.incoming, particle.outgoing, particle.alerts });
+    }
+    fn auditResource(self: *Host, hit: draw.Rect, index: u32) void {
+        if (c.getenv("XODB_OVERVIEW_AUDIT") == null) return;
+        const graph = self.v.graph.graph orelse return;
+        if (index >= graph.node_count) return;
+        const node = graph.nodes[index];
+        std.debug.print("xodb: galaxy-resource node={d} kind={d} device={d} inode={d} x={d:.1} y={d:.1}\n", .{ index, node.kind, node.device, node.inode, hit.x + hit.w / 2, hit.y + hit.h / 2 });
     }
     pub fn nodeHit(self: *Host, hit: draw.Rect, star: model.Node, i: u32, synthetic: bool, audit: bool) void {
         if (!synthetic) self.v.hit(hit, .{ .graph_star = @intCast(i) });
         if (audit and !synthetic) panel.auditStar(self.v, @intCast(i), star.at);
         if (star.unavailable and star.units == 0)
-            self.v.hover(hit, "{s} · fd table denied; needs /proc access · click for process", .{star.label()})
+            self.v.hover(hit, "{s} · fd table denied; needs /proc access · click select / L files", .{star.label()})
         else
             self.v.hover(hit, "{s} · {d} processes · {d} fds · read {d:.0} B/s / write {d:.0} B/s · {d} deleted · sampled inode joins", .{ star.label(), star.members, star.units, star.incoming, star.outgoing, star.alerts });
     }

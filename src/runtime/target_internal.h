@@ -30,6 +30,18 @@ struct xrt_step {
     uint8_t atomic_original[2][4];
     uint8_t atomic_count;
     uint8_t atomic_owned[2];
+    /* Set when the step is a larx/stcx. sequence resumed with PTRACE_CONT.
+     * atomic_count can be 0 when every exit is already a user breakpoint.
+     * Hardware single-step would clear the reservation. */
+    uint8_t atomic_run;
+    /* x86 hidden step of `syscall` that a signal interrupted. The step trap
+     * reports the PC already on the next instruction before the kernel
+     * restarts the call. The user breakpoint stays lifted until the call's
+     * real exit at that site, or until the handler returns somewhere else
+     * (EINTR). syscall_sigreturn marks an rt_sigreturn between its entry and
+     * exit stops. Not a wire field. */
+    uint8_t syscall_open, syscall_sigreturn;
+    uint64_t syscall_nr;
     /* software is set only after the resume has been issued. probe_owned marks
      * temporary probes this step planted and must remove. A user probe already
      * at a successor keeps probe_owned clear. */

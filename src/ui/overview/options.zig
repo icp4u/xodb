@@ -25,6 +25,7 @@ pub const usage =
     \\  --files-start-ticks N  require this exact identity with --files-pid
     \\  --look NAME     win95: whole overview skin; memory map: win9x (Disk Defragmenter), dos (MS-DOS DEFRAG), modern, deep (zoomable), gibson (3D city)
     \\  --gibson-flight start the memory city in street-level auto-flight (F returns)
+    \\  --gibson-film  start auto-flight with the faster film preset (V toggles speed)
     \\  --memmap-pid N  start on the Memory map of one process; --memmap-start-ticks pins its start
     \\  --interval-ms N sampling interval, 250..10000 (live default 500; processes refresh
     \\                  at 1 Hz; process IO/fd detail is collected by panes that show it)
@@ -58,6 +59,7 @@ pub const Options = struct {
     galaxy_tour: bool = false,
     look: ?vw.memmap.Look = null,
     gibson_flight: bool = false,
+    gibson_film: bool = false,
     memmap_pid: ?i32 = null,
     memmap_start: u64 = 0,
     interval_ms: ?u64 = null,
@@ -80,6 +82,11 @@ pub fn parse(args: []const [:0]const u8) !Options {
         }
         if (std.mem.eql(u8, arg, "--gibson-flight")) {
             o.gibson_flight = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--gibson-film")) {
+            o.gibson_flight = true;
+            o.gibson_film = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--attach-exe")) {
@@ -196,6 +203,8 @@ pub fn parse(args: []const [:0]const u8) !Options {
 
 test "overview options reject debugger targets and bad values" {
     const flight = try parse(&.{ "xodb", "--overview", "--gibson-flight" });
+    const film = try parse(&.{ "xodb", "--overview", "--gibson-film" });
+    try std.testing.expect(film.gibson_flight and film.gibson_film);
     try std.testing.expect(flight.gibson_flight and flight.look == .gibson and flight.panel == .memory_map);
     try std.testing.expectError(error.InvalidGibsonFlight, parse(&.{ "xodb", "--overview", "--gibson-flight", "--panel", "files" }));
     const ok = try parse(&.{ "xodb", "--overview", "--redact", "--theme", "builtin:green", "--panel", "disk_space", "--interval-ms", "250" });

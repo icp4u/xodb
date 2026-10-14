@@ -3,6 +3,7 @@
 #include <sched.h>
 #include <sys/ptrace.h>
 #include <sys/syscall.h>
+#include <sys/user.h>
 
 /* Wait only on TIDs learned through launch, attach or kernel birth events.
  * Other subsystems may own traced children of this same debugger process. */
@@ -195,6 +196,57 @@ static const int ignored_signals[] = {SIGCHLD, SIGWINCH, SIGURG};
 static int default_ignored(int sig)
 {
     return sig == SIGCHLD || sig == SIGWINCH || sig == SIGURG;
+}
+/* x86 reports PTRACE_SINGLESTEP of `syscall` as TRAP_BRKPT at syscall exit,
+ * with the PC already on the next instruction. For a call a signal
+ * interrupted that is before the restart rewinds the PC.
+ * The two bytes at `entry` are the opcode. */
+static int x86_open_syscall(struct xrt_target *t, uint64_t entry, uint64_t pc)
+{
+    if (!t->arch || t->arch->machine != XRT_X86_64 || !entry || pc != entry + 2)
+        return 0;
+    uint8_t op[2];
+    size_t count = 0;
+    /* The target is not marked stopped yet, so the overlay read would refuse. */
+    if (xrt_memory_read(t->step.tid, entry, op, 2, &count) != XRT_OK || count != 2)
+        return 0;
+    return op[0] == 0x0f && op[1] == 0x05;
+}
+/* x86-64 syscall numbers and errnos, as the stopped registers show them. */
+enum { X86_RT_SIGRETURN = 15, X86_RESTART_SYSCALL = 219, X86_ENOSYS = 38 };
+/* The call was interrupted and the kernel has not yet chosen between restart
+ * and EINTR. Any other rax at the step trap is a finished call, -ENOSYS
+ * included: a single-step reports at syscall exit, never at entry. */
+static int syscall_restarting(uint64_t rax)
+{
+    const int64_t value = (int64_t)rax;
+    return value == -512 || value == -513 || value == -514 || value == -516;
+}
+static enum xrt_status syscall_regs(int32_t tid, uint64_t *rax, uint64_t *orig)
+{
+#if defined(__x86_64__)
+    struct user_regs_struct regs;
+    const enum xrt_status status = xrt_trace(PTRACE_GETREGS, tid, 0, (uintptr_t)&regs);
+    if (status != XRT_OK)
+        return status;
+    *rax = (uint64_t)regs.rax;
+    *orig = (uint64_t)regs.orig_rax;
+    return XRT_OK;
+#else
+    (void)tid;
+    (void)rax;
+    (void)orig;
+    return XRT_UNSUPPORTED_ARCHITECTURE;
+#endif
+}
+static enum xrt_status resume_open_syscall(struct xrt_target *t, int i, int32_t tid, int sig)
+{
+    TRY(xrt_trace(PTRACE_SYSCALL, tid, 0, (uintptr_t)sig));
+    if (sig || !default_ignored(t->threads[i].signal))
+        t->threads[i].signal = 0;
+    t->threads[i].reason = XRT_STOP_NONE;
+    t->threads[i].state = XRT_RUNNING;
+    return XRT_OK;
 }
 /* The thread record carries one signal for the resume. When the stepped
  * thread reports another before its instruction retires, the earlier one
@@ -405,8 +457,11 @@ static enum xrt_status poll(struct xrt_target *t)
                 if (stepping_here || t->want_run) {
                     /* A hardware step is still one instruction. CONT would run
                      * past it. A software step is resumed with CONT because its
-                     * successor trap is already planted in this address space. */
-                    const int hardware_step = stepping_here && !t->step.software;
+                     * successor trap is already planted in this address space.
+                     * A larx/stcx. step is resumed with CONT; single-step would
+                     * clear the reservation. */
+                    const int hardware_step =
+                        stepping_here && !t->step.software && !t->step.atomic_run;
                     TRY(xrt_trace(hardware_step ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, 0));
                     t->threads[i].state = XRT_RUNNING;
                     t->threads[i].reason = XRT_STOP_NONE;
@@ -479,7 +534,10 @@ static enum xrt_status poll(struct xrt_target *t)
                 TRY(xrt_detach_held_vfork(t));
                 const int stepping_here = t->stepping && t->step.tid == tid;
                 if (stepping_here || t->want_run) {
-                    const int hardware_step = stepping_here && !t->step.software;
+                    /* A signal handler that runs inside a larx/stcx. step may
+                     * vfork. That step stays on CONT like the fork resume. */
+                    const int hardware_step =
+                        stepping_here && !t->step.software && !t->step.atomic_run;
                     TRY(xrt_trace(hardware_step ? PTRACE_SINGLESTEP : PTRACE_CONT, tid, 0, 0));
                     t->threads[i].state = XRT_RUNNING;
                     t->threads[i].reason = XRT_STOP_NONE;
@@ -531,7 +589,12 @@ static enum xrt_status poll(struct xrt_target *t)
          * explicit Pause must interrupt a previous run/step request. */
         if (kind == PTRACE_EVENT_STOP && sig == SIGTRAP && t->stepping && t->step.tid == tid &&
             !t->step.interrupted && !t->step.software) {
-            TRY(xrt_trace(PTRACE_SINGLESTEP, tid, 0, 0));
+            /* An open syscall must keep stopping at its exit. Single-step would
+             * clear a larx reservation, so that step is continued. */
+            TRY(xrt_trace(t->step.syscall_open  ? PTRACE_SYSCALL
+                          : t->step.atomic_run ? PTRACE_CONT
+                                               : PTRACE_SINGLESTEP,
+                          tid, 0, 0));
             if (!default_ignored(t->threads[i].signal))
                 t->threads[i].signal = 0;
             t->threads[i].reason = XRT_STOP_NONE;
@@ -552,6 +615,13 @@ static enum xrt_status poll(struct xrt_target *t)
          * stop request exists; this guard is where one would go. An idle stop
          * that is not a step still reports the signal. */
         const bool step_here = t->stepping && t->step.tid == tid;
+        if (kind == 0 && default_ignored(sig) && step_here && t->step.syscall_open) {
+            /* The call is still in the kernel. CONT would let the restart
+             * execute the replanted breakpoint. */
+            park_signal(t, tid, t->threads[i].signal, sig);
+            TRY(resume_open_syscall(t, i, tid, sig));
+            continue;
+        }
         if (kind == 0 && default_ignored(sig) && (step_here || t->want_run || t->stepping)) {
             int advanced = 0;
             uint64_t pc = 0;
@@ -559,7 +629,10 @@ static enum xrt_status poll(struct xrt_target *t)
              * the pending signal with the PC moved. Finishing another
              * single-step would skip one more instruction. A stop still at
              * the stepped PC has not retired it. */
-            if (step_here && !t->step.software && t->step.exec_entry_pc) {
+            /* atomic_run is a larx/stcx. sequence on PTRACE_CONT. The PC moves
+             * through the sequence before the exit trap. That is not the step
+             * ending, and single-step would clear the reservation. */
+            if (step_here && !t->step.software && !t->step.atomic_run && t->step.exec_entry_pc) {
                 struct xrt_registers regs;
                 if (xrt_target_registers(t, tid, &regs) == XRT_OK &&
                     xrt_registers_pc(&regs, &pc) == XRT_OK && pc != t->step.exec_entry_pc)
@@ -584,7 +657,7 @@ static enum xrt_status poll(struct xrt_target *t)
                 TRY(xrt_stop_peers(t));
                 continue;
             }
-            if (step_here && !t->step.software) {
+            if (step_here && !t->step.software && !t->step.atomic_run) {
                 /* The instruction has not retired, and the signal is already
                  * dequeued. Single-step with zero so delivery does not enter
                  * the handler. The step trap keeps this signal and injects it
@@ -623,6 +696,52 @@ static enum xrt_status poll(struct xrt_target *t)
             const enum xrt_status pc_status = xrt_registers_pc(&regs, &pc);
             if (pc_status != XRT_OK)
                 return pc_status;
+            /* PTRACE_O_TRACESYSGOOD is not set, so a syscall stop is SIGTRAP
+             * with si_code SIGTRAP. Any other trap while the call is open,
+             * such as a breakpoint inside the signal handler, is an ordinary
+             * stop and ends the step below. */
+            if (t->step.syscall_open && t->stepping && t->step.tid == tid && info.code == SIGTRAP) {
+                uint64_t rax = 0, orig = 0;
+                TRY(syscall_regs(tid, &rax, &orig));
+                bool over = false;
+                if ((int64_t)rax == -X86_ENOSYS)
+                    /* Entry stop. Remember a signal return for its exit. */
+                    t->step.syscall_sigreturn = orig == X86_RT_SIGRETURN;
+                else if (t->step.syscall_sigreturn) {
+                    /* rt_sigreturn has put the interrupted registers back. A
+                     * PC on the syscall is the kernel's restart. Anywhere else
+                     * the call is over (EINTR) and the program runs on, so the
+                     * breakpoint must be back before it can arrive again. */
+                    t->step.syscall_sigreturn = 0;
+                    over = pc != t->step.exec_entry_pc;
+                } else
+                    /* The exit of the call itself, or of the restart_syscall
+                     * the kernel substituted, back at the stepped site. */
+                    over = pc == t->step.exec_entry_pc + 2 && !syscall_restarting(rax) &&
+                           (orig == t->step.syscall_nr || orig == X86_RESTART_SYSCALL);
+                if (!over) {
+                    TRY(resume_open_syscall(t, i, tid, 0));
+                    continue;
+                }
+                const bool stop_after = t->step.stop_after;
+                t->step.syscall_open = 0;
+                if (!default_ignored(t->threads[i].signal))
+                    t->threads[i].signal = 0;
+                TRY(xrt_finish_step(t, true));
+                t->threads[i].reason = XRT_STOP_SINGLE_STEP;
+                t->threads[i].breakpoint_address = 0;
+                xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
+                t->events[t->event_count - 1].pc = pc;
+                t->events[t->event_count - 1].pc_known = 1;
+                if (!stop_after) {
+                    t->threads[i].reason = XRT_STOP_NONE;
+                    t->state = XRT_STOPPED;
+                    TRY(xrt_target_continue(t));
+                    continue;
+                }
+                TRY(xrt_stop_peers(t));
+                continue;
+            }
             if (t->stepping && t->step.software && t->step.tid == tid) {
                 int handled = 0;
                 TRY(xrt_software_step_hit(t, i, pc, &handled));
@@ -689,6 +808,26 @@ static enum xrt_status poll(struct xrt_target *t)
                     t->events[t->event_count - 1].pc_known = 1;
                 }
             } else if (stepped) {
+                /* A syscall a signal interrupted reports this trap with a
+                 * restart errno, before the kernel restarts it or returns
+                 * EINTR. Leave its breakpoint lifted and stop at the real exit.
+                 * A syscall that already returned has an ordinary rax and
+                 * finishes like any other instruction. */
+                if (!t->step.stop_after && !t->step.has_watch &&
+                    x86_open_syscall(t, t->step.exec_entry_pc, pc)) {
+                    uint64_t rax = 0, orig = 0;
+                    TRY(syscall_regs(tid, &rax, &orig));
+                    if (syscall_restarting(rax)) {
+                        t->step.syscall_nr = orig;
+                        t->step.syscall_open = 1;
+                        t->step.syscall_sigreturn = 0;
+                        t->threads[i].breakpoint_address = 0;
+                        if (!default_ignored(t->threads[i].signal))
+                            t->threads[i].signal = 0;
+                        TRY(resume_open_syscall(t, i, tid, 0));
+                        continue;
+                    }
+                }
                 const bool stop_after = t->step.stop_after, watch = t->step.has_watch;
                 /* A hardware step holds an ignore-default signal here until
                  * this trap. Clearing it would drop the handler. */

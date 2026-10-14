@@ -53,6 +53,8 @@ pub const Collector = struct {
     fd_collector: ?*c.struct_xrt_fdactivity = null,
     fd_opens: u64 = 0,
     fd_scope: []const i32 = &.{},
+    /// Owner-thread GUI publication, borrowed only while its galaxy is visible.
+    graph_scene: ?*const @import("../ui/overview/galaxy_model.zig").Scene = null,
     fd_event_state: FdEventState = .inactive,
     fd_lease: ?@import("../service/lease.zig").Lease = null,
 

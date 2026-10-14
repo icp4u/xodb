@@ -16,6 +16,7 @@ const amber: draw.Color = .{ 1, 0.68, 0.28, 1 };
 const empty = draw.Rect{ .x = 0, .y = 0, .w = 0, .h = 0 };
 
 pub const State = struct {
+    look: @import("../../preferences.zig").Gibson = .{},
     layout: city.Layout = .{},
     camera: city.Camera = .{},
     flight: flight.Flight = .{},
@@ -36,9 +37,11 @@ pub const State = struct {
     /// Shells are built here: the GPU instance buffer is write-only memory.
     shells: std.ArrayList(Box) = .empty,
     pub fn deinit(self: *State) void {
+        const look = self.look;
         self.layout.deinit();
         self.shells.deinit(std.heap.page_allocator);
         self.* = .{};
+        self.look = look;
     }
 };
 
@@ -97,13 +100,17 @@ pub fn key(v: *vw.View, event: @import("../../platform/input.zig").Event, now: u
             if (event.kind == .press) camera.automatic = false;
             return true;
         },
-        'f', 'r', 'h', 'c' => {},
+        'f', 'r', 'h', 'c', 'v' => {},
         else => return false,
     }
     if (event.kind != .press) return true;
     switch (event.shortcut) {
         'f' => {
-            if (s.flight.active() or camera.automatic) s.flight.toggle(camera, &s.layout, now) else camera.fly(now);
+            if (s.flight.active() or camera.automatic) s.flight.toggle(camera, &s.layout, now, s.look) else camera.fly(now);
+        },
+        'v' => {
+            s.look.film = !s.look.film;
+            if (s.flight.on) s.flight.preset(s.look);
         },
         'r' => {
             s.flight = .{};
@@ -160,7 +167,7 @@ fn selectedIndex(s: *State, map: *const md.Map) ?usize {
 
 fn modeName(s: *const State, now: u64) []const u8 {
     if (s.flight.returning) return "RETURNING TO CAMERA";
-    if (s.flight.on) return if (s.flight.automatic) "AUTO FLIGHT / AVENUES" else "MANUAL FLIGHT / AVENUES";
+    if (s.flight.on) return if (s.flight.film) (if (s.flight.automatic) "AUTO FLIGHT / FILM" else "MANUAL FLIGHT / FILM") else if (s.flight.automatic) "AUTO FLIGHT / AVENUES" else "MANUAL FLIGHT / AVENUES";
     return if (s.camera.orbiting(now)) "AUTO ORBIT + DOLLY" else if (s.camera.automatic) "AUTO ORBIT PAUSED" else "MANUAL CAMERA";
 }
 
@@ -177,7 +184,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     try ctx.textFit(inner.x, inner.y, inner.w, std.fmt.bufPrint(&buffer, "G I B S O N   /   {s}   /   {s}", .{ mm.label(v, &label), modeName(s, now) }) catch "GIBSON", cyan);
     if (inner.h < 96 or inner.w < 120) return;
     const mp = ms.map();
-    try ctx.textFit(inner.x, inner.y + 24, inner.w, "F manual/orbit/flight   arrows/drag steer   +/- speed   R reset   H height   C colour   O process", muted);
+    try ctx.textFit(inner.x, inner.y + 24, inner.w, "F manual/orbit/flight   V film   arrows/drag steer   +/- speed   R reset   H height   C colour   O process", muted);
     if (ms.picker_open) {
         if (v.layout != null) std.debug.print("xodb: gibson picker selected={d} rows={d}\n", .{ ms.pick, ms.pick_count + 1 });
         try ctx.textFit(inner.x, inner.y + 50, inner.w, "Choose process: arrows / Enter / Esc", white);
@@ -217,7 +224,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const field = draw.Rect{ .x = rect.x, .y = inner.y + 106, .w = rect.w, .h = @max(0, inner.h - 106 - footer) };
     if (field.w > 0 and field.h > 0 and ctx.r.device != null) {
         if (s.start_flight and s.layout.districts.items.len > 0) {
-            s.flight.toggle(&s.camera, &s.layout, now);
+            s.flight.toggle(&s.camera, &s.layout, now, s.look);
             s.start_flight = false;
         }
         var vp: math.Mat4 = undefined;
@@ -263,6 +270,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     if (v.layout != null or c.getenv("XODB_MEMMAP_PERF") != null) {
         s.frames += 1;
         std.debug.print("xodb: gibson-flight on={} returning={} automatic={} x={d:.6} y={d:.6} z={d:.6} bank={d:.4} speed={d:.3} corners={d} faces={d} far={d}\n", .{ s.flight.on, s.flight.returning, s.flight.automatic, s.eye[0], s.eye[1], s.eye[2], s.flight.bank, s.flight.speed, s.flight.corners, s.face_labels, s.far_labels });
+        std.debug.print("xodb: gibson-route visit={d} district={d} two_sided={d} film={} cruise={d:.2} street_names={} facts_alpha={d:.2}\n", .{ s.flight.visits, if (s.layout.districts.items.len > 0) s.flight.visits % s.layout.districts.items.len else 0, s.flight.two_sided, s.flight.film, s.flight.cruise, s.look.street_names, s.look.facts_alpha });
         std.debug.print("xodb: gibson frame={d} seq={d} x={d:.1} y={d:.1} w={d:.1} h={d:.1} towers={d} districts={d} unknown={d} partial={d} pending={d} collapsed={d} split={d} ease={d:.3} auto={} yaw={d:.3} pitch={d:.3} zoom={d:.3} pan_x={d:.6} pan_z={d:.6} now={d} auto_until={d} moving={} focused={} selected={?d} height={s} colour={s} redacted={} labels={d} gpu_ns={?d}\n", .{ s.frames, map.sequence, s.field.x, s.field.y, s.field.w, s.field.h, s.layout.places.items.len, s.layout.districts.items.len, counts.unknown, counts.partial, @intFromBool(map.pending), counts.collapsed, counts.split, ms.ease(now), s.camera.orbiting(now), s.camera.yaw, s.camera.pitch, s.camera.zoom, s.camera.pan[0], s.camera.pan[1], now, s.camera.auto_until, s.camera.animating(now) or (s.camera.active and s.flight.active()), s.camera.active, s.selected, @tagName(s.height), @tagName(s.colour), v.redact or map.redacted, if (ctx.r.scene_gpu) |gpu| gpu.stats.glyphs else @as(u32, 0), if (ctx.r.scene_gpu) |gpu| gpu.stats.gpu_ns else null });
     }
 }
@@ -372,7 +380,8 @@ fn towerText(v: *vw.View, ctx: draw.Ctx, map: *const md.Map) !void {
         const name = raw[0..length];
         const dx = s.eye[0] - place.x;
         const dz = s.eye[2] - place.z;
-        const normal: math.Vec3 = if (@abs(dx) > @abs(dz)) .{ if (dx >= 0) 1 else -1, 0, 0 } else .{ 0, 0, if (dz >= 0) 1 else -1 };
+        const street = s.flight.on and s.look.street_names;
+        const normal: math.Vec3 = if (if (street) (s.flight.direction == 0 or s.flight.direction == 2) else @abs(dx) > @abs(dz)) .{ if (dx >= 0) 1 else -1, 0, 0 } else .{ 0, 0, if (dz >= 0) 1 else -1 };
         const right: math.Vec3 = .{ normal[2], 0, -normal[0] };
         const alpha = std.math.clamp((9 - item.distance) / 4, 0, 1);
         const tint: draw.Color = .{ 0.75, 0.94, 1, alpha };
@@ -383,18 +392,28 @@ fn towerText(v: *vw.View, ctx: draw.Ctx, map: *const md.Map) !void {
         const base = std.fmt.bufPrint(&buffer, "{d} KiB", .{(cell.end - cell.start) / 1024}) catch "";
         const small = @min(0.009, 0.62 / @max(1, ctx.measure(base)));
         try ctx.r.sceneSurfaceText(ctx.font, math.add(origin, math.scale(right, -0.31)), math.scale(right, small), .{ 0, -small, 0 }, base, tint);
-        if (item.distance < 5) {
+        if (street or (s.look.facts and item.distance < 5)) {
             const side: math.Vec3 = if (normal[0] != 0) .{ 0, 0, if (dz >= 0) 1 else -1 } else .{ if (dx >= 0) 1 else -1, 0, 0 };
             const tangent: math.Vec3 = .{ side[2], 0, -side[0] };
-            var resident_buffer: [32]u8 = undefined;
-            const resident = if (cell.known & md.present_bit != 0) (std.fmt.bufPrint(&resident_buffer, "{d}K", .{cell.present / 1024}) catch "?") else "?";
-            const facts = std.fmt.bufPrint(&buffer, "{s}  res {s}  dirty ?", .{ vma.perms, resident }) catch "";
-            const fact_size = @min(0.014, (place.height - 0.4) / @max(1, ctx.measure(facts)));
             const at = math.add(.{ place.x, 0.3, place.z }, math.scale(side, 0.367));
-            try ctx.r.sceneSurfaceText(ctx.font, math.add(at, math.scale(tangent, -0.12)), .{ 0, fact_size, 0 }, math.scale(tangent, fact_size), facts, tint);
+            // Names remain visible head-on at a junction as well as along the
+            // street. Facts use the spare narrow strip, with lower contrast.
+            if (street) try ctx.r.sceneSurfaceText(ctx.font, math.add(at, math.scale(tangent, -0.18)), .{ 0, size, 0 }, math.scale(tangent, size), name, tint);
+            if (!s.look.facts or item.distance >= 5) {
+                s.face_labels += 1;
+                continue;
+            }
+            // Only measured facts. Cells carry no dirty count, and an
+            // unmeasured resident size draws nothing rather than a "?".
+            const facts = (if (cell.known & md.present_bit != 0) std.fmt.bufPrint(&buffer, "{s}  res {d}K", .{ vma.perms, cell.present / 1024 }) else std.fmt.bufPrint(&buffer, "{s}", .{vma.perms})) catch "";
+            // A long name on a short tower shrinks to fit; the facts shrink with
+            // it so they never read larger than the name.
+            const fact_size = @min(@min(0.007, size * 0.6), (place.height - 0.4) / @max(1, ctx.measure(facts)));
+            const fact_tint = draw.fade(tint, s.look.facts_alpha);
+            try ctx.r.sceneSurfaceText(ctx.font, math.add(at, math.scale(tangent, 0.12)), .{ 0, fact_size, 0 }, math.scale(tangent, fact_size), facts, fact_tint);
             const change = std.fmt.bufPrint(&buffer, "res {d}K / change {d}K", .{ cell.present / 1024, cell.changed / 1024 }) catch "";
-            const change_size = @min(0.012, (place.height - 0.4) / @max(1, ctx.measure(change)));
-            if (cell.known & md.present_bit != 0 and cell.change_known != 0) try ctx.r.sceneSurfaceText(ctx.font, math.add(at, math.scale(tangent, 0.10)), .{ 0, change_size, 0 }, math.scale(tangent, change_size), change, tint);
+            const change_size = @min(@min(0.006, size * 0.5), (place.height - 0.4) / @max(1, ctx.measure(change)));
+            if (cell.known & md.present_bit != 0 and cell.change_known != 0) try ctx.r.sceneSurfaceText(ctx.font, math.add(at, math.scale(tangent, 0.26)), .{ 0, change_size, 0 }, math.scale(tangent, change_size), change, fact_tint);
         }
         s.face_labels += 1;
     }

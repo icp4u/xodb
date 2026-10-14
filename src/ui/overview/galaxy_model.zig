@@ -62,6 +62,9 @@ pub const Cluster = struct {
     r: f32 = 0,
     name: [40]u8 = undefined,
     name_len: u8 = 0,
+    pub fn label(self: *const Cluster) []const u8 {
+        return self.name[0..self.name_len];
+    }
 };
 pub const Counts = struct { used: f32 = 0, stars: u32 = 0, clusters: u32 = 0, strands: u32 = 0, strands_drawn: u32 = 0, impulses: u32 = 0, cloud: u32 = 0, mesh: u32 = 0, labels: u32 = 0, moving: bool = false };
 
@@ -115,6 +118,9 @@ pub const Scene = struct {
         if (self.strand_count == max_strands or strand.a == strand.b) return;
         self.strands[self.strand_count] = strand;
         self.strand_count += 1;
+        // Membership is data, not a side effect of running the galaxy layout.
+        if (strand.a < self.star_count and strand.b >= max_stars and strand.b - max_stars < self.junction_count)
+            self.junctions[strand.b - max_stars].holders += 1;
     }
     pub fn end(self: *const Scene, index: u16) [2]f32 {
         return if (index < max_stars) self.stars[index].at else self.junctions[index - max_stars].at;

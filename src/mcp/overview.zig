@@ -10,6 +10,7 @@ const memstat = @import("memstat.zig");
 pub const definitions = @import("tool_catalog.zig").overview_definitions;
 
 pub fn handles(name: []const u8) bool {
+    if (std.mem.eql(u8, name, "get_graph")) return true;
     if (fd.handles(name)) return true;
     for ([_][]const u8{ "get_overview", "list_processes", "get_process", "get_connections", "get_sensors" }) |candidate|
         if (std.mem.eql(u8, name, candidate)) return true;
@@ -29,6 +30,7 @@ fn group(id: c_uint) u32 {
 }
 
 pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) !Value {
+    if (std.mem.eql(u8, name, "get_graph")) return @import("graph.zig").descriptors(a, state, args);
     if (fd.handles(name)) return fd.call(a, state, name, args);
     if (memstat.handles(name)) return memstat.call(a, state, name, args);
     var opts = std.mem.zeroes(c.struct_xrt_sys_json_opts);
@@ -122,7 +124,7 @@ pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) 
 test "overview reads and explicit fd capture controls are advertised" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(16, parsed.value.array.items.len);
+    try std.testing.expectEqual(17, parsed.value.array.items.len);
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
         try std.testing.expectEqual(!fd.isControl(definition.object.get("name").?.string), definition.object.get("annotations").?.object.get("readOnlyHint").?.bool);

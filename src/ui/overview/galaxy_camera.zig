@@ -6,7 +6,7 @@ const model = @import("galaxy_model.zig");
 const input = @import("../../platform/input.zig");
 const Look = @import("../../preferences.zig").Galaxy;
 pub const Selection = union(enum) { node: u64, cluster: u64 };
-pub const hints = "WASD pan (S not sort) / wheel zoom / drag / Enter frame / arrows clusters / , . rotate / H fit / O tour / ?";
+pub const hints = "WASD pan / wheel zoom / drag / Enter frame / arrows clusters / , . rotate / H fit / O tour / V table / ?";
 pub const Camera = struct {
     zoom: f32 = 1,
     shift: [2]f32 = .{ 0, 0 },
@@ -16,6 +16,7 @@ pub const Camera = struct {
     target_angle: f32 = 0,
     field: draw.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     selection: ?Selection = null,
+    frame_pending: bool = false,
     held: [3]f32 = @splat(0),
     active: bool = false,
     tour: bool = false,
@@ -29,6 +30,8 @@ pub const Camera = struct {
     drag: ?struct { pointer: [2]f32, shift: [2]f32 } = null,
     click_at: u64 = 0,
     click: ?Selection = null,
+    carousel_keys: [model.max_clusters]u64 = undefined,
+    carousel_count: usize = 0,
 
     pub fn transform(self: *const Camera) [6]f32 {
         return .{ self.zoom, 1, self.shift[0], self.shift[1], @cos(self.angle), @sin(self.angle) };
@@ -124,15 +127,14 @@ pub const Camera = struct {
         return true;
     }
     pub fn pointer(self: *Camera, point: [2]f32) void {
-        // The compositor's initial pointer position is not a user gesture.
-        if (self.last != 0) self.stopTour();
+        // Hover, pointer entry and incidental mouse motion leave a recording
+        // tour alone. A press owns cancellation before it starts a drag.
         const drag = self.drag orelse return;
         self.target_shift = .{ drag.shift[0] + point[0] - drag.pointer[0], drag.shift[1] + point[1] - drag.pointer[1] };
         self.shift = self.target_shift;
         self.active = true;
     }
     pub fn wheel(self: *Camera, lines: i32, point: [2]f32, prefs: Look) void {
-        self.stopTour();
         const world = self.unproject(point);
         self.target_zoom = std.math.clamp(self.zoom * std.math.pow(f32, prefs.zoom_speed, -@as(f32, @floatFromInt(lines))), 0.4, 12);
         // Zoom and translation land together so the pointed world point never
@@ -161,7 +163,34 @@ pub const Camera = struct {
                 return ca.key < cb.key;
             }
         };
-        std.mem.sort(u16, order[0..n], Context{ .scene = scene }, Context.less);
+        if (self.carousel_count == 0) {
+            std.mem.sort(u16, order[0..n], Context{ .scene = scene }, Context.less);
+            for (order[0..n], 0..) |index, i| self.carousel_keys[i] = scene.clusters[index].key;
+            self.carousel_count = n;
+        }
+        // Match stable identities, not positions or today's rates. Remove
+        // departed clusters and append newcomers without reordering survivors.
+        var count: usize = 0;
+        for (self.carousel_keys[0..self.carousel_count]) |key_| {
+            for (scene.clusters[0..n], 0..) |cluster, i| if (cluster.key == key_) {
+                order[count] = @intCast(i);
+                count += 1;
+                break;
+            };
+        }
+        for (scene.clusters[0..n], 0..) |_, i| {
+            var found = false;
+            for (order[0..count]) |index| if (index == i) {
+                found = true;
+                break;
+            };
+            if (!found) {
+                order[count] = @intCast(i);
+                count += 1;
+            }
+        }
+        for (order[0..n], 0..) |index, i| self.carousel_keys[i] = scene.clusters[index].key;
+        self.carousel_count = n;
         var next: usize = if (direction < 0) n - 1 else 0;
         if (self.selection) |selected| {
             const selected_key: ?u64 = switch (selected) {
@@ -200,7 +229,10 @@ pub const Camera = struct {
         }
         switch (event.shortcut) {
             'w', 'a', 's', 'd', ',', '.' => return true,
-            'h', 0xff50 => self.fit(),
+            'h', 0xff50 => {
+                self.carousel_count = 0;
+                self.fit();
+            },
             0xff51, 0xff53 => if (event.kind == .press) self.carousel(scene, if (event.shortcut == 0xff51) -1 else 1),
             0xff0d => if (event.kind == .press) self.frame(scene),
             '?' => if (event.kind == .press) {
@@ -258,6 +290,10 @@ pub const Camera = struct {
         const dt: f32 = @as(f32, @floatFromInt(@min(now -| self.last, 50_000_000))) / 1e9;
         self.last = now;
         self.frame_zoom = prefs.camera_zoom;
+        if (self.frame_pending) {
+            self.frame_pending = false;
+            self.frameAt(scene, false);
+        }
         if (self.help and self.help_until == 0) self.help_until = now + 8_000_000_000;
         if (self.help_until != 0 and now >= self.help_until) self.help = false;
         if (self.tour and (self.tour_at == 0 or now >= self.tour_at)) {
@@ -405,7 +441,7 @@ test "focus loss drops held keys and drags but leaves a tour running; tour hops 
     try std.testing.expect(toured > 0 and toured < (direct.zoom - 1) / 2);
 }
 
-test "empty drag pans; tour advances and any key or pointer stops it" {
+test "empty drag pans; tour survives pointer motion and stops on keys or clicks" {
     const scene = try std.testing.allocator.create(model.Scene);
     defer std.testing.allocator.destroy(scene);
     scene.* = .{};
@@ -424,5 +460,37 @@ test "empty drag pans; tour advances and any key or pointer stops it" {
     _ = camera.key(scene, .{ .kind = .press, .shortcut = 'o' });
     camera.pointer(.{ 55, 30 });
     camera.update(scene, 60_000_001, .{});
+    try std.testing.expect(camera.tour and camera.active);
+    camera.wheel(-1, .{ 55, 30 }, .{});
+    try std.testing.expect(camera.tour);
+    _ = camera.press(scene, .{ 10, 10 }, 60_000_002);
+    camera.drag = null;
+    camera.update(scene, 90_000_001, .{});
     try std.testing.expect(!camera.tour and !camera.active);
+}
+
+test "carousel freezes live order until Home and survives reordered or departed clusters" {
+    const scene = try std.testing.allocator.create(model.Scene);
+    defer std.testing.allocator.destroy(scene);
+    scene.* = .{};
+    scene.cluster_count = 3;
+    scene.clusters[0] = .{ .key = 1, .rate = 30 };
+    scene.clusters[1] = .{ .key = 2, .rate = 20 };
+    scene.clusters[2] = .{ .key = 3, .rate = 10 };
+    var camera = Camera{};
+    camera.carousel(scene, 1);
+    try std.testing.expectEqual(@as(u64, 1), camera.selection.?.cluster);
+    scene.clusters[2].rate = 100;
+    std.mem.swap(model.Cluster, &scene.clusters[0], &scene.clusters[2]);
+    camera.carousel(scene, 1);
+    try std.testing.expectEqual(@as(u64, 2), camera.selection.?.cluster);
+    camera.carousel(scene, -1);
+    try std.testing.expectEqual(@as(u64, 1), camera.selection.?.cluster);
+    _ = camera.key(scene, .{ .kind = .press, .shortcut = 0xff50 });
+    camera.carousel(scene, 1);
+    try std.testing.expectEqual(@as(u64, 3), camera.selection.?.cluster);
+    scene.clusters[0] = .{ .key = 4, .rate = 1000 };
+    camera.carousel(scene, 1);
+    try std.testing.expectEqual(@as(u64, 1), camera.selection.?.cluster);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 4 }, camera.carousel_keys[0..camera.carousel_count]);
 }

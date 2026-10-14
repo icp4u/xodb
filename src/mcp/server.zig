@@ -293,7 +293,9 @@ pub const Server = struct {
             return result;
         }
         // Whole-system observation needs no debug target or process routing.
-        if (overview.handles(name)) return overview.call(a, self.overview_shared orelse &self.overview, name, args);
+        const redot_graph = std.mem.eql(u8, name, "get_graph") and std.mem.eql(u8, try @import("graph.zig").kind(args), "redot");
+        if (redot_graph and self.overview_only) return error.GraphKindUnavailable;
+        if (overview.handles(name) and !redot_graph) return overview.call(a, self.overview_shared orelse &self.overview, name, args);
         const process_id = try @import("profile.zig").number(args, "process_id", 1);
         const session = if (root.process_tree) |tree| (try tree.find(process_id)).session else if (process_id == root.process_id) root else return error.UnknownProcess;
         if (!policy.localAllowed(session.agent_scope, root.shared_jobs or session.shared_jobs)) return error.AgentScopeDenied;
@@ -363,6 +365,7 @@ pub const Server = struct {
         const language_tabs = @import("language_tabs.zig");
         if (language_tabs.handles(name)) return language_tabs.call(a, session, name, args);
         const redot = @import("redot.zig");
+        if (std.mem.eql(u8, name, "get_graph")) return @import("graph.zig").redot(a, session, args);
         if (redot.handles(name)) return redot.call(a, session, name, args);
         const allocations = @import("allocation_control.zig");
         if (allocations.handles(name)) return allocations.call(a, session, name, args);

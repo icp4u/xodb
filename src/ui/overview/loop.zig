@@ -93,6 +93,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
     if (live) try source.prepare(view);
     // After prepare: opening the --memmap-pid target resets the city state.
     view.memmap.city.start_flight = o.gibson_flight;
+    view.memmap.city.look = preferences.gibson;
+    if (o.gibson_film) view.memmap.city.look.film = true;
     view.source_label = if (live) "live" else "REPLAY";
     view.owns_samples = live;
 

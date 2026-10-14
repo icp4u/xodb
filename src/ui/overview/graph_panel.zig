@@ -8,7 +8,8 @@ const Input = @import("../../platform/input.zig").Event;
 
 pub fn key(v: *vw.View, event: Input) bool {
     const state = @import("galaxy_descriptors.zig").navigation();
-    if (v.panel == .galaxy and !v.searching and state.motion.navigation.key(&state.scene, event)) return true;
+    if (v.panel == .galaxy and !v.searching and state.table.event(&state.scene, &state.motion.navigation, event)) return true;
+    if (v.panel == .galaxy and !v.searching and !state.table.open and state.motion.navigation.key(&state.scene, event)) return true;
     if (event.kind != .press or !event.plain()) return false;
     if (event.sym == 0xff1b) {
         v.graph.all();
@@ -59,6 +60,7 @@ pub fn openResource(v: *vw.View, node: u32) void {
     const g = v.graph.graph orelse return;
     if (node >= g.node_count or g.nodes[node].type != c.XRT_FDG_RESOURCE) return;
     const n = g.nodes[node];
+    if (c.getenv("XODB_OVERVIEW_AUDIT") != null) std.debug.print("xodb: graph-resource-open node={d} device={d} inode={d} holders={d}\n", .{ node, n.device, n.inode, n.holders });
     if (n.flags & c.XRT_FDG_IDENTITY_UNKNOWN == 0) {
         v.files.all();
         v.files.file_filter = .{ .device = n.device, .inode = n.inode };
@@ -83,18 +85,7 @@ fn dot(ctx: draw.Ctx, x: f32, y: f32, radius: f32, color: draw.Color) !void {
     try ctx.r.shape(.{ .x = x - radius, .y = y - radius, .w = radius * 2, .h = radius * 2 }, color, .{ .radii = @splat(radius) });
 }
 pub fn starLabel(v: *vw.View, index: u32, buffer: []u8) []const u8 {
-    const p = v.graph.projection.?;
-    const g = v.graph.graph.?;
-    const s = v.graph.snapshot.?;
-    const star = p.stars[index];
-    if (star.mixed_groups != 0) return std.fmt.bufPrint(buffer, "{d} processes · grouped", .{star.processes}) catch "grouped";
-    if (star.processes > 1) {
-        const group = v.graph.cgroup(star.sample_node);
-        return if (v.redact or group.len == 0) std.fmt.bufPrint(buffer, "cgroup · {d} processes", .{star.processes}) catch "group" else std.fs.path.basename(group);
-    }
-    const node = g.nodes[star.source_node];
-    if (v.redact or node.source_process >= s.process_count) return std.fmt.bufPrint(buffer, "pid {d}", .{node.pid}) catch "process";
-    return fm.State.churnLabel(buffer, fm.State.name(@ptrCast(&s.processes[node.source_process])), node.pid, 24);
+    return @import("galaxy_descriptors.zig").starLabel(v, index, buffer);
 }
 fn drawStar(v: *vw.View, ctx: draw.Ctx, index: u32, at: [2]f32, label_width: f32) !void {
     const s = v.graph.projection.?.stars[index];
@@ -145,7 +136,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const demo = v.graph.demo != 0;
     if (!lk.plain) try ctx.r.shape(rect, lk.field, .{ .radii = @splat(6) });
     const navigation = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
-    try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, if (navigation.tour) "Descriptor galaxy / TOUR" else "Descriptor galaxy", lk.text);
+    try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, if (@import("galaxy_descriptors.zig").navigation().table.open) "Descriptor graph / TABLE" else if (navigation.tour) "Descriptor galaxy / TOUR" else "Descriptor galaxy", lk.text);
     try ctx.r.shape(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, draw.fade(lk.warn, 0.12), .{ .radii = @splat(5) });
     try ctx.textFit(rect.x + 16, rect.y + 38, rect.w - 32, if (demo) "DEMO · synthetic processes · nothing is read or traced" else bannerText(v, &buffer, &failure_buffer), lk.warn);
     var rows: [8]draw.Rect = undefined;
@@ -188,6 +179,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         return err;
     };
     ctx.r.clip = clip;
+    if (@import("galaxy_descriptors.zig").navigation().table.open) return;
     if (c.getenv("XODB_OVERVIEW_AUDIT") != null)
         std.debug.print("xodb: galaxy-frame stars={d} clusters={d} strands={d} drawn={d} impulses={d} cloud={d} mesh={d} labels={d} moving={d} demo={d} buffer={d:.2} clock={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses, counts.cloud, counts.mesh, counts.labels, @intFromBool(counts.moving), v.graph.demo, counts.used, v.graph.clock });
     if (demo) {

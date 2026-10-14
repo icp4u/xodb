@@ -345,6 +345,7 @@ pub const View = struct {
         return 1 - (1 - x) * (1 - x) * (1 - x);
     }
     pub fn animating(self: *const View, now: u64) bool {
+        if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().table.open) return false;
         if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().motion.navigation.active) return true;
         return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now));
     }
@@ -392,6 +393,16 @@ pub const View = struct {
             w.dirty = true;
         }
         while (w.input.next()) |event| {
+            if (self.panel == .galaxy and self.pending_action == null and self.classic_menu == null and !self.classic_about) {
+                if (galaxy_state.table.clipboard(w, &galaxy_state.scene, event)) {
+                    w.dirty = true;
+                    continue;
+                }
+                if (event.kind == .button_press and galaxy_state.table.open and galaxy_state.table.event(&galaxy_state.scene, camera, event)) {
+                    w.dirty = true;
+                    continue;
+                }
+            }
             switch (event.kind) {
                 .press, .repeat => {
                     // A held navigation key already has the camera's 30 fps
@@ -408,6 +419,7 @@ pub const View = struct {
                 },
                 .button_press => {
                     w.dirty = true;
+                    if (self.galaxyMap()) camera.stopTour();
                     // The deep map's field and minimap take presses (drag, select, jump).
                     if (event.code == 272) {
                         const unobscured = self.pending_action == null and self.classic_menu == null and !self.classic_about;
@@ -457,7 +469,7 @@ pub const View = struct {
         return self.panel == .memory_map and self.memmap.viewport() and !self.memmap.legend and !self.memmap.picker_open;
     }
     fn galaxyMap(self: *const View) bool {
-        return self.panel == .galaxy and self.classic_menu == null and !self.classic_about and self.pending_action == null;
+        return self.panel == .galaxy and !@import("galaxy_descriptors.zig").navigation().table.open and self.classic_menu == null and !self.classic_about and self.pending_action == null;
     }
     /// A shared resource under the pointer keeps its click (open holders),
     /// unless a star is the nearer target; everything else is the camera's.
@@ -475,6 +487,7 @@ pub const View = struct {
         return self.panel == .memory_map and self.memmap.look == .gibson and !self.memmap.picker_open and self.classic_menu == null and !self.classic_about and self.pending_action == null;
     }
     fn wheel(self: *View, lines: i32) void {
+        if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().table.open) return @import("galaxy_descriptors.zig").navigation().table.wheel(lines);
         if (self.galaxyMap()) return @import("galaxy_descriptors.zig").navigation().motion.navigation.wheel(lines, self.pointer, self.graph.look);
         if (self.gibsonMap()) {
             self.memmap.city.camera.wheel(lines);
@@ -800,13 +813,35 @@ pub const View = struct {
         self.setStatus("Opened {s} for pid {d} (start {d})", .{ @tagName(request.kind), request.id.pid, request.id.start }, now);
     }
 
+    fn nearestResource(self: *const View, x: f32, y: f32) ?u32 {
+        var nearest: ?u32 = null;
+        var distance: f32 = std.math.inf(f32);
+        for (self.hits[0..self.hit_count]) |candidate| {
+            if (candidate.action != .graph_resource or !draw.inside(candidate.rect, x, y)) continue;
+            const dx = x - (candidate.rect.x + candidate.rect.w / 2);
+            const dy = y - (candidate.rect.y + candidate.rect.h / 2);
+            const d2 = dx * dx + dy * dy;
+            const node = candidate.action.graph_resource;
+            if (d2 < distance or (d2 == distance and node < (nearest orelse std.math.maxInt(u32)))) {
+                distance = d2;
+                nearest = node;
+            }
+        }
+        return nearest;
+    }
+
     fn click(self: *View, x: f32, y: f32, now: u64) void {
         var i = self.hit_count;
         while (i > 0) {
             i -= 1;
             const target = self.hits[i];
             if (!draw.inside(target.rect, x, y)) continue;
-            const action = target.action;
+            // Resource hit boxes can overlap at subpixel separation. Resolve
+            // their centres, not their registration order, just like stars.
+            const action: Action = if (self.galaxyMap() and target.action == .graph_resource)
+                .{ .graph_resource = self.nearestResource(x, y) orelse target.action.graph_resource }
+            else
+                target.action;
             self.pointer = .{ x, y };
             if (action != .classic_page) self.classic_menu = null;
             self.activate(action, now);
@@ -1711,6 +1746,22 @@ test "queued search and actions cannot use a filtered-out process identity" {
     v.accept(n, 5);
     v.requestAction(.files, 6);
     try std.testing.expectEqual(999, v.pending_action.?.id.pid);
+}
+
+test "overlapping resource picks use nearest centre instead of registration order" {
+    var v = try View.init(std.testing.allocator);
+    defer v.deinit();
+    const first = Rect{ .x = 93.4, .y = 93, .w = 14, .h = 14 };
+    const second = Rect{ .x = 92.7, .y = 92.4, .w = 14, .h = 14 };
+    v.hit(first, .{ .graph_resource = 3 });
+    v.hit(second, .{ .graph_resource = 4 });
+    try std.testing.expectEqual(@as(?u32, 3), v.nearestResource(100, 100));
+    try std.testing.expectEqual(@as(?u32, 4), v.nearestResource(99, 99));
+    v.hit_count = 0;
+    v.hit(second, .{ .graph_resource = 4 });
+    v.hit(first, .{ .graph_resource = 3 });
+    try std.testing.expectEqual(@as(?u32, 3), v.nearestResource(100, 100));
+    try std.testing.expectEqual(@as(?u32, null), v.nearestResource(200, 200));
 }
 
 test "every panel draws through a resize from 0x0 to half screen with the pointer anywhere" {

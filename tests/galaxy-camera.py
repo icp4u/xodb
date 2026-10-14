@@ -106,8 +106,10 @@ try:
     touring = until(lambda r: r['tour'] == '1' and r['camera'] == '1', 'start option starts tour')
     check('start option requests a moving tour', touring['tour'] == '1')
     repaint(5, 5)
-    stopped = until(lambda r: r['tour'] == '0' and r['camera'] == '0', 'pointer stops tour')
-    check('pointer stops tour without an extra camera target', pose(stopped) == pose(repaint(6, 6)))
+    check('pointer motion leaves the recording tour running', latest()['tour'] == '1')
+    send('tap', 24)  # O stops without creating a new camera target.
+    stopped = until(lambda r: r['tour'] == '0' and r['camera'] == '0', 'O stops tour')
+    check('explicit key stops tour without an extra camera target', pose(stopped) == pose(repaint(6, 6)))
     # Keep a keyboard on the private seat: unplugging its last keyboard is a
     # real focus loss, which releases held keys and an empty-field drag.
     keeper = subprocess.Popen([h.HELPER, str(d.width), str(d.height), 'layout', 'us', 'barrier'],
@@ -140,6 +142,14 @@ try:
     until(lambda r: float(r['zoom']) > old[0] and r['camera'] == '0', 'wheel zoom')
     after = latest('galaxy-pick')
     check('wheel keeps the pointed star under the pointer', math.dist(point(anchor), point(after)) < 1)
+    send('scroll', *pointer, -10)
+    until(lambda r: float(r['zoom']) > 4 and r['camera'] == '0', 'high zoom settles')
+    cloud = latest('galaxy-cloud')
+    check('high zoom refines retained dust within its pixel budget', float(cloud['lod']) > 1 and float(cloud['max_pixel']) <= 4)
+    d.shot('cloud-detail')
+    send('scroll', *pointer, 10)
+    until(lambda r: float(r['zoom']) < 4 and r['camera'] == '0', 'return from high zoom')
+    after = latest('galaxy-pick')
     repaint(*map(round, point(after)))
     picked = latest('galaxy-pick')
     check('transformed hover hits the drawn anchor', picked['hovered'] == picked['anchor'])

@@ -720,16 +720,31 @@ resumes it. Movement keys, drag and the wheel take manual control instead,
 and F advances to the next camera mode. The title line names the current mode.
 
 The flight mode is street-level (or start directly with `--gibson-flight`). Auto-flight
-visits the largest district first, then tours the grid avenues. Arrows or a
+visits the largest district first, then traverses one lined avenue in every
+district, from cross street to cross street. It prefers streets with towers on
+both sides, especially the wide gaps between districts, and a street it can
+turn into over one that needs a U-turn back along the avenue just flown;
+transfers use straight grid segments. A lone or sparse
+district may only have a one-sided street. Arrows or a
 mouse drag take manual control: left/right queue turns at the next intersection;
 up/down change altitude, **+/-** adjust speed. Turns stay on safe integer avenues
-between tower footprints, with a slight camera bank. F again rises above the
+between tower footprints, with a slight camera bank. Manual flight turns along
+the perimeter street rather than leaving the city. F again rises above the
 roofs and eases back to the saved pose in manual mode, with no idle animation.
 Flight pauses when the city loses input focus. R leaves flight and resets.
+**V** toggles the calm (1.5 units/s) and film (4.2 units/s) speed presets without
+changing steering mode. `--gibson-film` starts flight with the film preset;
+`--gibson-flight --memmap-pid PID` starts the calm live-target view. **F** keeps
+its existing camera-mode cycle. Explicit JSON preferences under `gibson` expose
+`flight_speed`, `film_speed` (0.4–5 units/s), `film`, `street_names`, `facts`, and
+`facts_alpha` (0–1, default 0.38). No look changes require a rebuild.
 
 Near towers carry world-space mapping-name signage, size near the base, and
-protection/residency/change facts on the adjacent camera-facing face. Unknown
-dirty data remains `?`. Signs fade with distance; at most 24 towers and 3072
+protection/residency/change facts on the adjacent camera-facing face. In flight,
+names appear on street-facing walls and on the visible junction-facing wall;
+facts use a smaller, lower-contrast strip so they do not dominate the name. Only
+measured facts are drawn: there is no dirty figure, and an unmeasured resident
+size is left out. Signs fade with distance; at most 24 towers and 3072
 glyphs are considered, with no new per-frame collection allocation. Redaction
 removes both the face signs and floating district labels.
 These controls are local to Gibson: **D** moves right. Click a tower for the
@@ -763,14 +778,20 @@ object accepts `additive` (default true), `cloud_size` (0.5–3, default 1.6),
 `easing_ms` (50–2000, default 450), `max_stars` (8–1024, default 512), and
 `unfold` (default true). `camera_zoom` is the minimum cluster framing zoom;
 stars frame at three times that value. See `config/preferences.example.json`.
+`cloud_lod` (default true) refines retained dust and fibres in zoom bands,
+keeping the largest dust mark below `cloud_pixel_limit` (1–8 UI pixels,
+default 4). Haze stays diffuse; point and mesh budgets do not grow. Disable
+`cloud_lod` to keep the original magnified texture.
 
 The descriptor and Redot scene galaxies share navigation: hold `WASD` to pan
 (`S` overrides sorting), wheel to zoom about the pointer, or drag empty space.
 Left/Right frame clusters in descending activity, then size order; ties use
 stable identities. Hold comma/period to rotate about the field centre; labels
 stay upright. `H`/Home fits all and clears rotation. Esc backs out, then fits.
-`O` toggles an automatic carousel that glides between clusters; any other key
-or pointer input stops it, while losing window focus does not.
+`O` toggles an automatic carousel that glides between clusters; another key or
+a click stops it. Pointer motion, wheel zoom and focus loss leave it running.
+Carousel order is captured on entry, not re-sorted by changing tracing rates.
+Home re-sorts it; departed clusters are removed and newcomers append at the end.
 `--galaxy-tour` starts an overview galaxy tour for recording. `?` shows the
 navigation footer again. `q` still quits. Redot `P` opens the selected object's
 inspector; a single click stays in the galaxy.
@@ -783,7 +804,8 @@ Tour drift is a presentation effect, not measured activity. Camera movement is
 capped at 30 fps and stops requesting frames when the eased target is reached.
 
 Cloud points and fibres are retained in GPU storage: impulse animation and
-camera transforms do not rebuild them. Layout, appearance and focus changes
+camera transforms within a detail band do not rebuild them. Layout, appearance,
+zoom detail-band and focus changes
 invalidate the retained cloud. Layout positions ease by process/group identity
 in one bounded 100 ms transition per publication, at most 10 fps without camera
 motion or traffic. Sub-pixel and off-screen moves settle immediately. The old
@@ -798,6 +820,38 @@ selection routing live in `galaxy_descriptors.zig`; the renderer consumes a mode
 and view-local motion state through adapter callbacks. The descriptor and seeded
 demo sources use the same adapter. Extracting this boundary does not change the
 layout, capacities or look.
+
+### Graph table and machine-readable model
+
+**V** toggles the descriptor or Redot scene galaxy to its neutral graph table.
+Click column headings to sort names, units/weights, incoming or outgoing rates;
+**R** reverses the order. **Tab** switches between grouped nodes and edges.
+**/** captures a case-insensitive label filter (including an empty filter);
+Enter/Escape finishes typing, and Escape again clears it. Click a cluster's
+twisty or press Space/Left/Right to fold it. Filtering reveals matching children
+even in a folded group. These operations do not discard source graph entities.
+
+Picking a star selects its table row; picking a node row selects that same star
+and frames it on return to the galaxy. Arrow keys select rows. Edge rows select
+their first represented process/node endpoint. Shared resource rows show holder
+counts and retained rates. **Ctrl+C** copies all currently filtered/unfolded rows
+as tab-separated text (not just the visible viewport); tabs/newlines in labels
+are replaced with spaces. Labels have the same bounded length as the galaxy.
+The keyboard cursor is a faint band that follows its row through sorting,
+folding and refreshes. The platform clipboard holds 4096 bytes (about 30 rows):
+a larger copy is refused and the footer says so; filter or fold first, or read
+the whole model with `get_graph`.
+
+Observer MCP `get_graph({"kind":"descriptors","scope":"current"})` returns
+the visible GUI model, or the same adapter over retained inventory in a headless
+session. `kind:"redot"` returns the selected `process_id`'s engine scene graph
+(default original process 1). `scope:"current"` is the only scope in this
+version: it means the startup descriptor PID scope or that engine's scene.
+Results include namespaced string IDs, nodes, resource junctions, clusters,
+directed/undirected edges and interval pulses. Table sort/filter/fold is not
+applied to the export. Bounds and data semantics are explicit; pending initial
+inventory/scene requests should be polled. The tool never starts, stops or
+renews tracing/profiling. Scene signal connections remain unavailable.
 
 Two explicit retained-cloud slots let separate graph views queue geometry in one
 frame without overwriting each other. Each slot retains the existing 4 MiB vertex
