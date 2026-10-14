@@ -1,0 +1,25 @@
+# Allowed layer imports. One rule per line:
+#   deny NAME FROM... -> TO...   FROM must not reach TO
+#   only NAME FROM... -> TO...   FROM may reach only TO (and itself)
+# FROM and TO are layer names (tools/deps/layers) or path globs. Every rule is
+# checked directly and transitively: FROM reaching a forbidden file through files
+# outside FROM is a violation of the edge where the chain leaves FROM.
+# Violations present today are in tools/deps/baseline. See docs/DEPENDENCIES_LINT.md.
+
+# The model is application state: no frontend, drawing or window system in it.
+deny model-no-frontends     model -> ui mcp render platform memdefrag
+
+# Frontends talk to the application, not to each other.
+deny ui-no-mcp              ui -> mcp
+deny mcp-no-ui              mcp -> ui
+
+# Drawing and the window system import no application code.
+only render-leaf            render -> platform common c_ui config
+only platform-leaf          platform -> common c_ui
+
+# Providers get a narrow context, not the session.
+deny providers-no-session   language semq debug binary -> src/model/session.zig
+
+# The C runtime builds alone (src/runtime/Makefile, xodb-agent): it includes only
+# its own headers and the system's.
+only runtime-alone          runtime -> runtime

@@ -122,8 +122,14 @@ COVERS = (
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
+    (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
+    (('src/*.zig', 'src/*.c', 'src/*.h', 'src/*.cc', 'src/*.inc', 'src/*/Makefile', 'build.zig'), ('deps',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
+
+# Cheap steps that cover every source file without counting as its coverage in
+# `affected`: a file only they cover still selects the full gui tier.
+ALWAYS = ('deps',)
 
 # GUI steps that must run alone under --jobs: they assert frame time, CPU or
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
@@ -271,6 +277,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     for name in ('cache-pool', 'object-cache', 'symbol-query', 'dwarf-cursor', 'dwarf-index', 'dwarf-names', 'dwarf-types', 'javascript-ranged', 'javascript-image'):
         steps.append((name, [sys.executable, '-B', f'tests/{name}.py', '--work', '.work/' + name], 60))
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
+    steps.append(('deps', [sys.executable, '-B', 'scripts/deps', 'check'], 30))
+    steps.append(('deps-selftest', [sys.executable, '-B', 'tests/deps-selftest.py'], 30))
     steps.append(('complete-log-lines', [sys.executable, '-B', 'tests/complete-log-lines.py', '--work', '.work/complete-log-lines'], 10))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
     if tier in ('portable', 'quick', 'host', 'gui', 'all'):
@@ -1130,7 +1138,7 @@ def affected(steps, changed, fallback, registered=()):
         elif path == 'scripts/release-check':
             names = fallback
             lines.append(f'affected: {path}: no registration changed, so the full gui tier ({len(names)} steps)')
-        elif names:
+        elif any(name not in ALWAYS for name in names):
             lines.append(f'affected: {path}: {len(names)} steps: ' + ' '.join(names))
         elif path.startswith(('tests/', 'scripts/')):
             names = [step.name for step in steps if not periodic(step.name)]

@@ -1,0 +1,48 @@
+# Source file -> layer. One "GLOB LAYER" per line; the first matching line wins.
+# `*` stays inside one directory, `**` crosses directories. Every source file
+# under src/ (.zig .c .h .cc .inc) must match a line: an unmapped file fails
+# scripts/deps check. Layers follow today's directories; the layers of
+# docs/ARCHITECTURE_REVIEW.md 3.1 arrive as files move. See docs/DEPENDENCIES_LINT.md.
+
+# composition root: assembles everything
+src/main.zig              root
+src/startup.zig           root
+
+# shared leaves
+src/log.zig               common
+src/text.h                common
+src/c.zig                 c_engine   # C seen by the debug engine (@cImport)
+src/c_ui.zig              c_ui       # C seen by rendering, platform and UI code
+src/appearance.zig        config     # startup-only themes
+src/preferences.zig       config
+src/test_support.zig      test_support
+
+# application core
+src/model/**              model
+src/target/**             target
+src/remote/**             remote
+src/service/**            service
+src/observe/**            observe
+src/profile/**            profile
+src/frames/**             frames
+
+# providers: images, debug info, runtime languages, static analysis
+src/binary/**             binary
+src/debug/**              debug
+src/language/**           language
+src/semq/**               semq
+src/redot/**              redot
+src/import/**             import
+
+# C runtime: also builds alone (src/runtime/Makefile, xodb-agent)
+src/runtime/**            runtime
+
+# frontends
+src/ui/**                 ui
+src/mcp/**                mcp
+src/memdefrag/**          memdefrag
+src/lsoftop/**            lsoftop
+
+# drawing and the window system
+src/render/**             render
+src/platform/**           platform

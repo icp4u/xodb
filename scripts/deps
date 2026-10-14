@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""Source dependency linter: file graph, layers, rules, baseline ratchet, budgets, cycles.
+
+Reads @import("x.zig") and @cInclude("x.h") in Zig and #include "x.h" in C,
+resolves them to files under src/, maps each file to a layer with
+tools/deps/layers and checks tools/deps/rules, tools/deps/baseline and
+tools/deps/budgets. See docs/DEPENDENCIES_LINT.md.
+
+  scripts/deps check              exit 1 on a new violation, a stale baseline line,
+                                  a new cycle edge, an exceeded budget or an unmapped file
+  scripts/deps graph --json       files, edges and the layer of each file
+  scripts/deps layers             layer-to-layer edge counts
+  scripts/deps why A B            shortest import chain from file/layer A to file/layer B
+  scripts/deps rdeps FILE         every file that imports FILE, directly or not
+  scripts/deps baseline --write   regenerate tools/deps/baseline from today's tree
+"""
+import argparse
+from collections import deque
+import json
+import os
+from pathlib import Path
+import re
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SOURCES = ('.zig', '.c', '.h', '.cc', '.inc')
+PACKAGES = {'std', 'builtin', 'root'}  # Zig's own packages: never nodes
+
+ZIG_IMPORT = re.compile(r'@(import|cInclude)\s*\(\s*"([^"]+)"\s*,?\s*\)')
+C_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*(?:"([^"]+)"|<([^>]+)>)', re.M)
+C_COMMENT = re.compile(r'/\*.*?\*/', re.S)
+BUILD_INCLUDE = re.compile(r'addIncludePath\(\s*b\.path\(\s*"([^"]+)"\s*\)')
+BUILD_MODULE = re.compile(r'(?:addOptions|addImport|addAnonymousImport)\(\s*"([^"]+)"')
+MAKE_INCLUDE = re.compile(r'-I\$\((CURDIR|ROOT)\)(/[^\s]*)?')
+
+
+def fail(message):
+    print('deps: ' + message, file=sys.stderr)
+    sys.exit(2)
+
+
+def glob_regex(glob):
+    """`**` crosses directories, `*` and `?` do not."""
+    out, i = [], 0
+    while i < len(glob):
+        if glob.startswith('**/', i):
+            out.append('(?:.*/)?'); i += 3
+        elif glob.startswith('**', i):
+            out.append('.*'); i += 2
+        elif glob[i] == '*':
+            out.append('[^/]*'); i += 1
+        elif glob[i] == '?':
+            out.append('[^/]'); i += 1
+        else:
+            out.append(re.escape(glob[i])); i += 1
+    return re.compile(''.join(out) + r'\Z')
+
+
+def config_lines(path):
+    """(line number, words) for each non-blank line, # comments removed."""
+    if not path.exists():
+        fail(f'missing {path.relative_to(path.parents[2])}')
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        words = line.split('#', 1)[0].split()
+        if words:
+            yield number, words
+
+
+def zig_code(text):
+    """Zig text with // comments and \\\\ multiline string lines blanked."""
+    lines = []
+    for line in text.split('\n'):
+        stripped = line.lstrip()
+        if stripped.startswith('\\\\'):
+            lines.append('')
+            continue
+        quoted, i = False, 0
+        while i < len(line):
+            ch = line[i]
+            if quoted:
+                if ch == '\\':
+                    i += 1
+                elif ch == '"':
+                    quoted = False
+            elif ch == '"':
+                quoted = True
+            elif ch == "'" and i + 2 < len(line):
+                end = line.find("'", i + (3 if line[i + 1] == '\\' else 2))
+                i = end if end > 0 else i
+            elif line.startswith('//', i):
+                line = line[:i]
+                break
+            i += 1
+        lines.append(line)
+    return '\n'.join(lines)
+
+
+class Graph:
+    def __init__(self, root):
+        self.root = root
+        self.files = sorted(p.relative_to(root).as_posix() for p in (root / 'src').rglob('*')
+                            if p.suffix in SOURCES and p.is_file())
+        self.known = set(self.files)
+        self.edges = {}       # (from, to) -> kind; to is a file or 'module:NAME'
+        self.unresolved = []  # (file, spelled name, kind)
+        self.include_dirs, self.make_dirs, self.modules = self.build_settings()
+        for name in self.files:
+            self.scan(name)
+        self.out = {name: set() for name in self.files}
+        self.into = {name: set() for name in self.files}
+        for a, b in self.edges:
+            self.out[a].add(b)
+            if b in self.into:
+                self.into[b].add(a)
+
+    def build_settings(self):
+        """Include directories that build.zig and the Makefiles under src/ use."""
+        dirs, modules = [], set()
+        build = self.root / 'build.zig'
+        if build.exists():
+            text = build.read_text()
+            for found in BUILD_INCLUDE.findall(text):
+                if found.startswith('src/') and found not in dirs:
+                    dirs.append(found)
+            modules.update(BUILD_MODULE.findall(text))
+        make = {}
+        for makefile in sorted((self.root / 'src').glob('*/Makefile')):
+            here = makefile.parent.relative_to(self.root).as_posix()
+            found = []
+            for base, rest in MAKE_INCLUDE.findall(makefile.read_text()):
+                path = here if base == 'CURDIR' and not rest else (rest or '').lstrip('/') if base == 'ROOT' else None
+                if path and path not in found:
+                    found.append(path)
+            make[here] = found
+        return dirs, make, modules
+
+    def norm(self, path):
+        return os.path.normpath(path).replace(os.sep, '/')
+
+    def resolve_include(self, name, spelled, relative_first=True):
+        here = name.rsplit('/', 1)[0]
+        bases = ([here] if relative_first else []) + self.make_dirs.get(here, []) + self.include_dirs
+        for base in bases:
+            path = self.norm(base + '/' + spelled)
+            if path in self.known:
+                return path
+        return None
+
+    def scan(self, name):
+        text = (self.root / name).read_text(errors='replace')
+        here = name.rsplit('/', 1)[0]
+        if name.endswith('.zig'):
+            for kind, spelled in ZIG_IMPORT.findall(zig_code(text)):
+                if kind == 'cInclude':
+                    # @cImport resolves through the module's include paths, then the file's directory.
+                    target = self.resolve_include(name, spelled, relative_first=False) or self.resolve_include(name, spelled)
+                    if target:
+                        self.edges.setdefault((name, target), 'cinclude')
+                    elif spelled.startswith('.'):
+                        self.unresolved.append((name, spelled, 'cinclude'))
+                    continue  # anything else is a system or library header
+                if '/' not in spelled and '.' not in spelled:
+                    if spelled not in PACKAGES:
+                        self.edges.setdefault((name, 'module:' + spelled), 'module')
+                    continue
+                target = self.norm(here + '/' + spelled)
+                if target in self.known:
+                    self.edges.setdefault((name, target), 'import')
+                elif not (self.root / target).exists():
+                    self.unresolved.append((name, spelled, 'import'))
+        else:
+            for quoted, angled in C_INCLUDE.findall(C_COMMENT.sub('', text)):
+                # <x.h> skips the file's directory but still searches the -I directories,
+                # so a project header reached that way is an edge; anything else is a system header.
+                target = self.resolve_include(name, quoted or angled, relative_first=bool(quoted))
+                if target:
+                    self.edges.setdefault((name, target), 'include')
+                elif quoted:
+                    self.unresolved.append((name, quoted, 'include'))
+
+    def module_nodes(self):
+        return sorted({b for _, b in self.edges if b.startswith('module:')})
+
+
+class Layers:
+    def __init__(self, path):
+        self.rules = []
+        for number, words in config_lines(path):
+            if len(words) != 2:
+                fail(f'tools/deps/layers:{number}: expected "GLOB LAYER"')
+            self.rules.append((words[0], glob_regex(words[0]), words[1]))
+        self.names = list(dict.fromkeys(layer for _, _, layer in self.rules))
+
+    def of(self, name):
+        if name.startswith('module:'):
+            return 'module'
+        for _, regex, layer in self.rules:
+            if regex.match(name):
+                return layer
+        return None
+
+
+class Rule:
+    def __init__(self, number, words, layers, graph, layer_of):
+        # KIND NAME FROM... -> TO...
+        if len(words) < 5 or words[0] not in ('deny', 'only') or '->' not in words[3:]:
+            fail(f'tools/deps/rules:{number}: expected "deny|only NAME FROM... -> TO..."')
+        self.kind, self.name = words[0], words[1]
+        arrow = words.index('->')
+        self.sources, self.targets = words[2:arrow], words[arrow + 1:]
+        self.from_set = self.select(self.sources, number, layers, graph, layer_of)
+        allowed = self.select(self.targets, number, layers, graph, layer_of)
+        if self.kind == 'deny':
+            self.forbidden = allowed - self.from_set
+        else:
+            self.forbidden = set(graph.files) - allowed - self.from_set
+
+    @staticmethod
+    def select(terms, number, layers, graph, layer_of):
+        chosen = set()
+        for term in terms:
+            if '/' in term or '*' in term:
+                regex = glob_regex(term)
+                found = {name for name in graph.files if regex.match(name)}
+            elif term in layers.names:
+                found = {name for name in graph.files if layer_of[name] == term}
+            else:
+                fail(f'tools/deps/rules:{number}: "{term}" is neither a layer nor a path glob')
+            if not found:
+                fail(f'tools/deps/rules:{number}: "{term}" matches no file')
+            chosen |= found
+        return chosen
+
+    def violations(self, graph):
+        """(from, to, transitive) for each edge leaving the FROM set that reaches a
+        forbidden file. A transitive edge reaches it only through files outside FROM,
+        so each violation is reported once, at the edge where it starts."""
+        reach, queue = set(self.forbidden), deque(self.forbidden)
+        while queue:
+            node = queue.popleft()
+            for parent in graph.into[node]:
+                if parent not in reach and parent not in self.from_set:
+                    reach.add(parent)
+                    queue.append(parent)
+        found = []
+        for a in self.from_set:
+            for b in graph.out[a]:
+                if b in reach:
+                    found.append((a, b, b not in self.forbidden))
+        return found
+
+    def chain(self, graph, start):
+        """Shortest path from start to a forbidden file outside the FROM set."""
+        return shortest(graph, {start}, self.forbidden, avoid=self.from_set)
+
+
+def shortest(graph, starts, goals, avoid=()):
+    parent = {s: None for s in starts}
+    queue = deque(sorted(starts))
+    while queue:
+        node = queue.popleft()
+        if node in goals:
+            path = []
+            while node is not None:
+                path.append(node)
+                node = parent[node]
+            return path[::-1]
+        for nxt in sorted(graph.out.get(node, ())):
+            if nxt not in parent and nxt not in avoid and nxt in graph.out:
+                parent[nxt] = node
+                queue.append(nxt)
+    return None
+
+
+def components(graph):
+    """Strongly connected components with more than one file, or a file importing itself."""
+    index, low, stack, on, found, counter = {}, {}, [], set(), [], [0]
+    for start in graph.files:
+        if start in index:
+            continue
+        work = [(start, iter(sorted(graph.out[start])))]
+        index[start] = low[start] = counter[0]; counter[0] += 1
+        stack.append(start); on.add(start)
+        while work:
+            node, children = work[-1]
+            advanced = False
+            for child in children:
+                if child not in graph.out:
+                    continue
+                if child not in index:
+                    index[child] = low[child] = counter[0]; counter[0] += 1
+                    stack.append(child); on.add(child)
+                    work.append((child, iter(sorted(graph.out[child]))))
+                    advanced = True
+                    break
+                if child in on:
+                    low[node] = min(low[node], index[child])
+            if advanced:
+                continue
+            work.pop()
+            if work:
+                low[work[-1][0]] = min(low[work[-1][0]], low[node])
+            if low[node] == index[node]:
+                members = []
+                while True:
+                    member = stack.pop(); on.discard(member); members.append(member)
+                    if member == node:
+                        break
+                if len(members) > 1 or node in graph.out[node]:
+                    found.append(sorted(members))
+    return sorted(found, key=lambda c: (-len(c), c))
+
+
+class Linter:
+    def __init__(self, root):
+        self.root = root
+        self.config = root / 'tools/deps'
+        self.graph = Graph(root)
+        self.layers = Layers(self.config / 'layers')
+        self.layer_of = {name: self.layers.of(name) for name in self.graph.files}
+        self.unmapped = [name for name, layer in self.layer_of.items() if layer is None]
+        if self.unmapped:
+            for name in self.unmapped:
+                self.layer_of[name] = '?'
+        self.rules = [Rule(n, w, self.layers, self.graph, self.layer_of) for n, w in config_lines(self.config / 'rules')]
+        names = [rule.name for rule in self.rules]
+        if len(names) != len(set(names)):
+            fail('tools/deps/rules: rule names must be unique')
+
+    def violations(self):
+        """Baseline lines: one per violating direct edge, one per file in a cycle."""
+        lines = {}
+        for rule in self.rules:
+            for a, b, transitive in rule.violations(self.graph):
+                tag = rule.name + (' transitive' if transitive else '')
+                lines[f'{a} -> {b}  [{tag}]'] = (rule, a, b, transitive)
+        self.sccs = components(self.graph)
+        for members in self.sccs:
+            for name in members:
+                lines[f'{name}  [cycle]'] = (None, name, name, False)
+        return lines
+
+    def fan_in(self, name):
+        return len(self.graph.into.get(name, ()))
+
+    def budgets(self):
+        out = []
+        for number, words in config_lines(self.config / 'budgets'):
+            if len(words) != 2 or not words[1].isdigit():
+                fail(f'tools/deps/budgets:{number}: expected "FILE LIMIT"')
+            if words[0] not in self.graph.into:
+                fail(f'tools/deps/budgets:{number}: no such source file {words[0]}')
+            out.append((words[0], int(words[1])))
+        return out
+
+    def select(self, term):
+        """A file, a layer name or a path glob."""
+        if term in self.graph.out:
+            return {term}
+        if term in self.layers.names:
+            return {n for n in self.graph.files if self.layer_of[n] == term}
+        regex = glob_regex(term)
+        found = {n for n in self.graph.files if regex.match(n)}
+        if not found:
+            fail(f'"{term}" is not a source file, a layer or a glob that matches one')
+        return found
+
+
+def read_baseline(path):
+    if not path.exists():
+        return []
+    return [line.rstrip() for line in path.read_text().splitlines() if line.strip() and not line.startswith('#')]
+
+
+SIZES = 'cycle sizes:'
+
+
+def size_line(sccs):
+    """One baseline line with the size of every cycle, largest first. Per-file [cycle]
+    lines do not see two cycles merging; this line does."""
+    return ' '.join([SIZES] + [str(len(members)) for members in sccs])
+
+
+BASELINE_HEADER = """\
+# Violations present when this file was last written: scripts/deps baseline --write.
+# FROM -> TO  [RULE]             the direct edge breaks RULE
+# FROM -> TO  [RULE transitive]  the edge leaves RULE's FROM and TO reaches a forbidden file
+# FILE  [cycle]                  FILE is in an import cycle (a strongly connected component)
+# cycle sizes: N...              files in each cycle, largest first; may not grow or merge
+# scripts/deps check fails on a line missing here and on a line here that no longer
+# occurs, so this file only shrinks. See docs/DEPENDENCIES_LINT.md.
+"""
+
+
+def check(linter, verbose):
+    graph = linter.graph
+    current = linter.violations()
+    baseline_path = linter.config / 'baseline'
+    baseline = read_baseline(baseline_path)
+    sizes = [line for line in baseline if line.startswith(SIZES)]
+    baseline = [line for line in baseline if not line.startswith(SIZES)]
+    known = set(baseline)
+    new = sorted(set(current) - known)
+    stale = sorted(known - set(current))
+    duplicate = sorted({line for line in baseline if baseline.count(line) > 1})
+    failed = False
+    print(f'deps: {len(graph.files)} files, {len(graph.edges)} edges, {len(linter.layers.names)} layers, '
+          f'{len(linter.rules)} rules, {len(baseline)} baseline lines, {len(linter.sccs)} cycles')
+    for name in linter.unmapped:
+        print(f'deps: FAIL unmapped file (add a glob to tools/deps/layers): {name}')
+        failed = True
+    if new:
+        failed = True
+        print(f'deps: FAIL {len(new)} new violations. Remove the import, or if it is intended run '
+              f'scripts/deps baseline --write and justify the added lines in review:')
+        for line in new:
+            rule, a, b, transitive = current[line]
+            print('  + ' + line)
+            if rule is not None and transitive:
+                print('      chain: ' + ' -> '.join([a] + (rule.chain(graph, b) or [b])))
+            elif rule is None:
+                loop = min((shortest(graph, {b}, {a}) for b in graph.out[a] if b in graph.out), key=lambda p: (p is None, len(p or ())))
+                print('      cycle: ' + ' -> '.join([a] + (loop or [])))
+    if stale:
+        failed = True
+        print(f'deps: FAIL {len(stale)} baseline lines no longer occur. Remove them from tools/deps/baseline '
+              f'(or run scripts/deps baseline --write):')
+        for line in stale:
+            print('  - ' + line)
+    now = size_line(linter.sccs)
+    if len(sizes) != 1:
+        failed = True
+        print(f'deps: FAIL tools/deps/baseline needs exactly one "{SIZES}" line; this tree has: {now}')
+    elif sizes[0] != now:
+        failed = True
+        old = [int(n) for n in sizes[0].split()[2:]]
+        new = [len(members) for members in linter.sccs]
+        smaller = len(new) <= len(old) and all(n <= o for n, o in zip(new, old))
+        split = len(new) > len(old) and sum(new) <= sum(old) and max(new) <= max(old)
+        if not (smaller or split):
+            print(f'deps: FAIL import cycles grew or merged. Find the new import with git diff and '
+                  f'scripts/deps why A B, and remove it; if it is intended, write the new line '
+                  f'(scripts/deps baseline --write) and justify it in review:')
+        else:
+            print(f'deps: FAIL import cycles shrank or split. Replace the line in tools/deps/baseline '
+                  f'(or run scripts/deps baseline --write):')
+        print('  - ' + sizes[0])
+        print('  + ' + now)
+        left = list(old)
+        for members in linter.sccs:
+            if len(members) in left:
+                left.remove(len(members))
+            else:
+                print(f'      cycle of {len(members)}: ' + ' '.join(members[:6]) + (' ...' if len(members) > 6 else ''))
+    if duplicate:
+        failed = True
+        for line in duplicate:
+            print('deps: FAIL duplicate baseline line: ' + line)
+    for name, limit in linter.budgets():
+        count = linter.fan_in(name)
+        if count > limit:
+            failed = True
+            print(f'deps: FAIL {name} has {count} direct importers, budget {limit} (tools/deps/budgets). '
+                  f'List them with: scripts/deps rdeps --direct {name}')
+        elif count < limit:
+            print(f'deps: note: {name} has {count} direct importers, under its budget {limit}; '
+                  f'lower the budget to {count} in tools/deps/budgets')
+    if verbose:
+        for name, spelled, kind in graph.unresolved:
+            print(f'deps: note: unresolved {kind} in {name}: "{spelled}"')
+    elif graph.unresolved:
+        print(f'deps: note: {len(graph.unresolved)} unresolved includes (generated or missing headers; '
+              f'not checked; see check -v)')
+    print('deps: FAIL' if failed else 'deps: ok')
+    return 1 if failed else 0
+
+
+def write_baseline(linter):
+    lines = sorted(linter.violations())
+    (linter.config / 'baseline').write_text(BASELINE_HEADER + ''.join(line + '\n' for line in lines)
+                                            + size_line(linter.sccs) + '\n')
+    counts = {}
+    for line in lines:
+        tag = line.rsplit('[', 1)[1].rstrip(']')
+        counts[tag] = counts.get(tag, 0) + 1
+    print(f'deps: wrote tools/deps/baseline: {len(lines)} lines')
+    for tag in sorted(counts):
+        print(f'  {counts[tag]:6}  {tag}')
+    return 0
+
+
+def graph_json(linter):
+    graph = linter.graph
+    return dict(
+        schema=1,
+        files=[dict(path=name, layer=linter.layer_of[name], fan_in=linter.fan_in(name),
+                    fan_out=len(graph.out[name])) for name in graph.files],
+        modules=[dict(path=name, layer='module', declared=name[7:] in graph.modules) for name in graph.module_nodes()],
+        edges=[dict(source=a, target=b, kind=kind) for (a, b), kind in sorted(graph.edges.items())],
+        layers=linter.layers.names,
+        unresolved=[dict(file=f, name=s, kind=k) for f, s, k in graph.unresolved],
+        include_dirs=graph.include_dirs,
+    )
+
+
+def layer_table(linter, include_self):
+    counts = {}
+    for a, b in linter.graph.edges:
+        la, lb = linter.layer_of[a], linter.layers.of(b) if b.startswith('module:') else linter.layer_of[b]
+        if la != lb or include_self:
+            counts[(la, lb)] = counts.get((la, lb), 0) + 1
+    files = {}
+    for layer in linter.layer_of.values():
+        files[layer] = files.get(layer, 0) + 1
+    print(f'{"from":<12} {"to":<12} {"edges":>6}')
+    for (la, lb), n in sorted(counts.items(), key=lambda item: (item[0][0], -item[1], item[0][1])):
+        print(f'{la:<12} {lb:<12} {n:>6}')
+    print()
+    print(f'{"layer":<12} {"files":>6}')
+    for layer in linter.layers.names + (['?'] if '?' in files else []):
+        print(f'{layer:<12} {files.get(layer, 0):>6}')
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('--root', type=Path, default=ROOT, help='tree to check (default: this checkout)')
+    sub = parser.add_subparsers(dest='command', required=True)
+    p = sub.add_parser('check', help='exit 1 on any violation not in the baseline, a stale line, a budget or an unmapped file')
+    p.add_argument('-v', '--verbose', action='store_true', help='also list unresolved includes')
+    p = sub.add_parser('graph', help='print the file graph')
+    p.add_argument('--json', action='store_true', required=True)
+    p = sub.add_parser('layers', help='layer-to-layer edge counts')
+    p.add_argument('--all', action='store_true', help='include edges inside a layer')
+    p = sub.add_parser('why', help='shortest import chain from A to B (each a file, a layer or a glob)')
+    p.add_argument('source')
+    p.add_argument('target')
+    p = sub.add_parser('rdeps', help='files that import FILE, directly or transitively')
+    p.add_argument('file')
+    p.add_argument('--direct', action='store_true', help='only direct importers')
+    p = sub.add_parser('baseline', help='regenerate tools/deps/baseline')
+    p.add_argument('--write', action='store_true', required=True)
+    sub.add_parser('cycles', help='list import cycles (strongly connected components)')
+    args = parser.parse_args(argv)
+    linter = Linter(args.root.resolve())
+    if args.command == 'check':
+        return check(linter, args.verbose)
+    if args.command == 'baseline':
+        if linter.unmapped:
+            fail('unmapped files; fix tools/deps/layers first: ' + ' '.join(linter.unmapped))
+        return write_baseline(linter)
+    if args.command == 'graph':
+        json.dump(graph_json(linter), sys.stdout, indent=1)
+        print()
+        return 0
+    if args.command == 'layers':
+        return layer_table(linter, args.all)
+    if args.command == 'cycles':
+        linter.violations()
+        for i, members in enumerate(linter.sccs, 1):
+            print(f'cycle {i}: {len(members)} files')
+            for name in members:
+                print(f'  {name}  ({linter.layer_of[name]})')
+        return 0
+    if args.command == 'why':
+        sources, targets = linter.select(args.source), linter.select(args.target)
+        path = shortest(linter.graph, sources, targets)
+        if not path:
+            print(f'no import chain from {args.source} to {args.target}')
+            return 1
+        for i, name in enumerate(path):
+            kind = linter.graph.edges.get((path[i - 1], name)) if i else None
+            print(('  -> ' if i else '     ') + f'{name}  ({linter.layer_of[name]}{", " + kind if kind and kind != "import" else ""})')
+        return 0
+    if args.command == 'rdeps':
+        target = args.file
+        if target not in linter.graph.into:
+            fail(f'no such source file: {target}')
+        seen, queue = set(), deque([target])
+        while queue:
+            for parent in linter.graph.into[queue.popleft()]:
+                if parent not in seen and parent != target:
+                    seen.add(parent)
+                    if not args.direct:
+                        queue.append(parent)
+        for name in sorted(seen):
+            print(name)
+        print(f'deps: {len(seen)} {"direct" if args.direct else "transitive"} importers of {target}', file=sys.stderr)
+        return 0
+    return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())
