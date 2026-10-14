@@ -11,6 +11,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -195,19 +196,22 @@ int main(int argc, char **argv) {
           fprintf(stderr, "kernel TID filter admitted an unowned task\n");
           goto cleanup;
         }
+#if defined(__x86_64__)
+        /* Number 20 is compat getpid, not native writev. */
         if (r->operation == XRT_FDFLOW_RAW && r->number == 20)
           seen_compat = 1;
         if (!burst && r->operation != XRT_FDFLOW_RAW && r->number == 20) {
           fprintf(stderr, "compat getpid mislabelled as native writev\n");
           goto cleanup;
         }
+#endif
         if (r->kind == XRT_FDFLOW_ENTER) {
           pending_fd = (int32_t)r->args[0];
           pending_number = r->number;
           pending_cpu = r->cpu;
           /* No thread movement until its blocked read entry was
            * actually observed, including the exact known fd. */
-          if (!burst && pending_fd == data[0] && r->number == 0 && !moved) {
+          if (!burst && pending_fd == data[0] && r->number == SYS_read && !moved) {
             entry_cpu = r->cpu;
             if (pin(child, second) ||
                 write(data[1], "flow-fixture-data", 17) != 17)
@@ -257,7 +261,11 @@ int main(int argc, char **argv) {
         snapshot.lost != lost)
       goto cleanup;
   } else if (st.st_size != 17 || read_bytes != 17 || write_bytes != 17 ||
-             !moved || !seen_compat || entry_cpu != (uint32_t)first ||
+             !moved ||
+#if defined(__x86_64__)
+             !seen_compat ||
+#endif
+             entry_cpu != (uint32_t)first ||
              exit_cpu != (uint32_t)second || snapshot.lost ||
              (snapshot.flags &
               (XRT_FDFLOW_BAD_RECORD | XRT_FDFLOW_LOSS_UNKNOWN |

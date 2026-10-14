@@ -20,6 +20,19 @@ artifact id. `get_decomp_mapping` reads that cached artifact by exact token
 range, pseudo-C line, or runtime PC. The output is the worker's qualified
 static reconstruction, not verified source and not an observed execution.
 
+## RISC-V 64 from an x86 host
+
+```sh
+xodb --runtime-ssh HOST --ssh-config FILE --runtime-agent /path/to/xodb-agent --break main -- /path/to/program
+```
+
+**Space** runs to `main`. The planted breakpoint is `c.ebreak` (two bytes). The
+stopped PC stays on that instruction. Assembly uses the system Capstone RISC-V
+decoder. Instruction step and hardware watches report unsupported, and a
+continue that still has the breakpoint planted is refused, so remove the
+breakpoint before continuing. `x0` is not shown: it is architectural zero and
+the kernel regset does not include it.
+
 ## Emacs: Lisp and C at the same stop
 
 Run `./scripts/demo-emacs` with a supported debug Emacs 31.1. Press **Space**,

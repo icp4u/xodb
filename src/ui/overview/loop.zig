@@ -57,7 +57,7 @@ fn replay(o: *const Options, path: [:0]const u8, startup_started: u64) !void {
 }
 
 /// Opens the window and runs until it closes. `source` is a *Replay, or a
-/// live source with `prepare`, `interval`, `serving`, `poll` and `sample`.
+/// live source with `prepare`, `interval`, `serving`, `closed`, `poll` and `sample`.
 pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: anytype, startup_started: u64) !void {
     const live = comptime @TypeOf(source) != *Replay;
     var layout: ?*@import("draw.zig").Layout = null;
@@ -150,6 +150,8 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
             next_sample = 0;
         }
         if (live) try source.poll(view, &window, current);
+        // As in the debugger: a stdio MCP session ends with its client.
+        if (live and source.closed()) break;
         if (!view.paused and current >= next_sample) {
             const started = vw.threadNs();
             if (live) {
@@ -179,12 +181,15 @@ pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: an
         };
         window.dirty = !presented;
         if (!presented) continue;
-        if (rendered == 0) @import("../../startup.zig").report(startup_started, o.mcp);
+        if (rendered == 0) {
+            @import("../../startup.zig").report(startup_started, o.mcp);
+            view.startup_ns = now() -| startup_started;
+        }
         last_frame = current;
         rendered += 1;
         if (o.frames > 0 and rendered >= o.frames) break;
     }
-    const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else "frame_limit";
+    const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (live and source.closed()) "mcp_eof" else "frame_limit";
     log.info(.overview, "xodb: overview {d} frames, {d} samples, clean shutdown (reason={s})\n", .{ rendered, view.samples, reason });
 }
 

@@ -27,6 +27,8 @@ pub const Window = struct {
 
     opened: bool = false,
     backing_scale: f32 = 1,
+    surface_width: u32 = 1280,
+    surface_height: u32 = 800,
     scroll_points: f32 = 0,
     cursor: platform.Cursor = .default,
     clip_destination: u64 = 0,
@@ -43,8 +45,8 @@ pub const Window = struct {
         var height = self.height;
         var reported_scale = self.backing_scale;
         shim.xcocoa_size(&width, &height, &reported_scale);
-        if (width > 0) self.width = width;
-        if (height > 0) self.height = height;
+        self.surface_width = if (width > 0) width else self.width;
+        self.surface_height = if (height > 0) height else self.height;
         self.backing_scale = safeScale(reported_scale);
         self.syncScale();
         self.input.focus(true);
@@ -97,7 +99,16 @@ pub const Window = struct {
         return self.scale_override orelse safeScale(self.backing_scale);
     }
     fn syncScale(self: *Window) void {
-        if (self.opened) shim.xcocoa_set_scale(self.scale());
+        const pixels = self.bufferExtent();
+        self.width = platform.uiExtent(pixels.width, self.scale());
+        self.height = platform.uiExtent(pixels.height, self.scale());
+        if (self.opened) shim.xcocoa_set_scale(self.backing_scale);
+    }
+    pub fn bufferExtent(self: *const Window) platform.Extent {
+        return .{ .width = platform.deviceExtent(self.surface_width, self.backing_scale), .height = platform.deviceExtent(self.surface_height, self.backing_scale) };
+    }
+    fn pointerUnits(self: *const Window, value: f32) f32 {
+        return value * self.backing_scale / self.scale();
     }
 
     pub const vk_surface_extension: [*:0]const u8 = "VK_EXT_metal_surface";
@@ -106,6 +117,9 @@ pub const Window = struct {
         return @intCast(shim.xcocoa_create_surface(@ptrCast(instance), @ptrCast(surface)));
     }
     pub fn displayGpu(_: *Window) ?Node {
+        return null;
+    }
+    pub fn displayFd(_: *Window) ?c_int {
         return null;
     }
 
@@ -184,17 +198,17 @@ pub const Window = struct {
                 self.dirty = true;
             },
             shim.XCOCOA_EVENT_BUTTON => {
-                self.pointer_x = event.x;
-                self.pointer_y = event.y;
+                self.pointer_x = self.pointerUnits(event.x);
+                self.pointer_y = self.pointerUnits(event.y);
                 self.input.current = eventMods(event.mods);
                 const pressed = event.flags & shim.XCOCOA_PRESSED != 0;
-                self.input.button(event.time_ms, event.code, pressed, event.x, event.y);
+                self.input.button(event.time_ms, event.code, pressed, self.pointer_x, self.pointer_y);
                 if (event.code == 272) self.mouse_down = pressed;
                 self.dirty = true;
             },
             shim.XCOCOA_EVENT_MOTION => {
-                self.pointer_x = event.x;
-                self.pointer_y = event.y;
+                self.pointer_x = self.pointerUnits(event.x);
+                self.pointer_y = self.pointerUnits(event.y);
                 if (self.mouse_down) self.dirty = true;
             },
             shim.XCOCOA_EVENT_SCROLL => {
@@ -211,10 +225,14 @@ pub const Window = struct {
                 }
             },
             shim.XCOCOA_EVENT_RESIZE => if (event.width > 0 and event.height > 0) {
-                self.width = @intCast(event.width);
-                self.height = @intCast(event.height);
+                const previous_pointer_scale = self.backing_scale / self.scale();
+                self.surface_width = @intCast(event.width);
+                self.surface_height = @intCast(event.height);
                 self.backing_scale = safeScale(event.scale);
                 self.syncScale();
+                const pointer_ratio = self.backing_scale / self.scale() / previous_pointer_scale;
+                self.pointer_x *= pointer_ratio;
+                self.pointer_y *= pointer_ratio;
                 self.dirty = true;
             },
             shim.XCOCOA_EVENT_CLOSE => {
@@ -254,7 +272,28 @@ test "Cocoa events keep logical coordinates separate from backing scale" {
     try std.testing.expectEqual(@as(u32, 600), window.height);
     try std.testing.expectEqual(@as(f32, 2), window.scale());
     window.scale_override = 1.5;
+    window.syncScale();
     try std.testing.expectEqual(@as(f32, 1.5), window.scale());
+    try std.testing.expectEqual(@as(u32, 1200), window.width);
+    try std.testing.expectEqual(@as(u32, 800), window.height);
+    try std.testing.expectEqual(platform.Extent{ .width = 1800, .height = 1200 }, window.bufferExtent());
+    var click = std.mem.zeroes(shim.xcocoa_event);
+    click.kind = shim.XCOCOA_EVENT_BUTTON;
+    click.flags = shim.XCOCOA_PRESSED;
+    click.code = 272;
+    click.x = 525;
+    click.y = 48.75;
+    window.applyEvent(&click);
+    const button_event = window.input.next().?;
+    try std.testing.expectEqual(@as(f32, 700), button_event.x);
+    try std.testing.expectEqual(@as(f32, 65), button_event.y);
+    // Moving to a 1x display with an explicit UI size preserves pixel size,
+    // changes layout space, and reprojects a stationary pointer.
+    resize.scale = 1;
+    window.applyEvent(&resize);
+    try std.testing.expectEqual(@as(u32, 600), window.width);
+    try std.testing.expectEqual(@as(f32, 350), window.pointer_x);
+    try std.testing.expectEqual(platform.Extent{ .width = 900, .height = 600 }, window.bufferExtent());
 
     var focus = std.mem.zeroes(shim.xcocoa_event);
     focus.kind = shim.XCOCOA_EVENT_FOCUS;

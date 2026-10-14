@@ -71,6 +71,21 @@ pub const Lane = struct {
     /// Sorted, non-overlapping spans. Time covered by none is unknown.
     intervals: []const Interval = &.{},
 };
+/// One record of an external evidence stream on this axis.
+pub const Tick = struct { t_ns: u64, bytes: u32, undecoded: bool };
+/// An evidence stream (for example a pcap file) drawn as one extra lane:
+/// records as ticks, height by bytes, undecoded records in a distinct color.
+pub const StreamLane = struct {
+    label: []const u8,
+    /// Sorted by time; only records with a time on this axis.
+    ticks: []const Tick = &.{},
+    /// Records not drawn: no time, unaligned clock, or outside the extent.
+    off_axis: u64 = 0,
+    undecoded: u64 = 0,
+    /// How the times got onto this axis, shown on hover.
+    note: []const u8 = "",
+};
+pub const StreamBin = struct { packets: u32 = 0, bytes: u32 = 0, undecoded: u32 = 0 };
 pub const Data = struct {
     capture_id: u64,
     revision: u64,
@@ -87,6 +102,7 @@ pub const Data = struct {
     debugger_marks_dropped: u64 = 0,
     application_count: usize = 0,
     syscall_count: usize = 0,
+    stream: ?StreamLane = null,
 
     /// Null when the contract holds; otherwise a reason. O(total records).
     pub fn validate(self: *const Data) ?[]const u8 {
@@ -103,6 +119,7 @@ pub const Data = struct {
             }
         }
         for (self.marks) |mark| if (mark.to_ns < mark.from_ns) return "mark ends before it starts";
+        if (self.stream) |stream| for (stream.ticks[0..stream.ticks.len -| 1], stream.ticks[@min(1, stream.ticks.len)..]) |a, b| if (b.t_ns < a.t_ns) return "unsorted stream ticks";
         return null;
     }
 };
@@ -123,6 +140,8 @@ const Geometry = struct {
     overview: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     plot: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     labels: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
+    /// The evidence stream lane, below the thread lanes; zero when absent.
+    stream: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     fit: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     reset: gpu.Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     visible: usize = 0,
@@ -167,6 +186,8 @@ pub const Prepared = struct {
     density_first: [max_visible_lanes + 1]u16,
     marker_first: [max_visible_lanes + 1]u16,
     readout: Readout,
+    stream_bins: []const StreamBin = &.{},
+    stream_peak: u32 = 0,
 };
 comptime {
     @setEvalBranchQuota(20000);
@@ -210,6 +231,9 @@ pub const TimelineView = struct {
     marker_first: [max_visible_lanes + 1]u16 = @splat(0),
     masks: [max_columns]u8 = undefined,
     counts: [max_columns]u32 = undefined,
+    stream_bins: [max_columns]StreamBin = undefined,
+    stream_cols: usize = 0,
+    stream_peak: u32 = 0,
 
     pub fn request(self: *const TimelineView, bounds: gpu.Rect) Request {
         return .{ .session_id = self.session_id, .capture_id = self.capture_id, .range = self.range, .tid = self.tid, .tids = self.tids, .view = self.view, .first_lane = self.first_lane, .pointer = self.pointer, .bounds = bounds };
@@ -273,6 +297,8 @@ pub const TimelineView = struct {
         var display = data.*;
         display.lanes = lanes;
         display.marks = marks;
+        // The stream lane is drawn from its column bins; raw ticks stay with the owner.
+        if (data.stream) |stream| display.stream = .{ .label = try a.dupe(u8, stream.label), .off_axis = stream.off_axis, .undecoded = stream.undecoded, .note = try a.dupe(u8, stream.note) };
         if (data.state_label) |text| display.state_label = try a.dupe(u8, text);
         var buffer: [512]u8 = undefined;
         const footer_text = self.readout(&buffer, data);
@@ -293,6 +319,8 @@ pub const TimelineView = struct {
             .density_first = self.density_first,
             .marker_first = self.marker_first,
             .readout = .{ .text = try a.dupe(u8, footer_text.text), .tone = footer_text.tone },
+            .stream_bins = try a.dupe(StreamBin, self.stream_bins[0..self.stream_cols]),
+            .stream_peak = self.stream_peak,
         };
     }
     /// Frontend only. Every borrowed field is replaced before the old
@@ -326,6 +354,9 @@ pub const TimelineView = struct {
         @memcpy(self.state_runs[0..incoming.state_runs.len], incoming.state_runs);
         @memcpy(self.density_runs[0..incoming.density_runs.len], incoming.density_runs);
         @memcpy(self.markers[0..incoming.markers.len], incoming.markers);
+        @memcpy(self.stream_bins[0..incoming.stream_bins.len], incoming.stream_bins);
+        self.stream_cols = incoming.stream_bins.len;
+        self.stream_peak = incoming.stream_peak;
         self.state_first = incoming.state_first;
         self.density_first = incoming.density_first;
         self.marker_first = incoming.marker_first;
@@ -605,10 +636,12 @@ pub const TimelineView = struct {
         if (bounds.h >= header_h + overview_h + footer_h and plot_w >= 8) {
             g.overview = .{ .x = plot_x, .y = top, .w = plot_w, .h = overview_h - 6 };
             const lanes_y = top + overview_h + axis_h;
-            const room = bounds.y + bounds.h - footer_h - lanes_y;
+            const stream_h: f32 = if (data.stream != null) lane_h else 0;
+            const room = bounds.y + bounds.h - footer_h - lanes_y - stream_h;
             const rows: usize = if (room >= lane_h) @intFromFloat(room / lane_h) else 0;
             g.visible = @min(@min(rows, max_visible_lanes), data.lanes.len);
             g.plot = .{ .x = plot_x, .y = lanes_y, .w = plot_w, .h = @as(f32, @floatFromInt(g.visible)) * lane_h };
+            if (data.stream != null and room >= 0) g.stream = .{ .x = plot_x, .y = lanes_y + g.plot.h, .w = plot_w, .h = lane_h };
             g.labels = .{ .x = inner_x, .y = lanes_y, .w = label_w, .h = g.plot.h };
             g.cols = std.math.clamp(@as(usize, @intFromFloat(plot_w)), 1, max_columns);
         }
@@ -647,6 +680,26 @@ pub const TimelineView = struct {
             for (self.buckets[0..self.bucket_count]) |b| self.bucket_peak = @max(self.bucket_peak, b[0]);
         }
         const span = view.to_ns - view.from_ns;
+        self.stream_cols = 0;
+        self.stream_peak = 0;
+        if (data.stream) |stream| if (span > 0 and g.stream.h > 0) {
+            self.stream_cols = g.cols;
+            @memset(self.stream_bins[0..g.cols], .{});
+            var lo: usize = 0;
+            var hi = stream.ticks.len;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (stream.ticks[mid].t_ns < view.from_ns) lo = mid + 1 else hi = mid;
+            }
+            while (lo < stream.ticks.len and stream.ticks[lo].t_ns < view.to_ns) : (lo += 1) {
+                const tick = stream.ticks[lo];
+                const bin = &self.stream_bins[@intCast(@as(u128, tick.t_ns - view.from_ns) * g.cols / span)];
+                bin.packets +|= 1;
+                bin.bytes +|= tick.bytes;
+                if (tick.undecoded) bin.undecoded +|= 1;
+            }
+            for (self.stream_bins[0..g.cols]) |bin| self.stream_peak = @max(self.stream_peak, bin.bytes);
+        };
         if (span == 0 or g.visible == 0) return;
         const cols = g.cols;
         // Density uses one scale for all visible lanes so heights compare.
@@ -758,7 +811,9 @@ pub const TimelineView = struct {
         try self.drawOverview(r, font, current);
         try self.drawAxis(r, font);
         try self.drawLanes(r, font, current);
+        try self.drawStream(r, font, current);
         try self.drawSelection(r, g.plot, self.currentView());
+        try self.drawSelection(r, g.stream, self.currentView());
         try self.footer(r, font, current);
     }
     fn header(self: *TimelineView, r: *gpu.Renderer, font: *Font, data: *const Data) !void {
@@ -928,6 +983,34 @@ pub const TimelineView = struct {
             try r.shape(.{ .x = track.x, .y = track.y + @as(f32, @floatFromInt(self.first_lane)) / total * track.h, .w = 3, .h = @max(8, @as(f32, @floatFromInt(g.visible)) / total * track.h) }, theme.weak, .{ .radii = @splat(1.5) });
         }
     }
+    /// Bars are bytes per pixel column on one scale; columns with any
+    /// undecoded record carry a warm cap. The lane never shows unaligned time.
+    fn drawStream(self: *TimelineView, r: *gpu.Renderer, font: *Font, data: *const Data) !void {
+        const stream = data.stream orelse return;
+        const g = self.geometry;
+        if (g.stream.h == 0) return;
+        const y = g.stream.y;
+        const lane_rect = gpu.Rect{ .x = g.labels.x, .y = y, .w = g.labels.w + g.plot.w, .h = lane_h };
+        try r.rect(lane_rect, style.fade(theme.header, 0.6));
+        if (g.labels.w > 0) try label(r, font, g.labels.x + 6, y + 3, g.labels.w - 10, theme.text, "net {s}", .{stream.label});
+        r.clip = g.stream;
+        defer r.clip = g.bounds;
+        try r.rect(.{ .x = g.stream.x, .y = y + lane_h - 3, .w = g.stream.w, .h = 1 }, style.fade(theme.weak, 0.25));
+        const any = for (self.stream_bins[0..self.stream_cols]) |bin| {
+            if (bin.packets > 0) break true;
+        } else false;
+        if (!any) return label(r, font, g.stream.x + 6, y + 3, g.stream.w - 12, theme.weak, "{s}", .{if (stream.off_axis > 0) stream.note else "no records in this range"});
+        const col_w = g.stream.w / @as(f32, @floatFromInt(self.stream_cols));
+        const peak: f32 = @floatFromInt(@max(1, self.stream_peak));
+        for (self.stream_bins[0..self.stream_cols], 0..) |bin, i| {
+            if (bin.packets == 0) continue;
+            const x = g.stream.x + @as(f32, @floatFromInt(i)) * col_w;
+            const h = @max(2, @as(f32, @floatFromInt(bin.bytes)) / peak * (lane_h - 8));
+            const w = @max(1, col_w - 0.25);
+            if (bin.undecoded < bin.packets) try r.rect(.{ .x = x, .y = y + lane_h - 3 - h, .w = w, .h = h }, style.fade(theme.focus, 0.85));
+            if (bin.undecoded > 0) try r.rect(.{ .x = x, .y = y + 1, .w = w, .h = 4 }, theme.warm);
+        }
+    }
     fn drawSelection(self: *TimelineView, r: *gpu.Renderer, rect: gpu.Rect, view: Range) !void {
         if (rect.w <= 0 or rect.h <= 0) return;
         const span = view.to_ns - view.from_ns;
@@ -960,6 +1043,14 @@ pub const TimelineView = struct {
         var a: [32]u8 = undefined;
         var b: [32]u8 = undefined;
         if (data.debugger_marks_dropped > 0) return readoutFormat(buffer, .warm, "Debugger-stop overlays incomplete: {d} spans/markers omitted; inspect MCP control history.", .{data.debugger_marks_dropped});
+        if (self.pointer) |p| if (data.stream) |stream| if (inside(g.stream, p[0], p[1]) and self.stream_cols > 0) {
+            const view = self.currentView();
+            const t = timeAtX(p[0], g.stream, view.from_ns, view.to_ns - view.from_ns);
+            const col: usize = @min(self.stream_cols - 1, @as(usize, @intFromFloat(@max(0, (p[0] - g.stream.x) / g.stream.w * @as(f32, @floatFromInt(self.stream_cols))))));
+            const bin = self.stream_bins[col];
+            const per_px = (view.to_ns - view.from_ns) / @max(1, @as(u64, @intFromFloat(g.stream.w)));
+            return readoutFormat(buffer, .text, "+{s}  net {s}: {d} records, {d} bytes, {d} undecoded in {s}  /  {s}", .{ duration(&a, t), stream.label, bin.packets, bin.bytes, bin.undecoded, compact(&b, @max(1, per_px)), stream.note });
+        };
         if (self.pointer) |p| if (self.areaAt(p[0], p[1])) |area| if (area != .labels) {
             const view = if (area == .overview) Range{ .from_ns = 0, .to_ns = data.extent_ns } else self.currentView();
             const rect = if (area == .overview) g.overview else g.plot;
@@ -975,6 +1066,8 @@ pub const TimelineView = struct {
             return readoutFormat(buffer, .text, "+{s}{s}  /  wheel here zooms lanes; drag selects a range", .{ duration(&a, t), markText(data.marks, t, null) });
         };
         if (data.lost_samples > 0) return readoutFormat(buffer, .warm, "{d} perf records/samples lost at unknown times: sparse regions may be loss", .{data.lost_samples});
+        if (data.stream) |stream| if (data.lanes.len == 0) return readoutFormat(buffer, .weak, "net {s}: {s}; {d} undecoded (amber caps). Hover the lane for counts.", .{ stream.label, stream.note, stream.undecoded });
+        if (data.stream) |stream| if (stream.off_axis > 0) return readoutFormat(buffer, .warm, "net {s}: {d} records not on this axis ({s}); {d} undecoded (amber caps)", .{ stream.label, stream.off_axis, stream.note, stream.undecoded });
         if (data.syscall_count > 0) return readoutFormat(buffer, .weak, "{d} syscall spans: amber overlays (bounded drawing); hover or X for detail. Elapsed includes off CPU and debugger pauses.", .{data.syscall_count});
         if (data.application_count > 0) return readoutFormat(buffer, .weak, "{d} imported application intervals: blue overlays, hover for label; zoom to inspect crowded ranges. Timing is caller-supplied.", .{data.application_count});
         if (!data.scheduling) return .{ .text = "Bars are CPU samples. No scheduling evidence: time without samples is unknown, not waiting." };
@@ -1591,4 +1684,30 @@ test "prepared timeline retains exact counts and hover after history retirement"
     _ = frontend.present(publication.value.timeline, test_bounds);
     try testing.expect(frontend.prepared == null and frontend.pending);
     try testing.expectEqual(@as(?u32, 7), frontend.request(test_bounds).tid);
+}
+
+test "stream lane bins bytes per column and keeps undecoded distinct" {
+    const view = try testView();
+    defer testing.allocator.destroy(view);
+    const lanes = [_]Lane{.{ .tid = 11 }};
+    const ticks = [_]Tick{ .{ .t_ns = 0, .bytes = 100, .undecoded = false }, .{ .t_ns = 10, .bytes = 50, .undecoded = true }, .{ .t_ns = 999_999, .bytes = 7, .undecoded = false } };
+    const data = Data{ .capture_id = 1, .revision = 1, .extent_ns = 1_000_000, .lanes = &lanes, .stream = .{ .label = "t.pcapng", .ticks = &ticks, .off_axis = 2, .undecoded = 1, .note = "aligned" } };
+    try testing.expectEqual(@as(?[]const u8, null), data.validate());
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const prepared = try view.prepare(arena.allocator(), 1, view.request(test_bounds), &data);
+    const g = view.geometry;
+    try testing.expect(g.stream.h > 0);
+    try testing.expectEqual(g.plot.y + g.plot.h, g.stream.y);
+    try testing.expectEqual(g.cols, prepared.stream_bins.len);
+    try testing.expectEqual(StreamBin{ .packets = 2, .bytes = 150, .undecoded = 1 }, prepared.stream_bins[0]);
+    try testing.expectEqual(@as(u32, 7), prepared.stream_bins[g.cols - 1].bytes);
+    try testing.expectEqual(@as(u32, 150), prepared.stream_peak);
+    // The publication carries bins, not every tick.
+    try testing.expectEqual(@as(usize, 0), prepared.data.stream.?.ticks.len);
+    try testing.expectEqual(@as(u64, 2), prepared.data.stream.?.off_axis);
+    // Unsorted ticks are a rejected contract.
+    const bad = [_]Tick{ .{ .t_ns = 5, .bytes = 1, .undecoded = false }, .{ .t_ns = 4, .bytes = 1, .undecoded = false } };
+    const broken = Data{ .capture_id = 2, .revision = 1, .extent_ns = 10, .lanes = &.{}, .stream = .{ .label = "x", .ticks = &bad } };
+    try testing.expect(broken.validate() != null);
 }

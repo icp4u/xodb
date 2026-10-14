@@ -178,11 +178,14 @@ cache age, scan omissions, unproved cgroups and peer-query failures are shown
 explicitly. A peer query covers the collector's network namespace.
 
 Live byte rates enlarge stars and particles and pulse graph links. The C worker
-drains events independently of descriptor polling. Read/write counts cover
-native Linux x86-64 `read`, `write`, `pread64`, `pwrite64`, `readv`, `writev`,
-`preadv`, `pwritev`, `preadv2`, `pwritev2`, `sendto`, `recvfrom`, `sendmsg` and
-`recvmsg`. Compatibility calls, mmap, io_uring, splice and sendfile byte
-transfers are not covered. No target buffers are read.
+drains events independently of descriptor polling. Read/write counts cover the
+native `read`, `write`, `pread64`, `pwrite64`, `readv`, `writev`, `preadv`,
+`pwritev`, `preadv2`, `pwritev2`, `sendto`, `recvfrom`, `sendmsg` and `recvmsg`
+calls of the architecture this binary was built for, using that architecture's
+syscall numbers. A named exit the kernel does not provide drops that one call.
+Compatibility ABIs that share the raw tracepoints but use different numbers
+(x86 int 0x80 and x32, aarch64 32-bit, ppc32) stay unproved. mmap, io_uring,
+splice and sendfile byte transfers are not covered. No target buffers are read.
 
 **Inode attribution is a sampled correlation.** Fresh descriptor tables supply
 the identity; mutations, reuse, stale samples, missing pairs, loss and partial
@@ -201,8 +204,9 @@ Storage grows with observed demand, up to 16,384 processes and 262,144
 descriptors. The flow counter tracks the live set, not history: each poll drops
 rows for closed descriptors and forgets exited or idle processes and threads, so
 fork-heavy builds and connection churn neither fill its tables nor slow its drain.
-Only native x86-64 calls that change the descriptor table (open, close, dup, fork,
-exec and the like) withdraw a process's attribution until the next poll. The view aggregates these into at most 128 stars and 1,024 particle
+Only native calls that change the descriptor table (open or openat, close, dup,
+fork or clone, exec and the like; a name the architecture does not have is
+omitted) withdraw a process's attribution until the next poll. The view aggregates these into at most 128 stars and 1,024 particle
 groups; the graph draws at most 128 shared resources and 2,048 links and shows
 omission counts. These are display and collection bounds, not a claim that
 every cached row was refreshed at the same instant.
@@ -379,6 +383,70 @@ renew demand for the needed groups without sampling inside a request. The
 owner updates the cache on its clock. Replies include each group's sample
 time, age and pending state; poll after a pending response. Pausing the view
 freezes its display while requested MCP groups can continue refreshing.
+
+### Headless, for agents
+
+`xodb --overview --headless --mcp` (or `--session-socket PATH`, or both) runs
+the same collector cache and observer tools with no window, Vulkan or
+compositor. It keeps the history groups (summary, CPU, memory, disks,
+network, processes at 1 Hz, light) sampled at `--interval-ms` (default 500)
+and serves other groups on demand, with the same pending/age semantics. It
+exits when stdin closes; a windowed `--overview --mcp` now does too. Measured
+on the development machine: about 23 MiB RSS and 1 % of a core idle, about
+57 MiB once NVML is loaded for GPU sensors; the window is about 500 MiB, almost
+all of it graphics drivers (see below).
+
+| Question | Call |
+|---|---|
+| Top consumers by application | `get_process_groups` `by: tree` (or `cgroup`), `sort: cpu` or `rss` |
+| The process table, sorted and filtered | `list_processes` `sort` cpu, rss, io, fds, threads, age, start, pid; `filter` `{user, match, state}`; `limit`, `offset` |
+| CPU pressure over the last minutes | `get_history` `group: psi`, `seconds: 300` |
+| One process over time | `get_history` `group: processes`, `pid` (tracked for 10 minutes from the request) |
+| Who holds a socket | `get_connections`: `holders` (every visible holder, own uid fully), `owner_hint` when the owner needs privilege |
+| Stuck sockets of my uid | `get_connections` `filter: {uid: <my uid>, queued: true}`, paged with `offset` |
+
+`list_processes` is the canonical process table; `get_overview` takes the same
+`sort`/`filter`/`offset` for its process rows. Replies give `count` (the
+table), `matched` (after the filter), `shown`, `next_offset` (null on the last
+page) and `truncated` (rows the collector dropped at capacity). Filters see
+the reply's own view: under redaction a command line never matches.
+
+`get_history` keeps 1200 rows (10 minutes at 500 ms) on one time axis. A
+series whose group was not sampled on a tick is null there, never 0. Replies
+are bucket means over `step` seconds, at most 600 points (the step widens),
+with `times_s` relative to the newest sample. Processes tracked unasked are the
+top 8 by CPU and by RSS of each processes sample; at most 64 are kept.
+
+`get_process_groups` `by: tree` puts a process under its topmost ancestor
+with the same uid and process group: a shell job with its children, or an
+application with its helpers, is one row; kernel threads go under kthreadd.
+Rows sum `cpu_pct`, `rss`, `threads`, `fds` and `io_bps`, naming how many
+members could not be measured. RSS sums count shared pages once per member.
+
+`get_connections` lists in `holders` every process (up to 8, with
+`holder_count`) whose descriptor table holds the socket inode. When the
+owner needs privilege, `owner_hint` gives the socket's uid, whether it is
+yours, and the visible processes of that uid whose descriptor tables could
+not be read: the only possible holders this account can name.
+`filter` takes `proto` (tcp, udp, unix), `state` (exact, e.g. CLOSE_WAIT),
+`uid`, `external` (remote neither loopback nor wildcard) and `queued` (bytes
+in a queue, or pending accepts on a listener); `limit` (at most 400) and
+`offset` page the rows, with `matched`, `shown` and `next_offset`.
+
+### Where the window's memory goes
+
+Measured with `--overview --mcp` on the NVIDIA/Mesa development machine
+(Vulkan device NVIDIA): about 510 MiB RSS. xodb's own data is about 15 MiB
+(4 MiB glyph atlas, 2 MiB view, the collector cache and history, 1 MiB MCP
+buffer). The rest is the graphics stack: about 230 MiB of NVIDIA driver
+libraries, 49 MiB of `/dev/nvidiactl` mappings and about 35 MiB of driver
+heap, plus about 120 MiB of Mesa (LLVM, gallium, radeon and lavapipe ICDs)
+that the Vulkan loader and glvnd EGL load although the NVIDIA device is
+used. `VK_LOADER_DRIVERS_SELECT='*nvidia*'` and
+`__EGL_VENDOR_LIBRARY_FILENAMES` pointing at the NVIDIA vendor file remove the
+Mesa part (about 394 MiB). Agents should prefer the headless overview.
+
+### Actions
 
 Select a live process and press L (files), F (profile), or Enter (attach). The
 confirmation explains cost and access. Files opens in this overview window;

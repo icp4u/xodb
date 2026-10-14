@@ -37,7 +37,7 @@ work, have your agent fix it and send a pr.
 - **Portable where it counts.** Not glued to x86-64, ELF, DWARF, or 64-bit
   pointers. Mach-O and Swift with MacOS. 
   - GUI: Linux/x86_64 and Linux/Aarch64 - MacOS in the works
-  - Debugger targets: x86_64, aarch64, loongarch64 (龙芯), ppc64le and m68k. debugserver/adb.
+  - Debugger targets: x86_64, aarch64, loongarch64 (龙芯), riscv64, ppc64le and m68k. debugserver/adb.
 - **Dual Language runtimes:** Ruby, Perl, CPython, Lua, Node/JS, Go, Emacs Lisp, Redot/GDScript, Jai - see [docs](docs/)
 - **Non-PC:** remote debugging (Android especially), planned Lua scriptability
   with `dbg.eval()`, replay, object/causal graphs.
@@ -147,24 +147,25 @@ https://x.com/icpolicy/status/2109864753174806946
 architectures via SSH/TCP, USB (android) etc. Android: native executables *and*
 JNI libraries inside a debug APK, over USB.  ([ARM64](docs/ARM64.md) · [remote](docs/REMOTE_DEBUGGING.md) · [Android](docs/ANDROID.md))
 
-| Feature | x86-64 | aarch64 | loongarch64 | ppc64le | m68k | macOS (debugserver) | gdbserver / QEMU (RSP) | Android (adb) | Windows x64 under Wine |
-|---|---|---|---|---|---|---|---|---|---|
-| Launch / attach | ✓ | ✓ | ✓ | ✓ | launch | ✓ (stub) | ✓ (stub) | ✓ | ✓ |
-| Software breakpoints, stepping | ✓ | ✓ | ✓ (software step) | ✓ (incl. larx/stcx.) | ✓ | ✓ | ✓ (needs Z0) | ✓ | ✓ |
-| Hardware watchpoints | ✓ (4) | ✓ (4) | – | – | – | ✓ | – | ? | ✓ |
-| Source, locals, expressions | DWARF | DWARF | DWARF | DWARF | DWARF | Mach-O, Swift names | DWARF (host) | DWARF | PE exports, SEH unwind |
-| Disassembly | ✓ | ✓ | Capstone 6 build | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| Pseudo-C, Ghidra sidecar | ✓ | ✓ | ✓ (weak) | ✓ | ✓ | – | ? | ? | – |
-| Pseudo-C, native worker | ✓ (ELF) | – | – | – | – | – | – | – | – |
-| CPU profiling, flames | ✓ | – | – | – | – | – | – | – | ✓ (host) |
-| Syscall timing, allocations | ✓ | – | – | – | – | – | – | – | ? |
-| Fork/vfork following | ✓ | – | – | – | – | – | – | – | – |
-| Core dumps | ✓ | – | – | – | – | – | – | – | – |
-| Overview fd flow tracing | ✓ | – | – | – | – | – | – | – | n/a |
-| GUI host | ✓ | ✓ | – | – | – | in progress | n/a | n/a | n/a |
+| Feature | x86-64 | aarch64 | loongarch64 | riscv64 | ppc64le | m68k | macOS (debugserver) | gdbserver / QEMU (RSP) | Android (adb) | Windows x64 under Wine |
+|---|---|---|---|---|---|---|---|---|---|---|
+| Launch / attach | ✓ | ✓ | ✓ | ✓ | ✓ | launch | ✓ (stub) | ✓ (stub) | ✓ | ✓ |
+| Software breakpoints, stepping | ✓ | ✓ | ✓ (software step) | breakpoint; step refused | ✓ (incl. larx/stcx.) | ✓ | ✓ | ✓ (needs Z0) | ✓ | ✓ |
+| Hardware watchpoints | ✓ (4) | ✓ (4) | – | – | – | – | ✓ | – | ? | ✓ |
+| Source, locals, expressions | DWARF | DWARF | DWARF | DWARF | DWARF | DWARF | Mach-O, Swift names | DWARF (host) | DWARF | PE exports, SEH unwind |
+| Disassembly | ✓ | ✓ | Capstone 6 build | system Capstone 5 | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
+| Pseudo-C, Ghidra sidecar | ✓ | ✓ | ✓ (weak) | – | ✓ | ✓ | – | ? | ? | – |
+| Pseudo-C, native worker | ✓ (ELF) | – | – | – | – | – | – | – | – | – |
+| CPU profiling, flames | ✓ | – | – | – | – | – | – | – | – | ✓ (host) |
+| Syscall timing, allocations | ✓ | – | – | – | – | – | – | – | – | ? |
+| Fork/vfork following | ✓ | – | – | – | – | – | – | – | – | – |
+| Core dumps | ✓ | – | – | – | – | – | – | – | – | – |
+| Overview fd flow tracing | ✓ | – | – | – | – | – | – | – | – | n/a |
+| GUI host | ✓ | ✓ | – | – | – | – | in progress | n/a | n/a | n/a |
 
 Notes:
 - loongarch64 pseudo-C is weak: no parameter names, and calls through the PLT resolve to the wrong targets.
+- riscv64 steps are refused. `PTRACE_SINGLESTEP` returned EIO on the measured QEMU guest. Continue from a planted breakpoint stays refused until software step exists. Registers, memory, CFI stack, locals and expressions were checked through the agent.
 - Sidecar on macOS and Wine: Ghidra itself reads Mach-O and PE, but importing a remote Mach-O or a PE image was deferred in DC4.
 - The Wine column is a guess in two places. It is x86-64 native ptrace underneath, so profiling should work via the host, but no doc claims it; that's why it says "(host)". Syscall timing and allocations under Wine are untried.
 - Several x86-64-only rows are table work, not design limits. Fd flow tracing (G22) is one; profiling and syscall timing on aarch64 are listed as remaining work in ARM64.md.

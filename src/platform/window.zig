@@ -6,7 +6,8 @@
 //! the program may use of them is listed in `comptime` below; units:
 //!   width, height    content size in UI units, the units the UI lays out and
 //!                    the renderer draws in. A resize sets them and `dirty`.
-//!   scale()          device pixels per UI unit, as the window system reports it
+//!   scale()          device pixels per UI unit (override or window-system scale)
+//!   bufferExtent()   native backing pixels, independent of the UI override
 //!   pointer_x/y      UI units from the content's top left
 //!   scroll           whole text lines since the UI last cleared it, positive
 //!                    towards the end of the content; one wheel notch is three
@@ -43,6 +44,14 @@ pub fn deviceExtent(logical: u32, scale: f32) u32 {
     return @max(1, @as(u32, @intFromFloat(@min(pixels, std.math.maxInt(u32)))));
 }
 
+pub const Extent = struct { width: u32, height: u32 };
+
+/// Whole UI units that fit in a backing buffer. Never round back to pixels:
+/// fractional UI sizes can leave a fraction of a unit at the window edge.
+pub fn uiExtent(pixels: u32, scale: f32) u32 {
+    return @max(1, @as(u32, @intFromFloat(@min(@floor(@as(f64, @floatFromInt(pixels)) / scale), std.math.maxInt(u32)))));
+}
+
 /// Plain-text clipboard. A paste is asynchronous: `clipRequest` starts one for
 /// the editor named by `clipFocus`, `clipTake` returns it once. `primary`
 /// selects the select-to-copy selection where the window system has one.
@@ -65,7 +74,7 @@ comptime {
         "frameReady",  "requestFrame", "cancelFrame", "setCursor",       "setOwnFrame",
         "setTitle",    "setAppId",     "setMinSize",  "minimize",        "toggleMaximized",
         "beginMove",   "beginResize",  "clipFocus",   "clipRequest",     "clipTake",
-        "clipPending", "clipCopy",     "displayGpu",
+        "clipPending", "clipCopy",     "displayGpu",  "bufferExtent",
     }) |name| if (!@hasDecl(Window, name)) @compileError("platform Window." ++ name);
     for (.{ "queue", "head", "count", "dropped", "keymap_errors", "focused", "focus_revision", "trace" }) |name|
         if (!@hasField(Keyboard, name)) @compileError("platform Keyboard." ++ name);
@@ -91,4 +100,8 @@ test "UI scales are bounded and device extents round outward" {
     try std.testing.expectEqual(@as(u32, 1920), deviceExtent(1280, 1.5));
     try std.testing.expectEqual(@as(u32, 2), deviceExtent(1, 1.5));
     try std.testing.expectEqual(std.math.maxInt(u32), deviceExtent(std.math.maxInt(u32), 4));
+    try std.testing.expectEqual(@as(u32, 1706), uiExtent(2560, 1.5));
+    try std.testing.expectEqual(@as(u32, 640), uiExtent(1280, 2));
+    try std.testing.expectEqual(@as(u32, 2560), uiExtent(1280, 0.5));
+    try std.testing.expectEqual(@as(u32, 1), uiExtent(1, 4));
 }

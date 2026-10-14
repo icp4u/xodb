@@ -4,6 +4,7 @@ const std = @import("std");
 const timeline = @import("../ui/timeline.zig");
 const profile = @import("../profile/capture.zig");
 const linux = @import("../target/linux.zig");
+const evidence = @import("../evidence/stream.zig");
 /// The timeline's display data for the session capture: per-thread sample
 /// times and debugger stop ranges. Rebuilt when the capture revision changes,
 /// at most four times a second while collecting. Samples follow the capture's
@@ -16,6 +17,8 @@ pub const Source = struct {
     capture_id: u64 = 0,
     revision: u64 = 0,
     built_ns: u64 = 0,
+    /// External evidence drawn as one extra lane (read-only, set by the owner).
+    stream: ?*const evidence.Stream = null,
 
     pub fn deinit(self: *Source) void {
         self.arena.deinit();
@@ -29,8 +32,17 @@ pub const Source = struct {
     }
     pub fn refresh(self: *Source, capture: ?*profile.Capture) ?*const timeline.Data {
         const current = capture orelse {
-            self.data = null;
-            return null;
+            // A stream without a capture is drawn on its own clock, once.
+            const stream = self.stream orelse {
+                self.data = null;
+                return null;
+            };
+            if (self.data != null and self.capture_id == 0) return &self.data.?;
+            self.buildStreamOnly(stream) catch {
+                self.data = null;
+                return null;
+            };
+            return &self.data.?;
         };
         const same = self.data != null and current.id == self.capture_id;
         if (same and current.revision == self.revision) return &self.data.?;
@@ -106,10 +118,50 @@ pub const Source = struct {
             const to = (span.exit_ns orelse span.entry_ns.?) -| capture.started_ns;
             mark.* = .{ .from_ns = from, .to_ns = to, .kind = .syscall, .tid = @intCast(capture.threads[span.thread_index].perf.tid), .label = if (span.elapsed()) |ns| try std.fmt.allocPrint(a, "  /  syscall {s} ({d}): {d:.3} ms elapsed", .{ @import("../profile/syscalls.zig").name(span.nr) orelse "?", span.nr, @as(f64, @floatFromInt(ns)) / 1000000 }) else try std.fmt.allocPrint(a, "  /  syscall ({d}): {s}, duration unknown", .{ span.nr, @tagName(span.reason) }) };
         }
-        self.data = .{ .capture_id = capture.id, .revision = capture.revision, .extent_ns = extent, .live = capture.collector != null, .scheduling = capture.config.context_switch, .lanes = lanes, .marks = marks, .application_count = imported.len, .syscall_count = capture.syscalls.items.items.len, .debugger_marks_dropped = omitted +| capture.debugger_marker_dropped +| capture.debugger_events_lost, .lost_samples = capture.lost_samples };
+        self.data = .{ .capture_id = capture.id, .revision = capture.revision, .extent_ns = extent, .live = capture.collector != null, .scheduling = capture.config.context_switch, .lanes = lanes, .marks = marks, .application_count = imported.len, .syscall_count = capture.syscalls.items.items.len, .debugger_marks_dropped = omitted +| capture.debugger_marker_dropped +| capture.debugger_events_lost, .lost_samples = capture.lost_samples, .stream = if (self.stream) |stream| try streamLane(a, stream, capture.started_ns, extent) else null };
         self.capture_id = capture.id;
         self.revision = capture.revision;
         self.built_ns = linux.now();
+    }
+    fn buildStreamOnly(self: *Source, stream: *const evidence.Stream) !void {
+        self.data = null;
+        _ = self.arena.reset(.retain_capacity);
+        const first = stream.first_time_ns orelse 0;
+        const extent = if (stream.last_time_ns) |last| (last - first) +| 1 else 1;
+        var lane = try streamLane(self.arena.allocator(), stream, null, extent);
+        lane.note = "stream clock (CLOCK_REALTIME from the file), time since its first record; no capture opened";
+        self.data = .{ .capture_id = 0, .revision = 1, .extent_ns = extent, .state_label = "pcap only", .lanes = &.{}, .stream = lane };
+        self.capture_id = 0;
+        self.revision = 1;
+        self.built_ns = linux.now();
+    }
+    /// Ticks on this capture's axis. With `capture_started_ns` the stream must
+    /// be aligned through that same capture's ECTX pairs; otherwise records
+    /// stay off the axis and are counted. Null places them on the stream's own
+    /// clock, relative to its first record.
+    fn streamLane(a: std.mem.Allocator, stream: *const evidence.Stream, capture_started_ns: ?u64, extent: u64) !timeline.StreamLane {
+        var ticks: std.ArrayList(timeline.Tick) = .empty;
+        var off_axis: u64 = 0;
+        const same_capture = if (stream.context) |ctx| capture_started_ns != null and ctx.capture_started_ns == capture_started_ns.? else false;
+        for (0..stream.parsed.records.len) |i| {
+            const t = stream.timeOf(i);
+            const at: ?u64 = if (capture_started_ns == null)
+                (if (t.known) t.stream_ns - (stream.first_time_ns orelse t.stream_ns) else null)
+            else if (same_capture) t.capture_ns else null;
+            if (at == null or at.? >= extent) {
+                off_axis += 1;
+                continue;
+            }
+            try ticks.append(a, .{ .t_ns = at.?, .bytes = stream.parsed.records[i].origlen, .undecoded = stream.summaries[i].undecoded() });
+        }
+        std.mem.sort(timeline.Tick, ticks.items, {}, struct {
+            fn less(_: void, l: timeline.Tick, r: timeline.Tick) bool {
+                return l.t_ns < r.t_ns;
+            }
+        }.less);
+        var note_buffer: [160]u8 = undefined;
+        const note = if (capture_started_ns == null) "" else if (!same_capture) (if (stream.context == null) "unaligned: the capture archive has no clock pairs (ECTX); records are not placed on its clock" else "unaligned: clock pairs belong to a different capture") else try std.fmt.bufPrint(&note_buffer, "aligned to the capture clock from paired samples, +/-{d} ns", .{stream.mapping.uncertainty_ns});
+        return .{ .label = stream.label, .ticks = ticks.items, .off_axis = off_axis, .undecoded = stream.undecoded, .note = try a.dupe(u8, note) };
     }
     fn valid(capture: *const profile.Capture, sample: anytype) bool {
         return sample.timePresent() and sample.tidPresent() and sample.time_ns >= capture.started_ns;
@@ -185,6 +237,7 @@ pub const Capture = struct {
         };
         if (!self.changed(session) and std.meta.eql(wanted, self.requested)) return;
         if (self.session_id != session.id) self.clear();
+        self.source.stream = session.evidence_stream;
         const current = self.source.refresh(session.profile);
         _ = self.arena.reset(.retain_capacity);
         self.value = if (current) |data| self.viewport.prepare(self.arena.allocator(), session.id, request_, data) catch null else null;

@@ -98,6 +98,8 @@ pub const Font = struct {
         self.degraded = false;
         self.dirty = true;
         self.pixels[0] = 255;
+        if (c.getenv("XODB_INPUT_TRACE") != null)
+            log.info(.render, "ui font pixels={d} scale={d:.2}\n", .{ pixels, requested });
         // Reserve the missing-glyph box before source text can fill the cache.
         _ = try self.glyph(0);
     }

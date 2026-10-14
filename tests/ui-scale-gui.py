@@ -15,6 +15,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument('--work', type=Path)
 parser.add_argument('--evidence', type=Path)
 parser.add_argument('--galaxy', action='store_true', help='check retained galaxy rendering and logical hover input')
+parser.add_argument('--sizing', action='store_true', help='check UI sizing independently of compositor backing scale')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 os.chdir(root)
@@ -55,6 +56,47 @@ def wait_scale(d, effective, compositor, override):
     return scale_lines(d)
 
 scales = ((1.0, '1x'), (1.25, '1_25x'), (1.5, '1_5x'), (2.0, '2x'))
+if args.sizing:
+    # Four owned sessions, fast GUI lane. A preference-only run and a CLI
+    # override of that preference exercise both entry points at each output scale.
+    config = work / 'scale-preferences.json'
+    config.write_text(json.dumps({'appearance': {'ui_scale': 1.5}}))
+    for compositor in (1, 2):
+        layouts = []
+        for scale in (1, 1.5):
+            options = ['--config', str(config)]
+            if scale == 1:
+                options += ['--ui-scale', '1']
+            label = f'output-{compositor}-ui-{scale}'
+            d = h.Display(str(root), options + list(h.M1), output_scale=compositor)
+            try:
+                d.stopped()
+                # UI (700,65) is the Agent control. Convert to surface units,
+                # the coordinate system used by the compositor's virtual pointer.
+                pointer = d.keys('click', round(700 * scale / compositor), round(65 * scale / compositor), wait=False)
+                controlled = d.wait(lambda state: state['agent_scope'] == 'control', seconds=2 * h.load_scale())
+                check(label + ' pointer helper completed', pointer.wait(timeout=5) == 0)
+                check(label + ' scaled pointer hits Agent', controlled is not None)
+                text = Path(d.log).read_text(errors='replace')
+                rows = re.findall(r'ui layout units=(\d+)x(\d+) buffer=(\d+)x(\d+) scale=([\d.]+)', text)
+                faces = re.findall(r'ui font pixels=(\d+) scale=([\d.]+)', text)
+                check(label + ' rendered layout and font dump available', bool(rows) and bool(faces))
+                if rows and faces:
+                    width, height, pixels_w, pixels_h = map(int, rows[-1][:4])
+                    check(label + ' native backing buffer', (pixels_w, pixels_h) == (1280 * compositor, 800 * compositor), rows[-1])
+                    check(label + ' UI units follow requested scale', (width, height) == (int(pixels_w / scale), int(pixels_h / scale)), rows[-1])
+                    check(label + ' font raster follows requested size', int(faces[-1][0]) == round(16 * scale), faces[-1])
+                    layouts.append((width, height, int(faces[-1][0])))
+                if args.evidence:
+                    args.evidence.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(d.shot(label), args.evidence / (label + '.png'))
+            finally:
+                d.close()
+        check(f'output-{compositor} override changes layout and text size', len(layouts) == 2 and layouts[0][0] > layouts[1][0] and layouts[0][2] < layouts[1][2], layouts)
+    failed = [name for name, ok, _ in checks if not ok]
+    print(json.dumps({'checks': len(checks), 'failed': failed, 'work': str(work)}, indent=2))
+    raise SystemExit(bool(failed))
+
 if args.galaxy:
     os.environ['XODB_OVERVIEW_AUDIT'] = '1'
     os.environ['XODB_OVERVIEW_LAYOUT'] = '1'

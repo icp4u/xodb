@@ -23,3 +23,8 @@ deny providers-no-session   language semq debug binary -> src/model/session.zig
 # The C runtime builds alone (src/runtime/Makefile, xodb-agent): it includes only
 # its own headers and the system's.
 only runtime-alone          runtime -> runtime
+
+# External evidence (pcap/pcapng reader, decoders, clock domains, socket joins)
+# is pure data over bytes: no session, frontends or engine C. The collector
+# that reads /proc lives in profile; the MCP tools and timeline lane import it.
+only evidence-leaf          evidence -> common

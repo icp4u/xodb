@@ -96,7 +96,8 @@ pub fn encode(a: Allocator, s: *const model.Scene, graph_kind: []const u8, redac
 pub fn descriptors(a: Allocator, owner: *@import("../model/system.zig").Collector, args: Value) !Value {
     try validate(args, false);
     if (!std.mem.eql(u8, try kind(args), "descriptors")) return error.GraphKindUnavailable;
-    if (owner.graph_scene) |scene| {
+    if (owner.graph_scene) |opaque_scene| {
+        const scene: *const model.Scene = @ptrCast(@alignCast(opaque_scene));
         var result = try encode(a, scene, "descriptors", owner.redact);
         try result.object.put(a, "source", .{ .string = "visible_gui_model" });
         try result.object.put(a, "pending", .{ .bool = false });

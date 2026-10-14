@@ -21,6 +21,11 @@ static const struct xrt_register_desc arm_registers[] = {XRT_ARM_REGISTERS(ARM_D
      (id) == 0 ? XRT_REG_READ_ONLY : XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
 static const struct xrt_register_desc loongarch_registers[] = {XRT_LOONGARCH_REGISTERS(LOONGARCH_DESC)};
 #undef LOONGARCH_DESC
+#define RISCV_DESC(name, dwarf, word, id, role)                                                    \
+    {#name, id, dwarf, offsetof(struct xrt_riscv_registers, name), (word) * 8, 8, role,           \
+     XRT_REG_READ_WRITE, XRT_REG_ALWAYS},
+static const struct xrt_register_desc riscv_registers[] = {XRT_RISCV_REGISTERS(RISCV_DESC)};
+#undef RISCV_DESC
 /* msr, softe, dar, dsisr and result are published by the kernel and ignored
  * on write. orig_gpr3 (34) and trap (40) stay writable: they steer restart. */
 #define PPC_DESC(name, dwarf, word, id, role)                                                      \
@@ -44,6 +49,10 @@ static const struct xrt_probe_choice arm_probes[] = {
     {XRT_ISA_MODE_ORDINARY, 4, 4, 0, {0x00, 0x00, 0x20, 0xd4}, {0, 0, 0, 0}}};
 static const struct xrt_probe_choice loongarch_probes[] = {
     {XRT_ISA_MODE_ORDINARY, 4, 4, 0, {0x00, 0x00, 0x2a, 0x00}, {0, 0, 0, 0}}};
+/* c.ebreak. The userspace ABI is RVC, and this CPU executes it when it
+ * overlays the first half of a 32-bit instruction. */
+static const struct xrt_probe_choice riscv_probes[] = {
+    {XRT_ISA_MODE_ORDINARY, 2, 2, 0, {0x02, 0x90, 0, 0}, {0, 0, 0, 0}}};
 static const struct xrt_probe_choice ppc64_probes[] = {
     {XRT_ISA_MODE_ORDINARY, 4, 4, 0, {0x08, 0x00, 0xe0, 0x7f}, {0, 0, 0, 0}}};
 
@@ -128,6 +137,28 @@ static const struct xrt_arch architectures[] = {
      .hardware_step = 0,
      .probes = loongarch_probes,
      .probe_count = 1},
+    {.machine = XRT_RISCV,
+     .kernel_gpr_bytes = 256,
+     .address_bits = 64,
+     .little_endian = 1,
+     .register_count = 32,
+     .dwarf_count = 32,
+     .trap_size = 2,
+     .trap_alignment = 2,
+     .breakpoint_adjust = 0,
+     .caller_adjust = 2,
+     .trap = {0x02, 0x90},
+     .registers = riscv_registers,
+     .elf_class = XRT_ELF_CLASS_64,
+     .linux_abi = XRT_LINUX_ABI_NATIVE,
+     .isa_mode = XRT_ISA_MODE_ORDINARY,
+     .control_kind = XRT_CONTROL_SINGLE_PC,
+     .tracer_bits = 64,
+     /* PTRACE_SINGLESTEP returned EIO on the measured QEMU guest. Refusing
+      * hardware step records that measurement; it is not an ISA-wide claim. */
+     .hardware_step = 0,
+     .probes = riscv_probes,
+     .probe_count = 1},
     {.machine = XRT_PPC64,
      .kernel_gpr_bytes = 384,
      .address_bits = 64,
@@ -153,7 +184,7 @@ static const struct xrt_arch architectures[] = {
 static int product_machine(uint16_t machine)
 {
     return machine == XRT_M68K || machine == XRT_X86_64 || machine == XRT_AARCH64 ||
-           machine == XRT_LOONGARCH || machine == XRT_PPC64;
+           machine == XRT_LOONGARCH || machine == XRT_RISCV || machine == XRT_PPC64;
 }
 
 static int choice_bounds(const struct xrt_probe_choice *choice)
@@ -340,6 +371,9 @@ const struct xrt_arch *xrt_arch_native(void)
     arch = xrt_arch_get(XRT_M68K);
 #elif defined(__loongarch_lp64) && defined(__loongarch_double_float)
     arch = xrt_arch_get(XRT_LOONGARCH);
+#elif defined(__riscv) && __riscv_xlen == 64 && defined(__riscv_float_abi_double) &&               \
+    defined(__riscv_compressed)
+    arch = xrt_arch_get(XRT_RISCV);
 #elif defined(__powerpc64__) && defined(_CALL_ELF) && _CALL_ELF == 2 &&                            \
     __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
     arch = xrt_arch_get(XRT_PPC64);

@@ -672,6 +672,7 @@ static void foundation(void)
                           : native->machine == XRT_LOONGARCH ? "r12"
                           : native->machine == XRT_PPC64     ? "r12"
                           : native->machine == XRT_M68K      ? "d2"
+                          : native->machine == XRT_RISCV     ? "a2"
                                                              : "x9";
     struct reg_bank bank = {0};
     struct xrt_reg_io io = {.read = bank_read, .write = bank_write, .ctx = &bank};
@@ -991,6 +992,13 @@ static void expect_breakpoint(unsigned hits)
  * The child reaches the following breakpoint only after the handlers have run. */
 static void ignored_signals(void)
 {
+    /* Continue from a planted breakpoint is a hidden step. An architecture
+     * with neither hardware step nor software successors refuses it, so this
+     * signal delivery has no way to leave the breakpoint. */
+    struct xrt_step_resources step_resources;
+    OK(xrt_arch_step_resources(xrt_arch_native(), XRT_ISA_MODE_ORDINARY, &step_resources));
+    if (!step_resources.hardware_step && !step_resources.software_probes)
+        return;
     int gate[2], again[2];
     CHECK(pipe(gate) == 0 && pipe(again) == 0);
     const pid_t parent = getpid();
@@ -1734,7 +1742,13 @@ int main(int argc, char **argv)
     ppc_atomic_signal();
     x86_syscall_signal();
     loong_live();
-    puts("C target: launch, restart, attach, stepping, breakpoint overlays/rearm, watches, "
-         "generations, cleanup passed");
+    struct xrt_step_resources step_resources;
+    OK(xrt_arch_step_resources(xrt_arch_native(), XRT_ISA_MODE_ORDINARY, &step_resources));
+    if (step_resources.hardware_step || step_resources.software_probes)
+        puts("C target: launch, restart, attach, stepping, breakpoint overlays/rearm, watches, "
+             "generations, cleanup passed");
+    else
+        puts("C target: launch, restart, attach, breakpoint overlays, generations, cleanup passed; "
+             "stepping and continue-from-breakpoint refused");
     return 0;
 }

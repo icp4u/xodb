@@ -78,7 +78,8 @@ COVERS = (
      ('memory-observer', 'memdefrag-tui', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-vga')),
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
       'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
-    (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h'),
+    (('src/ui/overview/fetch*', 'src/ui/overview/png.zig', 'tests/fetch*.py'), ('fetch', 'gui-fetch')),
+    (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h', 'src/model/system*.zig'),
      ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-safe-keys*', 'gui-themes')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
@@ -117,12 +118,15 @@ COVERS = (
       'source-blocks', 'stale-interrupt', 'fork-release*', 'process-tree', 'process-gui', 'm2-robustness',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*', 'src/preferences.zig', 'tests/ui-scale-gui.py'),
-     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-ui-scale', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'platform-cocoa*', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'platform-cocoa*', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
     (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
+    (('src/evidence/*', 'src/mcp/evidence*', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/fixtures/net-peer.py'),
+     ('network-evidence', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
+    (('tests/pcap-magic.py',), ('pcap-magic',)),
     (('src/*.zig', 'src/*.c', 'src/*.h', 'src/*.cc', 'src/*.inc', 'src/*/Makefile', 'build.zig'), ('deps',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
@@ -136,9 +140,9 @@ ALWAYS = ('deps',)
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
     'gui-gibson-live-flight',
-    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-galaxy-scale', 'gui-galaxy-churn',
+    'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-galaxy-scale', 'gui-galaxy-churn',
     'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-flight', 'gui-gibson-signs', 'gui-gibson-evidence',
-    'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-win95', 'gui-win95-all-panels', 'gui-profile', 'gui-fdgalaxy', 'gui-fdgalaxy-camera', 'gui-graph-table',
+    'gui-deepmap', 'gui-deepmap-evidence', 'gui-memdefrag', 'gui-memdefrag-smoke', 'gui-overview', 'gui-overview-live', 'gui-fetch', 'gui-win95', 'gui-win95-all-panels', 'gui-profile', 'gui-fdgalaxy', 'gui-fdgalaxy-camera', 'gui-graph-table',
 }
 
 # GUI steps that are never retried: they inject faults or race the renderer,
@@ -279,6 +283,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('release-runner', [sys.executable, '-B', 'tests/release-runner.py'], 30))
     steps.append(('deps', [sys.executable, '-B', 'scripts/deps', 'check'], 30))
     steps.append(('deps-selftest', [sys.executable, '-B', 'tests/deps-selftest.py'], 30))
+    # Privacy: no tracked file may be a packet capture; fixtures are generated at run time.
+    steps.append(('pcap-magic', [sys.executable, '-B', 'tests/pcap-magic.py'], 30))
     steps.append(('complete-log-lines', [sys.executable, '-B', 'tests/complete-log-lines.py', '--work', '.work/complete-log-lines'], 10))
     steps.append(('mcp-exact-guard', [sys.executable, '-B', 'tests/mcp-exact-guard.py'], 30))
     if tier in ('portable', 'quick', 'host', 'gui', 'all'):
@@ -466,6 +472,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((f'controller-scope-{int(remote)}', [sys.executable, '-B', 'tests/controller-scope.py',
                           '--work', f'.work/scope{int(remote)}', *(['--agent', 'zig-out/bin/xodb-agent'] if remote else [])], 90))
         steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
+        steps.append(('fetch', [sys.executable, '-B', 'tests/fetch.py'], 60))
+        steps.append(('sysstat-headless', [sys.executable, '-B', 'tests/overview-headless.py'], 120))
         steps.append(('memory-observer', [sys.executable, '-B', 'tests/memory-observer.py'], 180))
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
@@ -477,7 +485,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'log-levels',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
                      'comparison', 'scheduling-decode', 'observation-experiments',
-                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline'):
+                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
@@ -650,6 +658,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('vulkan-device', ['tests/vulkan-device.py']),
             ('gui-themes', ['tests/themes.py']),
             ('gui-ui-scale', ['tests/ui-scale-gui.py']),
+            ('gui-ui-sizing', ['tests/ui-scale-gui.py', '--sizing']),
             ('gui-galaxy-scale', ['tests/ui-scale-gui.py', '--galaxy']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),
@@ -692,6 +701,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-profile', ['scripts/gui-smoke.py', '--profile']),
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),
+            ('gui-network-evidence', ['tests/network-evidence.py', '--gui', '--work', '.work/gne']),
             ('remote-panes', ['tests/remote-gui.py', '--bin', 'zig-out/bin', '--running-panes']),
             ('hidden-window', ['tests/vulkan-stall.py', 'trace', '--attach-fixture']),
             ('acquire-timeout', ['tests/vulkan-stall.py', 'acquire', '--keep-hidden', '--quit', 'signal', '--attach-fixture']),
@@ -714,6 +724,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
+        steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))
         for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
             steps.append(('gui-safe-keys'+suffix, [sys.executable, '-B', 'tests/safe-keys-gui.py', '--work', '.work/sk'+suffix, *extra], 180))
@@ -1454,7 +1465,9 @@ def main(argv=None):
                          Step('capabilities', ['.work/release-probe'], 10, 'build', ['probe-build'])]
         else:
             preflight = []
-        for number in (signal.SIGTERM, signal.SIGHUP):
+        # SIGINT too: a launcher's `cmd &` leaves it ignored, the steps would
+        # inherit that, and a test's SIGINT to its own child would do nothing.
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
             signal.signal(number, signal.default_int_handler)  # stop the steps, as for an interrupt
         code = run_steps([*preflight, *steps], tree, env, logs, report, args.keep_going, retries, args.jobs)
         if code:

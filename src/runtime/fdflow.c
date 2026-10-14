@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "xrt_fdflow.h"
+#include "fdflow_syscalls.h"
 #include "perf_internal.h"
 #include <errno.h>
 #include <limits.h>
@@ -14,16 +15,21 @@ struct io_call {
   uint16_t number;
   uint8_t operation;
 };
-static const struct io_call calls[] = {
-    {"read", 0, XRT_FDFLOW_READ},      {"write", 1, XRT_FDFLOW_WRITE},
-    {"pread64", 17, XRT_FDFLOW_READ},  {"pwrite64", 18, XRT_FDFLOW_WRITE},
-    {"readv", 19, XRT_FDFLOW_READ},    {"writev", 20, XRT_FDFLOW_WRITE},
-    {"preadv", 295, XRT_FDFLOW_READ},  {"pwritev", 296, XRT_FDFLOW_WRITE},
-    {"preadv2", 327, XRT_FDFLOW_READ}, {"pwritev2", 328, XRT_FDFLOW_WRITE},
-    {"sendto", 44, XRT_FDFLOW_WRITE},  {"recvfrom", 45, XRT_FDFLOW_READ},
-    {"sendmsg", 46, XRT_FDFLOW_WRITE}, {"recvmsg", 47, XRT_FDFLOW_READ}};
-_Static_assert(2 + sizeof calls / sizeof *calls == XRT_FDFLOW_EVENTS,
-               "event table bound");
+#define XRT_FDFLOW_IO_FIT(name, num, op)                                                           \
+  _Static_assert((num) >= 0 && (num) <= 65535, #name);
+XRT_FDFLOW_EACH_IO(XRT_FDFLOW_IO_FIT)
+#undef XRT_FDFLOW_IO_FIT
+#define XRT_FDFLOW_IO_ROW(name, num, op) {#name, (uint16_t)(num), (uint8_t)(op)},
+#if XRT_FDFLOW_IO_COUNT == 0
+static const struct io_call calls[1];
+#else
+static const struct io_call calls[] = {XRT_FDFLOW_EACH_IO(XRT_FDFLOW_IO_ROW)};
+#endif
+#undef XRT_FDFLOW_IO_ROW
+_Static_assert(2 + XRT_FDFLOW_IO_COUNT <= XRT_FDFLOW_EVENTS, "event table bound");
+#if defined(__x86_64__) && !defined(__ILP32__)
+_Static_assert(2 + XRT_FDFLOW_IO_COUNT == XRT_FDFLOW_EVENTS, "x86 keeps 16 events");
+#endif
 struct cpu_sources {
   struct xrt_fdflow_source events[XRT_FDFLOW_EVENTS];
   uint32_t source_cpu;
@@ -41,7 +47,7 @@ struct xrt_fdflow {
   struct xrt_fdflow_record *records;
   struct merge_cpu *merge;
   uint32_t *heap;
-  uint32_t capacity, limit;
+  uint32_t capacity, limit, event_count;
   uint64_t last_time;
   int oom;
   struct xrt_fdflow_snapshot view;
@@ -150,8 +156,8 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
     xrt_perf_fail(f, "fd.flow", EINVAL, -1, "invalid scope or capture limits");
     return XRT_INVALID_ARGUMENT;
   }
-#if !defined(__x86_64__)
-  fail(f, 0, "native Linux x86-64 IO tracepoints only");
+#if XRT_FDFLOW_IO_COUNT == 0
+  fail(f, EOPNOTSUPP, "no native IO syscalls in this architecture's headers");
   return XRT_UNSUPPORTED_ARCHITECTURE;
 #endif
   struct xrt_fdflow_source spec[XRT_FDFLOW_EVENTS] = {0};
@@ -163,18 +169,32 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
                                           : XRT_FILE_UNAVAILABLE;
   /* Named entry events can copy user buffers on newer kernels. Raw entry
    * supplies only register arguments; a named exit corroborates native ABI
-   * and operation, without subscribing to those payload-bearing events. */
-  for (uint32_t i = 0; i < sizeof calls / sizeof *calls; ++i) {
-    uint32_t slot = 2 + i;
+   * and operation, without subscribing to those payload-bearing events.
+   * A kernel without one named exit drops that call. Permission and a layout
+   * this decoder cannot parse still refuse the whole capture. */
+  uint32_t nspec = 2, dropped = 0;
+  for (uint32_t i = 0; i < XRT_FDFLOW_IO_COUNT; ++i) {
+    struct xrt_fdflow_source slot = {.number = calls[i].number,
+                                     .operation = calls[i].operation,
+                                     .exit = 1};
     char name[80];
-    spec[slot] = (struct xrt_fdflow_source){
-        .number = calls[i].number, .operation = calls[i].operation, .exit = 1};
+    struct xrt_perf_failure one = {0};
     snprintf(name, sizeof name, "sys_exit_%s", calls[i].name);
-    if (!metadata("syscalls", name, &spec[slot], f))
-      return f->kind == XRT_PERF_PERMISSION ? XRT_PERMISSION_DENIED
+    if (!metadata("syscalls", name, &slot, &one)) {
+      if (one.kind == XRT_PERF_UNAVAILABLE) {
+        ++dropped;
+        continue;
+      }
+      if (f)
+        *f = one;
+      return one.kind == XRT_PERF_PERMISSION ? XRT_PERMISSION_DENIED
                                             : XRT_FILE_UNAVAILABLE;
+    }
+    spec[nspec++] = slot;
   }
-  for (uint32_t i = 0; i < XRT_FDFLOW_EVENTS; ++i)
+  if (nspec == 2)
+    return fail(f, ENOENT, "no named IO exit tracepoints");
+  for (uint32_t i = 0; i < nspec; ++i)
     for (uint32_t j = 0; j < i; ++j)
       if (spec[i].type == spec[j].type)
         return fail(f, EPROTO, "duplicate tracepoint IDs");
@@ -192,6 +212,7 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
   if (!c)
     return fail(f, ENOMEM, "flow owner allocation");
   c->limit = o->record_limit ? o->record_limit : 32768;
+  c->event_count = nspec;
   c->sources = calloc(count, sizeof *c->sources);
   c->cpus = calloc(count, sizeof *c->cpus);
   c->perf =
@@ -206,7 +227,7 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
   c->view.online_cpus = total;
   c->view.scoped = !!o->scoped;
   struct xrt_perf_attr attrs[XRT_FDFLOW_EVENTS] = {0};
-  for (uint32_t i = 0; i < XRT_FDFLOW_EVENTS; ++i) {
+  for (uint32_t i = 0; i < c->event_count; ++i) {
     attrs[i].size = 96;
     attrs[i].type = PERF_TYPE_TRACEPOINT;
     attrs[i].config = spec[i].type;
@@ -220,13 +241,13 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
   struct xrt_perf_failure failure = {0};
   for (uint32_t i = 0; i < count; ++i) {
     c->cpus[i].cpu = online[i];
-    int ok = xrt_perf_add_cpu(c->perf, online[i], attrs, XRT_FDFLOW_EVENTS,
+    int ok = xrt_perf_add_cpu(c->perf, online[i], attrs, c->event_count,
                               o->scoped ? filter : NULL, &failure);
     if (!ok && failure.error == EINVAL && failure.syscall &&
         !strcmp(failure.syscall, "perf_event_open") && attrs[0].read_format) {
-      for (uint32_t e = 0; e < XRT_FDFLOW_EVENTS; ++e)
+      for (uint32_t e = 0; e < c->event_count; ++e)
         attrs[e].read_format = 0;
-      ok = xrt_perf_add_cpu(c->perf, online[i], attrs, XRT_FDFLOW_EVENTS,
+      ok = xrt_perf_add_cpu(c->perf, online[i], attrs, c->event_count,
                             o->scoped ? filter : NULL, &failure);
       c->view.flags |= XRT_FDFLOW_LOSS_UNKNOWN;
     }
@@ -239,11 +260,11 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
     c->sources[slot].source_cpu = i;
     struct xrt_perf_thread thread;
     if (!xrt_perf_thread(c->perf, slot, &thread) ||
-        thread.event_count != XRT_FDFLOW_EVENTS) {
+        thread.event_count != c->event_count) {
       xrt_fdflow_close(c);
       return fail(f, EPROTO, "CPU event identity unavailable");
     }
-    for (uint32_t e = 0; e < XRT_FDFLOW_EVENTS; ++e) {
+    for (uint32_t e = 0; e < c->event_count; ++e) {
       c->sources[slot].events[e] = spec[e];
       c->sources[slot].events[e].id = thread.event_ids[e];
     }
@@ -266,8 +287,10 @@ enum xrt_status xrt_fdflow_open(const struct xrt_fdflow_options *o,
   xrt_perf_info(c->perf, &info);
   c->view.ring_bytes = info.allocated_ring_bytes;
   c->view.running = 1;
-  c->view.reason = "native x86-64 supported IO; CPUs online at capture start; "
-                   "compat IO unavailable";
+  c->view.reason = dropped ? "native supported IO; a named exit was absent; "
+                             "CPUs online at capture start; compat IO unavailable"
+                           : "native supported IO; CPUs online at capture start; "
+                             "compat IO unavailable";
   *out = c;
   return XRT_OK;
 }
@@ -304,7 +327,7 @@ static int next_record(struct xrt_fdflow *c, uint32_t index, uint64_t cutoff) {
       !xrt_perf_copy(ring->data, ring->size, ring->tail + m->used, bytes, size))
     return -1;
   const struct cpu_sources *cpu = &c->sources[index];
-  if (!xrt_fdflow_decode(bytes, size, cpu->events, XRT_FDFLOW_EVENTS, &m->next))
+  if (!xrt_fdflow_decode(bytes, size, cpu->events, c->event_count, &m->next))
     return -1;
   m->size = size;
   m->next.cpu = (uint32_t)c->cpus[cpu->source_cpu].cpu;

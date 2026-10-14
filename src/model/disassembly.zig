@@ -25,6 +25,7 @@ fn capstoneArch(architecture: Arch) c.cs_arch {
         .aarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_AARCH64 else c.CS_ARCH_ARM64,
         .m68k => c.CS_ARCH_M68K,
         .loongarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_ARCH_LOONGARCH else unreachable,
+        .riscv64 => c.CS_ARCH_RISCV,
         .ppc64le => c.CS_ARCH_PPC,
     };
 }
@@ -34,6 +35,8 @@ fn capstoneMode(architecture: Arch) c.cs_mode {
         .aarch64 => c.CS_MODE_ARM,
         .m68k => c.CS_MODE_BIG_ENDIAN | c.CS_MODE_M68K_040,
         .loongarch64 => if (comptime c.CS_API_MAJOR >= 6) c.CS_MODE_LOONGARCH64 else unreachable,
+        // Compressed encodings are part of the LP64D userspace ABI.
+        .riscv64 => if (comptime c.CS_API_MAJOR < 6) c.CS_MODE_RISCV64 | c.CS_MODE_RISCVC else unreachable,
         // Little-endian is Capstone's default. CS_MODE_BIG_ENDIAN would select the other endian.
         .ppc64le => c.CS_MODE_64,
     };
@@ -43,6 +46,8 @@ fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instru
     if (address > std.math.maxInt(u64) - bytes.len) return error.InvalidAddress;
     // Capstone 5 has no LoongArch decoder. Capstone 6 opens CS_ARCH_LOONGARCH.
     if (architecture == .loongarch64 and comptime c.CS_API_MAJOR < 6) return error.DisassemblerUnavailable;
+    // scripts/build-capstone leaves RISC-V out of the vendored Capstone 6.
+    if (architecture == .riscv64 and comptime c.CS_API_MAJOR >= 6) return error.DisassemblerUnavailable;
     var handle: c.csh = 0;
     if (c.cs_open(capstoneArch(architecture), capstoneMode(architecture), &handle) != c.CS_ERR_OK) return error.DisassemblerUnavailable;
     defer _ = c.cs_close(&handle);
@@ -125,6 +130,40 @@ fn decodeImpl(architecture: Arch, bytes: []const u8, address: u64, out: []Instru
                 if (raw.id != c.LOONGARCH_INS_JIRL and (out[i].flow == .call or out[i].flow == .jump or out[i].flow == .conditional)) {
                     for (la.operands[0..la.op_count]) |operand| if (operand.type == c.LOONGARCH_OP_IMM) {
                         out[i].target = @bitCast(operand.unnamed_0.imm);
+                    };
+                }
+            } else unreachable;
+        } else if (architecture == .riscv64) {
+            if (comptime c.CS_API_MAJOR < 6) {
+                // Capstone 5 puts every jal and jalr in the CALL group and lists
+                // jalr's register offset as an immediate. The encoding names rd.
+                const rv = raw.detail.*.unnamed_0.riscv;
+                const half = @as(u32, raw.bytes[0]) | @as(u32, raw.bytes[1]) << 8;
+                const word = if (raw.size == 4) half | @as(u32, raw.bytes[2]) << 16 | @as(u32, raw.bytes[3]) << 24 else half;
+                const rd = (word >> 7) & 0x1f;
+                const rs1 = (word >> 15) & 0x1f;
+                const jal = raw.size == 4 and word & 0x7f == 0x6f;
+                const jalr = raw.size == 4 and word & 0x7f == 0x67;
+                const indirect = jalr or raw.id == c.RISCV_INS_C_JR or raw.id == c.RISCV_INS_C_JALR;
+                out[i].flow = if (raw.id == c.RISCV_INS_EBREAK or raw.id == c.RISCV_INS_C_EBREAK)
+                    .trap
+                else if (raw.id == c.RISCV_INS_MRET or raw.id == c.RISCV_INS_SRET or raw.id == c.RISCV_INS_URET or
+                    (jalr and rd == 0 and rs1 == 1) or (raw.size == 2 and word == 0x8082))
+                    .ret
+                else if (((jal or jalr) and rd != 0) or raw.id == c.RISCV_INS_C_JAL or raw.id == c.RISCV_INS_C_JALR)
+                    .call
+                else if (jal or jalr or raw.id == c.RISCV_INS_C_J or raw.id == c.RISCV_INS_C_JR)
+                    .jump
+                else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_BRANCH_RELATIVE) != null)
+                    .conditional
+                else if (std.mem.indexOfScalar(u8, groups, c.CS_GRP_INT) != null or raw.id == c.RISCV_INS_ECALL)
+                    .system
+                else
+                    .ordinary;
+                // A direct jal or branch immediate is PC-relative.
+                if (!indirect and (out[i].flow == .call or out[i].flow == .jump or out[i].flow == .conditional)) {
+                    for (rv.operands[0..rv.op_count]) |operand| if (operand.type == c.RISCV_OP_IMM) {
+                        out[i].target = raw.address +% @as(u64, @bitCast(operand.unnamed_0.imm));
                     };
                 }
             } else unreachable;
@@ -255,6 +294,58 @@ test "loongarch disassembly follows the linked Capstone" {
     try std.testing.expectEqualStrings("ret", std.mem.sliceTo(&instructions[0].mnemonic, 0));
     try std.testing.expectEqual(Flow.ret, instructions[0].flow);
     try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+}
+
+test "riscv64 disassembly follows the linked Capstone" {
+    var instructions: [1]Instruction = undefined;
+    if (comptime c.CS_API_MAJOR >= 6) {
+        try std.testing.expectError(error.DisassemblerUnavailable, decodeFlowFor(.riscv64, &.{ 0x02, 0x90 }, 0x1000, &instructions));
+        return;
+    }
+    const trap = try decodeFlowFor(.riscv64, &.{ 0x02, 0x90 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), trap);
+    try std.testing.expectEqual(@as(u16, 2), instructions[0].size);
+    try std.testing.expectEqual(Flow.trap, instructions[0].flow);
+    const ebreak = try decodeFlowFor(.riscv64, &.{ 0x73, 0x00, 0x10, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(usize, 1), ebreak);
+    try std.testing.expectEqual(@as(u16, 4), instructions[0].size);
+    try std.testing.expectEqual(Flow.trap, instructions[0].flow);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x13, 0x00, 0x00, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.ordinary, instructions[0].flow);
+    _ = try decodeFlowFor(.riscv64, &.{ 0xef, 0x00, 0x80, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.call, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1008), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x67, 0x80, 0x00, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.ret, instructions[0].flow);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x82, 0x80 }, 0x1000, &instructions);
+    try std.testing.expectEqual(@as(u16, 2), instructions[0].size);
+    try std.testing.expectEqual(Flow.ret, instructions[0].flow);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x82, 0x90 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.call, instructions[0].flow);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x01, 0xa0 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.jump, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1000), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x63, 0x84, 0xb5, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.conditional, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1008), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x73, 0x00, 0x00, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.system, instructions[0].flow);
+    // Capstone 5 groups these as calls. rd = x0 is a jump; jalr has no static target.
+    _ = try decodeFlowFor(.riscv64, &.{ 0x6f, 0x00, 0x80, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.jump, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1008), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x67, 0x80, 0x02, 0x00 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.jump, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0xe7, 0x80, 0x07, 0x01 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.call, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x82, 0x82 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.jump, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, null), instructions[0].target);
+    _ = try decodeFlowFor(.riscv64, &.{ 0x01, 0xc5 }, 0x1000, &instructions);
+    try std.testing.expectEqual(Flow.conditional, instructions[0].flow);
+    try std.testing.expectEqual(@as(?u64, 0x1008), instructions[0].target);
 }
 
 test "ppc64le disassembly follows the linked Capstone" {

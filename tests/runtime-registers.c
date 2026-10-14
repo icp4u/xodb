@@ -11,6 +11,7 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
+#include <sys/uio.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #if defined(__x86_64__) && !defined(__ILP32__)
@@ -416,6 +417,7 @@ static void contract(void)
                           : native->machine == XRT_AARCH64    ? "x9"
                           : native->machine == XRT_LOONGARCH  ? "r12"
                           : native->machine == XRT_PPC64      ? "r12"
+                          : native->machine == XRT_RISCV      ? "a2"
                                                               : "d2";
     const struct xrt_register_desc *field =
         xrt_arch_register(native->machine, scratch, strlen(scratch));
@@ -447,6 +449,86 @@ static void contract(void)
     struct xrt_control_request one = {.count = 1, .value = {0x1000}};
     CHECK(xrt_control_write(1, &one, &io, &result) == XRT_PARTIAL_REGISTER_WRITE);
     CHECK(result.issued && !result.confirmed && bank.writes == 1 && bank.reads == 2);
+}
+
+static void riscv_replay(void)
+{
+    const struct xrt_arch *arch = xrt_arch_get(XRT_RISCV);
+    struct xrt_registers regs;
+    struct xrt_step_resources step;
+    struct xrt_probe_request request;
+    struct xrt_probe_encoding encoding;
+    unsigned char image[257];
+    unsigned char saved_bytes[sizeof(regs)];
+    uint64_t values[XRT_DWARF_REGISTER_COUNT];
+    uint8_t present[XRT_DWARF_REGISTER_COUNT];
+    uint64_t pc = 99;
+    uint64_t scanned = 7;
+    CHECK(arch && xrt_arch_validate(arch) == XRT_OK);
+    CHECK(arch->kernel_gpr_bytes == 256 && arch->register_count == 32 && arch->dwarf_count == 32);
+    CHECK(arch->hardware_step == 0 && arch->breakpoint_adjust == 0 && arch->caller_adjust == 2);
+    CHECK(arch->trap_size == 2 && arch->trap[0] == 0x02 && arch->trap[1] == 0x90);
+    CHECK(xrt_arch_resolve(xrt_arch_abi(arch)) == arch);
+    {
+        struct xrt_abi_id foreign = xrt_arch_abi(arch);
+        foreign.little_endian = 0;
+        CHECK(xrt_arch_resolve(foreign) == NULL);
+    }
+    CHECK(xrt_arch_step_resources(arch, XRT_ISA_MODE_ORDINARY, &step) == XRT_OK);
+    CHECK(step.hardware_step == 0 && step.software_probes == 0);
+    memset(&encoding, 0x5a, sizeof(encoding));
+    request = (struct xrt_probe_request){.address = 0x1000,
+                                         .isa_mode = XRT_ISA_MODE_ORDINARY,
+                                         .bytes = arch->trap,
+                                         .size = 2};
+    CHECK(xrt_arch_probe_prepare(arch, &request, &encoding) == XRT_OK);
+    CHECK(encoding.width == 2 && encoding.bytes[0] == 0x02 && encoding.bytes[1] == 0x90);
+    CHECK(xrt_arch_breakpoint_pc(XRT_RISCV, 0x1000, &pc) && pc == 0x1000);
+    CHECK(xrt_arch_caller_pc(XRT_RISCV, 0x1000, &pc) && pc == 0xffe);
+    CHECK(!xrt_arch_caller_pc(XRT_RISCV, 1, &pc) && pc == 0xffe);
+    CHECK(xrt_arch_breakpoint_valid(XRT_RISCV, 0x1000, 2));
+    CHECK(!xrt_arch_breakpoint_valid(XRT_RISCV, 0x1001, 2));
+    CHECK(!xrt_arch_breakpoint_valid(XRT_RISCV, 0x1000, 4));
+    memset(image, 0, sizeof(image));
+    for (size_t i = 0; i < 32; ++i)
+        for (size_t b = 0; b < 8; ++b)
+            image[1 + i * 8 + b] = (unsigned char)(word(i) >> (b * 8));
+    memset(&regs, 0xa5, sizeof(regs));
+    {
+        const struct xrt_abi_id abi = xrt_arch_abi(arch);
+        memcpy(saved_bytes, &regs, sizeof(regs));
+        CHECK(xrt_registers_decode(&abi, image + 1, 255, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(memcmp(&regs, saved_bytes, sizeof(regs)) == 0);
+        CHECK(xrt_registers_decode(&abi, image + 1, 257, &regs) == XRT_UNEXPECTED_REGISTER_SIZE);
+        CHECK(xrt_registers_decode(&abi, NULL, 256, &regs) == XRT_INVALID_ARGUMENT);
+        CHECK(xrt_registers_decode(&abi, image + 1, 256, &regs) == XRT_OK);
+    }
+    CHECK(regs.values.riscv.pc == word(0) && regs.values.riscv.ra == word(1));
+    CHECK(regs.values.riscv.sp == word(2) && regs.values.riscv.a0 == word(10));
+    CHECK(regs.values.riscv.a2 == word(12) && regs.values.riscv.t6 == word(31));
+    memset(values, 0xa5, sizeof(values));
+    memset(present, 0xa5, sizeof(present));
+    CHECK(xrt_registers_dwarf(&regs, values, present, XRT_DWARF_REGISTER_COUNT) == XRT_OK);
+    CHECK(present[0] == 0 && values[0] == UINT64_C(0xa5a5a5a5a5a5a5a5));
+    for (size_t i = 1; i < 32; ++i)
+        CHECK(values[i] == word(i) && present[i] == 1);
+    CHECK(present[32] == 0 && values[32] == UINT64_C(0xa5a5a5a5a5a5a5a5));
+    CHECK(xrt_registers_value_dwarf(&regs, 0, &scanned) == XRT_UNKNOWN_REGISTER && scanned == 7);
+    CHECK(xrt_arch_dwarf_name(XRT_RISCV, 0) == NULL);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_RISCV, 1), "ra") == 0);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_RISCV, 2), "sp") == 0);
+    CHECK(strcmp(xrt_arch_dwarf_name(XRT_RISCV, 31), "t6") == 0);
+    CHECK(xrt_registers_pc(&regs, &pc) == XRT_OK && pc == word(0));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_SP, &pc) == XRT_OK && pc == word(2));
+    CHECK(xrt_registers_role(&regs, XRT_ROLE_RA, &pc) == XRT_OK && pc == word(1));
+    CHECK(xrt_arch_register(XRT_RISCV, "x0", 2) == NULL);
+    CHECK(arch->registers[0].access == XRT_REG_READ_WRITE && strcmp(arch->registers[0].name, "pc") == 0);
+    {
+        unsigned char raw[256];
+        memset(raw, 0, sizeof(raw));
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "x0", 2, 1) == XRT_UNKNOWN_REGISTER);
+        CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "a2", 2, 1) == XRT_OK);
+    }
 }
 
 static void loongarch_replay(void)
@@ -807,6 +889,7 @@ int main(int argc, char **argv)
     descriptors();
     contract();
     loongarch_replay();
+    riscv_replay();
     ppc64_replay();
     partial_regsets();
     const struct xrt_arch *arch = xrt_arch_native();
@@ -832,6 +915,28 @@ int main(int argc, char **argv)
     XRT_X86_REGISTERS(COMPARE_KERNEL)
 #undef COMPARE_KERNEL
 #endif
+#if defined(__riscv) && __riscv_xlen == 64
+    /* The kernel rewrote every NT_PRSTATUS byte on the measured guest.
+     * A hole would disagree between a poisoned buffer and a zeroed one. */
+    unsigned char poisoned[256], zeroed[256];
+    memset(poisoned, 0xa5, sizeof(poisoned));
+    struct iovec poisoned_io = {.iov_base = poisoned, .iov_len = sizeof(poisoned)};
+    CHECK(ptrace(PTRACE_GETREGSET, child, (void *)(uintptr_t)1, &poisoned_io) == 0);
+    CHECK(poisoned_io.iov_len == 256);
+    memset(zeroed, 0, sizeof(zeroed));
+    struct iovec zeroed_io = {.iov_base = zeroed, .iov_len = sizeof(zeroed)};
+    CHECK(ptrace(PTRACE_GETREGSET, child, (void *)(uintptr_t)1, &zeroed_io) == 0);
+    CHECK(zeroed_io.iov_len == 256);
+    CHECK(memcmp(poisoned, zeroed, sizeof(zeroed)) == 0);
+#define COMPARE_RISCV(name, dwarf, word, id, role)                                                 \
+    do {                                                                                           \
+        uint64_t kernel_word = 0;                                                                  \
+        memcpy(&kernel_word, zeroed + (word) * 8, 8);                                              \
+        CHECK(before.values.riscv.name == kernel_word);                                           \
+    } while (0);
+    XRT_RISCV_REGISTERS(COMPARE_RISCV)
+#undef COMPARE_RISCV
+#endif
     uint64_t values[XRT_DWARF_REGISTER_COUNT];
     uint8_t present[XRT_DWARF_REGISTER_COUNT];
     CHECK(xrt_registers_dwarf(&before, values, present, XRT_DWARF_REGISTER_COUNT) == XRT_OK);
@@ -848,6 +953,7 @@ int main(int argc, char **argv)
     const char *scratch = arch->machine == XRT_X86_64      ? "r10"
                           : arch->machine == XRT_LOONGARCH ? "r12"
                           : arch->machine == XRT_PPC64     ? "r12"
+                          : arch->machine == XRT_RISCV     ? "a2"
                                                            : "x9";
     CHECK(xrt_register_write(child, scratch, strlen(scratch), UINT64_C(0xabcdef1234567890)) ==
           XRT_OK);
@@ -858,6 +964,8 @@ int main(int argc, char **argv)
         CHECK(after.values.loongarch.r12 == UINT64_C(0xabcdef1234567890));
     else if (arch->machine == XRT_PPC64)
         CHECK(after.values.ppc.r12 == UINT64_C(0xabcdef1234567890));
+    else if (arch->machine == XRT_RISCV)
+        CHECK(after.values.riscv.a2 == UINT64_C(0xabcdef1234567890));
     else
         CHECK(after.values.arm.x9 == UINT64_C(0xabcdef1234567890));
     /* A thread pointer is listed on x86-64 and is never writable (the kernel

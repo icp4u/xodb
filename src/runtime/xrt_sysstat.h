@@ -200,6 +200,7 @@ struct xrt_sys_network {
 };
 
 enum xrt_sys_proto { XRT_SYS_TCP = 1, XRT_SYS_UDP = 2, XRT_SYS_UNIX = 3 };
+#define XRT_SYS_MAX_HOLDERS 8
 struct xrt_sys_conn {
     uint8_t proto, family;                  /* family 4, 6 or 0 for unix */
     char state[16];                         /* "ESTABLISHED", "LISTEN", "UNCONN", ... */
@@ -209,6 +210,9 @@ struct xrt_sys_conn {
     struct xrt_sys_u64 pid;                 /* owner, via fd inode scan */
     char comm[16];                          /* owner comm when pid is OK */
     struct xrt_sys_u64 rx_queue, tx_queue;
+    uint32_t holder_count;                  /* every process seen holding the inode */
+    int32_t holders[XRT_SYS_MAX_HOLDERS];   /* the first of them, by pid */
+    uint8_t external;                       /* inet, remote neither loopback nor wildcard */
 };
 struct xrt_sys_connections {
     uint32_t count, capacity, truncated;     /* truncated: dropped past capacity */
@@ -294,6 +298,7 @@ struct xrt_sys_proc {
     struct xrt_sys_u64 fds;
     struct xrt_sys_u64 nice, kernel_thread;  /* nice is biased by +20: 0..39 */
     struct xrt_sys_name cgroup;
+    int32_t pgid, sid;                      /* process group and session; 0 = unknown */
 };
 struct xrt_sys_processes {
     uint32_t count, capacity, truncated;
@@ -385,13 +390,25 @@ void xrt_sys_snapshot_redact(struct xrt_sys_snapshot *);
  * {"state":"unavailable","why":"needs privilege"} otherwise. */
 enum xrt_sys_sort {
     XRT_SYS_SORT_PID, XRT_SYS_SORT_CPU, XRT_SYS_SORT_MEMORY,
-    XRT_SYS_SORT_IO, XRT_SYS_SORT_FDS, XRT_SYS_SORT_THREADS, XRT_SYS_SORT_START
+    XRT_SYS_SORT_IO, XRT_SYS_SORT_FDS, XRT_SYS_SORT_THREADS, XRT_SYS_SORT_START,
+    XRT_SYS_SORT_AGE                    /* oldest first */
 };
 struct xrt_sys_json_opts {
     uint32_t groups;            /* subset of snapshot->groups to emit */
     uint32_t sort;              /* xrt_sys_sort, processes only */
     uint32_t limit;             /* max processes/connections/sensors rows; 0 = all */
     int32_t pid;                /* > 0: only this process (and its connections) */
+    /* Process rows only; zero/NULL means no filter. A filter sees the
+     * snapshot as given, so a redacted copy matches no hidden text. */
+    uint32_t offset;            /* skip this many matching sorted rows (or connection rows) */
+    const char *match;          /* substring of comm or cmdline, ASCII case-insensitive */
+    const char *user;           /* user name, or decimal uid */
+    char state;                 /* one /proc state letter: R S D Z T t I X */
+    /* Connection rows only; offset above and user (decimal uid) apply too. */
+    const char *conn_state;     /* exact state, e.g. "ESTABLISHED" */
+    uint8_t conn_proto;         /* xrt_sys_proto; 0 = any */
+    uint8_t conn_external;      /* only sockets whose remote is not loopback or wildcard */
+    uint8_t conn_queued;        /* only sockets with bytes queued (rx or tx) */
 };
 /* Returns a malloc'd NUL-terminated string (caller frees) or NULL on OOM. */
 char *xrt_sys_json(const struct xrt_sys_snapshot *, const struct xrt_sys_json_opts *);

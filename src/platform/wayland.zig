@@ -81,6 +81,9 @@ pub const Window = struct {
     decoration_mode: u32 = 0,
     width: u32 = 1280,
     height: u32 = 800,
+    surface_width: u32 = 1280,
+    surface_height: u32 = 800,
+    backing_scale: f32 = 1,
     configured: bool = false,
     /// From the latest xdg_toplevel configure; the compositor decides it.
     maximized: bool = false,
@@ -102,6 +105,8 @@ pub const Window = struct {
 
     // Call on the final address: Wayland listeners retain this pointer.
     pub fn init(self: *Window) !void {
+        self.surface_width = self.width;
+        self.surface_height = self.height;
         self.input = Keyboard.init(null);
         self.input.trace = c.getenv("XODB_INPUT_TRACE") != null;
         errdefer self.input.deinit();
@@ -257,6 +262,12 @@ pub const Window = struct {
     pub fn scale(self: *const Window) f32 {
         return self.effective_scale;
     }
+    pub fn bufferExtent(self: *const Window) platform.Extent {
+        return .{ .width = platform.deviceExtent(self.surface_width, self.backing_scale), .height = platform.deviceExtent(self.surface_height, self.backing_scale) };
+    }
+    fn pointerUnits(self: *const Window, value: i32) f32 {
+        return @as(f32, @floatFromInt(value)) / 256 * self.backing_scale / self.scale();
+    }
     fn reportedScale(self: *const Window) f32 {
         if (self.fractional_preferred > 0) return @as(f32, @floatFromInt(self.fractional_preferred)) / 120;
         if (self.surface_preferred > 0) return @floatFromInt(self.surface_preferred);
@@ -268,8 +279,9 @@ pub const Window = struct {
     }
     fn applyScale(self: *Window) void {
         const reported = self.reportedScale();
-        const requested = self.scale_override orelse reported;
-        const bounded = std.math.clamp(requested, platform.min_ui_scale, platform.max_ui_scale);
+        // The compositor always receives native-resolution pixels. The UI
+        // override changes how many of those pixels each UI unit occupies.
+        const bounded = std.math.clamp(reported, platform.min_ui_scale, platform.max_ui_scale);
         const surface_version = if (self.surface_ready) c.wl_proxy_get_version(@ptrCast(self.surface)) else 0;
         const next = if (self.viewport != null)
             bounded
@@ -280,18 +292,26 @@ pub const Window = struct {
         if (self.surface_ready) {
             if (self.viewport) |viewport| {
                 if (surface_version >= c.WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) c.wl_surface_set_buffer_scale(self.surface, 1);
-                c.wp_viewport_set_destination(viewport, @intCast(self.width), @intCast(self.height));
+                c.wp_viewport_set_destination(viewport, @intCast(self.surface_width), @intCast(self.surface_height));
             } else if (surface_version >= c.WL_SURFACE_SET_BUFFER_SCALE_SINCE_VERSION) {
                 c.wl_surface_set_buffer_scale(self.surface, @intFromFloat(next));
             }
         }
-        const changed = @abs(next - self.effective_scale) >= 0.001;
+        const ui_scale = self.scale_override orelse next;
+        const changed = @abs(ui_scale - self.effective_scale) >= 0.001 or @abs(next - self.backing_scale) >= 0.001;
         if (changed) {
-            self.effective_scale = next;
+            const pointer_ratio = next / ui_scale / (self.backing_scale / self.effective_scale);
+            self.pointer_x *= pointer_ratio;
+            self.pointer_y *= pointer_ratio;
+            self.effective_scale = ui_scale;
+            self.backing_scale = next;
             self.dirty = true;
         }
+        const pixels = self.bufferExtent();
+        self.width = platform.uiExtent(pixels.width, ui_scale);
+        self.height = platform.uiExtent(pixels.height, ui_scale);
         if (self.input.trace and (self.traced_reported_scale == 0 or changed or @abs(reported - self.traced_reported_scale) >= 0.001)) {
-            log.info(.window, "ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ next, reported, if (self.scale_override != null) "yes" else "no" });
+            log.info(.window, "ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ ui_scale, reported, if (self.scale_override != null) "yes" else "no" });
             self.traced_reported_scale = reported;
         }
     }
@@ -306,6 +326,10 @@ pub const Window = struct {
     /// The DRM device the compositor renders with, when it says.
     pub fn displayGpu(self: *Window) ?Node {
         return @import("display_gpu.zig").query(self.display);
+    }
+    /// The compositor connection's socket, e.g. to ask who serves it.
+    pub fn displayFd(self: *Window) ?c_int {
+        return c.wl_display_get_fd(self.display);
     }
     /// Changing the active editor cancels both pending and completed old pastes.
     pub fn clipFocus(self: *Window, destination: u64, epoch: u64) void {
@@ -448,8 +472,8 @@ fn resized(data: ?*anyopaque, _: ?*c.xdg_toplevel, width: i32, height: i32, stat
     const w = window(data);
     const list: []const u32 = if (states) |s| (if (s.data) |p| @as([*]const u32, @ptrCast(@alignCast(p)))[0 .. s.size / 4] else &.{}) else &.{};
     w.maximized = hasState(list, c.XDG_TOPLEVEL_STATE_MAXIMIZED);
-    if (width > 0) w.width = @intCast(width);
-    if (height > 0) w.height = @intCast(height);
+    if (width > 0) w.surface_width = @intCast(width);
+    if (height > 0) w.surface_height = @intCast(height);
     w.applyScale();
     w.dirty = true;
 }
@@ -498,8 +522,8 @@ fn repeat(data: ?*anyopaque, _: ?*c.wl_keyboard, rate: i32, delay: i32) callconv
 }
 fn pointerEnter(data: ?*anyopaque, _: ?*c.wl_pointer, serial: u32, _: ?*c.wl_surface, x: i32, y: i32) callconv(.c) void {
     const w = window(data);
-    w.pointer_x = @as(f32, @floatFromInt(x)) / 256;
-    w.pointer_y = @as(f32, @floatFromInt(y)) / 256;
+    w.pointer_x = w.pointerUnits(x);
+    w.pointer_y = w.pointerUnits(y);
     // A cursor must be set on every enter; until then its image is undefined.
     w.pointer_serial = serial;
     w.pointer_inside = true;
@@ -509,8 +533,9 @@ fn pointerLeave(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, _: ?*c.wl_surface)
     window(data).pointer_inside = false;
 }
 fn motion(data: ?*anyopaque, _: ?*c.wl_pointer, _: u32, x: i32, y: i32) callconv(.c) void {
-    window(data).pointer_x = @as(f32, @floatFromInt(x)) / 256;
-    window(data).pointer_y = @as(f32, @floatFromInt(y)) / 256;
+    const w = window(data);
+    w.pointer_x = w.pointerUnits(x);
+    w.pointer_y = w.pointerUnits(y);
     // Hover changes are detected by the workspace; motion alone redraws only while dragging.
     if (window(data).mouse_down) window(data).dirty = true;
 }
@@ -638,6 +663,20 @@ test "maximize state follows the compositor's configure states" {
     try std.testing.expect(!state(&none, 1));
     try std.testing.expect(!state(&[_]u32{ 4, 5, 6 }, 1)); // activated and tiled edges only
     try std.testing.expect(state(&[_]u32{ 4, 1 }, 1));
+}
+
+test "UI override changes layout and pointer units but not backing pixels" {
+    // No protocol objects: exercise the same configure path without a display.
+    var w = Window{ .scale_override = 1, .surface_preferred = 2 };
+    // A surface supporting integer buffer scale, without making protocol calls.
+    // Fractional negotiation itself is covered by the private compositor test.
+    w.backing_scale = 2;
+    w.effective_scale = 1;
+    try std.testing.expectEqual(platform.Extent{ .width = 2560, .height = 1600 }, w.bufferExtent());
+    try std.testing.expectEqual(@as(f32, 700), w.pointerUnits(350 * 256));
+    w.effective_scale = 1.5;
+    try std.testing.expectEqual(@as(f32, 700), w.pointerUnits(525 * 256));
+    try std.testing.expectEqual(platform.Extent{ .width = 2560, .height = 1600 }, w.bufferExtent());
 }
 
 test {

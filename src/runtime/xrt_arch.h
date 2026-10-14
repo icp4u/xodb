@@ -10,6 +10,7 @@
 #define XRT_AARCH64 183
 #define XRT_PPC64 21
 #define XRT_LOONGARCH 258
+#define XRT_RISCV 243
 #define XRT_DWARF_NONE UINT16_MAX
 /* 66 covers the ELFv2 return-address column, DWARF register 65. */
 #define XRT_DWARF_REGISTER_COUNT 66
@@ -143,6 +144,43 @@
     X(pc, XRT_DWARF_NONE, 33, 33, XRT_ROLE_PC)                                                     \
     X(badv, XRT_DWARF_NONE, 34, 34, XRT_ROLE_NONE)
 
+/* RISC-V LP64D NT_PRSTATUS is user_regs_struct: 32 little-endian words.
+ * x0 is not in the image. pc is word 0 and has no DWARF number. ra is the
+ * return-address column (DWARF 1) and sp is DWARF 2. Words 1..31 are x1..x31. */
+#define XRT_RISCV_REGISTERS(X)                                                                     \
+    X(pc, XRT_DWARF_NONE, 0, 0, XRT_ROLE_PC)                                                       \
+    X(ra, 1, 1, 1, XRT_ROLE_RA)                                                                    \
+    X(sp, 2, 2, 2, XRT_ROLE_SP)                                                                    \
+    X(gp, 3, 3, 3, XRT_ROLE_NONE)                                                                  \
+    X(tp, 4, 4, 4, XRT_ROLE_NONE)                                                                  \
+    X(t0, 5, 5, 5, XRT_ROLE_NONE)                                                                  \
+    X(t1, 6, 6, 6, XRT_ROLE_NONE)                                                                  \
+    X(t2, 7, 7, 7, XRT_ROLE_NONE)                                                                  \
+    X(s0, 8, 8, 8, XRT_ROLE_NONE)                                                                  \
+    X(s1, 9, 9, 9, XRT_ROLE_NONE)                                                                  \
+    X(a0, 10, 10, 10, XRT_ROLE_NONE)                                                               \
+    X(a1, 11, 11, 11, XRT_ROLE_NONE)                                                               \
+    X(a2, 12, 12, 12, XRT_ROLE_NONE)                                                               \
+    X(a3, 13, 13, 13, XRT_ROLE_NONE)                                                               \
+    X(a4, 14, 14, 14, XRT_ROLE_NONE)                                                               \
+    X(a5, 15, 15, 15, XRT_ROLE_NONE)                                                               \
+    X(a6, 16, 16, 16, XRT_ROLE_NONE)                                                               \
+    X(a7, 17, 17, 17, XRT_ROLE_NONE)                                                               \
+    X(s2, 18, 18, 18, XRT_ROLE_NONE)                                                               \
+    X(s3, 19, 19, 19, XRT_ROLE_NONE)                                                               \
+    X(s4, 20, 20, 20, XRT_ROLE_NONE)                                                               \
+    X(s5, 21, 21, 21, XRT_ROLE_NONE)                                                               \
+    X(s6, 22, 22, 22, XRT_ROLE_NONE)                                                               \
+    X(s7, 23, 23, 23, XRT_ROLE_NONE)                                                               \
+    X(s8, 24, 24, 24, XRT_ROLE_NONE)                                                               \
+    X(s9, 25, 25, 25, XRT_ROLE_NONE)                                                               \
+    X(s10, 26, 26, 26, XRT_ROLE_NONE)                                                              \
+    X(s11, 27, 27, 27, XRT_ROLE_NONE)                                                              \
+    X(t3, 28, 28, 28, XRT_ROLE_NONE)                                                               \
+    X(t4, 29, 29, 29, XRT_ROLE_NONE)                                                               \
+    X(t5, 30, 30, 30, XRT_ROLE_NONE)                                                               \
+    X(t6, 31, 31, 31, XRT_ROLE_NONE)
+
 /* ppc64le ELFv2 NT_PRSTATUS is 48 little-endian words. The first 44 are
  * pt_regs. The kernel writes the last four; they stay in the raw image and
  * have no names here. nip is published as pc and has no DWARF number. r1 is
@@ -231,6 +269,9 @@ struct xrt_arm_registers {
 struct xrt_loongarch_registers {
     XRT_LOONGARCH_REGISTERS(XRT_REGISTER_FIELD)
 };
+struct xrt_riscv_registers {
+    XRT_RISCV_REGISTERS(XRT_REGISTER_FIELD)
+};
 struct xrt_ppc64_registers {
     XRT_PPC64_REGISTERS(XRT_REGISTER_FIELD)
 };
@@ -290,6 +331,7 @@ struct xrt_registers {
         struct xrt_arm_registers arm;
         struct xrt_m68k_registers m68k;
         struct xrt_loongarch_registers loongarch;
+        struct xrt_riscv_registers riscv;
         struct xrt_ppc64_registers ppc;
     } values;
 };

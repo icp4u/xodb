@@ -36,6 +36,7 @@ int main(int argc, char **argv) {
     struct xrt_fdflow *c = calloc(1, sizeof *c);
     CHECK(c);
     c->limit = 1;
+    c->event_count = XRT_FDFLOW_EVENTS;
     c->perf = xrt_perf_create(1, 2, 2 * xrt_perf_page_size());
     CHECK(c->perf);
     c->sources = calloc(2, sizeof *c->sources);

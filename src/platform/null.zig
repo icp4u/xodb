@@ -79,11 +79,17 @@ pub const Window = struct {
     pub fn scale(self: *const Window) f32 {
         return self.scale_override orelse 1;
     }
+    pub fn bufferExtent(self: *const Window) platform.Extent {
+        return .{ .width = platform.deviceExtent(self.width, self.scale()), .height = platform.deviceExtent(self.height, self.scale()) };
+    }
     pub const vk_surface_extension: [*:0]const u8 = "VK_EXT_headless_surface";
     pub fn createSurface(_: *Window, _: vk.VkInstance, _: *vk.VkSurfaceKHR) vk.VkResult {
         return vk.VK_ERROR_INITIALIZATION_FAILED;
     }
     pub fn displayGpu(_: *Window) ?Node {
+        return null;
+    }
+    pub fn displayFd(_: *Window) ?c_int {
         return null;
     }
     pub fn clipFocus(_: *Window, _: u64, _: u64) void {}

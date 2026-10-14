@@ -27,7 +27,7 @@ const Allocator = std.mem.Allocator;
 
 pub const magic = "XODBCAPT";
 pub const format_major: u16 = 2;
-pub const format_minor: u16 = 8;
+pub const format_minor: u16 = 9;
 /// Attaching FRAM stamps at least this minor. Minor 8 means typed (PE)
 /// images and is set only by a capture that has them.
 const frames_minor: u16 = 7;
@@ -78,7 +78,10 @@ pub const Tag = enum(u32) {
     annotations = 0x4f4e4e41, // "ANNO"
     thread_scope = 0x50435354, // "TSCP", required feature bit 3
     user_state = 0x41545355, // "USTA", required when feature bit 2 is set
+    evidence_context = 0x58544345, // "ECTX", optional collector context for external evidence (2.9)
 };
+/// Lowest minor that writes ECTX; captures without it keep their previous minor.
+const evidence_context_minor: u16 = 9;
 /// Required sections, in this order. A future minor version may append
 /// sections whose table flag marks them ignorable (bit 0).
 const section_order = [_]Tag{ .meta, .threads, .images, .mappings, .samples, .scheduling, .markers, .intervals, .annotations };
@@ -181,7 +184,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     if (capture.config.sample_limit == 0 or capture.config.sample_limit > capture_model.max_sample_limit) return error.ArchiveLimit;
     try validateUserState(capture);
     try validateThreadScope(capture);
-    var selected_storage: [section_order.len + 5]Tag = undefined;
+    var selected_storage: [section_order.len + 6]Tag = undefined;
     @memcpy(selected_storage[0..section_order.len], &section_order);
     var selected_count: usize = section_order.len;
     if (sampled) {
@@ -202,11 +205,15 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         selected_storage[selected_count] = .producer;
         selected_count += 1;
     }
+    if (capture.net != null) {
+        selected_storage[selected_count] = .evidence_context;
+        selected_count += 1;
+    }
     const selected = selected_storage[0..selected_count];
     if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len + capture.pe_assets.entries.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
-    var bodies: [section_order.len + 5]std.ArrayList(u8) = @splat(.empty);
+    var bodies: [section_order.len + 6]std.ArrayList(u8) = @splat(.empty);
     defer for (&bodies) |*body| body.deinit(a);
     for (selected, bodies[0..selected.len], 0..) |tag, *body, section_index| {
         try progress.step(env.progress, .encoding, section_index);
@@ -226,6 +233,11 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
             .intervals => try encodeIntervals(w, capture),
             .annotations => try encodeAnnotations(w, capture, env.progress),
             .user_state => try encodeUserState(w, capture, env.progress),
+            .evidence_context => {
+                const payload = try capture.net.?.encode(a);
+                defer a.free(payload);
+                try w.out.appendSlice(a, payload);
+            },
         }
     }
     var total: usize = header_bytes + entry_bytes * selected.len;
@@ -236,7 +248,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     @memset(out[0..header_bytes], 0);
     @memcpy(out[0..8], magic);
     std.mem.writeInt(u16, out[8..10], format_major, .little);
-    std.mem.writeInt(u16, out[10..12], if (typed_images) @as(u16, 8) else if (capture.producer != null) 6 else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
+    std.mem.writeInt(u16, out[10..12], if (capture.net != null) evidence_context_minor else if (typed_images) @as(u16, 8) else if (capture.producer != null) 6 else if (capture.syscalls.enabled) 5 else if (custom_limit) 4 else 3, .little);
     std.mem.writeInt(u32, out[12..16], header_bytes, .little);
     std.mem.writeInt(u64, out[16..24], total, .little);
     std.mem.writeInt(u32, out[24..28], @intCast(selected.len), .little);
@@ -250,7 +262,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
         const entry = out[header_bytes + i * entry_bytes ..][0..entry_bytes];
         std.mem.writeInt(u32, entry[0..4], @intFromEnum(tag), .little);
-        std.mem.writeInt(u32, entry[4..8], if (tag == .producer) flag_ignorable else 0, .little);
+        std.mem.writeInt(u32, entry[4..8], if (tag == .producer or tag == .evidence_context) flag_ignorable else 0, .little);
         std.mem.writeInt(u64, entry[8..16], offset, .little);
         std.mem.writeInt(u32, entry[16..20], @intCast(body.items.len), .little);
         std.mem.writeInt(u32, entry[20..24], std.hash.Crc32.hash(body.items), .little);
@@ -654,6 +666,8 @@ pub const Opened = struct {
     bytes: []const u8,
     /// Opaque optional evidence, borrowed from bytes, never an MCP status field.
     frame_bundle: ?[]const u8 = null,
+    /// ECTX payload (src/evidence/sockets.zig), borrowed from bytes.
+    evidence_context: ?[]const u8 = null,
     budget: *Budget,
     resolution_id: [32]u8,
     /// Owns `source` strings and reports. The capture owns its own memory.
@@ -681,7 +695,7 @@ pub const Opened = struct {
     }
 };
 
-const Header = struct { frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
+const Header = struct { evidence_context: ?[]const u8 = null, frames: ?[]const u8 = null, producer: ?[]const u8 = null, syscalls: ?[]const u8 = null, limits: ?[]const u8 = null, thread_scope: ?[]const u8 = null, user_state: ?[]const u8 = null, minor: u16, sections: [section_order.len][]const u8, ignored: usize, required_features: u64, optional_features: u64 };
 fn readHeader(bytes: []const u8, limit: usize) Error!Header {
     if (bytes.len > limit) return error.ArchiveTooLarge;
     if (bytes.len < header_bytes) return error.ArchiveTruncated;
@@ -735,6 +749,9 @@ fn readHeader(bytes: []const u8, limit: usize) Error!Header {
         } else if (tag == @intFromEnum(Tag.producer)) {
             if (flags != flag_ignorable or required != section_order.len or result.producer != null or minor < 6) return error.ArchiveSectionLayout;
             result.producer = body;
+        } else if (tag == @intFromEnum(Tag.evidence_context)) {
+            if (flags != flag_ignorable or required != section_order.len or result.evidence_context != null) return error.ArchiveSectionLayout;
+            result.evidence_context = body;
         } else if (tag == frames_tag) {
             if (flags != flag_ignorable or required != section_order.len or result.frames != null) return error.ArchiveSectionLayout;
             result.frames = body;
@@ -865,7 +882,8 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     // Large immutable evidence gets an exact allocation, avoiding arena growth slack.
     const retained = try a.dupe(u8, bytes);
     const frame_bundle = if (header.frames) |body| retained[@intFromPtr(body.ptr) - @intFromPtr(bytes.ptr) ..][0..body.len] else null;
-    return .{ .capture = self, .source = source, .arena = arena, .bytes = retained, .frame_bundle = frame_bundle, .budget = budget, .resolution_id = resolution.finalResult() };
+    const evidence_context = if (header.evidence_context) |body| retained[@intFromPtr(body.ptr) - @intFromPtr(bytes.ptr) ..][0..body.len] else null;
+    return .{ .capture = self, .source = source, .arena = arena, .bytes = retained, .frame_bundle = frame_bundle, .evidence_context = evidence_context, .budget = budget, .resolution_id = resolution.finalResult() };
 }
 fn decodeMeta(r: *Reader, self: *Capture, source: *Source, a: Allocator) !void {
     source.capture_id = try r.int(u64);
@@ -1690,4 +1708,10 @@ test "archive resolver refuses FIFO without an open side effect" {
     var events: [256]u8 = undefined;
     try std.testing.expectEqual(@as(isize, -1), c.read(monitor, &events, events.len));
     try std.testing.expectEqual(@as(c_int, c.EAGAIN), std.c._errno().*);
+}
+
+/// The ECTX payload of a valid archive, borrowed from `bytes`; null when the
+/// archive has none. Validates the container (header, table, checksums) only.
+pub fn evidenceContext(bytes: []const u8) Error!?[]const u8 {
+    return (try readHeader(bytes, max_file_bytes)).evidence_context;
 }

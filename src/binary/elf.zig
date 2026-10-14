@@ -297,7 +297,7 @@ pub const Image = struct {
             if (!f.is64) return error.UnsupportedClass;
             if (f.endian != .little) return error.UnsupportedEncoding;
         }
-        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k and machine != .loongarch and machine != .ppc64) return error.UnsupportedMachine;
+        if (machine != .x86_64 and machine != .aarch64 and machine != .m68k and machine != .loongarch and machine != .ppc64 and machine != .riscv) return error.UnsupportedMachine;
         if ((machine == .m68k) == f.is64) return error.UnsupportedClass;
         if (f.endian != (if (machine == .m68k) std.builtin.Endian.big else .little)) return error.UnsupportedEncoding;
         if (bytes[6] != 1 or f.read(u32, bytes, 20) != 1) return error.UnsupportedVersion;
@@ -932,7 +932,7 @@ test "synthetic image: unsupported formats are rejected by name" {
         .{ .at = 5, .value = 2, .err = error.UnsupportedEncoding },
         .{ .at = 6, .value = 0, .err = error.UnsupportedVersion },
         .{ .at = 20, .value = 2, .err = error.UnsupportedVersion },
-        .{ .at = 18, .value = 243, .err = error.UnsupportedMachine },
+        .{ .at = 18, .value = 8, .err = error.UnsupportedMachine },
         .{ .at = 16, .value = 1, .err = error.UnsupportedType }, // ET_REL
         .{ .at = 16, .value = 4, .err = error.UnsupportedType }, // ET_CORE
     }) |case| {
@@ -965,6 +965,16 @@ test "ELF64 little-endian ppc64 is accepted" {
     s.buf[19] = 0;
     const image = try Image.parse(&s.buf);
     try testing.expectEqual(Machine.ppc64, image.header.machine);
+    try testing.expect(image.format.is64);
+    try testing.expectEqual(std.builtin.Endian.little, image.format.endian);
+}
+
+test "ELF64 little-endian RISC-V is accepted" {
+    var s = Synthetic.init();
+    s.buf[18] = 0xf3;
+    s.buf[19] = 0;
+    const image = try Image.parse(&s.buf);
+    try testing.expectEqual(Machine.riscv, image.header.machine);
     try testing.expect(image.format.is64);
     try testing.expectEqual(std.builtin.Endian.little, image.format.endian);
 }

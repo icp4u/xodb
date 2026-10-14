@@ -1,0 +1,134 @@
+[
+  {
+    "name": "list_streams",
+    "description": "External evidence streams opened with --open-pcap: format, interfaces with link types and loss counters (ISB ifdrop/osdrop, epb_dropcount, truncated records), file stop state (complete/truncated/corrupt/limit with byte offset), undecoded count, flows, declared clock (pcap times are CLOCK_REALTIME) and its mapping to the --open-capture archive's CLOCK_MONOTONIC with uncertainty, or unaligned. Read-only; no live capture.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {}
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "query_stream",
+    "description": "Page through a stream's records: time and clock, interface, captured/original length, raw byte reference, decoded summary (Ethernet/VLAN/SLL/IPv4/IPv6/TCP/UDP/ICMP) or the typed reason it is undecoded, and flow_id. Filters: time range (clock 'stream' = file realtime ns since the epoch; 'capture' = ns since the capture start, aligned records only), flow_id, interface, protocol, port, undecoded. Continue with start=next.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "stream_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1,
+          "default": 1,
+          "description": "Stream id from list_streams."
+        },
+        "clock": {
+          "type": "string",
+          "enum": [
+            "stream",
+            "capture"
+          ],
+          "default": "stream"
+        },
+        "from_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "to_ns": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Exclusive."
+        },
+        "flow_id": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "interface": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "protocol": {
+          "type": "string",
+          "enum": [
+            "tcp",
+            "udp",
+            "icmp",
+            "icmpv6"
+          ]
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535
+        },
+        "undecoded": {
+          "type": "boolean"
+        },
+        "flows": {
+          "type": "boolean",
+          "default": false,
+          "description": "Also return the flow table page (flow_id, 5-tuple, packets, bytes)."
+        },
+        "include_raw": {
+          "type": "boolean",
+          "default": false,
+          "description": "Hex of the first 256 captured bytes per record."
+        },
+        "start": {
+          "type": "integer",
+          "minimum": 0,
+          "default": 0,
+          "description": "Record index to resume scanning from."
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 256,
+          "default": 64
+        }
+      }
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  },
+  {
+    "name": "correlate",
+    "description": "Join one record to the socket and process that held its 5-tuple, from the socket tables the capture archive recorded at capture start and stop. basis: exact (protocol and both endpoints equal a connected socket held by the process, packet time within the sampled window), sampled (same match, time outside the window or stream unaligned), inferred (local endpoint only: listening/unconnected socket), none. Thread attribution is not available from socket tables and is reported as null with the reason.",
+    "inputSchema": {
+      "type": "object",
+      "properties": {
+        "stream_id": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1,
+          "default": 1,
+          "description": "Stream id from list_streams."
+        },
+        "record": {
+          "type": "integer",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "record"
+      ]
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false,
+      "xodbSessionAccess": "observer"
+    }
+  }
+]

@@ -33,6 +33,7 @@ pub fn render(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !v
         .inheritance => try @import("inheritance_panel.zig").render(v, ctx, rect, now),
         .graph, .galaxy => try @import("graph_panel.zig").render(v, ctx, rect, now),
         .memory_map => try @import("memmap.zig").render(v, ctx, rect, now),
+        .fetch => try fetchCard(v, ctx, rect, s, now),
     }
 }
 
@@ -1678,4 +1679,93 @@ fn apps(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
         try valueRight(v, ctx, inner.x + inner.w, y, inner.w * 0.12, fromU(pk.size), .bytes, p.text);
         y += line_h;
     }
+}
+
+// --- xodbfetch -------------------------------------------------------------------
+
+const Spark = @import("fetch.zig").Spark;
+fn fetchRing(v: *View, spark: Spark) ?struct { r: *const h.Ring, max: f32 } {
+    const H = v.hist;
+    const gpu: ?*[3]h.Ring = if (H.gpus.count > 0) &H.gpus.rings[H.gpus.count - 1] else null;
+    return switch (spark) {
+        .none => null,
+        .cpu => .{ .r = &H.cpu_total, .max = 100 },
+        .boost => .{ .r = &H.boost, .max = h.nice(@max(1000, H.boost.max(60))) },
+        .memory => .{ .r = &H.mem_used, .max = 100 },
+        .swap => .{ .r = &H.swap_used, .max = 100 },
+        .disk_io => .{ .r = &H.disk_write, .max = h.nice(@max(1 << 20, H.disk_write.max(60))) },
+        .net => .{ .r = &H.net_rx, .max = h.nice(@max(64 << 10, H.net_rx.max(60))) },
+        .temp => .{ .r = &H.package_temp, .max = 100 },
+        .power => if (H.package_power.last() != null) .{ .r = &H.package_power, .max = h.nice(@max(10, H.package_power.max(60))) } else if (gpu) |g| .{ .r = &g[1], .max = h.nice(@max(10, g[1].max(60))) } else null,
+        .gpu => if (gpu) |g| .{ .r = &g[0], .max = 100 } else null,
+        .pressure => .{ .r = &H.psi[0], .max = h.nice(@max(1, H.psi[0].max(60))) },
+        .activity => .{ .r = &H.activity, .max = h.nice(@max(1000, H.activity.max(60))) },
+    };
+}
+
+/// The `xodb --fetch` card, live: logo and benchmarks left (fetch_panel.zig),
+/// then user@host, a rule, Key: value lines with sparklines, colour blocks.
+fn fetchCard(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
+    const fs = &v.fetch;
+    const p = ctx.p;
+    const rebuilt = try fs.prepare(v.gpa, v.redact, if (ctx.r.window) |w| w.displayFd() else null, s, v.samples, .{
+        .gui = true,
+        .vulkan = std.mem.sliceTo(&ctx.r.gpu_name, 0),
+        .draw_ms = if (v.last_frame_ns > 0) @as(f64, @floatFromInt(v.last_frame_ns)) / 1e6 else null,
+        .startup_ms = if (v.startup_ns > 0) @as(f64, @floatFromInt(v.startup_ns)) / 1e6 else null,
+    });
+    const tint = fs.tint(p);
+    const left_w = std.math.clamp(rect.w * 0.30, 170, 360);
+    const left = Rect{ .x = rect.x, .y = rect.y, .w = left_w, .h = rect.h };
+    const right = Rect{ .x = rect.x + left_w + 10, .y = rect.y, .w = rect.w - left_w - 10, .h = rect.h };
+    try fs.drawLeft(v.gpa, ctx, left, rect.h, std.math.clamp((v.hist.cpu_total.last() orelse 0) / 100, 0, 1));
+    v.hover(left, "Glow follows CPU load. B runs the benchmarks, Esc stops them: {s}", .{@import("fetch_bench.zig").method[0..std.mem.indexOfScalar(u8, @import("fetch_bench.zig").method, '\n').?]});
+    try ctx.panel(right);
+    const x0 = right.x + 16;
+    const w = right.w - 32;
+    var y = right.y + 12;
+    try ctx.glowText(x0, y, fs.title, tint);
+    y += 24;
+    var key_w: f32 = 0;
+    for (fs.lines) |l| key_w = @max(key_w, ctx.measure(l.key));
+    key_w += 14;
+    // The rule runs under the title and across the key column, in the logo's colour.
+    try ctx.r.shape(.{ .x = x0, .y = y, .w = @min(w, @max(ctx.measure(fs.title), key_w + 120)), .h = 2 }, tint, .{ .colors = .{ tint, fade(tint, 0.1), tint, fade(tint, 0.1) } });
+    y += 10;
+    // Sparklines sit in one column just after the longest value that has one.
+    const spark_w: f32 = if (w > 520) 96 else 56;
+    var value_w: f32 = 0;
+    for (fs.lines) |l| if (l.spark != .none) {
+        value_w = @max(value_w, ctx.measure(l.value));
+    };
+    const spark_x = x0 + key_w + @min(value_w + 16, w - key_w - spark_w);
+    const avail = right.y + right.h - y - 46;
+    const row_h: f32 = std.math.clamp(avail / @as(f32, @floatFromInt(@max(1, fs.lines.len))), 18, 26);
+    // One row stays for the "more" note when the lines do not all fit.
+    var fits: usize = @intFromFloat(@max(0, @floor(avail / row_h)));
+    if (fits < fs.lines.len) fits -|= 1;
+    const scroll = &v.scroll[@intFromEnum(vw.Panel.fetch)];
+    scroll.* = @min(scroll.*, fs.lines.len -| fits);
+    var cpu_spark: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+    for (fs.lines[scroll.*..][0..@min(fits, fs.lines.len - scroll.*)]) |l| {
+        try ctx.textFit(x0, y, key_w - 8, l.key, tint);
+        const series = fetchRing(v, l.spark);
+        try ctx.textFit(x0 + key_w, y, if (series != null) spark_x - x0 - key_w - 8 else w - key_w, l.value, p.text);
+        if (series) |sp| {
+            // The glyph box of a 16 px line: cap height to descender.
+            const at = Rect{ .x = spark_x, .y = y + 3, .w = spark_w, .h = 15 };
+            try ctx.r.shape(.{ .x = at.x - 2, .y = at.y - 1, .w = at.w + 4, .h = at.h + 2 }, fade(tint, 0.10), .{ .radii = @splat(3) });
+            try vw.spark(ctx, at, sp.r, sp.max, tint, 60, v.ease(now));
+            if (l.spark == .cpu and cpu_spark.w == 0) cpu_spark = at;
+        }
+        y += row_h;
+    }
+    var b: [48]u8 = undefined;
+    if (fits < fs.lines.len) try ctx.textFit(x0, y, w, std.fmt.bufPrint(&b, "wheel: {d} more lines", .{fs.lines.len - fits}) catch "", p.dim);
+    if (rebuilt and @import("../../c_ui.zig").api.getenv("XODB_OVERVIEW_AUDIT") != null)
+        @import("../../log.zig").info(.overview, "xodb: fetch lines={d} shown={d} logo={s} redacted={} wm={s} cpu_spark={d:.0},{d:.0},{d:.0},{d:.0}\n", .{ fs.lines.len, @min(fits, fs.lines.len), if (fs.blocks != null) "png" else "text", v.redact, (fs.static.?.wm orelse "none"), cpu_spark.x, cpu_spark.y, cpu_spark.w, cpu_spark.h });
+    // ANSI colour blocks, as fetch tools end their card.
+    const ansi = [16]u24{ 0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff };
+    const bw = @min(28, w / 16);
+    for (ansi, 0..) |col, i| try ctx.r.rect(.{ .x = x0 + @as(f32, @floatFromInt(i)) * bw, .y = right.y + right.h - 32, .w = bw, .h = 18 }, @import("../../appearance.zig").rgb(col));
 }

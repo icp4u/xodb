@@ -1,5 +1,6 @@
 #define _GNU_SOURCE 1
 #include "xrt_fdflow_count.h"
+#include "fdflow_syscalls.h"
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
@@ -196,7 +197,7 @@ static struct process *process_at(struct xrt_fdflow_counter *c, uint32_t i) {
 static int io_number(int64_t n);
 /* A call still owes an exit. exit/exit_group never return. */
 static int in_flight(const struct thread *t) {
-    return t->have_entry && t->number != 60 && t->number != 231 &&
+    return t->have_entry && t->number != XRT_FDFLOW_NR_EXIT && t->number != XRT_FDFLOW_NR_EXIT_GROUP &&
            !(t->raw_exit && (t->completed || !io_number(t->number)));
 }
 static int live(const struct xrt_fdflow_counter *c, int32_t pid) {
@@ -448,69 +449,37 @@ static void invalidate(struct xrt_fdflow_counter *c, struct process *p, uint64_t
         p->cutoff = time;
     c->view.invalidated = add(c->view.invalidated, 1);
 }
-/* Native x86-64 numbers only. Raw syscall tracepoints also fire for compat
- * (int $0x80) and x32 calls, with their own numbers, and the records carry no
- * ABI, so a compat close or dup2 of a joined fd is not seen as a mutation and
- * a later native IO on that fd can join the old inode. ABI-switching code is
- * outside coverage. Compat numbers alias common native calls (5 is fstat,
- * 8 lseek, 11 munmap), so they are not listed either.
- * Conservatively withdraw all this process's joins, then require a later poll.
- * Async io_uring may change descriptors after returning; stay unproved. */
+/* Numbers come from fdflow_syscalls.h. A compat close or dup of a joined fd
+ * is not seen as a mutation, and a later native IO on that fd can join the
+ * old inode. Conservatively withdraw all this process's joins, then require
+ * a later poll. Async io_uring may change descriptors after returning; stay
+ * unproved. fcntl is withdrawn on any command: the trace does not show which. */
 static int mutation(int64_t n) {
-    switch (n) {
-    case 2:   /* open */
-    case 3:   /* close */
-    case 22:  /* pipe */
-    case 32:  /* dup */
-    case 33:  /* dup2 */
-    case 41:  /* socket */
-    case 43:  /* accept */
-    case 47:  /* recvmsg: SCM_RIGHTS */
-    case 53:  /* socketpair */
-    case 56:  /* clone */
-    case 57:  /* fork */
-    case 58:  /* vfork */
-    case 59:  /* execve: close-on-exec */
-    case 72:  /* fcntl: F_DUPFD */
-    case 85:  /* creat */
-    case 257: /* openat */
-    case 288: /* accept4 */
-    case 292: /* dup3 */
-    case 293: /* pipe2 */
-    case 299: /* recvmmsg: SCM_RIGHTS */
-    case 322: /* execveat */
-    case 425: /* io_uring_setup */
-    case 426: /* io_uring_enter */
-    case 427: /* io_uring_register */
-    case 435: /* clone3 */
-    case 436: /* close_range */
-    case 437: /* openat2 */
-    case 438: /* pidfd_getfd */
+    (void)n; /* every list is empty off Linux */
+#define XRT_FDFLOW_IS_MUT(name, num, async)                                                        \
+    if (n == (int64_t)(num))                                                                       \
         return 1;
-    default:
-        return 0;
-    }
+    XRT_FDFLOW_EACH_MUTATION(XRT_FDFLOW_IS_MUT)
+#undef XRT_FDFLOW_IS_MUT
+    return 0;
+}
+static int asynchronous(int64_t n) {
+    (void)n; /* every list is empty off Linux */
+#define XRT_FDFLOW_IS_ASYNC(name, num, async)                                                      \
+    if ((async) && n == (int64_t)(num))                                                            \
+        return 1;
+    XRT_FDFLOW_EACH_MUTATION(XRT_FDFLOW_IS_ASYNC)
+#undef XRT_FDFLOW_IS_ASYNC
+    return 0;
 }
 static int io_number(int64_t n) {
-    switch (n) {
-    case 0:
-    case 1:
-    case 17:
-    case 18:
-    case 19:
-    case 20:
-    case 295:
-    case 296:
-    case 327:
-    case 328:
-    case 44:
-    case 45:
-    case 46:
-    case 47:
+    (void)n; /* every list is empty off Linux */
+#define XRT_FDFLOW_IS_IO(name, num, op)                                                            \
+    if (n == (int64_t)(num))                                                                       \
         return 1;
-    default:
-        return 0;
-    }
+    XRT_FDFLOW_EACH_IO(XRT_FDFLOW_IS_IO)
+#undef XRT_FDFLOW_IS_IO
+    return 0;
 }
 /* O(1): thread_at/process_at reset entries from an older epoch on access. */
 static void clear_pending(struct xrt_fdflow_counter *c, uint64_t time) {
@@ -625,7 +594,7 @@ enum xrt_status xrt_fdflow_counter_feed(struct xrt_fdflow_counter *c,
                 invalidate(c, p, r->time_ns);
                 ++p->mutating;
                 t->mutation = 1;
-                if (r->number >= 425 && r->number <= 427) {
+                if (asynchronous(r->number)) {
                     p->asynchronous = 1;
                     p->async_ns = r->time_ns;
                 }

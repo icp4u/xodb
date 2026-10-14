@@ -298,6 +298,8 @@ pub const Server = struct {
         const redot_graph = std.mem.eql(u8, name, "get_graph") and std.mem.eql(u8, try @import("graph.zig").kind(args), "redot");
         if (redot_graph and self.overview_only) return error.GraphKindUnavailable;
         if (overview.handles(name) and !redot_graph) return overview.call(a, self.overview_shared orelse &self.overview, name, args);
+        // External evidence belongs to the root session, not a target process.
+        if (@import("evidence.zig").handles(name)) return @import("evidence.zig").call(a, root.evidence_stream, name, args);
         const process_id = try @import("profile.zig").number(args, "process_id", 1);
         const session = if (root.process_tree) |tree| (try tree.find(process_id)).session else if (process_id == root.process_id) root else return error.UnknownProcess;
         if (!policy.localAllowed(session.agent_scope, root.shared_jobs or session.shared_jobs)) return error.AgentScopeDenied;
@@ -595,6 +597,8 @@ pub const Server = struct {
             const generation = session.target.snapshot().generation;
             if (regs.architecture() == .loongarch64)
                 return asValue(a, .{ .generation = generation, .tid = tid, .note = "r0 is the kernel restart slot, not architectural zero", .registers = Value{ .object = values } });
+            if (regs.architecture() == .riscv64)
+                return asValue(a, .{ .generation = generation, .tid = tid, .note = "x0 is architectural zero and is not in NT_PRSTATUS", .registers = Value{ .object = values } });
             return asValue(a, .{ .generation = generation, .tid = tid, .registers = Value{ .object = values } });
         }
         if (std.mem.eql(u8, name, "read_memory")) {

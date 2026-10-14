@@ -47,6 +47,11 @@ const Source = struct {
     pub fn interval(self: *Source, ns: u64) void {
         self.collector.fast_ns = ns;
     }
+    /// The stdio MCP client closed its input and every reply was written.
+    pub fn closed(self: *const Source) bool {
+        const p = self.server orelse return false;
+        return p.closed and p.queued == 0;
+    }
     /// MCP clients are served from the loop, so it must not sleep long.
     pub fn serving(self: *const Source) bool {
         return self.shared != null or self.server != null;

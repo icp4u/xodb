@@ -225,7 +225,7 @@ Examples, rather than an exhaustive tool catalog:
 | Ask static questions about a function | `analyze_function`, `slice_value`, `control_dependencies`, `cancel_static_analysis` (opt-in worker; observers may start a bounded host-side analysis but cancel only their own; [details](SEMANTIC_QUERIES.md#in-the-debugger)) |
 | Identify a mapped Mach-O (macOS) file | `get_macho_image` (UUID, architecture, segments, one symbol by name or address; bounded ranged reads of the mapped file; [details](MACHO.md)) |
 | Deliberately change target state | `write_memory`, `write_register` |
-| Look at the whole machine (no target needed) | `get_overview`, `list_processes`, `get_process`, `get_connections`, `get_sensors` (observer-only; every value is a number or `{state, why}`, never a silent 0) |
+| Look at the whole machine (no target needed) | `get_overview`, `list_processes` (sort, filter, paging), `get_process`, `get_connections` (socket holders, owner hints), `get_sensors`, `get_history` (recent series), `get_process_groups` (per-application rollup) (observer-only; every value is a number or `{state, why}`, never a silent 0; `xodb --overview --headless --mcp` serves them without a window) |
 
 Inspection jobs retain copied registers, stack, locals, expressions and bounded
 memory reads under one stopped generation. Function observations retain raw ABI

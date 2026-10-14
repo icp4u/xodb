@@ -5,6 +5,7 @@ pub const c = @import("../c_ui.zig").api;
 const a = std.heap.c_allocator;
 const Snapshot = c.struct_xrt_sys_snapshot;
 const count = c.XRT_SYS_G_COUNT;
+pub const History = @import("system_history.zig").History;
 pub fn bit(id: c_uint) u32 {
     return @as(u32, 1) << @intCast(id);
 }
@@ -54,8 +55,11 @@ pub const Collector = struct {
     fd_collector: ?*c.struct_xrt_fdactivity = null,
     fd_opens: u64 = 0,
     fd_scope: []const i32 = &.{},
-    /// Owner-thread GUI publication, borrowed only while its galaxy is visible.
-    graph_scene: ?*const @import("../ui/overview/galaxy_model.zig").Scene = null,
+    /// Owner-thread GUI publication (a galaxy_model.Scene), borrowed only
+    /// while its galaxy is visible. Opaque: the model does not know the view.
+    graph_scene: ?*const anyopaque = null,
+    /// Series for get_history; allocated on the first history row.
+    history: History = .{},
     fd_event_state: FdEventState = .inactive,
     fd_lease: ?@import("../service/lease.zig").Lease = null,
 
@@ -103,6 +107,7 @@ pub const Collector = struct {
         }
         if (self.ctx) |p| c.xrt_sys_close(p);
         if (self.memory_ctx) |p| c.xrt_memobserver_close(p);
+        self.history.deinit();
         self.* = .{};
     }
     pub fn memoryObserver(self: *Collector) !*c.struct_xrt_memobserver {
@@ -173,6 +178,7 @@ pub const Collector = struct {
         };
         if (mask & bit(c.XRT_SYS_G_PROCESSES) != 0) self.light = light;
         self.last_mask = mask;
+        try self.history.record(self.cache.?, mask, now);
         if (c.getenv("XODB_OVERVIEW_AUDIT") != null) log.info(.overview, "xodb: overview collector opens={d} sequence={d} groups={x} light={} processes_sample_ns={d}\n", .{ self.opens, self.cache.?.sequence, mask, self.light, self.sampled[c.XRT_SYS_G_PROCESSES] });
         return true;
     }

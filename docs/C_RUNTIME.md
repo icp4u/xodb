@@ -240,6 +240,7 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` or `--arch loongarch64` to `tests/runtime-host.py`.
+`tests/runtime-host.py` does not yet take `--arch riscv64`.
 On LoongArch64 that script steps one instruction, refuses watchpoints, profile and
 uprobes, and removes the breakpoint before continuing. Disassembly is refused on
 the system Capstone 5.x build and decoded when the binary was built with
@@ -274,6 +275,23 @@ lifted while it runs, so a breakpoint on its path cannot kill it. At
 again and the child is detached. The parent then resumes, and a step over
 `vfork` stops after the syscall returns with the child pid. x86 still holds
 the birth for the user to adopt.
+
+RISC-V 64 is ELF machine 243, ELFCLASS64, little-endian, LP64D, with the RVC
+and double-float ELF flags. The breakpoint is `c.ebreak` (`02 90`), two-byte
+aligned, and the stopped PC stays on that instruction. A four-byte instruction
+is stopped by overlaying its first half; restoring those two bytes puts the
+instruction back. The caller adjustment is 2: a compressed `c.jalr` return
+lands on the call, and a four-byte `jal`/`jalr` return lands inside the call.
+`NT_PRSTATUS` is the 256-byte `user_regs_struct`. `pc` is word 0 and has no
+DWARF number. `ra` is DWARF 1 and `sp` is DWARF 2. `x0` is not in the image.
+Hardware step is off because `PTRACE_SINGLESTEP` returned `EIO` on the measured
+QEMU guest; that is a measurement, not a claim about every RISC-V machine.
+Software step, including compressed control flow and LR/SC as one unit, is not
+in this row. Continue from a planted breakpoint is refused and the trap stays
+planted, so remove the breakpoint before continuing. Hardware watches are
+refused. Disassembly uses the system Capstone 5, which has a RISC-V decoder;
+the vendored Capstone 6 from `scripts/build-capstone` leaves RISC-V out, so a
+`-Dcapstone=vendored` build reports `DisassemblerUnavailable` for it.
 
 ppc64le is ELF machine 21, ELFCLASS64, little-endian, ELFv2. The breakpoint is
 `tw 31,0,0` (`08 00 e0 7f`), four-byte aligned, with no PC adjustment. A call's

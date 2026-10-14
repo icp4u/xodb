@@ -76,6 +76,8 @@ pub const Capture = struct {
     archive_busy: bool = false,
     boot_id: ?[36]u8 = null,
     producer: ?@import("producer.zig").Producer = null,
+    /// Local captures: clock pairs and socket endpoints at start and stop (archive ECTX).
+    net: ?@import("net_context.zig").Recorder = null,
     recorded: std.AutoHashMapUnmanaged(CacheKey, annotations.Record) = .empty,
     work_cancel: ?*const std.atomic.Value(bool) = null,
     id: u64,
@@ -195,6 +197,8 @@ pub const Capture = struct {
                     self.cpu_before[i] = activity.readTarget(@ptrCast(target), pid, config.tids[i]);
                     _ = std.fmt.bufPrintZ(&self.thread_names[i], "Thread {d}", .{config.tids[i]}) catch unreachable;
                 }
+                // A remote target's /proc is on another host.
+                if (self.producer == null) self.net = @import("net_context.zig").Recorder.begin(a, pid, started_ns);
                 return .{ .capture = self };
             },
         }
@@ -283,6 +287,7 @@ pub const Capture = struct {
         self.history.deinit(self.allocator);
         self.pe_assets.deinit(self.allocator);
         self.images.deinit();
+        if (self.net) |*net| net.deinit();
         self.arena.deinit();
         self.allocator.destroy(self);
     }
@@ -369,6 +374,7 @@ pub const Capture = struct {
         } else self.drain(128);
         collector.close();
         self.collector = null;
+        if (self.net) |*net| net.sample(.stop);
         if (self.diagnostic.len == 0) self.diagnostic = switch (self.status) {
             .duration => "configured capture duration reached (wall clock, including time stopped)",
             .target_ended => "target exited or detached",

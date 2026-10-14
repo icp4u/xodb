@@ -386,3 +386,36 @@ test "invalid optional frame evidence survives without blocking native capture" 
     try std.testing.expectEqualStrings("invalid frame envelope", opened.frame_bundle.?);
     try std.testing.expectEqual(.retained_opaque, opened.source.frame_attachments.?.state);
 }
+
+test "evidence context (ECTX) is optional, ignorable and round trips" {
+    const capture = try fixture.build(a, .empty, null);
+    defer capture.deinit();
+    const plain = try archive.encode(a, capture, .{});
+    defer a.free(plain);
+    try std.testing.expectEqual(@as(?[]const u8, null), try archive.evidenceContext(plain));
+    capture.net = .{ .arena = std.heap.ArenaAllocator.init(a), .pid = capture.pid, .started_ns = capture.started_ns };
+    capture.net.?.pairs[0] = .{ .monotonic_before_ns = 10, .realtime_ns = 20, .monotonic_after_ns = 12 };
+    capture.net.?.pair_count = 1;
+    const bytes = try archive.encode(a, capture, .{});
+    defer a.free(bytes);
+    var opened = try archive.decode(a, bytes, .{ .local_id = 3 });
+    defer opened.deinit();
+    try std.testing.expectEqual(@as(u16, 9), opened.source.format_minor);
+    try std.testing.expectEqual(@as(usize, 0), opened.source.ignored_sections);
+    const payload = (try archive.evidenceContext(bytes)).?;
+    try std.testing.expectEqualSlices(u8, payload, opened.evidence_context.?);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const ctx = try @import("../evidence/sockets.zig").decodeContext(arena.allocator(), payload);
+    try std.testing.expectEqual(@as(usize, 1), ctx.pairs.len);
+    try std.testing.expectEqual(capture.started_ns, ctx.capture_started_ns);
+    // The section must be marked ignorable, so older readers skip it.
+    const n = std.mem.readInt(u32, bytes[24..28], .little);
+    const entry = bytes[archive.header_bytes + (n - 1) * archive.entry_bytes ..][0..archive.entry_bytes];
+    try std.testing.expectEqual(@as(u32, 1), std.mem.readInt(u32, entry[4..8], .little));
+    const strict = try a.dupe(u8, bytes);
+    defer a.free(strict);
+    const strict_entry = strict[archive.header_bytes + (n - 1) * archive.entry_bytes ..][0..archive.entry_bytes];
+    std.mem.writeInt(u32, strict_entry[4..8], 0, .little);
+    try std.testing.expectError(error.ArchiveSectionLayout, archive.decode(a, strict, .{ .local_id = 4 }));
+}

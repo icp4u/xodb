@@ -19,7 +19,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -27,7 +27,7 @@ fn named(names: []const []const u8, arg: []const u8) bool {
 /// Every parser xodb dispatches to after log.init: the debugger, the overview
 /// and the scene3d probe ("--instances"; its "--frames" is in the other two).
 fn takesValue(arg: []const u8) bool {
-    return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
+    return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or named(&@import("ui/overview/fetch.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
 }
 fn parseUiScale(value: []const u8) !f32 {
     const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;
@@ -71,10 +71,19 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--scene3d-probe")) return @import("render/scene3d/probe.zig").main(args);
     };
-    // The overview is its own window and session with no debug target.
+    // The fetch card prints and exits: no window, no target.
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
-        if (std.mem.eql(u8, arg, "--overview") or std.mem.eql(u8, arg, "--attach-exe")) return @import("ui/overview/run.zig").main(args, startup_started);
+        if (std.mem.eql(u8, arg, "--fetch")) return @import("ui/overview/fetch.zig").main(args);
+    }
+    // The overview is its own window and session with no debug target;
+    // headless, it is the collector and MCP alone (no window code runs).
+    for (args[1..]) |arg| {
+        if (std.mem.eql(u8, arg, "--")) break;
+        if (std.mem.eql(u8, arg, "--overview") or std.mem.eql(u8, arg, "--attach-exe")) {
+            for (args[1..]) |other| if (std.mem.eql(u8, other, "--headless")) return overviewHeadless(args);
+            return @import("ui/overview/run.zig").main(args, startup_started);
+        }
     }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
@@ -113,6 +122,7 @@ pub fn main(init: std.process.Init) !void {
     var core_file: ?[:0]const u8 = null;
     var core_executable: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
+    var open_pcap: ?[:0]const u8 = null;
     var compare_capture: ?[:0]const u8 = null;
     var open_frames: ?[:0]const u8 = null;
     var open_profile: ?[:0]const u8 = null;
@@ -195,6 +205,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--browse-observation FILE opens .xoi in the GUI invocation/cohort browser (N reopens it).
                 \\--observation-threshold-ns N overrides the fast/slow wall-duration threshold (see docs/OBSERVATIONS.md).
                 \\--open-capture FILE opens an offline archive; --symbols DIR optionally loads SHA-256-named ELF assets.
+                \\--open-pcap FILE opens a pcap/pcapng file as a read-only evidence stream; with --open-capture, aligns and correlates it.
                 \\--compare-capture BASE with --open-capture AFTER compares recorded CPU sample shares; V switches views.
                 \\--resolve-capture-symbols explicitly derives new labels from verified assets; default is recorded labels.
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
@@ -205,6 +216,7 @@ pub fn main(init: std.process.Init) !void {
                 \\  driver that did not load: stderr names it in one "xodb: vulkan:" line (docs/GUIDE.md).
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
+                \\--fetch prints a fastfetch-style card of this machine and exits (--fetch --help; docs/FETCH.md).
                 \\Graph/galaxy default: LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
@@ -263,6 +275,7 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--open-frames")) open_frames = args[i];
             if (std.mem.eql(u8, arg, "--open-profile")) open_profile = args[i];
             if (std.mem.eql(u8, arg, "--open-capture")) open_capture = args[i];
+            if (std.mem.eql(u8, arg, "--open-pcap")) open_pcap = args[i];
             if (std.mem.eql(u8, arg, "--compare-capture")) compare_capture = args[i];
             if (std.mem.eql(u8, arg, "--symbols")) symbols = args[i];
             if (std.mem.eql(u8, arg, "--debug-dir")) try debug_dirs.append(a, args[i]);
@@ -322,6 +335,7 @@ pub fn main(init: std.process.Init) !void {
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
+    if (open_pcap != null and (attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenPcapOptionConflict;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
         log.err(.session, "xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
@@ -342,7 +356,7 @@ pub fn main(init: std.process.Init) !void {
     _ = c.signal(c.SIGHUP, onSignal);
     std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     // Saved profiles, captures and observations have no code to decompile.
-    const archive_viewer = open_profile != null or open_capture != null or open_observation != null or browse_observation != null;
+    const archive_viewer = open_profile != null or open_capture != null or open_pcap != null or open_observation != null or browse_observation != null;
     if (!remote_gui and !archive_viewer and ghidra_prestart) @import("semq/ghidra_sidecar.zig").prestart();
     if (remote_gui) {
         if (comptime build_options.gui) {
@@ -448,6 +462,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (!remote_destroyed) if (record_path) |path| session.saveInvestigations(path) catch |err| log.err(.session, "Evidence export failed: {s}\n", .{@errorName(err)});
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
+    if (open_pcap) |path| try openPcap(session, path, open_capture);
     if (open_profile) |path| try session.openImported(path);
     if (open_frames) |path| try session.openFrames(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
@@ -557,7 +572,7 @@ pub fn main(init: std.process.Init) !void {
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
-        workspace.show_profile = open_capture != null;
+        workspace.show_profile = open_capture != null or open_pcap != null;
         workspace.logical_frames.open = open_frames != null;
         workspace.comparison.open = compare_capture != null;
         workspace.invocations.open = browse_observation != null;
@@ -1055,6 +1070,63 @@ fn reportSlow(phase: []const u8, started: u64) void {
     const elapsed = linux.now() -| started;
     if (elapsed >= 250_000_000) log.debug(.window, "slow {s}: {d} ms\n", .{ phase, elapsed / 1_000_000 });
 }
+/// `xodb --overview --headless`: the overview collector and its observer MCP
+/// endpoints on the owner thread, without any window code.
+fn overviewHeadless(args: []const [:0]const u8) !void {
+    const options = @import("mcp/overview_serve.zig");
+    for (args) |arg| if (std.mem.eql(u8, arg, "--help")) {
+        std.debug.print("{s}", .{options.usage});
+        return;
+    };
+    const o = try options.parse(args);
+    _ = c.signal(c.SIGINT, onSignal);
+    _ = c.signal(c.SIGTERM, onSignal);
+    _ = c.signal(c.SIGHUP, onSignal);
+    _ = c.signal(c.SIGPIPE, c.SIG_IGN);
+    const a = std.heap.c_allocator;
+    var collector: @import("model/system.zig").Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count], .fast_ns = o.interval_ms * 1_000_000 };
+    defer collector.deinit();
+    const session = try a.create(Session);
+    defer a.destroy(session);
+    session.* = Session.init();
+    session.agent_scope = .observe;
+    defer session.deinit();
+    var shared: ?SharedSession = if (o.session_socket) |path| try SharedSession.init(path, null) else null;
+    defer if (shared) |*endpoint| endpoint.deinit();
+    if (shared) |*endpoint| {
+        endpoint.overview_shared = &collector;
+        endpoint.overview_only = true;
+    }
+    const server = if (o.mcp) try a.create(Server) else null;
+    defer if (server) |p| {
+        p.deinit();
+        a.destroy(p);
+    };
+    if (server) |p| {
+        p.* = .{ .overview_shared = &collector, .overview_only = true };
+        try p.init();
+    }
+    log.info(.overview, "xodb: headless overview serving mcp={} socket={} interval_ms={d}\n", .{ o.mcp, o.session_socket != null, o.interval_ms });
+    var samples: u64 = 0;
+    while (quitting == 0) {
+        // The owner clock: history groups at their periods, plus requested groups.
+        if (collector.tick(linux.now(), @import("model/system_history.zig").groups(), false) catch |err| blk: {
+            log.warn(.overview, "xodb: headless overview sampling failed: {s}\n", .{@errorName(err)});
+            break :blk false;
+        }) samples += 1;
+        if (shared) |*endpoint| try endpoint.pump(session);
+        if (server) |p| {
+            try p.pump(session);
+            if (p.closed and p.queued == 0) break;
+        }
+        // Wake at once for stdin; peers and the clock are served every 20 ms.
+        var fd = c.pollfd{ .fd = if (server) |p| (if (p.input_eof) -1 else p.input_fd) else -1, .events = c.POLLIN, .revents = 0 };
+        _ = c.poll(&fd, 1, 20);
+    }
+    const reason = if (quitting != 0) "signal" else "mcp_eof";
+    log.info(.overview, "xodb: headless overview {d} samples, history {d} rows {d} KiB, clean shutdown (reason={s})\n", .{ samples, collector.history.len, collector.history.bytes() / 1024, reason });
+}
+
 /// With a compositor the list also says which devices present and which is the display's.
 fn vkList() !void {
     if (comptime !build_options.gui) return error.GuiNotBuilt;
@@ -1080,6 +1152,32 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
     const presented = try renderer.end(font);
     reportSlow("Vulkan submit/present", started);
     return presented;
+}
+
+/// Reads a pcap/pcapng file into the session's evidence stream. With a
+/// capture archive, its ECTX section supplies the clock pairs and socket
+/// tables for alignment and correlation; without one the stream is unaligned.
+fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8) !void {
+    const archive = @import("profile/archive.zig");
+    const a = std.heap.page_allocator;
+    const bytes = archive.readFile(a, path, archive.max_file_bytes, null) catch |err| {
+        log.err(.session, "xodb: --open-pcap could not read the file: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const stream = @import("evidence/stream.zig").Stream.open(a, bytes, std.fs.path.basename(path)) catch |err| {
+        a.free(bytes);
+        log.err(.session, "xodb: --open-pcap: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    errdefer stream.destroy();
+    if (capture) |archive_path| {
+        const xoc = try archive.readFile(a, archive_path, archive.max_file_bytes, null);
+        defer a.free(xoc);
+        if (try archive.evidenceContext(xoc)) |payload| try stream.attachContext(payload);
+    }
+    const loss = stream.loss();
+    log.info(.session, "xodb: evidence stream {d}: {s} {d} records, {d} undecoded, {d} flows, file {s}, clock {s}; drops ifdrop={d} osdrop={d} epb={d}\n", .{ stream.id, @tagName(stream.parsed.format), stream.parsed.records.len, stream.undecoded, stream.flows.len, @tagName(stream.parsed.stop), @tagName(stream.mapping.state), loss.isb_ifdrop, loss.isb_osdrop, loss.epb_drops });
+    session.evidence_stream = stream;
 }
 
 test {
@@ -1115,6 +1213,9 @@ test {
     std.testing.refAllDecls(@import("mcp/allocations.zig"));
     std.testing.refAllDecls(@import("mcp/allocation_control.zig"));
     _ = @import("profile/archive_test.zig");
+    _ = @import("evidence/stream.zig");
+    _ = @import("profile/net_context.zig");
+    _ = @import("mcp/evidence.zig");
     _ = @import("profile/perf_test.zig");
     _ = @import("profile/recorded_view_test.zig");
     _ = @import("profile/user_state_test.zig");
@@ -1149,7 +1250,11 @@ test {
         _ = @import("ui/overview/loop.zig");
         _ = @import("ui/overview/memmap.zig");
         _ = @import("ui/overview/deepmap.zig");
+        _ = @import("ui/overview/fetch_panel.zig");
     }
+    _ = @import("ui/overview/fetch.zig");
+    _ = @import("ui/overview/fetch_bench.zig");
+    _ = @import("ui/overview/png.zig");
     _ = @import("memdefrag/model.zig");
     _ = @import("memdefrag/vga.zig");
     _ = @import("memdefrag/dos.zig");
@@ -1169,6 +1274,8 @@ test {
     _ = @import("semq/host.zig");
     std.testing.refAllDecls(@import("mcp/static_analysis.zig"));
     std.testing.refAllDecls(@import("mcp/overview.zig"));
+    std.testing.refAllDecls(@import("mcp/overview_serve.zig"));
+    std.testing.refAllDecls(@import("model/system_history.zig"));
     _ = @import("target/process_test.zig");
     std.testing.refAllDecls(@import("model/modules.zig"));
     std.testing.refAllDecls(@import("binary/apk.zig"));

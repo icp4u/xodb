@@ -9,6 +9,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -62,7 +63,7 @@ static int drain_to_read(struct xrt_fdflow *flow, struct xrt_fdflow_counter *cou
             if (r->kind == XRT_FDFLOW_ENTER || r->kind == XRT_FDFLOW_EXIT) {
                 if (r->pid != child || r->tid != child)
                     return 0;
-                if (r->kind == XRT_FDFLOW_ENTER && r->number == 0 && r->args[0] == (uint64_t)fd)
+                if (r->kind == XRT_FDFLOW_ENTER && r->number == SYS_read && r->args[0] == (uint64_t)fd)
                     ready = 1;
             }
         }

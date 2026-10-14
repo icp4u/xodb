@@ -83,8 +83,10 @@ duplicate keys, invalid values and malformed JSON fail startup with the path and
 error on stderr. Files must be regular files, at most 64 KiB; FIFO paths fail
 without waiting for a writer. JSON comments are not supported.
 
-`appearance.ui_scale` controls backing resolution while layout and pointer hit
-testing stay in UI units. On Wayland, xodb follows fractional output scale and
+`appearance.ui_scale` sets device pixels per UI unit: smaller values make text
+and controls smaller and fit more content. Backing resolution always follows
+the window system, independently of this setting; pointer hit testing is
+converted to UI units. On Wayland, xodb follows fractional output scale and
 updates when the window moves between outputs. Use `--ui-scale N` for a one-run
 override; the same option and preference work in `--overview` and remote GUI
 windows. A scale change re-rasterizes scalable fonts; the Win95 bitmap face is

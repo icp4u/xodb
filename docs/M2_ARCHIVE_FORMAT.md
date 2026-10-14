@@ -1,4 +1,4 @@
-# Experimental native capture format 2.8
+# Experimental native capture format 2.9
 
 This extends the integrated formats 2.0/2.1/2.2/2.3/2.4/2.5, which superseded T11's unshipped prototype 1.
 The canonical field order and validation are in src/profile/archive.zig.
@@ -182,3 +182,29 @@ host-domain timestamps. Original-byte copying preserves it.
 
 Standalone allocation archives also retain optional `producer` clock provenance.
 Their event times use the same host monotonic domain.
+
+
+## Evidence context (ECTX, 2.9)
+
+Local captures append the optional, ignorable ECTX section (tag `0x58544345`)
+after every other section and write minor version 9; captures without it keep
+their previous minor. Older readers skip it as an unknown optional section and
+keep the original bytes. Readers of 2.9 reject ECTX that is not marked
+ignorable, appears twice or precedes a required section. Like FRAM, it stays
+optional under an older minor number (a tool that rewrites the minor keeps it
+readable). No required feature bit is involved.
+
+The payload (little endian; encoder and validation in `src/evidence/sockets.zig`):
+
+| Field | Type |
+| --- | --- |
+| schema | u8 (1) |
+| capture start | u64, CLOCK_MONOTONIC, equal to META's start |
+| pid | i32 |
+| pair count (at most 8), then pairs | u8; each pair u64 monotonic before, u64 realtime, u64 monotonic after |
+| table count (at most 8), then tables | u8; each: u8 when (0 start, 1 stop), u64 monotonic sample time, u32 unreadable rows/files, u8 truncated, u32 process count (at most 1,024) of i32 pid + 16-byte comm, u32 socket count (at most 65,536) of i32 pid, i32 fd, u64 inode, u8 protocol (6 TCP, 17 UDP), u8 family (1 IPv4, 2 IPv6), 16-byte local address, u16 local port, 16-byte remote address, u16 remote port, u8 kernel state |
+
+Counts are checked against the remaining bytes before allocation; unknown
+enum values and trailing bytes fail. The collector reads `/proc` of the target
+only, unprivileged, at capture start and stop; remote captures write no ECTX.
+See [network evidence](NETWORK_EVIDENCE.md) for the join and its limits.

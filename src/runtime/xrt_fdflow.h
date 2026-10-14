@@ -1,9 +1,12 @@
 #ifndef XODB_RUNTIME_FDFLOW_H
 #define XODB_RUNTIME_FDFLOW_H
-/* System-wide native Linux x86-64 IO tracepoint records. One owner drains;
+/* System-wide native Linux IO tracepoint records for the architecture this
+ * binary was built for. Numbers come from <sys/syscall.h>. One owner drains;
  * returned arrays are borrowed until the next drain/close. No target buffers
  * are read. A syscall byte count and a polled inode association are different
  * evidence: polling cannot prove the kernel file selected by concurrent fdget.
+ * Compatibility ABIs that share the raw tracepoints but use different numbers
+ * (x86 int 0x80 and x32, aarch64 32-bit, ppc32) stay unproved.
  */
 #include "xrt.h"
 #include "xrt_perf.h"

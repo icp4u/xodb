@@ -159,6 +159,8 @@ pub const Session = struct {
     imported: ?@import("../profile/imported_job.zig").State = null,
     artifact: ?archive.Opened = null,
     comparison: ?*@import("../profile/comparison.zig").Job = null,
+    /// External evidence opened with --open-pcap (read-only, offline).
+    evidence_stream: ?*@import("../evidence/stream.zig").Stream = null,
     archive_job: ?*ArchiveJob = null,
     /// Published reconstructed-stack view and the last failed key. A failure
     /// is never retried automatically; `retryDerived` is an explicit action.
@@ -2157,6 +2159,7 @@ pub const Session = struct {
         if (self.observation_associations) |job| job.deinit();
         if (self.observation_analysis) |job| job.deinit();
         if (self.comparison) |job| job.deinit();
+        if (self.evidence_stream) |stream| stream.destroy();
         if (self.archive_job) |job| {
             job.deinit();
             self.archive_job = null;

@@ -76,7 +76,7 @@ A direct edge usually removes many transitive lines with it. All 107
 
 ## Current numbers (2026-10-14)
 
-572 source files, 2373 edges, 26 layers, 7 rules.
+579 source files, 2391 edges, 27 layers, 8 rules.
 
 | Rule | Says | Direct | Transitive |
 |---|---|---|---|
@@ -87,6 +87,7 @@ A direct edge usually removes many transitive lines with it. All 107
 | `platform-leaf` | platform reaches only common, c_ui | 4 | 4 |
 | `providers-no-session` | language, semq, debug, binary must not reach `src/model/session.zig` | 12 | 31 |
 | `runtime-alone` | src/runtime includes only src/runtime (and system headers) | 3 | 0 |
+| `evidence-leaf` | src/evidence (pcap reader, decoders, clocks, socket join) reaches only common: no session, frontends or engine C | 0 | 0 |
 | cycles | files in an import cycle, plus one `cycle sizes: 75 30 13 8 2 2 2 2` line | 134 files in 8 cycles | |
 | **baseline total** | | **344 lines** | |
 

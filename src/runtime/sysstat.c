@@ -22,6 +22,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -111,6 +112,7 @@ struct xrt_sys {
     uint32_t prev_count;
     struct sock_owner *owners;
     uint32_t owner_count, owner_cap;
+    uint32_t conn_prev_count;               /* sizes the next connections array */
     uint8_t owners_limited, owners_denied; /* map overflow; an own process's fds were unreadable */
     struct pw *pw;
     uint32_t pw_count;
@@ -1403,10 +1405,18 @@ static int64_t scan_fds(struct xrt_sys *s, int pfd, const char *pidname, int32_t
     sys_close(s, fd);
     return count;
 }
-static int owner_cmp(const void *a, const void *b)
+static int inode_cmp(const void *a, const void *b)
 {
     uint64_t x = ((const struct sock_owner *)a)->inode, y = ((const struct sock_owner *)b)->inode;
     return x < y ? -1 : x > y;
+}
+/* Sorted by inode, then pid, so a socket's holders are adjacent in pid order. */
+static int owner_cmp(const void *a, const void *b)
+{
+    int r = inode_cmp(a, b);
+    if (r) return r;
+    int32_t p = ((const struct sock_owner *)a)->pid, q = ((const struct sock_owner *)b)->pid;
+    return p < q ? -1 : p > q;
 }
 
 static void read_cmdline(struct xrt_sys *s, int pfd, const char *pidname, struct xrt_sys_name *f)
@@ -1484,6 +1494,27 @@ static ssize_t stat_read(struct xrt_sys *s, int fd) {
     return n;
 }
 
+/* Row arrays start near the previous sample's count and grow to the limit,
+ * so a snapshot holds its rows rather than the limit (8192 x 536 bytes for
+ * processes, zeroed and so resident on every sample). Returns 0 at the limit
+ * or on allocation failure. */
+static int grow_rows(void **rows, uint32_t *capacity, uint32_t limit, size_t size)
+{
+    if (*capacity >= limit) return 0;
+    uint32_t next = *capacity > limit / 2 ? limit : *capacity ? *capacity * 2 : 64;
+    if (next > limit) next = limit;
+    void *n = realloc(*rows, (size_t)next * size);
+    if (!n) return 0;
+    *rows = n;
+    *capacity = next;
+    return 1;
+}
+static uint32_t first_capacity(uint32_t previous, uint32_t limit)
+{
+    uint32_t want = previous + previous / 4 + 64;
+    return want < limit ? want : limit;
+}
+
 static void collect_processes(struct xrt_sys *s, struct xrt_sys_snapshot *snap, double dt, int have_dt, int links,
                               int want_procs, uint64_t deadline)
 {
@@ -1495,8 +1526,8 @@ static void collect_processes(struct xrt_sys *s, struct xrt_sys_snapshot *snap, 
     s->owners_limited = 0;
     s->owners_denied = 0;
     if (want_procs) {
-        ps->capacity = s->lim.max_processes;
-        ps->proc = calloc(ps->capacity ? ps->capacity : 1, sizeof *ps->proc);
+        ps->capacity = first_capacity(s->prev_count, s->lim.max_processes);
+        ps->proc = malloc((ps->capacity ? ps->capacity : 1) * sizeof *ps->proc);
         if (!ps->proc) {
             ps->capacity = 0;
             detail(g, ENOMEM, "out of memory");
@@ -1530,7 +1561,7 @@ static void collect_processes(struct xrt_sys *s, struct xrt_sys_snapshot *snap, 
             int32_t pid = (int32_t)strtol(e->name, NULL, 10);
             struct xrt_sys_proc *p = NULL;
             if (want_procs) {
-                if (ps->count >= ps->capacity) {
+                if (ps->count >= ps->capacity && !grow_rows((void **)&ps->proc, &ps->capacity, s->lim.max_processes, sizeof *ps->proc)) {
                     ps->truncated++;
                     if (!links) continue;
                 } else p = &ps->proc[ps->count];
@@ -1587,15 +1618,17 @@ static void collect_processes(struct xrt_sys *s, struct xrt_sys_snapshot *snap, 
             memcpy(p->comm, lp + 1, cl);
             p->comm[cl] = 0;
             char state;
-            int ppid;
+            int ppid, pgid, sid;
             unsigned flags;
             unsigned long long ut, st, start, vsize;
             long nice, threads, rss;
             int got = sscanf(rp + 2,
-                             "%c %d %*d %*d %*d %*d %u %*u %*u %*u %*u %llu %llu %*d %*d %*d %ld %ld %*d %llu %llu %ld",
-                             &state, &ppid, &flags, &ut, &st, &nice, &threads, &start, &vsize, &rss);
-            if (got != 10) continue;
+                             "%c %d %d %d %*d %*d %u %*u %*u %*u %*u %llu %llu %*d %*d %*d %ld %ld %*d %llu %llu %ld",
+                             &state, &ppid, &pgid, &sid, &flags, &ut, &st, &nice, &threads, &start, &vsize, &rss);
+            if (got != 12) continue;
             p->state = state;
+            p->pgid = pgid;
+            p->sid = sid;
             p->start_ticks = start;
             OK(p->ppid, (uint64_t)ppid);
             OK(p->start_s, (double)start / (double)s->hz);
@@ -1745,8 +1778,17 @@ static void conn_owner(struct xrt_sys *s, struct xrt_sys_snapshot *snap, struct 
         return;
     }
     struct sock_owner key = {.inode = c->inode};
-    struct sock_owner *o = s->owner_count ? bsearch(&key, s->owners, s->owner_count, sizeof *s->owners, owner_cmp) : NULL;
+    struct sock_owner *o = s->owner_count ? bsearch(&key, s->owners, s->owner_count, sizeof *s->owners, inode_cmp) : NULL;
     if (o) {
+        /* every holder: an inode can be shared by fork or SCM_RIGHTS */
+        while (o > s->owners && o[-1].inode == c->inode) o--;
+        for (const struct sock_owner *h = o; h < s->owners + s->owner_count && h->inode == c->inode; ++h) {
+            int seen = 0;
+            for (uint32_t k = 0; k < c->holder_count && k < XRT_SYS_MAX_HOLDERS; ++k) seen |= c->holders[k] == h->pid;
+            if (seen) continue;
+            if (c->holder_count < XRT_SYS_MAX_HOLDERS) c->holders[c->holder_count] = h->pid;
+            c->holder_count++;
+        }
         OK(c->pid, (uint64_t)o->pid);
         struct xrt_sys_proc pk = {.pid = o->pid};
         const struct xrt_sys_proc *p =
@@ -1760,10 +1802,10 @@ static void conn_owner(struct xrt_sys *s, struct xrt_sys_snapshot *snap, struct 
     else if (s->owners_denied) NA(c->pid, XRT_SYS_WHY_NEEDS_PRIVILEGE); /* e.g. our own non-dumpable process */
     else NA(c->pid, XRT_SYS_WHY_NOT_PRESENT);
 }
-static struct xrt_sys_conn *conn_slot(struct xrt_sys_snapshot *snap)
+static struct xrt_sys_conn *conn_slot(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
 {
     struct xrt_sys_connections *cs = &snap->connections;
-    if (cs->count >= cs->capacity) {
+    if (cs->count >= cs->capacity && !grow_rows((void **)&cs->conn, &cs->capacity, s->lim.max_connections, sizeof *cs->conn)) {
         cs->truncated++;
         return NULL;
     }
@@ -1811,7 +1853,7 @@ static int diag_dump(struct xrt_sys *s, struct xrt_sys_snapshot *snap, int fd, i
             if (family == AF_UNIX) {
                 struct unix_diag_msg *m = NLMSG_DATA(h);
                 cs->unix_sockets.v++;
-                struct xrt_sys_conn *c = conn_slot(snap);
+                struct xrt_sys_conn *c = conn_slot(s, snap);
                 if (!c) continue;
                 c->proto = XRT_SYS_UNIX;
                 c->inode = m->udiag_ino;
@@ -1859,13 +1901,14 @@ static int diag_dump(struct xrt_sys *s, struct xrt_sys_snapshot *snap, int fd, i
             else cs->tcp.v++;
             if (m->idiag_state == 10) cs->listening.v++;
             if (m->idiag_state == 1) cs->established.v++;
-            struct xrt_sys_conn *c = conn_slot(snap);
+            struct xrt_sys_conn *c = conn_slot(s, snap);
             if (!c) continue;
             c->proto = udp ? XRT_SYS_UDP : XRT_SYS_TCP;
             c->family = family == AF_INET ? 4 : 6;
             copy_str(c->state, sizeof c->state, tcp_state(m->idiag_state, udp));
             endpoint(&c->local, family, m->id.idiag_src, ntohs(m->id.idiag_sport), redact);
             endpoint(&c->remote, family, m->id.idiag_dst, ntohs(m->id.idiag_dport), redact);
+            c->external = !loopback_addr(family, m->id.idiag_dst);
             c->inode = m->idiag_inode;
             OK(c->uid, m->idiag_uid);
             OK(c->rx_queue, m->idiag_rqueue);
@@ -1886,8 +1929,8 @@ static void collect_connections(struct xrt_sys *s, struct xrt_sys_snapshot *snap
         g->why = XRT_SYS_WHY_NOT_SUPPORTED;
         return;
     }
-    cs->capacity = s->lim.max_connections;
-    cs->conn = calloc(cs->capacity ? cs->capacity : 1, sizeof *cs->conn);
+    cs->capacity = first_capacity(s->conn_prev_count, s->lim.max_connections);
+    cs->conn = malloc((cs->capacity ? cs->capacity : 1) * sizeof *cs->conn);
     if (!cs->conn) cs->capacity = 0;
     for (size_t i = 0; i < COUNT_OF(t); ++i) OK(*t[i], 0);
     s->syscalls++;
@@ -1912,6 +1955,7 @@ static void collect_connections(struct xrt_sys *s, struct xrt_sys_snapshot *snap
         }
     }
     sys_close(s, fd);
+    s->conn_prev_count = cs->count;
     if (s->owners_limited) detail(g, 0, "socket owner map limit reached");
 }
 
@@ -3023,6 +3067,7 @@ static double proc_key(const struct xrt_sys_proc *p, uint32_t sort)
     case XRT_SYS_SORT_FDS: return p->fds.st == XRT_SYS_OK || p->fds.st == XRT_SYS_STALE ? (double)p->fds.v : none;
     case XRT_SYS_SORT_THREADS: return ISOK(p->threads) ? (double)p->threads.v : none;
     case XRT_SYS_SORT_START: return (double)p->start_ticks;
+    case XRT_SYS_SORT_AGE: return -(double)p->start_ticks;
     default: return -(double)p->pid;
     }
 }
@@ -3055,7 +3100,47 @@ static void jproc(struct jb *b, const struct xrt_sys_proc *p)
     ju(b, "nice", &p->nice);
     ju(b, "kernel_thread", &p->kernel_thread);
     jnm(b, "cgroup", &p->cgroup);
+    if (p->pgid > 0) ji(b, "pgid", p->pgid);
+    if (p->sid > 0) ji(b, "sid", p->sid);
     jclose(b, '}');
+}
+static int contains_nocase(const char *hay, const char *needle)
+{
+    size_t n = strlen(needle);
+    for (; *hay; ++hay)
+        if (!strncasecmp(hay, needle, n)) return 1;
+    return n == 0;
+}
+static int proc_match(const struct xrt_sys_proc *p, const struct xrt_sys_json_opts *o)
+{
+    if (o->pid > 0 && p->pid != o->pid) return 0;
+    if (o->state && p->state != o->state) return 0;
+    if (o->match && !contains_nocase(p->comm, o->match) &&
+        !(p->cmdline.st == XRT_SYS_OK && contains_nocase(p->cmdline.s, o->match)))
+        return 0;
+    if (o->user) {
+        char *end;
+        unsigned long uid = strtoul(o->user, &end, 10);
+        if (*o->user && !*end) return ISOK(p->uid) && p->uid.v == uid;
+        return p->user.st == XRT_SYS_OK && !strcmp(p->user.s, o->user);
+    }
+    return 1;
+}
+static int conn_match(const struct xrt_sys_conn *c, const struct xrt_sys_json_opts *o)
+{
+    if (o->pid > 0 && !(ISOK(c->pid) && c->pid.v == (uint64_t)o->pid)) return 0;
+    if (o->conn_proto && c->proto != o->conn_proto) return 0;
+    if (o->conn_state && strcmp(c->state, o->conn_state)) return 0;
+    if (o->conn_external && !c->external) return 0;
+    /* A listener's tx_queue is its backlog limit; only pending accepts count. */
+    int listening = !strcmp(c->state, "LISTEN");
+    if (o->conn_queued && !((ISOK(c->rx_queue) && c->rx_queue.v) || (!listening && ISOK(c->tx_queue) && c->tx_queue.v))) return 0;
+    if (o->user) {
+        char *end;
+        unsigned long uid = strtoul(o->user, &end, 10);
+        if (!*o->user || *end || !ISOK(c->uid) || c->uid.v != uid) return 0;
+    }
+    return 1;
 }
 static void jconn(struct jb *b, const struct xrt_sys_conn *c)
 {
@@ -3070,6 +3155,15 @@ static void jconn(struct jb *b, const struct xrt_sys_conn *c)
     ju(b, "uid", &c->uid);
     ju(b, "pid", &c->pid);
     if (c->comm[0]) js(b, "comm", c->comm);
+    if (c->holder_count) {
+        jopen(b, "holders", '[');
+        for (uint32_t k = 0; k < c->holder_count && k < XRT_SYS_MAX_HOLDERS; ++k) {
+            jsep(b);
+            jprintf(b, "%d", c->holders[k]);
+        }
+        jclose(b, ']');
+        ji(b, "holder_count", c->holder_count);
+    }
     ju(b, "rx_queue", &c->rx_queue);
     ju(b, "tx_queue", &c->tx_queue);
     jclose(b, '}');
@@ -3299,16 +3393,21 @@ char *xrt_sys_json(const struct xrt_sys_snapshot *snap, const struct xrt_sys_jso
         ji(&b, "count", c->count);
         ji(&b, "truncated", c->truncated);
         jopen(&b, "rows", '[');
-        uint32_t shown = 0;
+        uint32_t shown = 0, matched = 0;
         for (uint32_t i = 0; i < c->count; ++i) {
             const struct xrt_sys_conn *x = &c->conn[i];
-            if (o->pid > 0 && !(ISOK(x->pid) && x->pid.v == (uint64_t)o->pid)) continue;
-            if (limit && shown >= limit) break;
+            if (!conn_match(x, o)) continue;
+            if (matched++ < o->offset || (limit && shown >= limit)) continue;
             jconn(&b, x);
             shown++;
         }
         jclose(&b, ']');
         ji(&b, "shown", shown);
+        ji(&b, "matched", matched);
+        ji(&b, "offset", o->offset);
+        jkey(&b, "next_offset");
+        if (o->offset + shown < matched) jprintf(&b, "%u", o->offset + shown);
+        else jputs(&b, "null");
         jclose(&b, '}');
     }
     if (W(XRT_SYS_G_POWER)) {
@@ -3423,18 +3522,23 @@ char *xrt_sys_json(const struct xrt_sys_snapshot *snap, const struct xrt_sys_jso
         struct sort_key *keys = ps->count ? malloc(ps->count * sizeof *keys) : NULL;
         uint32_t nk = 0;
         for (uint32_t i = 0; keys && i < ps->count; ++i) {
-            if (o->pid > 0 && ps->proc[i].pid != o->pid) continue;
+            if (!proc_match(&ps->proc[i], o)) continue;
             keys[nk].key = proc_key(&ps->proc[i], o->sort);
             keys[nk].idx = i;
             nk++;
         }
         if (nk) qsort(keys, nk, sizeof *keys, sort_desc);
         uint32_t shown = 0;
-        for (uint32_t i = 0; i < nk && (!limit || shown < limit); ++i, ++shown) jproc(&b, &ps->proc[keys[i].idx]);
+        for (uint32_t i = o->offset; i < nk && (!limit || shown < limit); ++i, ++shown) jproc(&b, &ps->proc[keys[i].idx]);
         if (ps->count && !keys) b.oom = 1;
         free(keys);
         jclose(&b, ']');
         ji(&b, "shown", shown);
+        ji(&b, "matched", nk);
+        ji(&b, "offset", o->offset);
+        jkey(&b, "next_offset");
+        if (o->offset + shown < nk) jprintf(&b, "%u", o->offset + shown);
+        else jputs(&b, "null");
         jclose(&b, '}');
     }
     if (W(XRT_SYS_G_SYSINFO)) {

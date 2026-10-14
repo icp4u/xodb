@@ -1,6 +1,7 @@
 # System-wide IO stream checks
 
-The stream is a C component for native Linux x86-64. It captures raw syscall
+The stream is a C component for the native Linux ABI of the architecture it was
+built for. It captures raw syscall
 arguments and returns plus named IO exits, without subscribing to named entry
 payloads. Compatibility syscalls have no native IO identity. The collector
 covers CPUs online when opened, reports individual CPU enrollment failures,

@@ -1,0 +1,345 @@
+#ifndef XODB_RUNTIME_FDFLOW_SYSCALLS_H
+#define XODB_RUNTIME_FDFLOW_SYSCALLS_H
+/* Native syscall numbers for the architecture this binary is compiled for.
+ * <sys/syscall.h> is the source. A name that header does not define is
+ * omitted (the generic table has no open, pipe, dup2, fork, vfork, creat).
+ * Raw tracepoints also fire for a compat ABI and carry no ABI tag, so those
+ * numbers stay unlisted and unproved:
+ *   x86-64: int 0x80 and x32 (their numbers alias native fstat/lseek/munmap)
+ *   aarch64: 32-bit compat
+ *   ppc64le: 32-bit compat
+ *   riscv64, loongarch64, m68k: no second userspace ABI is listed
+ * A missing name is not a reason to guess a number.
+ */
+/* The counter is also built into the macOS seam, which has no Linux capture
+ * to feed it; there every list is empty. */
+#ifdef __linux__
+#include <sys/syscall.h>
+#endif
+#ifdef SYS_exit_group
+#define XRT_FDFLOW_NR_EXIT SYS_exit
+#define XRT_FDFLOW_NR_EXIT_GROUP SYS_exit_group
+#else
+#define XRT_FDFLOW_NR_EXIT (-1)
+#define XRT_FDFLOW_NR_EXIT_GROUP (-1)
+#endif
+
+#ifdef SYS_read
+#define XRT_FDFLOW_HAVE_read(X) X(read, SYS_read, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_read(X)
+#endif
+#ifdef SYS_write
+#define XRT_FDFLOW_HAVE_write(X) X(write, SYS_write, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_write(X)
+#endif
+#ifdef SYS_pread64
+#define XRT_FDFLOW_HAVE_pread64(X) X(pread64, SYS_pread64, XRT_FDFLOW_READ)
+#elif defined(SYS_pread)
+#define XRT_FDFLOW_HAVE_pread64(X) X(pread, SYS_pread, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_pread64(X)
+#endif
+#ifdef SYS_pwrite64
+#define XRT_FDFLOW_HAVE_pwrite64(X) X(pwrite64, SYS_pwrite64, XRT_FDFLOW_WRITE)
+#elif defined(SYS_pwrite)
+#define XRT_FDFLOW_HAVE_pwrite64(X) X(pwrite, SYS_pwrite, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_pwrite64(X)
+#endif
+#ifdef SYS_readv
+#define XRT_FDFLOW_HAVE_readv(X) X(readv, SYS_readv, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_readv(X)
+#endif
+#ifdef SYS_writev
+#define XRT_FDFLOW_HAVE_writev(X) X(writev, SYS_writev, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_writev(X)
+#endif
+#ifdef SYS_preadv
+#define XRT_FDFLOW_HAVE_preadv(X) X(preadv, SYS_preadv, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_preadv(X)
+#endif
+#ifdef SYS_pwritev
+#define XRT_FDFLOW_HAVE_pwritev(X) X(pwritev, SYS_pwritev, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_pwritev(X)
+#endif
+#ifdef SYS_preadv2
+#define XRT_FDFLOW_HAVE_preadv2(X) X(preadv2, SYS_preadv2, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_preadv2(X)
+#endif
+#ifdef SYS_pwritev2
+#define XRT_FDFLOW_HAVE_pwritev2(X) X(pwritev2, SYS_pwritev2, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_pwritev2(X)
+#endif
+#ifdef SYS_sendto
+#define XRT_FDFLOW_HAVE_sendto(X) X(sendto, SYS_sendto, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_sendto(X)
+#endif
+#ifdef SYS_recvfrom
+#define XRT_FDFLOW_HAVE_recvfrom(X) X(recvfrom, SYS_recvfrom, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_recvfrom(X)
+#endif
+#ifdef SYS_sendmsg
+#define XRT_FDFLOW_HAVE_sendmsg(X) X(sendmsg, SYS_sendmsg, XRT_FDFLOW_WRITE)
+#else
+#define XRT_FDFLOW_HAVE_sendmsg(X)
+#endif
+#ifdef SYS_recvmsg
+#define XRT_FDFLOW_HAVE_recvmsg(X) X(recvmsg, SYS_recvmsg, XRT_FDFLOW_READ)
+#else
+#define XRT_FDFLOW_HAVE_recvmsg(X)
+#endif
+
+/* X(name, number, operation). operation is XRT_FDFLOW_READ or XRT_FDFLOW_WRITE.
+ * Those tokens expand when the list is used, so xrt_fdflow.h must be included
+ * before expanding this list in a context that reads the operation. */
+#define XRT_FDFLOW_EACH_IO(X)                                                                      \
+  XRT_FDFLOW_HAVE_read(X)                                                                          \
+  XRT_FDFLOW_HAVE_write(X)                                                                         \
+  XRT_FDFLOW_HAVE_pread64(X)                                                                       \
+  XRT_FDFLOW_HAVE_pwrite64(X)                                                                      \
+  XRT_FDFLOW_HAVE_readv(X)                                                                         \
+  XRT_FDFLOW_HAVE_writev(X)                                                                        \
+  XRT_FDFLOW_HAVE_preadv(X)                                                                        \
+  XRT_FDFLOW_HAVE_pwritev(X)                                                                       \
+  XRT_FDFLOW_HAVE_preadv2(X)                                                                       \
+  XRT_FDFLOW_HAVE_pwritev2(X)                                                                      \
+  XRT_FDFLOW_HAVE_sendto(X)                                                                        \
+  XRT_FDFLOW_HAVE_recvfrom(X)                                                                      \
+  XRT_FDFLOW_HAVE_sendmsg(X)                                                                       \
+  XRT_FDFLOW_HAVE_recvmsg(X)
+
+#define XRT_FDFLOW_IO_PLUS(name, num, op) +1
+#define XRT_FDFLOW_IO_COUNT (0 XRT_FDFLOW_EACH_IO(XRT_FDFLOW_IO_PLUS))
+
+#ifdef SYS_open
+#define XRT_FDFLOW_MUT_open(X) X(open, SYS_open, 0)
+#else
+#define XRT_FDFLOW_MUT_open(X)
+#endif
+#ifdef SYS_close
+#define XRT_FDFLOW_MUT_close(X) X(close, SYS_close, 0)
+#else
+#define XRT_FDFLOW_MUT_close(X)
+#endif
+#ifdef SYS_pipe
+#define XRT_FDFLOW_MUT_pipe(X) X(pipe, SYS_pipe, 0)
+#else
+#define XRT_FDFLOW_MUT_pipe(X)
+#endif
+#ifdef SYS_dup
+#define XRT_FDFLOW_MUT_dup(X) X(dup, SYS_dup, 0)
+#else
+#define XRT_FDFLOW_MUT_dup(X)
+#endif
+#ifdef SYS_dup2
+#define XRT_FDFLOW_MUT_dup2(X) X(dup2, SYS_dup2, 0)
+#else
+#define XRT_FDFLOW_MUT_dup2(X)
+#endif
+#ifdef SYS_socket
+#define XRT_FDFLOW_MUT_socket(X) X(socket, SYS_socket, 0)
+#else
+#define XRT_FDFLOW_MUT_socket(X)
+#endif
+#ifdef SYS_accept
+#define XRT_FDFLOW_MUT_accept(X) X(accept, SYS_accept, 0)
+#else
+#define XRT_FDFLOW_MUT_accept(X)
+#endif
+#ifdef SYS_recvmsg
+#define XRT_FDFLOW_MUT_recvmsg(X) X(recvmsg, SYS_recvmsg, 0)
+#else
+#define XRT_FDFLOW_MUT_recvmsg(X)
+#endif
+#ifdef SYS_socketpair
+#define XRT_FDFLOW_MUT_socketpair(X) X(socketpair, SYS_socketpair, 0)
+#else
+#define XRT_FDFLOW_MUT_socketpair(X)
+#endif
+#ifdef SYS_clone
+#define XRT_FDFLOW_MUT_clone(X) X(clone, SYS_clone, 0)
+#else
+#define XRT_FDFLOW_MUT_clone(X)
+#endif
+#ifdef SYS_fork
+#define XRT_FDFLOW_MUT_fork(X) X(fork, SYS_fork, 0)
+#else
+#define XRT_FDFLOW_MUT_fork(X)
+#endif
+#ifdef SYS_vfork
+#define XRT_FDFLOW_MUT_vfork(X) X(vfork, SYS_vfork, 0)
+#else
+#define XRT_FDFLOW_MUT_vfork(X)
+#endif
+#ifdef SYS_execve
+#define XRT_FDFLOW_MUT_execve(X) X(execve, SYS_execve, 0)
+#else
+#define XRT_FDFLOW_MUT_execve(X)
+#endif
+#ifdef SYS_fcntl
+#define XRT_FDFLOW_MUT_fcntl(X) X(fcntl, SYS_fcntl, 0)
+#else
+#define XRT_FDFLOW_MUT_fcntl(X)
+#endif
+#ifdef SYS_creat
+#define XRT_FDFLOW_MUT_creat(X) X(creat, SYS_creat, 0)
+#else
+#define XRT_FDFLOW_MUT_creat(X)
+#endif
+#ifdef SYS_openat
+#define XRT_FDFLOW_MUT_openat(X) X(openat, SYS_openat, 0)
+#else
+#define XRT_FDFLOW_MUT_openat(X)
+#endif
+#ifdef SYS_accept4
+#define XRT_FDFLOW_MUT_accept4(X) X(accept4, SYS_accept4, 0)
+#else
+#define XRT_FDFLOW_MUT_accept4(X)
+#endif
+#ifdef SYS_dup3
+#define XRT_FDFLOW_MUT_dup3(X) X(dup3, SYS_dup3, 0)
+#else
+#define XRT_FDFLOW_MUT_dup3(X)
+#endif
+#ifdef SYS_pipe2
+#define XRT_FDFLOW_MUT_pipe2(X) X(pipe2, SYS_pipe2, 0)
+#else
+#define XRT_FDFLOW_MUT_pipe2(X)
+#endif
+#ifdef SYS_recvmmsg
+#define XRT_FDFLOW_MUT_recvmmsg(X) X(recvmmsg, SYS_recvmmsg, 0)
+#else
+#define XRT_FDFLOW_MUT_recvmmsg(X)
+#endif
+#ifdef SYS_execveat
+#define XRT_FDFLOW_MUT_execveat(X) X(execveat, SYS_execveat, 0)
+#else
+#define XRT_FDFLOW_MUT_execveat(X)
+#endif
+#ifdef SYS_io_uring_setup
+#define XRT_FDFLOW_MUT_io_uring_setup(X) X(io_uring_setup, SYS_io_uring_setup, 1)
+#else
+#define XRT_FDFLOW_MUT_io_uring_setup(X)
+#endif
+#ifdef SYS_io_uring_enter
+#define XRT_FDFLOW_MUT_io_uring_enter(X) X(io_uring_enter, SYS_io_uring_enter, 1)
+#else
+#define XRT_FDFLOW_MUT_io_uring_enter(X)
+#endif
+#ifdef SYS_io_uring_register
+#define XRT_FDFLOW_MUT_io_uring_register(X) X(io_uring_register, SYS_io_uring_register, 1)
+#else
+#define XRT_FDFLOW_MUT_io_uring_register(X)
+#endif
+#ifdef SYS_clone3
+#define XRT_FDFLOW_MUT_clone3(X) X(clone3, SYS_clone3, 0)
+#else
+#define XRT_FDFLOW_MUT_clone3(X)
+#endif
+#ifdef SYS_close_range
+#define XRT_FDFLOW_MUT_close_range(X) X(close_range, SYS_close_range, 0)
+#else
+#define XRT_FDFLOW_MUT_close_range(X)
+#endif
+#ifdef SYS_openat2
+#define XRT_FDFLOW_MUT_openat2(X) X(openat2, SYS_openat2, 0)
+#else
+#define XRT_FDFLOW_MUT_openat2(X)
+#endif
+#ifdef SYS_pidfd_getfd
+#define XRT_FDFLOW_MUT_pidfd_getfd(X) X(pidfd_getfd, SYS_pidfd_getfd, 0)
+#else
+#define XRT_FDFLOW_MUT_pidfd_getfd(X)
+#endif
+#ifdef SYS_fcntl64
+#define XRT_FDFLOW_MUT_fcntl64(X) X(fcntl64, SYS_fcntl64, 0)
+#else
+#define XRT_FDFLOW_MUT_fcntl64(X)
+#endif
+#ifdef SYS_recvmmsg_time64
+#define XRT_FDFLOW_MUT_recvmmsg_time64(X) X(recvmmsg_time64, SYS_recvmmsg_time64, 0)
+#else
+#define XRT_FDFLOW_MUT_recvmmsg_time64(X)
+#endif
+/* socketcall multiplexes socket, accept and recvmsg on ppc64 and m68k. Its
+ * IO (send/recv through it) is not counted; its fd changes withdraw joins. */
+#ifdef SYS_socketcall
+#define XRT_FDFLOW_MUT_socketcall(X) X(socketcall, SYS_socketcall, 0)
+#else
+#define XRT_FDFLOW_MUT_socketcall(X)
+#endif
+
+/* X(name, number, asynchronous). asynchronous is 1 for io_uring calls. */
+#define XRT_FDFLOW_EACH_MUTATION(X)                                                                \
+  XRT_FDFLOW_MUT_open(X)                                                                           \
+  XRT_FDFLOW_MUT_close(X)                                                                          \
+  XRT_FDFLOW_MUT_pipe(X)                                                                           \
+  XRT_FDFLOW_MUT_dup(X)                                                                            \
+  XRT_FDFLOW_MUT_dup2(X)                                                                           \
+  XRT_FDFLOW_MUT_socket(X)                                                                         \
+  XRT_FDFLOW_MUT_accept(X)                                                                         \
+  XRT_FDFLOW_MUT_recvmsg(X)                                                                        \
+  XRT_FDFLOW_MUT_socketpair(X)                                                                     \
+  XRT_FDFLOW_MUT_clone(X)                                                                          \
+  XRT_FDFLOW_MUT_fork(X)                                                                           \
+  XRT_FDFLOW_MUT_vfork(X)                                                                          \
+  XRT_FDFLOW_MUT_execve(X)                                                                         \
+  XRT_FDFLOW_MUT_fcntl(X)                                                                          \
+  XRT_FDFLOW_MUT_creat(X)                                                                          \
+  XRT_FDFLOW_MUT_openat(X)                                                                         \
+  XRT_FDFLOW_MUT_accept4(X)                                                                        \
+  XRT_FDFLOW_MUT_dup3(X)                                                                           \
+  XRT_FDFLOW_MUT_pipe2(X)                                                                          \
+  XRT_FDFLOW_MUT_recvmmsg(X)                                                                       \
+  XRT_FDFLOW_MUT_execveat(X)                                                                       \
+  XRT_FDFLOW_MUT_io_uring_setup(X)                                                                 \
+  XRT_FDFLOW_MUT_io_uring_enter(X)                                                                 \
+  XRT_FDFLOW_MUT_io_uring_register(X)                                                              \
+  XRT_FDFLOW_MUT_clone3(X)                                                                         \
+  XRT_FDFLOW_MUT_close_range(X)                                                                    \
+  XRT_FDFLOW_MUT_openat2(X)                                                                        \
+  XRT_FDFLOW_MUT_pidfd_getfd(X)                                                                    \
+  XRT_FDFLOW_MUT_fcntl64(X)                                                                        \
+  XRT_FDFLOW_MUT_recvmmsg_time64(X)                                                                \
+  XRT_FDFLOW_MUT_socketcall(X)
+
+#if defined(__x86_64__) && !defined(__ILP32__)
+/* These are the literals tests/runtime-fdflow-count.c still passes. */
+_Static_assert(SYS_read == 0 && SYS_write == 1, "x86 read/write");
+_Static_assert(SYS_pread64 == 17 && SYS_pwrite64 == 18, "x86 pread/pwrite");
+_Static_assert(SYS_readv == 19 && SYS_writev == 20, "x86 readv/writev");
+_Static_assert(SYS_preadv == 295 && SYS_pwritev == 296, "x86 preadv/pwritev");
+_Static_assert(SYS_preadv2 == 327 && SYS_pwritev2 == 328, "x86 preadv2/pwritev2");
+_Static_assert(SYS_sendto == 44 && SYS_recvfrom == 45, "x86 sendto/recvfrom");
+_Static_assert(SYS_sendmsg == 46 && SYS_recvmsg == 47, "x86 sendmsg/recvmsg");
+_Static_assert(SYS_open == 2 && SYS_close == 3 && SYS_pipe == 22, "x86 open/close/pipe");
+_Static_assert(SYS_dup == 32 && SYS_dup2 == 33 && SYS_socket == 41, "x86 dup/socket");
+_Static_assert(SYS_accept == 43 && SYS_socketpair == 53, "x86 accept/socketpair");
+_Static_assert(SYS_clone == 56 && SYS_fork == 57 && SYS_vfork == 58, "x86 clone/fork");
+_Static_assert(SYS_execve == 59 && SYS_fcntl == 72 && SYS_creat == 85, "x86 exec/fcntl/creat");
+_Static_assert(SYS_openat == 257 && SYS_accept4 == 288, "x86 openat/accept4");
+_Static_assert(SYS_dup3 == 292 && SYS_pipe2 == 293 && SYS_recvmmsg == 299, "x86 dup3/pipe2");
+_Static_assert(SYS_execveat == 322, "x86 execveat");
+_Static_assert(SYS_io_uring_setup == 425 && SYS_io_uring_enter == 426 && SYS_io_uring_register == 427,
+               "x86 io_uring");
+_Static_assert(SYS_clone3 == 435 && SYS_close_range == 436, "x86 clone3/close_range");
+_Static_assert(SYS_openat2 == 437 && SYS_pidfd_getfd == 438, "x86 openat2/pidfd_getfd");
+_Static_assert(SYS_fstat == 5 && SYS_lseek == 8 && SYS_munmap == 11, "x86 compat aliases");
+_Static_assert(SYS_exit == 60 && SYS_exit_group == 231, "x86 exit/exit_group");
+#if defined(SYS_fcntl64) || defined(SYS_recvmmsg_time64) || defined(SYS_socketcall)
+#error "x86-64 mutation set changed"
+#endif
+_Static_assert(SYS_uname == 63 && SYS_getuid == 102, "x86 harmless numbers");
+_Static_assert(XRT_FDFLOW_IO_COUNT == 14, "x86 keeps 14 IO calls");
+#endif
+#endif

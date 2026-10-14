@@ -20,10 +20,10 @@ pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap" };
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -60,6 +60,8 @@ pub const History = struct {
     nets: h.Keyed(64, 2) = .{}, // rx, tx
     sensors: h.Keyed(256, 1) = .{},
     gpus: h.Keyed(8, 3) = .{}, // busy, power, temp
+    boost: h.Ring = .{}, // fastest core, MHz
+    activity: h.Ring = .{}, // context switches/s
     scales: [16]h.Scale = @splat(.{}),
 };
 pub const ScaleId = enum { disk_total, net_total, mem_psi, disk_card, net_card };
@@ -82,6 +84,9 @@ pub const View = struct {
     memmap: memmap.State = .{},
     graph: graph_model.State = .{},
     treemap: @import("treemap_model.zig").State = .{},
+    fetch: @import("fetch_panel.zig").State = .{},
+    /// Start to first presented frame, for the fetch panel.
+    startup_ns: u64 = 0,
     /// The Memory map looks draw period-styled tooltips.
     tooltip_style: enum { overview, win9x, dos } = .overview,
     current: ?*m.Owned = null,
@@ -159,6 +164,7 @@ pub const View = struct {
         self.memmap.deinit();
         self.graph.deinit();
         self.treemap.deinit();
+        self.fetch.deinit(self.gpa);
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -201,6 +207,7 @@ pub const View = struct {
             .users => &.{.users},
             .services => &.{.services},
             .apps => &.{.apps},
+            .fetch => &.{.filesystems},
             else => &.{},
         };
         if (!slow) return mask;
@@ -310,6 +317,12 @@ pub const View = struct {
         H.net_tx.push(tx);
         H.package_temp.push(s.cpu_package_temp.get());
         H.package_power.push(s.cpu_package_power.get());
+        var fastest: ?f64 = null;
+        for (s.cpus) |cpu| if (cpu.mhz.get()) |mhz| {
+            fastest = @max(fastest orelse 0, mhz);
+        };
+        H.boost.push(fastest);
+        H.activity.push(s.context_switches_ps.get());
         var name_buf: [96]u8 = undefined;
         for (s.sensors) |sensor| {
             const k = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ sensor.chip, sensor.label }) catch continue;
@@ -348,7 +361,7 @@ pub const View = struct {
     pub fn animating(self: *const View, now: u64) bool {
         if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().table.open) return false;
         if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().motion.navigation.active) return true;
-        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now));
+        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now)) or (self.panel == .fetch and self.fetch.busy());
     }
 
     pub fn setStatus(self: *View, comptime fmt: []const u8, args: anytype, now: u64) void {
@@ -519,6 +532,7 @@ pub const View = struct {
         }
         if (self.panel == .inheritance and (sym == 0xff0d or sym == 0xff8d)) return;
         if (self.panel == .treemap and @import("treemap_panel.zig").key(self, event)) return;
+        if (self.panel == .fetch) if (self.fetch.key(self.gpa, event)) |status| return self.setStatus("{s}", .{status}, now);
         if (self.panel == .files and self.filesKey(event, now)) return;
         if ((self.panel == .graph or self.panel == .galaxy) and @import("graph_panel.zig").key(self, event)) return;
         if (self.panel == .memory_map and !self.searching and memmap.key(self, event, now)) return;
@@ -605,6 +619,7 @@ pub const View = struct {
             'y' => self.show(.galaxy),
             'i' => self.show(.inheritance),
             'b' => self.show(.treemap),
+            'n' => self.show(.fetch),
             'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
@@ -1328,6 +1343,7 @@ pub const View = struct {
             if (item_h < 48) continue;
             // Second line: a live value and a sparkline where history exists.
             var vb: [48]u8 = undefined;
+            var ub: [48]u8 = undefined;
             const H = self.hist;
             var detail: struct { text: []const u8, ring: ?*const h.Ring = null, max: f32 = 100 } = if (s) |snapshot| switch (panel) {
                 .summary, .performance => .{ .text = format(&vb, .percent, H.cpu_total.last()), .ring = &H.cpu_total },
@@ -1344,6 +1360,7 @@ pub const View = struct {
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
                 .treemap => .{ .text = if (self.treemap.tree) |tree| std.fmt.bufPrint(&vb, "{d} handles", .{tree.fd_count}) catch "" else "sampled when shown" },
+                .fetch => .{ .text = if (snapshot.uptime_s.get()) |u| std.fmt.bufPrint(&vb, "up {s}", .{@import("fetch.zig").uptime(&ub, u, false)}) catch "" else "this machine" },
                 .inheritance => .{ .text = if (self.graph.inheritance) |rows| std.fmt.bufPrint(&vb, "{d} sampled matches", .{rows.matched}) catch "" else "sampled when shown" },
                 .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
                 .memory_map => .{ .text = if (self.memmap.coverage()) |coverage| switch (coverage) {
@@ -1450,7 +1467,7 @@ pub const View = struct {
             .files => .{ "Read-only descriptors in this window's Files & IO pane.", "Cost: shared scan once per second, 10 ms soft budget; no target pause.", "Access: your account's /proc permissions; denied fields stay unavailable.", "The view pins the sampled process identity. No privilege escalation." },
             .profile => .{ "Attach, start a 99 Hz CPU capture for 10 seconds, then resume.", "Cost: briefly stops all threads; perf buffers up to 64 MiB, plus symbols.", "Access: ptrace and perf_event permissions; denial is reported.", "The target is checked before and after attach. No privilege escalation." },
             .attach => .{ "Open this process in a separate debugger window.", "Cost: attaches and stops all threads until you continue or detach.", "Access: ptrace permission (same user or CAP_SYS_PTRACE).", "The target is checked before and after attach. No privilege escalation." },
-            .events => .{ "exact mode slows all syscalls on this machine by roughly 10 % while active", "Syscall-heavy targets can slow much more; up to 64 perf fds and 2 MiB rings.", "Access: native x86-64 tracepoints and perf permission; no ptrace stop.", "E stops. Pausing or leaving this pane stops capture. FD numbers span reuse." },
+            .events => .{ "exact mode slows all syscalls on this machine by roughly 10 % while active", "Syscall-heavy targets can slow much more; up to 64 perf fds and 2 MiB rings.", "Access: native tracepoints for this binary's architecture and perf permission; no ptrace stop.", "E stops. Pausing or leaving this pane stops capture. FD numbers span reuse." },
         };
         for (lines, 0..) |line, i| try ctx.textFit(box.x + 20, box.y + 58 + @as(f32, @floatFromInt(i)) * 30, w - 40, line, p.dim);
         const cancel = Rect{ .x = box.x + 20, .y = box.y + 222, .w = 190, .h = 36 };
@@ -1947,7 +1964,7 @@ test "short classic menus expose every full-height item by keyboard and paging" 
         win95.scrollMenu(&v, 1000);
         try std.testing.expectEqual(panel_count - 1, v.classic_cursor);
         v.key(.{ .kind = .press, .sym = 0xff0d }, 1);
-        try std.testing.expectEqual(Panel.treemap, v.panel);
+        try std.testing.expectEqual(Panel.fetch, v.panel);
         try std.testing.expect(v.classic_menu == null);
     }
 }

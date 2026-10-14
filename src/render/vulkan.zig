@@ -141,6 +141,8 @@ pub const Renderer = struct {
     scene_after_batches: usize = 0,
     clip: Rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 },
     gpu_name: [256]u8 = @splat(0),
+    /// The chosen device's kind; .cpu is a software renderer (llvmpipe, lavapipe).
+    gpu_kind: select.Kind = .other,
     /// Instance has VK_KHR_get_physical_device_properties2 for DRM nodes.
     device_nodes: bool = false,
     /// A driver library the loader reported as failing to load, if any.
@@ -159,6 +161,7 @@ pub const Renderer = struct {
         self.physical = found.items[choice.index].physical;
         self.family = found.items[choice.index].family;
         self.gpu_name = found.items[choice.index].name;
+        self.gpu_kind = found.items[choice.index].device.kind;
         log.info(.render, "Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
         log.debug(.render, "Vulkan device {d} of {d} chosen: {s}\n", .{ choice.index, found.items.len, switch (choice.why) {
             .requested => "requested with --vk-device or XODB_VK_DEVICE",
@@ -196,8 +199,8 @@ pub const Renderer = struct {
         try self.createBuffer();
         try self.createAtlas();
         try self.createDescriptors();
-        const scale = try @import("../platform/window.zig").validateScale(window.scale());
-        try self.createSwap(@import("../platform/window.zig").deviceExtent(window.width, scale), @import("../platform/window.zig").deviceExtent(window.height, scale));
+        const pixels = window.bufferExtent();
+        try self.createSwap(pixels.width, pixels.height);
     }
     /// The instance, with two optional extensions when the loader has them:
     /// device DRM nodes (to find the display GPU) and loader messages (to hear
@@ -731,16 +734,25 @@ pub const Renderer = struct {
         try check(ready);
         if (self.scene_gpu) |*scene_gpu| scene_gpu.timerRead();
         self.scene_requested = false;
-        self.ui_width = @floatFromInt(width);
-        self.ui_height = @floatFromInt(height);
+        const changed = @as(u32, @intFromFloat(self.ui_width)) != width or @as(u32, @intFromFloat(self.ui_height)) != height or self.ui_scale != scale;
         self.ui_scale = try @import("../platform/window.zig").validateScale(scale);
-        const physical_width = @import("../platform/window.zig").deviceExtent(width, self.ui_scale);
-        const physical_height = @import("../platform/window.zig").deviceExtent(height, self.ui_scale);
+        const pixels = if (self.window) |window| window.bufferExtent() else @import("../platform/window.zig").Extent{
+            .width = @import("../platform/window.zig").deviceExtent(width, self.ui_scale),
+            .height = @import("../platform/window.zig").deviceExtent(height, self.ui_scale),
+        };
+        const physical_width = pixels.width;
+        const physical_height = pixels.height;
         if (physical_width != self.extent.width or physical_height != self.extent.height) {
             try check(c.vkDeviceWaitIdle(self.device));
             self.destroySwap();
             try self.createSwap(physical_width, physical_height);
         }
+        // Keep projection and pixel clipping on exactly the same scale even
+        // when the final UI unit only partly fits in a fractional-size window.
+        self.ui_width = @as(f32, @floatFromInt(self.extent.width)) / self.ui_scale;
+        self.ui_height = @as(f32, @floatFromInt(self.extent.height)) / self.ui_scale;
+        if (changed and c.getenv("XODB_INPUT_TRACE") != null)
+            log.info(.render, "ui layout units={d}x{d} buffer={d}x{d} scale={d:.2}\n", .{ width, height, self.extent.width, self.extent.height, self.ui_scale });
         self.vertices = 0;
         self.cells_used = 0;
         self.batch_count = 0;
