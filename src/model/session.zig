@@ -86,7 +86,36 @@ pub const Investigation = struct {
     }
 };
 const RunTo = struct { tid: i32, thread_id: u64, address: u64, probe: u64, owns_probe: bool, image_epoch: u64, expected_sp: ?u64 = null, cancelled: bool = false, ignored_stops: usize = 0 };
-const SourceStep = struct { tid: i32, line: u32, path: [4096]u8, path_len: usize, over: bool, instructions: usize = 0, return_address: ?u64 = null };
+const SourceStep = struct { tid: i32, line: u32, path: [4096]u8, path_len: usize, over: bool, instructions: usize = 0, return_address: ?u64 = null, signal_return: ?u64 = null, signal_sp: ?u64 = null, signal_probe: ?u64 = null, deferred_ignored: u8 = 0 };
+fn isGoSigtramp(name: []const u8) bool {
+    return std.mem.eql(u8, name, "runtime.sigtramp") or std.mem.eql(u8, name, "runtime.sigtramp.abi0");
+}
+/// SIGCHLD, SIGWINCH and SIGURG. Same set the runtime passes through a step.
+/// Bit 0 is SIGCHLD, bit 1 SIGWINCH, bit 2 SIGURG.
+fn ignoredMask(sig: i32) u8 {
+    const c = @import("../c.zig").api;
+    if (sig == c.SIGCHLD) return 1;
+    if (sig == c.SIGWINCH) return 2;
+    if (sig == c.SIGURG) return 4;
+    return 0;
+}
+/// Linux x86-64 ucontext, as the kernel builds it for a rt_sigframe.
+/// runtime.sigtramp's entry CFA is the ucontext address. The sigcontext
+/// starts at byte 40; rsp is at 160 and rip at 168. DWARF numbers are the
+/// x86-64 ABI column. A short buffer is unreadable rather than a guessed caller.
+fn goSignalContext(bytes: []const u8) error{GoSignalContextUnreadable}!loc.RegisterSet {
+    if (bytes.len < 176) return error.GoSignalContextUnreadable;
+    const fields = [_]struct { dwarf: usize, at: usize }{
+        .{ .dwarf = 8, .at = 40 }, .{ .dwarf = 9, .at = 48 }, .{ .dwarf = 10, .at = 56 }, .{ .dwarf = 11, .at = 64 },
+        .{ .dwarf = 12, .at = 72 }, .{ .dwarf = 13, .at = 80 }, .{ .dwarf = 14, .at = 88 }, .{ .dwarf = 15, .at = 96 },
+        .{ .dwarf = 5, .at = 104 }, .{ .dwarf = 4, .at = 112 }, .{ .dwarf = 6, .at = 120 }, .{ .dwarf = 3, .at = 128 },
+        .{ .dwarf = 1, .at = 136 }, .{ .dwarf = 0, .at = 144 }, .{ .dwarf = 2, .at = 152 }, .{ .dwarf = 7, .at = 160 },
+        .{ .dwarf = 16, .at = 168 },
+    };
+    var out: loc.RegisterSet = @splat(null);
+    for (fields) |field| out[field.dwarf] = std.mem.readInt(u64, bytes[field.at..][0..8], .little);
+    return out;
+}
 pub const Session = struct {
     id: u64,
     process_id: u64 = 1,
@@ -1186,7 +1215,139 @@ pub const Session = struct {
         self.stepping_over = false;
         self.suppress_probe_resume = true;
         if (self.run_to) |*run| run.cancelled = true;
+        self.endSourceStep();
+    }
+    fn endSourceStep(self: *Session) void {
+        const deferred = if (self.source_step) |step| step.deferred_ignored else 0;
+        const tid = if (self.source_step) |step| step.tid else 0;
+        const pid = self.target.snapshot().pid;
+        var already: i32 = 0;
+        if (tid != 0) for (self.target.threadSlice()) |thread| if (thread.tid == tid) {
+            already = thread.signal;
+        };
+        const live = switch (self.target.snapshot().state) {
+            .exited, .idle => false,
+            else => true,
+        };
+        self.dropSignalProbe();
         self.source_step = null;
+        if (live and deferred != 0 and pid > 0 and tid > 0) requeueIgnored(pid, tid, deferred, already);
+    }
+    /// The runtime consumed the signal and left it on the thread for the next
+    /// resume. A further single-step would inject it and enter the handler
+    /// before this source line finishes. Hold it and deliver it when the step ends.
+    fn holdIgnoredSignal(self: *Session) void {
+        const tid = (self.source_step orelse return).tid;
+        var sig: i32 = 0;
+        for (self.target.threadSlice()) |thread| if (thread.tid == tid) {
+            sig = thread.signal;
+        };
+        const bit = ignoredMask(sig);
+        if (bit == 0) return;
+        self.target.suppressSignal(tid) catch return;
+        if (self.source_step) |*step| step.deferred_ignored |= bit;
+    }
+    /// Put a signal the step held back on the thread. The kernel delivers it
+    /// on the next resume. A signal already sitting on the thread is left
+    /// there, so it is not delivered twice. A thread that has gone is not an error.
+    fn requeueIgnored(pid: i32, tid: i32, deferred: u8, already: i32) void {
+        const c = @import("../c.zig").api;
+        const signals = [_]i32{ c.SIGCHLD, c.SIGWINCH, c.SIGURG };
+        var bit: u8 = 1;
+        for (signals) |sig| {
+            if (deferred & bit != 0 and sig != already) {
+                const rc = std.os.linux.tgkill(pid, tid, @enumFromInt(@as(u32, @intCast(sig))));
+                const err = std.posix.errno(rc);
+                if (err != .SUCCESS and err != .SRCH and err != .INVAL) log.debug(.session, "xodb: queued signal {d} was not restored\n", .{sig});
+            }
+            bit <<= 1;
+        }
+    }
+    fn dropSignalProbe(self: *Session) void {
+        const id = (self.source_step orelse return).signal_probe orelse {
+            if (self.source_step) |*step| {
+                step.signal_return = null;
+                step.signal_sp = null;
+            }
+            return;
+        };
+        if (self.source_step) |*step| {
+            step.signal_probe = null;
+            step.signal_return = null;
+            step.signal_sp = null;
+        }
+        self.target.removeBreakpoint(id) catch {};
+    }
+    fn inGoSigtramp(self: *Session, tid: i32) bool {
+        if (self.target.arch() != .x86_64) return false;
+        const regs = self.target.registers(tid) catch return false;
+        const pc = linux.programCounter(regs) catch return false;
+        const symbol = self.modules.symbolAt(pc) catch return false;
+        return isGoSigtramp(symbol.name);
+    }
+    /// A breakpoint already planted at the interrupted instruction belongs to
+    /// the user or to an existing step-over. Own a probe only when this step
+    /// creates one, and leave return_address alone.
+    /// Only the entry of the trampoline, reached by a default-ignored signal
+    /// (SIGCHLD, SIGWINCH, SIGURG; rdi is the signal number there). A fault
+    /// such as SIGSEGV is redirected to sigpanic and never returns to the
+    /// interrupted instruction, so resuming past it would run the step away.
+    fn ignoredGoSignalEntry(self: *Session, tid: i32) bool {
+        if (self.target.arch() != .x86_64) return false;
+        const regs = self.target.registers(tid) catch return false;
+        const pc = linux.programCounter(regs) catch return false;
+        const symbol = self.modules.symbolAt(pc) catch return false;
+        if (!isGoSigtramp(symbol.name) or symbol.offset != 0) return false;
+        const sig = loc.registers(regs)[5] orelse return false;
+        return sig <= std.math.maxInt(i32) and ignoredMask(@intCast(sig)) != 0;
+    }
+    fn armSignalReturn(self: *Session, address: u64, sp: u64) !void {
+        if (self.source_step.?.signal_probe) |id| {
+            self.target.removeBreakpoint(id) catch {};
+            if (self.source_step) |*step| step.signal_probe = null;
+        }
+        var owned = true;
+        for (self.target.breakpointSlice()) |probe| if (!probe.pending and probe.address == address) {
+            owned = false;
+            break;
+        };
+        const id = if (owned) try self.target.setBreakpoint(address, true) else null;
+        const step = &self.source_step.?;
+        step.signal_return = address;
+        step.signal_sp = sp;
+        step.signal_probe = id;
+    }
+    /// True when the source step continued out of runtime.sigtramp. The
+    /// handler is already entered, so the queued signal must not be delivered
+    /// again. An unreadable context stays the visible stop.
+    fn resumePastGoSignal(self: *Session) !bool {
+        const tid = (self.source_step orelse return false).tid;
+        if (!self.inGoSigtramp(tid)) {
+            self.dropSignalProbe();
+            return false;
+        }
+        if (!self.ignoredGoSignalEntry(tid)) return false;
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const frames = try self.stack(arena.allocator(), tid, 2);
+        const recovered = frames.len >= 2 and frames[0].unwind_method != null and std.mem.eql(u8, frames[0].unwind_method.?, "go_signal");
+        if (!recovered) return error.GoSignalContextUnreadable;
+        const rip = frames[1].pc;
+        const name = frames[1].symbol orelse return error.GoSignalContextUnreadable;
+        if (rip == 0 or isGoSigtramp(name)) return error.GoSignalContextUnreadable;
+        const sp = frames[1].registers[self.target.arch().sp()] orelse return error.GoSignalContextUnreadable;
+        try self.armSignalReturn(rip, sp);
+        try self.target.suppressSignal(tid);
+        // Bound a preempt storm. Each resume is one trip through the handler.
+        if (self.source_step) |*step| step.instructions += 1;
+        try self.target.continueExecution();
+        return true;
+    }
+    fn readGoSignal(self: *Session, cfa: u64) ?loc.RegisterSet {
+        var bytes: [176]u8 = undefined;
+        const n = self.target.readMemory(cfa, &bytes) catch return null;
+        if (n != bytes.len) return null;
+        return goSignalContext(&bytes) catch null;
     }
     fn resumeAllowed(self: *Session) bool {
         if (self.probe_resume_actor != .agent) return true;
@@ -1409,25 +1570,78 @@ pub const Session = struct {
         }
         if (self.source_step) |step| {
             if (self.target.snapshot().state == .exited or self.target.snapshot().state == .idle) {
-                self.source_step = null;
+                self.endSourceStep();
                 return;
             }
             if (self.target.snapshot().state != .stopped) return;
             var expected_stop = false;
+            var foreign_stop = false;
+            var other_frame = false;
             for (self.target.threadSlice()) |thread| {
-                if (thread.tid == step.tid) expected_stop = thread.reason == .single_step or (thread.reason == .breakpoint and step.return_address != null and step.return_address.? == thread.breakpoint_address);
-                if (thread.tid != step.tid and thread.reason != .interrupt and thread.reason != .none) {
-                    self.source_step = null;
-                    return;
+                const ignored_stop = thread.reason == .signal and ignoredMask(thread.signal) != 0;
+                if (thread.tid == step.tid) {
+                    // The interrupted instruction is reached again with the
+                    // same stack pointer. Another goroutine scheduled on this
+                    // thread, or a recursive frame, has a different one.
+                    var signal_back = false;
+                    if (thread.reason == .breakpoint and step.signal_return != null and step.signal_return.? == thread.breakpoint_address) {
+                        const regs = try self.target.registers(thread.tid);
+                        const sp = linux.stackPointer(regs) catch null;
+                        signal_back = sp != null and step.signal_sp != null and sp.? == step.signal_sp.?;
+                        other_frame = !signal_back and step.signal_probe != null;
+                    }
+                    const at_return = thread.reason == .breakpoint and ((step.return_address != null and step.return_address.? == thread.breakpoint_address) or signal_back);
+                    // SIGURG (and the other default-ignored signals) reported
+                    // on this thread is still the step. A real fault is not.
+                    expected_stop = thread.reason == .single_step or at_return or ignored_stop;
+                } else if (thread.reason != .interrupt and thread.reason != .none and !ignored_stop) {
+                    foreign_stop = true;
                 }
             }
-            if (!expected_stop) {
-                self.source_step = null;
+            if (foreign_stop) {
+                self.endSourceStep();
+                return;
+            }
+            // Our own probe, hit by a different frame on the stepped thread.
+            // The runtime drops temporary probes at a stop, so plant it again
+            // for the interrupted frame and continue.
+            if (other_frame and step.instructions < 10000) {
+                if (self.source_step) |*s| s.instructions += 1;
+                self.armSignalReturn(step.signal_return.?, step.signal_sp.?) catch |err| {
+                    self.step_diagnostic = @errorName(err);
+                    self.endSourceStep();
+                    return;
+                };
+                self.target.continueExecution() catch |err| {
+                    self.step_diagnostic = @errorName(err);
+                    self.endSourceStep();
+                    try @import("../target/runtime.zig").propagateUnknownOutcome(err);
+                };
+                return;
+            }
+            // SIGURG delivered during a hardware step stops at runtime.sigtramp's
+            // entry, often with SIGTRAP, while peers are stopped on SIGURG.
+            // That PC is still this step; its source line is not.
+            if (!expected_stop and !self.inGoSigtramp(step.tid)) {
+                self.endSourceStep();
                 return;
             }
             if (step.instructions >= 10000) {
                 self.step_diagnostic = "SourceStepResumeLimit";
-                self.source_step = null;
+                self.endSourceStep();
+                return;
+            }
+            if (self.resumePastGoSignal()) |resumed| {
+                if (resumed) return;
+                // A trampoline entry the step did not cause, or a real
+                // signal's handler: the stop is visible.
+                if (!expected_stop) {
+                    self.endSourceStep();
+                    return;
+                }
+            } else |err| {
+                self.step_diagnostic = @errorName(err);
+                self.endSourceStep();
                 return;
             }
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
@@ -1435,13 +1649,14 @@ pub const Session = struct {
             const regs = try self.target.registers(step.tid);
             if (self.sourceAt(arena.allocator(), try linux.programCounter(regs))) |site| {
                 if (site.line != step.line or !std.mem.eql(u8, site.path, step.path[0..step.path_len])) {
-                    self.source_step = null;
+                    self.endSourceStep();
                     return;
                 }
             } else |_| {}
+            self.holdIgnoredSignal();
             self.advanceSourceStep() catch |err| {
                 self.step_diagnostic = @errorName(err);
-                self.source_step = null;
+                self.endSourceStep();
                 try @import("../target/runtime.zig").propagateUnknownOutcome(err);
             };
         }
@@ -1809,6 +2024,8 @@ pub const Session = struct {
         var registers = loc.registers(raw_registers);
         var frames: std.ArrayList(Frame) = .empty;
         self.metadata.beginQuery();
+        // Set when the caller PC is an interrupted instruction, not a return address.
+        var sigcontext_pc = false;
         stack_walk: while (frames.items.len < @min(64, limit)) {
             const arch_ = self.target.arch();
             const slot = arch_.pc();
@@ -1821,7 +2038,9 @@ pub const Session = struct {
             else
                 registers[arch_.ra()] orelse break;
             if (pc == 0) break;
-            var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = if (frames.items.len > 0) self.target.arch().callerLookup(pc) orelse break else pc, .registers = registers };
+            const lookup_pc = if (frames.items.len > 0 and !sigcontext_pc) self.target.arch().callerLookup(pc) orelse break else pc;
+            sigcontext_pc = false;
+            var frame = Frame{ .architecture = self.target.arch(), .tid = tid, .index = frames.items.len, .pc = pc, .lookup_pc = lookup_pc, .registers = registers };
             const remote_caller = frames.items.len != 0 and @import("../target/runtime.zig").c.xrt_target_is_remote(self.target.handle);
             const metadata_only = self.modules.prefersUnwindMetadata(frame.lookup_pc) catch false;
             if (if (remote_caller or metadata_only) self.modules.cachedSymbolAt(frame.lookup_pc) else self.modules.symbolAt(frame.lookup_pc)) |symbol| {
@@ -1883,17 +2102,36 @@ pub const Session = struct {
                     break :stack_walk;
                 };
             };
+            var caller = step.caller;
+            var method_name: []const u8 = @tagName(step.method);
+            // Go's sigtramp FDE is not a DWARF signal frame. At its entry the
+            // CFA is the Linux ucontext; the interrupted instruction is rip
+            // there, and callerLookup must not subtract one from it.
+            if (frames.items.len == 0 and self.target.arch() == .x86_64 and frame.symbol != null and isGoSigtramp(frame.symbol.?)) {
+                if (self.readGoSignal(step.cfa)) |decoded| {
+                    const rip = decoded[16] orelse 0;
+                    if (rip != 0) {
+                        if (self.modules.symbolAt(rip)) |interrupted| {
+                            if (!isGoSigtramp(interrupted.name)) {
+                                caller = decoded;
+                                method_name = "go_signal";
+                                sigcontext_pc = true;
+                            } else if (frame.diagnostic == null) frame.diagnostic = "GoSignalContextUnreadable";
+                        } else |_| if (frame.diagnostic == null) frame.diagnostic = "GoSignalContextUnreadable";
+                    } else if (frame.diagnostic == null) frame.diagnostic = "GoSignalContextUnreadable";
+                } else if (frame.diagnostic == null) frame.diagnostic = "GoSignalContextUnreadable";
+            }
             frame.cfa = step.cfa;
-            frame.unwind_method = @tagName(step.method);
+            frame.unwind_method = method_name;
             try frames.append(a, frame);
-            const caller_pc = if (slot < step.caller.len) step.caller[slot] else step.caller[arch_.ra()];
+            const caller_pc = if (slot < caller.len) caller[slot] else caller[arch_.ra()];
             const frame_pc: ?u64 = if (slot < registers.len) registers[slot] else pc;
-            if (caller_pc == frame_pc and step.caller[arch_.sp()] == registers[arch_.sp()]) {
+            if (caller_pc == frame_pc and caller[arch_.sp()] == registers[arch_.sp()]) {
                 frames.items[frames.items.len - 1].diagnostic = "UnwindCycle";
                 break;
             }
-            if (step.outermost) break;
-            registers = step.caller;
+            if (step.outermost and !sigcontext_pc) break;
+            registers = caller;
         }
         return frames.toOwnedSlice(a);
     }
@@ -2276,6 +2514,36 @@ test "agent capabilities and generation protect shared execution state" {
     try session.authorize(.agent, .mutation, session.target.snapshot().generation);
     session.setAgentScope(.observe);
     try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .execution, session.target.snapshot().generation));
+}
+
+test "linux sigcontext gprs map onto x86 dwarf registers" {
+    var bytes: [176]u8 = @splat(0xaa);
+    const fields = [_]struct { dwarf: usize, at: usize, value: u64 }{
+        .{ .dwarf = 8, .at = 40, .value = 0x8 }, .{ .dwarf = 9, .at = 48, .value = 0x9 },
+        .{ .dwarf = 10, .at = 56, .value = 0x10 }, .{ .dwarf = 11, .at = 64, .value = 0x11 },
+        .{ .dwarf = 12, .at = 72, .value = 0x12 }, .{ .dwarf = 13, .at = 80, .value = 0x13 },
+        .{ .dwarf = 14, .at = 88, .value = 0x14 }, .{ .dwarf = 15, .at = 96, .value = 0x15 },
+        .{ .dwarf = 5, .at = 104, .value = 0x5 }, .{ .dwarf = 4, .at = 112, .value = 0x4 },
+        .{ .dwarf = 6, .at = 120, .value = 0x6 }, .{ .dwarf = 3, .at = 128, .value = 0x3 },
+        .{ .dwarf = 1, .at = 136, .value = 0x1 }, .{ .dwarf = 0, .at = 144, .value = 0xa },
+        .{ .dwarf = 2, .at = 152, .value = 0x2 }, .{ .dwarf = 7, .at = 160, .value = 0x160 },
+        .{ .dwarf = 16, .at = 168, .value = 0x4a0b04 },
+    };
+    for (fields) |field| std.mem.writeInt(u64, bytes[field.at..][0..8], field.value, .little);
+    const regs = try goSignalContext(&bytes);
+    for (fields) |field| try std.testing.expectEqual(@as(?u64, field.value), regs[field.dwarf]);
+    try std.testing.expectEqual(@as(?u64, null), regs[17]);
+    try std.testing.expectError(error.GoSignalContextUnreadable, goSignalContext(bytes[0..175]));
+    try std.testing.expect(isGoSigtramp("runtime.sigtramp"));
+    try std.testing.expect(isGoSigtramp("runtime.sigtramp.abi0"));
+    try std.testing.expect(!isGoSigtramp("runtime.sigtrampgo"));
+    try std.testing.expect(!isGoSigtramp("runtime.asyncPreempt.abi0"));
+    const c = @import("../c.zig").api;
+    try std.testing.expect(ignoredMask(c.SIGCHLD) != 0);
+    try std.testing.expect(ignoredMask(c.SIGWINCH) != 0);
+    try std.testing.expect(ignoredMask(c.SIGURG) != 0);
+    try std.testing.expectEqual(@as(u8, 0), ignoredMask(c.SIGSEGV));
+    try std.testing.expectEqual(@as(u8, 0), ignoredMask(c.SIGTRAP));
 }
 
 test "a source step rechecks its caller before another instruction" {

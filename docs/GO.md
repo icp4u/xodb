@@ -16,7 +16,18 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
 - **Native debugging:** `--break main.worker` and method names such as
   `main.(*Pool).Run`, source view, line stepping, locals, and backtraces that
   end in `runtime.goexit`. Go's preemption signal (SIGURG) is passed to the
-  program without a stop, as gdb does.
+  program without a stop, as gdb does. A source step that lands in
+  `runtime.sigtramp` for SIGURG, SIGCHLD or SIGWINCH does not finish there.
+  It resumes at the interrupted instruction (same stack pointer, so not
+  another goroutine or frame) and keeps stepping until the source line
+  changes. A step into the handler for a fault such as SIGSEGV still stops
+  in the trampoline, since Go never returns to the faulting instruction. A peer
+  stopped on SIGCHLD, SIGWINCH, or SIGURG does not cancel that step. A
+  preemption signal observed while the step is still on the same line is
+  delivered when the step finishes. A stack sampled in that trampoline keeps the trampoline as
+  frame 0, recovers the interrupted registers from the Linux sigcontext, and
+  names the method `go_signal`. A context that cannot be read sets
+  `GoSignalContextUnreadable` and leaves the ordinary caller in place.
 - **Goroutines** come from `runtime.allgs`; the count is cross-checked with the
   runtime's separate `runtime.allglen`. Each has its id, status and wait reason
   (the runtime's own `gStatusStrings`/`waitReasonStrings`, read from the
@@ -54,8 +65,9 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
 ## Remaining work and explicit refusals
 
 - No named Go locals inside the Go tab yet (use the C/C++ tab).
-- Not shown: which M/P a goroutine is on, CGO and signal frames (a running
-  goroutine on a system stack reports `GoRunningOnSystemStack`), plugins or
+- Not shown: which M/P a goroutine is on, CGO frames (a running goroutine on
+  a system stack, including a stop inside `runtime.sigtramp`, reports
+  `GoRunningOnSystemStack`), plugins or
   additional Go modules (`GoPcOutsideModule`), more than 128 goroutines
   (`truncated`), more than 48 frames (`GoFrameLimit`).
 - Reasons you may see: `GoFramePcUnmapped` (a saved PC outside the binary),
