@@ -4,6 +4,7 @@
 const std = @import("std");
 const network = @import("stream.zig");
 const decode = @import("decode.zig");
+const reassembly = @import("reassembly.zig");
 
 pub const decoder = "xodb-tls-keylog";
 pub const decoder_version: u32 = 1;
@@ -11,12 +12,13 @@ pub const max_keylog_entries = 16_384;
 pub const max_reassembled_bytes = 64 * 1024 * 1024;
 pub const max_plaintext_bytes = 64 * 1024 * 1024;
 pub const max_record_bytes = 18_432;
+pub const max_derived_records = 4 * 1024 * 1024;
 
 pub const Version = enum { tls12, tls13 };
 pub const Direction = enum { client_to_server, server_to_client };
 pub const Epoch = enum { handshake, application };
 pub const State = enum { decrypted, authentication_failed };
-pub const SessionState = enum { decrypted, missing_key, unsupported_cipher, incomplete_handshake, reassembly_gap };
+pub const SessionState = enum { decrypted, partial, missing_key, unsupported_cipher, incomplete_handshake, reassembly_gap };
 pub const Cipher = enum {
     aes_128_gcm_sha256,
     aes_256_gcm_sha384,
@@ -56,6 +58,7 @@ pub const Session = struct {
     state: SessionState,
     records: u32 = 0,
     authentication_failures: u32 = 0,
+    malformed_directions: u8 = 0,
 };
 
 pub const Stream = struct {
@@ -116,24 +119,32 @@ pub const Stream = struct {
         for (source.flows, 0..) |flow, flow_id_usize| {
             if (flow.key.protocol != 6) continue;
             const flow_id: u32 = @intCast(flow_id_usize);
-            var reassembled = try reassemble(a, source, by_flow[starts[flow_id]..starts[flow_id + 1]], flow.key);
+            var reassembled = try reassembly.reassemble(a, source, by_flow[starts[flow_id]..starts[flow_id + 1]], flow.key, max_reassembled_bytes);
             defer reassembled.deinit(a);
             if (reassembled.a.bytes.items.len == 0 or reassembled.b.bytes.items.len == 0) continue;
-            var raw_a = try parseRecords(a, &reassembled.a, &self.malformed_records);
+            var malformed_a = false;
+            var raw_a = try parseRecords(a, &reassembled.a, &self.malformed_records, &malformed_a);
             defer raw_a.deinit(a);
-            var raw_b = try parseRecords(a, &reassembled.b, &self.malformed_records);
+            var malformed_b = false;
+            var raw_b = try parseRecords(a, &reassembled.b, &self.malformed_records, &malformed_b);
             defer raw_b.deinit(a);
             if (raw_a.items.len == 0 and raw_b.items.len == 0) continue;
             const hello = scanHellos(a, raw_a.items, raw_b.items) catch {
-                try sessions.append(arena, .{ .flow_id = flow_id, .state = if (reassembled.gap) .reassembly_gap else .incomplete_handshake });
-                if (reassembled.gap) self.reassembly_gaps += 1;
+                try sessions.append(arena, .{ .flow_id = flow_id, .state = if (reassembled.incomplete()) .reassembly_gap else .incomplete_handshake });
+                if (reassembled.incomplete()) self.reassembly_gaps += 1;
                 continue;
             };
             const cipher = cipherOf(hello.cipher_suite, hello.version) orelse {
                 try sessions.append(arena, .{ .flow_id = flow_id, .version = hello.version, .state = .unsupported_cipher });
                 continue;
             };
-            var summary = Session{ .flow_id = flow_id, .version = hello.version, .cipher = cipher, .state = .decrypted };
+            var summary = Session{
+                .flow_id = flow_id,
+                .version = hello.version,
+                .cipher = cipher,
+                .state = .decrypted,
+                .malformed_directions = @as(u8, @intFromBool(malformed_a)) + @intFromBool(malformed_b),
+            };
             const client_records = if (hello.client_is_a) raw_a.items else raw_b.items;
             const server_records = if (hello.client_is_a) raw_b.items else raw_a.items;
             switch (hello.version) {
@@ -166,11 +177,12 @@ pub const Stream = struct {
                     }
                     var keys = derive12(cipher, master, hello.client_random, hello.server_random);
                     defer keys.wipe();
-                    try decrypt12(self, arena, &records, flow_id, .client_to_server, client_records, keys.client, source, &summary);
-                    try decrypt12(self, arena, &records, flow_id, .server_to_client, server_records, keys.server, source, &summary);
+                    try decrypt12(self, arena, &records, flow_id, .client_to_server, client_records, &keys.client, source, &summary);
+                    try decrypt12(self, arena, &records, flow_id, .server_to_client, server_records, &keys.server, source, &summary);
                 },
             }
-            if (reassembled.gap) {
+            if (summary.state == .decrypted and summary.malformed_directions != 0) summary.state = .partial;
+            if (reassembled.incomplete()) {
                 self.reassembly_gaps += 1;
                 if (summary.records == 0) summary.state = .reassembly_gap;
             }
@@ -254,164 +266,25 @@ fn switchLabel(label: []const u8) ?[]const u8 {
     return null;
 }
 
-const Segment = struct { seq: u32, record: u32, bytes: []const u8 };
-const Span = struct { first: usize, last: usize, record: u32 };
-const DirectionBytes = struct {
-    bytes: std.ArrayList(u8) = .empty,
-    spans: std.ArrayList(Span) = .empty,
-    segments: std.ArrayList(Segment) = .empty,
-    anchor: ?u32 = null,
-
-    fn deinit(self: *DirectionBytes, a: std.mem.Allocator) void {
-        self.bytes.deinit(a);
-        self.spans.deinit(a);
-        self.segments.deinit(a);
-    }
-    fn source(self: *const DirectionBytes, offset: usize) u32 {
-        // Spans are appended in byte order and never overlap.
-        const spans = self.spans.items;
-        if (spans.len == 0) return 0;
-        var low: usize = 0;
-        var high: usize = spans.len;
-        while (low < high) {
-            const mid = low + (high - low) / 2;
-            if (spans[mid].last <= offset) low = mid + 1 else high = mid;
-        }
-        return if (low < spans.len and offset >= spans[low].first) spans[low].record else spans[spans.len - 1].record;
-    }
-};
-const Reassembled = struct {
-    a: DirectionBytes = .{},
-    b: DirectionBytes = .{},
-    gap: bool = false,
-    fn deinit(self: *Reassembled, allocator: std.mem.Allocator) void {
-        self.a.deinit(allocator);
-        self.b.deinit(allocator);
-    }
-};
-
-fn reassemble(a: std.mem.Allocator, source: *const network.Stream, flow_records: []const u32, key: decode.Flow) !Reassembled {
-    var out = Reassembled{};
-    errdefer out.deinit(a);
-    for (flow_records) |record_index| {
-        const summary = source.summaries[record_index];
-        if (summary.protocol != 6) continue;
-        const a_to_b = std.mem.eql(u8, &summary.src, &key.src) and summary.src_port == key.src_port;
-        const direction = if (a_to_b) &out.a else &out.b;
-        // SYN (client) and SYN-ACK (server) both fix their direction's ISN.
-        if (summary.tcp_flags & 0x02 != 0) direction.anchor = summary.seq +% 1;
-        if (summary.payload_captured == 0) continue;
-        const bytes = tcpPayload(source.parsed.interfaces[source.parsed.records[record_index].interface].link_type, source.raw(record_index), summary) orelse continue;
-        if (bytes.len == 0) continue;
-        try direction.segments.append(a, .{ .seq = summary.seq, .record = @intCast(record_index), .bytes = bytes });
-    }
-    const gap_a = try linearize(a, &out.a);
-    const gap_b = try linearize(a, &out.b);
-    out.gap = gap_a or gap_b;
-    return out;
-}
-
-fn linearize(a: std.mem.Allocator, direction: *DirectionBytes) !bool {
-    if (direction.segments.items.len == 0) return false;
-    const anchor = direction.anchor orelse blk: {
-        // No SYN: the earliest segment in 32-bit serial order, so a
-        // reordered first capture does not silently drop earlier bytes.
-        var low = direction.segments.items[0].seq;
-        for (direction.segments.items[1..]) |segment| if (@as(i32, @bitCast(segment.seq -% low)) < 0) {
-            low = segment.seq;
-        };
-        break :blk low;
-    };
-    const Ctx = struct {
-        anchor: u32,
-        fn less(ctx: @This(), lhs: Segment, rhs: Segment) bool {
-            return lhs.seq -% ctx.anchor < rhs.seq -% ctx.anchor;
-        }
-    };
-    std.mem.sort(Segment, direction.segments.items, Ctx{ .anchor = anchor }, Ctx.less);
-    var expected: usize = 0;
-    var gap = false;
-    for (direction.segments.items) |segment| {
-        const relative_u32 = segment.seq -% anchor;
-        if (relative_u32 > std.math.maxInt(i32)) continue;
-        const relative: usize = relative_u32;
-        if (relative > expected) {
-            gap = true;
-            break;
-        }
-        const overlap = expected - relative;
-        if (overlap >= segment.bytes.len) continue;
-        const tail = segment.bytes[overlap..];
-        if (direction.bytes.items.len + tail.len > max_reassembled_bytes) {
-            gap = true;
-            break;
-        }
-        const first = direction.bytes.items.len;
-        try direction.bytes.appendSlice(a, tail);
-        expected += tail.len;
-        try direction.spans.append(a, .{ .first = first, .last = direction.bytes.items.len, .record = segment.record });
-    }
-    return gap;
-}
-
-fn tcpPayload(link_type: u16, frame: []const u8, summary: decode.Summary) ?[]const u8 {
-    var at: usize = switch (link_type) {
-        decode.link_ethernet => 14 + @as(usize, summary.vlan_count) * 4,
-        decode.link_sll => 16,
-        decode.link_sll2 => 20,
-        decode.link_null => 4,
-        decode.link_raw, decode.link_ipv4, decode.link_ipv6 => 0,
-        else => return null,
-    };
-    if (at >= frame.len) return null;
-    switch (summary.family) {
-        .ipv4 => {
-            if (frame.len - at < 20) return null;
-            at += @as(usize, frame[at] & 0x0f) * 4;
-        },
-        .ipv6 => {
-            if (frame.len - at < 40) return null;
-            var next = frame[at + 6];
-            at += 40;
-            var count: u8 = 0;
-            while (next == 0 or next == 43 or next == 44 or next == 60 or next == 51 or next == 135) {
-                if (count == decode.max_extension_headers or frame.len - at < 8) return null;
-                count += 1;
-                const length: usize = switch (next) {
-                    44 => 8,
-                    51 => (@as(usize, frame[at + 1]) + 2) * 4,
-                    else => (@as(usize, frame[at + 1]) + 1) * 8,
-                };
-                next = frame[at];
-                if (length > frame.len - at) return null;
-                at += length;
-            }
-        },
-        .none => return null,
-    }
-    if (frame.len - at < 20) return null;
-    const tcp_header = @as(usize, frame[at + 12] >> 4) * 4;
-    if (tcp_header < 20 or tcp_header > frame.len - at) return null;
-    at += tcp_header;
-    const length = @min(@as(usize, summary.payload_captured), frame.len - at);
-    return frame[at..][0..length];
-}
+const DirectionBytes = reassembly.Direction;
 
 const RawRecord = struct { outer_type: u8, version: u16, header: [5]u8, payload: []const u8, offset: usize, source_record: u32 };
 
-fn parseRecords(a: std.mem.Allocator, bytes: *const DirectionBytes, malformed: *u64) !std.ArrayList(RawRecord) {
+fn parseRecords(a: std.mem.Allocator, bytes: *const DirectionBytes, malformed: *u64, stopped_malformed: *bool) !std.ArrayList(RawRecord) {
     var out: std.ArrayList(RawRecord) = .empty;
     errdefer out.deinit(a);
     var at: usize = 0;
     while (at < bytes.bytes.items.len) {
         if (bytes.bytes.items.len - at < 5) {
             malformed.* += 1;
+            stopped_malformed.* = true;
             break;
         }
         const header: [5]u8 = bytes.bytes.items[at..][0..5].*;
         const length = std.mem.readInt(u16, header[3..5], .big);
         if (length > max_record_bytes or length > bytes.bytes.items.len - at - 5 or header[0] < 20 or header[0] > 24) {
             malformed.* += 1;
+            stopped_malformed.* = true;
             break;
         }
         try out.append(a, .{ .outer_type = header[0], .version = std.mem.readInt(u16, header[1..3], .big), .header = header, .payload = bytes.bytes.items[at + 5 ..][0..length], .offset = at, .source_record = bytes.source(at) });
@@ -536,13 +409,17 @@ fn derive13(cipher: Cipher, secret: []const u8) Key {
             var prk: [Hkdf.prk_length]u8 = @splat(0);
             @memcpy(prk[0..@min(secret.len, prk.len)], secret[0..@min(secret.len, prk.len)]);
             if (cipher == .aes_128_gcm_sha256) {
-                const key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 16);
+                var key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 16);
                 @memcpy(out.bytes[0..key.len], &key);
+                std.crypto.secureZero(u8, &key);
             } else {
-                const key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 32);
+                var key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 32);
                 @memcpy(&out.bytes, &key);
+                std.crypto.secureZero(u8, &key);
             }
-            out.iv = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "iv", "", 12);
+            var iv = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "iv", "", 12);
+            out.iv = iv;
+            std.crypto.secureZero(u8, &iv);
             std.crypto.secureZero(u8, &prk);
         },
         .aes_256_gcm_sha384 => {
@@ -550,17 +427,20 @@ fn derive13(cipher: Cipher, secret: []const u8) Key {
             const Hkdf = std.crypto.kdf.hkdf.Hkdf(Hmac);
             var prk: [Hkdf.prk_length]u8 = @splat(0);
             @memcpy(prk[0..@min(secret.len, prk.len)], secret[0..@min(secret.len, prk.len)]);
-            const key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 32);
+            var key = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "key", "", 32);
             @memcpy(&out.bytes, &key);
-            out.iv = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "iv", "", 12);
+            std.crypto.secureZero(u8, &key);
+            var iv = std.crypto.tls.hkdfExpandLabel(Hkdf, prk, "iv", "", 12);
+            out.iv = iv;
+            std.crypto.secureZero(u8, &iv);
             std.crypto.secureZero(u8, &prk);
         },
     }
     return out;
 }
 
-fn nonceFor(iv: [12]u8, sequence: u64) [12]u8 {
-    var nonce = iv;
+fn nonceFor(iv: *const [12]u8, sequence: u64) [12]u8 {
+    var nonce = iv.*;
     var seq: [8]u8 = undefined;
     std.mem.writeInt(u64, &seq, sequence, .big);
     for (seq, 4..) |b, i| nonce[i] ^= b;
@@ -568,29 +448,34 @@ fn nonceFor(iv: [12]u8, sequence: u64) [12]u8 {
 }
 
 fn decrypt13(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, keys: *const Traffic13, source: *const network.Stream, summary: *Session) !void {
-    const cipher = if (keys.application) |key| key.cipher else keys.handshake.?.cipher;
+    const cipher = if (keys.application) |*key| key.cipher else keys.handshake.?.cipher;
     var epoch: Epoch = if (keys.handshake != null) .handshake else .application;
     var handshake_seq: u64 = 0;
     var application_seq: u64 = 0;
     for (records) |record| {
         if (record.outer_type != 23) continue;
         const plaintext = try stream.backing.alloc(u8, record.payload.len -| 16);
+        // Wiped on every exit, including a TlsRecordLimit/OOM from appendPlain.
+        defer {
+            std.crypto.secureZero(u8, plaintext);
+            stream.backing.free(plaintext);
+        }
         var sequence = if (epoch == .handshake) handshake_seq else application_seq;
         var used_epoch = epoch;
-        const active = if (epoch == .handshake) keys.handshake else keys.application;
-        var ok = if (active) |key| decrypt13Record(key, sequence, record.header, record.payload, plaintext) else false;
-        if (!ok and epoch == .handshake and keys.application != null) {
-            if (decrypt13Record(keys.application.?, application_seq, record.header, record.payload, plaintext)) {
+        var ok = switch (epoch) {
+            .handshake => if (keys.handshake) |*key| decrypt13Record(key, sequence, record.header, record.payload, plaintext) else false,
+            .application => if (keys.application) |*key| decrypt13Record(key, sequence, record.header, record.payload, plaintext) else false,
+        };
+        if (!ok and epoch == .handshake) if (keys.application) |*application| {
+            if (decrypt13Record(application, application_seq, record.header, record.payload, plaintext)) {
                 epoch = .application;
                 used_epoch = .application;
                 sequence = application_seq;
                 ok = true;
             }
-        }
+        };
         if (used_epoch == .handshake) handshake_seq +%= 1 else application_seq +%= 1;
         if (!ok) {
-            std.crypto.secureZero(u8, plaintext);
-            stream.backing.free(plaintext);
             summary.authentication_failures += 1;
             try appendFailure(a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             continue;
@@ -598,8 +483,6 @@ fn decrypt13(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
         var end = plaintext.len;
         while (end > 0 and plaintext[end - 1] == 0) end -= 1;
         if (end == 0) {
-            std.crypto.secureZero(u8, plaintext);
-            stream.backing.free(plaintext);
             summary.authentication_failures += 1;
             try appendFailure(a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             continue;
@@ -607,26 +490,28 @@ fn decrypt13(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
         const content_type = plaintext[end - 1];
         const content = plaintext[0 .. end - 1];
         try appendPlain(stream, a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, content_type, content, source, summary);
-        std.crypto.secureZero(u8, plaintext);
-        stream.backing.free(plaintext);
     }
 }
 
-fn decrypt13Record(key: Key, sequence: u64, header: [5]u8, payload: []const u8, out: []u8) bool {
+fn decrypt13Record(key: *const Key, sequence: u64, header: [5]u8, payload: []const u8, out: []u8) bool {
     if (payload.len < 16 or out.len != payload.len - 16) return false;
     const cipher = payload[0 .. payload.len - 16];
     const tag: [16]u8 = payload[payload.len - 16 ..][0..16].*;
-    const nonce = nonceFor(key.iv, sequence);
+    var nonce = nonceFor(&key.iv, sequence);
+    defer std.crypto.secureZero(u8, &nonce);
+    var key_bytes = key.bytes;
+    defer std.crypto.secureZero(u8, &key_bytes);
     switch (key.cipher) {
         .aes_128_gcm_sha256 => {
-            const k: [16]u8 = key.bytes[0..16].*;
+            var k: [16]u8 = key_bytes[0..16].*;
+            defer std.crypto.secureZero(u8, &k);
             std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(out, cipher, tag, &header, nonce, k) catch return false;
         },
         .aes_256_gcm_sha384 => {
-            std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(out, cipher, tag, &header, nonce, key.bytes) catch return false;
+            std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(out, cipher, tag, &header, nonce, key_bytes) catch return false;
         },
         .chacha20_poly1305_sha256 => {
-            std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(out, cipher, tag, &header, nonce, key.bytes) catch return false;
+            std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(out, cipher, tag, &header, nonce, key_bytes) catch return false;
         },
     }
     return true;
@@ -667,6 +552,7 @@ fn derive12(cipher: Cipher, master: []const u8, client_random: [32]u8, server_ra
 
 fn pHash(comptime Hmac: type, out: []u8, secret: []const u8, seed_parts: []const []const u8) void {
     var initial = Hmac.init(secret);
+    defer std.crypto.secureZero(u8, std.mem.asBytes(&initial));
     for (seed_parts) |part| initial.update(part);
     var a_value: [Hmac.mac_length]u8 = undefined;
     initial.final(&a_value);
@@ -677,18 +563,20 @@ fn pHash(comptime Hmac: type, out: []u8, secret: []const u8, seed_parts: []const
         for (seed_parts) |part| round.update(part);
         var digest: [Hmac.mac_length]u8 = undefined;
         round.final(&digest);
+        std.crypto.secureZero(u8, std.mem.asBytes(&round));
         const take = @min(digest.len, out.len - at);
         @memcpy(out[at..][0..take], digest[0..take]);
         at += take;
         var next = Hmac.init(secret);
         next.update(&a_value);
         next.final(&a_value);
+        std.crypto.secureZero(u8, std.mem.asBytes(&next));
         std.crypto.secureZero(u8, &digest);
     }
     std.crypto.secureZero(u8, &a_value);
 }
 
-fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, key: Key, source: *const network.Stream, summary: *Session) !void {
+fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, key: *const Key, source: *const network.Stream, summary: *Session) !void {
     var encrypted = false;
     var sequence: u64 = 0;
     for (records) |record| {
@@ -706,52 +594,57 @@ fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
             continue;
         }
         const plaintext = try stream.backing.alloc(u8, record.payload.len - overhead);
-        const ok = decrypt12Record(key, sequence, record.header, record.payload, plaintext);
-        if (!ok) {
+        defer {
             std.crypto.secureZero(u8, plaintext);
             stream.backing.free(plaintext);
+        }
+        const ok = decrypt12Record(key, sequence, record.header, record.payload, plaintext);
+        if (!ok) {
             summary.authentication_failures += 1;
             try appendFailure(a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, source);
             sequence +%= 1;
             continue;
         }
         try appendPlain(stream, a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, record.outer_type, plaintext, source, summary);
-        std.crypto.secureZero(u8, plaintext);
-        stream.backing.free(plaintext);
         sequence +%= 1;
     }
 }
 
-fn decrypt12Record(key: Key, sequence: u64, header: [5]u8, payload: []const u8, out: []u8) bool {
+fn decrypt12Record(key: *const Key, sequence: u64, header: [5]u8, payload: []const u8, out: []u8) bool {
     var aad: [13]u8 = undefined;
     std.mem.writeInt(u64, aad[0..8], sequence, .big);
     @memcpy(aad[8..11], header[0..3]);
     std.mem.writeInt(u16, aad[11..13], @intCast(out.len), .big);
     var nonce: [12]u8 = undefined;
+    defer std.crypto.secureZero(u8, &nonce);
     const cipher_text = if (key.cipher == .chacha20_poly1305_sha256) payload[0 .. payload.len - 16] else blk: {
         @memcpy(nonce[0..4], key.iv[0..4]);
         @memcpy(nonce[4..12], payload[0..8]);
         break :blk payload[8 .. payload.len - 16];
     };
-    if (key.cipher == .chacha20_poly1305_sha256) nonce = nonceFor(key.iv, sequence);
+    if (key.cipher == .chacha20_poly1305_sha256) nonce = nonceFor(&key.iv, sequence);
     if (cipher_text.len != out.len) return false;
     const tag: [16]u8 = payload[payload.len - 16 ..][0..16].*;
+    var key_bytes = key.bytes;
+    defer std.crypto.secureZero(u8, &key_bytes);
     switch (key.cipher) {
         .aes_128_gcm_sha256 => {
-            const k: [16]u8 = key.bytes[0..16].*;
+            var k: [16]u8 = key_bytes[0..16].*;
+            defer std.crypto.secureZero(u8, &k);
             std.crypto.aead.aes_gcm.Aes128Gcm.decrypt(out, cipher_text, tag, &aad, nonce, k) catch return false;
         },
-        .aes_256_gcm_sha384 => std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(out, cipher_text, tag, &aad, nonce, key.bytes) catch return false,
-        .chacha20_poly1305_sha256 => std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(out, cipher_text, tag, &aad, nonce, key.bytes) catch return false,
+        .aes_256_gcm_sha384 => std.crypto.aead.aes_gcm.Aes256Gcm.decrypt(out, cipher_text, tag, &aad, nonce, key_bytes) catch return false,
+        .chacha20_poly1305_sha256 => std.crypto.aead.chacha_poly.ChaCha20Poly1305.decrypt(out, cipher_text, tag, &aad, nonce, key_bytes) catch return false,
     }
     return true;
 }
 
 fn appendFailure(a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, raw: RawRecord, version: Version, cipher: Cipher, epoch: Epoch, sequence: u64, source: *const network.Stream) !void {
-    try out.append(a, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .state = .authentication_failed });
+    try appendDerived(a, out, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .state = .authentication_failed }, max_derived_records);
 }
 
 fn appendPlain(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, raw: RawRecord, version: Version, cipher: Cipher, epoch: Epoch, sequence: u64, content_type: u8, plaintext: []const u8, source: *const network.Stream, summary: *Session) !void {
+    if (out.items.len >= max_derived_records) return error.TlsRecordLimit;
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(plaintext, &hash, .{});
     var copy: []u8 = &.{};
@@ -759,8 +652,13 @@ fn appendPlain(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record
         copy = try a.dupe(u8, plaintext);
         stream.plaintext_bytes += plaintext.len;
     } else stream.plaintext_dropped += plaintext.len;
-    try out.append(a, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .content_type = content_type, .state = .decrypted, .plaintext_length = @intCast(plaintext.len), .plaintext = copy, .plaintext_sha256 = hash });
+    try appendDerived(a, out, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .content_type = content_type, .state = .decrypted, .plaintext_length = @intCast(plaintext.len), .plaintext = copy, .plaintext_sha256 = hash }, max_derived_records);
     summary.records += 1;
+}
+
+fn appendDerived(a: std.mem.Allocator, out: *std.ArrayList(Record), record: Record, limit: usize) !void {
+    if (out.items.len >= limit) return error.TlsRecordLimit;
+    try out.append(a, record);
 }
 
 fn timeOf(source: *const network.Stream, record: u32) ?u64 {
@@ -797,13 +695,25 @@ test "TLS 1.3 AES-GCM record decrypts only with its authenticated header" {
     var cipher: [inner.len]u8 = undefined;
     var tag: [Aead.tag_length]u8 = undefined;
     const k: [16]u8 = key.bytes[0..16].*;
-    Aead.encrypt(&cipher, &tag, &inner, &header, nonceFor(key.iv, sequence), k);
+    var nonce = nonceFor(&key.iv, sequence);
+    defer std.crypto.secureZero(u8, &nonce);
+    Aead.encrypt(&cipher, &tag, &inner, &header, nonce, k);
     const payload = cipher ++ tag;
     var plain: [inner.len]u8 = undefined;
-    try std.testing.expect(decrypt13Record(key, sequence, header, &payload, &plain));
+    try std.testing.expect(decrypt13Record(&key, sequence, header, &payload, &plain));
     try std.testing.expectEqualSlices(u8, &inner, &plain);
     header[0] = 22;
-    try std.testing.expect(!decrypt13Record(key, sequence, header, &payload, &plain));
+    try std.testing.expect(!decrypt13Record(&key, sequence, header, &payload, &plain));
+}
+
+test "derived TLS records stop at their configured limit" {
+    const a = std.testing.allocator;
+    var records: std.ArrayList(Record) = .empty;
+    defer records.deinit(a);
+    const record = Record{ .index = 0, .flow_id = 0, .direction = .client_to_server, .source_record = 0, .time_ns = null, .version = .tls13, .cipher = .aes_128_gcm_sha256, .epoch = .application, .sequence = 0, .outer_type = 23, .state = .authentication_failed };
+    try appendDerived(a, &records, record, 1);
+    try std.testing.expectError(error.TlsRecordLimit, appendDerived(a, &records, record, 1));
+    try std.testing.expectEqual(@as(usize, 1), records.items.len);
 }
 
 test "TLS 1.2 PRF derives independent directional keys" {

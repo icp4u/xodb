@@ -10,6 +10,7 @@ const memstat = @import("memstat.zig");
 pub const definitions = @import("tool_catalog.zig").overview_definitions;
 
 pub fn handles(name: []const u8) bool {
+    if (@import("system_capture.zig").handles(name)) return true;
     if (std.mem.eql(u8, name, "get_layout")) return true;
     if (std.mem.eql(u8, name, "get_graph")) return true;
     if (fd.handles(name)) return true;
@@ -485,10 +486,12 @@ fn ownerHints(a: std.mem.Allocator, result: *Value, snap: *const c.struct_xrt_sy
 test "overview reads and explicit fd capture controls are advertised" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(20, parsed.value.array.items.len);
+    try std.testing.expectEqual(24, parsed.value.array.items.len);
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
-        try std.testing.expectEqual(!fd.isControl(definition.object.get("name").?.string), definition.object.get("annotations").?.object.get("readOnlyHint").?.bool);
+        const name = definition.object.get("name").?.string;
+        const request = std.mem.eql(u8, name, "request_system_capture") or std.mem.eql(u8, name, "cancel_system_capture");
+        try std.testing.expectEqual(!fd.isControl(name) and !request, definition.object.get("annotations").?.object.get("readOnlyHint").?.bool);
     }
 }
 

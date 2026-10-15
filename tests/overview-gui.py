@@ -148,6 +148,16 @@ def ocr(path, box=None):
     return re.sub(r'\s+', ' ', h.ocr(str(path)))
 
 
+def ocr_ink(path, box, level=90):
+    """OCR of light-on-dark text only: drops dim hatching, which tesseract
+    otherwise takes for an image region and skips the reason drawn on it."""
+    crop = Path(str(path) + f'.{box[0]}-{box[1]}-ink.png')
+    with Image.open(path) as im:
+        im = im.convert('L').crop(box).point(lambda v: 0 if v > level else 255)
+        im.resize(((box[2] - box[0]) * 2, (box[3] - box[1]) * 2), Image.LANCZOS).save(crop)
+    return re.sub(r'\s+', ' ', h.ocr(str(crop)))
+
+
 def colorful(path, region=None):
     """Distinct colors in a region: a blank or failed frame has very few."""
     with Image.open(path) as im:
@@ -195,7 +205,7 @@ else:
         check('no draw failures in log', 'Draw failed' not in d.text() and 'frame failed' not in d.text(), d.text()[-300:])
         # Unavailable reasons are visible, not zeros.
         d.tap('n9')
-        text = ocr(d.shot('power-reasons'), (240, 52, 700, 280))
+        text = ocr_ink(d.shot('power-reasons'), (240, 52, 700, 280))
         check('CPU package power shows its reason', 'needs privilege' in text.lower(), text[:200])
         d.tap('n1')
         text = ocr(d.shot('summary-honesty'), (1360, 540, 1920, 1052))

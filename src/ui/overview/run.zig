@@ -14,6 +14,7 @@ const Shared = @import("../../mcp/shared.zig").Endpoint;
 const Server = @import("../../mcp/server.zig").Server;
 const Session = @import("../../model/session.zig").Session;
 const Launcher = @import("actions.zig").Launcher;
+const Capture = @import("../../model/system_capture.zig").Owner(Session);
 
 pub fn main(args: []const [:0]const u8, startup_started: u64) !void {
     return loop.main(args, startup_started, live);
@@ -29,6 +30,8 @@ const Source = struct {
     server: ?*Server,
     launcher: *Launcher,
     sysstat: @import("sysstat.zig").Live,
+    capture: *Capture,
+    capture_sequence: u64 = 0,
 
     pub fn prepare(self: *Source, view: *vw.View) !void {
         if (self.o.memmap_pid) |pid| {
@@ -64,6 +67,11 @@ const Source = struct {
         if (self.launcher.poll()) view.setStatus("Process action failed; check target identity and access", .{}, current);
         const started = vw.threadNs();
         self.collector.redact = view.redact;
+        if (self.collector.capture.ownsFlow()) {
+            // Agent consent must not turn into unbounded pane demand afterward.
+            view.graph.events_enabled = false;
+            view.treemap.events_enabled = false;
+        }
         self.collector.graph_scene = if (view.panel == .galaxy) &@import("galaxy_descriptors.zig").navigation().scene else null;
         if (view.graph.flow_demand and ((view.panel != .graph and view.panel != .galaxy) or view.paused)) view.graph.stopCapture();
         if (view.treemap.flow_demand and (view.panel != .treemap or view.paused)) view.treemap.stopCapture();
@@ -124,19 +132,42 @@ const Source = struct {
         view.sourceCost(vw.threadNs() -| started);
         if (self.shared) |endpoint| try endpoint.pump(self.session);
         if (self.server) |p| try p.pump(self.session);
+        self.capture.stdio_alive = if (self.server) |p| !p.input_eof else false;
+        // Read the clock after the pumps: the service rejects a timestamp older than
+        // its last call, which would read as a disconnected shared requester.
+        self.capture.tick(now());
+        const consent = &self.collector.capture;
+        if (view.pending_action) |request| if (request.capture_id) |id| {
+            if (consent.current == null or consent.current.?.id != id or consent.current.?.phase != .pending) view.pending_action = null;
+        };
+        if (consent.current) |request| {
+            if (request.phase == .pending and view.pending_action == null and !view.searching) {
+                view.pending_action = .{ .kind = if (request.spec.kind == .cpu) .profile else .events, .id = .{ .pid = request.spec.pid, .start = request.spec.start_ticks }, .capture_id = request.id };
+                view.confirm_key = null;
+                view.confirm_after = current + 250_000_000;
+                window.dirty = true;
+            }
+            if (self.capture_sequence != consent.sequence) {
+                view.setStatus("Agent capture #{d}: {s} · Ctrl+Esc stops · {s}", .{ request.id, @tagName(request.phase), request.reason orelse "bounded capture" }, current);
+                self.capture_sequence = consent.sequence;
+                window.dirty = true;
+            }
+        }
     }
 };
 
 fn live(o: *const Options, startup_started: u64) !void {
+    if (o.redact) @import("../../redact.zig").enable();
     const gpa = std.heap.c_allocator;
     var collector: Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count] };
+    collector.capture.mode = .gui;
     defer collector.deinit();
     const session = try gpa.create(Session);
     defer gpa.destroy(session);
     session.* = Session.init();
     session.agent_scope = .observe;
     defer session.deinit();
-    var shared: ?Shared = if (o.session_socket) |path| try Shared.init(path, null) else null;
+    var shared: ?Shared = if (o.session_socket) |path| try Shared.init(path, null, o.redact) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
     if (shared) |*endpoint| {
         endpoint.overview_shared = &collector;
@@ -154,10 +185,15 @@ fn live(o: *const Options, startup_started: u64) !void {
     }
     var view = try vw.View.init(gpa);
     defer view.deinit();
+    var capture: Capture = .{ .collector = &collector, .root = session, .service = if (shared) |*endpoint| endpoint.service else null };
+    defer capture.deinit(now());
+    view.capture = &collector.capture;
+    if (shared) |*endpoint| endpoint.overview_capture = &capture.cpu;
+    if (server) |p| p.overview_capture = &capture.cpu;
     var launcher: Launcher = .{ .redact = o.redact };
     view.action_hook = launchAction;
     view.action_context = &launcher;
-    var source = Source{ .o = o, .gpa = gpa, .collector = &collector, .session = session, .shared = if (shared) |*endpoint| endpoint else null, .server = server, .launcher = &launcher, .sysstat = .{ .collector = &collector } };
+    var source = Source{ .o = o, .gpa = gpa, .collector = &collector, .session = session, .shared = if (shared) |*endpoint| endpoint else null, .server = server, .launcher = &launcher, .sysstat = .{ .collector = &collector }, .capture = &capture };
     try loop.run(o, gpa, &view, &source, startup_started);
 }
 

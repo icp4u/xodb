@@ -47,8 +47,13 @@ pub const Cpu = struct {
     id: u32,
     core: u32 = 0,
     package: u32 = 0,
-    /// Last-level cache domain (CCX/CCD on AMD); groups the Performance grid.
+    /// Last-level cache domain (CCX/CCD on AMD), or the cpu cluster id when
+    /// `cluster_domain` is set. Groups the Performance grid.
     cache: u32 = 0,
+    /// True when `cache` is a cpu cluster because this kernel has no L3 id.
+    cluster_domain: bool = false,
+    /// cpu_capacity when the kernel exposes it; 0 when it does not.
+    capacity: u32 = 0,
     /// Position among the core's SMT siblings (0 = first thread).
     smt: u32 = 0,
     /// Why package/core/cache/SMT are unknown; empty when all were measured.
@@ -294,6 +299,8 @@ pub const Snapshot = struct {
     cpu_system: F = .{},
     cpu_iowait: F = .{},
     cpu_package_temp: F = .{},
+    /// Empty when the temperature is an x86 package sensor (Tctl, Tdie, Package id).
+    cpu_temp_label: []const u8 = "",
     cpu_temps: []const Sensor = &.{},
     cpus: []const Cpu = &.{},
     memory: Memory = .{},
@@ -311,6 +318,8 @@ pub const Snapshot = struct {
     sensors: []const Sensor = &.{},
     gpus: []const Gpu = &.{},
     cpu_package_power: F = .{},
+    /// Empty means RAPL package power. Otherwise the hwmon label (system or SoC).
+    cpu_power_label: []const u8 = "",
     battery_pct: F = .{},
     users: []const UserSession = &.{},
     services: []const Service = &.{},

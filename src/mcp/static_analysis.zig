@@ -4,6 +4,7 @@
 //! producer's qualification; observed values come back in a separate field.
 const std = @import("std");
 const Session = @import("../model/session.zig").Session;
+const pseudo_values = @import("../model/pseudo_values.zig");
 const host = @import("../semq/host.zig");
 const answer = @import("../semq/answer.zig");
 const wire = @import("profile.zig");
@@ -46,6 +47,23 @@ fn out(a: Allocator, object: anytype) !V {
     var value = try wire.value(a, object);
     try hexWords(a, &value);
     return value;
+}
+
+fn readSessionMemory(user: *anyopaque, address: u64, bytes: []u8) !usize {
+    const session: *Session = @ptrCast(@alignCast(user));
+    return session.target.readMemory(address, bytes);
+}
+
+fn livePseudoValues(a: Allocator, session: *Session, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const pseudo_values.PseudoValue {
+    const frame_count = std.math.add(usize, frame_index, 1) catch return &.{};
+    const frames = session.stack(a, tid, frame_count) catch return &.{};
+    if (frame_index >= frames.len) return &.{};
+    const frame = frames[frame_index];
+    const link_pc = frame.lookup_pc -% analysis.function.bias;
+    // Outer-frame stack slots may have been changed by the callee after the
+    // lookup PC's proof. Registers remain available through unwinding.
+    const memory: ?pseudo_values.LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
+    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc);
 }
 
 fn hex(args: V, key: []const u8) !?u64 {
@@ -148,11 +166,16 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
         };
     }
     if (std.mem.eql(u8, name, "decompile_function")) {
-        try wire.fields(args, &.{ "address", "symbol", "retry", "deadline_ms" });
+        try wire.fields(args, &.{ "address", "symbol", "retry", "deadline_ms", "tid", "frame" });
+        const tid_given = args.object.get("tid") != null;
+        if (!tid_given and args.object.get("frame") != null) return error.InvalidArguments;
+        const tid: i32 = if (tid_given) std.math.cast(i32, try wire.number(args, "tid", null)) orelse return error.InvalidArguments else 0;
+        const frame: usize = if (tid_given) @intCast(try wire.number(args, "frame", 0)) else 0;
+        if (tid_given and (tid < 1 or frame >= 64)) return error.InvalidArguments;
         const address = try functionAddress(session, args) orelse return error.InvalidArguments;
         return switch (try analysisAt(a, session, address, try options(session, args))) {
             .status => |v| v,
-            .analysis => |analysis| decompile(a, analysis),
+            .analysis => |analysis| decompile(a, analysis, if (tid_given) try livePseudoValues(a, session, analysis, tid, frame) else null, if (tid_given) .{ .tid = tid, .frame = frame, .generation = session.target.snapshot().generation } else null),
         };
     }
     if (std.mem.eql(u8, name, "get_decomp_mapping")) {
@@ -239,7 +262,9 @@ pub fn call(a: Allocator, session: *Session, name: []const u8, args: V) !V {
     return out(a, .{ .status = "completed", .analysis = brief, .candidate = found[0], .controls = try answer.controls(a, session, analysis, chosen, limits) });
 }
 
-fn decompile(a: Allocator, analysis: *host.Analysis) !V {
+const LiveAt = struct { tid: i32, frame: usize, generation: u64 };
+
+fn decompile(a: Allocator, analysis: *host.Analysis, live_values: ?[]const pseudo_values.PseudoValue, live_at: ?LiveAt) !V {
     const Reason = struct { code: []const u8, level: []const u8, detail: []const u8, address: ?u64 };
     const reasons = try a.alloc(Reason, analysis.reasons.len);
     for (analysis.reasons, reasons) |reason, *row| row.* = .{ .code = reason.code, .level = reason.level, .detail = reason.detail, .address = if (reason.address) |pc| analysis.function.runtime(pc) else null };
@@ -261,6 +286,8 @@ fn decompile(a: Allocator, analysis: *host.Analysis) !V {
         .token_status = document.token_status,
         .address_map_status = document.address_map_status,
         .artifact_id = analysis.artifact_id,
+        .live_values = live_values,
+        .live_values_at = live_at,
         .entry_pad = if (document.entry_pad) |pad| .{ .start = analysis.function.runtime(pad.start), .end = analysis.function.runtime(pad.end), .line = pad.line } else null,
         .function = .{ .name = analysis.function.name, .entry = analysis.function.runtime(analysis.function.key.entry), .size = analysis.function.key.size, .module = analysis.function.module_path },
     });

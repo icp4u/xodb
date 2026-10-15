@@ -3,8 +3,8 @@
 
 Native: python3 tests/runtime-host.py
 Cross ISA: add --ssh HOST --ssh-config FILE --agent PATH --fixture PATH --arch m68k
-or --arch loongarch64 or --arch ppc64le. The remote fixture is tests/fixtures/runtime-isa.c
-compiled with -g -O0.
+or --arch loongarch64 or --arch ppc64le or --arch riscv64. The remote fixture is
+tests/fixtures/runtime-isa.c compiled with -g -O0.
 """
 import argparse
 import json
@@ -18,7 +18,7 @@ p.add_argument('--ssh')
 p.add_argument('--ssh-config')
 p.add_argument('--agent', default='./zig-out/bin/xodb-agent')
 p.add_argument('--fixture', default='./zig-out/bin/xodb-m1-fixture')
-p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k', 'loongarch64', 'ppc64le'])
+p.add_argument('--arch', default='x86_64', choices=['x86_64', 'm68k', 'loongarch64', 'ppc64le', 'riscv64'])
 a = p.parse_args()
 os.chdir(Path(__file__).resolve().parents[1])
 options = ['--runtime-agent', a.agent]
@@ -81,6 +81,48 @@ try:
         value = c.inspect('evaluate_expression', tid=tid, expression='state.value')
         assert int(value['bits'], 16) == 7, value
         c.action('write_register', tid=tid, name='r12', value=regs['r12'])
+    elif a.arch == 'riscv64':
+        def refused(tool_name, text, **args):
+            response = c.tool(tool_name, generation=c.session()['generation'], **args)
+            assert response['result']['isError'] and response['result']['content'][0]['text'] == text, response
+        # Major 5 decodes RISC-V. Vendored major 6 has no RISC-V and refuses it.
+        blob = Path(os.environ.get('XODB_BIN', './zig-out/bin/xodb')).read_bytes()
+        marker = b'xodb-capstone-api-major:'
+        at = blob.find(marker)
+        assert at >= 0, 'host binary has no Capstone major marker'
+        end = at + len(marker)
+        while end < len(blob) and 48 <= blob[end] <= 57:
+            end += 1
+        major = int(blob[at + len(marker):end])
+        regview = c.inspect('get_registers', tid=tid)
+        assert regview.get('note') == 'x0 is architectural zero and is not in NT_PRSTATUS', regview
+        assert 'x0' not in regview['registers'], regview['registers']
+        assert 'ra' in regs and 'sp' in regs, regs
+        assert int(regs['a0'], 16) == 5, regs['a0']
+        dis = c.tool('disassemble', generation=c.session()['generation'], address=regs[pc])
+        if major < 6:
+            instructions = dis['result']['structuredContent']['instructions']
+            assert instructions and instructions[0]['address'] == regs[pc], dis
+            disasm_note = 'disassembly decoded'
+        else:
+            assert dis['result']['isError'] and dis['result']['content'][0]['text'] == 'DisassemblerUnavailable', dis
+            disasm_note = 'disassembly refused'
+        c.action('step_instruction', tid=tid)
+        c.stopped('single_step')
+        stepped = c.inspect('get_registers', tid=tid)['registers']
+        assert stepped[pc] != regs[pc], (stepped[pc], regs[pc])
+        assert stepped['ra'] == regs['ra'], (stepped['ra'], regs['ra'])
+        refused('set_watchpoint', 'UnsupportedArchitecture', address=symbol['address'], length=8)
+        refused('start_profile', 'ProfilingUnsupportedArchitecture')
+        refused('start_allocations', 'UnsupportedAllocationArchitecture', tids=[tid])
+        refused('start_observation', 'UnsupportedObservationArchitecture', tids=[tid], mapping_address='0x1000', functions=['malloc'])
+        assert c.session()['state'] == 'stopped'
+        frames = c.inspect('get_stack', tid=tid)['frames']
+        assert len(frames) >= 2, frames
+        assert any(f.get('symbol') == 'main' for f in frames), frames
+        value = c.inspect('evaluate_expression', tid=tid, expression='state.value')
+        assert int(value['bits'], 16) == 7, value
+        c.action('write_register', tid=tid, name='ra', value=regs['ra'])
     else:
         instructions = c.inspect('disassemble', address=regs[pc])['instructions']
         assert instructions and instructions[0]['address'] == regs[pc]
@@ -117,6 +159,8 @@ try:
         time.sleep(.002)
     if a.arch == 'loongarch64':
         print(f'C agent host integration passed (loongarch64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; watchpoints, profile and uprobes refused')
+    elif a.arch == 'riscv64':
+        print(f'C agent host integration passed (riscv64): symbols, registers, breakpoint, stack, expression; {disasm_note}; software step; x0 omitted; watchpoints, profile and uprobes refused')
     elif a.arch == 'ppc64le':
         print('C agent host integration passed (ppc64le): symbols, registers, local-entry breakpoint, break/step, disassembly, stack, expression; watches, profile and uprobes refused')
     else:

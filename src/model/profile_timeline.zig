@@ -5,6 +5,7 @@ const timeline = @import("../ui/timeline.zig");
 const profile = @import("../profile/capture.zig");
 const linux = @import("../target/linux.zig");
 const evidence = @import("../evidence/stream.zig");
+const live_capture = @import("../capture/live.zig");
 /// The timeline's display data for the session capture: per-thread sample
 /// times and debugger stop ranges. Rebuilt when the capture revision changes,
 /// at most four times a second while collecting. Samples follow the capture's
@@ -19,11 +20,19 @@ pub const Source = struct {
     built_ns: u64 = 0,
     /// External evidence drawn as one extra lane (read-only, set by the owner).
     stream: ?*const evidence.Stream = null,
+    /// A live source is snapshotted on the same bounded GUI refresh cadence.
+    live: ?*live_capture.Live = null,
+    live_snapshot: ?live_capture.Snapshot = null,
 
     pub fn deinit(self: *Source) void {
+        if (self.live_snapshot) |*snapshot| snapshot.destroy();
         self.arena.deinit();
     }
     pub fn clear(self: *Source) void {
+        if (self.live_snapshot) |*snapshot| snapshot.destroy();
+        self.live_snapshot = null;
+        self.live = null;
+        self.stream = null;
         _ = self.arena.reset(.free_all);
         self.data = null;
         self.capture_id = 0;
@@ -31,20 +40,26 @@ pub const Source = struct {
         self.built_ns = 0;
     }
     pub fn refresh(self: *Source, capture: ?*profile.Capture) ?*const timeline.Data {
+        if (self.live) |live| {
+            const opened = live.snapshot(std.heap.page_allocator, 1) catch return if (self.data) |*data| data else null;
+            if (self.live_snapshot) |*snapshot| snapshot.destroy();
+            self.live_snapshot = opened;
+            self.stream = opened.stream;
+        }
         const current = capture orelse {
             // A stream without a capture is drawn on its own clock, once.
             const stream = self.stream orelse {
                 self.data = null;
                 return null;
             };
-            if (self.data != null and self.capture_id == 0) return &self.data.?;
+            if (self.live == null and self.data != null and self.capture_id == 0) return &self.data.?;
             self.buildStreamOnly(stream) catch {
                 self.data = null;
                 return null;
             };
             return &self.data.?;
         };
-        const same = self.data != null and current.id == self.capture_id;
+        const same = self.live == null and self.data != null and current.id == self.capture_id;
         if (same and current.revision == self.revision) return &self.data.?;
         if (same and current.collector != null and linux.now() -| self.built_ns < 250_000_000) return &self.data.?;
         self.build(current) catch {
@@ -129,8 +144,8 @@ pub const Source = struct {
         const first = stream.first_time_ns orelse 0;
         const extent = if (stream.last_time_ns) |last| (last - first) +| 1 else 1;
         var lane = try streamLane(self.arena.allocator(), stream, null, extent);
-        lane.note = "stream clock (CLOCK_REALTIME from the file), time since its first record; no capture opened";
-        self.data = .{ .capture_id = 0, .revision = 1, .extent_ns = extent, .state_label = "pcap only", .lanes = &.{}, .stream = lane };
+        lane.note = if (self.live != null) "live bounded ring; CLOCK_REALTIME, time since the oldest retained record" else "stream clock (CLOCK_REALTIME from the file), time since its first record; no capture opened";
+        self.data = .{ .capture_id = 0, .revision = 1, .extent_ns = extent, .state_label = if (self.live != null) "live pcap" else "pcap only", .lanes = &.{}, .stream = lane };
         self.capture_id = 0;
         self.revision = 1;
         self.built_ns = linux.now();
@@ -226,6 +241,7 @@ pub const Capture = struct {
     }
     pub fn changed(self: *const Capture, session: *const @import("session.zig").Session) bool {
         if (self.session_id != session.id) return true;
+        if (session.live_capture != null and linux.now() -| self.refreshed_ns >= 250 * std.time.ns_per_ms) return true;
         const current = session.profile orelse return self.capture_id != 0;
         if (self.capture_id != current.id) return true;
         return current.revision != self.revision and (current.collector == null or linux.now() -| self.refreshed_ns >= 250 * std.time.ns_per_ms);
@@ -238,6 +254,7 @@ pub const Capture = struct {
         if (!self.changed(session) and std.meta.eql(wanted, self.requested)) return;
         if (self.session_id != session.id) self.clear();
         self.source.stream = session.evidence_stream;
+        self.source.live = session.live_capture;
         const current = self.source.refresh(session.profile);
         _ = self.arena.reset(.retain_capacity);
         self.value = if (current) |data| self.viewport.prepare(self.arena.allocator(), session.id, request_, data) catch null else null;

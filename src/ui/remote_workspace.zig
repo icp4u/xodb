@@ -73,10 +73,13 @@ pub const Frontend = struct {
         if (identity.connection != self.owner.options.connection) return error.StaleProcess;
         const command = try boundary.Command.create(a, .{ .stamp = identity, .actor = .human, .action = action });
         errdefer command.destroy();
-        const index = if (command.urgent()) blk: {
-            if (self.pending[boundary.max_commands] != null) return error.Busy;
-            break :blk boundary.max_commands;
-        } else for (self.pending[0..boundary.max_commands], 0..) |slot, i| {
+        // Reserve admission for the first human stop/revoke even when ordinary
+        // work fills the buffer. Further urgent presses may use free ordinary
+        // slots: dropping the second F8 in one input burst loses a real toggle.
+        // They still enter the owner's single human reservation in order.
+        const index = if (command.urgent() and self.pending[boundary.max_commands] == null)
+            boundary.max_commands
+        else for (self.pending[0..boundary.max_commands], 0..) |slot, i| {
             if (slot == null) break i;
         } else return error.Busy;
         if (!command.urgent() and command.bytes > boundary.max_command_bytes -| self.pending_bytes) return error.Busy;
@@ -113,7 +116,9 @@ pub const Frontend = struct {
             };
             const sequence = self.owner.commands.trySubmit(copy) catch |err| {
                 copy.destroy();
-                if (err != error.Busy) p.workspace.status = @errorName(err);
+                // A second human stop waits for the owner's reservation; that
+                // is ordinary backpressure, not a failure to show the user.
+                if (err != error.Busy and !(err == error.QueueFull and p.command.urgent())) p.workspace.status = @errorName(err);
                 break;
             };
             p.sequence = sequence;
@@ -484,4 +489,41 @@ test "late old completion cannot finish a new connection command" {
     try std.testing.expect(frontend.pending[0] == null and frontend.inspection_sequence == null);
     try std.testing.expect(frontend.inspection_retry.failure.? == error.RemoteCancelled);
     try std.testing.expectEqual(@as(usize, 0), frontend.pending_bytes);
+}
+
+test "human urgent burst is retained in order with one reserved admission" {
+    const ta = std.testing.allocator;
+    const owner = try ta.create(Worker);
+    defer ta.destroy(owner);
+    owner.* = .{ .publications = .{ .connection = 2 }, .executor = undefined, .options = .{ .connection = 2 } };
+    defer owner.commands.deinit();
+    defer owner.publications.deinit();
+    const workspace = try ta.create(Workspace);
+    defer ta.destroy(workspace);
+    workspace.* = .{};
+    defer workspace.deinit();
+    var frontend: Frontend = .{ .owner = owner };
+    defer frontend.deinit();
+    const identity: boundary.Stamp = .{ .connection = 2, .session = 2, .process = 1, .pid = 77, .start_ticks = 22, .generation = 1, .image_epoch = 1 };
+    try frontend.enqueue(workspace, identity, .toggle_scope);
+    try frontend.enqueue(workspace, identity, .toggle_scope);
+    frontend.pump();
+    const first = (try owner.commands.take()).?;
+    try std.testing.expect(first.request.action == .toggle_scope);
+    const first_sequence = first.sequence;
+    owner.completions.put(.{ .sequence = first_sequence, .stamp = identity });
+    owner.commands.finish();
+    frontend.pump();
+    const second = (try owner.commands.take()).?;
+    try std.testing.expect(second.request.action == .toggle_scope);
+    try std.testing.expect(second.sequence > first_sequence);
+    owner.completions.put(.{ .sequence = second.sequence, .stamp = identity });
+    owner.commands.finish();
+    frontend.pump();
+    for (frontend.pending) |slot| try std.testing.expect(slot == null);
+    try std.testing.expectEqual(@as(usize, 0), frontend.pending_bytes);
+    for (0..boundary.max_commands) |_| try frontend.enqueue(workspace, identity, .{ .control = .continue_execution });
+    try frontend.enqueue(workspace, identity, .toggle_scope);
+    try std.testing.expectError(error.Busy, frontend.enqueue(workspace, identity, .toggle_scope));
+    try std.testing.expectError(error.Busy, frontend.enqueue(workspace, identity, .{ .control = .continue_execution }));
 }

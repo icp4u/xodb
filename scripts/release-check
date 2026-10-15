@@ -28,6 +28,9 @@ ROOT = Path(__file__).resolve().parents[1]
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
     (('src/model/command.zig', 'src/model/commands.zig', 'src/service/authority.zig', 'src/mcp/commands.zig', 'tests/command-boundary.py'), ('command-boundary*', 'm1-control', 'm1-source', 'm1-stepping', 'run-control', 'breakpoint-policy', 'shared-sessions*', 'remote-owner-batches*', 'gui-run-control')),
+    (('src/model/system_capture*', 'src/mcp/system_capture.zig', 'tests/system-capture*.py'), ('system-capture', 'system-capture-flow', 'gui-system-capture', 'sysstat-headless', 'gui-overview-live')),
+    (('src/mcp/base_tools.json', 'src/mcp/command_decode.zig', 'scripts/gen-command-decode'), ('command-decode', 'command-boundary*')),
+    (('tests/command-compare.py',), ('command-compare-selftest',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
@@ -73,6 +76,7 @@ COVERS = (
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
     (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
+    (('src/model/remote_worker.zig', 'src/model/remote_dispatch.zig', 'tests/fixtures/hold-ptrace.c'), ('gui-local-owner*',)),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
      ('jai-*', 'gui-jai-*', 'go-*', 'elisp-*', 'emacs-demo*')),
     (('src/mcp/memory.zig', 'src/mcp/registers.zig', 'src/model/memory.zig', 'src/runtime/memory.c',
@@ -129,8 +133,8 @@ COVERS = (
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
     (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
-    (('src/evidence/*', 'src/mcp/evidence*', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/private-network-evidence.py', 'tests/fixtures/net-peer.py'),
-     ('network-evidence', 'private-network-evidence', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
+    (('src/evidence/*', 'src/capture/*', 'src/mcp/evidence*', 'src/model/profile_timeline.zig', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/private-network-evidence.py', 'tests/live-network-evidence.py', 'tests/usb-evidence.py', 'tests/dbus-evidence.py', 'tests/fixtures/net-peer.py', 'tests/fixtures/capture-tool.py'),
+     ('network-evidence', 'private-network-evidence', 'live-network-evidence', 'usb-evidence', 'dbus-evidence', 'pcap-magic', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
     (('tests/pcap-magic.py',), ('pcap-magic',)),
     (('src/redact.zig', 'src/log.zig', 'src/mcp/server.zig', 'src/profile/archive.zig', 'src/profile/archive_job.zig', 'src/profile/net_context.zig',
       'src/evidence/sockets.zig', 'src/mcp/evidence.zig', 'src/render/vulkan.zig', 'tests/redact.py'),
@@ -147,6 +151,7 @@ ALWAYS = ('deps',)
 # RSS, inject compositor/Vulkan timeouts, rank processes by CPU, make many
 # OCR passes with bounded waits, or read a pixel from the first frame.
 SERIAL = {
+    'gui-local-owner',
     'gui-gibson-live-flight',
     'vulkan-faults', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-galaxy-scale', 'gui-galaxy-churn',
     'gui-scene3d', 'gui-scene3d-evidence', 'scene3d-faults', 'gui-gibson', 'gui-gibson-camera', 'gui-gibson-flight', 'gui-gibson-signs', 'gui-gibson-evidence',
@@ -283,6 +288,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if tier == 'periodic' and go:
         steps.append(('go-maps-interleaved', [sys.executable, '-B', 'tests/go-maps.py', '--go', go, '--experiment', 'nomapsplitgroup', '--strace', '--work', '.work/go-maps-interleaved'], 180))
     steps.append(('remote-retry', ['zig', 'test', 'src/model/remote_retry.zig', '-OReleaseSafe'], 30))
+    steps.append(('command-decode', [sys.executable, '-B', 'tests/command-decode.py'], 5))
+    steps.append(('command-compare-selftest', [sys.executable, '-B', 'tests/command-compare-selftest.py'], 5))
     steps.append(('scene3d-math', ['zig', 'test', 'src/render/scene3d/math.zig', '-OReleaseSafe'], 30))
     steps.append(('go-type-index', [sys.executable, '-B', 'tests/go-type-index.py', '--work', '.work/go-type-index'], 60))
     steps.append(('go-maps-component', [sys.executable, '-B', 'tests/go-maps-component.py', '--work', '.work/go-maps-component'], 60))
@@ -487,6 +494,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('sysstat-sensors', [sys.executable, '-B', 'tests/sysstat-sensors.py'], 30))
         steps.append(('fetch', [sys.executable, '-B', 'tests/fetch.py'], 60))
         steps.append(('sysstat-headless', [sys.executable, '-B', 'tests/overview-headless.py'], 120))
+        steps.append(('system-capture', [sys.executable, '-B', 'tests/system-capture.py'], 60))
+        steps.append(('system-capture-flow', [sys.executable, '-B', 'tests/system-capture-flow.py'], 60))
         steps.append(('memory-observer', [sys.executable, '-B', 'tests/memory-observer.py'], 180))
         steps.append(('memdefrag-tui', [sys.executable, '-B', 'tests/memdefrag-tui.py', '--mib', '256'], 240))
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
@@ -498,7 +507,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'ghidra-static-images', 'log-levels',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
                      'comparison', 'scheduling-decode', 'observation-experiments',
-                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence', 'private-network-evidence', 'redact'):
+                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence', 'private-network-evidence', 'live-network-evidence', 'usb-evidence', 'dbus-evidence', 'redact'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
@@ -676,6 +685,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-galaxy-scale', ['tests/ui-scale-gui.py', '--galaxy']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),
+            ('gui-local-owner', ['tests/local-owner-gui.py']),
+            ('gui-local-owner-startup', ['tests/local-owner-gui.py', '--startup-refusal']),
             ('gui-remote-close', ['tests/remote-owner-gui.py', '--close-held']),
             ('gui-remote-profile-close', ['tests/remote-owner-gui.py', '--capture-held']),
             ('gui-remote-profile-ack-close', ['tests/remote-owner-gui.py', '--capture-ack']),
@@ -744,6 +755,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-small-matrix-unavailable', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--unavailable'], 600))
         steps.append(('gui-overview-small-matrix-tracing-failure', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--tracing-failure'], 600))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
+        steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))
         for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
@@ -1261,12 +1273,18 @@ def main(argv=None):
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
     parser.add_argument('--capstone', choices=['system', 'vendored'], default='system', help='Link system Capstone, or the private prefix from scripts/build-capstone')
     parser.add_argument('--keep-going', action='store_true', help='Run every step after a failure (not after a failed build or probe), then summarise all failures')
+    parser.add_argument('--compare-binary', metavar='XODB', help='Opt-in: compare the same MCP command transcript against this reference binary (host/all/affected/periodic)')
+    parser.add_argument('--compare-agent', metavar='AGENT', help='Also compare local-agent mode using this reference agent and the built candidate agent; requires --compare-binary')
     parser.add_argument('--retry-flaky', type=int, metavar='N', help='Retry a failed GUI step up to N times; a later pass is recorded as flaky (default 1 for gui, all and periodic-gui, else 0)')
     chosen = parser.add_mutually_exclusive_group()
     chosen.add_argument('--only', metavar='STEP[,STEP]', help='Run only these steps (plus build-tests and their build steps)')
     chosen.add_argument('--from', dest='start', metavar='STEP', help='Run this step and every later step (plus build-tests)')
     args = parser.parse_args(argv)
     tier = args.tier
+    if args.compare_agent and not args.compare_binary:
+        parser.error('--compare-agent requires --compare-binary')
+    if args.compare_binary and (tier not in ('host', 'all', 'affected', 'periodic') or args.headless):
+        parser.error('--compare-binary requires host, all, affected or periodic, without --headless')
     if args.base and tier != 'affected':
         parser.error('--base requires the affected tier')
     if args.records and not args.list:
@@ -1337,6 +1355,16 @@ def main(argv=None):
                 decisions.append(f'affected: WARNING: without --{flag}, {len(lost)} steps that cover this change cannot run: ' + ' '.join(lost))
         decisions.append(f'affected: {len(changed)} changed files against {base} select {len(steps)} of {len(everything)} steps')
         print('\n'.join(decisions), file=sys.stderr if args.list else sys.stdout, flush=True)
+    if args.compare_binary:
+        for lane in ('native', 'agent', 'gui') if args.compare_agent else ('native', 'gui'):
+            argv = [sys.executable, '-B', 'tests/command-compare.py', '--reference', str(Path(args.compare_binary).resolve()),
+                    '--candidate', './zig-out/bin/xodb', '--work', '.work/command-compare-' + lane]
+            if lane == 'agent':
+                argv += ['--reference-agent', str(Path(args.compare_agent).resolve()), '--candidate-agent', './zig-out/bin/xodb-agent']
+            if lane == 'gui':
+                argv += ['--gui']  # the windowed native owner, private headless Sway
+            steps += [Step('command-compare-' + lane, argv, 400 if lane == 'gui' else 270, kind='gui' if lane == 'gui' else 'live',
+                           needs=('build-tests',), paths=('tests/command-compare.py',), work=('command-compare-' + lane,))]
     if args.capstone == 'vendored':
         for step in steps:
             if step.name in ('headless-app', 'build-tests', 'platform-null', 'platform-null-tests', 'platform-cocoa', 'platform-cocoa-tests'):

@@ -197,19 +197,27 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     s.freq_driver = text(get(cpu, "freq_driver"));
     s.governor = text(get(cpu, "governor"));
     s.cpu_package_temp = f64f(get(cpu, "package_temp_c"));
+    s.cpu_temp_label = str(get(cpu, "package_temp_label"));
     s.psi_cpu = pressure(get(cpu, "psi"));
     {
         const list = rows(cpu, &.{ "cpus", "cpu" });
         const out = try a.alloc(m.Cpu, list.len);
         for (list, out, 0..) |x, *c, i| {
             const t = any(x, &.{ "times", "t" });
+            const l3 = u64f(get(x, "l3_id"));
+            const cluster = u64f(get(x, "cluster_id"));
+            const use_cluster = l3.get() == null and cluster.get() != null;
+            const topo = [_]m.U{ u64f(get(x, "package_id")), u64f(get(x, "core_id")), u64f(get(x, "smt_index")), l3 };
+            const topo_n: usize = if (use_cluster) 3 else 4;
             c.* = .{
                 .id = @intCast(u64f(get(x, "id")).get() orelse i),
                 .core = @intCast(@min(u64f(get(x, "core_id")).get() orelse 0, 1 << 20)),
                 .package = @intCast(@min(u64f(get(x, "package_id")).get() orelse 0, 1 << 20)),
-                .cache = @intCast(@min(u64f(get(x, "l3_id")).get() orelse 0, 1 << 20)),
+                .cache = @intCast(@min((if (use_cluster) cluster else l3).get() orelse 0, 1 << 20)),
+                .cluster_domain = use_cluster,
+                .capacity = @intCast(@min(u64f(get(x, "capacity")).get() orelse 0, std.math.maxInt(u32))),
                 .smt = @intCast(@min(u64f(get(x, "smt_index")).get() orelse 0, 1 << 20)),
-                .topology_why = m.firstMissing(&.{ u64f(get(x, "package_id")), u64f(get(x, "core_id")), u64f(get(x, "l3_id")), u64f(get(x, "smt_index")) }),
+                .topology_why = m.firstMissing(topo[0..topo_n]),
                 .online = if (u64f(get(x, "online")).get()) |on| on != 0 else null,
                 .online_why = u64f(get(x, "online")).reason,
                 .total = f64f(get(t, "busy")),
@@ -341,6 +349,7 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     }
     const power = get(r, "power");
     s.cpu_package_power = f64f(get(power, "cpu_package_w"));
+    s.cpu_power_label = str(get(power, "cpu_power_label"));
     s.battery_pct = f64f(get(power, "battery_pct"));
     {
         const list = items(get(power, "sensors"));
@@ -431,6 +440,24 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     const me = get(r, "self");
     s.cost = .{ .wall_ms = f64f(get(me, "wall_ms")), .cpu_ms = f64f(get(me, "cpu_ms")), .cpu_pct = f64f(get(me, "cpu_pct_of_core")), .syscalls = u64f(any(me, &.{ "syscalls_estimate", "syscalls" })) };
     return owned;
+}
+
+test "replay groups arm64 cpus by cluster when L3 is absent" {
+    const line =
+        \\{"cpu":{"model":"Apple Synthetic Board, 2 P-cores + 4 E-cores","package_temp_c":44.0,"package_temp_label":"P-cluster Temperature 2","cpus":[{"id":0,"package_id":0,"core_id":0,"l3_id":{"state":"unavailable","why":"not present"},"smt_index":0,"cluster_id":1,"capacity":1024},{"id":1,"package_id":0,"core_id":1,"l3_id":{"state":"unavailable","why":"not present"},"smt_index":0,"cluster_id":0,"capacity":426}]},
+        \\ "power":{"cpu_package_w":4.3,"cpu_power_label":"Total System Power"}}
+    ;
+    const o = try parseOne(std.testing.allocator, line);
+    defer o.destroy();
+    const s = &o.snap;
+    try std.testing.expect(s.cpus[0].cluster_domain and s.cpus[1].cluster_domain);
+    try std.testing.expectEqual(@as(u32, 1), s.cpus[0].cache);
+    try std.testing.expectEqual(@as(u32, 0), s.cpus[1].cache);
+    try std.testing.expectEqual(@as(u32, 1024), s.cpus[0].capacity);
+    try std.testing.expectEqualStrings("", s.cpus[0].topology_why);
+    try std.testing.expectEqualStrings("P-cluster Temperature 2", s.cpu_temp_label);
+    try std.testing.expectEqualStrings("Total System Power", s.cpu_power_label);
+    try std.testing.expectEqual(@as(?f64, 4.3), s.cpu_package_power.get());
 }
 
 test "replay preserves recorded tracing failure without a live collector" {

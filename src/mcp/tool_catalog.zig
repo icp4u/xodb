@@ -1,7 +1,7 @@
 //! Catalog validation shared by the build and the runtime policy reader.
 const std = @import("std");
 const Value = std.json.Value;
-pub const Access = enum { observer, controller, mutator, lease };
+pub const Access = enum { observer, requester, controller, mutator, lease };
 /// Target read-only hints do not describe ownership of retained host jobs.
 /// Missing or invalid classifications fail closed instead of inferring from names.
 pub fn access(definition: Value) !Access {
@@ -12,6 +12,10 @@ pub fn access(definition: Value) !Access {
     if (value != .string) return error.InvalidToolSessionAccess;
     const required = std.meta.stringToEnum(Access, value.string) orelse return error.InvalidToolSessionAccess;
     if (!try readOnly(definition) and required == .observer) return error.InvalidToolSessionAccess;
+    if (required == .requester) {
+        const name = definition.object.get("name") orelse return error.InvalidToolSessionAccess;
+        if (name != .string or (!std.mem.eql(u8, name.string, "request_system_capture") and !std.mem.eql(u8, name.string, "cancel_system_capture"))) return error.InvalidToolSessionAccess;
+    }
     return required;
 }
 pub fn readOnly(definition: Value) !bool {

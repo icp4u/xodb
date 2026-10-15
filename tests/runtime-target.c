@@ -13,6 +13,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <pthread.h>
 #include <sched.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1694,6 +1695,26 @@ static void x86_syscall_signal(void)
 static void x86_syscall_signal(void) {}
 #endif
 
+static void *threaded_owner(void *unused)
+{
+    (void)unused;
+    CHECK(syscall(SYS_gettid) != getpid());
+    target = xrt_target_create();
+    CHECK(target);
+    const char *argv[] = {"/proc/self/exe", "--fixture-hold", NULL};
+    OK(xrt_target_launch(target, argv));
+    CHECK(view().state == XRT_STOPPED && view().owned);
+    CHECK(xrt_traced_member(view().pid, view().pid));
+    CHECK(!xrt_traced_member(view().pid, getpid())); /* planted wrong group */
+    struct xrt_task_info task;
+    OK(xrt_task_inspect(view().pid, &task));
+    CHECK(task.tracer == syscall(SYS_gettid));
+    OK(xrt_target_destroy(target));
+    target = NULL;
+    attach_probes(false);
+    return NULL;
+}
+
 int main(int argc, char **argv)
 {
     /* LeakSanitizer's exit helper cannot ptrace our already-traced fixture.
@@ -1732,6 +1753,9 @@ int main(int argc, char **argv)
         return 0;
     }
     foundation();
+    pthread_t owner;
+    CHECK(pthread_create(&owner, NULL, threaded_owner, NULL) == 0);
+    CHECK(pthread_join(owner, NULL) == 0);
     launch_restart();
     attach_probes(false);
     attach_probes(true);

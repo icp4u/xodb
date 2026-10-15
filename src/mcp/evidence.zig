@@ -5,8 +5,49 @@ const evidence = @import("../evidence/stream.zig");
 const decode = evidence.decode;
 const tls = @import("../evidence/tls.zig");
 const mitm = @import("../evidence/mitm.zig");
+const protocol = @import("../evidence/protocol.zig");
+const live_capture = @import("../capture/live.zig");
+const usb = @import("../evidence/usb.zig");
+const dbus = @import("../evidence/dbus.zig");
 const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
+
+pub const Transport = enum { stdio, listen, session_socket, remote };
+
+/// Fixed when an MCP connection is created. Private evidence authorization is
+/// never reconstructed later from the session or tool path.
+pub const PrivateAccess = enum {
+    allowed,
+    unavailable,
+    redacted,
+
+    pub fn init(transport: Transport, observer: bool, redact: bool) PrivateAccess {
+        if (redact) return .redacted;
+        return if (transport == .stdio and observer) .allowed else .unavailable;
+    }
+
+    fn payload(self: PrivateAccess, requested: bool) !bool {
+        if (!requested) return false;
+        return switch (self) {
+            .allowed => true,
+            .unavailable => error.PrivateEvidenceUnavailable,
+            .redacted => error.RawPayloadRedacted,
+        };
+    }
+
+    fn permitsPrivateMetadata(self: PrivateAccess) bool {
+        return self == .allowed;
+    }
+};
+
+test "private evidence access is fixed per MCP transport" {
+    try std.testing.expectEqual(PrivateAccess.allowed, PrivateAccess.init(.stdio, true, false));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.stdio, false, false).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.listen, true, false).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.session_socket, true, false).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.remote, true, false).payload(true));
+    try std.testing.expectError(error.RawPayloadRedacted, PrivateAccess.init(.stdio, true, true).payload(true));
+}
 
 pub fn handles(name: []const u8) bool {
     for ([_][]const u8{ "list_streams", "query_stream", "correlate" }) |candidate| if (std.mem.eql(u8, candidate, name)) return true;
@@ -39,11 +80,13 @@ fn boolean(args: Value, key: []const u8) !?bool {
 }
 pub const Access = struct {
     network: ?*evidence.Stream,
+    protocol_stream: ?*protocol.Stream,
     tls_stream: ?*tls.Stream,
+    usb_stream: ?*usb.Stream,
+    dbus_stream: ?*dbus.Stream,
     mitm_stream: ?*mitm.Stream,
-    /// True only for the direct observe-scope MCP connection of the xodb
-    /// process that opened the files. Shared peers never inherit this.
-    private_payloads: bool,
+    live_capture: ?*live_capture.Live,
+    private: PrivateAccess,
 };
 
 fn stream(access: Access, args: Value) !*evidence.Stream {
@@ -52,20 +95,53 @@ fn stream(access: Access, args: Value) !*evidence.Stream {
     return s;
 }
 
-pub fn call(a: Allocator, access: Access, name: []const u8, args: Value) !Value {
+pub fn call(a: Allocator, given: Access, name: []const u8, args: Value) !Value {
+    var access = given;
+    var snapshot: ?live_capture.Snapshot = null;
+    defer if (snapshot) |*opened| opened.destroy();
+    var derived: ?*protocol.Stream = null;
+    defer if (derived) |opened| opened.destroy();
+    var live_not_ready = false;
+    if (access.network == null) if (access.live_capture) |live| {
+        snapshot = live.snapshot(a, 1) catch |err| switch (err) {
+            error.LiveCaptureNotReady => blk: {
+                live_not_ready = true;
+                break :blk null;
+            },
+            else => return err,
+        };
+        if (snapshot) |*opened| {
+            access.network = opened.stream;
+            derived = try protocol.Stream.open(a, opened.stream, 2);
+            access.protocol_stream = derived;
+        }
+    };
     if (std.mem.eql(u8, name, "list_streams")) {
         try fields(args, &.{});
         var list = std.json.Array.init(a);
-        if (access.network) |s| try list.append(try describe(a, s));
+        if (access.network) |s| {
+            var description = try describe(a, s);
+            if (snapshot) |opened| {
+                try description.object.put(a, "live_capture", try value(a, opened.stats));
+            } else if (access.live_capture) |live| try description.object.put(a, "live_capture", try value(a, live.stats()));
+            try list.append(description);
+        } else if (live_not_ready) if (access.live_capture) |live| try list.append(try describeLive(a, live));
         if (access.tls_stream) |s| try list.append(try describeTls(a, s));
+        if (access.protocol_stream) |s| try list.append(try describeProtocol(a, s));
+        if (access.usb_stream) |s| try list.append(try describeUsb(a, s));
+        if (access.dbus_stream) |s| try list.append(try describeDbus(a, s));
         if (access.mitm_stream) |s| try list.append(try describeMitm(a, s));
         var out = Value{ .object = .empty };
         try out.object.put(a, "streams", .{ .array = list });
         return out;
     }
     if (std.mem.eql(u8, name, "query_stream")) {
+        if (live_not_ready) return error.LiveCaptureNotReady;
         const stream_id = try number(args, "stream_id") orelse 1;
         if (access.tls_stream) |s| if (stream_id == s.id) return queryTls(a, access, s, args);
+        if (access.protocol_stream) |s| if (stream_id == s.id) return queryProtocol(a, access, s, args);
+        if (access.usb_stream) |s| if (stream_id == s.id) return queryUsb(a, access, s, args);
+        if (access.dbus_stream) |s| if (stream_id == s.id) return queryDbus(a, access, s, args);
         if (access.mitm_stream) |s| if (stream_id == s.id) return queryMitm(a, access, s, args);
         try fields(args, &.{ "stream_id", "clock", "from_ns", "to_ns", "flow_id", "interface", "protocol", "port", "undecoded", "include_raw", "flows", "start", "limit" });
         const s = try stream(access, args);
@@ -85,9 +161,12 @@ pub fn call(a: Allocator, access: Access, name: []const u8, args: Value) !Value 
             }
             if (filter.protocol == null) return error.InvalidArguments;
         }
-        const include_raw = try boolean(args, "include_raw") orelse false;
+        var include_raw = try boolean(args, "include_raw") orelse false;
+        // USB and D-Bus packet bytes are application evidence. The parent
+        // stream cannot be used to bypass the derived stream's access gate.
+        if (include_raw and privateLink(s)) include_raw = try payloadAllowed(access, true);
         // Payload bytes cannot be redacted, only withheld.
-        if (include_raw and @import("../redact.zig").active() != null) return error.RawPayloadRedacted;
+        if (include_raw and access.private == .redacted) return error.RawPayloadRedacted;
         const limit = try number(args, "limit") orelse 64;
         if (limit == 0 or limit > 256) return error.InvalidArguments;
         const start = try number(args, "start") orelse 0;
@@ -122,17 +201,56 @@ pub fn call(a: Allocator, access: Access, name: []const u8, args: Value) !Value 
         try fields(args, &.{ "stream_id", "record" });
         const requested_stream = try number(args, "stream_id") orelse 1;
         if (access.mitm_stream) |mitm_stream| if (requested_stream == mitm_stream.id) return error.CorrelationUnavailable;
-        const s = access.network orelse return error.NoEvidenceStream;
-        const index = try number(args, "record") orelse return error.InvalidArguments;
-        const i: usize = if (access.tls_stream) |derived| blk: {
-            if (requested_stream != derived.id) {
-                if (requested_stream != s.id) return error.UnknownStream;
-                if (index >= s.parsed.records.len) return error.UnknownRecord;
-                break :blk @intCast(index);
+        if (access.usb_stream) |usb_derived| if (requested_stream == usb_derived.id) {
+            const index = try number(args, "record") orelse return error.InvalidArguments;
+            if (index >= usb_derived.records.len) return error.UnknownRecord;
+            const i: usize = @intCast(index);
+            const join = usb_derived.correlate(i);
+            var out = Value{ .object = .empty };
+            try out.object.put(a, "stream_id", .{ .integer = usb_derived.id });
+            try out.object.put(a, "source_record", .{ .integer = usb_derived.records[i].source_record });
+            try out.object.put(a, "record", try usbRecord(a, usb_derived.records[i], access.private, false));
+            try out.object.put(a, "basis", .{ .string = @tagName(join.basis) });
+            try out.object.put(a, "reason", .{ .string = join.reason });
+            if (join.process) |process| try out.object.put(a, "process", try value(a, .{ .pid = process.pid, .comm = std.mem.sliceTo(&process.comm, 0) })) else try out.object.put(a, "process", if (join.device_fd) |fd| try value(a, .{ .pid = fd.pid, .comm = @as(?[]const u8, null) }) else .null);
+            if (join.device_fd) |fd| {
+                try out.object.put(a, "device_fd", try value(a, fd));
+                const table = usb_derived.parent.context.?.tables[join.table.?];
+                try out.object.put(a, "table", try value(a, .{ .when = @tagName(table.when), .sampled_ns = table.sampled_ns }));
+            } else {
+                try out.object.put(a, "device_fd", .null);
+                try out.object.put(a, "table", .null);
             }
-            if (index >= derived.records.len) return error.UnknownRecord;
-            break :blk derived.records[@intCast(index)].source_record;
-        } else blk: {
+            return out;
+        };
+        if (access.dbus_stream) |dbus_derived| if (requested_stream == dbus_derived.id) {
+            const index = try number(args, "record") orelse return error.InvalidArguments;
+            if (index >= dbus_derived.records.len) return error.UnknownRecord;
+            const i: usize = @intCast(index);
+            const join = dbus_derived.correlate(i);
+            const private_metadata = access.private.permitsPrivateMetadata();
+            return value(a, .{
+                .stream_id = dbus_derived.id,
+                .source_record = dbus_derived.records[i].source_record,
+                .record = try dbusRecord(a, dbus_derived, i, access.private, false),
+                .basis = join.basis,
+                .reason = join.reason,
+                .bus_name = if (private_metadata) join.name else null,
+                .process = if (join.pid) |pid| .{ .pid = pid, .comm = @as(?[]const u8, null) } else null,
+                .identity = join.identity,
+            });
+        };
+        const s = access.network orelse return if (live_not_ready) error.LiveCaptureNotReady else error.NoEvidenceStream;
+        const index = try number(args, "record") orelse return error.InvalidArguments;
+        const i: usize = blk: {
+            if (access.tls_stream) |tls_derived| if (requested_stream == tls_derived.id) {
+                if (index >= tls_derived.records.len) return error.UnknownRecord;
+                break :blk tls_derived.records[@intCast(index)].source_record;
+            };
+            if (access.protocol_stream) |protocol_derived| if (requested_stream == protocol_derived.id) {
+                if (index >= protocol_derived.records.len) return error.UnknownRecord;
+                break :blk protocol_derived.records[@intCast(index)].source_record;
+            };
             if (requested_stream != s.id) return error.UnknownStream;
             if (index >= s.parsed.records.len) return error.UnknownRecord;
             break :blk @intCast(index);
@@ -165,10 +283,120 @@ pub fn call(a: Allocator, access: Access, name: []const u8, args: Value) !Value 
 }
 
 fn payloadAllowed(access: Access, requested: bool) !bool {
-    if (!requested) return false;
-    if (@import("../redact.zig").active() != null) return error.RawPayloadRedacted;
-    if (!access.private_payloads) return error.PrivateEvidenceUnavailable;
-    return true;
+    return access.private.payload(requested);
+}
+
+fn privateDigest(a: Allocator, access: Access, hash: ?[32]u8) !?[]u8 {
+    if (!access.private.permitsPrivateMetadata()) return null;
+    const present = hash orelse return null;
+    return try a.dupe(u8, &std.fmt.bytesToHex(present, .lower));
+}
+
+fn queryProtocol(a: Allocator, access: Access, s: *protocol.Stream, args: Value) !Value {
+    try fields(args, &.{ "stream_id", "from_ns", "to_ns", "flow_id", "kind", "method", "status", "dns_name", "rcode", "undecoded", "start", "limit" });
+    const redacted = access.private == .redacted;
+    const private = access.private.permitsPrivateMetadata();
+    const from = try number(args, "from_ns");
+    const to = try number(args, "to_ns");
+    const flow = try number(args, "flow_id");
+    const status = try number(args, "status");
+    const rcode = try number(args, "rcode");
+    const undecoded = try boolean(args, "undecoded");
+    const kind = if (args.object.get("kind")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk std.meta.stringToEnum(protocol.Kind, v.string) orelse return error.InvalidArguments;
+    } else null;
+    const method = if (args.object.get("method")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk v.string;
+    } else null;
+    const dns_name = if (args.object.get("dns_name")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk v.string;
+    } else null;
+    if ((method != null or dns_name != null) and !private) return if (redacted) error.RawPayloadRedacted else error.PrivateEvidenceUnavailable;
+    if ((flow != null and flow.? > std.math.maxInt(u32)) or (status != null and status.? > 999) or (rcode != null and rcode.? > 15)) return error.InvalidArguments;
+    const limit = try number(args, "limit") orelse 64;
+    if (limit == 0 or limit > 256) return error.InvalidArguments;
+    const start = try number(args, "start") orelse 0;
+    var rows = std.json.Array.init(a);
+    var index: usize = @min(start, s.records.len);
+    var next: ?usize = null;
+    while (index < s.records.len) : (index += 1) {
+        const record_ = s.records[index];
+        if (flow) |wanted| if (record_.flow_id != wanted) continue;
+        if (kind) |wanted| if (record_.kind != wanted) continue;
+        if (undecoded) |wanted| if ((record_.reason != .none) != wanted) continue;
+        if (from != null or to != null) {
+            const time = record_.time_ns orelse continue;
+            if (from) |bound| if (time < bound) continue;
+            if (to) |bound| if (time >= bound) continue;
+        }
+        if (method) |wanted| if (record_.method == null or !std.ascii.eqlIgnoreCase(record_.method.?, wanted)) continue;
+        if (dns_name) |wanted| if (record_.dns_name == null or !std.ascii.eqlIgnoreCase(record_.dns_name.?, wanted)) continue;
+        if (status) |wanted| if (record_.status == null or record_.status.? != wanted) continue;
+        if (rcode) |wanted| if (record_.dns_rcode == null or record_.dns_rcode.? != wanted) continue;
+        if (rows.items.len == limit) {
+            next = index;
+            break;
+        }
+        var row = try value(a, .{
+            .index = record_.index,
+            .flow_id = record_.flow_id,
+            .direction = @tagName(record_.direction),
+            .source_record = record_.source_record,
+            .time = .{ .known = record_.time_ns != null, .clock = "realtime", .stream_ns = record_.time_ns },
+            .transport = @tagName(record_.transport),
+            .kind = @tagName(record_.kind),
+            .undecoded = if (record_.reason == .none) @as(?[]const u8, null) else @tagName(record_.reason),
+            .request = record_.request,
+            .latency_ns = record_.latency_ns,
+            .method = if (private) record_.method else null,
+            .target = if (private) record_.target else null,
+            .http_version = record_.http_version,
+            .status = record_.status,
+            .transaction_id = record_.transaction_id,
+            .dns_name = if (private) record_.dns_name else null,
+            .dns_type = record_.dns_type,
+            .dns_class = record_.dns_class,
+            .dns_opcode = record_.dns_opcode,
+            .dns_rcode = record_.dns_rcode,
+        });
+        if (!private and (record_.method != null or record_.target != null or record_.dns_name != null)) try row.object.put(a, "private_fields", .{ .string = if (redacted) "redacted" else "available only to the direct observer that opened this stream" });
+        try rows.append(row);
+    }
+    return value(a, .{ .stream_id = s.id, .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
+}
+
+fn describeLive(a: Allocator, live: *live_capture.Live) !Value {
+    return value(a, .{
+        .stream_id = 1,
+        .kind = "network",
+        .label = "live capture",
+        .format = "pcap",
+        .records = 0,
+        .decoder = .{ .name = decode.decoder, .version = decode.decoder_version },
+        .live_capture = live.stats(),
+        .privacy = "packet bytes require include_raw and are unavailable under redaction",
+    });
+}
+
+fn describeProtocol(a: Allocator, s: *protocol.Stream) !Value {
+    return value(a, .{
+        .stream_id = s.id,
+        .kind = "protocol",
+        .label = s.label,
+        .format = "http1_dns_records",
+        .derived_from = s.parent_id,
+        .records = s.records.len,
+        .http_records = s.http_records,
+        .dns_records = s.dns_records,
+        .records_dropped = s.records_dropped,
+        .reassembly_gaps = s.reassembly_gaps,
+        .reassembly_limits = s.reassembly_limits,
+        .decoder = .{ .name = protocol.decoder, .version = protocol.decoder_version },
+        .privacy = "HTTP method/target and DNS name are available only to the direct observe-scope opener and are unavailable under redaction",
+    });
 }
 
 fn contentTypeName(kind: u8) []const u8 {
@@ -226,7 +454,7 @@ fn queryTls(a: Allocator, access: Access, s: *tls.Stream, args: Value) !Value {
             next = i;
             break;
         }
-        const digest = if (record_.plaintext_sha256) |hash| try a.dupe(u8, &std.fmt.bytesToHex(hash, .lower)) else null;
+        const digest = try privateDigest(a, access, record_.plaintext_sha256);
         var row = try value(a, .{
             .index = i,
             .flow_id = record_.flow_id,
@@ -255,11 +483,268 @@ fn queryTls(a: Allocator, access: Access, s: *tls.Stream, args: Value) !Value {
     return value(a, .{ .stream_id = s.id, .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
 }
 
+fn privateLink(s: *const evidence.Stream) bool {
+    for (s.parsed.interfaces) |iface| if (iface.link_type == usb.link_usb_linux or iface.link_type == usb.link_usb_linux_mmapped or iface.link_type == dbus.link_dbus) return true;
+    return false;
+}
+
+fn queryUsb(a: Allocator, access: Access, s: *usb.Stream, args: Value) !Value {
+    try fields(args, &.{ "stream_id", "view", "from_ns", "to_ns", "bus", "device", "endpoint", "event", "transfer_type", "undecoded", "include_raw", "start", "limit" });
+    const include_data = try payloadAllowed(access, try boolean(args, "include_raw") orelse false);
+    const view_name = if (args.object.get("view")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk v.string;
+    } else "records";
+    const limit = try number(args, "limit") orelse 64;
+    if (limit == 0 or limit > 256) return error.InvalidArguments;
+    const start = try number(args, "start") orelse 0;
+    if (std.mem.eql(u8, view_name, "devices")) {
+        try inventoryOnly(args);
+        var rows = std.json.Array.init(a);
+        const begin: usize = @min(start, s.devices.len);
+        const end = @min(s.devices.len, begin + limit);
+        for (s.devices[begin..end]) |device| try rows.append(try value(a, .{
+            .bus = device.bus,
+            .device = device.address,
+            .first_record = device.first_record,
+            .last_record = device.last_record,
+            .transfers = device.transfers,
+            .errors = device.errors,
+            .vendor_id = device.vendor_id,
+            .product_id = device.product_id,
+            .class_code = device.class_code,
+            .class = if (device.class_code) |code| usb.descriptorClassName(.{ .kind = .device, .descriptor_type = 1, .length = 18, .device_class = code }) else null,
+            .addressed_as = device.addressed_as,
+        }));
+        return value(a, .{ .stream_id = s.id, .view = "devices", .devices = Value{ .array = rows }, .next = if (end < s.devices.len) @as(?usize, end) else null, .total = s.devices.len });
+    }
+    if (std.mem.eql(u8, view_name, "endpoints")) {
+        try inventoryOnly(args);
+        var rows = std.json.Array.init(a);
+        const begin: usize = @min(start, s.endpoints.len);
+        const end = @min(s.endpoints.len, begin + limit);
+        for (s.endpoints[begin..end]) |endpoint| try rows.append(try value(a, .{
+            .bus = endpoint.bus,
+            .device = endpoint.device,
+            .endpoint = endpoint.endpoint,
+            .direction = @tagName(endpoint.direction),
+            .transfer_type = @tagName(endpoint.transfer),
+            .first_record = endpoint.first_record,
+            .last_record = endpoint.last_record,
+            .submits = endpoint.submits,
+            .completions = endpoint.completions,
+            .errors = endpoint.errors,
+            .captured_bytes = endpoint.captured_bytes,
+        }));
+        return value(a, .{ .stream_id = s.id, .view = "endpoints", .endpoints = Value{ .array = rows }, .next = if (end < s.endpoints.len) @as(?usize, end) else null, .total = s.endpoints.len });
+    }
+    if (!std.mem.eql(u8, view_name, "records")) return error.InvalidArguments;
+    const from = try number(args, "from_ns");
+    const to = try number(args, "to_ns");
+    const bus = try number(args, "bus");
+    const device = try number(args, "device");
+    const endpoint = try number(args, "endpoint");
+    if ((bus orelse 0) > std.math.maxInt(u16) or (device orelse 0) > std.math.maxInt(u8) or (endpoint orelse 0) > 15) return error.InvalidArguments;
+    const undecoded = try boolean(args, "undecoded");
+    const event = if (args.object.get("event")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk std.meta.stringToEnum(usb.Event, v.string) orelse return error.InvalidArguments;
+    } else null;
+    const transfer = if (args.object.get("transfer_type")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk std.meta.stringToEnum(usb.Transfer, v.string) orelse return error.InvalidArguments;
+    } else null;
+    var rows = std.json.Array.init(a);
+    var i: usize = @min(start, s.records.len);
+    var next: ?usize = null;
+    while (i < s.records.len) : (i += 1) {
+        const record_ = s.records[i];
+        if (from != null or to != null) {
+            const time = record_.time_ns orelse continue;
+            if (from) |bound| if (time < bound) continue;
+            if (to) |bound| if (time >= bound) continue;
+        }
+        if (bus) |wanted| if (record_.bus != wanted) continue;
+        if (device) |wanted| if (record_.device != wanted) continue;
+        if (endpoint) |wanted| if (record_.endpoint != wanted) continue;
+        if (event) |wanted| if (record_.event != wanted) continue;
+        if (transfer) |wanted| if (record_.transfer != wanted) continue;
+        if (undecoded) |wanted| if ((record_.reason != .none) != wanted) continue;
+        if (rows.items.len == limit) {
+            next = i;
+            break;
+        }
+        try rows.append(try usbRecord(a, record_, access.private, include_data));
+    }
+    return value(a, .{ .stream_id = s.id, .view = "records", .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
+}
+
+fn inventoryOnly(args: Value) !void {
+    for ([_][]const u8{ "from_ns", "to_ns", "bus", "device", "endpoint", "event", "transfer_type", "undecoded", "include_raw" }) |name| if (args.object.get(name) != null) return error.InvalidArguments;
+}
+
+fn usbRecord(a: Allocator, record_: usb.Record, private: PrivateAccess, include_data: bool) !Value {
+    const private_metadata = private.permitsPrivateMetadata();
+    var descriptors = std.json.Array.init(a);
+    for (record_.descriptors) |descriptor| try descriptors.append(try value(a, .{
+        .kind = @tagName(descriptor.kind),
+        .descriptor_type = descriptor.descriptor_type,
+        .length = descriptor.length,
+        .vendor_id = descriptor.vendor_id,
+        .product_id = descriptor.product_id,
+        .device_class = descriptor.device_class,
+        .configuration_value = descriptor.configuration_value,
+        .interface_number = descriptor.interface_number,
+        .alternate_setting = descriptor.alternate_setting,
+        .class_code = descriptor.class_code,
+        .subclass = descriptor.subclass,
+        .protocol = descriptor.protocol,
+        .class = usb.descriptorClassName(descriptor),
+        .endpoint_address = descriptor.endpoint_address,
+        .attributes = descriptor.attributes,
+        .max_packet_size = descriptor.max_packet_size,
+        .interval = descriptor.interval,
+        .cdc_subtype = descriptor.cdc_subtype,
+        .text = if (private_metadata) descriptor.text else null,
+    }));
+    var out = try value(a, .{
+        .source_stream = 1,
+        .source_record = record_.source_record,
+        .time = .{ .known = record_.time_ns != null, .clock = "realtime", .stream_ns = record_.time_ns },
+        .urb_id = record_.urb_id,
+        .event = @tagName(record_.event),
+        .transfer_type = @tagName(record_.transfer),
+        .direction = @tagName(record_.direction),
+        .endpoint = record_.endpoint,
+        .bus = record_.bus,
+        .device = record_.device,
+        .status = record_.status,
+        .requested_length = record_.requested_length,
+        .captured_length = record_.captured_length,
+        .setup = record_.setup,
+        .peer_record = record_.peer_record,
+        .latency_ns = record_.latency_ns,
+        .descriptors = Value{ .array = descriptors },
+        .undecoded = if (record_.reason == .none) @as(?[]const u8, null) else @tagName(record_.reason),
+    });
+    if (!private_metadata) try out.object.put(a, "private_fields", .{ .string = if (private == .redacted) "redacted" else "available only to the direct observer that opened this stream" });
+    if (include_data) {
+        const shown = record_.data[0..@min(record_.data.len, 65_536)];
+        try out.object.put(a, "data_hex", .{ .string = try hexBytes(a, shown) });
+        try out.object.put(a, "data_shown", .{ .integer = @intCast(shown.len) });
+        try out.object.put(a, "data_truncated", .{ .bool = shown.len != record_.data.len });
+    }
+    return out;
+}
+
+fn hasDbus(s: *const evidence.Stream) bool {
+    for (s.parsed.interfaces) |iface| if (iface.link_type == dbus.link_dbus) return true;
+    return false;
+}
+
+fn queryDbus(a: Allocator, access: Access, s: *dbus.Stream, args: Value) !Value {
+    try fields(args, &.{ "stream_id", "from_ns", "to_ns", "message_type", "dbus_interface", "dbus_member", "undecoded", "include_raw", "start", "limit" });
+    const include_raw = try payloadAllowed(access, try boolean(args, "include_raw") orelse false);
+    const from = try number(args, "from_ns");
+    const to = try number(args, "to_ns");
+    const undecoded = try boolean(args, "undecoded");
+    const message_type = if (args.object.get("message_type")) |v| blk: {
+        if (v != .string) return error.InvalidArguments;
+        break :blk std.meta.stringToEnum(dbus.MessageType, v.string) orelse return error.InvalidArguments;
+    } else null;
+    const interface = try optionalString(args, "dbus_interface");
+    const member = try optionalString(args, "dbus_member");
+    const limit = try number(args, "limit") orelse 64;
+    if (limit == 0 or limit > 256) return error.InvalidArguments;
+    const start = try number(args, "start") orelse 0;
+    var rows = std.json.Array.init(a);
+    var i: usize = @min(start, s.records.len);
+    var next: ?usize = null;
+    while (i < s.records.len) : (i += 1) {
+        const record_ = s.records[i];
+        if (from != null or to != null) {
+            const time = record_.time_ns orelse continue;
+            if (from) |bound| if (time < bound) continue;
+            if (to) |bound| if (time >= bound) continue;
+        }
+        if (message_type) |wanted| if (record_.message_type != wanted) continue;
+        if (interface) |wanted| if (record_.interface == null or !std.mem.eql(u8, record_.interface.?, wanted)) continue;
+        if (member) |wanted| if (record_.member == null or !std.mem.eql(u8, record_.member.?, wanted)) continue;
+        if (undecoded) |wanted| if ((record_.reason != .none) != wanted) continue;
+        if (rows.items.len == limit) {
+            next = i;
+            break;
+        }
+        try rows.append(try dbusRecord(a, s, i, access.private, include_raw));
+    }
+    return value(a, .{ .stream_id = s.id, .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
+}
+
+fn optionalString(args: Value, name: []const u8) !?[]const u8 {
+    const field = args.object.get(name) orelse return null;
+    if (field != .string) return error.InvalidArguments;
+    return field.string;
+}
+
+fn dbusRecord(a: Allocator, stream_: *const dbus.Stream, index: usize, private: PrivateAccess, include_raw: bool) !Value {
+    const private_metadata = private.permitsPrivateMetadata();
+    const record_ = stream_.records[index];
+    var arguments = std.json.Array.init(a);
+    for (record_.arguments) |argument| try arguments.append(try dbusArgument(a, argument, private_metadata));
+    var out = try value(a, .{
+        .index = index,
+        .source_stream = stream_.parent.id,
+        .source_record = record_.source_record,
+        .time = .{ .known = record_.time_ns != null, .clock = "realtime", .stream_ns = record_.time_ns },
+        .message_type = @tagName(record_.message_type),
+        .flags = record_.flags,
+        .serial = record_.serial,
+        .reply_serial = record_.reply_serial,
+        .sender = if (private_metadata) record_.sender else null,
+        .destination = if (private_metadata) record_.destination else null,
+        .path = if (private_metadata) record_.path else null,
+        .interface = record_.interface,
+        .member = record_.member,
+        .error_name = record_.error_name,
+        .body_signature = record_.body_signature,
+        .body_length = record_.body_length,
+        .arguments = Value{ .array = arguments },
+        .peer_record = record_.peer_record,
+        .latency_ns = record_.latency_ns,
+        .undecoded = if (record_.reason == .none) @as(?[]const u8, null) else @tagName(record_.reason),
+    });
+    if (!private_metadata) try out.object.put(a, "private_fields", .{ .string = if (private == .redacted) "redacted" else "available only to the direct observer that opened this stream" });
+    if (include_raw) {
+        const raw = stream_.parent.raw(record_.source_record);
+        const shown = raw[0..@min(raw.len, 65_536)];
+        try out.object.put(a, "raw_hex", .{ .string = try hexBytes(a, shown) });
+        try out.object.put(a, "raw_shown", .{ .integer = @intCast(shown.len) });
+        try out.object.put(a, "raw_truncated", .{ .bool = shown.len != raw.len });
+    }
+    return out;
+}
+
+fn dbusArgument(a: Allocator, argument: dbus.Argument, private_metadata: bool) !Value {
+    var children = std.json.Array.init(a);
+    for (argument.children) |child| try children.append(try dbusArgument(a, child, private_metadata));
+    // Values, not only strings, are payload: byte arrays carry file contents
+    // and Secret Service secrets. Non-openers see types and structure only.
+    return value(a, .{
+        .type = argument.signature,
+        .kind = @tagName(argument.kind),
+        .signed = if (private_metadata) argument.signed else null,
+        .unsigned = if (private_metadata) argument.unsigned else null,
+        .floating_bits = if (private_metadata) argument.floating_bits else null,
+        .text = if (private_metadata) argument.text else null,
+        .children = Value{ .array = children },
+    });
+}
+
 fn queryMitm(a: Allocator, access: Access, s: *mitm.Stream, args: Value) !Value {
     try fields(args, &.{ "stream_id", "from_ns", "to_ns", "method", "status", "undecoded", "include_raw", "start", "limit" });
     const include_content = try payloadAllowed(access, try boolean(args, "include_raw") orelse false);
-    const redacted = @import("../redact.zig").active() != null;
-    const private_metadata = access.private_payloads and !redacted;
+    const redacted = access.private == .redacted;
+    const private_metadata = access.private.permitsPrivateMetadata();
     const from = try number(args, "from_ns");
     const to = try number(args, "to_ns");
     const status = try number(args, "status");
@@ -303,8 +788,8 @@ fn queryMitm(a: Allocator, access: Access, s: *mitm.Stream, args: Value) !Value 
             .flow_type = record_.flow_type,
             .format_version = record_.format_version,
             .undecoded = if (record_.reason == .none) @as(?[]const u8, null) else @tagName(record_.reason),
-            .request = if (record_.request) |request| try mitmRequest(a, request, private_metadata, include_content) else null,
-            .response = if (record_.response) |response| try mitmResponse(a, response, private_metadata, include_content) else null,
+            .request = if (record_.request) |request| try mitmRequest(a, access, request, private_metadata, include_content) else null,
+            .response = if (record_.response) |response| try mitmResponse(a, access, response, private_metadata, include_content) else null,
         });
         if (!private_metadata) try row.object.put(a, "private_fields", .{ .string = if (redacted) "redacted" else "available only to the direct observer that opened this stream" });
         try rows.append(row);
@@ -312,7 +797,7 @@ fn queryMitm(a: Allocator, access: Access, s: *mitm.Stream, args: Value) !Value 
     return value(a, .{ .stream_id = s.id, .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
 }
 
-fn mitmRequest(a: Allocator, request: mitm.Request, private: bool, content: bool) !Value {
+fn mitmRequest(a: Allocator, access: Access, request: mitm.Request, private: bool, content: bool) !Value {
     return value(a, .{
         .method = if (private) request.method else null,
         .scheme = if (private) request.scheme else null,
@@ -320,22 +805,22 @@ fn mitmRequest(a: Allocator, request: mitm.Request, private: bool, content: bool
         .port = if (private) request.port else null,
         .authority = if (private) request.authority else null,
         .path = if (private) request.path else null,
-        .message = try mitmMessage(a, request.message, private, content),
+        .message = try mitmMessage(a, access, request.message, private, content),
     });
 }
 
-fn mitmResponse(a: Allocator, response: mitm.Response, private: bool, content: bool) !Value {
+fn mitmResponse(a: Allocator, access: Access, response: mitm.Response, private: bool, content: bool) !Value {
     return value(a, .{
         .status_code = response.status_code,
         .reason = if (private) response.reason_text else null,
-        .message = try mitmMessage(a, response.message, private, content),
+        .message = try mitmMessage(a, access, response.message, private, content),
     });
 }
 
-fn mitmMessage(a: Allocator, message: mitm.Message, private: bool, include_content: bool) !Value {
+fn mitmMessage(a: Allocator, access: Access, message: mitm.Message, private: bool, include_content: bool) !Value {
     var headers = std.json.Array.init(a);
     if (private) for (message.headers) |header| try headers.append(try value(a, .{ .name = header.name, .value = header.value }));
-    const digest = if (message.content_sha256) |hash| try a.dupe(u8, &std.fmt.bytesToHex(hash, .lower)) else null;
+    const digest = try privateDigest(a, access, message.content_sha256);
     var out = try value(a, .{
         .http_version = if (private) message.http_version else null,
         .headers = Value{ .array = headers },
@@ -373,6 +858,7 @@ fn describeTls(a: Allocator, s: *tls.Stream) !Value {
         .state = @tagName(session.state),
         .records = session.records,
         .authentication_failures = session.authentication_failures,
+        .malformed_directions = session.malformed_directions,
     }));
     return value(a, .{
         .stream_id = s.id,
@@ -388,7 +874,49 @@ fn describeTls(a: Allocator, s: *tls.Stream) !Value {
         .plaintext_dropped_bytes = s.plaintext_dropped,
         .malformed_records = s.malformed_records,
         .reassembly_gaps = s.reassembly_gaps,
-        .privacy = "plaintext requires include_raw and the direct observe-scope connection that opened the stream; unavailable to shared peers and under redaction",
+        .derived_record_limit = tls.max_derived_records,
+        .privacy = "plaintext and its SHA-256 require the direct observe-scope connection that opened the stream; unavailable to shared, network or remote peers and under redaction",
+    });
+}
+
+fn describeUsb(a: Allocator, s: *usb.Stream) !Value {
+    const loss = s.loss();
+    return value(a, .{
+        .stream_id = s.id,
+        .kind = "usb",
+        .label = s.label,
+        .format = "linux_usbmon_urbs",
+        .derived_from = s.parent.id,
+        .records = s.records.len,
+        .devices = s.devices.len,
+        .endpoints = s.endpoints.len,
+        .decoder = .{ .name = usb.decoder, .version = usb.decoder_version },
+        .loss = loss,
+        .bounds = .{ .max_records = usb.max_records, .max_devices = usb.max_devices, .max_endpoints = usb.max_endpoints, .max_descriptors_per_record = usb.max_descriptors_per_record, .max_total_descriptors = usb.max_total_descriptors },
+        .privacy = "USB data and string descriptors require the direct observe-scope connection that opened the stream; unavailable to shared peers and under redaction",
+    });
+}
+
+fn describeDbus(a: Allocator, s: *dbus.Stream) !Value {
+    const parent_loss = s.parent.loss();
+    return value(a, .{
+        .stream_id = s.id,
+        .kind = "dbus",
+        .label = s.label,
+        .format = "dbus_messages",
+        .derived_from = s.parent.id,
+        .records = s.records.len,
+        .decoder = .{ .name = dbus.decoder, .version = dbus.decoder_version },
+        .calls_paired = s.paired,
+        .orphan_replies = s.orphan_replies,
+        .pending_calls = s.pending_calls,
+        .pending_dropped = s.pending_dropped,
+        .malformed = s.malformed,
+        .identities = s.identities.len,
+        .derived_dropped = s.derived_dropped,
+        .pcap_loss = .{ .ifdrop = parent_loss.isb_ifdrop, .osdrop = parent_loss.isb_osdrop, .epb_drops = parent_loss.epb_drops, .truncated_packets = parent_loss.truncated_packets },
+        .bounds = .{ .max_records = dbus.max_records, .max_arguments = dbus.max_arguments, .max_total_arguments = dbus.max_total_arguments, .max_depth = dbus.max_depth, .max_array_bytes = dbus.max_array_bytes, .max_identities = dbus.max_identities, .max_pending = dbus.max_pending },
+        .privacy = "bus names, object paths, argument values and raw messages require the direct observe-scope connection that opened the stream; unavailable to shared peers and under redaction",
     });
 }
 
@@ -466,6 +994,9 @@ pub fn linkName(link: u16) []const u8 {
         decode.link_raw, decode.link_ipv4, decode.link_ipv6 => "raw_ip",
         decode.link_sll => "linux_sll",
         decode.link_sll2 => "linux_sll2",
+        dbus.link_dbus => "dbus",
+        usb.link_usb_linux => "linux_usbmon",
+        usb.link_usb_linux_mmapped => "linux_usbmon_mmapped",
         else => "unknown",
     };
 }

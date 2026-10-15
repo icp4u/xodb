@@ -28,3 +28,7 @@ only runtime-alone          runtime -> runtime
 # is pure data over bytes: no session, frontends or engine C. The collector
 # that reads /proc lives in profile; the MCP tools and timeline lane import it.
 only evidence-leaf          evidence -> common
+
+# Live capture owns a bounded external child and feeds immutable bytes into
+# the pure evidence layer; it has no session or frontend dependency.
+only capture-leaf           capture -> evidence common

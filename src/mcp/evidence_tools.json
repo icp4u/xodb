@@ -1,7 +1,7 @@
 [
   {
     "name": "list_streams",
-    "description": "External evidence streams opened with --open-pcap or --open-mitmproxy, plus TLS records derived by --tls-key-log: format, decoder provenance, bounds/loss and declared clock. TLS key material is consumed in memory and is never returned. Read-only; no live capture.",
+    "description": "External evidence streams opened with --open-pcap or --open-mitmproxy, or captured by an owned --live-capture child, plus derived HTTP/1, DNS, TLS, Linux usbmon and D-Bus records: format, decoder provenance, bounds/loss and declared clock. TLS key material is consumed in memory and is never returned. Read-only.",
     "inputSchema": {
       "type": "object",
       "properties": {}
@@ -16,14 +16,14 @@
   },
   {
     "name": "query_stream",
-    "description": "Page through a stream's records. Network streams return packet summaries and flow ids; derived TLS streams return authenticated record metadata, plaintext hashes and packet provenance; mitmproxy streams return HTTP request/response metadata and body hashes. include_raw returns packet bytes or private plaintext only to the direct observe-scope connection that opened the stream and is refused under redaction. Continue with start=next.",
+    "description": "Page through a stream's records. Network streams return packet summaries and flow ids; protocol streams return bounded HTTP/1 or DNS metadata, request/response latency and packet provenance; derived TLS streams return authenticated record metadata and packet provenance; USB returns URBs, setup packets and descriptors, with view=devices/endpoints for observed lifecycle; D-Bus returns bounded typed calls, replies, errors and signals; mitmproxy streams return HTTP request/response metadata. Private protocol text, USB string descriptors, D-Bus names/paths/strings, plaintext/body hashes and include_raw bytes are available only to the direct observe-scope connection that opened the stream and are withheld or refused under redaction. Continue with start=next.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "stream_id": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 2,
+          "maximum": 5,
           "default": 1,
           "description": "Stream id from list_streams."
         },
@@ -34,6 +34,12 @@
             "capture"
           ],
           "default": "stream"
+        },
+        "view": {
+          "type": "string",
+          "enum": ["records", "devices", "endpoints"],
+          "default": "records",
+          "description": "USB stream record or lifecycle inventory view."
         },
         "from_ns": {
           "type": "integer",
@@ -66,6 +72,34 @@
           "minimum": 0,
           "maximum": 65535
         },
+        "bus": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 65535,
+          "description": "USB bus filter."
+        },
+        "device": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 255,
+          "description": "USB device-address filter."
+        },
+        "endpoint": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15,
+          "description": "USB endpoint-number filter."
+        },
+        "event": {
+          "type": "string",
+          "enum": ["submit", "complete", "error_event", "unknown"],
+          "description": "USB URB event filter."
+        },
+        "transfer_type": {
+          "type": "string",
+          "enum": ["isochronous", "interrupt", "control", "bulk", "unknown"],
+          "description": "USB transfer filter."
+        },
         "undecoded": {
           "type": "boolean"
         },
@@ -76,6 +110,16 @@
             "server_to_client"
           ],
           "description": "TLS streams only."
+        },
+        "kind": {
+          "type": "string",
+          "enum": [
+            "http_request",
+            "http_response",
+            "dns_query",
+            "dns_response"
+          ],
+          "description": "Derived protocol stream only."
         },
         "content_type": {
           "type": "string",
@@ -98,13 +142,36 @@
         },
         "method": {
           "type": "string",
-          "description": "mitmproxy HTTP method filter."
+          "description": "HTTP/1 protocol or mitmproxy method filter. Private protocol text requires the direct observe-scope opener and is refused under redaction."
         },
         "status": {
           "type": "integer",
           "minimum": 0,
           "maximum": 999,
-          "description": "mitmproxy HTTP response status filter."
+          "description": "HTTP/1 protocol or mitmproxy response status filter."
+        },
+        "dns_name": {
+          "type": "string",
+          "description": "DNS question-name filter. Requires the direct observe-scope opener and is refused under redaction."
+        },
+        "rcode": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 15,
+          "description": "DNS response-code filter."
+        },
+        "message_type": {
+          "type": "string",
+          "enum": ["method_call", "method_return", "error_reply", "signal", "unknown"],
+          "description": "D-Bus message type filter."
+        },
+        "dbus_interface": {
+          "type": "string",
+          "description": "Exact D-Bus interface filter."
+        },
+        "dbus_member": {
+          "type": "string",
+          "description": "Exact D-Bus member filter."
         },
         "flows": {
           "type": "boolean",
@@ -114,7 +181,7 @@
         "include_raw": {
           "type": "boolean",
           "default": false,
-          "description": "Network: hex of the first 256 captured bytes. TLS/mitmproxy: up to 65536 plaintext bytes, only for the direct observe-scope opener. Refused (RawPayloadRedacted) under --redact."
+          "description": "Network: hex of the first 256 captured bytes (usbmon and D-Bus packets only for the direct observe-scope opener). TLS/USB/D-Bus/mitmproxy: up to 65536 private bytes, only for the direct observe-scope opener. Refused (RawPayloadRedacted) under --redact."
         },
         "start": {
           "type": "integer",
@@ -140,14 +207,14 @@
   },
   {
     "name": "correlate",
-    "description": "Join one network packet, or one derived TLS record through its source packet, to the socket and process that held its 5-tuple. basis: exact, sampled, inferred or none. mitmproxy streams have no packet correlation.",
+    "description": "Join one network packet, or one derived HTTP/1, DNS or TLS record through its source packet, to the socket and process that held its 5-tuple; one USB record to a sampled /dev/bus/usb descriptor; or one D-Bus record to a PID established by a captured bus-daemon reply. basis: exact, sampled, inferred or none. mitmproxy streams have no packet correlation.",
     "inputSchema": {
       "type": "object",
       "properties": {
         "stream_id": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 2,
+          "maximum": 5,
           "default": 1,
           "description": "Stream id from list_streams."
         },

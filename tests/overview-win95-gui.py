@@ -102,7 +102,14 @@ def near(name, xy, expected, slack=4):
         return all(abs(a - b) <= slack for a, b in zip(im.convert('RGB').getpixel(xy), expected))
 
 panels = ['summary', 'performance', 'processes', 'memory', 'disk', 'disk_space', 'network',
-          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy', 'inheritance', 'treemap']
+          'connections', 'power', 'system', 'users', 'services', 'apps', 'files', 'memory_map', 'graph', 'galaxy', 'inheritance', 'treemap', 'fetch']
+
+def nav_y(index, height):
+    """Centre of a nav button: rows shrink below 29 px to fit every panel
+    (win95.zig: nav.y = 70, nav.h = height - 146, 4 px inset)."""
+    row = min(29, (height - 146 - 8) // len(panels))
+    return 74 + index * row + row // 2
+
 sizes = [(1280, 720), (1920, 1080)] if args.all_panels else [(1280, 720)]
 try:
     for width, height in sizes:
@@ -164,7 +171,7 @@ try:
             if args.all_panels:
                 for i, panel in enumerate(panels):
                     previous = len(log())
-                    send('click', 80, 84 + i * 29, 'm', 2, 100)
+                    send('click', 80, nav_y(i, height), 'm', 2, 100)
                     if panel != 'summary':
                         until(lambda p=panel, n=previous: 'panel=' + p + ' ' in log()[n:], 'panel ' + panel)
                     shot = d.shot(panel)
@@ -214,7 +221,7 @@ for child in children:
             until(lambda: bool(re.search(r'fdgraph sequence=[2-9].*processes=2 ', log())), 'owned descriptors published')
             d.shot('owned-galaxy')
             check('galaxy collects only the two owned processes', 'scope_count=2' in log())
-            send('click', 80, 84 + 15 * 29, 'm', 2, 100)
+            send('click', 80, nav_y(panels.index('graph'), 720), 'm', 2, 100)
             until(lambda: 'panel=graph' in log(), 'owned graph')
             def star_label_clear():
                 """The row above the label text is plate-coloured: no link or dot runs through it."""
@@ -228,11 +235,11 @@ for child in children:
                 return all(px[i, y + 17] == (192, 192, 192) for i in range(x - 60, x + 60))
             until(star_label_clear, 'graph star label plate')
             check('classic graph star label is clear of the links under it', True)
-            send('click', 80, 84 + 17 * 29, 'm', 2, 100)
+            send('click', 80, nav_y(panels.index('inheritance'), 720), 'm', 2, 100)
             until(lambda: bool(re.search(r'fdinherit sequence=[1-9].*scope_count=2', log())), 'owned inheritance')
             d.shot('owned-inheritance')
             check('classic Parent/Child samples the owned scope', True)
-            send('click', 80, 84 + 18 * 29, 'm', 2, 100)
+            send('click', 80, nav_y(panels.index('treemap'), 720), 'm', 2, 100)
             until(lambda: bool(re.search(r'fdtreemap sequence=[1-9]\d* .*fds=[1-9].*scope_count=2', log())), 'owned treemap')
             d.shot('owned-treemap')
             check('classic Treemap shows owned descriptors', True)

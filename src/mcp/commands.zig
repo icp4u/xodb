@@ -1,112 +1,75 @@
 //! JSON adapter only. Execution and authority belong to model commands.
 const std = @import("std");
 const api = @import("../model/command.zig");
+const input = @import("command_decode.zig");
 const V = std.json.Value;
 const A = std.mem.Allocator;
 pub const Decoded = struct { operation: api.Operation, generation: u64 };
-pub fn handles(name: []const u8) bool {
-    inline for (.{ "continue", "interrupt", "step_instruction", "step_over_instruction", "step_source", "step_over", "set_breakpoint", "remove_breakpoint", "configure_breakpoint", "finish", "run_to", "restart", "detach" }) |known| {
-        if (std.mem.eql(u8, name, known)) return true;
-    }
-    return false;
+pub const handles = input.handles;
+fn thread(value_: u64) !i32 {
+    if (value_ == 0 or value_ > std.math.maxInt(i32)) return error.InvalidArguments;
+    return @intCast(value_);
 }
-fn number(args: V, key: []const u8, default: ?u64) !u64 {
-    const v = args.object.get(key) orelse return default orelse error.InvalidArguments;
-    if (v != .integer or v.integer < 0) return error.InvalidArguments;
-    return @intCast(v.integer);
+fn source(path: ?[]const u8, line: ?u64) !api.Source {
+    const number = line orelse return error.InvalidArguments;
+    if (number == 0 or number > std.math.maxInt(u32)) return error.InvalidArguments;
+    return .{ .path = path orelse return error.InvalidArguments, .line = @intCast(number) };
 }
-fn text(args: V, key: []const u8, default: ?[]const u8) ![]const u8 {
-    const v = args.object.get(key) orelse return default orelse error.InvalidArguments;
-    if (v != .string) return error.InvalidArguments;
-    return v.string;
-}
-fn fields(args: V, allowed: []const []const u8) !void {
-    var it = args.object.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "generation") or std.mem.eql(u8, entry.key_ptr.*, "process_id")) continue;
-        for (allowed) |key| {
-            if (std.mem.eql(u8, key, entry.key_ptr.*)) break;
-        } else return error.InvalidArguments;
-    }
-}
-fn tid(args: V) !i32 {
-    const thread = try number(args, "tid", null);
-    if (thread == 0 or thread > std.math.maxInt(i32)) return error.InvalidArguments;
-    return @intCast(thread);
-}
-fn source(args: V) !api.Source {
-    const line = try number(args, "line", null);
-    if (line == 0 or line > std.math.maxInt(u32)) return error.InvalidArguments;
-    return .{ .path = try text(args, "file", null), .line = @intCast(line) };
-}
-/// run_to has always auto-detected the base; set_breakpoint addresses are hex
-/// with an optional 0x prefix. Keep both protocol contracts unchanged.
-fn address(args: V) !u64 {
-    return std.fmt.parseInt(u64, try text(args, "address", null), 0) catch error.InvalidArguments;
-}
-fn hexAddress(args: V) !u64 {
-    const given = try text(args, "address", null);
-    return std.fmt.parseInt(u64, if (std.mem.startsWith(u8, given, "0x")) given[2..] else given, 16) catch error.InvalidArguments;
+fn address(given: ?[]const u8, base: u8) !u64 {
+    const text = given orelse return error.InvalidArguments;
+    const digits = if (base == 16 and std.mem.startsWith(u8, text, "0x")) text[2..] else text;
+    return std.fmt.parseInt(u64, digits, base) catch error.InvalidArguments;
 }
 pub fn decode(name: []const u8, args: V) !Decoded {
-    if (args != .object or !handles(name)) return error.InvalidArguments;
-    if (!args.object.contains("generation")) return error.GenerationRequired;
-    const generation = try number(args, "generation", null);
-    var op: api.Operation = undefined;
-    if (std.mem.eql(u8, name, "set_breakpoint")) {
-        try fields(args, &.{ "file", "line", "symbol", "address" });
-        if (args.object.contains("file")) {
-            if (args.object.contains("address") or args.object.contains("symbol")) return error.InvalidArguments;
-            op = .{ .breakpoint = .{ .source = try source(args) } };
-        } else {
-            if (args.object.contains("line")) return error.InvalidArguments;
-            if (args.object.contains("symbol")) {
-                if (args.object.contains("address")) return error.InvalidArguments;
-                op = .{ .breakpoint = .{ .symbol = try text(args, "symbol", null) } };
-            } else op = .{ .breakpoint = .{ .address = try hexAddress(args) } };
-        }
-    } else if (std.mem.eql(u8, name, "remove_breakpoint")) {
-        try fields(args, &.{"id"});
-        op = .{ .breakpoint = .{ .remove = try number(args, "id", null) } };
-    } else if (std.mem.eql(u8, name, "configure_breakpoint")) {
-        try fields(args, &.{ "id", "enabled", "condition", "log_expression", "tid", "ignore_count", "mode" });
-        var policy: api.Policy = .{ .id = try number(args, "id", null), .condition = try text(args, "condition", ""), .log_expression = try text(args, "log_expression", ""), .ignore_count = try number(args, "ignore_count", 0) };
-        policy.mode = std.meta.stringToEnum(@FieldType(api.Policy, "mode"), try text(args, "mode", "stop")) orelse return error.InvalidArguments;
-        if (args.object.contains("tid")) {
-            // An absent or impossible thread is not a malformed request here.
-            const thread = try number(args, "tid", null);
-            policy.tid = if (thread == 0 or thread > std.math.maxInt(i32)) return error.UnknownThread else @intCast(thread);
-        }
-        if (args.object.get("enabled")) |v| {
-            if (v != .bool) return error.InvalidArguments;
-            policy.enabled = v.bool;
-        }
-        op = .{ .breakpoint = .{ .policy = policy } };
-    } else if (std.mem.eql(u8, name, "finish")) {
-        try fields(args, &.{ "tid", "frame" });
-        const frame = try number(args, "frame", 0);
-        if (frame >= 63) return error.InvalidArguments;
-        op = .{ .control = .{ .finish_frame = .{ .tid = try tid(args), .frame = @intCast(frame) } } };
-    } else if (std.mem.eql(u8, name, "run_to")) {
-        try fields(args, &.{ "tid", "file", "line", "address" });
-        const thread = try tid(args);
-        if (args.object.contains("file")) {
-            if (args.object.contains("address")) return error.InvalidArguments;
-            const location = try source(args);
-            op = .{ .control = .{ .run_to_source = .{ .tid = thread, .path = location.path, .line = location.line } } };
-        } else {
-            if (args.object.contains("line")) return error.InvalidArguments;
-            op = .{ .control = .{ .run_to = .{ .tid = thread, .address = try address(args) } } };
-        }
-    } else if (std.mem.startsWith(u8, name, "step_")) {
-        try fields(args, &.{"tid"});
-        const thread = try tid(args);
-        op = .{ .control = if (std.mem.eql(u8, name, "step_instruction")) .{ .step_instruction = thread } else if (std.mem.eql(u8, name, "step_over_instruction")) .{ .step_over_instruction = thread } else .{ .step_source = .{ .tid = thread, .over = std.mem.eql(u8, name, "step_over") } } };
-    } else {
-        try fields(args, &.{});
-        op = .{ .control = if (std.mem.eql(u8, name, "continue")) .continue_execution else if (std.mem.eql(u8, name, "interrupt")) .interrupt else if (std.mem.eql(u8, name, "restart")) .restart else .detach };
-    }
-    return .{ .operation = op, .generation = generation };
+    const request = try input.decode(name, args);
+    const generation = switch (request) {
+        inline else => |p| p.generation,
+    };
+    const operation: api.Operation = switch (request) {
+        .@"continue" => .{ .control = .continue_execution },
+        .interrupt => .{ .control = .interrupt },
+        .restart => .{ .control = .restart },
+        .detach => .{ .control = .detach },
+        .step_instruction => |p| .{ .control = .{ .step_instruction = try thread(p.tid) } },
+        .step_over_instruction => |p| .{ .control = .{ .step_over_instruction = try thread(p.tid) } },
+        inline .step_source, .step_over => |p| .{ .control = .{ .step_source = .{ .tid = try thread(p.tid), .over = request == .step_over } } },
+        .set_breakpoint => |p| blk: {
+            if (p.file != null) {
+                if (p.address != null or p.symbol != null) return error.InvalidArguments;
+                break :blk .{ .breakpoint = .{ .source = try source(p.file, p.line) } };
+            }
+            if (p.line != null) return error.InvalidArguments;
+            if (p.symbol) |symbol| {
+                if (p.address != null) return error.InvalidArguments;
+                break :blk .{ .breakpoint = .{ .symbol = symbol } };
+            }
+            // set_breakpoint has always meant hex, with optional 0x.
+            break :blk .{ .breakpoint = .{ .address = try address(p.address, 16) } };
+        },
+        .remove_breakpoint => |p| .{ .breakpoint = .{ .remove = p.id } },
+        .configure_breakpoint => |p| blk: {
+            var policy: api.Policy = .{ .id = p.id, .enabled = p.enabled orelse true, .condition = p.condition orelse "", .log_expression = p.log_expression orelse "", .ignore_count = p.ignore_count orelse 0 };
+            policy.mode = std.meta.stringToEnum(@FieldType(api.Policy, "mode"), p.mode orelse "stop") orelse return error.InvalidArguments;
+            if (p.tid) |tid| policy.tid = thread(tid) catch return error.UnknownThread;
+            break :blk .{ .breakpoint = .{ .policy = policy } };
+        },
+        .finish => |p| blk: {
+            const frame = p.frame orelse 0;
+            break :blk .{ .control = .{ .finish_frame = .{ .tid = try thread(p.tid), .frame = @intCast(frame) } } };
+        },
+        .run_to => |p| blk: {
+            const tid = try thread(p.tid);
+            if (p.file != null) {
+                if (p.address != null) return error.InvalidArguments;
+                const location = try source(p.file, p.line);
+                break :blk .{ .control = .{ .run_to_source = .{ .tid = tid, .path = location.path, .line = location.line } } };
+            }
+            if (p.line != null) return error.InvalidArguments;
+            // run_to retains its base-detection contract.
+            break :blk .{ .control = .{ .run_to = .{ .tid = tid, .address = try address(p.address, 0) } } };
+        },
+    };
+    return .{ .operation = operation, .generation = generation };
 }
 fn value(a: A, data: anytype) !V {
     return (try std.json.parseFromSlice(V, a, try std.json.Stringify.valueAlloc(a, data, .{}), .{ .allocate = .alloc_always })).value;
@@ -176,4 +139,20 @@ test "migrated tool catalog agrees with the command execution effect" {
     try std.testing.expectEqual(@as(usize, 13), count);
     try std.testing.expectEqual(api.Effect.execution, (api.Operation{ .control = .continue_execution }).effect());
     try std.testing.expectEqual(api.Effect.execution, (api.Operation{ .breakpoint = .{ .address = 1 } }).effect());
+}
+
+test "generated command input rejects schema violations before semantic mapping" {
+    const cases = .{
+        .{ "finish", "{\"generation\":1,\"tid\":1,\"frame\":63}" },
+        .{ "continue", "{\"generation\":1,\"process_id\":1025}" },
+        .{ "step_source", "{\"generation\":1}" },
+        .{ "configure_breakpoint", "{\"generation\":1,\"id\":1,\"enabled\":1}" },
+        .{ "configure_breakpoint", "{\"generation\":1,\"id\":1,\"mode\":\"other\"}" },
+        .{ "run_to", "{\"generation\":1,\"tid\":1,\"file\":\"fixture.c\",\"line\":0}" },
+    };
+    inline for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(V, std.testing.allocator, case[1], .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.InvalidArguments, decode(case[0], parsed.value));
+    }
 }

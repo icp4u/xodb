@@ -118,15 +118,24 @@ pub fn convert(a: std.mem.Allocator, src: *const c.struct_xrt_sys_snapshot, s: *
     s.freq_driver = try name(a, cpu.freq_driver);
     s.governor = try name(a, cpu.governor);
     s.cpu_package_temp = f(cpu.package_temp_c);
+    s.cpu_temp_label = try chars(a, cpu.package_temp_label);
     s.psi_cpu = pressure(cpu.psi);
     const cpus = try a.alloc(m.Cpu, @min(cpu.count, c.XRT_SYS_MAX_CPUS));
-    for (cpus, cpu.cpu[0..cpus.len]) |*o, x| o.* = .{
+    for (cpus, cpu.cpu[0..cpus.len]) |*o, x| {
+        const l3 = u(x.l3_id);
+        const cluster = u(x.cluster_id);
+        const use_cluster = l3.get() == null and cluster.get() != null;
+        const topo = [_]m.U{ u(x.package_id), u(x.core_id), u(x.smt_index), l3 };
+        const topo_n: usize = if (use_cluster) 3 else 4;
+        o.* = .{
         .id = @intCast(@max(0, x.id)),
         .core = small(u(x.core_id)),
         .package = small(u(x.package_id)),
-        .cache = small(u(x.l3_id)),
+        .cache = small(if (use_cluster) cluster else l3),
+        .cluster_domain = use_cluster,
+        .capacity = small(u(x.capacity)),
         .smt = small(u(x.smt_index)),
-        .topology_why = m.firstMissing(&.{ u(x.package_id), u(x.core_id), u(x.l3_id), u(x.smt_index) }),
+        .topology_why = m.firstMissing(topo[0..topo_n]),
         .online = if (u(x.online).get()) |on| on != 0 else null,
         .online_why = u(x.online).reason,
         .total = f(x.t.busy),
@@ -138,7 +147,8 @@ pub fn convert(a: std.mem.Allocator, src: *const c.struct_xrt_sys_snapshot, s: *
         .mhz = f(x.freq_mhz),
         .max_mhz = f(x.freq_max_mhz),
         .temp_c = f(x.temp_c),
-    };
+        };
+    }
     s.cpus = cpus;
     const temps = try a.alloc(m.Sensor, @min(cpu.temp_count, cpu.temps.len));
     for (temps, cpu.temps[0..temps.len]) |*o, x| o.* = .{ .chip = try chars(a, x.chip), .label = try chars(a, x.label), .kind = .temp, .value = f(x.value) };
@@ -254,6 +264,7 @@ pub fn convert(a: std.mem.Allocator, src: *const c.struct_xrt_sys_snapshot, s: *
 
     const pw = &src.power;
     s.cpu_package_power = f(pw.cpu_package_w);
+    s.cpu_power_label = try chars(a, pw.cpu_power_label);
     s.battery_pct = f(pw.battery_pct);
     const sensors = try a.alloc(m.Sensor, @min(pw.sensor_count, c.XRT_SYS_MAX_SENSORS));
     for (sensors, pw.sensor[0..sensors.len]) |*o, x| o.* = .{ .chip = try chars(a, x.chip), .label = try chars(a, x.label), .kind = kind(x.kind), .value = f(x.value), .max = f(x.max), .crit = f(x.crit) };

@@ -33,6 +33,9 @@ pub const Socket = struct {
     }
 };
 pub const Process = struct { pid: i32, comm: [16]u8 = @splat(0) };
+/// A process descriptor whose symlink was exactly /dev/bus/usb/BBB/DDD.
+/// Only the numeric kernel device identity is archived; no path text is kept.
+pub const UsbFd = struct { pid: i32, fd: i32, bus: u16, device: u16 };
 pub const When = enum(u8) { start, stop };
 pub const Table = struct {
     when: When,
@@ -40,11 +43,13 @@ pub const Table = struct {
     sampled_ns: u64,
     processes: []const Process,
     sockets: []const Socket,
+    usb_fds: []const UsbFd = &.{},
     /// Rows or descriptors not read: permission, a vanished process, the row limit.
     unreadable: u32 = 0,
     truncated: bool = false,
 };
 pub const max_sockets = 65536;
+pub const max_usb_fds = 65536;
 pub const max_processes = 1024;
 pub const max_tables = 8;
 pub const max_pairs = 8;
@@ -121,6 +126,20 @@ pub fn socketInode(link: []const u8) ?u64 {
     return std.fmt.parseInt(u64, link[8 .. link.len - 1], 10) catch null;
 }
 
+/// Exact Linux usbfs node syntax. Suffixes, relative paths and other /dev
+/// nodes are deliberately rejected so an archive cannot make a guessed join.
+pub fn usbDevicePath(link: []const u8) ?struct { bus: u16, device: u16 } {
+    const prefix = "/dev/bus/usb/";
+    if (!std.mem.startsWith(u8, link, prefix)) return null;
+    const rest = link[prefix.len..];
+    const slash = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (slash == 0 or slash + 1 == rest.len or std.mem.indexOfScalar(u8, rest[slash + 1 ..], '/') != null) return null;
+    const bus = std.fmt.parseInt(u16, rest[0..slash], 10) catch return null;
+    const device = std.fmt.parseInt(u16, rest[slash + 1 ..], 10) catch return null;
+    if (bus == 0 or device == 0) return null;
+    return .{ .bus = bus, .device = device };
+}
+
 // ------------------------------------------------------------- join
 
 pub const Basis = enum(u8) {
@@ -147,6 +166,59 @@ pub const Join = struct {
     process: ?Process = null,
     reason: []const u8 = "no socket in the capture's tables matches this packet",
 };
+
+pub const UsbJoin = struct {
+    basis: Basis = .none,
+    device_fd: ?UsbFd = null,
+    table: ?usize = null,
+    process: ?Process = null,
+    reason: []const u8 = "no USB device descriptor in the capture's tables matches this bus and device address",
+};
+
+/// Join a usbmon record to a usbfs descriptor sampled in ECTX. usbmon does
+/// not name the URB submitter: kernel drivers and every other holder of the
+/// device share its traffic. So a join is never `exact`. A descriptor held in
+/// the tables that bracket the record's time is `sampled`; a one-sided or
+/// unaligned observation is `inferred`.
+pub fn correlateUsb(ctx: *const Context, bus: u16, device: u16, time: ?u64) UsbJoin {
+    var best = UsbJoin{};
+    for (ctx.tables, 0..) |table, ti| for (table.usb_fds) |fd| {
+        if (fd.bus != bus or fd.device != device) continue;
+        const within = if (time) |t| usbHeldAt(ctx, fd, t) else false;
+        const basis: Basis = if (within) .sampled else .inferred;
+        if (@intFromEnum(basis) < @intFromEnum(best.basis)) best = .{
+            .basis = basis,
+            .device_fd = fd,
+            .table = ti,
+            .process = processOf(table, fd.pid),
+            .reason = if (within)
+                "the process held a usbfs descriptor for this bus and device address in the tables that bracket the record's time; usbmon does not say which holder (or kernel driver) submitted the URB"
+            else if (time == null)
+                "bus and device address equal a sampled usbfs descriptor, but the stream is not aligned to the capture clock; addresses can be reused"
+            else
+                "bus and device address equal a sampled usbfs descriptor, but no tables holding it bracket the record's time; addresses can be reused",
+        };
+    };
+    return best;
+}
+
+fn usbHeldAt(ctx: *const Context, fd: UsbFd, t: u64) bool {
+    const u = slack(ctx);
+    var before: ?Table = null;
+    var after: ?Table = null;
+    for (ctx.tables) |table| {
+        const shows = holdsUsb(table, fd);
+        if (shows and t +| u >= table.sampled_ns and t <= table.sampled_ns +| u) return true;
+        if (table.sampled_ns <= t and (before == null or table.sampled_ns > before.?.sampled_ns)) before = table;
+        if (table.sampled_ns >= t and (after == null or table.sampled_ns < after.?.sampled_ns)) after = table;
+    }
+    return before != null and after != null and holdsUsb(before.?, fd) and holdsUsb(after.?, fd);
+}
+
+fn holdsUsb(table: Table, fd: UsbFd) bool {
+    for (table.usb_fds) |other| if (other.pid == fd.pid and other.fd == fd.fd and other.bus == fd.bus and other.device == fd.device) return true;
+    return false;
+}
 
 /// `time` is the packet time already mapped to the capture's monotonic clock, or null.
 pub fn correlate(ctx: *const Context, flow: decode.Flow, time: ?u64) Join {
@@ -214,6 +286,10 @@ fn slack(ctx: *const Context) u64 {
 pub const schema: u8 = 1;
 /// Schema 2: redacted; each socket carries a byte saying which ends are tags.
 pub const schema_redacted: u8 = 2;
+/// Schemas 3/4 append numeric USB device descriptors to each table. The
+/// legacy schemas remain the default when no table contains such a descriptor.
+pub const schema_usb: u8 = 3;
+pub const schema_usb_redacted: u8 = 4;
 
 /// An address for display: a tag prints as ip-XXXXXXXX (its first 4 bytes).
 pub fn formatEnd(buf: *[64]u8, family: decode.Family, addr: [16]u8, tagged: bool) []const u8 {
@@ -233,14 +309,20 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try o.appendSlice(al, &buf);
         }
     };
-    try out.append(a, if (ctx.redacted) schema_redacted else schema);
+    var has_usb = false;
+    for (ctx.tables) |table| has_usb = has_usb or table.usb_fds.len != 0;
+    const version: u8 = if (has_usb)
+        (if (ctx.redacted) schema_usb_redacted else schema_usb)
+    else
+        (if (ctx.redacted) schema_redacted else schema);
+    try out.append(a, version);
     try W.int(&out, a, u64, ctx.capture_started_ns);
     try W.int(&out, a, i32, ctx.pid);
     try out.append(a, @intCast(ctx.pairs.len));
     for (ctx.pairs) |p| for ([_]u64{ p.monotonic_before_ns, p.realtime_ns, p.monotonic_after_ns }) |v| try W.int(&out, a, u64, v);
     try out.append(a, @intCast(ctx.tables.len));
     for (ctx.tables) |t| {
-        if (t.processes.len > max_processes or t.sockets.len > max_sockets) return error.EvidenceContextLimit;
+        if (t.processes.len > max_processes or t.sockets.len > max_sockets or t.usb_fds.len > max_usb_fds) return error.EvidenceContextLimit;
         try out.append(a, @intFromEnum(t.when));
         try W.int(&out, a, u64, t.sampled_ns);
         try W.int(&out, a, u32, t.unreadable);
@@ -264,6 +346,15 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try out.append(a, s.state);
             if (ctx.redacted) try out.append(a, @as(u8, @intFromBool(s.local_tagged)) | @as(u8, @intFromBool(s.remote_tagged)) << 1);
         }
+        if (has_usb) {
+            try W.int(&out, a, u32, @intCast(t.usb_fds.len));
+            for (t.usb_fds) |fd| {
+                try W.int(&out, a, i32, fd.pid);
+                try W.int(&out, a, i32, fd.fd);
+                try W.int(&out, a, u16, fd.bus);
+                try W.int(&out, a, u16, fd.device);
+            }
+        }
     }
     return out.toOwnedSlice(a);
 }
@@ -273,8 +364,9 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
     if (bytes.len > max_bytes) return error.EvidenceContextLimit;
     var r = Reader{ .bytes = bytes };
     const version = try r.byte();
-    if (version != schema and version != schema_redacted) return error.EvidenceContextSchema;
-    const is_redacted = version == schema_redacted;
+    if (version != schema and version != schema_redacted and version != schema_usb and version != schema_usb_redacted) return error.EvidenceContextSchema;
+    const is_redacted = version == schema_redacted or version == schema_usb_redacted;
+    const has_usb = version == schema_usb or version == schema_usb_redacted;
     const started = try r.int(u64);
     const pid = try r.int(i32);
     const pair_count = try r.byte();
@@ -324,7 +416,14 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
                 s.remote_tagged = tags & 2 != 0;
             }
         }
-        t.* = .{ .when = when, .sampled_ns = sampled, .unreadable = unreadable, .truncated = truncated, .processes = processes, .sockets = sockets };
+        const usb_fds = if (has_usb) blk: {
+            const count = try r.int(u32);
+            if (count > max_usb_fds or count * 12 > r.left()) return error.EvidenceContextLimit;
+            const fds = try a.alloc(UsbFd, count);
+            for (fds) |*fd| fd.* = .{ .pid = try r.int(i32), .fd = try r.int(i32), .bus = try r.int(u16), .device = try r.int(u16) };
+            break :blk fds;
+        } else &.{};
+        t.* = .{ .when = when, .sampled_ns = sampled, .unreadable = unreadable, .truncated = truncated, .processes = processes, .sockets = sockets, .usb_fds = usb_fds };
     }
     if (r.left() != 0) return error.EvidenceContextTrailingBytes;
     return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables, .redacted = is_redacted };
@@ -378,6 +477,35 @@ test "proc net tables parse both families" {
     try std.testing.expectEqual(@as(u16, 53), rows[0].local_port);
     try std.testing.expectEqual(@as(?u64, 99), socketInode("socket:[99]"));
     try std.testing.expectEqual(@as(?u64, null), socketInode("pipe:[99]"));
+    try std.testing.expectEqual(@as(u16, 12), usbDevicePath("/dev/bus/usb/012/034").?.bus);
+    try std.testing.expectEqual(@as(u16, 34), usbDevicePath("/dev/bus/usb/012/034").?.device);
+    try std.testing.expect(usbDevicePath("/dev/bus/usb/012/034/deleted") == null);
+    try std.testing.expect(usbDevicePath("/dev/hidraw0") == null);
+}
+
+test "USB descriptors extend ECTX and join only when sampled" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var comm: [16]u8 = @splat(0);
+    @memcpy(comm[0..7], "fixture");
+    const held = UsbFd{ .pid = 17, .fd = 9, .bus = 3, .device = 5 };
+    const tables = [_]Table{
+        .{ .when = .start, .sampled_ns = 1_000, .processes = &.{.{ .pid = 17, .comm = comm }}, .sockets = &.{}, .usb_fds = &.{held} },
+        .{ .when = .stop, .sampled_ns = 5_000, .processes = &.{.{ .pid = 17, .comm = comm }}, .sockets = &.{}, .usb_fds = &.{held} },
+    };
+    const ctx = Context{ .capture_started_ns = 1_000, .pid = 17, .pairs = &.{.{ .monotonic_before_ns = 10, .realtime_ns = 100, .monotonic_after_ns = 12 }}, .tables = &tables };
+    const bytes = try encode(a, ctx);
+    defer a.free(bytes);
+    try std.testing.expectEqual(schema_usb, bytes[0]);
+    const back = try decodeContext(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(usize, 1), back.tables[0].usb_fds.len);
+    try std.testing.expectEqual(@as(i32, 9), back.tables[0].usb_fds[0].fd);
+    const bracketed = correlateUsb(&back, 3, 5, 3_000);
+    try std.testing.expectEqual(Basis.sampled, bracketed.basis);
+    try std.testing.expectEqual(@as(i32, 17), bracketed.process.?.pid);
+    try std.testing.expectEqual(Basis.inferred, correlateUsb(&back, 3, 5, null).basis);
+    try std.testing.expectEqual(Basis.none, correlateUsb(&back, 3, 6, 3_000).basis);
 }
 
 fn testContext(sockets: []const Socket, processes: []const Process, pairs: []const clock.Pair) Context {

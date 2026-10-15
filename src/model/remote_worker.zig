@@ -25,10 +25,10 @@ pub const Completion = struct {
     capture_control: ?@import("capture_view.zig").Outcome = null,
 };
 /// Normal replies use at most 64 slots; cancellation reserves another 64 plus
-/// the active and pending urgent commands. No allocation on the frame.
+/// one active and two pending urgent commands. No allocation on the frame.
 pub const Completions = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    items: [2 * boundary.max_commands + 2]Completion = undefined,
+    items: [2 * boundary.max_commands + 3]Completion = undefined,
     head: usize = 0,
     count: usize = 0,
     fn available(self: *Completions) bool {
@@ -57,6 +57,7 @@ pub const Completions = struct {
 };
 pub const Options = struct {
     connection: u64,
+    local: bool = false, // Native bootstrap, not transfer of a live ptrace target.
     server: ?*Server = null,
     endpoint: ?*Endpoint = null,
     source: ?[:0]const u8 = null,
@@ -136,9 +137,10 @@ pub const Worker = struct {
     test_probes: @import("remote_test.zig").Probes = .{},
 
     /// Exclusive ownership of tree/server/endpoint transfers until join. Native
-    /// ptrace never transfers. Startup may establish a remote link beforehand.
+    /// ptrace never transfers: its empty target must bootstrap on this thread.
     pub fn start(tree: *Tree, options: Options) !*Worker {
         if (tree.count == 0 or options.connection == 0) return error.InvalidArguments;
+        if (options.local and options.bootstrap == null) return error.NativeBootstrapRequired;
         for (tree.entries[0..tree.count]) |entry| {
             if (options.bootstrap != null) {
                 if (entry.session.target.handle != null or entry.session.target.core != null) return error.ConflictingTargets;
@@ -233,6 +235,7 @@ pub const Worker = struct {
         return null;
     }
     fn run(self: *Worker) void {
+        self.executor.owner_thread = std.Thread.getCurrentId();
         if (self.options.bootstrap) |bootstrap| bootstrap.run(bootstrap.context, self.cancel.?) catch |err| {
             self.startup_error.store(@intFromError(err), .release);
         };
@@ -570,6 +573,7 @@ pub const Worker = struct {
         self.selection.?.selection = .{ .tid = view.request.tid, .frame = view.selected_frame };
     }
     fn publish(self: *Worker, view: ?@import("../remote/view.zig").View, debugger: ?@import("debugger_view.zig").Presentation, language_: ?@import("language_view.zig").Presentation, failure: ?anyerror) !void {
+        const prepare_started = if (self.options.trace) linux.now() else 0;
         _ = self.preparation_attempts.fetchAdd(1, .monotonic);
         // A workspace always has the native columns and the selected language
         // body in the same publication, even when the selected tab is native.
@@ -667,8 +671,20 @@ pub const Worker = struct {
             .diagnostic = if (failure) |err| @errorName(err) else "",
         };
         if (try self.test_probes.failPublication()) return error.OutOfMemory;
+        const copy_started = if (self.options.trace) linux.now() else 0;
         const publication = try boundary.Publication.createDegraded(a, presentation);
+        const copy_finished = if (self.options.trace) linux.now() else 0;
         errdefer publication.destroy();
+        // Owner-side trace only. Do not make the frame acquire this mutex.
+        if (self.options.trace) {
+            var queued: ?usize = null;
+            if (self.commands.mutex.tryLock()) {
+                queued = self.commands.count + @intFromBool(self.commands.active != null) + @intFromBool(self.commands.poll_pending != null);
+                for (self.commands.urgent_pending) |pending| queued.? += @intFromBool(pending != null);
+                self.commands.mutex.unlock();
+            }
+            log.info(.runtime, "xodb: owner publication prep_ns={d} copy_ns={d} bytes={d} queue={?d}\n", .{ copy_started -| prepare_started, copy_finished -| copy_started, publication.bytes, queued });
+        }
         while (true) {
             const retired = self.publications.publish(publication) catch |err| {
                 if (err != error.Busy) return err;
@@ -690,6 +706,35 @@ pub const Worker = struct {
         self.last_tree_revision = if (processes) |v| v.revision else self.executor.tree.revision;
     }
 };
+
+test "native owner requires empty bootstrap instead of transferring ptrace" {
+    const session = try std.testing.allocator.create(@import("session.zig").Session);
+    defer std.testing.allocator.destroy(session);
+    session.* = @import("session.zig").Session.init();
+    defer session.deinit();
+    var tree: Tree = .{};
+    tree.init(session);
+    defer tree.deinit();
+    const Attempt = struct {
+        fn start(t: *Tree, options: Options) !void {
+            const owner = try Worker.start(t, options);
+            defer owner.destroy();
+            owner.join();
+        }
+    };
+    try std.testing.expectError(error.NativeBootstrapRequired, Attempt.start(&tree, .{ .connection = 1, .local = true }));
+    const Bootstrap = struct {
+        fn run(_: *anyopaque, _: *rt.struct_xrt_cancel) !void {}
+    };
+    // Even an idle allocated native handle is not transferable; only the
+    // owner may establish it during bootstrap.
+    session.target.handle = rt.xrt_target_create() orelse return error.OutOfMemory;
+    try std.testing.expectError(error.ConflictingTargets, Attempt.start(&tree, .{
+        .connection = 1,
+        .local = true,
+        .bootstrap = .{ .context = session, .run = Bootstrap.run },
+    }));
+}
 
 test "graceful shutdown cancels startup immediately but preserves a connected drain until its deadline" {
     const Barrier = struct {
@@ -800,6 +845,8 @@ test "silent saturated queue cancels exactly once with full completions" {
     worker.active = (try worker.commands.take()).?;
     const revoke = try boundary.Command.create(test_a, .{ .stamp = identity, .actor = .human, .action = .toggle_scope });
     try std.testing.expectEqual(boundary.max_commands + 2, try worker.commands.trySubmit(revoke));
+    const protocol_stop = try boundary.Command.create(test_a, .{ .stamp = identity, .actor = .{ .agent = .{ .client = 7, .lease = null } }, .action = .{ .control = .interrupt } });
+    try std.testing.expectEqual(boundary.max_commands + 3, try worker.commands.trySubmit(protocol_stop));
     // Quiescing itself cannot depend on acquiring a producer's queue lock.
     try std.testing.expect(worker.commands.mutex.tryLock());
     worker.requestStop();
@@ -814,13 +861,13 @@ test "silent saturated queue cancels exactly once with full completions" {
     }
     worker.joinCompleted();
     // No further producer input or completion consumption was needed to finish.
-    for (0..2 * boundary.max_commands + 2) |index| {
+    for (0..2 * boundary.max_commands + 3) |index| {
         const reply = (try worker.completions.take()).?;
         if (index < boundary.max_commands) {
             try std.testing.expectEqual(1000 + index, reply.sequence);
             try std.testing.expect(reply.failure == null);
         } else {
-            const expected = if (index < boundary.max_commands + 2) index + 1 else index - boundary.max_commands - 1;
+            const expected = if (index < boundary.max_commands + 3) index + 1 else index - boundary.max_commands - 2;
             try std.testing.expectEqual(expected, reply.sequence);
             try std.testing.expect(reply.failure.? == error.Cancelled);
         }
@@ -836,8 +883,8 @@ test "completion capacity reserves cancellation without losing earlier replies" 
         replies.put(.{ .sequence = i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 } });
     }
     try std.testing.expect(!replies.available());
-    for (0..boundary.max_commands + 2) |i| replies.put(.{ .sequence = boundary.max_commands + i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 }, .failure = error.Cancelled });
-    for (0..2 * boundary.max_commands + 2) |i| {
+    for (0..boundary.max_commands + 3) |i| replies.put(.{ .sequence = boundary.max_commands + i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 }, .failure = error.Cancelled });
+    for (0..2 * boundary.max_commands + 3) |i| {
         const reply = (try replies.take()).?;
         try std.testing.expectEqual(i + 1, reply.sequence);
         try std.testing.expectEqual(i >= boundary.max_commands, reply.failure != null);

@@ -216,9 +216,13 @@ pub const Queue = struct {
     count: usize = 0,
     active: ?*Command = null,
     poll_pending: ?*Command = null,
-    // One bounded stop/revoke request can bypass a full ordinary queue. It
-    // does not preempt an in-flight backend operation or coalesce mutations.
-    urgent_pending: ?*Command = null,
+    // One reservation per caller class: a protocol stop cannot occupy the
+    // human's F8/revoke slot. Human urgency wins, without preempting an active
+    // backend operation or coalescing mutations. Not one slot per client.
+    urgent_pending: [2]?*Command = @splat(null),
+    // A protocol client resubmitting stops cannot starve ordinary work: after
+    // a protocol urgent turn, ready ordinary work (or a poll) goes once first.
+    protocol_urgent_last: bool = false,
     bytes: usize = 0,
     next_sequence: u64 = 1,
     closed: std.atomic.Value(bool) = .init(false),
@@ -237,7 +241,7 @@ pub const Queue = struct {
                 return pending.sequence;
             }
         } else if (command.urgent()) {
-            if (self.urgent_pending != null) return error.QueueFull;
+            if (self.urgent_pending[urgentClass(command)] != null) return error.QueueFull;
         } else {
             const active_count: usize = if (self.active) |c| @intFromBool(c.request.action != .poll and !c.urgent()) else 0;
             if (self.count + active_count == max_commands or
@@ -251,7 +255,7 @@ pub const Queue = struct {
             return command.sequence;
         }
         if (command.urgent()) {
-            self.urgent_pending = command;
+            self.urgent_pending[urgentClass(command)] = command;
             return command.sequence;
         }
         self.slots[(self.head + self.count) % max_commands] = command;
@@ -263,20 +267,24 @@ pub const Queue = struct {
         if (!self.mutex.tryLock()) return error.Busy;
         defer self.mutex.unlock();
         if (self.active != null) return null;
-        if (self.urgent_pending) |urgent| {
+        for (&self.urgent_pending, 0..) |*pending, class| if (pending.*) |urgent| {
+            if (class == 1 and self.protocol_urgent_last and (self.count > 0 or self.poll_pending != null)) break;
             self.active = urgent;
-            self.urgent_pending = null;
+            pending.* = null;
+            self.protocol_urgent_last = class == 1;
             return urgent;
-        }
+        };
         if (self.poll_pending) |poll| {
             // Coalescing retains the first request's place in owner order.
             if (self.count == 0 or poll.sequence < self.slots[self.head].?.sequence) {
                 self.active = poll;
                 self.poll_pending = null;
+                self.protocol_urgent_last = false;
                 return poll;
             }
         }
         if (self.count == 0) return null;
+        self.protocol_urgent_last = false;
         self.active = self.slots[self.head];
         self.slots[self.head] = null;
         self.head = (self.head + 1) % max_commands;
@@ -301,9 +309,12 @@ pub const Queue = struct {
     pub fn deinit(self: *Queue) void {
         if (self.active) |command| command.destroy();
         if (self.poll_pending) |command| command.destroy();
-        if (self.urgent_pending) |command| command.destroy();
+        for (self.urgent_pending) |command| if (command) |c| c.destroy();
         for (self.slots) |command| if (command) |c| c.destroy();
         self.* = .{};
+    }
+    fn urgentClass(command: *const Command) usize {
+        return if (command.request.actor == .human) 0 else 1;
     }
 };
 
@@ -931,4 +942,55 @@ test "old-view interrupt and revocation keep reserved admission under queue pres
     try std.testing.expectError(error.StaleSnapshot, mutation.validate(current, &owner));
     queue.finish();
     try std.testing.expectEqual(@as(usize, 2), owner.calls);
+}
+
+test "protocol urgency cannot occupy or overtake the human reservation" {
+    var queue: Queue = .{};
+    defer queue.deinit();
+    for (0..max_commands) |_| {
+        _ = try queue.trySubmit(try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution })));
+    }
+    var protocol = testRequest(.{ .control = .interrupt });
+    protocol.actor = .{ .agent = .{ .client = 1, .lease = null } };
+    const agent_stop = try Command.create(std.testing.allocator, protocol);
+    _ = try queue.trySubmit(agent_stop);
+    // A second client shares the protocol reservation; it cannot grow it.
+    protocol.actor.agent.client = 2;
+    const duplicate = try Command.create(std.testing.allocator, protocol);
+    defer duplicate.destroy();
+    try std.testing.expectError(error.QueueFull, queue.trySubmit(duplicate));
+    var human = testRequest(.toggle_scope);
+    human.actor = .human;
+    const revoke = try Command.create(std.testing.allocator, human);
+    _ = try queue.trySubmit(revoke);
+    try std.testing.expect((try queue.take()).? == revoke);
+    queue.finish();
+    try std.testing.expect((try queue.take()).? == agent_stop);
+    queue.finish();
+    try std.testing.expectEqual(max_commands, queue.count);
+}
+
+test "a protocol client resubmitting stops cannot starve ordinary commands" {
+    var queue: Queue = .{};
+    defer queue.deinit();
+    for (0..3) |_| _ = try queue.trySubmit(try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution })));
+    var protocol = testRequest(.{ .control = .interrupt });
+    protocol.actor = .{ .agent = .{ .client = 1, .lease = null } };
+    var ordinary: usize = 0;
+    for (0..6) |_| {
+        // The client resubmits as soon as its reservation is free.
+        if (queue.urgent_pending[1] == null) _ = try queue.trySubmit(try Command.create(std.testing.allocator, protocol));
+        const taken = (try queue.take()).?;
+        if (!taken.urgent()) ordinary += 1;
+        queue.finish();
+    }
+    try std.testing.expectEqual(@as(usize, 3), ordinary);
+    // A human stop still goes first, ahead of the pending protocol stop.
+    try std.testing.expect(queue.urgent_pending[1] != null);
+    var human = testRequest(.toggle_scope);
+    human.actor = .human;
+    const revoke = try Command.create(std.testing.allocator, human);
+    _ = try queue.trySubmit(revoke);
+    try std.testing.expect((try queue.take()).? == revoke);
+    queue.finish();
 }

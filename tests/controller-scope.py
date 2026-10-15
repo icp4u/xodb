@@ -36,7 +36,10 @@ try:
     catalog=Client('mutate')
     try:
         definitions=catalog.call('tools/list')['result']['tools']
-        changing=[d for d in definitions if not d['annotations']['readOnlyHint']]
+        requests=[d for d in definitions if d['annotations']['xodbSessionAccess']=='requester']
+        assert {d['name'] for d in requests} == {'request_system_capture','cancel_system_capture'}
+        assert all(not d['annotations']['readOnlyHint'] for d in requests)
+        changing=[d for d in definitions if not d['annotations']['readOnlyHint'] and d['annotations']['xodbSessionAccess']!='requester']
         assert {'add_language_watch','remove_language_watch','write_memory','write_register'} <= {d['name'] for d in changing}
         assert all(d['annotations']['xodbSessionAccess'] in ('controller','mutator') for d in changing)
         report['definitions']=changing

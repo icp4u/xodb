@@ -50,10 +50,11 @@ pub const State = struct {
         self.context = ctx;
         if (!paused and (self.request_at == 0 or now -| self.request_at >= 500_000_000)) {
             // poll_all refreshes seekable offsets every scan; fdinfo_all would only re-read pipes/sockets.
-            const request = c.struct_xrt_fdactivity_request{ .interval_ms = 1000, .poll_all = 1, .flow = @intFromBool(self.events_enabled), .stop_flow = @intFromBool(!self.events_enabled) };
+            const agent_flow = owner.capture.ownsFlow();
+            const request = c.struct_xrt_fdactivity_request{ .interval_ms = 1000, .poll_all = 1, .flow = @intFromBool(!agent_flow and self.events_enabled), .stop_flow = @intFromBool(!agent_flow and !self.events_enabled) };
             if (c.xrt_fdactivity_request(ctx, &request) == c.XRT_OK) {
                 self.request_at = now;
-                self.flow_demand = self.events_enabled;
+                self.flow_demand = !agent_flow and self.events_enabled;
             }
         }
         var published: c.struct_xrt_fdactivity_view = undefined;

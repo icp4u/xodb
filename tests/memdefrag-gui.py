@@ -374,11 +374,14 @@ if 'buttons' in sections:
         shot = d.shot('buttons-before')
         boxes = {}
         # Buttons sit bottom-right of the dialog; find them by OCR word boxes.
-        tsv = subprocess.run(['tesseract', str(shot), '-', 'tsv'], capture_output=True, text=True).stdout.splitlines()
-        for row in tsv[1:]:
-            f = row.split('\t')
-            if len(f) == 12 and f[11].strip() in ('Stop', 'Resume', 'Legend', 'Hide'):
-                boxes.setdefault(f[11].strip().replace('Resume', 'Pause'), (int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2))
+        # Block layout can merge the second button row into the progress text;
+        # sparse-text mode (psm 11) finds those words on their own.
+        for mode in ([], ['--psm', '11']):
+            tsv = subprocess.run(['tesseract', str(shot), '-', *mode, 'tsv'], capture_output=True, text=True).stdout.splitlines()
+            for row in tsv[1:]:
+                f = row.split('\t')
+                if len(f) == 12 and f[11].strip() in ('Stop', 'Resume', 'Legend', 'Hide'):
+                    boxes.setdefault(f[11].strip().replace('Resume', 'Pause'), (int(f[6]) + int(f[8]) // 2, int(f[7]) + int(f[9]) // 2))
         check('the four buttons are on screen', len(boxes) == 4, boxes)
         if len(boxes) == 4:
             d.click(*boxes['Legend'])

@@ -50,7 +50,7 @@ import ghidra.util.task.TaskMonitorAdapter;
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.6";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.7";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -1096,8 +1096,11 @@ public final class XodbGhidraSidecar {
                 for (Varnode piece : pieces) {
                     JsonObject item = new JsonObject();
                     item.addProperty("size", piece.getSize());
-                    int valueOffset = program.getLanguage().isBigEndian()
-                        ? storage.size() - valueBytes - piece.getSize() : valueBytes;
+                    // HighSymbol join storage is ordered from the most-significant
+                    // piece to the least-significant piece. VariableStorage's
+                    // public constructor documents a different little-endian
+                    // order, but the decompiler join record is the source here.
+                    int valueOffset = storage.size() - valueBytes - piece.getSize();
                     item.addProperty("value_bit_offset", valueOffset * 8);
                     long[] interval = null;
                     if (piece.isRegister()) {

@@ -697,7 +697,12 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
     if (s.psi_cpu.some10.get()) |cpu| try add(&out, a, "Pressure", try std.fmt.allocPrint(a, "cpu {d:.1}% · memory {d:.1}% · io {d:.1}% (some, 10 s)", .{ cpu, s.psi_memory.some10.get() orelse 0, s.psi_io.some10.get() orelse 0 }), if (x.gui) .pressure else .none);
     {
         var tb: std.ArrayList(u8) = .empty;
-        if (s.cpu_package_temp.get()) |t| try part(a, &tb, "CPU {d:.0} °C{s}", .{ @round(t), nice(t, x.gui) });
+        if (s.cpu_package_temp.get()) |t| {
+            if (s.cpu_temp_label.len > 0)
+                try part(a, &tb, "{s} {d:.0} °C{s}", .{ s.cpu_temp_label, @round(t), nice(t, x.gui) })
+            else
+                try part(a, &tb, "CPU {d:.0} °C{s}", .{ @round(t), nice(t, x.gui) });
+        }
         for (s.gpus) |g| if (g.temp_c.get()) |t| try part(a, &tb, "GPU {d:.0} °C{s}", .{ @round(t), nice(t, x.gui) });
         for (s.disks) |d| if (d.temp_c.get()) |t| if (std.mem.startsWith(u8, d.name, "nvme")) {
             try part(a, &tb, "NVMe {d:.0} °C", .{t});
@@ -711,7 +716,10 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
     }
     {
         var pb: std.ArrayList(u8) = .empty;
-        if (s.cpu_package_power.get()) |w| try part(a, &pb, "CPU {d:.1} W", .{w});
+        if (s.cpu_package_power.get()) |w| {
+            const word = if (std.mem.indexOf(u8, s.cpu_power_label, "System") != null) "System" else "CPU";
+            try part(a, &pb, "{s} {d:.1} W", .{ word, w });
+        }
         for (s.gpus) |g| if (g.power_w.get()) |w| try part(a, &pb, "GPU {d:.1} W", .{w});
         try add(&out, a, "Power", pb.items, if (x.gui) .power else .none);
     }
@@ -1122,6 +1130,10 @@ test "a temperature rounding to 69 °C is nice in the terminal card only; no Mit
     try std.testing.expect(std.mem.endsWith(u8, value(list, "Network").?, "pkts (total since boot)"));
     list = try lines(a, &st, &s, .{ .gui = true });
     try std.testing.expect(!std.mem.startsWith(u8, value(list, "Network").?, "in 2.00 MB/s"));
+    s.cpu_temp_label = "P-cluster Temperature 2";
+    s.cpu_package_temp = m.F.of(44.2);
+    list = try lines(a, &st, &s, .{});
+    try std.testing.expectEqualStrings("P-cluster Temperature 2 44 °C", value(list, "Temps").?);
 }
 
 test "EDID preferred timing and name; ANSI colour from os-release" {

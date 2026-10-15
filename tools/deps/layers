@@ -38,6 +38,7 @@ src/redot/**              redot
 src/import/**             import
 # external evidence: capture files, decoders, clock domains, socket joins
 src/evidence/**           evidence
+src/capture/**            capture
 
 # C runtime: also builds alone (src/runtime/Makefile, xodb-agent)
 src/runtime/**            runtime

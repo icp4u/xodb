@@ -66,7 +66,7 @@ def build(label, target, expected, diagnostic=None):
 
 build('valid', 'check-catalog', 0)
 catalogs = sorted((tree/'src/mcp').glob('*_tools.json'))
-assert len(catalogs) == 10, 'update the catalog coverage when adding a publication fragment'
+assert len(catalogs) == 11, 'update the catalog coverage when adding a publication fragment'
 for index, path in enumerate(catalogs):
     original = path.read_bytes()
     try:
@@ -127,7 +127,8 @@ try:
     (tree/'src/mcp/static_tools.json').write_bytes(b' \n[]\t\r\n')
     build('assembled-publication', 'app', 0)
     expected = []
-    for name in ('base', 'static', 'runtime_type', 'macho', 'overview', 'fd', 'memstat'):
+    # Native publication order: tool_catalog.inputs[0..9].
+    for name in ('base', 'static', 'runtime_type', 'macho', 'overview', 'fd', 'memstat', 'redot', 'evidence'):
         expected.extend(json.loads((tree/'src/mcp'/(name+'_tools.json')).read_bytes()))
     os.environ['XODB_BIN'] = str(tree/'zig-out/bin/xodb')
     client = Client('mutate', executable=None, reply_seconds=10*scale)

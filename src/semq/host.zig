@@ -768,6 +768,7 @@ const WarmFunction = struct {
     seed_callees: bool,
 };
 const WarmFunctionCandidate = struct { sha256: [64]u8, path: []const u8, mapping: ?[]const u8, entry: u64, build_id: ?[]const u8, seed_callees: bool };
+const WarmRetry = struct { path: []u8, after_ms: u64 };
 
 const Warmup = struct {
     arena: std.heap.ArenaAllocator = .init(page),
@@ -995,9 +996,10 @@ pub const State = struct {
     /// The first image ever queued: the main executable. Never given up.
     warm_main: ?u64 = null,
     warm_main_path: ?[]u8 = null,
-    /// A cancelled import is retried later, never on every foreground poll.
-    warm_retry_path: ?[]u8 = null,
-    warm_retry_after_ms: u64 = 0,
+    /// Cancelled imports are retried later, never on every foreground poll.
+    /// Keep one entry for every image a single bounded warm pass may queue so
+    /// alternating images cannot evict each other's backoff.
+    warm_retries: [max_warm_images]?WarmRetry = @splat(null),
     next_job: u64 = 1,
 
     pub fn deinit(self: *State) void {
@@ -1018,10 +1020,10 @@ pub const State = struct {
             page.free(path);
             self.warm_main_path = null;
         }
-        if (self.warm_retry_path) |path| {
-            page.free(path);
-            self.warm_retry_path = null;
-        }
+        for (&self.warm_retries) |*retry| if (retry.*) |entry| {
+            page.free(entry.path);
+            retry.* = null;
+        };
         if (self.dir) |dir| {
             _ = c.xghx_remove_tree(dir.ptr);
             page.free(dir);
@@ -1041,13 +1043,41 @@ pub const State = struct {
     }
 
     fn warmBackedOff(self: *State, path: []const u8) bool {
-        const retry_path = self.warm_retry_path orelse return false;
-        if (!std.mem.eql(u8, retry_path, path)) return false;
-        if (nowMs() < self.warm_retry_after_ms) return true;
-        page.free(retry_path);
-        self.warm_retry_path = null;
-        self.warm_retry_after_ms = 0;
+        const now = nowMs();
+        for (&self.warm_retries) |*retry| if (retry.*) |entry| {
+            if (now >= entry.after_ms) {
+                page.free(entry.path);
+                retry.* = null;
+                continue;
+            }
+            if (std.mem.eql(u8, entry.path, path)) return true;
+        };
         return false;
+    }
+
+    fn rememberWarmBackoff(self: *State, path: []const u8) void {
+        const after_ms = nowMs() + warm_retry_delay_ms;
+        var empty: ?usize = null;
+        var oldest: usize = 0;
+        var oldest_after: u64 = std.math.maxInt(u64);
+        for (&self.warm_retries, 0..) |*retry, index| {
+            if (retry.*) |*entry| {
+                if (std.mem.eql(u8, entry.path, path)) {
+                    entry.after_ms = after_ms;
+                    return;
+                }
+                if (entry.after_ms < oldest_after) {
+                    oldest = index;
+                    oldest_after = entry.after_ms;
+                }
+            } else if (empty == null) {
+                empty = index;
+            }
+        }
+        const copy = page.dupe(u8, path) catch return;
+        const slot = empty orelse oldest;
+        if (self.warm_retries[slot]) |entry| page.free(entry.path);
+        self.warm_retries[slot] = .{ .path = copy, .after_ms = after_ms };
     }
 
     /// Joins a finished or cancelled worker and keeps what it learned.
@@ -1061,9 +1091,7 @@ pub const State = struct {
         // An import restarts from nothing after a cancel. Delay its next eager
         // attempt regardless of how quickly it was pre-empted.
         if (warm.cancelled_import.load(.acquire) and attempted < warm.images.len) {
-            if (self.warm_retry_path) |path| page.free(path);
-            self.warm_retry_path = page.dupe(u8, warm.images[attempted].path) catch null;
-            self.warm_retry_after_ms = nowMs() + warm_retry_delay_ms;
+            self.rememberWarmBackoff(warm.images[attempted].path);
         }
         if (warm.unusable.load(.acquire)) self.warmup_enabled = false;
         warm.destroy();
@@ -1615,6 +1643,16 @@ test "cancel: own jobs, or any job only with control" {
     try std.testing.expect(mayCancel(.human, .{ .agent = .{ .client = 8, .controller = true } }));
     try std.testing.expect(!mayCancel(.human, .{ .agent = .{ .client = null, .controller = false } }));
     try std.testing.expect(mayCancel(.{ .agent = null }, .{ .agent = .{ .client = null, .controller = false } }));
+}
+
+test "cancelled import backoff retains more than one image" {
+    var state: State = .{};
+    defer state.deinit();
+    state.rememberWarmBackoff("/owned/first.so");
+    state.rememberWarmBackoff("/owned/second.so");
+    try std.testing.expect(state.warmBackedOff("/owned/first.so"));
+    try std.testing.expect(state.warmBackedOff("/owned/second.so"));
+    try std.testing.expect(!state.warmBackedOff("/owned/third.so"));
 }
 
 test "sidecar variable metadata retains base register, subregister offset and lifetime" {

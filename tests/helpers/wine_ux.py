@@ -107,7 +107,10 @@ def gui(root, work, pid):
     replay.write_text(json.dumps(sample)+'\n')
     picker = h.Display(str(root), ['--attach-exe', '--replay', str(replay), '--pause'], stdio=False)
     try:
-        text = shot(picker, 'exe-picker', '0,40 1280x700', lambda t: 'owned-game.exe' in t and 'ordinary-native' not in t)
+        # OCR may split the name at its dot ("owned-game. exe"); compare without spaces.
+        text = shot(picker, 'exe-picker', '0,40 1280x700',
+                    lambda t: '1shown' in t.replace(' ', '') and 'owned-game.exe' in t.replace(' ', '')
+                    and 'ordinary-native' not in t.replace(' ', ''))
         report['picker_filtered'] = True
         report['picker_text'] = text
     finally:

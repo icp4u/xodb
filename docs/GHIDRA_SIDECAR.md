@@ -57,8 +57,9 @@ stack functions, then their direct callees, then user breakpoint functions,
 with a hard 16-function bound. This real-program warm-ahead replaces the old
 throwaway `prime` request, which measured no faster after decompiler reuse. Resume and an interactive analysis cancel
 this work before it can delay the debugger. A cancelled import starts again
-from nothing, so its path waits at least 30 seconds before another eager
-attempt; an explicit request remains immediate. Background imports stop at half of
+from nothing, so each cancelled path in the bounded eager queue waits at least
+30 seconds before another eager attempt; alternating images retain independent
+backoff entries. An explicit request remains immediate. Background imports stop at half of
 `XODB_GHIDRA_MAX_IMAGES`; the other half is kept for images you ask about.
 
 The cache is private and safe to delete while the sidecar is stopped. The
@@ -107,7 +108,7 @@ of the shared JVM and prevents idle exit.
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.6`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.7`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
 `pseudocode`. It also advertises `prime`, variables, types, function index, and the
@@ -204,6 +205,12 @@ entirely made of an exact whitelisted landing pad, its bytes map to the first
 exported code line in both directions and are labelled `entry_pad: true`.
 Other gaps remain unmapped.
 
+At a live stop, `decompile_function` accepts `tid` and optional `frame` and
+returns `live_values` plus `live_values_at`. These are the same values shown by
+the D pane: every storage piece must cover the requested PC and be readable
+from the stopped frame. Stack pieces are read only for frame 0; missing or
+unproven values are omitted rather than guessed.
+
 
 ## Pseudo-C behavior
 
@@ -213,8 +220,9 @@ selected sidecar cannot start on x86-64, the same request falls back to the
 configured native worker and the pane names that producer. Register-backed
 sidecar variables and CFA-relative stack pieces are overlaid from the stopped
 frame only inside their exported PC range; stack pieces only in the innermost
-frame. A value split over several pieces shows no live value yet: the 0.1.6
-export orders x86-64 aggregate pieces wrongly. `[` and `]` scroll
+frame. Values split over several proven pieces are assembled by significance;
+the 0.1.7 producer exports decompiler join pieces from their most-significant
+piece to their least-significant piece. `[` and `]` scroll
 long pseudo-C lines horizontally.
 
 ## Image-only sessions

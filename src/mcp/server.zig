@@ -87,9 +87,8 @@ pub const Server = struct {
     overview: overview.State = .{},
     overview_shared: ?*overview.State = null,
     overview_only: bool = false,
-    /// The MCP peer is a --listen TCP client, not the local process that
-    /// opened the files: it never receives private evidence payloads.
-    network_peer: bool = false,
+    overview_capture: ?*const ?*Session = null,
+    private_access: @import("evidence.zig").PrivateAccess = .unavailable,
     pub fn overviewTick(self: *Server) !void {
         if (self.overview_shared == null) _ = try self.overview.tick(@import("../target/linux.zig").now(), 0, false);
     }
@@ -281,6 +280,7 @@ pub const Server = struct {
         if (self.shared) |peer| {
             switch (policy.required) {
                 .observer => {},
+                .requester => try shared_context.check(shared_context.c.xsvc_authorize(peer.service, peer.client_id, shared_context.c.XSVC_OBSERVE, @import("../target/linux.zig").now())),
                 .controller => try peer.authorize(false),
                 .mutator => try peer.authorize(true),
                 .lease => return error.InvalidToolSessionAccess,
@@ -296,6 +296,10 @@ pub const Server = struct {
             try peer.tick(root);
         }
         const policy = try self.authorizeTool(root, name);
+        if (@import("system_capture.zig").handles(name)) {
+            const caller: @import("../model/command.zig").Caller = .{ .agent = .{ .client = if (self.shared) |peer| peer.client_id else 0, .lease = null } };
+            return @import("system_capture.zig").call(a, self.overview_shared orelse &self.overview, self.overview_capture, root.agent_scope, caller, name, args, @import("../target/linux.zig").now());
+        }
         if (std.mem.eql(u8, name, "get_layout")) {
             if (args.object.count() != 0) return error.InvalidArguments;
             const layout = @import("../layout_snapshot.zig");
@@ -307,6 +311,7 @@ pub const Server = struct {
             if (root.agent_scope == .observe) return error.AgentScopeDenied;
             // Shared calls already passed the authoritative lease check above.
             const collector = self.overview_shared orelse &self.overview;
+            if (std.mem.eql(u8, name, "start_fd_events") and collector.capture.backend_busy) return error.ExistingCaptureActive;
             const result = try @import("fd.zig").control(a, collector, name, args);
             collector.fd_lease = if (std.mem.eql(u8, name, "start_fd_events"))
                 (if (self.shared) |peer| @import("../service/lease.zig").Lease.capture(peer.service, peer.client_id) else null)
@@ -321,9 +326,13 @@ pub const Server = struct {
         // External evidence belongs to the root session, not a target process.
         if (@import("evidence.zig").handles(name)) return @import("evidence.zig").call(a, .{
             .network = root.evidence_stream,
+            .protocol_stream = root.protocol_stream,
             .tls_stream = root.tls_stream,
+            .usb_stream = root.usb_stream,
+            .dbus_stream = root.dbus_stream,
             .mitm_stream = root.mitm_stream,
-            .private_payloads = self.shared == null and !self.network_peer and root.agent_scope == .observe,
+            .live_capture = root.live_capture,
+            .private = self.private_access,
         }, name, args);
         const process_id = try @import("profile.zig").number(args, "process_id", 1);
         const session = if (root.process_tree) |tree| (try tree.find(process_id)).session else if (process_id == root.process_id) root else return error.UnknownProcess;
@@ -739,7 +748,7 @@ pub const Server = struct {
                 return;
             }
             self.negotiated = true;
-            try self.reply(a, id, .{ .protocolVersion = "2025-06-18", .capabilities = .{ .tools = .{ .listChanged = true } }, .serverInfo = .{ .name = "xodb", .version = "0.0.1" }, .instructions = if (self.overview_only) "Observer-only live system overview. Tools read a shared cache; inspect group ages and pending status, then poll after the owner tick. No debug target, control lease, or attach tools are available." else if (self.shared != null) "Shared local debugger session. Inspect as an observer; claim_session_control with the original process generation to start jobs or control targets. Renew before lease expiry. The human scope is authoritative; scope change, expiry, release or disconnect revokes control. Jobs and retained evidence survive reconnect. Poll get_session_clients/get_session_events for ownership and query_events for target events. Process mutations still require that process generation." else "Inspect and control debugger process sessions within the human-configured agent_scope. Optional process_id selects a stable process; omitted means original process 1, independent of GUI selection. List IDs with get_processes. Mutations require that process\'s current generation from get_session; the human may revoke scope for all processes. Continue/step/interrupt are asynchronous. Poll get_session and query_events for outcomes." });
+            try self.reply(a, id, .{ .protocolVersion = "2025-06-18", .capabilities = .{ .tools = .{ .listChanged = true } }, .serverInfo = .{ .name = "xodb", .version = "0.0.1" }, .instructions = if (self.overview_only) "Live system overview. Observers read shared caches; inspect ages and pending status. request_system_capture asks for bounded CPU/fd-flow collection: GUI requires human confirmation, headless requires explicit agent-scope control/mutate. Read consent, audit and deadlines with get_system_capture; polling never renews a capture. No general debugger control, control lease or attach tools are available." else if (self.shared != null) "Shared local debugger session. Inspect as an observer; claim_session_control with the original process generation to start jobs or control targets. Renew before lease expiry. The human scope is authoritative; scope change, expiry, release or disconnect revokes control. Jobs and retained evidence survive reconnect. Poll get_session_clients/get_session_events for ownership and query_events for target events. Process mutations still require that process generation." else "Inspect and control debugger process sessions within the human-configured agent_scope. Optional process_id selects a stable process; omitted means original process 1, independent of GUI selection. List IDs with get_processes. Mutations require that process\'s current generation from get_session; the human may revoke scope for all processes. Continue/step/interrupt are asynchronous. Poll get_session and query_events for outcomes." });
         } else if (std.mem.eql(u8, method, "ping")) {
             try self.reply(a, id, Value{ .object = .{} });
         } else if (!self.initialized) {
@@ -1200,7 +1209,7 @@ test {
     std.testing.refAllDecls(@import("debug_files.zig"));
 }
 
-test "queued stdio calls recheck live scope before every non-read-only handler" {
+test "queued stdio commands recheck live scope and capture requests keep separate consent" {
     const a = std.testing.allocator;
     const root = try a.create(Session);
     defer a.destroy(root);
@@ -1223,9 +1232,18 @@ test "queued stdio calls recheck live scope before every non-read-only handler" 
     for (definitions.value.array.items) |definition| {
         if (try shared_context.readOnly(definition)) continue;
         const name = string(member(definition, "name")).?;
+        if (try shared_context.access(definition) == .requester) {
+            try std.testing.expect(std.mem.eql(u8, name, "request_system_capture") or std.mem.eql(u8, name, "cancel_system_capture"));
+            continue;
+        }
         try std.testing.expectError(error.AgentScopeDenied, server.queuedTool(scratch, root, actor, name, .{ .object = .empty }));
         checked += 1;
     }
+    const request = try std.json.parseFromSlice(Value, scratch, "{\"kind\":\"fd_flow\",\"duration_ms\":100}", .{});
+    try std.testing.expectError(error.CaptureRequestsUnavailable, server.queuedTool(scratch, root, actor, "request_system_capture", request.value));
+    server.overview.capture.mode = .headless;
+    try std.testing.expectError(error.AgentScopeDenied, server.queuedTool(scratch, root, actor, "request_system_capture", request.value));
+    try std.testing.expect(server.overview.capture.current == null);
     try std.testing.expect(checked >= 50);
     root.agent_scope = .control;
     try std.testing.expectError(error.AgentScopeDenied, server.queuedTool(scratch, root, actor, "write_memory", .{ .object = .empty }));

@@ -95,10 +95,48 @@ scope/lease and process identity, passes caller identity explicitly to audit
 and deferred resume, and does not import frontend or publication machinery.
 Continue/step/breakpoint changes require the expected observation; interrupt
 and pending-continue cancellation accept an old view. Human scope revocation
-also ignores the displayed observation. A bounded urgent slot admits these
-stop/revoke actions ahead of ordinary queued work, without preempting a backend
-call already in flight. Local GUI execution remains synchronous until step 2;
-unmigrated tools retain the existing adapter path.
+also ignores the displayed observation. Separate bounded human and protocol
+urgent slots admit stop/revoke ahead of ordinary work, taking the human slot
+first, without preempting a backend call already in flight. Unmigrated tools
+retain the existing adapter path.
+
+The first native-owner slice starts the worker before local live GUI attach or
+launch. That thread establishes ptrace, executes controls, prepares immutable
+views, serves protocol peers and tears down the native process family. The
+same publication-only frame loop serves native and remote debugger windows;
+native targets cannot be transferred after creation, and dispatch rejects a
+different OS thread. Linux tracer membership compares against the owner task
+ID, not the process leader. Native sessions do not offer remote reconnect.
+
+Migration boundaries: native headless CLI, retained offline/investigation
+workspaces and the separate `--redot-debugger` scene adapter retain their
+existing lifecycles in this slice. In particular, there is not yet a scene
+publication adapter; enabling the scene debugger preserves its existing UI.
+These are explicit follow-ups, not a user-selectable legacy debugger mode.
+
+`gui-local-owner` holds an actual native register read with an owned test
+interposer and requires the watch editor to repaint before release. It checks
+the kernel tracer ID, measures step/input latency and CPU/RSS, and retains
+publication assembly/copy time, copied bytes and queue depth from opt-in input
+tracing. `--baseline` measures a prior binary; `--expect-blocked` proves that
+binary fails the same repaint property. Timings include the input driver and
+are evidence, not absolute performance gates; overloaded hosts are labelled
+not measurable. The C target suite also launches and attaches on a worker.
+
+`scripts/gen-command-decode` generates the migrated tools' typed JSON input
+decoder from `base_tools.json`; `mcp/commands.zig` only maps those values to model
+operations and encodes replies. The `command-decode` gate rejects stale output
+and tests changed schema limits/required fields. After a catalog edit, regenerate
+with `python3 scripts/gen-command-decode`.
+
+For behavioral comparisons, use `scripts/release-check host --compare-binary
+./before/xodb` (optionally `--compare-agent ./before/xodb-agent`). This opt-in
+step runs the same owned-fixture command sequence against both binaries and
+compares errors, reply shapes, stop locations relative to the fixture symbol,
+source lines, state and audit actions. Raw observations and stderr stay in the
+step's work directory. The always-registered comparison self-test rejects
+changed stop/error facts and incomplete transcripts. No installed binary or
+interactive desktop is selected implicitly.
 
 ## 3. Other items found while working this week
 

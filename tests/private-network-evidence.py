@@ -190,13 +190,35 @@ for ordinal, session in enumerate(sessions):
             client_seq += len(data)
         else:
             server_seq += len(data)
+    session['client_final_seq'] = client_seq
+    session['server_final_seq'] = server_seq
 packets.sort(key=lambda row: row[0])
-pcapng = block(0x0a0d0d0a, struct.pack('<IHHq', 0x1a2b3c4d, 1, 0, -1))
-pcapng += block(1, struct.pack('<HHI', 1, 0, 65535) + option(2, b'lo') + option(9, b'\x09') + option(0, b''))
-for when, packet in packets:
-    pcapng += block(6, struct.pack('<IIIII', 0, when >> 32, when & 0xffffffff, len(packet), len(packet)) + packet)
+
+
+def write_capture(path, rows):
+    pcapng = block(0x0a0d0d0a, struct.pack('<IHHq', 0x1a2b3c4d, 1, 0, -1))
+    pcapng += block(1, struct.pack('<HHI', 1, 0, 65535) + option(2, b'lo') + option(9, b'\x09') + option(0, b''))
+    for when, packet in sorted(rows, key=lambda row: row[0]):
+        pcapng += block(6, struct.pack('<IIIII', 0, when >> 32, when & 0xffffffff, len(packet), len(packet)) + packet)
+    path.write_bytes(pcapng)
+
+
 capture = work / 'owned-tls.pcapng'
-capture.write_bytes(pcapng)
+write_capture(capture, packets)
+partial_capture = work / 'owned-tls-partial.pcapng'
+partial_packets = list(packets)
+partial = sessions[0]
+partial_packets.append((max(row[0] for row in packets) + 1000,
+                        ethernet_tcp(partial['server_port'], partial['client_port'],
+                                     partial['server_final_seq'], partial['client_final_seq'], 0x18, b'\x16')))
+write_capture(partial_capture, partial_packets)
+# Both directions malformed: malformed_directions must count to 2 (a u1 sum
+# once aborted ReleaseSafe here).
+both_capture = work / 'owned-tls-both-malformed.pcapng'
+write_capture(both_capture, partial_packets + [
+    (max(row[0] for row in packets) + 2000,
+     ethernet_tcp(partial['client_port'], partial['server_port'],
+                  partial['client_final_seq'], partial['server_final_seq'] + 1, 0x18, b'\x17\x03\x03\xff\xff'))])
 
 
 def close_and_check(client, private_values):
@@ -209,11 +231,12 @@ def close_and_check(client, private_values):
 observer = Client('observe', None, options=['--open-pcap', str(capture), '--tls-key-log', str(keylog)])
 try:
     streams = observer.inspect('list_streams')['streams']
-    assert [stream['kind'] for stream in streams] == ['network', 'tls'], streams
+    assert [stream['kind'] for stream in streams] == ['network', 'tls', 'protocol'], streams
     tls_stream = streams[1]
     assert {session['tls_version'] for session in tls_stream['sessions']} == {'tls12', 'tls13'}, tls_stream
     assert all(session['state'] == 'decrypted' for session in tls_stream['sessions']), tls_stream
     rows = observer.inspect('query_stream', stream_id=tls_stream['stream_id'], state='decrypted', include_raw=True, limit=256)['records']
+    assert rows and all(row['plaintext']['sha256'] is not None for row in rows), rows
     by_flow = {}
     for row in rows:
         if row['content_type'] != 'application_data':
@@ -226,10 +249,28 @@ try:
 finally:
     close_and_check(observer, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
+partial_client = Client('observe', None, options=['--open-pcap', str(partial_capture), '--tls-key-log', str(keylog)])
+try:
+    tls_stream = partial_client.inspect('list_streams')['streams'][1]
+    affected = [session for session in tls_stream['sessions'] if session['tls_version'] == 'tls13']
+    assert len(affected) == 1 and affected[0]['state'] == 'partial' and affected[0]['malformed_directions'] == 1, tls_stream
+finally:
+    close_and_check(partial_client, [session['request'] for session in sessions] + [session['response'] for session in sessions])
+
+both_client = Client('observe', None, options=['--open-pcap', str(both_capture), '--tls-key-log', str(keylog)])
+try:
+    tls_stream = both_client.inspect('list_streams')['streams'][1]
+    affected = [session for session in tls_stream['sessions'] if session['tls_version'] == 'tls13']
+    assert len(affected) == 1 and affected[0]['state'] == 'partial' and affected[0]['malformed_directions'] == 2, tls_stream
+finally:
+    close_and_check(both_client, [session['request'] for session in sessions] + [session['response'] for session in sessions])
+
 controller = Client('control', None, options=['--open-pcap', str(capture), '--tls-key-log', str(keylog)])
 try:
     denied = controller.tool('query_stream', stream_id=2, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
+    metadata = controller.inspect('query_stream', stream_id=2)['records']
+    assert metadata and all(row['plaintext']['sha256'] is None for row in metadata), metadata
 finally:
     close_and_check(controller, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
@@ -263,6 +304,9 @@ try:
         wire.flush()
         denied = remote_call(2, 'tools/call', {'name': 'query_stream', 'arguments': {'stream_id': 2, 'include_raw': True}})
         assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
+        metadata = remote_call(3, 'tools/call', {'name': 'query_stream', 'arguments': {'stream_id': 2}})
+        rows = metadata['result']['structuredContent']['records']
+        assert rows and all(row['plaintext']['sha256'] is None for row in rows), metadata
 finally:
     if listener.poll() is None:
         listener.send_signal(signal.SIGINT)
@@ -292,11 +336,11 @@ shared_peer = None
 try:
     shared_peer = shared.Client(shared_host, 'x3-shared-observer')
     shared_streams = shared_peer.tool('list_streams')['streams']
-    assert [stream['kind'] for stream in shared_streams] == ['network', 'tls'], shared_streams
+    assert [stream['kind'] for stream in shared_streams] == ['network', 'tls', 'protocol'], shared_streams
     denied = shared_peer.raw('query_stream', stream_id=2, include_raw=True)
     shared.expect_error(denied, 'PrivateEvidenceUnavailable')
     metadata = shared_peer.tool('query_stream', stream_id=2, state='decrypted')['records']
-    assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] for row in metadata)
+    assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] is None for row in metadata)
 finally:
     if shared_peer is not None:
         shared_peer.close()
@@ -313,7 +357,7 @@ try:
     denied = redacted.tool('query_stream', stream_id=2, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'RawPayloadRedacted', denied
     metadata = redacted.inspect('query_stream', stream_id=2, state='decrypted')['records']
-    assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] for row in metadata)
+    assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] is None for row in metadata)
 finally:
     close_and_check(redacted, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
@@ -360,6 +404,8 @@ try:
     assert len(rows) == 1 and bytes.fromhex(rows[0]['request']['message']['content_hex']) == request_body
     assert bytes.fromhex(rows[0]['response']['message']['content_hex']) == response_body
     assert rows[0]['response']['status_code'] == 201
+    assert rows[0]['request']['message']['content']['sha256'] is not None
+    assert rows[0]['response']['message']['content']['sha256'] is not None
 finally:
     close_and_check(mitm_client, [request_body, response_body])
 
@@ -370,6 +416,8 @@ try:
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
     row = mitm_controller.inspect('query_stream')['records'][0]
     assert row['request']['method'] is None and 'content_hex' not in row['request']['message']
+    assert row['request']['message']['content']['sha256'] is None
+    assert row['response']['message']['content']['sha256'] is None
 finally:
     close_and_check(mitm_controller, [request_body, response_body])
 
@@ -380,6 +428,8 @@ try:
     row = mitm_redacted.inspect('query_stream')['records'][0]
     assert row['request']['host'] is None and row['request']['path'] is None
     assert row['request']['message']['headers'] == [] and 'content_hex' not in row['request']['message']
+    assert row['request']['message']['content']['sha256'] is None
+    assert row['response']['message']['content']['sha256'] is None
 finally:
     close_and_check(mitm_redacted, [request_body, response_body])
 

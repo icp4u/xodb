@@ -71,7 +71,7 @@ struct pw { uint32_t uid; char name[32]; };
  * replacement with the same PID. Failed/uncached opens retain the slow path. */
 #define PROC_STAT_SLOTS 4096
 struct proc_stat_fd { int32_t pid; int fd; uint64_t seen; };
-struct topo { struct xrt_sys_u64 package_id, die_id, core_id, l3_id, smt_index; struct xrt_sys_f64 fmin, fmax; uint8_t done; };
+struct topo { struct xrt_sys_u64 package_id, die_id, core_id, l3_id, smt_index, cluster_id, capacity; struct xrt_sys_f64 fmin, fmax; uint8_t done; };
 
 struct xrt_sys {
     struct xrt_sys_limits lim;
@@ -107,6 +107,9 @@ struct xrt_sys {
     uint64_t rapl_prev, rapl_range;
     int64_t rapl_mono;
     uint8_t rapl_have;
+    uint64_t gpu_engine_ns[XRT_SYS_MAX_GPUS];
+    uint8_t gpu_engine_have[XRT_SYS_MAX_GPUS];
+    int64_t gpu_engine_mono;
     /* processes from the previous sample, sorted by pid */
     struct xrt_sys_proc *prev;
     uint32_t prev_count;
@@ -691,6 +694,10 @@ static void read_topology(struct xrt_sys *s, uint32_t cpu, struct topo *t)
     get_u64(s, &t->core_id, p);
     snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%u/cache/index3/id", cpu);
     get_u64(s, &t->l3_id, p);
+    snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%u/topology/cluster_id", cpu);
+    get_u64(s, &t->cluster_id, p);
+    snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
+    get_u64(s, &t->capacity, p);
     ssize_t n = rdf(s, b, sizeof b, "/sys/devices/system/cpu/cpu%u/topology/thread_siblings_list", cpu);
     if (n < 0) NA(t->smt_index, why_errno((int)-n));
     else {
@@ -715,6 +722,41 @@ static void read_topology(struct xrt_sys *s, uint32_t cpu, struct topo *t)
     snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%u/cpufreq/cpuinfo_max_freq", cpu);
     get_f64(s, &t->fmax, p, 1e-3);
     t->done = 1;
+}
+
+/* Highest cpu_capacity is the performance class; a lower class is efficiency.
+ * Appended only when both exist and the 64-byte model name still fits. */
+static void append_pe(struct xrt_sys *s, char *name, size_t cap)
+{
+    uint32_t caps[64];
+    uint32_t n = 0, miss = 0;
+    int seen = 0;
+    for (uint32_t cpu = 0; cpu < 256 && n < COUNT_OF(caps); ++cpu) {
+        char p[96];
+        int64_t v;
+        snprintf(p, sizeof p, "/sys/devices/system/cpu/cpu%u/cpu_capacity", cpu);
+        if (read_i64(s, p, &v) != 0 || v < 0) {
+            if (seen && ++miss >= 8) break;
+            continue;
+        }
+        seen = 1;
+        miss = 0;
+        caps[n++] = (uint32_t)v;
+    }
+    if (n < 2) return;
+    uint32_t mx = caps[0], hi = 0, lo = 0;
+    for (uint32_t i = 1; i < n; ++i)
+        if (caps[i] > mx) mx = caps[i];
+    for (uint32_t i = 0; i < n; ++i) {
+        if (caps[i] == mx) hi++;
+        else lo++;
+    }
+    if (!hi || !lo) return;
+    char extra[48];
+    int el = snprintf(extra, sizeof extra, ", %u P-cores + %u E-cores", hi, lo);
+    size_t have = strlen(name);
+    if (el < 0 || have + (size_t)el + 1 > cap) return;
+    memcpy(name + have, extra, (size_t)el + 1);
 }
 
 static void cpu_model(struct xrt_sys *s, struct xrt_sys_name *model)
@@ -745,7 +787,23 @@ static void cpu_model(struct xrt_sys *s, struct xrt_sys_name *model)
             }
         }
     }
-    na_name(model, XRT_SYS_WHY_NOT_PRESENT);
+    /* arm64 cpuinfo has no model name. The device-tree model is the board name. */
+    char dt[128];
+    ssize_t dn = rd(s, "/proc/device-tree/model", dt, sizeof dt);
+    if (dn < 0 || !dt[0]) {
+        na_name(model, XRT_SYS_WHY_NOT_PRESENT);
+        return;
+    }
+    dt[sizeof dt - 1] = 0;
+    trim(dt);
+    if (!dt[0]) {
+        na_name(model, XRT_SYS_WHY_NOT_PRESENT);
+        return;
+    }
+    char name[64];
+    copy_str(name, sizeof name, dt);
+    append_pe(s, name, sizeof name);
+    set_name(model, name);
 }
 
 static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
@@ -762,7 +820,7 @@ static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
     get_name(s, &c->freq_driver, "/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver");
     get_name(s, &c->governor, "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor");
     get_name(s, &c->epp, "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference");
-    uint64_t pk_seen = 0, l3_seen[8] = {0}, cores = 0, pk_ok = 1, l3_ok = 1;
+    uint64_t pk_seen = 0, l3_seen[8] = {0}, cl_seen[8] = {0}, cores = 0, pk_ok = 1, l3_ok = 1, cl_ok = 1;
     for (uint32_t i = 0; i < c->count; ++i) {
         struct xrt_sys_cpu *u = &c->cpu[i];
         struct topo *t = &s->topo[i];
@@ -775,6 +833,8 @@ static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
             NA(u->core_id, XRT_SYS_WHY_NOT_PRESENT);
             NA(u->l3_id, XRT_SYS_WHY_NOT_PRESENT);
             NA(u->smt_index, XRT_SYS_WHY_NOT_PRESENT);
+            NA(u->cluster_id, XRT_SYS_WHY_NOT_PRESENT);
+            NA(u->capacity, XRT_SYS_WHY_NOT_PRESENT);
             NA(u->temp_c, XRT_SYS_WHY_NOT_PRESENT);
             continue;
         }
@@ -789,23 +849,32 @@ static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
         u->core_id = t->core_id;
         u->l3_id = t->l3_id;
         u->smt_index = t->smt_index;
+        u->cluster_id = t->cluster_id;
+        u->capacity = t->capacity;
         NA(u->temp_c, XRT_SYS_WHY_NOT_PRESENT);
         if (ISOK(t->package_id) && t->package_id.v < 64) pk_seen |= 1ull << t->package_id.v;
         else pk_ok = 0;
         if (ISOK(t->l3_id) && t->l3_id.v < 512) l3_seen[t->l3_id.v / 64] |= 1ull << (t->l3_id.v % 64);
         else l3_ok = 0;
+        if (ISOK(t->cluster_id) && t->cluster_id.v < 512) cl_seen[t->cluster_id.v / 64] |= 1ull << (t->cluster_id.v % 64);
+        else cl_ok = 0;
         if (ISOK(t->smt_index) && t->smt_index.v == 0) cores++;
     }
     if (pk_ok && pk_seen) OK(c->packages, (uint64_t)__builtin_popcountll(pk_seen));
     else NA(c->packages, XRT_SYS_WHY_NOT_PRESENT);
-    uint64_t l3 = 0;
-    for (int i = 0; i < 8; ++i) l3 += (uint64_t)__builtin_popcountll(l3_seen[i]);
+    uint64_t l3 = 0, cl = 0;
+    for (int i = 0; i < 8; ++i) {
+        l3 += (uint64_t)__builtin_popcountll(l3_seen[i]);
+        cl += (uint64_t)__builtin_popcountll(cl_seen[i]);
+    }
     if (l3_ok && l3) OK(c->l3_groups, l3);
+    else if (!l3_ok && cl_ok && cl) OK(c->l3_groups, cl); /* cluster count stands in; the JSON key stays l3_groups */
     else NA(c->l3_groups, XRT_SYS_WHY_NOT_PRESENT);
     if (cores) OK(c->cores, cores);
     else NA(c->cores, XRT_SYS_WHY_NOT_PRESENT);
-    /* CPU temperatures from hwmon (k10temp, zenpower, coretemp). */
+    /* CPU temperatures from hwmon (k10temp, zenpower, coretemp), else macsmc clusters. */
     NA(c->package_temp_c, XRT_SYS_WHY_NOT_PRESENT);
+    c->package_temp_label[0] = 0;
     c->temp_count = 0;
     for (uint32_t i = 0; i < snap->power.sensor_count; ++i) {
         struct xrt_sys_sensor *x = &snap->power.sensor[i];
@@ -829,6 +898,44 @@ static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
         if (sscanf(x->label, "Core %d", &core) == 1)
             for (uint32_t k = 0; k < c->count; ++k)
                 if (ISOK(c->cpu[k].core_id) && c->cpu[k].core_id.v == (uint64_t)core) c->cpu[k].temp_c = x->value;
+    }
+    /* Cluster sensors are not one-per-core. Keep them on the CPU temp list and
+     * name the hottest P-cluster (else E-cluster) instead of calling it a package. */
+    if (c->package_temp_c.st != XRT_SYS_OK) {
+        double best_p = -1e9, best_e = -1e9;
+        char lab_p[48] = {0}, lab_e[48] = {0};
+        struct xrt_sys_f64 val_p = {0}, val_e = {0};
+        for (uint32_t i = 0; i < snap->power.sensor_count; ++i) {
+            struct xrt_sys_sensor *x = &snap->power.sensor[i];
+            int pcluster = !strcmp(x->chip, "macsmc_hwmon") && !strncmp(x->label, "P-cluster Temperature", 21);
+            int ecluster = !strcmp(x->chip, "macsmc_hwmon") && !strncmp(x->label, "E-cluster Temperature", 21);
+            if (x->kind != XRT_SYS_TEMP || (!pcluster && !ecluster)) continue;
+            if (c->temp_count < COUNT_OF(c->temps)) {
+                struct xrt_sys_reading *r = &c->temps[c->temp_count++];
+                memset(r, 0, sizeof *r);
+                copy_str(r->chip, sizeof r->chip, x->chip);
+                copy_str(r->label, sizeof r->label, x->label);
+                r->value = x->value;
+            }
+            if (!ISOK(x->value)) continue;
+            if (pcluster && x->value.v > best_p) {
+                best_p = x->value.v;
+                val_p = x->value;
+                copy_str(lab_p, sizeof lab_p, x->label);
+            }
+            if (ecluster && x->value.v > best_e) {
+                best_e = x->value.v;
+                val_e = x->value;
+                copy_str(lab_e, sizeof lab_e, x->label);
+            }
+        }
+        if (lab_p[0]) {
+            c->package_temp_c = val_p;
+            copy_str(c->package_temp_label, sizeof c->package_temp_label, lab_p);
+        } else if (lab_e[0]) {
+            c->package_temp_c = val_e;
+            copy_str(c->package_temp_label, sizeof c->package_temp_label, lab_e);
+        }
     }
 }
 
@@ -901,6 +1008,34 @@ static void collect_memory(struct xrt_sys *s, struct xrt_sys_snapshot *snap, dou
 }
 
 /* ---- disks ---- */
+/* True when mountinfo names this whole device or a partition of it. */
+static int mount_uses(const char *info, const char *name)
+{
+    char key[48];
+    int kn = snprintf(key, sizeof key, "/dev/%s", name);
+    if (kn <= 0 || (size_t)kn >= sizeof key) return 0;
+    for (const char *q = info; (q = strstr(q, key)); q += (size_t)kn) {
+        char c = q[kn];
+        if (c == 0 || c == ' ' || c == '\t' || c == 'p' || c == '\n') return 1;
+    }
+    return 0;
+}
+/* Hide an nvme namespace when a sibling namespace of the same controller is mounted and this one is not. */
+static int hide_namespace(const char *name, const char *info, char **blocks, size_t nb)
+{
+    if (strncmp(name, "nvme", 4) || !info || !blocks) return 0;
+    const char *ns = strchr(name + 4, 'n');
+    if (!ns || ns == name + 4) return 0;
+    size_t cl = (size_t)(ns - name);
+    if (cl >= 16) return 0;
+    if (mount_uses(info, name)) return 0;
+    for (size_t i = 0; i < nb; ++i) {
+        if (!strcmp(blocks[i], name)) continue;
+        if (strncmp(blocks[i], name, cl) || blocks[i][cl] != 'n') continue;
+        if (mount_uses(info, blocks[i])) return 1;
+    }
+    return 0;
+}
 static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, double dt, int have_dt)
 {
     struct xrt_sys_disks *d = &snap->disks;
@@ -908,6 +1043,11 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
     int err;
     char **blocks = list_dir(s, "/sys/block", &nb, &err);
     if (!blocks && err) fail(&snap->group[XRT_SYS_G_DISKS], err, "/sys/block");
+    char *mntinfo = malloc(65536);
+    if (mntinfo) {
+        ssize_t mn = rd(s, "/proc/self/mountinfo", mntinfo, 65536);
+        if (mn < 0) mntinfo[0] = 0;
+    }
     ssize_t n = rd(s, "/proc/diskstats", s->buf, sizeof s->buf);
     if (n < 0) fail(&snap->group[XRT_SYS_G_DISKS], (int)-n, "/proc/diskstats");
     struct disk_prev next_prev[XRT_SYS_MAX_DISKS];
@@ -953,6 +1093,7 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
         if ((!strncmp(name, "loop", 4) || !strncmp(name, "ram", 3) || !strncmp(name, "nbd", 3)) &&
             (!ISOK(k->size_bytes) || !k->size_bytes.v))
             continue; /* unattached */
+        if (mntinfo && hide_namespace(name, mntinfo, blocks, nb)) continue;
         d->count++;
         OK(k->read_bytes, f[2] * 512);
         OK(k->write_bytes, f[6] * 512);
@@ -977,7 +1118,9 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
             uint64_t ops = (now[0] - o[0]) + (now[4] - o[4]);
             uint64_t ms = (now[3] - o[3]) + (now[7] - o[7]);
             if (ops) OK(k->avg_latency_ms, (double)ms / (double)ops);
-            else NA(k->avg_latency_ms, XRT_SYS_WHY_NOT_PRESENT); /* no operation completed */
+            else if (now[0] + now[4]) /* idle interval: the counters exist, so use them since boot */
+                OK(k->avg_latency_ms, (double)(now[3] + now[7]) / (double)(now[0] + now[4]));
+            else NA(k->avg_latency_ms, XRT_SYS_WHY_NOT_PRESENT); /* counter present, no completion yet */
         }
         NA(k->temp_c, XRT_SYS_WHY_NOT_PRESENT);
         for (uint32_t i = 0; i < snap->power.sensor_count && i < s->sensor_count; ++i) {
@@ -1001,6 +1144,7 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
     }
     memcpy(s->disk_prev, next_prev, next_count * sizeof next_prev[0]);
     s->disk_prev_count = next_count;
+    free(mntinfo);
     free_list(blocks, nb);
     psi_read(s, 2, &d->psi, dt, have_dt);
 }
@@ -1960,6 +2104,202 @@ static void collect_connections(struct xrt_sys *s, struct xrt_sys_snapshot *snap
 }
 
 /* ---- power: GPUs, RAPL, supplies ---- */
+static int apple_drm(const char *drv)
+{
+    return !strcmp(drv, "asahi") || !strcmp(drv, "apple") || !strcmp(drv, "apple-drm");
+}
+struct gpu_acc { uint64_t ns, bytes; uint8_t have_ns, have_bytes; };
+/* drm-usage-stats value: "<uint> ns" for engines, "<uint> [KiB|MiB]" for memory. */
+static int drm_value(const char *val, unsigned long long *v)
+{
+    char *end;
+    errno = 0;
+    unsigned long long x = strtoull(val, &end, 10);
+    if (end == val || errno) return 0;
+    while (*end == ' ') end++;
+    if (!strncmp(end, "KiB", 3)) x <<= 10;
+    else if (!strncmp(end, "MiB", 3)) x <<= 20;
+    *v = x;
+    return 1;
+}
+static void fdinfo_add(struct xrt_sys *s, const char *path, struct gpu_acc *a)
+{
+    char b[4096];
+    if (rd(s, path, b, sizeof b) < 0) return;
+    /* drm-memory-* is the legacy spelling; a driver printing both must not count twice. */
+    unsigned long long total = 0, legacy = 0;
+    int have_total = 0, have_legacy = 0;
+    for (char *line = b; *line;) {
+        char *nl = strchr(line, '\n');
+        if (nl) *nl++ = 0;
+        else nl = line + strlen(line);
+        char *colon = strchr(line, ':');
+        if (colon && !strncmp(line, "drm-", 4)) {
+            *colon = 0;
+            char *val = colon + 1;
+            while (*val == ' ' || *val == '\t') val++;
+            unsigned long long v = 0;
+            if (!strstr(line, "capacity") && !strncmp(line, "drm-engine-", 11) && drm_value(val, &v)) {
+                a->ns += v;
+                a->have_ns = 1;
+            } else if (!strncmp(line, "drm-total-", 10) && drm_value(val, &v)) {
+                total += v;
+                have_total = 1;
+            } else if (!strncmp(line, "drm-memory-", 11) && drm_value(val, &v)) {
+                legacy += v;
+                have_legacy = 1;
+            }
+        }
+        line = nl;
+    }
+    if (have_total || have_legacy) {
+        a->bytes += have_total ? total : legacy;
+        a->have_bytes = 1;
+    }
+}
+static void apple_gpu_gap(struct xrt_sys_power *p)
+{
+    for (uint32_t i = 0; i < p->gpu_count; ++i) {
+        struct xrt_sys_gpu *u = &p->gpu[i];
+        if (!apple_drm(u->driver)) continue;
+        if (!ISOK(u->busy_pct) && u->busy_pct.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->busy_pct, XRT_SYS_WHY_NOT_SUPPORTED);
+        if (!ISOK(u->vram_used) && u->vram_used.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->vram_used, XRT_SYS_WHY_NOT_SUPPORTED);
+        if (!ISOK(u->vram_total) && u->vram_total.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->vram_total, XRT_SYS_WHY_NOT_SUPPORTED);
+    }
+}
+static void gpu_apply(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sys_group *g, const struct gpu_acc *acc, int denied)
+{
+    int64_t now = mono_ns();
+    for (uint32_t i = 0; i < p->gpu_count && i < XRT_SYS_MAX_GPUS; ++i) {
+        struct xrt_sys_gpu *u = &p->gpu[i];
+        if (!apple_drm(u->driver) || ISOK(u->busy_pct)) continue;
+        if (acc[i].have_bytes && !ISOK(u->vram_used)) OK(u->vram_used, acc[i].bytes);
+        if (acc[i].have_ns) {
+            if (!s->gpu_engine_have[i]) NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
+            else if (acc[i].ns < s->gpu_engine_ns[i]) NA(u->busy_pct, XRT_SYS_WHY_COUNTER_RESET);
+            else {
+                double sec = (double)(now - s->gpu_engine_mono) * 1e-9;
+                if (sec > 0) {
+                    double pct = (double)(acc[i].ns - s->gpu_engine_ns[i]) / (sec * 1e9) * 100.0;
+                    if (pct > 100) pct = 100;
+                    OK(u->busy_pct, pct);
+                } else NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
+            }
+            s->gpu_engine_ns[i] = acc[i].ns;
+            s->gpu_engine_have[i] = 1;
+        }
+    }
+    s->gpu_engine_mono = now;
+    apple_gpu_gap(p);
+    if (denied || s->euid != 0) detail(g, 0, "GPU counters: own processes only");
+}
+/* Live only: a fixture root must not walk the host proc. Bounded so one sample cannot scan the whole machine. */
+static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sys_group *g)
+{
+    struct gpu_acc acc[XRT_SYS_MAX_GPUS] = {{0}};
+    struct gpu_acc loose = {0};
+    int targets = 0;
+    for (uint32_t i = 0; i < p->gpu_count; ++i)
+        if (apple_drm(p->gpu[i].driver) && !ISOK(p->gpu[i].busy_pct)) targets++;
+    int denied = 0, procs = 0;
+    int pfd = sys_open(s, "/proc", O_DIRECTORY);
+    DIR *d = pfd < 0 ? NULL : fdopendir(pfd);
+    if (!d) {
+        if (pfd >= 0) sys_close(s, pfd);
+        gpu_apply(s, p, g, acc, 1);
+        return;
+    }
+    struct dirent *e;
+    s->syscalls++;
+    while ((e = readdir(d)) && procs < 512) {
+        if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
+        procs++;
+        char rel[64];
+        if ((size_t)snprintf(rel, sizeof rel, "%s/fd", e->d_name) >= sizeof rel) continue;
+        int fdd = sys_openat(s, dirfd(d), rel, O_DIRECTORY);
+        if (fdd < 0) {
+            if (errno == EACCES || errno == EPERM) denied = 1;
+            continue;
+        }
+        DIR *fds = fdopendir(fdd);
+        if (!fds) {
+            sys_close(s, fdd);
+            continue;
+        }
+        int nfd = 0;
+        struct dirent *fe;
+        s->syscalls++;
+        while ((fe = readdir(fds)) && nfd < 64) {
+            if (fe->d_name[0] == '.') continue;
+            nfd++;
+            char link[128], lrel[96];
+            if ((size_t)snprintf(lrel, sizeof lrel, "%s/fd/%s", e->d_name, fe->d_name) >= sizeof lrel) continue;
+            s->syscalls++;
+            ssize_t ln = readlinkat(dirfd(d), lrel, link, sizeof link - 1);
+            if (ln <= 0) continue;
+            link[ln] = 0;
+            int which = -1;
+            unsigned card = 0;
+            char tail;
+            const char *cp = strstr(link, "/dev/dri/card");
+            if (cp && sscanf(cp, "/dev/dri/card%u%c", &card, &tail) == 1) {
+                char cardname[16];
+                snprintf(cardname, sizeof cardname, "card%u", card);
+                for (uint32_t i = 0; i < p->gpu_count; ++i)
+                    if (!strcmp(p->gpu[i].card, cardname)) which = (int)i;
+            } else if (strstr(link, "/dev/dri/renderD")) which = -2;
+            else continue;
+            char info[96];
+            if ((size_t)snprintf(info, sizeof info, "/proc/%s/fdinfo/%s", e->d_name, fe->d_name) >= sizeof info) continue;
+            struct gpu_acc one = {0};
+            fdinfo_add(s, info, &one);
+            struct gpu_acc *dst = NULL;
+            if (which >= 0) dst = &acc[which];
+            else if (which == -2) dst = &loose;
+            if (!dst) continue;
+            dst->ns += one.ns;
+            dst->bytes += one.bytes;
+            dst->have_ns = (uint8_t)(dst->have_ns | one.have_ns);
+            dst->have_bytes = (uint8_t)(dst->have_bytes | one.have_bytes);
+        }
+        closedir(fds);
+    }
+    closedir(d);
+    if (targets == 1 && (loose.have_ns || loose.have_bytes)) {
+        for (uint32_t i = 0; i < p->gpu_count; ++i) {
+            if (!apple_drm(p->gpu[i].driver) || ISOK(p->gpu[i].busy_pct)) continue;
+            if (!acc[i].have_ns && loose.have_ns) {
+                acc[i].ns = loose.ns;
+                acc[i].have_ns = 1;
+            }
+            if (!acc[i].have_bytes && loose.have_bytes) {
+                acc[i].bytes = loose.bytes;
+                acc[i].have_bytes = 1;
+            }
+            break;
+        }
+    }
+    gpu_apply(s, p, g, acc, denied);
+}
+/* dGPUs export mem_busy_percent and mem_info_vram_vendor; amdgpu hides both on APUs. */
+static int amdgpu_apu(struct xrt_sys *s, const char *card)
+{
+    char b[32];
+    return rdf(s, b, sizeof b, "/sys/class/drm/%s/device/mem_busy_percent", card) == -ENOENT &&
+           rdf(s, b, sizeof b, "/sys/class/drm/%s/device/mem_info_vram_vendor", card) == -ENOENT;
+}
+static int system_power(struct xrt_sys_snapshot *snap, struct xrt_sys_power *p)
+{
+    for (uint32_t i = 0; i < snap->power.sensor_count; ++i) {
+        struct xrt_sys_sensor *x = &snap->power.sensor[i];
+        if (x->kind != XRT_SYS_POWER_W || !ISOK(x->value)) continue;
+        if (strcmp(x->label, "Total System Power") && !strstr(x->label, "System Power") && !strstr(x->label, "SoC Power")) continue;
+        OK(p->cpu_package_w, x->value.v);
+        copy_str(p->cpu_power_label, sizeof p->cpu_power_label, x->label);
+        return 1;
+    }
+    return 0;
+}
 static void collect_power(struct xrt_sys *s, struct xrt_sys_snapshot *snap, double dt)
 {
     struct xrt_sys_power *p = &snap->power;
@@ -2025,13 +2365,33 @@ static void collect_power(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
         }
     }
     free_list(drm, n);
-    /* RAPL package energy */
+    {
+        int apple_gap = 0;
+        for (uint32_t i = 0; i < p->gpu_count; ++i)
+            if (apple_drm(p->gpu[i].driver) && !ISOK(p->gpu[i].busy_pct)) apple_gap = 1;
+        if (apple_gap && s->live) gpu_fdinfo(s, p, g);
+        else if (apple_gap) apple_gpu_gap(p);
+    }
+    /* RAPL package energy, or a labelled system/SoC power input when RAPL is absent. */
+    p->cpu_power_label[0] = 0;
     char b[64];
     ssize_t r = rd(s, "/sys/class/powercap/intel-rapl:0/energy_uj", b, sizeof b);
     if (r < 0) {
-        NA(p->cpu_package_w, why_errno((int)-r));
-        if (-r == EACCES || -r == EPERM) detail(g, (int)-r, "RAPL energy_uj: permission denied (root only)");
+        int err = (int)-r;
         s->rapl_have = 0;
+        if (err == EACCES || err == EPERM) {
+            NA(p->cpu_package_w, XRT_SYS_WHY_NEEDS_PRIVILEGE);
+            detail(g, err, "RAPL energy_uj: permission denied (root only)");
+        } else if (!system_power(snap, p)) {
+            char arch[32] = {0};
+            ssize_t an = rd(s, "/proc/sys/kernel/arch", arch, sizeof arch);
+            if (an >= 0) trim(arch);
+            if ((err == ENOENT || err == ENOTDIR || err == ENODEV || err == ENXIO) && an >= 0 && !strcmp(arch, "aarch64"))
+                NA(p->cpu_package_w, XRT_SYS_WHY_NOT_SUPPORTED);
+            else if (err == ENOENT || err == ENOTDIR || err == ENODEV || err == ENXIO)
+                NA(p->cpu_package_w, XRT_SYS_WHY_NOT_PRESENT);
+            else NA(p->cpu_package_w, why_errno(err));
+        }
     } else {
         uint64_t e = strtoull(b, NULL, 10);
         int64_t now = mono_ns();
@@ -2049,6 +2409,18 @@ static void collect_power(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
         s->rapl_prev = e;
         s->rapl_mono = now;
         s->rapl_have = 1;
+    }
+    /* O01d: an amdgpu APU's hwmon power is socket (package) PPT, not GPU power.
+     * Use it as package power when RAPL gave nothing; the GPU has no reading of its own. */
+    for (uint32_t i = 0; i < p->gpu_count; ++i) {
+        struct xrt_sys_gpu *u = &p->gpu[i];
+        if (strcmp(u->driver, "amdgpu") || !ISOK(u->power_w) || !amdgpu_apu(s, u->card)) continue;
+        if (!ISOK(p->cpu_package_w) && p->cpu_package_w.why != XRT_SYS_WHY_FIRST_SAMPLE) {
+            p->cpu_package_w = u->power_w;
+            copy_str(p->cpu_power_label, sizeof p->cpu_power_label, "APU package power (amdgpu)");
+        }
+        NA(u->power_w, XRT_SYS_WHY_NOT_PRESENT);
+        break;
     }
     (void)dt;
     /* power supplies */
@@ -3236,6 +3608,7 @@ char *xrt_sys_json(const struct xrt_sys_snapshot *snap, const struct xrt_sys_jso
         ju(&b, "l3_groups", &c->l3_groups);
         jtimes(&b, "total", &c->total);
         jf(&b, "package_temp_c", &c->package_temp_c);
+        if (c->package_temp_label[0]) js(&b, "package_temp_label", c->package_temp_label);
         jpsi(&b, "psi", &c->psi);
         jopen(&b, "temps", '[');
         for (uint32_t i = 0; i < c->temp_count; ++i) {
@@ -3261,6 +3634,8 @@ char *xrt_sys_json(const struct xrt_sys_snapshot *snap, const struct xrt_sys_jso
             ju(&b, "core_id", &u->core_id);
             ju(&b, "l3_id", &u->l3_id);
             ju(&b, "smt_index", &u->smt_index);
+            ju(&b, "cluster_id", &u->cluster_id);
+            ju(&b, "capacity", &u->capacity);
             jf(&b, "temp_c", &u->temp_c);
             jclose(&b, '}');
         }
@@ -3414,6 +3789,7 @@ char *xrt_sys_json(const struct xrt_sys_snapshot *snap, const struct xrt_sys_jso
         const struct xrt_sys_power *p = &snap->power;
         jopen(&b, "power", '{');
         jf(&b, "cpu_package_w", &p->cpu_package_w);
+        if (p->cpu_power_label[0]) js(&b, "cpu_power_label", p->cpu_power_label);
         jf(&b, "ac_online", &p->ac_online);
         jf(&b, "battery_pct", &p->battery_pct);
         jopen(&b, "gpus", '[');

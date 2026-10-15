@@ -36,6 +36,9 @@ pub const Interface = struct {
     snaplen: u32,
     /// pcapng section ordinal (0 for pcap).
     section: u32,
+    /// Byte order declared by the containing pcap file or pcapng section.
+    /// Native-layout link headers (notably Linux usbmon) use this order.
+    big_endian: bool = false,
     /// if_tsresol byte: bit 7 clear means 10^-n seconds, set means 2^-n.
     tsresol: u8 = 6,
     tsoffset_s: i64 = 0,
@@ -169,7 +172,7 @@ const Parser = struct {
         const zone = std.mem.readInt(i32, b[8..12], endian);
         const snaplen = std.mem.readInt(u32, b[16..20], endian);
         const link = std.mem.readInt(u32, b[20..24], endian);
-        try self.interfaces.append(self.a, .{ .link_type = @truncate(link), .snaplen = snaplen, .section = 0, .tsresol = if (result.nanosecond) 9 else 6 });
+        try self.interfaces.append(self.a, .{ .link_type = @truncate(link), .snaplen = snaplen, .section = 0, .big_endian = endian == .big, .tsresol = if (result.nanosecond) 9 else 6 });
         var at: usize = 24;
         while (at < b.len) {
             if (b.len - at < 16) return halt(result, .truncated, at, "record header");
@@ -223,7 +226,7 @@ const Parser = struct {
                 1 => {
                     if (body.len < 8) return halt(result, .corrupt, at, "interface description");
                     if (self.interfaces.items.len >= max_interfaces) return halt(result, .limit, at, "interface limit");
-                    var iface = Interface{ .link_type = std.mem.readInt(u16, body[0..2], endian), .snaplen = std.mem.readInt(u32, body[4..8], endian), .section = result.sections - 1 };
+                    var iface = Interface{ .link_type = std.mem.readInt(u16, body[0..2], endian), .snaplen = std.mem.readInt(u32, body[4..8], endian), .section = result.sections - 1, .big_endian = endian == .big };
                     var options = Options{ .bytes = body[8..], .endian = endian };
                     while (options.next()) |o| switch (o.code) {
                         2 => iface.name = o.value,

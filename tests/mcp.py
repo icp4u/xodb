@@ -54,7 +54,13 @@ try:
     process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
     process.stdin.flush()
     tools = request("tools/list")["result"]["tools"]
-    assert len(tools) >= 6 and all(t["annotations"]["readOnlyHint"] for t in tools)
+    requests = {"request_system_capture", "cancel_system_capture"}
+    assert requests <= {t["name"] for t in tools}
+    assert len(tools) >= 6 and all(t["annotations"]["readOnlyHint"] == (t["name"] not in requests) for t in tools)
+    # Requests are not a control lease. An ordinary debugger has no capture
+    # owner, so even a valid request must refuse without touching the target.
+    refused = tool("request_system_capture", {"kind": "fd_flow", "duration_ms": 100})["result"]
+    assert refused["isError"] and refused["content"][0]["text"] == "CaptureRequestsUnavailable"
     session = tool("get_session")["result"]["structuredContent"]
     assert session["state"] == "stopped"
     pid = session["pid"]

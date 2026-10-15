@@ -45,10 +45,10 @@ def tool(client, name, /, **args):
     return result["structuredContent"]
 
 
-def poll(client, symbol="qx_alloc"):
+def poll(client, symbol="qx_alloc", **arguments):
     deadline = time.monotonic() + 120
     while True:
-        result = tool(client, "decompile_function", symbol=symbol)
+        result = tool(client, "decompile_function", symbol=symbol, **arguments)
         if result.get("status") != "running" or time.monotonic() > deadline: return result
         time.sleep(.005)
 
@@ -242,7 +242,7 @@ try:
     assert parameters and all(int(row["valid_start"], 16) == entry and entry < int(row["valid_end"], 16) <= first_call + 1 for row in parameters), (parameters, hex(first_call))
     assert all(int(row["valid_start"], 16) > entry or row["valid_start"] == row["valid_end"] for row in registers if not row["parameter"]), registers
 
-    storage_image = gcc(work / "qx-storage", "-fno-pie", "-no-pie", "tests/fixtures/semq/qx-storage.c")
+    storage_image = gcc(work / "qx-storage", "-fno-pie", "-no-pie", "-Wl,--build-id=none", "tests/fixtures/semq/qx-storage.c")
     storage_sha = hashlib.sha256(storage_image.read_bytes()).hexdigest()
     storage_open, _ = exchange({"id": "storage-open", "verb": "open_image", "path": str(storage_image),
         "sha256": storage_sha, "deadline_ms": 10000})
@@ -264,8 +264,29 @@ try:
     split_reply, split_payload = wait_work(split_reply)
     assert split_reply.get("state") == "ready" and split_payload, split_reply
     split_variables = json.loads(split_payload)["variables"]
-    assert any(len(row.get("pieces", ())) > 1 and int(row["valid_start"], 16) < int(row["valid_end"], 16)
-               for row in split_variables), split_variables
+    split_parameter = next(row for row in split_variables if row.get("name") == "pair")
+    assert int(split_parameter["valid_start"], 16) < int(split_parameter["valid_end"], 16), split_parameter
+    split_offsets = {piece.get("register"): piece.get("value_bit_offset")
+                     for piece in split_parameter.get("pieces", ()) if piece.get("storage") == "register"}
+    assert split_offsets == {"RDI": 0, "RSI": 64}, split_parameter
+
+    # Prove the exported storage against the stopped target, through the MCP
+    # surface that users consume. qx_stack's seventh argument is on the stack;
+    # qx_split's aggregate is divided between RDI (low) and RSI (high).
+    client.p.stdin.close(); client.p.wait(timeout=10)
+    for symbol, name, expected in (("qx_stack", "seventh", "0x7"),
+                                   ("qx_split", "pair", "0x90000000000000008")):
+        client = Client("control", str(storage_image))
+        client.action("set_breakpoint", symbol=symbol)
+        client.continue_initial_stop()
+        stopped = client.stopped("breakpoint")
+        tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+        live = poll(client, symbol, tid=tid, frame=0)
+        assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
+        values = {row["name"]: row["display"] for row in live.get("live_values", ())}
+        assert values.get(name) == expected, (symbol, expected, values, live)
+        if symbol != "qx_split":
+            client.p.stdin.close(); client.p.wait(timeout=10)
 
     # Losing Ghidra's native decompiler child invalidates its pooled interface.
     # The request that encounters that death reopens the program and retries

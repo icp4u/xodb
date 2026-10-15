@@ -128,7 +128,9 @@ try:
     expected = {'get_overview','get_process','list_processes','get_connections','get_sensors','get_memory_map','get_thp_state','get_fragmentation',
                 'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open','get_fd_inheritance','get_fd_treemap',
                 'get_history','get_process_groups','get_graph','get_layout'}
-    check('overview exposes only observer tools', names == expected and all(x['annotations']['readOnlyHint'] for x in definitions))
+    requests = {'request_system_capture', 'cancel_system_capture'}
+    expected |= requests | {'get_system_capture', 'get_system_capture_result'}
+    check('overview exposes observers and capture requests, not general control', names == expected and all(x['annotations']['readOnlyHint'] == (x['name'] not in requests) for x in definitions))
     shared_names = {x['name'] for x in peers[0].call('tools/list')['result']['tools']}
     check('socket peers expose only observation and membership tools', shared_names == names | {'get_session_clients','get_session_events'})
     for forbidden in ('attach','claim_session_control'):

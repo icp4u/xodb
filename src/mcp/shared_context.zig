@@ -25,6 +25,7 @@ pub const Policy = struct {
             .controller => scope != .observe,
             .mutator => scope == .mutate,
             .observer => self.read_only,
+            .requester => true, // Capture-specific confirmation/policy, never general control.
             .lease => false,
         };
     }
@@ -63,7 +64,7 @@ pub const Context = struct {
         try @import("../service/authority.zig").authorize(self.service, self.client_id, mutate, linux.now());
     }
     pub fn visible(self: Context, required: Access) !bool {
-        if (required == .observer or required == .lease) return true;
+        if (required == .observer or required == .requester or required == .lease) return true;
         const s = try self.state();
         return s.controller == self.client_id and s.scope >= c.XSVC_CONTROL and
             (required != .mutator or s.scope == c.XSVC_MUTATE);

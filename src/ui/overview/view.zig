@@ -138,6 +138,7 @@ pub const View = struct {
     hit_count: usize = 0,
     action_hook: ?ActionHook = null,
     pending_action: ?actions.Request = null,
+    capture: ?*@import("../../model/system_capture_state.zig").State = null,
     confirm_key: ?u32 = null,
     confirm_after: u64 = 0,
     layout: ?*draw.Layout = null,
@@ -536,9 +537,19 @@ pub const View = struct {
     fn key(self: *View, event: @import("../../platform/input.zig").Event, now: u64) void {
         const sym = event.sym;
         const shortcut = event.shortcut;
+        if (event.kind == .press and event.plain() and shortcut == 'e' and !self.searching and (self.panel == .graph or self.panel == .galaxy or self.panel == .treemap)) if (self.capture) |capture| if (capture.ownsFlow()) {
+            capture.cancel(.human, capture.current.?.id, now) catch {};
+            return;
+        };
+        // Ctrl+Esc, or F8 as in the debugger window, revokes the agent capture.
+        if (event.kind == .press and ((event.mods.ctrl and sym == 0xff1b) or sym == 0xffc5)) if (self.capture) |capture| if (capture.current) |request| {
+            capture.cancel(.human, request.id, now) catch {};
+            if (self.pending_action != null and self.pending_action.?.capture_id != null) self.pending_action = null;
+            return;
+        };
         if (self.pending_action != null) {
             if (event.kind != .press) return;
-            if (sym == 0xff1b) self.pending_action = null;
+            if (sym == 0xff1b) self.cancelAction(now);
             if (sym == 0xff0d or sym == 0xff8d) self.confirmAction(now);
             return;
         }
@@ -818,11 +829,23 @@ pub const View = struct {
         self.confirm_key = null;
         self.confirm_after = now + 250_000_000;
     }
+    fn cancelAction(self: *View, now: u64) void {
+        if (self.pending_action) |request| if (request.capture_id) |id| if (self.capture) |capture| capture.cancel(.human, id, now) catch {};
+        self.pending_action = null;
+    }
     fn confirmAction(self: *View, now: u64) void {
         if (self.confirm_key != null or now < self.confirm_after) return;
         const request = self.pending_action orelse return;
         self.pending_action = null;
+        if (request.capture_id) |id| {
+            if (self.capture) |capture| capture.approve(id, now) catch |err| self.setStatus("Capture approval: {s}", .{@errorName(err)}, now);
+            return;
+        }
         if (request.kind == .files or request.kind == .events) {
+            if (request.kind == .events) if (self.capture) |capture| if (capture.backend_busy) {
+                self.setStatus("Agent capture active; Ctrl+Esc stops before starting another capture", .{}, now);
+                return;
+            };
             @import("../../model/process_identity.zig").validate(request.id) catch |err| {
                 self.setStatus("Cannot open process: {s}", .{@errorName(err)}, now);
                 return;
@@ -924,7 +947,7 @@ pub const View = struct {
             .files => self.requestAction(.files, now),
             .profile => self.requestAction(.profile, now),
             .confirm => self.confirmAction(now),
-            .cancel => self.pending_action = null,
+            .cancel => self.cancelAction(now),
             .tree => {
                 self.tree = !self.tree;
                 self.rows_dirty = true;
@@ -1442,6 +1465,8 @@ pub const View = struct {
             try ctx.textFit(12, rect.y + 4, left_w, "EXACT ACTIVE · all syscalls ~10% slower · E stops", p.warn);
         } else if (self.hover_len > 0) {
             try ctx.textFit(12, rect.y + 4, left_w, self.hover_text[0..self.hover_len], p.text);
+        } else if (self.capture != null and self.capture.?.backend_busy) {
+            try ctx.textFit(12, rect.y + 4, left_w, "Agent capture active · Ctrl+Esc stops", p.accent);
         } else if (self.status_len > 0 and now -| self.status_time < 6_000_000_000) {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
@@ -1504,11 +1529,17 @@ pub const View = struct {
             try ctx.text(ix + 4, iy - 1, "!", .{ 1, 1, 1, 1 });
         }
         try ctx.textFit(box.x + (if (p.win95) @as(f32, 46) else 20), box.y + (if (p.win95) @as(f32, 34) else 16), w - 40, std.fmt.bufPrint(&buf, "Open {s}: pid {d}, start {d}", .{ @tagName(request.kind), request.id.pid, request.id.start }) catch "", p.text);
-        const lines: [4][]const u8 = switch (request.kind) {
+        var lines: [4][]const u8 = switch (request.kind) {
             .files => .{ "Read-only descriptors in this window's Files & IO pane.", "Cost: shared scan once per second, 10 ms soft budget; no target pause.", "Access: your account's /proc permissions; denied fields stay unavailable.", "The view pins the sampled process identity. No privilege escalation." },
             .profile => .{ "Attach, start a 99 Hz CPU capture for 10 seconds, then resume.", "Cost: briefly stops all threads; perf buffers up to 64 MiB, plus symbols.", "Access: ptrace and perf_event permissions; denial is reported.", "The target is checked before and after attach. No privilege escalation." },
             .attach => .{ "Open this process in a separate debugger window.", "Cost: attaches and stops all threads until you continue or detach.", "Access: ptrace permission (same user or CAP_SYS_PTRACE).", "The target is checked before and after attach. No privilege escalation." },
             .events => .{ "exact mode slows all syscalls on this machine by roughly 10 % while active", "Syscall-heavy targets can slow much more; up to 64 perf fds and 2 MiB rings.", "Access: native tracepoints for this binary's architecture and perf permission; no ptrace stop.", "E stops. Pausing or leaving this pane stops capture. FD numbers span reuse." },
+        };
+        var capture_line: [160]u8 = undefined;
+        if (request.capture_id != null) if (self.capture) |capture| if (capture.current) |r| {
+            lines[0] = std.fmt.bufPrint(&capture_line, "Agent request #{d}: {s}, {d} ms, {d} {s}", .{ r.id, @tagName(r.spec.kind), r.spec.duration_ms, if (r.spec.kind == .cpu) r.spec.frequency_hz else r.spec.interval_ms, if (r.spec.kind == .cpu) "Hz" else "ms inventory interval" }) catch "Agent capture request";
+            if (r.spec.kind == .fd_flow) lines[1] = "Exact system-wide syscall tracing: ~11% host syscall overhead; bounded rings may lose events.";
+            lines[3] = "Only this capture is approved. Ctrl+Esc stops from any pane; disconnect/deadline stops too.";
         };
         for (lines, 0..) |line, i| try ctx.textFit(box.x + 20, box.y + 58 + @as(f32, @floatFromInt(i)) * 30, w - 40, line, p.dim);
         const cancel = Rect{ .x = box.x + 20, .y = box.y + 222, .w = 190, .h = 36 };

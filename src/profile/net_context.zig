@@ -108,6 +108,7 @@ pub fn read(a: std.mem.Allocator, pid: i32, when: sockets.When) !sockets.Table {
     table.processes = processes;
     // Socket inodes this process holds.
     var held: std.ArrayList(Held) = .empty;
+    var usb_fds: std.ArrayList(sockets.UsbFd) = .empty;
     const dir = c.opendir((try std.fmt.bufPrintZ(&path, "/proc/{d}/fd", .{pid})).ptr) orelse {
         table.unreadable += 1;
         return table;
@@ -119,7 +120,15 @@ pub fn read(a: std.mem.Allocator, pid: i32, when: sockets.When) !sockets.Table {
         var link: [64]u8 = undefined;
         const n = c.readlink((try std.fmt.bufPrintZ(&path, "/proc/{d}/fd/{d}", .{ pid, fd })).ptr, &link, link.len);
         if (n <= 0) continue;
-        const inode = sockets.socketInode(link[0..@intCast(n)]) orelse continue;
+        const target = link[0..@intCast(n)];
+        if (sockets.usbDevicePath(target)) |usb| {
+            if (usb_fds.items.len >= sockets.max_usb_fds) {
+                table.truncated = true;
+                break;
+            }
+            try usb_fds.append(a, .{ .pid = pid, .fd = fd, .bus = usb.bus, .device = usb.device });
+        }
+        const inode = sockets.socketInode(target) orelse continue;
         if (held.items.len >= sockets.max_sockets) {
             table.truncated = true;
             break;
@@ -146,6 +155,7 @@ pub fn read(a: std.mem.Allocator, pid: i32, when: sockets.When) !sockets.Table {
         };
     }
     table.sockets = out.items;
+    table.usb_fds = usb_fds.items;
     return table;
 }
 

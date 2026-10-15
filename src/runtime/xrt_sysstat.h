@@ -36,7 +36,7 @@ enum xrt_sys_reason {
     XRT_SYS_WHY_FIRST_SAMPLE,    /* a rate needs a previous sample */
     XRT_SYS_WHY_NOT_PRESENT,     /* kernel or hardware does not expose it */
     XRT_SYS_WHY_NEEDS_PRIVILEGE, /* EACCES/EPERM for this user */
-    XRT_SYS_WHY_NOT_SUPPORTED,   /* Linux has no unprivileged source for it */
+    XRT_SYS_WHY_NOT_SUPPORTED,   /* xodb has no collector for it on this platform (yet) */
     XRT_SYS_WHY_PARSE_ERROR,     /* source present but unreadable format */
     XRT_SYS_WHY_LIMIT,           /* capacity or time budget reached */
     XRT_SYS_WHY_REDACTED,        /* hidden by redaction mode */
@@ -116,8 +116,9 @@ struct xrt_sys_cpu {
     struct xrt_sys_cpu_times t;
     struct xrt_sys_f64 freq_mhz, freq_min_mhz, freq_max_mhz;
     /* topology: package, die, core; l3_id groups a CCX (shared L3);
-     * smt_index is the position within the core's thread siblings. */
-    struct xrt_sys_u64 package_id, die_id, core_id, l3_id, smt_index;
+     * smt_index is the position within the core's thread siblings.
+     * cluster_id and capacity are the arm64 substitutes when L3 is absent. */
+    struct xrt_sys_u64 package_id, die_id, core_id, l3_id, smt_index, cluster_id, capacity;
     struct xrt_sys_f64 temp_c;   /* per-core sensor (coretemp); often absent */
 };
 
@@ -125,9 +126,11 @@ struct xrt_sys_reading { char chip[32], label[48]; struct xrt_sys_f64 value; };
 
 struct xrt_sys_cpus {
     struct xrt_sys_name model, freq_driver, governor, epp;
+    /* l3_groups counts L3 domains, or distinct cluster_id values when no L3 id exists. */
     struct xrt_sys_u64 logical, online, cores, packages, l3_groups;
     struct xrt_sys_cpu_times total;
-    struct xrt_sys_f64 package_temp_c;       /* k10temp Tctl / coretemp Package */
+    struct xrt_sys_f64 package_temp_c;       /* k10temp Tctl / coretemp Package, or one labelled SoC sensor */
+    char package_temp_label[48];             /* empty for the x86 package sensors; otherwise the hwmon label */
     struct xrt_sys_psi psi;
     uint32_t temp_count;                     /* CPU-chip temps (Tccd1, ...) */
     struct xrt_sys_reading temps[16];
@@ -244,7 +247,8 @@ struct xrt_sys_power {
     struct xrt_sys_sensor sensor[XRT_SYS_MAX_SENSORS];
     uint32_t gpu_count;
     struct xrt_sys_gpu gpu[XRT_SYS_MAX_GPUS];
-    struct xrt_sys_f64 cpu_package_w;       /* RAPL energy delta; often needs privilege */
+    struct xrt_sys_f64 cpu_package_w;       /* RAPL package energy, or a labelled system/SoC power input */
+    char cpu_power_label[48];               /* empty means RAPL package; otherwise the hwmon label */
     struct xrt_sys_f64 ac_online, battery_pct;
 };
 

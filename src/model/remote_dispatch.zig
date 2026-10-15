@@ -31,6 +31,9 @@ pub const Result = union(enum) {
 pub const Executor = struct {
     connection: u64,
     tree: *@import("process_tree.zig").Tree,
+    // Set by Worker.run, never by a frontend. Native ptrace relationships
+    // must be created and used by this same OS thread.
+    owner_thread: ?std.Thread.Id = null,
     // Borrowed only by this owner; never queued or published.
     service: ?*context.c.struct_xsvc = null,
     source: ?[:0]const u8 = null,
@@ -178,9 +181,14 @@ pub const Executor = struct {
     }
 
     /// Validate non-core commands at their owner-thread boundary.
+    fn requireOwner(self: *const Executor, session: *const model.Session) !void {
+        if (self.owner_thread) |owner| {
+            if (owner != std.Thread.getCurrentId()) return error.WrongOwnerThread;
+        } else if (!session.target.isRemote()) return error.RemoteSessionRequired;
+    }
     pub fn sessionFor(self: *Executor, command: *const boundary.Command) !*model.Session {
         const session = (try self.tree.find(command.request.stamp.process)).session;
-        if (!session.target.isRemote()) return error.RemoteSessionRequired;
+        try self.requireOwner(session);
         var authorizer = Authorizer{ .executor = self, .session = session };
         try command.validate(stamp(self.connection, session), &authorizer);
         return session;
@@ -188,7 +196,7 @@ pub const Executor = struct {
     pub fn execute(self: *Executor, a: A, command: *const boundary.Command) !Result {
         const request = command.request;
         const session = (try self.tree.find(request.stamp.process)).session;
-        if (!session.target.isRemote()) return error.RemoteSessionRequired;
+        try self.requireOwner(session);
         const operation: ?api.Operation = switch (request.action) {
             .control => |control| .{ .control = control },
             .breakpoint => |bp| .{ .breakpoint = bp },
@@ -340,6 +348,31 @@ fn effect(action: boundary.Action) ?model.Effect {
         .poll, .inspect, .inline_expression, .mcp, .toggle_scope => null,
     };
 }
+test "native executor refuses access from a thread other than its owner" {
+    var session = model.Session.init();
+    defer session.deinit();
+    var tree: @import("process_tree.zig").Tree = .{};
+    tree.init(&session);
+    defer tree.deinit();
+    var executor: Executor = .{ .connection = 1, .tree = &tree, .owner_thread = std.Thread.getCurrentId() };
+    defer executor.deinit();
+    try executor.requireOwner(&session);
+    const Probe = struct {
+        executor: *Executor,
+        session: *model.Session,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.executor.requireOwner(self.session) catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var probe: Probe = .{ .executor = &executor, .session = &session };
+    const frontend = try std.Thread.spawn(.{}, Probe.run, .{&probe});
+    frontend.join();
+    try std.testing.expectEqual(error.WrongOwnerThread, probe.failure.?);
+}
+
 test "remote dispatch refuses local ownership and validates queued identities" {
     const a = std.testing.allocator;
     const session = try a.create(model.Session);

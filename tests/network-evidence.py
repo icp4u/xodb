@@ -175,8 +175,9 @@ summary = {}
 o = opened(pcapng, archive)
 try:
     streams = o.inspect('list_streams')['streams']
-    assert len(streams) == 1, streams
+    assert [stream['kind'] for stream in streams] == ['network', 'protocol'], streams
     s = streams[0]
+    assert streams[1]['records'] == 0 and streams[1]['derived_from'] == s['stream_id'], streams[1]
     assert s['format'] == 'pcapng' and s['records'] == len(packets) and s['undecoded'] == 1, s
     assert s['file']['stop'] == 'complete' and len(s['interfaces']) == 3, s
     assert [i['link'] for i in s['interfaces']] == ['ethernet', 'linux_sll', 'unknown'], s['interfaces']

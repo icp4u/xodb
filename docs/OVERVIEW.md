@@ -13,7 +13,7 @@ samples the whole system with the bounded, unprivileged collector
 | Panel | Shows |
 | --- | --- |
 | Summary | CPU, memory, GPU and temperature gauges; CPU, disk and network history; top processes; everything not measured right now, with reasons |
-| Performance | total CPU with user/system history; one tile per logical CPU grouped by package and L3 domain, with SMT siblings marked, busy meter, clock and history |
+| Performance | total CPU with user/system history; one tile per logical CPU grouped by package and L3 domain (by cpu cluster, labelled P-cluster or E-cluster, when the kernel has no L3 id), with SMT siblings marked, busy meter, clock and history |
 | Processes | tree or flat list sorted by CPU, memory, disk, network, FDs, threads, pid or name; `/` search; pid + start time identity; L opens files, F profiles, Enter attaches; each action shows cost and access before confirmation |
 | Memory | composition bar, swap, zswap ratio, faults, memory history and PSI (CPU, memory, I/O) |
 | Disk | per device read/write throughput, IOPS, busy, queue, latency, temperature |
@@ -39,7 +39,10 @@ be turned off without a restart); `q` quits. Mouse clicks and the wheel work too
 - A value that was not measured is never drawn as zero. Missing samples are
   hatched in graphs, missing values show their reason (`needs privilege`,
   `not supported`, `not present`, `first sample`, `redacted`, ...), and
-  hovering shows it in the footer. Stale values (slow sources such as NVMe and
+  hovering shows it in the footer. Three of these mean different things:
+  `not present` (this kernel or hardware does not expose it), `needs
+  privilege` (it exists but this user cannot read it) and `not supported`
+  (xodb has no collector for it on this platform yet). Stale values (slow sources such as NVMe and
   DIMM sensors) are dimmed and marked stale.
 - Processes are identified by pid and start time; the debugger hand-off sends
   both. The launcher and consumer recheck them and reject changed identities.
@@ -329,9 +332,10 @@ numbers across reuse, with no current-path attribution; loss, invalid records,
 unpaired calls and flags qualify the result. Loss or possible loss stays visible
 alongside the host-cost warning; unavailable kernel accounting is explicit.
 See [FD capture coverage](MCP_FD.md).
-Overview MCP peers remain observers: they can read a UI-started capture but
-cannot start, renew or stop one themselves. Other control-enabled sessions use
-the separate leased `start_fd_events`/`stop_fd_events` tools.
+Overview MCP peers can read a UI-started capture but cannot take it over.
+They may request a separate bounded capture through the confirmation/policy
+path below. Other control-enabled sessions use the separate leased
+`start_fd_events`/`stop_fd_events` tools.
 
 The view owns its displayed copy, so pause can freeze it while an MCP peer
 continues polling. Capture activity status remains live while paused. A system
@@ -458,6 +462,49 @@ profile starts a 99 Hz, ten-second capture in a debugger window. Attach stops
 the process until continued or detached. All actions validate the selected PID
 and start ticks; external consumers validate again after attachment. Replay
 cannot start them. Profile and attach windows remain open when overview closes.
+
+### Agent-requested captures
+
+`request_system_capture` accepts `kind: "cpu"` with sampled `pid` and
+`start_ticks`, or `kind: "fd_flow"` for system-wide native syscall IO counters.
+The GUI presents the existing cost/access confirmation. A request is not
+permission: Escape denies it (and holds off a new prompt for 5 seconds), and an
+unanswered prompt expires after 30 seconds.
+Approval grants only that capture, even while general agent scope is observe.
+**Ctrl+Escape** (or F8) revokes from any pane; E also stops an agent fd-flow capture in
+the graph, galaxy or treemap. A footer warning remains while capture is active.
+
+Headless overview defaults to observe and refuses capture requests. Explicit
+`--agent-scope control` (or mutate) supplies policy consent. Shared observers
+may request under that policy without acquiring a general debugger lease.
+The trusted transport identity, not a JSON field, identifies the requester.
+Only that requester or the human can cancel it with `cancel_system_capture`.
+
+One request is pending/active at a time; requests are limited to one per second.
+Duration is 100–10000 ms. CPU sampling is 1–99 Hz with 16384 retained samples
+and at most 64 MiB perf rings; symbols and immutable image metadata cost extra.
+It briefly attaches/stops the identified process, samples user CPU, resumes and
+detaches at completion. FD flow uses the existing bounded native tracer, with
+250/1000 ms inventory demand. This is exact tracing (~11% host syscall overhead),
+not an event-rate sampler; the bounded rings/drains can lose records. Existing
+`--graph-pid` scope also applies. Permission failures remain explicit; no capture
+request escalates privilege or changes host policy.
+
+The owner clock stops on deadline, cancellation, requester disconnect or shutdown;
+headless scope revocation also stops it. Polling does not extend the deadline.
+FD cleanup completes after the current background drain; `cleanup_pending`
+distinguishes that interval from a finished backend. Leaving a pane does not
+extend or transfer the agent's grant to unbounded GUI tracing.
+
+`get_system_capture` reports state, limits, the retained result ID and the last
+32 audit transitions, each with requester, kind/PID/duration and reason.
+`get_system_capture_result(request_id)` lets only the requester read the one
+retained CPU summary or completed fd-flow counter result, including
+loss/CPU coverage and uncertain byte attribution. CPU `view: "samples"` and
+`view: "stack"` use the profile reader's capture ID/revision and bounded paging;
+stack reads do not start reconstruction jobs. No flamegraph job/export is exposed
+by this first capture surface. A new approved capture can replace the result;
+an unapproved request cannot. MCP replies use the normal redaction boundary.
 
 ## NVIDIA sensors
 

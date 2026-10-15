@@ -10,7 +10,7 @@ const c = @cImport({
 });
 const identity = @import("../../model/process_identity.zig");
 pub const Kind = enum { files, profile, attach, events };
-pub const Request = struct { kind: Kind, id: identity.Identity };
+pub const Request = struct { kind: Kind, id: identity.Identity, capture_id: ?u64 = null };
 pub const Launcher = struct {
     children: [16]c.pid_t = @splat(0),
     redact: bool = false,

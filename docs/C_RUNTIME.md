@@ -239,8 +239,9 @@ The last command explicitly exercises the existing sudo helper workflow. The
 GUI test uses a private headless compositor. For the cross-ISA host check, compile
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
---fixture /path/fixture --arch m68k` or `--arch loongarch64` to `tests/runtime-host.py`.
-`tests/runtime-host.py` does not yet take `--arch riscv64`.
+--fixture /path/fixture --arch m68k` (or `loongarch64`, `ppc64le`, `riscv64`) to
+`tests/runtime-host.py`. On riscv64 it checks that `x0` is omitted, steps one
+instruction in software and refuses watchpoints, profile and uprobes.
 On LoongArch64 that script steps one instruction, refuses watchpoints, profile and
 uprobes, and removes the breakpoint before continuing. Disassembly is refused on
 the system Capstone 5.x build and decoded when the binary was built with

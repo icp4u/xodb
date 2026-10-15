@@ -3,6 +3,7 @@ const std = @import("std");
 const Session = @import("session.zig").Session;
 const host = @import("../semq/host.zig");
 const answer = @import("../semq/answer.zig");
+const pseudo_values = @import("pseudo_values.zig");
 pub const Mode = enum { decompile, slice, controls };
 pub const Phase = enum { functions, questions, answer };
 /// A source line carries every line-table row and every function those rows
@@ -32,97 +33,31 @@ pub const EntryPadMapping = struct {
     line: u32,
     token: u32,
 };
-pub const PseudoValue = struct { name: []const u8, display: []const u8, parameter: bool };
-
-const LiveMemory = struct {
-    user: *anyopaque,
-    read: *const fn (*anyopaque, u64, []u8) anyerror!usize,
-};
+pub const PseudoValue = pseudo_values.PseudoValue;
+const LiveMemory = pseudo_values.LiveMemory;
+const livePseudoValue = pseudo_values.value;
 
 fn readSessionMemory(user: *anyopaque, address: u64, bytes: []u8) !usize {
     const session: *Session = @ptrCast(@alignCast(user));
     return session.target.readMemory(address, bytes);
 }
 
-fn widthMask(width: u8) u64 {
-    return if (width == 64) std.math.maxInt(u64) else (@as(u64, 1) << @intCast(width)) - 1;
-}
-
-fn livePseudoValue(a: std.mem.Allocator, architecture: @import("../target/arch.zig").Arch, registers: @import("../debug/location.zig").RegisterSet, cfa: ?u64, memory: ?LiveMemory, link_pc: u64, variable: host.PseudoVariable) !?PseudoValue {
-    if (variable.size == 0 or variable.size > 32) return null;
-    const value_size: usize = @intCast(variable.size);
-    const start = variable.valid_start orelse return null;
-    const end = variable.valid_end orelse return null;
-    if (link_pc < start or link_pc >= end or start >= end) return null;
-    // Ghidra's decompiler lists join pieces most significant first while
-    // VariableStorage documents least significant first on little-endian;
-    // the 0.1.6 export assembles x86-64 SysV aggregates byte-swapped
-    // (RDI, the low half, at bit 64). Until the order is proven on a live
-    // target, a value split over several pieces is shown as unavailable.
-    if (variable.pieces.len > 1) return null;
-    var legacy: [1]host.PseudoPiece = undefined;
-    const pieces = if (variable.pieces.len != 0) variable.pieces else blk: {
-        if (!std.mem.eql(u8, variable.storage, "register") or variable.register == null or variable.size > 8) return null;
-        legacy[0] = .{ .storage = "register", .size = @intCast(variable.size), .value_bit_offset = 0, .register = variable.register, .register_bit_offset = variable.register_bit_offset };
-        break :blk &legacy;
-    };
-    var bytes: [32]u8 = @splat(0);
-    var covered: [32]bool = @splat(false);
-    for (pieces) |piece| {
-        const width: u8 = piece.size * 8;
-        if (piece.size == 0 or piece.value_bit_offset % 8 != 0) return null;
-        const value_byte_offset: usize = piece.value_bit_offset / 8;
-        if (value_byte_offset + piece.size > value_size) return null;
-        var value: u64 = undefined;
-        if (std.mem.eql(u8, piece.storage, "register")) {
-            const name = piece.register orelse return null;
-            const lower = try a.dupe(u8, name);
-            defer a.free(lower);
-            _ = std.ascii.lowerString(lower, name);
-            const register = architecture.registerNumber(lower) orelse return null;
-            const raw = registers[register] orelse return null;
-            if (@as(u16, piece.register_bit_offset) + width > 64) return null;
-            value = (raw >> @intCast(piece.register_bit_offset)) & widthMask(width);
-        } else if (std.mem.eql(u8, piece.storage, "stack")) {
-            const base = cfa orelse return null;
-            const offset = piece.cfa_offset orelse return null;
-            const address = if (offset >= 0)
-                std.math.add(u64, base, @intCast(offset)) catch return null
-            else if (offset == std.math.minInt(i64))
-                return null
-            else
-                std.math.sub(u64, base, @intCast(-offset)) catch return null;
-            var memory_bytes: [8]u8 = undefined;
-            const reader = memory orelse return null;
-            const got = (reader.read)(reader.user, address, memory_bytes[0..piece.size]) catch return null;
-            if (got != piece.size) return null;
-            value = @import("../debug/location.zig").lowBits(memory_bytes[0..piece.size], architecture.endian());
-        } else return null;
-        for (0..piece.size) |index| {
-            const at = value_byte_offset + index;
-            if (covered[at]) return null;
-            covered[at] = true;
-            bytes[at] = @truncate(value >> @intCast(index * 8));
-        }
-    }
-    for (covered[0..value_size]) |present| if (!present) return null;
-    const nonzero = for (bytes[0..value_size], 0..) |byte, index| {
-        if (byte != 0) break index;
-    } else 0;
-    const display = if (std.mem.indexOf(u8, variable.type_name, "bool") != null)
-        (if (nonzero == 0 and bytes[0] == 0) "false" else "true")
-    else blk: {
-        var highest: usize = value_size - 1;
-        while (highest > 0 and bytes[highest] == 0) highest -= 1;
-        var text: [66]u8 = undefined;
-        var written = (try std.fmt.bufPrint(&text, "0x{x}", .{bytes[highest]})).len;
-        while (highest > 0) {
-            highest -= 1;
-            written += (try std.fmt.bufPrint(text[written..], "{x:0>2}", .{bytes[highest]})).len;
-        }
-        break :blk try a.dupe(u8, text[0..written]);
-    };
-    return .{ .name = variable.name, .display = display, .parameter = variable.parameter };
+/// Apply the sidecar's storage proof to one stopped frame. MCP keeps an
+/// identical copy (src/mcp/static_analysis.zig livePseudoValues; the layer
+/// rules keep it from importing this file); both end in pseudo_values.collect
+/// so a variable cannot gain a different live meaning on a different surface.
+pub fn livePseudoValues(a: std.mem.Allocator, session: *Session, analysis: *host.Analysis, tid: i32, frame_index: usize) ![]const PseudoValue {
+    if (tid == 0) return &.{};
+    const frame_count = std.math.add(usize, frame_index, 1) catch return &.{};
+    const frames = session.stack(a, tid, frame_count) catch return &.{};
+    if (frame_index >= frames.len) return &.{};
+    const frame = frames[frame_index];
+    const link_pc = frame.lookup_pc -% analysis.function.bias;
+    // A stack proof includes the call that ends it, and an outer frame's
+    // lookup PC is that call on arm64. The callee may have written the slot
+    // since, so outer frames read no stack pieces.
+    const memory: ?LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
+    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc);
 }
 
 const State = struct {
@@ -582,28 +517,7 @@ pub const Capture = struct {
                         view.pseudo_reasons = try std.fmt.allocPrint(a, "reasons {s}", .{reasons.items});
                     }
                     view.pseudo_tokens = tokens;
-                    var live_values: std.ArrayList(PseudoValue) = .empty;
-                    if (request.tid != 0) if (session.stack(a, request.tid, request.frame + 1)) |frames| {
-                        if (request.frame < frames.len) {
-                            const frame = frames[request.frame];
-                            const link_pc = frame.lookup_pc -% analysis.function.bias;
-                            // A stack proof includes the call that ends it, and an
-                            // outer frame's lookup PC is that call on arm64. The
-                            // callee may have written the slot since, so outer
-                            // frames read no stack pieces.
-                            const memory: ?LiveMemory = if (request.frame == 0) .{ .user = session, .read = readSessionMemory } else null;
-                            if (link_pc -% analysis.function.key.entry < analysis.function.key.size) for (document.variables) |variable| {
-                                const value = (try livePseudoValue(a, frame.architecture, frame.registers, frame.cfa, memory, link_pc, variable)) orelse continue;
-                                var duplicate = false;
-                                for (live_values.items) |old| if (std.mem.eql(u8, old.name, value.name)) {
-                                    duplicate = true;
-                                    break;
-                                };
-                                if (!duplicate) try live_values.append(a, value);
-                            };
-                        }
-                    } else |_| {};
-                    view.pseudo_values = live_values.items;
+                    view.pseudo_values = try livePseudoValues(a, session, analysis, request.tid, request.frame);
                     if (document.entry_pad) |pad| view.pseudo_entry_pad = .{
                         .start = analysis.function.runtime(pad.start),
                         .end = analysis.function.runtime(pad.end),
@@ -758,7 +672,7 @@ test "pseudo-C live values use base registers, subregister offsets and PC bounds
     })) == null);
 }
 
-test "pseudo-C live values read proven stack pieces and refuse split pieces" {
+test "pseudo-C live values read stack pieces and assemble proven split pieces" {
     const loc = @import("../debug/location.zig");
     const Arch = @import("../target/arch.zig").Arch;
     const Memory = struct {
@@ -791,7 +705,7 @@ test "pseudo-C live values read proven stack pieces and refuse split pieces" {
     })).?;
     defer std.testing.allocator.free(seventh.display);
     try std.testing.expectEqualStrings("0x12345678", seventh.display);
-    try std.testing.expect((try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1010, .{
+    const split = (try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1010, .{
         .name = "split",
         .type_name = "owned6",
         .size = 6,
@@ -803,5 +717,7 @@ test "pseudo-C live values read proven stack pieces and refuse split pieces" {
         .valid_start = 0x1000,
         .valid_end = 0x1020,
         .pieces = &pieces,
-    })) == null);
+    })).?;
+    defer std.testing.allocator.free(split.display);
+    try std.testing.expectEqualStrings("0x12345678abcd", split.display);
 }

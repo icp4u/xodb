@@ -1,5 +1,29 @@
 [
   {
+    "name": "request_system_capture",
+    "description": "Request one bounded overview CPU profile or fd-flow/syscall capture. GUI: waits for human cost/scope confirmation. Headless: requires explicit agent-scope control or mutate. Never grants general debugger control. Maximum 10 seconds, CPU 99 Hz; one outstanding request, one request per second. FD flow is exact tracing with bounded rings/drains, not a sampled event-rate guarantee.",
+    "annotations": {"readOnlyHint": false, "xodbSessionAccess": "requester"},
+    "inputSchema": {"type": "object", "properties": {"kind": {"enum": ["cpu", "fd_flow"]}, "pid": {"type": "integer", "minimum": 2}, "start_ticks": {"type": "integer", "minimum": 1}, "duration_ms": {"type": "integer", "minimum": 100, "maximum": 10000}, "frequency_hz": {"type": "integer", "minimum": 1, "maximum": 99}, "interval_ms": {"enum": [250, 1000]}}, "required": ["kind"], "additionalProperties": false}
+  },
+  {
+    "name": "cancel_system_capture",
+    "description": "Cancel your pending or active capture request. Independent of displayed generation; only the requester or human can cancel. Owner closes tracing/detaches even without further polling.",
+    "annotations": {"readOnlyHint": false, "xodbSessionAccess": "requester"},
+    "inputSchema": {"type": "object", "properties": {"request_id": {"type": "integer", "minimum": 1}}, "required": ["request_id"], "additionalProperties": false}
+  },
+  {
+    "name": "get_system_capture",
+    "description": "Read current capture request, consent/deadline, cleanup status, resource limits and last 32 audit transitions. Does not renew capture. Pending approval expires in 30 seconds.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+  },
+  {
+    "name": "get_system_capture_result",
+    "description": "Read the one retained capture by request_id; only its requester may read it. CPU: summary, samples (pages up to 16), or stack; capture_id/revision and sample arguments follow the profile readers. FD flow: completed counter rows, loss and CPU coverage (pages up to 128). No output file or new host job; a new approved capture replaces the previous result.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {"request_id": {"type": "integer", "minimum": 1}, "view": {"enum": ["summary", "samples", "stack"]}, "start": {"type": "integer", "minimum": 0}, "limit": {"type": "integer", "minimum": 1, "maximum": 128}, "capture_id": {"type": "integer", "minimum": 1}, "revision": {"type": "integer", "minimum": 0}, "sample": {"type": "integer", "minimum": 0}}, "required": ["request_id"], "additionalProperties": false}
+  },
+  {
     "name": "get_layout",
     "description": "Read the last GUI layout in UI units: window and buffer sizes, both scales, density, pane rectangles and collapsed tabs, whole toolbar controls and overflow actions, and value/identifier row elision flags. available=false without a GUI publication; never drives rendering.",
     "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },

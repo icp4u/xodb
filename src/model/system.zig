@@ -62,6 +62,10 @@ pub const Collector = struct {
     history: History = .{},
     fd_event_state: FdEventState = .inactive,
     fd_lease: ?@import("../service/lease.zig").Lease = null,
+    capture: @import("system_capture_state.zig").State = .{},
+    capture_flow: ?*c.struct_xrt_fdflow_live = null,
+    /// Owner-thread-only policy for new replies after the GUI's live X toggle.
+    capture_redaction: ?@import("../redact.zig").Policy = null,
 
     /// Cached publication only: displaying status never creates or renews capture.
     pub fn fdEventState(self: *Collector) FdEventState {
@@ -96,6 +100,7 @@ pub const Collector = struct {
     }
 
     pub fn deinit(self: *Collector) void {
+        c.xrt_fdflow_live_free(self.capture_flow);
         if (self.fd_collector) |owner| c.xrt_fdactivity_destroy(owner);
         if (self.cache) |p| {
             c.xrt_sys_snapshot_free(p);

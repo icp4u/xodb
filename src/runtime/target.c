@@ -1,6 +1,7 @@
 #define _GNU_SOURCE 1
 #include "target_internal.h"
 #include <sys/ptrace.h>
+#include <sys/syscall.h>
 #include "wire_target.h"
 #include <dirent.h>
 #include <stdio.h>
@@ -134,7 +135,9 @@ enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn)
 bool xrt_traced_member(int32_t tid, int32_t group)
 {
     struct xrt_task_info info;
-    return xrt_task_inspect(tid, &info) == XRT_OK && info.group == group && info.tracer == getpid();
+    /* Linux records the tracing task, not its process leader. A native owner
+     * may be a worker thread; another thread in our process is not its owner. */
+    return xrt_task_inspect(tid, &info) == XRT_OK && info.group == group && info.tracer == syscall(SYS_gettid);
 }
 bool xrt_task_zombie(int32_t tid)
 {

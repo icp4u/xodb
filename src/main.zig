@@ -19,7 +19,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -126,6 +126,9 @@ pub fn main(init: std.process.Init) !void {
     var core_executable: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
     var open_pcap: ?[:0]const u8 = null;
+    var live_capture: ?[:0]const u8 = null;
+    var capture_tool: ?[:0]const u8 = null;
+    var capture_ring_bytes: usize = @import("capture/live.zig").default_ring_bytes;
     var tls_key_log: ?[:0]const u8 = null;
     var open_mitmproxy: ?[:0]const u8 = null;
     var compare_capture: ?[:0]const u8 = null;
@@ -217,7 +220,9 @@ pub fn main(init: std.process.Init) !void {
                 \\--browse-observation FILE opens .xoi in the GUI invocation/cohort browser (N reopens it).
                 \\--observation-threshold-ns N overrides the fast/slow wall-duration threshold (see docs/OBSERVATIONS.md).
                 \\--open-capture FILE opens an offline archive; --symbols DIR optionally loads SHA-256-named ELF assets.
-                \\--open-pcap FILE opens a pcap/pcapng file as a read-only evidence stream; with --open-capture, aligns and correlates it.
+                \\--open-pcap FILE opens network, Linux usbmon or dbus-monitor pcap/pcapng as read-only evidence; with --open-capture, aligns and correlates it.
+                \\--live-capture INTERFACE starts one owned dumpcap/tcpdump child and a bounded 64 MiB packet ring.
+                \\--capture-tool PATH selects dumpcap or tcpdump explicitly; --capture-ring-bytes SIZE sets 64K..256M.
                 \\--tls-key-log FILE decrypts TLS 1.2/1.3 records in --open-pcap; secrets are consumed in memory and never logged.
                 \\--open-mitmproxy FILE opens a mitmproxy flow dump as a read-only evidence stream.
                 \\--compare-capture BASE with --open-capture AFTER compares recorded CPU sample shares; V switches views.
@@ -293,6 +298,9 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--open-profile")) open_profile = args[i];
             if (std.mem.eql(u8, arg, "--open-capture")) open_capture = args[i];
             if (std.mem.eql(u8, arg, "--open-pcap")) open_pcap = args[i];
+            if (std.mem.eql(u8, arg, "--live-capture")) live_capture = args[i];
+            if (std.mem.eql(u8, arg, "--capture-tool")) capture_tool = args[i];
+            if (std.mem.eql(u8, arg, "--capture-ring-bytes")) capture_ring_bytes = std.math.cast(usize, snapshot.parseSize(args[i]) catch return error.InvalidCaptureRingSize) orelse return error.InvalidCaptureRingSize;
             if (std.mem.eql(u8, arg, "--tls-key-log")) tls_key_log = args[i];
             if (std.mem.eql(u8, arg, "--open-mitmproxy")) open_mitmproxy = args[i];
             if (std.mem.eql(u8, arg, "--compare-capture")) compare_capture = args[i];
@@ -356,9 +364,11 @@ pub fn main(init: std.process.Init) !void {
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
-    if (open_pcap != null and (attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenPcapOptionConflict;
+    if (open_pcap != null and (live_capture != null or attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenPcapOptionConflict;
+    if (live_capture != null and (open_capture != null or open_mitmproxy != null or open_profile != null or core_file != null or connect != null or ssh != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.LiveCaptureOptionConflict;
+    if (live_capture == null and (capture_tool != null or capture_ring_bytes != @import("capture/live.zig").default_ring_bytes)) return error.CaptureOptionRequiresLiveCapture;
     if (tls_key_log != null and open_pcap == null) return error.TlsKeyLogRequiresPcap;
-    if (open_mitmproxy != null and (open_pcap != null or tls_key_log != null or open_capture != null or attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenMitmproxyOptionConflict;
+    if (open_mitmproxy != null and (open_pcap != null or live_capture != null or tls_key_log != null or open_capture != null or attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenMitmproxyOptionConflict;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     // Before any thread starts: the policy is read without locks afterwards.
     if (redact) @import("redact.zig").enable();
@@ -448,10 +458,23 @@ pub fn main(init: std.process.Init) !void {
     }
     var remote_destroyed = false; // Read only after the remote owner finishes.
     defer if (!remote_destroyed) session.deinit();
+    if (live_capture) |interface| {
+        const tool = capture_tool orelse @import("capture/live.zig").defaultTool();
+        session.live_capture = try @import("capture/live.zig").Live.start(std.heap.page_allocator, tool, interface, capture_ring_bytes);
+        const version = session.live_capture.?.version;
+        log.info(.session, "xodb: live capture started with {s} {d}.{d}; ring limit {d} bytes; it stops with this session\n", .{ @tagName(version.producer), version.major, version.minor, capture_ring_bytes });
+    }
     // Bind before any launch/attach: a conflicting endpoint cannot touch a target.
-    var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source) else null;
+    var shared: ?SharedSession = if (session_socket) |path| try SharedSession.init(path, source, redact) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
-    const async_remote_start = runtime_remote;
+    // First native ownership slice: ordinary live debugger windows. Retained
+    // offline views and the separate scene-debugger adapter keep their own
+    // lifecycle until their publication contracts are migrated.
+    const native_owner = !headless and !runtime_remote and !redot_debugger and
+        (attach != null or launch.len > 0) and core_file == null and
+        open_capture == null and open_profile == null and open_pcap == null and
+        open_mitmproxy == null and open_observation == null and browse_observation == null and observation_recipe == null;
+    const async_remote_start = runtime_remote or native_owner;
     var remote_transport: std.ArrayList([:0]const u8) = .empty;
     if (!async_remote_start) if (gdb_remote) |endpoint| try session.target.connectGdbRemote(endpoint);
     if (runtime_agent != null or runtime_ssh != null) {
@@ -530,14 +553,18 @@ pub fn main(init: std.process.Init) !void {
         if (!mcp and shared == null) return;
     }
     const server = try a.create(Server);
-    server.* = .{ .source_path = source, .overview_shared = if (shared) |*endpoint| endpoint.collector() else null };
+    const private_transport: @import("mcp/evidence.zig").Transport = if (listen != null) .listen else if (runtime_remote) .remote else .stdio;
+    server.* = .{
+        .source_path = source,
+        .overview_shared = if (shared) |*endpoint| endpoint.collector() else null,
+        .private_access = .init(private_transport, agent_scope == .observe, redact),
+    };
     // --redact: the system tools (processes, connections, fds, memory maps)
     // also apply the overview's own rules: other accounts, command lines.
     if (redact) (server.overview_shared orelse &server.overview).redact = true;
     if (listen != null) {
         server.input_fd = connection.fd;
         server.output_fd = connection.fd;
-        server.network_peer = true;
     }
     if (mcp) try server.init();
     defer if (mcp) server.deinit();
@@ -604,7 +631,7 @@ pub fn main(init: std.process.Init) !void {
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
-        workspace.show_profile = open_capture != null or open_pcap != null or open_mitmproxy != null;
+        workspace.show_profile = open_capture != null or open_pcap != null or open_mitmproxy != null or live_capture != null;
         workspace.logical_frames.open = open_frames != null;
         workspace.comparison.open = compare_capture != null;
         workspace.invocations.open = browse_observation != null;
@@ -614,16 +641,17 @@ pub fn main(init: std.process.Init) !void {
         var archive_status: [512]u8 = undefined;
         var archive_completed_id: u64 = 0;
         var archive_status_time: u64 = 0;
-        if (runtime_remote) {
+        if (runtime_remote or native_owner) {
             const first_workspace = workspaces[0].?;
             var incarnation: u64 = 1;
             var protocol_server: ?*Server = if (mcp) server else null;
-            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count] };
+            var startup = RemoteStartup{ .session = session, .gdb = gdb_remote, .transport = remote_transport.items, .attach = attach, .launch = launch, .follow = follow_forks, .breakpoints = initial_breakpoints[0..initial_breakpoint_count], .expected_start = expected_start, .start_profile = start_profile, .report_attach = native_owner };
             while (true) {
                 var shutdown = RemoteShutdown{ .tree = &tree, .session = session, .destroyed = &remote_destroyed, .capture_out = if (incarnation == 1) capture_out else null, .profile_out = if (incarnation == 1) profile_out else null, .record_path = if (incarnation == 1) record_path else null };
                 const reconnect = lifecycle: {
                     const owner = try @import("model/remote_worker.zig").Worker.start(&tree, .{
                         .connection = incarnation,
+                        .local = native_owner,
                         .bootstrap = .{ .context = &startup, .run = RemoteStartup.run },
                         .shutdown = .{ .context = &shutdown, .run = RemoteShutdown.run },
                         .trace = window.input.trace,
@@ -643,7 +671,7 @@ pub fn main(init: std.process.Init) !void {
                 if (shared) |*endpoint| {
                     endpoint.deinit();
                     shared = null;
-                    shared = try SharedSession.init(session_socket.?, source);
+                    shared = try SharedSession.init(session_socket.?, source, redact);
                 }
                 // Stdio cannot identify a new peer. Terminate that channel;
                 // shared clients may connect again and acquire a new lease.
@@ -866,7 +894,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         rt.xrt_remote_io_guard_strict(false);
     }
     var workspace = workspaces[0].?;
-    workspace.status = if (owner.options.connection == 1) "Connecting; Ctrl+Shift+R starts a fresh connection" else "Reconnecting; target continuity and prior control outcomes are unconfirmed";
+    workspace.status = if (owner.options.local) "Starting local target" else if (owner.options.connection == 1) "Connecting; Ctrl+Shift+R starts a fresh connection" else "Reconnecting; target continuity and prior control outcomes are unconfirmed";
     var reconnect = false;
     defer renderer.deinit();
     var renderer_ready = false;
@@ -885,7 +913,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
             const event = &window.input.queue[(window.input.head + offset) % keys.capacity];
             if (event.kind == .press and event.mods.ctrl and !event.mods.alt and !event.mods.super and event.shortcut == 'r') {
                 if (event.mods.shift) {
-                    reconnect = true;
+                    if (!owner.options.local) reconnect = true;
                 } else {
                     frontend.invalidateInspection();
                 }
@@ -895,7 +923,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         if (reconnect) break;
         const startup_error = owner.startup_error.load(.acquire);
         if (startup_error != 0) {
-            workspace.status = std.fmt.bufPrint(&workspace.presentation_status, "Connection unavailable: {s}; Ctrl+Shift+R reconnects", .{@errorName(@errorFromInt(startup_error))}) catch "Connection unavailable";
+            workspace.status = std.fmt.bufPrint(&workspace.presentation_status, "{s}: {s}{s}", .{ if (owner.options.local) "Local startup failed" else "Connection unavailable", @errorName(@errorFromInt(startup_error)), if (owner.options.local) "" else "; Ctrl+Shift+R reconnects" }) catch "Session unavailable";
         }
         frontend.pump();
         if (try frontend.take()) {
@@ -910,7 +938,7 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
             workspace = workspaces[index].?;
             frontend.present(workspace, window);
             if (!confirmed_connection) {
-                workspace.status = if (owner.options.connection == 1) "Connected; Ctrl+R retries inspection; Ctrl+Shift+R reconnects" else "Fresh connection; previous target and control outcomes remain unconfirmed";
+                workspace.status = if (owner.options.local) "Local target ready; Ctrl+R retries inspection" else if (owner.options.connection == 1) "Connected; Ctrl+R retries inspection; Ctrl+Shift+R reconnects" else "Fresh connection; previous target and control outcomes remain unconfirmed";
                 confirmed_connection = true;
             }
         }
@@ -951,8 +979,14 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
     }
     finishRemoteOwner(owner, window);
     if (owner.failure) |err| return err;
+    if (owner.options.local) {
+        const startup_failure = owner.startup_error.load(.acquire);
+        if (startup_failure != 0) return @errorFromInt(startup_failure);
+    }
     const reason = if (quitting != 0) "signal" else if (window.closing) @tagName(window.close_reason) else if (frames > 0 and rendered >= frames) "frame_limit" else "owner_exit";
-    log.warn(.runtime, "xodb: {d} frames, remote owner closed (reason={s}, signal={d}); remote target cleanup unconfirmed\n", .{ rendered, reason, quitting });
+    if (owner.options.local) {
+        log.info(.session, "xodb: {d} frames, clean shutdown (reason={s}, signal={d})\n", .{ rendered, reason, quitting });
+    } else log.warn(.runtime, "xodb: {d} frames, remote owner closed (reason={s}, signal={d}); remote target cleanup unconfirmed\n", .{ rendered, reason, quitting });
     if (reconnect) {
         // Discard input collected while the old owner was quiescing.
         window.input.count = 0;
@@ -997,16 +1031,19 @@ const RemoteStartup = struct {
     initial_actions: bool = true,
     observation: ?struct { allocator: std.mem.Allocator, path: [:0]const u8, output: [:0]const u8, threshold: ?u64 } = null,
     report_attach: bool = false, // headless prints the same attach lines as a local attach
+    expected_start: ?u64 = null,
+    start_profile: bool = false,
     completed: bool = false, // owner thread only: written here, read by RemoteShutdown
     fn run(context: *anyopaque, cancel: *@import("target/runtime.zig").c.struct_xrt_cancel) !void {
         const self: *RemoteStartup = @ptrCast(@alignCast(context));
         if (self.gdb) |endpoint| {
             log.debug(.runtime, "connecting to GDB remote stub {s}\n", .{endpoint});
             try self.session.target.connectGdbRemoteCancel(endpoint, cancel);
-        } else {
+        } else if (self.transport.len > 0) {
             log.debug(.runtime, "starting runtime agent transport {s} ({d} arguments)\n", .{ self.transport[0], self.transport.len - 1 });
             try self.session.target.connectRemoteCancel(self.transport, cancel);
         }
+        if (@import("target/runtime.zig").c.xrt_cancel_requested(cancel)) return error.RemoteCancelled;
         // A reconnect establishes a new transport only. Never replay attach,
         // launch, breakpoints, resume, or the old session's controller grant.
         if (!self.initial_actions) {
@@ -1014,12 +1051,21 @@ const RemoteStartup = struct {
             return;
         }
         if (self.attach) |pid| {
+            if (self.expected_start) |ticks| try @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks });
             const started = linux.now();
             if (self.report_attach) log.info(.session, "xodb: attaching to pid={d}\n", .{pid});
             self.session.target.attach(pid) catch |err| {
                 if (self.report_attach) log.err(.session, "xodb: attach failed: {s}; pid={d} elapsed_ms={d}\n", .{ @errorName(err), pid, (linux.now() -| started) / 1_000_000 });
                 return err;
             };
+            if (self.expected_start) |ticks| @import("model/process_identity.zig").validate(.{ .pid = pid, .start = ticks }) catch |err| {
+                self.session.target.detach() catch {};
+                return err;
+            };
+            if (self.start_profile) {
+                _ = try self.session.startProfile(.{ .frequency_hz = 99, .duration_ms = 10_000 });
+                try self.session.continueExecution(.human);
+            }
             if (self.report_attach) log.info(.session, "xodb: attached pid={d} threads={d} state={s} elapsed_ms={d}\n", .{ pid, self.session.target.snapshot().thread_count, @tagName(self.session.target.snapshot().state), (linux.now() -| started) / 1_000_000 });
         }
         if (self.launch.len > 0) try self.session.launch(self.launch);
@@ -1047,7 +1093,7 @@ const RemoteShutdown = struct {
         const self: *RemoteShutdown = @ptrCast(@alignCast(context));
         defer self.destroyed.* = true;
         defer self.session.deinit();
-        defer self.tree.deinitRemote();
+        defer if (self.session.target.isRemote()) self.tree.deinitRemote() else self.tree.deinit();
         defer if (self.record_path) |path| self.session.saveInvestigations(path) catch |err| log.err(.session, "Evidence export failed: {s}\n", .{@errorName(err)});
         defer exportProfileOnExit(self.session, self.profile_out);
         // A startup that failed or was cancelled has nothing to archive: the
@@ -1111,6 +1157,7 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
         return;
     };
     const o = try options.parse(args);
+    if (o.redact) @import("redact.zig").enable();
     _ = c.signal(c.SIGINT, onSignal);
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
@@ -1119,13 +1166,14 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     std.posix.sigaction(std.posix.SIG.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     const a = std.heap.c_allocator;
     var collector: @import("model/system.zig").Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count], .fast_ns = o.interval_ms * 1_000_000 };
+    collector.capture.mode = .headless;
     defer collector.deinit();
     const session = try a.create(Session);
     defer a.destroy(session);
     session.* = Session.init();
-    session.agent_scope = .observe;
+    session.agent_scope = o.agent_scope;
     defer session.deinit();
-    var shared: ?SharedSession = if (o.session_socket) |path| try SharedSession.init(path, null) else null;
+    var shared: ?SharedSession = if (o.session_socket) |path| try SharedSession.init(path, null, o.redact) else null;
     defer if (shared) |*endpoint| endpoint.deinit();
     if (shared) |*endpoint| {
         endpoint.overview_shared = &collector;
@@ -1137,10 +1185,14 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
         a.destroy(p);
     };
     if (server) |p| {
-        p.* = .{ .overview_shared = &collector, .overview_only = true };
+        p.* = .{ .overview_shared = &collector, .overview_only = true, .private_access = .init(.stdio, o.agent_scope == .observe, o.redact) };
         try p.init();
     }
     log.info(.overview, "xodb: headless overview serving mcp={} socket={} interval_ms={d}\n", .{ o.mcp, o.session_socket != null, o.interval_ms });
+    var capture: @import("model/system_capture.zig").Owner(Session) = .{ .collector = &collector, .root = session, .service = if (shared) |*endpoint| endpoint.service else null };
+    defer capture.deinit(linux.now());
+    if (shared) |*endpoint| endpoint.overview_capture = &capture.cpu;
+    if (server) |p| p.overview_capture = &capture.cpu;
     var samples: u64 = 0;
     while (quitting == 0) {
         // The owner clock: history groups at their periods, plus requested groups.
@@ -1153,6 +1205,8 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
             try p.pump(session);
             if (p.closed and p.queued == 0) break;
         }
+        capture.stdio_alive = if (server) |p| !p.input_eof else false;
+        capture.tick(linux.now());
         // Wake at once for stdin; peers and the clock are served every 20 ms.
         var fd = c.pollfd{ .fd = if (server) |p| (if (p.input_eof) -1 else p.input_fd) else -1, .events = c.POLLIN, .revents = 0 };
         _ = c.poll(&fd, 1, 20);
@@ -1213,6 +1267,21 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylo
     }
     const loss = stream.loss();
     log.info(.session, "xodb: evidence stream {d}: {s} {d} records, {d} undecoded, {d} flows, file {s}, clock {s}; drops ifdrop={d} osdrop={d} epb={d}\n", .{ stream.id, @tagName(stream.parsed.format), stream.parsed.records.len, stream.undecoded, stream.flows.len, @tagName(stream.parsed.stop), @tagName(stream.mapping.state), loss.isb_ifdrop, loss.isb_osdrop, loss.epb_drops });
+    var usb_stream: ?*@import("evidence/usb.zig").Stream = null;
+    errdefer if (usb_stream) |derived| derived.destroy();
+    if (try @import("evidence/usb.zig").Stream.open(a, stream)) |derived| {
+        const usb_loss = derived.loss();
+        log.info(.session, "xodb: USB evidence stream {d}: {d} URBs, {d} devices, {d} endpoints; malformed={d} unmatched={d} orphan={d} dropped={d}\n", .{ derived.id, derived.records.len, derived.devices.len, derived.endpoints.len, usb_loss.malformed, usb_loss.unmatched_submits, usb_loss.orphan_completions, usb_loss.derived_dropped });
+        usb_stream = derived;
+    }
+    var tls_stream: ?*@import("evidence/tls.zig").Stream = null;
+    errdefer if (tls_stream) |derived| derived.destroy();
+    var dbus_stream: ?*@import("evidence/dbus.zig").Stream = null;
+    errdefer if (dbus_stream) |derived| derived.destroy();
+    if (try @import("evidence/dbus.zig").Stream.open(a, stream)) |derived| {
+        log.info(.session, "xodb: D-Bus evidence stream {d}: {d} messages, {d} paired calls, {d} identities; malformed={d} orphan={d} pending={d} dropped={d}\n", .{ derived.id, derived.records.len, derived.paired, derived.identities.len, derived.malformed, derived.orphan_replies, derived.pending_calls, derived.derived_dropped + derived.pending_dropped });
+        dbus_stream = derived;
+    }
     if (keylog_path) |secret_path| {
         const keylog = try archive.readFile(a, secret_path, 16 * 1024 * 1024, null);
         defer {
@@ -1226,8 +1295,15 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylo
             for (derived.sessions) |summary| failures += summary.authentication_failures;
             break :blk failures;
         }, derived.reassembly_gaps });
-        session.tls_stream = derived;
+        tls_stream = derived;
     }
+    const protocol_stream = try @import("evidence/protocol.zig").Stream.open(a, stream, if (tls_stream == null) 2 else 3);
+    errdefer protocol_stream.destroy();
+    log.info(.session, "xodb: protocol evidence stream {d}: {d} HTTP/1 records, {d} DNS records, {d} reassembly gaps\n", .{ protocol_stream.id, protocol_stream.http_records, protocol_stream.dns_records, protocol_stream.reassembly_gaps });
+    session.tls_stream = tls_stream;
+    session.protocol_stream = protocol_stream;
+    session.usb_stream = usb_stream;
+    session.dbus_stream = dbus_stream;
     session.evidence_stream = stream;
 }
 
@@ -1284,6 +1360,8 @@ test {
     _ = @import("profile/archive_test.zig");
     _ = @import("evidence/stream.zig");
     _ = @import("evidence/tls.zig");
+    _ = @import("evidence/usb.zig");
+    _ = @import("evidence/dbus.zig");
     _ = @import("evidence/mitm.zig");
     _ = @import("profile/net_context.zig");
     _ = @import("mcp/evidence.zig");

@@ -165,10 +165,18 @@ pub const Session = struct {
     comparison: ?*@import("../profile/comparison.zig").Job = null,
     /// External evidence opened with --open-pcap (read-only, offline).
     evidence_stream: ?*@import("../evidence/stream.zig").Stream = null,
+    /// HTTP/1 and DNS records derived from evidence_stream.
+    protocol_stream: ?*@import("../evidence/protocol.zig").Stream = null,
     /// Authenticated plaintext derived from evidence_stream. Secrets are not retained.
     tls_stream: ?*@import("../evidence/tls.zig").Stream = null,
+    /// Linux usbmon URBs and descriptors derived from evidence_stream.
+    usb_stream: ?*@import("../evidence/usb.zig").Stream = null,
+    /// D-Bus messages derived from dbus-monitor --pcap evidence_stream.
+    dbus_stream: ?*@import("../evidence/dbus.zig").Stream = null,
     /// A read-only mitmproxy flow-file evidence stream.
     mitm_stream: ?*@import("../evidence/mitm.zig").Stream = null,
+    /// Owned dumpcap/tcpdump child and bounded packet ring.
+    live_capture: ?*@import("../capture/live.zig").Live = null,
     archive_job: ?*ArchiveJob = null,
     /// Published reconstructed-stack view and the last failed key. A failure
     /// is never retried automatically; `retryDerived` is an explicit action.
@@ -1144,6 +1152,17 @@ pub const Session = struct {
         return .{ .actor = actor, .client = if (actor == .agent) self.agent_client_id else null, .lease = if (actor == .agent) self.agent_lease else null };
     }
     pub fn continueAs(self: *Session, caller: Caller) !void {
+        // Rejected calls must leave an earlier deferred continue and its
+        // authority intact, including when the backend itself rejects resume.
+        const previous_actor = self.probe_resume_actor;
+        const previous_lease = self.probe_resume_lease;
+        errdefer {
+            self.probe_resume_actor = previous_actor;
+            self.probe_resume_lease = previous_lease;
+        }
+        if (caller.actor == .agent) if (caller.lease) |lease| {
+            if (!lease.valid(linux.now(), @intFromEnum(self.agent_scope))) return error.ControlLeaseRequired;
+        };
         try self.persistent.remember(self);
         try self.persistent.poll(self);
         self.probe_resume_actor = caller.actor;
@@ -1154,11 +1173,11 @@ pub const Session = struct {
             self.suppress_probe_resume = true;
             return;
         }
-        self.pending_continue = null;
         if (caller.actor == .agent) if (caller.lease) |lease| {
             if (!lease.valid(linux.now(), @intFromEnum(self.agent_scope))) return error.ControlLeaseRequired;
         };
         try self.target.continueExecution();
+        self.pending_continue = null;
         self.suppress_probe_resume = false;
     }
     pub fn cancelStep(self: *Session) void {
@@ -2201,7 +2220,11 @@ pub const Session = struct {
         if (self.observation_associations) |job| job.deinit();
         if (self.observation_analysis) |job| job.deinit();
         if (self.comparison) |job| job.deinit();
+        if (self.live_capture) |capture| capture.destroy();
         if (self.tls_stream) |stream| stream.destroy();
+        if (self.protocol_stream) |stream| stream.destroy();
+        if (self.usb_stream) |stream| stream.destroy();
+        if (self.dbus_stream) |stream| stream.destroy();
         if (self.mitm_stream) |stream| stream.destroy();
         if (self.evidence_stream) |stream| stream.destroy();
         if (self.archive_job) |job| {
@@ -2263,6 +2286,45 @@ test "a source step rechecks its caller before another instruction" {
     session.source_step = .{ .tid = 1, .line = 1, .path = undefined, .path_len = 0, .over = false };
     try std.testing.expectError(error.AgentScopeRevoked, session.advanceSourceStep());
     try std.testing.expectEqual(@as(usize, 0), session.source_step_resumes);
+}
+
+test "failed continue preserves an earlier deferred continue and caller" {
+    var session = Session.init();
+    defer session.deinit();
+    session.pending_continue = .{ .generation = 19, .epoch = 3, .actor = .human, .lease = null };
+    session.probe_resume_actor = .human;
+    session.suppress_probe_resume = true;
+    const pending = session.pending_continue;
+    // An idle native target rejects resume without needing a live process.
+    if (session.continueAs(.{ .actor = .agent })) |_| {
+        return error.ExpectedBackendRejection;
+    } else |_| {}
+    try std.testing.expectEqualDeep(pending, session.pending_continue);
+    try std.testing.expectEqual(Actor.human, session.probe_resume_actor);
+    try std.testing.expect(session.suppress_probe_resume);
+}
+
+test "invalid lease cannot replace a resolving deferred continue" {
+    const service_api = @import("../service/authority.zig").c;
+    var cwd: [4096]u8 = undefined;
+    if (@import("../c.zig").api.getcwd(&cwd, cwd.len) == null) return error.TestDirectoryUnavailable;
+    const path = try std.fmt.allocPrintSentinel(std.testing.allocator, "{s}/command-lease-{d}.sock", .{ std.mem.sliceTo(&cwd, 0), linux.now() }, 0);
+    defer std.testing.allocator.free(path);
+    const service = service_api.xsvc_open(path.ptr) orelse return error.TestServiceUnavailable;
+    defer service_api.xsvc_close(service);
+    var session = Session.init();
+    defer session.deinit();
+    session.agent_scope = .control;
+    session.pending_continue = .{ .generation = 19, .epoch = 3, .actor = .human, .lease = null };
+    session.persistent.resolving = true;
+    const pending = session.pending_continue;
+    try std.testing.expectError(error.ControlLeaseRequired, session.continueAs(.{
+        .actor = .agent,
+        .lease = .{ .service = service, .client = 7, .id = 1 },
+    }));
+    try std.testing.expectEqualDeep(pending, session.pending_continue);
+    try std.testing.expectEqual(Actor.human, session.probe_resume_actor);
+    try std.testing.expect(session.persistent.resolving);
 }
 
 test "retained evidence owns enum and nested preview and frame strings" {

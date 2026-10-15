@@ -16,8 +16,10 @@ pub const Endpoint = struct {
     overview: @import("overview.zig").State = .{},
     overview_shared: ?*@import("overview.zig").State = null,
     overview_only: bool = false,
+    overview_capture: ?*const ?*Session = null,
     owner_queue: ?*@import("../model/remote_owner.zig").Queue = null,
     owner_connection: u64 = 0,
+    private_access: @import("evidence.zig").PrivateAccess = .unavailable,
     pub fn queuedServer(self: *Endpoint, sequence: u64) ?*Server {
         for (self.clients) |slot| if (slot) |client| {
             if (client.server.pending_sequence == sequence) return client.server;
@@ -28,12 +30,12 @@ pub const Endpoint = struct {
         return self.overview_shared orelse &self.overview;
     }
     const Client = struct { id: u64, server: *Server, accepted: u64, progressed: u64 };
-    pub fn init(path: [:0]const u8, source: ?[:0]const u8) !Endpoint {
+    pub fn init(path: [:0]const u8, source: ?[:0]const u8, redact: bool) !Endpoint {
         const service = c.xsvc_open(path.ptr) orelse {
             log.err(.mcp, "xodb: cannot open shared session socket {s}: errno={d}\n", .{ path, std.c._errno().* });
             return error.SessionSocketUnavailable;
         };
-        return .{ .service = service, .source_path = source };
+        return .{ .service = service, .source_path = source, .private_access = .init(.session_socket, false, redact) };
     }
     pub fn deinit(self: *Endpoint) void {
         for (&self.clients) |*slot| if (slot.*) |client| {
@@ -81,7 +83,8 @@ pub const Endpoint = struct {
                 _ = c.xsvc_drop(self.service, peer.id, linux.now());
                 continue;
             };
-            server.* = .{ .input_fd = peer.fd, .output_fd = peer.fd, .source_path = self.source_path, .shared = .{ .service = self.service, .client_id = peer.id }, .request_limit = 1, .overview_shared = self.collector(), .overview_only = self.overview_only, .owner_queue = self.owner_queue, .owner_connection = self.owner_connection };
+            server.* = .{ .input_fd = peer.fd, .output_fd = peer.fd, .source_path = self.source_path, .shared = .{ .service = self.service, .client_id = peer.id }, .request_limit = 1, .overview_shared = self.collector(), .overview_only = self.overview_only, .owner_queue = self.owner_queue, .owner_connection = self.owner_connection, .private_access = self.private_access };
+            server.overview_capture = self.overview_capture;
             server.init() catch {
                 allocator.destroy(server);
                 _ = c.xsvc_drop(self.service, peer.id, linux.now());

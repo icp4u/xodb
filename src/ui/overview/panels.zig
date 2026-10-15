@@ -373,10 +373,11 @@ fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void
     {
         const f = s.cpu_package_temp;
         const readout = if (f.get()) |x| std.fmt.bufPrint(&b, "{d:.0}", .{x}) catch "" else "";
-        const sub = if (s.cpu_package_power.get()) |w| std.fmt.bufPrint(&sb, "°C · package {d:.1} W", .{w}) catch "" else "°C · power —";
+        const word = if (std.mem.indexOf(u8, s.cpu_power_label, "System") != null) "system" else "package";
+        const sub = if (s.cpu_package_power.get()) |w| std.fmt.bufPrint(&sb, "°C · {s} {d:.1} W", .{ word, w }) catch "" else "°C · power —";
         const bounds = Rect{ .x = rect.x + 3 * (gw + gap), .y = rect.y, .w = gw, .h = top_h };
         try gauge(v, ctx, bounds, if (gw < 190) "CPU temp" else "CPU temperature", f, 100, readout, sub, p.warn, prevF(v.prev(), "cpu_package_temp"), now);
-        if (s.cpu_package_power.get() == null) v.hover(bounds, "Package power unavailable: {s}", .{s.cpu_package_power.reason});
+        if (s.cpu_package_power.get() == null) v.hover(bounds, "{s} unavailable: {s}", .{ powerLabel(s), s.cpu_package_power.reason });
     }
     // History row.
     const mid_y = rect.y + top_h + gap;
@@ -515,8 +516,8 @@ fn honesty(v: *View, ctx: Ctx, inner: Rect, s: *const m.Snapshot) !void {
         const st = s.groups[i];
         if (st.status != .ok and !std.mem.eql(u8, st.reason, "not collected")) add(&list, &count, g.name, if (st.detail.len > 0) st.detail else st.reason);
     }
-    if (s.cpu_package_power.get() == null) add(&list, &count, "CPU package power", s.cpu_package_power.reason);
-    if (s.cpu_package_temp.get() == null) add(&list, &count, "CPU temperature", s.cpu_package_temp.reason);
+    if (s.cpu_package_power.get() == null) add(&list, &count, if (s.cpu_power_label.len > 0) s.cpu_power_label else if (std.mem.eql(u8, s.cpu_package_power.reason, "not supported")) "CPU power" else "CPU package power", s.cpu_package_power.reason);
+    if (s.cpu_package_temp.get() == null) add(&list, &count, if (s.cpu_temp_label.len > 0) s.cpu_temp_label else "CPU temperature", s.cpu_package_temp.reason);
     if (s.cpus.len > 0 and s.cpus[0].temp_c.get() == null) add(&list, &count, "Per-core temperature", s.cpus[0].temp_c.reason);
     for (s.gpus) |g| {
         if (g.busy.get() == null) add(&list, &count, "GPU busy", g.busy.reason);
@@ -588,9 +589,9 @@ fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !
         y += line_h;
         try kv(v, ctx, inner.x, y, inner.w, "Fastest core", if (n > 0) m.F.of(max_mhz) else m.F.missing("no frequency"), .mhz);
         y += line_h;
-        try kv(v, ctx, inner.x, y, inner.w, "Package temperature", s.cpu_package_temp, .celsius);
+        try kv(v, ctx, inner.x, y, inner.w, tempLabel(s), s.cpu_package_temp, .celsius);
         y += line_h;
-        if (y + line_h <= inner.y + inner.h) try kv(v, ctx, inner.x, y, inner.w, "Package power", s.cpu_package_power, .watts);
+        if (y + line_h <= inner.y + inner.h) try kv(v, ctx, inner.x, y, inner.w, powerLabel(s), s.cpu_package_power, .watts);
     }
     {
         var rb: [96]u8 = undefined;
@@ -647,12 +648,17 @@ fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !
         }
         const label = if (topology_why.len > 0)
             std.fmt.bufPrint(&lb, "{d} logical CPUs · topology unavailable: {s}", .{ d[1] - d[0], topology_why }) catch ""
+        else if (first.cluster_domain)
+            std.fmt.bufPrint(&lb, "Package {d} · {s} {d} · {d} cores / {d} threads", .{ first.package, clusterKind(s, first), first.cache, cores, d[1] - d[0] }) catch ""
         else
             std.fmt.bufPrint(&lb, "Package {d} · L3 domain {d} · {d} cores / {d} threads", .{ first.package, first.cache, cores, d[1] - d[0] }) catch "";
-        var temp_b: [48]u8 = undefined;
-        const temp_label: []const u8 = if (di < s.cpu_temps.len) (if (s.cpu_temps[di].value.get()) |t| std.fmt.bufPrint(&temp_b, "{s} {d:.1} °C", .{ s.cpu_temps[di].label, t }) catch "" else "") else "";
+        var temp_b: [64]u8 = undefined;
+        const temp_label: []const u8 = domainTemp(&temp_b, s, first, di);
         const inner = try card(ctx, box, label, temp_label);
-        if (!someCoreTemps(s) and s.cpus[0].temp_c.reason.len > 0) v.hover(.{ .x = box.x, .y = box.y, .w = box.w, .h = 30 }, "Per-core temperature: {s}; package and CCD sensors are on Power & Thermals", .{s.cpus[0].temp_c.reason});
+        if (!someCoreTemps(s) and s.cpus[0].temp_c.reason.len > 0) {
+            const where = if (first.cluster_domain) "cluster sensors are on Power & Thermals" else "package and CCD sensors are on Power & Thermals";
+            v.hover(.{ .x = box.x, .y = box.y, .w = box.w, .h = 30 }, "Per-core temperature: {s}; {s}", .{ s.cpus[0].temp_c.reason, where });
+        }
         const n = d[1] - d[0];
         // Tile layout: as square-ish as fits.
         var cols: usize = 1;
@@ -672,6 +678,49 @@ fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !
             try cpuTile(v, ctx, tile, s, ci, now);
         }
     }
+}
+
+/// Hottest cluster sensor of this domain. L3 domains keep the temperature at the same index.
+fn domainTemp(buf: []u8, s: *const m.Snapshot, cpu: m.Cpu, index: usize) []const u8 {
+    if (cpu.cluster_domain) {
+        const kind = clusterKind(s, cpu);
+        if (std.mem.eql(u8, kind, "P-cluster") or std.mem.eql(u8, kind, "E-cluster")) {
+            var best: ?f64 = null;
+            var best_label: []const u8 = "";
+            for (s.cpu_temps) |t| {
+                if (!std.mem.startsWith(u8, t.label, kind)) continue;
+                const v = t.value.get() orelse continue;
+                if (best == null or v > best.?) {
+                    best = v;
+                    best_label = t.label;
+                }
+            }
+            if (best) |v| return std.fmt.bufPrint(buf, "{s} {d:.1} °C", .{ best_label, v }) catch "";
+        }
+    }
+    if (index < s.cpu_temps.len) if (s.cpu_temps[index].value.get()) |t|
+        return std.fmt.bufPrint(buf, "{s} {d:.1} °C", .{ s.cpu_temps[index].label, t }) catch "";
+    return "";
+}
+
+fn powerLabel(s: *const m.Snapshot) []const u8 {
+    return if (s.cpu_power_label.len > 0) s.cpu_power_label else "Package power";
+}
+fn tempLabel(s: *const m.Snapshot) []const u8 {
+    return if (s.cpu_temp_label.len > 0) s.cpu_temp_label else "Package temperature";
+}
+/// P-cluster is the highest cpu_capacity only when a lower class also exists.
+fn clusterKind(s: *const m.Snapshot, cpu: m.Cpu) []const u8 {
+    var max: u32 = 0;
+    var min: u32 = std.math.maxInt(u32);
+    var any = false;
+    for (s.cpus) |c| if (c.capacity > 0) {
+        any = true;
+        max = @max(max, c.capacity);
+        min = @min(min, c.capacity);
+    };
+    if (!any or min == max) return "cluster";
+    return if (cpu.capacity == max) "P-cluster" else "E-cluster";
 }
 
 /// The first CPU's topology reason when any CPU's topology is unknown.
@@ -730,7 +779,7 @@ fn cpuTile(v: *View, ctx: Ctx, tile: Rect, s: *const m.Snapshot, index: usize, n
             v.hover(r, "CPU {d} temperature: {s}", .{ c.id, c.temp_c.reason });
         }
     }
-    if (!known) v.hover(tile, "CPU {d}: topology unavailable: {s}", .{ c.id, c.topology_why }) else if (c.online == null) v.hover(tile, "CPU {d}: online state unavailable: {s}", .{ c.id, c.online_why }) else v.hover(tile, "CPU {d}: package {d}, L3 {d}, core {d}, thread {d}", .{ c.id, c.package, c.cache, c.core, c.smt });
+    if (!known) v.hover(tile, "CPU {d}: topology unavailable: {s}", .{ c.id, c.topology_why }) else if (c.online == null) v.hover(tile, "CPU {d}: online state unavailable: {s}", .{ c.id, c.online_why }) else if (c.cluster_domain) v.hover(tile, "CPU {d}: package {d}, {s} {d}, capacity {d}, core {d}, thread {d}", .{ c.id, c.package, clusterKind(s, c), c.cache, c.capacity, c.core, c.smt }) else v.hover(tile, "CPU {d}: package {d}, L3 {d}, core {d}, thread {d}", .{ c.id, c.package, c.cache, c.core, c.smt });
 }
 
 // --- Processes ----------------------------------------------------------------
@@ -1392,7 +1441,9 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
     // CPU package power and temperature: the privileged reading shows its reason.
     const cw: f32 = @min(420, rect.w * 0.3);
     {
-        const inner = try card(ctx, .{ .x = rect.x, .y = rect.y, .w = cw, .h = top_h }, "CPU package", "RAPL · hwmon");
+        const heading = if (s.cpu_temp_label.len > 0 or s.cpu_power_label.len > 0) "CPU" else "CPU package";
+        const source = if (s.cpu_power_label.len > 0) s.cpu_power_label else "RAPL · hwmon";
+        const inner = try card(ctx, .{ .x = rect.x, .y = rect.y, .w = cw, .h = top_h }, heading, source);
         var b: [32]u8 = undefined;
         if (s.cpu_package_temp.get()) |t| {
             const w = try ctx.vfd(inner.x, inner.y + 4, 56, std.fmt.bufPrint(&b, "{d:.1}", .{t}) catch "", p.warn);
@@ -1400,13 +1451,13 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
         } else try missing(v, ctx, inner.x, inner.y + 20, inner.w, s.cpu_package_temp.reason);
         const py = inner.y + 78;
         if (s.cpu_package_power.get()) |w| {
-            try kv(v, ctx, inner.x, py, inner.w, "Package power", m.F.of(w), .watts);
+            try kv(v, ctx, inner.x, py, inner.w, powerLabel(s), m.F.of(w), .watts);
         } else {
-            try ctx.textFit(inner.x, py, inner.w, "Package power", p.dim);
+            try ctx.textFit(inner.x, py, inner.w, powerLabel(s), p.dim);
             const box = Rect{ .x = inner.x, .y = py + 24, .w = inner.w, .h = 40 };
             try ctx.hatch(box);
             try missing(v, ctx, box.x + 8, box.y + 10, box.w - 16, s.cpu_package_power.reason);
-            v.hover(box, "RAPL energy counters are readable by root only on this kernel; nothing is estimated", .{});
+            if (s.cpu_power_label.len == 0 and std.mem.eql(u8, s.cpu_package_power.reason, "needs privilege")) v.hover(box, "RAPL energy counters are readable by root only on this kernel; nothing is estimated", .{}) else v.hover(box, "{s}: {s}", .{ powerLabel(s), s.cpu_package_power.reason });
         }
     }
     // GPUs.
