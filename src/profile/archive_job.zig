@@ -1,6 +1,7 @@
 //! One archive operation owns its worker, progress and unpublished result.
 const std = @import("std");
 const archive = @import("archive.zig");
+const redact = @import("../redact.zig");
 const Capture = @import("capture.zig").Capture;
 const Progress = @import("archive_progress.zig").Progress;
 const a = std.heap.page_allocator;
@@ -91,6 +92,8 @@ pub const Job = struct {
                 self.opened = try archive.decode(a, bytes, .{ .local_id = self.local_id, .resolver = .{ .enabled = self.symbols != null or self.reanalyze, .root = self.symbols }, .reanalyze = self.reanalyze, .progress = &self.progress });
             },
             .allocation_save => {
+                // Allocation archives have no redacting writer yet.
+                if (redact.active() != null) return error.AllocationArchiveNotRedacted;
                 const bytes = try @import("allocation_archive.zig").encode(a, self.allocation.?, &self.progress);
                 defer a.free(bytes);
                 self.publication = archive.publish(self.path, bytes, &self.progress);
@@ -98,15 +101,21 @@ pub const Job = struct {
             .save => {
                 var encoded: ?[]u8 = null;
                 defer if (encoded) |bytes| a.free(bytes);
+                const policy = redact.active();
+                // Copying an opened archive keeps its bytes: under --redact
+                // only one that was itself written redacted.
+                if (policy != null and self.original_bytes != null and !archive.isRedacted(self.original_bytes.?)) return error.ArchiveNotRedacted;
                 const native_bytes = self.original_bytes orelse blk: {
-                    encoded = try archive.encode(a, self.capture.?, .{ .writer_boot_id = @import("../binary/snapshot.zig").bootId(), .progress = &self.progress });
+                    encoded = try archive.encode(a, self.capture.?, .{ .writer_boot_id = @import("../binary/snapshot.zig").bootId(), .progress = &self.progress, .redact = policy });
                     break :blk encoded.?;
                 };
                 if (self.progress.cancel.load(.acquire)) {
                     self.publication = archive.publish(self.path, native_bytes, &self.progress);
                     return;
                 }
-                const attached = if (self.frames) |frames| try frames.encode(null) else null;
+                // Imported frame sources are not scrubbed: not attached under --redact.
+                const frames = if (policy == null) self.frames else null;
+                const attached = if (frames) |owner| try owner.encode(null) else null;
                 defer if (attached) |data| data.deinit();
                 const with_frames = if (attached) |data| try archive.attachFrames(a, native_bytes, data.bytes()) else null;
                 defer if (with_frames) |data| a.free(data);

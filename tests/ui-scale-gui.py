@@ -60,7 +60,7 @@ if args.sizing:
     # Four owned sessions, fast GUI lane. A preference-only run and a CLI
     # override of that preference exercise both entry points at each output scale.
     config = work / 'scale-preferences.json'
-    config.write_text(json.dumps({'appearance': {'ui_scale': 1.5}}))
+    config.write_text(json.dumps({'appearance': {'ui_scale': 1.5, 'density': 'normal'}}))
     for compositor in (1, 2):
         layouts = []
         for scale in (1, 1.5):
@@ -71,9 +71,31 @@ if args.sizing:
             d = h.Display(str(root), options + list(h.M1), output_scale=compositor)
             try:
                 d.stopped()
-                # UI (700,65) is the Agent control. Convert to surface units,
-                # the coordinate system used by the compositor's virtual pointer.
-                pointer = d.keys('click', round(700 * scale / compositor), round(65 * scale / compositor), wait=False)
+                # Resolve overflow at the actual UI size, then convert its hit
+                # rectangle to the compositor's native surface coordinates.
+                deadline = time.monotonic() + 5 * h.load_scale()
+                while True:
+                    layout = d.tool('get_layout')
+                    if layout['available']:
+                        break
+                    if time.monotonic() > deadline:
+                        raise AssertionError(layout)
+                    time.sleep(.015)
+                agent = next(c for c in layout['controls'] if c['name'] == 'Agent')
+                if agent['overflow']:
+                    more = next(c['rect'] for c in layout['controls'] if c['name'] == 'More')
+                    click = d.keys('click', round((more['x'] + 20) * scale / compositor), round((more['y'] + 12) * scale / compositor), wait=False)
+                    while True:
+                        layout = d.tool('get_layout')
+                        agent = next((c for c in layout['controls'] if c['name'] == 'Agent' and not c['overflow']), None)
+                        if agent:
+                            break
+                        if time.monotonic() > deadline:
+                            raise AssertionError(layout)
+                        time.sleep(.015)
+                    check(label + ' overflow pointer completed', click.wait(timeout=5) == 0)
+                hit = agent['rect']
+                pointer = d.keys('click', round((hit['x'] + 25) * scale / compositor), round((hit['y'] + 12) * scale / compositor), wait=False)
                 controlled = d.wait(lambda state: state['agent_scope'] == 'control', seconds=2 * h.load_scale())
                 check(label + ' pointer helper completed', pointer.wait(timeout=5) == 0)
                 check(label + ' scaled pointer hits Agent', controlled is not None)

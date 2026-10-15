@@ -57,8 +57,8 @@ stack functions, then their direct callees, then user breakpoint functions,
 with a hard 16-function bound. This real-program warm-ahead replaces the old
 throwaway `prime` request, which measured no faster after decompiler reuse. Resume and an interactive analysis cancel
 this work before it can delay the debugger. A cancelled import starts again
-from nothing, so a library whose import was twice cancelled after seconds of
-work is left to an explicit request. Background imports stop at half of
+from nothing, so its path waits at least 30 seconds before another eager
+attempt; an explicit request remains immediate. Background imports stop at half of
 `XODB_GHIDRA_MAX_IMAGES`; the other half is kept for images you ask about.
 
 The cache is private and safe to delete while the sidecar is stopped. The
@@ -98,14 +98,16 @@ The two lengths must agree. Lines are capped at 1 MiB and documents at 64 MiB.
 A closed or truncated connection is a typed `sidecar_died` or
 `sidecar_io_failed` job failure; xodb and the debugger remain usable.
 
-The server accepts multiple requests on a connection. The current xodb client
-uses a fresh connection per request so a failed client cannot desynchronise a
-later exchange.
+The server accepts multiple requests on a connection. Each xodb session owns
+one validated idle connection for its lifetime, while requests use independent
+connections so a failed exchange cannot desynchronise later work. The held
+connection carries no requests; it records that a live xodb session owns use
+of the shared JVM and prevents idle exit.
 
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.5`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.6`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
 `pseudocode`. It also advertises `prime`, variables, types, function index, and the
@@ -116,13 +118,17 @@ real functions after the target architecture and stack are known, because the
 throwaway-program prime did not improve first-use latency once decompilers were
 pooled. `open_image` carries `path` and lowercase `sha256`. It hashes the file before
 import. The operation is idempotent by SHA-256 and returns progress through
-`hashing`, `importing`, and `analyzing`. Format loaders also find adjacent
-owned debug companions such as a PDB or dSYM. Analysis keeps format/debug,
+`hashing`, `importing`, and `analyzing`. A caller may also supply a debug
+companion path and SHA-256; the sidecar verifies both files and keys that
+analysis cache entry by both identities. Analysis keeps format/debug,
 function, reference, string, switch, stack, and demangling work; analyzers
 unrelated to the exported function document are disabled.
 
 `decompile` carries the same `path` and `sha256`, canonical hexadecimal
 `entry` and `size`, optional GNU `build_id`, and `options` (`default` today).
+An image-only request uses `symbol` in place of `entry` and `size`; Ghidra
+resolves that name in the imported project and refuses an absent or ambiguous
+function.
 The entry may be the start or an address inside the Ghidra function. Every
 address in a request or a document is a link address: the runtime address
 minus the module's load bias. The sidecar imports an ELF at its linked base,
@@ -130,8 +136,9 @@ not at Ghidra's default base for position-independent code, so a
 position-independent executable or a shared library answers exactly as a
 fixed-address build does. A cached import found at another base (written
 before producer 0.1.1) is replaced on its next `open_image`. Documents
-are immutable and cached by image SHA-256, resolved function entry, options,
-and producer version.
+are immutable and cached by image SHA-256, requested entry or symbol, options,
+and producer version; the document and artifact identity carry the resolved
+function entry.
 
 `status` without `job` returns process health and resource counts. With `job`
 it returns that operation's `pending`, `ready`, or `failed` state and progress;
@@ -147,11 +154,10 @@ shutdown merely because an xodb session exits.
 The JVM exits cleanly after 30 minutes with no connected client and no request.
 Set `XODB_GHIDRA_IDLE` to a number of minutes; fractional values are accepted
 for short-lived private runs, and `0` disables idle exit. An open connection
-keeps the sidecar alive regardless of request traffic, but xodb opens one
-connection per request and holds none in between: an xodb that sits at a stop,
-or lets its target run, for longer than the limit finds the sidecar gone and
-starts it again on its next request (a few seconds; the project cache is
-kept). `status` reports `idle_seconds`, `idle_limit_seconds`, and
+keeps the sidecar alive regardless of request traffic. Every xodb session
+opens and validates one idle hold connection and closes it during session
+teardown; a stopped or running session therefore keeps the shared JVM warm.
+`status` reports `idle_seconds`, `idle_limit_seconds`, and
 `clients_connected`, and the log records why the JVM stopped
 (`lifetime: stopping: idle`, `endpoint_replaced` or `shutdown`).
 
@@ -175,14 +181,17 @@ the graph consumed by xsg and the pseudo-C document consumed by the D pane:
 - decoded instruction bytes, mnemonics, raw p-code, and high-op links used to
   account for no-effect landing pads that high p-code omits;
 - pseudo-C text and positioned syntax tokens;
-- variables with name, type, register/stack/temp storage, base-register name,
-  subregister bit offset, and PC range. For a register the range is a proof
+- variables with name, type and an ordered list of register/stack/temp pieces,
+  each with its value bit offset, register/subregister location or signed CFA
+  offset, and a common PC range. For a register the range is a proof
   that a stop PC inside it finds the value in that register: straight-line
   code from the function entry (a parameter) or from just after the
   instruction that wrote the register (a local), ending at the first write to
   the register, call, branch, user-defined p-code op or jump target. An
-  unproven register variable has an empty range. Other storage carries the
-  looser first-to-last-use span;
+  unproven register variable has an empty range. Stack parameters are proven
+  from entry; a stack local starts only at an exact address-tied defining store,
+  and its range ends at the first call, branch, join, opaque instruction or
+  memory write. Every piece must be proven or the variable has an empty range;
 - referenced types, function prototype, and calling convention;
 - function bounds, direct callees, callers, and referenced strings.
 
@@ -202,5 +211,21 @@ The D pane keeps pseudo-C text even when graph admission fails and shows the
 one-line graph reason; graph-only queries return `graph_unavailable`. If a
 selected sidecar cannot start on x86-64, the same request falls back to the
 configured native worker and the pane names that producer. Register-backed
-sidecar variables are overlaid from the stopped frame only inside their
-exported PC range. `[` and `]` scroll long pseudo-C lines horizontally.
+sidecar variables and CFA-relative stack pieces are overlaid from the stopped
+frame only inside their exported PC range; stack pieces only in the innermost
+frame. A value split over several pieces shows no live value yet: the 0.1.6
+export orders x86-64 aggregate pieces wrongly. `[` and `]` scroll
+long pseudo-C lines horizontally.
+
+## Image-only sessions
+
+`xodb --decompile FILE [--function NAME]` prints pseudo-C without launching or
+attaching to a process. xodb copies the regular input into a private bounded
+snapshot, hashes that exact copy, and removes it after the sidecar has imported
+and decompiled the requested function. An adjacent same-stem PDB is copied into
+the private snapshot under its original name and a 64 MiB bound; its hash is
+verified by the sidecar and forms part of the cached-analysis identity. With no function name, the sidecar
+chooses `main` or `entry`; ambiguous or absent names are typed failures. This
+path supports every format Ghidra can import and is gated with owned x86-64 PE
+and arm64 Mach-O fixtures. It has no target generation, runtime bias, frame,
+register or live-value overlay.

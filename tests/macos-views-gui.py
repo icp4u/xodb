@@ -8,6 +8,7 @@ from pathlib import Path
 import subprocess
 import time
 from types import SimpleNamespace
+from PIL import Image
 
 
 def module(name,path):
@@ -28,6 +29,19 @@ def main():
     def ocr(display,name):
         assert display.alive(),Path(display.log).read_text()
         shot=display.shot(name)
+        if name=='threads':
+            # Full-frame page segmentation can omit the selected row's second
+            # line beside the assembly column. Read the actual pane at 2x;
+            # the same worker-name and queue assertions still test pixels.
+            layout=client.tool('get_layout')
+            pane=next(p['rect'] for p in layout['panes'] if p['name']=='Threads')
+            factor=layout['window']['ui_scale']
+            box=tuple(round(n*factor) for n in (pane['x'],pane['y'],pane['x']+pane['w'],pane['y']+pane['h']))
+            crop=str(shot)+'.threads.png'
+            with Image.open(shot) as im:
+                region=im.crop(box)
+                region.resize((region.width*2,region.height*2)).save(crop)
+            shot=crop
         text=subprocess.run(['tesseract',shot,'stdout'],capture_output=True,text=True,check=True,
                             env={**os.environ,'OMP_THREAD_LIMIT':'1'},timeout=10*scale).stdout
         assert display.alive(),Path(display.log).read_text()

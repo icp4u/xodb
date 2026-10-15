@@ -110,7 +110,13 @@ fn emit(topic: Topic, level: Level, comptime fmt: []const u8, args: anytype) voi
         const ms = (now() -| epoch) / std.time.ns_per_ms;
         w.print("xodb[{s}] +{d}.{d:0>3}s ", .{ @tagName(topic), ms / 1000, ms % 1000 }) catch {};
     }
-    w.print(fmt, args) catch {};
+    if (@import("redact.zig").active()) |policy| {
+        // --redact: the whole line, every level, before it reaches the file.
+        var line: [4096]u8 = undefined;
+        var raw = std.Io.Writer.fixed(&line);
+        raw.print(fmt, args) catch {};
+        policy.scrub(&w, raw.buffered()) catch {};
+    } else w.print(fmt, args) catch {};
     w.flush() catch {};
 }
 

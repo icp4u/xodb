@@ -87,6 +87,19 @@ def rss_kib(pid):
         if line.startswith("VmRSS:"): return int(line.split()[1])
     raise AssertionError(f"VmRSS absent for {pid}")
 
+
+def native_decompilers(pid):
+    children = set()
+    for thread in Path(f"/proc/{pid}/task").iterdir():
+        try: children.update(map(int, (thread / "children").read_text().split()))
+        except (FileNotFoundError, ProcessLookupError): pass
+    found = []
+    for child in children:
+        try: command = Path(f"/proc/{child}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace")
+        except FileNotFoundError: continue
+        if "decompile" in command: found.append(child)
+    return found
+
 SOURCE = "tests/fixtures/semq/qx.c"
 CALLS = {"qx_alloc": ("malloc", "memset"), "qx_copy": ("memcpy",), "qx_sum": (), "qx_indirect": ()}
 
@@ -228,6 +241,43 @@ try:
     parameters = [row for row in registers if row["parameter"]]
     assert parameters and all(int(row["valid_start"], 16) == entry and entry < int(row["valid_end"], 16) <= first_call + 1 for row in parameters), (parameters, hex(first_call))
     assert all(int(row["valid_start"], 16) > entry or row["valid_start"] == row["valid_end"] for row in registers if not row["parameter"]), registers
+
+    storage_image = gcc(work / "qx-storage", "-fno-pie", "-no-pie", "tests/fixtures/semq/qx-storage.c")
+    storage_sha = hashlib.sha256(storage_image.read_bytes()).hexdigest()
+    storage_open, _ = exchange({"id": "storage-open", "verb": "open_image", "path": str(storage_image),
+        "sha256": storage_sha, "deadline_ms": 10000})
+    storage_open, _ = wait_work(storage_open, 120)
+    assert storage_open.get("state") == "ready", storage_open
+    stack_reply, stack_payload = exchange({"id": "stack-variables", "verb": "decompile", "path": str(storage_image),
+        "sha256": storage_sha, "entry": hex(link_address(storage_image, "qx_stack")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    stack_reply, stack_payload = wait_work(stack_reply)
+    assert stack_reply.get("state") == "ready" and stack_payload, stack_reply
+    stack_variables = json.loads(stack_payload)["variables"]
+    stack_parameter = next(row for row in stack_variables if row.get("name") == "seventh")
+    stack_pieces = [piece for piece in stack_parameter.get("pieces", ()) if piece.get("storage") == "stack"]
+    stack_entry = link_address(storage_image, "qx_stack")
+    assert stack_pieces and all(isinstance(piece.get("cfa_offset"), int) for piece in stack_pieces), stack_parameter
+    assert int(stack_parameter["valid_start"], 16) == stack_entry < int(stack_parameter["valid_end"], 16), stack_parameter
+
+    split_reply, split_payload = exchange({"id": "split-variables", "verb": "decompile", "path": str(storage_image),
+        "sha256": storage_sha, "entry": hex(link_address(storage_image, "qx_split")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    split_reply, split_payload = wait_work(split_reply)
+    assert split_reply.get("state") == "ready" and split_payload, split_reply
+    split_variables = json.loads(split_payload)["variables"]
+    assert any(len(row.get("pieces", ())) > 1 and int(row["valid_start"], 16) < int(row["valid_end"], 16)
+               for row in split_variables), split_variables
+
+    # Losing Ghidra's native decompiler child invalidates its pooled interface.
+    # The request that encounters that death reopens the program and retries
+    # once, rather than exposing a transient "Stream closed" failure.
+    sidecar_pid = status()["pid"]
+    children = native_decompilers(sidecar_pid)
+    assert children, f"no native decompiler child below sidecar {sidecar_pid}"
+    for child in children: os.kill(child, 9)
+    crash_reply, crash_payload = exchange({"id": "crash-retry", "verb": "decompile", "path": str(fixed),
+        "sha256": sha, "entry": hex(link_address(fixed, "qx_alias")), "size": "0x0", "options": "crash-retry", "deadline_ms": 10000})
+    crash_reply, crash_payload = wait_work(crash_reply)
+    assert crash_reply.get("state") == "ready" and crash_payload, crash_reply
     client.p.stdin.close(); client.p.wait(timeout=10)
     client = Client("observe", str(fixed))
     for _ in range(200):

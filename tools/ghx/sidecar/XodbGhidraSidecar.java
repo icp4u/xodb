@@ -20,6 +20,7 @@ import ghidra.GhidraApplicationLayout;
 import ghidra.app.cmd.disassemble.DisassembleCommand;
 import ghidra.app.decompiler.*;
 import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.app.plugin.core.analysis.PdbUniversalAnalyzer;
 import ghidra.app.decompiler.component.DecompilerUtils;
 import ghidra.app.util.bin.ByteProvider;
 import ghidra.app.util.bin.FileByteProvider;
@@ -49,7 +50,7 @@ import ghidra.util.task.TaskMonitorAdapter;
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.5";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.6";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -62,6 +63,10 @@ public final class XodbGhidraSidecar {
     final AtomicInteger connectedClients = new AtomicInteger();
     final AtomicLong lastRequestNanos = new AtomicLong(System.nanoTime());
     final ExecutorService clients = Executors.newCachedThreadPool();
+    // Priming uses an isolated in-memory ProgramDB.  Keep it off the single
+    // project worker: loading a language is not TaskMonitor-aware and can hold
+    // that worker for hundreds of milliseconds after cancellation.
+    final ExecutorService primes = Executors.newSingleThreadExecutor();
     final ThreadPoolExecutor ghidra = new ThreadPoolExecutor(1, 1, 0L, TimeUnit.MILLISECONDS, new PriorityBlockingQueue<>());
     final ScheduledExecutorService lifetime = Executors.newSingleThreadScheduledExecutor();
     final ConcurrentMap<String, Work> jobs = new ConcurrentHashMap<>();
@@ -87,15 +92,21 @@ public final class XodbGhidraSidecar {
     volatile String stopReason = "running";
 
     static final class Image {
+        final String key;
         final String sha;
         final String path;
+        final String debugPath;
+        final String debugSha;
         volatile String state = "pending";
         volatile String progress = "queued";
         volatile String code;
         volatile String detail;
         // Imported ahead of any request; may not take the slots kept for requests.
         volatile boolean background;
-        Image(String sha, String path) { this.sha = sha; this.path = path; }
+        Image(String key, String sha, String path, String debugPath, String debugSha) {
+            this.key = key; this.sha = sha; this.path = path;
+            this.debugPath = debugPath; this.debugSha = debugSha;
+        }
     }
     static final class Work {
         final String id;
@@ -205,8 +216,10 @@ public final class XodbGhidraSidecar {
             try { listener.close(); } catch (Exception ignored) {}
             lifetime.shutdownNow();
             clients.shutdownNow();
+            primes.shutdownNow();
             ghidra.shutdownNow();
             for (Work work : jobs.values()) work.monitor.cancel();
+            try { primes.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             try { ghidra.awaitTermination(5, TimeUnit.SECONDS); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
             closeOpenPrograms();
             project.close();
@@ -307,7 +320,8 @@ public final class XodbGhidraSidecar {
         String jobId = "prime:" + architecture;
         Work work = jobs.computeIfAbsent(jobId, key -> {
             Work made = makeWork(key);
-            made.future = submitGhidra(made, true, () -> primeArchitecture(architecture, made));
+            made.background = true;
+            made.future = primes.submit(() -> primeArchitecture(architecture, made));
             return made;
         });
         sendWork(out, id, work);
@@ -318,10 +332,13 @@ public final class XodbGhidraSidecar {
         Object consumer = new Object();
         try {
             work.progress = "loading language";
+            work.monitor.checkCanceled();
             PrimeSpec spec = PrimeSpec.forArchitecture(architecture);
             Language language = DefaultLanguageService.getLanguageService().getLanguage(new LanguageID(spec.language));
+            work.monitor.checkCanceled();
             CompilerSpec compiler = language.getCompilerSpecByID(new CompilerSpecID(spec.compiler));
             program = new ProgramDB("xodb-prime-" + architecture, language, compiler, consumer);
+            work.monitor.checkCanceled();
             int transaction = program.startTransaction("prime decompiler");
             Function function;
             try {
@@ -332,6 +349,7 @@ public final class XodbGhidraSidecar {
                 DisassembleCommand disassemble = new DisassembleCommand(start, new AddressSet(start, start.add(spec.code.length - 1)), true);
                 disassemble.enableCodeAnalysis(false);
                 if (!disassemble.applyTo(program, work.monitor)) throw new Failure("prime_disassembly_failed", architecture + ": " + disassemble.getStatusMsg());
+                work.monitor.checkCanceled();
                 function = program.getFunctionManager().createFunction("xodb_prime", start, new AddressSet(start, start.add(spec.code.length - 1)), SourceType.ANALYSIS);
                 program.endTransaction(transaction, true);
             } catch (Throwable error) {
@@ -344,7 +362,9 @@ public final class XodbGhidraSidecar {
                 decompiler.toggleSyntaxTree(true);
                 decompiler.toggleCCode(true);
                 decompiler.setSimplificationStyle("decompile");
+                work.monitor.checkCanceled();
                 if (!decompiler.openProgram(program)) throw new Failure("prime_decompiler_open_failed", decompiler.getLastMessage());
+                work.monitor.checkCanceled();
                 DecompileResults result = decompiler.decompileFunction(function, 10, work.monitor);
                 if (!result.decompileCompleted()) throw new Failure("prime_decompile_failed", result.getErrorMessage());
             } finally { decompiler.dispose(); }
@@ -407,7 +427,10 @@ public final class XodbGhidraSidecar {
         String sha = required(q, "sha256");
         String path = required(q, "path");
         if (!sha.matches("[0-9a-f]{64}")) { sendFailure(out, id, "bad_sha256", sha); return; }
-        String jobId = "open:" + sha;
+        String key = analysisKey(q);
+        String debugPath = text(q, "debug_path", null);
+        String debugSha = text(q, "debug_sha256", null);
+        String jobId = "open:" + key;
         if (!jobs.containsKey(jobId) && jobs.size() >= maxImages + maxDocuments + 128) {
             sendFailure(out, id, "queue_full", "retained job limit reached; restart the sidecar");
             return;
@@ -416,26 +439,26 @@ public final class XodbGhidraSidecar {
         if (!background) {
             preemptBackground();
             Work oldWork = jobs.get(jobId);
-            Image oldImage = images.get(sha);
+            Image oldImage = images.get(key);
             // An explicit request restarts an import that it just pre-empted;
             // the old task owns a different Image object and cannot clobber it.
             if (oldWork != null && oldWork.background && oldWork.state.equals("pending")) {
                 oldWork.monitor.cancel();
                 if (oldWork.future != null) oldWork.future.cancel(true);
                 jobs.remove(jobId, oldWork);
-                if (oldImage != null) images.remove(sha, oldImage);
+                if (oldImage != null) images.remove(key, oldImage);
             }
         }
         // Eager imports stop at half the limit: the rest is for images a user asks about.
-        if (background && !images.containsKey(sha) && images.size() >= maxImages / 2) {
+        if (background && !images.containsKey(key) && images.size() >= maxImages / 2) {
             sendFailure(out, id, "cache_reserved", "background imports stop at half of the image limit " + maxImages);
             return;
         }
-        Image image = images.compute(sha, (key, old) -> {
+        Image image = images.compute(key, (ignored, old) -> {
             if (old != null && !old.state.equals("failed")) { if (!background) old.background = false; return old; }
-            Image made = new Image(key, path); made.background = background; return made;
+            Image made = new Image(key, sha, path, debugPath, debugSha); made.background = background; return made;
         });
-        Work work = jobs.compute(jobId, (key, old) -> old == null || old.state.equals("failed") ? startImport(image, key, background) : old);
+        Work work = jobs.compute(jobId, (ignored, old) -> old == null || old.state.equals("failed") ? startImport(image, jobId, background) : old);
         sendWork(out, id, work);
     }
 
@@ -450,13 +473,18 @@ public final class XodbGhidraSidecar {
             work.progress = image.progress = "hashing";
             String actual = sha256(Paths.get(image.path));
             if (!actual.equals(image.sha)) throw new Failure("image_identity_mismatch", "expected " + image.sha + ", got " + actual);
+            if (image.debugPath != null) {
+                String actualDebug = sha256(Paths.get(image.debugPath));
+                if (!actualDebug.equals(image.debugSha))
+                    throw new Failure("debug_identity_mismatch", "expected " + image.debugSha + ", got " + actualDebug);
+            }
             work.monitor.checkCanceled();
-            boolean cached = project.getProjectData().getFile("/" + image.sha) != null;
-            if (!cached || !cachedAtLinkedBase(image.sha)) {
-                closeOpenProgram(image.sha);
+            boolean cached = project.getProjectData().getFile("/" + image.key) != null;
+            if (!cached || !cachedAtLinkedBase(image.key)) {
+                closeOpenProgram(image.key);
                 if (!cached && image.background && project.getRootFolder().getFiles().length >= maxImages / 2)
                     throw new Failure("cache_reserved", "background imports stop at half of the image limit " + maxImages);
-                if (!cached) makeProjectSlot(image.sha);
+                if (!cached) makeProjectSlot(image.key);
                 work.progress = image.progress = "importing";
                 Program program = load(new File(image.path));
                 if (!atLinkedBase(program)) {
@@ -467,6 +495,8 @@ public final class XodbGhidraSidecar {
                 boolean saved = false;
                 try {
                     work.progress = image.progress = "analyzing";
+                    if (image.debugPath != null)
+                        PdbUniversalAnalyzer.setPdbFileOption(program, new File(image.debugPath));
                     trimAnalysis(program);
                     AutoAnalysisManager manager = AutoAnalysisManager.getAnalysisManager(program);
                     manager.initializeOptions();
@@ -474,15 +504,15 @@ public final class XodbGhidraSidecar {
                     manager.startAnalysis(work.monitor);
                     work.monitor.checkCanceled();
                     program.endTransaction(tx, true); tx = -1;
-                    project.saveAs(program, "/", image.sha, true);
+                    project.saveAs(program, "/", image.key, true);
                     saved = true;
                 } finally {
                     if (tx >= 0) program.endTransaction(tx, false);
                     if (saved) project.close(program); else program.release(project);
                 }
             }
-            imageLastUsed.put(image.sha, System.nanoTime());
-            trimProjectCache(image.sha);
+            imageLastUsed.put(image.key, System.nanoTime());
+            trimProjectCache(image.key);
             image.state = work.state = "ready";
             image.progress = work.progress = "ready";
         } catch (Throwable e) {
@@ -627,9 +657,10 @@ public final class XodbGhidraSidecar {
 
     void decompile(JsonObject q, OutputStream out, String id) throws Exception {
         String sha = required(q, "sha256");
-        long entry = unsignedHex(required(q, "entry"));
+        String analysisKey = analysisKey(q);
+        String selector = q.has("symbol") ? "symbol=" + required(q, "symbol") : "entry=" + required(q, "entry");
         String options = text(q, "options", "default");
-        String key = sha + ":" + Long.toUnsignedString(entry, 16) + ":" + options;
+        String key = analysisKey + ":" + selector + ":" + options;
         byte[] cached = documents.get(key);
         if (cached != null) { send(out, base(id, "ready"), cached); return; }
         boolean background = q.has("background") && q.get("background").isJsonPrimitive() && q.get("background").getAsBoolean();
@@ -645,10 +676,10 @@ public final class XodbGhidraSidecar {
                 jobs.remove(jobId, oldWork);
             }
         }
-        Image image = images.get(sha);
+        Image image = images.get(analysisKey);
         if (image == null || !image.state.equals("ready")) {
             JsonObject r = base(id, "pending");
-            r.addProperty("job", "open:" + sha);
+            r.addProperty("job", "open:" + analysisKey);
             r.addProperty("progress", image == null ? "open_image required" : image.progress);
             send(out, r, null);
             return;
@@ -675,22 +706,75 @@ public final class XodbGhidraSidecar {
     void export(JsonObject q, String key, Work work) {
         try {
             work.progress = "opening project image";
-            String sha = required(q, "sha256");
-            OpenProgram slot = openProgram(sha);
-            Program program = slot.program;
-            long entry = unsignedHex(required(q, "entry"));
-            Address address = program.getAddressFactory().getDefaultAddressSpace().getAddress(entry);
-            Function fn = program.getFunctionManager().getFunctionContaining(address);
-            if (fn == null) fn = program.getFunctionManager().getFunctionAt(address);
-            if (fn == null) throw new Failure("function_not_found", "no Ghidra function contains " + hx(entry));
+            String analysisKey = analysisKey(q);
+            OpenProgram slot = openProgram(analysisKey);
+            Function fn = requestedFunction(slot.program, q);
             work.progress = "decompiling";
-            byte[] payload = exportDocument(slot, fn, q, work.monitor);
+            byte[] payload;
+            try {
+                payload = exportDocument(slot, fn, q, work.monitor);
+            } catch (Failure first) {
+                if (!first.code.equals("decompile_failed") || work.monitor.isCancelled()) throw first;
+                // A native decompiler child may disappear while its pooled
+                // interface is open. Reopen the program and retry this request
+                // once; a persistent fault is still returned to the caller.
+                closeOpenProgram(analysisKey);
+                slot = openProgram(analysisKey);
+                fn = requestedFunction(slot.program, q);
+                payload = exportDocument(slot, fn, q, work.monitor);
+            }
             if (payload.length > MAX_PAYLOAD) throw new Failure("document_too_large", Integer.toString(payload.length));
             documents.put(key, payload);
             work.payload = payload;
             work.progress = "ready";
             work.state = "ready";
         } catch (Throwable e) { failed(work, e); }
+    }
+
+    static Function functionAt(Program program, long entry) throws Failure {
+        Address address = program.getAddressFactory().getDefaultAddressSpace().getAddress(entry);
+        Function fn = program.getFunctionManager().getFunctionContaining(address);
+        if (fn == null) fn = program.getFunctionManager().getFunctionAt(address);
+        if (fn == null) throw new Failure("function_not_found", "no Ghidra function contains " + hx(entry));
+        return fn;
+    }
+
+    static Function functionNamed(Program program, String requested) throws Failure {
+        Function exact = null;
+        Function alias = null;
+        boolean exactAmbiguous = false;
+        boolean aliasAmbiguous = false;
+        for (Function fn : program.getFunctionManager().getFunctions(true)) {
+            String name = fn.getName();
+            if (name.equals(requested)) {
+                if (exact != null) exactAmbiguous = true;
+                exact = fn;
+                continue;
+            }
+            boolean matchesAlias = name.equals("_" + requested) || requested.equals("_" + name);
+            if (!matchesAlias) continue;
+            if (alias != null) aliasAmbiguous = true;
+            alias = fn;
+        }
+        if (exactAmbiguous) throw new Failure("function_ambiguous", "more than one Ghidra function is named " + requested);
+        if (exact != null) return exact;
+        if (alias != null && !aliasAmbiguous) return alias;
+        throw new Failure(aliasAmbiguous ? "function_ambiguous" : "function_not_found",
+            aliasAmbiguous ? "more than one Ghidra function matches " + requested : "no Ghidra function is named " + requested);
+    }
+
+    static Function requestedFunction(Program program, JsonObject request) throws Failure {
+        if (request.has("symbol")) {
+            String symbol = required(request, "symbol");
+            if (symbol.isEmpty()) {
+                for (String candidate : new String[]{"main", "_main", "entry", "_entry"}) {
+                    try { return functionNamed(program, candidate); } catch (Failure ignored) {}
+                }
+                throw new Failure("function_not_found", "no default main or entry function was found; pass --function NAME");
+            }
+            return functionNamed(program, symbol);
+        }
+        return functionAt(program, unsignedHex(required(request, "entry")));
     }
 
     void cancel(OutputStream out, String id, String jobId) throws Exception {
@@ -780,8 +864,9 @@ public final class XodbGhidraSidecar {
         doc.addProperty("contract", "XODB-GHIDRA-SIDECAR.v1");
         doc.addProperty("status", "ok");
         String sha = required(request, "sha256");
+        String analysisKey = analysisKey(request);
         String entryText = hx(fn.getEntryPoint().getOffset());
-        doc.addProperty("artifact_id", artifact(sha, entryText, text(request, "options", "default")));
+        doc.addProperty("artifact_id", artifact(analysisKey, entryText, text(request, "options", "default")));
         JsonObject producer = new JsonObject();
         producer.addProperty("kind", "ghidra_java_sidecar"); producer.addProperty("worker_version", PRODUCER);
         producer.addProperty("ghidra_commit", Application.getApplicationVersion()); producer.addProperty("java", true);
@@ -789,6 +874,8 @@ public final class XodbGhidraSidecar {
         JsonObject image = new JsonObject();
         image.addProperty("path", text(request, "path", program.getExecutablePath()));
         image.addProperty("sha256", sha);
+        if (request.has("debug_sha256") && !request.get("debug_sha256").isJsonNull())
+            image.addProperty("debug_sha256", request.get("debug_sha256").getAsString());
         if (request.has("build_id") && !request.get("build_id").isJsonNull()) image.addProperty("gnu_build_id", request.get("build_id").getAsString());
         image.addProperty("format", program.getExecutableFormat());
         doc.add("image", image);
@@ -988,20 +1075,56 @@ public final class XodbGhidraSidecar {
             row.addProperty("size", Math.max(0, symbol.getSize()));
             row.addProperty("parameter", symbol.isParameter());
             VariableStorage storage = symbol.getStorage();
-            Varnode varnode = storage == null ? null : storage.getFirstVarnode();
+            Varnode[] pieces = storage == null ? new Varnode[0] : storage.getVarnodes();
+            Varnode varnode = pieces.length == 0 ? null : pieces[0];
             long[] proven = null;
             if (varnode != null) {
-                row.addProperty("storage", varnode.isRegister() ? "register" : varnode.getAddress().getAddressSpace().getName().equals("stack") ? "stack" : "temp");
+                row.addProperty("storage", pieces.length > 1 ? "split" : varnode.isRegister() ? "register" : varnode.getAddress().getAddressSpace().getName().equals("stack") ? "stack" : "temp");
                 row.addProperty("storage_offset", hx(varnode.getOffset()));
-                if (varnode.isRegister()) {
+                if (pieces.length == 1 && varnode.isRegister()) {
                     Register register = program.getRegister(varnode.getAddress(), varnode.getSize());
                     if (register != null) {
                         Register base = register.getBaseRegister();
                         row.addProperty("register", base.getName());
                         row.addProperty("register_bit_offset", register.getLeastSignificantBitInBaseRegister());
-                        proven = registerLifetime(program, fn, symbol, varnode, base);
                     }
                 }
+                JsonArray pieceRows = new JsonArray();
+                int valueBytes = 0;
+                boolean supported = symbol.getSize() > 0 && symbol.getSize() <= 32;
+                long start = fn.getEntryPoint().getOffset(), end = fn.getBody().getMaxAddress().getOffset() + 1;
+                for (Varnode piece : pieces) {
+                    JsonObject item = new JsonObject();
+                    item.addProperty("size", piece.getSize());
+                    int valueOffset = program.getLanguage().isBigEndian()
+                        ? storage.size() - valueBytes - piece.getSize() : valueBytes;
+                    item.addProperty("value_bit_offset", valueOffset * 8);
+                    long[] interval = null;
+                    if (piece.isRegister()) {
+                        Register register = program.getRegister(piece.getAddress(), piece.getSize());
+                        if (register != null) {
+                            Register base = register.getBaseRegister();
+                            item.addProperty("storage", "register");
+                            item.addProperty("register", base.getName());
+                            item.addProperty("register_bit_offset", register.getLeastSignificantBitInBaseRegister());
+                            interval = registerLifetime(program, fn, symbol, piece, base);
+                        }
+                    } else if (piece.getAddress().getAddressSpace().getName().equals("stack")) {
+                        item.addProperty("storage", "stack");
+                        PrototypeModel model = fn.getCallingConvention();
+                        if (model == null) model = program.getCompilerSpec().getDefaultCallingConvention();
+                        int stackshift = model == null ? 0 : model.getStackshift();
+                        item.addProperty("cfa_offset", piece.getOffset() - stackshift);
+                        interval = stackLifetime(program, fn, symbol, piece);
+                    } else item.addProperty("storage", "temp");
+                    if (interval == null) supported = false;
+                    else { start = Math.max(start, interval[0]); end = Math.min(end, interval[1]); }
+                    pieceRows.add(item);
+                    valueBytes += piece.getSize();
+                }
+                row.add("pieces", pieceRows);
+                long none = fn.getEntryPoint().getOffset();
+                proven = supported && valueBytes == symbol.getSize() && start < end ? new long[]{start, end} : new long[]{none, none};
             } else row.addProperty("storage", "temp");
             long functionStart = fn.getBody().getMinAddress().getOffset();
             long functionEnd = fn.getBody().getMaxAddress().getOffset() + 1;
@@ -1023,9 +1146,8 @@ public final class XodbGhidraSidecar {
             long validEnd = lastInstruction == null ? lastUse + 1 : lastInstruction.getMaxAddress().getOffset() + 1;
             validStart = Math.max(functionStart, Math.min(validStart, functionEnd - 1));
             validEnd = Math.max(validStart + 1, Math.min(validEnd, functionEnd));
-            // A register row is what xodb overlays with a live value, so its
-            // interval is the proven one, and may be empty. Other storage
-            // keeps the loose first-to-last-use span, which nothing reads as proof.
+            // Every storage kind xodb may read uses a proven interval, and an
+            // unsupported or ambiguous piece makes the whole value unavailable.
             if (proven != null) { validStart = proven[0]; validEnd = proven[1]; }
             row.addProperty("valid_start", hx(validStart));
             row.addProperty("valid_end", hx(validEnd));
@@ -1105,6 +1227,49 @@ public final class XodbGhidraSidecar {
             at = instruction.getFallThrough();
         }
         return new long[] { start.getOffset(), end };
+    }
+
+    static boolean storesMemory(Instruction instruction) {
+        try {
+            for (PcodeOp op : instruction.getPcode()) if (op.getOpcode() == PcodeOp.STORE) return true;
+            return false;
+        } catch (Exception e) { return true; }
+    }
+
+    /** Conservative straight-line proof for a CFA-relative stack piece. */
+    long[] stackLifetime(Program program, Function fn, HighSymbol symbol, Varnode storage) {
+        Listing listing = program.getListing();
+        ReferenceManager references = program.getReferenceManager();
+        Address entry = fn.getEntryPoint();
+        long none = entry.getOffset();
+        Address start = null;
+        if (symbol.isParameter()) start = entry;
+        else {
+            Address pc = symbol.getPCAddress();
+            HighVariable variable = symbol.getHighVariable();
+            Instruction definer = pc == null ? null : listing.getInstructionAt(pc);
+            if (variable != null && definer != null && storesMemory(definer) && !opaque(definer))
+                for (Varnode instance : variable.getInstances()) {
+                    PcodeOp def = instance.getDef();
+                    if (def == null || !instance.isAddrTied() || !instance.getAddress().equals(storage.getAddress()) ||
+                        instance.getSize() != storage.getSize() || !def.getSeqnum().getTarget().equals(pc)) continue;
+                    int opcode = def.getOpcode();
+                    if (opcode != PcodeOp.INDIRECT && opcode != PcodeOp.MULTIEQUAL) start = definer.getFallThrough();
+                    break;
+                }
+        }
+        if (start == null) return new long[]{none, none};
+        long end = start.getOffset();
+        for (Address at = start; at != null && fn.getBody().contains(at);) {
+            Instruction instruction = listing.getInstructionAt(at);
+            if (instruction == null) break;
+            if (!(symbol.isParameter() && at.equals(entry)) && joined(references, at)) break;
+            end = at.getOffset() + 1;
+            if (!instruction.getFlowType().isFallthrough() || instruction.getFlowType().isCall() ||
+                storesMemory(instruction) || opaque(instruction)) break;
+            at = instruction.getFallThrough();
+        }
+        return new long[]{start.getOffset(), end};
     }
 
     JsonArray types(HighFunction high, Function fn) {
@@ -1193,6 +1358,7 @@ public final class XodbGhidraSidecar {
 
     static String tokenKind(ClangToken t){String n=t.getClass().getSimpleName();if(n.contains("Type"))return"type";if(n.contains("Variable"))return"variable";if(n.contains("FuncName"))return"funcname";if(n.contains("Field"))return"field";if(n.contains("Op"))return"operator";if(n.contains("Comment"))return"comment";if(n.contains("Label"))return"label";return"syntax";}
     static String opid(PcodeOpAST op){return"op:"+op.getSeqnum().getTime();} static String vnid(VarnodeAST v){return"vn:"+v.getUniqueId();}
+    static String analysisKey(JsonObject request)throws Exception{String sha=required(request,"sha256");String debugPath=text(request,"debug_path",null);String debugSha=text(request,"debug_sha256",null);if((debugPath==null)!=(debugSha==null))throw new Failure("bad_debug_identity","debug_path and debug_sha256 must be supplied together");if(debugSha==null)return sha;if(!debugSha.matches("[0-9a-f]{64}"))throw new Failure("bad_debug_sha256",debugSha);return digest((sha+"\n"+debugSha).getBytes(StandardCharsets.UTF_8));}
     static String artifact(String sha,String entry,String options)throws Exception{return"ghj1-"+digest((sha+":"+entry+":"+options+":"+PRODUCER).getBytes(StandardCharsets.UTF_8));}
     static String sha256(Path path)throws Exception{MessageDigest md=MessageDigest.getInstance("SHA-256");try(InputStream in=Files.newInputStream(path)){byte[]b=new byte[1<<20];for(int n;(n=in.read(b))>0;)md.update(b,0,n);}return hex(md.digest());}
     static String digest(byte[]bytes)throws Exception{return hex(MessageDigest.getInstance("SHA-256").digest(bytes));}static String hex(byte[]bytes){StringBuilder b=new StringBuilder(bytes.length*2);for(byte x:bytes)b.append(String.format("%02x",x&255));return b.toString();}

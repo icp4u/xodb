@@ -182,10 +182,10 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const inner = draw.inset(rect, 12);
     var buffer: [512]u8 = undefined;
     var label: [96]u8 = undefined;
-    try ctx.textFit(inner.x, inner.y, inner.w, std.fmt.bufPrint(&buffer, "G I B S O N   /   {s}   /   {s}", .{ mm.label(v, &label), modeName(s, now) }) catch "GIBSON", cyan);
+    try ctx.textFit(inner.x, inner.y, inner.w, std.fmt.bufPrint(&buffer, "G I B S O N   /   {s}   /   {s}", .{ modeName(s, now), mm.label(v, &label) }) catch "GIBSON", cyan);
     if (inner.h < 96 or inner.w < 120) return;
     const mp = ms.map();
-    try ctx.textFit(inner.x, inner.y + 24, inner.w, "F manual/orbit/flight   V film   arrows/drag steer   +/- speed   R reset   H height   C colour   O process", muted);
+    try ctx.clauses(.{ .x = inner.x, .y = inner.y + 24, .w = inner.w, .h = 20 }, "F manual/orbit/flight  V film  arrows/drag steer  +/- speed  R reset  H height  C colour  O process", muted);
     if (ms.picker_open) {
         if (v.layout != null) log.info(.overview, "xodb: gibson picker selected={d} rows={d}\n", .{ ms.pick, ms.pick_count + 1 });
         try ctx.textFit(inner.x, inner.y + 50, inner.w, "Choose process: arrows / Enter / Esc", white);
@@ -254,8 +254,8 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         .huge => "THP-backed MiB",
         .swapped => "swapped MiB",
     };
-    const encoding = std.fmt.bufPrint(&buffer, "H height: {s}   C colour: {s}   {s}", .{ height_name, @tagName(s.colour), modeName(s, now) }) catch "";
-    try ctx.textFit(inner.x, y, inner.w, encoding, white);
+    const encoding = std.fmt.bufPrint(&buffer, "{s}  H height: {s}  C colour: {s}", .{ modeName(s, now), height_name, @tagName(s.colour) }) catch "";
+    try ctx.clauses(.{ .x = inner.x, .y = y, .w = inner.w, .h = 20 }, encoding, white);
     y += 24;
     if (ms.cursor) |index| {
         try ctx.textFit(inner.x, y, inner.w, mm.detail(v, map, index, &buffer), amber);

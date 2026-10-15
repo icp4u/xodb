@@ -21,6 +21,7 @@ const progress = @import("archive_progress.zig");
 const snapshot = @import("../binary/snapshot.zig");
 const flame = @import("flame.zig");
 const info = @import("../debug/info.zig");
+const redact = @import("../redact.zig");
 pub const max_memory_bytes = 512 * 1024 * 1024;
 pub const analysis_version = "xodb-recorded-flames-v1";
 const Allocator = std.mem.Allocator;
@@ -33,6 +34,14 @@ pub const format_minor: u16 = 9;
 const frames_minor: u16 = 7;
 pub const frames_tag: u32 = 0x4d415246; // FRAM: optional evidence bundle
 pub const header_bytes = 64;
+/// Optional feature bit 0 (header bytes 48..56): written under --redact.
+/// Every text was scrubbed, socket addresses are tags under a key that was
+/// not stored, stack copies were masked and no FRAM bundle is attached; the
+/// originals are not in the file, so nothing can un-redact it.
+pub const optional_redacted: u64 = 1;
+pub fn isRedacted(bytes: []const u8) bool {
+    return bytes.len >= header_bytes and std.mem.readInt(u64, bytes[48..56], .little) & optional_redacted != 0;
+}
 pub const entry_bytes = 24;
 pub const machine_x86_64: u16 = 62; // EM_X86_64; addresses are that machine's user VAs
 pub const clock_monotonic: u32 = 1; // CLOCK_MONOTONIC; comparable only within one boot
@@ -128,6 +137,8 @@ pub const Environment = struct {
     saved_realtime_ns: ?u64 = null,
     encoder: []const u8 = "xodb archive 2.2",
     frame_bundle: ?[]const u8 = null,
+    /// --redact: written redacted under a fresh key (see `optional_redacted`).
+    redact: ?*const redact.Policy = null,
 };
 /// Identity of one ELF file as it was mapped during capture.
 pub const ImageIdentity = struct { file_bytes: u64, sha256: [32]u8, build_id: ?[]const u8 };
@@ -139,6 +150,7 @@ const ImageKindCode = Codes(ImageKind, &.{ "elf", "pe" });
 const Writer = struct {
     a: Allocator,
     out: *std.ArrayList(u8),
+    policy: ?*const redact.Policy = null,
     fn int(self: Writer, comptime T: type, value: T) !void {
         var buffer: [@sizeOf(T)]u8 = undefined;
         std.mem.writeInt(T, &buffer, value, .little);
@@ -156,8 +168,12 @@ const Writer = struct {
     }
     fn text(self: Writer, value: []const u8, max: usize) !void {
         if (value.len > max) return error.ArchiveLimit;
-        try self.int(u32, @intCast(value.len));
-        try self.out.appendSlice(self.a, value);
+        const scrubbed = if (self.policy) |p| try p.scrubAlloc(self.a, value) else null;
+        defer if (scrubbed) |bytes| self.a.free(bytes);
+        // A longer replacement ("user" for a 3-letter name) is cut at the limit.
+        const shown = if (scrubbed) |bytes| bytes[0..@min(bytes.len, max)] else value;
+        try self.int(u32, @intCast(shown.len));
+        try self.out.appendSlice(self.a, shown);
     }
     fn count(self: Writer, n: usize) !void {
         try self.int(u32, std.math.cast(u32, n) orelse return error.ArchiveLimit);
@@ -210,6 +226,9 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         selected_count += 1;
     }
     const selected = selected_storage[0..selected_count];
+    // One key per archive, never stored: tags are stable within this file only.
+    const archive_policy: ?redact.Policy = if (env.redact) |p| p.rekeyed(redact.randomKey()) else null;
+    const policy: ?*const redact.Policy = if (archive_policy) |*p| p else null;
     if (capture.thread_count > perf.max_threads or capture.samples.len() > capture.config.sample_limit or capture.images.loaded.items.len + capture.pe_assets.entries.items.len > max_images) return error.ArchiveLimit;
     // Lanes beyond the recorded threads are never written by the collector.
     for (capture.switches.lanes[capture.thread_count..]) |lane| if (lane.events.items.len != 0 or lane.cutoff_ns != null or lane.contradictory) return error.ArchiveInconsistent;
@@ -217,7 +236,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     defer for (&bodies) |*body| body.deinit(a);
     for (selected, bodies[0..selected.len], 0..) |tag, *body, section_index| {
         try progress.step(env.progress, .encoding, section_index);
-        const w = Writer{ .a = a, .out = body };
+        const w = Writer{ .a = a, .out = body, .policy = policy };
         switch (tag) {
             .producer => try encodeProducer(w, capture.producer.?),
             .limits => try w.int(u32, capture.config.sample_limit),
@@ -234,7 +253,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
             .annotations => try encodeAnnotations(w, capture, env.progress),
             .user_state => try encodeUserState(w, capture, env.progress),
             .evidence_context => {
-                const payload = try capture.net.?.encode(a);
+                const payload = try capture.net.?.encode(a, policy);
                 defer a.free(payload);
                 try w.out.appendSlice(a, payload);
             },
@@ -257,6 +276,7 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
     std.mem.writeInt(u16, out[34..36], machine_x86_64, .little);
     std.mem.writeInt(u32, out[36..40], clock_monotonic, .little);
     std.mem.writeInt(u64, out[40..48], (@as(u64, if (capture.config.duration_ms == 0 or capture.config.duration_ms > 60000) 3 else 1) | @as(u64, if (sampled) 4 else 0) | 8 | @as(u64, if (custom_limit) 16 else 0) | @as(u64, if (capture.syscalls.enabled) 32 else 0) | @as(u64, if (typed_images) 64 else 0)), .little); // bit 6: typed ELF/PE assets
+    std.mem.writeInt(u64, out[48..56], if (policy != null) optional_redacted else 0, .little);
     std.mem.writeInt(u32, out[56..60], std.hash.Crc32.hash(out[0..56]), .little);
     var offset: usize = header_bytes + entry_bytes * selected.len;
     for (selected, bodies[0..selected.len], 0..) |tag, body, i| {
@@ -269,9 +289,11 @@ fn encodeInner(a: Allocator, capture: *const Capture, env: Environment) ![]u8 {
         @memcpy(out[offset..][0..body.items.len], body.items);
         offset += body.items.len;
     }
-    if (env.frame_bundle) |bundle| {
+    // Imported frame sources are opaque to the scrubber: not attached.
+    const bundle = if (policy == null) env.frame_bundle else null;
+    if (bundle) |frames| {
         defer a.free(out);
-        return attachFrames(a, out, bundle);
+        return attachFrames(a, out, frames);
     }
     return out;
 }
@@ -655,6 +677,8 @@ pub const Source = struct {
     stack_registers: []const u8 = "not_recorded",
     reconstructed_callers: []const u8 = "not_recorded",
     optional_features: u64 = 0,
+    /// Written under --redact (optional feature bit 0).
+    redacted: bool = false,
     saved_realtime_ns: ?u64,
     encoder: []const u8,
     images: []ImageReport,
@@ -788,7 +812,7 @@ fn decodeInner(budget: *Budget, bytes: []const u8, options: Options) !Opened {
     self.* = .{ .allocator = a, .arena = std.heap.ArenaAllocator.init(a), .id = options.local_id, .session_id = 0, .generation = std.math.maxInt(u64), .image_epoch = std.math.maxInt(u64), .pid = 0, .started_ns = 0, .config = .{}, .accepted = undefined, .thread_count = 0, .collector = null, .images = modules.Modules.init(a) };
     errdefer self.deinit();
     self.offline = true;
-    var source = Source{ .format_major = format_major, .format_minor = header.minor, .archive_sha256 = undefined, .file_bytes = bytes.len, .capture_id = 0, .session_id = 0, .generation = 0, .image_epoch = 0, .pid = 0, .revision = 0, .boot_id = null, .saved_realtime_ns = null, .encoder = "", .images = &.{}, .ignored_sections = header.ignored, .optional_features = header.optional_features };
+    var source = Source{ .format_major = format_major, .format_minor = header.minor, .archive_sha256 = undefined, .file_bytes = bytes.len, .capture_id = 0, .session_id = 0, .generation = 0, .image_epoch = 0, .pid = 0, .revision = 0, .boot_id = null, .saved_realtime_ns = null, .encoder = "", .images = &.{}, .ignored_sections = header.ignored, .optional_features = header.optional_features, .redacted = header.optional_features & optional_redacted != 0 };
     if (header.frames) |body| {
         // Optional payload validation belongs to the frame worker. Native
         // decode retains the bytes regardless of frame version or contents.
@@ -1557,7 +1581,10 @@ fn encodeUserState(w: Writer, self: *const Capture, state: ?*progress.Progress) 
         try w.int(u64, raw.stack_size);
         try w.int(u64, raw.stack_dyn);
         try w.int(u32, raw.stack_len);
+        const at = w.out.items.len;
         try w.out.appendSlice(w.a, self.user_state.stack(entry));
+        // Stack copies are raw memory: names and paths in them become 'x'.
+        if (w.policy) |p| p.mask(w.out.items[at..]);
     }
 }
 fn decodeUserState(r: *Reader, self: *Capture) !void {

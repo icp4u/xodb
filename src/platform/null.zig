@@ -58,6 +58,7 @@ pub const Window = struct {
     mouse_down: bool = false,
     scroll: i32 = 0,
     scale_override: ?f32 = null,
+    backing_scale: f32 = 1,
 
     pub fn init(_: *Window) !void {
         return error.NoDisplay;

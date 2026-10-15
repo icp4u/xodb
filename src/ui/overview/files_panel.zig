@@ -9,6 +9,7 @@ const Ctx = draw.Ctx;
 const Rect = draw.Rect;
 const fade = draw.fade;
 const titles = [_][]const u8{ "Files", "Processes", "Leak watch", "Deleted", "Exact events" };
+const short_titles = [_][]const u8{ "Files", "Processes", "Leaks", "Deleted", "Exact" };
 
 fn button(v: *vw.View, ctx: Ctx, rect: Rect, label: []const u8, selected: bool, action: vw.View.Action) !void {
     try ctx.button(rect, selected);
@@ -30,7 +31,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     const tab_w = @min(154, (rect.w - 110) / 5);
     for (titles, 0..) |title, i| {
         const mode: fm.Mode = @enumFromInt(i);
-        try button(v, ctx, .{ .x = rect.x + @as(f32, @floatFromInt(i)) * tab_w, .y = rect.y + 32, .w = tab_w - 6, .h = 30 }, title, f.mode == mode, .{ .files_mode = mode });
+        try button(v, ctx, .{ .x = rect.x + @as(f32, @floatFromInt(i)) * tab_w, .y = rect.y + 32, .w = tab_w - 6, .h = 30 }, if (ctx.measure(title) + 26 > tab_w) short_titles[i] else title, f.mode == mode, .{ .files_mode = mode });
     }
     try button(v, ctx, .{ .x = rect.x + rect.w - 98, .y = rect.y + 32, .w = 98, .h = 30 }, if (f.event_authorized or f.exact_active) "Stop / E" else "All", false, if (f.event_authorized or f.exact_active) .stop_events else .files_all);
     const snapshot = f.snapshot orelse {
@@ -43,7 +44,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         (now -| s.taken_ns) / 1_000_000,                    s.hidden, s.stale, s.unscanned, s.dropped_processes +| s.dropped_fds,
         @as(f64, @floatFromInt(s.scan_cpu_ns)) / 1_000_000,
     }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 72, rect.w - 16, status, if (s.hidden +| s.stale +| s.unscanned +| s.dropped_fds > 0) ctx.p.warn else ctx.p.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + 72, .w = rect.w - 16, .h = 20 }, status, if (s.hidden +| s.stale +| s.unscanned +| s.dropped_fds > 0) ctx.p.warn else ctx.p.dim);
     const card_w = (rect.w - 24) / 4;
     // System-wide totals (see the status line); short enough to fit a quarter width.
     const cards = [_][]const u8{ "Visible fds", "Read/s · partial", "Write/s · partial", "FD changes/s" };
@@ -63,7 +64,9 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         const card = Rect{ .x = rect.x + @as(f32, @floatFromInt(i)) * (card_w + 8), .y = rect.y + 100, .w = card_w, .h = 70 };
         // accent2 is the palette's write series; an unmeasured value uses the hatch text colour.
         const measured = if (i == 1 or i == 2) known_io else if (i == 3) known_churn else true;
-        try tile(ctx, card, label, value, if (!measured) ctx.p.hatch else if (i == 2) ctx.p.accent2 else ctx.p.accent);
+        const short = ([_][]const u8{ "FDs", "Read/s*", "Write/s*", "Changes/s" })[i];
+        try tile(ctx, card, if (ctx.measure(label) + 24 > card.w) short else label, value, if (!measured) ctx.p.hatch else if (i == 2) ctx.p.accent2 else ctx.p.accent);
+        v.hover(card, "{s}: {s}; * partial coverage", .{ label, value });
         if ((i == 1 or i == 2) and !known_io) v.hover(card, "No comparable readable /proc IO sample yet", .{});
         if (i == 3 and !known_churn) v.hover(card, "No comparable fresh descriptor sample yet", .{});
     }
@@ -97,7 +100,9 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     if (ctx.p.win95) try @import("win95.zig").scrollbar(v, ctx, .{ .x = table_outer.x + table_outer.w - 18, .y = table.y + 32, .w = 16, .h = table.h - 36 }, f.top, f.rows.items.len, f.visible);
     if (f.rows.items.len == 0) {
         var reason: []const u8 = if (f.mode == .leaks) "No growth candidates in the sampled cache" else if (f.mode == .deleted) "No deleted holders in the sampled cache" else "No matching rows; inspect partial coverage above";
-        if (f.mode != .events) if (f.scopeReason()) |scope_reason| { reason = scope_reason; };
+        if (f.mode != .events) if (f.scopeReason()) |scope_reason| {
+            reason = scope_reason;
+        };
         var line: [400]u8 = undefined;
         const failed = f.mode == .events and std.mem.eql(u8, f.captureState(), "failed");
         if (f.mode == .events) reason = if (f.event_status == c.XRT_STALE_SNAPSHOT) (if (f.exact_requested or f.event_authorized) "Event enrollment pending" else "Exact capture is off; E opens its cost and access confirmation") else if (f.failure_len > 0) (if (failed) std.fmt.bufPrint(&line, "Exact capture failed: {s}", .{f.failure[0..f.failure_len]}) catch "Exact capture failed" else f.failure[0..f.failure_len]) else "Select a process and confirm event capture";

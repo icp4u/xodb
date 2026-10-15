@@ -127,7 +127,11 @@ pub const Server = struct {
         }
         return self.policies.get(name) orelse error.UnknownTool;
     }
-    fn queue(self: *Server, bytes: []const u8) !void {
+    fn queue(self: *Server, given: []const u8) !void {
+        // --redact: every string of every reply, one place for all tools.
+        const scrubbed = if (@import("../redact.zig").active()) |policy| try policy.scrubJson(std.heap.page_allocator, given, "id") else null;
+        defer if (scrubbed) |bytes| std.heap.page_allocator.free(bytes);
+        const bytes = scrubbed orelse given;
         if (self.sent > 0) {
             std.mem.copyForwards(u8, &self.output, self.output[self.sent..self.queued]);
             self.queued -= self.sent;
@@ -283,6 +287,13 @@ pub const Server = struct {
             try peer.tick(root);
         }
         const policy = try self.authorizeTool(root, name);
+        if (std.mem.eql(u8, name, "get_layout")) {
+            if (args.object.count() != 0) return error.InvalidArguments;
+            const layout = @import("../layout_snapshot.zig");
+            const snapshot = try a.create(layout.Snapshot);
+            layout.read(snapshot);
+            return asValue(a, snapshot);
+        }
         if (@import("fd.zig").isControl(name)) {
             if (root.agent_scope == .observe) return error.AgentScopeDenied;
             // Shared calls already passed the authoritative lease check above.
@@ -1017,6 +1028,27 @@ test "tool policy cache is mode-specific and does not cache authorization" {
     try std.testing.expectError(error.UnknownTool, server.toolPolicy(overview.definitions, "add_language_watch"));
     try std.testing.expectError(error.UnknownTool, server.toolPolicy(@import("imported.zig").definitions, "write_memory"));
     try std.testing.expectEqual(shared_context.Access.mutator, (try server.toolPolicy(tool_definitions, "write_memory")).required);
+}
+
+test "layout is an observer publication even without a target or GUI" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const server = try a.create(Server);
+    server.* = .{};
+    defer server.clearPolicies();
+    const session = try a.create(Session);
+    session.* = Session.init();
+    defer session.deinit();
+    const args = (try std.json.parseFromSlice(Value, a, "{}", .{})).value;
+    @import("../layout_snapshot.zig").unavailable();
+    for ([_]bool{ false, true }) |overview_only| {
+        server.overview_only = overview_only;
+        const result = try server.tool(a, session, "get_layout", args);
+        try std.testing.expect(!result.object.get("available").?.bool);
+        try std.testing.expectEqual(@as(usize, 0), result.object.get("panes").?.array.items.len);
+        try std.testing.expectEqual(@as(i64, 640), result.object.get("window").?.object.get("minimum_width").?.integer);
+    }
 }
 
 test "tool replies preserve numeric fields and share exact structured and text results" {

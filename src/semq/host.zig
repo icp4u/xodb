@@ -110,6 +110,14 @@ pub const EntryPadMapping = struct {
     line: u32,
     token: u32,
 };
+pub const PseudoPiece = struct {
+    storage: []const u8,
+    size: u8,
+    value_bit_offset: u8,
+    register: ?[]const u8 = null,
+    register_bit_offset: u8 = 0,
+    cfa_offset: ?i64 = null,
+};
 pub const PseudoVariable = struct {
     name: []const u8,
     type_name: []const u8,
@@ -121,6 +129,7 @@ pub const PseudoVariable = struct {
     storage_offset: ?u64,
     valid_start: ?u64,
     valid_end: ?u64,
+    pieces: []const PseudoPiece = &.{},
 };
 pub const PseudoDocument = struct {
     language: []const u8 = "c",
@@ -572,6 +581,20 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
         const size = number(variable, "size") orelse 0;
         if (size < 0 or size > std.math.maxInt(u32)) continue;
         const parameter = if (variable == .object) if (variable.object.get("parameter")) |value| value == .bool and value.bool else false else false;
+        var pieces: std.ArrayList(PseudoPiece) = .empty;
+        if (variable == .object) if (variable.object.get("pieces")) |piece_list| if (piece_list == .array) for (piece_list.array.items) |piece| {
+            const piece_size = number(piece, "size") orelse continue;
+            const value_offset = number(piece, "value_bit_offset") orelse continue;
+            if (piece_size <= 0 or piece_size > 8 or value_offset < 0 or value_offset > 255) continue;
+            try pieces.append(a, .{
+                .storage = try a.dupe(u8, str(piece, "storage") orelse "temp"),
+                .size = @intCast(piece_size),
+                .value_bit_offset = @intCast(value_offset),
+                .register = if (str(piece, "register")) |name| try a.dupe(u8, name) else null,
+                .register_bit_offset = @intCast(@min(63, @max(0, number(piece, "register_bit_offset") orelse 0))),
+                .cfa_offset = number(piece, "cfa_offset"),
+            });
+        };
         try variables.append(a, .{
             .name = try a.dupe(u8, str(variable, "name") orelse ""),
             .type_name = try a.dupe(u8, str(variable, "type") orelse ""),
@@ -583,6 +606,7 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
             .storage_offset = hexField(variable, "storage_offset"),
             .valid_start = hexField(variable, "valid_start"),
             .valid_end = hexField(variable, "valid_end"),
+            .pieces = pieces.items,
         });
     };
     var pad_mapping: ?EntryPadMapping = null;
@@ -718,8 +742,11 @@ pub fn mayCancel(owner: Owner, requester: Requester) bool {
 const Hashed = struct { module_id: u64, ptr: usize, len: usize, sha: [64]u8 };
 const max_warm_images = 8;
 const max_warm_functions = 16;
-/// A cancelled background import that ran at least this long counts as wasted.
-const warm_waste_ms = 2000;
+const warm_stop_delay_ms = 150;
+const sidecar_hold_retry_delay_ms = 2000;
+/// Ghidra cannot resume a cancelled import. Avoid immediately paying the same
+/// startup cost again after every foreground request.
+const warm_retry_delay_ms = 30_000;
 
 const WarmImage = struct {
     module_id: u64,
@@ -753,8 +780,8 @@ const Warmup = struct {
     /// The sidecar could not be reached or started; asking again per image
     /// would only run the starter again.
     unusable: std.atomic.Value(bool) = .init(false),
-    /// A cancelled import had already cost the sidecar real work.
-    wasted: std.atomic.Value(bool) = .init(false),
+    /// Identifies cancellation while the image at `attempted` was importing.
+    cancelled_import: std.atomic.Value(bool) = .init(false),
     done: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
@@ -783,10 +810,9 @@ const Warmup = struct {
                 break :blk image.snapshot_path;
             };
             var failure: sidecar.Failure = undefined;
-            const begun = nowMs();
             sidecar.openImage(a, self.endpoint, path, &sha, &self.cancel, &self.stage, &failure) catch |err| {
                 if (self.cancel.load(.acquire)) {
-                    if (nowMs() - begun >= warm_waste_ms) self.wasted.store(true, .release);
+                    self.cancelled_import.store(true, .release);
                     return;
                 }
                 if (sidecarGone(err, &failure)) return self.unusable.store(true, .release);
@@ -959,18 +985,25 @@ pub const State = struct {
     analyses: std.ArrayList(*Analysis) = .empty,
     job: ?*Job = null,
     warmup: ?*Warmup = null,
+    sidecar_hold: ?sidecar.Hold = null,
+    sidecar_hold_retry_ms: u64 = 0,
     warm_seen: [64]u64 = @splat(0),
     warm_seen_count: usize = 0,
     warm_generation: ?u64 = null,
+    warm_stopped_generation: ?u64 = null,
+    warm_stopped_since_ms: u64 = 0,
     /// The first image ever queued: the main executable. Never given up.
     warm_main: ?u64 = null,
     warm_main_path: ?[]u8 = null,
-    /// The image whose import was last cancelled after real work.
-    warm_struck: ?u64 = null,
+    /// A cancelled import is retried later, never on every foreground poll.
+    warm_retry_path: ?[]u8 = null,
+    warm_retry_after_ms: u64 = 0,
     next_job: u64 = 1,
 
     pub fn deinit(self: *State) void {
         self.cancelWarmup();
+        if (self.sidecar_hold) |*hold| hold.close();
+        self.sidecar_hold = null;
         if (self.job) |job| {
             job.destroy();
             page.destroy(job);
@@ -984,6 +1017,10 @@ pub const State = struct {
         if (self.warm_main_path) |path| {
             page.free(path);
             self.warm_main_path = null;
+        }
+        if (self.warm_retry_path) |path| {
+            page.free(path);
+            self.warm_retry_path = null;
         }
         if (self.dir) |dir| {
             _ = c.xghx_remove_tree(dir.ptr);
@@ -1003,6 +1040,16 @@ pub const State = struct {
         self.warm_seen_count += 1;
     }
 
+    fn warmBackedOff(self: *State, path: []const u8) bool {
+        const retry_path = self.warm_retry_path orelse return false;
+        if (!std.mem.eql(u8, retry_path, path)) return false;
+        if (nowMs() < self.warm_retry_after_ms) return true;
+        page.free(retry_path);
+        self.warm_retry_path = null;
+        self.warm_retry_after_ms = 0;
+        return false;
+    }
+
     /// Joins a finished or cancelled worker and keeps what it learned.
     fn reapWarmup(self: *State) void {
         const warm = self.warmup orelse return;
@@ -1011,14 +1058,12 @@ pub const State = struct {
         warm.thread = null;
         const attempted = @min(warm.attempted.load(.acquire), warm.images.len);
         for (warm.images[0..attempted]) |image| self.markWarmSeen(image.module_id);
-        // An import restarts from nothing after a cancel. One that was twice
-        // cancelled after real work is left to an explicit request, so short
-        // stops cannot keep the sidecar busy for no result.
-        if (warm.wasted.load(.acquire) and attempted < warm.images.len) {
-            const id = warm.images[attempted].module_id;
-            if (self.warm_main != id) {
-                if (self.warm_struck == id) self.markWarmSeen(id) else self.warm_struck = id;
-            }
+        // An import restarts from nothing after a cancel. Delay its next eager
+        // attempt regardless of how quickly it was pre-empted.
+        if (warm.cancelled_import.load(.acquire) and attempted < warm.images.len) {
+            if (self.warm_retry_path) |path| page.free(path);
+            self.warm_retry_path = page.dupe(u8, warm.images[attempted].path) catch null;
+            self.warm_retry_after_ms = nowMs() + warm_retry_delay_ms;
         }
         if (warm.unusable.load(.acquire)) self.warmup_enabled = false;
         warm.destroy();
@@ -1061,9 +1106,29 @@ pub const State = struct {
         count.* += 1;
     }
 
+    fn maintainSidecarHold(self: *State) void {
+        if (self.sidecar_hold) |*hold| {
+            if (hold.alive()) return;
+            hold.close();
+            self.sidecar_hold = null;
+        }
+        var arena = std.heap.ArenaAllocator.init(page);
+        defer arena.deinit();
+        const a = arena.allocator();
+        // An absent or incompatible sidecar is asked again only every few
+        // seconds, not on every owner poll.
+        if (nowMs() < self.sidecar_hold_retry_ms) return;
+        self.sidecar_hold_retry_ms = nowMs() + sidecar_hold_retry_delay_ms;
+        if (!(sidecar.selected(a) catch false)) return;
+        const path = sidecar.socketPath(a) catch return;
+        self.sidecar_hold = sidecar.Hold.open(a, path) catch null;
+        if (self.sidecar_hold != null) self.sidecar_hold_retry_ms = 0;
+    }
+
     /// Starts only bounded background work. The owner calls this after its
     /// normal target poll, so startup, priming and imports never delay it.
     pub fn maintain(self: *State, session: *Session) void {
+        self.maintainSidecarHold();
         self.harvestWarmup();
         const snapshot = session.target.snapshot();
         // Resume only flips the cancellation flag. Joining here would put
@@ -1071,11 +1136,21 @@ pub const State = struct {
         // the worker after it has cancelled its queued Ghidra job.
         if (self.warmup) |warm| if (snapshot.state != .stopped) {
             warm.cancel.store(true, .release);
+            self.warm_stopped_generation = null;
             return;
         };
+        if (snapshot.state != .stopped) {
+            self.warm_stopped_generation = null;
+            return;
+        }
+        if (self.warm_stopped_generation == null or self.warm_stopped_generation.? != snapshot.generation) {
+            self.warm_stopped_generation = snapshot.generation;
+            self.warm_stopped_since_ms = nowMs();
+            return;
+        }
+        if (nowMs() - self.warm_stopped_since_ms < warm_stop_delay_ms) return;
         if (!self.warmup_enabled or self.warmup != null) return;
         if (snapshot.pid == 0) return;
-        if (snapshot.state != .stopped) return;
         var select_arena = std.heap.ArenaAllocator.init(page);
         defer select_arena.deinit();
         if (!(sidecar.selected(select_arena.allocator()) catch false)) return;
@@ -1099,6 +1174,7 @@ pub const State = struct {
             hash.update(region.path);
             const id = hash.final() | (@as(u64, 1) << 63);
             if (self.sawWarmImage(id)) continue;
+            if (self.warmBackedOff(region.path)) continue;
             var duplicate = false;
             for (selected_images[0..count]) |old| if (old.id == id) {
                 duplicate = true;
@@ -1120,6 +1196,7 @@ pub const State = struct {
         // xodb has loaded its immutable snapshot, queue that exact byte slice.
         for (session.modules.loaded.items) |module| {
             if (count == selected_images.len or self.sawWarmImage(module.id)) continue;
+            if (self.warmBackedOff(module.path)) continue;
             var duplicate = false;
             for (selected_images[0..count]) |old| if (std.mem.eql(u8, old.path, module.path)) {
                 duplicate = true;

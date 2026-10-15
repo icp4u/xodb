@@ -122,6 +122,7 @@ pub const Preferences = struct {
         theme: ThemePath = .{},
         /// Device pixels per UI unit. Null follows the window system.
         ui_scale: ?f32 = null,
+        density: @import("look.zig").Density = .auto,
     } = .{},
     languages: Languages = .{},
     decompiler: struct {

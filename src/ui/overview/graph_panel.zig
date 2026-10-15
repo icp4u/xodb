@@ -186,25 +186,25 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     if (demo) {
         const text = std.fmt.bufPrint(&buffer, "{d} stars · {d} clusters · {d} threads ({d} drawn) · {d} impulses · synthetic", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, text, lk.dim);
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (navigation.help) @import("galaxy_camera.zig").hints else "P pause · hover for detail · ? navigation · run without --galaxy-demo for live descriptors", lk.dim);
+        try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, if (navigation.help) @import("galaxy_camera.zig").hints else "P pause · hover for detail · ? navigation · run without --galaxy-demo for live descriptors", lk.dim);
         return;
     }
     const g = v.graph.graph.?;
     const p = v.graph.projection.?;
     const group_text = std.fmt.bufPrint(&buffer, "{d} stars · {d} particles · {d} threads · cgroups: {d} fresh / {d} cached / {d} unknown · peers: {s}", .{ p.star_count, p.particle_count, counts.strands, g.cgroup_processes, g.cgroup_stale_processes, g.processes - g.cgroup_processes - g.cgroup_stale_processes, if (v.graph.peer_status == c.XRT_OK) "current namespace" else v.graph.peer_reason orelse "unavailable" }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 72, rect.w - 16, group_text, lk.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 72, .w = rect.w - 16, .h = 20 }, group_text, lk.dim);
     if (v.graph.layout) |layout| {
         const hidden = counts.strands - counts.strands_drawn;
         const limit_text = std.fmt.bufPrint(&buffer, "Sampled joins · {d} bytes unattributed · {d} resources / {d} links omitted · {s}", .{ v.graph.flow_unknown, layout.omitted_resources, layout.omitted_links + hidden, if (v.graph.flow_flags != 0) "capture incomplete" else "no capture loss reported" }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links + hidden > 0) lk.warn else lk.dim);
     }
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (navigation.help) @import("galaxy_camera.zig").hints else "E tracing · C cgroups · +/- detail · Esc all · click select / Enter frame · L files · ? navigation", lk.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, if (navigation.help) @import("galaxy_camera.zig").hints else "E tracing · C cgroups · +/- detail · Esc all · click select / Enter frame · L files · ? navigation", lk.dim);
 }
 fn bannerText(v: *vw.View, buffer: []u8, failure_buffer: []u8) []const u8 {
     return if (v.graph.flow_running)
         @import("../../model/system.zig").graph_cost
     else if (v.paused) "PAUSED · tracing stopped" else if (!v.graph.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (v.graph.flow_status != c.XRT_OK and v.graph.flow_status != c.XRT_STALE_SNAPSHOT)
-        std.fmt.bufPrint(buffer, "POLLING · {s} · E off/on retries", .{@import("../../model/system.zig").failureText(failure_buffer, v.graph.flow_failure)}) catch "POLLING · tracing unavailable"
+        std.fmt.bufPrint(buffer, "POLLING · E off/on retries · {s}", .{@import("../../model/system.zig").failureText(failure_buffer, v.graph.flow_failure)}) catch "POLLING · tracing unavailable"
     else
         "Starting live syscall tracing (~11% host cost) · E to stop";
 }
@@ -218,7 +218,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const banner: []const u8 = if (v.graph.flow_running)
         @import("../../model/system.zig").graph_cost
     else if (v.paused) "PAUSED · tracing stopped" else if (!v.graph.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (v.graph.flow_status != c.XRT_OK and v.graph.flow_status != c.XRT_STALE_SNAPSHOT)
-        std.fmt.bufPrint(&buffer, "POLLING · {s} · E off/on retries", .{@import("../../model/system.zig").failureText(&failure_buffer, v.graph.flow_failure)}) catch "POLLING · tracing unavailable"
+        std.fmt.bufPrint(&buffer, "POLLING · E off/on retries · {s}", .{@import("../../model/system.zig").failureText(&failure_buffer, v.graph.flow_failure)}) catch "POLLING · tracing unavailable"
     else
         "Starting live syscall tracing (~11% host cost) · E to stop";
     try ctx.textFit(rect.x + 16, rect.y + 38, rect.w - 32, banner, ctx.p.warn);
@@ -267,10 +267,10 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     }
     ctx.r.clip = clip;
     const group_text = std.fmt.bufPrint(&buffer, "{d} stars · {d} particles · cgroups: {d} fresh / {d} cached / {d} unknown · UNIX peers: {s}", .{ p.star_count, p.particle_count, g.cgroup_processes, g.cgroup_stale_processes, g.processes - g.cgroup_processes - g.cgroup_stale_processes, if (v.graph.peer_status == c.XRT_OK) "current namespace" else v.graph.peer_reason orelse "unavailable" }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 72, rect.w - 16, group_text, ctx.p.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 72, .w = rect.w - 16, .h = 20 }, group_text, ctx.p.dim);
     if (v.graph.layout) |layout| {
         const limit_text = std.fmt.bufPrint(&buffer, "Sampled joins · {d} bytes unattributed · {d} resources / {d} links omitted · {s}", .{ v.graph.flow_unknown, layout.omitted_resources, layout.omitted_links, if (v.graph.flow_flags != 0) "capture incomplete" else "no capture loss reported" }) catch "";
         try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links > 0) ctx.p.warn else ctx.p.dim);
     }
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, "E tracing on/off · C cgroups · +/- detail · Esc all · click expand/holders · L files", ctx.p.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, "E tracing on/off · C cgroups · +/- detail · Esc all · click expand/holders · L files", ctx.p.dim);
 }

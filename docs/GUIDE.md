@@ -462,6 +462,41 @@ xodb writes its messages to stderr. Each has a level; you choose how much you se
   resume; a second such pair within ten seconds is left out.
 - `--debug-dir` and `--debug-file` are about debug symbols, not about messages.
 
+## Redaction
+
+`--redact` is for recording a video or sharing what xodb wrote. It works in
+every mode: the debugger window, `--headless --mcp`, `--open-capture`,
+`--open-pcap`, and the overview tools (`--overview`, `--fetch`, `--lsof-top`,
+`--memdefrag`, which had it first). In debugger modes one policy
+(`src/redact.zig`) applies to:
+
+| Surface | What happens |
+|---|---|
+| Window text | Every string is rewritten just before it is drawn. |
+| MCP replies | Every string value of every reply (object keys and the request id stay). |
+| Log lines | Every level, before the line reaches stderr or `--log-file`. |
+| Saved capture archive | Written redacted, with header bit "redacted" (optional feature bit 0). Texts are rewritten, socket addresses become tags, stack copies have names overwritten with `x`, and imported frame sources are not attached. The originals are not in the file, so it cannot be un-redacted. |
+| Copy of an opened archive | Allowed only when that archive was itself written redacted (`ArchiveNotRedacted` otherwise). |
+| Allocation archive | Refused (`AllocationArchiveNotRedacted`): it has no redacting writer yet. |
+| `query_stream include_raw` | Refused (`RawPayloadRedacted`): payload bytes are withheld, not rewritten. |
+| System tools (`get_process`, `get_connections`, `who_has_open`, ...) | The overview's own `redact` rules apply as well (command lines, other accounts; path lookups refused). |
+
+| Private | Shown as |
+|---|---|
+| `/home/NAME/...`, your `$HOME` | `~/...` |
+| your user names, host name | `user`, `host` (any case, as a token: between non-letters such as `/`, `@`, `.`, `_`, `-` or digits, or at a camelCase step; names of 8+ characters also inside longer words, so a short name does not rewrite `stream`) |
+| IPv4/IPv6 outside loopback, unspecified, broadcast and documentation ranges | `ip-` and 8 hex digits |
+| MAC addresses | `mac-` and 8 hex digits |
+
+A tag is the start of HMAC-SHA256 of the address under a random key that is
+never written down. Within one run (or one archive) the same peer always gets
+the same tag, so flows still group by peer; two runs or two archives give
+different tags, so they cannot be linked. A redacted archive's socket table
+therefore matches loopback and documentation tuples in a pcap, never tagged
+ones. Not covered yet: speedscope and investigation exports, `.xoi`/`.xof`
+files, the remote GUI wire protocol, raw memory reads, and binary (non-text)
+addresses inside stack copies.
+
 ## HiDPI and UI scale
 
 xodb normally takes its device-pixel scale from the compositor, including
@@ -479,6 +514,32 @@ UI units at scale 2, or 1266 whole UI units at scale 1.5.
 `appearance.ui_scale` in an explicitly loaded [preferences](PREFERENCES.md)
 file supplies the same setting; the CLI wins. Both work in the debugger,
 remote GUI and `--overview`. Omit both to follow the compositor.
+
+### Small debugger windows
+
+The debugger fits down to 640×400 UI units. It collapses Events, Values,
+Stack, Threads, then Assembly as their minimum useful sizes stop fitting;
+space goes to the remaining panes. Click a collapsed title tab or use
+Alt+1…Alt+6 (Source, Assembly, Values, Threads, Stack, Events) to give that
+pane priority; press its shortcut again to restore automatic priorities.
+Source is the last to give way; an explicit reopen can borrow the whole body,
+and Alt+1 restores Source. Text-entry fields keep keyboard ownership.
+
+Toolbar actions that do not fit move into **More**; their shortcuts still
+work. Ctrl+Shift+D cycles auto/normal/compact density without changing UI
+scale. Shortened values have an ellipsis and reveal retained text on hover
+(up to 255 bytes; longer diagnostic copies are explicitly flagged).
+Thread IDs remain whole. MCP `get_layout` reports both scales, pane and control
+rectangles, collapsed tabs, overflow actions and visible native value rows.
+It is observer-only and does not wake drawing; `available=false` means this
+view has no layout publication (including headless operation).
+
+The overview reserves space for values before shortening labels, uses a dash
+for an unavailable reason that cannot fit, and shows the reason on hover.
+Small windows put overhead on a second footer row; key hints drop whole,
+lower-priority clauses. Hover details use the footer without covering tiles.
+Its `get_layout` publication includes the content rectangle, actual text
+rectangles, overlap/unmarked-clip counts and explicit bounded-copy flags.
 
 ## Where to go next
 

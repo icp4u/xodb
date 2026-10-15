@@ -77,7 +77,7 @@
         "include_raw": {
           "type": "boolean",
           "default": false,
-          "description": "Hex of the first 256 captured bytes per record."
+          "description": "Hex of the first 256 captured bytes per record. Refused (RawPayloadRedacted) when xodb runs with --redact."
         },
         "start": {
           "type": "integer",

@@ -46,6 +46,18 @@ pub fn deviceExtent(logical: u32, scale: f32) u32 {
 
 pub const Extent = struct { width: u32, height: u32 };
 
+/// Window managers take native surface units, not UI units.
+pub fn minimumSurface(units: i32, ui_scale: f32, backing_scale: f32) i32 {
+    return @intFromFloat(@ceil(@as(f64, @floatFromInt(@max(0, units))) * ui_scale / backing_scale));
+}
+
+test "minimum window size is in UI units at each backing scale" {
+    for ([_]f32{ 1, 1.25, 2 }) |backing| for ([_]f32{ 0.5, 1, 1.5, 4 }) |ui| {
+        const surface: u32 = @intCast(minimumSurface(640, ui, backing));
+        try std.testing.expect(uiExtent(deviceExtent(surface, backing), ui) >= 640);
+    };
+}
+
 /// Whole UI units that fit in a backing buffer. Never round back to pixels:
 /// fractional UI sizes can leave a fraction of a unit at the window edge.
 pub fn uiExtent(pixels: u32, scale: f32) u32 {

@@ -27,6 +27,7 @@ pub const Font = struct {
     /// enlarged by the renderer; scalable faces use the requested scale.
     scale: f32 = 1,
     raster_scale: f32 = 1,
+    ui_size: f32 = 16,
     pub fn init(self: *Font, path: [:0]const u8) !void {
         return self.initMode(path, false);
     }
@@ -76,7 +77,7 @@ pub const Font = struct {
     }
     fn configure(self: *Font, requested: f32) !void {
         const raster: f32 = if (self.retro) 1 else requested;
-        const pixels: u32 = @intFromFloat(@round(16 * raster));
+        const pixels: u32 = @intFromFloat(@round((if (self.retro) @as(f32, 16) else self.ui_size) * raster));
         if (c.FT_Set_Pixel_Sizes(self.face, 0, pixels) != 0) return error.FontSizeFailed;
         const hb = c.hb_ft_font_create_referenced(self.face) orelse return error.FontShapeFailed;
         errdefer c.hb_font_destroy(hb);
@@ -110,6 +111,15 @@ pub const Font = struct {
         if (@abs(scale - self.scale) < 0.001) return false;
         try self.configure(scale);
         return true;
+    }
+    pub fn setUiSize(self: *Font, size: f32) !void {
+        if (size == self.ui_size) return;
+        const old = self.ui_size;
+        self.ui_size = size;
+        self.configure(self.scale) catch |err| {
+            self.ui_size = old;
+            return err;
+        };
     }
     pub fn deinit(self: *Font) void {
         c.hb_buffer_destroy(self.buffer);

@@ -61,12 +61,14 @@ fn replay(o: *const Options, path: [:0]const u8, startup_started: u64) !void {
 pub fn run(o: *const Options, gpa: std.mem.Allocator, view: *vw.View, source: anytype, startup_started: u64) !void {
     const live = comptime @TypeOf(source) != *Replay;
     var layout: ?*@import("draw.zig").Layout = null;
-    if (c.getenv("XODB_OVERVIEW_LAYOUT") != null) {
+    view.layout_log = c.getenv("XODB_OVERVIEW_LAYOUT") != null;
+    if (live or view.layout_log) {
         layout = try gpa.create(@import("draw.zig").Layout);
         layout.?.* = .{};
         view.layout = layout;
     }
     defer if (layout) |l| gpa.destroy(l);
+    defer @import("../../layout_snapshot.zig").unavailable();
     view.font_path = o.font;
     view.redact = o.redact;
     view.paused = o.paused;

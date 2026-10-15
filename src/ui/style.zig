@@ -85,9 +85,9 @@ pub fn button(r: *gpu.Renderer, font: *Font, rect: gpu.Rect, label: []const u8, 
         const light = fade(theme.highlight, 0.08 * active);
         try r.shape(.{ .x = rect.x, .y = rect.y + rect.h - depth, .w = rect.w, .h = depth }, light, .{ .radii = radii, .colors = .{ fade(light, 0), fade(light, 0), light, light } });
     }
-    const key_width = r.measure(font, key) + 12;
+    const key_width = if (key.len > 0) r.measure(font, key) + 12 else 0;
     try r.textFit(font, rect.x + 13, rect.y + 5 + active, rect.w - key_width - 21, label, color);
-    _ = try chip(r, font, rect.x + rect.w - key_width - 6, rect.y + 4 + active, key, theme.weak);
+    if (key.len > 0) _ = try chip(r, font, rect.x + rect.w - key_width - 6, rect.y + 4 + active, key, theme.weak);
 }
 
 /// Marks a line as a thread's next instruction: a thin line in the thread's color that

@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCER = "ghidra-jvm-sidecar-0.1.5"
+PRODUCER = "ghidra-jvm-sidecar-0.1.6"
 CAPS = ["prime", "open_image", "decompile", "cancel", "status", "shutdown", "hints", "xsg", "pseudocode"]
 
 
@@ -79,10 +79,12 @@ def serve():
                 if verb == "hello":
                     send(conn, {"id": request.get("id"), "state": "ready",
                                 "protocol": 999 if mode == "wrong" else 1, "schema": 1,
-                                "producer": PRODUCER, "ghidra_version": "fake-owned-fixture",
+                                "producer": "ghidra-jvm-sidecar-0.1.0" if mode == "old" else PRODUCER, "ghidra_version": "fake-owned-fixture",
                                 "uid": os.getuid(), "healthy": True,
                                 "capabilities": [cap for cap in CAPS if cap != "prime" or mode != "no_prime"],
                                 "log": os.environ.get("FAKE_GHIDRA_LOG", "fake-sidecar.log")})
+                    if request.get("id") == "xodb-session":
+                        while conn.recv(1): pass
                 elif verb == "prime" and mode == "no_prime":
                     send(conn, {"id": request.get("id"), "state": "failed", "code": "unknown_verb", "detail": "prime"})
                 elif verb == "prime":
@@ -359,12 +361,45 @@ value = client(("--config", str(preferences)))
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
     requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
-    if any(request.get("verb") == "open_image" for request in requests): break
+    if any(request.get("verb") == "decompile" and request.get("background") is True for request in requests): break
+    tool(value, "get_session")
     time.sleep(.02)
 opened = [Path(request.get("path", "")) for request in requests
           if request.get("verb") == "open_image" and request.get("background") is True]
 record("eager library byte bound keeps the main image eligible and skips libraries",
        opened and all(path == fixture for path in opened), opened)
+warm_paths = [Path(request.get("path", "")) for request in requests
+              if request.get("background") is True and request.get("verb") in ("open_image", "decompile")]
+record("outer stack frames cannot bypass the eager library bound",
+       warm_paths and all(path == fixture for path in warm_paths), warm_paths)
+close(value)
+stop_server()
+
+# Stops produced by a tight instruction-step loop do not start background work.
+# The final stop remains eligible once it has been stable for the debounce.
+case = configure("warm-step-delay")
+value = client(scope="control")
+value.action("set_breakpoint", symbol="qx_alloc")
+value.continue_initial_stop()
+value.stopped("breakpoint")
+time.sleep(.3)
+(case / "requests").write_text("")
+for _ in range(3):
+    state = tool(value, "get_session")
+    tid = next(thread["tid"] for thread in state["threads"] if thread["state"] == "stopped")
+    value.action("step_instruction", tid=tid)
+    value.stopped("single_step")
+fast_requests = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
+fast_background = [request for request in fast_requests if request.get("background") is True]
+record("fast instruction steps do not start warm-ahead", not fast_background, fast_background)
+deadline = time.monotonic() + 2
+while time.monotonic() < deadline:
+    tool(value, "get_session")
+    logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
+    if any(request.get("background") is True for request in logged): break
+    time.sleep(.02)
+record("a stable stop becomes eligible for warm-ahead after the delay",
+       any(request.get("background") is True for request in logged), logged)
 close(value)
 stop_server()
 
@@ -413,8 +448,16 @@ while time.monotonic() < deadline:
     time.sleep(.02)
 try:
     result = poll_decompile(value)
+    for _ in range(20):
+        tool(value, "get_session")
+        time.sleep(.03)
+    logged = [json.loads(line) for line in (case / "requests").read_text().splitlines()]
+    eager_opens = [request for request in logged if request.get("id") == "xodb-warm-open" and
+                   Path(request.get("path", "")) == fixture]
     record("interactive pseudo-C cancels queued background import", result.get("status") == "completed" and
            (case / "cancelled").exists() and (case / "cancelled").read_text() == "warm:hang", result)
+    record("a cancelled import backs off instead of restarting after each foreground poll",
+           len(eager_opens) == 1, eager_opens)
 finally: close(value)
 stop_server()
 
@@ -457,6 +500,36 @@ fake_start()
 os.environ["FAKE_GHIDRA_MODE"] = "correct"
 completed("wrong hello is replaced once by the expected protocol")
 record("wrong hello replacement adds exactly one process", len((case / "starts").read_text().splitlines()) == 2)
+stop_server()
+
+# An installed xodb may see an old shared sidecar without having its starter
+# installed. Name both versions and the searched locations once; never dump the
+# hello document on repeated startup paths.
+case = configure("old-no-starter", "old")
+fake_start()
+isolated = case / "installed/bin/xodb"
+isolated.parent.mkdir(parents=True)
+shutil.copy2(os.environ.get("XODB_BIN", ROOT / "zig-out/bin/xodb"), isolated)
+saved_bin, saved_log, saved_starter = os.environ.get("XODB_BIN"), os.environ.get("XODB_LOG"), os.environ["XODB_GHIDRA_SIDECAR"]
+os.environ.update(XODB_BIN=str(isolated), XODB_LOG="debug", XODB_GHIDRA_SIDECAR=str(case / "missing-starter"))
+value = client()
+for _ in range(40):  # about one second of owner polls with the target stopped
+    tool(value, "get_session")
+    time.sleep(.025)
+close(value)
+diagnostics = value.p.stderr.read().decode()
+line = "running sidecar is 0.1.0, this xodb needs 0.1.6"
+logged = [json.loads(entry) for entry in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
+hellos = [entry for entry in logged if entry.get("verb") == "hello"]
+record("an incompatible sidecar is not asked again on every owner poll", len(hellos) <= 4, len(hellos))
+record("old sidecar without a starter has one concise version diagnostic",
+       diagnostics.count(line) == 1 and "no starter found to replace it (looked in " in diagnostics and '"capabilities"' not in diagnostics,
+       diagnostics)
+if saved_bin is None: os.environ.pop("XODB_BIN", None)
+else: os.environ["XODB_BIN"] = saved_bin
+if saved_log is None: os.environ.pop("XODB_LOG", None)
+else: os.environ["XODB_LOG"] = saved_log
+os.environ["XODB_GHIDRA_SIDECAR"] = saved_starter
 stop_server()
 
 # If the replacement is still wrong, the job reports the exact protocol gate.

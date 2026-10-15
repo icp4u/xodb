@@ -33,23 +33,42 @@ fn lerpV(a: V, b: V, t: f32) V {
 /// assert that no two labels collide (XODB_OVERVIEW_LAYOUT=1).
 pub const Layout = struct {
     boxes: [4096]Rect = undefined,
-    labels: [4096][28]u8 = undefined,
+    labels: [4096][96]u8 = undefined,
     lens: [4096]u8 = undefined,
+    clipped: [4096]bool = undefined,
+    truncated: [4096]bool = undefined,
     count: usize = 0,
+    elided: usize = 0,
+    unmarked: usize = 0,
+    omitted: usize = 0,
     pub fn add(self: *Layout, r: Rect, s: []const u8) void {
+        self.addText(r, s, false);
+    }
+    pub fn addText(self: *Layout, r: Rect, s: []const u8, clipped: bool) void {
         if (self.count == self.boxes.len or r.w < 1 or s.len == 0) return;
         if (std.mem.trim(u8, s, " ").len == 0) return;
         self.boxes[self.count] = r;
-        const n = @min(s.len, 28);
+        var n = @min(s.len, 96);
+        while (n > 0 and n < s.len and s[n] & 0xc0 == 0x80) n -= 1;
         @memcpy(self.labels[self.count][0..n], s[0..n]);
         self.lens[self.count] = @intCast(n);
+        self.clipped[self.count] = clipped;
+        self.truncated[self.count] = n < s.len;
         self.count += 1;
     }
     /// Pairs of boxes that overlap, or sit on one row closer than `gap`
     /// pixels (two labels that read as one phrase); reports the first three.
     pub fn overlaps(self: *const Layout, first: *[6][]const u8) usize {
         var n: usize = 0;
-        for (0..self.count) |i| for (i + 1..self.count) |j| {
+        var order: [4096]u16 = undefined;
+        for (order[0..self.count], 0..) |*slot, i| slot.* = @intCast(i);
+        std.mem.sort(u16, order[0..self.count], self, struct {
+            fn less(l: *const Layout, a: u16, b: u16) bool {
+                return l.boxes[a].y < l.boxes[b].y;
+            }
+        }.less);
+        for (order[0..self.count], 0..) |i, at| for (order[at + 1 .. self.count]) |j| {
+            if (self.boxes[j].y >= self.boxes[i].y + self.boxes[i].h - 4) break;
             // Glyph marks (tree twisties, state letters) may sit tight; words may not.
             const gap: f32 = if (self.lens[i] >= 4 and self.lens[j] >= 4) 12 else 0;
             const x = self.boxes[i];
@@ -66,13 +85,27 @@ pub const Layout = struct {
     }
 };
 
+test "layout audit detects planted collisions without comparing separate rows" {
+    var layout = Layout{};
+    var first: [6][]const u8 = @splat("");
+    layout.add(.{ .x = 0, .y = 40, .w = 50, .h = 16 }, "value");
+    layout.add(.{ .x = 0, .y = 0, .w = 50, .h = 16 }, "name");
+    try std.testing.expectEqual(@as(usize, 0), layout.overlaps(&first));
+    layout.add(.{ .x = 25, .y = 40, .w = 50, .h = 16 }, "planted collision");
+    try std.testing.expectEqual(@as(usize, 1), layout.overlaps(&first));
+}
+
 pub const Ctx = struct {
     r: *gpu.Renderer,
     font: *Font,
     p: *const Palette,
     layout: ?*Layout = null,
     fn note(self: Ctx, x: f32, y: f32, w: f32, s: []const u8) void {
-        if (self.layout) |l| l.add(.{ .x = x, .y = y + 2, .w = w, .h = 16 }, s);
+        if (self.layout) |l| {
+            const clip = self.r.clip;
+            if (x < clip.x or y < clip.y or x + w > clip.x + clip.w + 0.5 or y + 18 > clip.y + clip.h + 0.5) l.unmarked += 1;
+            l.addText(.{ .x = x, .y = y + 2, .w = w, .h = 16 }, s, self.measure(s) > w + 0.5);
+        }
     }
 
     /// Convex polygon, clipped to the renderer's clip rectangle (Sutherland-Hodgman)
@@ -241,18 +274,79 @@ pub const Ctx = struct {
         try self.r.shape(rect, fade(self.p.hatch, 0.5), .{ .border = 1 });
     }
     pub fn text(self: Ctx, x: f32, y: f32, s: []const u8, color: Color) !void {
-        if (self.layout != null) self.note(x, y, self.measure(s), s);
-        try self.r.text(self.font, @round(x), @round(y), s, color);
+        try self.textFit(x, y, self.r.clip.x + self.r.clip.w - x, s, color);
     }
     pub fn textFit(self: Ctx, x: f32, y: f32, w: f32, s: []const u8, color: Color) !void {
-        if (w <= 4) return;
-        if (self.layout != null) self.note(x, y, @min(w, self.measure(s)), s);
-        try self.r.textFit(self.font, @round(x), @round(y), w, s, color);
+        const clip = self.r.clip;
+        const width = @min(w, clip.x + clip.w - x);
+        const measured = self.measure(s);
+        // Omit a whole offscreen row, never the bottom half of its glyphs.
+        if (width <= 0 or (measured > width and width < self.measure("...")) or x < clip.x or y < clip.y or y + 18 > clip.y + clip.h) {
+            if (self.layout) |l| l.omitted += @intFromBool(s.len > 0);
+            return;
+        }
+        if (self.layout) |l| {
+            l.elided += @intFromBool(measured > width);
+            self.note(x, y, @min(width, measured), s);
+        }
+        try self.r.textFit(self.font, @round(x), @round(y), width, s, color);
     }
     pub fn textRight(self: Ctx, right: f32, y: f32, s: []const u8, color: Color) !void {
         const w = self.r.measure(self.font, s);
-        if (self.layout != null) self.note(right - w, y, w, s);
-        try self.r.text(self.font, @round(right - w), @round(y), s, color);
+        try self.textFit(@max(self.r.clip.x, right - w), y, @min(w, right - self.r.clip.x), s, color);
+    }
+    /// A right-aligned value owns its cell; it cannot grow into its label.
+    pub fn textRightFit(self: Ctx, right: f32, y: f32, width: f32, s: []const u8, color: Color) !void {
+        const w = @max(0, @min(width, self.measure(s)));
+        try self.textFit(right - w, y, w, s, color);
+    }
+    pub fn wrap(self: Ctx, rect: Rect, text_: []const u8, color: Color) !void {
+        const step = @import("../../look.zig").overview.line;
+        var rest = std.mem.trim(u8, text_, " \n");
+        var y = rect.y;
+        while (rest.len > 0 and y + 18 <= rect.y + rect.h) : (y += step) {
+            if (y + step + 18 > rect.y + rect.h or self.measure(rest) <= rect.w) {
+                try self.textFit(rect.x, y, rect.w, rest, color);
+                break;
+            }
+            var end: usize = 0;
+            var words = std.mem.tokenizeAny(u8, rest, " \n");
+            while (words.next()) |word| {
+                const next = @intFromPtr(word.ptr) - @intFromPtr(rest.ptr) + word.len;
+                if (self.measure(rest[0..next]) > rect.w) {
+                    if (end == 0) end = next;
+                    break;
+                }
+                end = next;
+            }
+            if (end == 0) break;
+            try self.textFit(rect.x, y, rect.w, rest[0..end], color);
+            rest = std.mem.trimStart(u8, rest[end..], " \n");
+        }
+    }
+    /// Fit whole clauses, in priority order. Never cut a key binding in half.
+    pub fn clauses(self: Ctx, rect: Rect, text_: []const u8, color: Color) !void {
+        return self.clausesWith(rect, text_, color, "  ");
+    }
+    pub fn status(self: Ctx, rect: Rect, text_: []const u8, color: Color) !void {
+        return self.clausesWith(rect, text_, color, " · ");
+    }
+    fn clausesWith(self: Ctx, rect: Rect, text_: []const u8, color: Color, separator: []const u8) !void {
+        var clauses_ = std.mem.splitSequence(u8, text_, separator);
+        var x = rect.x;
+        var y = rect.y;
+        while (clauses_.next()) |part| {
+            const clause = std.mem.trim(u8, part, " ");
+            const w = self.measure(clause);
+            if (x + w > rect.x + rect.w) {
+                x = rect.x;
+                y += @import("../../look.zig").overview.line;
+            }
+            if (y + 18 > rect.y + rect.h) break;
+            if (w > rect.w) continue;
+            try self.text(x, y, clause, color);
+            x += w + 20;
+        }
     }
     pub fn measure(self: Ctx, s: []const u8) f32 {
         return self.r.measure(self.font, s);

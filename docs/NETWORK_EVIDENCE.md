@@ -147,8 +147,13 @@ writes its pcapng from the endpoints of two owned loopback peers at run time,
 and the `pcap-magic` gate step fails if any tracked file starts with a pcap or
 pcapng magic number. Socket tables in an archive name the target's endpoints,
 including remote addresses and ports, for every local capture; share archives
-with that in mind. Debugger and capture mode have no `--redact` yet: MCP
-`correlate` and `query_stream` show addresses as recorded.
+with that in mind, or save them with `--redact`: addresses outside loopback and
+the documentation ranges are then stored as tags under a per-archive key that
+is not stored (ECTX schema 2), process names are masked, and those sockets
+match no packet. Under `--redact`, MCP `correlate`, `query_stream` and
+`list_streams` show such addresses as per-session tags (`ip-` and 8 hex
+digits), and `include_raw` is refused (`RawPayloadRedacted`). See
+[GUIDE.md](GUIDE.md#redaction).
 
 ## Layout
 

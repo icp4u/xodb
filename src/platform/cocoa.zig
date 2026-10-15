@@ -24,6 +24,7 @@ pub const Window = struct {
     mouse_down: bool = false,
     scroll: i32 = 0,
     scale_override: ?f32 = null,
+    minimum_ui: [2]i32 = .{ @import("../look.zig").minimum.width, @import("../look.zig").minimum.height },
 
     opened: bool = false,
     backing_scale: f32 = 1,
@@ -71,7 +72,8 @@ pub const Window = struct {
         if (self.opened) shim.xcocoa_set_app_id(app_id);
     }
     pub fn setMinSize(self: *Window, width: i32, height: i32) void {
-        if (self.opened) shim.xcocoa_set_min_size(width, height);
+        self.minimum_ui = .{ width, height };
+        if (self.opened) shim.xcocoa_set_min_size(platform.minimumSurface(width, self.scale(), self.backing_scale), platform.minimumSurface(height, self.scale(), self.backing_scale));
     }
     pub fn minimize(self: *Window) void {
         if (self.opened) shim.xcocoa_minimize();
@@ -103,6 +105,7 @@ pub const Window = struct {
         self.width = platform.uiExtent(pixels.width, self.scale());
         self.height = platform.uiExtent(pixels.height, self.scale());
         if (self.opened) shim.xcocoa_set_scale(self.backing_scale);
+        self.setMinSize(self.minimum_ui[0], self.minimum_ui[1]);
     }
     pub fn bufferExtent(self: *const Window) platform.Extent {
         return .{ .width = platform.deviceExtent(self.surface_width, self.backing_scale), .height = platform.deviceExtent(self.surface_height, self.backing_scale) };

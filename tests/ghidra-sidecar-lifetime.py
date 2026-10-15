@@ -7,6 +7,7 @@ import os
 import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -21,17 +22,28 @@ if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
 work = Path(tempfile.mkdtemp(prefix="xodb-ghl-", dir=os.environ.get("XODB_TEST_TMPDIR")))
 atexit.register(shutil.rmtree, work, True)
-endpoint = work / "run/.xodb.ghidra.s"
+endpoint = work / "private/socket/.xodb.ghidra.s"
 os.environ.update(
     XDG_RUNTIME_DIR=str(work / "run"),
     XODB_GHIDRA_SOCKET=str(endpoint),
-    XODB_GHIDRA_HOME=ghidra,
+    XODB_GHIDRA_SIDECAR=str(ROOT / "scripts/ghidra-sidecar"),
     XODB_GHIDRA_CACHE=str(work / "cache"),
     XODB_GHIDRA_STATE=str(work / "state"),
     XODB_GHIDRA_XMX="1g",
     XODB_GHIDRA_SOFT_MAX="256m",
     XODB_GHIDRA_IDLE="0.02",  # minutes: 1.2 seconds
 )
+opt_discovery = Path("/opt/ghidra/support/analyzeHeadless").exists() and Path(ghidra).resolve() == Path("/opt/ghidra").resolve()
+if opt_discovery:
+    os.environ.pop("XODB_GHIDRA_HOME", None)
+    os.environ.pop("GHIDRA_HOME", None)
+else:
+    os.environ["XODB_GHIDRA_HOME"] = ghidra
+sys.path.insert(0, str(ROOT / "tests"))
+from client import Client
+fixture_dir = work / "qx"
+subprocess.run(["sh", "tests/fixtures/semq/build_fixtures.sh", str(fixture_dir)], check=True, timeout=60)
+fixture = fixture_dir / "qx-gcc-O2"
 
 
 def command(action, timeout=90):
@@ -95,17 +107,32 @@ replacement = None
 try:
     started = command("start")
     assert started.returncode == 0, (started.stdout, started.stderr)
+    assert endpoint.parent.is_dir(), "starter did not create the configured socket directory"
+    if opt_discovery:
+        startup_log = (work / "state/sidecar.log").read_text()
+        assert f"using Ghidra {Path('/opt/ghidra').resolve()}; JDK java " in startup_log and "; javac " in startup_log, startup_log
     first = status()
     assert abs(first["idle_limit_seconds"] - 1.2) < .01 and first["idle_seconds"] >= 0
     pid = first["pid"]
 
-    # A live connection suppresses idle exit even when it sends no requests.
-    with socket.socket(socket.AF_UNIX) as client:
-        client.connect(str(endpoint))
-        client.sendall(b'{"id":"held","verb":"hello"}\n')
-        assert json.loads(client.makefile("rb").readline())["state"] == "ready"
+    # A stopped xodb owns one validated connection for its whole session. Once
+    # warm-ahead settles, that idle connection alone keeps the JVM alive.
+    session = Client("observe", str(fixture))
+    try:
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            current = status()
+            if current["queue"] == 0 and current["clients_connected"] >= 2:
+                break
+            time.sleep(.05)
+        else:
+            raise AssertionError("xodb did not establish its sidecar hold")
         time.sleep(2.5)
-        assert process_alive(pid), "connected client did not keep the sidecar alive"
+        held = status()
+        assert process_alive(pid) and held["clients_connected"] >= 2, held
+    finally:
+        session.p.stdin.close()
+        session.p.wait(timeout=10)
     wait_gone(pid)
     assert not endpoint.exists(), "idle exit left its socket behind"
 
@@ -130,4 +157,4 @@ finally:
     command("stop", 10)
 
 reap_adopted()
-print("pass: connected client holds sidecar; idle and replaced endpoint exit cleanly")
+print("pass: stopped xodb session holds sidecar; idle and replaced endpoint exit cleanly")

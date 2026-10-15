@@ -1,5 +1,11 @@
 [
   {
+    "name": "get_layout",
+    "description": "Read the last GUI layout; available=false when this view has no layout publication.",
+    "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+    "annotations": { "readOnlyHint": true, "xodbSessionAccess": "observer" }
+  },
+  {
     "name": "get_session",
     "description": "Inspect the offline session.",
     "inputSchema": {

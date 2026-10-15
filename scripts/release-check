@@ -27,6 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
+    (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
+    (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
     (('src/semq/adapter*', 'scripts/semq/c01_to_xsg.py', 'tests/semq/test_adapter.py'), ('semq-adapter',)),
     (('src/log.zig', 'src/startup.zig', 'src/runtime/log.c', 'src/runtime/xrt_log.h'), ('log-levels', 'gui-log-levels')),
@@ -86,8 +88,10 @@ COVERS = (
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),
     (('src/mcp/static_*', 'src/ui/static_analysis.zig', 'src/model/static_view.zig', 'src/model/analysis_ir.zig', 'src/model/control_flow.zig',
       'src/semq/host.zig', 'src/semq/answer.zig', 'src/semq/ghidra_sidecar.zig', 'scripts/demo-decompile', 'scripts/ghidra-sidecar',
-      'scripts/helpers/ghidra_sidecar_ctl.py', 'tools/ghx/sidecar/*', 'tests/ghidra-sidecar*.py'),
-     ('static-analysis', 'ghidra-sidecar*', 'gui-static-analysis')),
+      'scripts/helpers/ghidra_sidecar_ctl.py', 'tools/ghx/sidecar/*', 'tests/ghidra-sidecar*.py',
+      'src/semq/static_image.zig', 'tests/ghidra-static-images.py', 'tests/fixtures/semq/qx-storage.c',
+      'tests/fixtures/semq/static-image.c'),
+     ('static-analysis', 'ghidra-sidecar*', 'ghidra-static-images', 'gui-static-analysis')),
     (('src/mcp/observation.zig', 'src/mcp/associations.zig', 'src/mcp/probes.zig', 'src/model/probes.zig',
       'src/ui/probes.zig', 'src/ui/invocations.zig', 'src/model/invocation_view.zig', 'src/runtime/probes.c', 'src/runtime/xrt_uprobes.h', 'src/observe/*'), ('observation*', 'inspections*', 'inspection-lifecycle*', 'gui-invocations')),
     (('src/profile/*', 'src/mcp/profile.zig', 'src/mcp/sampled_stack.zig', 'src/mcp/archive.zig', 'src/mcp/comparison.zig',
@@ -127,6 +131,9 @@ COVERS = (
     (('src/evidence/*', 'src/mcp/evidence*', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/fixtures/net-peer.py'),
      ('network-evidence', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
     (('tests/pcap-magic.py',), ('pcap-magic',)),
+    (('src/redact.zig', 'src/log.zig', 'src/mcp/server.zig', 'src/profile/archive.zig', 'src/profile/archive_job.zig', 'src/profile/net_context.zig',
+      'src/evidence/sockets.zig', 'src/mcp/evidence.zig', 'src/render/vulkan.zig', 'tests/redact.py'),
+     ('redact', 'gui-redact')),
     (('src/*.zig', 'src/*.c', 'src/*.h', 'src/*.cc', 'src/*.inc', 'src/*/Makefile', 'build.zig'), ('deps',)),
     (('docs/*', '*.md', 'packaging/*', 'scripts/package-source'), ('package-source',)),
 )
@@ -156,6 +163,7 @@ NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-dev
 # of the rest. host/gui/all keep a quicker check of each area. `affected`
 # still selects one of these when a test script it runs changes.
 PERIODIC = (
+    'gui-overview-small-matrix*',
     'redot-time-demo-gui',
     'remote-unknown-matrix', 'remote-startup-matrix',
     'gui-remote-publication', 'gui-owner-*',
@@ -239,7 +247,7 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -336,6 +344,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                 # A real Mac over ssh: debugserver on its loopback, reached through a tunnel. Never has a default host.
                 steps.append(('macos-debugserver', [sys.executable, '-B', 'tests/macos-debugserver.py', '--ssh', macos_ssh,
                               '--work', '.work/macos-debugserver'], 300))
+            if arm64_sidecar:
+                ssh, agent, fixture = arm64_sidecar
+                steps.append(('ghidra-sidecar-arm64', [sys.executable, '-B', 'tests/ghidra-sidecar-arm64.py',
+                              '--ssh', ssh, '--agent', agent, '--fixture', fixture], 300))
         steps.append(('pe-unwind-fuzz', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
         steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',
@@ -482,10 +494,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
-                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'log-levels',
+                     'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'ghidra-static-images', 'log-levels',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
                      'comparison', 'scheduling-decode', 'observation-experiments',
-                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence'):
+                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence', 'redact'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
@@ -659,6 +671,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-themes', ['tests/themes.py']),
             ('gui-ui-scale', ['tests/ui-scale-gui.py']),
             ('gui-ui-sizing', ['tests/ui-scale-gui.py', '--sizing']),
+            ('gui-small-window', ['tests/small-window-gui.py']),
             ('gui-galaxy-scale', ['tests/ui-scale-gui.py', '--galaxy']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),
@@ -702,6 +715,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-flame-status', ['tests/flame-status-gui.py']),
             ('gui-capture-setup', ['tests/m2-capture-setup.py']),
             ('gui-network-evidence', ['tests/network-evidence.py', '--gui', '--work', '.work/gne']),
+            ('gui-redact', ['tests/redact.py', '--gui', '--work', '.work/grd']),
             ('remote-panes', ['tests/remote-gui.py', '--bin', 'zig-out/bin', '--running-panes']),
             ('hidden-window', ['tests/vulkan-stall.py', 'trace', '--attach-fixture']),
             ('acquire-timeout', ['tests/vulkan-stall.py', 'acquire', '--keep-hidden', '--quit', 'signal', '--attach-fixture']),
@@ -723,6 +737,10 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                       sys.executable, '-B', 'tests/process-gui.py'], 120))
         # Many OCR passes on a private display; bounded well above its usual few minutes.
         steps.append(('gui-overview', [sys.executable, '-B', 'tests/overview-gui.py', '--focused'], 900))
+        steps.append(('gui-overview-small', [sys.executable, '-B', 'tests/overview-small-gui.py'], 120))
+        steps.append(('gui-overview-layout', [sys.executable, '-B', 'tests/overview-small-gui.py', '--live'], 120))
+        steps.append(('gui-overview-small-matrix', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix'], 600))
+        steps.append(('gui-overview-small-matrix-unavailable', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--unavailable'], 600))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))
@@ -1235,6 +1253,7 @@ def main(argv=None):
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
     parser.add_argument('--redot', help='Include GDScript stack and value checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
     parser.add_argument('--macos-ssh', metavar='HOST', help='Include the live Apple debugserver test against this Mac, reached with ssh HOST (periodic tier; no default host)')
+    parser.add_argument('--arm64-sidecar', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the live arm64 Ghidra-sidecar test using an SSH destination and owned remote agent/fixture paths (periodic tier)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -1279,6 +1298,8 @@ def main(argv=None):
         parser.error('--redot is not for the portable or perf tier')
     if args.macos_ssh and (args.tier != 'periodic' or args.headless):
         parser.error('--macos-ssh requires the periodic tier without --headless')
+    if args.arm64_sidecar and args.tier != 'periodic':
+        parser.error('--arm64-sidecar requires the periodic tier')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1286,7 +1307,7 @@ def main(argv=None):
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'

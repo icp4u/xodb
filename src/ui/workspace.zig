@@ -22,17 +22,12 @@ const watch_ui = @import("watch.zig");
 const native_watches = @import("../model/native_watches.zig");
 const info = @import("../debug/info.zig");
 const profile = @import("../profile/capture.zig");
-const ToolButton = struct { label: []const u8, key: []const u8, code: u32, x: f32, w: f32 };
-// One table for drawing and hit-testing. The zones are the ones the smoke tests click.
-const buttons = [_]ToolButton{
-    .{ .label = "Continue", .key = "SPACE", .code = 57, .x = 18, .w = 174 },
-    .{ .label = "Detach", .key = "Shift+D", .code = 32, .x = 200, .w = 166 },
-    .{ .label = "Step", .key = "F11", .code = 87, .x = 375, .w = 104 },
-    .{ .label = "Over", .key = "F10", .code = 68, .x = 485, .w = 110 },
-    .{ .label = "Agent", .key = "F8", .code = 66, .x = 605, .w = 200 },
-    .{ .label = "Watch", .key = "W", .code = 17, .x = 940, .w = 110 },
-    .{ .label = "Flow", .key = "G", .code = 34, .x = 1068, .w = 138 },
-};
+const look = @import("../look.zig");
+const layout_snapshot = @import("../layout_snapshot.zig");
+const buttons = look.actions;
+fn gpuRect(b: look.Rect) gpu.Rect {
+    return .{ .x = b.x, .y = b.y, .w = b.w, .h = b.h };
+}
 const tab_width = 4;
 /// In the profile view, flames take the body above this fraction of the height
 /// and the timeline the row below it.
@@ -45,6 +40,15 @@ fn lineStatus(session: *const Session, err: anyerror) []const u8 {
     return @errorName(err);
 }
 pub const Workspace = struct {
+    density: look.Density = .auto,
+    compact: bool = false,
+    layout: look.Layout = .{},
+    layout_key: ?struct { width: u32, height: u32, split: f32, compact: bool, pinned: ?look.Pane, watch: bool, named_threads: bool } = null,
+    pinned_pane: ?look.Pane = null,
+    more_open: bool = false,
+    value_hover: ?usize = null,
+    layout_report: layout_snapshot.Snapshot = .{},
+
     shared_clients: ?usize = null,
     shared_controller: ?u64 = null,
     /// Owner loop consumes this even when several toggles restore the old scope.
@@ -90,8 +94,6 @@ pub const Workspace = struct {
     thread_list: @import("thread_list.zig").Panel = .{},
     compatibility_info: @import("../model/compatibility.zig").Info = .{ .kind = .unavailable },
     thread_labels: []const @import("../model/compatibility.zig").Label = &.{},
-    // Hit testing uses the geometry last drawn, never a retired publication.
-    thread_width_fraction: f32 = 0.36,
     inspection_capture: @import("../model/inspection_view.zig").Capture = .{},
     selected_frame: usize = 0,
     last_frame: usize = std.math.maxInt(usize),
@@ -192,6 +194,26 @@ pub const Workspace = struct {
         self.runtime_watch_capture.deinit();
         self.prepared.deinit();
         self.static_panel.deinit();
+    }
+    pub fn updateLayout(self: *Workspace, w: *const Window) void {
+        self.compact = look.compactFor(self.density, @floatFromInt(w.width), self.compact);
+        const named_threads = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
+        const pinned: ?look.Pane = if (self.editor.open) .events else if (self.language_panel.editor.open) .registers else self.pinned_pane;
+        const key: @typeInfo(@TypeOf(self.layout_key)).optional.child = .{ .width = w.width, .height = w.height, .split = self.split, .compact = self.compact, .pinned = pinned, .watch = self.show_watch, .named_threads = named_threads };
+        if (self.layout_key) |old| if (std.meta.eql(old, key)) return;
+        self.layout = look.Layout.compute(@floatFromInt(w.width), @floatFromInt(w.height), self.split, self.compact, pinned, self.show_watch);
+        if (named_threads) self.layout.threadFraction(0.48);
+        self.layout_key = key;
+    }
+    fn menuRect(self: *const Workspace, index: usize, width: f32) look.Rect {
+        var row: usize = 0;
+        for (self.layout.toolbar[0..index]) |b| if (b.w == 0) {
+            row += 1;
+        };
+        return .{ .x = width - look.overflow.width - look.overflow.margin, .y = look.overflow.top + @as(f32, @floatFromInt(row)) * look.overflow.row, .w = look.overflow.width, .h = look.overflow.height };
+    }
+    fn rowStep(self: *const Workspace) f32 {
+        return if (self.compact) look.compact.row else look.normal.row;
     }
     pub fn loadSource(self: *Workspace, path: []const u8) !void {
         try self.prepared.source.load(path);
@@ -308,6 +330,7 @@ pub const Workspace = struct {
     /// Applies the queued key and button events one at a time, in order, then the
     /// pointer state. A click is handled at the position where it happened.
     pub fn input(self: *Workspace, w: *Window, context: anytype) void {
+        self.updateLayout(w);
         const remote = @TypeOf(context) != *Session;
         const session = if (remote) {} else context;
         const language = if (remote) context.language else @import("../model/language_view.zig").header(session);
@@ -401,6 +424,28 @@ pub const Workspace = struct {
             if (self.activeEditor(context)) |editor| if (editor.clipboard(w, event)) continue;
             switch (event.kind) {
                 .press, .repeat => {
+                    if (self.activeEditor(context) == null and event.kind == .press and event.mods.alt and event.shortcut >= '1' and event.shortcut <= '6') {
+                        const p: look.Pane = @enumFromInt(event.shortcut - '1');
+                        self.pinned_pane = if (self.pinned_pane == p) null else p;
+                        self.updateLayout(w);
+                        w.dirty = true;
+                        continue;
+                    }
+                    if (self.activeEditor(context) == null and event.kind == .press and event.mods.ctrl and event.mods.shift and event.shortcut == 'd') {
+                        self.density = switch (self.density) {
+                            .auto => .normal,
+                            .normal => .compact,
+                            .compact => .auto,
+                        };
+                        self.status = switch (self.density) {
+                            .auto => "Density: auto",
+                            .normal => "Density: normal",
+                            .compact => "Density: compact",
+                        };
+                        self.updateLayout(w);
+                        w.dirty = true;
+                        continue;
+                    }
                     if (!remote and self.activeEditor(context) == null and session.comparison != null and event.plain() and event.kind == .press and event.shortcut == 'v') {
                         self.comparison.open = true;
                         w.dirty = true;
@@ -742,6 +787,7 @@ pub const Workspace = struct {
         };
         self.show_flow = false;
         self.static_panel.showDecompile(.{ .pc = pc });
+        self.pinned_pane = .assembly;
         self.status = "Preparing pseudo-C; D returns to assembly";
     }
     /// With XODB_INPUT_TRACE, each static answer is logged once for GUI tests.
@@ -870,18 +916,57 @@ pub const Workspace = struct {
             click = false;
             w.dirty = true;
         }
-        if (!self.show_profile and click and @abs(w.pointer_x - @as(f32, @floatFromInt(w.width)) * self.split) < 7 and w.pointer_y > 90) self.dragging = true;
+        if (!self.show_profile and self.layout.visible(.source) and self.layout.visible(.assembly) and click and @abs(w.pointer_x - self.layout.left) < 7 and w.pointer_y > 90) self.dragging = true;
         if (!w.mouse_down) self.dragging = false;
-        if (self.dragging) self.split = std.math.clamp(w.pointer_x / @as(f32, @floatFromInt(w.width)), 0.30, 0.62);
+        if (self.dragging) {
+            self.split = std.math.clamp(w.pointer_x / @as(f32, @floatFromInt(w.width)), 0.30, 0.62);
+            self.updateLayout(w);
+        }
         var code = key;
+        var value_hover: ?usize = null;
+        for (self.layout_report.rows[0..self.layout_report.row_count], 0..) |row, i| if (row.value_elided and row.rect.contains(w.pointer_x, w.pointer_y)) {
+            value_hover = i;
+            break;
+        };
+        if (value_hover != self.value_hover) w.dirty = true;
+        self.value_hover = value_hover;
+        if (click and !self.show_profile) for (self.layout.tabs, 0..) |b, i| {
+            if (b.contains(w.pointer_x, w.pointer_y)) {
+                self.pinned_pane = @enumFromInt(i);
+                self.updateLayout(w);
+                w.dirty = true;
+                return;
+            }
+        };
+        if (click and self.layout.more.contains(w.pointer_x, w.pointer_y)) {
+            self.more_open = !self.more_open;
+            w.dirty = true;
+            return;
+        }
+        if (self.more_open) {
+            if (key == 1) {
+                self.more_open = false;
+                w.dirty = true;
+                return;
+            }
+            if (click) {
+                for (self.layout.toolbar, 0..) |b, i| if (b.w == 0 and self.menuRect(i, @floatFromInt(w.width)).contains(w.pointer_x, w.pointer_y)) {
+                    code = buttons[i].code;
+                };
+                self.more_open = false;
+                w.dirty = true;
+                if (code == 0) return;
+                click = false;
+            }
+        }
         // Hover targets: a change needs one redraw, after which the animation keeps itself going.
         var hovered: ?usize = null;
-        if (w.pointer_y >= 44 and w.pointer_y < 84) for (buttons, 0..) |b, i| {
-            if (w.pointer_x >= b.x and w.pointer_x < b.x + b.w) hovered = i;
+        if (w.pointer_y >= 44 and w.pointer_y < 84) for (self.layout.toolbar, 0..) |b, i| {
+            if (b.contains(w.pointer_x, w.pointer_y)) hovered = i;
         };
         const gutter_row = (w.pointer_y - 135) / 23;
-        const hover_line: ?u32 = if (!self.show_profile and w.pointer_x > 10 and w.pointer_x < 74 and gutter_row >= 0 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) @intCast(self.source_line + @as(i32, @intFromFloat(gutter_row)) + 1) else null;
-        const divider_hot = !self.show_profile and @abs(w.pointer_x - @as(f32, @floatFromInt(w.width)) * self.split) < 7 and w.pointer_y > 90;
+        const hover_line: ?u32 = if (!self.show_profile and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and gutter_row >= 0 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) @intCast(self.source_line + @as(i32, @intFromFloat(gutter_row)) + 1) else null;
+        const divider_hot = !self.show_profile and self.layout.visible(.source) and self.layout.visible(.assembly) and @abs(w.pointer_x - self.layout.left) < 7 and w.pointer_y > 90;
         if (hovered != self.hovered or hover_line != self.hover_line or divider_hot != self.divider_hot) w.dirty = true;
         self.hovered = hovered;
         self.hover_line = hover_line;
@@ -890,9 +975,7 @@ pub const Workspace = struct {
             code = buttons[i].code;
             self.pressed[i] = 1;
         };
-        const flame_x: f32 = if (w.width < 900) 280 else 380;
-        const flame_w: f32 = if (w.width < 900) 110 else 178;
-        if (click and w.pointer_x >= flame_x and w.pointer_x < flame_x + flame_w and w.pointer_y >= 8 and w.pointer_y < 37) code = 33;
+        if (click and self.layout.flames.contains(w.pointer_x, w.pointer_y)) code = 33;
         if (code == 62 and !self.show_profile) {
             if (remote) context.send(self, .{ .control = .restart }) else {
                 session.restart() catch |err| {
@@ -1066,7 +1149,7 @@ pub const Workspace = struct {
             if (click or code == 44 or code == 14 or code == 28) w.dirty = true;
             if (w.pointer_y >= 90 and w.pointer_y < @as(f32, @floatFromInt(w.height)) * 0.73) click = false;
         }
-        if (code == 24 or (click and w.pointer_y >= 8 and w.pointer_y < 37 and w.pointer_x >= 91 and w.pointer_x < 262)) {
+        if (code == 24 or (click and self.layout.processes.contains(w.pointer_x, w.pointer_y))) {
             if (remote) {
                 self.process_panel.show(context.processes);
             } else if (session.process_tree) |tree| {
@@ -1082,6 +1165,7 @@ pub const Workspace = struct {
             self.show_profile = false;
             self.static_panel.hideDecompile();
             self.show_flow = !self.show_flow;
+            if (self.show_flow) self.pinned_pane = .assembly;
             w.dirty = true;
         }
         if (!self.show_profile and self.show_flow and snapshot.state == .stopped and self.flow.generation == snapshot.generation) {
@@ -1091,7 +1175,7 @@ pub const Workspace = struct {
                 self.status = "Browsing block; execution unchanged";
                 w.dirty = true;
             };
-            if (!(self.show_watch and self.watch_focus) and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_x < @as(f32, @floatFromInt(w.width)) * 0.79) {
+            if (!(self.show_watch and self.watch_focus) and self.layout.rect(.assembly).contains(w.pointer_x, w.pointer_y)) {
                 self.flow.scrollBy(w.scroll + (if (code == 108) @as(i32, 3) else if (code == 103) @as(i32, -3) else 0));
                 w.scroll = 0;
                 if (code == 108 or code == 103) code = 0;
@@ -1111,6 +1195,7 @@ pub const Workspace = struct {
             }
             if (code == 47) {
                 self.show_watch = !self.show_watch;
+                if (self.show_watch) self.pinned_pane = .events;
                 if (!self.show_watch) self.watch_focus = false;
                 w.dirty = true;
             }
@@ -1176,14 +1261,14 @@ pub const Workspace = struct {
                 }
             }
         }
-        if (!self.show_profile and click) {
+        if (!self.show_profile and self.layout.visible(.registers) and click) {
             if (self.language_panel.hit(w.pointer_x, w.pointer_y)) |tab| {
                 if (remote) context.send(self, .{ .language = .{ .tab = tab } }) else session.language_tabs.select(tab) catch {};
                 click = false;
                 w.dirty = true;
             }
         }
-        if (!self.show_profile and @intFromEnum(language.selected) >= 2) {
+        if (!self.show_profile and self.layout.visible(.registers) and @intFromEnum(language.selected) >= 2) {
             if (click) {
                 if (remote) {
                     const result = self.language_panel.clickView(language, w.pointer_x, w.pointer_y) catch |err| {
@@ -1213,13 +1298,14 @@ pub const Workspace = struct {
                     }
                 }
             }
-            if (w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.scroll != 0) {
+            if (self.layout.rect(.registers).contains(w.pointer_x, w.pointer_y) and w.pointer_y >= self.language_panel.content_y and w.scroll != 0) {
                 if (w.pointer_y >= self.language_panel.binding_y) self.language_panel.scrollBindings(w.scroll) else if (w.pointer_y >= self.language_panel.native_y) self.language_panel.scrollNative(w.scroll) else self.language_panel.scrollBy(w.scroll);
                 w.scroll = 0;
                 w.dirty = true;
             }
         }
         if (code == 15) {
+            if (!self.layout.visible(.registers)) self.pinned_pane = .registers;
             if (remote) {
                 const tabs = @import("../model/language_tabs.zig");
                 for (1..tabs.order.len + 1) |offset| {
@@ -1232,7 +1318,7 @@ pub const Workspace = struct {
             } else session.language_tabs.cycle();
             w.dirty = true;
         }
-        if (click and language.selected == .native and w.pointer_x >= @as(f32, @floatFromInt(w.width)) * 0.79 and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
+        if (click and language.selected == .native and self.layout.rect(.registers).contains(w.pointer_x, w.pointer_y) and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.selected_local = @intFromFloat((w.pointer_y - self.language_panel.content_y) / 48);
             w.dirty = true;
         }
@@ -1288,7 +1374,7 @@ pub const Workspace = struct {
                 self.status = "Write investigation started";
             }
         }
-        if (click and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
+        if (click and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
             if (remote) {
                 const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
                 context.send(self, .{ .workspace = .{ .toggle_source = .{ .path = self.source_path, .line = number } } });
@@ -1319,7 +1405,7 @@ pub const Workspace = struct {
                 if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
             }
         }
-        if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
+        if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < self.layout.left and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
             self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
             self.static_from_line = true;
             self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints, S static slice";
@@ -1380,18 +1466,20 @@ pub const Workspace = struct {
             self.status = if (code == 88) "Running until selected frame returns" else "Running to selected source line";
             self.browse_address = null;
         }
-        const stack_x = @round(@as(f32, @floatFromInt(w.width)) * self.split * self.thread_width_fraction);
+        const thread_bounds = self.layout.rect(.threads);
+        const stack_bounds = self.layout.rect(.stack);
+        const stack_x = thread_bounds.x + thread_bounds.w + 4;
         const stack_y = self.bottomY(@floatFromInt(w.height)) + 44;
-        if (click and !self.show_profile and threads.len > 0 and w.pointer_x >= 12 and w.pointer_x < stack_x and w.pointer_y >= stack_y - 2) {
+        if (click and !self.show_profile and threads.len > 0 and thread_bounds.contains(w.pointer_x, w.pointer_y) and w.pointer_y >= stack_y) {
             const bottom = self.bottomY(@floatFromInt(w.height));
             const wine = self.compatibility_info.kind == .wine;
             const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
             const selected = if (wine or darwin)
-                self.thread_list.hit(.{ .x = 12, .y = bottom + 42, .w = stack_x - 20, .h = @max(0, @as(f32, @floatFromInt(w.height)) - bottom - 82) }, threads, self.thread_labels, self.selected, w.pointer_x, w.pointer_y)
+                self.thread_list.hit(.{ .x = 12, .y = bottom + 42, .w = stack_x - 20, .h = @max(0, thread_bounds.h - 50) }, threads, self.thread_labels, self.selected, w.pointer_x, w.pointer_y)
             else blk: {
-                const visible: usize = @intFromFloat(@max(1, (@as(f32, @floatFromInt(w.height)) - bottom - 87) / 25));
+                const visible: usize = @intFromFloat(@max(0, (thread_bounds.h - 50) / self.rowStep()));
                 const first = (self.selected + 1) -| visible;
-                const row: usize = @intFromFloat((w.pointer_y - stack_y) / 25);
+                const row: usize = @intFromFloat((w.pointer_y - stack_y) / self.rowStep());
                 const index = first + row;
                 break :blk if (index < threads.len and row < visible) index else null;
             };
@@ -1403,9 +1491,9 @@ pub const Workspace = struct {
                 w.dirty = true;
             }
         }
-        if (click and !self.show_profile and w.pointer_x >= stack_x and w.pointer_x < @as(f32, @floatFromInt(w.width)) * self.split and w.pointer_y >= stack_y and self.frames.len > 0) {
+        if (click and !self.show_profile and stack_bounds.contains(w.pointer_x, w.pointer_y) and w.pointer_y >= stack_y and w.pointer_y + self.rowStep() <= stack_bounds.y + stack_bounds.h and self.frames.len > 0) {
             self.browse_address = null;
-            self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / 25)));
+            self.selected_frame = @min(self.frames.len - 1, @as(usize, @intFromFloat((w.pointer_y - stack_y) / self.rowStep())));
             self.selectNative(context);
             w.dirty = true;
         }
@@ -1703,6 +1791,7 @@ pub const Workspace = struct {
     /// Top of the bottom row (threads, stack, events/watch). Short windows give
     /// the watch view more rows; the source and assembly panes shrink instead.
     fn bottomY(self: *const Workspace, height: f32) f32 {
+        if (self.layout_key != null) return self.layout.bottom;
         return @round(height * @as(f32, if (self.show_watch and height < 640) 0.56 else 0.73));
     }
     fn refreshWatch(self: *Workspace, session: *Session) void {
@@ -1904,6 +1993,7 @@ pub const Workspace = struct {
         }
     }
     pub fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, session: *Session) !void {
+        if (self.logical_frames.open or self.invocations.open or session.imported != null or (session.comparison != null and self.comparison.open)) layout_snapshot.unavailable();
         self.compatibility_info = session.compatibility.info;
         self.thread_labels = session.compatibility.labels.items;
         if (self.logical_frames.open) {
@@ -1966,6 +2056,21 @@ pub const Workspace = struct {
     }
     /// Rendering uses only copied pane values; callers prepare or publish them.
     pub fn drawPrepared(self: *Workspace, r: *gpu.Renderer, font: *Font, w: *Window, display: debugger_view.Presentation, header: @import("../model/workspace_view.zig").Header, language: @import("../model/language_view.zig").Header, core: bool) !void {
+        self.updateLayout(w);
+        const extent = w.bufferExtent();
+        self.layout_report = .{ .available = !self.show_profile, .width = w.width, .height = w.height, .buffer_width = extent.width, .buffer_height = extent.height, .ui_scale = w.scale(), .backing_scale = w.backing_scale, .density = self.density, .compact = self.compact, .font_size = font.ui_size };
+        defer layout_snapshot.publish(&self.layout_report);
+        if (w.width < look.minimum.width or w.height < look.minimum.height) {
+            self.layout_report.too_small = true;
+            r.clip = r.fullClip();
+            try r.rect(r.clip, theme.background);
+            try r.textWrap(font, .{ .x = 8, .y = 8, .w = @max(0, @as(f32, @floatFromInt(w.width)) - 16), .h = @max(0, @as(f32, @floatFromInt(w.height)) - 16) }, "Window too small. Enlarge to 640 x 400 UI units, or lower --ui-scale.", theme.warm);
+            return;
+        }
+        if (!self.show_profile) {
+            for (look.pane_names, 0..) |name, i| self.layout_report.panes[i] = .{ .name = name, .key = look.pane_keys[i], .rect = self.layout.panes[i], .tab = self.layout.tabs[i], .collapsed = self.layout.collapsed[i] };
+            self.layout_report.pane_count = 6;
+        }
         self.animate(display.snapshot.state, display.threads);
         const state = display.snapshot.state;
         const width: f32 = @floatFromInt(w.width);
@@ -1980,7 +2085,8 @@ pub const Workspace = struct {
         try r.text(font, 18, 12, "xo", theme.good);
         try r.text(font, 41, 12, "db", theme.text);
         r.clip = .{ .x = 0, .y = 0, .w = width - 322, .h = 44 };
-        if (core) try r.text(font, 91, 12, "/  core dump (read-only)", theme.weak) else try style.button(r, font, .{ .x = 91, .y = 8, .w = 171, .h = 29 }, "Processes", "O", theme.text, 0, 0);
+        if (core) try r.textFit(font, 91, 12, self.layout.processes.w, "core (read-only)", theme.weak) else try style.button(r, font, gpuRect(self.layout.processes), if (width < 900) "Tasks" else "Processes", "O", theme.text, 0, 0);
+        self.layout_report.control("Processes", "O", self.layout.processes, false);
         if (self.compatibility_info.kind == .wine) {
             var title: [192]u8 = undefined;
             const title_x: f32 = if (width < 900) 405 else 575;
@@ -1996,12 +2102,17 @@ pub const Workspace = struct {
                 .running => theme.good,
                 else => theme.weak,
             };
-            const pill = gpu.Rect{ .x = width - 312, .y = 9, .w = r.measure(font, label_text) + 28, .h = 26 };
+            const pill_width = r.measure(font, label_text) + 28;
+            const pill = gpu.Rect{ .x = width - pill_width - 8, .y = 9, .w = pill_width, .h = 26 };
             try style.box(r, pill, style.fade(color, 0.10), style.fade(color, 0.45), @splat(13));
-            try r.text(font, width - 298, 12, label_text, color);
+            try r.text(font, pill.x + 14, 12, label_text, color);
         }
-        try style.button(r, font, .{ .x = if (width < 900) 280 else 380, .y = 8, .w = if (width < 900) 110 else 178, .h = 29 }, if (self.show_profile) "Source" else "Flames", "F", theme.warm, 0, 0);
+        try style.button(r, font, gpuRect(self.layout.flames), if (self.show_profile) "Source" else "Flames", "F", theme.warm, 0, 0);
+        self.layout_report.control("Flames", "F", self.layout.flames, false);
         for (buttons, 0..) |b, i| {
+            const bounds = self.layout.toolbar[i];
+            self.layout_report.control(b.label, b.key, bounds, bounds.w == 0);
+            if (bounds.w == 0) continue;
             const label_text: []const u8 = switch (b.code) {
                 57 => if (core) "Read-only" else switch (state) {
                     .running => "Pause",
@@ -2014,12 +2125,17 @@ pub const Workspace = struct {
             };
             const live = (!core or b.code == 34) and (state == .stopped or (state == .running and (b.code == 57 or b.code == 32 or b.code == 66)));
             const color = if (!live) theme.weak else if (b.code == 57) theme.good else if (b.code == 66 and header.scope != .observe) theme.warm else theme.text;
-            try style.button(r, font, .{ .x = b.x, .y = 50, .w = b.w, .h = 29 }, label_text, b.key, color, if (live) self.hot[i] else 0, self.pressed[i]);
+            try style.button(r, font, gpuRect(bounds), label_text, b.key, color, if (live) self.hot[i] else 0, self.pressed[i]);
         }
-        _ = try style.chip(r, font, 822, 54, "TAB", theme.weak);
-        try r.text(font, 872, 55, "panes", theme.weak);
-        const left = @round(width * self.split);
-        const right = @round(width * 0.79);
+        if (self.layout.more.w > 0) {
+            try style.button(r, font, gpuRect(self.layout.more), "More", "", theme.text, 0, 0);
+            self.layout_report.control("More", "", self.layout.more, false);
+        } else {
+            _ = try style.chip(r, font, 822, 54, "TAB", theme.weak);
+            try r.text(font, 872, 55, "panes", theme.weak);
+        }
+        const left = self.layout.left;
+        const right = self.layout.right;
         const bottom = if (self.show_profile) @round(height * profile_split) else self.bottomY(height);
         const body_y: f32 = 91;
         const timeline_bounds = gpu.Rect{ .x = 8, .y = bottom, .w = width - 16, .h = height - bottom - 37 };
@@ -2027,13 +2143,18 @@ pub const Workspace = struct {
             try self.flame.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = bottom - body_y - 5 });
         } else {
             try self.drawDebuggerColumns(r, font, left, right, bottom, body_y, state, display.architecture, thread_color);
-            const side = gpu.Rect{ .x = right + 2, .y = body_y, .w = width - right - 10, .h = bottom - body_y - 5 };
-            try self.language_panel.header(r, font, side, language);
-            const content_y = self.language_panel.content_y;
-            if (language.selected == .native or language.selected == .registers) {
-                try self.drawNativeValues(r, font, side, content_y, bottom, language.selected, thread_color);
-            } else {
-                try self.language_panel.drawBody(r, font, side, language, self.selected_frame, self.locals, self.local_diagnostic);
+            if (self.layout.visible(.registers)) {
+                const side = gpuRect(self.layout.rect(.registers));
+                try self.language_panel.header(r, font, side, language);
+                for (self.language_panel.hits, 0..) |hit, i| if (hit) |b| {
+                    self.layout_report.control(@tagName(@import("../model/language_tabs.zig").order[i]), "Tab", .{ .x = b.x, .y = b.y, .w = b.w, .h = b.h }, false);
+                };
+                const content_y = self.language_panel.content_y;
+                if (language.selected == .native or language.selected == .registers) {
+                    try self.drawNativeValues(r, font, side, content_y, bottom, language.selected, thread_color);
+                } else {
+                    try self.language_panel.drawBody(r, font, side, language, self.selected_frame, self.locals, self.local_diagnostic);
+                }
             }
         }
         if (self.show_profile) {
@@ -2046,6 +2167,11 @@ pub const Workspace = struct {
             }
         } else try self.drawBottom(r, font, display.threads, display.events, display.signal_table, width, height, left, bottom, thread_color);
         r.clip = all;
+        if (!self.show_profile) for (self.layout.tabs, 0..) |b, i| {
+            if (b.w == 0) continue;
+            try style.button(r, font, gpuRect(b), look.pane_names[i], look.pane_tab_keys[i], theme.weak, 0, 0);
+            self.layout_report.control(look.pane_names[i], look.pane_keys[i], b, false);
+        };
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 1 }, theme.status_border);
         const pending_metadata = header.metadata;
@@ -2069,7 +2195,7 @@ pub const Workspace = struct {
             try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(header.scope), display.snapshot.generation });
         }
         if (width >= 900 and self.fd_event_state == .inactive) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
-        if (!self.show_profile) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = height - body_y - 35 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
+        if (!self.show_profile and self.layout.visible(.source) and self.layout.visible(.assembly)) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = bottom - body_y - 5 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
         try self.probes_panel.draw(r, font, width, height);
         try self.inspection_panel.draw(r, font, width, height);
         try self.runtime_type_panel.drawPrepared(r, font, width, height);
@@ -2088,53 +2214,84 @@ pub const Workspace = struct {
             try r.textFit(font, b.x + 10, b.y + 61, b.w - 20, self.allocation_save_editor.message, theme.warm);
         }
         try self.process_panel.draw(r, font, width, height);
+        r.clip = all;
+        if (self.more_open) {
+            // An opaque sheet: pane text must not show between the menu rows.
+            var rows: f32 = 0;
+            for (self.layout.toolbar) |b| rows += @floatFromInt(@intFromBool(b.w == 0));
+            const sheet = look.Rect{ .x = width - look.overflow.width - 2 * look.overflow.margin, .y = look.overflow.top - 6, .w = look.overflow.width + 2 * look.overflow.margin, .h = rows * look.overflow.row + 12 - (look.overflow.row - look.overflow.height) };
+            if (rows > 0) try style.box(r, gpuRect(sheet), theme.background, theme.border, @splat(8));
+        }
+        if (self.more_open) for (buttons, 0..) |b, i| {
+            if (self.layout.toolbar[i].w != 0) continue;
+            const bounds = self.menuRect(i, width);
+            try style.button(r, font, gpuRect(bounds), b.label, b.key, theme.text, 0, 0);
+            self.layout_report.control(b.label, b.key, bounds, false);
+        };
+        // Full values are available without changing the selected debug frame.
+        for (self.layout_report.rows[0..self.layout_report.row_count]) |row| {
+            if (!row.value_elided or !row.rect.contains(w.pointer_x, w.pointer_y)) continue;
+            const text = std.mem.sliceTo(&row.value, 0);
+            const tw = @min(width - 2 * look.tooltip.margin, r.measure(font, text) + 2 * look.tooltip.padding);
+            const th = @min(height - look.tooltip.top - 40, (@ceil(r.measure(font, text) / (tw - 2 * look.tooltip.padding)) + 1) * look.tooltip.row + look.tooltip.padding);
+            const tip = gpu.Rect{ .x = std.math.clamp(w.pointer_x, look.tooltip.margin, width - tw - look.tooltip.margin), .y = @max(look.tooltip.top, @min(row.rect.y - th - 4, height - th - 40)), .w = tw, .h = th };
+            try style.box(r, tip, theme.header, theme.focus, @splat(4));
+            try r.textWrap(font, .{ .x = tip.x + look.tooltip.padding, .y = tip.y + 5, .w = tip.w - 2 * look.tooltip.padding, .h = tip.h - 10 }, text, theme.text);
+            break;
+        }
     }
     /// Pure source, assembly and flow painting from the bound presentation.
     pub fn drawDebuggerColumns(self: *Workspace, r: *gpu.Renderer, font: *Font, left: f32, right: f32, bottom: f32, body_y: f32, state: linux.State, architecture: @import("../target/arch.zig").Arch, thread_color: gpu.Color) !void {
-        const source_rect = gpu.Rect{ .x = 8, .y = body_y, .w = left - 12, .h = bottom - body_y - 5 };
-        try pane(r, font, source_rect, if (self.source_remote) "SOURCE / remote copy" else if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
-        if (self.source.len == 0) {
-            try r.text(font, 24, body_y + 58, "Open a file with --source <path>", theme.weak);
-            try r.text(font, 24, body_y + 86, "Stop in code with DWARF to follow source.", theme.weak);
-        } else {
-            var lines = std.mem.splitScalar(u8, self.source, '\n');
-            var number: i32 = 0;
-            var y = body_y + 44;
-            var more = false;
-            while (lines.next()) |source| : (number += 1) {
-                if (number < self.source_line) continue;
-                if (y + 20 > bottom - 10) {
-                    more = source.len != 0 or lines.rest().len != 0;
-                    break;
+        if (self.layout.visible(.source)) {
+            const source_rect = gpu.Rect{ .x = 8, .y = body_y, .w = left - 12, .h = bottom - body_y - 5 };
+            try pane(r, font, source_rect, if (self.source_remote) "SOURCE / remote copy" else if (self.source_truncated) "SOURCE (first 1 MiB)" else if (self.browse_address != null) "SOURCE / browsing" else "SOURCE", std.fs.path.basename(self.source_path));
+            if (self.source.len == 0) {
+                try r.textWrap(font, .{ .x = 24, .y = body_y + 48, .w = source_rect.w - 32, .h = source_rect.h - 58 }, "Open a file with --source <path>. Stop in code with DWARF to follow source.", theme.weak);
+            } else {
+                var lines = std.mem.splitScalar(u8, self.source, '\n');
+                var number: i32 = 0;
+                var y = body_y + 44;
+                var more = false;
+                while (lines.next()) |source| : (number += 1) {
+                    if (number < self.source_line) continue;
+                    if (y + 20 > bottom - 10) {
+                        more = source.len != 0 or lines.rest().len != 0;
+                        break;
+                    }
+                    const line_number: u32 = @intCast(number + 1);
+                    const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = 23 };
+                    const current = self.current_line != null and self.current_line.? == line_number;
+                    const has_breakpoint = std.mem.indexOfScalar(u32, self.breakpoint_lines, line_number) != null;
+                    if (has_breakpoint) {
+                        const red = style.fade(theme.breakpoint, 0.13);
+                        try r.shape(row, red, .{ .colors = .{ red, style.fade(red, 0), red, style.fade(red, 0) } });
+                    }
+                    if (self.cursor_line == line_number) {
+                        if (@import("../appearance.zig").active.block_selection) try style.focus(r, row, 0, 1) else try r.rect(row, style.fade(theme.focus, 0.08));
+                    }
+                    if (current) {
+                        try style.threadLine(r, row, if (self.browse_address != null) theme.focus else thread_color, self.alive, 16);
+                        try r.text(font, 24, y, if (self.browse_address != null) "\u{25c6}" else "\u{25b6}", if (self.browse_address != null) theme.focus else thread_color);
+                    }
+                    if (has_breakpoint) {
+                        try style.disc(r, 16, y + 9.5, 5, theme.breakpoint);
+                    } else if (self.hover_line == line_number and state == .stopped) {
+                        try style.disc(r, 16, y + 9.5, 5, style.fade(theme.breakpoint, 0.3));
+                    }
+                    try label(r, font, 36, y, if (current) (if (self.browse_address != null) theme.focus else thread_color) else theme.weak, "{d: >4}", .{line_number});
+                    const trimmed = std.mem.trimStart(u8, source, " \t");
+                    const color = if (std.mem.startsWith(u8, trimmed, "#")) theme.neutral else if (std.mem.startsWith(u8, trimmed, "//")) theme.weak else theme.text;
+                    var expanded: [1024]u8 = undefined;
+                    try r.textFit(font, 88, y, left - 14 - 88, expandTabs(&expanded, source[0..@min(source.len, 512)]), color);
+                    y += 23;
                 }
-                const line_number: u32 = @intCast(number + 1);
-                const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = 23 };
-                const current = self.current_line != null and self.current_line.? == line_number;
-                const has_breakpoint = std.mem.indexOfScalar(u32, self.breakpoint_lines, line_number) != null;
-                if (has_breakpoint) {
-                    const red = style.fade(theme.breakpoint, 0.13);
-                    try r.shape(row, red, .{ .colors = .{ red, style.fade(red, 0), red, style.fade(red, 0) } });
-                }
-                if (self.cursor_line == line_number) {
-                    if (@import("../appearance.zig").active.block_selection) try style.focus(r, row, 0, 1) else try r.rect(row, style.fade(theme.focus, 0.08));
-                }
-                if (current) {
-                    try style.threadLine(r, row, if (self.browse_address != null) theme.focus else thread_color, self.alive, 16);
-                    try r.text(font, 24, y, if (self.browse_address != null) "\u{25c6}" else "\u{25b6}", if (self.browse_address != null) theme.focus else thread_color);
-                }
-                if (has_breakpoint) {
-                    try style.disc(r, 16, y + 9.5, 5, theme.breakpoint);
-                } else if (self.hover_line == line_number and state == .stopped) {
-                    try style.disc(r, 16, y + 9.5, 5, style.fade(theme.breakpoint, 0.3));
-                }
-                try label(r, font, 36, y, if (current) (if (self.browse_address != null) theme.focus else thread_color) else theme.weak, "{d: >4}", .{line_number});
-                const trimmed = std.mem.trimStart(u8, source, " \t");
-                const color = if (std.mem.startsWith(u8, trimmed, "#")) theme.neutral else if (std.mem.startsWith(u8, trimmed, "//")) theme.weak else theme.text;
-                var expanded: [1024]u8 = undefined;
-                try r.textFit(font, 88, y, left - 14 - 88, expandTabs(&expanded, source[0..@min(source.len, 512)]), color);
-                y += 23;
+                if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
             }
-            if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
+        }
+        if (!self.layout.visible(.assembly)) {
+            self.assembly_rows.count = 0;
+            self.static_panel.decompile_rows.count = 0;
+            return;
         }
         if (self.static_panel.decompile_open) {
             try self.drawPseudoC(r, font, left, right, bottom, body_y, thread_color);
@@ -2338,7 +2495,7 @@ pub const Workspace = struct {
     pub fn drawNativeValues(self: *Workspace, r: *gpu.Renderer, font: *Font, side: gpu.Rect, content_y: f32, bottom: f32, tab: @import("../model/language_tabs.zig").Tab, thread_color: gpu.Color) !void {
         const right = side.x - 2;
         if (tab == .native) {
-            if (self.local_diagnostic) |diagnostic| try r.text(font, right + 14, content_y + 4, diagnostic, theme.weak);
+            if (self.local_diagnostic) |diagnostic| try r.textWrap(font, .{ .x = right + 14, .y = content_y + 4, .w = side.w - 24, .h = bottom - content_y - 14 }, diagnostic, theme.weak);
             for (self.locals, 0..) |local, i| {
                 const y = content_y + @as(f32, @floatFromInt(i)) * 48;
                 if (y + 40 > bottom - 10) break;
@@ -2348,6 +2505,7 @@ pub const Workspace = struct {
                 const advisory = if (local.value.visualization) |v| v.extent_advisory else false;
                 try r.textFit(font, type_x, y, side.x + side.w - 10 - type_x, if (advisory) "extent unproved" else local.value.type, theme.weak);
                 try r.textFit(font, right + 14, y + 21, side.w - 24, local.value.display, if (local.value.availability == .available and !advisory) theme.text else theme.weak);
+                self.layout_report.row("Values", .{ .x = right + 14, .y = y + 21, .w = side.w - 24, .h = 21 }, local.name, local.value.display, r.measure(font, local.name) > side.w - 24, r.measure(font, local.value.display) > side.w - 24, false);
             }
         } else if (tab == .registers) {
             const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
@@ -2356,62 +2514,80 @@ pub const Workspace = struct {
             if (self.regs) |regs| {
                 for (regs.descriptions(), 0..) |desc, i| {
                     const y = register_y + @as(f32, @floatFromInt(i)) * 23;
+                    if (y + 21 > bottom - 10) break;
                     const value = regs.value(desc) catch null;
                     const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
                     const changed = value != null and previous != null and value.? != previous.?;
-                    if (changed) try r.shape(.{ .x = right + 79, .y = y - 2, .w = 166, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
                     const name = std.mem.span(desc.name);
-                    try label(r, font, right + 14, y, theme.weak, "{s}", .{name});
-                    if (restart_slot and std.mem.eql(u8, name, "r0")) {
-                        const tag = "slot";
-                        const tag_x = right + 14 + r.measure(font, name) + 6;
-                        if (tag_x + r.measure(font, tag) <= right + 80) try r.text(font, tag_x, y, tag, theme.weak);
-                    }
-                    if (value) |word| {
-                        try label(r, font, right + 85, y, if (i == 0) thread_color else if (changed) theme.warm else theme.text, "{x:0>16}", .{word});
-                    } else try label(r, font, right + 85, y, theme.weak, "{s}", .{"unavailable"});
+                    var buffer: [32]u8 = undefined;
+                    const text = if (value) |word| try std.fmt.bufPrint(&buffer, "0x{x}", .{word}) else "—";
+                    const value_width = @min(side.w - 58, r.measure(font, text));
+                    const value_x = side.x + side.w - 12 - value_width;
+                    const name_width = @max(0, value_x - right - 22);
+                    if (changed) try r.shape(.{ .x = value_x - 4, .y = y - 2, .w = value_width + 8, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
+                    try r.textFit(font, right + 14, y, name_width, name, theme.weak);
+                    try r.textFit(font, value_x, y, value_width, text, if (i == 0) thread_color else if (changed) theme.warm else theme.text);
+                    self.layout_report.row("Values", .{ .x = right + 14, .y = y, .w = side.w - 24, .h = 21 }, name, text, r.measure(font, name) > name_width, r.measure(font, text) > value_width, false);
                 }
             } else try r.text(font, right + 14, content_y + 10, "No stopped thread", theme.weak);
         }
     }
     /// Threads, stack and events, below the source view.
-    pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, signal_table: linux.SignalTable, width: f32, height: f32, left: f32, bottom: f32, thread_color: gpu.Color) !void {
+    pub fn drawBottom(self: *Workspace, r: *gpu.Renderer, font: *Font, threads: []const linux.Thread, events: []const linux.Event, signal_table: linux.SignalTable, _: f32, _: f32, _: f32, bottom: f32, thread_color: gpu.Color) !void {
         const wine = self.compatibility_info.kind == .wine;
         const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
-        self.thread_width_fraction = if (darwin) 0.48 else 0.36;
-        const thread_right = @round(left * self.thread_width_fraction);
-        const hint = if (!wine) "J/K to select" else if (self.thread_list.hide_internal) "H show" else "H hide";
-        try pane(r, font, .{ .x = 8, .y = bottom, .w = thread_right - 12, .h = height - bottom - 37 }, "THREADS", hint);
-        if (wine or darwin) {
-            try self.thread_list.draw(r, font, .{ .x = 12, .y = bottom + 42, .w = thread_right - 20, .h = @max(0, height - bottom - 82) }, threads, self.thread_labels, self.selected);
-        } else {
-            const thread_rows: usize = @intFromFloat(@max(1, (height - bottom - 87) / 25));
-            const first_thread = (self.selected + 1) -| thread_rows;
-            for (threads, 0..) |thread, i| {
-                if (i < first_thread) continue;
-                const y = bottom + 44 + @as(f32, @floatFromInt(i - first_thread)) * 25;
-                if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - 3, .w = thread_right - 20, .h = 25 }, 6, 1);
-                try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
-                try fit(r, font, 40, y, thread_right - 12 - 40, if (i == self.selected) theme.text else theme.weak, "{d} {s}", .{ @as(u32, @intCast(thread.tid)), if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state) });
+        const thread_rect = gpuRect(self.layout.rect(.threads));
+        const thread_right = thread_rect.x + thread_rect.w + 4;
+        const row_step = self.rowStep();
+        if (self.layout.visible(.threads)) {
+            const hint = if (!wine) "J/K to select" else if (self.thread_list.hide_internal) "H show" else "H hide";
+            try pane(r, font, thread_rect, "THREADS", hint);
+            if (wine or darwin) {
+                try self.thread_list.draw(r, font, .{ .x = 12, .y = bottom + 42, .w = thread_right - 20, .h = @max(0, thread_rect.h - 50) }, threads, self.thread_labels, self.selected);
+            } else {
+                const thread_rows: usize = @intFromFloat(@max(0, (thread_rect.h - 50) / row_step));
+                const first_thread = (self.selected + 1) -| thread_rows;
+                for (threads, 0..) |thread, i| {
+                    if (i < first_thread) continue;
+                    if (i - first_thread >= thread_rows) break;
+                    const y = bottom + 44 + @as(f32, @floatFromInt(i - first_thread)) * row_step;
+                    if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - 3, .w = thread_right - 20, .h = row_step }, 6, 1);
+                    try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
+                    var id_buffer: [32]u8 = undefined;
+                    const id_text = try std.fmt.bufPrint(&id_buffer, "{d}", .{thread.tid});
+                    const id_width = r.measure(font, id_text);
+                    try r.text(font, 40, y, id_text, if (i == self.selected) theme.text else theme.weak);
+                    const state_text = if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state);
+                    const state_width = @max(0, thread_right - 60 - id_width);
+                    try r.textFit(font, 48 + id_width, y, state_width, state_text, theme.weak);
+                    self.layout_report.row("Threads", .{ .x = 40, .y = y, .w = thread_right - 52, .h = row_step }, state_text, id_text, r.measure(font, state_text) > state_width, false, true);
+                }
+            }
+            if (threads.len == 0) try r.textWrap(font, .{ .x = 24, .y = bottom + 44, .w = thread_right - 40, .h = thread_rect.h - 54 }, "Launch with -- <executable> [args]", theme.weak);
+        }
+        const stack = gpuRect(self.layout.rect(.stack));
+        if (self.layout.visible(.stack)) {
+            try pane(r, font, stack, "STACK", "click frame / I inline");
+            for (self.frames, 0..) |frame, i| {
+                const y = bottom + 44 + @as(f32, @floatFromInt(i)) * row_step;
+                if (y + row_step > stack.y + stack.h - 4) break;
+                if (i == self.selected_frame) try style.focus(r, .{ .x = stack.x + 4, .y = y - 3, .w = stack.w - 8, .h = row_step }, 6, 1);
+                try label(r, font, stack.x + 12, y, if (i == 0) thread_color else theme.weak, "{d: >2}", .{i});
+                // Frames without source are dimmed; frames with it show where.
+                var where_buffer: [96]u8 = undefined;
+                const where = if (frame.source) |site| std.fmt.bufPrint(&where_buffer, "{s}:{d}", .{ std.fs.path.basename(site.path), site.line }) catch "" else "";
+                const where_width = @min(stack.w * 0.4, r.measure(font, where));
+                const name_width = stack.w - 54 - (if (where.len > 0 and stack.w > 330) where_width + 16 else 0);
+                try fit(r, font, stack.x + 42, y, name_width, if (frame.source != null) theme.text else theme.weak, "{s} {s}", .{ frame.symbol orelse "?", frame.diagnostic orelse "" });
+                if (where.len > 0 and stack.w > 330) try r.textFit(font, stack.x + stack.w - where_width - 12, y, where_width, where, theme.weak);
+                self.layout_report.row("Stack", .{ .x = stack.x + 42, .y = y, .w = name_width, .h = row_step }, "", frame.symbol orelse "?", false, r.measure(font, frame.symbol orelse "?") > name_width, false);
             }
         }
-        if (threads.len == 0) try r.textFit(font, 24, bottom + 50, thread_right - 40, "Launch with -- <executable> [args]", theme.weak);
-        const stack = gpu.Rect{ .x = thread_right, .y = bottom, .w = left - thread_right - 4, .h = height - bottom - 37 };
-        try pane(r, font, stack, "STACK", "click frame / I inline");
-        for (self.frames, 0..) |frame, i| {
-            const y = bottom + 44 + @as(f32, @floatFromInt(i)) * 25;
-            if (y + 20 > height - 40) break;
-            if (i == self.selected_frame) try style.focus(r, .{ .x = thread_right + 4, .y = y - 3, .w = stack.w - 8, .h = 25 }, 6, 1);
-            try label(r, font, thread_right + 12, y, if (i == 0) thread_color else theme.weak, "{d: >2}", .{i});
-            // Frames without source are dimmed; frames with it show where.
-            var where_buffer: [96]u8 = undefined;
-            const where = if (frame.source) |site| std.fmt.bufPrint(&where_buffer, "{s}:{d}", .{ std.fs.path.basename(site.path), site.line }) catch "" else "";
-            const where_width = r.measure(font, where);
-            const name_width = stack.w - 54 - (if (where.len > 0 and stack.w > 330) where_width + 16 else 0);
-            try fit(r, font, thread_right + 42, y, name_width, if (frame.source != null) theme.text else theme.weak, "{s} {s}", .{ frame.symbol orelse "?", frame.diagnostic orelse "" });
-            if (where.len > 0 and stack.w > 330) try r.text(font, stack.x + stack.w - where_width - 12, y, where, theme.weak);
+        if (!self.layout.visible(.events)) {
+            self.watch_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
+            return;
         }
-        const events_rect = gpu.Rect{ .x = left + 2, .y = bottom, .w = width - left - 10, .h = height - bottom - 37 };
+        const events_rect = gpuRect(self.layout.rect(.events));
         if (self.show_watch and @intFromEnum(self.runtime_watch_view.selected_language) >= 2) {
             try pane(r, font, events_rect, "RUNTIME WATCHES", "W binding  Shift+E name  V events  [] scroll  Del remove");
             self.watch_rect = events_rect;
@@ -2429,32 +2605,36 @@ pub const Workspace = struct {
         }
         self.watch_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         try pane(r, font, events_rect, "EVENTS", if (self.watch_view.entries.len > 0) "monotonic time  /  V watch" else "monotonic time  /  E expression");
-        const visible: usize = @intFromFloat(@max(1, (height - bottom - 87) / 23));
+        const visible: usize = @intFromFloat(@max(0, (events_rect.h - 50) / 23));
         const start = events.len -| visible;
         for (events[start..], 0..) |event, i| {
             const y = bottom + 44 + @as(f32, @floatFromInt(i)) * 23;
             if ((start + i) % 2 == 1) try r.rect(.{ .x = events_rect.x + 1, .y = y - 2, .w = events_rect.w - 2, .h = 23 }, theme.stripe);
             const ms = (event.time_ns - events[0].time_ns) / 1_000_000;
-            try label(r, font, left + 16, y, theme.weak, "+{d: >7} ms", .{ms});
+            // The kind column is as wide as the longest kind, so kinds stay whole
+            // while the value keeps the rest of the row.
+            const kind_x = events_rect.x + 106;
+            const kind_width = @min(r.measure(font, "breakpoint_hit"), @max(0, events_rect.w * 0.5 - 118));
+            const value_x = kind_x + kind_width + 12;
+            const value_width = @max(0, events_rect.x + events_rect.w - 12 - value_x);
+            try fit(r, font, events_rect.x + 14, y, 80, theme.weak, "+{d} ms", .{ms});
             const kind_color = switch (event.kind) {
                 .stop => theme.warm,
                 .breakpoint_hit, .watchpoint_hit => theme.breakpoint,
                 .exit, .detach => theme.weak,
                 else => theme.good,
             };
-            try label(r, font, left + 160, y, kind_color, "{s: <12}", .{@tagName(event.kind)});
-            if (event.kind == .watchpoint_hit) {
+            try r.textFit(font, kind_x, y, kind_width, @tagName(event.kind), kind_color);
+            var value_buffer: [256]u8 = undefined;
+            const value_text = if (event.kind == .watchpoint_hit) value: {
                 if (!event.before_valid or !event.after_valid or event.watch_attribution == .candidate) {
-                    try fit(r, font, left + 325, y, events_rect.w - 335, theme.warm, "0x{x}: {s} / {s}", .{ event.address, @tagName(event.watch_phase), if (event.watch_attribution == .candidate) "candidate watch" else "value unavailable" });
-                } else try fit(r, font, left + 325, y, events_rect.w - 335, theme.warm, "0x{x}: {d} -> {d}", .{ event.address, event.before, event.after });
-            } else if (event.kind == .exit) {
-                if (event.detail >= 0)
-                    try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "exited with status {d}", .{event.detail})
-                else
-                    try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "killed by {s} ({d})", .{ linux.signalNameIn(signal_table, std.math.cast(i32, -%event.detail) orelse 0), -%event.detail });
-            } else if (event.kind == .image_replaced) {
-                try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "program image changed; breakpoints removed", .{});
-            } else try fit(r, font, left + 325, y, events_rect.w - 335, theme.text, "thread {d}   detail {d}", .{ event.tid, event.detail });
+                    break :value try std.fmt.bufPrint(&value_buffer, "0x{x}: {s} / {s}", .{ event.address, @tagName(event.watch_phase), if (event.watch_attribution == .candidate) "candidate watch" else "value unavailable" });
+                } else break :value try std.fmt.bufPrint(&value_buffer, "0x{x}: {d} -> {d}", .{ event.address, event.before, event.after });
+            } else if (event.kind == .exit)
+                (if (event.detail >= 0) try std.fmt.bufPrint(&value_buffer, "status {d}", .{event.detail}) else try std.fmt.bufPrint(&value_buffer, "{s} ({d})", .{ linux.signalNameIn(signal_table, std.math.cast(i32, -%event.detail) orelse 0), -%event.detail }))
+            else if (event.kind == .image_replaced) "image changed; breakpoints removed" else try std.fmt.bufPrint(&value_buffer, "thread {d} · detail {d}", .{ event.tid, event.detail });
+            try r.textFit(font, value_x, y, value_width, value_text, theme.text);
+            self.layout_report.row("Events", .{ .x = value_x, .y = y, .w = value_width, .h = 21 }, @tagName(event.kind), value_text, r.measure(font, @tagName(event.kind)) > kind_width, r.measure(font, value_text) > value_width, false);
         }
     }
 };
@@ -2467,13 +2647,14 @@ test "queued drag preserves release position and quit ends the batch" {
     var workspace = Workspace{};
     defer workspace.deinit();
     var w = Window{ .width = 1000, .height = 800, .pointer_x = 600, .pointer_y = 300 };
-    w.input.button(1, 272, true, 480, 300);
+    workspace.updateLayout(&w);
+    w.input.button(1, 272, true, workspace.layout.left, 300);
     w.input.button(2, 272, false, 600, 300);
     workspace.input(&w, &session);
     try std.testing.expectApproxEqAbs(@as(f32, 0.60), workspace.split, 0.001);
     try std.testing.expect(!workspace.dragging);
     w.mouse_down = true;
-    w.input.button(3, 272, true, 600, 300);
+    w.input.button(3, 272, true, workspace.layout.left, 300);
     workspace.input(&w, &session);
     try std.testing.expect(workspace.dragging);
     // A key before a queued release must not observe the final button state

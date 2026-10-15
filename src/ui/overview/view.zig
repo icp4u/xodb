@@ -23,6 +23,14 @@ const fade = draw.fade;
 pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
 pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch" };
+pub fn shortTitle(panel: Panel) []const u8 {
+    return switch (panel) {
+        .power => "Power / Temp",
+        .inheritance => "FD Inheritance",
+        .apps => "Apps",
+        else => titles[@intFromEnum(panel)],
+    };
+}
 const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
@@ -133,9 +141,12 @@ pub const View = struct {
     confirm_key: ?u32 = null,
     confirm_after: u64 = 0,
     layout: ?*draw.Layout = null,
+    layout_log: bool = false,
+    layout_report: @import("../../layout_snapshot.zig").Snapshot = .{},
     layout_reported: usize = std.math.maxInt(usize),
     layout_panel: Panel = .summary,
     layout_size: [2]f32 = .{ 0, 0 },
+    layout_palette: usize = std.math.maxInt(usize),
     process_ns_start: u64 = 0,
     total_pct: ?f64 = null,
     action_context: ?*anyopaque = null,
@@ -1167,14 +1178,20 @@ pub const View = struct {
             self.classic_about = false;
         }
         if (p.win95) self.tooltip_style = .win9x;
-        if (self.layout) |l| l.count = 0;
+        if (self.layout) |l| {
+            l.count = 0;
+            l.elided = 0;
+            l.unmarked = 0;
+            l.omitted = 0;
+        }
         var ctx = Ctx{ .r = r, .font = font, .p = p, .layout = self.layout };
         try r.rect(.{ .x = 0, .y = 0, .w = self.width, .h = self.height }, p.background);
         if (p.glow > 0.5) try r.shape(.{ .x = self.width * 0.1, .y = self.height * 0.05, .w = self.width * 0.8, .h = self.height * 0.9 }, fade(p.accent, 0.035), .{ .radii = @splat(self.height * 0.3), .softness = self.height * 0.2 });
         const compact = self.width < 1500;
-        const header_h: f32 = 52;
-        const footer_h: f32 = 28;
-        const nav_w: f32 = if (compact) 196 else 236;
+        const look = @import("../../look.zig").overview;
+        const header_h: f32 = look.header;
+        const footer_h: f32 = if (self.width < look.small_width) look.footer_small else look.footer;
+        const nav_w: f32 = if (compact) look.nav else look.nav_wide;
         const content = if (p.win95) try win95.chrome(self, ctx) else blk: {
             try self.header(ctx, .{ .x = 0, .y = 0, .w = self.width, .h = header_h }, now);
             try self.nav(ctx, .{ .x = 0, .y = header_h, .w = nav_w, .h = self.height - header_h - footer_h });
@@ -1194,16 +1211,26 @@ pub const View = struct {
         }
         r.clip = saved;
         if (p.win95) {
-            if (self.width >= 640 and self.height >= 120) try self.footer(ctx, .{ .x = 8, .y = self.height - 72, .w = self.width - 16, .h = footer_h }, now);
+            if (self.width >= 640 and self.height >= 120) try self.footer(ctx, .{ .x = 8, .y = self.height - 44 - footer_h, .w = self.width - 16, .h = footer_h }, now);
         } else try self.footer(ctx, .{ .x = 0, .y = self.height - footer_h, .w = self.width, .h = footer_h }, now);
         if (self.layout) |l| {
             var first: [6][]const u8 = @splat("");
             const n = l.overlaps(&first);
-            if (n != self.layout_reported or self.panel != self.layout_panel or self.layout_size[0] != self.width or self.layout_size[1] != self.height) {
+            self.layout_report = .{ .view = .overview, .available = self.classic_menu == null and !self.classic_about and self.pending_action == null, .width = w.width, .height = w.height, .buffer_width = r.extent.width, .buffer_height = r.extent.height, .ui_scale = w.scale(), .backing_scale = w.backing_scale, .font_size = 16, .text_overlaps = n, .unmarked_text = l.unmarked };
+            self.layout_report.panes[0] = .{ .name = "Overview", .key = "Tab", .rect = .{ .x = content.x, .y = content.y, .w = content.w, .h = content.h }, .tab = .{}, .collapsed = false };
+            self.layout_report.pane_count = 1;
+            for (self.hits[0..self.hit_count]) |target| self.layout_report.control(@tagName(target.action), "", .{ .x = target.rect.x, .y = target.rect.y, .w = target.rect.w, .h = target.rect.h }, false);
+            for (l.boxes[0..l.count], 0..) |box, i| {
+                self.layout_report.row("Overview", .{ .x = box.x, .y = box.y, .w = box.w, .h = box.h }, "", l.labels[i][0..l.lens[i]], false, l.clipped[i], false);
+                if (i < self.layout_report.rows.len) self.layout_report.rows[i].full_text_truncated = l.truncated[i];
+            }
+            @import("../../layout_snapshot.zig").publish(&self.layout_report);
+            if (self.layout_log and (n != self.layout_reported or self.palette != self.layout_palette or self.panel != self.layout_panel or self.layout_size[0] != self.width or self.layout_size[1] != self.height)) {
                 self.layout_size = .{ self.width, self.height };
-                log.info(.overview, "xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\"\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5] });
+                log.info(.overview, "xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\" theme={s} content={d}x{d} texts={d} elided={d} unmarked={d} omitted={d}\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5], p.name, @as(u32, @intFromFloat(content.w)), @as(u32, @intFromFloat(content.h)), l.count, l.elided, l.unmarked, l.omitted });
                 self.layout_reported = n;
                 self.layout_panel = self.panel;
+                self.layout_palette = self.palette;
             }
         }
         ctx.layout = null;
@@ -1339,7 +1366,7 @@ pub const View = struct {
                 try ctx.r.shape(.{ .x = row.x + 10, .y = ty + 1, .w = 18, .h = 18 }, fade(p.dim, 0.14), .{ .radii = @splat(4) });
                 try ctx.text(row.x + 14, ty, keys[i], if (on) p.accent else p.dim);
             }
-            try ctx.textFit(row.x + 36, ty, row.w - 40, titles[i], if (on) p.text else mixText(p, 0.75));
+            try ctx.textFit(row.x + 36, ty, row.w - 40, if (ctx.measure(titles[i]) > row.w - 40) shortTitle(panel) else titles[i], if (on) p.text else mixText(p, 0.75));
             if (item_h < 48) continue;
             // Second line: a live value and a sparkline where history exists.
             var vb: [48]u8 = undefined;
@@ -1391,13 +1418,15 @@ pub const View = struct {
         const live = std.mem.eql(u8, self.source_label, "live");
         // Total is the whole process's CPU time (all threads, driver included).
         const overhead = if (self.view_pct) |v| std.fmt.bufPrint(&buf, "overhead (4 s)  draw {d:.1}%  {s} {d:.1}%  total {d:.1}% of a core", .{ v, if (live) "collector" else "replay", self.collector_pct orelse 0, self.total_pct orelse v + (self.collector_pct orelse 0) }) catch "" else "overhead  measuring (first second)";
+        const stacked = rect.h > 28;
         const ow = ctx.measure(overhead) + 20;
-        const orect = Rect{ .x = rect.w - ow - 8, .y = rect.y + 3, .w = ow, .h = rect.h - 6 };
+        const orect = Rect{ .x = rect.x + rect.w - ow - 8, .y = rect.y + 3 + @as(f32, if (stacked) 24 else 0), .w = ow, .h = 22 };
         if (p.win95) try ctx.bevel(orect, true) else try ctx.r.shape(orect, fade(p.accent, 0.10), .{ .radii = @splat(5) });
-        try ctx.text(orect.x + 10, rect.y + 4, overhead, p.dim);
+        try ctx.text(orect.x + 10, orect.y + 1, overhead, p.dim);
+        if (stacked and orect.x - rect.x > 150) try ctx.text(rect.x + 12, orect.y + 1, "— unavailable; hover", p.dim);
         self.hover(orect, "Overhead over the last second, % of one core: drawing, sampling, and total for the whole process (all threads)", .{});
         // Left: hover reason, status, or key hints.
-        const left_w = orect.x - 16;
+        const left_w = if (stacked) rect.w - 24 else orect.x - rect.x - 24;
         if (self.files.exact_active) {
             try ctx.textFit(12, rect.y + 4, left_w, "EXACT ACTIVE · all syscalls ~10% slower · E stops", p.warn);
         } else if (self.hover_len > 0) {
@@ -1406,12 +1435,15 @@ pub const View = struct {
             try ctx.textFit(12, rect.y + 4, left_w, self.status[0..self.status_len], p.accent);
         } else {
             const hints = if (self.panel == .memory_map and self.memmap.look == .gibson) "WASD move  drag orbit  wheel zoom  f orbit/flight  r reset  h height  c colour  g legend  click details  o process" else if (self.panel == .memory_map and self.memmap.look == .modern and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  p pause" else if (self.panel == .memory_map and self.memmap.viewport()) "t look  wheel/+/- zoom  drag/arrows pan  f fit  [ ] VMA  click select  o process  g legend  d details  p pause" else if (self.panel == .memory_map) "t look  [ ] process  o select  arrows cell  +/- zoom  g legend  d details  Esc stop  p pause  m from Processes" else if (self.panel == .files) "↑↓ select  Enter process files  [ ] view  / search  s sort  h holders  e events  a attach  Esc all  p pause" else if (self.panel == .processes) "↑↓ select  ←→ fold  Enter open in debugger  / search  s sort  r reverse  v tree  t theme  p pause  q quit" else "1-9 0 Tab panels  ↑↓ scroll  L files  / search processes  t theme  p pause  x redact  q quit";
-            try ctx.textFit(12, rect.y + 4, left_w, hints, p.dim);
+            try ctx.clauses(.{ .x = rect.x + 12, .y = rect.y + 4, .w = left_w, .h = 20 }, hints, p.dim);
         }
     }
 
     fn tooltip(self: *View, ctx: Ctx) !void {
         if (self.hover_len == 0) return;
+        // Narrow views already dedicate the footer to the hovered fact. A
+        // second floating copy would obscure the very tile being inspected.
+        if (self.width < @import("../../look.zig").overview.small_width) return;
         const p = ctx.p;
         const text = self.hover_text[0..self.hover_len];
         const w = @min(ctx.measure(text) + 20, self.width * 0.5);

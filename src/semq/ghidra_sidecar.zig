@@ -22,9 +22,10 @@ const Value = std.json.Value;
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 const protocol = 1;
 const schema = 1;
-pub const producer = "ghidra-jvm-sidecar-0.1.5";
+pub const producer = "ghidra-jvm-sidecar-0.1.6";
 const max_line = 1 << 20;
 const max_payload = 64 << 20;
+var reported_unreplaceable = std.atomic.Value(bool).init(false);
 
 pub const Stage = enum(u8) { queued, starting, opening, hashing, importing, analyzing, decompiling, loading, ready, failed };
 pub fn stageText(stage: Stage) []const u8 {
@@ -74,7 +75,7 @@ pub fn socketPath(a: Allocator) ![:0]u8 {
 }
 
 pub fn starterPath(a: Allocator) !?[:0]u8 {
-    if (c.getenv("XODB_GHIDRA_SIDECAR")) |path| if (path[0] != 0) return try a.dupeZ(u8, std.mem.span(path));
+    if (c.getenv("XODB_GHIDRA_SIDECAR")) |path| if (path[0] != 0) return if (c.access(path, c.X_OK) == 0) try a.dupeZ(u8, std.mem.span(path)) else null;
     // Never the current directory: the starter is found from where this
     // executable lives (beside it, an installed share directory, or the
     // source tree a zig-out/bin build sits in).
@@ -88,6 +89,32 @@ pub fn starterPath(a: Allocator) !?[:0]u8 {
         a.free(path);
     }
     return null;
+}
+
+fn starterSearch(a: Allocator) []const u8 {
+    if (env("XODB_GHIDRA_SIDECAR")) |path| return path;
+    var exe: [std.fs.max_path_bytes]u8 = undefined;
+    const length = c.readlink("/proc/self/exe", &exe, exe.len);
+    if (length <= 0 or length >= exe.len) return "XODB_GHIDRA_SIDECAR and paths relative to /proc/self/exe";
+    const dir = std.fs.path.dirname(exe[0..@intCast(length)]) orelse return "XODB_GHIDRA_SIDECAR and paths relative to /proc/self/exe";
+    return std.fmt.allocPrint(a, "{s}/ghidra-sidecar, {s}/../share/xodb/scripts/ghidra-sidecar, {s}/../../scripts/ghidra-sidecar", .{ dir, dir, dir }) catch "paths relative to /proc/self/exe";
+}
+
+fn pathExecutable(a: Allocator, name: []const u8) bool {
+    const path = env("PATH") orelse return false;
+    var entries = std.mem.splitScalar(u8, path, ':');
+    while (entries.next()) |directory| {
+        const candidate = std.fmt.allocPrintSentinel(a, "{s}/{s}", .{ if (directory.len == 0) "." else directory, name }, 0) catch return false;
+        const found = c.access(candidate.ptr, c.X_OK) == 0;
+        a.free(candidate);
+        if (found) return true;
+    }
+    return false;
+}
+
+fn producerVersion(name: []const u8) []const u8 {
+    const prefix = "ghidra-jvm-sidecar-";
+    return if (std.mem.startsWith(u8, name, prefix)) name[prefix.len..] else name;
 }
 
 /// Where scripts/ghidra-sidecar appends the JVM's and its own diagnostics.
@@ -114,7 +141,7 @@ pub fn selected(a: Allocator) !bool {
     if (c.lstat(socket.ptr, &st) == 0) return true;
     if (try starterPath(a) == null) return false;
     for ([_][*:0]const u8{ "XODB_GHIDRA_HOME", "GHIDRA_HOME" }) |name| if (c.getenv(name)) |path| if (path[0] != 0) return true;
-    return false;
+    return c.access("/opt/ghidra/support/analyzeHeadless", c.X_OK) == 0 or pathExecutable(a, "analyzeHeadless");
 }
 
 const Connection = struct {
@@ -188,6 +215,42 @@ const Connection = struct {
             if (ch[0] != '\r') try line.append(a, ch[0]);
         }
         return error.SidecarLineTooLarge;
+    }
+};
+
+/// A validated, otherwise idle connection owned by one xodb session.  The
+/// sidecar counts open connections when deciding whether it may idle-exit.
+pub const Hold = struct {
+    fd: c_int = -1,
+
+    pub fn open(a: Allocator, path: [:0]const u8) !Hold {
+        var never_cancel = std.atomic.Value(bool).init(false);
+        var connection = try Connection.open(path, &never_cancel, nowNs() + 2 * std.time.ns_per_s);
+        errdefer connection.close();
+        const encoded = try std.json.Stringify.valueAlloc(a, .{ .id = "xodb-session", .verb = "hello", .deadline_ms = 2000 }, .{});
+        try connection.writeAll(encoded);
+        try connection.writeAll("\n");
+        const line = try connection.readLine(a);
+        const reply = try std.json.parseFromSliceLeaky(Value, a, line, .{ .max_value_len = max_line });
+        if (!expectedHello(reply)) return error.SidecarProtocolMismatch;
+        const fd = connection.fd;
+        connection.fd = -1;
+        return .{ .fd = fd };
+    }
+
+    pub fn alive(self: *const Hold) bool {
+        if (self.fd < 0) return false;
+        var byte: [1]u8 = undefined;
+        const n = c.recv(self.fd, &byte, byte.len, c.MSG_PEEK | c.MSG_DONTWAIT);
+        if (n > 0) return true;
+        if (n == 0) return false;
+        const err = std.c._errno().*;
+        return err == c.EAGAIN or err == c.EWOULDBLOCK or err == c.EINTR;
+    }
+
+    pub fn close(self: *Hold) void {
+        if (self.fd >= 0) _ = c.close(self.fd);
+        self.fd = -1;
     }
 };
 
@@ -285,12 +348,23 @@ fn fail(a: Allocator, out: *Failure, code: []const u8, comptime format: []const 
 
 fn ensure(a: Allocator, endpoint: Endpoint, cancel: *const std.atomic.Value(bool), deadline: u64, stage: *std.atomic.Value(Stage), failure: *Failure) !void {
     var seen: []const u8 = "no answering socket";
+    var observed_producer: ?[]const u8 = null;
     if (hello(a, endpoint.socket_path, cancel, @min(deadline, nowNs() + 2 * std.time.ns_per_s))) |reply| {
         if (expectedHello(reply)) return log.debug(.sidecar, "Ghidra sidecar answers on {s}; using it\n", .{endpoint.socket_path});
+        observed_producer = memberText(reply, "producer");
         seen = try std.json.Stringify.valueAlloc(a, reply, .{});
     } else |_| {}
-    log.debug(.sidecar, "Ghidra sidecar {s}: {s}\n", .{ if (endpoint.starter != null) "start or restart" else "unavailable, no starter", seen });
-    const starter = endpoint.starter orelse return fail(a, failure, "sidecar_unavailable", "Ghidra sidecar is absent ({s}); set GHIDRA_HOME and XODB_GHIDRA_SIDECAR or start scripts/ghidra-sidecar", .{seen});
+    const starter = endpoint.starter orelse {
+        const searched = starterSearch(a);
+        if (observed_producer) |observed| {
+            if (reported_unreplaceable.cmpxchgStrong(false, true, .acq_rel, .acquire) == null)
+                log.debug(.sidecar, "Ghidra sidecar unavailable: running sidecar is {s}, this xodb needs {s}; no starter found to replace it (looked in {s})\n", .{ producerVersion(observed), producerVersion(producer), searched });
+            return fail(a, failure, "sidecar_protocol_mismatch", "running sidecar is {s}, this xodb needs {s}; no starter found to replace it (looked in {s})", .{ producerVersion(observed), producerVersion(producer), searched });
+        }
+        log.debug(.sidecar, "Ghidra sidecar unavailable: no answering socket and no starter found (looked in {s})\n", .{searched});
+        return fail(a, failure, "sidecar_unavailable", "Ghidra sidecar is absent; no starter found (looked in {s}); set XODB_GHIDRA_SIDECAR", .{searched});
+    };
+    log.debug(.sidecar, "Ghidra sidecar start or restart: {s}\n", .{seen});
     stage.store(.starting, .release);
     start(starter, cancel, deadline) catch |err| {
         log.debug(.sidecar, "Ghidra sidecar starter {s} failed: {s}\n", .{ starter, @errorName(err) });
@@ -371,6 +445,23 @@ pub fn run(a: Allocator, request: Request, cancel: *const std.atomic.Value(bool)
     const ready = try waitJob(a, request.socket_path, decompile_reply, cancel, deadline, stage, failure);
     const document = ready.payload orelse return fail(a, failure, "sidecar_bad_reply", "ready decompile reply omitted its framed document", .{});
     stage.store(.loading, .release);
+    return .{ .document = document, .elapsed_ms = @as(f64, @floatFromInt(nowNs() - begun)) / std.time.ns_per_ms };
+}
+
+/// Decompile a named function from an immutable image without inventing a
+/// target process, runtime bias, stop generation, registers or live values.
+pub fn runStatic(a: Allocator, endpoint: Endpoint, image_path: []const u8, display_path: []const u8, sha256: []const u8, debug_path: ?[]const u8, debug_sha256: ?[]const u8, symbol: []const u8, cancel: *const std.atomic.Value(bool), stage: *std.atomic.Value(Stage), failure: *Failure) !Result {
+    const begun = nowNs();
+    const deadline = begun + @as(u64, endpoint.deadline_ms) * std.time.ns_per_ms;
+    try ensure(a, endpoint, cancel, deadline, stage, failure);
+    stage.store(.opening, .release);
+    const open_reply = call(a, endpoint.socket_path, .{ .id = "xodb-static-open", .verb = "open_image", .path = image_path, .sha256 = sha256, .debug_path = debug_path, .debug_sha256 = debug_sha256, .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else if (err == error.SidecarDied) "sidecar_died" else "sidecar_io_failed", "open_image: {s}", .{@errorName(err)});
+    _ = try waitJob(a, endpoint.socket_path, open_reply, cancel, deadline, stage, failure);
+    stage.store(.decompiling, .release);
+    const decompile_reply = call(a, endpoint.socket_path, .{ .id = "xodb-static-decompile", .verb = "decompile", .path = display_path, .sha256 = sha256, .debug_path = debug_path, .debug_sha256 = debug_sha256, .symbol = symbol, .options = "default", .deadline_ms = endpoint.deadline_ms }, cancel, deadline) catch |err| return fail(a, failure, if (err == error.Cancelled) "cancelled" else if (err == error.SidecarDied) "sidecar_died" else "sidecar_io_failed", "decompile: {s}", .{@errorName(err)});
+    const ready = try waitJob(a, endpoint.socket_path, decompile_reply, cancel, deadline, stage, failure);
+    const document = ready.payload orelse return fail(a, failure, "sidecar_bad_reply", "ready static decompile reply omitted its framed document", .{});
+    stage.store(.ready, .release);
     return .{ .document = document, .elapsed_ms = @as(f64, @floatFromInt(nowNs() - begun)) / std.time.ns_per_ms };
 }
 

@@ -1,5 +1,11 @@
 [
   {
+    "name": "get_layout",
+    "description": "Read the last GUI layout in UI units: window and buffer sizes, both scales, density, pane rectangles and collapsed tabs, whole toolbar controls and overflow actions, and value/identifier row elision flags. available=false without a GUI publication; never drives rendering.",
+    "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+    "annotations": { "readOnlyHint": true, "xodbSessionAccess": "observer" }
+  },
+  {
     "name": "get_graph",
     "description": "Neutral graph used by the galaxy and its table peer: bounded nodes, clusters, directed/undirected edges and retained flow pulses. kind is descriptors or redot. scope=current uses the configured descriptor PID scope (and visible GUI projection when present), or the selected process_id engine scene. No attach, tracing or profiling is enabled. First inventory/scene requests can be pending; poll again. IDs are namespaced decimal strings. Table filtering/sorting/folding is presentation only and does not discard model entities.",
     "inputSchema": {

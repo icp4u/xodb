@@ -55,14 +55,16 @@ fn card(ctx: Ctx, rect: Rect, label: []const u8, right: []const u8) !Rect {
 fn missing(v: *View, ctx: Ctx, x: f32, y: f32, w: f32, why: []const u8) !void {
     // A group not requested yet is sampled when its panel is shown.
     const reason = if (std.mem.eql(u8, why, "not collected")) "sampled when shown" else why;
-    const tw = @min(w, ctx.measure(reason) + 12);
+    const short = ctx.measure(reason) + 12 > w;
+    const shown = if (short) "—" else reason;
+    const tw = @min(w, ctx.measure(shown) + 12);
     const r = Rect{ .x = x, .y = y + 1, .w = tw, .h = 18 };
     try ctx.hatchLight(r);
-    try ctx.textFit(x + 6, y, tw - 8, reason, ctx.p.dim);
+    try ctx.textFit(x + 6, y, tw - 8, shown, ctx.p.dim);
     v.hover(r, "Unavailable: {s}", .{reason});
 }
 fn missingRight(v: *View, ctx: Ctx, right: f32, y: f32, w: f32, reason: []const u8) !void {
-    const tw = @min(w, ctx.measure(reason) + 12);
+    const tw = @min(w, ctx.measure(if (ctx.measure(reason) + 12 > w) "—" else reason) + 12);
     try missing(v, ctx, right - tw, y, tw, reason);
 }
 
@@ -77,7 +79,8 @@ fn valueRight(v: *View, ctx: Ctx, right: f32, y: f32, w: f32, f: m.F, kind: Kind
     var b: [48]u8 = undefined;
     if (f.get()) |x_| {
         const t = format(&b, kind, @floatCast(x_));
-        try ctx.textRight(right, y, t, if (f.status == .stale) ctx.p.dim else color);
+        try ctx.textRightFit(right, y, w, t, if (f.status == .stale) ctx.p.dim else color);
+        if (ctx.measure(t) > w) v.hover(.{ .x = right - w, .y = y, .w = w, .h = 20 }, "{s}", .{t});
     } else try missingRight(v, ctx, right, y, w, f.reason);
 }
 /// Dense-table form of `missing`: a small hatched cell, the reason on hover
@@ -97,12 +100,15 @@ fn text(v: *View, ctx: Ctx, x: f32, y: f32, w: f32, t: m.Text, color: Color) !vo
     if (t.ok()) try ctx.textFit(x, y, w, t.s, color) else try missing(v, ctx, x, y, w, t.why);
 }
 fn kv(v: *View, ctx: Ctx, x: f32, y: f32, w: f32, key: []const u8, f: m.F, kind: Kind) !void {
-    try ctx.text(x, y, key, ctx.p.dim);
-    try valueRight(v, ctx, x + w, y, @max(40, w - ctx.measure(key) - 14), f, kind, ctx.p.text);
+    var b: [48]u8 = undefined;
+    const value_w = @min(w * 0.6, if (f.get()) |n| ctx.measure(format(&b, kind, @floatCast(n))) else ctx.measure(if (ctx.measure(f.reason) + ctx.measure(key) + 26 <= w) f.reason else "—") + 12);
+    try ctx.textFit(x, y, @max(0, w - value_w - 16), key, ctx.p.dim);
+    try valueRight(v, ctx, x + w, y, value_w, f, kind, ctx.p.text);
+    v.hover(.{ .x = x, .y = y, .w = w, .h = 20 }, "{s}: {s}", .{ key, if (f.get()) |n| format(&b, kind, @floatCast(n)) else f.reason });
 }
 fn kvText(v: *View, ctx: Ctx, x: f32, y: f32, w: f32, key: []const u8, t: m.Text) !void {
-    try ctx.text(x, y, key, ctx.p.dim);
-    const kw = @max(ctx.measure(key) + 16, w * 0.32);
+    const kw = @min(ctx.measure(key) + 16, w * 0.38);
+    try ctx.textFit(x, y, kw - 16, key, ctx.p.dim);
     try text(v, ctx, x + kw, y, w - kw, t, ctx.p.text);
 }
 
@@ -187,6 +193,8 @@ pub fn graph(v: *View, base_ctx: Ctx, outer: Rect, series: []const Series, o: Gr
             try ctx.r.shape(.{ .x = rect.x + rect.w / 2 - tw / 2 - 10, .y = rect.y + rect.h / 2 - 13, .w = tw + 20, .h = 26 }, p.panel, .{ .radii = @splat(5) });
             try ctx.textFit(rect.x + rect.w / 2 - tw / 2, rect.y + rect.h / 2 - 11, tw + 1, reason, p.dim);
             v.hover(rect, "Unavailable: {s}", .{reason});
+            // No measured traces means no scale or some/full legend either.
+            return;
         }
     }
     var raw: [h.capacity + 2]?[2]f32 = undefined;
@@ -283,7 +291,7 @@ fn catmull(src: []const ?[2]f32, out: []?[2]f32, _: f32, lo: f32, hi: f32) []con
 fn gauge(v: *View, ctx: Ctx, rect: Rect, label: []const u8, f: m.F, max: f64, readout: []const u8, sub: []const u8, color: Color, prev: ?f64, now: u64) !void {
     const p = ctx.p;
     const inner = try card(ctx, rect, label, "");
-    const radius = @min(inner.w * 0.4, (inner.h - 30) / 2) - 2;
+    const radius = @min(inner.w * 0.4, (inner.h - 48) / 2) - 2;
     const cx = inner.x + inner.w / 2;
     const cy = inner.y + radius + 6;
     const a0: f32 = std.math.pi * 0.75;
@@ -302,13 +310,12 @@ fn gauge(v: *View, ctx: Ctx, rect: Rect, label: []const u8, f: m.F, max: f64, re
         const w = Ctx.vfdWidth(dh, readout);
         _ = try ctx.vfd(cx - w / 2, cy - dh * 0.62, dh, readout, c);
     } else {
-        const w = @min(inner.w - 20, ctx.measure(f.reason) + 16);
-        try ctx.hatch(.{ .x = cx - w / 2, .y = cy - 14, .w = w, .h = 26 });
-        try ctx.text(cx - w / 2 + 8, cy - 12, f.reason, p.hatch);
+        try missing(v, ctx, cx - radius * 0.5, cy - 10, radius, f.reason);
         v.hover(.{ .x = cx - radius, .y = cy - radius, .w = radius * 2, .h = radius * 2 }, "{s} unavailable: {s}", .{ label, f.reason });
     }
-    const sw = ctx.measure(sub);
-    try ctx.textFit(@max(inner.x, cx - sw / 2), cy + radius * 0.78, inner.w, sub, p.dim);
+    const caption = Rect{ .x = inner.x, .y = cy + radius + 4, .w = inner.w, .h = 42 };
+    try ctx.wrap(caption, sub, p.dim);
+    v.hover(caption, "{s}", .{sub});
 }
 
 fn prevF(prev: ?*const m.Snapshot, comptime field: []const u8) ?f64 {
@@ -321,7 +328,7 @@ fn prevF(prev: ?*const m.Snapshot, comptime field: []const u8) ?f64 {
 fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
     const p = ctx.p;
     const gap: f32 = 10;
-    const top_h = @min(280, rect.h * 0.3);
+    const top_h = @min(280, @max(180, rect.h * 0.3));
     const gw = (rect.w - gap * 3) / 4;
     var b: [64]u8 = undefined;
     var sb: [96]u8 = undefined;
@@ -354,7 +361,7 @@ fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void
                 if (g.busy.get() == null or busy > g.busy.get().?) g = x;
             };
             f = g.busy;
-            sub = if (g.power_w.get()) |w| std.fmt.bufPrint(&sb, "{s} {s} · {d:.1} W", .{ g.card, g.driver, w }) catch "" else std.fmt.bufPrint(&sb, "{s} · power {s}", .{ g.card, g.power_w.reason }) catch "";
+            sub = if (g.power_w.get()) |w| std.fmt.bufPrint(&sb, "{s} {s} · {d:.1} W", .{ g.card, g.driver, w }) catch "" else std.fmt.bufPrint(&sb, "{s} · power —", .{g.card}) catch "";
             if (v.prev()) |ps| for (ps.gpus) |x| if (std.mem.eql(u8, x.card, g.card)) {
                 pv = x.busy.get();
             };
@@ -366,8 +373,10 @@ fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void
     {
         const f = s.cpu_package_temp;
         const readout = if (f.get()) |x| std.fmt.bufPrint(&b, "{d:.0}", .{x}) catch "" else "";
-        const sub = if (s.cpu_package_power.get()) |w| std.fmt.bufPrint(&sb, "°C · package {d:.1} W", .{w}) catch "" else std.fmt.bufPrint(&sb, "°C · package power: {s}", .{s.cpu_package_power.reason}) catch "";
-        try gauge(v, ctx, .{ .x = rect.x + 3 * (gw + gap), .y = rect.y, .w = gw, .h = top_h }, "CPU temperature", f, 100, readout, sub, p.warn, prevF(v.prev(), "cpu_package_temp"), now);
+        const sub = if (s.cpu_package_power.get()) |w| std.fmt.bufPrint(&sb, "°C · package {d:.1} W", .{w}) catch "" else "°C · power —";
+        const bounds = Rect{ .x = rect.x + 3 * (gw + gap), .y = rect.y, .w = gw, .h = top_h };
+        try gauge(v, ctx, bounds, if (gw < 190) "CPU temp" else "CPU temperature", f, 100, readout, sub, p.warn, prevF(v.prev(), "cpu_package_temp"), now);
+        if (s.cpu_package_power.get() == null) v.hover(bounds, "Package power unavailable: {s}", .{s.cpu_package_power.reason});
     }
     // History row.
     const mid_y = rect.y + top_h + gap;
@@ -392,25 +401,26 @@ fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void
     if (low_h < 80) return;
     const lw = (rect.w - gap * 2) / 3;
     {
-        const inner = try card(ctx, .{ .x = rect.x, .y = low_y, .w = lw, .h = low_h }, "Top processes by CPU", "3 opens Processes");
+        const inner = try card(ctx, .{ .x = rect.x, .y = low_y, .w = lw, .h = low_h }, if (lw < 250) "Top CPU" else "Top processes by CPU", "3 opens Processes");
         try topProcesses(v, ctx, inner, s);
     }
     {
         const inner = try card(ctx, .{ .x = rect.x + lw + gap, .y = low_y, .w = lw, .h = low_h }, "System", "");
         var y = inner.y;
         const w = inner.w;
-        try kv(v, ctx, inner.x, y, w, "Processes", fromU(s.process_count), .count);
-        y += line_h;
-        try kv(v, ctx, inner.x, y, w, "Threads", fromU(s.thread_count), .count);
-        y += line_h;
-        try kv(v, ctx, inner.x, y, w, "Running / blocked", fromU(s.running), .count);
-        y += line_h;
-        try kv(v, ctx, inner.x, y, w, "Context switches /s", s.context_switches_ps, .count);
-        y += line_h;
-        try kv(v, ctx, inner.x, y, w, "Forks /s", s.forks_ps, .count);
-        y += line_h;
-        try kv(v, ctx, inner.x, y, w, "Swap used", fromU(s.memory.swap_used), .bytes);
-        y += line_h;
+        const facts = [_]struct { []const u8, m.F, Kind }{
+            .{ "Processes", fromU(s.process_count), .count },
+            .{ "Threads", fromU(s.thread_count), .count },
+            .{ "Running / blocked", fromU(s.running), .count },
+            .{ "Context switches /s", s.context_switches_ps, .count },
+            .{ "Forks /s", s.forks_ps, .count },
+            .{ "Swap used", fromU(s.memory.swap_used), .bytes },
+        };
+        for (facts) |row| {
+            if (y + line_h > inner.y + inner.h) break;
+            try kv(v, ctx, inner.x, y, w, row[0], row[1], row[2]);
+            y += line_h;
+        }
         if (y + line_h < inner.y + inner.h) {
             try kv(v, ctx, inner.x, y, w, "Fullest filesystem", fullestMount(s), .percent);
             y += line_h;
@@ -433,7 +443,7 @@ fn summary(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void
         }
     }
     {
-        const inner = try card(ctx, .{ .x = rect.x + 2 * (lw + gap), .y = low_y, .w = lw, .h = low_h }, "Not measured right now", "never shown as zero");
+        const inner = try card(ctx, .{ .x = rect.x + 2 * (lw + gap), .y = low_y, .w = lw, .h = low_h }, if (lw < 250) "Unavailable" else "Not measured right now", "never shown as zero");
         try honesty(v, ctx, inner, s);
     }
 }
@@ -469,11 +479,19 @@ fn topProcesses(v: *View, ctx: Ctx, inner: Rect, s: *const m.Snapshot) !void {
         if (y + line_h > inner.y + inner.h) break;
         const proc = s.processes[i];
         var nb: [24]u8 = undefined;
-        try ctx.textFit(inner.x, y, inner.w * 0.44 - 16, vw.processName(v, &proc, &nb), ctx.p.text);
         var b: [16]u8 = undefined;
-        try ctx.text(inner.x + inner.w * 0.44, y, std.fmt.bufPrint(&b, "{d}", .{proc.pid}) catch "", ctx.p.dim);
-        try ctx.bar(.{ .x = inner.x + inner.w * 0.58, .y = y + 7, .w = inner.w * 0.24, .h = 7 }, (proc.cpu.get() orelse 0) / 100, ctx.p.accent);
-        try valueRight(v, ctx, inner.x + inner.w, y, inner.w * 0.16, proc.cpu, .percent, ctx.p.text);
+        const pid = std.fmt.bufPrint(&b, "{d}", .{proc.pid}) catch "";
+        var cb: [48]u8 = undefined;
+        const cpu = format(&cb, .percent, @floatCast(proc.cpu.get().?));
+        const cw = ctx.measure(cpu);
+        const pw = ctx.measure(pid);
+        const right = inner.x + inner.w;
+        const bar_w: f32 = if (inner.w >= 440) 72 else 0;
+        const pid_x = right - cw - 16 - bar_w - (if (bar_w > 0) @as(f32, 16) else 0) - pw;
+        try ctx.textFit(inner.x, y, pid_x - inner.x - 16, vw.processName(v, &proc, &nb), ctx.p.text);
+        try ctx.text(pid_x, y, pid, ctx.p.dim);
+        if (bar_w > 0) try ctx.bar(.{ .x = pid_x + pw + 16, .y = y + 7, .w = bar_w, .h = 7 }, proc.cpu.get().? / 100, ctx.p.accent);
+        try ctx.textRight(right, y, cpu, ctx.p.text);
         y += line_h;
     }
 }
@@ -529,8 +547,12 @@ fn honesty(v: *View, ctx: Ctx, inner: Rect, s: *const m.Snapshot) !void {
             break;
         }
         try ctx.r.shape(.{ .x = inner.x, .y = y + 6, .w = 8, .h = 8 }, ctx.p.hatch, .{ .radii = @splat(4) });
-        try ctx.textFit(inner.x + 16, y, inner.w * 0.5 - 16, item.label, ctx.p.text);
-        try missingRight(v, ctx, inner.x + inner.w, y, inner.w * 0.5, item.reason);
+        const rw = if (ctx.measure(item.reason) + ctx.measure(item.label) + 44 <= inner.w) ctx.measure(item.reason) + 12 else ctx.measure("—") + 12;
+        const label_width = inner.w - rw - 32;
+        const short = if (std.mem.eql(u8, item.label, "CPU package power")) "CPU power" else if (std.mem.eql(u8, item.label, "CPU temperature")) "CPU temp" else if (std.mem.eql(u8, item.label, "Per-core temperature")) "Core temp" else if (std.mem.eql(u8, item.label, "Per-process network")) "Process net" else if (std.mem.startsWith(u8, item.label, "Open files of")) "Open files" else item.label;
+        try ctx.textFit(inner.x + 16, y, label_width, if (ctx.measure(item.label) > label_width) short else item.label, ctx.p.text);
+        try missingRight(v, ctx, inner.x + inner.w, y, rw, item.reason);
+        v.hover(.{ .x = inner.x, .y = y, .w = inner.w, .h = line_h }, "{s}: {s}", .{ item.label, item.reason });
         y += line_h;
         shown += 1;
     }
@@ -541,13 +563,13 @@ fn honesty(v: *View, ctx: Ctx, inner: Rect, s: *const m.Snapshot) !void {
 fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
     const p = ctx.p;
     const gap: f32 = 10;
-    const top_h = @min(220, rect.h * 0.28);
+    const top_h = @min(220, @max(190, rect.h * 0.28));
     const H = v.hist;
     // Headline: VFD total and facts, then the big graph.
     const left_w: f32 = 300;
     {
         const inner = try card(ctx, .{ .x = rect.x, .y = rect.y, .w = left_w, .h = top_h }, "Total CPU", if (s.cpu_model.ok()) "" else s.cpu_model.why);
-        const digit_h: f32 = if (p.win95) @min(64, @max(20, inner.h - 3 * line_h - 12)) else 64;
+        const digit_h: f32 = @min(64, @max(20, inner.h - 3 * line_h - 20));
         var b: [32]u8 = undefined;
         if (s.cpu_total.get()) |x| {
             const t = std.fmt.bufPrint(&b, "{d:.1}%", .{x}) catch "";
@@ -566,7 +588,7 @@ fn performance(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !
         y += line_h;
         try kv(v, ctx, inner.x, y, inner.w, "Fastest core", if (n > 0) m.F.of(max_mhz) else m.F.missing("no frequency"), .mhz);
         y += line_h;
-        try kv(v, ctx, inner.x, y, inner.w, "Package", s.cpu_package_temp, .celsius);
+        try kv(v, ctx, inner.x, y, inner.w, "Package temperature", s.cpu_package_temp, .celsius);
         y += line_h;
         if (y + line_h <= inner.y + inner.h) try kv(v, ctx, inner.x, y, inner.w, "Package power", s.cpu_package_power, .watts);
     }
@@ -673,7 +695,12 @@ fn cpuTile(v: *View, ctx: Ctx, tile: Rect, s: *const m.Snapshot, index: usize, n
     const known = c.topology_why.len == 0;
     if (known and c.smt > 0) try ctx.r.rect(.{ .x = tile.x, .y = tile.y + 4, .w = 2, .h = tile.h - 8 }, fade(p.accent3, 0.5));
     var lb: [32]u8 = undefined;
-    const label = std.fmt.bufPrint(&lb, "CPU {d}", .{c.id}) catch "";
+    var vb: [16]u8 = undefined;
+    const busy_text: []const u8 = if (c.total.get()) |busy| std.fmt.bufPrint(&vb, "{d:.0}%", .{busy}) catch "" else "";
+    const dh: f32 = if (tile.h >= 70) 20 else 14;
+    // Narrow tiles drop the "CPU" prefix before the readout would cover the number.
+    const wide_label = tile.x + 14 + ctx.measure("CPU 00") + Ctx.vfdWidth(dh, "100%") <= tile.x + tile.w - 8;
+    const label = std.fmt.bufPrint(&lb, "{s}{d}", .{ if (wide_label) "CPU " else "", c.id }) catch "";
     try ctx.text(tile.x + 8, tile.y + 2, label, p.text);
     var cb: [32]u8 = undefined;
     const core = std.fmt.bufPrint(&cb, "core {d}", .{c.core}) catch "";
@@ -681,11 +708,8 @@ fn cpuTile(v: *View, ctx: Ctx, tile: Rect, s: *const m.Snapshot, index: usize, n
     if (c.online == false) return missing(v, ctx, tile.x + 8, tile.y + 24, tile.w - 16, "offline");
     // VFD readout of this CPU's busy share.
     if (c.total.get()) |busy| {
-        var vb: [16]u8 = undefined;
-        const t = std.fmt.bufPrint(&vb, "{d:.0}%", .{busy}) catch "";
-        const dh: f32 = if (tile.h >= 70) 20 else 14;
         const hot = !p.monochrome and busy > 90;
-        _ = try ctx.vfd(tile.x + tile.w - 8 - Ctx.vfdWidth(dh, t), tile.y + 3, dh, t, if (hot) p.warn else p.accent);
+        _ = try ctx.vfd(tile.x + tile.w - 8 - Ctx.vfdWidth(dh, busy_text), tile.y + 3, dh, busy_text, if (hot) p.warn else p.accent);
     } else try missingRight(v, ctx, tile.x + tile.w - 8, tile.y + 2, 90, c.total.reason);
     const has_graph = tile.h >= 70;
     const meter_y = tile.y + tile.h - (if (tile.h >= 54) @as(f32, 34) else 16);
@@ -728,7 +752,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     if (q.len > 0 or v.searching) {
         try ctx.textFit(search.x + 8, search.y + 2, search.w - 16, q, p.text);
         if (v.searching) try ctx.r.rect(.{ .x = search.x + 9 + ctx.measure(q), .y = search.y + 4, .w = 2, .h = 16 }, p.accent);
-    } else try ctx.textFit(search.x + 8, search.y + 2, search.w - 16, "/ search name, pid or command", p.dim);
+    } else try ctx.textFit(search.x + 8, search.y + 2, search.w - 16, if (narrow) "/ Search" else "/ search name, pid or command", p.dim);
     var x = search.x + search.w + 14;
     if (!narrow) {
         try ctx.text(x, rect.y + 7, "sort", p.dim);
@@ -740,6 +764,7 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
         var nb: [24]u8 = undefined;
         const label = if (on) std.fmt.bufPrint(&nb, "{s} {s}", .{ name, if (v.descending) "▼" else "▲" }) catch name else name;
         const w = ctx.measure(label) + 16;
+        if (x + w > rect.x + rect.w - 80) continue;
         const chip = Rect{ .x = x, .y = rect.y + 6, .w = w, .h = 22 };
         if (p.win95) try ctx.button(chip, on) else try ctx.r.shape(chip, if (on) fade(p.accent, 0.18) else fade(p.raised, 1), .{ .radii = @splat(11) });
         if (on and !p.win95) try ctx.r.shape(chip, fade(p.accent, 0.7), .{ .radii = @splat(11), .border = 1 });
@@ -770,18 +795,18 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     const wide = rect.w > 1300;
     const cols_all = [_]Column{
         .{ .label = "Name", .width = 0, .sort = .name, .right = false },
-        .{ .label = "PID", .width = if (narrow) 56 else 70, .sort = .pid },
+        .{ .label = "PID", .width = 80, .sort = .pid },
         .{ .label = "User", .width = if (narrow) 64 else 92, .sort = null, .right = false },
         .{ .label = "S", .width = 22, .sort = null, .right = false },
-        .{ .label = "CPU", .width = if (narrow) 112 else 150, .sort = .cpu },
-        .{ .label = "Memory", .width = if (narrow) 124 else 150, .sort = .memory },
+        .{ .label = "CPU", .width = if (rect.w < 1000) 80 else 150, .sort = .cpu },
+        .{ .label = "Memory", .width = if (rect.w < 1000) 100 else 150, .sort = .memory },
         .{ .label = "Disk", .width = if (narrow) 104 else 104, .sort = .disk },
         .{ .label = "Net", .width = if (narrow) 50 else 104, .sort = .net },
         .{ .label = "Thr", .width = 54, .sort = .threads },
         .{ .label = "FDs", .width = 64, .sort = .fds },
         .{ .label = "Command", .width = 330, .sort = null, .right = false },
     };
-    const cols: []const Column = if (wide) &cols_all else cols_all[0..10];
+    const cols: []const Column = if (wide) &cols_all else cols_all[0..@as(usize, if (rect.w < 800) 6 else if (rect.w < 1000) 8 else 10)];
     var fixed: f32 = 0;
     for (cols[1..]) |c| fixed += c.width + 10;
     const name_w = @max(140, table.w - 24 - fixed - (if (p.win95) @as(f32, 18) else 0));
@@ -995,7 +1020,7 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
     const gap: f32 = 10;
     const mem = s.memory;
     const H = v.hist;
-    const top_h: f32 = 190;
+    const top_h: f32 = 214;
     {
         var rb: [64]u8 = undefined;
         var tb: [24]u8 = undefined;
@@ -1032,15 +1057,15 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
             }
         }
         // Legend.
-        var lx = bar.x;
-        const ly = bar.y + bar.h + 10;
-        for (parts) |part| {
+        const columns: usize = if (bar.w < 600) 3 else 5;
+        const legend_w = bar.w / @as(f32, @floatFromInt(columns));
+        for (parts, 0..) |part, i| {
+            const lx = bar.x + @as(f32, @floatFromInt(i % columns)) * legend_w;
+            const ly = bar.y + bar.h + 10 + @as(f32, @floatFromInt(i / columns)) * 48;
             try ctx.r.shape(.{ .x = lx, .y = ly + 5, .w = 10, .h = 10 }, part.color, .{ .radii = @splat(2) });
-            try ctx.text(lx + 16, ly, part.label, p.dim);
-            const lw = ctx.measure(part.label);
+            try ctx.textFit(lx + 16, ly, legend_w - 24, part.label, p.dim);
             var vb: [24]u8 = undefined;
-            if (part.f.get()) |val| try ctx.text(lx + 16, ly + 20, m.bytes(&vb, @floatFromInt(val)), p.text) else try missing(v, ctx, lx + 16, ly + 20, 130, part.f.reason);
-            lx += @max(lw + 30, 150);
+            if (part.f.get()) |val| try ctx.textFit(lx + 16, ly + 20, legend_w - 24, m.bytes(&vb, @floatFromInt(val)), p.text) else try missing(v, ctx, lx + 16, ly + 20, legend_w - 24, part.f.reason);
         }
         var y = inner.y + 72;
         const kw: f32 = 240;
@@ -1184,7 +1209,10 @@ fn diskSpace(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
         const dev = v.private(mount.device);
         const devtext = std.fmt.bufPrint(&db, "{s}{s}{s}", .{ if (dev.ok()) dev.s else "device hidden", if (mount.fstype.len > 0) " · " else "", mount.fstype }) catch "";
         try ctx.textFit(inner.x, y + 21, inner.w * 0.28, devtext, p.dim);
-        const bar = Rect{ .x = inner.x + inner.w * 0.3, .y = y + 6, .w = inner.w * 0.42, .h = 16 };
+        const facts_w = @min(330, inner.w * 0.55);
+        const rx = inner.x + inner.w - facts_w;
+        const percent_w: f32 = 64;
+        const bar = Rect{ .x = inner.x + inner.w * 0.3, .y = y + 6, .w = @max(0, rx - inner.x - inner.w * 0.3 - 16), .h = 16 };
         const frac: ?f64 = if (mount.used_pct.get()) |x| x / 100 else null;
         const color = if (frac) |f| if (p.monochrome) p.accent else if (f > 0.9) p.crit else if (f > 0.8) p.warn else p.accent else p.accent;
         try ctx.segments(bar, frac, color);
@@ -1193,13 +1221,12 @@ fn diskSpace(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
         var b1: [24]u8 = undefined;
         var b2: [24]u8 = undefined;
         var b3: [24]u8 = undefined;
-        const rx = inner.x + inner.w * 0.74;
         if (mount.used.get() != null and mount.total.get() != null) {
             const line = std.fmt.bufPrint(&db, "{s} of {s}", .{ m.bytes(&b1, @floatFromInt(mount.used.get().?)), m.bytes(&b2, @floatFromInt(mount.total.get().?)) }) catch "";
-            try ctx.text(rx, y + 2, line, p.text);
-        } else try missing(v, ctx, rx, y + 2, 200, mount.total.reason);
-        if (mount.available.get()) |a| try ctx.text(rx, y + 22, std.fmt.bufPrint(&db, "{s} free", .{m.bytes(&b3, @floatFromInt(a))}) catch "", p.dim);
-        try valueRight(v, ctx, inner.x + inner.w, y + 2, 90, mount.used_pct, .percent, color);
+            try ctx.textFit(rx, y + 2, facts_w - percent_w - 16, line, p.text);
+        } else try missing(v, ctx, rx, y + 2, facts_w - percent_w - 16, mount.total.reason);
+        if (mount.available.get()) |a| try ctx.textFit(rx, y + 22, facts_w - 110, std.fmt.bufPrint(&db, "{s} free", .{m.bytes(&b3, @floatFromInt(a))}) catch "", p.dim);
+        try valueRight(v, ctx, inner.x + inner.w, y + 2, percent_w, mount.used_pct, .percent, color);
         if (mount.inodes_total.get()) |it| if (it > 0) if (mount.inodes_free.get()) |fr| {
             var ib: [32]u8 = undefined;
             try ctx.textRight(inner.x + inner.w, y + 22, std.fmt.bufPrint(&ib, "inodes {d:.0}%", .{100 - @as(f64, @floatFromInt(fr)) * 100 / @as(f64, @floatFromInt(it))}) catch "", p.dim);
@@ -1336,16 +1363,13 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
             try ctx.text(inner.x + w + 6, inner.y + 4, "°C", p.dim);
         } else try missing(v, ctx, inner.x, inner.y + 20, inner.w, s.cpu_package_temp.reason);
         const py = inner.y + 78;
-        try ctx.text(inner.x, py, "Package power", p.dim);
         if (s.cpu_package_power.get()) |w| {
-            try ctx.text(inner.x + 130, py, std.fmt.bufPrint(&b, "{d:.1} W", .{w}) catch "", p.text);
+            try kv(v, ctx, inner.x, py, inner.w, "Package power", m.F.of(w), .watts);
         } else {
+            try ctx.textFit(inner.x, py, inner.w, "Package power", p.dim);
             const box = Rect{ .x = inner.x, .y = py + 24, .w = inner.w, .h = 40 };
             try ctx.hatch(box);
-            var rb: [96]u8 = undefined;
-            const msg = std.fmt.bufPrint(&rb, "CPU package power: {s}", .{s.cpu_package_power.reason}) catch "";
-            try ctx.r.shape(.{ .x = box.x + 8, .y = box.y + 9, .w = ctx.measure(msg) + 12, .h = 22 }, p.panel, .{ .radii = @splat(4) });
-            try ctx.text(box.x + 14, box.y + 10, msg, p.text);
+            try missing(v, ctx, box.x + 8, box.y + 10, box.w - 16, s.cpu_package_power.reason);
             v.hover(box, "RAPL energy counters are readable by root only on this kernel; nothing is estimated", .{});
         }
     }
@@ -1363,11 +1387,11 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
                 const name = v.private(g.name);
                 const head = std.fmt.bufPrint(&hb, "{s} · {s} {s}", .{ g.card, g.driver, if (name.ok()) name.s else "" }) catch g.card;
                 const inner = try card(ctx, .{ .x = gx + @as(f32, @floatFromInt(i)) * (each + gap), .y = rect.y, .w = each, .h = top_h }, head, "");
-                const side: f32 = 190;
-                if (v.hist.gpus.find(g.card)) |si| {
+                const side: f32 = @min(190, inner.w);
+                if (inner.w > side + 80) if (v.hist.gpus.find(g.card)) |si| {
                     const rings = &v.hist.gpus.rings[si];
                     try graph(v, ctx, .{ .x = inner.x, .y = inner.y, .w = inner.w - side - 10, .h = inner.h }, &.{.{ .ring = &rings[0], .color = p.accent2, .label = "busy" }}, .{ .max = 100, .reason = g.busy.reason }, now);
-                }
+                };
                 const sx = inner.x + inner.w - side;
                 try kv(v, ctx, sx, inner.y, side, "Busy", g.busy, .percent);
                 try kv(v, ctx, sx, inner.y + 22, side, "Power", g.power_w, .watts);
@@ -1435,7 +1459,7 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
         const k2 = std.fmt.bufPrint(&key, "{s}/{s}", .{ sensor.chip, sensor.label }) catch "";
         if (v.hist.sensors.find(k2)) |si| {
             const ring = &v.hist.sensors.rings[si][0];
-            const g = Rect{ .x = tile.x + 6, .y = tile.y + 44, .w = tile.w - 12, .h = th - 50 };
+            const g = Rect{ .x = tile.x + 6, .y = tile.y + 44, .w = tile.w - 12, .h = th - 72 };
             // Zoom into the recent range so a 2 °C drift is visible; the range is printed.
             var lo: f32 = std.math.floatMax(f32);
             var hi: f32 = -std.math.floatMax(f32);
@@ -1451,12 +1475,12 @@ fn power(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
             const floor = @max(0, lo - pad);
             const top = hi + pad;
             try graph(v, ctx, g, &.{.{ .ring = ring, .color = if (hot and !p.monochrome) p.crit else p.accent, .fill = 0.25 }}, .{ .kind = kind, .max = top, .floor = floor, .samples = 90, .smooth = g.w / 90 >= 6, .labels = false, .width = 1.5, .reason = sensor.value.reason }, now);
-            if (g.h >= 40) {
+            if (g.h >= 18) {
                 var rb: [48]u8 = undefined;
                 var b1: [20]u8 = undefined;
                 var b2: [20]u8 = undefined;
                 const range = std.fmt.bufPrint(&rb, "{s} – {s}", .{ format(&b1, kind, floor), format(&b2, kind, top) }) catch "";
-                try ctx.text(g.x + 4, g.y + g.h - 20, range, fade(p.dim, 0.8));
+                try ctx.textFit(g.x + 4, g.y + g.h + 2, g.w - 8, range, fade(p.dim, 0.8));
             }
         }
         if (crit) |cv| {
@@ -1570,27 +1594,28 @@ fn users(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     const inner = try card(ctx, rect, "Sessions (utmp)", std.fmt.bufPrint(&rb, "{d} sessions", .{s.users.len}) catch "");
     var y = inner.y;
     if (try groupBanner(v, ctx, inner, s, .users)) y += 66;
-    const cols = [_]f32{ 0, 0.25, 0.42, 0.7, 0.85 };
+    const cols = [_]f32{ 0, inner.w * 0.22, inner.w * 0.4, inner.w - 232, inner.w - 80 };
     const labels = [_][]const u8{ "User", "Line", "From", "Login", "PID" };
     if (p.win95) try ctx.list(.{ .x = inner.x - 4, .y = y - 4, .w = inner.w + 8, .h = inner.y + inner.h - y + 4 });
-    for (labels, cols, 0..) |label, fraction, i| {
-        if (p.win95) try ctx.bevel(.{ .x = inner.x + inner.w * fraction - 2, .y = y - 2, .w = inner.w * ((if (i + 1 < cols.len) cols[i + 1] else 1) - fraction), .h = 26 }, false);
-        try ctx.text(inner.x + inner.w * fraction, y, label, p.dim);
+    for (labels, cols, 0..) |label, offset, i| {
+        const width = (if (i + 1 < cols.len) cols[i + 1] else inner.w) - offset;
+        if (p.win95) try ctx.bevel(.{ .x = inner.x + offset - 2, .y = y - 2, .w = width, .h = 26 }, false);
+        try ctx.textFit(inner.x + offset, y, width - 12, label, p.dim);
     }
     y += line_h + 4;
     for (s.users, 0..) |u, i| {
         if (y + line_h > inner.y + inner.h) break;
         var nb: [24]u8 = undefined;
         const name = v.private(u.name);
-        if (name.ok()) try ctx.text(inner.x, y, name.s, p.text) else try ctx.text(inner.x, y, std.fmt.bufPrint(&nb, "user {d}", .{i + 1}) catch "", p.dim);
-        try ctx.text(inner.x + inner.w * cols[1], y, u.line, p.text);
-        try text(v, ctx, inner.x + inner.w * cols[2], y, inner.w * 0.26, v.private(u.from), p.text);
+        try ctx.textFit(inner.x, y, cols[1] - 12, if (name.ok()) name.s else std.fmt.bufPrint(&nb, "user {d}", .{i + 1}) catch "", p.text);
+        try ctx.textFit(inner.x + cols[1], y, cols[2] - cols[1] - 12, u.line, p.text);
+        try text(v, ctx, inner.x + cols[2], y, cols[3] - cols[2] - 12, v.private(u.from), p.text);
         if (u.login_s.get()) |t| {
             var tb: [32]u8 = undefined;
             const ago = if (s.boot_time.get()) |_| t else t;
-            try ctx.text(inner.x + inner.w * cols[3], y, std.fmt.bufPrint(&tb, "unix {d}", .{ago}) catch "", p.dim);
-        } else try missing(v, ctx, inner.x + inner.w * cols[3], y, inner.w * 0.14, u.login_s.reason);
-        try valueRight(v, ctx, inner.x + inner.w, y, inner.w * 0.14, fromU(u.pid), .count, p.dim);
+            try ctx.textFit(inner.x + cols[3], y, cols[4] - cols[3] - 12, std.fmt.bufPrint(&tb, "unix {d}", .{ago}) catch "", p.dim);
+        } else try missing(v, ctx, inner.x + cols[3], y, cols[4] - cols[3] - 12, u.login_s.reason);
+        try valueRight(v, ctx, inner.x + inner.w, y, 80, fromU(u.pid), .count, p.dim);
         y += line_h;
     }
     if (s.users.len == 0 and s.group(.users).status == .ok) try ctx.text(inner.x, y, "No login sessions recorded in utmp.", p.dim);
@@ -1609,12 +1634,17 @@ fn services(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     }
     try ctx.textFit(inner.x, y, inner.w, "Observed daemon processes · process state, not unit health · CPU % of one core", p.dim);
     y += line_h + 6;
-    const fractions = [_]f32{ 0, 0.26, 0.38, 0.54, 0.62, 0.77, 0.88, 1 };
-    const labels = [_][]const u8{ "Name", "PID", "User (UID)", "State", "Uptime", "CPU %", "RSS" };
+    const widths = @import("../../look.zig").overview.service_columns;
+    var columns: [8]f32 = undefined;
+    columns[0] = 0;
+    columns[7] = inner.w;
+    var column: usize = 6;
+    while (column > 0) : (column -= 1) columns[column] = columns[column + 1] - widths[column - 1];
+    const labels = [_][]const u8{ "Name", "PID", if (inner.w < 800) "User" else "User (UID)", if (inner.w < 800) "S" else "State", "Uptime", "CPU %", "RSS" };
     if (p.win95) try ctx.list(.{ .x = inner.x - 4, .y = y - 4, .w = inner.w + 8, .h = inner.y + inner.h - y + 4 });
     for (labels, 0..) |label, i| {
-        if (p.win95) try ctx.bevel(.{ .x = inner.x + inner.w * fractions[i] - 2, .y = y - 2, .w = inner.w * (fractions[i + 1] - fractions[i]), .h = 26 }, false);
-        try ctx.textFit(inner.x + inner.w * fractions[i], y, inner.w * (fractions[i + 1] - fractions[i]) - 8, label, p.dim);
+        if (p.win95) try ctx.bevel(.{ .x = inner.x + columns[i] - 2, .y = y - 2, .w = columns[i + 1] - columns[i], .h = 26 }, false);
+        try ctx.textFit(inner.x + columns[i], y, columns[i + 1] - columns[i] - 12, label, p.dim);
     }
     y += line_h + 4;
     if (s.services.len == 0) {
@@ -1637,7 +1667,7 @@ fn services(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
             if (svc.cpu.get()) |pct| std.fmt.bufPrint(&cpu, "{d:.1}", .{pct}) catch "" else svc.cpu.reason,
             if (svc.rss.get()) |bytes| m.bytes(&rss, @floatFromInt(bytes)) else svc.rss.reason,
         };
-        for (texts, 0..) |content, i| try ctx.textFit(inner.x + inner.w * fractions[i], y, inner.w * (fractions[i + 1] - fractions[i]) - 8, content, if (i == 0) p.text else p.dim);
+        for (texts, 0..) |content, i| try ctx.textFit(inner.x + columns[i], y, columns[i + 1] - columns[i] - 12, content, if (i == 0) p.text else p.dim);
         if (svc.pid.get()) |id| {
             if (svc.start.get()) |start| v.hover(.{ .x = inner.x, .y = y, .w = inner.w, .h = line_h }, "PID {d}, start {d} ticks · state {s} · CPU: {s}", .{ id, start, texts[3], texts[5] });
         }
@@ -1661,8 +1691,10 @@ fn apps(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
             try ctx.text(inner.x + w + 10, inner.y + 30, "packages", p.dim);
         } else try missing(v, ctx, inner.x, inner.y + 10, 300, s.apps_count.reason);
         if (s.apps_bytes.get()) |t| {
-            const w = try ctx.vfd(inner.x + 420, inner.y + 6, 48, std.fmt.bufPrint(&b, "{d:.1}", .{@as(f64, @floatFromInt(t)) / (1 << 30)}) catch "", p.accent3);
-            try ctx.text(inner.x + 420 + w + 10, inner.y + 30, "GiB installed", p.dim);
+            const digits = std.fmt.bufPrint(&b, "{d:.1}", .{@as(f64, @floatFromInt(t)) / (1 << 30)}) catch "";
+            const x = @min(inner.x + 420, inner.x + inner.w - Ctx.vfdWidth(48, digits) - 10 - ctx.measure("GiB installed"));
+            const w = try ctx.vfd(x, inner.y + 6, 48, digits, p.accent3);
+            try ctx.text(x + w + 10, inner.y + 30, "GiB installed", p.dim);
         } else try missing(v, ctx, inner.x + 420, inner.y + 10, 300, s.apps_bytes.reason);
     }
     const inner = try card(ctx, .{ .x = rect.x, .y = rect.y + top_h + gap, .w = rect.w, .h = rect.h - top_h - gap }, "Largest packages", "read-only package database");
@@ -1673,10 +1705,12 @@ fn apps(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot) !void {
     const first = @min(v.scroll[@intFromEnum(vw.Panel.apps)], s.packages.len -| 1);
     for (s.packages[first..]) |pk| {
         if (y + line_h > inner.y + inner.h) break;
-        try ctx.textFit(inner.x, y, inner.w * 0.25, pk.name, p.text);
+        // Size owns a whole cell; the decorative bar gives way first.
+        const size_w: f32 = 96;
+        try ctx.textFit(inner.x, y, inner.w * 0.26 - 14, pk.name, p.text);
         try ctx.textFit(inner.x + inner.w * 0.26, y, inner.w * 0.16, pk.version, p.dim);
-        try ctx.bar(.{ .x = inner.x + inner.w * 0.44, .y = y + 8, .w = inner.w * 0.42, .h = 7 }, if (pk.size.get()) |sz| @as(f64, @floatFromInt(sz)) / max else null, p.accent);
-        try valueRight(v, ctx, inner.x + inner.w, y, inner.w * 0.12, fromU(pk.size), .bytes, p.text);
+        try ctx.bar(.{ .x = inner.x + inner.w * 0.44, .y = y + 8, .w = @max(0, inner.w * 0.56 - size_w - 12), .h = 7 }, if (pk.size.get()) |sz| @as(f64, @floatFromInt(sz)) / max else null, p.accent);
+        try valueRight(v, ctx, inner.x + inner.w, y, size_w, fromU(pk.size), .bytes, p.text);
         y += line_h;
     }
 }

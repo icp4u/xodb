@@ -19,7 +19,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -87,6 +87,8 @@ pub fn main(init: std.process.Init) !void {
     }
     var allocation_helper: ?[:0]const u8 = null;
     var static_analysis: ?[:0]const u8 = if (@import("c.zig").api.getenv("XODB_STATIC_ANALYSIS")) |dir| std.mem.span(dir) else null;
+    var static_decompile: ?[:0]const u8 = null;
+    var static_function: []const u8 = "";
     var no_ghidra_prestart = false;
     var config_path: ?[:0]const u8 = null;
     var languages_off = @import("preferences.zig").Languages{};
@@ -102,6 +104,7 @@ pub fn main(init: std.process.Init) !void {
     var expected_start: ?u64 = null;
     var start_profile = false;
     var redot_debugger = false;
+    var redact = false;
     var listen: ?[:0]const u8 = null;
     var connect: ?[:0]const u8 = null;
     var ssh: ?[:0]const u8 = null;
@@ -152,6 +155,10 @@ pub fn main(init: std.process.Init) !void {
             redot_debugger = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--redact")) {
+            redact = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--help")) {
             std.debug.print(
                 \\xodb — native Linux debugger (M1 workstation baseline)
@@ -192,6 +199,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--gdb-remote HOST:PORT connects to an existing all-stop gdbserver, QEMU or Apple debugserver target.
                 \\--redot-debugger adds a private loopback scene-debugger peer to a local owned Redot/Godot launch.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
+                \\--redact hides home paths, user and host names, and addresses outside loopback/documentation ranges in the GUI,
+                \\  MCP replies, logs and saved archives (not exports yet); addresses become per-session tags (docs/GUIDE.md "Redaction").
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
                 \\--start-profile attaches, starts a 99 Hz / 10 s CPU capture, and resumes the target.
@@ -221,6 +230,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
                 \\  native Ghidra worker built in DIR (tools/ghx); XODB_STATIC_ANALYSIS=DIR does the same.
+                \\--decompile FILE [--function NAME] prints Ghidra pseudo-C from a private immutable static-image session.
                 \\--no-ghidra-prestart leaves the configured Ghidra sidecar idle until pseudo-C is requested.
                 \\-q shows warnings and errors only, -qq errors only; -v adds debug lines (decisions), -vv trace lines
                 \\  (per-event detail). --log=LEVEL names the level (error|warn|info|debug|trace) and
@@ -252,6 +262,8 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--runtime-agent")) runtime_agent = args[i];
             if (std.mem.eql(u8, arg, "--gdb-remote")) gdb_remote = args[i];
             if (std.mem.eql(u8, arg, "--static-analysis")) static_analysis = args[i];
+            if (std.mem.eql(u8, arg, "--decompile")) static_decompile = args[i];
+            if (std.mem.eql(u8, arg, "--function")) static_function = args[i];
             if (std.mem.eql(u8, arg, "--runtime-ssh")) runtime_ssh = args[i];
             if (std.mem.eql(u8, arg, "--ssh-config")) ssh_config = args[i];
             if (std.mem.eql(u8, arg, "--allocation-helper")) allocation_helper = args[i];
@@ -301,6 +313,8 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--frames")) frames = try std.fmt.parseInt(u64, args[i], 10);
         } else return error.UnknownArgument;
     }
+    if (static_function.len != 0 and static_decompile == null) return error.FunctionRequiresStaticDecompile;
+    if (static_decompile != null and (launch.len != 0 or attach != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or runtime_agent != null or runtime_ssh != null or gdb_remote != null or core_file != null or open_capture != null or open_profile != null or open_frames != null or observation_recipe != null or open_observation != null or browse_observation != null or initial_breakpoint_count != 0)) return error.StaticDecompileOptionConflict;
     if (observation_recipe != null) {
         if (observation_out == null or open_observation != null or browse_observation != null or mcp or session_socket != null or listen != null or connect != null or ssh != null or core_file != null or open_capture != null or open_profile != null or initial_breakpoint_count != 0 or follow_forks or capture_out != null or profile_out != null or record_path != null) return error.ObservationRecipeOptionConflict;
         if (launch.len == 0 and attach == null) return error.ObservationRecipeRequiresTarget;
@@ -330,13 +344,15 @@ pub fn main(init: std.process.Init) !void {
     if (connect != null and (ssh != null or attach != null or launch.len > 0 or source != null or initial_breakpoint_count != 0 or scope_explicit or image_limit != null or image_total_limit != null)) return error.RemoteConnectTargetBelongsOnServer;
     if (ssh != null and attach == null and launch.len == 0) return error.RemoteSshRequiresTarget;
     if (listen != null and (!headless or !mcp)) return error.ListenRequiresHeadlessMcp;
-    if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null) return error.HeadlessRequiresMcp;
+    if (headless and !mcp and session_socket == null and observation_recipe == null and open_observation == null and static_decompile == null) return error.HeadlessRequiresMcp;
     if ((expected_start != null or start_profile) and (attach == null or runtime_remote or remote_gui)) return error.IdentityRequiresLocalAttach;
     if (attach != null and launch.len > 0) return error.ConflictingTargets;
     if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if (open_pcap != null and (attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenPcapOptionConflict;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
+    // Before any thread starts: the policy is read without locks afterwards.
+    if (redact) @import("redact.zig").enable();
     const preferences = if (config_path) |path| @import("preferences.zig").load(a, path) catch |err| {
         log.err(.session, "xodb: preferences failed: {s}; {s}\n", .{ @errorName(err), path });
         if (err == error.InvalidImageBudget) log.err(.session, "xodb: symbols.image_bytes and symbols.image_total_bytes take bytes from {d} to {d}\n", .{ snapshot.min_limit, snapshot.max_limit });
@@ -349,6 +365,7 @@ pub fn main(init: std.process.Init) !void {
     inline for (@typeInfo(@TypeOf(languages)).@"struct".fields) |field| @field(languages, field.name) = @field(languages, field.name) and @field(languages_off, field.name);
     // The command line wins over the config file; both were range-checked.
     try snapshot.configure(image_limit orelse preferences.symbols.image_bytes, image_total_limit orelse preferences.symbols.image_total_bytes);
+    if (static_decompile) |path| return @import("semq/static_image.zig").decompile(a, path, static_function);
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
     try @import("target/runtime.zig").saveLaunchSignals();
     _ = c.signal(c.SIGINT, onSignal);
@@ -372,6 +389,7 @@ pub fn main(init: std.process.Init) !void {
                 }
                 if (source) |path| try remote_args.appendSlice(a, &.{ "--source", path });
                 if (!ghidra_prestart) try remote_args.append(a, "--no-ghidra-prestart");
+                if (redact) try remote_args.append(a, "--redact");
                 for (debug_dirs.items) |path| try remote_args.appendSlice(a, &.{ "--debug-dir", path });
                 for (source_maps.items) |spec| try remote_args.appendSlice(a, &.{ "--source-map", spec });
                 for (debug_files.items) |path| try remote_args.appendSlice(a, &.{ "--debug-file", path });
@@ -503,6 +521,9 @@ pub fn main(init: std.process.Init) !void {
     }
     const server = try a.create(Server);
     server.* = .{ .source_path = source, .overview_shared = if (shared) |*endpoint| endpoint.collector() else null };
+    // --redact: the system tools (processes, connections, fds, memory maps)
+    // also apply the overview's own rules: other accounts, command lines.
+    if (redact) (server.overview_shared orelse &server.overview).redact = true;
     if (listen != null) {
         server.input_fd = connection.fd;
         server.output_fd = connection.fd;
@@ -567,7 +588,7 @@ pub fn main(init: std.process.Init) !void {
         defer font.deinit();
         var workspaces: [@import("model/process_tree.zig").maximum]?*Workspace = @splat(null);
         workspaces[0] = try a.create(Workspace);
-        workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
+        workspaces[0].?.* = .{ .density = preferences.appearance.density, .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
         var workspace = workspaces[0].?;
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
@@ -641,7 +662,7 @@ pub fn main(init: std.process.Init) !void {
                     entry.* = null;
                 };
                 workspaces[0] = first_workspace;
-                workspaces[0].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
+                workspaces[0].?.* = .{ .density = preferences.appearance.density, .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
                 session.* = Session.init();
                 remote_destroyed = false;
                 session.persistent.cancel = &quitting;
@@ -696,7 +717,7 @@ pub fn main(init: std.process.Init) !void {
             const active = tree.active();
             if (workspaces[tree.selected] == null) {
                 workspaces[tree.selected] = try a.create(Workspace);
-                workspaces[tree.selected].?.* = .{ .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
+                workspaces[tree.selected].?.* = .{ .density = preferences.appearance.density, .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
             }
             workspace = workspaces[tree.selected].?;
             if (active.process_id != last_process) {
@@ -1138,6 +1159,8 @@ fn vkList() !void {
 fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: *Window, context: anytype) !bool {
     var started = linux.now();
     _ = try font.setScale(window.scale());
+    workspace.updateLayout(window);
+    try font.setUiSize(if (workspace.compact) @import("look.zig").compact.font else @import("look.zig").normal.font);
     if (!try renderer.begin(window.width, window.height, window.scale())) return false;
     reportSlow("Vulkan frame begin", started);
     started = linux.now();
@@ -1182,6 +1205,7 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8) !void
 
 test {
     std.testing.refAllDecls(@import("redot/protocol.zig"));
+    std.testing.refAllDecls(@import("redact.zig"));
     std.testing.refAllDecls(@import("appearance.zig"));
     std.testing.refAllDecls(@import("remote/transport.zig"));
     std.testing.refAllDecls(@import("remote/client.zig"));

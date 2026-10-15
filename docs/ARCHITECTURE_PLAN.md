@@ -99,6 +99,16 @@ the better one (review 1.1). Plan:
 | One preferences schema, generated docs and validation | Preferences grew per feature. |
 | "not present / needs privilege / not supported" as one shared type | The overview showed one phrase for three situations. |
 
+Every process xodb starts must record its owner, teardown path, and independent
+exit rule at the launch site. A detached shared service such as the Ghidra JVM
+uses a validated session-held connection plus idle/orphaned-endpoint exit;
+per-session workers and agents are joined, reaped, or terminated by that
+session. On every connection the parent checks an explicit protocol version,
+producer version and required capabilities before sending state. A mismatch is
+a typed refusal or one bounded replacement attempt, never an assumption that a
+new option is understood. New agent and remote-xodb transports follow this
+rule as their launch paths move behind the owner.
+
 ## 4. View layer for agents (concept)
 
 Goal: an agent can put a purpose-built view on screen for the question at hand,

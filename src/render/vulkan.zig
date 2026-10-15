@@ -1,4 +1,5 @@
 const std = @import("std");
+const redact = @import("../redact.zig");
 const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 const Window = @import("../platform/window.zig").Window;
@@ -945,7 +946,11 @@ pub const Renderer = struct {
         try self.quad(r, .{ .x = @as(f32, 0.5) / fonts.atlas_size, .y = @as(f32, 0.5) / fonts.atlas_size, .w = 0, .h = 0 }, color);
     }
     const Run = struct { glyphs: [*c]c.hb_glyph_info_t, positions: [*c]c.hb_glyph_position_t, count: u32 };
-    fn shapeRun(font: *fonts.Font, str: []const u8) Run {
+    /// --redact: drawn and measured text is scrubbed here, below every pane.
+    /// HarfBuzz copies the text, so one scratch buffer serves every call.
+    var redact_scratch: [16384]u8 = undefined;
+    fn shapeRun(font: *fonts.Font, given: []const u8) Run {
+        const str = if (redact.active()) |policy| policy.scrubInto(&redact_scratch, given) else given;
         c.hb_buffer_reset(font.buffer);
         c.hb_buffer_add_utf8(font.buffer, str.ptr, @intCast(str.len), 0, @intCast(str.len));
         c.hb_buffer_guess_segment_properties(font.buffer);
@@ -985,6 +990,32 @@ pub const Renderer = struct {
         const run = shapeRun(font, str);
         var pen = x;
         for (0..run.count) |i| pen = try self.glyphAt(font, run.glyphs[i].codepoint, run.positions[i], pen, y, color);
+    }
+    /// Word wrapping in a bounded cell. Only an overlong word or the last
+    /// available line is elided; textFit supplies its visible ellipsis.
+    pub fn textWrap(self: *Renderer, font: *fonts.Font, cell: Rect, str: []const u8, color: Color) !void {
+        const step = font.ui_size + 6;
+        var rest = std.mem.trim(u8, str, " \n");
+        var y = cell.y;
+        while (rest.len > 0 and y + font.ui_size <= cell.y + cell.h) : (y += step) {
+            if (y + step + font.ui_size > cell.y + cell.h or self.measure(font, rest) <= cell.w) {
+                try self.textFit(font, cell.x, y, cell.w, rest, color);
+                break;
+            }
+            var line_end: usize = 0;
+            var words = std.mem.tokenizeAny(u8, rest, " \n");
+            while (words.next()) |word| {
+                const next = @intFromPtr(word.ptr) - @intFromPtr(rest.ptr) + word.len;
+                if (self.measure(font, rest[0..next]) > cell.w) {
+                    if (line_end == 0) line_end = next;
+                    break;
+                }
+                line_end = next;
+            }
+            if (line_end == 0) break;
+            try self.textFit(font, cell.x, y, cell.w, rest[0..line_end], color);
+            rest = std.mem.trimStart(u8, rest[line_end..], " \n");
+        }
     }
     /// Advance width of `str` in pixels.
     pub fn measure(_: *Renderer, font: *fonts.Font, str: []const u8) f32 {

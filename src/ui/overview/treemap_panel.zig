@@ -46,7 +46,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     var failure: [320]u8 = undefined;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, "Descriptor path treemap · area = open handles", ctx.p.text);
     const banner: []const u8 = if (state.flow_running) system.graph_cost else if (v.paused) "PAUSED · tracing stopped" else if (!state.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (state.flow_status != c.XRT_OK and state.flow_status != c.XRT_STALE_SNAPSHOT)
-        std.fmt.bufPrint(&b, "POLLING · {s} · E off/on retries", .{system.failureText(&failure, state.failure)}) catch "POLLING · tracing unavailable"
+        std.fmt.bufPrint(&b, "POLLING · E off/on retries · {s}", .{system.failureText(&failure, state.failure)}) catch "POLLING · tracing unavailable"
     else
         "Starting live syscall tracing (~11% host cost) · E to stop";
     try ctx.textFit(rect.x + 8, rect.y + 30, rect.w - 16, banner, ctx.p.warn);
@@ -109,5 +109,5 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     }
     ctx.r.clip = clip;
     if (layout.count == 0) try ctx.textFit(body.x + 8, body.y + 8, body.w - 16, "No descriptors represented at this path", ctx.p.dim);
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 26, rect.w - 16, "Click to zoom · Backspace up · Esc root · +/- tile limit · E tracing · P pause", ctx.p.dim);
+    try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 26, .w = rect.w - 16, .h = 20 }, "Click to zoom · Backspace up · Esc root · +/- tile limit · E tracing · P pause", ctx.p.dim);
 }

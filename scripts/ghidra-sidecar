@@ -18,14 +18,18 @@ ctl=$script_dir/helpers/ghidra_sidecar_ctl.py
 uid=$(id -u)
 runtime_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}/xodb-$uid}
 socket=${XODB_GHIDRA_SOCKET:-$runtime_dir/.xodb.ghidra.s}
+socket_dir=$(dirname -- "$socket")
 lock=$socket.lock
 cache_dir=${XODB_GHIDRA_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/xodb/ghidra-sidecar}
 state_dir=${XODB_GHIDRA_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/xodb/ghidra-sidecar}
 log=$state_dir/sidecar.log
 pid_file=$state_dir/sidecar.pid
 
-mkdir -p -- "$runtime_dir" "$cache_dir" "$state_dir"
+socket_dir_existed=0
+[[ -d $socket_dir ]] && socket_dir_existed=1
+mkdir -p -- "$runtime_dir" "$socket_dir" "$cache_dir" "$state_dir"
 chmod 0700 -- "$runtime_dir" "$cache_dir" "$state_dir"
+(( socket_dir_existed )) || chmod 0700 -- "$socket_dir"
 
 hello() {
     "$ctl" hello "$socket" --timeout 2 2>/dev/null
@@ -125,7 +129,9 @@ fi
 
 ghidra_home=${XODB_GHIDRA_HOME:-${GHIDRA_HOME:-}}
 if [[ -z $ghidra_home ]]; then
-    if command -v analyzeHeadless >/dev/null 2>&1; then
+    if [[ -x /opt/ghidra/support/analyzeHeadless ]]; then
+        ghidra_home=/opt/ghidra
+    elif command -v analyzeHeadless >/dev/null 2>&1; then
         ghidra_home=$(CDPATH= cd -- "$(dirname -- "$(command -v analyzeHeadless)")/.." && pwd)
     else
         echo "ghidra-sidecar: Ghidra is missing; set GHIDRA_HOME or XODB_GHIDRA_HOME" >&2
@@ -142,6 +148,9 @@ java=${JAVA_HOME:+$JAVA_HOME/bin/}java
 javac=${JAVA_HOME:+$JAVA_HOME/bin/}javac
 command -v "$java" >/dev/null 2>&1 || { echo "ghidra-sidecar: JDK is missing; set JAVA_HOME or put java on PATH" >&2; exit 4; }
 command -v "$javac" >/dev/null 2>&1 || { echo "ghidra-sidecar: JDK compiler is missing; set JAVA_HOME or put javac on PATH" >&2; exit 4; }
+java=$(command -v "$java")
+javac=$(command -v "$javac")
+echo "ghidra-sidecar: using Ghidra $ghidra_home; JDK java $java; javac $javac" >>"$log"
 
 classpath_file=$cache_dir/classpath
 find "$ghidra_home" -type f -name '*.jar' -print | LC_ALL=C sort | paste -sd: - >"$classpath_file.tmp"

@@ -84,6 +84,7 @@ fn menuBar(v: *View, ctx: Ctx) !void {
 pub fn chrome(v: *View, ctx: Ctx) !Rect {
     const w = v.width;
     const h = v.height;
+    const extra_footer: f32 = if (w < @import("../../look.zig").overview.small_width) 24 else 0;
     try ctx.r.rect(.{ .x = 0, .y = 0, .w = w, .h = h }, rgb(0x008080));
     if (w < 64 or h < 100) return .{ .x = 0, .y = 0, .w = 0, .h = 0 };
     const frame = Rect{ .x = 6, .y = 6, .w = w - 12, .h = h - 50 };
@@ -104,20 +105,20 @@ pub fn chrome(v: *View, ctx: Ctx) !Rect {
     try menuBar(v, ctx);
     const nav_w: f32 = if (w >= 760) 180 else 0;
     if (nav_w > 0) {
-        const nav = Rect{ .x = 12, .y = 70, .w = nav_w, .h = @max(0, h - 146) };
+        const nav = Rect{ .x = 12, .y = 70, .w = nav_w, .h = @max(0, h - 146 - extra_footer) };
         try ctx.bevel(nav, true);
         const row_h = @min(29, @floor((nav.h - 8) / vw.panel_count));
         if (row_h >= 20) for (vw.titles, 0..) |label, i| {
             const rect = Rect{ .x = nav.x + 5, .y = nav.y + 4 + @as(f32, @floatFromInt(i)) * row_h, .w = nav.w - 10, .h = row_h - 2 };
             const panel: vw.Panel = @enumFromInt(i);
-            try control(v, ctx, rect, label, v.panel == panel, .{ .panel = panel });
+            try control(v, ctx, rect, if (ctx.measure(label) + 20 > rect.w) vw.shortTitle(panel) else label, v.panel == panel, .{ .panel = panel });
             v.hover(rect, "Open {s}", .{label});
         };
     }
     const x = nav_w + 20;
     // Property-sheet tab and its raised page edge.
     const tab = Rect{ .x = x, .y = 66, .w = @min(w - x - 16, ctx.measure(vw.titles[@intFromEnum(v.panel)]) + 30), .h = 27 };
-    try ctx.bevel(.{ .x = x, .y = 90, .w = @max(0, w - x - 14), .h = @max(0, h - 164) }, false);
+    try ctx.bevel(.{ .x = x, .y = 90, .w = @max(0, w - x - 14), .h = @max(0, h - 164 - extra_footer) }, false);
     try ctx.bevel(tab, false);
     try ctx.r.rect(.{ .x = tab.x + 2, .y = tab.y + tab.h - 2, .w = @max(0, tab.w - 4), .h = 4 }, ctx.p.panel);
     try ctx.textFit(tab.x + 12, tab.y + 4, tab.w - 24, vw.titles[@intFromEnum(v.panel)], ctx.p.text);
@@ -151,7 +152,7 @@ pub fn chrome(v: *View, ctx: Ctx) !Rect {
         try ctx.textFit(tray.x + 8, tray.y + 5, tray.w - 100, meters, ctx.p.text);
     }
     v.hover(tray, "Host CPU / memory utilization; current clock in UTC", .{});
-    return .{ .x = x + 8, .y = 100, .w = @max(0, w - x - 30), .h = @max(0, h - 182) };
+    return .{ .x = x + 8, .y = 100, .w = @max(0, w - x - 30), .h = @max(0, h - 182 - extra_footer) };
 }
 
 /// Short pull-downs keep full-height text and page the items, with visible

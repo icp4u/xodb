@@ -70,6 +70,8 @@ pub fn call(a: Allocator, session_stream: ?*evidence.Stream, name: []const u8, a
             if (filter.protocol == null) return error.InvalidArguments;
         }
         const include_raw = try boolean(args, "include_raw") orelse false;
+        // Payload bytes cannot be redacted, only withheld.
+        if (include_raw and @import("../redact.zig").active() != null) return error.RawPayloadRedacted;
         const limit = try number(args, "limit") orelse 64;
         if (limit == 0 or limit > 256) return error.InvalidArguments;
         const start = try number(args, "start") orelse 0;
@@ -118,7 +120,7 @@ pub fn call(a: Allocator, session_stream: ?*evidence.Stream, name: []const u8, a
         } else try out.object.put(a, "process", if (join.socket) |sock| try value(a, .{ .pid = sock.pid, .comm = @as(?[]const u8, null) }) else .null);
         if (join.socket) |sock| {
             var text: [2][64]u8 = undefined;
-            try out.object.put(a, "socket", try value(a, .{ .fd = sock.fd, .inode = sock.inode, .protocol = @tagName(sock.protocol), .family = @tagName(sock.family), .local = decode.formatAddress(&text[0], sock.family, sock.local), .local_port = sock.local_port, .remote = decode.formatAddress(&text[1], sock.family, sock.remote), .remote_port = sock.remote_port, .state = sock.state }));
+            try out.object.put(a, "socket", try value(a, .{ .fd = sock.fd, .inode = sock.inode, .protocol = @tagName(sock.protocol), .family = @tagName(sock.family), .local = evidence.sockets.formatEnd(&text[0], sock.family, sock.local, sock.local_tagged), .local_port = sock.local_port, .remote = evidence.sockets.formatEnd(&text[1], sock.family, sock.remote, sock.remote_tagged), .remote_port = sock.remote_port, .state = sock.state }));
             const table = s.context.?.tables[join.table.?];
             try out.object.put(a, "table", try value(a, .{ .when = @tagName(table.when), .sampled_ns = table.sampled_ns }));
         } else {
@@ -176,7 +178,7 @@ fn describe(a: Allocator, s: *evidence.Stream) !Value {
             .declared_by = "pcap/pcapng file format: seconds since the Unix epoch (CLOCK_REALTIME of the capturing host)",
             .mapping = .{ .state = @tagName(m.state), .to = "CLOCK_MONOTONIC of the opened capture archive", .offset_ns = if (m.state == .aligned) std.math.cast(i64, m.offset_ns) else null, .uncertainty_ns = if (m.state == .aligned) @as(?u64, m.uncertainty_ns) else null, .pairs = m.pairs, .spread_ns = m.spread_ns, .reason = m.reason },
         },
-        .context = .{ .present = s.context != null, .capture_pid = if (s.context) |ctx| @as(?i32, ctx.pid) else null, .capture_started_ns = if (s.context) |ctx| @as(?u64, ctx.capture_started_ns) else null },
+        .context = .{ .present = s.context != null, .redacted = if (s.context) |ctx| ctx.redacted else false, .capture_pid = if (s.context) |ctx| @as(?i32, ctx.pid) else null, .capture_started_ns = if (s.context) |ctx| @as(?u64, ctx.capture_started_ns) else null },
     });
     try out.object.put(a, "interfaces", .{ .array = interfaces });
     try out.object.getPtr("context").?.object.put(a, "tables", .{ .array = tables });

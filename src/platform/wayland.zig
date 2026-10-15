@@ -100,6 +100,7 @@ pub const Window = struct {
     scroll_remainder: i32 = 0,
     /// Explicit CLI/config choice. Null follows the compositor.
     scale_override: ?f32 = null,
+    minimum_ui: [2]i32 = .{ @import("../look.zig").minimum.width, @import("../look.zig").minimum.height },
     effective_scale: f32 = 1,
     traced_reported_scale: f32 = 0,
 
@@ -133,7 +134,7 @@ pub const Window = struct {
         _ = c.xdg_toplevel_add_listener(self.top, &top_listener, self);
         c.xdg_toplevel_set_title(self.top, "xodb — hugs and kisses debugger");
         c.xdg_toplevel_set_app_id(self.top, "xodb");
-        c.xdg_toplevel_set_min_size(self.top, 720, 480);
+        self.setMinSize(@import("../look.zig").minimum.width, @import("../look.zig").minimum.height);
         // Negotiate before the first commit: the compositor owns the native
         // title bar, including move, resize, minimize, maximize and close,
         // unless the content draws a frame of its own.
@@ -233,7 +234,8 @@ pub const Window = struct {
         if (self.top) |top| c.xdg_toplevel_set_app_id(top, id);
     }
     pub fn setMinSize(self: *Window, width: i32, height: i32) void {
-        if (self.top) |top| c.xdg_toplevel_set_min_size(top, width, height);
+        self.minimum_ui = .{ width, height };
+        if (self.top) |top| c.xdg_toplevel_set_min_size(top, platform.minimumSurface(width, self.scale(), self.backing_scale), platform.minimumSurface(height, self.scale(), self.backing_scale));
     }
     pub fn minimize(self: *Window) void {
         if (self.top) |top| c.xdg_toplevel_set_minimized(top);
@@ -310,6 +312,7 @@ pub const Window = struct {
         const pixels = self.bufferExtent();
         self.width = platform.uiExtent(pixels.width, ui_scale);
         self.height = platform.uiExtent(pixels.height, ui_scale);
+        if (changed) self.setMinSize(self.minimum_ui[0], self.minimum_ui[1]);
         if (self.input.trace and (self.traced_reported_scale == 0 or changed or @abs(reported - self.traced_reported_scale) >= 0.001)) {
             log.info(.window, "ui scale effective={d:.2} compositor={d:.2} override={s}\n", .{ ui_scale, reported, if (self.scale_override != null) "yes" else "no" });
             self.traced_reported_scale = reported;

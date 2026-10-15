@@ -9,6 +9,7 @@ const std = @import("std");
 const c = @import("../c.zig").api;
 const sockets = @import("../evidence/sockets.zig");
 const clock = @import("../evidence/clock.zig");
+const redact = @import("../redact.zig");
 
 pub const Recorder = struct {
     arena: std.heap.ArenaAllocator,
@@ -37,11 +38,47 @@ pub const Recorder = struct {
             self.table_count += 1;
         }
     }
-    /// The ECTX payload, allocated with `a`.
-    pub fn encode(self: *const Recorder, a: std.mem.Allocator) ![]u8 {
-        return sockets.encode(a, .{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count] });
+    /// The ECTX payload, allocated with `a`; redacted under `policy` (the
+    /// archive's own key).
+    pub fn encode(self: *const Recorder, a: std.mem.Allocator, policy: ?*const redact.Policy) ![]u8 {
+        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count] };
+        const p = policy orelse return sockets.encode(a, ctx);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        return sockets.encode(a, try redacted(arena.allocator(), ctx, p));
     }
 };
+
+/// A copy of `ctx` for a shared archive: addresses outside loopback and the
+/// documentation ranges become tags under `policy`'s key (one per archive,
+/// never stored: stable within the archive, unlinkable across archives) and
+/// process names are masked. Allocates in `a` (an arena).
+pub fn redacted(a: std.mem.Allocator, ctx: sockets.Context, policy: *const redact.Policy) !sockets.Context {
+    const tables = try a.alloc(sockets.Table, ctx.tables.len);
+    for (ctx.tables, tables) |t, *out| {
+        const processes = try a.dupe(sockets.Process, t.processes);
+        for (processes) |*p| policy.mask(&p.comm);
+        const socks = try a.dupe(sockets.Socket, t.sockets);
+        for (socks) |*sock| {
+            const v6 = sock.family == .ipv6;
+            if (!sock.local_tagged and redact.privateAddress(v6, sock.local)) {
+                sock.local = policy.tag16("ip", &sock.local);
+                sock.local_tagged = true;
+            }
+            if (!sock.remote_tagged and redact.privateAddress(v6, sock.remote)) {
+                sock.remote = policy.tag16("ip", &sock.remote);
+                sock.remote_tagged = true;
+            }
+        }
+        out.* = t;
+        out.processes = processes;
+        out.sockets = socks;
+    }
+    var copy = ctx;
+    copy.tables = tables;
+    copy.redacted = true;
+    return copy;
+}
 
 fn now(id: c_int) u64 {
     var ts: c.struct_timespec = undefined;
@@ -152,4 +189,35 @@ test "records this process's own loopback socket" {
     try std.testing.expect(found);
     const p = pair();
     try std.testing.expect(p.monotonic_after_ns >= p.monotonic_before_ns);
+}
+
+test "redacted context: private ends tagged with the archive key, loopback and names" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const decode = @import("../evidence/decode.zig");
+    const lo = decode.v4(127, 0, 0, 1);
+    const lan = decode.v4(10, 20, 30, 40);
+    const peer = decode.v4(172, 16, 9, 9);
+    var comm: [16]u8 = @splat(0);
+    @memcpy(comm[0..10], "zed-client");
+    const socks = [_]sockets.Socket{
+        .{ .pid = 7, .fd = 3, .inode = 11, .protocol = .tcp, .family = .ipv4, .local = lo, .local_port = 1, .remote = lo, .remote_port = 2, .state = 1 },
+        .{ .pid = 7, .fd = 4, .inode = 12, .protocol = .tcp, .family = .ipv4, .local = lan, .local_port = 3, .remote = peer, .remote_port = 443, .state = 1 },
+    };
+    const tables = [_]sockets.Table{.{ .when = .stop, .sampled_ns = 2_000, .processes = &.{.{ .pid = 7, .comm = comm }}, .sockets = &socks }};
+    const ctx = sockets.Context{ .capture_started_ns = 1_000, .pid = 7, .pairs = &.{}, .tables = &tables };
+    var policy = redact.Policy.init(@splat(3));
+    policy.add(.user, "zed");
+    const bytes = try sockets.encode(a, try redacted(arena.allocator(), ctx, &policy));
+    defer a.free(bytes);
+    try std.testing.expect(std.mem.indexOf(u8, bytes, lan[0..4]) == null and std.mem.indexOf(u8, bytes, peer[0..4]) == null and std.mem.indexOf(u8, bytes, "zed") == null);
+    const back = try sockets.decodeContext(arena.allocator(), bytes);
+    const s = back.tables[0].sockets;
+    try std.testing.expect(back.redacted and !s[0].local_tagged and s[1].local_tagged and s[1].remote_tagged);
+    try std.testing.expectEqualSlices(u8, &lo, &s[0].local);
+    try std.testing.expectEqualSlices(u8, &policy.tag16("ip", &peer), &s[1].remote);
+    // Another archive, another key: the same peer is not linkable.
+    const other = policy.rekeyed(@splat(4));
+    try std.testing.expect(!std.mem.eql(u8, &other.tag16("ip", &peer), &s[1].remote));
 }

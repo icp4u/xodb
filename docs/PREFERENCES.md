@@ -36,6 +36,7 @@ and pass its path. This keeps location, merging and persistence choices open.
 | wine.hide_internal_threads | false | Hide advisory Wine internal thread names in the GUI; selected and faulting threads stay visible, and MCP still lists every thread |
 | appearance.theme | builtin:dark | GUI theme preset or file relative to these preferences; CLI --theme wins |
 | appearance.ui_scale | compositor | Device pixels per UI unit, 0.5–4; CLI `--ui-scale` wins, and omitting both follows the window system |
+| appearance.density | `"auto"` | Debugger spacing and text size: `"auto"`, `"normal"`, or `"compact"`; Ctrl+Shift+D cycles for this window |
 | profile.duration_ms | 60000 | Wall-clock deadline in milliseconds; 0 means until stopped |
 | profile.frequency_hz | 99 | Requested user CPU sample rate per selected thread, 1–1000 Hz |
 | profile.sample_limit | 16384 | Maximum retained samples, 1–65536; the independent 32 MiB sample store may fill earlier |
@@ -91,6 +92,13 @@ updates when the window moves between outputs. Use `--ui-scale N` for a one-run
 override; the same option and preference work in `--overview` and remote GUI
 windows. A scale change re-rasterizes scalable fonts; the Win95 bitmap face is
 kept at its native raster and enlarged cleanly.
+
+Debugger density is independent of UI scale. Normal uses a 16-unit font;
+compact uses 14 units and tighter toolbar/list spacing. Auto enters compact
+below 960 UI units wide and returns to normal at 1040, so resizing near the
+threshold does not oscillate. The key changes this window only, not the file.
+The minimum window request is 640×400 UI units, converted to native surface
+units at the current UI and backing scales.
 
 ## Defaults and active captures
 

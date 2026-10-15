@@ -41,7 +41,8 @@ pub const Panel = struct {
         self.prepare(threads, labels, selected);
         const heading: f32 = if (self.hide_internal) 20 else 0;
         if (y < rect.y + heading) return null;
-        const visible: usize = @intFromFloat(@max(1, (rect.h - heading) / 39));
+        const visible: usize = @intFromFloat(@max(0, (rect.h - heading) / 39));
+        if (visible == 0 or self.count == 0) return null;
         const at = std.mem.indexOfScalar(usize, self.rows[0..self.count], selected) orelse 0;
         const first = (at + 1) -| visible;
         const row: usize = @intFromFloat((y - rect.y - heading) / 39);
@@ -57,7 +58,8 @@ pub const Panel = struct {
             const count = std.fmt.bufPrint(&buffer, "{d} hidden / H show", .{self.hidden}) catch "Hidden threads";
             try renderer.textFit(font, rect.x + 8, rect.y, rect.w - 16, count, style.theme.weak);
         }
-        const visible: usize = @intFromFloat(@max(1, (rect.h - heading) / 39));
+        const visible: usize = @intFromFloat(@max(0, (rect.h - heading) / 39));
+        if (visible == 0 or self.count == 0) return;
         const at = std.mem.indexOfScalar(usize, self.rows[0..self.count], selected) orelse 0;
         const first = (at + 1) -| visible;
         for (self.rows[first..@min(self.count, first + visible)], 0..) |index, offset| {
@@ -66,8 +68,11 @@ pub const Panel = struct {
             const y = rect.y + heading + @as(f32, @floatFromInt(offset)) * 39;
             if (index == selected) try style.focus(renderer, .{ .x = rect.x, .y = y - 2, .w = rect.w, .h = 38 }, 5, 1);
             const text = if (row) |name| if (name.readable) name.text() else if (index == 0) "main" else "" else "";
-            const title = std.fmt.bufPrint(&buffer, "{d}{s}{s}{s}", .{ thread.tid, if (text.len > 0) " " else "", text, if (row != null and row.?.possibly_truncated) "~" else "" }) catch "";
-            try renderer.textFit(font, rect.x + 8, y, rect.w - 16, title, if (index == selected) style.theme.text else style.theme.weak);
+            const id = std.fmt.bufPrint(&buffer, "{d}", .{thread.tid}) catch "";
+            const id_width = renderer.measure(font, id);
+            try renderer.text(font, rect.x + 8, y, id, if (index == selected) style.theme.text else style.theme.weak);
+            const title = std.fmt.bufPrint(&buffer, "{s}{s}", .{ text, if (row != null and row.?.possibly_truncated) "~" else "" }) catch "";
+            try renderer.textFit(font, rect.x + 16 + id_width, y, rect.w - 24 - id_width, title, if (index == selected) style.theme.text else style.theme.weak);
             const state = if (thread.reason != .none and thread.state == .stopped) @tagName(thread.reason) else @tagName(thread.state);
             const detail = if (row != null and row.?.dispatch_queue != null)
                 std.fmt.bufPrint(&buffer, "{s} / queue 0x{x}", .{ state, row.?.dispatch_queue.? }) catch state

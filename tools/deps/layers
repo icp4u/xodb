@@ -10,6 +10,9 @@ src/startup.zig           root
 
 # shared leaves
 src/log.zig               common
+src/redact.zig            common
+src/look.zig              common
+src/layout_snapshot.zig   common
 src/text.h                common
 src/c.zig                 c_engine   # C seen by the debug engine (@cImport)
 src/c_ui.zig              c_ui       # C seen by rendering, platform and UI code

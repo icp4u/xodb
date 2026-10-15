@@ -23,6 +23,10 @@ pub const Socket = struct {
     remote_port: u16,
     /// Kernel socket state as /proc/net prints it (TCP: 1 established, 10 listen; UDP: 7 unconnected, 1 connected).
     state: u8,
+    /// Written under --redact: the address is a keyed tag (src/redact.zig `tag16`)
+    /// whose key was never stored. It matches no packet.
+    local_tagged: bool = false,
+    remote_tagged: bool = false,
 
     pub fn connected(self: Socket) bool {
         return self.remote_port != 0 and !std.mem.allEqual(u8, &self.remote, 0);
@@ -51,6 +55,8 @@ pub const Context = struct {
     pid: i32,
     pairs: []const clock.Pair,
     tables: []const Table,
+    /// Written under --redact (schema 2): private addresses are tags, names masked.
+    redacted: bool = false,
 
     pub fn mapping(self: *const Context) clock.Mapping {
         return clock.fromPairs(self.pairs);
@@ -151,11 +157,13 @@ pub fn correlate(ctx: *const Context, flow: decode.Flow, time: ?u64) Join {
     };
     var best = Join{};
     for (ctx.tables, 0..) |table, ti| for (table.sockets) |s| {
-        if (s.protocol != protocol or s.family != flow.family) continue;
+        // A tag (redacted archive) names no address a packet could carry.
+        if (s.protocol != protocol or s.family != flow.family or s.local_tagged) continue;
         for ([_]bool{ true, false }) |outbound| {
             const here = if (outbound) flow else flow.reversed();
             if (!sameAddress(s.local, here.src, s.family) or s.local_port != here.src_port) continue;
             if (s.connected()) {
+                if (s.remote_tagged) continue;
                 if (!std.mem.eql(u8, &s.remote, &here.dst) or s.remote_port != here.dst_port) continue;
                 const within = if (time) |t| heldAt(ctx, s, t) else false;
                 const basis: Basis = if (within) .exact else .sampled;
@@ -204,6 +212,14 @@ fn slack(ctx: *const Context) u64 {
 // ------------------------------------------------------------- ECTX encoding
 
 pub const schema: u8 = 1;
+/// Schema 2: redacted; each socket carries a byte saying which ends are tags.
+pub const schema_redacted: u8 = 2;
+
+/// An address for display: a tag prints as ip-XXXXXXXX (its first 4 bytes).
+pub fn formatEnd(buf: *[64]u8, family: decode.Family, addr: [16]u8, tagged: bool) []const u8 {
+    if (!tagged) return decode.formatAddress(buf, family, addr);
+    return std.fmt.bufPrint(buf, "ip-{s}", .{&std.fmt.bytesToHex(addr[0..4].*, .lower)}) catch unreachable;
+}
 pub const max_bytes = 16 * 1024 * 1024;
 
 pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
@@ -217,7 +233,7 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try o.appendSlice(al, &buf);
         }
     };
-    try out.append(a, schema);
+    try out.append(a, if (ctx.redacted) schema_redacted else schema);
     try W.int(&out, a, u64, ctx.capture_started_ns);
     try W.int(&out, a, i32, ctx.pid);
     try out.append(a, @intCast(ctx.pairs.len));
@@ -246,6 +262,7 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try out.appendSlice(a, &s.remote);
             try W.int(&out, a, u16, s.remote_port);
             try out.append(a, s.state);
+            if (ctx.redacted) try out.append(a, @as(u8, @intFromBool(s.local_tagged)) | @as(u8, @intFromBool(s.remote_tagged)) << 1);
         }
     }
     return out.toOwnedSlice(a);
@@ -255,7 +272,9 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
 pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
     if (bytes.len > max_bytes) return error.EvidenceContextLimit;
     var r = Reader{ .bytes = bytes };
-    if (try r.byte() != schema) return error.EvidenceContextSchema;
+    const version = try r.byte();
+    if (version != schema and version != schema_redacted) return error.EvidenceContextSchema;
+    const is_redacted = version == schema_redacted;
     const started = try r.int(u64);
     const pid = try r.int(i32);
     const pair_count = try r.byte();
@@ -282,7 +301,7 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
             p.comm = (try r.take(16))[0..16].*;
         }
         const sc = try r.int(u32);
-        if (sc > max_sockets or sc * 55 > r.left()) return error.EvidenceContextLimit;
+        if (sc > max_sockets or sc * @as(usize, if (is_redacted) 56 else 55) > r.left()) return error.EvidenceContextLimit;
         const sockets = try a.alloc(Socket, sc);
         for (sockets) |*s| {
             s.pid = try r.int(i32);
@@ -296,11 +315,19 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
             s.remote = (try r.take(16))[0..16].*;
             s.remote_port = try r.int(u16);
             s.state = try r.byte();
+            s.local_tagged = false;
+            s.remote_tagged = false;
+            if (is_redacted) {
+                const tags = try r.byte();
+                if (tags > 3) return error.EvidenceContextValue;
+                s.local_tagged = tags & 1 != 0;
+                s.remote_tagged = tags & 2 != 0;
+            }
         }
         t.* = .{ .when = when, .sampled_ns = sampled, .unreadable = unreadable, .truncated = truncated, .processes = processes, .sockets = sockets };
     }
     if (r.left() != 0) return error.EvidenceContextTrailingBytes;
-    return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables };
+    return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables, .redacted = is_redacted };
 }
 const Reader = struct {
     bytes: []const u8,
@@ -421,4 +448,41 @@ test "ECTX round trip and validation" {
     const trailing = try std.mem.concat(a, u8, &.{ bytes, "x" });
     defer a.free(trailing);
     try std.testing.expectError(error.EvidenceContextTrailingBytes, decodeContext(arena.allocator(), trailing));
+}
+
+test "redacted ECTX: tagged ends round-trip and match no packet, loopback stays" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const lo = decode.v4(127, 0, 0, 1);
+    const lan = decode.v4(10, 20, 30, 40);
+    const peer = decode.v4(172, 16, 9, 9);
+    var tagged = Socket{ .pid = 7, .fd = 4, .inode = 12, .protocol = .tcp, .family = .ipv4, .local = lan, .local_port = 3, .remote = peer, .remote_port = 443, .state = 1 };
+    tagged.local_tagged = true;
+    tagged.remote_tagged = true;
+    const sockets = [_]Socket{
+        .{ .pid = 7, .fd = 3, .inode = 11, .protocol = .tcp, .family = .ipv4, .local = lo, .local_port = 1, .remote = lo, .remote_port = 2, .state = 1 },
+        tagged,
+    };
+    var ctx = testContext(&sockets, &.{.{ .pid = 7 }}, &.{.{ .monotonic_before_ns = 100, .realtime_ns = 10_000, .monotonic_after_ns = 102 }});
+    ctx.redacted = true;
+    const bytes = try encode(a, ctx);
+    defer a.free(bytes);
+    try std.testing.expectEqual(schema_redacted, bytes[0]);
+    const back = try decodeContext(arena.allocator(), bytes);
+    try std.testing.expect(back.redacted);
+    const s = back.tables[0].sockets;
+    try std.testing.expect(!s[0].local_tagged and !s[0].remote_tagged and s[1].local_tagged and s[1].remote_tagged);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("ip-ac100909", formatEnd(&buf, .ipv4, s[1].remote, true));
+    const loop = decode.Flow{ .family = .ipv4, .protocol = 6, .src = lo, .dst = lo, .src_port = 2, .dst_port = 1 };
+    try std.testing.expectEqual(Basis.exact, correlate(&back, loop, 2_001).basis);
+    // A packet that carries the tag's bytes is still not that socket.
+    const out = decode.Flow{ .family = .ipv4, .protocol = 6, .src = lan, .dst = peer, .src_port = 3, .dst_port = 443 };
+    try std.testing.expectEqual(Basis.none, correlate(&back, out, 2_001).basis);
+    for (0..bytes.len) |cut| try std.testing.expect(std.meta.isError(decodeContext(arena.allocator(), bytes[0..cut])));
+    var bad = try a.dupe(u8, bytes);
+    defer a.free(bad);
+    bad[bad.len - 1] = 4;
+    try std.testing.expectError(error.EvidenceContextValue, decodeContext(arena.allocator(), bad));
 }
