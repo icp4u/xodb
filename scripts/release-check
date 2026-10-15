@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
+    (('src/model/command.zig', 'src/model/commands.zig', 'src/service/authority.zig', 'src/mcp/commands.zig', 'tests/command-boundary.py'), ('command-boundary*', 'm1-control', 'm1-source', 'm1-stepping', 'run-control', 'breakpoint-policy', 'shared-sessions*', 'remote-owner-batches*', 'gui-run-control')),
     (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
@@ -491,7 +492,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('sysstat-nvml', [sys.executable, '-B', 'tests/nvml.py'], 30))
         steps.append(('repeated-break', [sys.executable, '-B', 'tests/repeated-break.py'], 180))
         for name in ('frame-host', 'frame-jvm', 'frame-archive', 'mcp', 'mcp-precision', 'mcp-modules', 'macho-mcp', 'mcp-list-pages', 'review-boundaries', 'm1-control', 'm1-source', 'm1-stepping',
-                     'breakpoint-policy', 'run-control', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
+                     'breakpoint-policy', 'run-control', 'command-boundary', 'memory-registers', 'memory-search-speed', 'memory-search-ranges', 'restart-pending', 'debug-discovery', 'optimized-info', 'composite-values', 'core-debugging',
                      'm2-profile', 'm2-mappings', 'm2-dynamic-threads', 'syscall-timing',
                      'm2-robustness', 'm2-sampled', 'm2-recorded-views',
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'ghidra-static-images', 'log-levels',
@@ -501,7 +502,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
-        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'memory-search-speed', 'memory-search-ranges', 'fork-release'):
+        for name in ('m2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-processes', 'command-boundary', 'memory-search-speed', 'memory-search-ranges', 'fork-release'):
             steps.append((name + '-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', f'tests/{name}.py'], 180))
         if uprobes:
             for name in ('observations-live', 'observation-recipes', 'observation-associations'):

@@ -1,5 +1,6 @@
 //! The xodbfetch panel's state and its left column: the distro logo (from
-//! the running system; its glow follows CPU load and the legend says so) and
+//! the running system, or redacted a retro system's ASCII logo; its glow
+//! follows CPU load and the legend says so) and
 //! the benchmarks. B runs them (CPU and memory on a thread, then scene3d on
 //! the GPU), Esc cancels. The card itself is drawn in panels.zig. This file
 //! does not import the view, so the view can own the state.
@@ -193,6 +194,20 @@ pub const State = struct {
                 const y: f32 = @floatFromInt(i / logo_cells);
                 out[k] = .{ .rect = .{ logo.x + x * cell, logo.y + y * cell, cell + 0.5, cell + 0.5 }, .fill = b, .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
                 k += 1;
+            };
+        } else if (self.static.?.madlib) |ml| {
+            // Redacted: the retro system's ASCII logo, one glyph per fixed cell
+            // so the art keeps its shape in a proportional face. Art, not text:
+            // drawn past the layout audit like the PNG cells.
+            const art = fetch.retro[ml.system].logo;
+            var cols: usize = 1;
+            for (art) |row| cols = @max(cols, row.len);
+            const pitch = @min(logo.w / @as(f32, @floatFromInt(cols)), ctx.measure("M"));
+            const row_h: f32 = 20;
+            const x0 = logo.x + (logo.w - pitch * @as(f32, @floatFromInt(cols))) / 2;
+            const y0 = logo.y + (logo.h - row_h * @as(f32, @floatFromInt(art.len))) / 2;
+            for (art, 0..) |row, r| for (row, 0..) |ch, k| if (ch != ' ') {
+                try ctx.r.text(ctx.font, @round(x0 + pitch * @as(f32, @floatFromInt(k))), @round(y0 + row_h * @as(f32, @floatFromInt(r))), row[k..][0..1], tint_);
             };
         } else {
             // No PNG logo: the distribution's name on its colour.

@@ -101,13 +101,22 @@ pub const Edit = union(enum) {
 };
 pub const Request = struct { key: Key, edit: Edit };
 pub const Outcome = enum { updated, removed, symbol_added };
+pub const Resolved = struct { operation: @import("command.zig").Operation, outcome: Outcome };
 pub fn apply(session: *model.Session, request: Request, actor: model.Actor) !Outcome {
+    if (actor != .human) return error.ExplicitCallerRequired;
+    const resolved = try resolve(session, request);
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    _ = try session.humanCommand(arena.allocator(), request.key.generation, resolved.operation);
+    return resolved.outcome;
+}
+/// Resolve an editor delta without side effects; the common command handler
+/// authorizes and performs the resulting complete policy operation.
+pub fn resolve(session: *model.Session, request: Request) !Resolved {
     const current = sessionKey(session);
     if (request.key.session != current.session or request.key.image != current.image or request.key.generation != current.generation) return error.StaleSnapshot;
     if (request.edit == .symbol) {
-        _ = try session.breakSymbol(request.edit.symbol);
-        session.record(actor, "set_breakpoint");
-        return .symbol_added;
+        return .{ .operation = .{ .breakpoint = .{ .symbol = request.edit.symbol } }, .outcome = .symbol_added };
     }
     const id = switch (request.edit) {
         .symbol => unreachable,
@@ -117,9 +126,7 @@ pub fn apply(session: *model.Session, request: Request, actor: model.Actor) !Out
     const probe = @import("persistent.zig").Manager.probe(session, id) orelse return error.UnknownBreakpoint;
     if (probe.internal) return error.InternalBreakpoint;
     if (request.edit == .remove) {
-        try session.target.removeBreakpoint(id);
-        session.record(actor, "remove_breakpoint");
-        return .removed;
+        return .{ .operation = .{ .breakpoint = .{ .remove = id } }, .outcome = .removed };
     }
     var enabled = probe.enabled;
     var options: policy.Options = if (session.probes.rule(id)) |rule| .{ .condition = rule.condition.slice(), .log_expression = rule.log_expression.slice(), .thread_id = rule.thread_id, .ignore_count = rule.ignore_remaining, .mode = rule.mode } else .{};
@@ -145,9 +152,7 @@ pub fn apply(session: *model.Session, request: Request, actor: model.Actor) !Out
             }
         },
     }
-    try session.probes.configure(&session.target, id, options, enabled);
-    session.record(actor, "configure_breakpoint");
-    return .updated;
+    return .{ .operation = .{ .breakpoint = .{ .policy = .{ .id = id, .enabled = enabled, .condition = options.condition, .log_expression = options.log_expression, .thread_id = options.thread_id, .ignore_count = options.ignore_count, .mode = @enumFromInt(@intFromEnum(options.mode)) } } }, .outcome = .updated };
 }
 
 test "breakpoint edits reject a changed session or stop before mutation" {

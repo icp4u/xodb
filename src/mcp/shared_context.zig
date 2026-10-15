@@ -6,18 +6,7 @@ const Value = std.json.Value;
 const Allocator = std.mem.Allocator;
 pub const definitions = @embedFile("session_tools.json");
 
-pub fn check(result: c.enum_xsvc_result) !void {
-    switch (result) {
-        c.XSVC_OK => {},
-        c.XSVC_BAD_REQUEST => return error.InvalidArguments,
-        c.XSVC_NO_CLIENT => return error.UnknownSessionClient,
-        c.XSVC_SCOPE_DENIED => return error.ScopeDenied,
-        c.XSVC_CONTROLLER_BUSY => return error.ControllerBusy,
-        c.XSVC_CONTROL_REQUIRED => return error.ControlLeaseRequired,
-        c.XSVC_LIMIT => return error.SessionLimit,
-        else => return error.SessionServiceFailed,
-    }
-}
+pub const check = @import("../service/authority.zig").check;
 const catalog = @import("tool_catalog.zig");
 pub const Access = catalog.Access;
 pub const access = catalog.access;
@@ -71,9 +60,7 @@ pub const Context = struct {
     }
     pub fn authorize(self: Context, mutate: bool) !void {
         // The C service is authoritative for both lease ownership and scope.
-        const result = c.xsvc_authorize(self.service, self.client_id, if (mutate) c.XSVC_MUTATE else c.XSVC_CONTROL, linux.now());
-        if (result == c.XSVC_SCOPE_DENIED) return error.AgentScopeDenied;
-        try check(result);
+        try @import("../service/authority.zig").authorize(self.service, self.client_id, mutate, linux.now());
     }
     pub fn visible(self: Context, required: Access) !bool {
         if (required == .observer or required == .lease) return true;

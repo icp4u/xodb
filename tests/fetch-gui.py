@@ -7,8 +7,11 @@ WM line names the private Sway that draws the panel (not the session's
 compositor), and OCR of the redacted screen shows none of this machine's
 private names, matched as src/redact.zig matches them. The title, OCR'd alone,
 reads user@host. A control run without --redact must read the real user@host
-and find a private name, so the check is proven able to see one. The
-benchmarks are never started here. Screenshots stay in .work.
+and find a private name, so the check is proven able to see one. Redacted,
+the card wears a mad-lib retro system (ASCII logo, OS, kernel) from the
+table in src/ui/overview/fetch.zig; every card has a Network line and no
+Mitigations line. The benchmarks are never started here. Screenshots stay
+in .work.
 """
 import importlib.util
 import json
@@ -102,6 +105,8 @@ if os.environ.get('HOME'): users.add(os.path.basename(os.environ['HOME'].rstrip(
 def names(group): return {n.lower() for n in group if len(n) >= 2 and n.lower() not in ('localhost', 'root')}
 users, hosts = names(users), names(hosts)
 private = users | hosts | {os.uname().release.lower()}
+RETRO = len(re.findall(r'\.os = "', (root / 'src/ui/overview/fetch.zig').read_text()))
+assert RETRO >= 8
 
 # ASCII classes, as src/redact.zig's std.ascii: a non-ASCII letter is an edge,
 # and lowering never changes the text's length.
@@ -137,6 +142,8 @@ try:
     d.keys('tap', 49)  # N
     fields, _ = until(lambda: (lambda r: r if r and r[1] else None)(spark_rect()), 'fetch lines (control)')
     check('control: card drawn unredacted', fields['redacted'] == 'false')
+    check('control: no mad-libs and the real logo or name', fields['madlib'] == '-1' and fields['logo'] in ('png', 'text'))
+    check('control: the card has a Network line', fields['network'] == 'true')
     time.sleep(1.5)
     shot = d.shot('control')
     title = title_text(shot, box(fields, 'title'))
@@ -157,11 +164,15 @@ try:
         fields, rect = until(lambda: (lambda r: r if r and r[1] else None)(spark_rect()), 'fetch lines with a CPU sparkline')
         check(f'{size[0]}x{size[1]}: redacted card with {fields["lines"]} lines', fields['redacted'] == 'true' and int(fields['shown']) >= 8)
         check(f'{size[0]}x{size[1]}: WM is the compositor the panel is on', fields['wm'] == 'sway')
+        check(f'{size[0]}x{size[1]}: a mad-lib retro system from the table, with its ASCII logo', 0 <= int(fields['madlib']) < RETRO and fields['logo'] == 'ascii')
+        check(f'{size[0]}x{size[1]}: the card has a Network line', fields['network'] == 'true')
         if size[0] == 1600:
             # The CLI in this session asks $WAYLAND_DISPLAY's server, not $XDG_CURRENT_DESKTOP or /proc.
             out = subprocess.run(['zig-out/bin/xodb', '--fetch', '--json'], env=dict(d.env, XDG_CURRENT_DESKTOP='Hyprland'), capture_output=True, text=True, timeout=30)
-            wm = [l['value'] for l in json.loads(out.stdout)['lines'] if l['key'] in ('WM', 'DE')]
+            card = json.loads(out.stdout)['lines']
+            wm = [l['value'] for l in card if l['key'] in ('WM', 'DE')]
             check('--fetch in the private session names its compositor', wm == ['sway'])
+            check('--fetch has a Network line and no Mitigations line', 'Network' in [l['key'] for l in card] and 'Mitigations' not in out.stdout)
         layout = until(lambda: [l for l in lines('overview layout ') if 'panel=fetch ' in l], 'layout audited')
         time.sleep(1.5)
         layout = [l for l in lines('overview layout ') if 'panel=fetch ' in l]

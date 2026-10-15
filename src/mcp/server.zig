@@ -202,13 +202,19 @@ pub const Server = struct {
             .client = peer.client_id,
             .lease = if (@import("../service/lease.zig").Lease.capture(peer.service, peer.client_id)) |lease| lease.id else null,
         } } else .{ .agent = .{ .client = 0, .lease = null } };
+        const commands = @import("commands.zig");
+        const decoded = if (commands.handles(name)) try commands.decode(name, args) else null;
         const command = try boundary.Command.create(std.heap.page_allocator, .{
             // This stamp protects time spent in our queue. The ordinary tool
             // handler separately interprets/validates its generation argument;
             // lease tools, for example, do not mutate a target generation.
-            .stamp = .{ .connection = self.owner_connection, .session = session.id, .process = process_id, .pid = snapshot.pid, .image_epoch = snapshot.image_epoch, .generation = snapshot.generation },
+            .stamp = .{ .connection = self.owner_connection, .session = session.id, .process = process_id, .pid = snapshot.pid, .image_epoch = snapshot.image_epoch, .generation = if (decoded) |typed| typed.generation else snapshot.generation },
             .actor = actor,
-            .action = .{ .mcp = .{ .name = name, .arguments_json = try std.json.Stringify.valueAlloc(a, args, .{}) } },
+            .action = if (decoded) |typed| switch (typed.operation) {
+                .control => |control| .{ .control = control },
+                .breakpoint => |bp| .{ .breakpoint = bp },
+            } else .{ .mcp = .{ .name = name, .arguments_json = try std.json.Stringify.valueAlloc(a, args, .{}) } },
+            .protocol_reply = true,
         });
         errdefer command.destroy();
         self.pending_sequence = self.owner_queue.?.trySubmit(command) catch |err| switch (err) {
@@ -325,6 +331,19 @@ pub const Server = struct {
         var local = Value{ .object = .empty };
         var fields = args.object.iterator();
         while (fields.next()) |field| if (!std.mem.eql(u8, field.key_ptr.*, "process_id")) try local.object.put(a, field.key_ptr.*, field.value_ptr.*);
+        if (@import("commands.zig").handles(name)) {
+            const decoded = try @import("commands.zig").decode(name, local);
+            const state = session.target.snapshot();
+            const caller: @import("../model/command.zig").Caller = if (self.shared) |peer| .{ .agent = .{ .client = peer.client_id, .lease = if (@import("../service/lease.zig").Lease.capture(peer.service, peer.client_id)) |lease| lease.id else null } } else .{ .agent = .{ .client = 0, .lease = null } };
+            const result = session.executeCommand(a, 0, if (self.shared) |peer| peer.service else null, .{
+                .stamp = .{ .connection = 0, .session = session.id, .process = session.process_id, .pid = state.pid, .image_epoch = state.image_epoch, .generation = decoded.generation },
+                .caller = caller,
+                .operation = decoded.operation,
+            }) catch |err| return self.lineError(a, session, err);
+            var reply_value = try @import("commands.zig").reply(a, session, decoded.operation, result);
+            try processFields(a, session, &reply_value);
+            return reply_value;
+        }
         const previous_lease = session.agent_lease;
         session.agent_lease = if (self.shared) |peer| @import("../service/lease.zig").Lease.capture(peer.service, peer.client_id) else null;
         defer session.agent_lease = previous_lease;
@@ -340,6 +359,30 @@ pub const Server = struct {
             try result.object.put(a, "process_session_id", .{ .integer = @intCast(session.id) });
         }
         return result;
+    }
+    fn processFields(a: Allocator, session: *Session, result: *Value) !void {
+        if (result.* == .object) {
+            try result.object.put(a, "process_id", .{ .integer = @intCast(session.process_id) });
+            try result.object.put(a, "process_session_id", .{ .integer = @intCast(session.id) });
+        }
+    }
+    /// Encode a typed owner's result without re-entering a tool handler.
+    pub fn commandReply(self: *Server, a: Allocator, session: *Session, request: @import("../model/remote_owner.zig").Request, result: anytype) ![]const u8 {
+        const outcome = result catch |err| return self.lineError(a, session, err);
+        const operation: @import("../model/command.zig").Operation = switch (request.action) {
+            .control => |control| .{ .control = control },
+            .breakpoint => |bp| .{ .breakpoint = bp },
+            else => return error.InvalidOwnerReply,
+        };
+        var reply_value = try @import("commands.zig").reply(a, session, operation, outcome.command);
+        try processFields(a, session, &reply_value);
+        return std.json.Stringify.valueAlloc(a, reply_value, .{});
+    }
+    pub fn queuedCaller(self: *const Server, actor: @import("../model/remote_owner.zig").Actor) !void {
+        if (actor != .agent) return error.ProtocolActorRequired;
+        if (self.shared) |peer| {
+            if (actor.agent.client != peer.client_id) return error.UnknownSessionClient;
+        } else if (actor.agent.client != 0 or actor.agent.lease != null) return error.UnknownSessionClient;
     }
     fn toolForProcess(self: *Server, a: Allocator, session: *Session, name: []const u8, args: Value) !Value {
         if (@import("frames.zig").handles(name)) return @import("frames.zig").call(a, session, name, args);
@@ -459,7 +502,7 @@ pub const Server = struct {
         if (std.mem.eql(u8, name, "get_breakpoints")) return asValue(a, .{ .breakpoints = session.target.breakpointSlice(), .watchpoints = session.target.watchpointSlice(), .policies = session.probes.rules, .definitions = session.persistent.entries.items, .loader_status = session.persistent.loader_status, .loader_reads = session.persistent.loader_reads, .symbol_transfer = .{ .bytes = session.persistent.file_reads.bytes, .files = session.persistent.file_reads.files, .negative_hits = session.persistent.file_reads.negative_hits, .skipped = session.persistent.file_reads.skipped, .resumed_bytes = session.persistent.file_reads.resumed_bytes, .cached_modules = session.modules.cachedSymbolCount(), .retained_bytes = session.modules.symbol_bytes }, .data_watch_slots = session.target.watchpointCapacity() catch null, .execution_watches = session.target.gdbRemoteInfo() == null and session.target.arch() == .x86_64 });
         if (std.mem.eql(u8, name, "get_investigation")) return asValue(a, (try session.investigation(number(member(args, "id")) orelse return error.InvalidArguments)).*);
         if (std.mem.eql(u8, name, "get_audit")) return asValue(a, .{ .actions = session.audit[0..session.audit_count] });
-        const execution_names = [_][]const u8{ "continue", "interrupt", "step_instruction", "step_over_instruction", "step_source", "step_over", "investigate_write", "set_breakpoint", "remove_breakpoint", "set_watchpoint", "remove_watchpoint" };
+        const execution_names = [_][]const u8{ "investigate_write", "set_watchpoint", "remove_watchpoint" };
         const mutation_names = [_][]const u8{ "write_memory", "write_register" };
         var effect: ?@import("../model/session.zig").Effect = null;
         var action: []const u8 = "";
@@ -480,38 +523,6 @@ pub const Server = struct {
                 const frame_index = if (member(args, "frame")) |v| number(v) orelse return error.InvalidArguments else 0;
                 if (frame_index >= 64) return error.InvalidArguments;
                 created_id = try session.investigateWrite(@intCast(tid), @intCast(frame_index), string(member(args, "question")) orelse return error.InvalidArguments, string(member(args, "expression")) orelse return error.InvalidArguments);
-            } else if (std.mem.eql(u8, name, "continue")) try session.continueExecution(.agent) else if (std.mem.eql(u8, name, "interrupt")) {
-                session.cancelStep();
-                try session.target.interrupt();
-            } else if (std.mem.eql(u8, name, "step_instruction") or std.mem.eql(u8, name, "step_over_instruction") or std.mem.eql(u8, name, "step_source") or std.mem.eql(u8, name, "step_over")) {
-                session.probe_resume_actor = .agent;
-                const t = number(member(args, "tid")) orelse return error.InvalidArguments;
-                if (t == 0 or t > std.math.maxInt(i32)) return error.InvalidArguments;
-                if (std.mem.eql(u8, name, "step_source") or std.mem.eql(u8, name, "step_over")) try session.startSourceStep(@intCast(t), std.mem.eql(u8, name, "step_over")) else if (std.mem.eql(u8, name, "step_instruction")) try session.stepInstruction(@intCast(t)) else try session.stepOverInstruction(@intCast(t));
-            } else if (std.mem.eql(u8, name, "set_breakpoint")) {
-                if (string(member(args, "file"))) |file| {
-                    if (member(args, "address") != null or member(args, "symbol") != null) return error.InvalidArguments;
-                    const line_number = number(member(args, "line")) orelse return error.InvalidArguments;
-                    if (line_number == 0 or line_number > std.math.maxInt(u32)) return error.InvalidArguments;
-                    const ids = session.setSourceBreakpoint(a, file, @intCast(line_number)) catch |err| return self.lineError(a, session, err);
-                    session.record(.agent, action);
-                    const skipped = session.modules.skipped();
-                    return asValue(a, .{ .id = ids[0], .ids = ids, .images_not_searched = skipped.count, .image_budget = skipped.first, .session = session.snapshot() });
-                }
-                if (member(args, "line") != null) return error.InvalidArguments;
-                var location: u64 = undefined;
-                if (string(member(args, "symbol"))) |symbol_name| {
-                    if (member(args, "address") != null) return error.InvalidArguments;
-                    created_id = try session.breakSymbol(symbol_name);
-                    session.record(.agent, action);
-                    const persistent = @import("../model/persistent.zig").Manager.probe(session, created_id.?);
-                    return asValue(a, .{ .id = created_id, .pending = if (persistent) |probe| probe.pending else false, .session = session.snapshot() });
-                } else location = try address(args);
-                created_id = try session.target.setBreakpoint(location, false);
-            } else if (std.mem.eql(u8, name, "remove_breakpoint")) {
-                const id = number(member(args, "id")) orelse return error.InvalidArguments;
-                if (@import("../model/persistent.zig").Manager.probe(session, id)) |probe| if (probe.internal) return error.InternalBreakpoint;
-                try session.target.removeBreakpoint(id);
             } else if (std.mem.eql(u8, name, "remove_watchpoint")) try session.target.removeWatchpoint(number(member(args, "id")) orelse return error.InvalidArguments) else if (std.mem.eql(u8, name, "set_watchpoint")) {
                 const length = number(member(args, "length")) orelse return error.InvalidArguments;
                 if (length > 8) return error.InvalidArguments;
@@ -950,12 +961,32 @@ test "queued tools preserve client and lease identity at execution" {
     try std.testing.expectEqual(.cancelled, root.memory.search.?.state);
     try std.testing.expectEqual(peer.id + 123, root.agent_client_id.?);
     try std.testing.expect(!root.agent_controller);
+    // The typed path must not borrow the ambient client's audit identity.
+    const api = @import("../model/command.zig");
+    const state = root.target.snapshot();
+    const rejected_step: api.Request = .{ .stamp = .{ .connection = 7, .session = root.id, .process = root.process_id, .pid = state.pid, .image_epoch = state.image_epoch, .generation = state.generation }, .caller = actor, .operation = .{ .control = .{ .step_instruction = std.math.maxInt(i32) } } };
+    root.probe_resume_actor = .human;
+    root.probe_resume_lease = null;
+    try std.testing.expectError(error.UnknownThread, root.executeCommand(scratch, 7, service, rejected_step));
+    try std.testing.expectEqual(.human, root.probe_resume_actor);
+    try std.testing.expect(root.probe_resume_lease == null);
+    const typed: api.Request = .{ .stamp = .{ .connection = 7, .session = root.id, .process = root.process_id, .pid = state.pid, .image_epoch = state.image_epoch, .generation = 0 }, .caller = actor, .operation = .{ .control = .cancel_continue } };
+    _ = try root.executeCommand(scratch, 7, service, typed);
+    try std.testing.expectEqual(peer.id, root.audit[root.audit_count - 1].client_id.?);
+    try std.testing.expectEqual(peer.id + 123, root.agent_client_id.?);
+    try std.testing.expect(root.agent_lease == null);
+    try std.testing.expect(!root.agent_controller);
+    root.pending_continue = .{ .generation = root.target.snapshot().generation, .epoch = root.target.snapshot().image_epoch, .actor = .agent, .lease = original };
     try shared_context.check(service_c.xsvc_release(service, peer.id, now()));
     try shared_context.check(service_c.xsvc_claim(service, peer.id, service_c.XSVC_MAX_TTL_MS, now()));
     try std.testing.expect(original.id != Lease.capture(service, peer.id).?.id);
+    try std.testing.expectError(error.ControlLeaseRequired, root.executeCommand(scratch, 7, service, typed));
+    try root.poll();
+    try std.testing.expect(root.pending_continue == null);
+    try std.testing.expectEqual(.stopped, root.target.snapshot().state);
     try std.testing.expectError(error.ControlLeaseRequired, server.queuedTool(scratch, root, actor, "continue", args));
     try std.testing.expectError(error.ControlLeaseRequired, server.queuedTool(scratch, root, actor, "remove_language_watch", args));
-    try std.testing.expectEqual(@as(usize, 0), root.audit_count);
+    try std.testing.expectEqual(@as(usize, 1), root.audit_count);
     const fresh_actor: @import("../model/remote_owner.zig").Actor = .{ .agent = .{ .client = peer.id, .lease = Lease.capture(service, peer.id).?.id } };
     root.agent_scope = .observe;
     try std.testing.expectError(error.AgentScopeDenied, server.queuedTool(scratch, root, fresh_actor, "add_language_watch", args));
@@ -989,7 +1020,7 @@ test "queued protocol preserves request IDs and pipelined bytes across backpress
     // Fill user capacity with commands that have not executed. Admission must
     // retain the original protocol line and produce neither a reply nor a job.
     for (0..boundary.max_commands) |_| {
-        const command = try boundary.Command.create(a, .{ .stamp = .{ .connection = 17, .session = root.id, .process = 1, .pid = 0, .image_epoch = 0, .generation = 0 }, .actor = .human, .action = .{ .control = .interrupt } });
+        const command = try boundary.Command.create(a, .{ .stamp = .{ .connection = 17, .session = root.id, .process = 1, .pid = 0, .image_epoch = 0, .generation = 0 }, .actor = .human, .action = .{ .control = .continue_execution } });
         _ = try queue.trySubmit(command);
     }
     try std.testing.expectError(error.OwnerQueueBusy, server.handle(root, server.input[0..first.len]));
@@ -1022,6 +1053,35 @@ test "queued protocol preserves request IDs and pipelined bytes across backpress
     defer a.free(encoded);
     try std.testing.expectEqualStrings(encoded, text);
     try std.testing.expectError(error.StaleReply, server.completeQueued(sequence, "{}"));
+}
+
+test "migrated queued tools carry typed operations and separate reply routing" {
+    const boundary = @import("../model/remote_owner.zig");
+    const a = std.testing.allocator;
+    const root = try a.create(Session);
+    defer a.destroy(root);
+    root.* = Session.init();
+    defer root.deinit();
+    root.agent_scope = .control;
+    var queue: boundary.Queue = .{};
+    defer queue.deinit();
+    const server = try a.create(Server);
+    defer a.destroy(server);
+    server.* = .{ .owner_queue = &queue, .owner_connection = 23 };
+    defer server.clearPolicies();
+    {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const args = (try std.json.parseFromSlice(Value, arena.allocator(), "{\"generation\":42,\"symbol\":\"owned_stop\"}", .{})).value;
+        try server.enqueueTool(arena.allocator(), root, "set_breakpoint", args, 1);
+    }
+    const queued = (try queue.take()).?;
+    try std.testing.expect(queued.request.protocol_reply);
+    try std.testing.expectEqual(@as(u64, 42), queued.request.stamp.generation);
+    try std.testing.expectEqual(@as(u64, 23), queued.request.stamp.connection);
+    try std.testing.expectEqualStrings("owned_stop", queued.request.action.breakpoint.symbol);
+    try std.testing.expectEqual(@as(u64, 0), queued.request.actor.agent.client);
+    queue.finish();
 }
 
 test "tool policy cache is mode-specific and does not cache authorization" {

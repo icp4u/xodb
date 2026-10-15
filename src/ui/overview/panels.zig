@@ -1834,7 +1834,7 @@ fn fetchCard(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     var b: [48]u8 = undefined;
     if (fits < fs.lines.len) try ctx.textFit(x0, y, w, std.fmt.bufPrint(&b, "wheel: {d} more lines", .{fs.lines.len - fits}) catch "", p.dim);
     if (rebuilt and @import("../../c_ui.zig").api.getenv("XODB_OVERVIEW_AUDIT") != null)
-        @import("../../log.zig").info(.overview, "xodb: fetch lines={d} shown={d} logo={s} redacted={} wm={s} cpu_spark={d:.0},{d:.0},{d:.0},{d:.0} title={d:.0},{d:.0},{d:.0},{d:.0}\n", .{ fs.lines.len, @min(fits, fs.lines.len), if (fs.blocks != null) "png" else "text", v.redact, (fs.static.?.wm orelse "none"), cpu_spark.x, cpu_spark.y, cpu_spark.w, cpu_spark.h, title_at.x, title_at.y, title_at.w, title_at.h });
+        @import("../../log.zig").info(.overview, "xodb: fetch lines={d} shown={d} logo={s} redacted={} madlib={d} network={} wm={s} cpu_spark={d:.0},{d:.0},{d:.0},{d:.0} title={d:.0},{d:.0},{d:.0},{d:.0}\n", .{ fs.lines.len, @min(fits, fs.lines.len), if (fs.blocks != null) "png" else if (fs.static.?.madlib != null) "ascii" else "text", v.redact, if (fs.static.?.madlib) |ml| @as(i64, @intCast(ml.system)) else -1, for (fs.lines) |l| (if (std.mem.eql(u8, l.key, "Network")) break true) else false, (fs.static.?.wm orelse "none"), cpu_spark.x, cpu_spark.y, cpu_spark.w, cpu_spark.h, title_at.x, title_at.y, title_at.w, title_at.h });
     // ANSI colour blocks, as fetch tools end their card.
     const ansi = [16]u24{ 0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff };
     const bw = @min(28, w / 16);

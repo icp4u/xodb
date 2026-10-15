@@ -398,6 +398,15 @@ def journal(client):
     return {'retained_events': len(events), 'oldest': sequences[0], 'latest': sequences[-1]}
 
 
+def core_command_arguments(tid):
+    return [('continue', {}), ('interrupt', {}),
+            ('step_instruction', {'tid': tid}), ('step_over_instruction', {'tid': tid}),
+            ('step_source', {'tid': tid}), ('step_over', {'tid': tid}),
+            ('set_breakpoint', {'symbol': 'change_value'}), ('remove_breakpoint', {'id': 1}),
+            ('configure_breakpoint', {'id': 1}), ('finish', {'tid': tid}),
+            ('run_to', {'tid': tid, 'address': '0x1'}), ('restart', {}), ('detach', {})]
+
+
 def control_checks(server):
     controller, one, two = [Client(server, label) for label in ('controller', 'observer-1', 'observer-2')]
     initial = eventually(controller.session, lambda value: value['state'] == 'stopped', 'initial target stop')
@@ -408,7 +417,7 @@ def control_checks(server):
     assert {row['id'] for row in one.info()['clients']} == set(ids)
     assert one.info()['controller_id'] is None
     derived_view_guards(one)
-    for name, args in [('continue', {}), ('set_breakpoint', {'symbol': 'change_value'}),
+    for name, args in [*core_command_arguments(tid),
                        ('start_inspection', {'tid': tid, 'registers': True, 'stack': False})]:
         expect_error(one.raw(name, generation=one.session()['generation'], **args), 'ControlLeaseRequired')
     # Acquiring a lease is independent of the running target's snapshot.
@@ -553,6 +562,8 @@ def observe_checks(server):
     state = client.session()
     server.remember_target(state)
     expect_error(client.raw('claim_session_control', generation=state['generation']), 'ScopeDenied')
+    for name, args in core_command_arguments(state['threads'][0]['tid']):
+        expect_error(client.raw(name, generation=state['generation'], **args), 'AgentScopeDenied')
     expect_error(client.raw('start_inspection', generation=state['generation'],
                             tid=state['threads'][0]['tid'], registers=True, stack=False), 'AgentScopeDenied')
     assert client.info()['controller_id'] is None

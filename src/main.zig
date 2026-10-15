@@ -1114,7 +1114,9 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     _ = c.signal(c.SIGINT, onSignal);
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
-    _ = c.signal(c.SIGPIPE, c.SIG_IGN);
+    // c.SIG_IGN translates to a misaligned function pointer on aarch64;
+    // std's SIG.IGN is typed align(1) and compiles on every target.
+    std.posix.sigaction(std.posix.SIG.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     const a = std.heap.c_allocator;
     var collector: @import("model/system.zig").Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count], .fast_ns = o.interval_ms * 1_000_000 };
     defer collector.deinit();
@@ -1334,6 +1336,8 @@ test {
     _ = @import("model/remote_source.zig");
     _ = @import("model/remote_owner.zig");
     _ = @import("model/remote_dispatch.zig");
+    _ = @import("model/command.zig");
+    _ = @import("mcp/commands.zig");
     _ = @import("model/remote_worker.zig");
     if (build_options.gui) _ = @import("ui/remote_workspace.zig");
     _ = @import("binary/tls.zig");

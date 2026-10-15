@@ -124,6 +124,8 @@ pub const Net = struct {
     name: []const u8,
     state: Text = .{},
     loopback: bool = false,
+    /// A physical link (not a bridge, veth or tunnel): what the totals count.
+    physical: bool = false,
     rx_bps: F = .{},
     tx_bps: F = .{},
     rx_pps: F = .{},

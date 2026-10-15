@@ -57,31 +57,14 @@ pub const Action = union(enum) {
 };
 pub fn apply(a: std.mem.Allocator, session: *Session, action: Action) !void {
     switch (action) {
-        .cancel_continue => {
-            session.cancelStep();
-            session.record(.human, "cancel_pending_continue");
-        },
-        .run_to_source => |source| {
-            if (source.tid <= 0 or source.line == 0 or source.path.len == 0 or source.path.len > 4096) return error.InvalidArguments;
-            const addresses = try session.sourceAddresses(a, source.path, source.line);
-            if (addresses.len == 0) return error.NoCodeForSourceLine;
-            try session.runTo(source.tid, addresses[0], null, .human);
-            session.record(.human, "run_to");
-        },
-        .toggle_source => |source| {
-            if (source.line == 0 or source.path.len == 0 or source.path.len > 4096) return error.InvalidArguments;
-            const addresses = try session.sourceAddresses(a, source.path, source.line);
-            var removed = false;
-            for (addresses) |address| {
-                for (session.target.breakpointSlice()) |probe| if (probe.address == address) {
-                    if (@import("persistent.zig").Manager.probe(session, probe.id)) |entry| if (entry.internal) continue;
-                    try session.target.removeBreakpoint(probe.id);
-                    removed = true;
-                    break;
-                };
-            }
-            if (!removed) _ = try session.setSourceBreakpoint(a, source.path, source.line);
-            session.record(.human, "toggle_source_breakpoint");
+        .cancel_continue, .run_to_source, .toggle_source => {
+            const operation: @import("command.zig").Operation = switch (action) {
+                .cancel_continue => .{ .control = .cancel_continue },
+                .run_to_source => |source| .{ .control = .{ .run_to_source = .{ .tid = source.tid, .path = source.path, .line = source.line } } },
+                .toggle_source => |source| .{ .breakpoint = .{ .toggle_source = .{ .path = source.path, .line = source.line } } },
+                else => unreachable,
+            };
+            _ = try session.humanCommand(a, session.target.snapshot().generation, operation);
         },
         .watch_local => |local| {
             if (local.metadata != session.metadata.revision) return error.StaleDebugMetadata;

@@ -978,12 +978,11 @@ pub const Workspace = struct {
         if (click and self.layout.flames.contains(w.pointer_x, w.pointer_y)) code = 33;
         if (code == 62 and !self.show_profile) {
             if (remote) context.send(self, .{ .control = .restart }) else {
-                session.restart() catch |err| {
+                _ = session.humanCommand(std.heap.page_allocator, self.last_generation, .{ .control = .restart }) catch |err| {
                     self.status = @errorName(err);
                     w.dirty = true;
                     return;
                 };
-                session.record(.human, "restart");
             }
             self.status = "Restarted owned launch; watches cleared, breakpoints relocated";
             self.selected = 0;
@@ -1377,31 +1376,15 @@ pub const Workspace = struct {
         if (click and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= look.workspace.source_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
             if (remote) {
                 const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - look.workspace.source_y) / look.workspace.code_row)) + 1);
-                context.send(self, .{ .workspace = .{ .toggle_source = .{ .path = self.source_path, .line = number } } });
+                context.send(self, .{ .breakpoint = .{ .toggle_source = .{ .path = self.source_path, .line = number } } });
             } else {
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
                 const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - look.workspace.source_y) / look.workspace.code_row)) + 1);
-                const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, number) catch |err| {
+                _ = session.humanCommand(scratch.allocator(), self.last_generation, .{ .breakpoint = .{ .toggle_source = .{ .path = self.source_path, .line = number } } }) catch |err| {
                     self.status = lineStatus(session, err);
                     return;
                 };
-                var removed = false;
-                for (addresses) |address| {
-                    for (session.target.breakpointSlice()) |probe| if (probe.address == address) {
-                        session.target.removeBreakpoint(probe.id) catch |err| {
-                            self.status = @errorName(err);
-                            return;
-                        };
-                        removed = true;
-                        break;
-                    };
-                }
-                if (!removed) _ = session.setSourceBreakpoint(scratch.allocator(), self.source_path, number) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                };
-                session.record(.human, "toggle_source_breakpoint");
                 if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
             }
         }
@@ -1435,33 +1418,19 @@ pub const Workspace = struct {
                         self.status = "Click a source line first";
                         return;
                     };
-                    context.send(self, .{ .workspace = .{ .run_to_source = .{ .tid = tid, .path = self.source_path, .line = line } } });
+                    context.send(self, .{ .control = .{ .run_to_source = .{ .tid = tid, .path = self.source_path, .line = line } } });
                 }
             } else {
-                if (code == 88) session.finishFrame(tid, self.selected_frame, .human) catch |err| {
-                    self.status = @errorName(err);
+                const action: @import("../model/command.zig").Control = if (code == 88) .{ .finish_frame = .{ .tid = tid, .frame = self.selected_frame } } else .{ .run_to_source = .{ .tid = tid, .path = self.source_path, .line = self.cursor_line orelse {
+                    self.status = "Click a source line first";
                     return;
-                } else {
-                    const line_number = self.cursor_line orelse {
-                        self.status = "Click a source line first";
-                        return;
-                    };
-                    var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-                    defer scratch.deinit();
-                    const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, line_number) catch |err| {
-                        self.status = lineStatus(session, err);
-                        return;
-                    };
-                    if (addresses.len == 0) {
-                        self.status = "No code at selected line";
-                        return;
-                    }
-                    session.runTo(tid, addresses[0], null, .human) catch |err| {
-                        self.status = @errorName(err);
-                        return;
-                    };
-                }
-                session.record(.human, if (code == 88) "finish" else "run_to");
+                } } };
+                var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+                defer scratch.deinit();
+                _ = session.humanCommand(scratch.allocator(), self.last_generation, .{ .control = action }) catch |err| {
+                    self.status = lineStatus(session, err);
+                    return;
+                };
             }
             self.status = if (code == 88) "Running until selected frame returns" else "Running to selected source line";
             self.browse_address = null;
@@ -1508,19 +1477,12 @@ pub const Workspace = struct {
                 context.send(self, .{ .control = action });
                 self.selected_frame = 0;
             } else {
-                session.probe_resume_actor = .human;
-                if (self.current_line != null) session.startSourceStep(tid, code == 68) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                } else if (code == 87) session.stepInstruction(tid) catch |err| {
-                    self.status = @errorName(err);
-                    return;
-                } else session.stepOverInstruction(tid) catch |err| {
+                const action: @import("../model/command.zig").Control = if (self.current_line != null) .{ .step_source = .{ .tid = tid, .over = code == 68 } } else if (code == 87) .{ .step_instruction = tid } else .{ .step_over_instruction = tid };
+                _ = session.humanCommand(std.heap.page_allocator, self.last_generation, .{ .control = action }) catch |err| {
                     self.status = @errorName(err);
                     return;
                 };
                 self.selected_frame = 0;
-                session.record(.human, if (code == 87) "step" else "step_over");
             }
         }
         if (remote) {
@@ -1542,32 +1504,23 @@ pub const Workspace = struct {
         }
         if (remote) {
             if (code == 57 or code == 63 or code == 64) {
-                if (context.header.pending_continue) context.send(self, .{ .workspace = .cancel_continue }) else if (snapshot.state == .stopped) context.send(self, .{ .control = .continue_execution }) else if (snapshot.state == .running) context.send(self, .{ .control = .interrupt });
+                if (context.header.pending_continue) context.send(self, .{ .control = .cancel_continue }) else if (snapshot.state == .stopped) context.send(self, .{ .control = .continue_execution }) else if (snapshot.state == .running) context.send(self, .{ .control = .interrupt });
                 self.selected_frame = 0;
             }
             if (code == 32 and snapshot.pid != 0) context.send(self, .{ .control = .detach });
         } else {
             if (code == 57 or code == 63 or code == 64) {
-                if (session.pending_continue != null) {
-                    session.cancelStep();
-                    self.status = "Pending continue cancelled";
-                } else if (snapshot.state == .stopped) {
-                    session.continueExecution(.human) catch |err| {
+                const action: ?@import("../model/command.zig").Control = if (session.pending_continue != null) .cancel_continue else if (snapshot.state == .stopped) .continue_execution else if (snapshot.state == .running) .interrupt else null;
+                if (action) |control| {
+                    _ = session.humanCommand(std.heap.page_allocator, self.last_generation, .{ .control = control }) catch |err| {
                         self.status = @errorName(err);
                         return;
                     };
-                    if (session.pending_continue != null) self.status = "Resolving symbols; Space cancels the queued continue";
-                } else if (snapshot.state == .running) {
-                    session.cancelStep();
-                    session.target.interrupt() catch |err| {
-                        self.status = @errorName(err);
-                        return;
-                    };
+                    if (control == .cancel_continue) self.status = "Pending continue cancelled" else if (session.pending_continue != null) self.status = "Resolving symbols; Space cancels the queued continue";
                 }
                 self.selected_frame = 0;
             }
-            if (code == 57 or code == 63 or code == 64) session.record(.human, "continue_or_interrupt");
-            if (code == 32 and snapshot.pid != 0) session.detach() catch |err| {
+            if (code == 32 and snapshot.pid != 0) _ = session.humanCommand(std.heap.page_allocator, self.last_generation, .{ .control = .detach }) catch |err| {
                 self.status = @errorName(err);
                 return;
             };

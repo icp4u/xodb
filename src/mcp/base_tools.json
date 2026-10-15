@@ -394,7 +394,7 @@
   },
   {
     "name": "interrupt",
-    "description": "Request a stop; poll get_session until stopped. Requires control scope.",
+    "description": "Request a stop; poll get_session until stopped. Requires current control scope and lease. An old generation is accepted for interrupt only; process and connection identity must still match.",
     "inputSchema": {
       "type": "object",
       "properties": {

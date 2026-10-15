@@ -25,7 +25,7 @@ pub const Frontend = struct {
     header: @import("../model/workspace_view.zig").Header = .{},
     language: @import("../model/language_view.zig").Header = empty_language,
     processes: @import("../model/process_view.zig").View = .{},
-    pending: [boundary.max_commands]?Pending = @splat(null),
+    pending: [boundary.max_commands + 1]?Pending = @splat(null),
     pending_bytes: usize = 0,
     next_order: u64 = 0,
     inspection_sequence: ?u64 = null,
@@ -71,14 +71,17 @@ pub const Frontend = struct {
     }
     fn enqueue(self: *Frontend, workspace: *Workspace, identity: boundary.Stamp, action: boundary.Action) !void {
         if (identity.connection != self.owner.options.connection) return error.StaleProcess;
-        const index = for (self.pending, 0..) |slot, i| {
-            if (slot == null) break i;
-        } else return error.Busy;
         const command = try boundary.Command.create(a, .{ .stamp = identity, .actor = .human, .action = action });
         errdefer command.destroy();
-        if (command.bytes > boundary.max_command_bytes -| self.pending_bytes) return error.Busy;
+        const index = if (command.urgent()) blk: {
+            if (self.pending[boundary.max_commands] != null) return error.Busy;
+            break :blk boundary.max_commands;
+        } else for (self.pending[0..boundary.max_commands], 0..) |slot, i| {
+            if (slot == null) break i;
+        } else return error.Busy;
+        if (!command.urgent() and command.bytes > boundary.max_command_bytes -| self.pending_bytes) return error.Busy;
         self.pending[index] = .{ .command = command, .workspace = workspace, .order = self.next_order, .editor_signature = if (editor(workspace, action)) |field| editorSignature(field) else null };
-        self.pending_bytes += command.bytes;
+        if (!command.urgent()) self.pending_bytes += command.bytes;
         self.next_order += 1;
     }
     /// Admission is nonblocking. Keep a private command copy for retry and for
@@ -90,7 +93,7 @@ pub const Frontend = struct {
                     reply.stamp.connection != p.command.request.stamp.connection) continue;
                 self.complete(p, reply);
                 if (p.command.request.action == .inspect) self.inspection_sequence = null;
-                self.pending_bytes -= p.command.bytes;
+                if (!p.command.urgent()) self.pending_bytes -= p.command.bytes;
                 p.command.destroy();
                 slot.* = null;
                 break;
@@ -99,7 +102,9 @@ pub const Frontend = struct {
         while (true) {
             var oldest: ?*Pending = null;
             for (&self.pending) |*slot| if (slot.*) |*entry| {
-                if (entry.sequence == null and (oldest == null or entry.order < oldest.?.order)) oldest = entry;
+                if (entry.sequence == null and (oldest == null or
+                    (entry.command.urgent() and !oldest.?.command.urgent()) or
+                    (entry.command.urgent() == oldest.?.command.urgent() and entry.order < oldest.?.order))) oldest = entry;
             };
             const p = oldest orelse break;
             const copy = boundary.Command.create(a, p.command.request) catch |err| {

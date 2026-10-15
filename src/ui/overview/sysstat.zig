@@ -211,6 +211,7 @@ pub fn convert(a: std.mem.Allocator, src: *const c.struct_xrt_sys_snapshot, s: *
             .name = try chars(a, x.name),
             .state = try name(a, x.operstate),
             .loopback = (u(x.loopback).get() orelse 0) != 0,
+            .physical = (u(x.physical).get() orelse 0) != 0,
             .rx_bps = f(x.rx_bps),
             .tx_bps = f(x.tx_bps),
             .rx_pps = f(x.rx_pps),

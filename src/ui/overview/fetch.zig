@@ -2,9 +2,10 @@
 //! and exits (no window, no Vulkan); the overview's Fetch panel draws the same
 //! lines live. Facts come from the overview collector (sysstat.zig) plus a few
 //! bounded file reads; nothing runs a subprocess. With redaction the user,
-//! host, kernel, machine model, GPU and monitor names are hidden as the
-//! overview hides them; serial numbers and addresses are never read. The
-//! distribution and its logo stay: they are the point of a fetch card.
+//! host, machine model, GPU and monitor names are hidden as the overview
+//! hides them, and the identity lines become obviously fake mad-libs (a
+//! retro system's logo, OS and kernel, ...); serial numbers and addresses
+//! are never read.
 const std = @import("std");
 const builtin = @import("builtin");
 const c = @import("../../c_ui.zig").api;
@@ -20,7 +21,8 @@ pub const usage =
     \\xodb --fetch [--json] [--redact] [--bench [--bench-mb N]]
     \\  A fastfetch-style card of this machine, then exit. No window.
     \\  --json        the same lines as JSON
-    \\  --redact      hide user, host, kernel, machine model, GPU and monitor names (the distribution stays)
+    \\  --redact      hide user, host, machine model, GPU and monitor names; identity lines become
+    \\                obviously fake retro mad-libs (OS, kernel, logo, shell, theme, ...)
     \\  --bench       also run the benchmarks (a few seconds; heats the CPU): SHA-256 one core and
     \\                all cores, memcpy bandwidth, memory latency; saved in the xodb state directory
     \\  --bench-mb N  memcpy/latency buffer size in MiB, 1..4096 (default 256)
@@ -106,6 +108,118 @@ fn countLines(p: [:0]const u8, needle: []const u8) ?u64 {
     return if (n > 0) n else null;
 }
 
+// --- Mad-libs (--redact) --------------------------------------------------------------
+
+/// Under redaction the card's hidden identity lines become obviously fake
+/// retro ones: a system (logo, OS and kernel that match), a shell, a theme,
+/// an icon set, an uptime, a package count and network rates. Display only:
+/// src/redact.zig's placeholders, MCP and archives never see these. The
+/// logos are original ASCII art, not anyone's trademark.
+pub const Retro = struct { os: []const u8, kernel: []const u8, tint: [3]u8, logo: []const []const u8 };
+pub const retro = [_]Retro{
+    .{ .os = "OS/2 Warp 4 (i386)", .kernel = "OS2KRNL 14.104a (warp factor 9)", .tint = .{ 59, 111, 182 }, .logo = &.{
+        " *    .   ---==>    .",
+        "   .   OS/2 ===>>>   *",
+        " .   ---==>     .",
+        "   *      .   WARP 4",
+    } },
+    .{ .os = "BeOS R5 (BeBox)", .kernel = "kernel_ppc R5.0.3 (pervasively multithreaded)", .tint = .{ 222, 160, 40 }, .logo = &.{
+        "    __     __",
+        "   (  )\\ /(  )",
+        "    \\  (o)  /    bzz",
+        "    /  (_)  \\",
+        "   (__)/ \\(__)   BeOS",
+    } },
+    .{ .os = "CP/M 2.2 (Z80)", .kernel = "BDOS 2.2 + CCP (64 KiB of RAM, all of it)", .tint = .{ 80, 200, 90 }, .logo = &.{
+        " .------------------.",
+        " | A>DIR            |",
+        " | A: PIP     COM   |",
+        " | A>_              |",
+        " '------------------'",
+    } },
+    .{ .os = "MUMPS (PDP-11)", .kernel = "MUMPS-11 ANSI X11.1-1977 (it is all globals)", .tint = .{ 200, 120, 60 }, .logo = &.{
+        " .------------------.",
+        " | S ^X(\"hi\")=1     |",
+        " | W $D(^X(\"hi\"))   |",
+        " | 1                |",
+        " '------------------'",
+    } },
+    .{ .os = "AmigaOS 3.1 (68000)", .kernel = "exec.library 40.10 (Kickstart 3.1, 512 KiB chip RAM)", .tint = .{ 220, 60, 50 }, .logo = &.{
+        " #######################",
+        " # Software Failure.   #",
+        " # Guru Meditation     #",
+        " # #00000004.0000AAC0  #",
+        " #######################",
+    } },
+    .{ .os = "NeXTSTEP 3.3 (68040)", .kernel = "Mach 2.5 (Display PostScript, black hardware)", .tint = .{ 170, 90, 200 }, .logo = &.{
+        "      .------.",
+        "     /      /|",
+        "    .------. |",
+        "    |      | .",
+        "    |      |/",
+        "    '------'",
+    } },
+    .{ .os = "OpenVMS 5.5 (VAX)", .kernel = "VMS V5.5-2 (1 VUP, a cluster of one)", .tint = .{ 90, 160, 220 }, .logo = &.{
+        " $ SHOW TIME",
+        "    1-JAN-1990 00:00:00",
+        " $ PURGE/KEEP=1",
+        " %SYSTEM-S-NORMAL",
+    } },
+    .{ .os = "Plan 9 from Bell Labs (386)", .kernel = "9pccpu (everything is a file, even this)", .tint = .{ 120, 180, 160 }, .logo = &.{
+        "  .---------.",
+        "  | /dev    |",
+        "  | /net    |",
+        "  | /proc   |",
+        "  '---------'   9P",
+    } },
+};
+pub const ikea = [_][]const u8{ "BILLY", "SKRUVBY", "KALLAX", "LACK", "MALM", "FRAKTA", "TRASSLA", "VINGLIG", "SKRUVLOS" };
+pub const pop = [_][]const u8{ "Michael Jackson", "Madonna", "Prince", "Cher", "Freddie Mercury", "Dolly Parton", "David Bowie", "Whitney Houston" };
+pub const shell_madlib = "3rdseashell";
+
+pub const Madlib = struct {
+    system: usize,
+    uptime_s: u64,
+    packages: u32,
+    theme: usize,
+    icons: usize,
+    /// The panel's rates: MB/s in, packets/s in, MB/s out, packets/s out.
+    net: [4]f64,
+    /// --fetch's totals since boot: bytes in, packets in, bytes out, packets out.
+    totals: [4]f64,
+
+    pub fn pick(seed: u64) Madlib {
+        var prng = std.Random.DefaultPrng.init(seed);
+        const r = prng.random();
+        var k: Madlib = .{
+            .system = r.uintLessThan(usize, retro.len),
+            // under ten years even after the live panel adds this run's uptime
+            .uptime_s = r.uintLessThan(u64, 9 * 365 * 86400),
+            .packages = 100 + r.uintLessThan(u32, 9000),
+            .theme = r.uintLessThan(usize, ikea.len),
+            .icons = r.uintLessThan(usize, pop.len),
+            .net = .{ 0.01 + r.float(f64) * 40, @floor(10 + r.float(f64) * 30000), 0.01 + r.float(f64) * 8, @floor(10 + r.float(f64) * 9000) },
+            .totals = undefined,
+        };
+        const in = 1e9 + r.float(f64) * 4e12;
+        const out = in * (0.05 + r.float(f64) * 0.5);
+        k.totals = .{ in, @floor(in / (500 + r.float(f64) * 900)), out, @floor(out / (200 + r.float(f64) * 600)) };
+        return k;
+    }
+};
+
+/// One seed per process, so a card (and the panel across redaction toggles)
+/// stays self-consistent.
+var madlib_seed: ?u64 = null;
+fn madlibSeed() u64 {
+    if (madlib_seed == null) {
+        var b: [8]u8 = undefined;
+        const got = if (builtin.os.tag == .linux) std.os.linux.getrandom(&b, b.len, 0) else 0;
+        madlib_seed = if (got == b.len) std.mem.readInt(u64, &b, .little) else @intFromPtr(&madlib_seed) ^ 0x9e3779b97f4a7c15;
+    }
+    return madlib_seed.?;
+}
+
 // --- Static facts (read once) -----------------------------------------------------
 
 pub const Static = struct {
@@ -129,7 +243,8 @@ pub const Static = struct {
     terminal: ?[]const u8 = null,
     locale: ?[]const u8 = null,
     nvme: []const []const u8 = &.{},
-    mitigations: ?[]const u8 = null,
+    /// Under redaction: the fake identity lines (see Madlib).
+    madlib: ?Madlib = null,
     scheduler: ?[]const u8 = null,
     /// Collector GPU names resolved through pci.ids, read once per name.
     gpu_names: std.ArrayList([2][]const u8) = .empty,
@@ -157,7 +272,8 @@ pub const Static = struct {
                 if (std.mem.eql(u8, k, "LOGO")) logo_name = try a.dupe(u8, value);
                 if (std.mem.eql(u8, k, "ANSI_COLOR")) s.tint = ansiColor(value);
             }
-            s.logo = loadLogo(gpa, logo_name orelse s.os_id);
+            // Redacted, the card wears a retro system's ASCII logo instead.
+            if (!redact) s.logo = loadLogo(gpa, logo_name orelse s.os_id);
             if (s.logo) |*img| if (png.dominant(img)) |rgb| {
                 s.tint = rgb;
             };
@@ -174,15 +290,27 @@ pub const Static = struct {
         };
         s.packages = try packages(a);
         if (env("SHELL")) |sh| s.shell = try a.dupe(u8, std.fs.path.basename(sh));
+        if (redact) {
+            const ml = Madlib.pick(madlibSeed());
+            s.madlib = ml;
+            s.tint = retro[ml.system].tint;
+            s.packages = try std.fmt.allocPrint(a, "{d} (floppies)", .{ml.packages});
+            s.shell = shell_madlib;
+        }
         s.displays = try displays(a, redact);
         s.de = try desktop(a);
         s.wm = try peerComm(a, display_fd orelse -1) orelse try sessionCompositor(a);
-        // Theme and icon names are free text (often the distribution's own).
-        if (!redact) try gtkSettings(a, &s);
+        // Theme and icon names are free text (often the distribution's own):
+        // redacted, a made-up name keeps only the toolkit suffix; no font.
+        try gtkSettings(a, &s);
+        if (s.madlib) |ml| {
+            if (s.theme != null) s.theme = try std.fmt.allocPrint(a, "{s} [GTK3]", .{ikea[ml.theme]});
+            if (s.icons != null) s.icons = try std.fmt.allocPrint(a, "{s} [GTK3]", .{pop[ml.icons]});
+            s.font = null;
+        }
         if (terminal) s.terminal = try terminalName(a);
         s.locale = if (env("LC_ALL") orelse env("LANG")) |l| try a.dupe(u8, l) else null;
         s.nvme = try nvme(a);
-        s.mitigations = try mitigations(a);
         if (readf(&b, "/sys/kernel/sched_ext/state", .{})) |state| if (std.mem.eql(u8, state, "enabled")) {
             var ob: [128]u8 = undefined;
             s.scheduler = try std.fmt.allocPrint(a, "sched_ext {s}", .{readf(&ob, "/sys/kernel/sched_ext/root/ops", .{}) orelse "(unnamed)"});
@@ -411,20 +539,6 @@ fn nvme(a: std.mem.Allocator) ![]const []const u8 {
     return out.items;
 }
 
-fn mitigations(a: std.mem.Allocator) !?[]const u8 {
-    const Count = struct {
-        n: [3]u32 = .{ 0, 0, 0 },
-        fn each(self: *@This(), name: []const u8) void {
-            var b: [256]u8 = undefined;
-            const t = readf(&b, "/sys/devices/system/cpu/vulnerabilities/{s}", .{name}) orelse return;
-            if (std.mem.startsWith(u8, t, "Not affected")) self.n[0] += 1 else if (std.mem.startsWith(u8, t, "Vulnerable")) self.n[2] += 1 else self.n[1] += 1;
-        }
-    };
-    var k = Count{};
-    if (!entries("/sys/devices/system/cpu/vulnerabilities", &k, Count.each) or k.n[0] + k.n[1] + k.n[2] == 0) return null;
-    return try std.fmt.allocPrint(a, "{d} mitigated · {d} vulnerable · {d} not affected", .{ k.n[1], k.n[2], k.n[0] });
-}
-
 // --- Lines -------------------------------------------------------------------------
 
 pub const Extra = struct {
@@ -434,6 +548,9 @@ pub const Extra = struct {
     draw_ms: ?f64 = null,
     startup_ms: ?f64 = null,
     bench: ?bench.Result = null,
+    /// CLI: bytes in, packets in, bytes out, packets out since boot over
+    /// physical links (netTotals); the panel shows live rates instead.
+    net_totals: ?[4]f64 = null,
 };
 
 /// Appends one " · "-separated part.
@@ -525,11 +642,15 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
         }
     }.f;
     const arch = if (s.arch.ok()) s.arch.s else "";
-    try add(&out, a, "OS", try std.fmt.allocPrint(a, "{s} {s}", .{ st.os_name orelse "Linux", arch }), .none);
+    const ml = st.madlib;
+    const sys: ?Retro = if (ml) |k| retro[k.system] else null;
+    try add(&out, a, "OS", if (sys) |r| r.os else try std.fmt.allocPrint(a, "{s} {s}", .{ st.os_name orelse "Linux", arch }), .none);
     try add(&out, a, "Host", st.host_model, .none);
-    try add(&out, a, "Kernel", if (redact or !s.kernel.ok()) null else try std.fmt.allocPrint(a, "Linux {s}", .{s.kernel.s}), .none);
+    try add(&out, a, "Kernel", if (sys) |r| r.kernel else if (redact or !s.kernel.ok()) null else try std.fmt.allocPrint(a, "Linux {s}", .{s.kernel.s}), .none);
     var ub: [64]u8 = undefined;
-    try add(&out, a, "Uptime", if (s.uptime_s.get()) |u| try a.dupe(u8, uptime(&ub, u, x.gui)) else null, .none);
+    // Redacted: a random start, ticking with this machine's uptime.
+    const up: ?f64 = if (ml) |k| @as(f64, @floatFromInt(k.uptime_s)) + @min(s.uptime_s.get() orelse 0, 365 * 86400) else s.uptime_s.get();
+    try add(&out, a, "Uptime", if (up) |u| try a.dupe(u8, uptime(&ub, u, x.gui)) else null, .none);
     try add(&out, a, "Packages", st.packages, .none);
     try add(&out, a, "Shell", st.shell, .none);
     for (st.displays) |d| try add(&out, a, "Display", d, .none);
@@ -576,8 +697,8 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
     if (s.psi_cpu.some10.get()) |cpu| try add(&out, a, "Pressure", try std.fmt.allocPrint(a, "cpu {d:.1}% · memory {d:.1}% · io {d:.1}% (some, 10 s)", .{ cpu, s.psi_memory.some10.get() orelse 0, s.psi_io.some10.get() orelse 0 }), if (x.gui) .pressure else .none);
     {
         var tb: std.ArrayList(u8) = .empty;
-        if (s.cpu_package_temp.get()) |t| try part(a, &tb, "CPU {d:.0} °C", .{t});
-        for (s.gpus) |g| if (g.temp_c.get()) |t| try part(a, &tb, "GPU {d:.0} °C", .{t});
+        if (s.cpu_package_temp.get()) |t| try part(a, &tb, "CPU {d:.0} °C{s}", .{ @round(t), nice(t, x.gui) });
+        for (s.gpus) |g| if (g.temp_c.get()) |t| try part(a, &tb, "GPU {d:.0} °C{s}", .{ @round(t), nice(t, x.gui) });
         for (s.disks) |d| if (d.temp_c.get()) |t| if (std.mem.startsWith(u8, d.name, "nvme")) {
             try part(a, &tb, "NVMe {d:.0} °C", .{t});
             break;
@@ -595,11 +716,6 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
         try add(&out, a, "Power", pb.items, if (x.gui) .power else .none);
     }
     for (st.nvme) |n| try add(&out, a, "NVMe", n, .none);
-    if (x.gui) if (s.net_rx_bps.get()) |rx| {
-        var r1: [32]u8 = undefined;
-        var r2: [32]u8 = undefined;
-        try add(&out, a, "Network", try std.fmt.allocPrint(a, "down {s} · up {s}", .{ m.rate(&r1, rx), m.rate(&r2, s.net_tx_bps.get() orelse 0) }), .net);
-    };
     if (x.gui) {
         var rd: ?f64 = if (s.disks.len > 0) 0 else null;
         var wr: f64 = 0;
@@ -612,7 +728,7 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
         if (rd) |r| try add(&out, a, "Disk IO", try std.fmt.allocPrint(a, "read {s} · write {s}", .{ m.rate(&r1, r), m.rate(&r2, wr) }), .disk_io);
     }
     if (s.governor.ok()) try add(&out, a, "Governor", if (s.freq_driver.ok()) try std.fmt.allocPrint(a, "{s} · {s}", .{ s.governor.s, s.freq_driver.s }) else s.governor.s, .none);
-    try add(&out, a, "Mitigations", st.mitigations, .none);
+    try add(&out, a, "Network", try network(a, s, ml, x), if (x.gui and ml == null) .net else .none);
     try add(&out, a, "Scheduler", st.scheduler, .none);
     {
         var fb: [128]u8 = undefined;
@@ -626,12 +742,67 @@ pub fn lines(a: std.mem.Allocator, st: *Static, s: *const m.Snapshot, x: Extra) 
     if (x.gui and (x.draw_ms != null or x.startup_ms != null)) try add(&out, a, "xodb frame", try std.fmt.allocPrint(a, "draw {d:.2} ms · first frame {d:.0} ms after start", .{ x.draw_ms orelse 0, x.startup_ms orelse 0 }), .none);
     if (x.bench) |r| {
         var sb: [256]u8 = undefined;
-        var db: [32]u8 = undefined;
-        try add(&out, a, "Benchmark", try std.fmt.allocPrint(a, "{s} · {s}", .{ bench.summary(&sb, r), bench.date(&db, r.when) }), .none);
+        try add(&out, a, "Benchmark", try std.fmt.allocPrint(a, "{s}", .{bench.summary(&sb, r)}), .none);
         var gb: [128]u8 = undefined;
         if (r.gpu_instances_ps) |ips| try add(&out, a, "GPU bench", try std.fmt.allocPrint(a, "{d:.1} M instances/s on {s} ({d} boxes at {d}x{d})", .{ ips / 1e6, bench.device(&gb, r, redact), r.gpu_instances, r.gpu_size[0], r.gpu_size[1] }), .none);
     }
     return out.items;
+}
+
+/// " (nice)" after a temperature that rounds to 69 °C, in the terminal card.
+fn nice(t: f64, gui: bool) []const u8 {
+    return if (!gui and @round(t) == 69) " (nice)" else "";
+}
+
+/// Physical links only (bridges, veth and tunnels repeat their traffic), in
+/// and out: the panel's live MB/s and packets/s, or --fetch's totals since
+/// boot (a show-off card, not a monitor: one read, no waiting); redacted,
+/// the card's made-up numbers.
+fn network(a: std.mem.Allocator, s: *const m.Snapshot, ml: ?Madlib, x: Extra) !?[]const u8 {
+    if (!x.gui) {
+        const t = if (ml) |k| k.totals else x.net_totals orelse return null;
+        var b: [4][32]u8 = undefined;
+        return try std.fmt.allocPrint(a, "in {s}, {s} pkts · out {s}, {s} pkts (total since boot)", .{ m.bytes(&b[0], t[0]), count(&b[1], t[1]), m.bytes(&b[2], t[2]), count(&b[3], t[3]) });
+    }
+    if (ml) |k| return try std.fmt.allocPrint(a, "in {d:.2} MB/s, {d:.0} pkt/s · out {d:.2} MB/s, {d:.0} pkt/s", .{ k.net[0], k.net[1], k.net[2], k.net[3] });
+    const rx = s.net_rx_bps.get() orelse return null;
+    const tx = s.net_tx_bps.get() orelse return null;
+    var pps: ?[2]f64 = .{ 0, 0 };
+    for (s.nets) |n| if (n.physical) {
+        pps = if (pps != null and n.rx_pps.get() != null and n.tx_pps.get() != null) .{ pps.?[0] + n.rx_pps.get().?, pps.?[1] + n.tx_pps.get().? } else null;
+    };
+    if (pps) |p| return try std.fmt.allocPrint(a, "in {d:.2} MB/s, {d:.0} pkt/s · out {d:.2} MB/s, {d:.0} pkt/s", .{ rx / 1e6, p[0], tx / 1e6, p[1] });
+    return try std.fmt.allocPrint(a, "in {d:.2} MB/s · out {d:.2} MB/s", .{ rx / 1e6, tx / 1e6 });
+}
+
+/// 980, 12.3 k, 456 M, 1.23 G: three figures, as m.bytes.
+fn count(buf: []u8, v: f64) []const u8 {
+    const units = [_][]const u8{ "", " k", " M", " G", " T" };
+    var x = v;
+    var i: usize = 0;
+    while (x >= 1000 and i + 1 < units.len) : (i += 1) x /= 1000;
+    return (if (i == 0 or x >= 100) std.fmt.bufPrint(buf, "{d:.0}{s}", .{ x, units[i] }) else if (x >= 10) std.fmt.bufPrint(buf, "{d:.1}{s}", .{ x, units[i] }) else std.fmt.bufPrint(buf, "{d:.2}{s}", .{ x, units[i] })) catch "?";
+}
+
+/// Bytes and packets in and out since boot, summed over the links the
+/// collector marks physical, from /proc/net/dev text; null when none is.
+pub fn netTotals(text: []const u8, nets: []const m.Net) ?[4]f64 {
+    var t: [4]f64 = .{ 0, 0, 0, 0 };
+    var any = false;
+    var it = std.mem.splitScalar(u8, text, '\n');
+    while (it.next()) |line| {
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
+        const name = std.mem.trim(u8, line[0..colon], " ");
+        const physical = for (nets) |n| (if (std.mem.eql(u8, n.name, name)) break n.physical) else false;
+        if (!physical) continue;
+        // rx bytes packets errs drop fifo frame compressed multicast, tx bytes packets ...
+        var v: [10]f64 = undefined;
+        var f = std.mem.tokenizeAny(u8, line[colon + 1 ..], " \t");
+        for (&v) |*x| x.* = @floatFromInt(std.fmt.parseInt(u64, f.next() orelse return null, 10) catch return null);
+        t = .{ t[0] + v[0], t[1] + v[1], t[2] + v[8], t[3] + v[9] };
+        any = true;
+    }
+    return if (any) t else null;
 }
 
 /// "user@host", or a neutral placeholder under redaction.
@@ -643,13 +814,16 @@ pub fn title(a: std.mem.Allocator, st: *const Static, s: *const m.Snapshot) ![]c
 // --- Sampling for the CLI ---------------------------------------------------------
 
 /// One collector sample of the groups the card reads, converted to the
-/// overview's model. Rates are absent (one sample).
+/// overview's model. Rates are absent (one sample); unredacted, the network
+/// group is there for its physical-link flags (see netTotals).
 pub fn sample(a: std.mem.Allocator, redact: bool) !*m.Snapshot {
     var limits: c.struct_xrt_sys_limits = undefined;
     c.xrt_sys_limits_default(&limits);
     const ids = [_]c_uint{ c.XRT_SYS_G_SUMMARY, c.XRT_SYS_G_CPU, c.XRT_SYS_G_MEMORY, c.XRT_SYS_G_DISKS, c.XRT_SYS_G_FILESYSTEMS, c.XRT_SYS_G_POWER, c.XRT_SYS_G_SYSINFO };
     var mask: u32 = 0;
     for (ids) |id| mask |= @as(u32, 1) << @intCast(id);
+    const net: u32 = @as(u32, 1) << @intCast(c.XRT_SYS_G_NETWORK);
+    if (!redact) mask |= net;
     limits.groups = mask;
     limits.flags = if (redact) c.XRT_SYS_REDACT else c.XRT_SYS_SHOW_HOSTNAME;
     const ctx = c.xrt_sys_open(&limits) orelse return error.OutOfMemory;
@@ -766,11 +940,27 @@ pub fn render(a: std.mem.Allocator, out: *Out, st: *const Static, head: []const 
             try text_rows.append(a, blocks.items);
         }
     }
-    const logo: ?[logo_rows][]const u8 = if (color and t.utf8) if (st.logo) |*img| try logoRows(a, img, t) else null else null;
-    const n = @max(text_rows.items.len, if (logo != null) @as(usize, logo_rows) else 0);
+    // The distribution's PNG as half blocks, or (redacted) the retro ASCII logo.
+    var png_rows: [logo_rows][]const u8 = undefined;
+    var logo: ?[]const []const u8 = null;
+    var logo_w: usize = logo_cols;
+    if (color and t.utf8) if (st.logo) |*img| {
+        png_rows = try logoRows(a, img, t);
+        logo = &png_rows;
+    };
+    if (color) if (st.madlib) |ml| {
+        const art = retro[ml.system].logo;
+        logo_w = 0;
+        for (art) |row| logo_w = @max(logo_w, row.len);
+        const rows = try a.alloc([]const u8, art.len);
+        for (rows, art) |*r, row| r.* = try std.fmt.allocPrint(a, "{s}{s}{s}{s}", .{ key, row, reset, (" " ** 64)[0..@min(64, logo_w - row.len)] });
+        logo = rows;
+    };
+    const logo_n = if (logo) |rows| rows.len else 0;
+    const n = @max(text_rows.items.len, logo_n);
     for (0..n) |i| {
         if (logo) |rows| {
-            if (i < logo_rows) out.print("{s}", .{rows[i]}) else out.print("{s}", .{" " ** logo_cols});
+            if (i < logo_n) out.print("{s}", .{rows[i]}) else out.print("{s}", .{(" " ** 64)[0..@min(64, logo_w)]});
             out.print("   ", .{});
         }
         if (i < text_rows.items.len) out.print("{s}", .{text_rows.items[i]});
@@ -832,7 +1022,9 @@ pub fn main(args: []const [:0]const u8) !void {
     if (redact) if (result) |*r| {
         r.gpu_device = "";
     };
-    const list = try lines(a, &st, s, .{ .bench = result });
+    var nb: [32768]u8 = undefined;
+    const totals = if (redact) null else if (readZ(&nb, "/proc/net/dev")) |t| netTotals(t, s.nets) else null;
+    const list = try lines(a, &st, s, .{ .bench = result, .net_totals = totals });
     const head = try title(a, &st, s);
     var out = Out{ .a = a };
     if (as_json) {
@@ -862,15 +1054,74 @@ test "fetch lines keep fastfetch order, omit the unmeasured and honour redaction
     try std.testing.expectEqualStrings("2.00 GiB / 8.00 GiB (25%)", list[6].value);
     try std.testing.expectEqualStrings("demo@demo-host", try title(a, &st, &s));
     st.redacted = true;
+    st.madlib = Madlib.pick(7);
+    const sys = retro[st.madlib.?.system];
     const hidden = try lines(a, &st, &s, .{});
     try std.testing.expectEqualStrings("user@host", try title(a, &st, &s));
-    try std.testing.expectEqualStrings("Demo Linux x86_64", hidden[0].value);
-    try std.testing.expect(!std.mem.eql(u8, hidden[1].key, "Kernel"));
+    try std.testing.expectEqualStrings(sys.os, hidden[0].value);
+    try std.testing.expectEqualStrings("Kernel", hidden[1].key);
+    try std.testing.expectEqualStrings(sys.kernel, hidden[1].value);
+    for (hidden) |l| try std.testing.expect(std.mem.indexOf(u8, l.value, "6.1.0") == null);
     var out = Out{ .a = a };
     try render(a, &out, &st, "user@host", hidden, .{});
     try std.testing.expect(std.mem.indexOf(u8, out.buf.items, "demo-host") == null);
     try std.testing.expect(std.mem.indexOf(u8, out.buf.items, "\x1b") == null);
-    try std.testing.expect(std.mem.startsWith(u8, out.buf.items, "user@host\n---------\nOS: Demo Linux x86_64\n"));
+    try std.testing.expect(std.mem.startsWith(u8, out.buf.items, "user@host\n---------\nOS: "));
+    // Coloured, the retro ASCII logo leads the card.
+    var tty = Out{ .a = a };
+    try render(a, &tty, &st, "user@host", hidden, .{ .depth = .truecolor });
+    try std.testing.expect(std.mem.indexOf(u8, tty.buf.items, sys.logo[1]) != null);
+    // One seed, one card: the same pick every time.
+    try std.testing.expectEqual(Madlib.pick(7).system, Madlib.pick(7).system);
+}
+
+test "a temperature rounding to 69 °C is nice in the terminal card only; no Mitigations" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var st = Static{ .arena = .init(std.testing.allocator), .redacted = false };
+    defer st.deinit();
+    var s = m.Snapshot{ .cpu_package_temp = m.F.of(68.6), .net_rx_bps = m.F.of(2e6), .net_tx_bps = m.F.of(5e5) };
+    s.nets = &.{
+        .{ .name = "eth0", .physical = true, .rx_pps = m.F.of(1500), .tx_pps = m.F.of(400) },
+        .{ .name = "br0", .rx_pps = m.F.of(9999), .tx_pps = m.F.of(9999) },
+    };
+    const value = struct {
+        fn f(list: []const Line, key: []const u8) ?[]const u8 {
+            for (list) |l| if (std.mem.eql(u8, l.key, key)) return l.value;
+            return null;
+        }
+    }.f;
+    // /proc/net/dev: only eth0 is physical.
+    const dev =
+        \\Inter-|   Receive                                                |  Transmit
+        \\ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+        \\    lo: 9999999    9999    0    0    0     0          0         0  9999999    9999    0    0    0     0       0          0
+        \\  eth0: 1288490188800 980000000 0 0 0 0 0 0 332859965440 410000000 0 0 0 0 0 0
+        \\   br0: 777777    77    0    0    0     0          0         0   777777      77    0    0    0     0       0          0
+    ;
+    const totals = netTotals(dev, s.nets).?;
+    try std.testing.expectEqual([4]f64{ 1288490188800, 980000000, 332859965440, 410000000 }, totals);
+    var list = try lines(a, &st, &s, .{ .net_totals = totals });
+    try std.testing.expectEqualStrings("CPU 69 °C (nice)", value(list, "Temps").?);
+    try std.testing.expectEqualStrings("in 1.17 TiB, 980 M pkts · out 310 GiB, 410 M pkts (total since boot)", value(list, "Network").?);
+    try std.testing.expect(netTotals(dev, &.{}) == null);
+    try std.testing.expect(value(list, "Mitigations") == null);
+    list = try lines(a, &st, &s, .{ .gui = true });
+    try std.testing.expectEqualStrings("CPU 69 °C", value(list, "Temps").?);
+    try std.testing.expectEqualStrings("in 2.00 MB/s, 1500 pkt/s · out 0.50 MB/s, 400 pkt/s", value(list, "Network").?);
+    s.cpu_package_temp = m.F.of(68.5);
+    list = try lines(a, &st, &s, .{});
+    try std.testing.expectEqualStrings("CPU 69 °C (nice)", value(list, "Temps").?);
+    s.cpu_package_temp = m.F.of(69.6);
+    list = try lines(a, &st, &s, .{});
+    try std.testing.expectEqualStrings("CPU 70 °C", value(list, "Temps").?);
+    st.madlib = Madlib.pick(3);
+    list = try lines(a, &st, &s, .{ .net_totals = totals });
+    try std.testing.expect(!std.mem.startsWith(u8, value(list, "Network").?, "in 1.17 TiB"));
+    try std.testing.expect(std.mem.endsWith(u8, value(list, "Network").?, "pkts (total since boot)"));
+    list = try lines(a, &st, &s, .{ .gui = true });
+    try std.testing.expect(!std.mem.startsWith(u8, value(list, "Network").?, "in 2.00 MB/s"));
 }
 
 test "EDID preferred timing and name; ANSI colour from os-release" {

@@ -24,11 +24,11 @@ pub const Completion = struct {
     probe_policy: ?@import("probe_view.zig").Outcome = null,
     capture_control: ?@import("capture_view.zig").Outcome = null,
 };
-/// Normal replies use at most 64 slots; another 64 are reserved for cancellation
-/// of the remaining input queue. No allocation or payload free on the frame.
+/// Normal replies use at most 64 slots; cancellation reserves another 64 plus
+/// the active and pending urgent commands. No allocation on the frame.
 pub const Completions = struct {
     mutex: std.atomic.Mutex = .unlocked,
-    items: [2 * boundary.max_commands]Completion = undefined,
+    items: [2 * boundary.max_commands + 2]Completion = undefined,
     head: usize = 0,
     count: usize = 0,
     fn available(self: *Completions) bool {
@@ -331,11 +331,11 @@ pub const Worker = struct {
                 self.requestStop();
                 return false;
             })) return false;
-            const needs_completion = command.request.action != .mcp and command.request.action != .poll;
+            const needs_completion = !command.request.protocol_reply and command.request.action != .mcp and command.request.action != .poll;
             if (!needs_completion or self.completions.available()) {
                 var arena = std.heap.ArenaAllocator.init(a);
                 defer arena.deinit();
-                var result: anyerror!dispatch.Result = if (command.request.action == .inspect and command.request.stamp.process != self.executor.tree.active().process_id) error.StaleProcess else self.executor.execute(arena.allocator(), command, self.serverFor(command.sequence));
+                var result: anyerror!dispatch.Result = if (command.request.action == .inspect and command.request.stamp.process != self.executor.tree.active().process_id) error.StaleProcess else self.execute(arena.allocator(), command);
                 if (result) |value| {
                     if (command.request.action == .inspect and (value == .view or value == .debugger or value == .language)) {
                         const inspection = command.request.action.inspect;
@@ -436,12 +436,41 @@ pub const Worker = struct {
         };
         return if (continuation) .continuation else .none;
     }
+    /// Frontend routing lives at the owner composition boundary, not inside
+    /// semantic command execution. Migrated protocol calls carry typed values.
+    fn execute(self: *Worker, allocator: std.mem.Allocator, command: *const boundary.Command) !dispatch.Result {
+        const request = command.request;
+        if (request.action == .mcp) {
+            _ = try self.executor.sessionFor(command);
+            const server = self.serverFor(command.sequence) orelse return error.UnknownSessionClient;
+            const call = request.action.mcp;
+            const parsed = try std.json.parseFromSlice(std.json.Value, allocator, call.arguments_json, .{});
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidArguments;
+            if (parsed.value.object.get("process_id")) |id| {
+                if (id != .integer or id.integer != request.stamp.process) return error.StaleProcess;
+            } else if (request.stamp.process != self.executor.tree.root().process_id) return error.StaleProcess;
+            const value = try server.queuedTool(allocator, self.executor.tree.root(), request.actor, call.name, parsed.value);
+            return .{ .json = try std.json.Stringify.valueAlloc(allocator, value, .{}) };
+        }
+        if (request.action == .inspect and request.action.inspect.kind == .view) {
+            const session = try self.executor.sessionFor(command);
+            return .{ .view = try @import("../mcp/remote.zig").captureView(allocator, session, .{ .generation = request.stamp.generation, .selection = request.action.inspect.selection, .source = self.options.source }) };
+        }
+        if (request.protocol_reply) {
+            const server = self.serverFor(command.sequence) orelse return error.UnknownSessionClient;
+            try server.queuedCaller(request.actor);
+            const session = (try self.executor.tree.find(request.stamp.process)).session;
+            return .{ .json = try server.commandReply(allocator, session, request, self.executor.execute(allocator, command)) };
+        }
+        return self.executor.execute(allocator, command);
+    }
     fn complete(self: *Worker, command: *const boundary.Command, result: anyerror!dispatch.Result) void {
         if (command.request.action == .poll) {
             if (result) |_| {} else |err| self.reportPresentationError(err);
             return;
         }
-        if (command.request.action == .mcp) {
+        if (command.request.protocol_reply or command.request.action == .mcp) {
             const server = self.serverFor(command.sequence) orelse {
                 // A dropped client's admitted command is disposed exactly once;
                 // there is no socket to receive a terminal protocol reply.
@@ -474,12 +503,17 @@ pub const Worker = struct {
                 completion.id_count = value.ids.len;
                 if (value.ids.len > 0) completion.first_id = value.ids[0];
             }
+            if (value == .command) {
+                completion.id_count = value.command.ids.len;
+                if (value.command.ids.len > 0) completion.first_id = value.command.ids[0];
+            }
         } else |err| completion.failure = err;
         if (self.executor.tree.find(command.request.stamp.process)) |entry| {
             if (entry.session.modules.skipped().count != 0) {
                 const source_action = switch (command.request.action) {
                     .workspace => |v| v == .run_to_source or v == .toggle_source,
-                    .breakpoint => |v| v == .source,
+                    .breakpoint => |v| v == .source or v == .toggle_source,
+                    .control => |v| v == .run_to_source,
                     else => false,
                 };
                 const message: ?[]const u8 = if (completion.failure != null and completion.failure.? == error.NoCodeForSourceLine)
@@ -761,6 +795,11 @@ test "silent saturated queue cancels exactly once with full completions" {
         try std.testing.expectEqual(index + 1, try worker.commands.trySubmit(command));
     }
     try std.testing.expect(!worker.completions.available());
+    const urgent = try boundary.Command.create(test_a, .{ .stamp = identity, .actor = .human, .action = .{ .control = .interrupt } });
+    try std.testing.expectEqual(boundary.max_commands + 1, try worker.commands.trySubmit(urgent));
+    worker.active = (try worker.commands.take()).?;
+    const revoke = try boundary.Command.create(test_a, .{ .stamp = identity, .actor = .human, .action = .toggle_scope });
+    try std.testing.expectEqual(boundary.max_commands + 2, try worker.commands.trySubmit(revoke));
     // Quiescing itself cannot depend on acquiring a producer's queue lock.
     try std.testing.expect(worker.commands.mutex.tryLock());
     worker.requestStop();
@@ -775,13 +814,14 @@ test "silent saturated queue cancels exactly once with full completions" {
     }
     worker.joinCompleted();
     // No further producer input or completion consumption was needed to finish.
-    for (0..2 * boundary.max_commands) |index| {
+    for (0..2 * boundary.max_commands + 2) |index| {
         const reply = (try worker.completions.take()).?;
         if (index < boundary.max_commands) {
             try std.testing.expectEqual(1000 + index, reply.sequence);
             try std.testing.expect(reply.failure == null);
         } else {
-            try std.testing.expectEqual(index - boundary.max_commands + 1, reply.sequence);
+            const expected = if (index < boundary.max_commands + 2) index + 1 else index - boundary.max_commands - 1;
+            try std.testing.expectEqual(expected, reply.sequence);
             try std.testing.expect(reply.failure.? == error.Cancelled);
         }
     }
@@ -796,8 +836,8 @@ test "completion capacity reserves cancellation without losing earlier replies" 
         replies.put(.{ .sequence = i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 } });
     }
     try std.testing.expect(!replies.available());
-    for (0..boundary.max_commands) |i| replies.put(.{ .sequence = boundary.max_commands + i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 }, .failure = error.Cancelled });
-    for (0..2 * boundary.max_commands) |i| {
+    for (0..boundary.max_commands + 2) |i| replies.put(.{ .sequence = boundary.max_commands + i + 1, .stamp = .{ .connection = 1, .session = 1, .process = 1, .pid = 1, .image_epoch = 0, .generation = 0 }, .failure = error.Cancelled });
+    for (0..2 * boundary.max_commands + 2) |i| {
         const reply = (try replies.take()).?;
         try std.testing.expectEqual(i + 1, reply.sequence);
         try std.testing.expectEqual(i >= boundary.max_commands, reply.failure != null);

@@ -221,6 +221,16 @@ pub fn build(b: *std.Build) void {
     const remote_lifecycle_tests = b.addTest(.{ .name = "xodb-remote-lifecycle-test", .root_module = module, .filters = &.{ "silent saturated queue", "late old completion", "process identity compares start", "publications retain nested strings" } });
     b.installArtifact(remote_lifecycle_tests);
     b.step("remote-lifecycle", "Test remote queue shutdown and stale incarnation refusal").dependOn(&b.addRunArtifact(remote_lifecycle_tests).step);
+    if (optimize == .Debug) {
+        // Zig 0.16.0's self-hosted Debug backend segfaults on this module.
+        // main through snapshot.configure compiles, and so does a tiny program
+        // that calls appearance.init or semq/static_image.zig decompile. That
+        // same prefix plus either call segfaults the compiler. LLVM Debug does not.
+        exe.use_llvm = true;
+        tests.use_llvm = true;
+        cocoa_contract_tests.use_llvm = true;
+        remote_lifecycle_tests.use_llvm = true;
+    }
     if (capstone_link == .vendored) {
         // The self-hosted Debug backend segfaults on the Capstone 6 translate-c output.
         exe.use_llvm = true;
@@ -493,10 +503,8 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit and real target integration tests");
     if (gui) {
         const coverage = b.addTest(.{ .root_module = module, .filters = &.{"bundled bitmap font covers every mark"} });
-        if (capstone_link == .vendored) {
-            coverage.use_llvm = true;
-            coverage.each_lib_rpath = false;
-        }
+        if (optimize == .Debug or capstone_link == .vendored) coverage.use_llvm = true;
+        if (capstone_link == .vendored) coverage.each_lib_rpath = false;
         const empty = b.addWriteFiles();
         _ = empty.add(".keep", "");
         const run_coverage = b.addRunArtifact(coverage);

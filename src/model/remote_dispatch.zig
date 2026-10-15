@@ -3,10 +3,12 @@
 const std = @import("std");
 const model = @import("session.zig");
 const boundary = @import("remote_owner.zig");
-const context = @import("../mcp/shared_context.zig");
+const context = @import("../service/authority.zig");
 const lease_model = @import("../service/lease.zig");
 const linux = @import("../target/linux.zig");
 const A = std.mem.Allocator;
+const api = @import("command.zig");
+pub const CommandResult = @import("commands.zig").Result;
 
 pub fn stamp(connection: u64, session: *const model.Session) boundary.Stamp {
     const state = session.target.snapshot();
@@ -15,6 +17,7 @@ pub fn stamp(connection: u64, session: *const model.Session) boundary.Stamp {
 
 pub const Result = union(enum) {
     done,
+    command: CommandResult,
     ids: []const u64,
     view: @import("../remote/view.zig").View,
     debugger: @import("debugger_view.zig").Presentation,
@@ -174,12 +177,30 @@ pub const Executor = struct {
         return self.language.value;
     }
 
-    /// server, when present, is resolved by the owner from the accepted MCP
-    /// connection. Neither a command nor its JSON may supply a Server pointer.
-    pub fn execute(self: *Executor, a: A, command: *const boundary.Command, server: ?*@import("../mcp/server.zig").Server) !Result {
+    /// Validate non-core commands at their owner-thread boundary.
+    pub fn sessionFor(self: *Executor, command: *const boundary.Command) !*model.Session {
+        const session = (try self.tree.find(command.request.stamp.process)).session;
+        if (!session.target.isRemote()) return error.RemoteSessionRequired;
+        var authorizer = Authorizer{ .executor = self, .session = session };
+        try command.validate(stamp(self.connection, session), &authorizer);
+        return session;
+    }
+    pub fn execute(self: *Executor, a: A, command: *const boundary.Command) !Result {
         const request = command.request;
         const session = (try self.tree.find(request.stamp.process)).session;
         if (!session.target.isRemote()) return error.RemoteSessionRequired;
+        const operation: ?api.Operation = switch (request.action) {
+            .control => |control| .{ .control = control },
+            .breakpoint => |bp| .{ .breakpoint = bp },
+            else => null,
+        };
+        if (operation) |op| return .{ .command = try session.executeCommand(a, self.connection, self.service, .{ .stamp = request.stamp, .caller = request.actor, .operation = op }) };
+        if (request.action == .probe_policy) {
+            _ = try self.sessionFor(command);
+            const resolved = try @import("probe_view.zig").resolve(session, request.action.probe_policy);
+            _ = try session.executeCommand(a, self.connection, self.service, .{ .stamp = request.stamp, .caller = request.actor, .operation = resolved.operation });
+            return .{ .probe_policy = resolved.outcome };
+        }
         var authorizer = Authorizer{ .executor = self, .session = session };
         try command.validate(stamp(self.connection, session), &authorizer);
 
@@ -198,7 +219,7 @@ pub const Executor = struct {
 
         switch (request.action) {
             .allocation => |intent| try @import("allocation_view.zig").apply(session, intent, actor),
-            .probe_policy => |intent| return .{ .probe_policy = try @import("probe_view.zig").apply(session, intent, actor) },
+            .probe_policy => unreachable,
             .poll => {
                 try self.tree.poll();
                 return .done;
@@ -208,32 +229,22 @@ pub const Executor = struct {
                 if (inspection.kind == .language) return .{ .language = try self.captureLanguage(session, inspection) };
                 if (inspection.kind == .debugger) return .{ .debugger = self.captureDebugger(session, inspection) };
                 if (inspection.kind != .view) return error.UnsupportedInspection;
-                return .{ .view = try @import("../mcp/remote.zig").captureView(a, session, .{ .generation = request.stamp.generation, .selection = inspection.selection, .source = self.source }) };
+                return error.ProtocolAdapterRequired;
             },
-            .mcp => |call| {
-                const endpoint = server orelse return error.UnknownSessionClient;
-                const parsed = try std.json.parseFromSlice(std.json.Value, a, call.arguments_json, .{});
-                defer parsed.deinit();
-                if (parsed.value != .object) return error.InvalidArguments;
-                if (parsed.value.object.get("process_id")) |id| {
-                    if (id != .integer or id.integer != request.stamp.process) return error.StaleProcess;
-                } else if (request.stamp.process != self.tree.root().process_id) return error.StaleProcess;
-                const value = try endpoint.queuedTool(a, self.tree.root(), request.actor, call.name, parsed.value);
-                return .{ .json = try std.json.Stringify.valueAlloc(a, value, .{}) };
-            },
+            .mcp => return error.ProtocolAdapterRequired,
             .workspace => |action| try @import("workspace_view.zig").apply(a, session, action),
             .toggle_scope => {
                 if (self.service) |service| try context.check(context.c.xsvc_revoke(service, linux.now()));
                 session.setAgentScope(if (session.agent_scope == .observe) .control else .observe);
             },
-            .control => |control| try self.executeControl(session, actor, control),
+            .control => unreachable,
             .static_cancel => |id| try @import("static_view.zig").cancel(session, actor, id),
             .invocation => |action| try self.invocations.apply(session, actor, action),
             .runtime_type => |action| try self.runtime_types.apply(session, actor, action),
             .logical_frames => |action| try @import("frame_view.zig").apply(&session.frames, action),
             .capture_control => |action| return .{ .capture_control = try @import("capture_view.zig").apply(&self.capture_control.rows, session, actor, action) },
             .language => |action| try @import("language_view.zig").apply(session, action),
-            .process => |operation| try @import("process_view.zig").apply(self.tree, request.stamp, actor, operation),
+            .process => |process_op| try @import("process_view.zig").apply(self.tree, request.stamp, actor, process_op),
             .inline_expression => |request_| return .{ .inline_expression = try @import("inline_view.zig").evaluate(session, request_) },
             .memory_action => |action| {
                 if (try @import("inspection_view.zig").apply(session, actor, action)) |value| {
@@ -256,34 +267,7 @@ pub const Executor = struct {
                     return .{ .ids = ids };
                 }
             },
-            .breakpoint => |bp| {
-                switch (bp) {
-                    .address => |address| {
-                        const ids = try a.alloc(u64, 1);
-                        const id = try session.target.setBreakpoint(address, false);
-                        ids[0] = id;
-                        session.record(actor, "set_breakpoint");
-                        return .{ .ids = ids };
-                    },
-                    .source => |source| {
-                        if (source.line == 0) return error.InvalidArguments;
-                        const ids = try session.setSourceBreakpoint(a, source.path, source.line);
-                        session.record(actor, "set_breakpoint");
-                        return .{ .ids = ids };
-                    },
-                    .remove => |id| {
-                        try publicBreakpoint(session, id);
-                        try session.target.removeBreakpoint(id);
-                        session.record(actor, "remove_breakpoint");
-                    },
-                    .enabled => |change| {
-                        try publicBreakpoint(session, change.id);
-                        // Enabling does not replace a condition/log policy.
-                        try session.target.enableBreakpoint(change.id, change.enabled);
-                        session.record(actor, "configure_breakpoint");
-                    },
-                }
-            },
+            .breakpoint => unreachable,
             .watchpoint => |wp| switch (wp) {
                 .add => |add| {
                     const ids = try a.alloc(u64, 1);
@@ -316,56 +300,6 @@ pub const Executor = struct {
         return .done;
     }
 
-    fn executeControl(self: *Executor, session: *model.Session, actor: model.Actor, action: boundary.Control) !void {
-        const name: []const u8 = switch (action) {
-            .interrupt => blk: {
-                session.cancelStep();
-                try session.target.interrupt();
-                break :blk "interrupt";
-            },
-            .continue_execution => blk: {
-                try session.continueExecution(actor);
-                break :blk "continue";
-            },
-            .step_instruction, .step_over_instruction => |tid| blk: {
-                if (tid <= 0) return error.InvalidArguments;
-                session.probe_resume_actor = actor;
-                if (action == .step_instruction) try session.stepInstruction(tid) else try session.stepOverInstruction(tid);
-                break :blk if (action == .step_instruction) "step_instruction" else "step_over_instruction";
-            },
-            .step_source => |step| blk: {
-                if (step.tid <= 0) return error.InvalidArguments;
-                session.probe_resume_actor = actor;
-                try session.startSourceStep(step.tid, step.over);
-                break :blk if (step.over) "step_over" else "step_source";
-            },
-            .finish_frame => |selection| blk: {
-                if (selection.tid <= 0) return error.InvalidArguments;
-                try session.finishFrame(selection.tid, selection.frame, actor);
-                break :blk "finish";
-            },
-            .run_to => |run| blk: {
-                if (run.tid <= 0) return error.InvalidArguments;
-                try session.runTo(run.tid, run.address, null, actor);
-                break :blk "run_to";
-            },
-            .restart => blk: {
-                try session.restart();
-                break :blk "restart";
-            },
-            .detach => blk: {
-                session.cancelStep();
-                try session.detach();
-                break :blk "detach";
-            },
-            .follow_processes => |follow| {
-                try self.tree.setFollowing(session, follow.enabled, follow.limit, actor);
-                return; // Tree records this action itself.
-            },
-        };
-        session.record(actor, name);
-    }
-
     const Authorizer = struct {
         executor: *Executor,
         session: *model.Session,
@@ -382,11 +316,10 @@ pub const Executor = struct {
             if (request.actor == .agent) {
                 const agent = request.actor.agent;
                 if (self.executor.service) |service| {
-                    const peer = context.Context{ .service = service, .client_id = agent.client };
-                    try peer.tick(self.executor.tree.root());
+                    try context.check(context.c.xsvc_tick(service, linux.now(), @intFromEnum(self.executor.tree.root().agent_scope)));
                     try context.check(context.c.xsvc_authorize(service, agent.client, context.c.XSVC_OBSERVE, linux.now()));
                     if (effect(request.action)) |required| {
-                        try peer.authorize(required == .mutation);
+                        try context.authorize(service, agent.client, required == .mutation, linux.now());
                         const live = lease_model.Lease.capture(service, agent.client) orelse return error.ControlLeaseRequired;
                         if (agent.lease != live.id) return error.ControlLeaseRequired;
                         self.lease = live;
@@ -407,10 +340,6 @@ fn effect(action: boundary.Action) ?model.Effect {
         .poll, .inspect, .inline_expression, .mcp, .toggle_scope => null,
     };
 }
-fn publicBreakpoint(session: *model.Session, id: u64) !void {
-    if (@import("persistent.zig").Manager.probe(session, id)) |probe| if (probe.internal) return error.InternalBreakpoint;
-}
-
 test "remote dispatch refuses local ownership and validates queued identities" {
     const a = std.testing.allocator;
     const session = try a.create(model.Session);
@@ -425,66 +354,67 @@ test "remote dispatch refuses local ownership and validates queued identities" {
     var executor: Executor = .{ .connection = 1, .tree = tree };
     const local = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .poll });
     defer local.destroy();
-    try std.testing.expectError(error.RemoteSessionRequired, executor.execute(a, local, null));
+    try std.testing.expectError(error.RemoteSessionRequired, executor.execute(a, local));
 
     try session.target.connectRemote(&.{ "./zig-out/bin/xodb-agent", "--stdio" });
     const old_connection = try boundary.Command.create(a, .{ .stamp = stamp(2, session), .actor = .human, .action = .{ .control = .interrupt } });
     defer old_connection.destroy();
-    try std.testing.expectError(error.StaleProcess, executor.execute(a, old_connection, null));
-    const old_stop = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .control = .interrupt } });
+    try std.testing.expectError(error.StaleProcess, executor.execute(a, old_connection));
+    const old_stop = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .control = .cancel_continue } });
     defer old_stop.destroy();
     try session.target.invalidate();
-    try std.testing.expectError(error.StaleSnapshot, executor.execute(a, old_stop, null));
+    _ = try executor.execute(a, old_stop); // Old-view cancellation remains effective.
+    const after_cancel = session.audit_count;
 
     const denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .control = .interrupt } });
     defer denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, denied, null));
-    try std.testing.expectEqual(@as(usize, 0), session.audit_count);
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, denied));
+    try std.testing.expectEqual(after_cancel, session.audit_count);
     const selection_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .language = .{ .tab = .registers } } });
     defer selection_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, selection_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, selection_denied));
     const probe_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .probe_policy = .{ .key = @import("probe_view.zig").sessionKey(session), .edit = .{ .remove = 1 } } } });
     defer probe_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, probe_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, probe_denied));
     const allocation_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .allocation = .{ .stop = .{ .identity = null, .serial = 0 } } } });
     defer allocation_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, allocation_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, allocation_denied));
     const watch_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .runtime_watch = .{ .remove = 1 } } });
     defer watch_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, watch_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, watch_denied));
     const watch_human = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .runtime_watch = .{ .remove = 1 } } });
     defer watch_human.destroy();
-    try std.testing.expectError(error.LanguageWatchNotFound, executor.execute(a, watch_human, null));
+    try std.testing.expectError(error.LanguageWatchNotFound, executor.execute(a, watch_human));
     const native_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .native_watch = .{ .remove = .{ .revision = 0, .index = 0 } } } });
     defer native_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, native_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, native_denied));
     const native_human = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .native_watch = .{ .remove = .{ .revision = 0, .index = 0 } } } });
     defer native_human.destroy();
-    try std.testing.expectError(error.WatchEntryNotFound, executor.execute(a, native_human, null));
+    try std.testing.expectError(error.WatchEntryNotFound, executor.execute(a, native_human));
     const memory_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .memory_action = .{ .cancel = 1 } } });
     defer memory_denied.destroy();
-    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, memory_denied, null));
+    try std.testing.expectError(error.AgentScopeDenied, executor.execute(a, memory_denied));
     const inspection_denied = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .inspect = .{ .request_id = 1, .selection = .{ .tid = 0 }, .kind = .debugger, .profile = .{ .basis = .reconstructed } } } });
     defer inspection_denied.destroy();
-    try std.testing.expectError(error.GuiActorRequired, executor.execute(a, inspection_denied, null));
+    try std.testing.expectError(error.GuiActorRequired, executor.execute(a, inspection_denied));
     try std.testing.expect(!session.profile_view_visible);
     const address_read = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .{ .memory_action = .{ .address = .{ .tid = 1, .frame = 0, .metadata = session.metadata.revision, .text = "0x1000" } } } });
     defer address_read.destroy();
-    const address_reply = try executor.execute(a, address_read, null);
+    const address_reply = try executor.execute(a, address_read);
     defer a.free(address_reply.ids);
     try std.testing.expectEqual(@as(u64, 0x1000), address_reply.ids[0]);
 
     const scope_stamp = stamp(1, session);
     const scope_denied = try boundary.Command.create(a, .{ .stamp = scope_stamp, .actor = .{ .agent = .{ .client = 0, .lease = null } }, .action = .toggle_scope });
     defer scope_denied.destroy();
-    try std.testing.expectError(error.GuiActorRequired, executor.execute(a, scope_denied, null));
+    try std.testing.expectError(error.GuiActorRequired, executor.execute(a, scope_denied));
     const scope_human = try boundary.Command.create(a, .{ .stamp = scope_stamp, .actor = .human, .action = .toggle_scope });
     defer scope_human.destroy();
     const audit_before = session.audit_count;
-    _ = try executor.execute(a, scope_human, null);
+    _ = try executor.execute(a, scope_human);
     try std.testing.expectEqual(model.AgentScope.control, session.agent_scope);
     // Both queued presses must apply even though the first invalidates the stop.
-    _ = try executor.execute(a, scope_human, null);
+    _ = try executor.execute(a, scope_human);
     try std.testing.expectEqual(model.AgentScope.observe, session.agent_scope);
     try std.testing.expectEqual(audit_before + 2, session.audit_count);
 
@@ -496,19 +426,19 @@ test "remote dispatch refuses local ownership and validates queued identities" {
     defer arena.deinit();
     const add = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .breakpoint = .{ .address = pc } } });
     defer add.destroy();
-    const result = try executor.execute(arena.allocator(), add, null);
-    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
-    const id = result.ids[0];
+    const result = try executor.execute(arena.allocator(), add);
+    try std.testing.expectEqual(@as(usize, 1), result.command.ids.len);
+    const id = result.command.ids[0];
     try session.probes.configure(&session.target, id, .{ .condition = "1", .ignore_count = 3 }, true);
     const disable = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .breakpoint = .{ .enabled = .{ .id = id, .enabled = false } } } });
     defer disable.destroy();
-    _ = try executor.execute(arena.allocator(), disable, null);
+    _ = try executor.execute(arena.allocator(), disable);
     try std.testing.expectEqualStrings("1", session.probes.rule(id).?.condition.slice());
     try std.testing.expectEqual(@as(u64, 3), session.probes.rule(id).?.ignore_remaining);
     try std.testing.expect(!@import("persistent.zig").Manager.probe(session, id).?.enabled);
     const remove = try boundary.Command.create(a, .{ .stamp = stamp(1, session), .actor = .human, .action = .{ .breakpoint = .{ .remove = id } } });
     defer remove.destroy();
-    _ = try executor.execute(arena.allocator(), remove, null);
+    _ = try executor.execute(arena.allocator(), remove);
     try std.testing.expect(@import("persistent.zig").Manager.probe(session, id) == null);
     try std.testing.expectEqual(model.Actor.human, session.audit[session.audit_count - 1].actor);
 }

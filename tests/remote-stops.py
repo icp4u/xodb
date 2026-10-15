@@ -154,12 +154,9 @@ try:
     results['hits_before'] = counter()
     start = time.monotonic()
     one.action('run_to', tid=worker, address=address)
-    one.tool('release_session_control')
-    # Deliberately stale, and then absent: neither may starve a lease claim.
-    time.sleep(.02)
-    two.tool('claim_session_control', generation=first['generation'])
-    two.tool('release_session_control')
-    one.tool('claim_session_control')
+    # Keep the original grant for this progress-cap oracle. Releasing it now
+    # cancels automatic resumes rather than transferring them to a new lease;
+    # replacement-lease/deferred-resume refusal is checked by the owner units.
     final = shared.eventually(one.session, lambda s: s['running_to'] is None and s['state'] == 'stopped', 'bounded wrong-thread run-to', timeout=30)
     results['wrong_thread_seconds'] = time.monotonic() - start
     results['wrong_thread_diagnostic'] = final['step_diagnostic']
@@ -169,6 +166,11 @@ try:
     assert results['hits_after'] - results['hits_before'] == 63, results
     assert final['step_diagnostic'] == 'RunToNoProgress', final
     assert not [p for p in one.tool('get_breakpoints')['breakpoints'] if not p['internal']]
+    one.tool('release_session_control')
+    # Deliberately stale, and then absent: neither may starve a lease claim.
+    two.tool('claim_session_control', generation=first['generation'])
+    two.tool('release_session_control')
+    one.tool('claim_session_control')
     shared.expect_error(one.raw('continue', generation=first['generation']), 'StaleSnapshot')
     results['resources_after'] = resource_sample(measured_pids)
     if args.perf:

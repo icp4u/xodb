@@ -87,6 +87,19 @@ the better one (review 1.1). Plan:
    (supported, not supported here, needs privilege, not present). The support
    matrix in the docs is generated from these, not hand-written.
 
+The first command slice uses `model/command.zig` for plain request values and
+`model/commands.zig` for owner-thread execution. GUI and MCP native controls and
+breakpoints share this handler; MCP only decodes and encodes. Queued replies
+are routed independently of the operation tag. The handler checks the live
+scope/lease and process identity, passes caller identity explicitly to audit
+and deferred resume, and does not import frontend or publication machinery.
+Continue/step/breakpoint changes require the expected observation; interrupt
+and pending-continue cancellation accept an old view. Human scope revocation
+also ignores the displayed observation. A bounded urgent slot admits these
+stop/revoke actions ahead of ordinary queued work, without preempting a backend
+call already in flight. Local GUI execution remains synchronous until step 2;
+unmigrated tools retain the existing adapter path.
+
 ## 3. Other items found while working this week
 
 | Item | Why |

@@ -11,27 +11,19 @@ fn number(args: Value, key: []const u8, default: u64) !u64 {
     return @intCast(value.integer);
 }
 pub fn handles(name: []const u8) bool {
-    return std.mem.eql(u8, name, "get_debug_view") or std.mem.eql(u8, name, "detach");
+    return std.mem.eql(u8, name, "get_debug_view");
 }
 pub fn call(a: A, session: *model.Session, name: []const u8, args: Value, source: ?[:0]const u8) !Value {
     if (args != .object) return error.InvalidArguments;
-    const detach = std.mem.eql(u8, name, "detach");
+    if (!handles(name)) return error.InvalidArguments;
     var fields = args.object.iterator();
     while (fields.next()) |entry| {
         const key = entry.key_ptr.*;
         if (std.mem.eql(u8, key, "generation")) continue;
-        if (!detach and (std.mem.eql(u8, key, "tid") or std.mem.eql(u8, key, "frame") or std.mem.eql(u8, key, "summary_only"))) continue;
+        if (std.mem.eql(u8, key, "tid") or std.mem.eql(u8, key, "frame") or std.mem.eql(u8, key, "summary_only")) continue;
         return error.InvalidArguments;
     }
     if (session.offline) return error.OfflineSession;
-    if (detach) {
-        if (args.object.get("generation") == null) return error.GenerationRequired;
-        try session.authorize(.agent, .execution, try number(args, "generation", 0));
-        session.cancelStep();
-        try session.detach();
-        session.record(.agent, "detach");
-        return asValue(a, session.snapshot());
-    }
     const tid = try number(args, "tid", 0);
     const frame = try number(args, "frame", 0);
     if (tid > std.math.maxInt(i32) or frame >= 64) return error.InvalidArguments;

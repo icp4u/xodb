@@ -11,9 +11,12 @@ const ArchiveJob = @import("../profile/archive_job.zig").Job;
 const perf = @import("../profile/linux_perf.zig");
 const cfg = @import("control_flow.zig");
 pub const FunctionGraph = struct { generation: u64, image_epoch: u64, module_id: u64, symbol: []const u8, link_address: u64, extent_source: enum { elf_symbol, dwarf_subprogram } = .elf_symbol, range_index: usize = 0, range_count: usize = 1, graph: cfg.Graph };
-pub const AgentScope = enum { observe, control, mutate };
-pub const Actor = enum { human, agent };
-pub const Effect = enum { execution, mutation };
+pub const AgentScope = @import("command.zig").AgentScope;
+pub const Actor = @import("command.zig").Actor;
+pub const Effect = @import("command.zig").Effect;
+/// Owner-held execution context, never queued or published. Legacy adapters
+/// still bind their ambient fields; migrated commands pass this explicitly.
+pub const Caller = @import("../service/authority.zig").Caller;
 pub const Audit = struct { sequence: u64, actor: Actor, client_id: ?u64 = null, action: []const u8, generation: u64, runtime_write: ?@import("runtime_writes.zig").Change = null };
 pub const Frame = struct {
     architecture: @import("../target/arch.zig").Arch = .x86_64,
@@ -136,6 +139,7 @@ pub const Session = struct {
     launch_argv: []const [:0]const u8 = &.{},
     suppress_probe_resume: bool = false,
     probe_resume_actor: Actor = .human,
+    probe_resume_lease: ?@import("../service/lease.zig").Lease = null,
     profile: ?*profile.Capture = null,
     /// Session defaults for future GUI captures and omitted MCP arguments.
     profile_defaults: profile.Config = .{},
@@ -1050,6 +1054,9 @@ pub const Session = struct {
         try self.target.singleStep(tid);
     }
     pub fn runTo(self: *Session, tid: i32, address: u64, expected_sp: ?u64, actor: Actor) !void {
+        return self.runToAs(tid, address, expected_sp, self.legacyCaller(actor));
+    }
+    pub fn runToAs(self: *Session, tid: i32, address: u64, expected_sp: ?u64, caller: Caller) !void {
         if (self.target.snapshot().state != .stopped) return error.NotStopped;
         if (self.source_step != null or self.run_to != null) return error.StepInProgress;
         var identity: ?u64 = null;
@@ -1069,17 +1076,20 @@ pub const Session = struct {
         self.run_to = .{ .tid = tid, .thread_id = stable_id, .address = address, .probe = id, .owns_probe = owned, .image_epoch = self.target.snapshot().image_epoch, .expected_sp = expected_sp };
         errdefer self.run_to = null;
         self.step_diagnostic = null;
-        try self.continueExecution(actor);
+        try self.continueAs(caller);
     }
     pub fn finishFrame(self: *Session, tid: i32, frame_index: usize, actor: Actor) !void {
+        return self.finishAs(tid, frame_index, self.legacyCaller(actor));
+    }
+    pub fn finishAs(self: *Session, tid: i32, frame_index: usize, caller: Caller) !void {
         if (frame_index >= 63) return error.InvalidFrame;
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         defer arena.deinit();
         const frames = try self.stack(arena.allocator(), tid, frame_index + 2);
         if (frames.len <= frame_index + 1) return error.CallerUnavailable;
-        const caller = frames[frame_index + 1];
-        const sp = caller.registers[self.target.arch().sp()] orelse return error.CallerUnavailable;
-        try self.runTo(tid, caller.pc, sp, actor);
+        const caller_frame = frames[frame_index + 1];
+        const sp = caller_frame.registers[self.target.arch().sp()] orelse return error.CallerUnavailable;
+        try self.runToAs(tid, caller_frame.pc, sp, caller);
     }
     fn pollRunTo(self: *Session, filtered: bool) !void {
         const run = self.run_to orelse return;
@@ -1117,28 +1127,52 @@ pub const Session = struct {
         }
     }
     pub fn continueExecution(self: *Session, actor: Actor) !void {
+        return self.continueAs(self.legacyCaller(actor));
+    }
+    pub fn executeCommand(self: *Session, a: std.mem.Allocator, connection: u64, service: ?*@import("../service/authority.zig").c.struct_xsvc, request: @import("command.zig").Request) !@import("commands.zig").Result {
+        return @import("commands.zig").execute(a, self, connection, service, request, linux.now());
+    }
+    pub fn breakpoint(self: *const Session, id: u64) ?@import("../target/breakpoints.zig").Breakpoint {
+        return @import("persistent.zig").Manager.probe(self, id);
+    }
+    pub fn humanCommand(self: *Session, a: std.mem.Allocator, generation: u64, operation: @import("command.zig").Operation) !@import("commands.zig").Result {
+        var expected = @import("commands.zig").stamp(0, self);
+        expected.generation = generation;
+        return self.executeCommand(a, 0, null, .{ .stamp = expected, .caller = .human, .operation = operation });
+    }
+    fn legacyCaller(self: *const Session, actor: Actor) Caller {
+        return .{ .actor = actor, .client = if (actor == .agent) self.agent_client_id else null, .lease = if (actor == .agent) self.agent_lease else null };
+    }
+    pub fn continueAs(self: *Session, caller: Caller) !void {
         try self.persistent.remember(self);
         try self.persistent.poll(self);
-        self.probe_resume_actor = actor;
+        self.probe_resume_actor = caller.actor;
+        self.probe_resume_lease = caller.lease;
         if (self.persistent.resolving) {
             const snapshot_ = self.target.snapshot();
-            self.pending_continue = .{ .generation = snapshot_.generation, .epoch = snapshot_.image_epoch, .actor = actor, .lease = if (actor == .agent) self.agent_lease else null };
+            self.pending_continue = .{ .generation = snapshot_.generation, .epoch = snapshot_.image_epoch, .actor = caller.actor, .lease = caller.lease };
             self.suppress_probe_resume = true;
             return;
         }
         self.pending_continue = null;
-        if (actor == .agent) if (self.agent_lease) |lease| {
+        if (caller.actor == .agent) if (caller.lease) |lease| {
             if (!lease.valid(linux.now(), @intFromEnum(self.agent_scope))) return error.ControlLeaseRequired;
         };
         try self.target.continueExecution();
         self.suppress_probe_resume = false;
     }
     pub fn cancelStep(self: *Session) void {
+        self.probe_resume_lease = null;
         self.pending_continue = null;
         self.stepping_over = false;
         self.suppress_probe_resume = true;
         if (self.run_to) |*run| run.cancelled = true;
         self.source_step = null;
+    }
+    fn resumeAllowed(self: *Session) bool {
+        if (self.probe_resume_actor != .agent) return true;
+        if (self.agent_scope == .observe) return false;
+        return if (self.probe_resume_lease) |lease| lease.valid(linux.now(), @intFromEnum(self.agent_scope)) else true;
     }
     pub fn startSourceStep(self: *Session, tid: i32, over: bool) !void {
         try self.persistent.remember(self);
@@ -1162,6 +1196,7 @@ pub const Session = struct {
     }
     fn advanceSourceStep(self: *Session) !void {
         if (self.source_step == null) return;
+        if (!self.resumeAllowed()) return error.AgentScopeRevoked;
         const step = &self.source_step.?;
         self.source_step.?.instructions += 1;
         self.source_step_resumes += 1;
@@ -1326,7 +1361,7 @@ pub const Session = struct {
         // A hidden loader rendezvous may interrupt an instruction/source step-over.
         // Preserve its temporary return probe; explicit pause cancels the operation.
         if (filtered and self.target.onlyInternalStops() and (self.source_step != null or self.stepping_over) and self.run_to == null) {
-            if (self.probe_resume_actor == .agent and self.agent_scope == .observe) {
+            if (!self.resumeAllowed()) {
                 self.step_diagnostic = "AgentScopeRevoked";
                 return;
             }
@@ -1342,7 +1377,7 @@ pub const Session = struct {
             }
         }
         if (filtered and self.source_step == null and !self.suppress_probe_resume) {
-            if (self.probe_resume_actor == .agent and self.agent_scope == .observe) {
+            if (!self.resumeAllowed()) {
                 self.step_diagnostic = "AgentScopeRevoked";
             } else {
                 self.target.continueExecution() catch |err| {
@@ -2077,15 +2112,18 @@ pub const Session = struct {
         if (generation) |g| try self.target.expectGeneration(g);
     }
     pub fn record(self: *Session, actor: Actor, action: []const u8) void {
+        self.recordAs(self.legacyCaller(actor), action);
+    }
+    pub fn recordAs(self: *Session, caller: Caller, action: []const u8) void {
         // Action names are static strings owned by the command implementation.
         self.audit_sequence += 1;
         if (self.audit_count == self.audit.len) {
             std.mem.copyForwards(Audit, self.audit[0 .. self.audit.len - 1], self.audit[1..]);
             self.audit_count -= 1;
         }
-        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = actor, .client_id = if (actor == .agent) self.agent_client_id else null, .action = action, .generation = self.target.snapshot().generation };
+        self.audit[self.audit_count] = .{ .sequence = self.audit_sequence, .actor = caller.actor, .client_id = caller.client, .action = action, .generation = self.target.snapshot().generation };
         self.audit_count += 1;
-        if (actor == .agent) {
+        if (caller.actor == .agent) {
             self.target.event(.agent_action, self.target.snapshot().pid, @intCast(self.audit_sequence)) catch |err| {
                 self.step_diagnostic = @errorName(err);
                 return;
@@ -2215,6 +2253,16 @@ test "agent capabilities and generation protect shared execution state" {
     try session.authorize(.agent, .mutation, session.target.snapshot().generation);
     session.setAgentScope(.observe);
     try std.testing.expectError(error.AgentScopeDenied, session.authorize(.agent, .execution, session.target.snapshot().generation));
+}
+
+test "a source step rechecks its caller before another instruction" {
+    var session = Session.init();
+    defer session.deinit();
+    session.probe_resume_actor = .agent;
+    session.agent_scope = .observe;
+    session.source_step = .{ .tid = 1, .line = 1, .path = undefined, .path_len = 0, .over = false };
+    try std.testing.expectError(error.AgentScopeRevoked, session.advanceSourceStep());
+    try std.testing.expectEqual(@as(usize, 0), session.source_step_resumes);
 }
 
 test "retained evidence owns enum and nested preview and frame strings" {

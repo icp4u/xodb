@@ -7,39 +7,11 @@ pub const max_commands = 64;
 pub const max_command_bytes = 8 * 1024 * 1024;
 pub const max_publication_bytes = 16 * 1024 * 1024;
 
-pub const Stamp = struct {
-    connection: u64, // Never reused, including after reconnect to the same PID.
-    session: u64,
-    process: u64,
-    pid: i32,
-    // Compare start times when both are known. Connection/session/process/PID
-    // must always match; learning a start time does not replace that identity.
-    start_ticks: ?u64 = null,
-    image_epoch: u64,
-    generation: u64,
-    pub fn sameProcess(a: Stamp, b: Stamp) bool {
-        return a.connection == b.connection and a.session == b.session and
-            a.process == b.process and a.pid == b.pid and
-            (a.start_ticks == null or b.start_ticks == null or a.start_ticks == b.start_ticks);
-    }
-};
-pub const Actor = union(enum) {
-    human,
-    agent: struct { client: u64, lease: ?u64 },
-};
-pub const Selection = struct { tid: i32, frame: usize = 0 };
-pub const Control = union(enum) {
-    interrupt,
-    continue_execution,
-    step_instruction: i32,
-    step_over_instruction: i32,
-    step_source: struct { tid: i32, over: bool },
-    finish_frame: Selection,
-    run_to: struct { tid: i32, address: u64 },
-    restart,
-    detach,
-    follow_processes: struct { enabled: bool, limit: ?usize },
-};
+const commands = @import("command.zig");
+pub const Stamp = commands.Stamp;
+pub const Actor = commands.Caller;
+pub const Selection = commands.Selection;
+pub const Control = commands.Control;
 pub const Inspection = struct {
     request_id: u64, // Changes with selection, tab, expression or display options.
     selection: Selection,
@@ -87,12 +59,7 @@ pub const Action = union(enum) {
     invocation: @import("invocation_view.zig").Action,
     workspace: @import("workspace_view.zig").Action,
     toggle_scope,
-    breakpoint: union(enum) {
-        address: u64,
-        source: struct { path: []const u8, line: u32 },
-        remove: u64,
-        enabled: struct { id: u64, enabled: bool },
-    },
+    breakpoint: commands.Breakpoint,
     watchpoint: union(enum) {
         add: struct { address: u64, length: u8, kind: enum { write, read_write, execute } },
         remove: u64,
@@ -105,7 +72,13 @@ pub const Action = union(enum) {
     /// also covers retained jobs without duplicating their schemas here.
     mcp: struct { name: []const u8, arguments_json: []const u8 },
 };
-pub const Request = struct { stamp: Stamp, actor: Actor, action: Action };
+pub const Request = struct {
+    stamp: Stamp,
+    actor: Actor,
+    action: Action,
+    /// Trusted adapter metadata, independent of the operation's semantic tag.
+    protocol_reply: bool = false,
+};
 
 // C register storage uses an untagged union of fixed-size values. It can be
 // copied as a value only when every alternative is pointer-free; no inactive
@@ -186,6 +159,11 @@ pub const Command = struct {
     request: Request,
     bytes: usize,
     sequence: u64 = 0,
+    pub fn urgent(self: *const Command) bool {
+        const action = self.request.action;
+        return action == .toggle_scope or (action == .control and
+            (action.control == .interrupt or action.control == .cancel_continue));
+    }
     pub fn create(a: Allocator, request: Request) !*Command {
         var remaining: usize = max_command_bytes - @sizeOf(Command);
         try payloadBytes(request, &remaining);
@@ -213,7 +191,9 @@ pub const Command = struct {
         // the execution-time snapshot, while mutations validate the caller's
         // generation in the authoritative handler. Lease/job operations may
         // not refer to a target stop at all. Process identity still pins both.
-        if (self.request.action != .poll and self.request.action != .mcp and self.request.action != .toggle_scope and
+        const old_view_allowed = self.request.action == .control and
+            (self.request.action.control == .interrupt or self.request.action.control == .cancel_continue);
+        if (!old_view_allowed and self.request.action != .poll and self.request.action != .mcp and self.request.action != .toggle_scope and
             (expected.image_epoch != current.image_epoch or expected.generation != current.generation))
             return error.StaleSnapshot;
         try authorizer.authorize(self.request);
@@ -236,6 +216,9 @@ pub const Queue = struct {
     count: usize = 0,
     active: ?*Command = null,
     poll_pending: ?*Command = null,
+    // One bounded stop/revoke request can bypass a full ordinary queue. It
+    // does not preempt an in-flight backend operation or coalesce mutations.
+    urgent_pending: ?*Command = null,
     bytes: usize = 0,
     next_sequence: u64 = 1,
     closed: std.atomic.Value(bool) = .init(false),
@@ -253,8 +236,10 @@ pub const Queue = struct {
                 coalesced = command;
                 return pending.sequence;
             }
+        } else if (command.urgent()) {
+            if (self.urgent_pending != null) return error.QueueFull;
         } else {
-            const active_count: usize = if (self.active) |c| @intFromBool(c.request.action != .poll) else 0;
+            const active_count: usize = if (self.active) |c| @intFromBool(c.request.action != .poll and !c.urgent()) else 0;
             if (self.count + active_count == max_commands or
                 command.bytes > max_command_bytes - self.bytes) return error.QueueFull;
         }
@@ -263,6 +248,10 @@ pub const Queue = struct {
         self.next_sequence += 1;
         if (command.request.action == .poll) {
             self.poll_pending = command;
+            return command.sequence;
+        }
+        if (command.urgent()) {
+            self.urgent_pending = command;
             return command.sequence;
         }
         self.slots[(self.head + self.count) % max_commands] = command;
@@ -274,6 +263,11 @@ pub const Queue = struct {
         if (!self.mutex.tryLock()) return error.Busy;
         defer self.mutex.unlock();
         if (self.active != null) return null;
+        if (self.urgent_pending) |urgent| {
+            self.active = urgent;
+            self.urgent_pending = null;
+            return urgent;
+        }
         if (self.poll_pending) |poll| {
             // Coalescing retains the first request's place in owner order.
             if (self.count == 0 or poll.sequence < self.slots[self.head].?.sequence) {
@@ -294,7 +288,7 @@ pub const Queue = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
         const command = self.active.?;
         self.active = null;
-        if (command.request.action != .poll) self.bytes -= command.bytes;
+        if (command.request.action != .poll and !command.urgent()) self.bytes -= command.bytes;
         self.mutex.unlock();
         command.destroy();
     }
@@ -307,6 +301,7 @@ pub const Queue = struct {
     pub fn deinit(self: *Queue) void {
         if (self.active) |command| command.destroy();
         if (self.poll_pending) |command| command.destroy();
+        if (self.urgent_pending) |command| command.destroy();
         for (self.slots) |command| if (command) |c| c.destroy();
         self.* = .{};
     }
@@ -594,10 +589,10 @@ test "owner validates process epoch and generation at execution" {
 test "owner input is bounded including active command and contention is explicit" {
     var queue: Queue = .{};
     defer queue.deinit();
-    const extra = try Command.create(std.testing.allocator, testRequest(.{ .control = .interrupt }));
+    const extra = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
     defer extra.destroy();
     for (0..max_commands) |_| {
-        const c = try Command.create(std.testing.allocator, testRequest(.{ .control = .interrupt }));
+        const c = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
         _ = try queue.trySubmit(c);
     }
     try std.testing.expectError(error.QueueFull, queue.trySubmit(extra));
@@ -697,7 +692,7 @@ const FakeWorker = struct {
 test "fake owner can hold an operation while frontend queues the next" {
     var queue: Queue = .{};
     defer queue.deinit();
-    const first = try Command.create(std.testing.allocator, testRequest(.{ .control = .interrupt }));
+    const first = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
     const sequence = try queue.trySubmit(first);
     var worker: FakeWorker = .{ .queue = &queue };
     const thread = try std.Thread.spawn(.{}, FakeWorker.run, .{&worker});
@@ -730,7 +725,7 @@ test "inspection readiness rejects old selection at unchanged generation" {
 test "poll pressure never consumes user capacity and retains owner order" {
     var queue: Queue = .{};
     defer queue.deinit();
-    const active = try Command.create(std.testing.allocator, testRequest(.{ .control = .interrupt }));
+    const active = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
     _ = try queue.trySubmit(active);
     _ = try queue.take();
     var poll_sequence: u64 = 0;
@@ -744,7 +739,7 @@ test "poll pressure never consumes user capacity and retains owner order" {
         const mutation = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
         _ = try queue.trySubmit(mutation);
     }
-    const extra = try Command.create(std.testing.allocator, testRequest(.{ .control = .interrupt }));
+    const extra = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
     defer extra.destroy();
     try std.testing.expectError(error.QueueFull, queue.trySubmit(extra));
     queue.finish();
@@ -911,4 +906,29 @@ test "pane budget is aggregate and a rejected pane leaves room for later panes" 
     try std.testing.expect(publication.value.workspace.?.frame_failure == null);
     try std.testing.expectEqualStrings("a smaller later pane still fits", publication.value.diagnostic);
     try std.testing.expect(publication.bytes < max_publication_bytes);
+}
+
+test "old-view interrupt and revocation keep reserved admission under queue pressure" {
+    var queue: Queue = .{};
+    defer queue.deinit();
+    for (0..max_commands) |_| {
+        const mutation = try Command.create(std.testing.allocator, testRequest(.{ .control = .continue_execution }));
+        _ = try queue.trySubmit(mutation);
+    }
+    var owner: FakeOwner = .{};
+    var current = fixture_stamp;
+    current.generation += 1;
+    current.image_epoch += 1;
+    inline for (.{ Action{ .control = .interrupt }, Action.toggle_scope }) |action| {
+        const urgent = try Command.create(std.testing.allocator, testRequest(action));
+        _ = try queue.trySubmit(urgent);
+        const taken = (try queue.take()).?;
+        try std.testing.expect(taken == urgent);
+        try taken.validate(current, &owner);
+        queue.finish();
+    }
+    const mutation = (try queue.take()).?;
+    try std.testing.expectError(error.StaleSnapshot, mutation.validate(current, &owner));
+    queue.finish();
+    try std.testing.expectEqual(@as(usize, 2), owner.calls);
 }

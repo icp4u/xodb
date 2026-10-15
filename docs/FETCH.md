@@ -55,12 +55,12 @@ Lines fetch tools do not show (moving ones have a sparkline in the panel):
 | Boost | fastest core's `scaling_cur_freq` now / highest max | both; sparkline |
 | Activity | context switches/s and forks/s from `/proc/stat`, task count | panel |
 | Pressure | `/proc/pressure/{cpu,memory,io}` some avg10 | both |
-| Temps | CPU package (k10temp/coretemp), GPUs, NVMe, first fan | both |
+| Temps | CPU package (k10temp/coretemp), GPUs, NVMe, first fan; a CPU or GPU at 69 °C gets " (nice)" | both ("nice": terminal only) |
 | Power | RAPL package power (often needs privilege), GPU power | both |
 | NVMe | `/sys/class/nvme/nvme*/model` and the PCIe link (`current_link_speed`, `current_link_width`) | both |
-| Network, Disk IO | collector rates | panel |
+| Disk IO | collector rates | panel |
 | Governor | cpufreq governor and driver | both |
-| Mitigations | `/sys/devices/system/cpu/vulnerabilities/*`: mitigated, vulnerable, not affected | both |
+| Network | physical links only (bridges, veth and tunnels repeat their traffic): in and out: live MB/s and packets/s in the panel; `--fetch` shows bytes and packets since boot from `/proc/net/dev` (one read, no waiting: it is a show-off card, not a monitor) | both; sparkline in the panel |
 | Scheduler | `/sys/kernel/sched_ext/root/ops` when sched_ext is enabled | both |
 | Open files | `/proc/sys/fs/file-nr` | both |
 | xodb | the Vulkan device xodb draws on; draw time; first frame after start | panel |
@@ -69,19 +69,41 @@ Lines fetch tools do not show (moving ones have a sparkline in the panel):
 Not shown: boot-to-desktop time (no portable unprivileged source without
 systemd), deleted-but-open files and syscalls/s (they need the descriptor
 scan or tracepoints, which cost more than a card should), VRR/HDR (the
-compositor does not report them to xodb).
+compositor does not report them to xodb), CPU vulnerability mitigations
+(security sensitive; deliberately left out).
 
 ## Redaction
 
 `--fetch --redact`, `--overview --redact` and **x** hide what the overview
-hides: the title becomes `user@host`; Kernel, Host, Theme, Icons and Font are
-left out; GPU names, the Vulkan device (also in the benchmark result) and
-monitor names are hidden. The distribution's name and logo stay: they are not
-identifying, and they are the point of a fetch card. Serial numbers (DMI, EDID,
-NVMe) and network addresses are never read. `tests/fetch.py` reads the
-machine's host, user, kernel, model names and DMI serials at test time and
-checks that none appears in redacted text or JSON; `tests/fetch-gui.py` does
-the same with OCR of the panel.
+hides: the title becomes `user@host`; Host and Font are left out; GPU names,
+the Vulkan device (also in the benchmark result) and monitor names are
+hidden. Serial numbers (DMI, EDID, NVMe) and network addresses are never
+read.
+
+Rather than blanks, the card's identity lines become mad-libs: obviously
+fake values no one could take for this machine's, picked once per run so
+one card is self-consistent.
+
+| Line | Redacted |
+|---|---|
+| Logo | a retro system's small original ASCII logo (OS/2 Warp, BeOS, CP/M, MUMPS, AmigaOS, NeXTSTEP, OpenVMS, Plan 9), in its colour |
+| OS, Kernel | that system's name and a matching silly kernel string |
+| Uptime | random, under ten years (ticking in the panel) |
+| Packages | a random count "(floppies)" |
+| Shell | `3rdseashell` |
+| Theme | an IKEA-style name with the toolkit suffix, e.g. `SKRUVBY [GTK3]` |
+| Icons | a pop icon, e.g. `Michael Jackson [GTK3]` |
+| Network | random plausible totals (`--fetch`) or rates (panel) |
+
+The rest (Display, CPU, Memory, Temps, ...) are real values under their
+usual rules. Mad-libs live only in this card: `src/redact.zig`'s
+placeholders (`user`, `host`, `~`, ...), MCP replies, archives and logs are
+unchanged, so redacted evidence never carries plausible fakes. The tables
+are in `src/ui/overview/fetch.zig`. `tests/fetch.py` reads the machine's
+host, user, kernel, model names and DMI serials at test time and checks
+that none appears in redacted text or JSON, and that each mad-lib comes
+from those tables; `tests/fetch-gui.py` does the same with OCR of the
+panel.
 
 ## Benchmarks
 

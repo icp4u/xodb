@@ -3,8 +3,10 @@
 
 Reads this machine, so it asserts structure, never values. Private names
 (host, user, kernel, machine model, DMI serials) are read here at test time
-and only checked for absence; they are never printed or saved. The
-distribution is not private: the card shows it and its logo under --redact.
+and only checked for absence; they are never printed or saved. Under
+--redact the identity lines are mad-libs (a retro system's OS, kernel and
+logo, a fake shell, theme, icons, uptime, packages and network); they are
+checked against the tables in src/ui/overview/fetch.zig, parsed here.
 """
 import json
 import os
@@ -39,7 +41,20 @@ def run(*args, timeout=30):
 
 ORDER = ['OS', 'Host', 'Kernel', 'Uptime', 'Packages', 'Shell', 'Display', 'DE', 'WM', 'Theme', 'Icons', 'Font',
          'Terminal', 'CPU', 'GPU', 'Memory', 'Swap', 'Disk (/)', 'Battery', 'Locale', 'Boost', 'Pressure', 'Temps',
-         'Power', 'NVMe', 'Governor', 'Mitigations', 'Scheduler', 'Open files', 'Benchmark']
+         'Power', 'NVMe', 'Governor', 'Network', 'Scheduler', 'Open files', 'Benchmark']
+
+# The mad-lib tables, from the source.
+src = (root / 'src/ui/overview/fetch.zig').read_text()
+RETRO = {}
+for os_name, kernel, logo in re.findall(r'\.os = "([^"]+)", \.kernel = "([^"]+)",.*?\.logo = &\.\{\n(.*?)\n\s*\} \}', src, re.S):
+    RETRO[os_name] = (kernel, [json.loads(r.strip().rstrip(',')) for r in logo.split('\n')])
+def word_list(name):
+    return re.findall(r'"([^"]+)"', re.search(r'pub const ' + name + r' = \[_\]\[\]const u8\{([^}]*)\}', src).group(1))
+IKEA, POP = word_list('ikea'), word_list('pop')
+assert len(RETRO) >= 8 and IKEA and POP
+
+def values(text):
+    return dict(l.split(': ', 1) for l in text.rstrip('\n').split('\n')[2:])
 
 def keys_of(text):
     lines = text.rstrip('\n').split('\n')
@@ -53,6 +68,32 @@ check('title is user@host and the rule underlines it', '@' in title and rule == 
 check('every line is "Key: value"', all(': ' in l for l in plain.rstrip('\n').split('\n')[2:]))
 check('keys are known and in fastfetch order', all(k in ORDER for k in keys) and [ORDER.index(k) for k in keys] == sorted(ORDER.index(k) for k in keys))
 check('the essential lines are present', all(k in keys for k in ('OS', 'Uptime', 'CPU', 'Memory')))
+check('there is no Mitigations line', 'Mitigations' not in plain)
+NET = r'in ([\d.]+) ([KMGTP]?i?B), ([\d.]+)((?: [kMGT])?) pkts · out ([\d.]+) ([KMGTP]?i?B), ([\d.]+)((?: [kMGT])?) pkts \(total since boot\)'
+def net_values(line):
+    """Bytes in, packets in, bytes out, packets out from a Network line."""
+    g = re.fullmatch(NET, line).groups()
+    b = lambda v, u: float(v) * 1024 ** ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'].index(u)
+    n = lambda v, u: float(v) * 1000 ** ['', ' k', ' M', ' G', ' T'].index(u)
+    return b(g[0], g[1]), n(g[2], g[3]), b(g[4], g[5]), n(g[6], g[7])
+def proc_net_dev():
+    """The same sums, straight from /proc/net/dev (physical: has a device link)."""
+    t = [0, 0, 0, 0]
+    for l in open('/proc/net/dev').read().split('\n')[2:]:
+        if ':' not in l: continue
+        name, v = l.split(':', 1)
+        if not os.path.exists(f'/sys/class/net/{name.strip()}/device'): continue
+        v = [int(x) for x in v.split()]
+        t = [t[0] + v[0], t[1] + v[1], t[2] + v[8], t[3] + v[9]]
+    return t
+net = values(plain).get('Network')
+before = proc_net_dev()
+fresh = values(run()).get('Network')
+after = proc_net_dev()
+if any(before):
+    check('the Network line is the totals since boot over physical links (/proc/net/dev)', fresh and all(lo * 0.99 - 1 <= v <= hi * 1.01 + 1 for v, lo, hi in zip(net_values(fresh), before, after)))
+else:
+    check('no physical link, no Network line', net is None)
 t0 = time.monotonic()
 run()
 check('the card prints in under two seconds', time.monotonic() - t0 < 2)
@@ -88,13 +129,24 @@ for label, text in (('text', redacted_text), ('JSON', redacted_json)):
     check(f'--redact {label} shows no IPv4 address or MAC', not re.search(r'\b\d{1,3}(\.\d{1,3}){3}\b', text) and not re.search(r'\b[0-9a-f]{2}(:[0-9a-f]{2}){5}\b', text, re.I))
 r_title, _, r_keys = keys_of(redacted_text)
 check('--redact title is the user@host placeholder', r_title == 'user@host' and json.loads(redacted_json)['redacted'] is True)
-check('--redact hides kernel, machine model and theme names', not ({'Kernel', 'Host', 'Theme', 'Icons'} & set(r_keys)))
-check('--redact OS line still names the distribution', redacted_text.split('\n')[2] == plain.split('\n')[2])
+check('--redact hides the machine model and font', not ({'Host', 'Font'} & set(r_keys)))
+check('--redact text and JSON have no Mitigations line', 'Mitigations' not in redacted_text and 'Mitigations' not in redacted_json)
+rv = values(redacted_text)
+check('--redact OS is a retro system from the table, its kernel the matching one', rv['OS'] in RETRO and rv.get('Kernel') == RETRO[rv['OS']][0])
+check('--redact shell is 3rdseashell', rv['Shell'] == '3rdseashell')
+up = dict((u.rstrip('s'), int(n)) for n, u in re.findall(r'(\d+) (day|hour|min)s?', rv['Uptime']))
+check('--redact uptime is under ten years', 0 < up.get('day', 0) < 3650)
+check('--redact packages is a made-up count', re.fullmatch(r'\d+ \(floppies\)', rv['Packages']))
+pv = values(plain)
+check('--redact theme is a made-up name with the toolkit suffix (when there is a theme)', ('Theme' in pv) == ('Theme' in rv) and ('Theme' not in rv or (rv['Theme'].endswith(' [GTK3]') and rv['Theme'][:-7] in IKEA)))
+check('--redact icons are a pop icon (when there are icons)', ('Icons' in pv) == ('Icons' in rv) and ('Icons' not in rv or rv['Icons'][:-7] in POP))
+check('--redact Network line has made-up totals', re.fullmatch(NET, rv.get('Network', '')) and rv['Network'] != net)
+check('--redact JSON lines are the text lines', [l['key'] for l in json.loads(redacted_json)['lines']] == r_keys)
 
-def on_tty(**extra):
+def on_tty(*args, **extra):
     """The card as a terminal sees it, under these environment changes."""
     leader, follower = pty.openpty()
-    proc = subprocess.Popen([xodb, '--fetch'], env={k: v for k, v in dict(env, **extra).items() if v is not None}, stdin=follower, stdout=follower, stderr=subprocess.PIPE)
+    proc = subprocess.Popen([xodb, '--fetch', *args], env={k: v for k, v in dict(env, **extra).items() if v is not None}, stdin=follower, stdout=follower, stderr=subprocess.PIPE)
     os.close(follower)
     data = b''
     while select.select([leader], [], [], 10)[0]:
@@ -118,6 +170,9 @@ basic = on_tty(COLORTERM=None, TERM='linux', LC_ALL='C.UTF-8')
 check('a 16-colour terminal gets only basic colour codes', all(re.fullmatch(r'[0-9;]*', m) and all(int(n) < 108 and n not in ('38', '48') for n in m.split(';') if n) for m in re.findall(r'\x1b\[([^m]*)m', basic)))
 ascii_only = on_tty(COLORTERM='truecolor', TERM='xterm-256color', LC_ALL='C', LANG=None, LC_CTYPE=None)
 check('a non-UTF-8 locale gets no half-block logo', '\u2580' not in ascii_only and '\u2584' not in ascii_only)
+r_tty = re.sub(r'\x1b\[[0-9;]*m', '', on_tty('--redact', COLORTERM='truecolor', **utf8)).replace('\r', '')
+r_os = re.search(r'OS: (.*)', r_tty).group(1).strip()
+check('--redact in a terminal draws the matching retro ASCII logo, not the distribution PNG', r_os in RETRO and all(row in r_tty for row in RETRO[r_os][1]) and '\u2580' not in r_tty and not leaks(r_tty))
 check('TERM=dumb and NO_COLOR keep a terminal plain', '\x1b[' not in on_tty(TERM='dumb') and '\x1b[' not in on_tty(NO_COLOR='1', COLORTERM='truecolor'))
 
 # The benchmark with the smallest buffers; results persist with their date.
@@ -128,7 +183,7 @@ check('--bench says how it measured', 'SHA-256' in bench['bench_method'] and 'me
 check('--bench result is saved in the state directory', (work / 'state' / 'xodb' / 'fetch-bench.json').is_file())
 again = json.loads(run('--json'))
 check('a later card shows the saved result without re-running', again['bench'] and again['bench']['when'] == b['when'] and again['lines'][-1]['key'] == 'Benchmark')
-check('the saved result carries its date', re.search(r'\d{4}-\d\d-\d\d \d\d:\d\d UTC', again['lines'][-1]['value']))
+check('the saved result carries its date', isinstance(again['bench'].get('when'), int) and again['bench']['when'] > 0)
 bad = subprocess.run([xodb, '--fetch', '--bench-mb', '0'], env=env, capture_output=True, text=True, timeout=10)
 check('--bench-mb out of range is refused', bad.returncode != 0)
 help_text = run('--help')
