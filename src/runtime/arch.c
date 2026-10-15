@@ -154,8 +154,9 @@ static const struct xrt_arch architectures[] = {
      .isa_mode = XRT_ISA_MODE_ORDINARY,
      .control_kind = XRT_CONTROL_SINGLE_PC,
      .tracer_bits = 64,
-     /* PTRACE_SINGLESTEP returned EIO on the measured QEMU guest. Refusing
-      * hardware step records that measurement; it is not an ISA-wide claim. */
+     /* PTRACE_SINGLESTEP returned EIO on the measured QEMU guest. Hardware
+      * step stays off. That is a measurement, not an ISA-wide claim. Software
+      * successors cover instruction step and continue-from-breakpoint. */
      .hardware_step = 0,
      .probes = riscv_probes,
      .probe_count = 1},
@@ -525,7 +526,10 @@ enum xrt_status xrt_arch_step_resources(const struct xrt_arch *arch, uint8_t isa
     *out = (struct xrt_step_resources){
         .max_probes = XRT_STEP_PROBE_MAX,
         .hardware_step = arch->hardware_step,
-        .software_probes = arch->machine == XRT_LOONGARCH && !arch->hardware_step ? 2 : 0};
+        .software_probes = (arch->machine == XRT_LOONGARCH || arch->machine == XRT_RISCV) &&
+                                   !arch->hardware_step
+                               ? 2
+                               : 0};
     return XRT_OK;
 }
 

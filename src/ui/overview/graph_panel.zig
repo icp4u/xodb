@@ -139,7 +139,9 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     const navigation = &@import("galaxy_descriptors.zig").navigation().motion.navigation;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, if (@import("galaxy_descriptors.zig").navigation().table.open) "Descriptor graph / TABLE" else if (navigation.tour) "Descriptor galaxy / TOUR" else "Descriptor galaxy", lk.text);
     try ctx.r.shape(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, draw.fade(lk.warn, 0.12), .{ .radii = @splat(5) });
-    try ctx.textFit(rect.x + 16, rect.y + 38, rect.w - 32, if (demo) "DEMO · synthetic processes · nothing is read or traced" else bannerText(v, &buffer, &failure_buffer), lk.warn);
+    const banner = v.recordedTraceBanner(&buffer) orelse if (demo) "DEMO · synthetic processes · nothing is read or traced" else bannerText(v, &buffer, &failure_buffer);
+    try ctx.statusLine(rect.x + 16, rect.y + 38, rect.w - 32, banner, lk.warn);
+    v.hover(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, "{s}", .{banner});
     var rows: [8]draw.Rect = undefined;
     var row_count: usize = 0;
     for ([_]f32{ 4, 38, 72, 94 }) |y| {
@@ -158,12 +160,12 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         };
         if (v.graph.projection == null) return;
         const stats = std.fmt.bufPrint(&buffer, "{d} processes · {d} fds · {d} denied · {d} stale · {d} unknown · CPUs {d}/{d} · lost {d}", .{ g.processes, g.member_count, g.denied_processes, g.stale_descriptors, g.unknown_descriptors, if (v.graph.flow_running) v.graph.flow_active_cpus else 0, v.graph.flow_online_cpus, v.graph.flow_lost }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + 72, rect.w - 16, stats, lk.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + 72, rect.w - 16, stats, lk.dim);
         const omissions = std.fmt.bufPrint(&buffer, "{d} unscanned · {d} gone · capped: {d} processes / {d} fds · {d} unmatched peers", .{ g.unscanned_processes, g.gone_processes, g.dropped_processes, g.dropped_descriptors, g.unmatched_peers }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + 94, rect.w - 16, omissions, lk.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + 94, rect.w - 16, omissions, lk.dim);
         if (v.graph.failure()) |reason| {
             const failure = std.fmt.bufPrint(&buffer, "{s} · showing previous snapshot ({d:.1}s old)", .{ reason, @as(f64, @floatFromInt(now -| g.taken_ns)) / 1_000_000_000.0 }) catch reason;
-            try ctx.textFit(rect.x + 8, rect.y + 116, rect.w - 16, failure, lk.warn);
+            try ctx.statusLine(rect.x + 8, rect.y + 116, rect.w - 16, failure, lk.warn);
             rows[row_count] = .{ .x = rect.x, .y = rect.y + 116, .w = rect.w, .h = 22 };
             row_count += 1;
             top = 146;
@@ -185,7 +187,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
         log.info(.overview, "xodb: galaxy-frame stars={d} clusters={d} strands={d} drawn={d} impulses={d} cloud={d} mesh={d} labels={d} moving={d} demo={d} buffer={d:.2} clock={d}\n", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses, counts.cloud, counts.mesh, counts.labels, @intFromBool(counts.moving), v.graph.demo, counts.used, v.graph.clock });
     if (demo) {
         const text = std.fmt.bufPrint(&buffer, "{d} stars · {d} clusters · {d} threads ({d} drawn) · {d} impulses · synthetic", .{ counts.stars, counts.clusters, counts.strands, counts.strands_drawn, counts.impulses }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, text, lk.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, text, lk.dim);
         try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, if (navigation.help) @import("galaxy_camera.zig").hints else "P pause · hover for detail · ? navigation · run without --galaxy-demo for live descriptors", lk.dim);
         return;
     }
@@ -196,7 +198,7 @@ fn renderGalaxy(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     if (v.graph.layout) |layout| {
         const hidden = counts.strands - counts.strands_drawn;
         const limit_text = std.fmt.bufPrint(&buffer, "Sampled joins · {d} bytes unattributed · {d} resources / {d} links omitted · {s}", .{ v.graph.flow_unknown, layout.omitted_resources, layout.omitted_links + hidden, if (v.graph.flow_flags != 0) "capture incomplete" else "no capture loss reported" }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links + hidden > 0) lk.warn else lk.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links + hidden > 0) lk.warn else lk.dim);
     }
     try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, if (navigation.help) @import("galaxy_camera.zig").hints else "E tracing · C cgroups · +/- detail · Esc all · click select / Enter frame · L files · ? navigation", lk.dim);
 }
@@ -215,25 +217,26 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     var failure_buffer: [320]u8 = undefined;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, "Shared files & IPC", ctx.p.text);
     try ctx.r.shape(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, draw.fade(ctx.p.warn, 0.12), .{ .radii = @splat(5) });
-    const banner: []const u8 = if (v.graph.flow_running)
+    const banner: []const u8 = v.recordedTraceBanner(&buffer) orelse if (v.graph.flow_running)
         @import("../../model/system.zig").graph_cost
     else if (v.paused) "PAUSED · tracing stopped" else if (!v.graph.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (v.graph.flow_status != c.XRT_OK and v.graph.flow_status != c.XRT_STALE_SNAPSHOT)
         std.fmt.bufPrint(&buffer, "POLLING · E off/on retries · {s}", .{@import("../../model/system.zig").failureText(&failure_buffer, v.graph.flow_failure)}) catch "POLLING · tracing unavailable"
     else
         "Starting live syscall tracing (~11% host cost) · E to stop";
-    try ctx.textFit(rect.x + 16, rect.y + 38, rect.w - 32, banner, ctx.p.warn);
+    try ctx.statusLine(rect.x + 16, rect.y + 38, rect.w - 32, banner, ctx.p.warn);
+    v.hover(.{ .x = rect.x + 8, .y = rect.y + 32, .w = rect.w - 16, .h = 30 }, "{s}", .{banner});
     const g = v.graph.graph orelse {
         try ctx.textFit(rect.x + 12, rect.y + 84, rect.w - 24, if (v.graph.demo != 0) "Synthetic galaxy: no descriptors are read · run without --galaxy-demo for the live graph" else v.graph.failure() orelse "Waiting for descriptor snapshot", ctx.p.dim);
         return;
     };
     const p = v.graph.projection orelse return;
     const stats = std.fmt.bufPrint(&buffer, "{d} processes · {d} fds · {d} denied · {d} stale · {d} unknown · CPUs {d}/{d} · lost {d}", .{ g.processes, g.member_count, g.denied_processes, g.stale_descriptors, g.unknown_descriptors, if (v.graph.flow_running) v.graph.flow_active_cpus else 0, v.graph.flow_online_cpus, v.graph.flow_lost }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 72, rect.w - 16, stats, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 72, rect.w - 16, stats, ctx.p.dim);
     const omissions = std.fmt.bufPrint(&buffer, "{d} unscanned · {d} gone · capped: {d} processes / {d} fds · {d} unmatched peers", .{ g.unscanned_processes, g.gone_processes, g.dropped_processes, g.dropped_descriptors, g.unmatched_peers }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 94, rect.w - 16, omissions, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 94, rect.w - 16, omissions, ctx.p.dim);
     if (v.graph.failure()) |reason| {
         const failure = std.fmt.bufPrint(&buffer, "{s} · showing previous snapshot ({d:.1}s old)", .{ reason, @as(f64, @floatFromInt(now -| g.taken_ns)) / 1_000_000_000.0 }) catch reason;
-        try ctx.textFit(rect.x + 8, rect.y + 116, rect.w - 16, failure, ctx.p.warn);
+        try ctx.statusLine(rect.x + 8, rect.y + 116, rect.w - 16, failure, ctx.p.warn);
     }
     const body = draw.Rect{ .x = rect.x + 24, .y = rect.y + 150, .w = @max(1, rect.w - 48), .h = @max(1, rect.h - 234) };
     const clip = ctx.r.clip;
@@ -270,7 +273,7 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 72, .w = rect.w - 16, .h = 20 }, group_text, ctx.p.dim);
     if (v.graph.layout) |layout| {
         const limit_text = std.fmt.bufPrint(&buffer, "Sampled joins · {d} bytes unattributed · {d} resources / {d} links omitted · {s}", .{ v.graph.flow_unknown, layout.omitted_resources, layout.omitted_links, if (v.graph.flow_flags != 0) "capture incomplete" else "no capture loss reported" }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links > 0) ctx.p.warn else ctx.p.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, limit_text, if (layout.omitted_resources + layout.omitted_links > 0) ctx.p.warn else ctx.p.dim);
     }
     try ctx.status(.{ .x = rect.x + 8, .y = rect.y + rect.h - 24, .w = rect.w - 16, .h = 20 }, "E tracing on/off · C cgroups · +/- detail · Esc all · click expand/holders · L files", ctx.p.dim);
 }

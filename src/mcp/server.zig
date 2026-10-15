@@ -87,6 +87,9 @@ pub const Server = struct {
     overview: overview.State = .{},
     overview_shared: ?*overview.State = null,
     overview_only: bool = false,
+    /// The MCP peer is a --listen TCP client, not the local process that
+    /// opened the files: it never receives private evidence payloads.
+    network_peer: bool = false,
     pub fn overviewTick(self: *Server) !void {
         if (self.overview_shared == null) _ = try self.overview.tick(@import("../target/linux.zig").now(), 0, false);
     }
@@ -310,7 +313,12 @@ pub const Server = struct {
         if (redot_graph and self.overview_only) return error.GraphKindUnavailable;
         if (overview.handles(name) and !redot_graph) return overview.call(a, self.overview_shared orelse &self.overview, name, args);
         // External evidence belongs to the root session, not a target process.
-        if (@import("evidence.zig").handles(name)) return @import("evidence.zig").call(a, root.evidence_stream, name, args);
+        if (@import("evidence.zig").handles(name)) return @import("evidence.zig").call(a, .{
+            .network = root.evidence_stream,
+            .tls_stream = root.tls_stream,
+            .mitm_stream = root.mitm_stream,
+            .private_payloads = self.shared == null and !self.network_peer and root.agent_scope == .observe,
+        }, name, args);
         const process_id = try @import("profile.zig").number(args, "process_id", 1);
         const session = if (root.process_tree) |tree| (try tree.find(process_id)).session else if (process_id == root.process_id) root else return error.UnknownProcess;
         if (!policy.localAllowed(session.agent_scope, root.shared_jobs or session.shared_jobs)) return error.AgentScopeDenied;

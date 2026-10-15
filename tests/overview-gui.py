@@ -335,7 +335,7 @@ d = Overview(['--interval-ms', '250', '--frames', '0'])
 try:
     time.sleep(2.5)
     text = ocr(d.shot('running'))
-    check('overhead indicator is visible', 'overhead' in text.lower() and 'view' in text.lower(), text[-200:])
+    check('overhead indicator is visible', 'overhead' in text.lower() and 'draw' in text.lower(), text[-200:])
     d.tap('q')
     try:
         d.app.wait(timeout=5)

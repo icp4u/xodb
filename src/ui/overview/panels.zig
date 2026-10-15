@@ -960,11 +960,11 @@ fn processes(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
 
 fn userCell(v: *View, ctx: Ctx, x: f32, y: f32, w: f32, proc: *const m.Process) !void {
     const t = v.private(proc.user);
-    if (t.ok()) return ctx.textFit(x, y, w, t.s, ctx.p.dim);
+    if (t.ok() and ctx.measure(t.s) <= w) return ctx.textFit(x, y, w, t.s, ctx.p.dim);
     // Redacted names keep the root/user distinction, which is not private.
     if (proc.uid.get()) |uid| {
         var b: [24]u8 = undefined;
-        return ctx.textFit(x, y, w, if (uid == 0) "root" else std.fmt.bufPrint(&b, "uid ≥1000", .{}) catch "user", ctx.p.dim);
+        return ctx.textFit(x, y, w, if (uid == 0) "root" else if (v.redact) "user" else std.fmt.bufPrint(&b, "{d}", .{uid}) catch "user", ctx.p.dim);
     }
     try missing(v, ctx, x, y, w, t.why);
 }
@@ -984,25 +984,28 @@ fn processDetail(v: *View, ctx: Ctx, rect: Rect, now: u64) !void {
     // Three columns that never overlap: identity, sparklines, the hand-off button.
     const button_label = "Debugger  Enter";
     const bw: f32 = ctx.measure(button_label) + 32;
-    const left_w = rect.w * 0.46;
+    const show_graphs = rect.w >= 1200;
+    const left_w = if (show_graphs) rect.w * 0.46 else rect.w - bw - 30;
     var b: [160]u8 = undefined;
     var nb: [24]u8 = undefined;
     const pname = vw.processName(v, proc, &nb);
+    const ident = std.fmt.bufPrint(&b, "PID {d} · start {d}", .{ proc.pid, proc.start }) catch "";
+    try ctx.statusLine(rect.x + 14, rect.y + 8, left_w - 28, ident, p.dim);
     const name_w = @min(ctx.measure(pname), left_w * 0.4);
-    try ctx.textFit(rect.x + 14, rect.y + 8, name_w + 1, pname, p.text);
-    const ident = std.fmt.bufPrint(&b, "pid {d}  ·  start tick {d}  ·  parent {d}  ·  state {c}", .{ proc.pid, proc.start, proc.ppid, proc.state }) catch "";
-    try ctx.textFit(rect.x + 14 + name_w + 14, rect.y + 8, left_w - name_w - 28, ident, p.dim);
-    try ctx.text(rect.x + 14, rect.y + 34, "cgroup", p.dim);
-    try text(v, ctx, rect.x + 104, rect.y + 34, left_w - 104, v.private(proc.cgroup), p.text);
+    try ctx.textFit(rect.x + 14, rect.y + 34, name_w, pname, p.text);
+    try text(v, ctx, rect.x + 28 + name_w, rect.y + 34, left_w - name_w - 42, v.private(proc.cgroup), p.dim);
+    v.hover(.{ .x = rect.x, .y = rect.y, .w = left_w, .h = rect.h }, "PID {d} · start tick {d} · parent {d} · state {c}", .{ proc.pid, proc.start, proc.ppid, proc.state });
     try ctx.text(rect.x + 14, rect.y + 58, "command", p.dim);
     try text(v, ctx, rect.x + 104, rect.y + 58, left_w - 104, v.private(proc.cmdline), p.text);
     // Sparklines of the selection since it was selected.
-    const gx = rect.x + left_w + 10;
-    const gw = @max(40, (rect.w - left_w - 10 - bw - 40 - 12) / 2);
-    try ctx.text(gx, rect.y + 6, "CPU", p.dim);
-    try graph(v, ctx, .{ .x = gx, .y = rect.y + 28, .w = gw, .h = rect.h - 36 }, &.{.{ .ring = &v.hist.selected_cpu, .color = p.accent }}, .{ .scale = &v.hist.scales[8], .samples = 60, .labels = false, .smooth = false, .width = 1.5, .reason = proc.cpu.reason }, now);
-    try ctx.text(gx + gw + 12, rect.y + 6, "Memory", p.dim);
-    try graph(v, ctx, .{ .x = gx + gw + 12, .y = rect.y + 28, .w = gw, .h = rect.h - 36 }, &.{.{ .ring = &v.hist.selected_mem, .color = p.accent3 }}, .{ .kind = .bytes, .scale = &v.hist.scales[9], .samples = 60, .labels = false, .smooth = false, .width = 1.5, .reason = proc.rss.reason }, now);
+    if (show_graphs) {
+        const gx = rect.x + left_w + 10;
+        const gw = @max(40, (rect.w - left_w - 10 - bw - 40 - 12) / 2);
+        try ctx.text(gx, rect.y + 6, "CPU", p.dim);
+        try graph(v, ctx, .{ .x = gx, .y = rect.y + 28, .w = gw, .h = rect.h - 36 }, &.{.{ .ring = &v.hist.selected_cpu, .color = p.accent }}, .{ .scale = &v.hist.scales[8], .samples = 60, .labels = false, .smooth = false, .width = 1.5, .reason = proc.cpu.reason }, now);
+        try ctx.text(gx + gw + 12, rect.y + 6, "Memory", p.dim);
+        try graph(v, ctx, .{ .x = gx + gw + 12, .y = rect.y + 28, .w = gw, .h = rect.h - 36 }, &.{.{ .ring = &v.hist.selected_mem, .color = p.accent3 }}, .{ .kind = .bytes, .scale = &v.hist.scales[9], .samples = 60, .labels = false, .smooth = false, .width = 1.5, .reason = proc.rss.reason }, now);
+    }
     // Every action opens a cost/privilege confirmation before launch.
     for ([_][]const u8{ "Files  L", "Profile  F", button_label }, [_]View.Action{ .files, .profile, .attach }, 0..) |label, action, i| {
         const button = Rect{ .x = rect.x + rect.w - bw - 14, .y = rect.y + 4 + @as(f32, @floatFromInt(i)) * 27, .w = bw, .h = 25 };
@@ -1016,11 +1019,37 @@ fn processDetail(v: *View, ctx: Ctx, rect: Rect, now: u64) !void {
 // --- Memory -------------------------------------------------------------------
 
 fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void {
+    const sizes = @import("../../look.zig").memory;
+    // At the minimum outer window there is no room for three card rows.
+    // Keep the facts and PSI categories; only the decorative composition and
+    // secondary history plots yield. No negative-size cards or vanished PSI.
+    if (rect.h < sizes.compact_below) {
+        const half = (rect.w - sizes.gap) / 2;
+        const left = try card(ctx, .{ .x = rect.x, .y = rect.y, .w = half, .h = rect.h }, "Memory in use", "");
+        const fields = [_]struct { []const u8, m.U }{
+            .{ "Used", s.memory.used },           .{ "Available", s.memory.available },   .{ "Cached", s.memory.cached },
+            .{ "Swap used", s.memory.swap_used }, .{ "zswap pool", s.memory.zswap_pool }, .{ "Slab", s.memory.slab },
+        };
+        for (fields, 0..) |field, i| {
+            const y = left.y + @as(f32, @floatFromInt(i)) * line_h;
+            if (y + 18 > left.y + left.h) break;
+            try kv(v, ctx, left.x, y, left.w, field[0], fromU(field[1]), .bytes);
+        }
+        const right = try card(ctx, .{ .x = rect.x + half + sizes.gap, .y = rect.y, .w = half, .h = rect.h }, "Pressure (PSI)", "avg10");
+        const pressures = [_]m.Pressure{ s.psi_cpu, s.psi_memory, s.psi_io };
+        for ([_][]const u8{ "CPU", "Memory", "I/O" }, pressures, 0..) |name, pressure, i| {
+            const y = right.y + @as(f32, @floatFromInt(i)) * 3 * line_h;
+            try ctx.textFit(right.x, y, right.w, name, ctx.p.text);
+            try kv(v, ctx, right.x, y + line_h, right.w, "Some %", pressure.some10, .percent);
+            try kv(v, ctx, right.x, y + 2 * line_h, right.w, "Full %", pressure.full10, .percent);
+        }
+        return;
+    }
     const p = ctx.p;
-    const gap: f32 = 10;
+    const gap = sizes.gap;
     const mem = s.memory;
     const H = v.hist;
-    const top_h: f32 = 214;
+    const top_h = sizes.composition;
     {
         var rb: [64]u8 = undefined;
         var tb: [24]u8 = undefined;
@@ -1079,17 +1108,19 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
     }
     // Swap and zswap.
     const row_y = rect.y + top_h + gap;
-    const row_h: f32 = 150;
+    const row_h = sizes.middleHeight(rect.h);
+    const compact_row = row_h < sizes.middle;
     const third = (rect.w - 2 * gap) / 3;
     {
         const inner = try card(ctx, .{ .x = rect.x, .y = row_y, .w = third, .h = row_h }, "Swap", "");
         if (mem.swap_total.get()) |t| {
             if (t == 0) try ctx.text(inner.x, inner.y, "No swap configured", p.dim) else {
                 const used = mem.swap_used.get();
-                try ctx.segments(.{ .x = inner.x, .y = inner.y + 4, .w = inner.w, .h = 16 }, if (used) |u| @as(f64, @floatFromInt(u)) / @as(f64, @floatFromInt(t)) else null, p.accent2);
-                try kv(v, ctx, inner.x, inner.y + 30, inner.w, "Used", fromU(mem.swap_used), .bytes);
-                try kv(v, ctx, inner.x, inner.y + 52, inner.w, "Total", fromU(mem.swap_total), .bytes);
-                try kv(v, ctx, inner.x, inner.y + 74, inner.w, "Swap in / out (pages/s)", mem.swap_out_ps, .count);
+                if (!compact_row) try ctx.segments(.{ .x = inner.x, .y = inner.y + 4, .w = inner.w, .h = 16 }, if (used) |u| @as(f64, @floatFromInt(u)) / @as(f64, @floatFromInt(t)) else null, p.accent2);
+                const y = inner.y + @as(f32, if (compact_row) 0 else 30);
+                try kv(v, ctx, inner.x, y, inner.w, "Used", fromU(mem.swap_used), .bytes);
+                try kv(v, ctx, inner.x, y + line_h, inner.w, "Total", fromU(mem.swap_total), .bytes);
+                try kv(v, ctx, inner.x, y + 2 * line_h, inner.w, "Swap out (pages/s)", mem.swap_out_ps, .count);
             }
         } else try missing(v, ctx, inner.x, inner.y, inner.w, mem.swap_total.reason);
     }
@@ -1100,10 +1131,15 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
         if (pool != null and stored != null and pool.? > 0) {
             const ratio = @as(f64, @floatFromInt(stored.?)) / @as(f64, @floatFromInt(pool.?));
             var b: [24]u8 = undefined;
-            const w = try ctx.vfd(inner.x, inner.y + 2, 40, std.fmt.bufPrint(&b, "{d:.1}", .{ratio}) catch "", p.accent);
-            try ctx.text(inner.x + w + 6, inner.y + 18, "× compression", p.dim);
-            try kv(v, ctx, inner.x, inner.y + 52, inner.w, "Pool (RAM)", fromU(mem.zswap_pool), .bytes);
-            try kv(v, ctx, inner.x, inner.y + 74, inner.w, "Stored (original)", fromU(mem.zswap_stored), .bytes);
+            if (compact_row) {
+                try ctx.textFit(inner.x, inner.y, inner.w, std.fmt.bufPrint(&b, "{d:.1} × compression", .{ratio}) catch "", p.accent);
+            } else {
+                const w = try ctx.vfd(inner.x, inner.y + 2, 40, std.fmt.bufPrint(&b, "{d:.1}", .{ratio}) catch "", p.accent);
+                try ctx.textFit(inner.x + w + 6, inner.y + 18, inner.w - w - 6, "× compression", p.dim);
+            }
+            const y = inner.y + @as(f32, if (compact_row) line_h else 52);
+            try kv(v, ctx, inner.x, y, inner.w, "Pool (RAM)", fromU(mem.zswap_pool), .bytes);
+            try kv(v, ctx, inner.x, y + line_h, inner.w, "Stored (original)", fromU(mem.zswap_stored), .bytes);
         } else if (pool != null and pool.? == 0) {
             try ctx.text(inner.x, inner.y, "zswap pool is empty", p.dim);
         } else try missing(v, ctx, inner.x, inner.y, inner.w, mem.zswap_pool.reason);
@@ -1111,18 +1147,18 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
     {
         const inner = try card(ctx, .{ .x = rect.x + 2 * (third + gap), .y = row_y, .w = third, .h = row_h }, "Faults", "");
         try kv(v, ctx, inner.x, inner.y, inner.w, "Major faults /s", mem.major_faults_ps, .count);
-        try kv(v, ctx, inner.x, inner.y + 22, inner.w, "Swap in pages /s", mem.swap_in_ps, .count);
-        try kv(v, ctx, inner.x, inner.y + 44, inner.w, "Swap out pages /s", mem.swap_out_ps, .count);
-        try kv(v, ctx, inner.x, inner.y + 66, inner.w, "Slab (reclaimable)", fromU(mem.slab), .bytes);
+        const step: f32 = if (compact_row) 20 else line_h;
+        try kv(v, ctx, inner.x, inner.y + step, inner.w, "Swap in pages /s", mem.swap_in_ps, .count);
+        try kv(v, ctx, inner.x, inner.y + 2 * step, inner.w, "Swap out pages /s", mem.swap_out_ps, .count);
+        try kv(v, ctx, inner.x, inner.y + 3 * step, inner.w, "Slab (reclaimable)", fromU(mem.slab), .bytes);
     }
     // History and pressure.
     const low_y = row_y + row_h + gap;
     const low_h = rect.y + rect.h - low_y;
-    if (low_h < 100) return;
     const half = (rect.w - gap) / 2;
     {
         const inner = try card(ctx, .{ .x = rect.x, .y = low_y, .w = half, .h = low_h }, "Memory in use", "% of installed");
-        try graph(v, ctx, inner, &.{ .{ .ring = &H.mem_used, .color = p.accent3, .label = "used" }, .{ .ring = &H.mem_cached, .color = p.accent, .fill = 0.1, .label = "cached" }, .{ .ring = &H.swap_used, .color = p.accent2, .fill = 0, .label = "swap" } }, .{ .max = 100, .samples = 180 }, now);
+        try graph(v, ctx, inner, &.{ .{ .ring = &H.mem_used, .color = p.accent3, .label = "used" }, .{ .ring = &H.mem_cached, .color = p.accent, .fill = 0.1, .label = "cached" }, .{ .ring = &H.swap_used, .color = p.accent2, .fill = 0, .label = "swap" } }, .{ .max = 100, .samples = 180, .labels = low_h >= 150 }, now);
     }
     {
         const inner = try card(ctx, .{ .x = rect.x + half + gap, .y = low_y, .w = half, .h = low_h }, "Pressure stall (PSI, avg10)", "some = any task stalled · full = all stalled");
@@ -1132,7 +1168,7 @@ fn memory(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !void 
         for (0..3) |i| {
             const g = Rect{ .x = inner.x + 70, .y = inner.y + @as(f32, @floatFromInt(i)) * (third_h + 6), .w = inner.w - 70, .h = third_h };
             try ctx.text(inner.x, g.y + g.h / 2 - 10, names[i], p.dim);
-            try graph(v, ctx, g, &.{ .{ .ring = &H.psi[i * 2], .color = p.warn, .label = "some" }, .{ .ring = &H.psi[i * 2 + 1], .color = p.crit, .fill = 0.2, .label = "full" } }, .{ .scale = &H.scales[10 + i], .samples = 120, .reason = reasons[i] }, now);
+            try graph(v, ctx, g, &.{ .{ .ring = &H.psi[i * 2], .color = p.warn, .label = "some" }, .{ .ring = &H.psi[i * 2 + 1], .color = p.crit, .fill = 0.2, .label = "full" } }, .{ .scale = &H.scales[10 + i], .samples = 120, .reason = reasons[i], .labels = g.h >= 60 }, now);
         }
     }
 }
@@ -1759,6 +1795,7 @@ fn fetchCard(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     const w = right.w - 32;
     var y = right.y + 12;
     try ctx.glowText(x0, y, fs.title, tint);
+    const title_at = Rect{ .x = x0, .y = y, .w = ctx.measure(fs.title), .h = 22 };
     y += 24;
     var key_w: f32 = 0;
     for (fs.lines) |l| key_w = @max(key_w, ctx.measure(l.key));
@@ -1797,7 +1834,7 @@ fn fetchCard(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     var b: [48]u8 = undefined;
     if (fits < fs.lines.len) try ctx.textFit(x0, y, w, std.fmt.bufPrint(&b, "wheel: {d} more lines", .{fs.lines.len - fits}) catch "", p.dim);
     if (rebuilt and @import("../../c_ui.zig").api.getenv("XODB_OVERVIEW_AUDIT") != null)
-        @import("../../log.zig").info(.overview, "xodb: fetch lines={d} shown={d} logo={s} redacted={} wm={s} cpu_spark={d:.0},{d:.0},{d:.0},{d:.0}\n", .{ fs.lines.len, @min(fits, fs.lines.len), if (fs.blocks != null) "png" else "text", v.redact, (fs.static.?.wm orelse "none"), cpu_spark.x, cpu_spark.y, cpu_spark.w, cpu_spark.h });
+        @import("../../log.zig").info(.overview, "xodb: fetch lines={d} shown={d} logo={s} redacted={} wm={s} cpu_spark={d:.0},{d:.0},{d:.0},{d:.0} title={d:.0},{d:.0},{d:.0},{d:.0}\n", .{ fs.lines.len, @min(fits, fs.lines.len), if (fs.blocks != null) "png" else "text", v.redact, (fs.static.?.wm orelse "none"), cpu_spark.x, cpu_spark.y, cpu_spark.w, cpu_spark.h, title_at.x, title_at.y, title_at.w, title_at.h });
     // ANSI colour blocks, as fetch tools end their card.
     const ansi = [16]u24{ 0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff };
     const bw = @min(28, w / 16);

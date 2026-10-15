@@ -196,6 +196,12 @@ pub const View = struct {
     pub fn pal(self: *const View) *const themes.Palette {
         return &themes.all[self.palette];
     }
+    pub fn recordedTraceBanner(self: *const View, buffer: []u8) ?[]const u8 {
+        if (self.action_hook != null) return null;
+        const sample = self.snap() orelse return null;
+        if (!sample.tracing_failure.ok()) return null;
+        return std.fmt.bufPrint(buffer, "Recorded tracing failure · {s}", .{sample.tracing_failure.s}) catch "Recorded tracing failure";
+    }
     pub fn snap(self: *const View) ?*const m.Snapshot {
         return if (self.current) |c| &c.snap else null;
     }
@@ -1229,6 +1235,8 @@ pub const View = struct {
                 self.layout_size = .{ self.width, self.height };
                 log.info(.overview, "xodb: overview layout {d}x{d} panel={s} overlaps={d} first=\"{s}\"/\"{s}\" \"{s}\"/\"{s}\" \"{s}\"/\"{s}\" theme={s} content={d}x{d} texts={d} elided={d} unmarked={d} omitted={d}\n", .{ @as(u32, @intFromFloat(self.width)), @as(u32, @intFromFloat(self.height)), @tagName(self.panel), n, first[0], first[1], first[2], first[3], first[4], first[5], p.name, @as(u32, @intFromFloat(content.w)), @as(u32, @intFromFloat(content.h)), l.count, l.elided, l.unmarked, l.omitted });
                 self.layout_reported = n;
+                if (self.panel == .memory) log.info(.overview, "xodb: overview sections panel=memory theme={s} content={d}x{d} history={} pressure={} cpu={} memory={} io={}\n", .{ p.name, @as(u32, @intFromFloat(content.w)), @as(u32, @intFromFloat(content.h)), l.hasFullText("Memory in use"), l.hasFullText("Pressure stall (PSI, avg10)"), l.hasFullText("CPU"), l.hasFullText("Memory"), l.hasFullText("I/O") });
+                if (self.panel == .graph or self.panel == .galaxy or self.panel == .treemap) log.info(.overview, "xodb: overview sections panel={s} theme={s} content={d}x{d} recorded_failure={}\n", .{ @tagName(self.panel), p.name, @as(u32, @intFromFloat(content.w)), @as(u32, @intFromFloat(content.h)), l.hasFullText("Recorded tracing failure") });
                 self.layout_panel = self.panel;
                 self.layout_palette = self.palette;
             }
@@ -1289,8 +1297,11 @@ pub const View = struct {
         try ctx.r.rect(.{ .x = rect.x, .y = rect.y + rect.h - 1, .w = rect.w, .h = 1 }, p.border);
         // Wordmark: a small VFD glyph block and the name.
         try ctx.r.shape(.{ .x = 14, .y = 12, .w = 28, .h = 28 }, fade(p.accent, 0.14), .{ .radii = @splat(6) });
-        _ = try ctx.vfd(19, 17, 18, "88", fade(p.accent, 0.25));
-        _ = try ctx.vfd(19, 17, 18, "0", p.accent);
+        // Decorative overprinted logo, not a displayed numeric value.
+        var logo = ctx;
+        logo.layout = null;
+        _ = try logo.vfd(19, 17, 18, "88", fade(p.accent, 0.25));
+        _ = try logo.vfd(19, 17, 18, "0", p.accent);
         try ctx.glowText(52, 7, "xodb overview", p.text);
         const s = self.snap();
         var buf: [256]u8 = undefined;
@@ -1300,7 +1311,7 @@ pub const View = struct {
             const kernel = self.kernelText(snapshot.kernel);
             const line = std.fmt.bufPrint(&buf, "{s}  ·  {s}  ·  up {s}", .{ if (host.ok()) host.s else "host hidden", if (kernel.ok()) kernel.s else "kernel ?", if (snapshot.uptime_s.get()) |u| m.duration(&b2, u) else "?" }) catch "";
             const chips_w = @as(f32, @floatFromInt(headerChips(rect.w))) * 178 + ctx.measure(if (self.paused) "PAUSED" else self.source_label) + 50;
-            try ctx.textFit(52, 27, @max(0, rect.w - chips_w - 62), line, p.dim);
+            try ctx.statusLine(52, 27, @max(0, rect.w - chips_w - 62), line, p.dim);
             if (!host.ok()) self.hover(.{ .x = 52, .y = 27, .w = 120, .h = 20 }, "Hostname: {s}", .{host.why});
         }
         // Live stat chips with sparklines, right-aligned.
@@ -1441,37 +1452,35 @@ pub const View = struct {
 
     fn tooltip(self: *View, ctx: Ctx) !void {
         if (self.hover_len == 0) return;
-        // Narrow views already dedicate the footer to the hovered fact. A
-        // second floating copy would obscure the very tile being inspected.
-        if (self.width < @import("../../look.zig").overview.small_width) return;
         const p = ctx.p;
         const text = self.hover_text[0..self.hover_len];
-        const w = @min(ctx.measure(text) + 20, self.width * 0.5);
-        var x = self.pointer[0] + 14;
-        var y = self.pointer[1] + 18;
-        if (x + w > self.width - 8) x = self.width - 8 - w;
-        if (y + 28 > self.height - 30) y = self.pointer[1] - 34;
-        const rect = Rect{ .x = x, .y = y, .w = w, .h = 26 };
+        const sizes = @import("../../look.zig");
+        const margin = sizes.tooltip.margin;
+        const pad = sizes.tooltip.padding;
+        const w = @min(ctx.measure(text) + 2 * pad, @min(460, self.width - 2 * margin));
+        const height: f32 = if (ctx.measure(text) <= w - 2 * pad) 28 else 3 * sizes.tooltip.row + 8;
+        const rect = draw.tooltipRect(.{ .x = margin, .y = sizes.overview.header, .w = self.width - 2 * margin, .h = self.height - sizes.overview.header - sizes.overview.footer_small - margin }, self.hover_rect orelse .{ .x = self.pointer[0], .y = self.pointer[1], .w = 1, .h = 1 }, self.pointer, w, height) orelse return;
+        const content = Rect{ .x = rect.x + pad, .y = rect.y + 4, .w = rect.w - 2 * pad, .h = rect.h - 8 };
         switch (self.tooltip_style) {
             .overview => {},
             .win9x => {
                 // Yellow 9x tooltip with a hard black frame.
                 try ctx.r.rect(rect, draw.Color{ 1, 1, 0.882, 1 });
                 try ctx.r.shape(rect, draw.Color{ 0, 0, 0, 1 }, .{ .border = 1 });
-                try ctx.textFit(x + 8, y + 3, w - 16, text, draw.Color{ 0, 0, 0, 1 });
+                try ctx.wrap(content, text, draw.Color{ 0, 0, 0, 1 });
                 return;
             },
             .dos => {
                 try ctx.r.rect(rect, draw.Color{ 0, 0, 0, 1 });
                 try ctx.r.rect(draw.inset(rect, 2), draw.Color{ 0, 0.667, 0.667, 1 });
-                try ctx.textFit(x + 8, y + 3, w - 16, text, draw.Color{ 0, 0, 0, 1 });
+                try ctx.wrap(content, text, draw.Color{ 0, 0, 0, 1 });
                 return;
             },
         }
         try ctx.r.shape(.{ .x = rect.x - 4, .y = rect.y - 2, .w = rect.w + 12, .h = rect.h + 10 }, fade(.{ 0, 0, 0, 1 }, 0.35), .{ .radii = @splat(8), .softness = 4 });
         try ctx.r.shape(rect, p.raised, .{ .radii = @splat(5) });
         try ctx.r.shape(rect, p.border, .{ .radii = @splat(5), .border = 1 });
-        try ctx.textFit(x + 10, y + 3, w - 18, text, p.text);
+        try ctx.wrap(content, text, p.text);
     }
 
     /// CRT treatment for phosphor themes: scanlines and vignette over everything.

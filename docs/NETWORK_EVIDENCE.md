@@ -1,8 +1,8 @@
-# Network evidence (X1): pcap/pcapng beside a capture
+# Network evidence (X1/X3): packets, TLS and mitmproxy flows
 
-Status: slice X1 of the external-evidence design, 2026-10-14. Offline only:
-xodb reads capture files you already have; it does not capture traffic, needs
-no privilege and adds no helper.
+Status: slices X1 and X3 of the external-evidence design, 2026-10-14. Offline
+only: xodb reads capture files you already have; it does not capture traffic,
+needs no privilege and adds no helper.
 
 ## Try it
 
@@ -10,11 +10,59 @@ no privilege and adds no helper.
 |---|---|
 | `xodb --open-pcap trace.pcapng` | The stream in the profile view's timeline as a `net` lane on the file's own clock; MCP tools below. |
 | `xodb --open-pcap trace.pcapng --open-capture run.xoc` | The lane on the capture's clock (when the archive has clock pairs), and `correlate` joins packets to the captured process. |
+| `xodb --open-pcap trace.pcapng --tls-key-log ssl.keys` | A second, derived evidence stream containing authenticated TLS 1.2/1.3 records. Plaintext is returned only on an explicit raw query by the direct observer that opened the files. |
+| `xodb --open-mitmproxy flows.mitm` | HTTP request/response metadata and content references from a mitmproxy flow dump. Other flow types remain visible as `unsupported_flow`. |
 | `xodb --headless --mcp --open-pcap trace.pcap --open-capture run.xoc` | The same for an agent: `list_streams`, `query_stream`, `correlate`. |
 | `python3 -B tests/network-evidence.py [--gui]` | The end-to-end demo: two owned loopback peers, a real capture archive, a synthetic pcapng of their traffic, correlation with basis `exact` for the exchange inside the capture and `sampled` for the one before it. |
+| `python3 -B tests/private-network-evidence.py` | Runtime-only owned TLS 1.2/1.3 loopback sessions and a synthetic mitmproxy flow; checks authentication, import, access control, redaction and log privacy. |
 
 `--open-pcap` combines only with `--open-capture` (no live target, core, imported
 profile or remote session).
+
+`--tls-key-log` requires `--open-pcap`. `--open-mitmproxy` opens its own offline
+stream and does not combine with another target or evidence file.
+
+## TLS key-log decryption
+
+The key log uses the NSS `SSLKEYLOGFILE` text format. xodb consumes it while
+opening the capture, wipes the input and parsed secrets, and retains only
+authenticated plaintext records plus their hashes and packet provenance. It
+does not store the key log in an archive or print its path, secrets or
+plaintext.
+
+| Version | Key-log labels | Cipher suites |
+|---|---|---|
+| TLS 1.3 | `CLIENT_HANDSHAKE_TRAFFIC_SECRET`, `SERVER_HANDSHAKE_TRAFFIC_SECRET`, `CLIENT_TRAFFIC_SECRET_0`, `SERVER_TRAFFIC_SECRET_0` | AES-128-GCM/SHA-256, AES-256-GCM/SHA-384, ChaCha20-Poly1305/SHA-256 |
+| TLS 1.2 | `CLIENT_RANDOM` | RSA/ECDHE AES-128-GCM/SHA-256, RSA/ECDHE AES-256-GCM/SHA-384, ECDHE/DHE ChaCha20-Poly1305/SHA-256 |
+
+TCP is reassembled independently in each direction. Each derived record names
+its flow, direction, TLS version, cipher, epoch, sequence number, source packet
+and source timestamp. AEAD authentication failure is retained as
+`authentication_failed`; missing secrets, unsupported suites, incomplete
+handshakes and reassembly gaps are explicit session states.
+
+The capture must contain the ClientHello and ServerHello and contiguous TCP
+bytes from the beginning of each TLS direction. This slice does not decrypt
+TLS 1.3 0-RTT data, post-`KeyUpdate` traffic, CBC suites, DTLS, QUIC or
+mid-stream captures. Reassembly and retained plaintext are each capped at 64
+MiB; a TLS record is capped at 18,432 bytes and a key log at 16 MiB/16,384
+recognized entries. Plaintext beyond the retention cap keeps its authenticated
+length and SHA-256 with `retained=false`.
+
+## mitmproxy flow import
+
+The reader accepts mitmproxy's concatenated tnetstring flow records, including
+the current version-21 HTTP field layout. It exposes request/response timing,
+method, URL components, status, headers, content length and SHA-256. HTTP body
+bytes are borrowed from the owned file buffer and erased with that buffer at
+shutdown. TCP, WebSocket, DNS and other flow types remain in the stream as
+typed `unsupported_flow` records.
+
+The parser stops safely after earlier complete flows on a truncated or corrupt
+tail. It caps the file at the common 256 MiB input limit, one million flows,
+64 levels of nesting, 65,536 tnetstring nodes per flow and 256 retained headers
+per message. It does not decompress HTTP content or migrate older mitmproxy
+layouts whose field names differ.
 
 ## What is read
 
@@ -115,11 +163,17 @@ the direction (`outbound` when the packet's source is the socket's local end).
 
 | Tool | Arguments | Returns |
 |---|---|---|
-| `list_streams` | none | format, byte order, sections, interfaces (link, name, snaplen, `tsresol`, packets, truncated packets, `epb_drops`, ISB counters), file stop state and counts, undecoded, flows, decoder, clock domain and mapping, capture context and its tables |
-| `query_stream` | `stream_id`, `clock` (`stream`/`capture`), `from_ns`, `to_ns` (exclusive), `flow_id`, `interface`, `protocol`, `port`, `undecoded`, `flows`, `include_raw`, `start`, `limit` (1–256) | records in file order and `next` to continue; with `flows`, a page of the flow table |
-| `correlate` | `stream_id`, `record` | as above |
+| `list_streams` | none | every opened or derived stream, its decoder/version, format, bounds and stop state; network interfaces/clock/context, TLS sessions or mitmproxy flow counts as applicable |
+| `query_stream` | common: `stream_id`, time bounds, `include_raw`, `start`, `limit` (1–256); network: clock/flow/interface/protocol/port/undecoded/flows; TLS: flow/direction/content type/state; mitmproxy: method/status/undecoded | records in source order and `next` to continue; metadata and content SHA-256 by default, explicit bytes only when access permits |
+| `correlate` | `stream_id`, `record` | network records as above; a TLS record maps through its source packet; mitmproxy files have no packet/socket correlation |
 
-All three are observer tools: read-only and allowed in every agent scope.
+All three tools are read-only and callable in every agent scope. Decrypted TLS
+bytes and mitmproxy headers, URLs and body bytes are private evidence: only the
+direct `observe`-scope MCP connection of the xodb process that opened the file
+can receive them. A controller, shared-session peer or `--listen` TCP client
+receives counts, public protocol metadata and content hashes; an explicit
+private-payload request, or a mitmproxy `method` filter, is refused. `--redact` also refuses every `include_raw` request, including packet
+bytes and decrypted content, and withholds mitmproxy headers and URL fields.
 
 ## Archive storage (format 2.9)
 
@@ -135,7 +189,7 @@ file itself is not copied into the archive in X1: keep it beside the `.xoc`.
 |---|---|
 | Socket tables are sampled at start and stop only | a connection opened and closed between them is not seen; `sampled`/`none` say so. Exact per-I/O attribution (thread, syscall) needs the fd-flow/syscall join (X2). |
 | Only the captured process | children and other local peers are not in the tables. |
-| No TCP reassembly, request/response, HTTP or DNS | X2. |
+| The base network stream has no general-purpose TCP reassembly, request/response, HTTP or DNS decoder | X3 reassembles only TLS flows for record decryption; the general decoders belong to X2. |
 | No live capture | X2: an owned dumpcap/tcpdump child. |
 | Streams are not stored inside the archive | a later slice can attach them as an optional section the way FRAM is attached. |
 | GUI: one lane in the profile view's timeline, no packet table | records are queried through MCP. Selecting a time range in the timeline does not filter the stream. |
@@ -155,6 +209,10 @@ match no packet. Under `--redact`, MCP `correlate`, `query_stream` and
 digits), and `include_raw` is refused (`RawPayloadRedacted`). See
 [GUIDE.md](GUIDE.md#redaction).
 
+The X3 test generates its certificate, private key, TLS key
+log, random plaintext, packet capture and mitmproxy dump only in its runtime
+work directory. None is a source fixture or gate artifact.
+
 ## Layout
 
 | File | Layer | Role |
@@ -164,6 +222,8 @@ digits), and `include_raw` is refused (`RawPayloadRedacted`). See
 | `src/evidence/clock.zig` | evidence | clock domains, mapping with uncertainty |
 | `src/evidence/sockets.zig` | evidence | `/proc/net` parser, ECTX encoding, the join |
 | `src/evidence/stream.zig` | evidence | the stream: records, summaries, flows, loss, queries |
+| `src/evidence/tls.zig` | evidence | bounded TCP reassembly, key-log parsing, TLS 1.2/1.3 authenticated record derivation |
+| `src/evidence/mitm.zig` | evidence | bounded mitmproxy tnetstring flow reader |
 | `src/profile/net_context.zig` | profile | the collector step (reads `/proc`) |
 | `src/mcp/evidence.zig`, `evidence_tools.json` | mcp | the three tools |
 | `src/model/profile_timeline.zig`, `src/ui/timeline.zig` | model, ui | the lane |

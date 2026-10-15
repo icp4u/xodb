@@ -19,7 +19,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -126,6 +126,8 @@ pub fn main(init: std.process.Init) !void {
     var core_executable: ?[:0]const u8 = null;
     var open_capture: ?[:0]const u8 = null;
     var open_pcap: ?[:0]const u8 = null;
+    var tls_key_log: ?[:0]const u8 = null;
+    var open_mitmproxy: ?[:0]const u8 = null;
     var compare_capture: ?[:0]const u8 = null;
     var open_frames: ?[:0]const u8 = null;
     var open_profile: ?[:0]const u8 = null;
@@ -200,7 +202,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--redot-debugger adds a private loopback scene-debugger peer to a local owned Redot/Godot launch.
                 \\--agent-scope observe|control|mutate limits MCP access (default: observe).
                 \\--redact hides home paths, user and host names, and addresses outside loopback/documentation ranges in the GUI,
-                \\  MCP replies, logs and saved archives (not exports yet); addresses become per-session tags (docs/GUIDE.md "Redaction").
+                \\  MCP replies, logs and saved archives (not exports yet); raw packet and decrypted payload replies are refused.
+                \\  Addresses become per-session tags (docs/GUIDE.md "Redaction").
                 \\--record FILE saves investigation evidence at shutdown (must be a new file).
                 \\--expected-start-ticks N refuses attach if the sampled process identity changed.
                 \\--start-profile attaches, starts a 99 Hz / 10 s CPU capture, and resumes the target.
@@ -215,6 +218,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--observation-threshold-ns N overrides the fast/slow wall-duration threshold (see docs/OBSERVATIONS.md).
                 \\--open-capture FILE opens an offline archive; --symbols DIR optionally loads SHA-256-named ELF assets.
                 \\--open-pcap FILE opens a pcap/pcapng file as a read-only evidence stream; with --open-capture, aligns and correlates it.
+                \\--tls-key-log FILE decrypts TLS 1.2/1.3 records in --open-pcap; secrets are consumed in memory and never logged.
+                \\--open-mitmproxy FILE opens a mitmproxy flow dump as a read-only evidence stream.
                 \\--compare-capture BASE with --open-capture AFTER compares recorded CPU sample shares; V switches views.
                 \\--resolve-capture-symbols explicitly derives new labels from verified assets; default is recorded labels.
                 \\MCP uses stdio; --headless --mcp runs without a display. Inferior output goes to stderr.
@@ -241,7 +246,7 @@ pub fn main(init: std.process.Init) !void {
                 \\
             , .{});
             return;
-        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--")) {
+        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--redact")) redact = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
         } else if (named(&value_options, arg)) {
@@ -288,6 +293,8 @@ pub fn main(init: std.process.Init) !void {
             if (std.mem.eql(u8, arg, "--open-profile")) open_profile = args[i];
             if (std.mem.eql(u8, arg, "--open-capture")) open_capture = args[i];
             if (std.mem.eql(u8, arg, "--open-pcap")) open_pcap = args[i];
+            if (std.mem.eql(u8, arg, "--tls-key-log")) tls_key_log = args[i];
+            if (std.mem.eql(u8, arg, "--open-mitmproxy")) open_mitmproxy = args[i];
             if (std.mem.eql(u8, arg, "--compare-capture")) compare_capture = args[i];
             if (std.mem.eql(u8, arg, "--symbols")) symbols = args[i];
             if (std.mem.eql(u8, arg, "--debug-dir")) try debug_dirs.append(a, args[i]);
@@ -350,6 +357,8 @@ pub fn main(init: std.process.Init) !void {
     if (redot_debugger and (launch.len == 0 or attach != null or runtime_remote or remote_gui or core_file != null or open_capture != null or open_profile != null)) return error.RedotDebuggerRequiresLocalOwnedLaunch;
     if (open_capture != null and (attach != null or launch.len > 0 or initial_breakpoint_count != 0 or source != null)) return error.ConflictingTargets;
     if (open_pcap != null and (attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenPcapOptionConflict;
+    if (tls_key_log != null and open_pcap == null) return error.TlsKeyLogRequiresPcap;
+    if (open_mitmproxy != null and (open_pcap != null or tls_key_log != null or open_capture != null or attach != null or launch.len > 0 or core_file != null or open_profile != null or connect != null or ssh != null or gdb_remote != null or runtime_remote or compare_capture != null or open_observation != null or browse_observation != null or observation_recipe != null)) return error.OpenMitmproxyOptionConflict;
     if ((symbols != null or reanalyze) and open_capture == null) return error.SymbolsRequireArchive;
     // Before any thread starts: the policy is read without locks afterwards.
     if (redact) @import("redact.zig").enable();
@@ -373,7 +382,7 @@ pub fn main(init: std.process.Init) !void {
     _ = c.signal(c.SIGHUP, onSignal);
     std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     // Saved profiles, captures and observations have no code to decompile.
-    const archive_viewer = open_profile != null or open_capture != null or open_pcap != null or open_observation != null or browse_observation != null;
+    const archive_viewer = open_profile != null or open_capture != null or open_pcap != null or open_mitmproxy != null or open_observation != null or browse_observation != null;
     if (!remote_gui and !archive_viewer and ghidra_prestart) @import("semq/ghidra_sidecar.zig").prestart();
     if (remote_gui) {
         if (comptime build_options.gui) {
@@ -480,7 +489,8 @@ pub fn main(init: std.process.Init) !void {
     defer if (!remote_destroyed) if (record_path) |path| session.saveInvestigations(path) catch |err| log.err(.session, "Evidence export failed: {s}\n", .{@errorName(err)});
     if (core_file) |path| try session.openCore(path, core_executable);
     if (open_capture) |path| try session.openArchive(path, symbols, reanalyze);
-    if (open_pcap) |path| try openPcap(session, path, open_capture);
+    if (open_pcap) |path| try openPcap(session, path, open_capture, tls_key_log);
+    if (open_mitmproxy) |path| try openMitmproxy(session, path);
     if (open_profile) |path| try session.openImported(path);
     if (open_frames) |path| try session.openFrames(path);
     if (compare_capture) |path| session.comparison = try @import("profile/comparison.zig").Job.start(path, open_capture.?);
@@ -527,6 +537,7 @@ pub fn main(init: std.process.Init) !void {
     if (listen != null) {
         server.input_fd = connection.fd;
         server.output_fd = connection.fd;
+        server.network_peer = true;
     }
     if (mcp) try server.init();
     defer if (mcp) server.deinit();
@@ -593,7 +604,7 @@ pub fn main(init: std.process.Init) !void {
         defer for (workspaces) |entry| if (entry) |view| view.deinit();
         var last_process: u64 = 1;
         var last_tree_revision: u64 = 0;
-        workspace.show_profile = open_capture != null or open_pcap != null;
+        workspace.show_profile = open_capture != null or open_pcap != null or open_mitmproxy != null;
         workspace.logical_frames.open = open_frames != null;
         workspace.comparison.open = compare_capture != null;
         workspace.invocations.open = browse_observation != null;
@@ -1180,7 +1191,7 @@ fn renderFrame(renderer: *Renderer, font: *Font, workspace: *Workspace, window: 
 /// Reads a pcap/pcapng file into the session's evidence stream. With a
 /// capture archive, its ECTX section supplies the clock pairs and socket
 /// tables for alignment and correlation; without one the stream is unaligned.
-fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8) !void {
+fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylog_path: ?[:0]const u8) !void {
     const archive = @import("profile/archive.zig");
     const a = std.heap.page_allocator;
     const bytes = archive.readFile(a, path, archive.max_file_bytes, null) catch |err| {
@@ -1200,7 +1211,39 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8) !void
     }
     const loss = stream.loss();
     log.info(.session, "xodb: evidence stream {d}: {s} {d} records, {d} undecoded, {d} flows, file {s}, clock {s}; drops ifdrop={d} osdrop={d} epb={d}\n", .{ stream.id, @tagName(stream.parsed.format), stream.parsed.records.len, stream.undecoded, stream.flows.len, @tagName(stream.parsed.stop), @tagName(stream.mapping.state), loss.isb_ifdrop, loss.isb_osdrop, loss.epb_drops });
+    if (keylog_path) |secret_path| {
+        const keylog = try archive.readFile(a, secret_path, 16 * 1024 * 1024, null);
+        defer {
+            std.crypto.secureZero(u8, keylog);
+            a.free(keylog);
+        }
+        const derived = try @import("evidence/tls.zig").Stream.open(a, stream, keylog);
+        errdefer derived.destroy();
+        log.info(.session, "xodb: TLS evidence stream {d}: {d} sessions, {d} authenticated records, {d} authentication failures, {d} reassembly gaps\n", .{ derived.id, derived.sessions.len, derived.records.len, blk: {
+            var failures: u64 = 0;
+            for (derived.sessions) |summary| failures += summary.authentication_failures;
+            break :blk failures;
+        }, derived.reassembly_gaps });
+        session.tls_stream = derived;
+    }
     session.evidence_stream = stream;
+}
+
+fn openMitmproxy(session: *Session, path: [:0]const u8) !void {
+    const archive = @import("profile/archive.zig");
+    const a = std.heap.page_allocator;
+    const bytes = archive.readFile(a, path, archive.max_file_bytes, null) catch |err| {
+        log.err(.session, "xodb: --open-mitmproxy could not read the file: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    const stream = @import("evidence/mitm.zig").Stream.open(a, bytes, std.fs.path.basename(path)) catch |err| {
+        std.crypto.secureZero(u8, bytes);
+        a.free(bytes);
+        log.err(.session, "xodb: --open-mitmproxy: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    log.info(.session, "xodb: mitmproxy evidence stream {d}: {d} flows, {d} unsupported, file {s}\n", .{ stream.id, stream.records.len, stream.unsupported, @tagName(stream.stop) });
+    session.mitm_stream = stream;
 }
 
 test {
@@ -1238,6 +1281,8 @@ test {
     std.testing.refAllDecls(@import("mcp/allocation_control.zig"));
     _ = @import("profile/archive_test.zig");
     _ = @import("evidence/stream.zig");
+    _ = @import("evidence/tls.zig");
+    _ = @import("evidence/mitm.zig");
     _ = @import("profile/net_context.zig");
     _ = @import("mcp/evidence.zig");
     _ = @import("profile/perf_test.zig");

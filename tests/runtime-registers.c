@@ -2,6 +2,7 @@
  * names an i386 executable for the x86-64 live ABI-mismatch regression. */
 #define _GNU_SOURCE 1
 #include "loongarch_step.h"
+#include "riscv_step.h"
 #include "rpc.h"
 #include "xrt_arch.h"
 #include <errno.h>
@@ -451,6 +452,178 @@ static void contract(void)
     CHECK(result.issued && !result.confirmed && bank.writes == 1 && bank.reads == 2);
 }
 
+static void riscv_expect(uint64_t pc, const uint8_t *bytes, size_t size, const uint64_t gpr[32],
+                         uint32_t known, enum xrt_status status, uint8_t emulate, uint8_t count,
+                         uint64_t first, uint64_t second)
+{
+    struct xrt_riscv_plan plan;
+    CHECK(xrt_riscv_plan(pc, bytes, size, gpr, known, &plan) == status);
+    if (status != XRT_OK)
+        return;
+    CHECK(plan.emulate == emulate && plan.count == count);
+    if (count > 0)
+        CHECK(plan.pc[0] == first);
+    if (count > 1)
+        CHECK(plan.pc[1] == second);
+}
+static void put32(uint8_t *out, uint32_t word)
+{
+    out[0] = (uint8_t)word;
+    out[1] = (uint8_t)(word >> 8);
+    out[2] = (uint8_t)(word >> 16);
+    out[3] = (uint8_t)(word >> 24);
+}
+/* Encodings are the bytes llvm-mc emitted for RV64. Offsets are byte displacements. */
+static void riscv_plan_tests(void)
+{
+    uint64_t gpr[32];
+    memset(gpr, 0, sizeof(gpr));
+    const uint8_t nop[] = {0x13, 0x00, 0x00, 0x00};
+    const uint8_t cnop[] = {0x01, 0x00};
+    CHECK(xrt_riscv_plan(0x1000, nop, 4, gpr, 0, NULL) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_riscv_plan(0x1000, NULL, 4, gpr, 0, &(struct xrt_riscv_plan){0}) == XRT_INVALID_ARGUMENT);
+    CHECK(xrt_riscv_plan(0x1000, nop, 4, NULL, 0, &(struct xrt_riscv_plan){0}) == XRT_INVALID_ARGUMENT);
+    riscv_expect(0x1001, nop, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, nop, 0, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, nop, 2, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, nop, 3, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, nop, 4, gpr, 0, XRT_OK, 0, 1, 0x1004, 0);
+    riscv_expect(0x1000, cnop, 2, gpr, 0, XRT_OK, 0, 1, 0x1002, 0);
+    riscv_expect(UINT64_MAX - 1, nop, 4, gpr, 0, XRT_INVALID_ADDRESS, 0, 0, 0, 0);
+    riscv_expect(UINT64_MAX - 1, cnop, 2, gpr, 0, XRT_INVALID_ADDRESS, 0, 0, 0, 0);
+    /* c.addiw, the RV32 c.jal encoding, is not a jump on RV64. */
+    const uint8_t addiw[] = {0x01, 0x25};
+    riscv_expect(0x1000, addiw, 2, gpr, 0, XRT_OK, 0, 1, 0x1002, 0);
+    const uint8_t overlong[] = {0x3f, 0x00, 0x00, 0x00};
+    riscv_expect(0x1000, overlong, 2, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, overlong, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t reserved[] = {0x63, 0x20, 0x00, 0x00};
+    riscv_expect(0x1000, reserved, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t ebreak[] = {0x73, 0x00, 0x10, 0x00};
+    const uint8_t cebreak[] = {0x02, 0x90};
+    const uint8_t cjr0[] = {0x02, 0x80};
+    const uint8_t mret[] = {0x73, 0x00, 0x20, 0x30};
+    const uint8_t sret[] = {0x73, 0x00, 0x20, 0x10};
+    const uint8_t uret[] = {0x73, 0x00, 0x20, 0x00};
+    riscv_expect(0x1000, ebreak, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, cebreak, 2, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, cjr0, 2, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, mret, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, sret, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, uret, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t wfi[] = {0x73, 0x00, 0x50, 0x10};
+    riscv_expect(0x1000, wfi, 4, gpr, 0, XRT_OK, 0, 1, 0x1004, 0);
+    const uint8_t ecall[] = {0x73, 0x00, 0x00, 0x00};
+    riscv_expect(0x1000, ecall, 4, gpr, 0, XRT_OK, 0, 1, 0x1004, 0);
+    gpr[17] = 63;
+    riscv_expect(0x1000, ecall, 4, gpr, 1u << 17, XRT_OK, 0, 1, 0x1004, 0);
+    gpr[17] = 139;
+    riscv_expect(0x1000, ecall, 4, gpr, 1u << 17, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    gpr[17] = 139;
+    riscv_expect(0x1000, ecall, 4, gpr, 0, XRT_OK, 0, 1, 0x1004, 0);
+    const uint8_t jself[] = {0x6f, 0x00, 0x00, 0x00};
+    const uint8_t cjself[] = {0x01, 0xa0};
+    const uint8_t callself[] = {0xef, 0x00, 0x00, 0x00};
+    riscv_expect(0x1000, jself, 4, gpr, 0, XRT_OK, 1, 0, 0, 0);
+    riscv_expect(0x1000, cjself, 2, gpr, 0, XRT_OK, 1, 0, 0, 0);
+    riscv_expect(0x1000, callself, 4, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t jal8[] = {0x6f, 0x00, 0x80, 0x00};
+    const uint8_t jalra8[] = {0xef, 0x00, 0x80, 0x00};
+    const uint8_t cj8[] = {0x21, 0xa0};
+    riscv_expect(0x1000, jal8, 4, gpr, 0, XRT_OK, 0, 1, 0x1008, 0);
+    riscv_expect(0x1000, jalra8, 4, gpr, 0, XRT_OK, 0, 1, 0x1008, 0);
+    riscv_expect(0x1000, cj8, 2, gpr, 0, XRT_OK, 0, 1, 0x1008, 0);
+    const uint8_t jalback[] = {0x6f, 0xf0, 0x9f, 0xff};
+    const uint8_t cjback[] = {0xf5, 0xbf};
+    riscv_expect(0x1000, jalback, 4, gpr, 0, XRT_OK, 0, 1, 0xff8, 0);
+    riscv_expect(0x1000, cjback, 2, gpr, 0, XRT_OK, 0, 1, 0xffc, 0);
+    const uint8_t beq8[] = {0x63, 0x04, 0x00, 0x00};
+    const uint8_t beq0[] = {0x63, 0x00, 0x00, 0x00};
+    const uint8_t beqback[] = {0xe3, 0x0c, 0x00, 0xfe};
+    const uint8_t blt256[] = {0x63, 0xc0, 0x62, 0x10};
+    const uint8_t bgeuback[] = {0x63, 0x70, 0xb5, 0x80};
+    const uint8_t cbeq[] = {0x01, 0xc5};
+    const uint8_t cbnez[] = {0x6d, 0xfd};
+    const uint8_t cbeq32[] = {0x05, 0xc0};
+    const uint8_t cbnez256[] = {0x81, 0xf0};
+    riscv_expect(0x1000, beq8, 4, gpr, 0, XRT_OK, 0, 2, 0x1008, 0x1004);
+    riscv_expect(0x1000, beq0, 4, gpr, 0, XRT_OK, 0, 1, 0x1004, 0);
+    riscv_expect(0x1000, beqback, 4, gpr, 0, XRT_OK, 0, 2, 0xff8, 0x1004);
+    riscv_expect(0x1000, blt256, 4, gpr, 0, XRT_OK, 0, 2, 0x1100, 0x1004);
+    riscv_expect(0x2000, bgeuback, 4, gpr, 0, XRT_OK, 0, 2, 0x1000, 0x2004);
+    riscv_expect(0x1000, cbeq, 2, gpr, 0, XRT_OK, 0, 2, 0x1008, 0x1002);
+    riscv_expect(0x1000, cbnez, 2, gpr, 0, XRT_OK, 0, 2, 0xffa, 0x1002);
+    riscv_expect(0x1000, cbeq32, 2, gpr, 0, XRT_OK, 0, 2, 0x1020, 0x1002);
+    riscv_expect(0x1100, cbnez256, 2, gpr, 0, XRT_OK, 0, 2, 0x1000, 0x1102);
+    const uint8_t jalr_ra[] = {0x67, 0x80, 0x00, 0x00};
+    const uint8_t jalr_x0[] = {0x67, 0x00, 0x00, 0x00};
+    const uint8_t jalr_imm[] = {0x67, 0x00, 0x00, 0x01};
+    const uint8_t jalr_a5[] = {0xe7, 0x80, 0x07, 0x01};
+    const uint8_t cjr[] = {0x82, 0x80};
+    const uint8_t cjalr[] = {0x82, 0x90};
+    riscv_expect(0x1000, jalr_ra, 4, gpr, 0, XRT_REGISTER_UNAVAILABLE, 0, 0, 0, 0);
+    gpr[0] = 0x9999;
+    riscv_expect(0x1000, jalr_x0, 4, gpr, 1u, XRT_OK, 0, 1, 0, 0);
+    riscv_expect(0x1000, jalr_imm, 4, gpr, 1u, XRT_OK, 0, 1, 16, 0);
+    gpr[1] = 0x4321;
+    riscv_expect(0x1000, jalr_ra, 4, gpr, 1u << 1, XRT_OK, 0, 1, 0x4320, 0);
+    riscv_expect(0x1000, cjr, 2, gpr, 1u << 1, XRT_OK, 0, 1, 0x4320, 0);
+    riscv_expect(0x1000, cjalr, 2, gpr, 1u << 1, XRT_OK, 0, 1, 0x4320, 0);
+    gpr[1] = 0x1000;
+    riscv_expect(0x1000, jalr_ra, 4, gpr, 1u << 1, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    riscv_expect(0x1000, cjalr, 2, gpr, 1u << 1, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    gpr[15] = 0x2001;
+    riscv_expect(0x1000, jalr_a5, 4, gpr, 1u << 15, XRT_OK, 0, 1, 0x2010, 0);
+    riscv_expect(0x1000, jalr_a5, 4, gpr, 0, XRT_REGISTER_UNAVAILABLE, 0, 0, 0, 0);
+    /* lr.w, sc.w, no branch: stop on the instruction after sc. */
+    const uint8_t pair[] = {0xaf, 0x22, 0x05, 0x10, 0x2f, 0x23, 0x55, 0x18};
+    riscv_expect(0x2000, pair, sizeof pair, gpr, 0, XRT_OK, 0, 1, 0x2008, 0);
+    /* lr.w, addi, sc.w, bne -12 back to lr. The exit is the fall-through. */
+    const uint8_t retry[] = {0xaf, 0x22, 0x05, 0x10, 0x13, 0x00, 0x00, 0x00,
+                             0x2f, 0x23, 0x55, 0x18, 0xe3, 0x1a, 0x03, 0xfe};
+    riscv_expect(0x2000, retry, sizeof retry, gpr, 0, XRT_OK, 0, 1, 0x2010, 0);
+    const uint8_t retry_d[] = {0xaf, 0x32, 0x05, 0x10, 0x13, 0x00, 0x00, 0x00,
+                               0x2f, 0x33, 0x55, 0x18, 0xe3, 0x1a, 0x03, 0xfe};
+    riscv_expect(0x3000, retry_d, sizeof retry_d, gpr, 0, XRT_OK, 0, 1, 0x3010, 0);
+    /* lr.w, c.nop, c.nop, sc.w, c.bnez back to lr. */
+    const uint8_t mixed[] = {0xaf, 0x22, 0x05, 0x10, 0x01, 0x00, 0x01, 0x00,
+                             0x2f, 0x23, 0x55, 0x18, 0x75, 0xf9};
+    riscv_expect(0x2000, mixed, sizeof mixed, gpr, 0, XRT_OK, 0, 1, 0x200e, 0);
+    /* lr.w, sc.w, c.bnez back to lr, then a 48-bit parcel: bytes past the
+     * instruction after sc are not decoded. */
+    const uint8_t tail[] = {0xaf, 0x22, 0x05, 0x10, 0x2f, 0x23, 0x55, 0x18, 0x65, 0xfc, 0x1f, 0x00};
+    riscv_expect(0x2000, tail, sizeof tail, gpr, 0, XRT_OK, 0, 1, 0x200a, 0);
+    const uint8_t spin[] = {0xaf, 0x22, 0x05, 0x10, 0xaf, 0x22, 0x55, 0x18, 0xe5, 0xbf};
+    riscv_expect(0x2000, spin, sizeof spin, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t lone[] = {0xaf, 0x22, 0x05, 0x10, 0x13, 0x00, 0x00, 0x00};
+    riscv_expect(0x2000, lone, sizeof lone, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t nested[] = {0xaf, 0x22, 0x05, 0x10, 0xaf, 0x22, 0x05, 0x10, 0x2f, 0x23, 0x55, 0x18};
+    riscv_expect(0x2000, nested, sizeof nested, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t mismatch[] = {0xaf, 0x22, 0x05, 0x10, 0x2f, 0x33, 0x55, 0x18};
+    riscv_expect(0x2000, mismatch, sizeof mismatch, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t indirect[] = {0xaf, 0x22, 0x05, 0x10, 0x67, 0x80, 0x00, 0x00, 0x2f, 0x23, 0x55, 0x18};
+    gpr[1] = 0x8000;
+    riscv_expect(0x2000, indirect, sizeof indirect, gpr, 1u << 1, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t cjr_in[] = {0xaf, 0x22, 0x05, 0x10, 0x82, 0x80, 0x2f, 0x23, 0x55, 0x18};
+    riscv_expect(0x2000, cjr_in, sizeof cjr_in, gpr, 1u << 1, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t call_in[] = {0xaf, 0x22, 0x05, 0x10, 0xef, 0x00, 0x80, 0x00, 0x2f, 0x23, 0x55, 0x18};
+    riscv_expect(0x2000, call_in, sizeof call_in, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    const uint8_t three[] = {0xaf, 0x22, 0x05, 0x10, 0x63, 0x00, 0x00, 0x02,
+                             0x2f, 0x23, 0x55, 0x18, 0x63, 0x10, 0x00, 0x02};
+    riscv_expect(0x2000, three, sizeof three, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    uint8_t long_window[4 + 16 * 4];
+    put32(long_window, 0x100522afu);
+    for (int i = 0; i < 16; ++i)
+        put32(long_window + 4 + i * 4, 0x00000013u);
+    riscv_expect(0x2000, long_window, sizeof long_window, gpr, 0, XRT_UNSUPPORTED_CONTROL, 0, 0, 0, 0);
+    uint8_t fitted[4 + 15 * 4 + 4];
+    put32(fitted, 0x100522afu);
+    for (int i = 0; i < 15; ++i)
+        put32(fitted + 4 + i * 4, 0x00000013u);
+    put32(fitted + 4 + 15 * 4, 0x1855232fu);
+    riscv_expect(0x2000, fitted, sizeof fitted, gpr, 0, XRT_OK, 0, 1, 0x2044, 0);
+}
+
 static void riscv_replay(void)
 {
     const struct xrt_arch *arch = xrt_arch_get(XRT_RISCV);
@@ -475,7 +648,7 @@ static void riscv_replay(void)
         CHECK(xrt_arch_resolve(foreign) == NULL);
     }
     CHECK(xrt_arch_step_resources(arch, XRT_ISA_MODE_ORDINARY, &step) == XRT_OK);
-    CHECK(step.hardware_step == 0 && step.software_probes == 0);
+    CHECK(step.hardware_step == 0 && step.software_probes == 2);
     memset(&encoding, 0x5a, sizeof(encoding));
     request = (struct xrt_probe_request){.address = 0x1000,
                                          .isa_mode = XRT_ISA_MODE_ORDINARY,
@@ -529,6 +702,7 @@ static void riscv_replay(void)
         CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "x0", 2, 1) == XRT_UNKNOWN_REGISTER);
         CHECK(xrt_registers_poke(arch, raw, sizeof(raw), "a2", 2, 1) == XRT_OK);
     }
+    riscv_plan_tests();
 }
 
 static void loongarch_replay(void)

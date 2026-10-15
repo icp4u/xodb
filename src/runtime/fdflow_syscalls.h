@@ -314,7 +314,8 @@
   XRT_FDFLOW_MUT_socketcall(X)
 
 #if defined(__x86_64__) && !defined(__ILP32__)
-/* These are the literals tests/runtime-fdflow-count.c still passes. */
+/* x86-64 LP64 numbers. The count and churn tests spell SYS_*; these asserts
+ * keep the macros equal to the numbers those tests used to write out. */
 _Static_assert(SYS_read == 0 && SYS_write == 1, "x86 read/write");
 _Static_assert(SYS_pread64 == 17 && SYS_pwrite64 == 18, "x86 pread/pwrite");
 _Static_assert(SYS_readv == 19 && SYS_writev == 20, "x86 readv/writev");

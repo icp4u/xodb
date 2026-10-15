@@ -128,8 +128,8 @@ COVERS = (
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
     (('scripts/deps', 'tools/deps/*', 'tests/deps-selftest.py'), ('deps', 'deps-selftest')),
-    (('src/evidence/*', 'src/mcp/evidence*', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/fixtures/net-peer.py'),
-     ('network-evidence', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
+    (('src/evidence/*', 'src/mcp/evidence*', 'src/profile/net_context.zig', 'tests/network-evidence.py', 'tests/private-network-evidence.py', 'tests/fixtures/net-peer.py'),
+     ('network-evidence', 'private-network-evidence', 'gui-network-evidence', 'm2-archive', 'gui-profile')),
     (('tests/pcap-magic.py',), ('pcap-magic',)),
     (('src/redact.zig', 'src/log.zig', 'src/mcp/server.zig', 'src/profile/archive.zig', 'src/profile/archive_job.zig', 'src/profile/net_context.zig',
       'src/evidence/sockets.zig', 'src/mcp/evidence.zig', 'src/render/vulkan.zig', 'tests/redact.py'),
@@ -497,7 +497,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                      'm2-archive', 'm2-limits', 'm2-preferences', 'inspections', 'inspection-lifecycle', 'remote-owner-batches', 'shared-sessions', 'shared-cleanup', 'shared-processes', 'static-analysis', 'ghidra-sidecar', 'ghidra-sidecar-real', 'ghidra-sidecar-lifetime', 'ghidra-static-images', 'log-levels',
                      'metadata-ready-validation', 'lsof-top', 'fdactivity', 'runtime-agent', 'runtime-host', 'source-blocks', 'stale-interrupt', 'fork-release', 'process-tree',
                      'comparison', 'scheduling-decode', 'observation-experiments',
-                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence', 'redact'):
+                     'm2-export', 'm2-flow', 'm2-intervals', 'm2-ir', 'm2-recovery', 'm2-scheduling', 'm2-timeline', 'network-evidence', 'private-network-evidence', 'redact'):
             steps.append((name, [sys.executable, '-B', f'tests/{name}.py'], 180))
         steps.append(('semq-adapter', [sys.executable, '-B', 'tests/semq/test_adapter.py'], 60))
         steps.append(('allocation-helper', [sys.executable, '-B', 'tests/allocation-helper.py', './zig-out/bin/xodb-allocation-helper'], 30))
@@ -741,6 +741,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-layout', [sys.executable, '-B', 'tests/overview-small-gui.py', '--live'], 120))
         steps.append(('gui-overview-small-matrix', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix'], 600))
         steps.append(('gui-overview-small-matrix-unavailable', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--unavailable'], 600))
+        steps.append(('gui-overview-small-matrix-tracing-failure', [sys.executable, '-B', 'tests/overview-small-gui.py', '--matrix', '--tracing-failure'], 600))
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))

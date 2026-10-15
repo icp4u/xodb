@@ -9,7 +9,7 @@ const Ctx = draw.Ctx;
 const Rect = draw.Rect;
 const fade = draw.fade;
 const titles = [_][]const u8{ "Files", "Processes", "Leak watch", "Deleted", "Exact events" };
-const short_titles = [_][]const u8{ "Files", "Processes", "Leaks", "Deleted", "Exact" };
+const short_titles = [_][]const u8{ "Files", "Procs", "Leaks", "Deleted", "Exact" };
 
 fn button(v: *vw.View, ctx: Ctx, rect: Rect, label: []const u8, selected: bool, action: vw.View.Action) !void {
     try ctx.button(rect, selected);
@@ -118,7 +118,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
     }
     if (f.mode == .events) {
         const evidence = std.fmt.bufPrint(&buf, "Capture {d} · lost {d} · unpaired {d} · invalid {d} · {s}", .{ f.event_generation, f.event.lost, f.event.unpaired, f.event.invalid, f.captureState() }) catch "";
-        try ctx.textFit(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, evidence, if (std.mem.eql(u8, f.captureState(), "failed")) ctx.p.crit else if (f.event.flags != 0) ctx.p.warn else ctx.p.dim);
+        try ctx.statusLine(rect.x + 8, rect.y + rect.h - 48, rect.w - 16, evidence, if (std.mem.eql(u8, f.captureState(), "failed")) ctx.p.crit else if (f.event.flags != 0) ctx.p.warn else ctx.p.dim);
     }
     const note = std.fmt.bufPrint(&buf, "{d} cached rows · {d} ms shared polling · soft budget {d} ms · {s}", .{ f.rows.items.len, f.active_interval_ms, if (f.active_interval_ms == 250) @as(u8, 5) else 10, if (v.paused) "view frozen; peers may continue sampling" else "read-only; no target pause" }) catch "";
     var gone_buf: [128]u8 = undefined;
@@ -127,7 +127,7 @@ pub fn render(v: *vw.View, ctx: Ctx, rect: Rect, now: u64) !void {
         std.fmt.bufPrint(&gone_buf, "Selected pid {d} fd {d} is gone; view kept · ↑↓ or click selects another", .{ f.selected.?.owner.pid, f.selected.?.fd }) catch null
     else
         std.fmt.bufPrint(&gone_buf, "Selected pid {d} is gone; view kept · ↑↓ or click selects another", .{f.selected.?.owner.pid}) catch null;
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (f.exact_active) "exact mode slows all syscalls on this machine by roughly 10 % while active" else gone orelse note, if (f.exact_active or gone != null) ctx.p.warn else ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, if (f.exact_active) "Exact capture active · ~10% system-wide syscall overhead · E stop" else gone orelse note, if (f.exact_active or gone != null) ctx.p.warn else ctx.p.dim);
 }
 
 /// Up to `lines` lines broken after a space or '/', the last one truncated; returns the next y.
@@ -154,7 +154,7 @@ fn wrap(ctx: Ctx, x: f32, y0: f32, w: f32, text: []const u8, color: draw.Color, 
 }
 
 fn heatmap(ctx: Ctx, rect: Rect, s: *const c.struct_xrt_fd_snapshot, redact: bool) !void {
-    try ctx.text(rect.x + 8, rect.y, "System fd churn history · sampled opens + closes", ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y, rect.w - 16, "System fd churn history · sampled opens + closes", ctx.p.dim);
     var best: [8]?u32 = @splat(null);
     for (s.processes[0..s.process_count], 0..) |p, index| {
         for (&best, 0..) |*entry, slot| {
@@ -166,19 +166,29 @@ fn heatmap(ctx: Ctx, rect: Rect, s: *const c.struct_xrt_fd_snapshot, redact: boo
             }
         }
     }
-    const width = rect.w / 8;
-    for (best, 0..) |maybe, tile_index| {
+    // Identity sets the minimum tile width. Prefer fewer histories to eight
+    // identical "pid..." labels, even for the largest supported PID.
+    var min_width: f32 = 72;
+    for (best) |maybe| if (maybe) |index| {
+        var pid_buf: [24]u8 = undefined;
+        const pid = std.fmt.bufPrint(&pid_buf, "{d}", .{s.processes[index].pid}) catch "";
+        min_width = @max(min_width, ctx.measure(pid) + 16);
+    };
+    const count_shown = @min(best.len, @max(1, @as(usize, @intFromFloat(rect.w / min_width))));
+    const width = rect.w / @as(f32, @floatFromInt(count_shown));
+    for (best[0..count_shown], 0..) |maybe, tile_index| {
         const index = maybe orelse continue;
         const p: *const c.struct_xrt_fd_process = @ptrCast(&s.processes[index]);
         const x = rect.x + @as(f32, @floatFromInt(tile_index)) * width;
         var buf: [64]u8 = undefined;
-        var name: []const u8 = if (redact) std.fmt.bufPrint(&buf, "pid {d}", .{p.pid}) catch "" else "";
+        var name: []const u8 = std.fmt.bufPrint(&buf, "{d}", .{p.pid}) catch "";
         if (!redact) {
             // Keep the pid visible: shorten only the command name.
             const comm = fm.State.name(p);
             var keep = comm.len;
             name = fm.State.churnLabel(&buf, comm, p.pid, keep);
             while (keep > 0 and ctx.measure(name) > width - 16) : (keep -= 1) name = fm.State.churnLabel(&buf, comm, p.pid, keep - 1);
+            if (ctx.measure(name) > width - 16) name = std.fmt.bufPrint(&buf, "{d}", .{p.pid}) catch "";
         }
         try ctx.textFit(x + 8, rect.y + 24, width - 16, name, if (p.flags & c.XRT_FDP_STALE != 0) ctx.p.dim else ctx.p.text);
         const count = @min(p.history.samples, c.XRT_FD_HISTORY);

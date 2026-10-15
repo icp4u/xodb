@@ -364,7 +364,7 @@ pub const Workspace = struct {
         const decompile_rows = self.static_panel.decompile_rows;
         if (self.static_panel.decompile_open and scroll != 0 and decompile_rows.count > 0 and
             w.pointer_x >= decompile_rows.x and w.pointer_x < decompile_rows.x + decompile_rows.w and
-            w.pointer_y >= decompile_rows.y - 2 and w.pointer_y < decompile_rows.y - 2 + @as(f32, @floatFromInt(decompile_rows.count)) * 23)
+            w.pointer_y >= decompile_rows.y - 2 and w.pointer_y < decompile_rows.y - 2 + @as(f32, @floatFromInt(decompile_rows.count)) * look.workspace.code_row)
         {
             self.static_panel.wheelDecompile(scroll);
             scroll = 0;
@@ -964,7 +964,7 @@ pub const Workspace = struct {
         if (w.pointer_y >= 44 and w.pointer_y < 84) for (self.layout.toolbar, 0..) |b, i| {
             if (b.contains(w.pointer_x, w.pointer_y)) hovered = i;
         };
-        const gutter_row = (w.pointer_y - 135) / 23;
+        const gutter_row = (w.pointer_y - look.workspace.source_y) / look.workspace.code_row;
         const hover_line: ?u32 = if (!self.show_profile and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and gutter_row >= 0 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) @intCast(self.source_line + @as(i32, @intFromFloat(gutter_row)) + 1) else null;
         const divider_hot = !self.show_profile and self.layout.visible(.source) and self.layout.visible(.assembly) and @abs(w.pointer_x - self.layout.left) < 7 and w.pointer_y > 90;
         if (hovered != self.hovered or hover_line != self.hover_line or divider_hot != self.divider_hot) w.dirty = true;
@@ -1319,7 +1319,7 @@ pub const Workspace = struct {
             w.dirty = true;
         }
         if (click and language.selected == .native and self.layout.rect(.registers).contains(w.pointer_x, w.pointer_y) and w.pointer_y >= self.language_panel.content_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
-            self.selected_local = @intFromFloat((w.pointer_y - self.language_panel.content_y) / 48);
+            self.selected_local = @intFromFloat((w.pointer_y - self.language_panel.content_y) / look.workspace.local_row);
             w.dirty = true;
         }
         if (code == 17 and @intFromEnum(language.selected) >= 2) {
@@ -1374,14 +1374,14 @@ pub const Workspace = struct {
                 self.status = "Write investigation started";
             }
         }
-        if (click and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
+        if (click and self.layout.visible(.source) and w.pointer_x > 10 and w.pointer_x < 74 and w.pointer_y >= look.workspace.source_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10 and snapshot.state == .stopped) {
             if (remote) {
-                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
+                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - look.workspace.source_y) / look.workspace.code_row)) + 1);
                 context.send(self, .{ .workspace = .{ .toggle_source = .{ .path = self.source_path, .line = number } } });
             } else {
                 var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
                 defer scratch.deinit();
-                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
+                const number: u32 = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - look.workspace.source_y) / look.workspace.code_row)) + 1);
                 const addresses = session.sourceAddresses(scratch.allocator(), self.source_path, number) catch |err| {
                     self.status = lineStatus(session, err);
                     return;
@@ -1405,8 +1405,8 @@ pub const Workspace = struct {
                 if (session.modules.skipped().count != 0) self.status = "Breakpoint toggled in the images searched; some are over the image budget (Modules lists them)";
             }
         }
-        if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < self.layout.left and w.pointer_y >= 135 and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
-            self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - 135) / 23)) + 1);
+        if (click and !self.show_profile and w.pointer_x >= 74 and w.pointer_x < self.layout.left and w.pointer_y >= look.workspace.source_y and w.pointer_y < self.bottomY(@floatFromInt(w.height)) - 10) {
+            self.cursor_line = @intCast(self.source_line + @as(i32, @intFromFloat((w.pointer_y - look.workspace.source_y) / look.workspace.code_row)) + 1);
             self.static_from_line = true;
             self.status = "Source line selected; F9 run to cursor, F12 finish, B breakpoints, S static slice";
             w.dirty = true;
@@ -1418,8 +1418,8 @@ pub const Workspace = struct {
             click = false;
         }
         const rows = self.assembly_rows;
-        if (click and !self.show_profile and !self.show_flow and !self.static_panel.decompile_open and rows.count > 0 and w.pointer_x >= rows.x and w.pointer_x < rows.x + rows.w and w.pointer_y >= rows.y - 2 and w.pointer_y < rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * 23) {
-            const index: usize = @intFromFloat((w.pointer_y - rows.y + 2) / 23);
+        if (click and !self.show_profile and !self.show_flow and !self.static_panel.decompile_open and rows.count > 0 and w.pointer_x >= rows.x and w.pointer_x < rows.x + rows.w and w.pointer_y >= rows.y - 2 and w.pointer_y < rows.y - 2 + @as(f32, @floatFromInt(rows.count)) * look.workspace.code_row) {
+            const index: usize = @intFromFloat((w.pointer_y - rows.y + 2) / look.workspace.code_row);
             if (index < self.instruction_count) {
                 self.assembly_cursor = self.instructions[index].address;
                 self.static_from_line = false;
@@ -2137,7 +2137,7 @@ pub const Workspace = struct {
         const left = self.layout.left;
         const right = self.layout.right;
         const bottom = if (self.show_profile) @round(height * profile_split) else self.bottomY(height);
-        const body_y: f32 = 91;
+        const body_y: f32 = look.frame.body_y;
         const timeline_bounds = gpu.Rect{ .x = 8, .y = bottom, .w = width - 16, .h = height - bottom - 37 };
         if (self.show_profile) {
             try self.flame.draw(r, font, .{ .x = 8, .y = body_y, .w = width - 16, .h = bottom - body_y - 5 });
@@ -2169,7 +2169,7 @@ pub const Workspace = struct {
         r.clip = all;
         if (!self.show_profile) for (self.layout.tabs, 0..) |b, i| {
             if (b.w == 0) continue;
-            try style.button(r, font, gpuRect(b), look.pane_names[i], look.pane_tab_keys[i], theme.weak, 0, 0);
+            try style.button(r, font, gpuRect(b), look.pane_tab_names[i], look.pane_keys[i], theme.weak, 0, 0);
             self.layout_report.control(look.pane_names[i], look.pane_keys[i], b, false);
         };
         try r.rect(.{ .x = 0, .y = height - 28, .w = width, .h = 28 }, self.bar);
@@ -2180,21 +2180,21 @@ pub const Workspace = struct {
                 (if (width >= 1100) "Exact FD capture ACTIVE: exact mode slows all syscalls on this machine by roughly 10 % while active" else "Exact FD capture ACTIVE: all host syscalls roughly 10 % slower")
             else
                 "Exact FD capture requested: all host syscalls roughly 10 % slower while active";
-            try fit(r, font, 16, height - 23, width - 32, theme.warm, "{s}", .{message});
+            try fit(r, font, 16, height - look.workspace.footer_text, width - 32, theme.warm, "{s}", .{message});
         } else if (header.frame_failure) |err| {
-            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ header.frame_state, err });
+            try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.warm, "Archive frames {s}: {s} / L details", .{ header.frame_state, err });
         } else if (pending_metadata) |job| {
-            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
+            try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "Debug data: {s}, {d} units, {d} MiB read", .{ job.state, job.units, job.source_bytes / (1024 * 1024) });
         } else if (self.shared_clients) |count| {
             if (self.shared_controller) |owner| {
-                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(header.scope), owner, count });
+                try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / controller #{d} / {d} clients", .{ self.status, @tagName(header.scope), owner, count });
             } else {
-                try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / no controller / {d} clients", .{ self.status, @tagName(header.scope), count });
+                try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "{s} / agent {s} / no controller / {d} clients", .{ self.status, @tagName(header.scope), count });
             }
         } else {
-            try fit(r, font, 16, height - 23, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(header.scope), display.snapshot.generation });
+            try fit(r, font, 16, height - look.workspace.footer_text, if (width >= 900) width - 432 else width - 32, theme.text, "{s}  /  agent {s}  /  generation {d}", .{ self.status, @tagName(header.scope), display.snapshot.generation });
         }
-        if (width >= 900 and self.fd_event_state == .inactive) try r.text(font, width - 400, height - 23, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
+        if (width >= 900 and self.fd_event_state == .inactive) try r.text(font, width - 400, height - look.workspace.footer_text, std.mem.sliceTo(@as([]const u8, &r.gpu_name), 0), style.fade(theme.text, 0.55));
         if (!self.show_profile and self.layout.visible(.source) and self.layout.visible(.assembly)) try r.rect(.{ .x = left - 3, .y = body_y, .w = 3, .h = bottom - body_y - 5 }, if (self.dragging) theme.focus else if (self.divider_hot) style.fade(theme.focus, 0.55) else style.fade(theme.border, 0.6));
         try self.probes_panel.draw(r, font, width, height);
         try self.inspection_panel.draw(r, font, width, height);
@@ -2250,7 +2250,7 @@ pub const Workspace = struct {
             } else {
                 var lines = std.mem.splitScalar(u8, self.source, '\n');
                 var number: i32 = 0;
-                var y = body_y + 44;
+                var y: f32 = look.workspace.source_y;
                 var more = false;
                 while (lines.next()) |source| : (number += 1) {
                     if (number < self.source_line) continue;
@@ -2259,7 +2259,7 @@ pub const Workspace = struct {
                         break;
                     }
                     const line_number: u32 = @intCast(number + 1);
-                    const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = 23 };
+                    const row = gpu.Rect{ .x = 9, .y = y - 2, .w = left - 14, .h = look.workspace.code_row };
                     const current = self.current_line != null and self.current_line.? == line_number;
                     const has_breakpoint = std.mem.indexOfScalar(u32, self.breakpoint_lines, line_number) != null;
                     if (has_breakpoint) {
@@ -2283,7 +2283,7 @@ pub const Workspace = struct {
                     const color = if (std.mem.startsWith(u8, trimmed, "#")) theme.neutral else if (std.mem.startsWith(u8, trimmed, "//")) theme.weak else theme.text;
                     var expanded: [1024]u8 = undefined;
                     try r.textFit(font, 88, y, left - 14 - 88, expandTabs(&expanded, source[0..@min(source.len, 512)]), color);
-                    y += 23;
+                    y += look.workspace.code_row;
                 }
                 if (more) try style.fadeBottom(r, .{ .x = source_rect.x + 1, .y = source_rect.y, .w = source_rect.w - 2, .h = source_rect.h - 1 }, 0.55);
             }
@@ -2316,7 +2316,7 @@ pub const Workspace = struct {
             const current_pc = if (self.regs) |regs| linux.programCounter(regs) catch null else null;
             self.assembly_rows = .{ .x = left + 2, .y = body_y + 45, .w = right - left - 6, .count = 0 };
             for (self.instructions[0..self.instruction_count], 0..) |inst, i| {
-                const y = body_y + 45 + @as(f32, @floatFromInt(i)) * 23;
+                const y = body_y + 45 + @as(f32, @floatFromInt(i)) * look.workspace.code_row;
                 if (y + 20 > bottom - 10) break;
                 self.assembly_rows.count = i + 1;
                 var pseudo_selected = false;
@@ -2324,9 +2324,9 @@ pub const Workspace = struct {
                     pseudo_selected = true;
                     break;
                 };
-                if ((self.assembly_cursor == inst.address and !self.static_from_line) or pseudo_selected) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = 23 }, 4, 1);
+                if ((self.assembly_cursor == inst.address and !self.static_from_line) or pseudo_selected) try style.focus(r, .{ .x = left + 4, .y = y - 2, .w = right - left - 10, .h = look.workspace.code_row }, 4, 1);
                 if (current_pc != null and inst.address == current_pc.?) {
-                    try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = 23 }, thread_color, self.alive, 16);
+                    try style.threadLine(r, .{ .x = left + 3, .y = y - 2, .w = right - left - 8, .h = look.workspace.code_row }, thread_color, self.alive, 16);
                     try r.text(font, left + 8, y, "\u{25b6}", thread_color);
                 }
                 try label(r, font, left + 22, y, if (current_pc != null and inst.address == current_pc.?) thread_color else theme.weak, "{x:0>12}", .{inst.address});
@@ -2369,7 +2369,7 @@ pub const Workspace = struct {
             if (view.status == .pending) self.animating = true;
             return;
         }
-        try r.textFit(font, left + 14, body_y + 39, rect.w - 24, view.pseudo_qualification, if (view.unreliable) theme.breakpoint else theme.weak);
+        try r.textFit(font, left + 14, body_y + look.workspace.pseudo_qualification_y, rect.w - 24, view.pseudo_qualification, if (view.unreliable) theme.breakpoint else theme.weak);
         try r.textFit(font, left + 14, body_y + 58, rect.w - 24, if (view.pseudo_cut) "pane document capped" else if (!std.mem.eql(u8, view.pseudo_token_status, "ok")) "token map incomplete: some text has no colours or PCs" else view.pseudo_reasons, if (view.pseudo_cut or !std.mem.eql(u8, view.pseudo_token_status, "ok")) theme.warm else theme.weak);
         var observed: [384]u8 = undefined;
         const observed_prefix = "observed now";
@@ -2402,10 +2402,10 @@ pub const Workspace = struct {
         self.static_panel.syncDecompilePC(self.assembly_cursor orelse current_pc);
         while (lines.next()) |line| : (line_number += 1) {
             if (line_number < first) continue;
-            const y = start_y + @as(f32, @floatFromInt(shown)) * 23;
+            const y = start_y + @as(f32, @floatFromInt(shown)) * look.workspace.code_row;
             if (y + 20 > bottom - 10) break;
             shown += 1;
-            const row = gpu.Rect{ .x = left + 4, .y = y - 2, .w = rect.w - 6, .h = 23 };
+            const row = gpu.Rect{ .x = left + 4, .y = y - 2, .w = rect.w - 6, .h = look.workspace.code_row };
             var current = false;
             if (view.pseudo_entry_pad) |pad| {
                 if (current_pc) |pc| current = line_number == pad.line and pc >= pad.start and pc < pad.end;
@@ -2497,9 +2497,9 @@ pub const Workspace = struct {
         if (tab == .native) {
             if (self.local_diagnostic) |diagnostic| try r.textWrap(font, .{ .x = right + 14, .y = content_y + 4, .w = side.w - 24, .h = bottom - content_y - 14 }, diagnostic, theme.weak);
             for (self.locals, 0..) |local, i| {
-                const y = content_y + @as(f32, @floatFromInt(i)) * 48;
+                const y = content_y + @as(f32, @floatFromInt(i)) * look.workspace.local_row;
                 if (y + 40 > bottom - 10) break;
-                if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = 47 }, 6, 1);
+                if (i == self.selected_local) try style.focus(r, .{ .x = right + 6, .y = y - 3, .w = side.w - 8, .h = look.workspace.local_focus }, 6, 1);
                 try r.textFit(font, right + 14, y, side.w - 24, local.name, theme.neutral);
                 const type_x = right + 14 + r.measure(font, local.name) + 14;
                 const advisory = if (local.value.visualization) |v| v.extent_advisory else false;
@@ -2509,11 +2509,11 @@ pub const Workspace = struct {
             }
         } else if (tab == .registers) {
             const restart_slot = if (self.regs) |regs| regs.architecture() == .loongarch64 else false;
-            const register_y = content_y + @as(f32, if (restart_slot) 23 else 0);
+            const register_y = content_y + @as(f32, if (restart_slot) look.workspace.code_row else 0);
             if (restart_slot) try r.textFit(font, right + 14, content_y, side.w - 24, "r0 is the kernel restart slot", theme.weak);
             if (self.regs) |regs| {
                 for (regs.descriptions(), 0..) |desc, i| {
-                    const y = register_y + @as(f32, @floatFromInt(i)) * 23;
+                    const y = register_y + @as(f32, @floatFromInt(i)) * look.workspace.code_row;
                     if (y + 21 > bottom - 10) break;
                     const value = regs.value(desc) catch null;
                     const previous = if (self.stale_regs) |old| if (old.architecture() == regs.architecture()) old.value(desc) catch null else null else null;
@@ -2524,7 +2524,7 @@ pub const Workspace = struct {
                     const value_width = @min(side.w - 58, r.measure(font, text));
                     const value_x = side.x + side.w - 12 - value_width;
                     const name_width = @max(0, value_x - right - 22);
-                    if (changed) try r.shape(.{ .x = value_x - 4, .y = y - 2, .w = value_width + 8, .h = 23 }, theme.fresh, .{ .radii = @splat(5) });
+                    if (changed) try r.shape(.{ .x = value_x - 4, .y = y - 2, .w = value_width + 8, .h = look.workspace.code_row }, theme.fresh, .{ .radii = @splat(5) });
                     try r.textFit(font, right + 14, y, name_width, name, theme.weak);
                     try r.textFit(font, value_x, y, value_width, text, if (i == 0) thread_color else if (changed) theme.warm else theme.text);
                     self.layout_report.row("Values", .{ .x = right + 14, .y = y, .w = side.w - 24, .h = 21 }, name, text, r.measure(font, name) > name_width, r.measure(font, text) > value_width, false);
@@ -2551,7 +2551,7 @@ pub const Workspace = struct {
                     if (i < first_thread) continue;
                     if (i - first_thread >= thread_rows) break;
                     const y = bottom + 44 + @as(f32, @floatFromInt(i - first_thread)) * row_step;
-                    if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - 3, .w = thread_right - 20, .h = row_step }, 6, 1);
+                    if (i == self.selected) try style.focus(r, .{ .x = 12, .y = y - look.workspace.focus_top, .w = thread_right - 20, .h = row_step }, 6, 1);
                     try style.disc(r, 25, y + 9.5, 4, style.fade(style.threadColor(thread.id), if (thread.state == .running) 0.5 else 1));
                     var id_buffer: [32]u8 = undefined;
                     const id_text = try std.fmt.bufPrint(&id_buffer, "{d}", .{thread.tid});
@@ -2571,7 +2571,7 @@ pub const Workspace = struct {
             for (self.frames, 0..) |frame, i| {
                 const y = bottom + 44 + @as(f32, @floatFromInt(i)) * row_step;
                 if (y + row_step > stack.y + stack.h - 4) break;
-                if (i == self.selected_frame) try style.focus(r, .{ .x = stack.x + 4, .y = y - 3, .w = stack.w - 8, .h = row_step }, 6, 1);
+                if (i == self.selected_frame) try style.focus(r, .{ .x = stack.x + 4, .y = y - look.workspace.focus_top, .w = stack.w - 8, .h = row_step }, 6, 1);
                 try label(r, font, stack.x + 12, y, if (i == 0) thread_color else theme.weak, "{d: >2}", .{i});
                 // Frames without source are dimmed; frames with it show where.
                 var where_buffer: [96]u8 = undefined;
@@ -2605,11 +2605,11 @@ pub const Workspace = struct {
         }
         self.watch_rect = .{ .x = 0, .y = 0, .w = 0, .h = 0 };
         try pane(r, font, events_rect, "EVENTS", if (self.watch_view.entries.len > 0) "monotonic time  /  V watch" else "monotonic time  /  E expression");
-        const visible: usize = @intFromFloat(@max(0, (events_rect.h - 50) / 23));
+        const visible: usize = @intFromFloat(@max(0, (events_rect.h - 50) / look.workspace.code_row));
         const start = events.len -| visible;
         for (events[start..], 0..) |event, i| {
-            const y = bottom + 44 + @as(f32, @floatFromInt(i)) * 23;
-            if ((start + i) % 2 == 1) try r.rect(.{ .x = events_rect.x + 1, .y = y - 2, .w = events_rect.w - 2, .h = 23 }, theme.stripe);
+            const y = bottom + 44 + @as(f32, @floatFromInt(i)) * look.workspace.code_row;
+            if ((start + i) % 2 == 1) try r.rect(.{ .x = events_rect.x + 1, .y = y - 2, .w = events_rect.w - 2, .h = look.workspace.code_row }, theme.stripe);
             const ms = (event.time_ns - events[0].time_ns) / 1_000_000;
             // The kind column is as wide as the longest kind, so kinds stay whole
             // while the value keeps the rest of the row.

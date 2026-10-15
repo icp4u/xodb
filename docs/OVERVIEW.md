@@ -374,6 +374,10 @@ snapshot, or one per line, cycled at the sampling interval. History is filled
 from every frame at start, so `--pause` shows complete graphs at once.
 `tests/fixtures/overview-synth.py` writes deterministic synthetic samples
 (invented names and documentation addresses) used by `tests/overview-gui.py`.
+An optional `tracing_failure` string preserves a recorded tracing diagnostic
+in Graph, Galaxy and Treemap. It is labelled as recorded, uses whole status
+clauses, and exposes the full reason on hover. It never starts a collector or
+offers a live retry from replay. Descriptor snapshots are still not replayed.
 
 ## Shared observation and actions
 

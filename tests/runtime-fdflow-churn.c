@@ -9,7 +9,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/syscall.h>
 #include <time.h>
+#if defined(__x86_64__) && !defined(__ILP32__)
+_Static_assert(SYS_read == 0 && SYS_write == 1 && SYS_close == 3, "x86 io/close");
+_Static_assert(SYS_clone == 56 && SYS_execve == 59 && SYS_openat == 257, "x86 process");
+_Static_assert(SYS_exit_group == 231 && SYS_getpid == 39, "x86 exit/getpid");
+#endif
 
 enum { SERVER = 500, PARENT = 1000, ROWS = 262144, THREADS = 65536, PROCESSES = 16384 };
 static uint64_t now_ns = 1000, sequence;
@@ -49,7 +55,7 @@ static void raw(struct xrt_fdflow_counter *c, int32_t pid, int32_t tid, int64_t 
     push(c, pid, tid, XRT_FDFLOW_EXIT, XRT_FDFLOW_RAW, number, 0, 0);
 }
 static void io(struct xrt_fdflow_counter *c, int32_t pid, int32_t tid, int write, int fd, int64_t n) {
-    int64_t number = write ? 1 : 0;
+    int64_t number = write ? SYS_write : SYS_read;
     push(c, pid, tid, XRT_FDFLOW_ENTER, XRT_FDFLOW_RAW, number, fd, 0);
     push(c, pid, tid, XRT_FDFLOW_EXIT, XRT_FDFLOW_RAW, number, 0, n);
     push(c, pid, tid, XRT_FDFLOW_EXIT, write ? XRT_FDFLOW_WRITE : XRT_FDFLOW_READ, number, 0, n);
@@ -102,12 +108,12 @@ static void process_churn(void) {
         int32_t child = 2000 + (int32_t)k;
         uint32_t phase = k * phases / total;
         uint64_t cpu0 = feed_cpu, records0 = feed_records;
-        raw(c, PARENT, PARENT, 56, 0);           /* clone in the parent */
-        raw(c, child, child, 59, 0);             /* execve */
-        raw(c, child, child, 257, 0);            /* openat -> fd 3 */
-        io(c, child, child, 0, 3, 64);           /* read: fd 3 not in any poll */
-        raw(c, child, child, 3, 3);              /* close */
-        push(c, child, child, XRT_FDFLOW_ENTER, XRT_FDFLOW_RAW, 231, 0, 0); /* exit_group */
+        raw(c, PARENT, PARENT, SYS_clone, 0);
+        raw(c, child, child, SYS_execve, 0);
+        raw(c, child, child, SYS_openat, 0); /* -> fd 3 */
+        io(c, child, child, 0, 3, 64);       /* read: fd 3 not in any poll */
+        raw(c, child, child, SYS_close, 3);
+        push(c, child, child, XRT_FDFLOW_ENTER, XRT_FDFLOW_RAW, SYS_exit_group, 0, 0);
         io(c, SERVER, SERVER, 1, 7, 10);         /* a steady server write */
         server_bytes += 10;
         if (used > 60000)
@@ -150,7 +156,7 @@ static void pid_flood(void) {
     for (int round = 0; round < 4; ++round) {
         for (int i = 0; i < 32768; ++i) {
             records[i] = (struct xrt_fdflow_record){.time_ns = ++now_ns, .pid = pid, .tid = pid,
-                                                    .kind = XRT_FDFLOW_ENTER, .number = 39};
+                                                    .kind = XRT_FDFLOW_ENTER, .number = SYS_getpid};
             ++pid;
         }
         struct xrt_fdflow_snapshot s = {.records = records, .record_count = 32768, .taken_ns = ++now_ns};

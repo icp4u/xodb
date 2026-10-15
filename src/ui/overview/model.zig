@@ -255,6 +255,8 @@ pub const GroupState = struct {
 };
 
 pub const Snapshot = struct {
+    /// Optional recorded diagnostic. Replaying it never starts a collector.
+    tracing_failure: Text = Text.missing("not in sample"),
     /// Monotonic sample time and the interval it covers.
     time_ns: u64 = 0,
     interval_s: F = .{},

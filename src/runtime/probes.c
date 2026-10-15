@@ -2,6 +2,7 @@
 #include "target_internal.h"
 #include <sys/ptrace.h>
 #include "loongarch_step.h"
+#include "riscv_step.h"
 
 int xrt_image_borrowed(const struct xrt_target *t)
 {
@@ -790,6 +791,87 @@ static enum xrt_status read_word(struct xrt_target *t, uint64_t address, uint32_
            ((uint32_t)buf[3] << 24);
     return XRT_OK;
 }
+/* A full window can cross an unmapped page. Keep the longest prefix that reads. */
+static enum xrt_status read_window(struct xrt_target *t, uint64_t address, uint8_t *buf,
+                                   size_t cap, size_t *got)
+{
+    *got = 0;
+    if (!cap)
+        return XRT_MEMORY_UNREADABLE;
+    size_t n = cap;
+    for (;;) {
+        size_t count = 0;
+        if (xrt_target_read(t, address, buf, n, &count) == XRT_OK && count) {
+            *got = count;
+            return XRT_OK;
+        }
+        if (n <= 2)
+            return XRT_MEMORY_UNREADABLE;
+        n = n > 4 ? 4 : 2;
+    }
+}
+/* Plant successors and PTRACE_CONT. emulate completes the step in place.
+ * LoongArch and RISC-V share this tail so a failed plant rolls the same way. */
+static enum xrt_status software_resume(struct xrt_target *t, int thread_index, int32_t tid,
+                                       bool stop_after, uint64_t pc, uint8_t emulate,
+                                       const uint64_t succ[2], uint8_t count)
+{
+    if (emulate) {
+        t->threads[thread_index].reason = XRT_STOP_SINGLE_STEP;
+        t->threads[thread_index].breakpoint_address = 0;
+        t->stepping = false;
+        xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
+        t->events[t->event_count - 1].pc = pc;
+        t->events[t->event_count - 1].pc_known = 1;
+        return XRT_OK;
+    }
+    uint64_t rearm = 0;
+    const int at = xrt_breakpoint_at(t, pc);
+    if (at >= 0 && t->breakpoints[at].enabled && t->breakpoints[at].patched) {
+        struct xrt_breakpoint *p = &t->breakpoints[at];
+        TRY(xrt_target_commit_owned(t, p->address, p->original, p->planted, p->width));
+        p->patched = false;
+        xrt_sync_shared_patch(t, p->id, false);
+        rearm = p->id;
+    }
+    uint64_t ids[2] = {0};
+    uint8_t owned[2] = {0};
+    const enum xrt_status planted = xrt_software_plant(t, succ, count, ids, owned);
+    if (planted != XRT_OK) {
+        restore_rearm(t, rearm);
+        return planted;
+    }
+    const enum xrt_status resumed =
+        xrt_trace(PTRACE_CONT, tid, 0, (uintptr_t)t->threads[thread_index].signal);
+    if (resumed != XRT_OK) {
+        enum xrt_status rolled = drop_owned_probe(t, ids[0], owned[0]);
+        if (owned[1]) {
+            const enum xrt_status second = drop_owned_probe(t, ids[1], owned[1]);
+            if (rolled == XRT_OK)
+                rolled = second;
+        }
+        restore_rearm(t, rearm);
+        return rolled != XRT_OK ? rolled : resumed;
+    }
+    t->step = (struct xrt_step){.tid = tid,
+                                .rearm = rearm,
+                                .stop_after = stop_after,
+                                .has_exec_entry = t->threads[thread_index].reason == XRT_STOP_EXEC,
+                                .exec_entry_pc = pc,
+                                .software = 1,
+                                .successor_count = count,
+                                .probe_owned = {owned[0], owned[1]},
+                                .successor_pc = {succ[0], succ[1]},
+                                .probe_id = {ids[0], ids[1]}};
+    t->threads[thread_index].signal = 0;
+    t->threads[thread_index].reason = XRT_STOP_NONE;
+    t->threads[thread_index].state = XRT_RUNNING;
+    t->stepping = true;
+    t->want_run = false;
+    t->state = XRT_RUNNING;
+    xrt_target_event(t, XRT_EVENT_STEP_STARTED, tid, 0);
+    return XRT_OK;
+}
 static enum xrt_status loongarch_software_begin(struct xrt_target *t, int32_t tid, bool stop_after)
 {
     TRY(xrt_target_settle_plant_cleanup(t, 0));
@@ -837,61 +919,46 @@ static enum xrt_status loongarch_software_begin(struct xrt_target *t, int32_t ti
     /* rt_sigreturn does not resume at pc+4. Refuse before any plant. */
     if ((insn & 0xffff8000u) == 0x002b0000u && (known & (1u << 11)) && gpr[11] == 139)
         return XRT_UNSUPPORTED_CONTROL;
-    if (plan.emulate) {
-        t->threads[i].reason = XRT_STOP_SINGLE_STEP;
-        t->threads[i].breakpoint_address = 0;
-        t->stepping = false;
-        xrt_target_event(t, XRT_EVENT_STEP_COMPLETE, tid, 0);
-        t->events[t->event_count - 1].pc = pc;
-        t->events[t->event_count - 1].pc_known = 1;
-        return XRT_OK;
+    return software_resume(t, i, tid, stop_after, pc, plan.emulate, plan.pc, plan.count);
+}
+static enum xrt_status riscv_software_begin(struct xrt_target *t, int32_t tid, bool stop_after)
+{
+    TRY(xrt_target_settle_plant_cleanup(t, 0));
+    TRY(xrt_rearm_inherited(t));
+    if (xrt_image_borrowed(t))
+        return XRT_UNSUPPORTED_CONTROL;
+    if (t->state != XRT_STOPPED || t->stepping)
+        return XRT_NOT_STOPPED;
+    TRY(xrt_ensure_watches(t));
+    const int i = xrt_thread_index(t, tid);
+    if (i < 0)
+        return XRT_UNKNOWN_THREAD;
+    struct xrt_registers regs;
+    TRY(xrt_target_registers(t, tid, &regs));
+    uint64_t pc = 0;
+    TRY(xrt_registers_pc(&regs, &pc));
+    /* 17 instructions of 4 bytes. A short mapping returns a prefix. */
+    enum { WINDOW = 68 };
+    uint8_t bytes[WINDOW];
+    size_t cap = WINDOW;
+    if (pc > UINT64_MAX - cap)
+        cap = (size_t)(UINT64_MAX - pc + 1);
+    size_t got = 0;
+    TRY(read_window(t, pc, bytes, cap, &got));
+    uint64_t gpr[32] = {0};
+    uint32_t known = 0;
+    for (uint16_t d = 1; d < 32; ++d) {
+        uint64_t value = 0;
+        if (xrt_registers_value_dwarf(&regs, d, &value) != XRT_OK)
+            continue;
+        gpr[d] = value;
+        known |= 1u << d;
     }
-    uint64_t rearm = 0;
-    const int at = xrt_breakpoint_at(t, pc);
-    if (at >= 0 && t->breakpoints[at].enabled && t->breakpoints[at].patched) {
-        struct xrt_breakpoint *p = &t->breakpoints[at];
-        TRY(xrt_target_commit_owned(t, p->address, p->original, p->planted, p->width));
-        p->patched = false;
-        xrt_sync_shared_patch(t, p->id, false);
-        rearm = p->id;
-    }
-    uint64_t ids[2] = {0};
-    uint8_t owned[2] = {0};
-    const enum xrt_status planted = xrt_software_plant(t, plan.pc, plan.count, ids, owned);
-    if (planted != XRT_OK) {
-        restore_rearm(t, rearm);
-        return planted;
-    }
-    const enum xrt_status resumed =
-        xrt_trace(PTRACE_CONT, tid, 0, (uintptr_t)t->threads[i].signal);
-    if (resumed != XRT_OK) {
-        enum xrt_status rolled = drop_owned_probe(t, ids[0], owned[0]);
-        if (owned[1]) {
-            const enum xrt_status second = drop_owned_probe(t, ids[1], owned[1]);
-            if (rolled == XRT_OK)
-                rolled = second;
-        }
-        restore_rearm(t, rearm);
-        return rolled != XRT_OK ? rolled : resumed;
-    }
-    t->step = (struct xrt_step){.tid = tid,
-                                .rearm = rearm,
-                                .stop_after = stop_after,
-                                .has_exec_entry = t->threads[i].reason == XRT_STOP_EXEC,
-                                .exec_entry_pc = pc,
-                                .software = 1,
-                                .successor_count = plan.count,
-                                .probe_owned = {owned[0], owned[1]},
-                                .successor_pc = {plan.pc[0], plan.pc[1]},
-                                .probe_id = {ids[0], ids[1]}};
-    t->threads[i].signal = 0;
-    t->threads[i].reason = XRT_STOP_NONE;
-    t->threads[i].state = XRT_RUNNING;
-    t->stepping = true;
-    t->want_run = false;
-    t->state = XRT_RUNNING;
-    xrt_target_event(t, XRT_EVENT_STEP_STARTED, tid, 0);
-    return XRT_OK;
+    struct xrt_riscv_plan plan;
+    const enum xrt_status planned = xrt_riscv_plan(pc, bytes, got, gpr, known, &plan);
+    if (planned != XRT_OK)
+        return planned;
+    return software_resume(t, i, tid, stop_after, pc, plan.emulate, plan.pc, plan.count);
 }
 enum xrt_status xrt_software_step_hit(struct xrt_target *t, int thread_index, uint64_t pc,
                                       int *handled)
@@ -947,10 +1014,12 @@ enum xrt_status xrt_software_step_hit(struct xrt_target *t, int thread_index, ui
 enum xrt_status xrt_begin_step(struct xrt_target *t, int32_t tid, bool stop_after)
 {
     TRY(xrt_execution_allowed(t));
-    /* Hardware step stays 0 on this row. Software successors run before the
-       refusal, and only for LoongArch. Other rows still refuse before rearm. */
-    if (t->arch && t->arch->machine == XRT_LOONGARCH && t->arch->hardware_step == 0)
+    /* Hardware step stays 0 on these rows. Software successors run before the
+       refusal. Other rows still refuse before rearm. */
+    if (t->arch && t->arch->hardware_step == 0 && t->arch->machine == XRT_LOONGARCH)
         return loongarch_software_begin(t, tid, stop_after);
+    if (t->arch && t->arch->hardware_step == 0 && t->arch->machine == XRT_RISCV)
+        return riscv_software_begin(t, tid, stop_after);
     if (!t->arch || t->arch->hardware_step == 0)
         return XRT_UNSUPPORTED_CONTROL;
     TRY(xrt_rearm_inherited(t));

@@ -144,6 +144,7 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     if (root != .object) return error.ReplayNotObject;
     const r: ?J = root;
     var s = &owned.snap;
+    s.tracing_failure = text(get(r, "tracing_failure"));
     s.sequence = u64f(get(r, "sequence")).get() orelse 0;
     s.redacted = if (get(r, "redacted")) |x| x == .bool and x.bool else false;
     s.interval_s = f64f(get(r, "interval_s"));
@@ -430,6 +431,12 @@ pub fn parseOne(gpa: std.mem.Allocator, line: []const u8) !*m.Owned {
     const me = get(r, "self");
     s.cost = .{ .wall_ms = f64f(get(me, "wall_ms")), .cpu_ms = f64f(get(me, "cpu_ms")), .cpu_pct = f64f(get(me, "cpu_pct_of_core")), .syscalls = u64f(any(me, &.{ "syscalls_estimate", "syscalls" })) };
     return owned;
+}
+
+test "replay preserves recorded tracing failure without a live collector" {
+    var replay = try Replay.load(std.testing.allocator, "{\"tracing_failure\":\"perf_event_open: Permission denied\"}");
+    defer replay.deinit();
+    try std.testing.expectEqualStrings("perf_event_open: Permission denied", replay.advance().snap.tracing_failure.s);
 }
 
 test "replay keeps unavailable reasons and never invents zeros" {

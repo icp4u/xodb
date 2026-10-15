@@ -24,7 +24,54 @@ pub fn inset(r: Rect, by: f32) Rect {
     return .{ .x = r.x + by, .y = r.y + by, .w = @max(0, r.w - 2 * by), .h = @max(0, r.h - 2 * by) };
 }
 
+/// A float must fit the viewport and leave the hovered object uncovered.
+/// A large row/tile may leave no room; the footer remains the fallback.
+pub fn tooltipRect(bounds: Rect, anchor: Rect, pointer: [2]f32, width: f32, height: f32) ?Rect {
+    if (width > bounds.w or height > bounds.h) return null;
+    const x = std.math.clamp(pointer[0] + 14, bounds.x, bounds.x + bounds.w - width);
+    const y = std.math.clamp(pointer[1] + 18, bounds.y, bounds.y + bounds.h - height);
+    const candidates = [_]Rect{
+        .{ .x = x, .y = anchor.y + anchor.h + 8, .w = width, .h = height },
+        .{ .x = x, .y = anchor.y - height - 8, .w = width, .h = height },
+        .{ .x = anchor.x + anchor.w + 8, .y = y, .w = width, .h = height },
+        .{ .x = anchor.x - width - 8, .y = y, .w = width, .h = height },
+    };
+    for (candidates) |r| if (r.x >= bounds.x and r.y >= bounds.y and r.x + r.w <= bounds.x + bounds.w and r.y + r.h <= bounds.y + bounds.h) return r;
+    return null;
+}
+
 const V = struct { p: [2]f32, c: Color };
+const ClauseFlow = struct {
+    rect: Rect,
+    x: f32 = 0,
+    y: f32 = 0,
+    fn offer(self: *ClauseFlow, width: f32) ?Rect {
+        const step = @import("../../look.zig").overview.line;
+        if (width > self.rect.w or self.y + 18 > self.rect.h) return null;
+        if (self.x + width > self.rect.w) {
+            if (self.y + step + 18 > self.rect.h) return null;
+            self.x = 0;
+            self.y += step;
+        }
+        const cell = Rect{ .x = self.rect.x + self.x, .y = self.rect.y + self.y, .w = width, .h = 18 };
+        self.x += width + 20;
+        return cell;
+    }
+};
+
+test "whole clauses skip oversized facts without consuming the remaining row" {
+    var flow = ClauseFlow{ .rect = .{ .x = 10, .y = 20, .w = 160, .h = 20 } };
+    try std.testing.expect(flow.offer(500) == null);
+    try std.testing.expectEqual(@as(f32, 10), flow.offer(50).?.x);
+    try std.testing.expect(flow.offer(100) == null);
+    const later = flow.offer(70).?;
+    try std.testing.expectEqual(@as(f32, 80), later.x);
+    try std.testing.expectEqual(@as(f32, 20), later.y);
+    var wrapped = ClauseFlow{ .rect = .{ .x = 0, .y = 0, .w = 160, .h = 42 } };
+    _ = wrapped.offer(100).?;
+    try std.testing.expectEqual(@as(f32, 22), wrapped.offer(100).?.y);
+    try std.testing.expect(wrapped.offer(100) == null);
+}
 fn lerpV(a: V, b: V, t: f32) V {
     return .{ .p = .{ a.p[0] + (b.p[0] - a.p[0]) * t, a.p[1] + (b.p[1] - a.p[1]) * t }, .c = mix(a.c, b.c, t) };
 }
@@ -37,12 +84,24 @@ pub const Layout = struct {
     lens: [4096]u8 = undefined,
     clipped: [4096]bool = undefined,
     truncated: [4096]bool = undefined,
+    shaped: [4096]bool = @splat(false),
     count: usize = 0,
     elided: usize = 0,
     unmarked: usize = 0,
     omitted: usize = 0,
+    pub fn hasFullText(self: *const Layout, text: []const u8) bool {
+        for (self.lens[0..self.count], 0..) |len, i| {
+            if (!self.clipped[i] and !self.truncated[i] and std.mem.eql(u8, self.labels[i][0..len], text)) return true;
+        }
+        return false;
+    }
     pub fn add(self: *Layout, r: Rect, s: []const u8) void {
         self.addText(r, s, false);
+    }
+    pub fn addShapeText(self: *Layout, r: Rect, s: []const u8) void {
+        const before = self.count;
+        self.addText(r, s, false);
+        if (self.count > before) self.shaped[before] = true;
     }
     pub fn addText(self: *Layout, r: Rect, s: []const u8, clipped: bool) void {
         if (self.count == self.boxes.len or r.w < 1 or s.len == 0) return;
@@ -54,6 +113,7 @@ pub const Layout = struct {
         self.lens[self.count] = @intCast(n);
         self.clipped[self.count] = clipped;
         self.truncated[self.count] = n < s.len;
+        self.shaped[self.count] = false;
         self.count += 1;
     }
     /// Pairs of boxes that overlap, or sit on one row closer than `gap`
@@ -70,7 +130,7 @@ pub const Layout = struct {
         for (order[0..self.count], 0..) |i, at| for (order[at + 1 .. self.count]) |j| {
             if (self.boxes[j].y >= self.boxes[i].y + self.boxes[i].h - 4) break;
             // Glyph marks (tree twisties, state letters) may sit tight; words may not.
-            const gap: f32 = if (self.lens[i] >= 4 and self.lens[j] >= 4) 12 else 0;
+            const gap: f32 = if (!self.shaped[i] and !self.shaped[j] and self.lens[i] >= 4 and self.lens[j] >= 4) 12 else 0;
             const x = self.boxes[i];
             const a = intersect(.{ .x = x.x - gap / 2, .y = x.y, .w = x.w + gap, .h = x.h }, .{ .x = self.boxes[j].x - gap / 2, .y = self.boxes[j].y, .w = self.boxes[j].w + gap, .h = self.boxes[j].h });
             if (a.w > 2 and a.h > 4) {
@@ -93,6 +153,25 @@ test "layout audit detects planted collisions without comparing separate rows" {
     try std.testing.expectEqual(@as(usize, 0), layout.overlaps(&first));
     layout.add(.{ .x = 25, .y = 40, .w = 50, .h = 16 }, "planted collision");
     try std.testing.expectEqual(@as(usize, 1), layout.overlaps(&first));
+}
+
+test "shape drawn numbers participate in text collision audit" {
+    var layout = Layout{};
+    var first: [6][]const u8 = @splat("");
+    layout.addShapeText(.{ .x = 0, .y = 0, .w = 55, .h = 40 }, "100");
+    layout.add(.{ .x = 60, .y = 20, .w = 60, .h = 16 }, "CPU use");
+    try std.testing.expectEqual(@as(usize, 0), layout.overlaps(&first));
+    layout.add(.{ .x = 30, .y = 0, .w = 50, .h = 16 }, "collision");
+    try std.testing.expectEqual(@as(usize, 1), layout.overlaps(&first));
+}
+
+test "small viewport tooltips avoid hovered objects or fall back" {
+    const bounds = Rect{ .x = 12, .y = 52, .w = 616, .h = 284 };
+    const anchor = Rect{ .x = 100, .y = 200, .w = 150, .h = 40 };
+    const r = tooltipRect(bounds, anchor, .{ 200, 220 }, 400, 76).?;
+    try std.testing.expect(intersect(r, anchor).h == 0);
+    try std.testing.expect(r.x >= bounds.x and r.y >= bounds.y and r.x + r.w <= bounds.x + bounds.w and r.y + r.h <= bounds.y + bounds.h);
+    try std.testing.expect(tooltipRect(bounds, bounds, .{ 200, 220 }, 400, 76) == null);
 }
 
 pub const Ctx = struct {
@@ -331,21 +410,19 @@ pub const Ctx = struct {
     pub fn status(self: Ctx, rect: Rect, text_: []const u8, color: Color) !void {
         return self.clausesWith(rect, text_, color, " · ");
     }
+    pub fn statusLine(self: Ctx, x: f32, y: f32, w: f32, text_: []const u8, color: Color) !void {
+        return self.status(.{ .x = x, .y = y, .w = w, .h = 20 }, text_, color);
+    }
     fn clausesWith(self: Ctx, rect: Rect, text_: []const u8, color: Color, separator: []const u8) !void {
         var clauses_ = std.mem.splitSequence(u8, text_, separator);
-        var x = rect.x;
-        var y = rect.y;
+        var flow = ClauseFlow{ .rect = rect };
         while (clauses_.next()) |part| {
             const clause = std.mem.trim(u8, part, " ");
-            const w = self.measure(clause);
-            if (x + w > rect.x + rect.w) {
-                x = rect.x;
-                y += @import("../../look.zig").overview.line;
-            }
-            if (y + 18 > rect.y + rect.h) break;
-            if (w > rect.w) continue;
-            try self.text(x, y, clause, color);
-            x += w + 20;
+            const cell = flow.offer(self.measure(clause)) orelse {
+                if (self.layout) |l| l.omitted += 1;
+                continue;
+            };
+            try self.text(cell.x, cell.y, clause, color);
         }
     }
     pub fn measure(self: Ctx, s: []const u8) f32 {
@@ -467,6 +544,14 @@ pub const Ctx = struct {
     pub fn vfd(self: Ctx, x: f32, y: f32, h: f32, s: []const u8, color: Color) !f32 {
         const w = digitWidth(h);
         const t = @max(2, h * 0.11);
+        if (self.layout) |l| {
+            // The advance includes a trailing inter-digit gap; only ink is
+            // collision-tested. Decorative bloom is deliberately excluded.
+            const bounds = Rect{ .x = x, .y = y, .w = @max(0, vfdWidth(h, s) - t), .h = h };
+            const clip = self.r.clip;
+            if (x < clip.x or y < clip.y or x + bounds.w > clip.x + clip.w + 0.5 or y + h > clip.y + clip.h + 0.5) l.unmarked += 1;
+            l.addShapeText(bounds, s);
+        }
         const ghost = fade(color, self.p.ghost);
         var pen = x;
         for (s) |ch| {

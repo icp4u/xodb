@@ -537,9 +537,11 @@ view has no layout publication (including headless operation).
 The overview reserves space for values before shortening labels, uses a dash
 for an unavailable reason that cannot fit, and shows the reason on hover.
 Small windows put overhead on a second footer row; key hints drop whole,
-lower-priority clauses. Hover details use the footer without covering tiles.
+lower-priority clauses. Hover details wrap beside the hovered object when
+space permits; otherwise the footer remains the fallback.
 Its `get_layout` publication includes the content rectangle, actual text
-rectangles, overlap/unmarked-clip counts and explicit bounded-copy flags.
+rectangles (including shape-drawn numeric readouts), overlap/unmarked-clip
+counts and explicit bounded-copy flags.
 
 ## Where to go next
 

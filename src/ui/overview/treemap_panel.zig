@@ -45,26 +45,27 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     var b: [640]u8 = undefined;
     var failure: [320]u8 = undefined;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, "Descriptor path treemap · area = open handles", ctx.p.text);
-    const banner: []const u8 = if (state.flow_running) system.graph_cost else if (v.paused) "PAUSED · tracing stopped" else if (!state.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (state.flow_status != c.XRT_OK and state.flow_status != c.XRT_STALE_SNAPSHOT)
+    const banner: []const u8 = v.recordedTraceBanner(&b) orelse if (state.flow_running) system.graph_cost else if (v.paused) "PAUSED · tracing stopped" else if (!state.events_enabled) "POLLING · E to start live syscall tracing (~11% host cost)" else if (state.flow_status != c.XRT_OK and state.flow_status != c.XRT_STALE_SNAPSHOT)
         std.fmt.bufPrint(&b, "POLLING · E off/on retries · {s}", .{system.failureText(&failure, state.failure)}) catch "POLLING · tracing unavailable"
     else
         "Starting live syscall tracing (~11% host cost) · E to stop";
-    try ctx.textFit(rect.x + 8, rect.y + 30, rect.w - 16, banner, ctx.p.warn);
+    try ctx.statusLine(rect.x + 8, rect.y + 30, rect.w - 16, banner, ctx.p.warn);
+    v.hover(.{ .x = rect.x + 8, .y = rect.y + 30, .w = rect.w - 16, .h = 20 }, "{s}", .{banner});
     const tree = state.tree orelse {
         try ctx.textFit(rect.x + 8, rect.y + 64, rect.w - 16, if (state.build_status == c.XRT_OUT_OF_MEMORY) "Treemap unavailable: out of memory" else if (v.action_hook == null) "Descriptor data unavailable in this replay" else "Waiting for descriptor snapshot", ctx.p.dim);
         return;
     };
     const metric = tree.nodes[state.focus].total;
     const totals = std.fmt.bufPrint(&b, "{d} handles · {d} stale · {d} deleted · {d} unknown paths · {d} unexpanded", .{ metric.descriptors, metric.stale, metric.deleted, metric.unknown_paths, metric.unexpanded }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 56, rect.w - 16, totals, ctx.p.dim);
-    const coverage = std.fmt.bufPrint(&b, "Scan: {d} denied / {d} unscanned / {d} gone · capped {d} processes / {d} fds · age {d:.1}s", .{ tree.denied, tree.unscanned, tree.gone, tree.dropped_processes, tree.dropped_fds, @as(f64, @floatFromInt(now -| tree.taken_ns)) / 1e9 }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 78, rect.w - 16, coverage, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 56, rect.w - 16, totals, ctx.p.dim);
+    const coverage = std.fmt.bufPrint(&b, "{d} denied · {d} unscanned · {d} gone · capped {d} processes / {d} fds · age {d:.1}s", .{ tree.denied, tree.unscanned, tree.gone, tree.dropped_processes, tree.dropped_fds, @as(f64, @floatFromInt(now -| tree.taken_ns)) / 1e9 }) catch "";
+    try ctx.statusLine(rect.x + 8, rect.y + 78, rect.w - 16, coverage, ctx.p.dim);
     const io = if (metric.flow_measured > 0) std.fmt.bufPrint(&b, "Sampled IO: {d:.0} read / {d:.0} write B/s · {d} handles measured · lost {d} / unattributed {d} B", .{ if (state.flow_running and !v.paused) metric.read_rate else 0, if (state.flow_running and !v.paused) metric.write_rate else 0, metric.flow_measured, state.lost, state.unknown }) catch "" else "Sampled IO not measured · offset progress is separate from syscall bytes";
-    try ctx.textFit(rect.x + 8, rect.y + 100, rect.w - 16, io, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 100, rect.w - 16, io, ctx.p.dim);
     const note = if (state.focus_lost) "Selected path vanished or exceeded limits; returned to root" else if (state.poll_status != c.XRT_OK or state.build_status != c.XRT_OK) "Snapshot update unavailable; showing previous data" else "Path groups may combine different inodes/namespaces · blue: unmeasured, warm: sampled IO";
-    try ctx.textFit(rect.x + 8, rect.y + 122, rect.w - 16, note, ctx.p.warn);
+    try ctx.statusLine(rect.x + 8, rect.y + 122, rect.w - 16, note, ctx.p.warn);
     const trace_coverage = std.fmt.bufPrint(&b, "Tracing: {d}/{d} CPUs · lost {d} events · unattributed {d} B · {s}", .{ state.active_cpus, state.online_cpus, state.lost, state.unknown, if (tree.flow_flags != 0 or tree.count_flags != 0) "incomplete or limited coverage" else "sampled association" }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 144, rect.w - 16, trace_coverage, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 144, rect.w - 16, trace_coverage, ctx.p.dim);
     try button(v, ctx, .{ .x = rect.x + 8, .y = rect.y + 174, .w = 64, .h = 26 }, "Up", .treemap_up);
     try button(v, ctx, .{ .x = rect.x + 80, .y = rect.y + 174, .w = 64, .h = 26 }, "Root", .{ .treemap_node = 0 });
     try button(v, ctx, .{ .x = rect.x + 152, .y = rect.y + 174, .w = 248, .h = 26 }, "L: sampled holder Files", .treemap_holder);

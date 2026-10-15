@@ -53,10 +53,11 @@ def check_layout(layout):
     width, height = w['width'], w['height']
     assert layout['available'] and not layout['rows_truncated'], layout
     panes = {p['name']: p for p in layout['panes']}
-    for p in panes.values():
+    for index, p in enumerate(panes.values(), 1):
         check_rect(p['rect'], width, height)
         check_rect(p['tab'], width, height)
         assert p['key'] and (p['tab']['w'] > 0) == p['collapsed'], p
+        assert p['key'] == f'Alt+{index}', p
     prior = True
     for name in ('Events', 'Values', 'Stack', 'Threads', 'Assembly'):
         hidden = panes[name]['collapsed']
@@ -113,9 +114,9 @@ for scale in (1, 2):
             if not panes['Threads']['collapsed']:
                 assert any(r['identifier'] for r in layout['rows']), layout
             (work / f'layout-{scale}-{width}.json').write_text(json.dumps(layout, indent=2))
-            if args.evidence and width == 950:
+            if args.evidence and width in (950, 640):
                 args.evidence.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(d.shot(f'small-{scale}'), args.evidence / f'950x700-scale{scale}.png')
+                shutil.copy2(d.shot(f'small-{scale}'), args.evidence / f'{width}x{height}-scale{scale}.png')
             count += 1
         # At the minimum size, source/assembly becomes a real one-pane toggle.
         assert layout['panes'][1]['collapsed'], layout

@@ -286,10 +286,21 @@ lands on the call, and a four-byte `jal`/`jalr` return lands inside the call.
 DWARF number. `ra` is DWARF 1 and `sp` is DWARF 2. `x0` is not in the image.
 Hardware step is off because `PTRACE_SINGLESTEP` returned `EIO` on the measured
 QEMU guest; that is a measurement, not a claim about every RISC-V machine.
-Software step, including compressed control flow and LR/SC as one unit, is not
-in this row. Continue from a planted breakpoint is refused and the trap stays
-planted, so remove the breakpoint before continuing. Hardware watches are
-refused. Disassembly uses the system Capstone 5, which has a RISC-V decoder;
+Instruction step and continue-from-breakpoint plant temporary software
+successors. Conditional branches, including compressed `c.beqz` and `c.bnez`,
+plant both successors. `jalr`, `c.jr` and `c.jalr` use the GPRs and clear the
+low bit of the target; a base of `x0` is architectural zero. An unconditional
+direct jump to itself (`jal x0, 0` or `c.j 0`) completes the step in place.
+A call or an indirect branch to itself is refused. `c.ebreak` and `ebreak`
+are refused, and so are `mret`, `sret` and `uret`. `ecall` steps to the next
+instruction unless `a7` is known to be 139 (`rt_sigreturn`), which is refused.
+An `lr`/`sc` pair of the same width steps as one unit. The branch after `sc`
+is included so a retry is not a stop. A nested `lr`, a width mismatch, an
+indirect branch or a call inside the window, or a window with no exit, is
+refused. At most 17 instructions are examined. Hardware watches are refused.
+A successor that is already a trap is not planted again. The glibc loader
+rendezvous uses this software step.
+Disassembly uses the system Capstone 5, which has a RISC-V decoder;
 the vendored Capstone 6 from `scripts/build-capstone` leaves RISC-V out, so a
 `-Dcapstone=vendored` build reports `DisassemblerUnavailable` for it.
 

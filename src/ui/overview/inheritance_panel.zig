@@ -8,7 +8,9 @@ const fm = @import("files_model.zig");
 pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     var buffer: [512]u8 = undefined;
     try ctx.textFit(rect.x + 8, rect.y + 4, rect.w - 16, "Parent & child descriptors", ctx.p.text);
-    try ctx.textFit(rect.x + 8, rect.y + 30, rect.w - 16, "POLLING · matching fd + inode · inheritance and exec history unproved", ctx.p.warn);
+    const banner = "POLLING · matching fd + inode · inheritance and exec history unproved";
+    try ctx.statusLine(rect.x + 8, rect.y + 30, rect.w - 16, banner, ctx.p.warn);
+    v.hover(.{ .x = rect.x + 8, .y = rect.y + 30, .w = rect.w - 16, .h = 20 }, "{s}", .{banner});
     const rows = v.graph.inheritance orelse {
         const reason = if (v.graph.failure()) |why| why else if (v.graph.inheritance_status == c.XRT_OUT_OF_MEMORY) "Not enough memory for descriptor comparisons" else if (v.graph.inheritance_status != c.XRT_OK and v.graph.inheritance_status != c.XRT_STALE_SNAPSHOT) "Descriptor comparison unavailable" else if (v.action_hook == null) "Descriptor data is unavailable in this replay" else "Waiting for descriptor snapshot";
         try ctx.textFit(rect.x + 8, rect.y + 64, rect.w - 16, reason, ctx.p.dim);
@@ -16,14 +18,14 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     };
     const snapshot = v.graph.snapshot orelse return;
     const totals = std.fmt.bufPrint(&buffer, "{d} pairs · {d} sampled matches · child flags: {d} CLOEXEC / {d} no CLOEXEC / {d} unknown", .{ rows.parent_pairs, rows.matched, rows.cloexec, rows.no_cloexec, rows.flags_unknown }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 58, rect.w - 16, totals, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 58, rect.w - 16, totals, ctx.p.dim);
     const limits = std.fmt.bufPrint(&buffer, "{d} cached matches · parents: {d} need privilege, {d} exited or hidepid, {d} pid reused · {d} unknown identities · {d} rows capped", .{ rows.stale, rows.parent_denied, rows.parent_absent, rows.parent_reused, rows.identity_unknown, rows.dropped }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 80, rect.w - 16, limits, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 80, rect.w - 16, limits, ctx.p.dim);
     const omissions = std.fmt.bufPrint(&buffer, "Scan: {d} denied · {d} unscanned · {d} gone · capped {d} processes / {d} fds", .{ snapshot.hidden, snapshot.unscanned, snapshot.gone, snapshot.dropped_processes, snapshot.dropped_fds }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + 102, rect.w - 16, omissions, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + 102, rect.w - 16, omissions, ctx.p.dim);
     if (v.graph.failure()) |why| {
         const line = std.fmt.bufPrint(&buffer, "{s} · previous snapshot ({d:.1}s old)", .{ why, @as(f64, @floatFromInt(now -| rows.taken_ns)) / 1_000_000_000.0 }) catch why;
-        try ctx.textFit(rect.x + 8, rect.y + 124, rect.w - 16, line, ctx.p.warn);
+        try ctx.statusLine(rect.x + 8, rect.y + 124, rect.w - 16, line, ctx.p.warn);
     }
     const top = &v.scroll[@intFromEnum(vw.Panel.inheritance)];
     const height = @max(0, rect.h - 208);
@@ -59,6 +61,6 @@ pub fn render(v: *vw.View, ctx: draw.Ctx, rect: draw.Rect, now: u64) !void {
     ctx.r.clip = clip;
     if (rows.count == 0) try ctx.textFit(rect.x + 12, rect.y + 166, rect.w - 24, "No sampled parent/child matches; review missing coverage above", ctx.p.dim);
     const excluded = std.fmt.bufPrint(&buffer, "{d} child fds lack a matching parent fd · {d} different objects · same inode does not prove same open", .{ rows.no_parent_fd, rows.different_object }) catch "";
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 46, rect.w - 16, excluded, ctx.p.dim);
-    try ctx.textFit(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, "Click a row for child Files · arrows/wheel scroll · P pause · G graph · Y galaxy", ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + rect.h - 46, rect.w - 16, excluded, ctx.p.dim);
+    try ctx.statusLine(rect.x + 8, rect.y + rect.h - 24, rect.w - 16, "Click a row for child Files · arrows/wheel scroll · P pause · G graph · Y galaxy", ctx.p.dim);
 }
