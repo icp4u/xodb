@@ -19,6 +19,7 @@ src/c_ui.zig              c_ui       # C seen by rendering, platform and UI code
 src/appearance.zig        config     # startup-only themes
 src/preferences.zig       config
 src/test_support.zig      test_support
+src/memset.c              common     # replaces compiler_rt memset in the executable
 
 # application core
 src/model/**              model

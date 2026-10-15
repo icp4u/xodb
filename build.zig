@@ -44,6 +44,8 @@ pub fn build(b: *std.Build) void {
         module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     }
     module.addCSourceFile(.{ .file = b.path("src/service/session.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    // Replaces compiler_rt's byte-at-a-time memset; see the file's comment.
+    module.addCSourceFile(.{ .file = b.path("src/memset.c"), .flags = &.{ "-std=c11", "-fno-builtin", "-fno-sanitize=all", "-Wall", "-Wextra", "-Werror" } });
     // lsof-top: a terminal view over the runtime's fd scanner (xodb --lsof-top).
     module.addCSourceFile(.{ .file = b.path("src/lsoftop/lsoftop.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     // Host-only whole-system observer (overview view and MCP); not part of the agent.
