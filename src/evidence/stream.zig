@@ -161,9 +161,9 @@ pub const Stream = struct {
     pub fn loss(self: *const Stream) Loss {
         var l = Loss{ .orphan_records = self.parsed.orphan_records, .file_stop = self.parsed.stop };
         for (self.parsed.interfaces) |iface| {
-            l.epb_drops += iface.epb_drops;
-            l.isb_ifdrop += iface.isb_ifdrop orelse 0;
-            l.isb_osdrop += iface.isb_osdrop orelse 0;
+            l.epb_drops +|= iface.epb_drops;
+            l.isb_ifdrop +|= iface.isb_ifdrop orelse 0;
+            l.isb_osdrop +|= iface.isb_osdrop orelse 0;
             l.truncated_packets += iface.truncated_packets;
         }
         return l;
@@ -214,6 +214,27 @@ test "stream decodes, groups flows and correlates" {
     try std.testing.expect(!join.outbound);
     try std.testing.expect(s.correlate(0).outbound);
     try std.testing.expect(s.matches(1, .{ .clock = .capture, .from_ns = 15, .to_ns = 21 }));
+}
+
+test "loss totals saturate across hostile interface counters" {
+    const a = std.testing.allocator;
+    var w = pcap.TestWriter{ .a = a };
+    defer w.deinit();
+    const max = std.math.maxInt(u64);
+    try w.shb();
+    try w.idb(decode.link_ethernet, null, "");
+    try w.idb(decode.link_ethernet, null, "");
+    try w.epb(0, 0, "a", 1, max);
+    try w.epb(1, 0, "b", 1, max);
+    try w.isb(0, max, max);
+    try w.isb(1, max, max);
+    const bytes = try a.dupe(u8, w.out.items);
+    const s = try Stream.open(a, bytes, "test");
+    defer s.destroy();
+    const l = s.loss();
+    try std.testing.expectEqual(@as(u64, max), l.epb_drops);
+    try std.testing.expectEqual(@as(u64, max), l.isb_ifdrop);
+    try std.testing.expectEqual(@as(u64, max), l.isb_osdrop);
 }
 
 test "random corruption of a stream never crashes and stays typed" {

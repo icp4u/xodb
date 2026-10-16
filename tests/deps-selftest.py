@@ -161,6 +161,27 @@ class DepsSelfTest(unittest.TestCase):
         self.write('tools/deps/budgets', 'src/model/state.zig 5\n')
         self.assertIn('lower the budget to 2', self.passes())
 
+    def test_unwidened_int_from_bool_sum_fails(self):
+        self.write('src/model/hub.zig',
+                   'const bad = @intFromBool(first()) + @intFromBool(second());\n')
+        self.fails('direct @intFromBool additions use u1 arithmetic',
+                   'src/model/hub.zig:1: @intFromBool(...) + @intFromBool(...)')
+
+    def test_grouped_int_from_bool_sum_fails(self):
+        self.write('src/model/hub.zig',
+                   'const a = (@intFromBool(first())) + @intFromBool(second());\n'
+                   'const b = @intFromBool(first()) + ( @intFromBool(second()) );\n')
+        self.fails('src/model/hub.zig:1: @intFromBool(...) + @intFromBool(...)',
+                   'src/model/hub.zig:2: @intFromBool(...) + @intFromBool(...)')
+
+    def test_widened_int_from_bool_sum_and_literal_text_pass(self):
+        self.write('src/model/hub.zig',
+                   'const good = @as(u8, @intFromBool(first())) + @intFromBool(second());\n'
+                   'const chain = @as(usize, 4) + @intFromBool(first()) + @intFromBool(second());\n'
+                   'const text = "@intFromBool(a) + @intFromBool(b)";\n'
+                   '// @intFromBool(a) + @intFromBool(b)\n')
+        self.passes()
+
     def test_why_and_rdeps(self):
         run = self.deps('why', 'root', 'common')
         self.assertEqual(run.returncode, 0, run.stderr)

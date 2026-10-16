@@ -38,6 +38,39 @@ opens a window. Retina backing scale is the default. Cmd-Q, Cmd-W and SIGTERM
 use normal shutdown; shifted plain Q closes outside editors, matching the
 remote UI. Live resize redraws the current publication without backend calls.
 The native translator currently handles committed characters, not IME composition.
+SIGTERM sets a signal-safe close flag; during AppKit's native resize/title drag,
+shutdown waits for mouse-up and then takes the normal teardown path. No AppKit
+calls are made from a signal handler. Bundle executables are stripped of debug
+maps before signing; the build-tree executable retains debug information.
+
+### Native test hooks
+
+`XODB_TEST_SCRIPT=FILE` enables frame-numbered steps through the same NSEvent
+translator as real input. Each line is `FRAME COMMAND ARGS`; `#` starts a comment.
+Frames must be nondecreasing. The reader retains one line, capped at 4096 bytes,
+and accepts at most 4096 lines. Invalid/unavailable steps fail explicitly.
+
+Commands: `key VK CHARS UNMOD MODS`, `text STRING`, `click X Y`, `move X Y`,
+`scroll X Y DY PRECISE`, `resize W H`, `dragresize DW DH STEPS`, `clipset TEXT`,
+`clipget`, `state`, `close`. Coordinates are content points from the top left;
+scroll DY is positive down. Key modifiers are shift=1, control=2, option=4,
+command=8; character tokens include CR, ESC, TAB, UP, DOWN, LEFT, RIGHT and `-`
+(empty). Text is limited to 120 UTF-16 units per step. Script key presses try
+the main menu's key equivalents first, as real input does, so `key 12 q q 8`
+closes like Cmd-Q; posting real keys still checks the window-server path.
+`shot` is not implemented.
+
+Clipboard steps require `XODB_MAC_PRIVATE_PASTEBOARD=1`, never the general
+pasteboard. `state` reports actual locals/registers/watches selection, pointer,
+size and RSS. This thin client has no overview search, so it reports
+`search_supported=false`, not a simulated search result. `dragresize` posts a
+corner drag to this app's own queue at 60 Hz and requires an on-screen window;
+offscreen runs refuse it. The shutdown summary counts frames submitted inside
+the native live-resize callback separately.
+
+`XODB_PACING=1` prints streaming present-gap statistics at exit. Pacing and
+script modes continuously render so frame-numbered tests can progress; normal
+idle behavior is unchanged. The diagnostic modes are not idle-power benchmarks.
 
 For automated SSH checks, use `scripts/release-check gui --macos mac` (or
 `all`/`periodic`). Set `XODB_MAC_ZIG`, `XODB_MAC_DEPS` and `XODB_MAC_MOLTENVK`
@@ -48,10 +81,33 @@ receives a synthetic TCP publication and tests normal SIGTERM cleanup. It does
 **not** yet test local debugserver, real input, on-screen resize or scanout.
 The retained directory is recorded in `.work/macos-native-remote-dir.txt`.
 
+The next native engine component is `xrt_debugserver_start` (not yet wired into
+the GUI/Session). It discovers debugserver in the selected Xcode, starts launch
+or attach with an OS-assigned loopback port, and returns that endpoint to the
+existing GDB client. Its private Unix handshake uses debugserver's documented
+implementation of [`--unix-socket`](https://github.com/llvm/llvm-project/blob/main/lldb/tools/debugserver/source/debugserver.cpp),
+not a reserve-and-close TCP-port race. The helper has its own process group and
+inherits no session descriptors. The owner must detach/close the GDB connection
+before reaping the helper; this component never signals a target pid. A cleanup
+timeout retains the helper pid rather than claiming success or force-killing it.
+The bootstrap currently discards child stdio; target console forwarding is not
+implemented by this component.
+
+`zig build test-debugserver -Doptimize=ReleaseSafe` is an explicit, native-only
+component test. It launches and attaches owned fixtures, checks the helper's
+actual listener is loopback-only, steps using the existing GDB packet/link
+implementation, detaches, checks helper reaping and preserves an attached
+fixture after transport loss. `tests/macos-native.py --ssh mac --bootstrap` and
+the opt-in `macos-bootstrap` release-check step run this lane; Linux's
+`macos-seam` also compiles the component. These are **not** acceptance of a
+native GUI owner, source/locals/MCP or the local `-- ./program` CLI yet.
+
 Startup logs distinguish main-to-first-submitted-frame from on-screen appearance.
-`XODB_STARTUP_TRACE=1` additionally observes the app's own window-server
-on-screen bit on a worker thread, timed from kernel process start; it does not
-capture pixels. Offscreen runs cannot supply this measurement. Keep first
+`XODB_STARTUP_TRACE=1` additionally logs when the window's occlusion
+notification first reports it visible, timed from kernel process start (about
+10-17 ms after the window server shows it). It never queries the window list
+in-process: that deadlocks the commit that shows the window for ~0.5 s. Time
+on-screen appearance exactly from another process. It does not capture pixels. Offscreen runs cannot supply this measurement. Keep first
 execution of a new binary separate from warm runs; do not call it a cold-cache
 measurement unless cache state is actually known.
 
@@ -228,8 +284,7 @@ synchronous macOS clipboard shape, FIFO frame pacing, and a
 `VK_EXT_metal_surface` creation hook. `cocoa_shim.h` is the stable C boundary
 for the Objective-C/AppKit implementation.
 
-This is groundwork, not a usable Mac application. The AppKit implementation,
-MoltenVK/static dependency build, application bundle, live resize callback,
-`NSTextInputClient`, Command-key policy, and on-screen Mac test lane still need
-a Mac that can open windows. The remote debugserver client described above is
-independent and remains usable from Linux.
+The native implementation and bundle are described above. The Linux stub is
+only a compile/contract lane, not a substitute for native execution. IME
+composition still needs `NSTextInputClient`. The remote debugserver client
+described above is independent and remains usable from Linux.

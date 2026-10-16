@@ -2,6 +2,7 @@
 const std = @import("std");
 const vk = @import("../c_ui.zig").api;
 const platform = @import("window.zig");
+const phases = @import("../startup_phases.zig");
 const input = @import("input.zig");
 const Node = @import("../render/vk_select.zig").Node;
 const shim = @cImport(@cInclude("cocoa_shim.h"));
@@ -33,10 +34,14 @@ pub const Window = struct {
     clip_destination: u64 = 0,
     clip_epoch: u64 = 0,
     clip_result: ?platform.clip.Result = null,
+    test_state: bool = false,
 
     pub fn init(self: *Window) !void {
         self.input = Keyboard.init();
         self.input.trace = std.c.getenv("XODB_INPUT_TRACE") != null;
+        // AppKit has no separate display connection, so connect stays 0.000.
+        phases.begin(.window);
+        defer phases.end(.window);
         if (shim.xcocoa_open(self.width, self.height, "xodb") == 0) return error.CocoaUnavailable;
         self.opened = true;
         errdefer shim.xcocoa_close();
@@ -113,6 +118,9 @@ pub const Window = struct {
     }
 
     pub const vk_surface_extension: [*:0]const u8 = "VK_EXT_metal_surface";
+    pub fn surfaceExtension(_: *const Window) [*:0]const u8 {
+        return vk_surface_extension;
+    }
     pub fn createSurface(_: *Window, instance: vk.VkInstance, surface: *vk.VkSurfaceKHR) vk.VkResult {
         surface.* = null;
         return @intCast(shim.xcocoa_create_surface(@ptrCast(instance), @ptrCast(surface)));
@@ -189,6 +197,44 @@ pub const Window = struct {
     pub fn setLiveResize(_: *Window, callback: ?*const fn (?*anyopaque) callconv(.c) void, context: ?*anyopaque) void {
         shim.xcocoa_set_live_resize(callback, context);
     }
+    pub fn framePool(_: *Window) ?*anyopaque {
+        return shim.xcocoa_pool_push();
+    }
+    pub fn drainFramePool(_: *Window, pool: ?*anyopaque) void {
+        shim.xcocoa_pool_pop(pool);
+    }
+    pub fn testStep(self: *Window, frame: u64) !bool {
+        const log = @import("../log.zig");
+        switch (shim.xcocoa_test_step(frame)) {
+            0 => return false,
+            1 => {},
+            2 => self.test_state = true,
+            3 => {
+                const text = std.mem.span(shim.xcocoa_test_text());
+                const copied = self.clipCopy(false, text);
+                log.info(.window, "xodb: clipboard set \"{s}\" -> {d}\n", .{ text, @intFromBool(copied) });
+                if (!copied) return error.ScriptClipboardUnavailable;
+            },
+            4 => {
+                _ = self.clipRequest(false);
+                var result: platform.clip.Result = undefined;
+                if (!self.clipTake(&result) or result.status != .ready) return error.ScriptClipboardUnavailable;
+                log.info(.window, "xodb: clipboard get \"{s}\"\n", .{result.bytes[0..result.size]});
+            },
+            else => return error.InvalidCocoaTestStep,
+        }
+        self.consumeEvents();
+        self.dirty = true;
+        return true;
+    }
+    pub fn takeTestState(self: *Window) bool {
+        const requested = self.test_state;
+        self.test_state = false;
+        return requested;
+    }
+    pub fn residentBytes(_: *Window) u64 {
+        return shim.xcocoa_resident_bytes();
+    }
     fn applyEvent(self: *Window, event: *const shim.xcocoa_event) void {
         switch (event.kind) {
             shim.XCOCOA_EVENT_KEY => {
@@ -253,6 +299,9 @@ pub const Window = struct {
                 self.input.focus(focused);
                 if (!focused) self.mouse_down = false;
             },
+            // Native tracking consumed the mouse-up. Cancel held state, without
+            // moving the pointer or inventing a click/release in content.
+            shim.XCOCOA_EVENT_RELEASE_POINTER => self.mouse_down = false,
             else => {},
         }
     }
@@ -341,4 +390,17 @@ test "native Cocoa stub refuses before creating a Vulkan surface" {
     var surface: vk.VkSurfaceKHR = undefined;
     try std.testing.expectEqual(vk.VK_ERROR_EXTENSION_NOT_PRESENT, window.createSurface(null, &surface));
     try std.testing.expect(surface == null);
+}
+
+test "Cocoa resize cancellation keeps pointer and does not invent clicks" {
+    var window = Window{ .mouse_down = true, .pointer_x = 321, .pointer_y = 123 };
+    var event = std.mem.zeroes(shim.xcocoa_event);
+    event.kind = shim.XCOCOA_EVENT_RELEASE_POINTER;
+    window.applyEvent(&event);
+    try std.testing.expect(!window.mouse_down);
+    try std.testing.expectEqual(@as(f32, 321), window.pointer_x);
+    try std.testing.expectEqual(@as(f32, 123), window.pointer_y);
+    try std.testing.expect(window.input.next() == null);
+    window.applyEvent(&event); // No preceding press is also harmless.
+    try std.testing.expect(window.input.next() == null);
 }

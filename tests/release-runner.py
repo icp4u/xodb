@@ -30,6 +30,7 @@ UNREGISTERED = {
         ('loaded by other test scripts, not run alone', ('client.py', 'elisp-memory.py', 'elisp-values-memory.py', 'elisp-bindings-memory.py', 'go-maps-gdb.py', 'go-values-gdb.py', 'pe_profile.py',)),
         ('needs an ARM64 host', ('arm64-demo.py', 'arm64-native.py', 'arm64-watchpoints.py', 'remote-ssh-gui.py',)),
         ('needs gdbserver and QEMU targets', ('gdb-remote.py',)),
+        ('run on a riscv64 guest by tests/riscv64-guest.sh (periodic --riscv64-guest)', ('runtime-riscv64.py',)),
         ('needs a device profile', ('simpleperf-import.py', 'simpleperf-import-gui.py',)),
         ('needs sudo: the privileged allocation helper, or a configured host', ('allocations-live.py', 'm2-syscall-configured.py',)),
         ('measurement, no pass criteria', ('allocation-cost.py', 'memory-cost.py', 'm2-server-cost.py', 'm2-workload-cost.py',)),
@@ -363,11 +364,12 @@ class RunnerTests(unittest.TestCase):
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
                 ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'], ['--macos', 'MAC'],
-                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
+                ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--riscv64-guest', 'SSH', 'AGENT', 'FIXTURE'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
                       ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD', macos_ssh='MAC',
-                      arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'), macos='MAC')
+                      arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'), macos='MAC',
+                      riscv64_guest=('SSH', 'AGENT', 'FIXTURE'))
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):
@@ -563,6 +565,23 @@ class RunnerTests(unittest.TestCase):
         self.assertIn('gui-language-tabs', [step.name for step in picked])
         picked, lines = gate.affected(bare, ['src/mcp/observation.zig'], fallback)
         self.assertIn('inspections', [step.name for step in picked])
+
+    def test_native_mac_paths_have_focused_coverage(self):
+        steps = gate.plan('all', macos='fixture-mac')
+        for path in ('build_macos.zig', 'src/macos_main.zig', 'scripts/macos-bundle.py', 'tests/cocoa-native.m'):
+            selected, why = gate.affected(steps, [path], ['gui-overview'])
+            names = {step.name for step in selected}
+            self.assertTrue({'platform-cocoa', 'platform-cocoa-tests', 'release-runner', 'macos-native'} <= names)
+            self.assertNotIn('gui-overview', names)
+            self.assertFalse(any('not mapped' in line for line in why))
+        periodic = {step.name for step in gate.plan('periodic', macos='fixture-mac')}
+        self.assertIn('macos-native-stress', periodic)
+        self.assertNotIn('macos-native-stress', {step.name for step in steps})
+        self.assertIn('macos-bootstrap', {step.name for step in steps})
+        self.assertNotIn('macos-bootstrap', {step.name for step in gate.plan('all')})
+        picked, _ = gate.affected(steps, ['src/runtime/macos_debugserver.c'], ['gui-overview'])
+        self.assertIn('macos-bootstrap', {step.name for step in picked})
+        self.assertNotIn('gui-overview', {step.name for step in picked})
 
     def test_jobs_run_gui_steps_together_and_serial_steps_alone(self):
         # No sleeps: a step is busy between its .in and .out files. The four

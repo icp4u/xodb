@@ -16,10 +16,11 @@ pub fn build(b: *std.Build) void {
     const portable_target = b.resolveTargetQuery(portable_query);
     const gui = b.option(bool, "gui", "Build the graphical Vulkan interface (disable for headless MCP)") orelse true;
     // The window system behind src/platform/window.zig. null has no display: it runs the unit tests.
-    const Platform = enum { wayland, cocoa, null };
+    // linux embeds Wayland and X11 and chooses at run time. wayland and x11 are single-backend builds.
+    const Platform = enum { wayland, x11, linux, cocoa, null };
     const requested_platform = b.option(Platform, "platform", "Window system backend for the interface");
     const platform = if (!gui) Platform.null else requested_platform orelse switch (target.result.os.tag) {
-        .linux => Platform.wayland,
+        .linux => Platform.linux,
         .macos => Platform.cocoa,
         else => Platform.null,
     };
@@ -88,7 +89,7 @@ pub fn build(b: *std.Build) void {
             });
         },
     }
-    if (gui and platform == .wayland) {
+    if (gui and (platform == .wayland or platform == .linux)) {
         const header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
         const xdg_header = header.addOutputFileArg("xdg-shell-client-protocol.h");
         const protocol = b.addSystemCommand(&.{ "wayland-scanner", "private-code", "/usr/share/wayland-protocols/stable/xdg-shell/xdg-shell.xml" });
@@ -135,6 +136,9 @@ pub fn build(b: *std.Build) void {
         }
         for ([_][]const u8{ "wayland-client", "xkbcommon" }) |lib| module.linkSystemLibrary(lib, .{});
     }
+    // X11 libraries are loaded at run time. An x11-only build still needs xkbcommon,
+    // which the Wayland and linux builds already link above.
+    if (gui and platform == .x11) module.linkSystemLibrary("xkbcommon", .{});
     if (gui and platform == .cocoa) {
         // This C ABI is the boundary for the future Objective-C/AppKit shim.
         // The checked-in native stub makes the whole GUI compile on Linux and
@@ -447,6 +451,7 @@ pub fn build(b: *std.Build) void {
     macos_seam.root_module.addIncludePath(b.path("src/runtime"));
     for (macos_seam_sources) |source|
         macos_seam.root_module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    macos_seam.root_module.addCSourceFile(.{ .file = b.path("src/runtime/macos_debugserver.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     const macos_seam_step = b.step("macos-seam", "Compile the portable runtime client sources for aarch64-macos");
     macos_seam_step.dependOn(&macos_seam.step);
     const gdb_model_tests = b.addExecutable(.{ .name = "xodb-gdb-model-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });

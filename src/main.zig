@@ -19,7 +19,7 @@ fn imageBudgetError(err: anyerror, option: []const u8, value: []const u8) anyerr
 }
 /// The debugger options that are followed by a value. The parser in main and
 /// log.init share the list, so a value is never read as an option.
-const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
+const value_options = [_][]const u8{ "--language-off", "--wine-threads", "--observe-recipe", "--observation-out", "--open-observation", "--browse-observation", "--observation-threshold-ns", "--static-analysis", "--decompile", "--function", "--gdb-remote", "--runtime-agent", "--runtime-ssh", "--ssh-config", "--allocation-helper", "--process-limit", "--core", "--exe", "--debug-dir", "--source-map", "--connect", "--ssh", "--remote-xodb", "--session-socket", "--listen", "--config", "--source", "--font", "--theme", "--ui-scale", "--platform", "--expected-start-ticks", "--attach", "--frames", "--vk-device", "--agent-scope", "--break", "--record", "--profile-out", "--capture-out", "--open-frames", "--open-profile", "--compare-capture", "--open-capture", "--open-pcap", "--live-capture", "--capture-tool", "--capture-ring-bytes", "--tls-key-log", "--open-mitmproxy", "--symbols", "--debug-file", "--image-limit", "--image-total-limit" };
 fn named(names: []const []const u8, arg: []const u8) bool {
     for (names) |name| if (std.mem.eql(u8, arg, name)) return true;
     return false;
@@ -62,6 +62,12 @@ pub fn main(init: std.process.Init) !void {
     if (comptime build_options.gui) for (args[1..], 1..) |arg, k| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--vk-device") and k + 1 < args.len) @import("render/vulkan.zig").device_request = args[k + 1];
+        if (!std.mem.eql(u8, arg, "--platform")) continue;
+        if (k + 1 >= args.len) {
+            log.err(.window, "xodb: --platform needs wayland or x11\n", .{});
+            return error.InvalidPlatform;
+        }
+        try @import("platform/window.zig").requestPlatform(args[k + 1]);
     };
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
@@ -186,6 +192,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--theme FILE|builtin:dark|builtin:light|builtin:contrast|builtin:vga selects the GUI theme at startup.
                 \\--config FILE loads provisional JSON preferences (see config/preferences.example.json).
                 \\--ui-scale N sets device pixels per UI unit (0.5..4); otherwise appearance.ui_scale or the compositor wins.
+                \\--platform wayland|x11 selects the window system; otherwise a set WAYLAND_DISPLAY, then DISPLAY.
                 \\--language-off NAME|all turns a language view off, as "languages" in the preferences does; repeatable.
                 \\--wine-threads show|hide controls Wine-internal name hints (default show); H toggles in the GUI.
                 \\--attach-exe opens the process picker with an editable .exe filter; Enter confirms attach.

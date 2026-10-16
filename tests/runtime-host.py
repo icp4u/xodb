@@ -4,7 +4,8 @@
 Native: python3 tests/runtime-host.py
 Cross ISA: add --ssh HOST --ssh-config FILE --agent PATH --fixture PATH --arch m68k
 or --arch loongarch64 or --arch ppc64le or --arch riscv64. The remote fixture is
-tests/fixtures/runtime-isa.c compiled with -g -O0.
+tests/fixtures/runtime-isa.c compiled with -g -O0. The riscv64 row is the smoke
+check. The full software-step table is tests/runtime-riscv64.py.
 """
 import argparse
 import json

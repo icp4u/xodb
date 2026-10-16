@@ -11,6 +11,7 @@ src/startup.zig           root
 
 # shared leaves
 src/log.zig               common
+src/startup_phases.zig    common
 src/redact.zig            common
 src/look.zig              common
 src/layout_snapshot.zig   common

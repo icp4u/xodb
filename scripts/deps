@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Source dependency linter: file graph, layers, rules, baseline ratchet, budgets, cycles.
+"""Source dependency linter: graph rules, budgets, cycles and small source checks.
 
 Reads @import("x.zig") and @cInclude("x.h") in Zig and #include "x.h" in C,
 resolves them to files under src/, maps each file to a layer with
@@ -7,7 +7,8 @@ tools/deps/layers and checks tools/deps/rules, tools/deps/baseline and
 tools/deps/budgets. See docs/DEPENDENCIES_LINT.md.
 
   scripts/deps check              exit 1 on a new violation, a stale baseline line,
-                                  a new cycle edge, an exceeded budget or an unmapped file
+                                  a new cycle edge, an exceeded budget, an unmapped file,
+                                  or unsafe narrow integer arithmetic
   scripts/deps graph --json       files, edges and the layer of each file
   scripts/deps layers             layer-to-layer edge counts
   scripts/deps why A B            shortest import chain from file/layer A to file/layer B
@@ -93,6 +94,115 @@ def zig_code(text):
             i += 1
         lines.append(line)
     return '\n'.join(lines)
+
+
+def zig_expressions(text):
+    """Zig text with comments and string/character literal contents blanked.
+
+    Keep byte positions and newlines stable so a source check can report the
+    original line. Zig multiline string lines begin with `\\\\` after space.
+    """
+    lines = []
+    for line in text.split('\n'):
+        if line.lstrip().startswith('\\\\'):
+            lines.append(' ' * len(line))
+            continue
+        out = list(line)
+        quote, i = None, 0
+        while i < len(line):
+            if quote is not None:
+                out[i] = ' '
+                if line[i] == '\\' and i + 1 < len(line):
+                    i += 1
+                    out[i] = ' '
+                elif line[i] == quote:
+                    quote = None
+            elif line.startswith('//', i):
+                out[i:] = ' ' * (len(line) - i)
+                break
+            elif line[i] in ('"', "'"):
+                quote = line[i]
+                out[i] = ' '
+            i += 1
+        lines.append(''.join(out))
+    return '\n'.join(lines)
+
+
+def call_end(text, start, name):
+    """Offset just after NAME(...), or None for something else/malformed."""
+    if not text.startswith(name, start):
+        return None
+    at = start + len(name)
+    while at < len(text) and text[at].isspace():
+        at += 1
+    if at == len(text) or text[at] != '(':
+        return None
+    depth = 1
+    at += 1
+    while at < len(text) and depth != 0:
+        if text[at] == '(':
+            depth += 1
+        elif text[at] == ')':
+            depth -= 1
+        at += 1
+    return at if depth == 0 else None
+
+
+def bool_operand(code, start, name):
+    """End of `@intFromBool(...)` at START, allowing grouping parentheses."""
+    opens = 0
+    while start < len(code) and (code[start] == '(' or code[start].isspace()):
+        opens += code[start] == '('
+        start += 1
+    end = call_end(code, start, name)
+    if end is None:
+        return None
+    while opens:
+        while end < len(code) and code[end].isspace():
+            end += 1
+        if end == len(code) or code[end] != ')':
+            return None
+        end, opens = end + 1, opens - 1
+    return end
+
+
+def narrow_bool_sums(root, files):
+    """Direct u1 + u1 additions which panic when both booleans are true."""
+    name = '@intFromBool'
+    found = []
+    for filename in files:
+        if not filename.endswith('.zig'):
+            continue
+        code = zig_expressions((root / filename).read_text(errors='replace'))
+        start = 0
+        while True:
+            start = code.find(name, start)
+            if start < 0:
+                break
+            end = call_end(code, start, name)
+            at = end if end is not None else start + len(name)
+            # `(@intFromBool(a)) + ...`: grouping parentheses keep u1.
+            prior = start - 1
+            while end is not None:
+                while prior >= 0 and code[prior].isspace():
+                    prior -= 1
+                close = at
+                while close < len(code) and code[close].isspace():
+                    close += 1
+                if prior < 0 or code[prior] != '(' or close == len(code) or code[close] != ')':
+                    break
+                prior, at = prior - 1, close + 1
+            while at < len(code) and code[at].isspace():
+                at += 1
+            while prior >= 0 and code[prior].isspace():
+                prior -= 1
+            if at < len(code) and code[at] == '+' and (at + 1 == len(code) or code[at + 1] not in '%|=+'):
+                # In `wide + bool + bool`, left associativity has already
+                # widened the first bool before this textual pair is reached.
+                if (prior < 0 or code[prior] != '+') and bool_operand(code, at + 1, name) is not None:
+                    found.append((filename, code.count('\n', 0, start) + 1))
+            start += len(name)
+    return found
 
 
 class Graph:
@@ -406,6 +516,12 @@ def check(linter, verbose):
     failed = False
     print(f'deps: {len(graph.files)} files, {len(graph.edges)} edges, {len(linter.layers.names)} layers, '
           f'{len(linter.rules)} rules, {len(baseline)} baseline lines, {len(linter.sccs)} cycles')
+    narrow = narrow_bool_sums(linter.root, graph.files)
+    if narrow:
+        failed = True
+        print('deps: FAIL direct @intFromBool additions use u1 arithmetic. Widen one operand before adding:')
+        for name, line in narrow:
+            print(f'  {name}:{line}: @intFromBool(...) + @intFromBool(...)')
     for name in linter.unmapped:
         print(f'deps: FAIL unmapped file (add a glob to tools/deps/layers): {name}')
         failed = True

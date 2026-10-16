@@ -19,12 +19,41 @@
 //!   closing          set by the window system's close request, or by the UI
 //!                    to close the window; `close_reason` says which
 const std = @import("std");
+const log = @import("../log.zig");
 const vk = @import("../c_ui.zig").api;
 const backend = switch (@import("build_options").platform) {
     .wayland => @import("wayland.zig"),
+    .x11 => @import("x11.zig"),
+    .linux => @import("linux_host.zig"),
     .cocoa => @import("cocoa.zig"),
     .null => @import("null.zig"),
 };
+/// `--platform wayland|x11` for the linux build. Single-backend builds accept only themselves.
+pub const Runtime = enum { wayland, x11 };
+var runtime_request: ?Runtime = null;
+pub fn requestPlatform(name: []const u8) !void {
+    const choice: Runtime = if (std.mem.eql(u8, name, "wayland"))
+        .wayland
+    else if (std.mem.eql(u8, name, "x11"))
+        .x11
+    else {
+        log.err(.window, "xodb: --platform expected wayland or x11\n", .{});
+        return error.InvalidPlatform;
+    };
+    switch (@import("build_options").platform) {
+        .linux => runtime_request = choice,
+        .wayland => if (choice != .wayland) return refusePlatform(),
+        .x11 => if (choice != .x11) return refusePlatform(),
+        else => return refusePlatform(),
+    }
+}
+fn refusePlatform() error{PlatformUnavailable} {
+    log.err(.window, "xodb: this build does not include that window system\n", .{});
+    return error.PlatformUnavailable;
+}
+pub fn requestedPlatform() ?Runtime {
+    return runtime_request;
+}
 pub const Window = backend.Window;
 pub const Keyboard = backend.Keyboard;
 

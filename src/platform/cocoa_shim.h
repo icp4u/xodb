@@ -17,6 +17,7 @@ enum xcocoa_event_kind {
     XCOCOA_EVENT_RESIZE,
     XCOCOA_EVENT_CLOSE,
     XCOCOA_EVENT_FOCUS,
+    XCOCOA_EVENT_RELEASE_POINTER,
 };
 
 enum xcocoa_event_flag {
@@ -68,6 +69,14 @@ void xcocoa_size(uint32_t *width, uint32_t *height, float *scale);
 void xcocoa_set_scale(float scale);
 /* Called on the AppKit thread during native resize tracking; never re-enter pump. */
 void xcocoa_set_live_resize(void (*draw)(void *), void *context);
+/* Nestable pools for caller-owned Vulkan work, including resize callbacks. */
+void *xcocoa_pool_push(void);
+void xcocoa_pool_pop(void *pool);
+/* Opt-in bounded frame script: 0 waiting/end, 1 input, 2 state, 3 clipset,
+ * 4 clipget, -1 invalid/unavailable step. Text lives until the next step. */
+int xcocoa_test_step(uint64_t frame);
+const char *xcocoa_test_text(void);
+uint64_t xcocoa_resident_bytes(void);
 void xcocoa_set_title(const char *title);
 void xcocoa_set_app_id(const char *app_id);
 void xcocoa_set_min_size(int32_t width, int32_t height);

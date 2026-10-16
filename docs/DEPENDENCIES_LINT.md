@@ -9,7 +9,7 @@ today are listed in a baseline that may only shrink. Plan:
 
 | Command | What it does |
 |---|---|
-| `scripts/deps check` | Exit 1 on a new violation, a stale baseline line, a new file in a cycle, a changed `cycle sizes:` line, an exceeded budget or an unmapped file. `-v` also lists unresolved includes. |
+| `scripts/deps check` | Exit 1 on a new violation, a stale baseline line, a new file in a cycle, a changed `cycle sizes:` line, an exceeded budget, an unmapped file or an unsafe narrow-integer source pattern. `-v` also lists unresolved includes. |
 | `scripts/deps why A B` | Shortest import chain from A to B. A and B are each a file, a layer or a glob: `why model ui`, `why render runtime`, `why src/language/lua.zig src/model/session.zig`. |
 | `scripts/deps rdeps FILE` | Every file that imports FILE, directly or through others (`--direct`: only direct). |
 | `scripts/deps layers` | Edge counts between layers, and files per layer (`--all` includes edges inside a layer). |
@@ -33,6 +33,16 @@ The whole repository takes about half a second. Python 3 standard library only.
 An include that resolves nowhere is reported (`check -v`), not guessed. Today
 there is one: the generated Wayland header that `src/platform/clipboard.c` uses.
 Comments and Zig multiline strings are skipped.
+
+## Narrow integer source check
+
+`check` rejects a direct `@intFromBool(a) + @intFromBool(b)`. Each call returns
+`u1`, so two true inputs overflow before a wider assignment can receive the
+result. Widen an operand before the addition, for example
+`@as(u8, @intFromBool(a)) + @intFromBool(b)`. Comments and string or character
+literals are ignored. This is a deliberately small check for the crash pattern
+found repeatedly in evidence decoders; bounds and explicit widening remain
+required for other arithmetic on decoded integers.
 
 ## Configuration (`tools/deps/`)
 

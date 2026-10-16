@@ -25,6 +25,9 @@ def main():
     shutil.copy2(library, dylib)
     os.chmod(executable, 0o755)
     os.chmod(dylib, 0o755)
+    # The build-tree executable keeps its debug map; the redistributable copy
+    # must not retain compiler/cache object paths in Mach-O N_OSO symbols.
+    run('/usr/bin/strip', '-S', str(executable))
     # No account-private tool paths in the relocatable bundle.
     commands = run('/usr/bin/otool', '-l', str(executable)).splitlines()
     for i, line in enumerate(commands):

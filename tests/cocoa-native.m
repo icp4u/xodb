@@ -32,14 +32,47 @@ int main(int argc, char **argv) {
         handle(key); // An unpaired release is still a release, never a press.
         CHECK(xcocoa_next(&event) && !event.flags && event.code == 30);
         XCDelegate *test_delegate = [XCDelegate new];
+        for (unsigned i = 0; i < 4; ++i) {
+            NSPoint outside[] = { {-1, 320}, {1000, 320}, {500, -1}, {500, 641} };
+            NSEvent *border = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:outside[i]
+                modifierFlags:0 timestamp:2 windowNumber:0 context:nil eventNumber:1 clickCount:1 pressure:1];
+            handle(border);
+            CHECK(!xcocoa_next(&event));
+        }
+        NSNotification *resized = [NSNotification notificationWithName:NSWindowDidEndLiveResizeNotification object:nil];
+        [test_delegate windowDidEndLiveResize:resized];
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_RELEASE_POINTER);
+        CHECK(!xcocoa_next(&event));
         CHECK([test_delegate applicationShouldTerminate:[NSApplication sharedApplication]] == NSTerminateCancel);
         CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_CLOSE);
         for (unsigned i = 0; i < QCAP + 5; ++i) push((struct xcocoa_event){ .kind = XCOCOA_EVENT_MOTION });
+        [test_delegate windowDidEndLiveResize:resized];
         [test_delegate requestClose:nil];
         CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_CLOSE);
         unsigned count = 0;
-        while (xcocoa_next(&event)) ++count;
+        while (xcocoa_next(&event)) {
+            if (event.kind == XCOCOA_EVENT_RELEASE_POINTER) break;
+            ++count;
+        }
         CHECK(count == QCAP); // Burst, then silence; no later event needed for close.
+        CHECK(event.kind == XCOCOA_EVENT_RELEASE_POINTER && !xcocoa_next(&event));
+        char click[] = "click 123 45";
+        CHECK(test_run(click) == 1);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_MOTION && event.x == 123 && event.y == 45);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_BUTTON && event.flags == XCOCOA_PRESSED);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_BUTTON && event.flags == 0);
+        char scrolling[] = "scroll 123 45 32 1";
+        CHECK(test_run(scrolling) == 1);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_MOTION);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_SCROLL && event.scroll_y == 32 && (event.flags & XCOCOA_PRECISE));
+        char tab[] = "key 48 TAB TAB 0";
+        CHECK(test_run(tab) == 1);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_KEY && event.sym == 0xff09 && event.flags == XCOCOA_PRESSED);
+        CHECK(xcocoa_next(&event) && event.kind == XCOCOA_EVENT_KEY && event.flags == 0);
+        char invalid[] = "click 123";
+        CHECK(test_run(invalid) == -1 && !xcocoa_next(&event));
+        char drag[] = "dragresize 10 10 60";
+        CHECK(test_run(drag) == -1); // Never claim an offscreen resize was a native drag.
         VkInstance instance = VK_NULL_HANDLE;
         const char *extensions[] = { "VK_KHR_surface", "VK_EXT_metal_surface" };
         VkInstanceCreateInfo info = { .sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,

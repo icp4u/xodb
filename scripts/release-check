@@ -27,6 +27,11 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
+    (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'tests/macos-bootstrap.c'),
+     ('build-tests', 'macos-bootstrap', 'release-runner')),
+    (('build_macos.zig', 'src/macos_main.zig', 'src/platform/cocoa*', 'src/platform/macos_process.c',
+      'src/platform/input_macos.zig', 'scripts/macos-bundle.py', 'tests/macos-native.py', 'tests/cocoa-native.m'),
+     ('platform-cocoa*', 'release-runner', 'macos-native')),
     (('src/model/command.zig', 'src/model/commands.zig', 'src/service/authority.zig', 'src/mcp/commands.zig', 'tests/command-boundary.py'), ('command-boundary*', 'm1-control', 'm1-source', 'm1-stepping', 'run-control', 'breakpoint-policy', 'shared-sessions*', 'remote-owner-batches*', 'gui-run-control')),
     (('src/model/system_capture*', 'src/mcp/system_capture.zig', 'tests/system-capture*.py'), ('system-capture', 'system-capture-flow', 'gui-system-capture', 'sysstat-headless', 'gui-overview-live')),
     (('src/mcp/base_tools.json', 'src/mcp/command_decode.zig', 'scripts/gen-command-decode'), ('command-decode', 'command-boundary*')),
@@ -110,6 +115,8 @@ COVERS = (
       'src/runtime/wire*', 'src/runtime/rpc.h', 'src/runtime/xrt_remote.h', 'src/runtime/xrt_wire.h', 'src/model/remote_*'),
      ('remote', 'remote-stops', 'agent-startup', 'runtime-agent', 'runtime-host', 'remote-panes', 'gui-remote-caller', '*-agent',
       'controller-scope-1')),
+    (('tests/runtime-riscv64.py', 'tests/fixtures/runtime-riscv64.c', 'tests/riscv64-guest.sh'),
+     ('runtime-host', 'riscv64-guest')),
     (('src/mcp/*',), ('mcp', 'mcp-*', 'review-boundaries', 'controller-scope-*', 'client-control', 'shared-readiness')),
     (('src/debug/*', 'src/model/debug_metadata.zig', 'src/model/source_maps.zig', 'src/ui/inline.zig', 'src/runtime/source*',
       'src/runtime/symbol_job.c', 'src/runtime/xrt_source.h'),
@@ -127,8 +134,10 @@ COVERS = (
       'source-blocks', 'stale-interrupt', 'fork-release*', 'process-tree', 'process-gui', 'm2-robustness',
       'gui-debug', 'gui-breakpoints', 'gui-restart', 'gui-run-control', 'gui-repeated-break')),
     (('src/render/*', 'src/platform/*', 'src/preferences.zig', 'tests/ui-scale-gui.py'),
-     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'platform-cocoa*', 'hidden-window', 'acquire-timeout',
+     ('vulkan-*', 'scene3d-faults', 'gui-gibson*', 'gui-deepmap*', 'gui-scene3d*', 'scene3d-math', 'gui-themes', 'gui-ui-scale', 'gui-ui-sizing', 'gui-vga', 'gui-clipboard', 'gui-debug', 'gui-decoration', 'platform-null', 'platform-cocoa*', 'platform-x11', 'gui-x11', 'hidden-window', 'acquire-timeout',
       'fence-timeout', 'wayland-read-race')),
+    (('tests/x11-gate.c',), ('gui-x11',)),
+    (('src/startup_phases.zig',), ('platform-null', 'platform-cocoa*', 'platform-x11', 'log-levels', 'gui-log-levels', 'gui-x11')),
     (('src/runtime/gdb*', 'src/runtime/xrt_gdbremote.h', 'src/runtime/host_compat.h', 'src/model/gdb_images.zig', 'src/mcp/module_list.zig'),
      ('gdb-debugserver*', 'macos-debugserver')),
     (('scripts/release-check',), ('release-runner',)),
@@ -253,7 +262,7 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None, riscv64_guest=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -272,12 +281,17 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                   dict(kind='build', needs=() if headless else ('headless-app',))))
     if macos and not headless and tier in ('gui', 'all', 'periodic'):
         steps.append(('macos-native', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos], 420))
+        steps.append(('macos-bootstrap', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--bootstrap'], 420))
+        if tier == 'periodic':
+            steps.append(('macos-native-stress', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--stress'], 1000))
     if not headless and tier in ('gui', 'all'):
         # The interface with no window system behind src/platform/window.zig: nothing else may name one.
         steps.append(('platform-null', ['scripts/build', 'app', '-Dplatform=null', '-Doptimize=' + optimize,
                       '-p', '.work/platform-null'], 600, dict(kind='build')))
         steps.append(('platform-cocoa', ['scripts/build', 'app', '-Dplatform=cocoa', '-Doptimize=' + optimize,
                       '-p', '.work/platform-cocoa'], 600, dict(kind='build')))
+        steps.append(('platform-x11', ['scripts/build', 'app', '-Dplatform=x11', '-Doptimize=' + optimize,
+                      '-p', '.work/platform-x11'], 600, dict(kind='build')))
         steps.append(('platform-cocoa-tests', ['scripts/build', 'test-cocoa', '-Dplatform=cocoa', '-Doptimize=' + optimize,
                       '-p', '.work/platform-cocoa'], 900, dict(kind='build')))
     if not headless and tier == 'periodic':
@@ -360,6 +374,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
                               '--ssh', ssh, '--agent', agent, '--fixture', fixture,
                               '--expected-value', 'count=0x1', '--expected-value', 'size=0x8',
                               '--expected-value', 'flag=false'], 300))
+            if riscv64_guest:
+                ssh, agent, fixture = riscv64_guest
+                steps.append(('riscv64-guest', ['sh', 'tests/riscv64-guest.sh', ssh, agent, fixture], 900))
         steps.append(('pe-unwind-fuzz', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
         steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',
@@ -762,6 +779,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))
+        steps.append(('gui-x11', [sys.executable, '-B', 'tests/x11-gui.py'], 180))
         for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):
             steps.append(('gui-safe-keys'+suffix, [sys.executable, '-B', 'tests/safe-keys-gui.py', '--work', '.work/sk'+suffix, *extra], 180))
         steps.append(('gui-files', [sys.executable, '-B', 'tests/files-gui.py'], 300))
@@ -1273,6 +1291,7 @@ def main(argv=None):
     parser.add_argument('--macos-ssh', metavar='HOST', help='Include the live Apple debugserver test against this Mac, reached with ssh HOST (periodic tier; no default host)')
     parser.add_argument('--macos', metavar='HOST', help='Opt-in native macOS build, Cocoa contract, bundle and offscreen presentation checks over SSH (gui/all/periodic; no on-screen windows)')
     parser.add_argument('--arm64-sidecar', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the live arm64 Ghidra-sidecar test using an SSH destination and owned remote agent/fixture paths (periodic tier)')
+    parser.add_argument('--riscv64-guest', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the riscv64 software-step driver (periodic tier). AGENT and FIXTURE are remote executables; a path that is not executable makes the step build a fresh guest tree. Holds XODB_GUEST_LEASE and uses ssh from PATH.')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
     parser.add_argument('--node-include', default='/usr/include/node', help='Matching Node development header directory')
@@ -1327,6 +1346,8 @@ def main(argv=None):
         parser.error('--macos requires gui/all/periodic without --headless')
     if args.arm64_sidecar and args.tier != 'periodic':
         parser.error('--arm64-sidecar requires the periodic tier')
+    if args.riscv64_guest and args.tier != 'periodic':
+        parser.error('--riscv64-guest requires the periodic tier')
     if args.node and args.tier in ('portable', 'perf'):
         parser.error('--node is not for the portable or perf tier')
     if args.node_refusal and args.tier not in ('gui', 'all', 'periodic', 'periodic-gui'):
@@ -1334,7 +1355,7 @@ def main(argv=None):
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos, riscv64_guest=args.riscv64_guest)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'
@@ -1374,7 +1395,7 @@ def main(argv=None):
                            needs=('build-tests',), paths=('tests/command-compare.py',), work=('command-compare-' + lane,))]
     if args.capstone == 'vendored':
         for step in steps:
-            if step.name in ('headless-app', 'build-tests', 'platform-null', 'platform-null-tests', 'platform-cocoa', 'platform-cocoa-tests'):
+            if step.name in ('headless-app', 'build-tests', 'platform-null', 'platform-null-tests', 'platform-cocoa', 'platform-cocoa-tests', 'platform-x11'):
                 step.argv.append('-Dcapstone=vendored')
     try:
         if args.only or args.start:
@@ -1419,7 +1440,8 @@ def main(argv=None):
                     (['Node.js language checks (use --node PATH)'] if args.tier not in ('portable', 'perf') and not args.node else []) +
                     (['Node.js frame-proof refusal (use --node-refusal PATH)'] if args.tier in ('gui', 'all') and not args.node_refusal else []) +
                     (['Lua live checks (use --lua EXECUTABLE SOURCE LIBRARY)'] if args.tier not in ('portable', 'perf') and not args.lua else []) +
-                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'perf') and not args.padwalker else []))
+                    (['Perl named-local oracle checks (use --perl PATH --padwalker BUILT_TREE)'] if args.tier not in ('portable', 'perf') and not args.padwalker else []) +
+                    (['riscv64 software-step guest (use periodic --riscv64-guest SSH AGENT FIXTURE)'] if not args.riscv64_guest else []))
     print(f'Release evidence: {run}', flush=True)
     began = time.monotonic()
     # periodic runs the live steps that host leaves out, unless it is headless.

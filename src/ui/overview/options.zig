@@ -6,7 +6,7 @@ const vw = @import("view.zig");
 
 pub const usage =
     \\xodb --overview [--replay FILE] [--redact] [--theme NAME] [--panel NAME] [--interval-ms N] [--pause] [--frames N] [--font FILE]
-    \\               [--ui-scale N] [--config FILE]
+    \\               [--ui-scale N] [--platform wayland|x11] [--config FILE]
     \\               [--look win95|win9x|dos|modern|deep|gibson] [--memmap-pid N [--memmap-start-ticks N]]
     \\  A system overview window with no debug target: CPU, memory, disks, network,
     \\  connections, sensors, processes, users, services and packages. Unmeasured values
@@ -16,6 +16,7 @@ pub const usage =
     \\  --redact        hide hostname, users, addresses, mount points and command arguments
     \\  --theme NAME    dark, light, green, amber, blue, mono or win95 (builtin: prefix accepted)
     \\  --ui-scale N   device pixels per UI unit, 0.5..4 (otherwise config or compositor)
+    \\  --platform wayland|x11  window system; otherwise WAYLAND_DISPLAY, then DISPLAY
     \\  --config FILE  load UI scale and galaxy look from provisional JSON preferences
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
     \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap or fetch
@@ -71,7 +72,7 @@ pub const Options = struct {
 };
 
 /// The overview options that are followed by a value.
-pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
+pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--platform", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
 
 /// Parses overview arguments (args[0] is the program). Debugger options are
 /// rejected: the overview has no target.

@@ -191,7 +191,7 @@ pub const Stream = struct {
     fn dnsTcp(self: *Stream, a: std.mem.Allocator, records: *std.ArrayList(Record), source: *const network.Stream, flow_id: u32, direction: Direction, bytes: *const reassembly.Direction) !void {
         var at: usize = 0;
         while (bytes.bytes.items.len - at >= 2) {
-            const length = std.mem.readInt(u16, bytes.bytes.items[at..][0..2], .big);
+            const length = @as(usize, std.mem.readInt(u16, bytes.bytes.items[at..][0..2], .big));
             if (length == 0) return;
             if (length > bytes.bytes.items.len - at - 2) return;
             try self.dns(a, records, source, flow_id, direction, .tcp, bytes.source(at + 2), bytes.bytes.items[at + 2 ..][0..length]);
@@ -492,4 +492,29 @@ test "HTTP/1 and DNS decoders survive mutated input" {
     try std.testing.expect(dnsName(&loop, 12, &end, &looped) == null);
     const past = [_]u8{ 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0xc0, 200 };
     try std.testing.expect(dnsName(&past, 12, &end, &looped) == null);
+}
+
+test "maximum TCP DNS length advances without narrow integer overflow" {
+    const a = std.testing.allocator;
+    const body = try a.alloc(u8, std.math.maxInt(u16));
+    defer a.free(body);
+    @memset(body, 0);
+    const framed = try a.alloc(u8, body.len + 2);
+    defer a.free(framed);
+    std.mem.writeInt(u16, framed[0..2], std.math.maxInt(u16), .big);
+    @memcpy(framed[2..], body);
+
+    const part_size = 1024;
+    const part_count = (framed.len + part_size - 1) / part_size;
+    const parts = try a.alloc([]const u8, part_count);
+    defer a.free(parts);
+    for (parts, 0..) |*part, i| {
+        const start = i * part_size;
+        part.* = framed[start..@min(start + part_size, framed.len)];
+    }
+
+    const derived = try decodeOne(a, 6, 53, parts);
+    defer derived.destroy();
+    try std.testing.expectEqual(@as(usize, 1), derived.records.len);
+    try std.testing.expectEqual(@as(?u16, 0), derived.records[0].transaction_id);
 }

@@ -9,7 +9,7 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const module = b.createModule(.{ .root_source_file = b.path("src/macos_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", true);
-    options.addOption(enum { wayland, cocoa, null }, "platform", .cocoa);
+    options.addOption(enum { wayland, x11, linux, cocoa, null }, "platform", .cocoa);
     options.addOption(bool, "capstone_vendored", false);
     options.addOption([]const u8, "font_path", font);
     module.addOptions("build_options", options);
@@ -79,4 +79,13 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     bundle.addArg(b.fmt("{s}/dynamic/dylib/macOS/libMoltenVK.dylib", .{mvk}));
     bundle.addArg(b.getInstallPath(.prefix, "xodb.app"));
     b.step("bundle", "Package an ad-hoc signed native app with MoltenVK").dependOn(&bundle.step);
+
+    const bootstrap_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true });
+    bootstrap_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "tests/macos-bootstrap.c", "src/runtime/macos_debugserver.c", "src/runtime/cancel.c", "src/runtime/gdb_link.c", "src/runtime/gdb_packet.c", "src/runtime/log.c" }) |source|
+        bootstrap_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
+    const bootstrap = b.addExecutable(.{ .name = "xodb-macos-bootstrap", .root_module = bootstrap_module });
+    const bootstrap_check = b.step("test-debugserver", "Opt-in: test native debugserver bootstrap on owned fixtures");
+    bootstrap_check.dependOn(&b.addRunArtifact(bootstrap).step);
+    bootstrap_check.dependOn(&b.addInstallArtifact(bootstrap, .{}).step);
 }

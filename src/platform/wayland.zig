@@ -22,6 +22,7 @@ pub const c = @cImport({
     @cInclude("vulkan/vulkan.h");
 });
 const vk = @import("../c_ui.zig").api;
+const phases = @import("../startup_phases.zig");
 const platform = @import("window.zig");
 const Cursor = platform.Cursor;
 const clip = platform.clip;
@@ -111,7 +112,12 @@ pub const Window = struct {
         self.input = Keyboard.init(null);
         self.input.trace = c.getenv("XODB_INPUT_TRACE") != null;
         errdefer self.input.deinit();
-        self.display = c.wl_display_connect(null) orelse return error.WaylandUnavailable;
+        phases.begin(.connect);
+        errdefer phases.end(.connect);
+        self.display = c.wl_display_connect(null) orelse {
+            log.err(.window, "xodb: Wayland was selected and the compositor connection failed\n", .{});
+            return error.WaylandUnavailable;
+        };
         errdefer c.wl_display_disconnect(self.display);
         self.clipboard = c.xclip_create(self.display);
         errdefer c.xclip_destroy(self.clipboard);
@@ -119,6 +125,9 @@ pub const Window = struct {
         _ = c.wl_registry_add_listener(self.registry, &registry_listener, self);
         if (c.wl_display_roundtrip(self.display) < 0) return error.WaylandDisconnected;
         if (self.compositor == null or self.wm == null) return error.WaylandGlobalsMissing;
+        phases.end(.connect);
+        phases.begin(.window);
+        errdefer phases.end(.window);
         self.surface = c.wl_compositor_create_surface(self.compositor) orelse return error.SurfaceFailed;
         self.surface_ready = true;
         _ = c.wl_surface_add_listener(self.surface, &wl_surface_listener, self);
@@ -145,6 +154,7 @@ pub const Window = struct {
         }
         c.wl_surface_commit(self.surface);
         while (!self.configured) if (c.wl_display_dispatch(self.display) < 0) return error.WaylandDisconnected;
+        phases.end(.window);
     }
     fn requestDecoration(self: *Window) void {
         if (self.decoration) |v| c.zxdg_toplevel_decoration_v1_set_mode(v, if (self.own_frame) c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_CLIENT_SIDE else c.ZXDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE);
@@ -319,6 +329,9 @@ pub const Window = struct {
         }
     }
     pub const vk_surface_extension: [*:0]const u8 = "VK_KHR_wayland_surface";
+    pub fn surfaceExtension(_: *const Window) [*:0]const u8 {
+        return vk_surface_extension;
+    }
     pub fn createSurface(self: *Window, instance: vk.VkInstance, surface: *vk.VkSurfaceKHR) vk.VkResult {
         var info = std.mem.zeroes(c.VkWaylandSurfaceCreateInfoKHR);
         info.sType = c.VK_STRUCTURE_TYPE_WAYLAND_SURFACE_CREATE_INFO_KHR;

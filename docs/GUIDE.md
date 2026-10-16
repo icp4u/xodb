@@ -504,7 +504,9 @@ xodb normally takes its device-pixel scale from the compositor, including
 fractional Wayland scales such as 1.5. Layout, clipping and pointer hit testing
 remain in window UI units; swapchain images, font rasters and 3D overlays use
 the scaled device extent. Moving a window between differently scaled outputs
-updates the backing resolution and font atlas.
+updates the backing resolution and font atlas. On X11 the scale comes from the
+Xft.dpi resource and then RandR; `--ui-scale` still wins, and `--platform wayland|x11`
+overrides a set WAYLAND_DISPLAY, then DISPLAY.
 
 `--ui-scale N` sets device pixels per UI unit for that run, from 0.5 through 4.
 Smaller values make text and controls smaller and leave more layout space;

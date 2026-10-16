@@ -440,7 +440,11 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     defer window.deinit();
     try client.start();
     var renderer = gpu.Renderer{};
-    defer renderer.deinit();
+    defer {
+        const pool = if (@hasDecl(Window, "framePool")) window.framePool() else null;
+        defer if (@hasDecl(Window, "drainFramePool")) window.drainFramePool(pool);
+        renderer.deinit();
+    }
     const font = try a.create(Font);
     defer a.destroy(font);
     font.* = .{};
@@ -450,16 +454,39 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     defer workspace.deinit();
     var recovery = @import("../render/recovery.zig").Recovery{};
     var frames = Frames{ .renderer = &renderer, .font = font, .workspace = &workspace, .window = &window, .recovery = &recovery, .facts = client.facts(), .label = label, .started = startup_started, .limit = max_frames };
+    const scripted = @hasDecl(Window, "testStep") and std.c.getenv("XODB_TEST_SCRIPT") != null;
+    const pacing = std.c.getenv("XODB_PACING") != null;
     if (@hasDecl(Window, "setLiveResize")) window.setLiveResize(Frames.liveResize, &frames);
     defer if (@hasDecl(Window, "setLiveResize")) window.setLiveResize(null, null);
     var old_state: remote.State = .connecting;
     var old_busy = true;
     while (!window.closing and quitting.* == 0) {
-        try window.pump(window.input.timeoutMs(transport.now(), 8));
+        const pool = if (@hasDecl(Window, "framePool")) window.framePool() else null;
+        defer if (@hasDecl(Window, "drainFramePool")) window.drainFramePool(pool);
+        try window.pump(window.input.timeoutMs(transport.now(), if (scripted or pacing) 0 else 8));
         window.input.tick(transport.now());
         const changed = workspace.sync(client);
         if (changed) window.dirty = true;
         workspace.input(&window, client);
+        if (@hasDecl(Window, "testStep")) {
+            var steps: usize = 0;
+            while (!window.closing and steps < 64 and try window.testStep(frames.rendered)) : (steps += 1) {
+                workspace.input(&window, client);
+                if (window.takeTestState()) {
+                    log.info(.window, "xodb: state panel={s} selected={} search=\"\" searching=false search_supported=false source_scroll={d} pointer={d:.0},{d:.0} size={d}x{d} frames={d} rss_bytes={d}\n", .{
+                        if (workspace.registers) "registers" else if (workspace.watch_list) "watches" else "locals",
+                        workspace.selected_value != null or workspace.selected_watch != null,
+                        workspace.source_scroll,
+                        window.pointer_x,
+                        window.pointer_y,
+                        window.width,
+                        window.height,
+                        frames.rendered,
+                        window.residentBytes(),
+                    });
+                }
+            }
+        }
         if (window.closing) break;
         const facts = client.facts();
         frames.facts = facts;
@@ -467,14 +494,15 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         old_state = facts.state;
         old_busy = facts.busy;
         const now = transport.now();
-        if (now < recovery.retry_at or (!window.dirty and now -| frames.last_frame < 250_000_000)) continue;
+        if (now < recovery.retry_at or (!scripted and !pacing and !window.dirty and now -| frames.last_frame < 250_000_000)) continue;
         if (!recovery.ready) {
             if (!try recovery.init(&renderer, &window, now)) continue;
             font.dirty = true;
         }
         frames.present(now);
     }
-    log.info(.runtime, "xodb: remote GUI closing after {d} frames; closing transport\n", .{frames.rendered});
+    if (pacing) frames.gaps.report();
+    log.info(.runtime, "xodb: remote GUI closing after {d} frames ({d} during live resize); closing transport\n", .{ frames.rendered, frames.live_frames });
     log.info(.window, "xodb: clean shutdown (reason={s})\n", .{if (quitting.* != 0) "signal" else if (max_frames != 0 and frames.rendered >= max_frames) "frame_limit" else @tagName(window.close_reason)});
 }
 // All data here belongs to the UI thread. The nested AppKit resize loop redraws
@@ -492,14 +520,20 @@ const Frames = struct {
     rendered: u64 = 0,
     last_frame: u64 = 0,
     drawing: bool = false,
+    live_frames: u64 = 0,
+    gaps: Pacing = .{},
     fn liveResize(context: ?*anyopaque) callconv(.c) void {
         const self: *Frames = @ptrCast(@alignCast(context orelse return));
         if (self.drawing or !self.recovery.ready) return;
         if (@hasDecl(Window, "consumeEvents")) self.window.consumeEvents();
+        const before = self.rendered;
         if (!self.window.closing) self.present(transport.now());
+        self.live_frames += self.rendered - before;
     }
     fn present(self: *Frames, now: u64) void {
         if (self.drawing) return;
+        const pool = if (@hasDecl(Window, "framePool")) self.window.framePool() else null;
+        defer if (@hasDecl(Window, "drainFramePool")) self.window.drainFramePool(pool);
         self.drawing = true;
         defer self.drawing = false;
         const presented = drawFrame(self.renderer, self.font, self.workspace, self.window, self.facts, self.label) catch |err| {
@@ -510,11 +544,45 @@ const Frames = struct {
         self.window.dirty = !presented;
         if (!presented) return;
         if (self.rendered == 0) @import("../startup.zig").report(self.started, false);
-        self.last_frame = now;
+        const completed = transport.now();
+        if (self.rendered != 0) self.gaps.add((completed -| self.last_frame) / 1000);
+        self.last_frame = completed;
         self.rendered += 1;
         if (self.limit != 0 and self.rendered >= self.limit) self.window.closing = true;
     }
 };
+// Streaming present-to-present gaps, including native tracking callbacks.
+// No per-frame allocations; diagnostics never change ordinary idle pacing.
+const Pacing = struct {
+    count: u64 = 0,
+    total: u64 = 0,
+    min: u64 = std.math.maxInt(u64),
+    max: u64 = 0,
+    late: u64 = 0,
+    fn add(self: *Pacing, us: u64) void {
+        self.count += 1;
+        self.total +|= us;
+        self.min = @min(self.min, us);
+        self.max = @max(self.max, us);
+        self.late += @intFromBool(us > 20_000);
+    }
+    fn report(self: Pacing) void {
+        const mean = self.total / @max(1, self.count);
+        log.info(.window, "xodb: pacing {d} frames mean {d} us ({d} fps) min {d} max {d}, over 20 ms: {d}\n", .{
+            self.count, mean, 1_000_000 / @max(1, mean), if (self.count == 0) 0 else self.min, self.max, self.late,
+        });
+    }
+};
+
+test "remote pacing counts present gaps without retaining samples" {
+    var gaps = Pacing{};
+    for ([_]u64{ 10_000, 20_000, 30_000 }) |us| gaps.add(us);
+    try std.testing.expectEqual(@as(u64, 3), gaps.count);
+    try std.testing.expectEqual(@as(u64, 60_000), gaps.total);
+    try std.testing.expectEqual(@as(u64, 10_000), gaps.min);
+    try std.testing.expectEqual(@as(u64, 30_000), gaps.max);
+    try std.testing.expectEqual(@as(u64, 1), gaps.late);
+}
 fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, facts: remote.Client.Facts, label: []const u8) !bool {
     _ = try font.setScale(window.scale());
     if (!try r.begin(window.width, window.height, window.scale())) return false;

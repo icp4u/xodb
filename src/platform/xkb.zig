@@ -129,6 +129,20 @@ pub const Keyboard = struct {
         if (self.compose_table) |table| self.compose = c.xkb_compose_state_new(table, c.XKB_COMPOSE_STATE_NO_FLAGS);
         for (&self.mod_index, [_][*:0]const u8{ c.XKB_MOD_NAME_SHIFT, c.XKB_MOD_NAME_CTRL, c.XKB_MOD_NAME_ALT, c.XKB_MOD_NAME_LOGO, c.XKB_MOD_NAME_CAPS, c.XKB_MOD_NAME_NUM }) |*index, name| index.* = c.xkb_keymap_mod_get_index(map, name);
     }
+    /// An X11 keymap and state created with xkbcommon-x11. This keyboard unrefs both.
+    pub fn adoptKeymap(self: *Keyboard, keymap_ptr: *anyopaque, state_ptr: *anyopaque) void {
+        self.dropKeymap();
+        self.xkb_keymap = @ptrCast(keymap_ptr);
+        self.state = @ptrCast(state_ptr);
+        if (self.compose_table) |table| self.compose = c.xkb_compose_state_new(table, c.XKB_COMPOSE_STATE_NO_FLAGS);
+        const map = self.xkb_keymap orelse return;
+        for (&self.mod_index, [_][*:0]const u8{ c.XKB_MOD_NAME_SHIFT, c.XKB_MOD_NAME_CTRL, c.XKB_MOD_NAME_ALT, c.XKB_MOD_NAME_LOGO, c.XKB_MOD_NAME_CAPS, c.XKB_MOD_NAME_NUM }) |*index, name| index.* = c.xkb_keymap_mod_get_index(map, name);
+    }
+    /// `x_keycode` is the X keycode (evdev code plus 8), before `key` translates it.
+    pub fn updateKey(self: *Keyboard, x_keycode: u32, pressed: bool) void {
+        const state = self.state orelse return;
+        _ = c.xkb_state_update_key(state, x_keycode, if (pressed) c.XKB_KEY_DOWN else c.XKB_KEY_UP);
+    }
     fn failKeymap(self: *Keyboard) void {
         self.keymap_errors += 1;
     }

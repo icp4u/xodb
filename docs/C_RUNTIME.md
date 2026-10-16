@@ -240,8 +240,20 @@ GUI test uses a private headless compositor. For the cross-ISA host check, compi
 `tests/fixtures/runtime-isa.c` with `-g -O0 -fno-omit-frame-pointer -fno-pie -no-pie`
 on the target, then pass `--ssh HOST --ssh-config FILE --agent /path/xodb-agent
 --fixture /path/fixture --arch m68k` (or `loongarch64`, `ppc64le`, `riscv64`) to
-`tests/runtime-host.py`. On riscv64 it checks that `x0` is omitted, steps one
-instruction in software and refuses watchpoints, profile and uprobes.
+`tests/runtime-host.py`. On riscv64 that smoke row checks that `x0` is omitted,
+steps one instruction in software and refuses watchpoints, profile and uprobes.
+The full software-step table is `tests/runtime-riscv64.py` against
+`tests/fixtures/runtime-riscv64.c`, built on the guest with `-g -O0 -pthread`.
+It checks exact successors for 2-byte and 4-byte steps, compressed and full
+branches, jal, jalr and ret, including jalr through a register rewritten before
+the step, ecall, an lr.w/sc.w unit, 400 continues from a planted breakpoint
+while two threads contend (the counter finishes at 40000), continue from
+planted breakpoints, code bytes compared with the file, empty breakpoint
+lists, source step and step-over, and a signal during a step.
+`scripts/release-check periodic --riscv64-guest SSH AGENT FIXTURE` runs
+`tests/riscv64-guest.sh`. The script holds `XODB_GUEST_LEASE`, uses `ssh` from
+`PATH`, builds a fresh guest tree when those remote paths are not executable,
+runs the driver, and removes only the directory it created.
 On LoongArch64 that script steps one instruction, refuses watchpoints, profile and
 uprobes, and removes the breakpoint before continuing. Disassembly is refused on
 the system Capstone 5.x build and decoded when the binary was built with

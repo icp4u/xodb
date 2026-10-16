@@ -12,48 +12,37 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 #include <time.h>
-#include <stdatomic.h>
+#include <mach/mach.h>
 
-// Diagnostic only: query our own window's on-screen bit, never screen pixels.
-// Keep this off the AppKit thread so font/device work cannot delay the sample.
-static dispatch_group_t startup_watch;
-static atomic_bool startup_stop;
+extern void *objc_autoreleasePoolPush(void);
+extern void objc_autoreleasePoolPop(void *);
+void *xcocoa_pool_push(void) { return objc_autoreleasePoolPush(); }
+void xcocoa_pool_pop(void *pool) { objc_autoreleasePoolPop(pool); }
+uint64_t xcocoa_resident_bytes(void) {
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO, (task_info_t)&info, &count) != KERN_SUCCESS) return 0;
+    return info.resident_size;
+}
+
+// Diagnostic only, from the window's own occlusion notification. Never query
+// the window server in-process (CGWindowList*): that call holds the connection's
+// transaction lock and stalls the main thread's commit that shows the window.
+static double startup_start_ms; // 0: not tracing, or already reported
 static double monotonic_ms(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
 }
-static void watch_onscreen(CGWindowID number) {
+static void startup_trace_begin(void) {
+    startup_start_ms = 0;
     if (!getenv("XODB_STARTUP_TRACE")) return;
     struct kinfo_proc process = {0}; size_t size = sizeof process;
     int mib[] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, getpid() };
     struct timeval wall;
     if (sysctl(mib, 4, &process, &size, NULL, 0) || size != sizeof process || gettimeofday(&wall, NULL)) return;
-    double start = monotonic_ms() - ((wall.tv_sec - process.kp_proc.p_starttime.tv_sec) * 1000.0 +
+    startup_start_ms = monotonic_ms() - ((wall.tv_sec - process.kp_proc.p_starttime.tv_sec) * 1000.0 +
         (wall.tv_usec - process.kp_proc.p_starttime.tv_usec) / 1000.0);
-    atomic_store(&startup_stop, false);
-    startup_watch = dispatch_group_create();
-    dispatch_group_async(startup_watch, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        double deadline = monotonic_ms() + 5000;
-        while (!atomic_load(&startup_stop) && monotonic_ms() < deadline) {
-            @autoreleasepool {
-                CFArrayRef windows = CGWindowListCopyWindowInfo(kCGWindowListOptionIncludingWindow, number);
-                bool visible = false;
-                if (windows && CFArrayGetCount(windows)) {
-                    CFBooleanRef on = CFDictionaryGetValue(CFArrayGetValueAtIndex(windows, 0), kCGWindowIsOnscreen);
-                    visible = on && CFBooleanGetValue(on);
-                }
-                if (windows) CFRelease(windows);
-                if (visible) {
-                    xrt_log(XRT_LOG_INFO, XRT_LOG_WINDOW, "xodb: own window on screen in %.3f ms since process start (window-server observation)\n", monotonic_ms() - start);
-                    return;
-                }
-            }
-            usleep(1000);
-        }
-        if (!atomic_load(&startup_stop))
-            xrt_log(XRT_LOG_INFO, XRT_LOG_WINDOW, "xodb: own-window on-screen timing unavailable\n");
-    });
 }
 
 @interface XCView : NSView
@@ -69,7 +58,7 @@ static void watch_onscreen(CGWindowID number) {
 #define QCAP 256
 static struct xcocoa_event queue[QCAP];
 static unsigned q_head, q_count;
-static int close_pending, offscreen, resize_drawing;
+static int close_pending, release_pending, offscreen, resize_drawing;
 static NSWindow *win;
 static XCView *view;
 static CAMetalLayer *layer;
@@ -77,10 +66,12 @@ static uint32_t cur_w, cur_h;
 static float cur_scale = 1, pixel_scale = 1;
 static void (*resize_draw)(void *);
 static void *resize_context;
+static void test_close(void);
 
 static void push(struct xcocoa_event event) {
     // A close must survive a full input queue, even after the producer goes idle.
     if (event.kind == XCOCOA_EVENT_CLOSE) { close_pending = 1; return; }
+    if (event.kind == XCOCOA_EVENT_RELEASE_POINTER) { release_pending = 1; return; }
     if (q_count == QCAP) return;
     queue[(q_head + q_count++) % QCAP] = event;
 }
@@ -90,7 +81,12 @@ int xcocoa_next(struct xcocoa_event *event) {
         *event = (struct xcocoa_event){ .kind = XCOCOA_EVENT_CLOSE };
         return 1;
     }
-    if (!q_count) return 0;
+    if (!q_count) {
+        if (!release_pending) return 0;
+        release_pending = 0;
+        *event = (struct xcocoa_event){ .kind = XCOCOA_EVENT_RELEASE_POINTER };
+        return 1;
+    }
     *event = queue[q_head]; q_head = (q_head + 1) % QCAP; q_count--;
     return 1;
 }
@@ -122,9 +118,15 @@ static void note_size(void) {
 - (void)windowDidEndLiveResize:(NSNotification *)notification {
     (void)notification; note_size();
     // AppKit consumes the resize mouse-up, so release our held pointer state.
-    push((struct xcocoa_event){ .kind = XCOCOA_EVENT_BUTTON, .code = 272 });
+    push((struct xcocoa_event){ .kind = XCOCOA_EVENT_RELEASE_POINTER });
 }
 - (void)windowDidChangeBackingProperties:(NSNotification *)notification { (void)notification; note_size(); }
+- (void)windowDidChangeOcclusionState:(NSNotification *)notification {
+    (void)notification;
+    if (!startup_start_ms || !(win.occlusionState & NSWindowOcclusionStateVisible)) return;
+    xrt_log(XRT_LOG_INFO, XRT_LOG_WINDOW, "xodb: own window visible in %.3f ms since process start (occlusion notification, ~10-17 ms after the window server)\n", monotonic_ms() - startup_start_ms);
+    startup_start_ms = 0;
+}
 - (void)windowDidBecomeKey:(NSNotification *)notification {
     (void)notification; push((struct xcocoa_event){ .kind = XCOCOA_EVENT_FOCUS, .flags = XCOCOA_PRESSED });
 }
@@ -230,7 +232,7 @@ static void handle(NSEvent *e) {
         x.kind = XCOCOA_EVENT_BUTTON; where(e, &x);
         x.flags = (t == NSEventTypeLeftMouseDown || t == NSEventTypeRightMouseDown || t == NSEventTypeOtherMouseDown) ? XCOCOA_PRESSED : 0;
         x.code = (t == NSEventTypeLeftMouseDown || t == NSEventTypeLeftMouseUp) ? 272 : (t == NSEventTypeRightMouseDown || t == NSEventTypeRightMouseUp) ? 273 : 274;
-        if (x.y < 0 || x.y > cur_h) break; // title bar
+        if (x.x < 0 || x.x >= cur_w || x.y < 0 || x.y >= cur_h) break; // native border/title bar
         push(x); break; }
     case NSEventTypeMouseMoved: case NSEventTypeLeftMouseDragged: case NSEventTypeRightMouseDragged: case NSEventTypeOtherMouseDragged:
         x.kind = XCOCOA_EVENT_MOTION; where(e, &x); push(x); break;
@@ -244,7 +246,7 @@ static void handle(NSEvent *e) {
 int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
     @autoreleasepool {
         if (layer || !width || !height || width > 16384 || height > 16384) return 0;
-        q_head = q_count = 0; close_pending = 0;
+        q_head = q_count = 0; close_pending = release_pending = 0;
         cur_w = width; cur_h = height; pixel_scale = cur_scale = 1;
         offscreen = getenv("XODB_MAC_OFFSCREEN") != NULL;
         if (offscreen) {
@@ -266,7 +268,7 @@ int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
             fmin(width, available.size.width), fmin(height, available.size.height));
         win = [[NSWindow alloc] initWithContentRect:rect styleMask:style backing:NSBackingStoreBuffered defer:NO];
         if (!win) return 0;
-        watch_onscreen((CGWindowID)win.windowNumber);
+        startup_trace_begin();
         delegate = [XCDelegate new];
         win.delegate = delegate; NSApp.delegate = delegate;
         win.releasedWhenClosed = NO; win.acceptsMouseMovedEvents = YES;
@@ -295,18 +297,21 @@ int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
         xcocoa_pump(0);
         xrt_log(XRT_LOG_DEBUG, XRT_LOG_WINDOW, "Cocoa window requested=%ux%u actual=%ux%u backing=%.2f\n",
             width, height, cur_w, cur_h, (double)cur_scale);
+        xrt_log(XRT_LOG_INFO, XRT_LOG_WINDOW, "xodb: window on screen %ux%u points, os scale %.2f, pixel scale %.2f\n",
+            cur_w, cur_h, (double)cur_scale, (double)pixel_scale);
         return 1;
     }
 }
 void xcocoa_close(void) {
     @autoreleasepool {
-        atomic_store(&startup_stop, true);
-        if (startup_watch) { dispatch_group_wait(startup_watch, DISPATCH_TIME_FOREVER); startup_watch = nil; }
+        startup_start_ms = 0;
         resize_draw = NULL; resize_context = NULL;
+        test_close();
         if (win) { win.delegate = nil; [win close]; }
         if (NSApp.delegate == delegate) NSApp.delegate = nil;
+        NSApp.mainMenu = nil;
         win = nil; view = nil; layer = nil; delegate = nil;
-        q_head = q_count = 0; close_pending = 0; resize_drawing = 0;
+        q_head = q_count = 0; close_pending = release_pending = 0; resize_drawing = 0;
     }
 }
 void xcocoa_pump(int32_t timeout_ms) {
@@ -390,3 +395,5 @@ int32_t xcocoa_create_surface(void *instance, void **surface) {
     VkMetalSurfaceCreateInfoEXT info = { .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT, .pLayer = layer };
     return vkCreateMetalSurfaceEXT((VkInstance)instance, &info, NULL, (VkSurfaceKHR *)surface);
 }
+
+#include "cocoa_script.inc"

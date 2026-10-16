@@ -253,7 +253,7 @@ const Parser = struct {
                         result.orphan_records += 1;
                     } else {
                         const iface = &self.interfaces.items[index];
-                        if (kind == 2) iface.epb_drops += std.mem.readInt(u16, body[2..4], endian);
+                        if (kind == 2) iface.epb_drops +|= std.mem.readInt(u16, body[2..4], endian);
                         const units = (@as(u64, std.mem.readInt(u32, body[4..8], endian)) << 32) | std.mem.readInt(u32, body[8..12], endian);
                         const ns = scale(units, iface.tsresol, iface.tsoffset_s);
                         if (ns == null) result.time_overflow += 1;
@@ -603,4 +603,26 @@ test "record limit stops with a typed result" {
     defer r.deinit(a);
     try std.testing.expectEqual(Stop.limit, r.stop);
     try std.testing.expectEqual(@as(usize, 3), r.records.len);
+}
+
+test "packet block drops saturate after an EPB drop option" {
+    const a = std.testing.allocator;
+    var w = TestWriter{ .a = a };
+    defer w.deinit();
+    try w.shb();
+    try w.idb(1, null, "");
+    try w.epb(0, 0, "a", 1, std.math.maxInt(u64));
+    const s = try w.begin(2);
+    try w.int(u16, 0);
+    try w.int(u16, 1);
+    try w.int(u32, 0);
+    try w.int(u32, 0);
+    try w.int(u32, 1);
+    try w.int(u32, 1);
+    try w.out.append(a, 'b');
+    try w.end(s);
+    var r = try parse(a, w.out.items, .{});
+    defer r.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), r.records.len);
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), r.interfaces[0].epb_drops);
 }

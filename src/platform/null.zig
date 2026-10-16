@@ -84,6 +84,9 @@ pub const Window = struct {
         return .{ .width = platform.deviceExtent(self.width, self.scale()), .height = platform.deviceExtent(self.height, self.scale()) };
     }
     pub const vk_surface_extension: [*:0]const u8 = "VK_EXT_headless_surface";
+    pub fn surfaceExtension(_: *const Window) [*:0]const u8 {
+        return vk_surface_extension;
+    }
     pub fn createSurface(_: *Window, _: vk.VkInstance, _: *vk.VkSurfaceKHR) vk.VkResult {
         return vk.VK_ERROR_INITIALIZATION_FAILED;
     }

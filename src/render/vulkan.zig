@@ -3,6 +3,7 @@ const redact = @import("../redact.zig");
 const log = @import("../log.zig");
 const c = @import("../c_ui.zig").api;
 const Window = @import("../platform/window.zig").Window;
+const phases = @import("../startup_phases.zig");
 const fonts = @import("font.zig");
 const select = @import("vk_select.zig");
 /// `--vk-device`: an index from `--vk-list` or part of a device name. It wins
@@ -155,6 +156,7 @@ pub const Renderer = struct {
         errdefer self.deinit();
         try self.createInstance();
         try created(window.createSurface(self.instance, &self.surface), &self.surface);
+        phases.begin(.device);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
         const display = window.displayGpu();
@@ -182,6 +184,7 @@ pub const Renderer = struct {
         device_info.enabledExtensionCount = device_ext.len;
         device_info.ppEnabledExtensionNames = &device_ext;
         try created(c.vkCreateDevice(self.physical, &device_info, null, &self.device), &self.device);
+        phases.end(.device);
         c.vkGetDeviceQueue(self.device, self.family, 0, &self.queue);
         var pool_info = info(c.VkCommandPoolCreateInfo, c.VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO);
         pool_info.queueFamilyIndex = self.family;
@@ -207,10 +210,12 @@ pub const Renderer = struct {
     /// device DRM nodes (to find the display GPU) and loader messages (to hear
     /// about a driver that did not load). The messenger lives for this call only.
     fn createInstance(self: *Renderer) !void {
+        phases.begin(.instance);
         var app = info(c.VkApplicationInfo, c.VK_STRUCTURE_TYPE_APPLICATION_INFO);
         app.pApplicationName = "xodb";
         app.apiVersion = c.VK_API_VERSION_1_0;
-        const extensions = [_][*c]const u8{ "VK_KHR_surface", Window.vk_surface_extension, "VK_KHR_get_physical_device_properties2", "VK_EXT_debug_utils" };
+        const surface_ext = if (self.window) |w| w.surfaceExtension() else Window.vk_surface_extension;
+        const extensions = [_][*c]const u8{ "VK_KHR_surface", surface_ext, "VK_KHR_get_physical_device_properties2", "VK_EXT_debug_utils" };
         var messenger = info(c.VkDebugUtilsMessengerCreateInfoEXT, c.VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT);
         messenger.messageSeverity = c.VK_DEBUG_UTILS_MESSAGE_SEVERITY_ERROR_BIT_EXT;
         messenger.messageType = c.VK_DEBUG_UTILS_MESSAGE_TYPE_GENERAL_BIT_EXT;
@@ -232,6 +237,7 @@ pub const Renderer = struct {
             result = c.vkCreateInstance(&instance_info, null, &self.instance);
         }
         try created(result, &self.instance);
+        phases.end(.instance);
     }
     fn loaderMessage(_: c.VkDebugUtilsMessageSeverityFlagBitsEXT, _: c.VkDebugUtilsMessageTypeFlagsEXT, data: [*c]const c.VkDebugUtilsMessengerCallbackDataEXT, user: ?*anyopaque) callconv(.c) c.VkBool32 {
         const self: *Renderer = @ptrCast(@alignCast(user orelse return c.VK_FALSE));
@@ -469,6 +475,7 @@ pub const Renderer = struct {
         try created(c.vkCreatePipelineLayout(self.device, &pipeline_layout, null, &self.layout), &self.layout);
     }
     fn createSwap(self: *Renderer, width: u32, height: u32) !void {
+        phases.begin(.swapchain);
         var caps: c.VkSurfaceCapabilitiesKHR = undefined;
         try check(c.vkGetPhysicalDeviceSurfaceCapabilitiesKHR(self.physical, self.surface, &caps));
         var formats = try enumerate(c.VkSurfaceFormatKHR, c.vkGetPhysicalDeviceSurfaceFormatsKHR, .{ self.physical, self.surface }, "vkGetPhysicalDeviceSurfaceFormatsKHR");
@@ -548,6 +555,7 @@ pub const Renderer = struct {
             var sem = info(c.VkSemaphoreCreateInfo, c.VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO);
             try created(c.vkCreateSemaphore(self.device, &sem, null, &self.finished[i]), &self.finished[i]);
         }
+        phases.end(.swapchain);
     }
     fn createPass(self: *Renderer) !void {
         var attachment = std.mem.zeroes(c.VkAttachmentDescription);
@@ -1172,6 +1180,7 @@ pub const Renderer = struct {
         submit.signalSemaphoreCount = 1;
         submit.pSignalSemaphores = &self.finished[image_index];
         call_started = Wait.now();
+        phases.begin(.draw);
         const submitted = c.vkQueueSubmit(self.queue, 1, &submit, self.fence);
         reportSlowCall("vkQueueSubmit", call_started);
         try check(submitted);
@@ -1186,6 +1195,7 @@ pub const Renderer = struct {
         if (self.window) |window| try window.requestFrame();
         call_started = Wait.now();
         const result = c.vkQueuePresentKHR(self.queue, &present);
+        if (result == c.VK_SUCCESS or result == c.VK_SUBOPTIMAL_KHR) phases.end(.draw);
         reportSlowCall("vkQueuePresentKHR", call_started);
         if (result != c.VK_SUCCESS and result != c.VK_SUBOPTIMAL_KHR) {
             if (self.window) |window| window.cancelFrame();
