@@ -27,6 +27,9 @@ pub fn value(a: std.mem.Allocator, architecture: Arch, registers: location.Regis
         legacy[0] = .{ .storage = "register", .size = @intCast(variable.size), .value_bit_offset = 0, .register = variable.register, .register_bit_offset = variable.register_bit_offset };
         break :blk &legacy;
     };
+    if (variable.parameter and !variable.stack_parameter_verified) for (pieces) |piece| {
+        if (std.mem.eql(u8, piece.storage, "stack")) return null;
+    };
     var bytes: [32]u8 = @splat(0);
     var covered: [32]bool = @splat(false);
     for (pieces) |piece| {
@@ -70,16 +73,41 @@ pub fn value(a: std.mem.Allocator, architecture: Arch, registers: location.Regis
     const nonzero = for (bytes[0..value_size], 0..) |byte, index| {
         if (byte != 0) break index;
     } else 0;
-    const display = if (std.mem.indexOf(u8, variable.type_name, "bool") != null)
+    var padding: [32]bool = @splat(false);
+    for (variable.padding) |range| {
+        const offset: usize = range.offset;
+        const range_size: usize = range.size;
+        if (offset >= value_size or range_size > value_size - offset) return null;
+        for (padding[offset .. offset + range_size]) |*byte| {
+            if (byte.*) return null;
+            byte.* = true;
+        }
+    }
+    const has_padding = std.mem.indexOfScalar(bool, padding[0..value_size], true) != null;
+    const display = if (!has_padding and std.mem.indexOf(u8, variable.type_name, "bool") != null)
         (if (nonzero == 0 and bytes[0] == 0) "false" else "true")
     else blk: {
         var highest: usize = value_size - 1;
-        while (highest > 0 and bytes[highest] == 0) highest -= 1;
+        if (!has_padding) {
+            while (highest > 0 and bytes[highest] == 0) highest -= 1;
+        }
         var text: [66]u8 = undefined;
-        var written = (try std.fmt.bufPrint(&text, "0x{x}", .{bytes[highest]})).len;
+        var written: usize = 2;
+        @memcpy(text[0..2], "0x");
+        if (padding[highest]) {
+            @memcpy(text[written .. written + 2], "??");
+            written += 2;
+        } else if (has_padding) {
+            written += (try std.fmt.bufPrint(text[written..], "{x:0>2}", .{bytes[highest]})).len;
+        } else {
+            written += (try std.fmt.bufPrint(text[written..], "{x}", .{bytes[highest]})).len;
+        }
         while (highest > 0) {
             highest -= 1;
-            written += (try std.fmt.bufPrint(text[written..], "{x:0>2}", .{bytes[highest]})).len;
+            if (padding[highest]) {
+                @memcpy(text[written .. written + 2], "??");
+                written += 2;
+            } else written += (try std.fmt.bufPrint(text[written..], "{x:0>2}", .{bytes[highest]})).len;
         }
         break :blk try a.dupe(u8, text[0..written]);
     };
@@ -104,7 +132,7 @@ pub fn collect(a: std.mem.Allocator, analysis: *host.Analysis, architecture: Arc
 }
 
 test "aarch64 split pieces assemble most-significant first and vector pieces are refused" {
-    // Piece rows as the 0.1.7 producer exports them for an AAPCS64 16-byte
+    // Piece rows as the 0.1.8 producer exports them for an AAPCS64 16-byte
     // aggregate (x1 high, x0 low) and for an HFA float pair (z1/z0).
     const a = std.testing.allocator;
     var registers: location.RegisterSet = @splat(null);
@@ -146,4 +174,38 @@ test "aarch64 split pieces assemble most-significant first and vector pieces are
     variable.size = 16;
     variable.pieces = &doubles;
     try std.testing.expect((try value(a, .x86_64, registers, null, null, 0x1000, variable)) == null);
+}
+
+test "stack parameters require ABI verification and aggregate padding is hidden" {
+    const a = std.testing.allocator;
+    const Memory = struct {
+        fn read(_: *anyopaque, address: u64, bytes: []u8) !usize {
+            if (address != 0x8000 or bytes.len != 8) return error.UnexpectedRead;
+            @memcpy(bytes, &[_]u8{ 7, 0, 0, 0, 0xaa, 0xbb, 0xcc, 0xdd });
+            return bytes.len;
+        }
+    };
+    var context: u8 = 0;
+    const registers: location.RegisterSet = @splat(null);
+    const stack = [_]host.PseudoPiece{.{ .storage = "stack", .size = 8, .value_bit_offset = 0, .cfa_offset = 0 }};
+    const hidden = [_]host.PseudoPadding{.{ .offset = 4, .size = 4 }};
+    var variable: host.PseudoVariable = .{
+        .name = "seventh",
+        .type_name = "owned_pad",
+        .size = 8,
+        .parameter = true,
+        .storage = "stack",
+        .register = null,
+        .register_bit_offset = 0,
+        .storage_offset = null,
+        .valid_start = 0x1000,
+        .valid_end = 0x1010,
+        .pieces = &stack,
+        .padding = &hidden,
+    };
+    try std.testing.expect((try value(a, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1000, variable)) == null);
+    variable.stack_parameter_verified = true;
+    const found = (try value(a, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1000, variable)).?;
+    defer a.free(found.display);
+    try std.testing.expectEqualStrings("0x????????00000007", found.display);
 }

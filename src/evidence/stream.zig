@@ -86,8 +86,8 @@ pub const Stream = struct {
         a.destroy(self);
     }
     /// Adds collector context from a capture archive (ECTX payload).
-    pub fn attachContext(self: *Stream, payload: []const u8) !void {
-        const ctx = try sockets.decodeContext(self.arena.allocator(), payload);
+    pub fn attachContext(self: *Stream, payload: []const u8, usb_payload: ?[]const u8) !void {
+        const ctx = try sockets.decodeContextWithUsb(self.arena.allocator(), payload, usb_payload);
         self.context = ctx;
         self.mapping = ctx.mapping();
     }
@@ -205,7 +205,7 @@ test "stream decodes, groups flows and correlates" {
     const tables = [_]sockets.Table{ .{ .when = .start, .sampled_ns = 1_000, .processes = &.{.{ .pid = 9 }}, .sockets = &table_sockets }, .{ .when = .stop, .sampled_ns = 5_000, .processes = &.{.{ .pid = 9 }}, .sockets = &table_sockets } };
     const payload = try sockets.encode(a, .{ .capture_started_ns = 1_000, .pid = 9, .pairs = &.{.{ .monotonic_before_ns = 999, .realtime_ns = base, .monotonic_after_ns = 1_001 }}, .tables = &tables });
     defer a.free(payload);
-    try s.attachContext(payload);
+    try s.attachContext(payload, null);
     try std.testing.expectEqual(@as(?u64, 10), s.timeOf(0).capture_ns);
     try std.testing.expectEqual(@as(?u64, 1), s.timeOf(0).uncertainty_ns);
     const join = s.correlate(1);

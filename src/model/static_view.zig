@@ -701,6 +701,7 @@ test "pseudo-C live values read stack pieces and assemble proven split pieces" {
         .storage_offset = null,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
+        .stack_parameter_verified = true,
         .pieces = &stack,
     })).?;
     defer std.testing.allocator.free(seventh.display);
@@ -716,6 +717,7 @@ test "pseudo-C live values read stack pieces and assemble proven split pieces" {
         .storage_offset = null,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
+        .stack_parameter_verified = true,
         .pieces = &pieces,
     })).?;
     defer std.testing.allocator.free(split.display);

@@ -144,9 +144,11 @@ pub const Frontend = struct {
         }
         const same_editor = if (editor(workspace, action)) |field| pending.editor_signature != null and editorSignature(field) == pending.editor_signature.? else true;
         if (reply.failure) |err| {
-            workspace.status = @errorName(err);
+            // Runtime watch refusals carry the same hints as the in-process path.
+            const message = if (action == .runtime_watch) @import("language_tabs.zig").watchError(err) else @errorName(err);
+            workspace.status = message;
             if (same_editor) {
-                if (editor(workspace, action)) |field| field.message = @errorName(err);
+                if (editor(workspace, action)) |field| field.message = message;
             }
             if (action == .runtime_type) workspace.runtime_type_panel.complete(err);
             if (action == .invocation) workspace.invocations.complete(err);
@@ -172,13 +174,19 @@ pub const Frontend = struct {
                 workspace.allocation_save_editor.open = false;
             },
             .native_watch => |value| switch (value) {
-                .add => {
+                .add => |request| {
                     if (reply.first_id) |id| if (reply.native_watch_revision) |revision| workspace.watch_panel.addedAt(@intCast(id), revision);
                     if (same_editor) workspace.editor.open = false;
-                    workspace.status = "Watch added; activation lifetime between stops is unproved";
+                    workspace.status = Workspace.watchAddedStatus(request.mode == .live);
                 },
                 .remove => |token| workspace.watch_panel.removed(token.index, workspace.watch_view.entries.len -| 1),
                 .investigate_write => workspace.status = "Write investigation started",
+                .toggle_mode => |request| if (request.entry.index < workspace.watch_view.entries.len) {
+                    // The owner flipped the entry. An unchanged revision means
+                    // this frame still shows the mode from before the toggle.
+                    const shown = workspace.watch_view.entries[request.entry.index].mode == .live;
+                    workspace.status = Workspace.watchModeStatus(if (workspace.watch_view.revision == request.entry.revision) !shown else shown);
+                },
                 else => {},
             },
             .runtime_watch => |value| {
@@ -399,7 +407,7 @@ pub const Frontend = struct {
     pub fn draw(self: *Frontend, workspace: *Workspace, r: *@import("../render/vulkan.zig").Renderer, font: *@import("../render/font.zig").Font, window: *Window) !void {
         // Thread metadata is copied into the immutable owner publication;
         // the painter never reads target or local task metadata itself.
-        workspace.compatibility_info = .{ .kind = .unavailable };
+        workspace.compatibility_info = self.display.compatibility;
         workspace.thread_labels = self.display.thread_labels;
         defer workspace.thread_labels = &.{};
         if (workspace.logical_frames.open) {

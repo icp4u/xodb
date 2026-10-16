@@ -108,7 +108,7 @@ of the shared JVM and prevents idle exit.
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.7`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.8`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
 `pseudocode`. It also advertises `prime`, variables, types, function index, and the
@@ -220,9 +220,22 @@ selected sidecar cannot start on x86-64, the same request falls back to the
 configured native worker and the pane names that producer. Register-backed
 sidecar variables and CFA-relative stack pieces are overlaid from the stopped
 frame only inside their exported PC range; stack pieces only in the innermost
-frame. Values split over several proven pieces are assembled by significance;
-the 0.1.7 producer exports decompiler join pieces from their most-significant
-piece to their least-significant piece. `[` and `]` scroll
+frame. A parameter is available only when its decompiler storage matches
+the producer's own ELF SysV x86-64 or AAPCS64 placement for integer, pointer
+and integer-only aggregate arguments. Ghidra's prototype model misplaces
+`__int128`, `_Complex` and `_Float128` arguments and shifts later ones, so it
+is not used as the check; any other argument class, and every argument after
+it, gets an empty interval. Ghidra's types lose some classes, so the producer
+also refuses typedefs named complex/decimal/float (unclassified DWARF base
+types), aggregates holding arrays (GNU vectors), 16-byte aggregates where a
+16-byte alignment would move them, aggregates in C++/Rust images (non-trivial
+classes go by reference), non-default calling conventions, and every
+parameter of a function whose code reads an argument register or incoming
+stack slot that no parameter owns (for example `ms_abi`). Values split over several
+proven pieces are assembled by significance; the 0.1.8 producer exports
+decompiler join pieces from their most-significant piece to their
+least-significant piece. Aggregate padding is shown as `??` bytes rather than
+as a value. `[` and `]` scroll
 long pseudo-C lines horizontally.
 
 ## Image-only sessions

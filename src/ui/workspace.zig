@@ -1441,10 +1441,13 @@ pub const Workspace = struct {
         const stack_y = self.bottomY(@floatFromInt(w.height)) + 44;
         if (click and !self.show_profile and threads.len > 0 and thread_bounds.contains(w.pointer_x, w.pointer_y) and w.pointer_y >= stack_y) {
             const bottom = self.bottomY(@floatFromInt(w.height));
-            const wine = self.compatibility_info.kind == .wine;
-            const darwin = self.thread_labels.len > 0 and self.thread_labels[0].source == .gdb_thread_info;
+            // The owner frontend clears self.thread_labels after each draw;
+            // hit-test against the same publication rows that were drawn.
+            const labels = if (remote) context.display.thread_labels else self.thread_labels;
+            const wine = if (remote) context.display.compatibility.kind == .wine else self.compatibility_info.kind == .wine;
+            const darwin = labels.len > 0 and labels[0].source == .gdb_thread_info;
             const selected = if (wine or darwin)
-                self.thread_list.hit(.{ .x = 12, .y = bottom + 42, .w = stack_x - 20, .h = @max(0, thread_bounds.h - 50) }, threads, self.thread_labels, self.selected, w.pointer_x, w.pointer_y)
+                self.thread_list.hit(.{ .x = 12, .y = bottom + 42, .w = stack_x - 20, .h = @max(0, thread_bounds.h - 50) }, threads, labels, self.selected, w.pointer_x, w.pointer_y)
             else blk: {
                 const visible: usize = @intFromFloat(@max(0, (thread_bounds.h - 50) / self.rowStep()));
                 const first = (self.selected + 1) -| visible;
@@ -1525,13 +1528,16 @@ pub const Workspace = struct {
                 return;
             };
         }
-        if (!remote) {
-            if (code == 35 and session.compatibility.info.kind == .wine) {
+        // View-only thread grouping; the owner frontend reads its publication.
+        {
+            const wine = if (remote) context.display.compatibility.kind == .wine else session.compatibility.info.kind == .wine;
+            const labels = if (remote) context.display.thread_labels else session.compatibility.labels.items;
+            if (code == 35 and wine) {
                 self.thread_list.hide_internal = !self.thread_list.hide_internal;
                 self.status = if (self.thread_list.hide_internal) "Wine internal names hidden; selected/faulting threads remain visible; capture keeps all threads" else "All threads shown; Wine internal names grouped below application threads";
             }
-            if (code == 36 or code == 37) if (session.compatibility.info.kind == .wine) {
-                self.thread_list.prepare(threads, session.compatibility.labels.items, self.selected);
+            if (code == 36 or code == 37) if (wine) {
+                self.thread_list.prepare(threads, labels, self.selected);
                 self.selected = self.thread_list.move(self.selected, code == 36);
                 self.selected_frame = 0;
                 self.selectNative(context);
@@ -1707,7 +1713,7 @@ pub const Workspace = struct {
                         return;
                     };
                     self.watch_panel.added(@intCast(added.?));
-                    self.status = if (self.editor.mode == .live) "Live display added; updates in the selected frame at each stop / Shift+L pins it" else "Watch added; later CFA matches cannot prove call lifetime between stops / Shift+L makes it live";
+                    self.status = watchAddedStatus(self.editor.mode == .live);
                     self.editor.open = false;
                     self.watch_focus = true;
                     self.refreshWatch(session);
@@ -1737,9 +1743,15 @@ pub const Workspace = struct {
             }
             const thread = session.target.threadSlice()[self.selected];
             if (!self.applyWatch(session, .{ .toggle_mode = .{ .entry = self.watchToken(index), .binding = .{ .selection = .{ .tid = thread.tid, .index = self.selected_frame }, .metadata = session.metadata.revision } } })) return;
-            self.status = if (self.watch_view.entries[index].mode == .live) "Live display: follows the selected frame / Shift+L pins it" else "Watch pinned to the selected frame / Shift+L makes it live";
+            self.status = watchModeStatus(self.watch_view.entries[index].mode == .live);
             self.refreshWatch(session);
         }
+    }
+    pub fn watchAddedStatus(live: bool) []const u8 {
+        return if (live) "Live display added; updates in the selected frame at each stop / Shift+L pins it" else "Watch added; later CFA matches cannot prove call lifetime between stops / Shift+L makes it live";
+    }
+    pub fn watchModeStatus(live: bool) []const u8 {
+        return if (live) "Live display: follows the selected frame / Shift+L pins it" else "Watch pinned to the selected frame / Shift+L makes it live";
     }
     /// Top of the bottom row (threads, stack, events/watch). Short windows give
     /// the watch view more rows; the source and assembly panes shrink instead.

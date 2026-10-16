@@ -1,4 +1,4 @@
-# Experimental native capture format 2.9
+# Experimental native capture format 2.10
 
 This extends the integrated formats 2.0/2.1/2.2/2.3/2.4/2.5, which superseded T11's unshipped prototype 1.
 The canonical field order and validation are in src/profile/archive.zig.
@@ -208,3 +208,15 @@ Counts are checked against the remaining bytes before allocation; unknown
 enum values and trailing bytes fail. The collector reads `/proc` of the target
 only, unprivileged, at capture start and stop; remote captures write no ECTX.
 See [network evidence](NETWORK_EVIDENCE.md) for the join and its limits.
+
+## USB evidence context (EUSB, 2.10)
+
+When an ECTX table contains sampled usbfs descriptors, the archive appends an
+optional, ignorable EUSB section (tag `0x42535545`) and writes minor version
+10. ECTX stays at schema 1 or 2, so a 2.9 reader decodes the clock and socket
+tables and ignores EUSB. Readers also accept the interim ECTX schemas 3 and 4
+that appended USB rows directly.
+
+EUSB is little endian: u8 schema (1), u8 table count matching ECTX, then for
+each table a u32 row count followed by rows of i32 pid, i32 fd, u16 bus and
+u16 device. Counts, the remaining input, and trailing bytes are validated.

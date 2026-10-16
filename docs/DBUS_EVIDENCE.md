@@ -11,6 +11,10 @@ typed body arguments. It supports D-Bus basic values, arrays, structures,
 dictionary entries and variants with explicit limits on message records,
 pending calls, body-array bytes, argument nodes and nesting depth. A malformed
 message remains addressable with an `undecoded` reason.
+Byte arrays (`ay`) are retained as a bounded byte count and SHA-256 summary,
+rather than one argument node per byte. The digest is private metadata. Calls
+whose flags contain `NO_REPLY_EXPECTED` are counted separately and never enter
+the pending-call table.
 
 Calls and replies are paired by the caller's unique name plus serial and the
 reply's destination plus `reply_serial`. Both records report their peer and

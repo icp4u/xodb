@@ -53,6 +53,7 @@ pub const Module = struct {
     mapping: []align(std.heap.page_size_min) u8,
     owns_mapping: bool = true,
     immutable: bool = false,
+    explicit_gdb: bool = false,
     file_source: mapped_file.Source = .unopened,
     pub fn debugInfo(self: *Module) !*DebugInfo {
         if (self.debug == null) {
@@ -175,6 +176,9 @@ pub const Modules = struct {
     core_source: ?*const @import("../binary/core.zig").Core = null,
     core_ids: std.StringHashMapUnmanaged(union(enum) { id: []const u8, failure: anyerror }) = .empty,
     core_executable: ?struct { path: [:0]u8, id: []u8 } = null,
+    /// Borrowed argv storage. Used only when a Linux GDB stub cannot list its
+    /// images and the user supplied a fixed-address ELF with --exe.
+    gdb_executable: ?[:0]const u8 = null,
     allocator: std.mem.Allocator,
     regions: std.ArrayList(Region) = .empty,
     loaded: std.ArrayList(*Module) = .empty,
@@ -331,6 +335,100 @@ pub const Modules = struct {
             };
             try self.regions.append(self.allocator, .{ .start = mapping.start, .end = mapping.end, .offset = mapping.offset, .inode = std.hash.Wyhash.hash(0, mapping.path), .device_major = 0, .device_minor = 0, .permissions = permissions, .path = try self.allocator.dupe(u8, mapping.path) });
         }
+    }
+    pub fn fromGdbExecutable(self: *Modules, name: []const u8, machine: u16, target: anytype) !void {
+        if (self.loaded.items.len != 0) return;
+        const name_z = try self.allocator.dupeZ(u8, name);
+        defer self.allocator.free(name_z);
+        const real = c.realpath(name_z.ptr, null) orelse return error.GdbExecutableUnavailable;
+        defer c.free(real);
+        const fd = c.open(real, c.O_RDONLY | c.O_CLOEXEC | c.O_NONBLOCK);
+        if (fd < 0) return error.GdbExecutableUnavailable;
+        defer _ = c.close(fd);
+        var stat: c.struct_stat = undefined;
+        if (c.fstat(fd, &stat) != 0 or stat.st_size <= 0 or stat.st_mode & c.S_IFMT != c.S_IFREG) return error.GdbExecutableUnavailable;
+        const mapped = try snapshot.readRange(fd, 0, std.math.cast(usize, stat.st_size) orelse return error.BinarySnapshotLimit, snapshot.per_image_limit, null);
+        errdefer snapshot.free(mapped);
+        var after: c.struct_stat = undefined;
+        if (c.fstat(fd, &after) != 0 or stat.st_size != after.st_size or
+            stat.st_mtim.tv_sec != after.st_mtim.tv_sec or stat.st_mtim.tv_nsec != after.st_mtim.tv_nsec or
+            stat.st_ctim.tv_sec != after.st_ctim.tv_sec or stat.st_ctim.tv_nsec != after.st_ctim.tv_nsec) return error.BinaryChangedDuringRead;
+        const image = try elf.Image.parse(mapped);
+        if (image.header.type != .executable) return error.GdbExecutablePositionIndependentUnsupported;
+        if (@intFromEnum(image.header.machine) != machine) return error.UnsupportedTargetArchitecture;
+        // The stub cannot name its image. A rebuild can keep every code byte
+        // and still change its DWARF, so the loaded GNU build ID must match.
+        if (image.buildId()) |id| {
+            const note_at: u64 = @intFromPtr(id.ptr) - @intFromPtr(mapped.ptr);
+            // A note outside every PT_LOAD (added after linking) is not in
+            // target memory; only the entry check then guards, as without one.
+            const address: ?u64 = for (0..image.header.segment_count) |i| {
+                const segment = try image.segment(@intCast(i));
+                if (segment.type == .load and note_at >= segment.offset and note_at - segment.offset + id.len <= segment.file_size) break segment.vaddr + (note_at - segment.offset);
+            } else null;
+            var loaded: [64]u8 = undefined;
+            if (address) |note| if (id.len > loaded.len or try target.readMemory(note, loaded[0..id.len]) != id.len or
+                !std.mem.eql(u8, loaded[0..id.len], id)) return error.GdbExecutableMismatch;
+        }
+        const path = try self.allocator.dupeZ(u8, std.mem.span(real));
+        errdefer self.allocator.free(path);
+        const inode: u64 = @intCast(stat.st_ino);
+        var start: u64 = std.math.maxInt(u64);
+        var end: u64 = 0;
+        var added: usize = 0;
+        errdefer {
+            while (added > 0) {
+                const region = self.regions.pop().?;
+                self.allocator.free(region.path);
+                added -= 1;
+            }
+        }
+        for (0..image.header.segment_count) |i| {
+            const segment = try image.segment(@intCast(i));
+            if (segment.type != .load) continue;
+            start = @min(start, segment.vaddr);
+            end = @max(end, std.math.add(u64, segment.vaddr, segment.mem_size) catch return error.InvalidAddress);
+            if (segment.file_size == 0) continue;
+            const file_end = std.math.add(u64, segment.vaddr, segment.file_size) catch return error.InvalidAddress;
+            var permissions: [4]u8 = "---p".*;
+            if (segment.flags & elf.pf.r != 0) permissions[0] = 'r';
+            if (segment.flags & elf.pf.w != 0) permissions[1] = 'w';
+            if (segment.flags & elf.pf.x != 0) permissions[2] = 'x';
+            try self.regions.append(self.allocator, .{
+                .start = segment.vaddr,
+                .end = file_end,
+                .offset = segment.offset,
+                .inode = inode,
+                .device_major = 0,
+                .device_minor = 0,
+                .permissions = permissions,
+                .path = try self.allocator.dupe(u8, path),
+                .file_source = .host_path,
+            });
+            added += 1;
+        }
+        if (added == 0 or start == std.math.maxInt(u64) or start >= end) return error.NoLoadSegment;
+        const module = try self.allocator.create(Module);
+        errdefer self.allocator.destroy(module);
+        module.* = .{
+            .id = self.next_id,
+            .inode = inode,
+            .device_major = 0,
+            .device_minor = 0,
+            .path = path,
+            .image = image,
+            .bias = 0,
+            .start = start,
+            .end = end,
+            .mapping = mapped,
+            .immutable = true,
+            .explicit_gdb = true,
+            .file_source = .host_path,
+        };
+        try self.loaded.append(self.allocator, module);
+        self.next_id += 1;
+        self.snapshot_bytes += mapped.len;
+        self.maps_revision +|= 1;
     }
     fn coreId(self: *Modules, path: []const u8) ![]const u8 {
         if (self.core_ids.get(path)) |value| return switch (value) {
@@ -890,6 +988,7 @@ pub const Modules = struct {
     /// Match both mapped identity and placement without opening a target file.
     pub fn cachedAt(self: *Modules, address: u64) !*Module {
         for (self.regions.items) |region| if (address >= region.start and address < region.end) {
+            for (self.loaded.items) |module| if (module.explicit_gdb and address >= module.start and address < module.end) return module;
             const module = self.cachedRange(region, false) orelse return error.DebugMetadataNotLoaded;
             return module;
         };
@@ -1386,6 +1485,12 @@ pub const Modules = struct {
             for (self.loaded.items) |module| {
                 if (r.inode != module.inode or r.device_major != module.device_major or
                     r.device_minor != module.device_minor or !std.mem.eql(u8, r.path, module.path)) continue;
+                if (module.explicit_gdb) {
+                    if (module.symbols().findSymbol(name)) |symbol| {
+                        if (symbol.hasAddress()) return publishedSymbol(module.image.header.machine, module.id, symbol, symbol.value);
+                    }
+                    continue :regions;
+                }
                 const p = self.placement(&module.image, module.file_offset, r, false) catch continue;
                 if (p.bias != module.bias) continue;
                 if (module.symbols().findSymbol(name)) |symbol| {

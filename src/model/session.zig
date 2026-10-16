@@ -968,7 +968,19 @@ pub const Session = struct {
         self.maps_generation = self.target.snapshot().generation;
     }
     pub fn refreshMaps(self: *Session) !void {
-        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) return error.GdbLibrariesUnavailable;
+        if (self.target.gdbRemoteInfo()) |gdb| if (gdb.libraries == .unsupported) {
+            const executable = self.modules.gdb_executable orelse return error.GdbLibrariesUnavailable;
+            if (self.target.snapshot().state == .stopped and self.modules.loaded.items.len == 0) {
+                self.modules.debug_files = self.symbolFiles();
+                self.modules.target = self.target.handle;
+                self.modules.owner_target = self.target.handle;
+                self.modules.beginStop(self.target.snapshot().generation);
+                try self.modules.fromGdbExecutable(executable, self.target.arch().descriptor().machine, &self.target);
+            }
+            self.maps_epoch = self.target.snapshot().image_epoch;
+            self.maps_generation = self.target.snapshot().generation;
+            return;
+        };
         if (self.target.core != null) return;
         if (self.target.snapshot().state == .stopped and self.maps_generation != self.target.snapshot().generation) {
             if (self.maps_epoch != self.target.snapshot().image_epoch) {

@@ -59,8 +59,7 @@ def close_clean(client):
 
 observer = Client('observe', None, options=['--open-pcap', str(path)])
 try:
-    # The staged HTTP/DNS protocol stream is always derived (empty here).
-    streams = [row for row in observer.inspect('list_streams')['streams'] if row['kind'] != 'protocol']
+    streams = observer.inspect('list_streams')['streams']
     assert [row['kind'] for row in streams] == ['network', 'usb'], streams
     network, stream = streams
     assert network['interfaces'][0]['link'] == 'linux_usbmon_mmapped', network
@@ -68,6 +67,7 @@ try:
     assert stream['devices'] == 1 and stream['loss']['malformed'] == 1, stream
     assert stream['loss']['pcap_ifdrop'] == 2 and stream['loss']['pcap_osdrop'] == 3, stream
     rows = observer.inspect('query_stream', stream_id=4, include_raw=True, limit=32)['records']
+    assert rows[0]['urb_id'] == 1, rows[0]
     assert rows[0]['peer_record'] == 1 and rows[1]['latency_ns'] == 100, rows[:2]
     assert rows[1]['descriptors'][0]['vendor_id'] == 0x1234, rows[1]
     assert rows[3]['descriptors'][0]['text'] == private.decode(), rows[3]
@@ -87,7 +87,7 @@ finally:
 controller = Client('control', None, options=['--open-pcap', str(path)])
 try:
     row = controller.inspect('query_stream', stream_id=4)['records'][3]
-    assert row['descriptors'][0]['text'] is None and row['private_fields'], row
+    assert row['urb_id'] is None and row['descriptors'][0]['text'] is None and row['private_fields'], row
     denied = controller.tool('query_stream', stream_id=4, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
     denied = controller.tool('query_stream', stream_id=1, include_raw=True)
@@ -100,6 +100,7 @@ try:
     result = redacted.inspect('query_stream', stream_id=4)
     assert private.decode() not in json.dumps(result), result
     assert result['records'][3]['descriptors'][0]['text'] is None, result['records'][3]
+    assert result['records'][0]['urb_id'] is None, result['records'][0]
     denied = redacted.tool('query_stream', stream_id=4, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'RawPayloadRedacted', denied
 finally:

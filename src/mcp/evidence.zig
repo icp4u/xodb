@@ -614,7 +614,7 @@ fn usbRecord(a: Allocator, record_: usb.Record, private: PrivateDecision, includ
         .source_stream = 1,
         .source_record = record_.source_record,
         .time = .{ .known = record_.time_ns != null, .clock = "realtime", .stream_ns = record_.time_ns },
-        .urb_id = record_.urb_id,
+        .urb_id = if (private_metadata) @as(?u64, record_.urb_id) else null,
         .event = @tagName(record_.event),
         .transfer_type = @tagName(record_.transfer),
         .direction = @tagName(record_.direction),
@@ -739,6 +739,8 @@ fn dbusArgument(a: Allocator, argument: dbus.Argument, private_metadata: bool) !
         .unsigned = if (private_metadata) argument.unsigned else null,
         .floating_bits = if (private_metadata) argument.floating_bits else null,
         .text = if (private_metadata) argument.text else null,
+        .byte_length = argument.byte_length,
+        .byte_sha256 = if (private_metadata) if (argument.byte_sha256) |digest| try hexBytes(a, &digest) else null else null,
         .children = Value{ .array = children },
     });
 }
@@ -914,6 +916,7 @@ fn describeDbus(a: Allocator, s: *dbus.Stream) !Value {
         .calls_paired = s.paired,
         .orphan_replies = s.orphan_replies,
         .pending_calls = s.pending_calls,
+        .no_reply_calls = s.no_reply_calls,
         .pending_dropped = s.pending_dropped,
         .malformed = s.malformed,
         .identities = s.identities.len,

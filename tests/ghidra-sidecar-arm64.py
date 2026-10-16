@@ -54,10 +54,12 @@ def result(client, name, **arguments):
     return value["structuredContent"]
 
 
-def poll_decompile(client, symbol, **arguments):
+def poll_decompile(client, symbol=None, **arguments):
     deadline = time.monotonic() + 180
     while True:
-        value = result(client, "decompile_function", symbol=symbol, **arguments)
+        if symbol is not None:
+            arguments["symbol"] = symbol
+        value = result(client, "decompile_function", **arguments)
         if value.get("status") != "running": return value
         assert time.monotonic() < deadline, value
         time.sleep(.01)
@@ -100,6 +102,8 @@ args = parser.parse_args()
 if args.ssh and not args.agent:
     parser.error("--agent is required with --ssh")
 expected_values = dict(value.split("=", 1) for value in args.expected_value)
+if not expected_values:
+    parser.error("at least one --expected-value NAME=DISPLAY is required")
 
 ghidra = os.environ.get("GHIDRA_HOME") or os.environ.get("XODB_GHIDRA_HOME")
 if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
@@ -154,7 +158,7 @@ try:
         while not listening(qemu_process, port):
             assert time.monotonic() < deadline, "QEMU readiness deadline"
             time.sleep(.01)
-        client = Client("control", None, options=("--gdb-remote", f"127.0.0.1:{port}"), reply_seconds=30)
+        client = Client("control", None, options=("--gdb-remote", f"127.0.0.1:{port}", "--exe", str(fixture)), reply_seconds=30)
     else:
         options = ("--runtime-ssh", args.ssh, "--runtime-agent", args.agent, "--break", args.symbol)
         client = Client("control", args.fixture, options=options, reply_seconds=30)
@@ -168,22 +172,17 @@ try:
     stopped = client.stopped("breakpoint", seconds=60)
     assert stopped["architecture"] == "aarch64", stopped
     tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+    analysis = poll_decompile(client, None if args.qemu else args.symbol,
+                              **({"address": hex(entry)} if args.qemu else {}), tid=tid, frame=0)
+    assert analysis.get("status") == "completed", analysis
+    assert analysis.get("producer", {}).get("name") == "ghidra_java_sidecar", analysis
+    assert args.symbol in analysis.get("signature", "") and analysis.get("token_status") in ("ok", "partial_alignment"), analysis
+    mapping = result(client, "get_decomp_mapping", artifact_id=analysis["artifact_id"], pc=analysis["function"]["entry"])
+    assert mapping.get("tokens") or mapping.get("line") is not None, mapping
+    live_values = {row["name"]: row["display"] for row in analysis.get("live_values", ())}
+    assert all(live_values.get(name) == display for name, display in expected_values.items()), (expected_values, live_values, analysis)
     if args.qemu:
-        registers = result(client, "get_registers", tid=tid)["registers"]
-        assert int(registers["x0"], 16) == 8 and int(registers["x1"], 16) == 9, registers
-        assembled = hex((int(registers["x1"], 16) << 64) | int(registers["x0"], 16))
-        assert expected_values == {"pair": assembled}, (expected_values, assembled, registers, split)
-    else:
-        analysis = poll_decompile(client, args.symbol, tid=tid, frame=0)
-        assert analysis.get("status") == "completed", analysis
-        assert analysis.get("producer", {}).get("name") == "ghidra_java_sidecar", analysis
-        assert args.symbol in analysis.get("signature", "") and analysis.get("token_status") in ("ok", "partial_alignment"), analysis
-        mapping = result(client, "get_decomp_mapping", artifact_id=analysis["artifact_id"], pc=analysis["function"]["entry"])
-        assert mapping.get("tokens") or mapping.get("line") is not None, mapping
-        live_values = {row["name"]: row["display"] for row in analysis.get("live_values", ())}
-        assert all(live_values.get(name) == display for name, display in expected_values.items()), (expected_values, live_values, analysis)
-    if args.qemu:
-        print(f"pass: live arm64 {args.symbol} proved split ordering against {len(expected_values)} known values")
+        print(f"pass: live arm64 {args.symbol} decompiled and proved {len(expected_values)} known live values through xodb and the local Ghidra sidecar")
     else:
         print(f"pass: live arm64 {args.symbol} decompiled with {len(expected_values)} known live values through the local Ghidra sidecar")
 finally:

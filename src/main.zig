@@ -213,6 +213,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--profile-out FILE saves the full CPU aggregate as Speedscope JSON at shutdown (new file).
                 \\--capture-out FILE saves a native archive at shutdown (new file, no durability sync).
                 \\--core FILE opens a read-only x86-64 ELF core; --exe FILE supplies a matching moved executable.
+                \\With --gdb-remote, --exe may supply its fixed-address ELF when the stub cannot list images.
                 \\--open-frames FILE opens logical-frame JSONL or a saved .xof bundle.
                 \\--open-profile FILE opens an imported simpleperf JSON profile (see scripts/import-simpleperf).
                 \\--observe-recipe FILE --observation-out FILE runs a bounded headless function investigation and saves .xoi evidence.
@@ -393,7 +394,10 @@ pub fn main(init: std.process.Init) !void {
     std.posix.sigaction(.PIPE, &.{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 }, null);
     // Saved profiles, captures and observations have no code to decompile.
     const archive_viewer = open_profile != null or open_capture != null or open_pcap != null or open_mitmproxy != null or open_observation != null or browse_observation != null;
-    if (!remote_gui and !archive_viewer and ghidra_prestart) @import("semq/ghidra_sidecar.zig").prestart();
+    // The GUI starts the sidecar after its first frame: on a small or busy
+    // machine the starter's javac and JVM warm-up compete with Vulkan setup.
+    const sidecar_prestart = !remote_gui and !archive_viewer and ghidra_prestart;
+    if (sidecar_prestart and headless) @import("semq/ghidra_sidecar.zig").prestart();
     if (remote_gui) {
         if (comptime build_options.gui) {
             var remote_args: std.ArrayList([:0]const u8) = .empty;
@@ -448,7 +452,10 @@ pub fn main(init: std.process.Init) !void {
         launch = redot_launch.items;
         log.info(.redot, "xodb: Redot/Godot scene debugger listening on private loopback port {d}; waiting for owned pid\n", .{port});
     }
-    if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
+    if (gdb_remote != null) {
+        session.gdb_map.symbols.executable = core_executable;
+        session.modules.gdb_executable = core_executable;
+    }
     session.static_analysis.toolchain_dir = static_analysis;
     session.static_analysis.warmup_enabled = ghidra_prestart;
     session.static_analysis.eager_library_bytes = preferences.decompiler.eager_library_bytes;
@@ -662,7 +669,7 @@ pub fn main(init: std.process.Init) !void {
                         .initial_view = .{ .process = 1, .selection = .{ .tid = 0 }, .request_id = 0, .kind = .debugger },
                     });
                     defer owner.destroy();
-                    break :lifecycle try remoteGui(owner, &window, &renderer, font, &workspaces, frames, startup_started, mcp);
+                    break :lifecycle try remoteGui(owner, &window, &renderer, font, &workspaces, frames, startup_started, mcp, sidecar_prestart);
                 };
                 if (!reconnect) return;
                 if (!remote_destroyed or session.target.handle != null) return error.RemoteReadersStillActive;
@@ -710,7 +717,10 @@ pub fn main(init: std.process.Init) !void {
                 session.profile_defaults = preferences.profile.config();
                 session.allocation_defaults = preferences.allocations;
                 session.allocation_helper = allocation_helper;
-                if (gdb_remote != null) session.gdb_map.symbols.executable = core_executable;
+                if (gdb_remote != null) {
+                    session.gdb_map.symbols.executable = core_executable;
+                    session.modules.gdb_executable = core_executable;
+                }
                 session.static_analysis.toolchain_dir = static_analysis;
                 session.static_analysis.warmup_enabled = ghidra_prestart;
                 session.static_analysis.eager_library_bytes = preferences.decompiler.eager_library_bytes;
@@ -852,7 +862,10 @@ pub fn main(init: std.process.Init) !void {
                 };
                 window.dirty = !presented;
                 if (!presented) continue;
-                if (rendered == 0) @import("startup.zig").report(startup_started, mcp);
+                if (rendered == 0) {
+                    @import("startup.zig").report(startup_started, mcp);
+                    if (sidecar_prestart) @import("semq/ghidra_sidecar.zig").prestart();
+                }
                 last_allocation_serial = active.allocations.serial;
                 last_allocation_state = allocation_state;
                 if (active.allocations.capture) |capture| last_allocation_revision = capture.revision;
@@ -879,7 +892,7 @@ pub fn main(init: std.process.Init) !void {
 }
 /// The live family belongs exclusively to the worker for this loop's lifetime.
 /// The frame thread receives no Session, Tree, Server or Endpoint pointer.
-fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window, renderer: *Renderer, font: *Font, workspaces: *[@import("model/process_tree.zig").maximum]?*Workspace, frames: usize, startup_started: u64, mcp: bool) !bool {
+fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window, renderer: *Renderer, font: *Font, workspaces: *[@import("model/process_tree.zig").maximum]?*Workspace, frames: usize, startup_started: u64, mcp: bool, sidecar_prestart: bool) !bool {
     var frontend = @import("ui/remote_workspace.zig").Frontend{ .owner = owner };
     defer frontend.deinit();
     // All stack-owned model/server/endpoint storage remains alive while the
@@ -971,7 +984,10 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
         };
         window.dirty = !presented;
         if (!presented) continue;
-        if (rendered == 0) @import("startup.zig").report(startup_started, mcp);
+        if (rendered == 0) {
+            @import("startup.zig").report(startup_started, mcp);
+            if (sidecar_prestart) @import("semq/ghidra_sidecar.zig").prestart();
+        }
         last_frame = now;
         rendered += 1;
         if (window.input.trace) log.info(.runtime, "xodb: remote frame={d} publication={d} editor={s} preparations={d}\n", .{ rendered, if (frontend.current) |p| p.value.revision else 0, if (workspace.activeEditor(&frontend) != null) "open" else "closed", owner.preparation_attempts.load(.monotonic) });
@@ -1263,7 +1279,7 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylo
     if (capture) |archive_path| {
         const xoc = try archive.readFile(a, archive_path, archive.max_file_bytes, null);
         defer a.free(xoc);
-        if (try archive.evidenceContext(xoc)) |payload| try stream.attachContext(payload);
+        if (try archive.evidenceContext(xoc)) |payload| try stream.attachContext(payload, try archive.usbEvidenceContext(xoc));
     }
     const loss = stream.loss();
     log.info(.session, "xodb: evidence stream {d}: {s} {d} records, {d} undecoded, {d} flows, file {s}, clock {s}; drops ifdrop={d} osdrop={d} epb={d}\n", .{ stream.id, @tagName(stream.parsed.format), stream.parsed.records.len, stream.undecoded, stream.flows.len, @tagName(stream.parsed.stop), @tagName(stream.mapping.state), loss.isb_ifdrop, loss.isb_osdrop, loss.epb_drops });
@@ -1301,9 +1317,15 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylo
         }, derived.records.len, derived.reassembly_gaps, derived.derived_limit_hit });
         tls_stream = derived;
     }
-    const protocol_stream = try @import("evidence/protocol.zig").Stream.open(a, stream, if (tls_stream == null) 2 else 3);
-    errdefer protocol_stream.destroy();
-    log.info(.session, "xodb: protocol evidence stream {d}: {d} HTTP/1 records, {d} DNS records, {d} reassembly gaps\n", .{ protocol_stream.id, protocol_stream.http_records, protocol_stream.dns_records, protocol_stream.reassembly_gaps });
+    var protocol_stream: ?*@import("evidence/protocol.zig").Stream = null;
+    const candidate = try @import("evidence/protocol.zig").Stream.open(a, stream, if (tls_stream == null) 2 else 3);
+    if (candidate.records.len == 0 and (usb_stream != null or dbus_stream != null)) {
+        candidate.destroy();
+    } else {
+        protocol_stream = candidate;
+        log.info(.session, "xodb: protocol evidence stream {d}: {d} HTTP/1 records, {d} DNS records, {d} reassembly gaps\n", .{ candidate.id, candidate.http_records, candidate.dns_records, candidate.reassembly_gaps });
+    }
+    errdefer if (protocol_stream) |derived| derived.destroy();
     session.tls_stream = tls_stream;
     session.protocol_stream = protocol_stream;
     session.usb_stream = usb_stream;

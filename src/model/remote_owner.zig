@@ -445,7 +445,7 @@ test "debugger publication retains source inline frames and target rows" {
         .taken_ns = 1,
         .status = .ready,
         .inspection_id = 3,
-        .debugger = .{ .snapshot = .{ .pid = 7, .generation = 2 }, .source = .{ .bytes = &source, .path = "sample.c" }, .frames = &frames, .threads = &threads, .thread_labels = &labels },
+        .debugger = .{ .snapshot = .{ .pid = 7, .generation = 2 }, .source = .{ .bytes = &source, .path = "sample.c" }, .frames = &frames, .threads = &threads, .thread_labels = &labels, .compatibility = .{ .kind = .wine } },
     });
     defer publication.destroy();
     @memset(&source, 'x');
@@ -463,6 +463,9 @@ test "debugger publication retains source inline frames and target rows" {
     try std.testing.expectEqual(@import("../target/linux.zig").State.stopped, view.threads[0].state);
     try std.testing.expectEqualStrings("worker", view.thread_labels[0].text());
     try std.testing.expectEqual(@as(?u64, 0x1234), view.thread_labels[0].dispatch_queue);
+    // The painter's Wine header comes only from this publication.
+    var title: [192]u8 = undefined;
+    try std.testing.expectEqualStrings("Windows process under Wine", view.compatibility.title(&title));
     try std.testing.expect(publication.value.matchesInspection(publication.value.stamp, 3));
 }
 /// Transfer, not a shared mutable cache. The presenter keeps at most its current

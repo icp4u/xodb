@@ -43,6 +43,8 @@ pub const Argument = struct {
     unsigned: ?u64 = null,
     floating_bits: ?u64 = null,
     text: ?[]const u8 = null,
+    byte_length: ?u32 = null,
+    byte_sha256: ?[32]u8 = null,
     children: []const Argument = &.{},
 };
 
@@ -95,6 +97,7 @@ pub const Stream = struct {
     paired: u64 = 0,
     orphan_replies: u64 = 0,
     pending_calls: u64 = 0,
+    no_reply_calls: u64 = 0,
     pending_dropped: u64 = 0,
     derived_dropped: u64 = 0,
 
@@ -126,13 +129,15 @@ pub const Stream = struct {
             const time = parent.timeOf(source_index);
             record.time_ns = if (time.known) time.stream_ns else null;
             const record_index: u32 = @intCast(records.items.len);
-            if (record.message_type == .method_call and record.reason == .none) {
+            if (record.message_type == .method_call and record.reason == .none and expectsReply(record.flags)) {
                 if (record.sender) |sender| {
                     if (pending.count() < max_pending) {
                         const key = try pairKey(arena, sender, record.serial);
                         if (try pending.fetchPut(arena, key, record_index)) |_| self.pending_dropped += 1;
                     } else self.pending_dropped += 1;
                 }
+            } else if (record.message_type == .method_call and record.reason == .none) {
+                self.no_reply_calls += 1;
             } else if ((record.message_type == .method_return or record.message_type == .error_reply) and record.reply_serial != null and record.destination != null) {
                 const key = try pairKey(arena, record.destination.?, record.reply_serial.?);
                 if (pending.fetchRemove(key)) |entry| {
@@ -176,6 +181,10 @@ pub const Stream = struct {
         return .{ index, self.identities[index] };
     }
 };
+
+fn expectsReply(flags: u8) bool {
+    return flags & 0x1 == 0; // D-Bus NO_REPLY_EXPECTED
+}
 
 fn pairKey(a: std.mem.Allocator, name: []const u8, serial: u32) ![]const u8 {
     const key = try a.alloc(u8, name.len + 5);
@@ -389,6 +398,14 @@ fn parseOne(state: *ParseState, cursor: *Cursor, signature: []const u8, depth: u
             try cursor.alignTo(typeAlignment(element[0]));
             if (size > cursor.bytes.len - cursor.at) return error.Truncated;
             const end = cursor.at + size;
+            if (element.len == 1 and element[0] == 'y') {
+                const bytes = try cursor.take(size);
+                out.byte_length = size;
+                var digest: [32]u8 = undefined;
+                std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                out.byte_sha256 = digest;
+                return out;
+            }
             var children: std.ArrayList(Argument) = .empty;
             while (cursor.at < end) {
                 try state.take();
@@ -540,4 +557,30 @@ test "D-Bus argument nodes are charged to a stream budget" {
     var cursor = Cursor{ .bytes = &.{ 1, 2, 3 }, .endian = .little };
     try std.testing.expectError(error.ArgumentLimit, parseArguments(&state, &cursor, "yyy", 0));
     try std.testing.expectEqual(@as(usize, 0), budget);
+}
+
+test "D-Bus byte arrays are summarized without one node per byte" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const length: u32 = 5000;
+    const body = try a.alloc(u8, 4 + length);
+    defer a.free(body);
+    std.mem.writeInt(u32, body[0..4], length, .little);
+    @memset(body[4..], 0xa5);
+    var cursor = Cursor{ .bytes = body, .endian = .little };
+    var budget: usize = 1;
+    var state = ParseState{ .a = arena.allocator(), .budget = &budget };
+    const args = try parseArguments(&state, &cursor, "ay", 0);
+    try std.testing.expectEqual(@as(usize, 1), args.len);
+    try std.testing.expectEqual(length, args[0].byte_length.?);
+    try std.testing.expect(args[0].byte_sha256 != null);
+    try std.testing.expectEqual(@as(usize, 0), args[0].children.len);
+    try std.testing.expectEqual(@as(usize, 0), budget);
+}
+
+test "D-Bus NO_REPLY_EXPECTED calls are not pending" {
+    try std.testing.expect(expectsReply(0));
+    try std.testing.expect(!expectsReply(1));
+    try std.testing.expect(!expectsReply(3));
 }

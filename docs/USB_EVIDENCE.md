@@ -28,13 +28,20 @@ for data bytes. `--redact` applies the same refusal and the common output
 scrubber. The raw parent stream applies that gate too, so it cannot bypass the
 USB stream policy.
 
-When an opened capture archive has ECTX tables containing an exact
+When an opened capture archive has ECTX tables plus the optional EUSB section
+containing an exact
 `/dev/bus/usb/BBB/DDD` descriptor, `correlate` can join the bus/device address
 to its process and fd. usbmon does not name the URB submitter (kernel drivers
 and every holder of the device share its traffic), so a USB join is never
 `exact`: a descriptor present in snapshots bracketing the aligned record is
 `sampled`; a one-sided or unaligned observation is `inferred`.
 Other device nodes and absent tables are not guessed.
+
+URB ids are kernel correlation tokens and can encode pointer-like values.
+They are private metadata: only the direct observe-scope opener receives them.
+Controllers, shared peers, network transports and redacted sessions receive
+null. Archives at format 2.10 store USB fd rows in ignorable EUSB while keeping
+ECTX at its 2.9 schema, so older readers retain network context and skip EUSB.
 
 ## Making a capture
 

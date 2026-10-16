@@ -72,7 +72,7 @@ software breakpoints, which become available after confirmation.
 | Detach while stopped | Supported | Supported |
 | Hardware watches; library maps; binary `X` writes | Unsupported by this client | Unsupported by this client |
 | Apple debugserver (arm64 macOS) | See [MACOS.md](MACOS.md) | Watchpoints, Darwin signal numbers, regions and images work there |
-| Source/symbol breakpoints, source stepping, module-backed stack/locals | Unavailable without remote library/image support | Unavailable without remote library/image support |
+| Source/symbol breakpoints, source stepping, module-backed stack/locals | Unavailable without remote library/image support or an explicit fixed-address ELF | Unavailable without remote library/image support or an explicit fixed-address ELF |
 
 Memory writes use hexadecimal `M` packets. Register writes first try `P`; if
 unsupported, a `G` write uses only bytes read from the stopped target, with the
@@ -104,15 +104,21 @@ xodb --headless --mcp --agent-scope mutate --gdb-remote 127.0.0.1:2345
 
 Inspect `get_session`, `list_threads` and `get_registers`. Set a breakpoint with
 `set_breakpoint {"address":"0x...","generation":...}` using an address from
-your own binary. Symbol/module queries report `GdbLibrariesUnavailable` until
-that data path is implemented. Raw disassembly uses the selected architecture
-when the installed decoder supports it.
+your own binary. When the stub cannot list images, symbol and module queries
+report `GdbLibrariesUnavailable` unless `--exe` names the matching local
+fixed-address ELF. xodb snapshots that file, validates its architecture and
+load segments, requires its GNU build ID (when one is in a load segment) to match target
+memory before using its symbols or DWARF, and compares the requested
+function's target bytes before pseudo-C. Without a build ID only that
+function-entry check guards the image, so pass the exact build. PIE/shared ELF files need a stub image
+list to prove their load address. Raw disassembly uses the selected
+architecture when the installed decoder supports it.
 
 For a static AArch64 program on an x86 host:
 
 ```sh
 qemu-aarch64 -g 2345 ./program-aarch64
-xodb --gdb-remote 127.0.0.1:2345
+xodb --gdb-remote 127.0.0.1:2345 --exe ./program-aarch64
 ```
 
 This operates through the QEMU stub; it does not attach to QEMU as a native

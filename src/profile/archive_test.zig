@@ -403,6 +403,7 @@ test "evidence context (ECTX) is optional, ignorable and round trips" {
     try std.testing.expectEqual(@as(u16, 9), opened.source.format_minor);
     try std.testing.expectEqual(@as(usize, 0), opened.source.ignored_sections);
     const payload = (try archive.evidenceContext(bytes)).?;
+    try std.testing.expectEqual(@as(u8, 1), payload[0]);
     try std.testing.expectEqualSlices(u8, payload, opened.evidence_context.?);
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -418,4 +419,16 @@ test "evidence context (ECTX) is optional, ignorable and round trips" {
     const strict_entry = strict[archive.header_bytes + (n - 1) * archive.entry_bytes ..][0..archive.entry_bytes];
     std.mem.writeInt(u32, strict_entry[4..8], 0, .little);
     try std.testing.expectError(error.ArchiveSectionLayout, archive.decode(a, strict, .{ .local_id = 4 }));
+
+    capture.net.?.tables[0] = .{ .when = .start, .sampled_ns = 11, .processes = &.{}, .sockets = &.{}, .usb_fds = &.{.{ .pid = capture.pid, .fd = 7, .bus = 2, .device = 3 }} };
+    capture.net.?.table_count = 1;
+    const with_usb = try archive.encode(a, capture, .{});
+    defer a.free(with_usb);
+    try std.testing.expectEqual(@as(u16, 10), std.mem.readInt(u16, with_usb[10..12], .little));
+    const base_payload = (try archive.evidenceContext(with_usb)).?;
+    const usb_payload = (try archive.usbEvidenceContext(with_usb)).?;
+    try std.testing.expectEqual(@as(u8, 1), base_payload[0]);
+    const extended = try @import("../evidence/sockets.zig").decodeContextWithUsb(arena.allocator(), base_payload, usb_payload);
+    try std.testing.expectEqual(@as(usize, 1), extended.tables[0].usb_fds.len);
+    try std.testing.expectEqual(@as(u16, 3), extended.tables[0].usb_fds[0].device);
 }

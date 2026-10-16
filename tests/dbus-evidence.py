@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """D-Bus evidence from a test-owned daemon, monitor and scripted client."""
-import atexit, json, os, socket, struct, subprocess, tempfile, time
+import atexit, hashlib, json, os, socket, struct, subprocess, tempfile, time
 from pathlib import Path
 from client import Client
 
@@ -66,6 +66,9 @@ def signature(value):
 
 def body_values(sig, values):
     out = bytearray()
+    if sig == 'ay':
+        raw = values[0]
+        return struct.pack('<I', len(raw)) + raw
     for code, value in zip(sig, values):
         if code in 'so':
             align(out, 4); out += text32(value)
@@ -75,7 +78,7 @@ def body_values(sig, values):
             raise AssertionError(code)
     return bytes(out)
 
-def message(kind, serial, fields, sig='', values=()):
+def message(kind, serial, fields, sig='', values=(), flags=0):
     body = body_values(sig, values)
     encoded = bytearray()
     for code, value_sig, value in fields + ([(8, 'g', sig)] if sig else []):
@@ -90,17 +93,17 @@ def message(kind, serial, fields, sig='', values=()):
             align(encoded, 4); encoded += struct.pack('<I', value)
         else:
             raise AssertionError(value_sig)
-    fixed = struct.pack('<cBBBIII', b'l', kind, 0, 1, len(body), serial, len(encoded))
+    fixed = struct.pack('<cBBBIII', b'l', kind, flags, 1, len(body), serial, len(encoded))
     packet = bytearray(fixed + encoded)
     align(packet, 8)
     packet += body
     return bytes(packet)
 
-def call(serial, member, sig='', values=()):
+def call(serial, member, sig='', values=(), flags=0):
     return message(1, serial, [(1, 'o', '/org/freedesktop/DBus'),
                                (2, 's', 'org.freedesktop.DBus'),
                                (3, 's', member),
-                               (6, 's', 'org.freedesktop.DBus')], sig, values)
+                               (6, 's', 'org.freedesktop.DBus')], sig, values, flags)
 
 def receive_exact(sock, size):
     result = bytearray()
@@ -181,14 +184,22 @@ assert kind == 3 and fields[4].startswith('org.freedesktop.DBus.Error.')
 client.sendall(call(6, 'ListNames'))
 kind, fields, body = reply(client, 6)
 assert kind == 2 and fields[8] == 'as'
+before_extra = capture.stat().st_size
+large_bytes = bytes((index % 251 for index in range(5000)))
+client.sendall(message(4, 7, [(1, 'o', '/com/example/xquinellax/private'),
+                              (2, 's', 'com.example.Fixture'),
+                              (3, 's', 'Bytes')], 'ay', (large_bytes,)))
+client.sendall(call(8, 'ListNames', flags=1))
 client.close()
 
 deadline = time.monotonic() + 5
 while time.monotonic() < deadline:
     capture_file.flush()
-    if capture.stat().st_size > 24:
+    if capture.stat().st_size >= before_extra + len(large_bytes):
         break
     time.sleep(.01)
+else:
+    raise AssertionError('private dbus-monitor did not publish the byte array')
 monitor.terminate()
 assert monitor.wait(timeout=5) in (-15, 0)
 capture_file.close()
@@ -202,13 +213,13 @@ def close_clean(client_):
 
 observer = Client('observe', None, options=['--open-pcap', str(capture)])
 try:
-    # The staged HTTP/DNS protocol stream is always derived (empty here).
-    streams = [row for row in observer.inspect('list_streams')['streams'] if row['kind'] != 'protocol']
+    streams = observer.inspect('list_streams')['streams']
     assert [row['kind'] for row in streams] == ['network', 'dbus'], streams
     network, stream = streams
     assert network['interfaces'][0]['link'] == 'dbus', network
     assert stream['stream_id'] == 5 and stream['records'] >= 12, stream
     assert stream['calls_paired'] >= 6 and stream['identities'] >= 1 and stream['malformed'] == 0, stream
+    assert stream['no_reply_calls'] >= 1 and stream['pending_calls'] == 0, stream
     rows = observer.inspect('query_stream', stream_id=5, limit=256)['records']
     pid_call = next(row for row in rows if row['member'] == 'GetConnectionUnixProcessID')
     pid_reply = rows[pid_call['peer_record']]
@@ -216,6 +227,10 @@ try:
     signal = next(row for row in rows if row['message_type'] == 'signal' and row['member'] == 'Ping')
     assert signal['path'] == '/com/example/xquinellax/private', signal
     assert signal['arguments'][0]['text'] == private, signal
+    byte_signal = next(row for row in rows if row['message_type'] == 'signal' and row['member'] == 'Bytes')
+    byte_argument = byte_signal['arguments'][0]
+    assert byte_argument['byte_length'] == len(large_bytes) and byte_argument['children'] == [], byte_argument
+    assert byte_argument['byte_sha256'] == hashlib.sha256(large_bytes).hexdigest(), byte_argument
     error = next(row for row in rows if row['message_type'] == 'error_reply' and row['peer_record'] is not None)
     assert error['error_name'].startswith('org.freedesktop.DBus.Error.'), error
     list_reply = next(rows[row['peer_record']] for row in rows if row['member'] == 'ListNames' and row['peer_record'] is not None)
@@ -234,6 +249,10 @@ try:
     pid_call = next(row for row in rows if row['member'] == 'GetConnectionUnixProcessID')
     pid_reply = rows[pid_call['peer_record']]
     assert pid_reply['arguments'][0]['unsigned'] is None, pid_reply
+    byte_signal = next(row for row in rows if row['member'] == 'Bytes')
+    assert byte_signal['arguments'][0]['byte_sha256'] is None, byte_signal
+    assert hashlib.sha256(large_bytes).hexdigest() not in json.dumps(rows), byte_signal
+    assert next(row for row in rows if row['member'] == 'ListNames' and row['flags'] & 1)['peer_record'] is None
     denied = controller.tool('query_stream', stream_id=5, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
     denied = controller.tool('query_stream', stream_id=1, include_raw=True)
@@ -246,6 +265,9 @@ try:
     result = redacted.inspect('query_stream', stream_id=5, limit=256)
     encoded = json.dumps(result)
     assert private not in encoded and 'xquinellax' not in encoded, encoded
+    assert hashlib.sha256(large_bytes).hexdigest() not in encoded, encoded
+    byte_signal = next(row for row in result['records'] if row['member'] == 'Bytes')
+    assert byte_signal['arguments'][0]['byte_sha256'] is None and byte_signal['arguments'][0]['byte_length'] == len(large_bytes), byte_signal
     denied = redacted.tool('query_stream', stream_id=5, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'RawPayloadRedacted', denied
 finally:

@@ -14,7 +14,7 @@ import time
 
 PROTOCOL = 1
 SCHEMA = 1
-PRODUCER = "ghidra-jvm-sidecar-0.1.7"
+PRODUCER = "ghidra-jvm-sidecar-0.1.8"
 # "prime" is advertised but not required, so an older running sidecar is kept.
 CAPABILITIES = {"open_image", "decompile", "cancel", "status", "shutdown", "xsg", "pseudocode"}
 

@@ -29,9 +29,20 @@ def schedule(client, capture, tid, **filters):
     assert cursor == data['range']['to_ns'] and totals == data['totals']
     return dict(data, spans=spans)
 
+def cpu_ms(pid):
+    # Independent process-wide (all threads) user/kernel time from procfs.
+    fields = Path(f'/proc/{pid}/stat').read_text().rsplit(')', 1)[1].split()
+    tick = os.sysconf('SC_CLK_TCK')
+    return int(fields[11]) * 1000 // tick, int(fields[12]) * 1000 // tick
+
+# CPU modes run until the fixture has really used this much CPU, measured
+# from procfs, so a loaded host stretches the wall time, not the assertion.
+NEED = {'threads': (0, 800), 'kernel': (1, 200)}
+
 for mode, enabled in [('sleep', True), ('threads', True), ('kernel', True), ('sleep', False)]:
     name = f'{mode}-{enabled}'
-    client = Client('control', './zig-out/bin/xodb-profile-fixture', args=['2', mode])
+    # The fixture's wall-clock fail-safe must outlast the CPU wait below.
+    client = Client('control', './zig-out/bin/xodb-profile-fixture', args=['6' if mode in NEED else '2', mode])
     try:
         bp = client.action('set_breakpoint', symbol='profile_ready')['id']
         client.action('continue')
@@ -43,8 +54,16 @@ for mode, enabled in [('sleep', True), ('threads', True), ('kernel', True), ('sl
         assert bad['error']['code'] == -32602, bad
         capture = client.action('start_profile', context_switch=enabled, frequency_hz=199, duration_ms=5000)['capture']
         assert capture['accepted']['context_switch'] == enabled
+        pid = client.session()['pid']
+        before = cpu_ms(pid)
         client.action('continue')
         time.sleep(.65)
+        if mode in NEED:
+            field, need = NEED[mode]
+            deadline = time.monotonic() + 3.5  # stop well inside duration_ms=5000
+            while cpu_ms(pid)[field] - before[field] < need and time.monotonic() < deadline:
+                time.sleep(.05)
+        used = [now - then for now, then in zip(cpu_ms(pid), before)]
         capture = client.action('stop_profile', capture_id=capture['id'])['capture']
         assert capture['status'] == 'manual', capture
         assert capture['scheduling']['discarded_events'] == capture['scheduling']['invalid_events'] == 0
@@ -69,9 +88,13 @@ for mode, enabled in [('sleep', True), ('threads', True), ('kernel', True), ('sl
             if mode == 'threads':
                 # A spinning thread may never switch out before disable: its
                 # final interval must stay unknown even when CPU samples exist.
-                assert capture['cpu_activity']['user_ms'] > 500
+                # cpu_activity snapshots after `used` was read: it holds at least that much, less ticks.
+                assert used[0] > 500, ('host too loaded: fixture got too little CPU', used)
+                assert capture['cpu_activity']['user_ms'] > 500 and capture['cpu_activity']['user_ms'] >= used[0] - 50, (capture['cpu_activity'], used)
                 assert all(lane['spans'][-1]['state'] == 'unknown' for lane in lanes)
-            if mode == 'kernel': assert capture['cpu_activity']['kernel_ms'] > 100
+            if mode == 'kernel':
+                assert used[1] > 100, ('host too loaded: fixture got too little CPU', used)
+                assert capture['cpu_activity']['kernel_ms'] > 100 and capture['cpu_activity']['kernel_ms'] >= used[1] - 50, (capture['cpu_activity'], used)
         else:
             assert capture['scheduling']['recorded_events'] == 0
             assert whole['totals']['unknown_ns'] == extent
@@ -88,7 +111,7 @@ for mode, enabled in [('sleep', True), ('threads', True), ('kernel', True), ('sl
         assert client.session()['generation'] == generation and client.inspect('get_registers', tid=tids[0]) == regs
         assert not any('perf_event' in os.readlink(p) for p in Path(f'/proc/{client.p.pid}/fd').iterdir())
         client.action('continue')
-        deadline = time.monotonic() + 5
+        deadline = time.monotonic() + 10
         while client.session()['state'] != 'exited':
             assert time.monotonic() < deadline
             time.sleep(.03)

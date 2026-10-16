@@ -15,6 +15,9 @@ for xml,stem in ((h.VPTR,'virtual-pointer'),(h.VKBD,'virtual-keyboard')):
 h.HELPER=str(w/'vinput');subprocess.run(['cc','-Wall','-Wextra','-Werror','-I',str(w),'tests/helpers/vinput.c',str(w/'virtual-pointer.c'),str(w/'virtual-keyboard.c'),'-lwayland-client','-lxkbcommon','-lm','-o',h.HELPER],check=True,timeout=60)
 tree=w/'tree';(tree/'zig-out/bin').mkdir(parents=True)
 (tree/'zig-out/bin/xodb').symlink_to((a.binary or root/'zig-out/bin/xodb').resolve())
+# Non-PIE, so the link-time address of its 1 GiB .bss is the run-time one.
+slab=w/'search-slab';subprocess.run(['cc','-g','-O0','-no-pie','tests/fixtures/search-slab.c','-o',str(slab)],check=True,timeout=60)
+slab_address=next(int(f[0],16) for f in (l.split() for l in subprocess.run(['nm',str(slab)],capture_output=True,text=True,check=True,timeout=30).stdout.splitlines()) if f[-1]=='slab')
 def error(reply):
     if reply is None:return 'JsonRpcErrorWithoutToolResult'
     return reply['content'][0]['text'] if reply.get('isError') else None
@@ -25,7 +28,7 @@ def resources():
     return {'cpu_seconds':(int(fields[11])+int(fields[12]))/os.sysconf('SC_CLK_TCK'), 'rss_kib':int(fields[21])*os.sysconf('SC_PAGE_SIZE')//1024,'load':os.getloadavg(),'allowed_cpus':len(os.sched_getaffinity(0))}
 report={'status':'running','calls':[]};d=None
 try:
-    d=h.Display(str(tree),['--agent-scope','observe',*(['--runtime-agent',str(a.agent.resolve())] if a.agent else []),'--',str(root/'zig-out/bin/xodb-m1-fixture'),'w'])
+    d=h.Display(str(tree),['--agent-scope','observe',*(['--runtime-agent',str(a.agent.resolve())] if a.agent else []),'--',str(slab)])
     state=d.wait(lambda s:s['state']=='stopped' and not s.get('symbol_discovery_pending'));assert state
     d.keys('tap',50)  # Human opens Memory; the GUI captures its own stack page.
     deadline=time.monotonic()+20;baseline=None
@@ -46,18 +49,27 @@ try:
     # generation and would make an already-running search stale.
     d.keys('tap',66);state=d.wait(lambda s:s['agent_scope']=='observe');assert state
     before=d.tool('get_registers',tid=state['pid']);generation=state['generation']
-    # Maximum bounded range and an unlikely multi-byte pattern keep the job
-    # running across the actual cancellation attempt; no sample-rate guess.
+    # The job must still be running across the actual cancellation attempt.
+    # A mostly unmapped range finishes in well under a second, so search the
+    # fixture's 1 GiB readable .bss at the maximum length, with a pattern
+    # (31 zero bytes, then 01) that zeros keep almost matching: a byte-by-byte
+    # scan that takes seconds, never a hit. No sample-rate guess.
+    hex_keys={**{str(n):2+(n-1)%10 for n in range(10)},'a':30,'b':48,'c':46,'d':32,'e':18,'f':33,'x':45}
+    d.keys('tap',34,*[part for c in hex(slab_address) for part in ('tap',hex_keys[c])],'tap',28) # G 0x<slab> Return
     d.keys('tap',38,'tap',2,'tap',11,'tap',8,'tap',4,'tap',8,'tap',5,'tap',2,'tap',9,'tap',3,'tap',5,'tap',28) # L 1073741824 Return
-    pattern_keys=[part for _ in range(16) for part in ('tap',30,'tap',48)]
-    d.keys('tap',53,*pattern_keys,'tap',28) # / ababab... Return
-    search=None
-    for ident in range(1,9):
-        reply=call('get_memory_search',id=ident)
-        if not error(reply):search=reply['structuredContent'];break
+    pattern_keys=[part for _ in range(31) for part in ('tap',11,'tap',11)]
+    d.keys('tap',53,*pattern_keys,'tap',11,'tap',2,'tap',28) # / 0000...0001 Return
+    # The owner starts the search after it receives Return: wait for it.
+    search=None;deadline=time.monotonic()+20
+    while search is None and time.monotonic()<deadline:
+        for ident in range(1,9):
+            reply=call('get_memory_search',id=ident)
+            if not error(reply):search=reply['structuredContent'];break
+        else:time.sleep(.05)
+    if search is None:d.shot('human-search-missing')
     assert search is not None,'human GUI search was not observed'
     report['human_search']=search
-    assert search['state']=='running' and search['length']==1073741824,search
+    assert search['state']=='running' and search['length']==1073741824 and int(search['ranges'][0]['address'],16)==slab_address and search['unreadable']==0,search
     cancellation=call('cancel_memory_search',id=search['id']);report['cancel_reply']=cancellation
     report['search_after']=call('get_memory_search',id=search['id'])
     # Both sides must observe this same job running. A completed or stale

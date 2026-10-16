@@ -257,6 +257,7 @@ try:
     stack_pieces = [piece for piece in stack_parameter.get("pieces", ()) if piece.get("storage") == "stack"]
     stack_entry = link_address(storage_image, "qx_stack")
     assert stack_pieces and all(isinstance(piece.get("cfa_offset"), int) for piece in stack_pieces), stack_parameter
+    assert stack_parameter.get("stack_parameter_verified") is True, stack_parameter
     assert int(stack_parameter["valid_start"], 16) == stack_entry < int(stack_parameter["valid_end"], 16), stack_parameter
 
     split_reply, split_payload = exchange({"id": "split-variables", "verb": "decompile", "path": str(storage_image),
@@ -269,13 +270,49 @@ try:
     split_offsets = {piece.get("register"): piece.get("value_bit_offset")
                      for piece in split_parameter.get("pieces", ()) if piece.get("storage") == "register"}
     assert split_offsets == {"RDI": 0, "RSI": 64}, split_parameter
+    assert split_parameter.get("padding") == [{"offset": 12, "size": 4}], split_parameter
+
+    # Ghidra's decompiler assigns this x86-64 __int128 parameter to caller
+    # stack memory even though the ABI puts it in RDI:RSI, and then gives
+    # RDI to the next argument. Both rows must be empty: Ghidra's prototype
+    # model repeats the mistake, so only the producer's own ABI can check it.
+    wide_reply, wide_payload = exchange({"id": "wide-variables", "verb": "decompile", "path": str(storage_image),
+        "sha256": storage_sha, "entry": hex(link_address(storage_image, "qx_wide")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    wide_reply, wide_payload = wait_work(wide_reply)
+    assert wide_reply.get("state") == "ready" and wide_payload, wide_reply
+    wide_variables = json.loads(wide_payload)["variables"]
+    wide_parameter = next(row for row in wide_variables if row.get("name") == "wide")
+    assert any(piece.get("storage") == "stack" for piece in wide_parameter.get("pieces", ())), wide_parameter
+    assert wide_parameter.get("stack_parameter_verified") is False, wide_parameter
+    assert wide_parameter["valid_start"] == wide_parameter["valid_end"], wide_parameter
+    after_parameter = next(row for row in wide_variables if row.get("name") == "after")
+    assert after_parameter["valid_start"] == after_parameter["valid_end"], after_parameter
+    # A _Complex double is in XMM0:XMM1, but Ghidra places it in RDI:RSI and
+    # its fifth and sixth integers on caller stack slots. All are refused.
+    complex_reply, complex_payload = exchange({"id": "complex-variables", "verb": "decompile", "path": str(storage_image),
+        "sha256": storage_sha, "entry": hex(link_address(storage_image, "qx_complex")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    complex_reply, complex_payload = wait_work(complex_reply)
+    assert complex_reply.get("state") == "ready" and complex_payload, complex_reply
+    complex_parameters = [row for row in json.loads(complex_payload)["variables"] if row.get("parameter")]
+    assert len(complex_parameters) == 7 and all(row["valid_start"] == row["valid_end"] for row in complex_parameters), complex_parameters
+    # Misplaced arguments that the code never reads: only the producer's type
+    # rules (complex name, vector array, possible 16-byte alignment) refuse.
+    for function, refused, kept in (("qx_cfloat", {"z", "a", "b"}, set()), ("qx_vector_arg", {"v", "a", "b"}, set()),
+                                    ("qx_aligned", {"s", "t"}, {"a", "g"})):
+        reply, payload = exchange({"id": f"{function}-variables", "verb": "decompile", "path": str(storage_image),
+            "sha256": storage_sha, "entry": hex(link_address(storage_image, function)), "size": "0x0", "options": "default", "deadline_ms": 10000})
+        reply, payload = wait_work(reply)
+        assert reply.get("state") == "ready" and payload, reply
+        rows = {row["name"]: row for row in json.loads(payload)["variables"] if row.get("parameter")}
+        assert all(rows[name]["valid_start"] == rows[name]["valid_end"] for name in refused), (function, rows)
+        assert all(rows[name]["valid_start"] != rows[name]["valid_end"] for name in kept), (function, rows)
 
     # Prove the exported storage against the stopped target, through the MCP
     # surface that users consume. qx_stack's seventh argument is on the stack;
     # qx_split's aggregate is divided between RDI (low) and RSI (high).
     client.p.stdin.close(); client.p.wait(timeout=10)
     for symbol, name, expected in (("qx_stack", "seventh", "0x7"),
-                                   ("qx_split", "pair", "0x90000000000000008")):
+                                   ("qx_split", "pair", "0x????????000000090000000000000008")):
         client = Client("control", str(storage_image))
         client.action("set_breakpoint", symbol=symbol)
         client.continue_initial_stop()
@@ -287,6 +324,16 @@ try:
         assert values.get(name) == expected, (symbol, expected, values, live)
         if symbol != "qx_split":
             client.p.stdin.close(); client.p.wait(timeout=10)
+
+    client.p.stdin.close(); client.p.wait(timeout=10)
+    client = Client("control", str(storage_image))
+    client.action("set_breakpoint", symbol="qx_wide")
+    client.continue_initial_stop()
+    stopped = client.stopped("breakpoint")
+    tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+    live = poll(client, "qx_wide", tid=tid, frame=0)
+    assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
+    assert not {"wide", "after"} & {row["name"] for row in live.get("live_values", ())}, live
 
     # Losing Ghidra's native decompiler child invalidates its pooled interface.
     # The request that encounters that death reopens the program and retries

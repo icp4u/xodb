@@ -42,7 +42,8 @@ for base in ('src', 'tests', 'scripts', 'tools', 'examples', 'packaging', 'docs'
             dest.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, dest)
             manifest[str(relative)] = hashlib.sha256(source.read_bytes()).hexdigest()
-for name in ('build.zig', 'build.zig.zon', 'README.md', 'LICENSE', 'SETUP.md'):
+# Every top-level build script: build.zig @imports its per-OS siblings.
+for name in sorted({path.name for path in root.glob('build*.zig')} | {'build.zig.zon', 'README.md', 'LICENSE', 'SETUP.md'}):
     if (root/name).is_file():
         shutil.copy2(root/name, tree/name)
         manifest[name] = hashlib.sha256((root/name).read_bytes()).hexdigest()

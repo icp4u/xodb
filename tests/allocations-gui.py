@@ -16,7 +16,7 @@ h.WORK=str(work)
 for name in ('tmp','cache','cache/mesa','cache/nvidia'):(work/name).mkdir(parents=True,exist_ok=True)
 tree=work/'tree';tree.mkdir()
 shutil.copytree(root/'src',tree/'src')
-shutil.copy2(root/'build.zig',tree/'build.zig')
+for build in root.glob('build*.zig'):shutil.copy2(build,tree/build.name)
 shutil.copy2(root/'tests/fixtures/allocations-preview.zig',tree/'src/allocation_preview.zig')
 def edit(path,changes):
     text=path.read_text()

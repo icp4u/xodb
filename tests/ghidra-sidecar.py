@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-PRODUCER = "ghidra-jvm-sidecar-0.1.7"
+PRODUCER = "ghidra-jvm-sidecar-0.1.8"
 CAPS = ["prime", "open_image", "decompile", "cancel", "status", "shutdown", "hints", "xsg", "pseudocode"]
 
 
@@ -518,7 +518,7 @@ for _ in range(40):  # about one second of owner polls with the target stopped
     time.sleep(.025)
 close(value)
 diagnostics = value.p.stderr.read().decode()
-line = "running sidecar is 0.1.0, this xodb needs 0.1.7"
+line = "running sidecar is 0.1.0, this xodb needs 0.1.8"
 logged = [json.loads(entry) for entry in (case / "requests").read_text().splitlines()] if (case / "requests").exists() else []
 hellos = [entry for entry in logged if entry.get("verb") == "hello"]
 record("an incompatible sidecar is not asked again on every owner poll", len(hellos) <= 4, len(hellos))

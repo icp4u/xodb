@@ -47,6 +47,17 @@ pub const Recorder = struct {
         defer arena.deinit();
         return sockets.encode(a, try redacted(arena.allocator(), ctx, p));
     }
+    pub fn encodeUsb(self: *const Recorder, a: std.mem.Allocator, policy: ?*const redact.Policy) ![]u8 {
+        const ctx = sockets.Context{ .capture_started_ns = self.started_ns, .pid = self.pid, .pairs = self.pairs[0..self.pair_count], .tables = self.tables[0..self.table_count] };
+        const p = policy orelse return sockets.encodeUsb(a, ctx);
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        return sockets.encodeUsb(a, try redacted(arena.allocator(), ctx, p));
+    }
+    pub fn hasUsb(self: *const Recorder) bool {
+        for (self.tables[0..self.table_count]) |table| if (table.usb_fds.len != 0) return true;
+        return false;
+    }
 };
 
 /// A copy of `ctx` for a shared archive: addresses outside loopback and the

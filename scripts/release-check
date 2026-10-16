@@ -357,7 +357,9 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             if arm64_sidecar:
                 ssh, agent, fixture = arm64_sidecar
                 steps.append(('ghidra-sidecar-arm64', [sys.executable, '-B', 'tests/ghidra-sidecar-arm64.py',
-                              '--ssh', ssh, '--agent', agent, '--fixture', fixture], 300))
+                              '--ssh', ssh, '--agent', agent, '--fixture', fixture,
+                              '--expected-value', 'count=0x1', '--expected-value', 'size=0x8',
+                              '--expected-value', 'flag=false'], 300))
         steps.append(('pe-unwind-fuzz', [sys.executable, '-B', 'tests/pe-unwind.py',
                       '--work', '.work/pe-unwind-fuzz', '--fuzz'], 90))
         steps.append(('pe-job', [sys.executable, '-B', 'tests/pe-job.py',

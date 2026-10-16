@@ -158,7 +158,7 @@ does and does not protect against:
 [language views and hostile targets](GUIDE.md#language-views-and-hostile-targets).
 
 `decompiler.prestart` defaults to `true`. With a configured Ghidra sidecar,
-xodb starts it during launch, primes the target architecture, and imports
+xodb starts it during launch (the GUI waits for its first frame), primes the target architecture, and imports
 mapped executable images in the background. Set it to `false`, or pass
 `--no-ghidra-prestart`, to retain on-demand startup. `XODB_GHIDRA_SIDECAR=off`
 disables the sidecar regardless of this preference.

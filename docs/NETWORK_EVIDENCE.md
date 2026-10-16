@@ -239,13 +239,16 @@ refused. `--redact` also refuses every `include_raw` request, including packet
 bytes and decrypted content, and withholds private hashes, HTTP method/target,
 DNS names, mitmproxy headers and URL fields.
 
-## Archive storage (format 2.9)
+## Archive storage (format 2.10)
 
 Local captures write an optional, ignorable `ECTX` section after the others and
 set minor version 9; captures without it keep their previous minor. Older
 readers skip the section and stay correct. See
 [M2_ARCHIVE_FORMAT.md](M2_ARCHIVE_FORMAT.md#evidence-context-ectx-29). The pcap
 file itself is not copied into the archive in X1: keep it beside the `.xoc`.
+USB fd rows use a separate optional `EUSB` section at minor 10. Keeping ECTX
+at schema 1 or 2 lets 2.9 readers retain network alignment and socket joins
+while ignoring USB correlation data they do not understand.
 
 ## Limits
 

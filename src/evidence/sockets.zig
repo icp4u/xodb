@@ -286,10 +286,12 @@ fn slack(ctx: *const Context) u64 {
 pub const schema: u8 = 1;
 /// Schema 2: redacted; each socket carries a byte saying which ends are tags.
 pub const schema_redacted: u8 = 2;
-/// Schemas 3/4 append numeric USB device descriptors to each table. The
-/// legacy schemas remain the default when no table contains such a descriptor.
+/// Schemas 3/4 were briefly used to append USB descriptor rows to ECTX.
+/// Decoders retain them for compatibility, but archives now put those rows in
+/// a separate ignorable EUSB section so 2.9 readers can still decode ECTX.
 pub const schema_usb: u8 = 3;
 pub const schema_usb_redacted: u8 = 4;
+pub const usb_schema: u8 = 1;
 
 /// An address for display: a tag prints as ip-XXXXXXXX (its first 4 bytes).
 pub fn formatEnd(buf: *[64]u8, family: decode.Family, addr: [16]u8, tagged: bool) []const u8 {
@@ -309,12 +311,7 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try o.appendSlice(al, &buf);
         }
     };
-    var has_usb = false;
-    for (ctx.tables) |table| has_usb = has_usb or table.usb_fds.len != 0;
-    const version: u8 = if (has_usb)
-        (if (ctx.redacted) schema_usb_redacted else schema_usb)
-    else
-        (if (ctx.redacted) schema_redacted else schema);
+    const version: u8 = if (ctx.redacted) schema_redacted else schema;
     try out.append(a, version);
     try W.int(&out, a, u64, ctx.capture_started_ns);
     try W.int(&out, a, i32, ctx.pid);
@@ -346,14 +343,33 @@ pub fn encode(a: std.mem.Allocator, ctx: Context) ![]u8 {
             try out.append(a, s.state);
             if (ctx.redacted) try out.append(a, @as(u8, @intFromBool(s.local_tagged)) | @as(u8, @intFromBool(s.remote_tagged)) << 1);
         }
-        if (has_usb) {
-            try W.int(&out, a, u32, @intCast(t.usb_fds.len));
-            for (t.usb_fds) |fd| {
-                try W.int(&out, a, i32, fd.pid);
-                try W.int(&out, a, i32, fd.fd);
-                try W.int(&out, a, u16, fd.bus);
-                try W.int(&out, a, u16, fd.device);
-            }
+    }
+    return out.toOwnedSlice(a);
+}
+
+/// USB descriptor rows for archive section EUSB. Table identity and all
+/// non-USB fields remain in ECTX; the table count binds the two payloads.
+pub fn encodeUsb(a: std.mem.Allocator, ctx: Context) ![]u8 {
+    if (ctx.tables.len > max_tables) return error.EvidenceContextLimit;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    const W = struct {
+        fn int(o: *std.ArrayList(u8), al: std.mem.Allocator, comptime T: type, v: T) !void {
+            var buf: [@sizeOf(T)]u8 = undefined;
+            std.mem.writeInt(T, &buf, v, .little);
+            try o.appendSlice(al, &buf);
+        }
+    };
+    try out.append(a, usb_schema);
+    try out.append(a, @intCast(ctx.tables.len));
+    for (ctx.tables) |table| {
+        if (table.usb_fds.len > max_usb_fds) return error.EvidenceContextLimit;
+        try W.int(&out, a, u32, @intCast(table.usb_fds.len));
+        for (table.usb_fds) |fd| {
+            try W.int(&out, a, i32, fd.pid);
+            try W.int(&out, a, i32, fd.fd);
+            try W.int(&out, a, u16, fd.bus);
+            try W.int(&out, a, u16, fd.device);
         }
     }
     return out.toOwnedSlice(a);
@@ -428,6 +444,27 @@ pub fn decodeContext(a: std.mem.Allocator, bytes: []const u8) !Context {
     if (r.left() != 0) return error.EvidenceContextTrailingBytes;
     return .{ .capture_started_ns = started, .pid = pid, .pairs = pairs, .tables = tables, .redacted = is_redacted };
 }
+
+/// Decodes ECTX and, when present, attaches its optional EUSB rows.
+pub fn decodeContextWithUsb(a: std.mem.Allocator, bytes: []const u8, usb_bytes: ?[]const u8) !Context {
+    const ctx = try decodeContext(a, bytes);
+    const payload = usb_bytes orelse return ctx;
+    if (payload.len > max_bytes) return error.EvidenceContextLimit;
+    var r = Reader{ .bytes = payload };
+    if (try r.byte() != usb_schema) return error.EvidenceContextSchema;
+    const count = try r.byte();
+    if (count != ctx.tables.len) return error.EvidenceContextValue;
+    const tables: []Table = @constCast(ctx.tables);
+    for (tables) |*table| {
+        const n = try r.int(u32);
+        if (n > max_usb_fds or n * 12 > r.left()) return error.EvidenceContextLimit;
+        const fds = try a.alloc(UsbFd, n);
+        for (fds) |*fd| fd.* = .{ .pid = try r.int(i32), .fd = try r.int(i32), .bus = try r.int(u16), .device = try r.int(u16) };
+        table.usb_fds = fds;
+    }
+    if (r.left() != 0) return error.EvidenceContextTrailingBytes;
+    return ctx;
+}
 const Reader = struct {
     bytes: []const u8,
     at: usize = 0,
@@ -483,7 +520,7 @@ test "proc net tables parse both families" {
     try std.testing.expect(usbDevicePath("/dev/hidraw0") == null);
 }
 
-test "USB descriptors extend ECTX and join only when sampled" {
+test "USB descriptors use an optional extension and join only when sampled" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -497,8 +534,12 @@ test "USB descriptors extend ECTX and join only when sampled" {
     const ctx = Context{ .capture_started_ns = 1_000, .pid = 17, .pairs = &.{.{ .monotonic_before_ns = 10, .realtime_ns = 100, .monotonic_after_ns = 12 }}, .tables = &tables };
     const bytes = try encode(a, ctx);
     defer a.free(bytes);
-    try std.testing.expectEqual(schema_usb, bytes[0]);
-    const back = try decodeContext(arena.allocator(), bytes);
+    try std.testing.expectEqual(schema, bytes[0]);
+    const usb_bytes = try encodeUsb(a, ctx);
+    defer a.free(usb_bytes);
+    const legacy = try decodeContext(arena.allocator(), bytes);
+    try std.testing.expectEqual(@as(usize, 0), legacy.tables[0].usb_fds.len);
+    const back = try decodeContextWithUsb(arena.allocator(), bytes, usb_bytes);
     try std.testing.expectEqual(@as(usize, 1), back.tables[0].usb_fds.len);
     try std.testing.expectEqual(@as(i32, 9), back.tables[0].usb_fds[0].fd);
     const bracketed = correlateUsb(&back, 3, 5, 3_000);

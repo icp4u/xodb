@@ -22,7 +22,7 @@ const Value = std.json.Value;
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 const protocol = 1;
 const schema = 1;
-pub const producer = "ghidra-jvm-sidecar-0.1.7";
+pub const producer = "ghidra-jvm-sidecar-0.1.8";
 const max_line = 1 << 20;
 const max_payload = 64 << 20;
 var reported_unreplaceable = std.atomic.Value(bool).init(false);

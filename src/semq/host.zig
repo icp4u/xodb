@@ -118,6 +118,10 @@ pub const PseudoPiece = struct {
     register_bit_offset: u8 = 0,
     cfa_offset: ?i64 = null,
 };
+pub const PseudoPadding = struct {
+    offset: u8,
+    size: u8,
+};
 pub const PseudoVariable = struct {
     name: []const u8,
     type_name: []const u8,
@@ -129,7 +133,9 @@ pub const PseudoVariable = struct {
     storage_offset: ?u64,
     valid_start: ?u64,
     valid_end: ?u64,
+    stack_parameter_verified: bool = false,
     pieces: []const PseudoPiece = &.{},
+    padding: []const PseudoPadding = &.{},
 };
 pub const PseudoDocument = struct {
     language: []const u8 = "c",
@@ -595,6 +601,14 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
                 .cfa_offset = number(piece, "cfa_offset"),
             });
         };
+        var padding: std.ArrayList(PseudoPadding) = .empty;
+        if (variable == .object) if (variable.object.get("padding")) |padding_list| if (padding_list == .array) for (padding_list.array.items) |range| {
+            const offset = number(range, "offset") orelse continue;
+            const range_size = number(range, "size") orelse continue;
+            if (offset < 0 or offset > 31 or range_size <= 0 or range_size > 32) continue;
+            try padding.append(a, .{ .offset = @intCast(offset), .size = @intCast(range_size) });
+        };
+        const stack_parameter_verified = if (variable == .object) if (variable.object.get("stack_parameter_verified")) |value| value == .bool and value.bool else false else false;
         try variables.append(a, .{
             .name = try a.dupe(u8, str(variable, "name") orelse ""),
             .type_name = try a.dupe(u8, str(variable, "type") orelse ""),
@@ -606,7 +620,9 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
             .storage_offset = hexField(variable, "storage_offset"),
             .valid_start = hexField(variable, "valid_start"),
             .valid_end = hexField(variable, "valid_end"),
+            .stack_parameter_verified = stack_parameter_verified,
             .pieces = pieces.items,
+            .padding = padding.items,
         });
     };
     var pad_mapping: ?EntryPadMapping = null;
@@ -1432,6 +1448,14 @@ pub const State = struct {
         }
         if (size == 0) return error.FunctionBoundsUnavailable;
         if (size > max_function_bytes) return error.FunctionTooLarge;
+        if (module.explicit_gdb) {
+            const count: usize = @intCast(@min(size, 64));
+            const offset = module.image.fileOffset(entry) orelse return error.GdbExecutableMismatch;
+            if (offset > module.mapping.len or count > module.mapping.len - @as(usize, @intCast(offset))) return error.GdbExecutableMismatch;
+            var memory: [64]u8 = undefined;
+            if (try session.target.readMemory(try module.runtimeAddress(entry), memory[0..count]) != count or
+                !std.mem.eql(u8, memory[0..count], module.mapping[@intCast(offset)..][0..count])) return error.GdbExecutableMismatch;
+        }
         const build_id = if (module.image.buildId()) |id| try hexAlloc(a, id) else null;
         return .{ .key = .{ .image_sha256 = self.identity(module), .entry = entry, .size = size }, .name = name, .module_id = module.id, .module_path = module.path, .bias = module.bias, .bounds_source = source, .build_id = build_id };
     }
