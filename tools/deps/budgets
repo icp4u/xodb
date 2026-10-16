@@ -2,5 +2,5 @@
 # Exceeding a limit fails scripts/deps check; being under it prints the lower
 # number to write here, in the same diff that earned it.
 src/model/session.zig     96   # the session hub (review 1.3)
-src/target/linux.zig      57   # live target backend: handles stay with their owner
+src/target/linux.zig      56   # live target backend: handles stay with their owner
 src/target/runtime.zig    44

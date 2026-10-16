@@ -77,9 +77,9 @@ reassembler used for HTTP/1 and DNS-over-TCP. Each derived record names
 its flow, direction, TLS version, cipher, epoch, sequence number, source packet
 and source timestamp. AEAD authentication failure is retained as
 `authentication_failed`; missing secrets, unsupported suites, incomplete
-handshakes and reassembly gaps are explicit session states. If one direction
-ends at a malformed TLS record after useful records were decoded, the session
-state is `partial` and `malformed_directions` says how many directions stopped.
+handshakes and reassembly gaps are explicit session states. If either direction
+ends at a malformed TLS record, the session state is `partial` even when no
+record authenticated; `malformed_directions` says how many directions stopped.
 
 For TLS 1.3, a key log containing only application traffic secrets is not
 enough. The encrypted handshake records fail authentication and consume the
@@ -90,11 +90,11 @@ The capture must contain the ClientHello and ServerHello and contiguous TCP
 bytes from the beginning of each TLS direction. This slice does not decrypt
 TLS 1.3 0-RTT data, post-`KeyUpdate` traffic, CBC suites, DTLS, QUIC or
 mid-stream captures. Reassembly and retained plaintext are each capped at 64
-MiB; a TLS record is capped at 18,432 bytes, derived output at 4,194,304
-records, and a key log at 16 MiB/16,384 recognized entries. Crossing the
-derived-record cap fails the open with `TlsRecordLimit`. Plaintext beyond the
-retention cap keeps its authenticated length and SHA-256 with
-`retained=false` for the opener.
+MiB; a TLS record is capped at 18,432 bytes, derived output at 262,144 records,
+and a key log at 16 MiB/16,384 recognized entries. At the derived-record cap,
+the affected session is `partial`, `derived_record_limit_hit` is true, and the
+packet stream remains available. Plaintext beyond the retention cap keeps its
+authenticated length and SHA-256 with `retained=false` for the opener.
 
 ## mitmproxy flow import
 

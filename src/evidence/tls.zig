@@ -12,7 +12,7 @@ pub const max_keylog_entries = 16_384;
 pub const max_reassembled_bytes = 64 * 1024 * 1024;
 pub const max_plaintext_bytes = 64 * 1024 * 1024;
 pub const max_record_bytes = 18_432;
-pub const max_derived_records = 4 * 1024 * 1024;
+pub const max_derived_records = 256 * 1024;
 
 pub const Version = enum { tls12, tls13 };
 pub const Direction = enum { client_to_server, server_to_client };
@@ -74,6 +74,7 @@ pub const Stream = struct {
     malformed_records: u64 = 0,
     reassembly_gaps: u64 = 0,
     keylog_entries: u32 = 0,
+    derived_limit_hit: bool = false,
 
     /// `keylog` is always wiped before this function returns. The caller still
     /// owns and must free its allocation.
@@ -94,7 +95,11 @@ pub const Stream = struct {
         var secrets = try KeyLog.parse(a, keylog);
         defer secrets.deinit(a);
         self.keylog_entries = @intCast(secrets.entries.items.len);
+        // Records use the backing allocator so ArrayList growth releases old
+        // buffers. Arena-backed growth retained every prior buffer and made a
+        // cap-sized stream consume close to 2 GiB.
         var records: std.ArrayList(Record) = .empty;
+        errdefer records.deinit(a);
         var sessions: std.ArrayList(Session) = .empty;
         errdefer for (records.items) |record| if (record.plaintext.len != 0) std.crypto.secureZero(u8, record.plaintext);
         // Bucket packet records by flow once; scanning every record per flow
@@ -161,8 +166,14 @@ pub const Stream = struct {
                         continue;
                     };
                     defer sk.wipe();
-                    try decrypt13(self, arena, &records, flow_id, .client_to_server, client_records, &ck, source, &summary);
-                    try decrypt13(self, arena, &records, flow_id, .server_to_client, server_records, &sk, source, &summary);
+                    decrypt13(self, a, arena, &records, flow_id, .client_to_server, client_records, &ck, source, &summary) catch |err| switch (err) {
+                        error.TlsRecordLimit => self.derived_limit_hit = true,
+                        else => return err,
+                    };
+                    if (!self.derived_limit_hit) decrypt13(self, a, arena, &records, flow_id, .server_to_client, server_records, &sk, source, &summary) catch |err| switch (err) {
+                        error.TlsRecordLimit => self.derived_limit_hit = true,
+                        else => return err,
+                    };
                 },
                 .tls12 => {
                     const master = secrets.find(.client_random, hello.client_random) orelse {
@@ -177,18 +188,25 @@ pub const Stream = struct {
                     }
                     var keys = derive12(cipher, master, hello.client_random, hello.server_random);
                     defer keys.wipe();
-                    try decrypt12(self, arena, &records, flow_id, .client_to_server, client_records, &keys.client, source, &summary);
-                    try decrypt12(self, arena, &records, flow_id, .server_to_client, server_records, &keys.server, source, &summary);
+                    decrypt12(self, a, arena, &records, flow_id, .client_to_server, client_records, &keys.client, source, &summary) catch |err| switch (err) {
+                        error.TlsRecordLimit => self.derived_limit_hit = true,
+                        else => return err,
+                    };
+                    if (!self.derived_limit_hit) decrypt12(self, a, arena, &records, flow_id, .server_to_client, server_records, &keys.server, source, &summary) catch |err| switch (err) {
+                        error.TlsRecordLimit => self.derived_limit_hit = true,
+                        else => return err,
+                    };
                 },
             }
-            if (summary.state == .decrypted and summary.malformed_directions != 0) summary.state = .partial;
+            if (summary.state == .decrypted and (summary.malformed_directions != 0 or self.derived_limit_hit)) summary.state = .partial;
             if (reassembled.incomplete()) {
                 self.reassembly_gaps += 1;
-                if (summary.records == 0) summary.state = .reassembly_gap;
+                if (summary.records == 0 and summary.malformed_directions == 0 and !self.derived_limit_hit) summary.state = .reassembly_gap;
             }
             try sessions.append(arena, summary);
+            if (self.derived_limit_hit) break;
         }
-        self.records = records.items;
+        self.records = try records.toOwnedSlice(a);
         self.sessions = sessions.items;
         return self;
     }
@@ -196,6 +214,8 @@ pub const Stream = struct {
     pub fn destroy(self: *Stream) void {
         const a = self.backing;
         for (self.records) |record| if (record.plaintext.len != 0) std.crypto.secureZero(u8, record.plaintext);
+        std.crypto.secureZero(u8, std.mem.sliceAsBytes(self.records));
+        a.free(self.records);
         self.arena.deinit();
         a.destroy(self);
     }
@@ -447,7 +467,7 @@ fn nonceFor(iv: *const [12]u8, sequence: u64) [12]u8 {
     return nonce;
 }
 
-fn decrypt13(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, keys: *const Traffic13, source: *const network.Stream, summary: *Session) !void {
+fn decrypt13(stream: *Stream, record_a: std.mem.Allocator, storage_a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, keys: *const Traffic13, source: *const network.Stream, summary: *Session) !void {
     const cipher = if (keys.application) |*key| key.cipher else keys.handshake.?.cipher;
     var epoch: Epoch = if (keys.handshake != null) .handshake else .application;
     var handshake_seq: u64 = 0;
@@ -476,20 +496,20 @@ fn decrypt13(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
         };
         if (used_epoch == .handshake) handshake_seq +%= 1 else application_seq +%= 1;
         if (!ok) {
+            try appendFailure(record_a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             summary.authentication_failures += 1;
-            try appendFailure(a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             continue;
         }
         var end = plaintext.len;
         while (end > 0 and plaintext[end - 1] == 0) end -= 1;
         if (end == 0) {
+            try appendFailure(record_a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             summary.authentication_failures += 1;
-            try appendFailure(a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, source);
             continue;
         }
         const content_type = plaintext[end - 1];
         const content = plaintext[0 .. end - 1];
-        try appendPlain(stream, a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, content_type, content, source, summary);
+        try appendPlain(stream, record_a, storage_a, out, flow_id, direction, record, .tls13, cipher, used_epoch, sequence, content_type, content, source, summary);
     }
 }
 
@@ -576,7 +596,7 @@ fn pHash(comptime Hmac: type, out: []u8, secret: []const u8, seed_parts: []const
     std.crypto.secureZero(u8, &a_value);
 }
 
-fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, key: *const Key, source: *const network.Stream, summary: *Session) !void {
+fn decrypt12(stream: *Stream, record_a: std.mem.Allocator, storage_a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, records: []const RawRecord, key: *const Key, source: *const network.Stream, summary: *Session) !void {
     var encrypted = false;
     var sequence: u64 = 0;
     for (records) |record| {
@@ -588,8 +608,8 @@ fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
         if (!encrypted) continue;
         const overhead: usize = if (key.cipher == .chacha20_poly1305_sha256) 16 else 24;
         if (record.payload.len < overhead) {
+            try appendFailure(record_a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, source);
             summary.authentication_failures += 1;
-            try appendFailure(a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, source);
             sequence +%= 1;
             continue;
         }
@@ -600,12 +620,12 @@ fn decrypt12(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record),
         }
         const ok = decrypt12Record(key, sequence, record.header, record.payload, plaintext);
         if (!ok) {
+            try appendFailure(record_a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, source);
             summary.authentication_failures += 1;
-            try appendFailure(a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, source);
             sequence +%= 1;
             continue;
         }
-        try appendPlain(stream, a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, record.outer_type, plaintext, source, summary);
+        try appendPlain(stream, record_a, storage_a, out, flow_id, direction, record, .tls12, key.cipher, .application, sequence, record.outer_type, plaintext, source, summary);
         sequence +%= 1;
     }
 }
@@ -643,16 +663,19 @@ fn appendFailure(a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32
     try appendDerived(a, out, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .state = .authentication_failed }, max_derived_records);
 }
 
-fn appendPlain(stream: *Stream, a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, raw: RawRecord, version: Version, cipher: Cipher, epoch: Epoch, sequence: u64, content_type: u8, plaintext: []const u8, source: *const network.Stream, summary: *Session) !void {
+fn appendPlain(stream: *Stream, record_a: std.mem.Allocator, storage_a: std.mem.Allocator, out: *std.ArrayList(Record), flow_id: u32, direction: Direction, raw: RawRecord, version: Version, cipher: Cipher, epoch: Epoch, sequence: u64, content_type: u8, plaintext: []const u8, source: *const network.Stream, summary: *Session) !void {
     if (out.items.len >= max_derived_records) return error.TlsRecordLimit;
+    // Reserve before retaining plaintext so an allocation failure cannot leave
+    // an unreferenced secret in arena storage.
+    try out.ensureUnusedCapacity(record_a, 1);
     var hash: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(plaintext, &hash, .{});
     var copy: []u8 = &.{};
     if (stream.plaintext_bytes + plaintext.len <= max_plaintext_bytes) {
-        copy = try a.dupe(u8, plaintext);
+        copy = try storage_a.dupe(u8, plaintext);
         stream.plaintext_bytes += plaintext.len;
     } else stream.plaintext_dropped += plaintext.len;
-    try appendDerived(a, out, .{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .content_type = content_type, .state = .decrypted, .plaintext_length = @intCast(plaintext.len), .plaintext = copy, .plaintext_sha256 = hash }, max_derived_records);
+    out.appendAssumeCapacity(.{ .index = @intCast(out.items.len), .flow_id = flow_id, .direction = direction, .source_record = raw.source_record, .time_ns = timeOf(source, raw.source_record), .version = version, .cipher = cipher, .epoch = epoch, .sequence = sequence, .outer_type = raw.outer_type, .content_type = content_type, .state = .decrypted, .plaintext_length = @intCast(plaintext.len), .plaintext = copy, .plaintext_sha256 = hash });
     summary.records += 1;
 }
 

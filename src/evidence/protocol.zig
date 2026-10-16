@@ -96,8 +96,8 @@ pub const Stream = struct {
             if (flow.key.protocol == 6) {
                 var joined = try reassembly.reassemble(a, source, indices, flow.key, max_flow_bytes);
                 defer joined.deinit(a);
-                self.reassembly_gaps += @intFromBool(joined.a.gap) + @intFromBool(joined.b.gap);
-                self.reassembly_limits += @intFromBool(joined.a.limited) + @intFromBool(joined.b.limited);
+                self.reassembly_gaps += @as(u64, @intFromBool(joined.a.gap)) + @intFromBool(joined.b.gap);
+                self.reassembly_limits += @as(u64, @intFromBool(joined.a.limited)) + @intFromBool(joined.b.limited);
                 if (flow.key.src_port == 53 or flow.key.dst_port == 53) {
                     try self.dnsTcp(arena, &records, source, flow_id, .a_to_b, &joined.a);
                     try self.dnsTcp(arena, &records, source, flow_id, .b_to_a, &joined.b);

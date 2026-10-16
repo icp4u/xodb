@@ -88,7 +88,7 @@ pub const Server = struct {
     overview_shared: ?*overview.State = null,
     overview_only: bool = false,
     overview_capture: ?*const ?*Session = null,
-    private_access: @import("evidence.zig").PrivateAccess = .unavailable,
+    private_access: @import("evidence.zig").PrivateAccess = .init(.remote, false),
     pub fn overviewTick(self: *Server) !void {
         if (self.overview_shared == null) _ = try self.overview.tick(@import("../target/linux.zig").now(), 0, false);
     }
@@ -332,7 +332,7 @@ pub const Server = struct {
             .dbus_stream = root.dbus_stream,
             .mitm_stream = root.mitm_stream,
             .live_capture = root.live_capture,
-            .private = self.private_access,
+            .private = self.private_access.resolve(root.agent_scope == .observe),
         }, name, args);
         const process_id = try @import("profile.zig").number(args, "process_id", 1);
         const session = if (root.process_tree) |tree| (try tree.find(process_id)).session else if (process_id == root.process_id) root else return error.UnknownProcess;

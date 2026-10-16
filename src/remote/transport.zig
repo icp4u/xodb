@@ -1,6 +1,7 @@
 //! A single MCP byte stream. TCP never binds implicitly; SSH owns one child.
 const std = @import("std");
 const log = @import("../log.zig");
+const macos = @import("builtin").os.tag == .macos;
 pub const c = @cImport({
     @cUndef("_FORTIFY_SOURCE");
     @cDefine("_GNU_SOURCE", "1");
@@ -10,7 +11,7 @@ pub const c = @cImport({
     @cInclude("errno.h");
     @cInclude("poll.h");
     @cInclude("signal.h");
-    @cInclude("spawn.h");
+    if (!macos) @cInclude("spawn.h"); // Darwin Mach types stay in macos_process.c.
     @cInclude("sys/socket.h");
     @cInclude("sys/wait.h");
     @cInclude("arpa/inet.h");
@@ -20,6 +21,7 @@ pub const c = @cImport({
 extern "c" fn connect(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn bind(c_int, *const c.sockaddr, c.socklen_t) c_int;
 extern "c" fn accept4(c_int, ?*c.sockaddr, ?*c.socklen_t, c_int) c_int;
+extern "c" fn xodb_macos_spawn_ssh([*:null]const ?[*:0]const u8, c_int, c_int, *c.pid_t) c_int;
 const a = std.heap.page_allocator;
 pub fn now() u64 {
     var ts: c.timespec = undefined;
@@ -86,9 +88,13 @@ pub const Stream = struct {
     }
     pub fn tcp(endpoint: []const u8, cancel: *const std.atomic.Value(bool)) !Stream {
         var address = try Address.parse(endpoint);
-        const fd = c.socket(address.family, c.SOCK_STREAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
+        const fd = if (macos) c.socket(address.family, c.SOCK_STREAM, 0) else c.socket(address.family, c.SOCK_STREAM | c.SOCK_CLOEXEC | c.SOCK_NONBLOCK, 0);
         if (fd < 0) return error.RemoteSocketFailed;
         errdefer _ = c.close(fd);
+        if (macos) {
+            if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.RemoteSocketFailed;
+            try nonblock(fd);
+        }
         const connected = connect(fd, @ptrCast(&address.storage), address.len);
         if (connected < 0 and std.c._errno().* != c.EINPROGRESS) return error.RemoteConnectFailed;
         var p = c.pollfd{ .fd = fd, .events = c.POLLOUT, .revents = 0 };
@@ -113,10 +119,16 @@ pub const Stream = struct {
         defer a.free(host_z);
         const argv = [_:null]?[*:0]const u8{ "ssh", "-T", "-o", "BatchMode=yes", "-o", "ForwardAgent=no", "-o", "StrictHostKeyChecking=yes", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", host_z.ptr, command.ptr };
         var fds: [2]c_int = undefined;
-        if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &fds) < 0) return error.RemoteSocketFailed;
+        if (c.socketpair(c.AF_UNIX, if (macos) c.SOCK_STREAM else c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &fds) < 0) return error.RemoteSocketFailed;
         errdefer _ = c.close(fds[0]);
         defer _ = c.close(fds[1]);
         try nonblock(fds[0]);
+        if (macos) {
+            for (fds) |fd| if (c.fcntl(fd, c.F_SETFD, c.FD_CLOEXEC) < 0) return error.RemoteSocketFailed;
+            var stream = Stream{ .fd = fds[0] };
+            if (xodb_macos_spawn_ssh(&argv, fds[0], fds[1], &stream.child) != 0) return error.RemoteSpawnFailed;
+            return stream;
+        }
         var actions: c.posix_spawn_file_actions_t = undefined;
         if (c.posix_spawn_file_actions_init(&actions) != 0) return error.RemoteSpawnFailed;
         defer _ = c.posix_spawn_file_actions_destroy(&actions);
@@ -184,8 +196,8 @@ fn tuneTcp(fd: c_int) void {
     const timeout: c_int = 30000;
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_NODELAY, &yes, @sizeOf(c_int));
     _ = c.setsockopt(fd, c.SOL_SOCKET, c.SO_KEEPALIVE, &yes, @sizeOf(c_int));
-    _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_KEEPIDLE, &idle, @sizeOf(c_int));
+    _ = c.setsockopt(fd, c.IPPROTO_TCP, if (macos) c.TCP_KEEPALIVE else c.TCP_KEEPIDLE, &idle, @sizeOf(c_int));
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_KEEPINTVL, &interval, @sizeOf(c_int));
     _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_KEEPCNT, &count, @sizeOf(c_int));
-    _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_USER_TIMEOUT, &timeout, @sizeOf(c_int));
+    if (!macos) _ = c.setsockopt(fd, c.IPPROTO_TCP, c.TCP_USER_TIMEOUT, &timeout, @sizeOf(c_int));
 }

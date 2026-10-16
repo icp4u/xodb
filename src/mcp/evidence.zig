@@ -14,19 +14,12 @@ const Allocator = std.mem.Allocator;
 
 pub const Transport = enum { stdio, listen, session_socket, remote };
 
-/// Fixed when an MCP connection is created. Private evidence authorization is
-/// never reconstructed later from the session or tool path.
-pub const PrivateAccess = enum {
+pub const PrivateDecision = enum {
     allowed,
     unavailable,
     redacted,
 
-    pub fn init(transport: Transport, observer: bool, redact: bool) PrivateAccess {
-        if (redact) return .redacted;
-        return if (transport == .stdio and observer) .allowed else .unavailable;
-    }
-
-    fn payload(self: PrivateAccess, requested: bool) !bool {
+    fn payload(self: PrivateDecision, requested: bool) !bool {
         if (!requested) return false;
         return switch (self) {
             .allowed => true,
@@ -35,18 +28,36 @@ pub const PrivateAccess = enum {
         };
     }
 
-    fn permitsPrivateMetadata(self: PrivateAccess) bool {
+    fn permitsPrivateMetadata(self: PrivateDecision) bool {
         return self == .allowed;
     }
 };
 
-test "private evidence access is fixed per MCP transport" {
-    try std.testing.expectEqual(PrivateAccess.allowed, PrivateAccess.init(.stdio, true, false));
-    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.stdio, false, false).payload(true));
-    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.listen, true, false).payload(true));
-    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.session_socket, true, false).payload(true));
-    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.remote, true, false).payload(true));
-    try std.testing.expectError(error.RawPayloadRedacted, PrivateAccess.init(.stdio, true, true).payload(true));
+/// Connection-invariant inputs are captured once. Resolve the effective
+/// decision for each call so live scope changes revoke and restore access.
+pub const PrivateAccess = struct {
+    transport: Transport = .remote,
+    redact: bool = false,
+
+    pub fn init(transport: Transport, redact: bool) PrivateAccess {
+        return .{ .transport = transport, .redact = redact };
+    }
+
+    pub fn resolve(self: PrivateAccess, observer: bool) PrivateDecision {
+        if (self.redact) return .redacted;
+        return if (self.transport == .stdio and observer) .allowed else .unavailable;
+    }
+};
+
+test "private evidence access follows live scope for every MCP transport" {
+    const local = PrivateAccess.init(.stdio, false);
+    try std.testing.expectEqual(PrivateDecision.allowed, local.resolve(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, local.resolve(false).payload(true));
+    try std.testing.expectEqual(PrivateDecision.allowed, local.resolve(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.listen, false).resolve(true).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.session_socket, false).resolve(true).payload(true));
+    try std.testing.expectError(error.PrivateEvidenceUnavailable, PrivateAccess.init(.remote, false).resolve(true).payload(true));
+    try std.testing.expectError(error.RawPayloadRedacted, PrivateAccess.init(.stdio, true).resolve(true).payload(true));
 }
 
 pub fn handles(name: []const u8) bool {
@@ -86,7 +97,7 @@ pub const Access = struct {
     dbus_stream: ?*dbus.Stream,
     mitm_stream: ?*mitm.Stream,
     live_capture: ?*live_capture.Live,
-    private: PrivateAccess,
+    private: PrivateDecision,
 };
 
 fn stream(access: Access, args: Value) !*evidence.Stream {
@@ -161,12 +172,9 @@ pub fn call(a: Allocator, given: Access, name: []const u8, args: Value) !Value {
             }
             if (filter.protocol == null) return error.InvalidArguments;
         }
-        var include_raw = try boolean(args, "include_raw") orelse false;
-        // USB and D-Bus packet bytes are application evidence. The parent
-        // stream cannot be used to bypass the derived stream's access gate.
-        if (include_raw and privateLink(s)) include_raw = try payloadAllowed(access, true);
-        // Payload bytes cannot be redacted, only withheld.
-        if (include_raw and access.private == .redacted) return error.RawPayloadRedacted;
+        // Frames can contain cleartext application data even when no derived
+        // decoder recognizes it. All packet bytes use the private gate.
+        const include_raw = try payloadAllowed(access, try boolean(args, "include_raw") orelse false);
         const limit = try number(args, "limit") orelse 64;
         if (limit == 0 or limit > 256) return error.InvalidArguments;
         const start = try number(args, "start") orelse 0;
@@ -483,11 +491,6 @@ fn queryTls(a: Allocator, access: Access, s: *tls.Stream, args: Value) !Value {
     return value(a, .{ .stream_id = s.id, .records = Value{ .array = rows }, .next = next, .total_records = s.records.len });
 }
 
-fn privateLink(s: *const evidence.Stream) bool {
-    for (s.parsed.interfaces) |iface| if (iface.link_type == usb.link_usb_linux or iface.link_type == usb.link_usb_linux_mmapped or iface.link_type == dbus.link_dbus) return true;
-    return false;
-}
-
 fn queryUsb(a: Allocator, access: Access, s: *usb.Stream, args: Value) !Value {
     try fields(args, &.{ "stream_id", "view", "from_ns", "to_ns", "bus", "device", "endpoint", "event", "transfer_type", "undecoded", "include_raw", "start", "limit" });
     const include_data = try payloadAllowed(access, try boolean(args, "include_raw") orelse false);
@@ -583,7 +586,7 @@ fn inventoryOnly(args: Value) !void {
     for ([_][]const u8{ "from_ns", "to_ns", "bus", "device", "endpoint", "event", "transfer_type", "undecoded", "include_raw" }) |name| if (args.object.get(name) != null) return error.InvalidArguments;
 }
 
-fn usbRecord(a: Allocator, record_: usb.Record, private: PrivateAccess, include_data: bool) !Value {
+fn usbRecord(a: Allocator, record_: usb.Record, private: PrivateDecision, include_data: bool) !Value {
     const private_metadata = private.permitsPrivateMetadata();
     var descriptors = std.json.Array.init(a);
     for (record_.descriptors) |descriptor| try descriptors.append(try value(a, .{
@@ -686,7 +689,7 @@ fn optionalString(args: Value, name: []const u8) !?[]const u8 {
     return field.string;
 }
 
-fn dbusRecord(a: Allocator, stream_: *const dbus.Stream, index: usize, private: PrivateAccess, include_raw: bool) !Value {
+fn dbusRecord(a: Allocator, stream_: *const dbus.Stream, index: usize, private: PrivateDecision, include_raw: bool) !Value {
     const private_metadata = private.permitsPrivateMetadata();
     const record_ = stream_.records[index];
     var arguments = std.json.Array.init(a);
@@ -875,6 +878,7 @@ fn describeTls(a: Allocator, s: *tls.Stream) !Value {
         .malformed_records = s.malformed_records,
         .reassembly_gaps = s.reassembly_gaps,
         .derived_record_limit = tls.max_derived_records,
+        .derived_record_limit_hit = s.derived_limit_hit,
         .privacy = "plaintext and its SHA-256 require the direct observe-scope connection that opened the stream; unavailable to shared, network or remote peers and under redaction",
     });
 }

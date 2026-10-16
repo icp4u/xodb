@@ -19,7 +19,7 @@ pub const Endpoint = struct {
     overview_capture: ?*const ?*Session = null,
     owner_queue: ?*@import("../model/remote_owner.zig").Queue = null,
     owner_connection: u64 = 0,
-    private_access: @import("evidence.zig").PrivateAccess = .unavailable,
+    private_access: @import("evidence.zig").PrivateAccess = .init(.session_socket, false),
     pub fn queuedServer(self: *Endpoint, sequence: u64) ?*Server {
         for (self.clients) |slot| if (slot) |client| {
             if (client.server.pending_sequence == sequence) return client.server;
@@ -35,7 +35,7 @@ pub const Endpoint = struct {
             log.err(.mcp, "xodb: cannot open shared session socket {s}: errno={d}\n", .{ path, std.c._errno().* });
             return error.SessionSocketUnavailable;
         };
-        return .{ .service = service, .source_path = source, .private_access = .init(.session_socket, false, redact) };
+        return .{ .service = service, .source_path = source, .private_access = .init(.session_socket, redact) };
     }
     pub fn deinit(self: *Endpoint) void {
         for (&self.clients) |*slot| if (slot.*) |client| {

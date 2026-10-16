@@ -270,13 +270,12 @@ const Workspace = struct {
             target.* = @min(max_rows -| 1, if (scroll > 0) target.* + 3 else target.* -| 3);
         }
     }
-    fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, window: *Window, client: *remote.Client, label: []const u8) !void {
+    fn draw(self: *Workspace, r: *gpu.Renderer, font: *Font, window: *Window, facts: remote.Client.Facts, label: []const u8) !void {
         const width: f32 = @floatFromInt(window.width);
         const height: f32 = @floatFromInt(window.height);
         const all = gpu.Rect{ .x = 0, .y = 0, .w = width, .h = height };
         r.clip = all;
         try r.rect(all, theme.background);
-        const facts = client.facts();
         const live_view: ?wire.View = if (self.snapshot) |s| s.value else null;
         const view = self.displayView();
         const historical = self.last_stop != null;
@@ -433,11 +432,13 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     const client = try a.create(remote.Client);
     defer a.destroy(client);
     client.* = .{ .endpoint = endpoint };
-    try client.start();
     defer client.deinit();
+    // Window first so it appears before any transport work; it also goes away
+    // first, so a slow transport join never leaves an unpumped window mapped.
     var window = Window{ .scale_override = ui_scale };
     try window.init();
     defer window.deinit();
+    try client.start();
     var renderer = gpu.Renderer{};
     defer renderer.deinit();
     const font = try a.create(Font);
@@ -448,8 +449,9 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
     var workspace = Workspace{};
     defer workspace.deinit();
     var recovery = @import("../render/recovery.zig").Recovery{};
-    var rendered: u64 = 0;
-    var last_frame: u64 = 0;
+    var frames = Frames{ .renderer = &renderer, .font = font, .workspace = &workspace, .window = &window, .recovery = &recovery, .facts = client.facts(), .label = label, .started = startup_started, .limit = max_frames };
+    if (@hasDecl(Window, "setLiveResize")) window.setLiveResize(Frames.liveResize, &frames);
+    defer if (@hasDecl(Window, "setLiveResize")) window.setLiveResize(null, null);
     var old_state: remote.State = .connecting;
     var old_busy = true;
     while (!window.closing and quitting.* == 0) {
@@ -460,33 +462,63 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         workspace.input(&window, client);
         if (window.closing) break;
         const facts = client.facts();
+        frames.facts = facts;
         if (facts.state != old_state or facts.busy != old_busy) window.dirty = true;
         old_state = facts.state;
         old_busy = facts.busy;
         const now = transport.now();
-        if (now < recovery.retry_at or (!window.dirty and now -| last_frame < 250_000_000)) continue;
+        if (now < recovery.retry_at or (!window.dirty and now -| frames.last_frame < 250_000_000)) continue;
         if (!recovery.ready) {
             if (!try recovery.init(&renderer, &window, now)) continue;
             font.dirty = true;
         }
-        const presented = drawFrame(&renderer, font, &workspace, &window, client, label) catch |err| {
-            log.err(.runtime, "xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
-            recovery.lost(&renderer, now);
-            continue;
-        };
-        window.dirty = !presented;
-        if (!presented) continue;
-        if (rendered == 0) @import("../startup.zig").report(startup_started, false);
-        last_frame = now;
-        rendered += 1;
-        if (max_frames != 0 and rendered >= max_frames) break;
+        frames.present(now);
     }
-    log.info(.runtime, "xodb: remote GUI closing after {d} frames; closing transport\n", .{rendered});
+    log.info(.runtime, "xodb: remote GUI closing after {d} frames; closing transport\n", .{frames.rendered});
+    log.info(.window, "xodb: clean shutdown (reason={s})\n", .{if (quitting.* != 0) "signal" else if (max_frames != 0 and frames.rendered >= max_frames) "frame_limit" else @tagName(window.close_reason)});
 }
-fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, client: *remote.Client, label: []const u8) !bool {
+// All data here belongs to the UI thread. The nested AppKit resize loop redraws
+// this publication only: no client lock, input actions, target reads or pumping.
+const Frames = struct {
+    renderer: *gpu.Renderer,
+    font: *Font,
+    workspace: *Workspace,
+    window: *Window,
+    recovery: *@import("../render/recovery.zig").Recovery,
+    facts: remote.Client.Facts,
+    label: []const u8,
+    started: u64,
+    limit: u64,
+    rendered: u64 = 0,
+    last_frame: u64 = 0,
+    drawing: bool = false,
+    fn liveResize(context: ?*anyopaque) callconv(.c) void {
+        const self: *Frames = @ptrCast(@alignCast(context orelse return));
+        if (self.drawing or !self.recovery.ready) return;
+        if (@hasDecl(Window, "consumeEvents")) self.window.consumeEvents();
+        if (!self.window.closing) self.present(transport.now());
+    }
+    fn present(self: *Frames, now: u64) void {
+        if (self.drawing) return;
+        self.drawing = true;
+        defer self.drawing = false;
+        const presented = drawFrame(self.renderer, self.font, self.workspace, self.window, self.facts, self.label) catch |err| {
+            log.err(.runtime, "xodb: remote GUI frame failed: {s}\n", .{@errorName(err)});
+            self.recovery.lost(self.renderer, now);
+            return;
+        };
+        self.window.dirty = !presented;
+        if (!presented) return;
+        if (self.rendered == 0) @import("../startup.zig").report(self.started, false);
+        self.last_frame = now;
+        self.rendered += 1;
+        if (self.limit != 0 and self.rendered >= self.limit) self.window.closing = true;
+    }
+};
+fn drawFrame(r: *gpu.Renderer, font: *Font, workspace: *Workspace, window: *Window, facts: remote.Client.Facts, label: []const u8) !bool {
     _ = try font.setScale(window.scale());
     if (!try r.begin(window.width, window.height, window.scale())) return false;
-    try workspace.draw(r, font, window, client, label);
+    try workspace.draw(r, font, window, facts, label);
     return r.end(font);
 }
 

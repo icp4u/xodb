@@ -196,11 +196,11 @@ packets.sort(key=lambda row: row[0])
 
 
 def write_capture(path, rows):
-    pcapng = block(0x0a0d0d0a, struct.pack('<IHHq', 0x1a2b3c4d, 1, 0, -1))
-    pcapng += block(1, struct.pack('<HHI', 1, 0, 65535) + option(2, b'lo') + option(9, b'\x09') + option(0, b''))
+    pcapng = [block(0x0a0d0d0a, struct.pack('<IHHq', 0x1a2b3c4d, 1, 0, -1)),
+              block(1, struct.pack('<HHI', 1, 0, 65535) + option(2, b'lo') + option(9, b'\x09') + option(0, b''))]
     for when, packet in sorted(rows, key=lambda row: row[0]):
-        pcapng += block(6, struct.pack('<IIIII', 0, when >> 32, when & 0xffffffff, len(packet), len(packet)) + packet)
-    path.write_bytes(pcapng)
+        pcapng.append(block(6, struct.pack('<IIIII', 0, when >> 32, when & 0xffffffff, len(packet), len(packet)) + packet))
+    path.write_bytes(b''.join(pcapng))
 
 
 capture = work / 'owned-tls.pcapng'
@@ -219,6 +219,26 @@ write_capture(both_capture, partial_packets + [
     (max(row[0] for row in packets) + 2000,
      ethernet_tcp(partial['client_port'], partial['server_port'],
                   partial['client_final_seq'], partial['server_final_seq'] + 1, 0x18, b'\x17\x03\x03\xff\xff'))])
+
+# Enough small, invalid application records to reach the production cap. The
+# packet stream must still open and the affected TLS session must be partial.
+tls_derived_limit = 256 * 1024
+failure_record = b'\x17\x03\x03\x00\x10' + b'\0' * 16
+cap_packets = list(packets)
+cap_session = sessions[0]
+cap_seq = cap_session['client_final_seq']
+cap_when = max(row[0] for row in packets) + 10_000
+remaining = tls_derived_limit + 32
+while remaining:
+    count = min(2500, remaining)
+    payload = failure_record * count
+    cap_packets.append((cap_when, ethernet_tcp(cap_session['client_port'], cap_session['server_port'],
+                                               cap_seq, cap_session['server_final_seq'], 0x18, payload)))
+    cap_seq += len(payload)
+    cap_when += 1
+    remaining -= count
+cap_capture = work / 'owned-tls-record-cap.pcapng'
+write_capture(cap_capture, cap_packets)
 
 
 def close_and_check(client, private_values):
@@ -246,6 +266,8 @@ try:
     server_streams = [bytes(data) for (flow, direction), data in by_flow.items() if direction == 'server_to_client']
     assert all(any(session['request'] in data for data in client_streams) for session in sessions)
     assert all(any(session['response'] in data for data in server_streams) for session in sessions)
+    packets_with_bytes = observer.inspect('query_stream', stream_id=1, include_raw=True, limit=1)['records']
+    assert packets_with_bytes and packets_with_bytes[0]['raw_hex'], packets_with_bytes
 finally:
     close_and_check(observer, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
@@ -265,9 +287,41 @@ try:
 finally:
     close_and_check(both_client, [session['request'] for session in sessions] + [session['response'] for session in sessions])
 
+cap_client = Client('observe', None, options=['--open-pcap', str(cap_capture), '--tls-key-log', str(keylog)])
+try:
+    streams = cap_client.inspect('list_streams')['streams']
+    assert [stream['kind'] for stream in streams] == ['network', 'tls', 'protocol'], streams
+    tls_stream = streams[1]
+    assert tls_stream['records'] == tls_derived_limit and tls_stream['derived_record_limit_hit'], tls_stream
+    assert any(session['state'] == 'partial' for session in tls_stream['sessions']), tls_stream
+    counted = sum(session['records'] + session['authentication_failures'] for session in tls_stream['sessions'])
+    assert counted == tls_derived_limit, (counted, tls_stream['sessions'])
+    status =Path(f'/proc/{cap_client.p.pid}/status').read_text()
+    peak_kib = int(next(line.split()[1] for line in status.splitlines() if line.startswith('VmHWM:')))
+    assert peak_kib < 512 * 1024, peak_kib
+finally:
+    close_and_check(cap_client, [session['request'] for session in sessions] + [session['response'] for session in sessions])
+
+# One TCP flow with a gap in both directions: the protocol stream counts two
+# gaps instead of overflowing a u1 sum (a large flow hits the same path
+# through the per-direction byte limit).
+gaps_capture = work / 'owned-two-gaps.pcapng'
+write_capture(gaps_capture, [(1, ethernet_tcp(40000, 8080, 100, 200, 0x18, b'GET ')),
+                             (2, ethernet_tcp(8080, 40000, 200, 104, 0x18, b'HTTP')),
+                             (3, ethernet_tcp(40000, 8080, 120, 204, 0x18, b'x')),
+                             (4, ethernet_tcp(8080, 40000, 220, 121, 0x18, b'y'))])
+gaps_client = Client('observe', None, options=['--open-pcap', str(gaps_capture)])
+try:
+    protocol_stream = gaps_client.inspect('list_streams')['streams'][1]
+    assert protocol_stream['kind'] == 'protocol' and protocol_stream['reassembly_gaps'] == 2, protocol_stream
+finally:
+    close_and_check(gaps_client, [])
+
 controller = Client('control', None, options=['--open-pcap', str(capture), '--tls-key-log', str(keylog)])
 try:
     denied = controller.tool('query_stream', stream_id=2, include_raw=True)
+    assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
+    denied = controller.tool('query_stream', stream_id=1, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
     metadata = controller.inspect('query_stream', stream_id=2)['records']
     assert metadata and all(row['plaintext']['sha256'] is None for row in metadata), metadata
@@ -304,6 +358,8 @@ try:
         wire.flush()
         denied = remote_call(2, 'tools/call', {'name': 'query_stream', 'arguments': {'stream_id': 2, 'include_raw': True}})
         assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
+        denied = remote_call(4, 'tools/call', {'name': 'query_stream', 'arguments': {'stream_id': 1, 'include_raw': True}})
+        assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'PrivateEvidenceUnavailable', denied
         metadata = remote_call(3, 'tools/call', {'name': 'query_stream', 'arguments': {'stream_id': 2}})
         rows = metadata['result']['structuredContent']['records']
         assert rows and all(row['plaintext']['sha256'] is None for row in rows), metadata
@@ -339,6 +395,8 @@ try:
     assert [stream['kind'] for stream in shared_streams] == ['network', 'tls', 'protocol'], shared_streams
     denied = shared_peer.raw('query_stream', stream_id=2, include_raw=True)
     shared.expect_error(denied, 'PrivateEvidenceUnavailable')
+    denied = shared_peer.raw('query_stream', stream_id=1, include_raw=True)
+    shared.expect_error(denied, 'PrivateEvidenceUnavailable')
     metadata = shared_peer.tool('query_stream', stream_id=2, state='decrypted')['records']
     assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] is None for row in metadata)
 finally:
@@ -355,6 +413,8 @@ finally:
 redacted = Client('observe', None, options=['--redact', '--open-pcap', str(capture), '--tls-key-log', str(keylog)])
 try:
     denied = redacted.tool('query_stream', stream_id=2, include_raw=True)
+    assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'RawPayloadRedacted', denied
+    denied = redacted.tool('query_stream', stream_id=1, include_raw=True)
     assert denied['result']['isError'] and denied['result']['content'][0]['text'] == 'RawPayloadRedacted', denied
     metadata = redacted.inspect('query_stream', stream_id=2, state='decrypted')['records']
     assert metadata and all('plaintext_hex' not in row and row['plaintext']['sha256'] is None for row in metadata)

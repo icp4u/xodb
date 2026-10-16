@@ -253,7 +253,7 @@ class Steps(list):
         return self
 
 
-def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None):
+def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None, node=None, node_include='/usr/include/node', lua=(), python=None, padwalker=None, ruby=None, node_refusal=None, go=None, wine=None, emacs=None, moved=False, redot=None, macos_ssh=None, arm64_sidecar=None, macos=None):
     # moved: return the PERIODIC steps of this tier's host and gui lanes instead of the others.
     runtimes = (headless, optimize, uprobes, perl, node, node_include, lua, python, padwalker, ruby, node_refusal, go, wine, emacs)
     live = tier in ('host', 'all')
@@ -270,6 +270,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('build-tests', ['scripts/build', 'test', '--summary', 'all',
                   '-Dgui=' + str(not headless).lower(), '-Doptimize=' + optimize], 600,
                   dict(kind='build', needs=() if headless else ('headless-app',))))
+    if macos and not headless and tier in ('gui', 'all', 'periodic'):
+        steps.append(('macos-native', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos], 420))
     if not headless and tier in ('gui', 'all'):
         # The interface with no window system behind src/platform/window.zig: nothing else may name one.
         steps.append(('platform-null', ['scripts/build', 'app', '-Dplatform=null', '-Doptimize=' + optimize,
@@ -1209,7 +1211,7 @@ def registered_since(base, runtimes, redot=None):
 def snapshot(destination):
     # Copy tracked *working* contents, including local edits, but no ignored
     # caches, captures or untracked prototypes that could hide missing inputs.
-    names = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build.zig',
+    names = subprocess.check_output(['git', 'ls-files', '-z', '--', 'build.zig', 'build_macos.zig',
         'build.zig.zon', 'src', 'tests', 'scripts', 'tools', 'examples', 'packaging',
         'docs', 'config', 'README.md', 'LICENSE', 'SETUP.md'], cwd=ROOT).decode().split('\0')
     hashes = {}
@@ -1267,6 +1269,7 @@ def main(argv=None):
     parser.add_argument('--go', help='Include Go goroutine checks using this go toolchain (builds an owned fixture)')
     parser.add_argument('--redot', help='Include GDScript stack and value checks using this debug-enabled Redot or Godot 4 engine binary with DWARF')
     parser.add_argument('--macos-ssh', metavar='HOST', help='Include the live Apple debugserver test against this Mac, reached with ssh HOST (periodic tier; no default host)')
+    parser.add_argument('--macos', metavar='HOST', help='Opt-in native macOS build, Cocoa contract, bundle and offscreen presentation checks over SSH (gui/all/periodic; no on-screen windows)')
     parser.add_argument('--arm64-sidecar', nargs=3, metavar=('SSH', 'AGENT', 'FIXTURE'), help='Include the live arm64 Ghidra-sidecar test using an SSH destination and owned remote agent/fixture paths (periodic tier)')
     parser.add_argument('--node-refusal', help='Also require completed metadata and an exact frame-proof refusal from this separately selected Node build (gui/all)')
     parser.add_argument('--lua', action='append', nargs=3, default=[], metavar=('EXECUTABLE', 'SOURCE', 'LIBRARY'), help='Include Lua live/component checks; repeat for each debug runtime and matching internal headers/static library')
@@ -1318,6 +1321,8 @@ def main(argv=None):
         parser.error('--redot is not for the portable or perf tier')
     if args.macos_ssh and (args.tier != 'periodic' or args.headless):
         parser.error('--macos-ssh requires the periodic tier without --headless')
+    if args.macos and (args.tier not in ('gui', 'all', 'periodic') or args.headless):
+        parser.error('--macos requires gui/all/periodic without --headless')
     if args.arm64_sidecar and args.tier != 'periodic':
         parser.error('--arm64-sidecar requires the periodic tier')
     if args.node and args.tier in ('portable', 'perf'):
@@ -1327,7 +1332,7 @@ def main(argv=None):
     if args.lua and args.tier in ('portable', 'perf'):
         parser.error('--lua is not for the portable or perf tier')
     runtimes = (args.headless, args.optimize, args.uprobes, args.perl, args.node, args.node_include, args.lua, args.python, args.padwalker, args.ruby, args.node_refusal, args.go, args.wine, args.emacs)
-    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar)
+    steps = plan(args.tier, *runtimes, redot=args.redot, macos_ssh=args.macos_ssh, arm64_sidecar=args.arm64_sidecar, macos=args.macos)
     decisions, missing = [], []
     if tier == 'affected':
         base = args.base or 'HEAD'

@@ -27,6 +27,7 @@ with tempfile.TemporaryDirectory(prefix='xodb-package-source-') as temporary:
     (repo / 'src/main.zig').write_text('working tree\n')
     (repo / 'src/new.zig').write_text('untracked repair\n')
     (repo / 'src/new.zig').chmod(0o755)
+    (repo / 'build_macos.zig').write_text('// native build entry\n')
     (repo / 'examples').mkdir()
     (repo / 'examples/observation.recipe.json').write_text('{"version":1}\n')
     for name in ('src/main.zig~', 'src/notes.bak', 'src/.private', 'src/AGENTS.md', 'README.md~'):
@@ -48,6 +49,8 @@ with tempfile.TemporaryDirectory(prefix='xodb-package-source-') as temporary:
             assert all(m.uid == m.gid == 0 and not m.uname and not m.gname and m.mtime == 1 for m in members)
             assert all('must not ship' not in tar.extractfile(m).read().decode() for m in members)
             prefix = archive.name.removesuffix('.tar.gz') + '/'
+            if tar.extractfile(prefix + 'build_macos.zig').read() != b'// native build entry\n':
+                raise RuntimeError('native build entry missing from source package')
             assert tar.extractfile(prefix + 'src/main.zig').read() == b'working tree\n'
             assert tar.extractfile(prefix + 'src/new.zig').read() == b'untracked repair\n'
             assert tar.getmember(prefix + 'src/new.zig').mode == 0o755

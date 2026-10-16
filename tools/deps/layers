@@ -6,6 +6,7 @@
 
 # composition root: assembles everything
 src/main.zig              root
+src/macos_main.zig        root
 src/startup.zig           root
 
 # shared leaves

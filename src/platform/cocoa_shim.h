@@ -66,6 +66,8 @@ void xcocoa_pump(int32_t timeout_ms);
 int xcocoa_next(struct xcocoa_event *event);
 void xcocoa_size(uint32_t *width, uint32_t *height, float *scale);
 void xcocoa_set_scale(float scale);
+/* Called on the AppKit thread during native resize tracking; never re-enter pump. */
+void xcocoa_set_live_resize(void (*draw)(void *), void *context);
 void xcocoa_set_title(const char *title);
 void xcocoa_set_app_id(const char *app_id);
 void xcocoa_set_min_size(int32_t width, int32_t height);

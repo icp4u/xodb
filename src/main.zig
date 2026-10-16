@@ -557,7 +557,7 @@ pub fn main(init: std.process.Init) !void {
     server.* = .{
         .source_path = source,
         .overview_shared = if (shared) |*endpoint| endpoint.collector() else null,
-        .private_access = .init(private_transport, agent_scope == .observe, redact),
+        .private_access = .init(private_transport, redact),
     };
     // --redact: the system tools (processes, connections, fds, memory maps)
     // also apply the overview's own rules: other accounts, command lines.
@@ -1185,7 +1185,7 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
         a.destroy(p);
     };
     if (server) |p| {
-        p.* = .{ .overview_shared = &collector, .overview_only = true, .private_access = .init(.stdio, o.agent_scope == .observe, o.redact) };
+        p.* = .{ .overview_shared = &collector, .overview_only = true, .private_access = .init(.stdio, o.redact) };
         try p.init();
     }
     log.info(.overview, "xodb: headless overview serving mcp={} socket={} interval_ms={d}\n", .{ o.mcp, o.session_socket != null, o.interval_ms });
@@ -1290,11 +1290,15 @@ fn openPcap(session: *Session, path: [:0]const u8, capture: ?[:0]const u8, keylo
         }
         const derived = try @import("evidence/tls.zig").Stream.open(a, stream, keylog);
         errdefer derived.destroy();
-        log.info(.session, "xodb: TLS evidence stream {d}: {d} sessions, {d} authenticated records, {d} authentication failures, {d} reassembly gaps\n", .{ derived.id, derived.sessions.len, derived.records.len, blk: {
+        log.info(.session, "xodb: TLS evidence stream {d}: {d} sessions, {d} authenticated records, {d} authentication failures, {d} retained records, {d} reassembly gaps; record_limit_hit={}\n", .{ derived.id, derived.sessions.len, blk: {
+            var authenticated: u64 = 0;
+            for (derived.sessions) |summary| authenticated += summary.records;
+            break :blk authenticated;
+        }, blk: {
             var failures: u64 = 0;
             for (derived.sessions) |summary| failures += summary.authentication_failures;
             break :blk failures;
-        }, derived.reassembly_gaps });
+        }, derived.records.len, derived.reassembly_gaps, derived.derived_limit_hit });
         tls_stream = derived;
     }
     const protocol_stream = try @import("evidence/protocol.zig").Stream.open(a, stream, if (tls_stream == null) 2 else 3);

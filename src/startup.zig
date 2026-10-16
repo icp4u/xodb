@@ -2,11 +2,13 @@
 //! This does not wait for compositor scanout or asynchronous target/data loading.
 const std = @import("std");
 const log = @import("log.zig");
-const linux = @import("target/linux.zig");
 const c = @import("c_ui.zig").api;
 
 pub fn report(started: u64, protocol_stdout: bool) void {
-    const elapsed_us = (linux.now() -| started) / 1000;
+    var ts: c.timespec = undefined;
+    _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
+    const now = @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));
+    const elapsed_us = (now -| started) / 1000;
     var buffer: [128]u8 = undefined;
     const line = std.fmt.bufPrint(&buffer, "xodb: first window frame submitted in {d}.{d:0>3} ms\n", .{ elapsed_us / 1000, elapsed_us % 1000 }) catch return;
     // MCP owns stdout; GUI diagnostics must not enter its JSON stream.

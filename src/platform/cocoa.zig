@@ -1,6 +1,4 @@
-//! Cocoa platform contract. The checked-in C implementation is a native stub:
-//! it lets the complete GUI compile with `-Dplatform=cocoa` before an AppKit
-//! implementation and Mac test lane land, and refuses cleanly when opened.
+//! Cocoa platform contract: native AppKit on macOS, refusing stub elsewhere.
 const std = @import("std");
 const vk = @import("../c_ui.zig").api;
 const platform = @import("window.zig");
@@ -180,8 +178,16 @@ pub const Window = struct {
     }
     fn drain(self: *Window, timeout_ms: i32) void {
         shim.xcocoa_pump(timeout_ms);
+        self.consumeEvents();
+    }
+    /// AppKit runs a nested tracking loop during resize. Consume queued events
+    /// there without recursively pumping AppKit or dispatching debugger work.
+    pub fn consumeEvents(self: *Window) void {
         var event: shim.xcocoa_event = undefined;
         while (shim.xcocoa_next(&event) != 0) self.applyEvent(&event);
+    }
+    pub fn setLiveResize(_: *Window, callback: ?*const fn (?*anyopaque) callconv(.c) void, context: ?*anyopaque) void {
+        shim.xcocoa_set_live_resize(callback, context);
     }
     fn applyEvent(self: *Window, event: *const shim.xcocoa_event) void {
         switch (event.kind) {
@@ -242,7 +248,11 @@ pub const Window = struct {
                 self.closing = true;
                 self.close_reason = .compositor_close;
             },
-            shim.XCOCOA_EVENT_FOCUS => self.input.focus(event.flags & shim.XCOCOA_PRESSED != 0),
+            shim.XCOCOA_EVENT_FOCUS => {
+                const focused = event.flags & shim.XCOCOA_PRESSED != 0;
+                self.input.focus(focused);
+                if (!focused) self.mouse_down = false;
+            },
             else => {},
         }
     }

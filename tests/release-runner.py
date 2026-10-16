@@ -14,6 +14,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 root = Path(__file__).resolve().parents[1]
 loader = SourceFileLoader('release_check', str(root / 'scripts/release-check'))
@@ -47,6 +48,16 @@ def lane(tier, *args, **flags):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_snapshot_keeps_native_build_entry(self):
+        def tracked(argv, **kwargs):
+            del kwargs
+            return b'build_macos.zig\0' if 'build_macos.zig' in argv else b''
+        with tempfile.TemporaryDirectory(prefix='native-snapshot-') as directory:
+            with mock.patch.object(gate.subprocess, 'check_output', tracked):
+                hashes = gate.snapshot(Path(directory))
+            self.assertIn('build_macos.zig', hashes)
+            self.assertEqual((Path(directory) / 'build_macos.zig').read_bytes(), (root / 'build_macos.zig').read_bytes())
+
     @classmethod
     def setUpClass(cls):
         assert ctypes.CDLL(None).prctl(36, 1, 0, 0, 0) == 0
@@ -351,12 +362,12 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError): gate.select(steps, start='no-such-step')
 
     RUNTIMES = (['--perl', 'P', '--padwalker', 'W'], ['--python', 'Y'], ['--emacs', 'E'], ['--ruby', 'R'], ['--node', 'N'],
-                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'],
+                ['--node', 'N', '--node-refusal', 'NR'], ['--go', 'G'], ['--redot', 'RD'], ['--macos-ssh', 'MAC'], ['--macos', 'MAC'],
                 ['--arm64-sidecar', 'SSH', 'AGENT', 'FIXTURE'], ['--wine', 'WINE'], ['--uprobes'], ['--headless'],
                 ['--lua', 'l', 's', 'b', '--lua', 'l2', 's2', 'b2'])
     EVERYTHING = dict(uprobes=True, perl='P', node='N', lua=[('l', 's', 'b'), ('l2', 's2', 'b2')], python='Y', padwalker='W',
                       ruby='R', node_refusal='NR', go='G', wine='WINE', emacs='E', redot='RD', macos_ssh='MAC',
-                      arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'))
+                      arm64_sidecar=('SSH', 'AGENT', 'FIXTURE'), macos='MAC')
     TIERS = ('portable', 'host', 'gui', 'all', 'periodic', 'periodic-gui', 'perf')
 
     def listed(self, *argv):

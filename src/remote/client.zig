@@ -7,7 +7,7 @@ const wire = @import("view.zig");
 const a = std.heap.page_allocator;
 const Value = std.json.Value;
 pub const Snapshot = std.json.Parsed(wire.View);
-pub const Endpoint = union(enum) { tcp: []const u8, ssh: struct { host: []const u8, args: []const [:0]const u8 } };
+pub const Endpoint = union(enum) { none, tcp: []const u8, ssh: struct { host: []const u8, args: []const [:0]const u8 } };
 pub const State = enum { connecting, ready, disconnected };
 pub const Client = struct {
     endpoint: Endpoint,
@@ -26,6 +26,12 @@ pub const Client = struct {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn start(self: *Client) !void {
+        if (self.endpoint == .none) {
+            self.state = .disconnected;
+            self.busy = false;
+            self.message("No endpoint selected; launch with --connect HOST:PORT");
+            return;
+        }
         self.thread = try std.Thread.spawn(.{}, run, .{self});
     }
     pub fn deinit(self: *Client) void {
@@ -41,7 +47,8 @@ pub const Client = struct {
         self.published = null;
         return result;
     }
-    pub fn facts(self: *Client) struct { state: State, busy: bool, status: [256]u8 } {
+    pub const Facts = struct { state: State, busy: bool, status: [256]u8 };
+    pub fn facts(self: *Client) Facts {
         self.lock();
         defer self.mutex.unlock();
         return .{ .state = self.state, .busy = self.busy or self.published != null, .status = self.status };
@@ -85,6 +92,7 @@ pub const Client = struct {
     }
     fn work(self: *Client) !void {
         var stream = switch (self.endpoint) {
+            .none => return,
             .tcp => |endpoint| try transport.Stream.tcp(endpoint, &self.stop),
             .ssh => |ssh| try transport.Stream.ssh(ssh.host, ssh.args),
         };
@@ -289,7 +297,11 @@ const MockReply = struct {
 };
 fn mockRpc(mem: std.mem.Allocator, bytes: []const u8, fragment: usize) !Value {
     var fds: [2]c_int = undefined;
-    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM | c.SOCK_CLOEXEC, 0, &fds) < 0) return error.SocketFailed;
+    if (c.socketpair(c.AF_UNIX, c.SOCK_STREAM, 0, &fds) < 0) return error.SocketFailed;
+    for (fds) |fd| if (c.fcntl(fd, c.F_SETFD, @as(c_int, c.FD_CLOEXEC)) < 0) {
+        for (fds) |open| _ = c.close(open);
+        return error.SocketFailed;
+    };
     defer _ = c.close(fds[1]);
     const thread = try std.Thread.spawn(.{}, MockReply.run, .{MockReply{ .fd = fds[1], .bytes = bytes, .fragment = fragment }});
     defer thread.join();
@@ -303,6 +315,16 @@ fn mockRpc(mem: std.mem.Allocator, bytes: []const u8, fragment: usize) !Value {
     rpc.* = .{ .fd = fds[0], .cancel = &cancel };
     return rpc.call(mem, "ping", struct {}{});
 }
+test "remote preview has no worker or transport" {
+    var client = Client{ .endpoint = .none };
+    try client.start();
+    defer client.deinit();
+    const status = client.facts();
+    try std.testing.expect(status.state == .disconnected and !status.busy);
+    try std.testing.expect(client.thread == null);
+    try std.testing.expectError(error.RemoteDisconnected, client.action("continue", .{}));
+}
+
 test "remote RPC reconstructs fragmented messages and skips notifications" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

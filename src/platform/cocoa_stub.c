@@ -15,6 +15,7 @@ void xcocoa_size(uint32_t *width, uint32_t *height, float *scale) {
     if (scale) *scale = 1.0f;
 }
 void xcocoa_set_scale(float scale) { (void)scale; }
+void xcocoa_set_live_resize(void (*draw)(void *), void *context) { (void)draw; (void)context; }
 void xcocoa_set_title(const char *title) { (void)title; }
 void xcocoa_set_app_id(const char *app_id) { (void)app_id; }
 void xcocoa_set_min_size(int32_t width, int32_t height) { (void)width; (void)height; }

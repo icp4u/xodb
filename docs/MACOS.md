@@ -1,9 +1,59 @@
-# macOS targets through Apple's debugserver
+# macOS: native client and Apple debugserver targets
 
 xodb runs on Linux and debugs a process on an Apple-silicon Mac by talking to
-Apple's own `debugserver` with its [GDB remote client](GDB_REMOTE.md). Nothing
-of xodb runs on the Mac. See [Mach-O metadata](MACHO.md) for UUID-matched
+Apple's own `debugserver` with its [GDB remote client](GDB_REMOTE.md). That
+debugger engine still runs on Linux. See [Mach-O metadata](MACHO.md) for UUID-matched
 local files and frame names.
+
+## Run the native client on a Mac
+
+The first native build is a **presentation client**, not yet the local debugger.
+It uses the existing remote-client panels and renderer with AppKit and MoltenVK.
+With no arguments it opens a disconnected preview and does not contact a server.
+`--connect HOST:PORT` connects to an xodb MCP endpoint (not directly to
+debugserver); use an authenticated SSH tunnel when the server is remote.
+Local `-- ./program`, `--attach`, overview/replay, MCP serving and the D pane
+are not implemented in this native entry point and refuse explicitly.
+
+Prerequisites: Zig 0.16, the macOS SDK, MoltenVK, and static FreeType/HarfBuzz
+libraries. No package manager or automatic installs are used. Configure the
+prefixes with `-Ddeps=PREFIX`, `-Dmoltenvk=PREFIX`, or `XODB_MAC_DEPS` and
+`XODB_MAC_MOLTENVK`. Defaults are `tools/deps-prefix` and `tools/moltenvk`.
+The MoltenVK prefix contains `include/` and `dynamic/dylib/macOS/`.
+Shaders compile with `glslc`, or pass `-Dshader-dir=DIR` / `XODB_MAC_SHADERS`
+containing this tree's compiled `.vert.spv` and `.frag.spv` files. The default
+font is the system Menlo font; `--font FILE` overrides it.
+
+```sh
+zig build -Doptimize=ReleaseSafe
+zig build bundle -Doptimize=ReleaseSafe
+zig build test-cocoa -Doptimize=ReleaseSafe
+zig-out/bin/xodb --connect 127.0.0.1:47001
+XODB_MAC_OFFSCREEN=1 zig-out/bin/xodb --frames 3
+```
+
+`bundle` creates `zig-out/xodb.app`, embeds MoltenVK with a bundle-relative
+loader path and verifies an ad-hoc signature. It neither installs the app nor
+opens a window. Retina backing scale is the default. Cmd-Q, Cmd-W and SIGTERM
+use normal shutdown; shifted plain Q closes outside editors, matching the
+remote UI. Live resize redraws the current publication without backend calls.
+The native translator currently handles committed characters, not IME composition.
+
+For automated SSH checks, use `scripts/release-check gui --macos mac` (or
+`all`/`periodic`). Set `XODB_MAC_ZIG`, `XODB_MAC_DEPS` and `XODB_MAC_MOLTENVK`
+to the already-provisioned Mac tool locations. The opt-in test copies current
+sources and locally compiled shaders into a fresh `~/xodb-mac/native-check.*`
+directory. It builds, tests Cocoa, checks the signed bundle, renders offscreen,
+receives a synthetic TCP publication and tests normal SIGTERM cleanup. It does
+**not** yet test local debugserver, real input, on-screen resize or scanout.
+The retained directory is recorded in `.work/macos-native-remote-dir.txt`.
+
+Startup logs distinguish main-to-first-submitted-frame from on-screen appearance.
+`XODB_STARTUP_TRACE=1` additionally observes the app's own window-server
+on-screen bit on a worker thread, timed from kernel process start; it does not
+capture pixels. Offscreen runs cannot supply this measurement. Keep first
+execution of a new binary separate from warm runs; do not call it a cold-cache
+measurement unless cache state is actually known.
 
 ## Quick start
 

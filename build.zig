@@ -7,6 +7,7 @@ const macos_seam_sources = [_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    if (target.result.os.tag == .macos) return @import("build_macos.zig").build(b, target, optimize);
     // Helpers are copied to other machines: never inherit the build host ISA.
     var portable_query = target.query;
     portable_query.cpu_model = .baseline;
