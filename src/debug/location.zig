@@ -5,7 +5,22 @@ const OP = std.dwarf.OP;
 const Registers = @import("../target/linux.zig").Registers;
 pub const Op = struct { atom: u8, number: u64 = 0, number2: u64 = 0, offset: u64 = 0, data: ?[]const u8 = null };
 pub const RegisterSet = @import("../target/runtime.zig").DwarfRegisters;
-pub const Place = struct { kind: enum { address, register, value }, bits: u64, register: ?u16 = null, data: ?[]const u8 = null, valid: ?[]const u8 = null };
+pub const Kind = enum { address, register, value };
+/// Proven source storage for one DW_OP_piece. `bits` is the adjusted runtime
+/// address for an address piece and the sampled value for a register/value
+/// piece. Missing pieces stay explicit so consumers cannot treat zero fill as
+/// a storage proof.
+pub const Piece = struct {
+    kind: Kind = .value,
+    bits: u64 = 0,
+    register: ?u16 = null,
+    bit_size: u32,
+    value_bit_offset: u32,
+    source_bit_offset: u32 = 0,
+    data: ?[]const u8 = null,
+    available: bool = false,
+};
+pub const Place = struct { kind: Kind, bits: u64, register: ?u16 = null, data: ?[]const u8 = null, valid: ?[]const u8 = null, pieces: ?[]const Piece = null };
 pub const Context = struct {
     endian: std.builtin.Endian = .little,
     address_bytes: usize = 8,
@@ -235,19 +250,28 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
     if (ops.len > 4096 or (ops[ops.len - 1].atom != OP.piece and ops[ops.len - 1].atom != OP.bit_piece)) return error.MalformedExpression;
     const data = try a.alloc(u8, (bits + 7) / 8);
     const valid = try a.alloc(u8, data.len);
+    const locations = try a.alloc(Piece, pieces);
     @memset(data, 0);
     @memset(valid, 0);
     var first: usize = 0;
     var dest: usize = 0;
+    var location_index: usize = 0;
     for (ops, 0..) |op, i| {
         if (op.atom != OP.piece and op.atom != OP.bit_piece) continue;
         const count: usize = @intCast(if (op.atom == OP.piece) op.number * 8 else op.number);
         const offset: u64 = if (op.atom == OP.bit_piece) op.number2 else 0;
+        if (offset > 4096 * 8) return error.CompositeTooLarge;
         const part = if (i == first) null else evaluate(ctx, ops[first..i]) catch |err| switch (err) {
             error.RegisterUnavailable, error.UnsupportedRegister, error.LocationUnavailable, error.EntryValueUnavailable, error.FrameBaseUnavailable, error.CfaUnavailable, error.MemoryUnreadable, error.UnsupportedLocation => null,
             else => return err,
         };
         first = i + 1;
+        locations[location_index] = .{
+            .bit_size = @intCast(count),
+            .value_bit_offset = @intCast(dest),
+        };
+        const source = &locations[location_index];
+        location_index += 1;
         if (part) |place| {
             var bytes: [4097]u8 = undefined;
             var available: []const u8 = &.{};
@@ -255,6 +279,9 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
             if (place.kind == .address) {
                 const address = std.math.add(u64, place.bits, offset / 8) catch return error.InvalidAddress;
                 source_bit = offset % 8;
+                source.bits = address;
+                const capacity: u64 = bytes.len * 8;
+                if (source_bit > capacity or count > capacity - source_bit) return error.CompositeTooLarge;
                 const wanted = (count + @as(usize, @intCast(source_bit)) + 7) / 8;
                 const n = ctx.read(ctx.user, address, bytes[0..wanted]) catch 0;
                 if (n > wanted) return error.InvalidMemoryRead;
@@ -266,6 +293,12 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
                 const width = @min((count + @as(usize, @intCast(source_bit)) + 7) / 8, ctx.address_bytes);
                 available = if (ctx.endian == .big) bytes[8 - width .. 8] else bytes[0..width];
             }
+            source.kind = place.kind;
+            source.bits = if (place.kind == .address) source.bits else place.bits;
+            source.register = place.register;
+            source.source_bit_offset = @intCast(source_bit);
+            source.data = place.data;
+            source.available = true;
             for (0..count) |j| {
                 const src = std.math.add(u64, source_bit, j) catch continue;
                 if (src / 8 >= available.len) continue;
@@ -277,7 +310,7 @@ pub fn composite(a: std.mem.Allocator, ctx: Context, ops: []const Op) !Place {
         }
         dest += count;
     }
-    return .{ .kind = .value, .bits = lowBits(data, ctx.endian), .data = data, .valid = valid };
+    return .{ .kind = .value, .bits = lowBits(data, ctx.endian), .data = data, .valid = valid, .pieces = locations };
 }
 
 /// CFI and frame-base consumers need complete scalar state, never missing bits.
@@ -310,10 +343,16 @@ test "composite pieces preserve partial register, memory and bit availability" {
     const mixed = try composite(a, ctx, &.{ .{ .atom = OP.reg0 }, .{ .atom = OP.piece, .number = 2 }, .{ .atom = OP.addr, .number = 0x1000 }, .{ .atom = OP.piece, .number = 4 }, .{ .atom = OP.piece, .number = 2 } });
     try std.testing.expectEqualSlices(u8, &.{ 0x78, 0x56, 0x9a, 0xbc, 0xde, 0, 0, 0 }, mixed.data.?);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255, 255, 255, 0, 0, 0 }, mixed.valid.?);
+    try std.testing.expectEqual(@as(usize, 3), mixed.pieces.?.len);
+    try std.testing.expect(mixed.pieces.?[0].available and mixed.pieces.?[0].kind == .register and mixed.pieces.?[0].register == 0 and mixed.pieces.?[0].bit_size == 16 and mixed.pieces.?[0].value_bit_offset == 0);
+    try std.testing.expect(mixed.pieces.?[1].available and mixed.pieces.?[1].kind == .address and mixed.pieces.?[1].bits == 0x1000 and mixed.pieces.?[1].bit_size == 32 and mixed.pieces.?[1].value_bit_offset == 16);
+    try std.testing.expect(!mixed.pieces.?[2].available and mixed.pieces.?[2].value_bit_offset == 48);
     try std.testing.expectError(error.LocationUnavailable, scalar(mixed, 8));
     const bits = try composite(a, ctx, &.{ .{ .atom = OP.reg0 }, .{ .atom = OP.bit_piece, .number = 4, .number2 = 4 }, .{ .atom = OP.bit_piece, .number = 4 }, .{ .atom = OP.addr, .number = 0x1000 }, .{ .atom = OP.bit_piece, .number = 8, .number2 = 4 } });
     try std.testing.expectEqualSlices(u8, &.{ 7, 0xc9 }, bits.data.?);
     try std.testing.expectEqualSlices(u8, &.{ 15, 255 }, bits.valid.?);
+    try std.testing.expectEqual(@as(u32, 4), bits.pieces.?[0].source_bit_offset);
+    try std.testing.expectEqual(@as(u32, 4), bits.pieces.?[2].source_bit_offset);
     const implicit = try composite(a, ctx, &.{ .{ .atom = OP.implicit_value, .data = &.{ 0x11, 0x22 } }, .{ .atom = OP.piece, .number = 2 }, .{ .atom = OP.reg1 }, .{ .atom = OP.piece, .number = 1 } });
     try std.testing.expectEqualSlices(u8, &.{ 0x11, 0x22, 0 }, implicit.data.?);
     try std.testing.expectEqualSlices(u8, &.{ 255, 255, 0 }, implicit.valid.?);

@@ -30,6 +30,8 @@ import ghidra.app.util.importer.ProgramLoader;
 import ghidra.app.util.opinion.ElfLoader;
 import ghidra.app.util.opinion.LoadResults;
 import ghidra.base.project.GhidraProject;
+import ghidra.formats.gfilesystem.FSRL;
+import ghidra.formats.gfilesystem.FileSystemService;
 import ghidra.framework.Application;
 import ghidra.framework.HeadlessGhidraApplicationConfiguration;
 import ghidra.framework.model.DomainFile;
@@ -50,7 +52,7 @@ import ghidra.util.task.TaskMonitorAdapter;
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.8";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.9";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -523,13 +525,38 @@ public final class XodbGhidraSidecar {
         }
     }
 
+    // A universal (fat) Mach-O holds one image per architecture and Ghidra
+    // imports the first, often x86_64. Import the slice of the architecture
+    // this JVM runs on, named the way Ghidra's universalbinary file system
+    // names it, and refuse a universal binary without one. Not universal: null.
+    static String fatHostSlice(File file) throws IOException, Failure {
+        String arch = System.getProperty("os.arch");
+        int want = arch.equals("aarch64") ? 0x0100000c : arch.equals("amd64") || arch.equals("x86_64") ? 0x01000007 : 0;
+        List<String> cpus = new ArrayList<>();
+        try (DataInputStream in = new DataInputStream(new BufferedInputStream(new FileInputStream(file)))) {
+            if (in.readInt() != 0xcafebabe) return null; // Ghidra reads no 64-bit (0xcafebabf) fat header
+            int n = in.readInt();
+            if (n <= 0 || n >= 0x20) return null; // a Java class file shares the magic
+            for (int i = 0; i < n; i++) {
+                int cpu = in.readInt(), sub = in.readInt();
+                in.skipBytes(12);
+                if (cpu == want) return (cpu == 0x0100000c ? "AARCH64" : "x86") + "-64-cpu0x" + Integer.toHexString(sub);
+                cpus.add(cpu == 0x0100000c ? "arm64" : cpu == 0x01000007 ? "x86_64" : "cputype 0x" + Integer.toHexString(cpu));
+            }
+        } catch (EOFException short_) { return null; }
+        throw new Failure("import_failed", "universal Mach-O has no " + (want == 0x0100000c ? "arm64" : want == 0 ? arch : "x86_64") + " slice for this host; it holds " + String.join(", ", cpus));
+    }
+
     // xodb asks about link addresses (runtime address minus load bias). Ghidra
     // moves a position-independent ELF, executable or library, to a default
     // base of its own unless told the base to use; loading at the linked base
     // keeps every address in the program, relocated data included, a link
     // address. Other formats have no such loader option and load as before.
     Program load(File file) throws Exception {
-        ProgramLoader.Builder builder = ProgramLoader.builder().source(file).project(project.getProject());
+        String slice = fatHostSlice(file);
+        ProgramLoader.Builder builder = ProgramLoader.builder().project(project.getProject());
+        if (slice == null) builder.source(file);
+        else builder.source(FSRL.fromString(FileSystemService.getInstance().getLocalFSRL(file) + "|universalbinary:///" + slice));
         try (ByteProvider bytes = new FileByteProvider(file, null, AccessMode.READ)) {
             ElfHeader elf = new ElfHeader(bytes, null);
             elf.parse();
@@ -660,7 +687,7 @@ public final class XodbGhidraSidecar {
         String analysisKey = analysisKey(q);
         String selector = q.has("symbol") ? "symbol=" + required(q, "symbol") : "entry=" + required(q, "entry");
         String options = text(q, "options", "default");
-        String key = analysisKey + ":" + selector + ":" + options;
+        String key = exportKey(q) + ":" + selector + ":" + options;
         byte[] cached = documents.get(key);
         if (cached != null) { send(out, base(id, "ready"), cached); return; }
         boolean background = q.has("background") && q.get("background").isJsonPrimitive() && q.get("background").getAsBoolean();
@@ -805,8 +832,10 @@ public final class XodbGhidraSidecar {
         // These analyzers do not contribute to the function graph, pseudo-C,
         // symbols, debug types, calls, strings, or switch recovery exported by
         // this milestone. Keep format/debug analyzers and core references on.
-        for (String name : new String[]{"Embedded Media", "Function ID", "Library Identification"})
-            if (options.contains(name)) options.setBoolean(name, false);
+        // The Objective-C message analyzer (Mach-O only) annotates objc_msgSend selectors and cost
+        // 100 of 253 s importing a 6 MB AppKit-linked arm64 binary; it adds comments, not graph facts.
+        for (String name : new String[]{"Embedded Media", "Function ID", "Library Identification", "Objective-C Message Analyzer"})
+            options.setBoolean(name, false); // unconditionally: on a fresh import no analyzer option is registered yet
     }
 
     static int envInt(String name, int fallback, int low, int high) {
@@ -866,7 +895,7 @@ public final class XodbGhidraSidecar {
         String sha = required(request, "sha256");
         String analysisKey = analysisKey(request);
         String entryText = hx(fn.getEntryPoint().getOffset());
-        doc.addProperty("artifact_id", artifact(analysisKey, entryText, text(request, "options", "default")));
+        doc.addProperty("artifact_id", artifact(exportKey(request), entryText, text(request, "options", "default")));
         JsonObject producer = new JsonObject();
         producer.addProperty("kind", "ghidra_java_sidecar"); producer.addProperty("worker_version", PRODUCER);
         producer.addProperty("ghidra_commit", Application.getApplicationVersion()); producer.addProperty("java", true);
@@ -1064,182 +1093,6 @@ public final class XodbGhidraSidecar {
         return -1;
     }
 
-    // Argument classes this producer decides without Ghidra's prototype
-    // model. Ghidra 12 places x86-64 __int128, _Complex and _Float128
-    // arguments in the wrong storage and then hands the registers they really
-    // occupy to later arguments, so its own model cannot check itself.
-    static final int ARG_UNKNOWN = 0, ARG_INTEGER = 1, ARG_FLOAT = 2;
-
-    // Ghidra's DWARF import turns a base type it cannot classify ("complex
-    // float", _Decimal64) into a typedef of a sized integer, the same shape
-    // as uint64_t. Only the name tells them apart, so refuse those names.
-    static DataType integerBase(DataType type) {
-        while (type instanceof TypeDef alias) {
-            String name = alias.getName().toLowerCase(Locale.ROOT);
-            for (String word : new String[]{"complex", "decimal", "imaginary", "float", "bf16", "fract", "accum"})
-                if (name.contains(word)) return null;
-            if (alias.getBaseDataType() == null) return null;
-            type = alias.getBaseDataType();
-        }
-        return type;
-    }
-
-    static boolean integerFields(DataType type, int offset, int depth) {
-        type = integerBase(type);
-        if (type == null || depth > 16) return false;
-        if (type instanceof Structure structure) {
-            DataTypeComponent[] fields = structure.getDefinedComponents();
-            if (fields.length == 0) return false;
-            for (DataTypeComponent field : fields)
-                if (!field.isBitFieldComponent() && !integerFields(field.getDataType(), offset + field.getOffset(), depth + 1)) return false;
-            return true;
-        }
-        // No arrays: Ghidra imports a GNU vector (SSE / AdvSIMD class) as one.
-        int size = type.getLength();
-        boolean scalar = type instanceof Pointer || type instanceof ghidra.program.model.data.Enum || type instanceof BooleanDataType ||
-            type instanceof AbstractIntegerDataType || type instanceof Undefined;
-        return scalar && (size == 1 || size == 2 || size == 4 || size == 8) && offset % size == 0;
-    }
-
-    static int argumentClass(DataType type, boolean cxx) {
-        type = integerBase(type);
-        if (type == null) return ARG_UNKNOWN;
-        int size = type.getLength();
-        if (type instanceof AbstractFloatDataType) return size == 4 || size == 8 ? ARG_FLOAT : ARG_UNKNOWN;
-        // A C++ class that is not trivially copyable is passed and returned by
-        // invisible reference; Ghidra's structure does not say which it is.
-        if (type instanceof Structure) return !cxx && size > 0 && size <= 16 && integerFields(type, 0, 0) ? ARG_INTEGER : ARG_UNKNOWN;
-        if (type instanceof Array) return ARG_UNKNOWN;
-        return integerFields(type, 0, 0) ? ARG_INTEGER : ARG_UNKNOWN;
-    }
-
-    static boolean cxxImage(Program program) {
-        SymbolTable symbols = program.getSymbolTable();
-        return symbols.getClassNamespaces().hasNext() || symbols.getSymbolIterator("_Z*", true).hasNext() ||
-            symbols.getSymbolIterator("_R*", true).hasNext();
-    }
-
-    /** True when the code reads an argument register or an incoming stack
-     * slot that the decompiler does not attribute to a parameter: the
-     * prototype then disagrees with the code (ms_abi, a vector or complex
-     * argument, an over-aligned slot, a hidden return pointer). */
-    static boolean prototypeContradicted(Program program, HighFunction high, String[] names, int stackshift) {
-        List<Register> arguments = new ArrayList<>();
-        for (String name : names) {
-            Register register = program.getRegister(name);
-            if (register == null) return true;
-            arguments.add(register);
-        }
-        for (Iterator<PcodeOpAST> ops = high.getPcodeOps(); ops.hasNext();) {
-            for (Varnode input : ops.next().getInputs()) {
-                if (input == null || !input.isInput() || input.getHigh() instanceof HighParam) continue;
-                Address at = input.getAddress();
-                if (at.isStackAddress()) {
-                    if (at.getOffset() >= stackshift) return true;
-                    continue;
-                }
-                if (!at.isRegisterAddress()) continue;
-                for (Register register : arguments) {
-                    long low = register.getAddress().getOffset();
-                    if (at.getOffset() < low + register.getMinimumByteSize() && low < at.getOffset() + input.getSize()) return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    /** Expected storage per parameter index under the ELF SysV x86-64 or
-     * AAPCS64 integer rules: register names from the least-significant
-     * eightbyte, or a CFA offset. Null means unverifiable; once one argument
-     * is unknown, every later argument is unverifiable too. */
-    static Object[] parameterAbi(Program program, HighFunction high, Function fn) {
-        FunctionPrototype prototype = high.getFunctionPrototype();
-        int count = prototype == null ? 0 : prototype.getNumParams();
-        Object[] expected = new Object[count];
-        if (count == 0 || !String.valueOf(program.getExecutableFormat()).contains("ELF")) return expected;
-        String processor = program.getLanguage().getProcessor().toString();
-        boolean arm64 = processor.equals("AARCH64");
-        String[] registers, inputs;
-        if (processor.equals("x86") && program.getLanguage().getLanguageDescription().getSize() == 64) {
-            registers = new String[]{"RDI", "RSI", "RDX", "RCX", "R8", "R9"};
-            inputs = new String[]{"RDI", "RSI", "RDX", "RCX", "R8", "R9", "XMM0", "XMM1", "XMM2", "XMM3", "XMM4", "XMM5", "XMM6", "XMM7"};
-        } else if (arm64) {
-            registers = new String[]{"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7"};
-            inputs = new String[]{"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "q0", "q1", "q2", "q3", "q4", "q5", "q6", "q7"};
-        } else return expected;
-        // Only the platform's standard convention is modelled; GCC records no
-        // ms_abi in DWARF, so that case rests on the input check below.
-        PrototypeModel standard = program.getCompilerSpec().getDefaultCallingConvention();
-        for (String name : new String[]{fn.getCallingConventionName(), prototype.getModelName()})
-            if (standard == null || name != null && !name.equals(standard.getName()) && !name.equals(Function.DEFAULT_CALLING_CONVENTION_STRING) &&
-                !name.equals(Function.UNKNOWN_CALLING_CONVENTION_STRING)) return expected;
-        if (prototypeContradicted(program, high, inputs, standard.getStackshift())) return expected;
-        boolean cxx = cxxImage(program);
-        // A memory-class return adds a hidden argument whose placement Ghidra
-        // may or may not list; refuse rather than guess.
-        DataType returned = prototype.getReturnType();
-        if (returned != null && !(returned instanceof VoidDataType) && argumentClass(returned, cxx) == ARG_UNKNOWN) return expected;
-        int integers = 0, floats = 0;
-        long stack = 0;
-        for (int i = 0; i < count; i++) {
-            HighSymbol parameter = prototype.getParam(i);
-            DataType type = parameter == null ? null : parameter.getDataType();
-            int kind = argumentClass(type, cxx);
-            if (kind == ARG_UNKNOWN) break;
-            int words = (type.getLength() + 7) / 8;
-            // Ghidra drops DW_AT_alignment, and a 16-byte aggregate may be
-            // 16-aligned: SysV then aligns its stack slot, AAPCS64 its
-            // register pair and stack slot. Stop where that could matter.
-            boolean wide = kind == ARG_INTEGER && type.getLength() == 16;
-            if (kind == ARG_FLOAT && floats < 8) { floats++; continue; }
-            if (kind == ARG_INTEGER && integers + words <= registers.length) {
-                if (wide && arm64 && integers % 2 != 0) break;
-                expected[i] = Arrays.copyOfRange(registers, integers, integers + words);
-                integers += words;
-                continue;
-            }
-            if (wide && stack % 16 != 0) break;
-            // AAPCS64 closes the core registers after a split aggregate;
-            // SysV keeps the remaining ones for later scalars.
-            if (kind == ARG_INTEGER && words > 1 && arm64) integers = registers.length;
-            expected[i] = stack;
-            stack += 8L * words;
-        }
-        return expected;
-    }
-
-    static boolean parameterVerified(Program program, Function fn, HighSymbol symbol, Varnode[] pieces, Object[] abi) {
-        if (!symbol.isParameter()) return true;
-        int index = symbol.getCategoryIndex();
-        if (index < 0 || index >= abi.length || abi[index] == null || pieces.length == 0) return false;
-        int total = 0;
-        for (Varnode piece : pieces) total += piece.getSize();
-        if (total != symbol.getSize()) return false;
-        PrototypeModel model = fn.getCallingConvention();
-        if (model == null) model = program.getCompilerSpec().getDefaultCallingConvention();
-        int stackshift = model == null ? 0 : model.getStackshift();
-        boolean[] used = abi[index] instanceof String[] names ? new boolean[names.length] : null;
-        int valueBytes = 0;
-        for (Varnode piece : pieces) {
-            // Same most-significant-first order as the exported pieces.
-            int valueOffset = total - valueBytes - piece.getSize();
-            valueBytes += piece.getSize();
-            if (abi[index] instanceof String[] names) {
-                if (!piece.isRegister() || valueOffset % 8 != 0 || piece.getSize() > 8) return false;
-                Register register = program.getRegister(piece.getAddress(), piece.getSize());
-                int word = valueOffset / 8;
-                if (register == null || register.getLeastSignificantBitInBaseRegister() != 0 || word >= names.length || used[word] ||
-                    !register.getBaseRegister().getName().equalsIgnoreCase(names[word])) return false;
-                used[word] = true;
-            } else {
-                if (!piece.getAddress().getAddressSpace().getName().equals("stack")) return false;
-                if (piece.getOffset() - stackshift != (Long) abi[index] + valueOffset) return false;
-            }
-        }
-        if (used != null) for (boolean word : used) if (!word) return false;
-        return true;
-    }
-
     static void semanticBytes(DataType type, boolean[] semantic, int start, int end, int depth) {
         if (start < 0 || start >= end || start >= semantic.length) return;
         end = Math.min(end, semantic.length);
@@ -1291,7 +1144,6 @@ public final class XodbGhidraSidecar {
 
     JsonArray variables(Program program, HighFunction high, Function fn) {
         JsonArray list = new JsonArray();
-        Object[] abi = parameterAbi(program, high, fn);
         for (Iterator<HighSymbol> it = high.getLocalSymbolMap().getSymbols(); it.hasNext();) {
             HighSymbol symbol = it.next();
             JsonObject row = new JsonObject();
@@ -1303,8 +1155,6 @@ public final class XodbGhidraSidecar {
             row.add("padding", padding(type, Math.max(0, symbol.getSize())));
             VariableStorage storage = symbol.getStorage();
             Varnode[] pieces = storage == null ? new Varnode[0] : storage.getVarnodes();
-            boolean stackVerified = parameterVerified(program, fn, symbol, pieces, abi);
-            row.addProperty("stack_parameter_verified", stackVerified);
             Varnode varnode = pieces.length == 0 ? null : pieces[0];
             long[] proven = null;
             if (varnode != null) {
@@ -1320,7 +1170,7 @@ public final class XodbGhidraSidecar {
                 }
                 JsonArray pieceRows = new JsonArray();
                 int valueBytes = 0;
-                boolean supported = symbol.getSize() > 0 && symbol.getSize() <= 32 && stackVerified;
+                boolean supported = symbol.getSize() > 0 && symbol.getSize() <= 32;
                 long start = fn.getEntryPoint().getOffset(), end = fn.getBody().getMaxAddress().getOffset() + 1;
                 for (Varnode piece : pieces) {
                     JsonObject item = new JsonObject();
@@ -1591,6 +1441,7 @@ public final class XodbGhidraSidecar {
     static String tokenKind(ClangToken t){String n=t.getClass().getSimpleName();if(n.contains("Type"))return"type";if(n.contains("Variable"))return"variable";if(n.contains("FuncName"))return"funcname";if(n.contains("Field"))return"field";if(n.contains("Op"))return"operator";if(n.contains("Comment"))return"comment";if(n.contains("Label"))return"label";return"syntax";}
     static String opid(PcodeOpAST op){return"op:"+op.getSeqnum().getTime();} static String vnid(VarnodeAST v){return"vn:"+v.getUniqueId();}
     static String analysisKey(JsonObject request)throws Exception{String sha=required(request,"sha256");String debugPath=text(request,"debug_path",null);String debugSha=text(request,"debug_sha256",null);if((debugPath==null)!=(debugSha==null))throw new Failure("bad_debug_identity","debug_path and debug_sha256 must be supplied together");if(debugSha==null)return sha;if(!debugSha.matches("[0-9a-f]{64}"))throw new Failure("bad_debug_sha256",debugSha);return digest((sha+"\n"+debugSha).getBytes(StandardCharsets.UTF_8));}
+    static String exportKey(JsonObject request)throws Exception{return analysisKey(request)+":build_id="+text(request,"build_id","none");}
     static String artifact(String sha,String entry,String options)throws Exception{return"ghj1-"+digest((sha+":"+entry+":"+options+":"+PRODUCER).getBytes(StandardCharsets.UTF_8));}
     static String sha256(Path path)throws Exception{MessageDigest md=MessageDigest.getInstance("SHA-256");try(InputStream in=Files.newInputStream(path)){byte[]b=new byte[1<<20];for(int n;(n=in.read(b))>0;)md.update(b,0,n);}return hex(md.digest());}
     static String digest(byte[]bytes)throws Exception{return hex(MessageDigest.getInstance("SHA-256").digest(bytes));}static String hex(byte[]bytes){StringBuilder b=new StringBuilder(bytes.length*2);for(byte x:bytes)b.append(String.format("%02x",x&255));return b.toString();}

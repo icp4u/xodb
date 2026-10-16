@@ -5,6 +5,21 @@ debugger and the standalone agent use this implementation. Zig retains the GUI,
 MCP, symbols, source stepping policy, DWARF analysis, expressions, profile decoding
 and archives. See the agreed [C/Zig boundary](ZIG_TO_C.md).
 
+## System overview
+
+`src/runtime/sysstat.c` fills `xodb --overview`. Every value has a state.
+`not present` means the kernel or hardware does not expose it, `needs privilege`
+means this user cannot read it, and `not supported` means there is no collector
+for it yet. Disk latency is the average over completions in this sample. An idle
+interval, when the device has completed I/O since boot but none in the sample,
+is unavailable with reason `no I/O this interval`. asahi busy and memory with no
+drm fdinfo stay `not present`. The display drivers `apple` and `apple-drm` are
+not GPUs. fdinfo busy is per drm client: duplicate descriptors count once, a
+client that appears during the interval contributes nothing until the next
+sample, and a client that leaves is a counter reset for that sample. The walk
+reads at most 512 processes and 64 descriptors each, in /proc order; clients
+past that are not counted. More than 64 distinct clients make busy `limit reached`.
+
 ## Build and try it
 
 The ordinary application build also produces `zig-out/bin/xodb-agent`:

@@ -98,12 +98,14 @@ parser.add_argument("--fixture", required=True, help="absolute target path to th
 parser.add_argument("--symbol", default="qx_alloc")
 parser.add_argument("--expected-value", action="append", default=[], metavar="NAME=DISPLAY",
                     help="require this exact proven pseudo-C live value; repeatable")
+parser.add_argument("--expected-refused", action="append", default=[], metavar="NAME",
+                    help="require that DWARF/Ghidra storage disagreement refuses this value; repeatable")
 args = parser.parse_args()
 if args.ssh and not args.agent:
     parser.error("--agent is required with --ssh")
 expected_values = dict(value.split("=", 1) for value in args.expected_value)
-if not expected_values:
-    parser.error("at least one --expected-value NAME=DISPLAY is required")
+if not expected_values and not args.expected_refused:
+    parser.error("at least one --expected-value NAME=DISPLAY or --expected-refused NAME is required")
 
 ghidra = os.environ.get("GHIDRA_HOME") or os.environ.get("XODB_GHIDRA_HOME")
 if not ghidra or not (Path(ghidra) / "support/analyzeHeadless").exists():
@@ -181,8 +183,9 @@ try:
     assert mapping.get("tokens") or mapping.get("line") is not None, mapping
     live_values = {row["name"]: row["display"] for row in analysis.get("live_values", ())}
     assert all(live_values.get(name) == display for name, display in expected_values.items()), (expected_values, live_values, analysis)
+    assert not set(args.expected_refused) & set(live_values), (args.expected_refused, live_values, analysis)
     if args.qemu:
-        print(f"pass: live arm64 {args.symbol} decompiled and proved {len(expected_values)} known live values through xodb and the local Ghidra sidecar")
+        print(f"pass: live arm64 {args.symbol} decompiled and proved {len(expected_values)} known live values and refused {len(args.expected_refused)} through xodb and the local Ghidra sidecar")
     else:
         print(f"pass: live arm64 {args.symbol} decompiled with {len(expected_values)} known live values through the local Ghidra sidecar")
 finally:

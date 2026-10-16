@@ -214,6 +214,18 @@ try:
     prime, _ = exchange({"id": "other-client-prime", "verb": "prime", "architecture": "aarch64", "deadline_ms": 10000})
     assert prime.get("state") in ("pending", "ready"), prime
     sha = hashlib.sha256(fixed.read_bytes()).hexdigest()
+    # Export identity participates in the document cache key. A raw prefetch
+    # without a build ID must not poison a later session-bound request.
+    cache_option = "build-id-cache-test"
+    no_id, no_id_payload = exchange({"id": "cache-no-id", "verb": "decompile", "path": str(fixed),
+        "sha256": sha, "entry": hex(link_address(fixed, "qx_alloc")), "size": "0x0", "options": cache_option, "deadline_ms": 10000})
+    no_id, no_id_payload = wait_work(no_id)
+    with_id, with_id_payload = exchange({"id": "cache-with-id", "verb": "decompile", "path": str(fixed),
+        "sha256": sha, "build_id": "0123", "entry": hex(link_address(fixed, "qx_alloc")), "size": "0x0", "options": cache_option, "deadline_ms": 10000})
+    with_id, with_id_payload = wait_work(with_id)
+    assert no_id.get("state") == with_id.get("state") == "ready" and no_id_payload and with_id_payload, (no_id, with_id)
+    assert "gnu_build_id" not in json.loads(no_id_payload)["image"], json.loads(no_id_payload)["image"]
+    assert json.loads(with_id_payload)["image"].get("gnu_build_id") == "0123", json.loads(with_id_payload)["image"]
     before = time.monotonic()
     foreground, foreground_payload = exchange({"id": "priority-foreground", "verb": "decompile", "path": str(fixed),
         "sha256": sha, "entry": hex(link_address(fixed, "qx_branch_u")), "size": "0x0", "options": "priority-test", "deadline_ms": 10000})
@@ -225,6 +237,7 @@ try:
     # offset and lifetime; this is what the stopped-frame overlay consumes.
     variable_reply, variable_payload = exchange({"id": "variables", "verb": "decompile", "path": str(fixed),
         "sha256": sha, "entry": hex(link_address(fixed, "qx_alloc")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    variable_reply, variable_payload = wait_work(variable_reply)
     assert variable_reply.get("state") == "ready" and variable_payload, variable_reply
     variables = json.loads(variable_payload)["variables"]
     registers = [row for row in variables if row.get("storage") == "register"]
@@ -257,7 +270,7 @@ try:
     stack_pieces = [piece for piece in stack_parameter.get("pieces", ()) if piece.get("storage") == "stack"]
     stack_entry = link_address(storage_image, "qx_stack")
     assert stack_pieces and all(isinstance(piece.get("cfa_offset"), int) for piece in stack_pieces), stack_parameter
-    assert stack_parameter.get("stack_parameter_verified") is True, stack_parameter
+    assert "stack_parameter_verified" not in stack_parameter, stack_parameter
     assert int(stack_parameter["valid_start"], 16) == stack_entry < int(stack_parameter["valid_end"], 16), stack_parameter
 
     split_reply, split_payload = exchange({"id": "split-variables", "verb": "decompile", "path": str(storage_image),
@@ -273,9 +286,9 @@ try:
     assert split_parameter.get("padding") == [{"offset": 12, "size": 4}], split_parameter
 
     # Ghidra's decompiler assigns this x86-64 __int128 parameter to caller
-    # stack memory even though the ABI puts it in RDI:RSI, and then gives
-    # RDI to the next argument. Both rows must be empty: Ghidra's prototype
-    # model repeats the mistake, so only the producer's own ABI can check it.
+    # stack memory even though the ABI puts it in RDI:RSI, and then gives RDI
+    # to the next argument. The producer exports these candidates; the stopped
+    # consumer below rejects both against current-PC DWARF.
     wide_reply, wide_payload = exchange({"id": "wide-variables", "verb": "decompile", "path": str(storage_image),
         "sha256": storage_sha, "entry": hex(link_address(storage_image, "qx_wide")), "size": "0x0", "options": "default", "deadline_ms": 10000})
     wide_reply, wide_payload = wait_work(wide_reply)
@@ -283,10 +296,9 @@ try:
     wide_variables = json.loads(wide_payload)["variables"]
     wide_parameter = next(row for row in wide_variables if row.get("name") == "wide")
     assert any(piece.get("storage") == "stack" for piece in wide_parameter.get("pieces", ())), wide_parameter
-    assert wide_parameter.get("stack_parameter_verified") is False, wide_parameter
-    assert wide_parameter["valid_start"] == wide_parameter["valid_end"], wide_parameter
+    assert "stack_parameter_verified" not in wide_parameter, wide_parameter
     after_parameter = next(row for row in wide_variables if row.get("name") == "after")
-    assert after_parameter["valid_start"] == after_parameter["valid_end"], after_parameter
+    assert "stack_parameter_verified" not in after_parameter, after_parameter
     # A _Complex double is in XMM0:XMM1, but Ghidra places it in RDI:RSI and
     # its fifth and sixth integers on caller stack slots. All are refused.
     complex_reply, complex_payload = exchange({"id": "complex-variables", "verb": "decompile", "path": str(storage_image),
@@ -294,18 +306,15 @@ try:
     complex_reply, complex_payload = wait_work(complex_reply)
     assert complex_reply.get("state") == "ready" and complex_payload, complex_reply
     complex_parameters = [row for row in json.loads(complex_payload)["variables"] if row.get("parameter")]
-    assert len(complex_parameters) == 7 and all(row["valid_start"] == row["valid_end"] for row in complex_parameters), complex_parameters
-    # Misplaced arguments that the code never reads: only the producer's type
-    # rules (complex name, vector array, possible 16-byte alignment) refuse.
-    for function, refused, kept in (("qx_cfloat", {"z", "a", "b"}, set()), ("qx_vector_arg", {"v", "a", "b"}, set()),
-                                    ("qx_aligned", {"s", "t"}, {"a", "g"})):
+    assert len(complex_parameters) == 7 and all("stack_parameter_verified" not in row for row in complex_parameters), complex_parameters
+    # Lossy Ghidra types no longer trigger producer name/placement rules.
+    for function in ("qx_cfloat", "qx_vector_arg", "qx_aligned"):
         reply, payload = exchange({"id": f"{function}-variables", "verb": "decompile", "path": str(storage_image),
             "sha256": storage_sha, "entry": hex(link_address(storage_image, function)), "size": "0x0", "options": "default", "deadline_ms": 10000})
         reply, payload = wait_work(reply)
         assert reply.get("state") == "ready" and payload, reply
         rows = {row["name"]: row for row in json.loads(payload)["variables"] if row.get("parameter")}
-        assert all(rows[name]["valid_start"] == rows[name]["valid_end"] for name in refused), (function, rows)
-        assert all(rows[name]["valid_start"] != rows[name]["valid_end"] for name in kept), (function, rows)
+        assert rows and all("stack_parameter_verified" not in row for row in rows.values()), (function, rows)
 
     # Prove the exported storage against the stopped target, through the MCP
     # surface that users consume. qx_stack's seventh argument is on the stack;
@@ -319,6 +328,13 @@ try:
         stopped = client.stopped("breakpoint")
         tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
         live = poll(client, symbol, tid=tid, frame=0)
+        # Entry-wide fbreg descriptions are refused until the first source row
+        # after the prologue: they can name uninitialized register home slots.
+        for _ in range(4):
+            if any(row["name"] == name for row in live.get("live_values", ())): break
+            client.action("step_instruction", tid=tid)
+            client.stopped(seconds=10)
+            live = poll(client, symbol, tid=tid, frame=0)
         assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
         values = {row["name"]: row["display"] for row in live.get("live_values", ())}
         assert values.get(name) == expected, (symbol, expected, values, live)
@@ -334,6 +350,35 @@ try:
     live = poll(client, "qx_wide", tid=tid, frame=0)
     assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
     assert not {"wide", "after"} & {row["name"] for row in live.get("live_values", ())}, live
+
+    # At qx_inline_shadow's entry the innermost DWARF scope is the inlined
+    # qx_triple, whose parameter `a` is b (0x22) in RSI, where Ghidra puts the
+    # outer a. Inner-scope names must never prove the outer variable.
+    client.p.stdin.close(); client.p.wait(timeout=10)
+    client = Client("control", str(storage_image))
+    client.action("set_breakpoint", symbol="qx_inline_shadow")
+    client.continue_initial_stop()
+    stopped = client.stopped("breakpoint")
+    tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+    live = poll(client, "qx_inline_shadow", tid=tid, frame=0)
+    assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
+    shadow = {row["name"]: row["display"] for row in live.get("live_values", ())}
+    assert shadow.get("a", "0x21") == "0x21" and shadow.get("b", "0x22") == "0x22", live
+
+    # Candidate storage alone is never enough. The same synthetic image with
+    # its DWARF removed has no pseudo-C live values.
+    client.p.stdin.close(); client.p.wait(timeout=10)
+    storage_no_dwarf = work / "qx-storage-no-dwarf"
+    shutil.copy2(storage_image, storage_no_dwarf)
+    subprocess.run(["objcopy", "--strip-debug", str(storage_no_dwarf)], check=True, timeout=30)
+    client = Client("control", str(storage_no_dwarf))
+    client.action("set_breakpoint", symbol="qx_stack")
+    client.continue_initial_stop()
+    stopped = client.stopped("breakpoint")
+    tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+    live = poll(client, "qx_stack", tid=tid, frame=0)
+    assert live.get("status") == "completed" and live.get("live_values_at", {}).get("tid") == tid, live
+    assert not live.get("live_values"), live
 
     # Losing Ghidra's native decompiler child invalidates its pooled interface.
     # The request that encounters that death reopens the program and retries

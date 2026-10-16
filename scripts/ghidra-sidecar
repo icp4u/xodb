@@ -28,8 +28,23 @@ pid_file=$state_dir/sidecar.pid
 socket_dir_existed=0
 [[ -d $socket_dir ]] && socket_dir_existed=1
 mkdir -p -- "$runtime_dir" "$socket_dir" "$cache_dir" "$state_dir"
-chmod 0700 -- "$runtime_dir" "$cache_dir" "$state_dir"
-(( socket_dir_existed )) || chmod 0700 -- "$socket_dir"
+# BSD chmod (macOS) takes no "--"; these paths never start with "-".
+chmod 0700 "$runtime_dir" "$cache_dir" "$state_dir"
+(( socket_dir_existed )) || chmod 0700 "$socket_dir"
+
+# Owner and process facts: /proc on Linux, stat -f and ps where there is no /proc (macOS).
+file_uid() { stat -c %u -- "$1" 2>/dev/null || stat -f %u -- "$1" 2>/dev/null || echo -1; }
+if [[ -d /proc/self ]]; then
+    pid_exists() { [[ -d /proc/$1 ]]; }
+    pid_uid() { stat -c %u -- "/proc/$1" 2>/dev/null || echo -1; }
+    pid_command() { tr '\0' ' ' <"/proc/$1/cmdline" 2>/dev/null || true; }
+    pid_zombie() { grep -qs '^State:[[:space:]]*Z' "/proc/$1/status"; }
+else
+    pid_exists() { ps -p "$1" >/dev/null 2>&1; }
+    pid_uid() { local u; u=$(ps -o uid= -p "$1" 2>/dev/null) && echo $u || echo -1; }
+    pid_command() { ps -ww -o command= -p "$1" 2>/dev/null || true; }
+    pid_zombie() { ps -o stat= -p "$1" 2>/dev/null | grep -q '^Z'; }
+fi
 
 hello() {
     "$ctl" hello "$socket" --timeout 2 2>/dev/null
@@ -38,7 +53,7 @@ hello() {
 socket_is_ours() {
     [[ ! -e $socket && ! -L $socket ]] && return 0
     local owner
-    owner=$(stat -c %u -- "$socket" 2>/dev/null || echo -1)
+    owner=$(file_uid "$socket")
     [[ $owner == "$uid" ]] || {
         echo "ghidra-sidecar: refusing endpoint owned by uid $owner: $socket" >&2
         return 1
@@ -49,10 +64,10 @@ stop_recorded() {
     [[ -f $pid_file ]] || return 1
     local pid owner command
     read -r pid <"$pid_file"
-    [[ $pid =~ ^[1-9][0-9]*$ && -d /proc/$pid ]] || return 1
-    owner=$(stat -c %u -- "/proc/$pid" 2>/dev/null || echo -1)
+    [[ $pid =~ ^[1-9][0-9]*$ ]] && pid_exists "$pid" || return 1
+    owner=$(pid_uid "$pid")
     [[ $owner == "$uid" ]] || return 1
-    command=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    command=$(pid_command "$pid")
     [[ $command == *XodbGhidraSidecar* ]] || return 1
     kill "$pid" 2>/dev/null || return 1
     for _ in {1..100}; do kill -0 "$pid" 2>/dev/null || return 0; sleep 0.02; done
@@ -67,13 +82,13 @@ wait_recorded_exit() {
     read -r pid <"$pid_file"
     [[ $pid =~ ^[1-9][0-9]*$ ]] || return 0
     local command
-    command=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+    command=$(pid_command "$pid")
     # An exiting process has an empty command line; any other name is not ours.
     [[ -z $command || $command == *XodbGhidraSidecar* ]] || return 0
     for _ in {1..250}; do
-        [[ -d /proc/$pid ]] || return 0
+        pid_exists "$pid" || return 0
         # Exited but not yet reaped by its parent: stopped all the same.
-        grep -qs '^State:[[:space:]]*Z' "/proc/$pid/status" && return 0
+        pid_zombie "$pid" && return 0
         sleep 0.02
     done
     return 1
@@ -110,7 +125,9 @@ esac
 # start (missing Ghidra or JDK, compile errors) in the log its message names.
 [[ /dev/stderr -ef /dev/null ]] && exec 2>>"$log"
 exec 9>"$lock"
-flock 9
+# flock(1) is util-linux; elsewhere take the same flock(2) lock on fd 9 through python3,
+# which the control helper needs anyway. The lock stays with the open fd after python exits.
+if command -v flock >/dev/null 2>&1; then flock 9; else python3 -c 'import fcntl; fcntl.flock(9, fcntl.LOCK_EX)'; fi
 if hello; then
     echo "ghidra-sidecar: already running at $socket"
     exit 0
@@ -175,7 +192,7 @@ fi
 # gives ProjectLocator an acceptable spelling for it.
 alias_root=/tmp/xodb-$uid
 mkdir -p -- "$alias_root"
-chmod 0700 -- "$alias_root"
+chmod 0700 "$alias_root"
 alias_id=$(printf '%s' "$cache_dir" | cksum | awk '{print $1}')
 project_alias=$alias_root/ghidra-cache-$alias_id
 if [[ -L $project_alias ]]; then
@@ -196,10 +213,12 @@ softmax=${XODB_GHIDRA_SOFT_MAX:-768m}
 read -r -a java_opts <<<"${XODB_GHIDRA_JAVA_OPTS:-}"
 tmp_dir=$cache_dir/tmp
 mkdir -p -- "$tmp_dir"
+# setsid(1) is util-linux; elsewhere start the new session through python3.
+if command -v setsid >/dev/null 2>&1; then session=(setsid); else session=(python3 -c 'import os, sys; os.setsid(); os.execvp(sys.argv[1], sys.argv[1:])'); fi
 # The JVM must not inherit the start lock (fd 9), or every later start blocks.
-nohup setsid "$java" -Duser.home="$cache_dir/home" -Djava.awt.headless=true -Djava.io.tmpdir="$tmp_dir" \
+nohup "${session[@]}" "$java" -Duser.home="$cache_dir/home" -Djava.awt.headless=true -Djava.io.tmpdir="$tmp_dir" \
     -Xms"$xms" -Xmx"$xmx" -XX:+UseZGC -XX:+ZGenerational -XX:SoftMaxHeapSize="$softmax" \
-    -XX:ZCollectionInterval=60 -XX:ZUncommitDelay=60 "${java_opts[@]}" \
+    -XX:ZCollectionInterval=60 -XX:ZUncommitDelay=60 ${java_opts[@]+"${java_opts[@]}"} \
     -cp "$classes:$classpath" XodbGhidraSidecar "$socket" "$project_alias" "$log" \
     >>"$log" 2>&1 </dev/null 9>&- &
 pid=$!

@@ -52,11 +52,31 @@ __attribute__((noinline)) uint64_t qx_aligned(uint64_t a, uint64_t b, uint64_t c
 	return a ^ g;
 }
 
+/* An inlined callee's parameter `a` holds b in RSI, where Ghidra misplaces the
+ * outer a. Only the outer function's DWARF may prove pseudo-C storage. */
+static inline __attribute__((always_inline)) uint64_t qx_triple(uint64_t a)
+{
+	uint64_t t;
+#ifdef __x86_64__
+	__asm__ volatile("lea (%1,%1,2),%0\n\tnop" : "=r"(t) : "r"(a));
+#else
+	__asm__ volatile("add %0, %1, %1, lsl #1\n\tnop" : "=r"(t) : "r"(a));
+#endif
+	return t;
+}
+__attribute__((noinline)) uint64_t qx_inline_shadow(_Complex float z, uint64_t a, uint64_t b)
+{
+	uint64_t r = qx_triple(b);
+	__asm__ volatile("" :: "r"(a));
+	return r ^ a ^ (uint64_t)(__real__ z > 0);
+}
+
 int main(void)
 {
 	qx_pair pair = { 8, 9 };
 	unsigned __int128 wide = ((unsigned __int128)0x99aabbccddeeff00ull << 64) | 0x1122334455667788ull;
 	return qx_stack(1, 2, 3, 4, 5, 6, 7) + (int)qx_split(pair) + (int)qx_wide(wide, 10) +
 	       (int)qx_complex(1.0 + 2.0i, 11, 12, 13, 14, 15, 16) + (int)qx_cfloat(3.0f + 4.0fi, 17, 18) +
-	       (int)qx_vector_arg((qx_vector){ { 19, 20 } }, 21, 22) + (int)qx_aligned(23, 24, 25, 26, 27, 28, 29, (qx_al16){ 30, 31 }, 32);
+	       (int)qx_vector_arg((qx_vector){ { 19, 20 } }, 21, 22) + (int)qx_aligned(23, 24, 25, 26, 27, 28, 29, (qx_al16){ 30, 31 }, 32) +
+	       (int)qx_inline_shadow(5.0f + 6.0fi, 33, 34);
 }

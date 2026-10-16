@@ -93,7 +93,7 @@ static void apple_case(void)
         " 259 1 nvme0n2 0 0 0 0 0 0 0 0 0 0 0\n");
     for (int c = 0; c < 6; ++c) {
         char p[160];
-        int perf = c == 0 || c == 5;
+        int perf = c >= 4; /* E-cores first, P-cores one contiguous block */
         snprintf(p, sizeof p, "sys/devices/system/cpu/cpu%d/topology/physical_package_id", c);
         put(p, "0\n");
         snprintf(p, sizeof p, "sys/devices/system/cpu/cpu%d/topology/core_id", c);
@@ -126,6 +126,9 @@ static void apple_case(void)
     put("sys/devices/platform/asahi-gpu/uevent", "DRIVER=asahi\n");
     mkdirs("sys/class/drm/card0");
     link_to("../../../devices/platform/asahi-gpu", "sys/class/drm/card0/device");
+    put("sys/devices/platform/apple-display/uevent", "DRIVER=apple\n");
+    mkdirs("sys/class/drm/card1");
+    link_to("../../../devices/platform/apple-display", "sys/class/drm/card1/device");
 
     struct xrt_sys_limits lim;
     xrt_sys_limits_default(&lim);
@@ -137,8 +140,10 @@ static void apple_case(void)
     assert(xrt_sys_sample(s, &a) == XRT_OK);
     assert(!strcmp(a.cpu.model.s, "Apple Synthetic Board, 2 P-cores + 4 E-cores"));
     assert(a.cpu.count == 6 && a.cpu.cores.v == 6 && a.cpu.packages.v == 1 && a.cpu.l3_groups.v == 2);
-    assert(a.cpu.cpu[0].cluster_id.st == XRT_SYS_OK && a.cpu.cpu[0].cluster_id.v == 1 && a.cpu.cpu[0].capacity.v == 1024);
+    assert(a.cpu.cpu[0].cluster_id.st == XRT_SYS_OK && a.cpu.cpu[0].cluster_id.v == 0 && a.cpu.cpu[0].capacity.v == 426);
     assert(a.cpu.cpu[1].cluster_id.v == 0 && a.cpu.cpu[1].capacity.v == 426);
+    assert(a.cpu.cpu[4].cluster_id.v == 1 && a.cpu.cpu[4].capacity.v == 1024);
+    assert(a.cpu.cpu[5].cluster_id.v == 1 && a.cpu.cpu[5].capacity.v == 1024);
     assert(a.cpu.cpu[0].l3_id.why == XRT_SYS_WHY_NOT_PRESENT);
     assert(near(a.cpu.package_temp_c.v, 44.0) && !strcmp(a.cpu.package_temp_label, "P-cluster Temperature 2"));
     assert(a.cpu.temp_count == 4);
@@ -147,11 +152,29 @@ static void apple_case(void)
     assert(!strcmp(a.power.cpu_power_label, "Total System Power"));
     assert(a.disks.count == 1 && !strcmp(a.disks.disk[0].name, "nvme0n1"));
     assert(a.power.gpu_count == 1 && !strcmp(a.power.gpu[0].driver, "asahi"));
-    assert(a.power.gpu[0].busy_pct.why == XRT_SYS_WHY_NOT_SUPPORTED);
-    assert(a.power.gpu[0].vram_used.why == XRT_SYS_WHY_NOT_SUPPORTED);
+    assert(a.power.gpu[0].busy_pct.why == XRT_SYS_WHY_NOT_PRESENT);
+    assert(a.power.gpu[0].vram_used.why == XRT_SYS_WHY_NOT_PRESENT);
+    assert(a.power.gpu[0].vram_total.why == XRT_SYS_WHY_NOT_PRESENT);
     char *j = xrt_sys_json(&a, NULL);
     assert(j && strstr(j, "Apple Synthetic Board, 2 P-cores + 4 E-cores") && strstr(j, "package_temp_label") && strstr(j, "cpu_power_label"));
     free(j);
+    xrt_sys_snapshot_free(&a);
+    xrt_sys_close(s);
+
+    /* No P/E prefix: hottest macsmc_hwmon sensor, its own label. Battery stays out. */
+    put("sys/class/hwmon/hwmon0/temp1_label", "Die A\n");
+    put("sys/class/hwmon/hwmon0/temp1_input", "39000\n");
+    put("sys/class/hwmon/hwmon0/temp2_label", "Die B\n");
+    put("sys/class/hwmon/hwmon0/temp2_input", "51000\n");
+    put("sys/class/hwmon/hwmon0/temp3_label", "Die C\n");
+    put("sys/class/hwmon/hwmon0/temp3_input", "28000\n");
+    put("sys/class/hwmon/hwmon0/temp4_label", "Die D\n");
+    put("sys/class/hwmon/hwmon0/temp4_input", "29000\n");
+    s = xrt_sys_open(&lim);
+    assert(s);
+    assert(xrt_sys_sample(s, &a) == XRT_OK);
+    assert(near(a.cpu.package_temp_c.v, 51.0) && !strcmp(a.cpu.package_temp_label, "Die B"));
+    assert(a.cpu.temp_count == 4);
     xrt_sys_snapshot_free(&a);
     xrt_sys_close(s);
 
@@ -208,6 +231,284 @@ static void apple_case(void)
     xrt_sys_close(s);
     snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
     assert(system(cmd) == 0);
+    memcpy(root, saved, sizeof root);
+}
+
+static void fresh_root(const char *tag)
+{
+    const char *tmp = getenv("TMPDIR");
+    if (!tmp || !*tmp) tmp = ".";
+    snprintf(root, sizeof root, "%s/xodb-sysstat-%s-XXXXXX", tmp, tag);
+    assert(mkdtemp(root));
+    chmod(root, 0755);
+}
+static void drop_root(void)
+{
+    char cmd[600];
+    snprintf(cmd, sizeof cmd, "rm -rf '%s'", root);
+    assert(system(cmd) == 0);
+}
+static void open_lim(struct xrt_sys_limits *lim)
+{
+    xrt_sys_limits_default(lim);
+    lim->root = root;
+    lim->sensor_timing_disabled = 1;
+}
+static void pause_ms(void)
+{
+    struct timespec pause = {0, 2 * 1000 * 1000};
+    nanosleep(&pause, NULL);
+}
+
+/* Idle interval keeps the since-boot average off the current latency. */
+static void idle_disk_case(void)
+{
+    char saved[sizeof root];
+    memcpy(saved, root, sizeof saved);
+    fresh_root("idle");
+    put("proc/stat", "cpu  1 0 1 1 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n");
+    put("proc/diskstats",
+        "   8 0 sda 10 0 80 40 5 0 40 60 0 100 200\n"
+        "   8 1 sdb 0 0 0 0 0 0 0 0 0 0 0\n");
+    mkdirs("sys/block/sda");
+    put("sys/block/sda/size", "100\n");
+    mkdirs("sys/block/sdb");
+    put("sys/block/sdb/size", "100\n");
+    struct xrt_sys_limits lim;
+    open_lim(&lim);
+    struct xrt_sys *s = xrt_sys_open(&lim);
+    assert(s);
+    static struct xrt_sys_snapshot snap;
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.disks.count == 2);
+    assert(snap.disks.disk[0].avg_latency_ms.why == XRT_SYS_WHY_FIRST_SAMPLE);
+    pause_ms();
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(!strcmp(snap.disks.disk[0].name, "sda"));
+    assert(snap.disks.disk[0].avg_latency_ms.st == XRT_SYS_UNAVAILABLE);
+    assert(snap.disks.disk[0].avg_latency_ms.why == XRT_SYS_WHY_NO_IO);
+    assert(!strcmp(snap.disks.disk[1].name, "sdb"));
+    assert(snap.disks.disk[1].avg_latency_ms.why == XRT_SYS_WHY_NOT_PRESENT);
+    char *j = xrt_sys_json(&snap, NULL);
+    assert(j && strstr(j, "no I/O this interval"));
+    free(j);
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    drop_root();
+    memcpy(root, saved, sizeof root);
+}
+
+/* Swap, a holder, and a truncated mountinfo stay visible. A mapper root hides nothing. */
+static void namespace_case(void)
+{
+    char saved[sizeof root];
+    memcpy(saved, root, sizeof saved);
+    fresh_root("ns");
+    put("proc/stat", "cpu  1 0 1 1 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n");
+    put("proc/diskstats",
+        " 259 0 nvme0n1 4 0 8 1 0 0 0 0 0 1 1\n"
+        " 259 1 nvme0n2 4 0 8 1 0 0 0 0 0 1 1\n"
+        " 259 2 nvme0n3 4 0 8 1 0 0 0 0 0 1 1\n"
+        " 259 3 nvme0n4 4 0 8 1 0 0 0 0 0 1 1\n"
+        " 259 4 nvme0n5 4 0 8 1 0 0 0 0 0 1 1\n");
+    for (int i = 1; i <= 5; ++i) {
+        char p[64];
+        snprintf(p, sizeof p, "sys/block/nvme0n%d/size", i);
+        put(p, "100\n");
+    }
+    mkdirs("sys/block/nvme0n3/holders/dm-0");
+    mkdirs("sys/block/nvme0n5/nvme0n5p1/holders/dm-1"); /* LVM PV on a partition */
+    put("proc/swaps", "Filename Type Size Used Priority\n/dev/nvme0n2p1 partition 1024 0 -2\n");
+    put("proc/self/mountinfo", "21 1 259:1 / / rw - btrfs /dev/nvme0n1p1 rw\n");
+    struct xrt_sys_limits lim;
+    open_lim(&lim);
+    struct xrt_sys *s = xrt_sys_open(&lim);
+    assert(s);
+    static struct xrt_sys_snapshot snap;
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.disks.count == 4);
+    assert(!strcmp(snap.disks.disk[0].name, "nvme0n1"));
+    assert(!strcmp(snap.disks.disk[1].name, "nvme0n2"));
+    assert(!strcmp(snap.disks.disk[2].name, "nvme0n3"));
+    assert(!strcmp(snap.disks.disk[3].name, "nvme0n5"));
+    {
+        char p[512];
+        snprintf(p, sizeof p, "%s/proc/self/mountinfo", root);
+        FILE *f = fopen(p, "w");
+        assert(f);
+        fputs("21 1 259:1 / / rw - btrfs /dev/nvme0n1p1 rw\n", f);
+        const char *pad = "30 1 0:1 / /pad rw - tmpfs pad rw\n";
+        size_t wrote = strlen("21 1 259:1 / / rw - btrfs /dev/nvme0n1p1 rw\n");
+        while (wrote < (1u << 20) + 64) {
+            fputs(pad, f);
+            wrote += strlen(pad);
+        }
+        fputs("31 1 259:4 / /n4 rw - btrfs /dev/nvme0n4p1 rw\n", f);
+        assert(fclose(f) == 0);
+    }
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.disks.count == 5);
+    assert(!strcmp(snap.disks.disk[3].name, "nvme0n4"));
+    put("proc/self/mountinfo", "21 1 254:1 / / rw - ext4 /dev/mapper/cryptroot rw\n");
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.disks.count == 5);
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    drop_root();
+    memcpy(root, saved, sizeof root);
+}
+
+static void fdinfo_text(int pid, int fd, const char *body)
+{
+    char rel[64];
+    snprintf(rel, sizeof rel, "proc/%d/fd", pid);
+    mkdirs(rel);
+    snprintf(rel, sizeof rel, "proc/%d/fd/%d", pid, fd);
+    link_to("/dev/dri/card0", rel);
+    snprintf(rel, sizeof rel, "proc/%d/fdinfo/%d", pid, fd);
+    put(rel, "%s", body);
+}
+
+/* Duplicate fds are one client. A new client does not spike. An exit is one reset, then the next sample is idle. */
+static void fdinfo_case(void)
+{
+    char saved[sizeof root];
+    memcpy(saved, root, sizeof saved);
+    fresh_root("fd");
+    put("proc/stat", "cpu  1 0 1 1 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n");
+    put("sys/devices/platform/asahi-gpu/uevent", "DRIVER=asahi\n");
+    mkdirs("sys/class/drm/card0");
+    link_to("../../../devices/platform/asahi-gpu", "sys/class/drm/card0/device");
+    const char *one =
+        "drm-driver:\tasahi\n"
+        "drm-client-id:\t7\n"
+        "drm-engine-gfx:\t5000 ns\n"
+        "drm-total-vram:\t1000\n"
+        "drm-memory-vram:\t1000\n";
+    fdinfo_text(10, 3, one);
+    fdinfo_text(10, 4, one);
+    struct xrt_sys_limits lim;
+    open_lim(&lim);
+    struct xrt_sys *s = xrt_sys_open(&lim);
+    assert(s);
+    static struct xrt_sys_snapshot snap;
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu_count == 1);
+    assert(snap.power.gpu[0].busy_pct.why == XRT_SYS_WHY_FIRST_SAMPLE);
+    assert(snap.power.gpu[0].vram_used.st == XRT_SYS_OK && snap.power.gpu[0].vram_used.v == 1000);
+    {
+        char p[512];
+        snprintf(p, sizeof p, "%s/proc/10/fd/4", root);
+        assert(unlink(p) == 0);
+        snprintf(p, sizeof p, "%s/proc/10/fdinfo/4", root);
+        assert(unlink(p) == 0);
+    }
+    pause_ms();
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu[0].busy_pct.st == XRT_SYS_OK && near(snap.power.gpu[0].busy_pct.v, 0.0));
+    assert(snap.power.gpu[0].busy_pct.why == XRT_SYS_WHY_NONE);
+    assert(snap.power.gpu[0].vram_used.v == 1000);
+    fdinfo_text(12, 3,
+                "drm-driver:\tasahi\n"
+                "drm-client-id:\t9\n"
+                "drm-engine-gfx:\t1000000000000 ns\n"
+                "drm-memory-vram:\t2048\n");
+    pause_ms();
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu[0].busy_pct.st == XRT_SYS_OK && near(snap.power.gpu[0].busy_pct.v, 0.0));
+    assert(snap.power.gpu[0].vram_used.v == 3048);
+    {
+        char cmd[600];
+        snprintf(cmd, sizeof cmd, "rm -rf '%s/proc/10'", root);
+        assert(system(cmd) == 0);
+    }
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu[0].busy_pct.why == XRT_SYS_WHY_COUNTER_RESET);
+    pause_ms();
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu[0].busy_pct.st == XRT_SYS_OK && near(snap.power.gpu[0].busy_pct.v, 0.0));
+    assert(snap.power.gpu[0].busy_pct.why == XRT_SYS_WHY_NONE);
+    /* The remaining client advances by more than the interval: busy is positive and capped at 100. */
+    fdinfo_text(12, 3,
+                "drm-driver:\tasahi\n"
+                "drm-client-id:\t9\n"
+                "drm-engine-gfx:\t1000500000000 ns\n");
+    pause_ms();
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu[0].busy_pct.st == XRT_SYS_OK && snap.power.gpu[0].busy_pct.v > 0.0 && snap.power.gpu[0].busy_pct.v <= 100.0);
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    drop_root();
+    memcpy(root, saved, sizeof root);
+}
+
+static void display_only_case(void)
+{
+    char saved[sizeof root];
+    memcpy(saved, root, sizeof saved);
+    fresh_root("disp");
+    put("proc/stat", "cpu  1 0 1 1 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n");
+    put("sys/devices/platform/apple-display/uevent", "DRIVER=apple-drm\n");
+    mkdirs("sys/class/drm/card0");
+    link_to("../../../devices/platform/apple-display", "sys/class/drm/card0/device");
+    struct xrt_sys_limits lim;
+    open_lim(&lim);
+    struct xrt_sys *s = xrt_sys_open(&lim);
+    assert(s);
+    static struct xrt_sys_snapshot snap;
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.power.gpu_count == 0);
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    drop_root();
+    memcpy(root, saved, sizeof root);
+}
+
+/* No device tree: implementer plus part, inherited across the next processor block. */
+static void no_dt_case(void)
+{
+    char saved[sizeof root];
+    memcpy(saved, root, sizeof saved);
+    fresh_root("nodt");
+    put("proc/stat",
+        "cpu  600 0 300 1200 0 0 0 0 0 0\n"
+        "cpu0 100 0 50 200 0 0 0 0 0 0\n"
+        "cpu1 100 0 50 200 0 0 0 0 0 0\n"
+        "cpu2 100 0 50 200 0 0 0 0 0 0\n"
+        "cpu3 100 0 50 200 0 0 0 0 0 0\n"
+        "cpu4 100 0 50 200 0 0 0 0 0 0\n"
+        "cpu5 100 0 50 200 0 0 0 0 0 0\n");
+    put("proc/cpuinfo", "processor\t: 0\nCPU implementer\t: 0x61\nCPU part\t: 0x061\n\nprocessor\t: 1\nCPU part\t: 0x060\n");
+    for (int c = 0; c < 6; ++c) {
+        char p[160];
+        int perf = c >= 4;
+        snprintf(p, sizeof p, "sys/devices/system/cpu/cpu%d/cpu_capacity", c);
+        put(p, "%d\n", perf ? 1024 : 426);
+    }
+    struct xrt_sys_limits lim;
+    open_lim(&lim);
+    struct xrt_sys *s = xrt_sys_open(&lim);
+    assert(s);
+    static struct xrt_sys_snapshot snap;
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(!strcmp(snap.cpu.model.s, "Apple part 0x061 + part 0x060, 2 P-cores + 4 E-cores"));
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    /* A part with no implementer is not a model. */
+    put("proc/cpuinfo", "processor\t: 0\nCPU part\t: 0x061\n");
+    s = xrt_sys_open(&lim);
+    assert(s);
+    memset(&snap, 0, sizeof snap);
+    assert(xrt_sys_sample(s, &snap) == XRT_OK);
+    assert(snap.cpu.model.why == XRT_SYS_WHY_NOT_PRESENT);
+    xrt_sys_snapshot_free(&snap);
+    xrt_sys_close(s);
+    drop_root();
     memcpy(root, saved, sizeof root);
 }
 
@@ -800,6 +1101,11 @@ int main(void)
     }
     int status; assert(waitpid(limited, &status, 0) == limited && WIFEXITED(status) && WEXITSTATUS(status) == 0);
     apple_case();
+    idle_disk_case();
+    namespace_case();
+    fdinfo_case();
+    display_only_case();
+    no_dt_case();
     puts("runtime sysstat: ok");
     return 0;
 }

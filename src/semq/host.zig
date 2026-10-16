@@ -133,7 +133,6 @@ pub const PseudoVariable = struct {
     storage_offset: ?u64,
     valid_start: ?u64,
     valid_end: ?u64,
-    stack_parameter_verified: bool = false,
     pieces: []const PseudoPiece = &.{},
     padding: []const PseudoPadding = &.{},
 };
@@ -608,7 +607,6 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
             if (offset < 0 or offset > 31 or range_size <= 0 or range_size > 32) continue;
             try padding.append(a, .{ .offset = @intCast(offset), .size = @intCast(range_size) });
         };
-        const stack_parameter_verified = if (variable == .object) if (variable.object.get("stack_parameter_verified")) |value| value == .bool and value.bool else false else false;
         try variables.append(a, .{
             .name = try a.dupe(u8, str(variable, "name") orelse ""),
             .type_name = try a.dupe(u8, str(variable, "type") orelse ""),
@@ -620,7 +618,6 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
             .storage_offset = hexField(variable, "storage_offset"),
             .valid_start = hexField(variable, "valid_start"),
             .valid_end = hexField(variable, "valid_end"),
-            .stack_parameter_verified = stack_parameter_verified,
             .pieces = pieces.items,
             .padding = padding.items,
         });

@@ -53,11 +53,16 @@ pub fn livePseudoValues(a: std.mem.Allocator, session: *Session, analysis: *host
     if (frame_index >= frames.len) return &.{};
     const frame = frames[frame_index];
     const link_pc = frame.lookup_pc -% analysis.function.bias;
+    // Pseudo-C names the physical function's variables. An inlined callee's
+    // parameter may share a name and shadow it at depth 0, so match only the
+    // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
+    if (frame.inline_diagnostic != null) return &.{};
+    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
     // A stack proof includes the call that ends it, and an outer frame's
     // lookup PC is that call on arm64. The callee may have written the slot
     // since, so outer frames read no stack pieces.
     const memory: ?LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
-    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc);
+    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc, locals);
 }
 
 const State = struct {
@@ -630,6 +635,7 @@ test "pseudo-C live values use base registers, subregister offsets and PC bounds
     var registers: loc.RegisterSet = @splat(null);
     registers[Arch.x86_64.registerNumber("rdi").?] = 0x1234_5678_9abc_def0;
     registers[Arch.x86_64.registerNumber("rax").?] = 0x0000_0000_0000_0100;
+    const rdi_proof: pseudo_values.DwarfLocation = .{ .size = 4, .place = .{ .kind = .register, .bits = registers[Arch.x86_64.registerNumber("rdi").?].?, .register = @intCast(Arch.x86_64.registerNumber("rdi").?) } };
     const value = (try livePseudoValue(std.testing.allocator, .x86_64, registers, null, null, 0x1010, .{
         .name = "count",
         .type_name = "unsigned int",
@@ -641,10 +647,11 @@ test "pseudo-C live values use base registers, subregister offsets and PC bounds
         .storage_offset = 0,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
-    })).?;
+    }, rdi_proof)).?;
     defer std.testing.allocator.free(value.display);
     try std.testing.expectEqualStrings("count", value.name);
     try std.testing.expectEqualStrings("0x9abcdef0", value.display);
+    const flag_piece = [_]loc.Piece{.{ .kind = .register, .bits = registers[Arch.x86_64.registerNumber("rax").?].?, .register = @intCast(Arch.x86_64.registerNumber("rax").?), .bit_size = 8, .value_bit_offset = 0, .source_bit_offset = 8, .available = true }};
     const flag = (try livePseudoValue(std.testing.allocator, .x86_64, registers, null, null, 0x1010, .{
         .name = "flag",
         .type_name = "bool",
@@ -656,7 +663,7 @@ test "pseudo-C live values use base registers, subregister offsets and PC bounds
         .storage_offset = 0,
         .valid_start = 0x1010,
         .valid_end = 0x1011,
-    })).?;
+    }, .{ .size = 1, .place = .{ .kind = .value, .bits = 1, .pieces = &flag_piece } })).?;
     try std.testing.expectEqualStrings("true", flag.display);
     try std.testing.expect((try livePseudoValue(std.testing.allocator, .x86_64, registers, null, null, 0x1020, .{
         .name = "count",
@@ -669,7 +676,7 @@ test "pseudo-C live values use base registers, subregister offsets and PC bounds
         .storage_offset = 0,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
-    })) == null);
+    }, rdi_proof)) == null);
 }
 
 test "pseudo-C live values read stack pieces and assemble proven split pieces" {
@@ -690,6 +697,10 @@ test "pseudo-C live values read stack pieces and assemble proven split pieces" {
         .{ .storage = "stack", .size = 4, .value_bit_offset = 16, .cfa_offset = -4 },
     };
     const stack = [_]host.PseudoPiece{.{ .storage = "stack", .size = 4, .value_bit_offset = 0, .cfa_offset = -4 }};
+    const split_proof_pieces = [_]loc.Piece{
+        .{ .kind = .register, .bits = registers[Arch.x86_64.registerNumber("rdi").?].?, .register = @intCast(Arch.x86_64.registerNumber("rdi").?), .bit_size = 16, .value_bit_offset = 0, .available = true },
+        .{ .kind = .address, .bits = 0x7ffc, .bit_size = 32, .value_bit_offset = 16, .available = true },
+    };
     const seventh = (try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1010, .{
         .name = "seventh",
         .type_name = "int",
@@ -701,9 +712,8 @@ test "pseudo-C live values read stack pieces and assemble proven split pieces" {
         .storage_offset = null,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
-        .stack_parameter_verified = true,
         .pieces = &stack,
-    })).?;
+    }, .{ .size = 4, .place = .{ .kind = .address, .bits = 0x7ffc } })).?;
     defer std.testing.allocator.free(seventh.display);
     try std.testing.expectEqualStrings("0x12345678", seventh.display);
     const split = (try livePseudoValue(std.testing.allocator, .x86_64, registers, 0x8000, .{ .user = &context, .read = Memory.read }, 0x1010, .{
@@ -717,9 +727,8 @@ test "pseudo-C live values read stack pieces and assemble proven split pieces" {
         .storage_offset = null,
         .valid_start = 0x1000,
         .valid_end = 0x1020,
-        .stack_parameter_verified = true,
         .pieces = &pieces,
-    })).?;
+    }, .{ .size = 6, .place = .{ .kind = .value, .bits = 0, .pieces = &split_proof_pieces } })).?;
     defer std.testing.allocator.free(split.display);
     try std.testing.expectEqualStrings("0x12345678abcd", split.display);
 }

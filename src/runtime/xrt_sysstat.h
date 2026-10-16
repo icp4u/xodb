@@ -46,6 +46,7 @@ enum xrt_sys_reason {
     XRT_SYS_WHY_NO_MANAGER,      /* no supported service/package manager */
     XRT_SYS_WHY_SLOW_SOURCE,     /* STALE: source costs > 1 ms (i2c, SMART); refreshed every 5 s */
     XRT_SYS_WHY_TOO_SOON,        /* no clock tick elapsed since the previous sample */
+    XRT_SYS_WHY_NO_IO,           /* completions exist, but none in this interval */
     XRT_SYS_WHY_COUNT
 };
 
@@ -159,7 +160,7 @@ struct xrt_sys_disk {   /* whole block devices; partitions are in filesystems */
     struct xrt_sys_f64 read_bps, write_bps, read_iops, write_iops;
     struct xrt_sys_f64 busy_pct;                    /* io_ticks delta / interval */
     struct xrt_sys_f64 queue_depth;                 /* weighted io_ticks delta / interval */
-    struct xrt_sys_f64 avg_latency_ms;              /* (rd+wr ticks) / ops in interval */
+    struct xrt_sys_f64 avg_latency_ms;              /* (rd+wr ticks) / ops in this interval; idle is NO_IO, not the since-boot average */
     struct xrt_sys_u64 in_flight;
     struct xrt_sys_f64 temp_c;                      /* nvme hwmon Composite */
 };

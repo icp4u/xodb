@@ -93,6 +93,7 @@ COVERS = (
     (('src/ui/overview/fetch*', 'src/ui/overview/png.zig', 'tests/fetch*.py'), ('fetch', 'gui-fetch')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h', 'src/model/system*.zig'),
      ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-safe-keys*', 'gui-themes')),
+    (('tests/runtime-sysstat.c',), ('sysstat-*', 'build-tests')),
     (('src/mcp/shared*', 'src/mcp/session_tools.json', 'src/mcp/processes.zig', 'src/service/*'),
      ('shared-*', 'gui-shared-*', 'controller-scope-*', 'client-control', '*-shared-*', 'jai-*-1', 'elisp-bindings-*-1')),
     (('src/mcp/inspection.zig', 'src/ui/inspection.zig'), ('inspections*', 'inspection-lifecycle*', 'gui-inspection')),

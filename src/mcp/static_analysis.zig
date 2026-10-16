@@ -60,10 +60,15 @@ fn livePseudoValues(a: Allocator, session: *Session, analysis: *host.Analysis, t
     if (frame_index >= frames.len) return &.{};
     const frame = frames[frame_index];
     const link_pc = frame.lookup_pc -% analysis.function.bias;
+    // Pseudo-C names the physical function's variables. An inlined callee's
+    // parameter may share a name and shadow it at depth 0, so match only the
+    // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
+    if (frame.inline_diagnostic != null) return &.{};
+    const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
     // Outer-frame stack slots may have been changed by the callee after the
     // lookup PC's proof. Registers remain available through unwinding.
     const memory: ?pseudo_values.LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
-    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc);
+    return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc, locals);
 }
 
 fn hex(args: V, key: []const u8) !?u64 {

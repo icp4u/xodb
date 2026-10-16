@@ -72,6 +72,14 @@ struct pw { uint32_t uid; char name[32]; };
 #define PROC_STAT_SLOTS 4096
 struct proc_stat_fd { int32_t pid; int fd; uint64_t seen; };
 struct topo { struct xrt_sys_u64 package_id, die_id, core_id, l3_id, smt_index, cluster_id, capacity; struct xrt_sys_f64 fmin, fmax; uint8_t done; };
+/* One drm client on one GPU. Duplicate fds of the same client collapse before a row is stored. */
+#define GPU_CLIENTS 64
+struct gpu_client {
+    uint8_t gpu, have_id;
+    uint32_t id, pid;
+    int32_t fdn;
+    uint64_t ns;
+};
 
 struct xrt_sys {
     struct xrt_sys_limits lim;
@@ -107,8 +115,8 @@ struct xrt_sys {
     uint64_t rapl_prev, rapl_range;
     int64_t rapl_mono;
     uint8_t rapl_have;
-    uint64_t gpu_engine_ns[XRT_SYS_MAX_GPUS];
-    uint8_t gpu_engine_have[XRT_SYS_MAX_GPUS];
+    struct gpu_client gpu_client[GPU_CLIENTS];
+    uint32_t gpu_client_count;
     int64_t gpu_engine_mono;
     /* processes from the previous sample, sorted by pid */
     struct xrt_sys_proc *prev;
@@ -142,7 +150,7 @@ const char *xrt_sys_reason_text(enum xrt_sys_reason why)
     static const char *const text[] = {"ok", "not collected", "first sample", "not present",
                                        "needs privilege", "not supported", "parse error", "limit reached",
                                        "redacted", "gone", "io error", "counter reset", "no manager",
-                                       "slow source, refreshed every 5 s", "interval too short"};
+                                       "slow source, refreshed every 5 s", "interval too short", "no I/O this interval"};
     return (unsigned)why < COUNT_OF(text) ? text[why] : "unknown";
 }
 const char *xrt_sys_state_text(enum xrt_sys_state st)
@@ -724,6 +732,85 @@ static void read_topology(struct xrt_sys *s, uint32_t cpu, struct topo *t)
     t->done = 1;
 }
 
+/* MIDR implementer codes. Unknown parts stay "part 0xNNN"; this table is vendors only. */
+static const char *cpu_vendor(unsigned impl)
+{
+    static const struct { unsigned id; const char *name; } known[] = {
+        {0x41, "ARM"}, {0x42, "Broadcom"}, {0x43, "Cavium"}, {0x4e, "NVIDIA"},
+        {0x50, "APM"}, {0x51, "Qualcomm"}, {0x53, "Samsung"}, {0x56, "Marvell"},
+        {0x61, "Apple"}, {0x69, "Intel"}, {0xc0, "Ampere"},
+    };
+    for (size_t i = 0; i < COUNT_OF(known); ++i)
+        if (known[i].id == impl) return known[i].name;
+    return NULL;
+}
+static int cpuinfo_hex(const char *line, const char *key, unsigned *out)
+{
+    size_t kl = strlen(key);
+    if (strncmp(line, key, kl)) return 0;
+    if (line[kl] != '\t' && line[kl] != ' ' && line[kl] != ':') return 0;
+    const char *colon = strchr(line, ':');
+    const char *nl = strchr(line, '\n');
+    if (!colon || (nl && colon > nl)) return 0;
+    char *end = NULL;
+    errno = 0;
+    unsigned long v = strtoul(colon + 1, &end, 0);
+    if (end == colon + 1 || errno) return 0;
+    *out = (unsigned)v;
+    return 1;
+}
+/* No device-tree model: "Apple part 0x061 + part 0x060". A lone CPU part is not a model.
+ * The last implementer applies to later processor blocks that omit it. */
+static int cpu_parts_from_cpuinfo(const char *buf, char *name, size_t cap)
+{
+    struct { unsigned impl, part; } got[8];
+    unsigned n = 0, cur = 0;
+    int have = 0, saw = 0;
+    for (const char *line = buf; line && *line;) {
+        const char *nl = strchr(line, '\n');
+        unsigned v = 0;
+        if (cpuinfo_hex(line, "CPU implementer", &v) || cpuinfo_hex(line, "CPU implementor", &v)) {
+            cur = v;
+            have = saw = 1;
+        } else if (have && cpuinfo_hex(line, "CPU part", &v)) {
+            int dup = 0;
+            for (unsigned i = 0; i < n; ++i)
+                if (got[i].impl == cur && got[i].part == v) dup = 1;
+            if (!dup && n < COUNT_OF(got)) {
+                got[n].impl = cur;
+                got[n].part = v;
+                n++;
+            }
+        }
+        line = nl ? nl + 1 : NULL;
+    }
+    if (!saw || !n) return 0;
+    name[0] = 0;
+    unsigned prev = 0;
+    int any = 0;
+    for (unsigned i = 0; i < n; ++i) {
+        const char *vendor = cpu_vendor(got[i].impl);
+        char extra[64];
+        int el;
+        if (!any) {
+            if (vendor) el = snprintf(extra, sizeof extra, "%s part 0x%03x", vendor, got[i].part);
+            else el = snprintf(extra, sizeof extra, "implementer 0x%02x part 0x%03x", got[i].impl, got[i].part);
+        } else if (got[i].impl == prev) {
+            el = snprintf(extra, sizeof extra, " + part 0x%03x", got[i].part);
+        } else if (vendor) {
+            el = snprintf(extra, sizeof extra, " + %s part 0x%03x", vendor, got[i].part);
+        } else el = snprintf(extra, sizeof extra, " + implementer 0x%02x part 0x%03x", got[i].impl, got[i].part);
+        if (el < 0 || (size_t)el >= sizeof extra) return 0;
+        size_t have_n = strlen(name);
+        /* append_pe needs room for ", N P-cores + N E-cores". */
+        if (have_n + (size_t)el + 1 + 24 > cap) break;
+        memcpy(name + have_n, extra, (size_t)el + 1);
+        prev = got[i].impl;
+        any = 1;
+    }
+    return any;
+}
+
 /* Highest cpu_capacity is the performance class; a lower class is efficiency.
  * Appended only when both exist and the 64-byte model name still fits. */
 static void append_pe(struct xrt_sys *s, char *name, size_t cap)
@@ -787,21 +874,25 @@ static void cpu_model(struct xrt_sys *s, struct xrt_sys_name *model)
             }
         }
     }
-    /* arm64 cpuinfo has no model name. The device-tree model is the board name. */
+    /* arm64 cpuinfo has no model name. The device-tree model is the board name.
+     * Without one, an implementer plus part is the model; a part alone is not. */
     char dt[128];
     ssize_t dn = rd(s, "/proc/device-tree/model", dt, sizeof dt);
-    if (dn < 0 || !dt[0]) {
-        na_name(model, XRT_SYS_WHY_NOT_PRESENT);
-        return;
-    }
-    dt[sizeof dt - 1] = 0;
-    trim(dt);
-    if (!dt[0]) {
-        na_name(model, XRT_SYS_WHY_NOT_PRESENT);
-        return;
-    }
     char name[64];
-    copy_str(name, sizeof name, dt);
+    if (dn >= 0 && dt[0]) {
+        dt[sizeof dt - 1] = 0;
+        trim(dt);
+        if (dt[0]) {
+            copy_str(name, sizeof name, dt);
+            append_pe(s, name, sizeof name);
+            set_name(model, name);
+            return;
+        }
+    }
+    if (!cpu_parts_from_cpuinfo(s->buf, name, sizeof name)) {
+        na_name(model, XRT_SYS_WHY_NOT_PRESENT);
+        return;
+    }
     append_pe(s, name, sizeof name);
     set_name(model, name);
 }
@@ -935,6 +1026,31 @@ static void collect_cpu(struct xrt_sys *s, struct xrt_sys_snapshot *snap)
         } else if (lab_e[0]) {
             c->package_temp_c = val_e;
             copy_str(c->package_temp_label, sizeof c->package_temp_label, lab_e);
+        } else {
+            /* No P/E prefix: the hottest macsmc_hwmon temperature, under its own label.
+             * macsmc_battery is a different chip and stays off this list. */
+            double best = -1e9;
+            char lab[48] = {0};
+            struct xrt_sys_f64 val = {0};
+            for (uint32_t i = 0; i < snap->power.sensor_count; ++i) {
+                struct xrt_sys_sensor *x = &snap->power.sensor[i];
+                if (x->kind != XRT_SYS_TEMP || strcmp(x->chip, "macsmc_hwmon")) continue;
+                if (c->temp_count < COUNT_OF(c->temps)) {
+                    struct xrt_sys_reading *r = &c->temps[c->temp_count++];
+                    memset(r, 0, sizeof *r);
+                    copy_str(r->chip, sizeof r->chip, x->chip);
+                    copy_str(r->label, sizeof r->label, x->label);
+                    r->value = x->value;
+                }
+                if (!ISOK(x->value) || x->value.v <= best) continue;
+                best = x->value.v;
+                val = x->value;
+                copy_str(lab, sizeof lab, x->label);
+            }
+            if (lab[0]) {
+                c->package_temp_c = val;
+                copy_str(c->package_temp_label, sizeof c->package_temp_label, lab);
+            }
         }
     }
 }
@@ -1020,15 +1136,50 @@ static int mount_uses(const char *info, const char *name)
     }
     return 0;
 }
-/* Hide an nvme namespace when a sibling namespace of the same controller is mounted and this one is not. */
-static int hide_namespace(const char *name, const char *info, char **blocks, size_t nb)
+static int dir_nonempty(struct xrt_sys *s, const char *path)
 {
-    if (strncmp(name, "nvme", 4) || !info || !blocks) return 0;
+    size_t count = 0;
+    int err = 0;
+    char **h = list_dir(s, path, &count, &err);
+    int full = h && count > 0;
+    free_list(h, count);
+    return full;
+}
+/* A device-mapper or LVM holder of the namespace or of one of its partitions
+ * (an LVM PV is usually nvme0n2p1) means it is in use even when not mounted. */
+static int block_held(struct xrt_sys *s, const char *name)
+{
+    char path[160];
+    int n = snprintf(path, sizeof path, "/sys/block/%s/holders", name);
+    if (n < 0 || (size_t)n >= sizeof path) return 1;
+    if (dir_nonempty(s, path)) return 1;
+    n = snprintf(path, sizeof path, "/sys/block/%s", name);
+    if (n < 0 || (size_t)n >= sizeof path) return 1;
+    size_t count = 0;
+    int err = 0;
+    char **parts = list_dir(s, path, &count, &err);
+    size_t nl = strlen(name);
+    int held = 0;
+    for (size_t i = 0; i < count && !held; ++i) {
+        if (strncmp(parts[i], name, nl) || parts[i][nl] != 'p') continue;
+        n = snprintf(path, sizeof path, "/sys/block/%s/%s/holders", name, parts[i]);
+        held = n < 0 || (size_t)n >= sizeof path || dir_nonempty(s, path);
+    }
+    free_list(parts, count);
+    return held;
+}
+/* Hide an nvme namespace when a sibling namespace of the same controller is mounted and this one is not.
+ * unsafe: mountinfo or swaps did not fit, so a later use of this namespace may have been missed. */
+static int hide_namespace(struct xrt_sys *s, const char *name, const char *info, const char *swaps, int unsafe, char **blocks, size_t nb)
+{
+    if (unsafe || strncmp(name, "nvme", 4) || !info || !blocks) return 0;
     const char *ns = strchr(name + 4, 'n');
     if (!ns || ns == name + 4) return 0;
     size_t cl = (size_t)(ns - name);
     if (cl >= 16) return 0;
     if (mount_uses(info, name)) return 0;
+    if (swaps && mount_uses(swaps, name)) return 0;
+    if (block_held(s, name)) return 0;
     for (size_t i = 0; i < nb; ++i) {
         if (!strcmp(blocks[i], name)) continue;
         if (strncmp(blocks[i], name, cl) || blocks[i][cl] != 'n') continue;
@@ -1043,10 +1194,19 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
     int err;
     char **blocks = list_dir(s, "/sys/block", &nb, &err);
     if (!blocks && err) fail(&snap->group[XRT_SYS_G_DISKS], err, "/sys/block");
-    char *mntinfo = malloc(65536);
+    enum { MNT_CAP = 1 << 20, SWAP_CAP = 1 << 16 };
+    char *mntinfo = malloc(MNT_CAP);
+    char *swaps = malloc(SWAP_CAP);
+    int mnt_unsafe = !mntinfo || !swaps;
     if (mntinfo) {
-        ssize_t mn = rd(s, "/proc/self/mountinfo", mntinfo, 65536);
+        ssize_t mn = rd(s, "/proc/self/mountinfo", mntinfo, MNT_CAP);
         if (mn < 0) mntinfo[0] = 0;
+        else if ((size_t)mn + 1 >= MNT_CAP) mnt_unsafe = 1; /* filled: a later mount of this namespace may be missing */
+    }
+    if (swaps) {
+        ssize_t sn = rd(s, "/proc/swaps", swaps, SWAP_CAP);
+        if (sn < 0) swaps[0] = 0;
+        else if ((size_t)sn + 1 >= SWAP_CAP) mnt_unsafe = 1;
     }
     ssize_t n = rd(s, "/proc/diskstats", s->buf, sizeof s->buf);
     if (n < 0) fail(&snap->group[XRT_SYS_G_DISKS], (int)-n, "/proc/diskstats");
@@ -1093,7 +1253,7 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
         if ((!strncmp(name, "loop", 4) || !strncmp(name, "ram", 3) || !strncmp(name, "nbd", 3)) &&
             (!ISOK(k->size_bytes) || !k->size_bytes.v))
             continue; /* unattached */
-        if (mntinfo && hide_namespace(name, mntinfo, blocks, nb)) continue;
+        if (hide_namespace(s, name, mntinfo, swaps, mnt_unsafe, blocks, nb)) continue;
         d->count++;
         OK(k->read_bytes, f[2] * 512);
         OK(k->write_bytes, f[6] * 512);
@@ -1118,8 +1278,8 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
             uint64_t ops = (now[0] - o[0]) + (now[4] - o[4]);
             uint64_t ms = (now[3] - o[3]) + (now[7] - o[7]);
             if (ops) OK(k->avg_latency_ms, (double)ms / (double)ops);
-            else if (now[0] + now[4]) /* idle interval: the counters exist, so use them since boot */
-                OK(k->avg_latency_ms, (double)(now[3] + now[7]) / (double)(now[0] + now[4]));
+            else if (now[0] + now[4]) /* idle interval: do not publish the since-boot average as current */
+                NA(k->avg_latency_ms, XRT_SYS_WHY_NO_IO);
             else NA(k->avg_latency_ms, XRT_SYS_WHY_NOT_PRESENT); /* counter present, no completion yet */
         }
         NA(k->temp_c, XRT_SYS_WHY_NOT_PRESENT);
@@ -1145,6 +1305,7 @@ static void collect_disks(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
     memcpy(s->disk_prev, next_prev, next_count * sizeof next_prev[0]);
     s->disk_prev_count = next_count;
     free(mntinfo);
+    free(swaps);
     free_list(blocks, nb);
     psi_read(s, 2, &d->psi, dt, have_dt);
 }
@@ -2104,11 +2265,23 @@ static void collect_connections(struct xrt_sys *s, struct xrt_sys_snapshot *snap
 }
 
 /* ---- power: GPUs, RAPL, supplies ---- */
+/* asahi is the GPU. "apple" and "apple-drm" are the display controller and are not enumerated. */
 static int apple_drm(const char *drv)
 {
-    return !strcmp(drv, "asahi") || !strcmp(drv, "apple") || !strcmp(drv, "apple-drm");
+    return !strcmp(drv, "asahi");
 }
-struct gpu_acc { uint64_t ns, bytes; uint8_t have_ns, have_bytes; };
+struct fdinfo_rec {
+    uint64_t ns, bytes;
+    uint32_t id;
+    uint8_t have_ns, have_bytes, have_id;
+};
+struct gpu_seen {
+    int gpu; /* card index, or -2 for a render node that names no card */
+    uint8_t have_id, have_ns, have_bytes;
+    uint32_t id, pid;
+    int32_t fdn;
+    uint64_t ns, bytes;
+};
 /* drm-usage-stats value: "<uint> ns" for engines, "<uint> [KiB|MiB]" for memory. */
 static int drm_value(const char *val, unsigned long long *v)
 {
@@ -2122,8 +2295,9 @@ static int drm_value(const char *val, unsigned long long *v)
     *v = x;
     return 1;
 }
-static void fdinfo_add(struct xrt_sys *s, const char *path, struct gpu_acc *a)
+static void fdinfo_parse(struct xrt_sys *s, const char *path, struct fdinfo_rec *o)
 {
+    memset(o, 0, sizeof *o);
     char b[4096];
     if (rd(s, path, b, sizeof b) < 0) return;
     /* drm-memory-* is the legacy spelling; a driver printing both must not count twice. */
@@ -2139,9 +2313,17 @@ static void fdinfo_add(struct xrt_sys *s, const char *path, struct gpu_acc *a)
             char *val = colon + 1;
             while (*val == ' ' || *val == '\t') val++;
             unsigned long long v = 0;
-            if (!strstr(line, "capacity") && !strncmp(line, "drm-engine-", 11) && drm_value(val, &v)) {
-                a->ns += v;
-                a->have_ns = 1;
+            if (!strcmp(line, "drm-client-id")) {
+                char *end = NULL;
+                errno = 0;
+                unsigned long id = strtoul(val, &end, 10);
+                if (end != val && !errno) {
+                    o->id = (uint32_t)id;
+                    o->have_id = 1;
+                }
+            } else if (!strstr(line, "capacity") && !strncmp(line, "drm-engine-", 11) && drm_value(val, &v)) {
+                o->ns += v;
+                o->have_ns = 1;
             } else if (!strncmp(line, "drm-total-", 10) && drm_value(val, &v)) {
                 total += v;
                 have_total = 1;
@@ -2153,51 +2335,180 @@ static void fdinfo_add(struct xrt_sys *s, const char *path, struct gpu_acc *a)
         line = nl;
     }
     if (have_total || have_legacy) {
-        a->bytes += have_total ? total : legacy;
-        a->have_bytes = 1;
+        o->bytes = have_total ? total : legacy;
+        o->have_bytes = 1;
     }
 }
-static void apple_gpu_gap(struct xrt_sys_power *p)
+static int seen_same(const struct gpu_seen *w, int gpu, uint8_t have_id, uint32_t id, uint32_t pid, int32_t fdn)
 {
-    for (uint32_t i = 0; i < p->gpu_count; ++i) {
-        struct xrt_sys_gpu *u = &p->gpu[i];
-        if (!apple_drm(u->driver)) continue;
-        if (!ISOK(u->busy_pct) && u->busy_pct.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->busy_pct, XRT_SYS_WHY_NOT_SUPPORTED);
-        if (!ISOK(u->vram_used) && u->vram_used.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->vram_used, XRT_SYS_WHY_NOT_SUPPORTED);
-        if (!ISOK(u->vram_total) && u->vram_total.why == XRT_SYS_WHY_NOT_PRESENT) NA(u->vram_total, XRT_SYS_WHY_NOT_SUPPORTED);
+    if (w->gpu != gpu) return 0;
+    if (have_id) return w->have_id && w->id == id;
+    return !w->have_id && w->pid == pid && w->fdn == fdn;
+}
+/* Duplicate fds of one client keep one copy (the larger engine sum and one memory value). */
+static void seen_add(struct gpu_seen *seen, uint32_t *n, uint8_t *overflow, int gpu, const struct fdinfo_rec *rec, uint32_t pid, int32_t fdn)
+{
+    if (!rec->have_ns && !rec->have_bytes) return;
+    for (uint32_t i = 0; i < *n; ++i) {
+        if (!seen_same(&seen[i], gpu, rec->have_id, rec->id, pid, fdn)) continue;
+        if (rec->have_ns && (!seen[i].have_ns || rec->ns > seen[i].ns)) {
+            seen[i].ns = rec->ns;
+            seen[i].have_ns = 1;
+        }
+        if (rec->have_bytes && (!seen[i].have_bytes || rec->bytes > seen[i].bytes)) {
+            seen[i].bytes = rec->bytes;
+            seen[i].have_bytes = 1;
+        }
+        return;
+    }
+    if (*n >= GPU_CLIENTS) {
+        if (gpu >= 0 && gpu < XRT_SYS_MAX_GPUS) overflow[gpu] = 1;
+        else {
+            for (int i = 0; i < XRT_SYS_MAX_GPUS; ++i) overflow[i] = 1;
+        }
+        return;
+    }
+    struct gpu_seen *w = &seen[(*n)++];
+    memset(w, 0, sizeof *w);
+    w->gpu = gpu;
+    w->have_id = rec->have_id;
+    w->id = rec->id;
+    w->pid = pid;
+    w->fdn = fdn;
+    w->ns = rec->ns;
+    w->bytes = rec->bytes;
+    w->have_ns = rec->have_ns;
+    w->have_bytes = rec->have_bytes;
+}
+/* A render node fills the single asahi GPU only for fields the card node did not already provide. */
+static void fold_loose(struct gpu_seen *seen, uint32_t n, int gi)
+{
+    int has_ns = 0, has_bytes = 0;
+    for (uint32_t i = 0; i < n; ++i) {
+        if (seen[i].gpu != gi) continue;
+        has_ns |= seen[i].have_ns;
+        has_bytes |= seen[i].have_bytes;
+    }
+    for (uint32_t i = 0; i < n; ++i) {
+        if (seen[i].gpu != -2) continue;
+        int dup = -1;
+        for (uint32_t j = 0; j < n; ++j) {
+            if (seen[j].gpu != gi || !seen[i].have_id || !seen[j].have_id || seen[i].id != seen[j].id) continue;
+            dup = (int)j;
+        }
+        if (dup >= 0) {
+            if (!seen[dup].have_bytes && seen[i].have_bytes) {
+                seen[dup].bytes = seen[i].bytes;
+                seen[dup].have_bytes = 1;
+            }
+            continue;
+        }
+        if (!has_ns && (seen[i].have_ns || seen[i].have_bytes)) seen[i].gpu = gi;
+        else if (!has_bytes && seen[i].have_bytes) {
+            seen[i].have_ns = 0;
+            seen[i].gpu = gi;
+        }
     }
 }
-static void gpu_apply(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sys_group *g, const struct gpu_acc *acc, int denied)
+static int base_match(const struct gpu_client *c, const struct gpu_seen *w)
+{
+    if ((int)c->gpu != w->gpu) return 0;
+    if (w->have_id) return c->have_id && c->id == w->id;
+    return !c->have_id && c->pid == w->pid && c->fdn == w->fdn;
+}
+static void store_clients(struct xrt_sys *s, int gpu, const struct gpu_seen *seen, uint32_t nseen)
+{
+    uint32_t w = 0;
+    for (uint32_t i = 0; i < s->gpu_client_count; ++i)
+        if ((int)s->gpu_client[i].gpu != gpu) s->gpu_client[w++] = s->gpu_client[i];
+    s->gpu_client_count = w;
+    for (uint32_t i = 0; i < nseen && s->gpu_client_count < GPU_CLIENTS; ++i) {
+        if (seen[i].gpu != gpu || !seen[i].have_ns) continue;
+        struct gpu_client *c = &s->gpu_client[s->gpu_client_count++];
+        memset(c, 0, sizeof *c);
+        c->gpu = (uint8_t)gpu;
+        c->have_id = seen[i].have_id;
+        c->id = seen[i].id;
+        c->pid = seen[i].pid;
+        c->fdn = seen[i].fdn;
+        c->ns = seen[i].ns;
+    }
+}
+static void gpu_apply(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sys_group *g, const struct gpu_seen *seen, uint32_t nseen,
+                      const uint8_t *overflow, int denied)
 {
     int64_t now = mono_ns();
     for (uint32_t i = 0; i < p->gpu_count && i < XRT_SYS_MAX_GPUS; ++i) {
         struct xrt_sys_gpu *u = &p->gpu[i];
         if (!apple_drm(u->driver) || ISOK(u->busy_pct)) continue;
-        if (acc[i].have_bytes && !ISOK(u->vram_used)) OK(u->vram_used, acc[i].bytes);
-        if (acc[i].have_ns) {
-            if (!s->gpu_engine_have[i]) NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
-            else if (acc[i].ns < s->gpu_engine_ns[i]) NA(u->busy_pct, XRT_SYS_WHY_COUNTER_RESET);
-            else {
-                double sec = (double)(now - s->gpu_engine_mono) * 1e-9;
-                if (sec > 0) {
-                    double pct = (double)(acc[i].ns - s->gpu_engine_ns[i]) / (sec * 1e9) * 100.0;
-                    if (pct > 100) pct = 100;
-                    OK(u->busy_pct, pct);
-                } else NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
+        uint64_t bytes = 0;
+        int have_bytes = 0, seen_ns = 0, base_n = 0;
+        for (uint32_t k = 0; k < nseen; ++k) {
+            if (seen[k].gpu != (int)i) continue;
+            if (seen[k].have_bytes) {
+                bytes += seen[k].bytes;
+                have_bytes = 1;
             }
-            s->gpu_engine_ns[i] = acc[i].ns;
-            s->gpu_engine_have[i] = 1;
+            if (seen[k].have_ns) seen_ns++;
         }
+        if (have_bytes && !ISOK(u->vram_used)) OK(u->vram_used, bytes);
+        for (uint32_t k = 0; k < s->gpu_client_count; ++k)
+            if ((int)s->gpu_client[k].gpu == (int)i) base_n++;
+        if (overflow[i]) {
+            NA(u->busy_pct, XRT_SYS_WHY_LIMIT);
+            continue;
+        }
+        if (!seen_ns && !base_n) continue; /* kernel published no engine time: not present */
+        if (!base_n) {
+            NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
+            store_clients(s, (int)i, seen, nseen);
+            continue;
+        }
+        int reset = !seen_ns;
+        for (uint32_t k = 0; k < s->gpu_client_count; ++k) {
+            if ((int)s->gpu_client[k].gpu != (int)i) continue;
+            int found = 0;
+            for (uint32_t j = 0; j < nseen; ++j) {
+                if (seen[j].gpu != (int)i || !seen[j].have_ns || !base_match(&s->gpu_client[k], &seen[j])) continue;
+                found = 1;
+                if (seen[j].ns < s->gpu_client[k].ns) reset = 1;
+            }
+            if (!found) reset = 1;
+        }
+        if (reset) {
+            NA(u->busy_pct, XRT_SYS_WHY_COUNTER_RESET);
+            store_clients(s, (int)i, seen, nseen);
+            continue;
+        }
+        uint64_t delta = 0;
+        for (uint32_t j = 0; j < nseen; ++j) {
+            if (seen[j].gpu != (int)i || !seen[j].have_ns) continue;
+            for (uint32_t k = 0; k < s->gpu_client_count; ++k) {
+                if (!base_match(&s->gpu_client[k], &seen[j])) continue;
+                delta += seen[j].ns - s->gpu_client[k].ns;
+                break; /* one baseline; a client with none adds nothing */
+            }
+        }
+        double sec = s->gpu_engine_mono ? (double)(now - s->gpu_engine_mono) * 1e-9 : 0;
+        if (sec > 0) {
+            double pct = (double)delta / (sec * 1e9) * 100.0;
+            if (pct > 100) pct = 100;
+            OK(u->busy_pct, pct);
+        } else NA(u->busy_pct, XRT_SYS_WHY_FIRST_SAMPLE);
+        store_clients(s, (int)i, seen, nseen);
     }
     s->gpu_engine_mono = now;
-    apple_gpu_gap(p);
     if (denied || s->euid != 0) detail(g, 0, "GPU counters: own processes only");
 }
-/* Live only: a fixture root must not walk the host proc. Bounded so one sample cannot scan the whole machine. */
+/* sys_open prefixes a fixture root, so this walk does not open the host proc.
+ * readlinkat returns the symlink text and does not open that path.
+ * Bounded so one sample cannot scan the whole machine. */
 static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sys_group *g)
 {
-    struct gpu_acc acc[XRT_SYS_MAX_GPUS] = {{0}};
-    struct gpu_acc loose = {0};
+    struct gpu_seen seen[GPU_CLIENTS];
+    memset(seen, 0, sizeof seen);
+    uint32_t nseen = 0;
+    uint8_t overflow[XRT_SYS_MAX_GPUS] = {0};
     int targets = 0;
     for (uint32_t i = 0; i < p->gpu_count; ++i)
         if (apple_drm(p->gpu[i].driver) && !ISOK(p->gpu[i].busy_pct)) targets++;
@@ -2206,7 +2517,7 @@ static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sy
     DIR *d = pfd < 0 ? NULL : fdopendir(pfd);
     if (!d) {
         if (pfd >= 0) sys_close(s, pfd);
-        gpu_apply(s, p, g, acc, 1);
+        gpu_apply(s, p, g, seen, 0, overflow, 1);
         return;
     }
     struct dirent *e;
@@ -2214,6 +2525,9 @@ static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sy
     while ((e = readdir(d)) && procs < 512) {
         if (e->d_name[0] < '1' || e->d_name[0] > '9') continue;
         procs++;
+        char *pend = NULL;
+        unsigned long pid_u = strtoul(e->d_name, &pend, 10);
+        if (!pend || *pend || pid_u > UINT32_MAX) continue;
         char rel[64];
         if ((size_t)snprintf(rel, sizeof rel, "%s/fd", e->d_name) >= sizeof rel) continue;
         int fdd = sys_openat(s, dirfd(d), rel, O_DIRECTORY);
@@ -2232,6 +2546,9 @@ static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sy
         while ((fe = readdir(fds)) && nfd < 64) {
             if (fe->d_name[0] == '.') continue;
             nfd++;
+            char *fend = NULL;
+            unsigned long fd_u = strtoul(fe->d_name, &fend, 10);
+            if (!fend || *fend || fd_u > INT32_MAX) continue;
             char link[128], lrel[96];
             if ((size_t)snprintf(lrel, sizeof lrel, "%s/fd/%s", e->d_name, fe->d_name) >= sizeof lrel) continue;
             s->syscalls++;
@@ -2249,37 +2566,24 @@ static void gpu_fdinfo(struct xrt_sys *s, struct xrt_sys_power *p, struct xrt_sy
                     if (!strcmp(p->gpu[i].card, cardname)) which = (int)i;
             } else if (strstr(link, "/dev/dri/renderD")) which = -2;
             else continue;
+            if (which == -1) continue;
             char info[96];
             if ((size_t)snprintf(info, sizeof info, "/proc/%s/fdinfo/%s", e->d_name, fe->d_name) >= sizeof info) continue;
-            struct gpu_acc one = {0};
-            fdinfo_add(s, info, &one);
-            struct gpu_acc *dst = NULL;
-            if (which >= 0) dst = &acc[which];
-            else if (which == -2) dst = &loose;
-            if (!dst) continue;
-            dst->ns += one.ns;
-            dst->bytes += one.bytes;
-            dst->have_ns = (uint8_t)(dst->have_ns | one.have_ns);
-            dst->have_bytes = (uint8_t)(dst->have_bytes | one.have_bytes);
+            struct fdinfo_rec rec;
+            fdinfo_parse(s, info, &rec);
+            seen_add(seen, &nseen, overflow, which, &rec, (uint32_t)pid_u, (int32_t)fd_u);
         }
         closedir(fds);
     }
     closedir(d);
-    if (targets == 1 && (loose.have_ns || loose.have_bytes)) {
+    if (targets == 1) {
         for (uint32_t i = 0; i < p->gpu_count; ++i) {
             if (!apple_drm(p->gpu[i].driver) || ISOK(p->gpu[i].busy_pct)) continue;
-            if (!acc[i].have_ns && loose.have_ns) {
-                acc[i].ns = loose.ns;
-                acc[i].have_ns = 1;
-            }
-            if (!acc[i].have_bytes && loose.have_bytes) {
-                acc[i].bytes = loose.bytes;
-                acc[i].have_bytes = 1;
-            }
+            fold_loose(seen, nseen, (int)i);
             break;
         }
     }
-    gpu_apply(s, p, g, acc, denied);
+    gpu_apply(s, p, g, seen, nseen, overflow, denied);
 }
 /* dGPUs export mem_busy_percent and mem_info_vram_vendor; amdgpu hides both on APUs. */
 static int amdgpu_apu(struct xrt_sys *s, const char *card)
@@ -2328,6 +2632,12 @@ static void collect_power(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
             char *slot = strstr(b, "PCI_SLOT_NAME=");
             if (slot) sscanf(slot + 14, "%31s", gpu_pci[p->gpu_count - 1]);
         }
+        /* The display controller is not a GPU. Missing asahi busy stays not present. */
+        if (!strcmp(u->driver, "apple") || !strcmp(u->driver, "apple-drm")) {
+            gpu_pci[p->gpu_count - 1][0] = 0;
+            p->gpu_count--;
+            continue;
+        }
         for (char *c = pci; *c; ++c) if (*c >= 'A' && *c <= 'Z') *c = (char)(*c - 'A' + 'a');
         if (pci[0]) set_name(&u->name, pci);
         else na_name(&u->name, XRT_SYS_WHY_NOT_PRESENT);
@@ -2369,8 +2679,7 @@ static void collect_power(struct xrt_sys *s, struct xrt_sys_snapshot *snap, doub
         int apple_gap = 0;
         for (uint32_t i = 0; i < p->gpu_count; ++i)
             if (apple_drm(p->gpu[i].driver) && !ISOK(p->gpu[i].busy_pct)) apple_gap = 1;
-        if (apple_gap && s->live) gpu_fdinfo(s, p, g);
-        else if (apple_gap) apple_gpu_gap(p);
+        if (apple_gap) gpu_fdinfo(s, p, g);
     }
     /* RAPL package energy, or a labelled system/SoC power input when RAPL is absent. */
     p->cpu_power_label[0] = 0;

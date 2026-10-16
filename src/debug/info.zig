@@ -7,7 +7,7 @@ const loc = @import("location.zig");
 const image_budget = @import("../binary/snapshot.zig");
 const eval = @import("../model/evaluate.zig");
 pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, line: u32, column: u32, address: u64, is_statement: bool, prologue_end: bool, discriminator: u32 };
-pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, diagnostic: ?[]const u8 = null };
+pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, location: ?loc.Place = null, diagnostic: ?[]const u8 = null };
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
 pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
@@ -851,8 +851,10 @@ pub const Image = struct {
         if (count < 0) return error.MalformedLocation;
         if (count == 0) return error.LocationUnavailable;
         if (count != 1) return error.AmbiguousLocation;
-        // Some -O0 producers describe a stack slot for the whole function,
-        // including instructions before arguments have been spilled into it.
+        // Some producers describe a spill/home slot for the whole function,
+        // including instructions before a register argument has been stored.
+        // A positive CFA offset is not sufficient evidence: Windows shadow
+        // space exists at entry but is still uninitialized.
         if (before_prologue) for (ops[0][0..lengths[0]]) |op| {
             if (op.atom == std.dwarf.OP.fbreg) return error.PrologueNotComplete;
         };
@@ -946,6 +948,7 @@ pub const Image = struct {
                         const t = if (reference(&die, std.dwarf.AT.type)) |ref| try self.typeOf(ref, 0) else &unknown;
                         var value = Local{ .name = variable_name, .parameter = tag == std.dwarf.TAG.formal_parameter, .value = .{ .type = t } };
                         if (self.place(a, &die, pc, ctx, before_prologue)) |where| {
+                            value.location = where;
                             if (where.kind == .address) value.value.address = where.bits else {
                                 value.value.bits = where.bits;
                                 value.value.data = if (where.data) |data| try a.dupe(u8, data) else if (t.kind == .array or t.kind == .structure) blk: {

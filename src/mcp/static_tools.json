@@ -39,7 +39,7 @@
   },
   {
     "name": "decompile_function",
-    "description": "Return the retained pseudo-C document for the function containing an address (or symbol): exact text, signature, producer qualification and reasons, and artifact id. With tid and optional frame at a stop inside the function, live_values reports only variables whose sidecar storage range and debugger registers/innermost-frame memory prove a known current value; live_values_at identifies the stop generation. It uses the same supervised, asynchronous per-function analysis and cache as analyze_function; poll while status is running. Pseudo-C remains a static possibility, not verified semantics.",
+    "description": "Return the retained pseudo-C document for the function containing an address (or symbol): exact text, signature, producer qualification and reasons, and artifact id. With tid and optional frame at a stop inside the function, live_values reports only variables whose exact current-PC DWARF location agrees with the sidecar storage and whose debugger registers/innermost-frame memory prove a known current value; live_values_at identifies the stop generation. It uses the same supervised, asynchronous per-function analysis and cache as analyze_function; poll while status is running. Pseudo-C remains a static possibility, not verified semantics.",
     "inputSchema": {
       "type": "object",
       "properties": {

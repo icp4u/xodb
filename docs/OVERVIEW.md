@@ -42,7 +42,11 @@ be turned off without a restart); `q` quits. Mouse clicks and the wheel work too
   hovering shows it in the footer. Three of these mean different things:
   `not present` (this kernel or hardware does not expose it), `needs
   privilege` (it exists but this user cannot read it) and `not supported`
-  (xodb has no collector for it on this platform yet). Stale values (slow sources such as NVMe and
+  (xodb has no collector for it on this platform yet). An idle disk, one that has
+  completed I/O since boot but none in this sample, is `no I/O this interval`
+  rather than a since-boot average. A GPU with no busy or memory source, including
+  asahi with no drm fdinfo, is `not present`. The Apple display controller is not
+  listed as a GPU. Stale values (slow sources such as NVMe and
   DIMM sensors) are dimmed and marked stale.
 - Processes are identified by pid and start time; the debugger hand-off sends
   both. The launcher and consumer recheck them and reject changed identities.
