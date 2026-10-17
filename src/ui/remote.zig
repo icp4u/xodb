@@ -470,7 +470,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         workspace.input(&window, client);
         if (@hasDecl(Window, "testStep")) {
             var steps: usize = 0;
-            while (!window.closing and steps < 64 and try window.testStep(frames.rendered)) : (steps += 1) {
+            while (!window.closing and steps < 64 and try window.testStep(frames.rendered, frames.stoppedPresented(client))) : (steps += 1) {
                 workspace.input(&window, client);
                 if (window.takeTestState()) {
                     log.info(.window, "xodb: state panel={s} selected={} search=\"\" searching=false search_supported=false source_scroll={d} pointer={d:.0},{d:.0} size={d}x{d} frames={d} rss_bytes={d}\n", .{
@@ -484,6 +484,12 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
                         frames.rendered,
                         window.residentBytes(),
                     });
+                    if (workspace.snapshot) |snapshot| {
+                        const v = snapshot.value;
+                        log.info(.window, "xodb: debugger state={s} generation={d} pc={x} registers={d} instructions={d} breakpoints={d}\n", .{
+                            v.state, v.generation, if (v.frames.len > 0) v.frames[0].pc else 0, v.registers.len, v.instructions.len, v.breakpoints.len,
+                        });
+                    }
                 }
             }
         }
@@ -518,10 +524,16 @@ const Frames = struct {
     started: u64,
     limit: u64,
     rendered: u64 = 0,
+    presented_generation: ?u64 = null,
     last_frame: u64 = 0,
     drawing: bool = false,
     live_frames: u64 = 0,
     gaps: Pacing = .{},
+    fn stoppedPresented(self: *const Frames, client: *remote.Client) bool {
+        const facts = client.facts();
+        const snapshot = self.workspace.snapshot orelse return false;
+        return facts.state == .ready and !facts.busy and self.presented_generation == snapshot.value.generation and std.mem.eql(u8, snapshot.value.state, "stopped");
+    }
     fn liveResize(context: ?*anyopaque) callconv(.c) void {
         const self: *Frames = @ptrCast(@alignCast(context orelse return));
         if (self.drawing or !self.recovery.ready) return;
@@ -548,6 +560,7 @@ const Frames = struct {
         if (self.rendered != 0) self.gaps.add((completed -| self.last_frame) / 1000);
         self.last_frame = completed;
         self.rendered += 1;
+        self.presented_generation = if (self.workspace.snapshot) |snapshot| snapshot.value.generation else null;
         if (self.limit != 0 and self.rendered >= self.limit) self.window.closing = true;
     }
 };

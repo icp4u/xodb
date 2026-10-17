@@ -59,17 +59,6 @@ static void store_field(const struct xrt_arch *arch, unsigned char *raw,
             (unsigned char)(value >> (8 * (arch->little_endian ? b : reg->width - 1 - b)));
 }
 
-enum xrt_status xrt_register_admit(const struct xrt_register_desc *reg, uint64_t value)
-{
-    if (!reg)
-        return XRT_INVALID_ARGUMENT;
-    if (reg->access == XRT_REG_READ_ONLY)
-        return XRT_REGISTER_NOT_WRITABLE;
-    if (reg->width < 8 && value >> (reg->width * 8))
-        return XRT_INVALID_ARGUMENT;
-    return XRT_OK;
-}
-
 enum xrt_status xrt_registers_poke(const struct xrt_arch *arch, void *raw, size_t size,
                                    const char *name, size_t length, uint64_t value)
 {

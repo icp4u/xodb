@@ -74,7 +74,7 @@ void *xcocoa_pool_push(void);
 void xcocoa_pool_pop(void *pool);
 /* Opt-in bounded frame script: 0 waiting/end, 1 input, 2 state, 3 clipset,
  * 4 clipget, -1 invalid/unavailable step. Text lives until the next step. */
-int xcocoa_test_step(uint64_t frame);
+int xcocoa_test_step(uint64_t frame, int stopped_presented);
 const char *xcocoa_test_text(void);
 uint64_t xcocoa_resident_bytes(void);
 void xcocoa_set_title(const char *title);

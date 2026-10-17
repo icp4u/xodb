@@ -1,6 +1,17 @@
 #include "xrt_arch.h"
 #include <string.h>
 
+enum xrt_status xrt_register_admit(const struct xrt_register_desc *reg, uint64_t value)
+{
+    if (!reg)
+        return XRT_INVALID_ARGUMENT;
+    if (reg->access == XRT_REG_READ_ONLY)
+        return XRT_REGISTER_NOT_WRITABLE;
+    if (reg->width < 8 && value >> (reg->width * 8))
+        return XRT_INVALID_ARGUMENT;
+    return XRT_OK;
+}
+
 /* fs_base (18) and gs_base (19) are the thread pointers: shown, so that
  * thread-local storage can be found, and never written. */
 #define X86_DESC(name, dwarf, word, id, role)                                                      \

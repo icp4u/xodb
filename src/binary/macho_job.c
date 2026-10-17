@@ -3,13 +3,21 @@
 #include "../runtime/xrt_files.h"
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __linux__
 #include <linux/magic.h>
+#else
+#include <sys/mount.h>
+/* Darwin opens a readable nonblocking descriptor in the first traversal. */
+#define O_PATH (O_RDONLY | O_NONBLOCK)
+#endif
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#ifdef __linux__
 #include <sys/statfs.h>
+#endif
 #include <time.h>
 #include <unistd.h>
 
@@ -84,9 +92,21 @@ static enum xmo_status read_object(void *context, uint64_t at, void *out, size_t
 static int regular(int fd) {
     struct stat st; struct statfs fs;
     if (fstat(fd, &st) || !S_ISREG(st.st_mode) || fstatfs(fd, &fs)) return 0;
+#ifdef __linux__
     unsigned long type = (unsigned long)fs.f_type;
     return type != PROC_SUPER_MAGIC && type != SYSFS_MAGIC && type != DEBUGFS_MAGIC &&
            type != TRACEFS_MAGIC && type != CGROUP2_SUPER_MAGIC;
+#else
+    return 1;
+#endif
+}
+static int readable_copy(int fd) {
+#ifdef __linux__
+    char descriptor[64];snprintf(descriptor,sizeof descriptor,"/proc/self/fd/%d",fd);
+    return open(descriptor,O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC);
+#else
+    return fcntl(fd,F_DUPFD_CLOEXEC,0);
+#endif
 }
 static uint64_t retained(const struct xmo_job *j) {
     uint64_t bytes=xmo_info(j->image)->retained_bytes+j->debug.size+j->unwind.size+j->compact_size+xmu_bytes(j->compact_table);
@@ -122,8 +142,7 @@ static enum xmo_debug_status debug_candidate(struct xmo_job *j, int fd) {
     if (!regular(fd) || xrt_file_identity(fd,&j->debug_identity)!=XRT_OK || j->debug_identity.size<0) {
         close(fd);return XMO_DEBUG_REFUSED;
     }
-    char descriptor[64];snprintf(descriptor,sizeof descriptor,"/proc/self/fd/%d",fd);
-    j->debug_fd=open(descriptor,O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC);close(fd);
+    j->debug_fd=readable_copy(fd);close(fd);
     if (j->debug_fd<0) return XMO_DEBUG_REFUSED;
     uint64_t allowance=available(j);
     enum xmo_status status=XMO_LIMIT;
@@ -188,8 +207,7 @@ static enum xmo_status object_candidate(struct xmo_job *j, uint32_t index, int f
     if (owner->mtime && (object->identity.mtime_sec<0 || owner->mtime!=(uint64_t)object->identity.mtime_sec)) {
         close(fd);return XMO_CHANGED;
     }
-    char descriptor[64];snprintf(descriptor,sizeof descriptor,"/proc/self/fd/%d",fd);
-    object->fd=open(descriptor,O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC);close(fd);
+    object->fd=readable_copy(fd);close(fd);
     if (object->fd<0) return XMO_IO;
     uint64_t allowance=available(j);
     enum xmo_status status=XMO_LIMIT;
@@ -311,9 +329,7 @@ static enum xmo_status candidate(struct xmo_job *j, int fd) {
     }
     /* Pin and reject special files before a read-open can reach a device.
      * The proc descriptor name refers only to our own verified regular file. */
-    char descriptor[64];
-    snprintf(descriptor,sizeof descriptor,"/proc/self/fd/%d",fd);
-    int readable=open(descriptor,O_RDONLY|O_NONBLOCK|O_NOCTTY|O_CLOEXEC);
+    int readable=readable_copy(fd);
     close(fd);fd=readable;
     if (fd<0 || xrt_file_unchanged(fd,&j->identity)!=XRT_OK) {
         if (fd>=0) close(fd);

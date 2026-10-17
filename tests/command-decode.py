@@ -9,7 +9,7 @@ generator = runpy.run_path(str(root / 'scripts/gen-command-decode'))
 catalog = json.loads((root / 'src/mcp/base_tools.json').read_text())
 generate = generator['generate']
 expected = generate(catalog)
-assert expected == (root / 'src/mcp/command_decode.zig').read_text(), 'stale generated decoder'
+assert expected == (root / 'src/model/command_decode.zig').read_text(), 'stale generated decoder'
 changed = copy.deepcopy(catalog)
 finish = next(t for t in changed if t['name'] == 'finish')['inputSchema']
 finish['properties']['frame']['maximum'] = 7

@@ -120,6 +120,39 @@ def link_address(path, symbol):
     raise AssertionError((path, symbol))
 
 
+def known_live_values(image, symbol, expected, options=(), max_steps=96, required=None):
+    """Single-step one owned function and check every displayed value."""
+    current = Client("control", str(image), options=options)
+    seen = set()
+    checked_values = 0
+    try:
+        current.action("set_breakpoint", symbol=symbol)
+        current.continue_initial_stop()
+        stopped = current.stopped("breakpoint")
+        tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+        found = tool(current, "find_symbol", name=symbol)
+        low, high = int(found["address"], 16), int(found["address"], 16) + found["size"]
+        for _ in range(max_steps):
+            registers = tool(current, "get_registers", tid=tid)["registers"]
+            pc = int(registers.get("rip") or registers.get("pc"), 16)
+            if not low <= pc < high: break
+            live = poll(current, symbol, tid=tid, frame=0)
+            assert live.get("status") == "completed", (symbol, hex(pc), live)
+            for row in live.get("live_values", ()):
+                assert row["name"] in expected, (symbol, hex(pc), row, live)
+                assert row["display"] == expected[row["name"]], (symbol, hex(pc), row, expected[row["name"]])
+                seen.add(row["name"])
+                checked_values += 1
+            current.action("step_instruction", tid=tid)
+            current.stopped(seconds=10)
+        required = set(expected) if required is None else set(required)
+        assert required <= seen <= set(expected), (symbol, required, seen, expected)
+        return checked_values
+    finally:
+        current.p.stdin.close()
+        current.p.wait(timeout=20)
+
+
 def checked(client, image, position_independent, entry_pad=False):
     """Decompile the qx functions of image in this live session; return their
     pseudo-C with the addresses Ghidra puts in generated names taken out."""
@@ -342,6 +375,92 @@ try:
             client.p.stdin.close(); client.p.wait(timeout=10)
 
     client.p.stdin.close(); client.p.wait(timeout=10)
+
+    # O0's physical parameter homes are distinct from Ghidra's entry-register
+    # symbols. Raw p-code must prove each exact register-to-stack spill; every
+    # value accepted while stepping is checked against the call's constants.
+    storage_o0 = work / "qx-storage-O0"
+    subprocess.run(["gcc", "-O0", "-g", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-Wl,--build-id=none",
+                    "tests/fixtures/semq/qx-storage.c", "-o", str(storage_o0)], check=True, timeout=120)
+    stack_answers = {"a": "0x1", "b": "0x2", "c": "0x3", "d": "0x4", "e": "0x5", "f": "0x6", "seventh": "0x7"}
+    o0_required = set(stack_answers) - {"seventh"}
+    o0_checked = known_live_values(storage_o0, "qx_stack", stack_answers, required=o0_required)
+    assert o0_checked >= len(o0_required), o0_checked
+
+    # Split DWARF leaves only a skeleton in the imported image. Ghidra calls
+    # its parameters param_N; the DWO's formal order plus exact storage proves
+    # their identity without a name guess.
+    storage_split = work / "qx-storage-split"
+    subprocess.run(["gcc", "-O2", "-g", "-gsplit-dwarf", "-fno-pie", "-no-pie", "-Wl,--build-id=none",
+                    str(ROOT / "tests/fixtures/semq/qx-storage.c"), "-o", storage_split.name], cwd=work, check=True, timeout=120)
+    assert list(work.glob("qx-storage-split*.dwo")), list(work.iterdir())
+    split_checked = known_live_values(storage_split, "qx_stack", stack_answers, required={"a"})
+    assert split_checked >= 1, split_checked
+    split_sha = hashlib.sha256(storage_split.read_bytes()).hexdigest()
+    split_open, _ = exchange({"id": "split-dwarf-open", "verb": "open_image", "path": str(storage_split), "sha256": split_sha, "deadline_ms": 10000})
+    split_open, _ = wait_work(split_open, 120)
+    split_raw, split_raw_payload = exchange({"id": "split-dwarf-vars", "verb": "decompile", "path": str(storage_split),
+        "sha256": split_sha, "entry": hex(link_address(storage_split, "qx_stack")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    if split_raw.get("state") == "pending": split_raw, split_raw_payload = wait_work(split_raw)
+    assert split_raw.get("state") == "ready" and split_raw_payload, split_raw
+    split_rows = [row for row in json.loads(split_raw_payload)["variables"] if row.get("parameter")]
+    assert split_rows and all(isinstance(row.get("parameter_index"), int) for row in split_rows), split_rows
+    assert any(row["name"].startswith("param_") for row in split_rows), split_rows
+
+    # A build-ID companion supplies xodb's DWARF while Ghidra analyzes the
+    # stripped image and again exports only param_N identities.
+    storage_full = work / "qx-storage-build-id-full"
+    storage_stripped = work / "qx-storage-build-id"
+    subprocess.run(["gcc", "-O2", "-g", "-fno-pie", "-no-pie", "-Wl,--build-id=sha1",
+                    "tests/fixtures/semq/qx-storage.c", "-o", str(storage_full)], check=True, timeout=120)
+    notes = subprocess.run(["readelf", "-n", str(storage_full)], check=True, capture_output=True, text=True).stdout
+    build_id = re.search(r"Build ID:\s*([0-9a-f]+)", notes).group(1)
+    debug_root = work / "debug-root"
+    companion = debug_root / ".build-id" / build_id[:2] / (build_id[2:] + ".debug")
+    companion.parent.mkdir(parents=True)
+    subprocess.run(["objcopy", "--only-keep-debug", str(storage_full), str(companion)], check=True, timeout=30)
+    shutil.copy2(storage_full, storage_stripped)
+    subprocess.run(["objcopy", "--strip-all", str(storage_stripped)], check=True, timeout=30)
+    stripped_checked = known_live_values(storage_stripped, "qx_stack", stack_answers,
+                                         options=("--debug-dir", str(debug_root)), required={"a"})
+    assert stripped_checked >= 1, stripped_checked
+    stripped_sha = hashlib.sha256(storage_stripped.read_bytes()).hexdigest()
+    stripped_open, _ = exchange({"id": "stripped-open", "verb": "open_image", "path": str(storage_stripped),
+        "sha256": stripped_sha, "deadline_ms": 10000})
+    stripped_open, _ = wait_work(stripped_open, 120)
+    stripped_raw, stripped_payload = exchange({"id": "stripped-vars", "verb": "decompile", "path": str(storage_stripped),
+        "sha256": stripped_sha, "entry": hex(link_address(storage_full, "qx_stack")), "size": "0x0", "options": "default", "deadline_ms": 10000})
+    if stripped_raw.get("state") == "pending": stripped_raw, stripped_payload = wait_work(stripped_raw)
+    assert stripped_raw.get("state") == "ready" and stripped_payload, stripped_raw
+    stripped_rows = [row for row in json.loads(stripped_payload)["variables"] if row.get("parameter")]
+    assert stripped_rows and all(isinstance(row.get("parameter_index"), int) for row in stripped_rows), stripped_rows
+    assert any(row["name"].startswith("param_") for row in stripped_rows), stripped_rows
+
+    # The current contents of an exactly matched caller stack slot are valid
+    # in frame 1. A callee write through an alias would be the current value,
+    # not a reason to hide the slot.
+    frame_source = work / "qx-frame.c"
+    frame_source.write_text("""
+__attribute__((noinline)) unsigned long qx_leaf(volatile unsigned long *p) { __asm__ volatile("" :: "r"(p)); return *p; }
+__attribute__((noinline)) unsigned long qx_outer(unsigned long a) { volatile unsigned long kept = a + 1; return qx_leaf(&kept) + a; }
+int main(void) { return (int)qx_outer(0x35); }
+""")
+    frame_image = work / "qx-frame"
+    subprocess.run(["gcc", "-O0", "-g", "-fno-omit-frame-pointer", "-fno-pie", "-no-pie", "-Wl,--build-id=none",
+                    str(frame_source), "-o", str(frame_image)], check=True, timeout=120)
+    client = Client("control", str(frame_image))
+    client.action("set_breakpoint", symbol="qx_leaf")
+    client.continue_initial_stop()
+    stopped = client.stopped("breakpoint")
+    tid = next(thread["tid"] for thread in stopped["threads"] if thread["state"] == "stopped")
+    outer = poll(client, "qx_outer", tid=tid, frame=1)
+    assert outer.get("status") == "completed", outer
+    outer_values = {row["name"]: row["display"] for row in outer.get("live_values", ())}
+    assert all(name in {"a", "kept"} for name in outer_values), outer
+    assert outer_values.get("a") == "0x35", outer
+    if "kept" in outer_values: assert outer_values["kept"] == "0x36", outer
+    client.p.stdin.close(); client.p.wait(timeout=20)
+
     client = Client("control", str(storage_image))
     client.action("set_breakpoint", symbol="qx_wide")
     client.continue_initial_stop()
@@ -462,4 +581,5 @@ print(f"pass: real Ghidra sidecar ELF fixed, PIE, CET and shared library; first 
       f"warm cache {warm_ms:.1f} ms; pooled uncached median {sorted(pooled_ms)[len(pooled_ms)//2]:.1f} ms, "
       f"cross-client foreground {priority_ms:.1f} ms; RSS demo {demo_rss_kib / 1024:.1f} MiB" +
       (f", after {idle_seconds:.0f}s idle {idle_rss_kib / 1024:.1f} MiB" if idle_rss_kib is not None else "") +
+      f"; DC9 known values O0={o0_checked} split={split_checked} stripped={stripped_checked} outer={len(outer_values)}" +
       f"; process survived xodb exit; work {work}")

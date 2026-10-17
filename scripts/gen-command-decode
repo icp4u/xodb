@@ -89,7 +89,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
-    output = ROOT / 'src/mcp/command_decode.zig'
+    output = ROOT / 'src/model/command_decode.zig'
     generated = generate(json.loads((ROOT / 'src/mcp/base_tools.json').read_text()))
     if args.check:
         if not output.exists() or output.read_text() != generated:

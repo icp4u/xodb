@@ -203,9 +203,9 @@ pub const Window = struct {
     pub fn drainFramePool(_: *Window, pool: ?*anyopaque) void {
         shim.xcocoa_pool_pop(pool);
     }
-    pub fn testStep(self: *Window, frame: u64) !bool {
+    pub fn testStep(self: *Window, frame: u64, stopped_presented: bool) !bool {
         const log = @import("../log.zig");
-        switch (shim.xcocoa_test_step(frame)) {
+        switch (shim.xcocoa_test_step(frame, @intFromBool(stopped_presented))) {
             0 => return false,
             1 => {},
             2 => self.test_state = true,

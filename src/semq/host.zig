@@ -127,6 +127,7 @@ pub const PseudoVariable = struct {
     type_name: []const u8,
     size: u32,
     parameter: bool,
+    parameter_ordinal: ?u32 = null,
     storage: []const u8,
     register: ?[]const u8,
     register_bit_offset: u8,
@@ -612,6 +613,7 @@ fn pseudoDocument(a: Allocator, root: std.json.Value) !PseudoDocument {
             .type_name = try a.dupe(u8, str(variable, "type") orelse ""),
             .size = @intCast(size),
             .parameter = parameter,
+            .parameter_ordinal = if (number(variable, "parameter_index")) |index| if (index >= 0 and index <= std.math.maxInt(u32)) @intCast(index) else null else null,
             .storage = try a.dupe(u8, str(variable, "storage") orelse "temp"),
             .register = if (str(variable, "register")) |name| try a.dupe(u8, name) else null,
             .register_bit_offset = @intCast(@min(63, @max(0, number(variable, "register_bit_offset") orelse 0))),
@@ -1680,13 +1682,14 @@ test "sidecar variable metadata retains base register, subregister offset and li
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const root = try std.json.parseFromSliceLeaky(std.json.Value, arena.allocator(),
-        \\{"pseudocode":{"text":"int f(int count)\\n","tokens":[]},"variables":[{"name":"count","type":"int","size":4,"parameter":true,"storage":"register","register":"RDI","register_bit_offset":8,"storage_offset":"0x20","valid_start":"0x1000","valid_end":"0x1010"}]}
+        \\{"pseudocode":{"text":"int f(int count)\\n","tokens":[]},"variables":[{"name":"count","type":"int","size":4,"parameter":true,"parameter_index":3,"storage":"register","register":"RDI","register_bit_offset":8,"storage_offset":"0x20","valid_start":"0x1000","valid_end":"0x1010"}]}
     , .{});
     const document = try pseudoDocument(arena.allocator(), root);
     try std.testing.expectEqual(@as(usize, 1), document.variables.len);
     const variable = document.variables[0];
     try std.testing.expectEqualStrings("count", variable.name);
     try std.testing.expectEqualStrings("RDI", variable.register.?);
+    try std.testing.expectEqual(@as(?u32, 3), variable.parameter_ordinal);
     try std.testing.expectEqual(@as(u8, 8), variable.register_bit_offset);
     try std.testing.expectEqual(@as(?u64, 0x20), variable.storage_offset);
     try std.testing.expectEqual(@as(?u64, 0x1000), variable.valid_start);

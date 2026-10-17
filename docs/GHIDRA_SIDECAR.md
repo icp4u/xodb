@@ -108,7 +108,7 @@ of the shared JVM and prevents idle exit.
 ## Verbs
 
 `hello` has no verb-specific fields. A usable reply is `ready` and contains
-protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.9`, Ghidra version,
+protocol `1`, schema `1`, producer `ghidra-jvm-sidecar-0.1.10`, Ghidra version,
 uid, `healthy: true`, log path, and these required capabilities:
 `open_image`, `decompile`, `cancel`, `status`, `shutdown`, `xsg`, and
 `pseudocode`. It also advertises `prime`, variables, types, function index, and the
@@ -208,8 +208,8 @@ Other gaps remain unmapped.
 At a live stop, `decompile_function` accepts `tid` and optional `frame` and
 returns `live_values` plus `live_values_at`. These are the same values shown by
 the D pane: every storage piece must cover the requested PC and be readable
-from the stopped frame. Stack pieces are read only for frame 0; missing or
-unproven values are omitted rather than guessed.
+from the stopped frame. Missing or unproven values are omitted rather than
+guessed.
 
 
 ## Pseudo-C behavior
@@ -223,14 +223,20 @@ range. At the stopped PC, xodb independently resolves the matching parameter
 or local from DWARF in the image or its identity-matched debug companion,
 taken from the physical function's own scope: an inlined callee's
 same-named variable never proves the outer one. The
-name, parameter/local role, byte size, every value-piece offset, register and
-register-bit offset or runtime CFA-relative address must agree exactly with
-the Ghidra storage. Missing, ambiguous, unsupported or conflicting DWARF omits
-the value; an image without DWARF has no live pseudo-C values. Stack pieces are
-read only for the innermost frame. At `-O0`, Ghidra commonly retains entry
-register storage while DWARF names the post-prologue spill slot; those values
-remain omitted because the locations do not agree. Values split over several agreed pieces are
-assembled by significance; the 0.1.9 producer exports decompiler join pieces
+name or proven formal-parameter order, parameter/local role, byte size, every
+value-piece offset, register and register-bit offset or runtime CFA-relative
+address must agree exactly with the Ghidra storage. Parameter order is used
+only when Ghidra's stripped or split-DWARF import has a synthetic `param_N`
+name; the live-value row then uses the compiler's DWARF name. Missing,
+ambiguous, unsupported or conflicting DWARF omits the value; an
+image without DWARF has no live pseudo-C values. A straight-line raw-p-code
+store from an exact incoming register proves the usual `-O0` parameter spill;
+that alternate storage ends at a join, branch, call, opaque instruction or
+overwrite. No type or calling-convention placement heuristic is involved.
+CFA-relative stack values may be read in an outer frame when both sources name
+the same runtime address; a change through an alias is then the variable's
+current value. Values split over several agreed pieces are
+assembled by significance; the 0.1.10 producer exports decompiler join pieces
 from their most-significant piece to their least-significant piece. Aggregate
 padding is shown as `??` bytes rather than as a value. `[` and `]` scroll
 long pseudo-C lines horizontally.

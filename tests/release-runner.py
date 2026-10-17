@@ -31,6 +31,7 @@ UNREGISTERED = {
         ('needs an ARM64 host', ('arm64-demo.py', 'arm64-native.py', 'arm64-watchpoints.py', 'remote-ssh-gui.py',)),
         ('needs gdbserver and QEMU targets', ('gdb-remote.py',)),
         ('run on a riscv64 guest by tests/riscv64-guest.sh (periodic --riscv64-guest)', ('runtime-riscv64.py',)),
+        ('run on Darwin by macos-native.py --local (release-check --macos)', ('macos-local.py',)),
         ('needs a device profile', ('simpleperf-import.py', 'simpleperf-import-gui.py',)),
         ('needs sudo: the privileged allocation helper, or a configured host', ('allocations-live.py', 'm2-syscall-configured.py',)),
         ('measurement, no pass criteria', ('allocation-cost.py', 'memory-cost.py', 'm2-server-cost.py', 'm2-workload-cost.py',)),
@@ -579,6 +580,11 @@ class RunnerTests(unittest.TestCase):
         self.assertNotIn('macos-native-stress', {step.name for step in steps})
         self.assertIn('macos-bootstrap', {step.name for step in steps})
         self.assertNotIn('macos-bootstrap', {step.name for step in gate.plan('all')})
+        self.assertIn('macos-local', {step.name for step in steps})
+        self.assertNotIn('macos-local', {step.name for step in gate.plan('all')})
+        for path in ('src/model/macos_session.zig', 'tests/macos-local.py', 'tests/fixtures/macos-local.c'):
+            picked, _ = gate.affected(steps, [path], ['gui-overview'])
+            self.assertIn('macos-local', {step.name for step in picked})
         picked, _ = gate.affected(steps, ['src/runtime/macos_debugserver.c'], ['gui-overview'])
         self.assertIn('macos-bootstrap', {step.name for step in picked})
         self.assertNotIn('gui-overview', {step.name for step in picked})

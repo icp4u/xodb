@@ -80,6 +80,19 @@ fn storageAgrees(a: std.mem.Allocator, architecture: Arch, cfa: ?u64, variable: 
     return pieceAgrees(a, architecture, cfa, pieces[0], direct);
 }
 
+fn syntheticParameterName(name: []const u8) bool {
+    const prefix = "param_";
+    if (!std.mem.startsWith(u8, name, prefix) or name.len == prefix.len) return false;
+    for (name[prefix.len..]) |byte| if (byte < '0' or byte > '9') return false;
+    return true;
+}
+
+fn identityAgrees(variable: host.PseudoVariable, local: debug_info.Local) bool {
+    if (local.parameter != variable.parameter or local.value.type.size != variable.size) return false;
+    if (std.mem.eql(u8, local.name, variable.name)) return true;
+    return variable.parameter and syntheticParameterName(variable.name) and variable.parameter_ordinal != null and local.parameter_ordinal == variable.parameter_ordinal;
+}
+
 pub fn value(a: std.mem.Allocator, architecture: Arch, registers: location.RegisterSet, cfa: ?u64, memory: ?LiveMemory, link_pc: u64, variable: host.PseudoVariable, dwarf: DwarfLocation) !?PseudoValue {
     if (variable.size == 0 or variable.size > 32) return null;
     const value_size: usize = @intCast(variable.size);
@@ -178,18 +191,23 @@ pub fn collect(a: std.mem.Allocator, analysis: *host.Analysis, architecture: Arc
     var values: std.ArrayList(PseudoValue) = .empty;
     for (analysis.pseudocode.variables) |variable| {
         var proof: ?DwarfLocation = null;
+        var proof_name: []const u8 = variable.name;
         var ambiguous = false;
         for (locals) |local| {
-            if (local.parameter != variable.parameter or !std.mem.eql(u8, local.name, variable.name) or local.value.type.size != variable.size) continue;
+            if (!identityAgrees(variable, local)) continue;
             const place = local.location orelse continue;
             if (proof != null) {
                 ambiguous = true;
                 break;
             }
             proof = .{ .size = local.value.type.size, .place = place };
+            proof_name = local.name;
         }
         if (ambiguous) continue;
-        const found = (try value(a, architecture, registers, cfa, memory, link_pc, variable, proof orelse continue)) orelse continue;
+        var found = (try value(a, architecture, registers, cfa, memory, link_pc, variable, proof orelse continue)) orelse continue;
+        // A stripped or split-DWARF Ghidra import may know only `param_N`.
+        // Once formal order and storage both agree, expose the compiler's name.
+        found.name = proof_name;
         var duplicate = false;
         for (values.items) |old| if (std.mem.eql(u8, old.name, found.name)) {
             duplicate = true;
@@ -198,6 +216,30 @@ pub fn collect(a: std.mem.Allocator, analysis: *host.Analysis, architecture: Arc
         if (!duplicate) try values.append(a, found);
     }
     return values.items;
+}
+
+test "DWARF parameter order proves synthetic Ghidra parameter names" {
+    const variable: host.PseudoVariable = .{
+        .name = "param_1",
+        .type_name = "undefined8",
+        .size = 8,
+        .parameter = true,
+        .parameter_ordinal = 0,
+        .storage = "register",
+        .register = "RDI",
+        .register_bit_offset = 0,
+        .storage_offset = null,
+        .valid_start = 0x1000,
+        .valid_end = 0x1010,
+    };
+    const actual: debug_info.Local = .{ .name = "actual_name", .parameter = true, .parameter_ordinal = 0, .value = .{ .type = &@import("evaluate.zig").uint_type } };
+    try std.testing.expect(identityAgrees(variable, actual));
+    var wrong = actual;
+    wrong.parameter_ordinal = 1;
+    try std.testing.expect(!identityAgrees(variable, wrong));
+    var named = variable;
+    named.name = "different_source_name";
+    try std.testing.expect(!identityAgrees(named, actual));
 }
 
 test "DWARF must agree with split Ghidra storage before pieces are assembled" {

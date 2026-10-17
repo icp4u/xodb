@@ -29,12 +29,15 @@ LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs',
 COVERS = (
     (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'tests/macos-bootstrap.c'),
      ('build-tests', 'macos-bootstrap', 'release-runner')),
+    (('src/model/macos_session.zig', 'src/remote/native_owner.zig', 'src/c_macos.zig', 'tests/macos-local.py', 'tests/fixtures/macos-local.*'),
+     ('macos-local', 'release-runner')),
+    (('src/runtime/target_state.c', 'src/runtime/file_identity.c'), ('build-tests', 'macos-local')),
     (('build_macos.zig', 'src/macos_main.zig', 'src/platform/cocoa*', 'src/platform/macos_process.c',
       'src/platform/input_macos.zig', 'scripts/macos-bundle.py', 'tests/macos-native.py', 'tests/cocoa-native.m'),
      ('platform-cocoa*', 'release-runner', 'macos-native')),
     (('src/model/command.zig', 'src/model/commands.zig', 'src/service/authority.zig', 'src/mcp/commands.zig', 'tests/command-boundary.py'), ('command-boundary*', 'm1-control', 'm1-source', 'm1-stepping', 'run-control', 'breakpoint-policy', 'shared-sessions*', 'remote-owner-batches*', 'gui-run-control')),
     (('src/model/system_capture*', 'src/mcp/system_capture.zig', 'tests/system-capture*.py'), ('system-capture', 'system-capture-flow', 'gui-system-capture', 'sysstat-headless', 'gui-overview-live')),
-    (('src/mcp/base_tools.json', 'src/mcp/command_decode.zig', 'scripts/gen-command-decode'), ('command-decode', 'command-boundary*')),
+    (('src/mcp/base_tools.json', 'src/model/command_decode.zig', 'src/model/json_command.zig', 'scripts/gen-command-decode'), ('command-decode', 'command-boundary*', 'macos-native')),
     (('tests/command-compare.py',), ('command-compare-selftest',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
@@ -283,6 +286,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     if macos and not headless and tier in ('gui', 'all', 'periodic'):
         steps.append(('macos-native', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos], 420))
         steps.append(('macos-bootstrap', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--bootstrap'], 420))
+        steps.append(('macos-local', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--local'], 420))
         if tier == 'periodic':
             steps.append(('macos-native-stress', [sys.executable, '-B', 'tests/macos-native.py', '--ssh', macos, '--stress'], 1000))
     if not headless and tier in ('gui', 'all'):

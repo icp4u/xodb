@@ -1,5 +1,5 @@
 //! C seen by the debug engine. Rendering, platform and UI code use c_ui.zig.
-pub const api = @cImport({
+pub const api = if (@import("builtin").os.tag == .macos) @import("c_macos.zig").api else @cImport({
     @cUndef("_FORTIFY_SOURCE"); // glibc's fortified fcntl wrappers do not translate; ReleaseSafe defines it
     @cDefine("_GNU_SOURCE", "1");
     @cDefine("BIONIC_IOCTL_NO_SIGNEDNESS_OVERLOAD", "1"); // translate-c needs one ioctl declaration

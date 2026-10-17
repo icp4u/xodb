@@ -4,6 +4,9 @@ const c = @import("../c.zig").api;
 const rt = @import("../target/runtime.zig").c;
 const budget = @import("../binary/snapshot.zig");
 const dwarf = @import("../debug/info.zig");
+const has_dwarf = @import("builtin").os.tag == .linux;
+const DebugImage = if (has_dwarf) dwarf.Image else void;
+const DebugCfi = if (has_dwarf) dwarf.Cfi else void;
 const elf = @import("../binary/elf.zig");
 const a = std.heap.page_allocator;
 const max_entries = 32;
@@ -19,10 +22,10 @@ const Entry = struct {
     failure: ?[]const u8 = null,
     charged: usize = 0,
     used: u64 = 0,
-    debug: ?dwarf.Image = null,
+    debug: ?DebugImage = null,
     debug_error: ?anyerror = null,
-    objects: [c.XMO_MAX_DEBUG_OBJECTS]?*dwarf.Image = @splat(null),
-    cfi: ?dwarf.Cfi = null,
+    objects: [c.XMO_MAX_DEBUG_OBJECTS]?*DebugImage = @splat(null),
+    cfi: ?DebugCfi = null,
     cfi_checked: bool = false,
     object_errors: [c.XMO_MAX_DEBUG_OBJECTS]?anyerror = @splat(null),
 };
@@ -74,12 +77,14 @@ pub const State = struct {
         self.* = .{};
     }
     fn destroy(self: *State, e: *Entry) void {
-        if (e.debug) |*debug| debug.deinit();
-        if (e.cfi) |*cfi| cfi.deinit();
-        for (e.objects) |object| if (object) |debug| {
-            debug.deinit();
-            a.destroy(debug);
-        };
+        if (comptime has_dwarf) {
+            if (e.debug) |*debug| debug.deinit();
+            if (e.cfi) |*cfi| cfi.deinit();
+            for (e.objects) |object| if (object) |debug| {
+                debug.deinit();
+                a.destroy(debug);
+            };
+        }
         if (e.job) |job| c.xmo_job_destroy(job);
         budget.release(e.charged);
         self.held -= e.charged;

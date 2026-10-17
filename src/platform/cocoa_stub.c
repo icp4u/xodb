@@ -18,7 +18,7 @@ void xcocoa_set_scale(float scale) { (void)scale; }
 void xcocoa_set_live_resize(void (*draw)(void *), void *context) { (void)draw; (void)context; }
 void *xcocoa_pool_push(void) { return 0; }
 void xcocoa_pool_pop(void *pool) { (void)pool; }
-int xcocoa_test_step(uint64_t frame) { (void)frame; return 0; }
+int xcocoa_test_step(uint64_t frame, int stopped_presented) { (void)frame; (void)stopped_presented; return 0; }
 const char *xcocoa_test_text(void) { return ""; }
 uint64_t xcocoa_resident_bytes(void) { return 0; }
 void xcocoa_set_title(const char *title) { (void)title; }

@@ -176,7 +176,7 @@ static int test_run(char *line) {
     }
     return -1; // Includes optional shot, which this client does not implement.
 }
-int xcocoa_test_step(uint64_t frame) {
+int xcocoa_test_step(uint64_t frame, int stopped_presented) {
     @autoreleasepool {
         if (!test_started) {
             test_started = 1;
@@ -205,6 +205,11 @@ int xcocoa_test_step(uint64_t frame) {
             test_previous = test_frame; test_command = p; test_pending = 1;
         }
         if (frame < test_frame || test_drag.valid) return 0;
+        if (!strcmp(test_command, "stopped")) {
+            if (!stopped_presented) return 0;
+            test_pending = 0;
+            return 1;
+        }
         test_pending = 0;
         return test_run(test_command);
     }

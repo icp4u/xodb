@@ -7,7 +7,17 @@ const loc = @import("location.zig");
 const image_budget = @import("../binary/snapshot.zig");
 const eval = @import("../model/evaluate.zig");
 pub const Site = struct { path: []const u8, original_path: ?[]const u8 = null, line: u32, column: u32, address: u64, is_statement: bool, prologue_end: bool, discriminator: u32 };
-pub const Local = struct { name: []const u8, parameter: bool, value: eval.Value, location: ?loc.Place = null, diagnostic: ?[]const u8 = null };
+pub const Local = struct {
+    name: []const u8,
+    parameter: bool,
+    /// Zero-based order among the formal parameters of this concrete DWARF
+    /// subprogram. This is identity evidence when a stripped Ghidra import can
+    /// only name the same parameter `param_N`.
+    parameter_ordinal: ?u32 = null,
+    value: eval.Value,
+    location: ?loc.Place = null,
+    diagnostic: ?[]const u8 = null,
+};
 /// `outermost`: CFI marks the return address undefined (DW_CFA_undefined),
 /// the DWARF end-of-stack convention (glibc _start and clone3).
 pub const Unwind = struct { cfa: u64, caller: loc.RegisterSet, method: enum { eh_frame, debug_frame, windows_unwind, windows_leaf, windows_epilog, macho_compact }, outermost: bool = false };
@@ -935,9 +945,15 @@ pub const Image = struct {
             var die: c.Dwarf_Die = undefined;
             if (c.dwarf_child(scope, &die) != 0) continue;
             var scanned: usize = 0;
+            var parameter_ordinal: u32 = 0;
             while (scanned < 1_000_000) : (scanned += 1) {
                 const tag = c.dwarf_tag(&die);
                 if (tag == std.dwarf.TAG.variable or tag == std.dwarf.TAG.formal_parameter) {
+                    const ordinal = if (tag == std.dwarf.TAG.formal_parameter) blk: {
+                        const current = parameter_ordinal;
+                        parameter_ordinal = std.math.add(u32, parameter_ordinal, 1) catch return error.LocalLimit;
+                        break :blk current;
+                    } else null;
                     const variable_name = name(&die);
                     var duplicate = variable_name.len == 0;
                     for (out.items) |v| if (std.mem.eql(u8, v.name, variable_name)) {
@@ -946,7 +962,7 @@ pub const Image = struct {
                     };
                     if (!duplicate) {
                         const t = if (reference(&die, std.dwarf.AT.type)) |ref| try self.typeOf(ref, 0) else &unknown;
-                        var value = Local{ .name = variable_name, .parameter = tag == std.dwarf.TAG.formal_parameter, .value = .{ .type = t } };
+                        var value = Local{ .name = variable_name, .parameter = tag == std.dwarf.TAG.formal_parameter, .parameter_ordinal = ordinal, .value = .{ .type = t } };
                         if (self.place(a, &die, pc, ctx, before_prologue)) |where| {
                             value.location = where;
                             if (where.kind == .address) value.value.address = where.bits else {

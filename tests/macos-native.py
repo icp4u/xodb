@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Opt-in native build/offscreen lane. No windows, installs or debugger claims.
+"""Opt-in native build/offscreen lane. No visible windows or installs.
 
 Run with --ssh HOST from Linux; sources and locally compiled shaders go into
 a fresh owned ~/xodb-mac/native-check.* directory. Artifacts stay there for
@@ -36,6 +36,8 @@ def run(argv, **kwargs):
 
 
 def check_bundle(binary):
+    libraries = run(['/usr/bin/otool', '-L', str(binary)], capture_output=True, text=True).stdout
+    check(not re.search(r'lib(?:capstone|dw|elf)[.\-]', libraries), 'native bundle has a dynamic Capstone/elfutils dependency')
     symbols = run(['/usr/bin/nm', '-pa', str(binary)], capture_output=True, text=True).stdout
     check(not re.search(r'\bOSO\b', symbols), 'bundle retains a Mach-O debug object map')
     data = Path(binary).read_bytes()
@@ -157,7 +159,7 @@ def native(stress=False):
     report = dict(native_build='pass', cocoa_contract='pass', negative_oracle='pass',
                   bundle_signature='pass', bundle_paths='pass', scripted_input='pass', invalid_script='pass',
                   private_clipboard=clipboard_status, pacing='pass', offscreen_present='pass', tcp_publication='pass',
-                  sigterm='pass', samples=samples, on_screen='not_tested', local_debugserver='not_implemented')
+                  sigterm='pass', samples=samples, on_screen='not_tested', local_debugserver='not_tested')
     if stress:
         report['stress_host'] = dict(load_average=os.getloadavg(), logical_cpus=os.cpu_count())
         script.write_text('1000 state\n10000 state\n20000 state\n20001 close\n')
@@ -182,10 +184,10 @@ def bootstrap_native():
     wrong = subprocess.run(['zig-out/bin/xodb-macos-bootstrap', 'planted-wrong-argc'],
                            capture_output=True, timeout=10)
     check(wrong.returncode != 0 and b'CHECK failed: argc == 1' in wrong.stderr, 'bootstrap oracle did not reject planted input')
-    print(json.dumps(dict(native_debugserver_bootstrap='pass', negative_oracle='pass', native_owner_gui='not_implemented')))
+    print(json.dumps(dict(native_debugserver_bootstrap='pass', negative_oracle='pass', native_owner_gui='not_tested')))
 
 
-def remote(host, stress=False, bootstrap=False):
+def remote(host, stress=False, bootstrap=False, local=False):
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=10', host]
     directory = run(ssh + [GUARD + 'umask 022; mkdir -p "$HOME/xodb-mac" && mktemp -d "$HOME/xodb-mac/native-check.XXXXXX"'],
                     capture_output=True, text=True, timeout=20).stdout.strip()
@@ -207,11 +209,11 @@ def remote(host, stress=False, bootstrap=False):
                 tar.add(output, arcname='.work/mac-shaders/' + output.name)
     run(ssh + [prefix + 'tar xf -'], input=archive.getvalue(), timeout=60)
     settings = ['XODB_MAC_OFFSCREEN=1']
-    for name in ('XODB_MAC_ZIG', 'XODB_MAC_DEPS', 'XODB_MAC_MOLTENVK'):
+    for name in ('XODB_MAC_ZIG', 'XODB_MAC_DEPS', 'XODB_MAC_MOLTENVK', 'XODB_MAC_CAPSTONE'):
         if name in os.environ:
             settings.append(name + '=' + shlex.quote(os.environ[name]))
     run(ssh + [prefix + ' '.join(settings) + ' /usr/bin/python3 -B tests/macos-native.py --native' +
-               (' --stress' if stress else '') + (' --bootstrap' if bootstrap else '')], timeout=960 if stress else 360)
+               (' --stress' if stress else '') + (' --bootstrap' if bootstrap else '') + (' --local' if local else '')], timeout=960 if stress else 360)
     print('Native artifacts retained in the fresh ~/xodb-mac/native-check.* directory; no on-screen launch.')
 
 
@@ -222,14 +224,17 @@ if __name__ == '__main__':
     mode.add_argument('--native', action='store_true')
     parser.add_argument('--stress', action='store_true', help='periodic: 20k offscreen frames with CPU/RSS evidence')
     parser.add_argument('--bootstrap', action='store_true', help='native debugserver lifecycle component, not the GUI owner')
+    parser.add_argument('--local', action='store_true', help='native local debugger GUI, owned launch/attach and instruction step')
     args = parser.parse_args()
-    if args.bootstrap and args.stress:
-        parser.error('--bootstrap and --stress are separate lanes')
+    if sum((args.bootstrap, args.stress, args.local)) > 1:
+        parser.error('--bootstrap, --local and --stress are separate lanes')
     os.chdir(ROOT)
     if args.native:
         if args.bootstrap:
             bootstrap_native()
         else:
             native(args.stress)
+            if args.local:
+                run([sys.executable, '-B', 'tests/macos-local.py'], timeout=150)
     else:
-        remote(args.ssh, args.stress, args.bootstrap)
+        remote(args.ssh, args.stress, args.bootstrap, args.local)

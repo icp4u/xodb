@@ -52,7 +52,7 @@ import ghidra.util.task.TaskMonitorAdapter;
 public final class XodbGhidraSidecar {
     static final int PROTOCOL = 1;
     static final int SCHEMA = 1;
-    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.9";
+    static final String PRODUCER = "ghidra-jvm-sidecar-0.1.10";
     static final Gson JSON = new GsonBuilder().disableHtmlEscaping().serializeNulls().create();
     static final int MAX_LINE = 1 << 20;
     static final int MAX_PAYLOAD = 64 << 20;
@@ -1152,6 +1152,7 @@ public final class XodbGhidraSidecar {
             row.addProperty("type", type == null ? "" : type.getDisplayName());
             row.addProperty("size", Math.max(0, symbol.getSize()));
             row.addProperty("parameter", symbol.isParameter());
+            if (symbol.isParameter()) row.addProperty("parameter_index", symbol.getCategoryIndex());
             row.add("padding", padding(type, Math.max(0, symbol.getSize())));
             VariableStorage storage = symbol.getStorage();
             Varnode[] pieces = storage == null ? new Varnode[0] : storage.getVarnodes();
@@ -1234,8 +1235,172 @@ public final class XodbGhidraSidecar {
             row.addProperty("valid_start", hx(validStart));
             row.addProperty("valid_end", hx(validEnd));
             list.add(row);
+            if (symbol.isParameter() && pieces.length == 1 && pieces[0].isRegister()) {
+                long[] spill = parameterSpill(program, fn, symbol, pieces[0]);
+                if (spill != null) {
+                    JsonObject alternate = row.deepCopy();
+                    alternate.addProperty("storage", "stack");
+                    alternate.addProperty("storage_offset", hx(spill[0]));
+                    alternate.remove("register");
+                    alternate.remove("register_bit_offset");
+                    alternate.addProperty("valid_start", hx(spill[2]));
+                    alternate.addProperty("valid_end", hx(spill[3]));
+                    alternate.addProperty("parameter_spill", true);
+                    JsonObject piece = new JsonObject();
+                    piece.addProperty("size", pieces[0].getSize());
+                    piece.addProperty("value_bit_offset", 0);
+                    piece.addProperty("storage", "stack");
+                    piece.addProperty("cfa_offset", spill[1]);
+                    JsonArray alternatePieces = new JsonArray();
+                    alternatePieces.add(piece);
+                    alternate.add("pieces", alternatePieces);
+                    list.add(alternate);
+                }
+            }
         }
         return list;
+    }
+
+    static boolean sameVarnode(Varnode a, Varnode b) {
+        return a != null && b != null && a.getSize() == b.getSize() && a.getAddress().equals(b.getAddress());
+    }
+
+    static String storageKey(Varnode node) {
+        return node.getAddress().getAddressSpace().getName() + ':' + Long.toUnsignedString(node.getOffset(), 16) + ':' + node.getSize();
+    }
+
+    static final class SpillValue {
+        static final int CONSTANT = 1, STACK = 2, PARAMETER = 3;
+        final int kind;
+        final long bits;
+        SpillValue(int kind, long bits) { this.kind = kind; this.bits = bits; }
+    }
+
+    static final class SpillStore {
+        final long offset;
+        final int size;
+        final boolean parameter;
+        SpillStore(long offset, int size, boolean parameter) { this.offset = offset; this.size = size; this.parameter = parameter; }
+    }
+
+    static SpillValue spillInput(Varnode node, Varnode parameter, Map<String, SpillValue> temporaries,
+                                 Map<String, SpillValue> registers) {
+        if (sameVarnode(node, parameter)) return new SpillValue(SpillValue.PARAMETER, 0);
+        if (node.isConstant()) return new SpillValue(SpillValue.CONSTANT, node.getOffset());
+        if (node.isUnique()) return temporaries.get(storageKey(node));
+        if (node.isRegister()) return registers.get(storageKey(node));
+        return null;
+    }
+
+    static SpillValue spillOutput(PcodeOp op, Varnode parameter, Map<String, SpillValue> temporaries,
+                                  Map<String, SpillValue> registers) {
+        SpillValue left = op.getNumInputs() > 0 ? spillInput(op.getInput(0), parameter, temporaries, registers) : null;
+        if (op.getOpcode() == PcodeOp.COPY) return left;
+        if (op.getOpcode() != PcodeOp.INT_ADD && op.getOpcode() != PcodeOp.INT_SUB) return null;
+        SpillValue right = op.getNumInputs() > 1 ? spillInput(op.getInput(1), parameter, temporaries, registers) : null;
+        if (left == null || right == null) return null;
+        if (op.getOpcode() == PcodeOp.INT_ADD) {
+            if (left.kind == SpillValue.STACK && right.kind == SpillValue.CONSTANT)
+                return new SpillValue(SpillValue.STACK, left.bits + right.bits);
+            if (right.kind == SpillValue.STACK && left.kind == SpillValue.CONSTANT)
+                return new SpillValue(SpillValue.STACK, right.bits + left.bits);
+        } else if (left.kind == SpillValue.STACK && right.kind == SpillValue.CONSTANT) {
+            return new SpillValue(SpillValue.STACK, left.bits - right.bits);
+        }
+        return null;
+    }
+
+    static List<SpillStore> spillInstruction(Instruction instruction, Varnode parameter,
+                                             Map<String, SpillValue> registers) throws Exception {
+        HashMap<String, SpillValue> temporaries = new HashMap<>();
+        ArrayList<SpillStore> stores = new ArrayList<>();
+        for (PcodeOp op : instruction.getPcode()) {
+            if (op.getOpcode() == PcodeOp.STORE && op.getNumInputs() >= 3) {
+                SpillValue address = spillInput(op.getInput(1), parameter, temporaries, registers);
+                SpillValue value = spillInput(op.getInput(2), parameter, temporaries, registers);
+                if (address != null && address.kind == SpillValue.STACK)
+                    stores.add(new SpillStore(address.bits, op.getInput(2).getSize(), value != null && value.kind == SpillValue.PARAMETER));
+            }
+            Varnode output = op.getOutput();
+            if (output == null) continue;
+            SpillValue value = spillOutput(op, parameter, temporaries, registers);
+            Map<String, SpillValue> destination = output.isUnique() ? temporaries : output.isRegister() ? registers : null;
+            if (destination == null) continue;
+            String key = storageKey(output);
+            // Keys are exact varnodes, but a write to RAX also changes EAX,
+            // AX and AL (and the reverse): forget every overlapping entry.
+            long low = output.getOffset(), high = low + output.getSize();
+            destination.keySet().removeIf(tracked -> {
+                String[] part = tracked.split(":");
+                long offset = Long.parseUnsignedLong(part[1], 16), size = Long.parseLong(part[2]);
+                return Long.compareUnsigned(offset, high) < 0 && Long.compareUnsigned(low, offset + size) < 0;
+            });
+            if (value != null) destination.put(key, value);
+        }
+        return stores;
+    }
+
+    /**
+     * Prove the common O0 parameter home: straight-line raw p-code stores the
+     * exact incoming register into one CFA-relative slot before that register
+     * is changed. The alternate ends before a call, join, branch, opaque op or
+     * overwrite of that exact slot. Names and imported data types play no role.
+     * Returns stack offset, CFA offset and the [start,end) PC interval.
+     */
+    long[] parameterSpill(Program program, Function fn, HighSymbol symbol, Varnode input) {
+        if (!symbol.isParameter() || input.getSize() <= 0 || input.getSize() > 8) return null;
+        Register register = program.getRegister(input.getAddress(), input.getSize());
+        if (register == null) return null;
+        Register base = register.getBaseRegister();
+        Listing listing = program.getListing();
+        ReferenceManager references = program.getReferenceManager();
+        Address entry = fn.getEntryPoint();
+        HashMap<String, SpillValue> registers = new HashMap<>();
+        Register stackPointer = program.getCompilerSpec().getStackPointer();
+        if (stackPointer == null) return null;
+        Varnode stackNode = new Varnode(stackPointer.getAddress(), stackPointer.getMinimumByteSize());
+        registers.put(storageKey(stackNode), new SpillValue(SpillValue.STACK, 0));
+        Address start = null;
+        long stackOffset = 0;
+        long end = entry.getOffset();
+        for (Address at = entry; at != null && fn.getBody().contains(at);) {
+            Instruction instruction = listing.getInstructionAt(at);
+            if (instruction == null || (!at.equals(entry) && joined(references, at))) break;
+            List<SpillStore> stores;
+            try {
+                stores = spillInstruction(instruction, input, registers);
+            } catch (Exception e) { return null; }
+            if (start == null) {
+                SpillStore candidate = null;
+                for (SpillStore store : stores) if (store.parameter && store.size == input.getSize()) {
+                    if (candidate != null && candidate.offset != store.offset) return null;
+                    candidate = store;
+                }
+                // A store only proves the incoming value when the same
+                // instruction leaves its source register untouched. Raw
+                // p-code inputs denote pre-instruction values, so accepting a
+                // simultaneous write would extend the register identity past
+                // the point at which it is known.
+                if (candidate != null && !writes(instruction, base)) {
+                    start = instruction.getFallThrough();
+                    stackOffset = candidate.offset;
+                    if (start == null || !fn.getBody().contains(start)) return null;
+                    end = start.getOffset();
+                } else if (candidate != null || !instruction.getFlowType().isFallthrough() || writes(instruction, base) || opaque(instruction)) return null;
+            } else {
+                end = instruction.getMaxAddress().getOffset() + 1;
+                boolean overwrite = false;
+                for (SpillStore store : stores)
+                    if (store.offset < stackOffset + input.getSize() && store.offset + store.size > stackOffset) overwrite = true;
+                if (overwrite || !instruction.getFlowType().isFallthrough() || instruction.getFlowType().isCall() || opaque(instruction)) break;
+            }
+            at = instruction.getFallThrough();
+        }
+        if (start == null || start.getOffset() >= end) return null;
+        PrototypeModel model = fn.getCallingConvention();
+        if (model == null) model = program.getCompilerSpec().getDefaultCallingConvention();
+        int stackshift = model == null ? 0 : model.getStackshift();
+        return new long[]{stackOffset, stackOffset - stackshift, start.getOffset(), end};
     }
 
     static boolean opaque(Instruction instruction) {

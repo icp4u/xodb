@@ -10,6 +10,7 @@ import argparse
 import hashlib
 import os
 import shutil
+import sys
 import subprocess
 import tarfile
 import urllib.request
@@ -22,6 +23,8 @@ SOURCE_DIR_NAME = 'capstone-6.0.0-Alpha11'
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--jobs', type=int, default=4)
+parser.add_argument('--prefix', type=Path, help='explicit private install prefix')
+parser.add_argument('--cmake', default='cmake', help='CMake executable')
 args = parser.parse_args()
 if args.jobs < 1:
     parser.error('--jobs must be positive')
@@ -29,7 +32,7 @@ if args.jobs < 1:
 os.umask(0o022)
 root = Path(__file__).resolve().parents[1]
 cache = root / '.work' / 'cache'
-prefix = root / '.work' / 'capstone'
+prefix = args.prefix.resolve() if args.prefix else root / '.work' / 'capstone'
 build = root / '.work' / 'capstone-build'
 archive = cache / ARCHIVE_NAME
 stamp = prefix / 'BUILD-STAMP'
@@ -91,7 +94,12 @@ if source_root.exists():
     shutil.rmtree(source_root)
 source_root.mkdir()
 with tarfile.open(archive) as source:
-    source.extractall(source_root, filter='data')
+    if sys.version_info >= (3, 12):
+        source.extractall(source_root, filter='data')
+    else:
+        # Apple's system Python predates extraction filters. This is the
+        # fixed upstream archive whose SHA256 was checked above.
+        subprocess.run(['/usr/bin/tar', '-xf', str(archive), '-C', str(source_root)], check=True)
 source = source_root / SOURCE_DIR_NAME
 if not (source / 'CMakeLists.txt').is_file():
     raise SystemExit('Unexpected archive layout: ' + ARCHIVE_NAME)
@@ -99,9 +107,9 @@ if not (source / 'CMakeLists.txt').is_file():
 configure = build / 'cmake'
 if configure.exists():
     shutil.rmtree(configure)
-logged('configure', ['cmake', '-S', str(source), '-B', str(configure), *cmake_flags], root)
-logged('build', ['cmake', '--build', str(configure), '-j', str(args.jobs)], root)
-logged('install', ['cmake', '--install', str(configure)], root)
+logged('configure', [args.cmake, '-S', str(source), '-B', str(configure), *cmake_flags], root)
+logged('build', [args.cmake, '--build', str(configure), '-j', str(args.jobs)], root)
+logged('install', [args.cmake, '--install', str(configure)], root)
 
 license_dir = prefix / 'share' / 'licenses' / 'capstone'
 license_dir.mkdir(parents=True, exist_ok=True)

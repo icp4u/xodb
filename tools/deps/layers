@@ -17,6 +17,7 @@ src/look.zig              common
 src/layout_snapshot.zig   common
 src/text.h                common
 src/c.zig                 c_engine   # C seen by the debug engine (@cImport)
+src/c_macos.zig           c_engine   # native metadata only, no Linux/elfutils
 src/c_ui.zig              c_ui       # C seen by rendering, platform and UI code
 src/appearance.zig        config     # startup-only themes
 src/preferences.zig       config

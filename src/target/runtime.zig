@@ -10,6 +10,11 @@ pub const c = @cImport({
     @cInclude("xrt_files.h");
     @cInclude("xrt_source.h");
     @cInclude("xrt_loader.h");
+    if (@import("builtin").os.tag == .macos) {
+        @cInclude("xrt_debugserver.h");
+        @cInclude("gdbremote.h");
+        @cInclude("wire_target.h");
+    }
 });
 
 pub const X86Registers = c.struct_xrt_x86_registers;

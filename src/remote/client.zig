@@ -7,7 +7,9 @@ const wire = @import("view.zig");
 const a = std.heap.page_allocator;
 const Value = std.json.Value;
 pub const Snapshot = std.json.Parsed(wire.View);
-pub const Endpoint = union(enum) { none, tcp: []const u8, ssh: struct { host: []const u8, args: []const [:0]const u8 } };
+pub const Endpoint = union(enum) { none, tcp: []const u8, ssh: struct { host: []const u8, args: []const [:0]const u8 }, local: Local };
+/// A native owner supplied by the entry point; this file never imports it.
+pub const Local = struct { context: *anyopaque, run: *const fn (*anyopaque, *Client) anyerror!void };
 pub const State = enum { connecting, ready, disconnected };
 pub const Client = struct {
     endpoint: Endpoint,
@@ -22,7 +24,7 @@ pub const Client = struct {
     tid: i32 = 0,
     frame: usize = 0,
     selection: u64 = 0,
-    fn lock(self: *Client) void {
+    pub fn lock(self: *Client) void {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
     }
     pub fn start(self: *Client) !void {
@@ -72,7 +74,7 @@ pub const Client = struct {
         self.busy = true;
         self.status = @splat(0);
     }
-    fn message(self: *Client, text: []const u8) void {
+    pub fn message(self: *Client, text: []const u8) void {
         self.lock();
         defer self.mutex.unlock();
         self.status = @splat(0);
@@ -91,8 +93,10 @@ pub const Client = struct {
         self.busy = false;
     }
     fn work(self: *Client) !void {
+        if (self.endpoint == .local) return self.endpoint.local.run(self.endpoint.local.context, self);
         var stream = switch (self.endpoint) {
             .none => return,
+            .local => unreachable,
             .tcp => |endpoint| try transport.Stream.tcp(endpoint, &self.stop),
             .ssh => |ssh| try transport.Stream.ssh(ssh.host, ssh.args),
         };

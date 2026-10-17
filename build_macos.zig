@@ -6,11 +6,14 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const mvk = b.option([]const u8, "moltenvk", "MoltenVK directory containing include/ and dynamic/") orelse b.graph.environ_map.get("XODB_MAC_MOLTENVK") orelse "tools/moltenvk";
     const spv = b.option([]const u8, "shader-dir", "Precompiled shaders from this source tree (otherwise use glslc)") orelse b.graph.environ_map.get("XODB_MAC_SHADERS");
     const font = b.option([]const u8, "font-path", "Default GUI font") orelse "/System/Library/Fonts/Menlo.ttc";
+    const capstone_link = b.option(enum { vendored }, "capstone", "Native builds use the private Capstone prefix") orelse .vendored;
+    _ = capstone_link;
+    const capstone = b.option([]const u8, "capstone-prefix", "Private static Capstone prefix") orelse b.graph.environ_map.get("XODB_MAC_CAPSTONE") orelse ".work/capstone";
     const module = b.createModule(.{ .root_source_file = b.path("src/macos_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const options = b.addOptions();
     options.addOption(bool, "gui", true);
     options.addOption(enum { wayland, x11, linux, cocoa, null }, "platform", .cocoa);
-    options.addOption(bool, "capstone_vendored", false);
+    options.addOption(bool, "capstone_vendored", true);
     options.addOption([]const u8, "font_path", font);
     module.addOptions("build_options", options);
     const coverage = b.addOptions();
@@ -18,6 +21,11 @@ pub fn build(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     coverage.addOption([]const []const u8, "sources", &.{});
     module.addOptions("overview_font_sources", coverage);
     module.addIncludePath(b.path("src/platform"));
+    module.addIncludePath(b.path("src/runtime"));
+    module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{capstone}) });
+    module.addObjectFile(.{ .cwd_relative = b.fmt("{s}/lib/libcapstone.a", .{capstone}) });
+    for ([_][]const u8{ "cancel.c", "gdb_packet.c", "gdb_link.c", "gdb_description.c", "gdb_lldb.c", "gdbremote.c", "target_state.c", "file_identity.c", "arch.c", "loongarch_step.c", "riscv_step.c", "wire.c", "wire_target.c", "macos_debugserver.c", "../binary/macho.c", "../binary/macho_job.c", "../debug/macho_dwarf.c", "../debug/macho_object.c", "../debug/macho_unwind.c" }) |source|
+        module.addCSourceFile(.{ .file = b.path(b.fmt("src/runtime/{s}", .{source})), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" } });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{mvk}) });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/freetype2", .{deps}) });
     module.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/harfbuzz", .{deps}) });

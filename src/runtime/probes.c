@@ -15,13 +15,6 @@ int xrt_breakpoint_at(const struct xrt_target *t, uint64_t address)
             return (int)i;
     return -1;
 }
-int xrt_breakpoint_index(const struct xrt_target *t, uint64_t id)
-{
-    for (size_t i = 0; i < t->breakpoint_count; ++i)
-        if (t->breakpoints[i].id == id)
-            return (int)i;
-    return -1;
-}
 enum xrt_status xrt_target_patch_span(struct xrt_target *t, int32_t tid, uint64_t address,
                                       const uint8_t *bytes, size_t width, size_t *accepted)
 {

@@ -8,12 +8,6 @@
 #include <stdlib.h>
 #include <time.h>
 
-uint64_t xrt_now(void)
-{
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * UINT64_C(1000000000) + (uint64_t)ts.tv_nsec;
-}
 enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uintptr_t data)
 {
     if (ptrace(request, tid, (void *)address, (void *)data) != -1)
@@ -23,17 +17,6 @@ enum xrt_status xrt_trace(unsigned request, int32_t tid, uintptr_t address, uint
     if (errno == ESRCH)
         return XRT_PROCESS_GONE;
     return XRT_PTRACE_FAILED;
-}
-struct xrt_target *xrt_target_create(void)
-{
-    struct xrt_target *t = calloc(1, sizeof(*t));
-    if (t) {
-        t->remote_collectors = 0; /* Not shared until create returns. */
-        t->arch = xrt_arch_native();
-        t->identity_admitted = t->arch && xrt_arch_validate(t->arch) == XRT_OK;
-        t->next_thread_id = t->next_probe_id = 1;
-    }
-    return t;
 }
 enum xrt_status xrt_target_destroy(struct xrt_target *t)
 {
@@ -45,34 +28,6 @@ enum xrt_status xrt_target_destroy(struct xrt_target *t)
     xodb_maps_free(&t->maps);
     free(t);
     return XRT_OK;
-}
-void xrt_target_view(const struct xrt_target *t, struct xrt_target_view *out)
-{
-    if (!t) {
-        *out = (struct xrt_target_view){.next_thread_id = 1, .next_probe_id = 1};
-        return;
-    }
-    *out = (struct xrt_target_view){.pid = t->pid,
-                                    .state = t->state,
-                                    .owned = t->owned,
-                                    .follow_processes = t->follow_processes,
-                                    .stepping = t->stepping,
-                                    .detach_pending = t->detach_pending,
-                                    .want_run = t->want_run,
-                                    .generation = t->generation,
-                                    .image_epoch = t->image_epoch,
-                                    .sequence = t->sequence,
-                                    .next_thread_id = t->next_thread_id,
-                                    .next_probe_id = t->next_probe_id,
-                                    .thread_count = t->thread_count,
-                                    .event_count = t->event_count,
-                                    .breakpoint_count = t->breakpoint_count,
-                                    .birth_count = t->birth_count,
-                                    .threads = t->threads,
-                                    .events = t->events,
-                                    .breakpoints = t->breakpoints,
-                                    .watchpoints = t->watchpoints,
-                                    .births = t->births};
 }
 enum xrt_status xrt_target_invalidate(struct xrt_target *t)
 {
@@ -115,23 +70,6 @@ enum xrt_status xrt_target_event(struct xrt_target *t, enum xrt_event_kind kind,
     ++t->generation;
     return XRT_OK;
 }
-int xrt_thread_index(const struct xrt_target *t, int32_t tid)
-{
-    for (size_t i = 0; i < t->thread_count; ++i)
-        if (t->threads[i].tid == tid)
-            return (int)i;
-    return -1;
-}
-enum xrt_status xrt_add_thread(struct xrt_target *t, int32_t tid, bool newborn)
-{
-    if (xrt_thread_index(t, tid) >= 0)
-        return XRT_OK;
-    if (t->thread_count == XRT_MAX_THREADS)
-        return XRT_TOO_MANY_THREADS;
-    t->threads[t->thread_count++] = (struct xrt_thread){
-        .id = t->next_thread_id++, .tid = tid, .state = XRT_RUNNING, .newborn = newborn};
-    return XRT_OK;
-}
 bool xrt_traced_member(int32_t tid, int32_t group)
 {
     struct xrt_task_info info;
@@ -150,17 +88,6 @@ static bool task_gone(int32_t tid)
     const enum xrt_status status = xrt_task_inspect(tid, &info);
     return status == XRT_PROCESS_GONE ||
            (status == XRT_OK && (info.state == 'Z' || info.state == 'X'));
-}
-enum xrt_status xrt_target_stopped_tid(const struct xrt_target *t, int32_t *tid)
-{
-    if (!t || !tid)
-        return XRT_INVALID_ARGUMENT;
-    for (size_t i = 0; i < t->thread_count; ++i)
-        if (t->threads[i].state == XRT_STOPPED) {
-            *tid = t->threads[i].tid;
-            return XRT_OK;
-        }
-    return XRT_NOT_STOPPED;
 }
 enum xrt_status xrt_target_launch(struct xrt_target *t, const char *const argv[])
 {

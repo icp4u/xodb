@@ -65,9 +65,9 @@ fn livePseudoValues(a: Allocator, session: *Session, analysis: *host.Analysis, t
     // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
     if (frame.inline_diagnostic != null) return &.{};
     const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
-    // Outer-frame stack slots may have been changed by the callee after the
-    // lookup PC's proof. Registers remain available through unwinding.
-    const memory: ?pseudo_values.LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
+    // A matched CFA-relative address remains an exact current-memory fact in
+    // outer frames; changes through a callee alias are part of that value.
+    const memory: ?pseudo_values.LiveMemory = .{ .user = session, .read = readSessionMemory };
     return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc, locals);
 }
 

@@ -58,10 +58,10 @@ pub fn livePseudoValues(a: std.mem.Allocator, session: *Session, analysis: *host
     // concrete subprogram's DWARF, and refuse when inline scopes are unknown.
     if (frame.inline_diagnostic != null) return &.{};
     const locals = session.frameLocalsAtDepth(a, frame, frame.inline_frames.len) catch return &.{};
-    // A stack proof includes the call that ends it, and an outer frame's
-    // lookup PC is that call on arm64. The callee may have written the slot
-    // since, so outer frames read no stack pieces.
-    const memory: ?LiveMemory = if (frame_index == 0) .{ .user = session, .read = readSessionMemory } else null;
+    // DWARF and Ghidra must independently name the same exact runtime stack
+    // address. Reading that address in an outer frame observes the variable's
+    // current value, including a legitimate change made through an alias.
+    const memory: ?LiveMemory = .{ .user = session, .read = readSessionMemory };
     return pseudo_values.collect(a, analysis, frame.architecture, frame.registers, frame.cfa, memory, link_pc, locals);
 }
 
