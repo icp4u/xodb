@@ -90,7 +90,7 @@ static void hold_reply(int fd, uint64_t value)
     assert(recv(fd, &byte, 1, 0) <= 0);
     close(fd); _exit(0);
 }
-static void serve_connection(int fd, int mode, bool adopted)
+static void serve_connection(int fd, int mode, bool adopted, int attach_pid)
 {
     if (adopted) {
         char first[128];
@@ -105,8 +105,17 @@ static void serve_connection(int fd, int mode, bool adopted)
         assert(++commands <= 4096); strcpy(response, "");
         if (!strncmp(request, "qSupported:", 11))
             strcpy(response, "PacketSize=1000;qXfer:features:read+");
+        else if (!strncmp(request, "vAttach;", 8)) {
+            char expected[32];
+            snprintf(expected, sizeof(expected), "vAttach;%x", attach_pid);
+            CHECK(attach_pid > 0 && !strcmp(request, expected));
+            strcpy(response, "T05thread:1;");
+        }
         else if (!strcmp(request, "vCont?")) strcpy(response, mode >= SLOW_THREADS ? "vCont;c;s" : "vCont;c");
-        else if (!strcmp(request, "?")) strcpy(response, mode == CHURN_THREADS ? "T05thread:10000;" : "T05thread:1;");
+        else if (!strcmp(request, "?")) {
+            CHECK(!attach_pid); // vAttach's stop reply is the initial stop.
+            strcpy(response, mode == CHURN_THREADS ? "T05thread:10000;" : "T05thread:1;");
+        }
         else if (!strncmp(request, "qXfer:features:read:target.xml:", 30)) {
             snprintf(response, sizeof(response), "l<target><architecture>%s</architecture><feature>"
                 "<reg name='rip' bitsize='64'/><reg name='rsp' bitsize='64'/>"
@@ -136,7 +145,7 @@ static void serve_connection(int fd, int mode, bool adopted)
                 }
             } else if (first) {
                 if (mode < SLOW_THREADS) reply(fd, "T05thread:1;"); /* Duplicate initial stop. */
-                strcpy(response, mode == 1 ? "" : "m1,2");
+                strcpy(response, mode == 1 || attach_pid ? "" : "m1,2");
             } else strcpy(response, "l");
         } else if (!strncmp(request, "vCont;s:", 8)) {
             ++round;
@@ -169,7 +178,7 @@ static void serve_connection(int fd, int mode, bool adopted)
         } else if (!strncmp(request, "Z0,", 3)) strcpy(response, "E01");
         else if (!strncmp(request, "z0,", 3)) strcpy(response, "OK");
         else if (!strcmp(request, "D")) {
-            strcpy(response, mode < SLOW_THREADS && detach_count++ == 0 ? "E01" : "OK");
+            strcpy(response, attach_pid || mode >= SLOW_THREADS || detach_count++ != 0 ? "OK" : "E01");
         }
         reply(fd, response);
     }
@@ -178,7 +187,7 @@ static void serve_connection(int fd, int mode, bool adopted)
 static void serve(int listener, int mode)
 {
     int fd = accept(listener, NULL, NULL); assert(fd >= 0); close(listener);
-    serve_connection(fd, mode, false);
+    serve_connection(fd, mode, false, 0);
 }
 struct fixture { pid_t child; char endpoint[64]; };
 static struct fixture start(int mode)
@@ -398,11 +407,11 @@ static void private_open(void)
 {
     int pair[2]; CHECK(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
     pid_t child = fork(); CHECK(child >= 0);
-    if (!child) { close(pair[0]); serve_connection(pair[1], 1, true); }
+    if (!child) { close(pair[0]); serve_connection(pair[1], 1, true, 0); }
     close(pair[1]);
     struct xrt_target *target = xrt_target_create(); CHECK(target);
     struct xrt_gdb *gdb = NULL;
-    CHECK(xrt_gdb_open_fd(pair[0], target, &gdb, NULL) == XRT_OK);
+    CHECK(xrt_gdb_open_fd(pair[0], 0, target, &gdb, NULL) == XRT_OK);
     CHECK(!xrt_gdb_detach_confirmed(gdb));
     struct xrt_target *idle = xrt_target_create(); CHECK(idle);
     CHECK(xrt_gdb_call(gdb, idle, &(struct xrt_call){.op=XRT_RPC_DETACH}) == XRT_OK);
@@ -416,6 +425,21 @@ static void private_open(void)
     CHECK(xrt_gdb_detach_confirmed(gdb));
     xrt_gdb_free(gdb); free(target); // Internal owner, no native pid relationship.
     CHECK(fcntl(pair[0], F_GETFD) == -1);
+    finish((struct fixture){.child=child});
+
+    CHECK(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    child = fork(); CHECK(child >= 0);
+    if (!child) { close(pair[0]); serve_connection(pair[1], 0, true, 42); }
+    close(pair[1]);
+    target = xrt_target_create(); CHECK(target);
+    gdb = NULL;
+    CHECK(xrt_gdb_open_fd(pair[0], 42, target, &gdb, NULL) == XRT_OK);
+    CHECK(xrt_gdb_mutation_bytes(gdb) > 0);
+    xrt_target_view(target, &view);
+    CHECK(view.state == XRT_STOPPED && view.thread_count == 1);
+    CHECK(xrt_gdb_call(gdb, target, &(struct xrt_call){.op=XRT_RPC_DETACH}) == XRT_OK);
+    CHECK(xrt_gdb_detach_confirmed(gdb));
+    xrt_gdb_free(gdb); free(target);
     finish((struct fixture){.child=child});
 }
 int main(int argc, char **argv)

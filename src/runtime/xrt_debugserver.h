@@ -14,13 +14,18 @@ struct xrt_debugserver {
 struct xrt_debugserver_options {
     const char *executable;     /* NULL: discover selected Xcode's debugserver. */
     const char *const *argv;    /* Launch OR attach_pid, never both. */
-    int32_t attach_pid;
+    int32_t attach_pid;         /* Validated here; xrt_gdb_open_fd sends vAttach. */
     struct xrt_cancel *cancel;  /* Borrowed; startup is bounded and cancellable. */
 };
 enum xrt_status xrt_debugserver_find(char *out, size_t capacity, struct xrt_cancel *);
 enum xrt_status xrt_debugserver_start(const struct xrt_debugserver_options *, struct xrt_debugserver *);
 /* Transfer the private descriptor to the one owning GDB link. */
 int xrt_debugserver_take_transport(struct xrt_debugserver *);
+/* After a D/OK reply and before the GDB link is freed: debugserver exits on
+ * its own once it has answered D. Closing our end first races that exit, and
+ * Apple's debugserver then detaches a second time and stays suspended. Never
+ * signals. */
+enum xrt_status xrt_debugserver_wait(struct xrt_debugserver *, uint32_t timeout_ms);
 /* Conservative close for startup failure or an unconfirmed/lost GDB link.
  * EOF asks debugserver to detach; this path never sends it a signal. */
 enum xrt_status xrt_debugserver_close(struct xrt_debugserver *);

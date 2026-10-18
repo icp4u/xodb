@@ -7,8 +7,11 @@ struct xrt_cancel;
 uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *);
 enum xrt_status xrt_gdb_open(const char *, struct xrt_target *, struct xrt_gdb **, struct xrt_cancel *);
 /* Native debugserver: consumes fd on success AND failure; first negotiates
- * detach-on-error, then uses the same handshake as the TCP GDB runtime. */
-enum xrt_status xrt_gdb_open_fd(int, struct xrt_target *, struct xrt_gdb **, struct xrt_cancel *);
+ * detach-on-error. A positive attach_pid is then attached with vAttach while
+ * debugserver's packet reader can observe owner death. Zero means the helper
+ * already launched its target. */
+enum xrt_status xrt_gdb_open_fd(int, int32_t attach_pid, struct xrt_target *,
+                                struct xrt_gdb **, struct xrt_cancel *);
 enum xrt_status xrt_gdb_call(struct xrt_gdb *, struct xrt_target *, const struct xrt_call *);
 enum xrt_status xrt_gdb_health(const struct xrt_gdb *);
 /* True only after an actual D/OK exchange, not an idle/exited no-op detach. */

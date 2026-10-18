@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """Step over a Go call that grows the stack.
 
-On aarch64, g lives in x28; on x86-64, r14. A return probe that only
+On aarch64, g lives in x28; on x86-64, r14; on riscv64, s11 (Go's X27).
+The row comes from the target's architecture. A return probe that only
 remembers the stack pointer runs away when the copy moves that pointer. This
 stops on the next line of the caller, with the same g and a readable local.
 
-release-check only runs on x86-64, so there this guards the r14 path; run it
-by hand on aarch64 for x28. Other machines print a skip line and exit 0.
---exe runs a binary already built from SOURCE, for a machine with no Go
-toolchain.
+release-check only runs on x86-64, so there this guards the r14 path. Run it
+on aarch64 for x28. For riscv64, pass --runtime-ssh, --runtime-agent and
+--exe so the target is riscv64. Other local machines print a skip line and
+exit 0. --exe runs a binary already built from SOURCE, for a machine with no
+Go toolchain.
 """
 import argparse, os, subprocess, sys, time
 from pathlib import Path
@@ -45,12 +47,15 @@ p = argparse.ArgumentParser(description=__doc__)
 p.add_argument('--go')
 p.add_argument('--exe', type=Path)
 p.add_argument('--work', type=Path, required=True)
+p.add_argument('--runtime-ssh')
+p.add_argument('--ssh-config', dest='ssh_file')
+p.add_argument('--runtime-agent')
 a = p.parse_args()
-REGS = {'aarch64': ('aarch64', 'x28', 'sp'), 'arm64': ('aarch64', 'x28', 'sp'), 'x86_64': ('x86_64', 'r14', 'rsp')}
-if os.uname().machine not in REGS:
-    print('go-arm64-step: skip, no Go g register on this host')
+REGS = {'aarch64': ('aarch64', 'x28', 'sp'), 'arm64': ('aarch64', 'x28', 'sp'), 'x86_64': ('x86_64', 'r14', 'rsp'), 'riscv64': ('riscv64', 's11', 'sp')}
+remote = bool(a.runtime_ssh or a.runtime_agent)
+if not remote and os.uname().machine not in REGS:
+    print('go-step-g: skip, no Go g register on this host')
     raise SystemExit(0)
-ARCH, G, SP = REGS[os.uname().machine]
 if a.exe is None and not a.go:
     p.error('--go is required unless --exe is set')
 
@@ -81,13 +86,24 @@ started = time.monotonic()
 def fail(message):
     raise SystemExit('FAIL: ' + str(message))
 
-client = Client('control', str(exe), reply_seconds=30)
+options = []
+if a.runtime_agent:
+    options += ['--runtime-agent', a.runtime_agent]
+if a.runtime_ssh:
+    options += ['--runtime-ssh', a.runtime_ssh]
+if a.ssh_file:
+    options += ['--ssh-config', a.ssh_file]
+limit = 90 if remote else 30
+client = Client('control', str(exe), options=options, reply_seconds=limit)
 try:
     client.action('set_breakpoint', symbol='main.caller')
     client.continue_initial_stop()
-    session = client.stopped('breakpoint', seconds=30)
-    if session['architecture'] != ARCH:
+    session = client.stopped('breakpoint', seconds=limit)
+    if not remote and session['architecture'] != REGS[os.uname().machine][0]:
         fail(session['architecture'])
+    if session['architecture'] not in REGS:
+        fail(session['architecture'])
+    ARCH, G, SP = REGS[session['architecture']]
     tid = next(t['tid'] for t in session['threads'] if t['reason'] == 'breakpoint')
 
     def frame(tid):
@@ -108,7 +124,7 @@ try:
         if at_caller(call_line):
             break
         client.action('step_over', tid=tid)
-        client.stopped(seconds=30)
+        client.stopped(seconds=limit)
         landed = at_caller(call_line)
         if landed:
             tid = landed[0]
@@ -123,7 +139,7 @@ try:
     saved_g = int(regs[G], 16)
     saved_sp = int(regs[SP], 16)
     client.action('step_over', tid=tid)
-    stepped = client.stopped(seconds=30)
+    stepped = client.stopped(seconds=limit)
     if stepped['source_stepping'] or stepped['step_diagnostic'] is not None:
         fail(stepped['step_diagnostic'])
     hits = at_caller(after_line)
@@ -151,6 +167,6 @@ try:
     bits = value.get('bits')
     if shown != '41' and bits != 41:
         fail(value)
-    print(f'go-arm64-step: next line after a stack copy, g held, kept readable ({time.monotonic() - started:.1f}s)')
+    print(f'go-step-g: next line after a stack copy, g held, kept readable ({time.monotonic() - started:.1f}s)')
 finally:
     client.close()

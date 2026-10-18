@@ -86,7 +86,7 @@ COVERS = (
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
     (('src/model/session.zig', 'tests/run-control.py', 'tests/run-control-gui.py'),
-     ('go-language*', 'go-gui', 'go-native*', 'go-arm64-step', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
+     ('go-language*', 'go-gui', 'go-native*', 'go-step-g', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
     (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/remote_worker.zig', 'src/model/remote_dispatch.zig', 'tests/fixtures/hold-ptrace.c'), ('gui-local-owner*',)),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
@@ -661,7 +661,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-values', [sys.executable, '-B', 'tests/go-values.py', '--go', go, '--strace', '--work', '.work/go-values'], 180))
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
             steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
-            steps.append(('go-arm64-step', [sys.executable, '-B', 'tests/go-arm64-step.py', '--go', go, '--work', '.work/go-arm64'], 180))
+            steps.append(('go-step-g', [sys.executable, '-B', 'tests/go-step-g.py', '--go', go, '--work', '.work/go-step-g'], 180))
         if redot:
             steps.append(('redot-protocol', [sys.executable, '-B', 'tests/redot-protocol.py', '--redot', redot, '--work', '.work/rdp'], 60))
             steps.append(('redot-time', [sys.executable, '-B', 'tests/redot-time.py', '--redot', redot, '--work', '.work/rdt'], 90))

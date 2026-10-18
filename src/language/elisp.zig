@@ -59,7 +59,12 @@ fn constant(session: *model.Session, module: *Module, name: []const u8, expected
 }
 fn profile(session: *model.Session, module: *Module) !*const c.struct_xel_layout {
     if (session.target.snapshot().state != .stopped) return error.NotStopped;
-    if (session.target.arch() != .x86_64) return error.ElispArchitectureUnsupported;
+    // The reader is DWARF- and memory-driven; every 64-bit little-endian
+    // target it has been proven on is listed. Others stay refused.
+    switch (session.target.arch()) {
+        .x86_64, .loongarch64 => {},
+        else => return error.ElispArchitectureUnsupported,
+    }
     const id = module.image.buildId() orelse return error.ElispBuildIdUnavailable;
     if (id.len == 0 or id.len > 64) return error.ElispBuildIdUnavailable;
     const note = module.image.sectionByName(".note.gnu.build-id") orelse return error.ElispBuildIdUnavailable;

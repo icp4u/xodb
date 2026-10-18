@@ -52,16 +52,37 @@ static enum xrt_status wait_read(int fd, uint64_t until, struct xrt_cancel *canc
         return XRT_TRANSPORT_FAILED;
     }
 }
+/* A spawn dup2 onto the same number leaves close-on-exec set, and
+ * POSIX_SPAWN_CLOEXEC_DEFAULT then closes it in the child. Darwin can mark the
+ * descriptor inherited directly. The portable component test instead gives
+ * dup2 a private source number, without clearing CLOEXEC in the parent. */
+static int place(posix_spawn_file_actions_t *actions, int fd, int target, int *temporary)
+{
+    *temporary = -1;
+    if (fd == target) {
+#ifdef __APPLE__
+        return posix_spawn_file_actions_addinherit_np(actions, fd);
+#else
+        int moved = fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        if (moved < 0) return errno ? errno : EBADF;
+        *temporary = moved;
+        fd = moved;
+#endif
+    }
+    return posix_spawn_file_actions_adddup2(actions, fd, target);
+}
 static int spawn_child(const char *path, char *const *argv, int output, int inherited, pid_t *pid)
 {
     posix_spawn_file_actions_t actions;
     int status = posix_spawn_file_actions_init(&actions);
     if (status) return status;
+    int output_copy = -1, inherited_copy = -1;
     /* Duplicate first: with the owner's stdio closed, output or inherited may
      * be 0..2, and the /dev/null opens below would replace them. */
     if (!status && inherited >= 0)
-        status = posix_spawn_file_actions_adddup2(&actions, inherited, DEBUGSERVER_FD);
-    if (!status && output >= 0) status = posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO);
+        status = place(&actions, inherited, DEBUGSERVER_FD, &inherited_copy);
+    if (!status && output >= 0)
+        status = place(&actions, output, STDOUT_FILENO, &output_copy);
     if (!status) status = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
     if (!status && output < 0)
         status = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
@@ -85,6 +106,8 @@ static int spawn_child(const char *path, char *const *argv, int output, int inhe
     if (!status) status = posix_spawn(pid, path, &actions, &attr, argv, environment());
     if (!attr_status) posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&actions);
+    if (output_copy >= 0) close(output_copy);
+    if (inherited_copy >= 0) close(inherited_copy);
     return status;
 }
 static enum xrt_status reap(struct xrt_debugserver *child, uint64_t until)
@@ -103,10 +126,10 @@ static enum xrt_status reap(struct xrt_debugserver *child, uint64_t until)
     }
     return XRT_OK;
 }
-/* Catch exec/argument/attach failures promptly without inventing a readiness
- * byte that Apple's --fd protocol does not provide. A live child may still be
- * loading or attaching when this short observation ends; the first GDB request
- * then reports any later failure directly through the private stream. */
+/* Catch exec and argument failures promptly without inventing a readiness byte
+ * that Apple's --fd protocol does not provide. A live launch may still be
+ * loading when this short observation ends; the first GDB request then reports
+ * any later failure directly through the private stream. */
 static enum xrt_status early_exit(struct xrt_debugserver *child, struct xrt_cancel *cancel)
 {
     uint64_t until = milliseconds() + 100;
@@ -156,6 +179,11 @@ static enum xrt_status close_child(struct xrt_debugserver *child, int detach_con
      * exact, now targetless helper and retain its pid if reaping still fails. */
     if (kill(child->pid, SIGTERM) && errno != ESRCH) return XRT_SIGNAL_FAILED;
     return reap(child, milliseconds() + 2000);
+}
+enum xrt_status xrt_debugserver_wait(struct xrt_debugserver *child, uint32_t timeout_ms)
+{
+    if (!child) return XRT_INVALID_ARGUMENT;
+    return reap(child, milliseconds() + timeout_ms);
 }
 enum xrt_status xrt_debugserver_close(struct xrt_debugserver *child)
 {
@@ -229,15 +257,15 @@ enum xrt_status xrt_debugserver_start(const struct xrt_debugserver_options *opti
         if (moved < 0) { close(transport[1]); return XRT_TRANSPORT_FAILED; }
         transport[0] = moved;
     }
-    char attach[32];
-    snprintf(attach, sizeof(attach), "--attach=%d", options->attach_pid);
     char fd_option[32];
     snprintf(fd_option, sizeof(fd_option), "--fd=%d", DEBUGSERVER_FD);
     char *args[264]; size_t n = 0;
     args[n++] = (char *)executable;
     args[n++] = fd_option;
     args[n++] = "--no-stdio";
-    if (options->attach_pid) args[n++] = attach;
+    /* Attach is deliberately not a command-line action. The GDB owner first
+     * enables detach-on-error, then sends vAttach while debugserver's packet
+     * read thread is already watching this private stream. */
     if (options->argv) {
         args[n++] = "--";
         for (size_t i = 0; i < argc; ++i) args[n++] = (char *)options->argv[i];

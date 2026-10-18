@@ -44,7 +44,7 @@ pub const Session = struct {
             .attach_pid = self.options.attach,
         }, &self.helper));
         log.info(.runtime, "xodb: native helper started pid={d}; private inherited transport\n", .{self.helper.pid});
-        try rt.check(c.xrt_gdb_open_fd(c.xrt_debugserver_take_transport(&self.helper), self.target, &self.gdb, null));
+        try rt.check(c.xrt_gdb_open_fd(c.xrt_debugserver_take_transport(&self.helper), self.options.attach, self.target, &self.gdb, null));
         self.metadata.executable = self.options.executable orelse if (self.options.argv.len != 0) self.options.argv[0] else null;
         if (self.options.source) |path| {
             const file = @import("../c.zig").api;
@@ -66,6 +66,7 @@ pub const Session = struct {
             self.call(.{ .op = c.XRT_RPC_DETACH }) catch |err|
                 log.warn(.runtime, "xodb: native detach unconfirmed: {s}\n", .{@errorName(err)});
             detach_confirmed = c.xrt_gdb_detach_confirmed(self.gdb);
+            if (detach_confirmed) _ = c.xrt_debugserver_wait(&self.helper, 2000);
             c.xrt_gdb_free(self.gdb);
             self.gdb = null;
         }

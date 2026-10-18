@@ -53,7 +53,6 @@ pub const Panel = struct {
     native_count: usize = 0,
     native_y: f32 = std.math.inf(f32),
     revealed: ?SelectedKey = null,
-    stack_basis: ?[]const u8 = null,
     message: []const u8 = "",
     key: ?Key = null,
     bindings: ?named.Result = null,
@@ -263,7 +262,6 @@ pub const Panel = struct {
         self.key = key;
         self.syncEditorView(view.header);
         self.rows = view.rows;
-        self.stack_basis = view.stack_basis;
         self.message = view.message;
         self.bindings = if (pending_page) null else view.bindings;
         self.bindings_reason = if (pending_page) "Preparing named locals" else view.bindings_reason;
@@ -326,12 +324,6 @@ pub const Panel = struct {
         if (std.mem.eql(u8, reason, "PythonInterpreterFrameUnavailable")) return "No Python frames on this thread";
         if (std.mem.eql(u8, reason, "PerlInterpreterFrameUnavailable")) return "No Perl frames on this thread";
         return reason;
-    }
-    fn basisText(basis: []const u8) []const u8 {
-        if (std.mem.eql(u8, basis, "postmortem-metadata")) return "postmortem metadata";
-        if (std.mem.eql(u8, basis, "version-table")) return "version table";
-        if (std.mem.eql(u8, basis, "version-table+dwarf-crosscheck")) return "version table + DWARF checks";
-        return basis;
     }
     fn nativeMatches(tab: tabs.Tab, value: @import("../model/session.zig").ValueSummary) bool {
         const preview = value.visualization orelse return false;
@@ -406,7 +398,6 @@ pub const Panel = struct {
         const version = if (entry.thread) |tid| std.fmt.bufPrint(&version_text, "{s} · thread {d}", .{ entry.version, tid }) catch entry.version else entry.version;
         try self.drawText(r, font, rect.x + 12, y, rect.w - 24, version, theme.neutral);
         y += 23;
-        try self.wrapped(r, font, rect, &y, basisText(self.stack_basis orelse entry.basis), theme.weak);
         if (entry.proof_generation == null or entry.proof_generation.? != state.generation or entry.reason != null) {
             if (entry.identity == .unwitnessed) {
                 try self.wrapped(r, font, rect, &y, "Runtime not seen executing", theme.weak);

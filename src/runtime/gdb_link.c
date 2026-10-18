@@ -268,7 +268,8 @@ enum xrt_status xrt_gdb_send(struct xrt_gdb_link *l, const void *payload, size_t
      * In particular vCont? queries capabilities; vCont; changes execution. */
     const uint8_t *bytes = payload;
     l->sent_mutation = size && (strchr("MXPGcCsSZzDkR", bytes[0]) != NULL ||
-        (size >= 6 && !memcmp(bytes, "vCont;", 6)));
+        (size >= 6 && !memcmp(bytes, "vCont;", 6)) ||
+        (size >= 8 && !memcmp(bytes, "vAttach;", 8)));
     return write_bytes(l, l->tx, l->sent, now() + TIMEOUT_NS, l->sent_mutation);
 }
 static bool console_packet(const uint8_t *p, size_t n)

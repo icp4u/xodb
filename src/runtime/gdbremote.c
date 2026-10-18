@@ -1026,10 +1026,12 @@ void xrt_gdb_free(struct xrt_gdb *g)
     xrt_gdb_disconnect(&g->link); free(g->last_stop); free(g->bank); free(g);
 }
 uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *g) { return g->link.mutation_written; }
-static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
+static enum xrt_status open_connection(const char *endpoint, int fd, int32_t attach_pid,
+                                       struct xrt_target *t, struct xrt_gdb **out,
+                                       struct xrt_cancel *cancel)
 {
     if (out) *out = NULL;
-    if (!out || !t || (!endpoint && fd < 0)) {
+    if (!out || !t || (!endpoint && fd < 0) || attach_pid < 0 || (endpoint && attach_pid)) {
         if (fd >= 0) close(fd);
         return XRT_INVALID_ARGUMENT;
     }
@@ -1085,6 +1087,25 @@ static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_
     g->vcont_signal_step = feature((char *)g->reply, "S");
     if (g->vcont_step) g->info.supported |= XRT_GDB_CAP_STEP;
     else g->info.unsupported |= XRT_GDB_CAP_STEP;
+    if (attach_pid) {
+        char command[32];
+        snprintf(command, sizeof(command), "vAttach;%" PRIx32, (uint32_t)attach_pid);
+        status = query(g, command);
+        if (status != XRT_OK) goto fail;
+        if (g->length && g->reply[0] == 'E') {
+            status = problem(g, XRT_PERMISSION_DENIED, "Debugserver attach failed");
+            goto fail;
+        }
+        if (!g->length || (g->reply[0] != 'T' && g->reply[0] != 'S')) {
+            status = problem(g, XRT_PROTOCOL_ERROR, "Debugserver attach returned no stop");
+            goto fail;
+        }
+        initial_size = g->length;
+        initial_stop = malloc(initial_size);
+        if (!initial_stop) { status = XRT_OUT_OF_MEMORY; goto fail; }
+        memcpy(initial_stop, g->reply, initial_size);
+        g->info.attached = 1;
+    }
     g->info.unsupported |= XRT_GDB_CAP_REGIONS | XRT_GDB_CAP_IMAGES | XRT_GDB_CAP_THREAD_INFO;
     if (g->native_signals) {
         /* An LLDB-family stub. Its host and process descriptions select the
@@ -1101,6 +1122,9 @@ static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_
             xrt_gdb_process_parse((char *)g->reply, g->length, &g->host) != XRT_OK) {
             status = problem(g, XRT_PROTOCOL_ERROR, "Malformed GDB qProcessInfo reply"); goto fail;
         }
+        if (attach_pid && g->host.pid && g->host.pid != (uint32_t)attach_pid) {
+            status = problem(g, XRT_PROTOCOL_ERROR, "Debugserver attached a different process"); goto fail;
+        }
         if (g->host.pid && !g->multiprocess) g->process = g->host.pid;
     }
     if (g->host.os == XRT_GDB_OS_DARWIN) {
@@ -1116,11 +1140,13 @@ static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_
     }
     /* Establish the stopped inferior before requesting target.xml. Some
      * gdbservers build their description only while encoding this reply. */
-    status = query(g, "?");
-    if (status != XRT_OK) goto fail;
-    initial_size = g->length; initial_stop = malloc(initial_size ? initial_size : 1);
-    if (!initial_stop) { status = XRT_OUT_OF_MEMORY; goto fail; }
-    memcpy(initial_stop, g->reply, initial_size);
+    if (!initial_stop) {
+        status = query(g, "?");
+        if (status != XRT_OK) goto fail;
+        initial_size = g->length; initial_stop = malloc(initial_size ? initial_size : 1);
+        if (!initial_stop) { status = XRT_OUT_OF_MEMORY; goto fail; }
+        memcpy(initial_stop, g->reply, initial_size);
+    }
     char *xml = NULL; size_t size = 0;
     status = annex(g, "target.xml", &xml, &size);
     /* debugserver's target.xml names no architecture; its Mach CPU type does. */
@@ -1143,7 +1169,12 @@ static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_
     else strcpy(command, "qAttached");
     status = query(g, command);
     if (status != XRT_OK) goto fail;
-    if (g->length == 1 && (g->reply[0] == '0' || g->reply[0] == '1')) g->info.attached = g->reply[0] - '0';
+    if (g->length == 1 && (g->reply[0] == '0' || g->reply[0] == '1')) {
+        if (attach_pid && g->reply[0] != '1') {
+            status = problem(g, XRT_PROTOCOL_ERROR, "Debugserver contradicted the requested attach"); goto fail;
+        }
+        g->info.attached = g->reply[0] - '0';
+    }
     /* The initial stop must be decoded before qAttached because decoding may
      * read registers and debugserver recordings preserve that packet order.
      * No observer can see the target until open returns, so correct an
@@ -1163,11 +1194,12 @@ fail:
 }
 enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
 {
-    return open_connection(endpoint, -1, t, out, cancel);
+    return open_connection(endpoint, -1, 0, t, out, cancel);
 }
-enum xrt_status xrt_gdb_open_fd(int fd, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
+enum xrt_status xrt_gdb_open_fd(int fd, int32_t attach_pid, struct xrt_target *t,
+                                struct xrt_gdb **out, struct xrt_cancel *cancel)
 {
-    return open_connection(NULL, fd, t, out, cancel);
+    return open_connection(NULL, fd, attach_pid, t, out, cancel);
 }
 enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const struct xrt_call *call)
 {

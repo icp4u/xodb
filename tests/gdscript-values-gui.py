@@ -75,7 +75,7 @@ try:
         while True:
             shot = d.shot(label); crop = shot + '.side.png'
             with Image.open(shot) as image:
-                pane = ImageOps.invert(image.crop((1522, 590, 1908, 862)).convert('L')); pane.resize((pane.width * 3, pane.height * 3)).save(crop)
+                pane = ImageOps.invert(image.crop((1522, 576, 1908, 862)).convert('L')); pane.resize((pane.width * 3, pane.height * 3)).save(crop)
             text = subprocess.run(['tesseract', crop, 'stdout', '--psm', '6'], env=dict(d.env, OMP_THREAD_LIMIT='1'), capture_output=True, text=True, check=True, timeout=30).stdout
             Path(shot + '.side.txt').write_text(text)
             if all(part in normalize(text) for part in wanted) and all(part not in normalize(text) for part in absent): return text

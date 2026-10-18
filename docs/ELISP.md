@@ -32,12 +32,27 @@ The launcher prints these tips and passes extra arguments to xodb, for example
 
 ## Supported builds
 
-The initial reader supports GNU Emacs **31.1**, x86-64 Linux, little endian,
-with modules enabled and the executable's own DWARF debug information. The
+The reader supports GNU Emacs **31.1** on x86-64 and LoongArch64 Linux, little
+endian, with modules enabled and the executable's own DWARF debug information.
+Other architectures return `ElispArchitectureUnsupported`. The
 loaded build ID, version, type layout and tagging constants must agree.
 Optimized builds are supported for the saved Lisp backtrace. The selected
 native thread must be the process's main thread and match `current_thread`.
 Other threads return `ElispThreadAssociationUnproved`.
+
+### Remote LoongArch64
+
+The reader runs in the local xodb, so a GUI on any host can read a LoongArch64
+Emacs through the C runtime agent. Proven on real LoongArch64 hardware
+(Emacs 31.1 built `-O2 -ggdb3 -fno-omit-frame-pointer`, batch-only, modules
+on): driven from an x86-64 host, all four demo stops and values match the
+x86-64 demo, including the native argument link. Copy `examples/emacs-demo.el`
+to the target and install `xodb-agent` on its `PATH`, then:
+
+```sh
+xodb --runtime-ssh HOST --break Fdebugger_trap -- \
+  /path/to/emacs -Q --batch -l /path/to/emacs-demo.el
+```
 
 An owned batch example from the checkout:
 

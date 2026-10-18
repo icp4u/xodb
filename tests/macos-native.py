@@ -35,6 +35,24 @@ def run(argv, **kwargs):
     return subprocess.run(argv, check=True, timeout=kwargs.pop('timeout', 300), **kwargs)
 
 
+def bootstrap_proof(output, expected_cycles):
+    proof = None
+    for line in output.splitlines():
+        try:
+            candidate = json.loads(line)
+        except (TypeError, json.JSONDecodeError):
+            continue
+        if candidate.get('native_debugserver_bootstrap') == 'pass':
+            proof = candidate
+    check(proof is not None, 'native debugserver bootstrap did not emit its proof record')
+    for field in ('private_transport', 'detach_before_close', 'closed_stdio', 'attach_owner_loss'):
+        check(proof.get(field) == 'pass', 'native debugserver bootstrap did not prove ' + field)
+    check(proof.get('attach_cycles') == expected_cycles and
+          proof.get('attach_owner_loss_cycles') == expected_cycles,
+          'native debugserver bootstrap ran the wrong cycle count')
+    return proof
+
+
 def check_bundle(binary):
     libraries = run(['/usr/bin/otool', '-L', str(binary)], capture_output=True, text=True).stdout
     check(not re.search(r'lib(?:capstone|dw|elf)[.\-]', libraries), 'native bundle has a dynamic Capstone/elfutils dependency')
@@ -181,11 +199,13 @@ def bootstrap_native(load=False):
     zig = os.environ.get('XODB_MAC_ZIG', 'zig')
     env = dict(os.environ, XODB_MAC_OFFSCREEN='1', ZIG_GLOBAL_CACHE_DIR=str(ROOT / '.cache/zig-global'))
     run([zig, 'build', 'test-debugserver', '-Doptimize=ReleaseSafe', '-j2', '--summary', 'all'], env=env)
+    checked = run(['zig-out/bin/xodb-macos-bootstrap'], env=env,
+                  capture_output=True, text=True, timeout=120)
+    proof = bootstrap_proof(checked.stdout + checked.stderr, 1)
     wrong = subprocess.run(['zig-out/bin/xodb-macos-bootstrap', 'planted-wrong-argc'],
                            capture_output=True, timeout=10)
     check(wrong.returncode != 0 and b'CHECK failed: argc == 1' in wrong.stderr, 'bootstrap oracle did not reject planted input')
-    report = dict(native_debugserver_bootstrap='pass', negative_oracle='pass',
-                  private_transport='pass', detach_before_close='pass', native_owner_gui='not_tested')
+    report = dict(proof, negative_oracle='pass', native_owner_gui='not_tested')
     if load:
         busy = [subprocess.Popen(['/usr/bin/yes'], stdout=subprocess.DEVNULL,
                                 stderr=subprocess.DEVNULL) for _ in range(6)]
@@ -194,8 +214,9 @@ def bootstrap_native(load=False):
             loaded = run(['zig-out/bin/xodb-macos-bootstrap'],
                          env=dict(env, XODB_BOOTSTRAP_ATTACH_RUNS='40'),
                          capture_output=True, text=True, timeout=900)
-            check('40 attach cycle(s)' in loaded.stdout,
-                  'load run did not complete all 40 known attach cycles')
+            loaded_proof = bootstrap_proof(loaded.stdout + loaded.stderr, 40)
+            for field in ('private_transport', 'detach_before_close', 'closed_stdio', 'attach_owner_loss'):
+                check(loaded_proof[field] == report[field], 'load run changed bootstrap proof for ' + field)
         finally:
             for process in busy:
                 process.terminate()

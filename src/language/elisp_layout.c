@@ -215,7 +215,7 @@ const char *xel_layout_build(Dwarf *dwarf, const uint8_t *id, size_t n,
     if (!dwarf) return "ElispDwarfUnavailable";
     GElf_Ehdr eh;
     if (!gelf_getehdr(dwarf_getelf(dwarf), &eh) || eh.e_ident[EI_CLASS] != ELFCLASS64 ||
-        eh.e_ident[EI_DATA] != ELFDATA2LSB || eh.e_machine != EM_X86_64) return "ElispArchitectureUnsupported";
+        eh.e_ident[EI_DATA] != ELFDATA2LSB || (eh.e_machine != EM_X86_64 && eh.e_machine != EM_LOONGARCH)) return "ElispArchitectureUnsupported";
     const void *actual_id = NULL;
     ssize_t actual_size = dwelf_elf_gnu_build_id(dwarf_getelf(dwarf), &actual_id);
     if (actual_size <= 0 || (size_t)actual_size != n || memcmp(id, actual_id, n)) return "ElispBuildIdMismatch";
