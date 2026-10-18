@@ -1394,12 +1394,21 @@ pub const Session = struct {
             step.return_sp = null;
         }
     }
-    /// Go keeps g in r14. A stack copy moves the stack, so a step-over return
-    /// names that goroutine by g, not by the stack pointer. Other code has no
-    /// g; the stack pointer distinguishes this frame from a recursive one.
-    /// Go code is a dotted symbol on a .go line; C symbols such as foo.isra.0
-    /// and cgo preamble functions are not. A recursive Go call keeps g; its
-    /// depth below g.stack.hi differs, and a stack copy keeps that depth.
+    /// Go's current-goroutine register. amd64 uses r14. aarch64 uses x28.
+    /// LoongArch has an r14 column too; that register is not g.
+    fn goGRegister(self: *Session) ?[]const u8 {
+        return switch (self.target.arch()) {
+            .x86_64 => "r14",
+            .aarch64 => "x28",
+            else => null,
+        };
+    }
+    /// A stack copy moves the stack, so a step-over return names that
+    /// goroutine by g, not by the stack pointer. Other code has no g; the
+    /// stack pointer distinguishes this frame from a recursive one. Go code
+    /// is a dotted symbol on a .go line; C symbols such as foo.isra.0 and
+    /// cgo preamble functions are not. A recursive Go call keeps g; its depth
+    /// below g.stack.hi differs, and a stack copy keeps that depth.
     fn noteReturnProbe(self: *Session, tid: i32, address: u64) !void {
         const regs = try self.target.registers(tid);
         const sp = linux.stackPointer(regs) catch null;
@@ -1409,9 +1418,11 @@ pub const Session = struct {
             if (linux.programCounter(regs)) |pc| {
                 if (self.modules.symbolAt(pc)) |symbol| {
                     if (std.mem.indexOfScalar(u8, symbol.name, '.') != null) {
-                        if (regs.named("r14")) |value| if (value != 0) {
-                            g = value;
-                        };
+                        if (self.goGRegister()) |name| {
+                            if (regs.named(name)) |value| if (value != 0) {
+                                g = value;
+                            };
+                        }
                     }
                 } else |_| {}
             } else |_| {}
@@ -1436,7 +1447,8 @@ pub const Session = struct {
     fn returnProbeMatches(self: *Session, step: *const SourceStep, regs: linux.Registers) bool {
         const sp = linux.stackPointer(regs) catch null;
         if (step.return_g) |saved| {
-            const g = regs.named("r14") orelse return false;
+            const name = self.goGRegister() orelse return false;
+            const g = regs.named(name) orelse return false;
             if (g != saved) return false;
             const depth = step.return_depth orelse return true;
             return sp != null and self.goStackDepth(g, sp.?) == depth;

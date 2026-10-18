@@ -417,6 +417,8 @@ class RunnerTests(unittest.TestCase):
             before = 'gui' in step.name.split('-') or any(str(arg).endswith('-gui.py') for arg in step.argv)
             self.assertEqual(step.kind == 'gui' and step.name not in gate.NO_RETRY, before, step.name)
         self.assertEqual(kinds['source-paths'].needs, ('build-tests', 'source-paths-build'))
+        self.assertEqual(kinds['vulkan-scale-recovery'].argv,
+                         [sys.executable, '-B', 'tests/vulkan-scale-recovery.py'])
         self.assertEqual(kinds['perl-gui'].needs, ('build-tests', 'perl-gui-fixtures'))
         self.assertTrue(kinds['gui-memdefrag-smoke'].serial and not kinds['gui-fdgraph'].serial)
         self.assertTrue({'vulkan-faults', 'gui-overview', 'gui-win95-all-panels', 'gui-clipboard', 'gui-memdefrag', 'gui-files',

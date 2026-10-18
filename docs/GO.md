@@ -23,13 +23,14 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
   changes. After that preemption the goroutine may resume on another
   thread. The step follows it when the stack pointer matches the one saved
   from the sigcontext, and reports the stop on the thread where it lands.
-  A step over a call uses a return probe. On amd64 Go that probe follows the
-  goroutine by g (R14) and by the frame's depth below `g.stack.hi`, which a
-  stack copy keeps, so the step follows it onto another thread after
-  `morestack` preempts or grows the stack. A different g, or the same g in a
-  deeper recursive frame, is not that return: the probe is planted again and
-  the step continues. A non-Go frame is the same return only when the stack
-  pointer matches, so a recursive call is not taken as the outer frame. A
+  A step over a call uses a return probe. On amd64 Go, g is R14. On aarch64
+  Go, g is X28. That probe follows the goroutine by g and by the frame's
+  depth below `g.stack.hi`, which a stack copy keeps, so the step follows it
+  onto another thread after `morestack` preempts or grows the stack. A
+  different g, or the same g in a deeper recursive frame, is not that return:
+  the probe is planted again and the step continues. A non-Go frame is the
+  same return only when the stack pointer matches, so a recursive call is not
+  taken as the outer frame. A block-end probe records no identity. A
   fault such as SIGSEGV stops the step. The step does not resume past it,
   including when that stop is already in the trampoline, since Go never
   returns to the faulting instruction. A peer

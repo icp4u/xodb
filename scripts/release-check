@@ -41,6 +41,7 @@ COVERS = (
     (('src/mcp/base_tools.json', 'src/model/command_decode.zig', 'src/model/json_command.zig', 'scripts/gen-command-decode'), ('command-decode', 'command-boundary*', 'macos-native')),
     (('tests/command-compare.py',), ('command-compare-selftest',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'src/mcp/server.zig', 'src/platform/*', 'src/render/font.zig', 'tests/small-window-gui.py'), ('gui-small-window',)),
+    (('src/render/vulkan.zig', 'src/render/recovery.zig', 'src/platform/*', 'tests/vulkan-scale-recovery.py', 'tests/vulkan-fault.c'), ('vulkan-scale-recovery',)),
     (('src/look.zig', 'src/layout_snapshot.zig', 'tests/overview-small-gui.py'), ('gui-overview-small*', 'gui-overview-layout')),
     (('src/ui/overview/graph_table.zig', 'src/ui/overview/galaxy_model.zig', 'src/mcp/graph.zig'), ('gui-graph-table', 'redot-galaxy-gui')),
     (('src/semq/adapter*', 'scripts/semq/c01_to_xsg.py', 'tests/semq/test_adapter.py'), ('semq-adapter',)),
@@ -76,7 +77,7 @@ COVERS = (
     (('src/language/perl*', 'tests/fixtures/perl/*'), ('perl-*', 'runtime-binding*', 'gui-runtime-binding*', *LANGUAGE_PANES)),
     (('src/language/ruby*', 'tests/fixtures/ruby/*'), ('ruby-*', *LANGUAGE_PANES)),
     (('src/language/javascript*', 'tests/fixtures/javascript/*'), ('javascript-*', *LANGUAGE_PANES)),
-    (('src/language/go*', 'tests/fixtures/go/*'), ('go-*',)),
+    (('src/language/go*', 'tests/fixtures/go/*', 'docs/GO.md'), ('go-*',)),
     (('src/language/gdscript*', 'tests/fixtures/redot/*', 'tests/fixtures/redot-values/*', 'scripts/demo-redot', 'src/debug/dwarf_types.*', 'src/binary/tls.zig'),
      ('gdscript-*', 'gui-owner-gdscript-*', 'dwarf-types', *LANGUAGE_PANES)),
     (('src/language/elisp*', 'tests/fixtures/elisp/*', 'examples/emacs-demo.el', 'scripts/demo-emacs'), ('elisp-*', 'emacs-demo*')),
@@ -85,7 +86,7 @@ COVERS = (
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
     (('src/model/session.zig', 'tests/run-control.py', 'tests/run-control-gui.py'),
-     ('go-language*', 'go-gui', 'go-native*', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
+     ('go-language*', 'go-gui', 'go-native*', 'go-arm64-step', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
     (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/remote_worker.zig', 'src/model/remote_dispatch.zig', 'tests/fixtures/hold-ptrace.c'), ('gui-local-owner*',)),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
@@ -177,7 +178,7 @@ SERIAL = {
 
 # GUI steps that are never retried: they inject faults or race the renderer,
 # so one failure in several runs is the defect they exist to catch.
-NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
+NO_RETRY = {'scene3d-faults', 'vulkan-faults', 'vulkan-enumeration', 'vulkan-device', 'vulkan-scale-recovery', 'hidden-window', 'acquire-timeout', 'fence-timeout', 'wayland-read-race'}
 
 # Host and gui steps (name globs) that run in `periodic` (live) or
 # `periodic-gui` (gui) instead, with the same commands: soaks, stress and
@@ -660,6 +661,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             steps.append(('go-values', [sys.executable, '-B', 'tests/go-values.py', '--go', go, '--strace', '--work', '.work/go-values'], 180))
             steps.append(('go-language', [sys.executable, '-B', 'tests/go-language.py', '--go', go, '--strace', '--work', '.work/go'], 120))
             steps.append(('go-language-agent', ['env', 'XODB_RUNTIME_AGENT=./zig-out/bin/xodb-agent', sys.executable, '-B', 'tests/go-language.py', '--go', go, '--work', '.work/go-agent'], 180))
+            steps.append(('go-arm64-step', [sys.executable, '-B', 'tests/go-arm64-step.py', '--go', go, '--work', '.work/go-arm64'], 180))
         if redot:
             steps.append(('redot-protocol', [sys.executable, '-B', 'tests/redot-protocol.py', '--redot', redot, '--work', '.work/rdp'], 60))
             steps.append(('redot-time', [sys.executable, '-B', 'tests/redot-time.py', '--redot', redot, '--work', '.work/rdt'], 90))
@@ -714,6 +716,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
             ('gui-ui-scale', ['tests/ui-scale-gui.py']),
             ('gui-ui-sizing', ['tests/ui-scale-gui.py', '--sizing']),
             ('gui-small-window', ['tests/small-window-gui.py']),
+            ('vulkan-scale-recovery', ['tests/vulkan-scale-recovery.py']),
             ('gui-galaxy-scale', ['tests/ui-scale-gui.py', '--galaxy']),
             ('gui-vga', ['tests/vga.py']),
             ('gui-remote-owner', ['tests/remote-owner-gui.py']),

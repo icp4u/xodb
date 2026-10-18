@@ -147,12 +147,18 @@ for scale in (1, 2):
     # Sway's explicit IPC resize can override client hints; that must be safe too.
     d = h.Display(str(root), ['--ui-scale', str(scale * 1.5), *h.M1], output_size=(1600, 1000), output_scale=scale, binary=args.binary, wayland_debug=True)
     try:
-        until(d, lambda v: v['available'])
+        # Mapping/focus can precede the first configure and preferred scale.
+        # With --ui-scale 3 the provisional 1280x800 buffer is only 426 UI
+        # units wide: it already satisfies the small-window predicate below.
+        # Observe the configured large window before asking it to shrink.
+        initial = until(d, lambda v: v['available'] and
+                        v['window']['width'] == 1066 and v['window']['height'] == 666)
         wire = Path(d.log).read_text(errors='replace')
         minima = re.findall(r'xdg_toplevel[^\n]*\.set_min_size\((\d+), (\d+)\)', wire)
         assert minima and minima[-1] == ('960', '600'), minima
         subprocess.run(['swaymsg', 'floating enable, resize set width 100 px height 100 px'], env=d.env, check=True, capture_output=True)
-        layout = until(d, lambda v: v['available'] and v['window']['width'] <= 650)
+        layout = until(d, lambda v: v['available'] and v['revision'] > initial['revision'] and
+                       v['window']['width'] <= 650)
         if layout['window']['width'] < 640 or layout['window']['height'] < 400:
             assert layout['too_small'] and not layout['panes'] and not layout['controls'] and not layout['rows'], layout
         else:
