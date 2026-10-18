@@ -11,7 +11,9 @@ pub const Font = struct {
     face: c.FT_Face = null,
     hb: ?*c.hb_font_t = null,
     buffer: ?*c.hb_buffer_t = null,
-    pixels: [atlas_size * atlas_size]u8 = @splat(0),
+    /// Fresh zero pages from mmap on first use: rows no glyph reached are
+    /// never touched, cleared or uploaded (see usedRows).
+    pixels: ?*[atlas_size * atlas_size]u8 = null,
     glyphs: [2048]Glyph = undefined,
     slots: [65536]u16 = @splat(0), // glyph id -> index + 1
     count: usize = 0,
@@ -36,6 +38,7 @@ pub const Font = struct {
         const pixel = @import("../appearance.zig").active.font.pixel;
         self.initMode(path, pixel) catch |err| {
             log.warn(.render, "xodb: Font failed: {s}; using default font; {s}\n", .{ @errorName(err), path });
+            self.freePixels();
             self.* = .{};
             try self.initMode(fallback, pixel);
         };
@@ -90,7 +93,12 @@ pub const Font = struct {
         self.buffer = buffer;
         self.scale = requested;
         self.raster_scale = raster;
-        @memset(&self.pixels, 0);
+        if (self.pixels) |atlas| {
+            @memset(atlas[0 .. self.usedRows() * atlas_size], 0);
+        } else {
+            const bytes = std.heap.page_allocator.rawAlloc(atlas_size * atlas_size, .fromByteUnits(std.heap.pageSize()), @returnAddress()) orelse return error.OutOfMemory;
+            self.pixels = @ptrCast(bytes);
+        }
         @memset(&self.slots, 0);
         self.count = 0;
         self.x = 2;
@@ -98,7 +106,7 @@ pub const Font = struct {
         self.row_height = 0;
         self.degraded = false;
         self.dirty = true;
-        self.pixels[0] = 255;
+        self.pixels.?[0] = 255;
         if (c.getenv("XODB_INPUT_TRACE") != null)
             log.info(.render, "ui font pixels={d} scale={d:.2}\n", .{ pixels, requested });
         // Reserve the missing-glyph box before source text can fill the cache.
@@ -121,7 +129,16 @@ pub const Font = struct {
             return err;
         };
     }
+    /// Atlas rows from the top that hold glyphs (the rest are zero).
+    pub fn usedRows(self: *const Font) u32 {
+        return @min(atlas_size, self.y + self.row_height + 1);
+    }
+    fn freePixels(self: *Font) void {
+        if (self.pixels) |pixels| std.heap.page_allocator.rawFree(pixels, .fromByteUnits(std.heap.pageSize()), @returnAddress());
+        self.pixels = null;
+    }
     pub fn deinit(self: *Font) void {
+        self.freePixels();
         c.hb_buffer_destroy(self.buffer);
         c.hb_font_destroy(self.hb);
         _ = c.FT_Done_Face(self.face);
@@ -149,9 +166,9 @@ pub const Font = struct {
             const src = bitmap.buffer + source_row * @as(usize, @intCast(@abs(bitmap.pitch)));
             const start = (self.y + row) * atlas_size + self.x;
             if (bitmap.pixel_mode == c.FT_PIXEL_MODE_MONO) {
-                for (0..bitmap.width) |col| self.pixels[start + col] = if (src[col / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(col % 8))) != 0) 255 else 0;
+                for (0..bitmap.width) |col| self.pixels.?[start + col] = if (src[col / 8] & (@as(u8, 0x80) >> @as(u3, @intCast(col % 8))) != 0) 255 else 0;
             } else {
-                @memcpy(self.pixels[start..][0..bitmap.width], src[0..bitmap.width]);
+                @memcpy(self.pixels.?[start..][0..bitmap.width], src[0..bitmap.width]);
             }
         }
         self.x += bitmap.width + 1;
@@ -261,7 +278,7 @@ test "pixel glyph atlas has binary nonempty coverage" {
     defer font.deinit();
     for ("Aa@0123") |ch| _ = try font.glyph(c.FT_Get_Char_Index(font.face, ch));
     var ink: usize = 0;
-    for (font.pixels) |value| {
+    for (font.pixels.?) |value| {
         try std.testing.expect(value == 0 or value == 255);
         if (value == 255) ink += 1;
     }
@@ -282,7 +299,7 @@ test "bundled bitmap font switches atomically and restores the overview font" {
         _ = try font.glyph(id);
     }
     var ink: usize = 0;
-    for (font.pixels) |value| {
+    for (font.pixels.?) |value| {
         try std.testing.expect(value == 0 or value == 255);
         if (value == 255) ink += 1;
     }

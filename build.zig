@@ -128,6 +128,8 @@ pub fn build(b: *std.Build) void {
         for ([_][]const u8{
             "/usr/share/wayland-protocols/staging/fractional-scale/fractional-scale-v1.xml",
             "/usr/share/wayland-protocols/stable/viewporter/viewporter.xml",
+            // Startup tracing only (XODB_STARTUP_TRACE): when the first frame was shown.
+            "/usr/share/wayland-protocols/stable/presentation-time/presentation-time.xml",
         }) |xml| {
             const scale_header = b.addSystemCommand(&.{ "wayland-scanner", "client-header", xml });
             module.addIncludePath(scale_header.addOutputFileArg(b.fmt("{s}-client-protocol.h", .{std.fs.path.stem(xml)})).dirname());

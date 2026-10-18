@@ -29,7 +29,7 @@ pub fn main(args: []const [:0]const u8) !void {
     var renderer = Renderer{};
     try renderer.init(&window);
     defer renderer.deinit();
-    log.info(.render, "scene3d base framebuffers={d}\n", .{renderer.count});
+    log.info(.render, "scene3d base framebuffers={d} pipelines={d} maps={d}\n", .{ renderer.count, renderer.pipelineCount(), @as(usize, 1) + @intFromBool(renderer.atlas_linear) });
     const font = try std.heap.page_allocator.create(Font);
     defer std.heap.page_allocator.destroy(font);
     font.* = .{};

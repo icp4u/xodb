@@ -19,6 +19,7 @@ pub const c = @cImport({
     @cInclude("linux-dmabuf-v1-client-protocol.h");
     @cInclude("fractional-scale-v1-client-protocol.h");
     @cInclude("viewporter-client-protocol.h");
+    @cInclude("presentation-time-client-protocol.h");
     @cInclude("vulkan/vulkan.h");
 });
 const vk = @import("../c_ui.zig").api;
@@ -94,6 +95,14 @@ pub const Window = struct {
     /// One compositor pacing callback for the last queued presentation. Hidden
     /// surfaces may never receive it until they become visible again.
     frame_callback: ?*c.wl_callback = null,
+    /// Bound only under XODB_STARTUP_TRACE: feedback for the first frame.
+    presentation: ?*c.wp_presentation = null,
+    presentation_clock: u32 = 0,
+    /// Feedback per frame until one is presented (traced once): a frame
+    /// replaced before the compositor showed it is discarded.
+    presentation_feedback: [64]?*c.struct_wp_presentation_feedback = @splat(null),
+    presentation_frames: u32 = 0,
+    presentation_shown: bool = false,
     pointer_x: f32 = 0,
     pointer_y: f32 = 0,
     mouse_down: bool = false,
@@ -179,6 +188,8 @@ pub const Window = struct {
         for (&self.outputs) |*output| output.destroy();
         if (self.fractional_manager) |v| c.wp_fractional_scale_manager_v1_destroy(v);
         if (self.viewporter) |v| c.wp_viewporter_destroy(v);
+        for (self.presentation_feedback) |feedback| if (feedback) |v| c.wp_presentation_feedback_destroy(v);
+        if (self.presentation) |v| c.wp_presentation_destroy(v);
         if (self.wm) |v| c.xdg_wm_base_destroy(v);
         if (self.decoration_manager) |v| c.zxdg_decoration_manager_v1_destroy(v);
         if (self.compositor) |v| c.wl_compositor_destroy(v);
@@ -381,6 +392,12 @@ pub const Window = struct {
         const callback = c.wl_surface_frame(self.surface) orelse return error.FrameCallbackFailed;
         self.frame_callback = callback;
         _ = c.wl_callback_add_listener(callback, &frame_listener, self);
+        if (self.presentation) |manager| if (!self.presentation_shown and self.presentation_frames < self.presentation_feedback.len) {
+            const feedback = c.wp_presentation_feedback(manager, self.surface) orelse return;
+            self.presentation_feedback[self.presentation_frames] = feedback;
+            self.presentation_frames += 1;
+            _ = c.wp_presentation_feedback_add_listener(feedback, &presentation_feedback_listener, self);
+        };
     }
     pub fn cancelFrame(self: *Window) void {
         if (self.frame_callback) |callback| c.wl_callback_destroy(callback);
@@ -455,6 +472,10 @@ fn global(data: ?*anyopaque, registry: ?*c.wl_registry, name: u32, interface: [*
     if (std.mem.eql(u8, s, "wp_cursor_shape_manager_v1")) {
         w.cursor_shapes = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_cursor_shape_manager_v1_interface, 1));
         w.attachCursor();
+    }
+    if (std.mem.eql(u8, s, "wp_presentation") and w.presentation == null and phases.tracing()) {
+        w.presentation = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_presentation_interface, 1));
+        _ = c.wp_presentation_add_listener(w.presentation, &presentation_listener, w);
     }
     if (std.mem.eql(u8, s, "wp_viewporter")) w.viewporter = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_viewporter_interface, 1));
     if (std.mem.eql(u8, s, "wp_fractional_scale_manager_v1")) w.fractional_manager = @ptrCast(c.wl_registry_bind(registry, name, &c.wp_fractional_scale_manager_v1_interface, 1));
@@ -617,6 +638,31 @@ fn outputName(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) vo
 fn outputDescription(_: ?*anyopaque, _: ?*c.wl_output, _: [*c]const u8) callconv(.c) void {}
 const registry_listener = c.wl_registry_listener{ .global = global, .global_remove = removed };
 const wm_listener = c.xdg_wm_base_listener{ .ping = ping };
+fn presentationClock(data: ?*anyopaque, _: ?*c.wp_presentation, clock: u32) callconv(.c) void {
+    window(data).presentation_clock = clock;
+}
+fn feedbackOutput(_: ?*anyopaque, _: ?*c.struct_wp_presentation_feedback, _: ?*c.wl_output) callconv(.c) void {}
+/// The 1-based frame number of `feedback`, which is released.
+fn feedbackDone(w: *Window, feedback: ?*c.struct_wp_presentation_feedback) u32 {
+    c.wp_presentation_feedback_destroy(feedback);
+    for (&w.presentation_feedback, 1..) |*slot, number| if (slot.* == feedback) {
+        slot.* = null;
+        return @intCast(number);
+    };
+    return 0;
+}
+fn feedbackPresented(data: ?*anyopaque, feedback: ?*c.struct_wp_presentation_feedback, hi: u32, lo: u32, nsec: u32, refresh: u32, _: u32, _: u32, _: u32) callconv(.c) void {
+    const w = window(data);
+    const number = feedbackDone(w, feedback);
+    if (w.presentation_shown) return;
+    w.presentation_shown = true;
+    phases.traceOnscreen(((@as(u64, hi) << 32) | lo) * 1_000_000_000 + nsec, w.presentation_clock, refresh, now(), number);
+}
+fn feedbackDiscarded(data: ?*anyopaque, feedback: ?*c.struct_wp_presentation_feedback) callconv(.c) void {
+    _ = feedbackDone(window(data), feedback);
+}
+const presentation_listener = c.wp_presentation_listener{ .clock_id = presentationClock };
+const presentation_feedback_listener = c.wp_presentation_feedback_listener{ .sync_output = feedbackOutput, .presented = feedbackPresented, .discarded = feedbackDiscarded };
 const surface_listener = c.xdg_surface_listener{ .configure = configured };
 const wl_surface_listener = c.wl_surface_listener{ .enter = surfaceEnter, .leave = surfaceLeave, .preferred_buffer_scale = preferredBufferScale, .preferred_buffer_transform = preferredBufferTransform };
 const fractional_listener = c.wp_fractional_scale_v1_listener{ .preferred_scale = fractionalPreferred };

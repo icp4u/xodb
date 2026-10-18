@@ -38,7 +38,11 @@ fn onSignal(signal: c_int) callconv(.c) void {
 }
 
 pub fn main(init: std.process.Init) !void {
-    const startup_started = linux.now();
+    // Read before xodbMain's prologue: its frame is megabytes, and in safe
+    // builds the stack probe faults every page in before its first statement.
+    return xodbMain(init, linux.now());
+}
+noinline fn xodbMain(init: std.process.Init, startup_started: u64) !void {
     const a = init.arena.allocator();
     const given = try init.minimal.args.toSlice(a);
     // lsof-top is a separate terminal program over the C fd scanner. Only
@@ -62,6 +66,7 @@ pub fn main(init: std.process.Init) !void {
     if (comptime build_options.gui) for (args[1..], 1..) |arg, k| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--vk-device") and k + 1 < args.len) @import("render/vulkan.zig").device_request = args[k + 1];
+        if (std.mem.eql(u8, arg, "--no-vk-layers")) @import("render/vulkan.zig").no_implicit_layers = true;
         if (!std.mem.eql(u8, arg, "--platform")) continue;
         if (k + 1 >= args.len) {
             log.err(.window, "xodb: --platform needs wayland or x11\n", .{});
@@ -89,6 +94,7 @@ pub fn main(init: std.process.Init) !void {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--overview") or std.mem.eql(u8, arg, "--attach-exe")) {
             for (args[1..]) |other| if (std.mem.eql(u8, other, "--headless")) return overviewHeadless(args);
+            if (comptime build_options.gui) if (@import("platform/window.zig").earlyDisplayGpu()) |node| @import("render/vulkan.zig").startEarly(node);
             return @import("ui/overview/run.zig").main(args, startup_started);
         }
     }
@@ -242,6 +248,8 @@ pub fn main(init: std.process.Init) !void {
                 \\--vk-list prints the Vulkan devices and marks the one xodb uses; --vk-device INDEX|NAME picks
                 \\  another (XODB_VK_DEVICE does the same). A blank window usually means the wrong GPU or a
                 \\  driver that did not load: stderr names it in one "xodb: vulkan:" line (docs/GUIDE.md).
+                \\--no-vk-layers starts xodb's own Vulkan instance without implicit layers (Mesa device_select,
+                \\  overlays such as MangoHud, OBS capture): slightly faster startup; layer variables you set win.
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
                 \\--fetch prints a fastfetch-style card of this machine and exits (--fetch --help; docs/FETCH.md).
@@ -261,7 +269,7 @@ pub fn main(init: std.process.Init) !void {
                 \\
             , .{});
             return;
-        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--redact")) redact = true else if (std.mem.eql(u8, arg, "--")) {
+        } else if (std.mem.eql(u8, arg, "--fetch-source")) fetch_source = true else if (std.mem.eql(u8, arg, "--resolve-capture-symbols")) reanalyze = true else if (std.mem.eql(u8, arg, "--follow-forks")) follow_forks = true else if (std.mem.eql(u8, arg, "--no-ghidra-prestart")) no_ghidra_prestart = true else if (std.mem.eql(u8, arg, "--no-vk-layers")) {} else if (std.mem.eql(u8, arg, "--headless")) headless = true else if (std.mem.eql(u8, arg, "--mcp")) mcp = true else if (std.mem.eql(u8, arg, "--redact")) redact = true else if (std.mem.eql(u8, arg, "--")) {
             launch = args[i + 1 ..];
             break;
         } else if (named(&value_options, arg)) {
@@ -395,6 +403,8 @@ pub fn main(init: std.process.Init) !void {
     // The command line wins over the config file; both were range-checked.
     try snapshot.configure(image_limit orelse preferences.symbols.image_bytes, image_total_limit orelse preferences.symbols.image_total_bytes);
     if (static_decompile) |path| return @import("semq/static_image.zig").decompile(a, path, static_function);
+    // Vulkan instance and device on a thread while the session and window are set up.
+    if (comptime build_options.gui) if (!headless and !remote_gui) if (@import("platform/window.zig").earlyDisplayGpu()) |node| @import("render/vulkan.zig").startEarly(node);
     if (!headless) @import("appearance.zig").init(try @import("preferences.zig").themeSelection(a, &preferences, config_path, theme_path));
     try @import("target/runtime.zig").saveLaunchSignals();
     _ = c.signal(c.SIGINT, onSignal);
@@ -445,7 +455,7 @@ pub fn main(init: std.process.Init) !void {
     defer connection.close();
     if (listen) |endpoint| connection = try @import("remote/transport.zig").acceptOne(endpoint, &quitting);
     const session = try a.create(Session);
-    session.* = Session.init();
+    session.initIn();
     session.persistent.cancel = &quitting;
     session.agent_scope = agent_scope;
     session.shared_jobs = !headless or session_socket != null;
@@ -718,7 +728,7 @@ pub fn main(init: std.process.Init) !void {
                 };
                 workspaces[0] = first_workspace;
                 workspaces[0].?.* = .{ .density = preferences.appearance.density, .thread_list = .{ .hide_internal = hide_wine_threads orelse preferences.wine.hide_internal_threads }, .redot_panel = .{ .look = preferences.galaxy } };
-                session.* = Session.init();
+                session.initIn();
                 remote_destroyed = false;
                 session.persistent.cancel = &quitting;
                 session.agent_scope = .observe;
@@ -764,7 +774,9 @@ pub fn main(init: std.process.Init) !void {
         var last_allocation_state: ?@import("profile/allocation_capture.zig").State = null;
         while (!window.closing and quitting == 0) {
             var phase_started = linux.now();
-            try window.pump(window.input.timeoutMs(phase_started, 8));
+            // Until the renderer first starts there is nothing to wait for:
+            // the first frame is drawn on this pass, not after an idle poll.
+            try window.pump(if (!recovery.ready and recovery.retry_at == 0) 0 else window.input.timeoutMs(phase_started, 8));
             reportSlow("Wayland event pump", phase_started);
             if (window.closing or quitting != 0) break;
             window.input.tick(linux.now());
@@ -926,7 +938,8 @@ fn remoteGui(owner: *@import("model/remote_worker.zig").Worker, window: *Window,
     var last_frame = linux.now();
     var confirmed_connection = false;
     while (!window.closing and quitting == 0 and !owner.done.load(.acquire) and !owner.stopping.load(.acquire)) {
-        try window.pump(window.input.timeoutMs(linux.now(), 8));
+        // As in the local loop: no idle poll before the renderer first starts.
+        try window.pump(if (!renderer_started and render_retry == 0) 0 else window.input.timeoutMs(linux.now(), 8));
         if (window.closing or quitting != 0) break;
         window.input.tick(linux.now());
         if (window.input.count > 0) window.dirty = true;
@@ -1199,7 +1212,7 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     defer collector.deinit();
     const session = try a.create(Session);
     defer a.destroy(session);
-    session.* = Session.init();
+    session.initIn();
     session.agent_scope = o.agent_scope;
     defer session.deinit();
     var shared: ?SharedSession = if (o.session_socket) |path| try SharedSession.init(path, null, o.redact) else null;

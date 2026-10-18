@@ -415,6 +415,14 @@ linux-dmabuf feedback, matched to the device's DRM node). If the compositor does
 Vulkan device matches, it takes the first discrete GPU, then an integrated one, then anything
 that can present. Indexes follow the driver's order, which can differ between sessions; names do not.
 
+To start fast, xodb then loads only the Vulkan driver for that GPU (on a laptop whose display is on
+the integrated GPU, the discrete GPU's driver is not loaded at all). It falls back to every driver
+when that one gives nothing usable, and loads every driver whenever you pass `--vk-device`, set
+`XODB_VK_DEVICE`, or set any of `VK_DRIVER_FILES`, `VK_ICD_FILENAMES`, `VK_ADD_DRIVER_FILES`,
+`VK_LOADER_DRIVERS_SELECT`, `VK_LOADER_DRIVERS_DISABLE` or a `VK_LOADER_*_ID_FILTER`. Programs xodb starts never inherit
+this choice. `--no-vk-layers` also turns off implicit Vulkan layers (Mesa's device_select,
+overlays such as MangoHud or OBS capture) for xodb's own window: about 1 ms faster.
+
 A device request that cannot be satisfied at startup exits with an error. After the renderer has
 initialized successfully, a device that temporarily disappears causes retries while the debugger
 retains its session and owned targets.

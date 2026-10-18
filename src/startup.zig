@@ -14,6 +14,7 @@ pub fn report(started: u64, protocol_stdout: bool) void {
     // Present ends this when the queue accepts the image. Ending here covers a
     // caller that reports without that hook, and is a no-op once it has ended.
     phases.end(.draw);
+    phases.tracePresent(started);
     var ts: c.timespec = undefined;
     _ = c.clock_gettime(c.CLOCK_MONOTONIC, &ts);
     const now = @as(u64, @intCast(ts.tv_sec)) * 1_000_000_000 + @as(u64, @intCast(ts.tv_nsec));

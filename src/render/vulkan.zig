@@ -9,6 +9,9 @@ const select = @import("vk_select.zig");
 /// `--vk-device`: an index from `--vk-list` or part of a device name. It wins
 /// over XODB_VK_DEVICE.
 pub var device_request: ?[]const u8 = null;
+/// `--no-vk-layers`: implicit loader layers off for xodb's own instance.
+pub var no_implicit_layers = false;
+const child_env = @import("../child_env.zig");
 pub const scene3d = @import("scene3d/gpu.zig");
 pub const Color = [4]f32;
 pub const Rect = struct { x: f32, y: f32, w: f32, h: f32 };
@@ -132,6 +135,11 @@ pub const Renderer = struct {
     atlas_view: c.VkImageView = null,
     sampler: c.VkSampler = null,
     atlas_ready: bool = false,
+    /// A linear, host-visible atlas written in place (GENERAL layout): no
+    /// copy command, so no driver copy shader to build on a first run.
+    atlas_linear: bool = false,
+    atlas_mapped: ?[*]u8 = null,
+    atlas_pitch: usize = 0,
     vertices: usize = 0,
     cells_used: u32 = 0,
     batches: [8]CellBatch = undefined,
@@ -152,26 +160,115 @@ pub const Renderer = struct {
     failed_driver_len: usize = 0,
 
     pub fn init(self: *Renderer, window: *Window) !void {
+        if (takeEarly()) |ready| {
+            self.* = ready;
+            self.window = window;
+            // Only a device that cannot present to this window starts over;
+            // any other failure is the renderer's, as on the ordinary path.
+            if (self.adopt(window)) return else |err| {
+                self.deinit();
+                if (err != error.VulkanDeviceCannotPresent) return err;
+                log.debug(.render, "Vulkan early device cannot present to this window; starting over\n", .{});
+            }
+        }
         self.window = window;
         errdefer self.deinit();
-        try self.createInstance();
+        const display = window.displayGpu();
+        // Without a device request the display's GPU is chosen, so every other
+        // ICD the loader opens is startup cost (NVIDIA's alone is 30-70 ms).
+        // Ask the loader for the display driver's ICD only, and retry with all
+        // of them when that yields nothing that can present.
+        // Children (targets: child_env.settle) and --vk-list never see the filter.
+        child_env.hold();
+        var filter = loaderFilter(display);
+        if (filter) |pattern| _ = c.setenv("VK_LOADER_DRIVERS_SELECT", pattern, 1);
+        const layers_off = implicitLayersOff();
+        const instance_made = self.createInstance();
+        if (filter != null) _ = c.unsetenv("VK_LOADER_DRIVERS_SELECT");
+        if (layers_off) _ = c.unsetenv("VK_LOADER_LAYERS_DISABLE");
+        child_env.release();
+        // No matching manifest, or the matching driver failed to load: the
+        // loader then has no driver at all; load every one, as without a filter.
+        if (instance_made) |_| {} else |err| if (filter) |pattern| {
+            log.debug(.render, "Vulkan loader drivers {s} gave no instance ({s}); loading every driver\n", .{ pattern, @errorName(err) });
+            filter = null;
+            try self.createInstance();
+        } else return err;
         try created(window.createSurface(self.instance, &self.surface), &self.surface);
         phases.begin(.device);
         var found = try self.probe();
         defer found.deinit(std.heap.page_allocator);
-        const display = window.displayGpu();
+        if (filter) |pattern| if (for (found.items) |item| {
+            if (item.device.usable) break false;
+        } else true) {
+            log.debug(.render, "Vulkan loader drivers {s} gave no device that can present; loading every driver\n", .{pattern});
+            found.deinit(std.heap.page_allocator);
+            found = .empty;
+            c.vkDestroySurfaceKHR(self.instance, self.surface, null);
+            self.surface = null;
+            c.vkDestroyInstance(self.instance, null);
+            self.instance = null;
+            try self.createInstance();
+            try created(window.createSurface(self.instance, &self.surface), &self.surface);
+            found = try self.probe();
+        };
         const choice = try pick(found.items, display);
         self.physical = found.items[choice.index].physical;
         self.family = found.items[choice.index].family;
         self.gpu_name = found.items[choice.index].name;
         self.gpu_kind = found.items[choice.index].device.kind;
         log.info(.render, "Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
-        log.debug(.render, "Vulkan device {d} of {d} chosen: {s}\n", .{ choice.index, found.items.len, switch (choice.why) {
+        logChoice(choice, found.items.len);
+        self.warn(found.items, choice, display);
+        try self.createDevice();
+        const pixels = window.bufferExtent();
+        try self.createSwap(pixels.width, pixels.height);
+    }
+    fn logChoice(choice: select.Choice, count: usize) void {
+        log.debug(.render, "Vulkan device {d} of {d} chosen: {s}\n", .{ choice.index, count, switch (choice.why) {
             .requested => "requested with --vk-device or XODB_VK_DEVICE",
             .display => "it drives the compositor's display",
             .ranked => "best kind that can present; the display's device is unknown or unusable",
         } });
+    }
+    /// The early thread's part: everything but the surface and swapchain.
+    /// Devices are probed without a surface (any graphics family) and chosen
+    /// by the same rule, the display's DRM node first; `adopt` checks that the
+    /// chosen family presents to the window.
+    fn prepare(self: *Renderer, display: ?select.Node) !void {
+        errdefer self.deinit();
+        const instance_made = self.createInstance();
+        // The loader has read its variables; a child launched from now on
+        // (on any thread) must not inherit them.
+        earlyRestore();
+        try instance_made;
+        phases.begin(.device);
+        var found = try self.probe();
+        defer found.deinit(std.heap.page_allocator);
+        const choice = try pick(found.items, display);
+        self.physical = found.items[choice.index].physical;
+        self.family = found.items[choice.index].family;
+        self.gpu_name = found.items[choice.index].name;
+        self.gpu_kind = found.items[choice.index].device.kind;
+        log.info(.render, "Vulkan device: {s}\n", .{std.mem.sliceTo(@as([]const u8, &self.gpu_name), 0)});
+        logChoice(choice, found.items.len);
         self.warn(found.items, choice, display);
+        try self.createDevice();
+        // The usual swapchain format; createSwap rebuilds pass and pipelines if the surface differs.
+        self.format = c.VK_FORMAT_B8G8R8A8_UNORM;
+        try self.createPass();
+    }
+    fn adopt(self: *Renderer, window: *Window) !void {
+        try created(window.createSurface(self.instance, &self.surface), &self.surface);
+        var present: c.VkBool32 = 0;
+        try check(c.vkGetPhysicalDeviceSurfaceSupportKHR(self.physical, self.family, self.surface, &present));
+        if (present == 0) return error.VulkanDeviceCannotPresent;
+        const pixels = window.bufferExtent();
+        try self.createSwap(pixels.width, pixels.height);
+    }
+    /// The logical device for `physical` and `family`, and everything that
+    /// needs only the device: queue, commands, sync, buffers, atlas, descriptors.
+    fn createDevice(self: *Renderer) !void {
         const priority: f32 = 1;
         var queue_info = info(c.VkDeviceQueueCreateInfo, c.VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO);
         queue_info.queueFamilyIndex = self.family;
@@ -203,8 +300,40 @@ pub const Renderer = struct {
         try self.createBuffer();
         try self.createAtlas();
         try self.createDescriptors();
-        const pixels = window.bufferExtent();
-        try self.createSwap(pixels.width, pixels.height);
+    }
+    /// With --no-vk-layers: implicit layers (overlays, capture hooks, Mesa's
+    /// device_select) off for xodb's own instance, unless the user configured
+    /// layers or requested a device. True when set.
+    fn implicitLayersOff() bool {
+        // Opt-in: it also turns off OBS vkcapture, MangoHud and Steam overlay hooks.
+        if (!no_implicit_layers) return false;
+        // Mesa's device_select layer orders the devices; --vk-device indices
+        // follow --vk-list, so a request keeps the layers.
+        if (device_request != null or c.getenv("XODB_VK_DEVICE") != null) return false;
+        for ([_][*:0]const u8{ "VK_LOADER_LAYERS_ENABLE", "VK_LOADER_LAYERS_DISABLE", "VK_INSTANCE_LAYERS" }) |name| {
+            if (c.getenv(name) != null) return false;
+        }
+        _ = c.setenv("VK_LOADER_LAYERS_DISABLE", "~implicit~", 1);
+        return true;
+    }
+    /// The loader filter for the display GPU's kernel driver, or null: when
+    /// there is no device request, the user set no loader driver variables,
+    /// and the driver is in the table.
+    fn loaderFilter(display: ?select.Node) ?[:0]const u8 {
+        const node = display orelse return null;
+        if (device_request != null or c.getenv("XODB_VK_DEVICE") != null) return null;
+        for ([_][*:0]const u8{ "VK_DRIVER_FILES", "VK_ICD_FILENAMES", "VK_ADD_DRIVER_FILES", "VK_LOADER_DRIVERS_SELECT", "VK_LOADER_DRIVERS_DISABLE", "VK_LOADER_DEVICE_ID_FILTER", "VK_LOADER_VENDOR_ID_FILTER", "VK_LOADER_DRIVER_ID_FILTER" }) |name| {
+            if (c.getenv(name) != null) return null;
+        }
+        var path: [64]u8 = undefined;
+        const link = std.fmt.bufPrintZ(&path, "/sys/dev/char/{d}:{d}/device/driver", .{ node.major, node.minor }) catch return null;
+        var target: [256]u8 = undefined;
+        const n = c.readlink(link.ptr, &target, target.len);
+        if (n <= 0) return null;
+        const driver = std.fs.path.basename(target[0..@intCast(n)]);
+        const pattern = select.loaderPattern(driver) orelse return null;
+        log.debug(.render, "Vulkan loader drivers {s} for the display's kernel driver {s}\n", .{ pattern, driver });
+        return pattern;
     }
     /// The instance, with two optional extensions when the loader has them:
     /// device DRM nodes (to find the display GPU) and loader messages (to hear
@@ -419,6 +548,48 @@ pub const Renderer = struct {
         try created(c.vkCreateImageView(self.device, &create, null, view), view);
     }
     fn createAtlas(self: *Renderer) !void {
+        self.createLinearAtlas() catch {
+            if (self.atlas != null) c.vkDestroyImage(self.device, self.atlas, null);
+            if (self.atlas_memory != null) c.vkFreeMemory(self.device, self.atlas_memory, null);
+            self.atlas = null;
+            self.atlas_memory = null;
+            self.atlas_linear = false;
+            self.atlas_mapped = null;
+            return self.createOptimalAtlas();
+        };
+        try self.createSampler();
+    }
+    fn createLinearAtlas(self: *Renderer) !void {
+        var format: c.VkFormatProperties = undefined;
+        c.vkGetPhysicalDeviceFormatProperties(self.physical, c.VK_FORMAT_R8_UNORM, &format);
+        if (format.linearTilingFeatures & c.VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT == 0) return error.LinearAtlasUnsupported;
+        var create = info(c.VkImageCreateInfo, c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
+        create.imageType = c.VK_IMAGE_TYPE_2D;
+        create.format = c.VK_FORMAT_R8_UNORM;
+        create.extent = .{ .width = fonts.atlas_size, .height = fonts.atlas_size, .depth = 1 };
+        create.mipLevels = 1;
+        create.arrayLayers = 1;
+        create.samples = c.VK_SAMPLE_COUNT_1_BIT;
+        create.tiling = c.VK_IMAGE_TILING_LINEAR;
+        create.usage = c.VK_IMAGE_USAGE_SAMPLED_BIT;
+        create.initialLayout = c.VK_IMAGE_LAYOUT_PREINITIALIZED;
+        try created(c.vkCreateImage(self.device, &create, null, &self.atlas), &self.atlas);
+        var req: c.VkMemoryRequirements = undefined;
+        c.vkGetImageMemoryRequirements(self.device, self.atlas, &req);
+        try self.allocate(req, c.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | c.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &self.atlas_memory);
+        try check(c.vkBindImageMemory(self.device, self.atlas, self.atlas_memory, 0));
+        const subresource = c.VkImageSubresource{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .arrayLayer = 0 };
+        var layout: c.VkSubresourceLayout = undefined;
+        c.vkGetImageSubresourceLayout(self.device, self.atlas, &subresource, &layout);
+        if (layout.rowPitch < fonts.atlas_size) return error.LinearAtlasUnsupported;
+        var mapped: ?*anyopaque = null;
+        try check(c.vkMapMemory(self.device, self.atlas_memory, 0, c.VK_WHOLE_SIZE, 0, &mapped));
+        self.atlas_mapped = @as([*]u8, @ptrCast(mapped.?)) + layout.offset;
+        self.atlas_pitch = @intCast(layout.rowPitch);
+        try self.createView(self.atlas, c.VK_FORMAT_R8_UNORM, &self.atlas_view);
+        self.atlas_linear = true;
+    }
+    fn createOptimalAtlas(self: *Renderer) !void {
         var create = info(c.VkImageCreateInfo, c.VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO);
         create.imageType = c.VK_IMAGE_TYPE_2D;
         create.format = c.VK_FORMAT_R8_UNORM;
@@ -434,6 +605,9 @@ pub const Renderer = struct {
         try self.allocate(req, c.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, &self.atlas_memory);
         try check(c.vkBindImageMemory(self.device, self.atlas, self.atlas_memory, 0));
         try self.createView(self.atlas, c.VK_FORMAT_R8_UNORM, &self.atlas_view);
+        try self.createSampler();
+    }
+    fn createSampler(self: *Renderer) !void {
         var sampler = info(c.VkSamplerCreateInfo, c.VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO);
         sampler.magFilter = c.VK_FILTER_NEAREST;
         sampler.minFilter = c.VK_FILTER_NEAREST;
@@ -459,7 +633,7 @@ pub const Renderer = struct {
         alloc.descriptorSetCount = 1;
         alloc.pSetLayouts = &self.descriptor_layout;
         try check(c.vkAllocateDescriptorSets(self.device, &alloc, &self.descriptor));
-        const image = c.VkDescriptorImageInfo{ .sampler = self.sampler, .imageView = self.atlas_view, .imageLayout = c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
+        const image = c.VkDescriptorImageInfo{ .sampler = self.sampler, .imageView = self.atlas_view, .imageLayout = if (self.atlas_linear) c.VK_IMAGE_LAYOUT_GENERAL else c.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL };
         var write = info(c.VkWriteDescriptorSet, c.VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET);
         write.dstSet = self.descriptor;
         write.descriptorCount = 1;
@@ -593,32 +767,45 @@ pub const Renderer = struct {
         try check(c.vkCreateShaderModule(self.device, &create, null, &module));
         return module;
     }
+    const ui_binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Vertex), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX };
+    const ui_attrs = [_]c.VkVertexInputAttributeDescription{
+        .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "position") },
+        .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "uv") },
+        .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Vertex, "color") },
+        .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "local") },
+        .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "half") },
+        .{ .location = 5, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = @offsetOf(Vertex, "shape") },
+    };
+    const cell_binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Cell), .inputRate = c.VK_VERTEX_INPUT_RATE_INSTANCE };
+    const cell_attrs = [_]c.VkVertexInputAttributeDescription{
+        .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Cell, "rect") },
+        .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "fill") },
+        .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "accent") },
+        .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "overlay") },
+        .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32_UINT, .offset = @offsetOf(Cell, "kind") },
+    };
+    const vert_spv align(4) = @embedFile("vert_spv").*;
+    const frag_spv align(4) = @embedFile("frag_spv").*;
+    const cell_vert_spv align(4) = @embedFile("cell_vert_spv").*;
+    const cell_frag_spv align(4) = @embedFile("cell_frag_spv").*;
+    /// The plain UI pipeline every frame uses; the cell and additive ones are
+    /// made by the first frame that draws them (ensurePipelines).
     fn createPipeline(self: *Renderer) !void {
-        const vert_bytes align(4) = @embedFile("vert_spv").*;
-        const frag_bytes align(4) = @embedFile("frag_spv").*;
-        const binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Vertex), .inputRate = c.VK_VERTEX_INPUT_RATE_VERTEX };
-        const attrs = [_]c.VkVertexInputAttributeDescription{
-            .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "position") },
-            .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "uv") },
-            .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Vertex, "color") },
-            .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "local") },
-            .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32G32_SFLOAT, .offset = @offsetOf(Vertex, "half") },
-            .{ .location = 5, .binding = 0, .format = c.VK_FORMAT_R32G32B32_SFLOAT, .offset = @offsetOf(Vertex, "shape") },
-        };
-        self.pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs, false);
-        self.glow_pipeline = try self.makePipeline(&vert_bytes, &frag_bytes, binding, &attrs, true);
-        const cell_vert align(4) = @embedFile("cell_vert_spv").*;
-        const cell_frag align(4) = @embedFile("cell_frag_spv").*;
-        const cell_binding = c.VkVertexInputBindingDescription{ .binding = 0, .stride = @sizeOf(Cell), .inputRate = c.VK_VERTEX_INPUT_RATE_INSTANCE };
-        const cell_attrs = [_]c.VkVertexInputAttributeDescription{
-            .{ .location = 0, .binding = 0, .format = c.VK_FORMAT_R32G32B32A32_SFLOAT, .offset = @offsetOf(Cell, "rect") },
-            .{ .location = 1, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "fill") },
-            .{ .location = 2, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "accent") },
-            .{ .location = 3, .binding = 0, .format = c.VK_FORMAT_R8G8B8A8_UNORM, .offset = @offsetOf(Cell, "overlay") },
-            .{ .location = 4, .binding = 0, .format = c.VK_FORMAT_R32_UINT, .offset = @offsetOf(Cell, "kind") },
-        };
-        self.cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs, false);
-        self.glow_cell_pipeline = try self.makePipeline(&cell_vert, &cell_frag, cell_binding, &cell_attrs, true);
+        self.pipeline = try self.makePipeline(&vert_spv, &frag_spv, ui_binding, &ui_attrs, false);
+    }
+    /// Graphics pipelines made so far (2D ones; scene3d has its own).
+    pub fn pipelineCount(self: *const Renderer) usize {
+        var n: usize = 0;
+        for ([_]c.VkPipeline{ self.pipeline, self.cell_pipeline, self.glow_pipeline, self.glow_cell_pipeline }) |p| n += @intFromBool(p != null);
+        return n;
+    }
+    fn ensurePipelines(self: *Renderer) !void {
+        for (self.batches[0..self.batch_count]) |b| {
+            if (b.additive) {
+                if (self.glow_cell_pipeline == null) self.glow_cell_pipeline = try self.makePipeline(&cell_vert_spv, &cell_frag_spv, cell_binding, &cell_attrs, true);
+                if (b.cloud != null and self.glow_pipeline == null) self.glow_pipeline = try self.makePipeline(&vert_spv, &frag_spv, ui_binding, &ui_attrs, true);
+            } else if (self.cell_pipeline == null) self.cell_pipeline = try self.makePipeline(&cell_vert_spv, &cell_frag_spv, cell_binding, &cell_attrs, false);
+        }
     }
     fn makePipeline(self: *Renderer, vert_bytes: []const u8, frag_bytes: []const u8, binding: c.VkVertexInputBindingDescription, attrs: []const c.VkVertexInputAttributeDescription, additive: bool) !c.VkPipeline {
         const vert = try self.shader(vert_bytes);
@@ -1061,6 +1248,8 @@ pub const Renderer = struct {
             if (self.scene_gpu) |*scene_gpu| scene_gpu.deinit();
             self.scene_gpu = null;
         }
+        // Before acquiring: a failed pipeline must not leave an image acquired.
+        try self.ensurePipelines();
         var image_index: u32 = 0;
         var call_started = Wait.now();
         const acquired = c.vkAcquireNextImageKHR(self.device, self.swap, 0, self.available, null, &image_index);
@@ -1080,9 +1269,31 @@ pub const Renderer = struct {
         begin_info.flags = c.VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
         try check(c.vkBeginCommandBuffer(self.command, &begin_info));
         if (self.scene_requested) self.scene_gpu.?.timerStart(self.command);
+        if (font.dirty and self.atlas_linear) {
+            // The previous frame's fence has signalled (begin), so nothing
+            // samples the atlas now; submission makes these writes visible.
+            const rows = font.usedRows();
+            for (0..rows) |row| @memcpy(self.atlas_mapped.?[row * self.atlas_pitch ..][0..fonts.atlas_size], font.pixels.?[row * fonts.atlas_size ..][0..fonts.atlas_size]);
+            if (!self.atlas_ready) {
+                var barrier = info(c.VkImageMemoryBarrier, c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
+                barrier.srcAccessMask = c.VK_ACCESS_HOST_WRITE_BIT;
+                barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
+                barrier.oldLayout = c.VK_IMAGE_LAYOUT_PREINITIALIZED;
+                barrier.newLayout = c.VK_IMAGE_LAYOUT_GENERAL;
+                barrier.srcQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
+                barrier.dstQueueFamilyIndex = c.VK_QUEUE_FAMILY_IGNORED;
+                barrier.image = self.atlas;
+                barrier.subresourceRange = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .baseMipLevel = 0, .levelCount = 1, .baseArrayLayer = 0, .layerCount = 1 };
+                c.vkCmdPipelineBarrier(self.command, c.VK_PIPELINE_STAGE_HOST_BIT, c.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &barrier);
+            }
+            font.dirty = false;
+            self.atlas_ready = true;
+        }
         if (font.dirty) {
             const dest: [*]u8 = @ptrCast(self.mapped.?);
-            @memcpy(dest[vertex_bytes..][0..font.pixels.len], &font.pixels);
+            // Only the rows glyphs reached: the rest of the atlas is never sampled.
+            const rows = font.usedRows();
+            @memcpy(dest[vertex_bytes..][0 .. rows * fonts.atlas_size], font.pixels.?[0 .. rows * fonts.atlas_size]);
             var barrier = info(c.VkImageMemoryBarrier, c.VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER);
             barrier.srcAccessMask = if (self.atlas_ready) c.VK_ACCESS_SHADER_READ_BIT else 0;
             barrier.dstAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
@@ -1096,7 +1307,7 @@ pub const Renderer = struct {
             var copy = std.mem.zeroes(c.VkBufferImageCopy);
             copy.bufferOffset = vertex_bytes;
             copy.imageSubresource = .{ .aspectMask = c.VK_IMAGE_ASPECT_COLOR_BIT, .mipLevel = 0, .baseArrayLayer = 0, .layerCount = 1 };
-            copy.imageExtent = .{ .width = fonts.atlas_size, .height = fonts.atlas_size, .depth = 1 };
+            copy.imageExtent = .{ .width = fonts.atlas_size, .height = rows, .depth = 1 };
             c.vkCmdCopyBufferToImage(self.command, self.buffer, self.atlas, c.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
             barrier.srcAccessMask = c.VK_ACCESS_TRANSFER_WRITE_BIT;
             barrier.dstAccessMask = c.VK_ACCESS_SHADER_READ_BIT;
@@ -1204,6 +1415,61 @@ pub const Renderer = struct {
         return result != c.VK_ERROR_OUT_OF_DATE_KHR;
     }
 };
+
+/// Window-independent Vulkan setup on a thread from GUI startup, so that
+/// instance and device creation (most of the time to the first frame) overlap
+/// the session, window and font setup. Only for Wayland, where the
+/// compositor's DRM node, and with it the device choice and loader filter,
+/// can be asked for on a short private connection before the window exists.
+const Early = struct {
+    thread: ?std.Thread = null,
+    renderer: Renderer = .{},
+    display: ?select.Node = null,
+    filtered: bool = false,
+    layers_off: bool = false,
+    failed: bool = false,
+};
+var early: Early = .{};
+/// Call once, before the window, in a process that will draw a GUI window,
+/// with the compositor's node from window.earlyDisplayGpu. The loader
+/// variables are set here and cleared by the thread once its vkCreateInstance
+/// returns (earlyRestore); launches wait for that in child_env.settle.
+pub fn startEarly(display: ?select.Node) void {
+    if (early.thread != null) return;
+    early.display = display;
+    child_env.hold();
+    if (Renderer.loaderFilter(early.display)) |pattern| {
+        _ = c.setenv("VK_LOADER_DRIVERS_SELECT", pattern, 1);
+        early.filtered = true;
+    }
+    early.layers_off = Renderer.implicitLayersOff();
+    early.thread = std.Thread.spawn(.{}, earlyRun, .{}) catch {
+        earlyRestore();
+        return;
+    };
+}
+/// Once, on the early thread (or here when it could not start).
+fn earlyRestore() void {
+    if (early.filtered) _ = c.unsetenv("VK_LOADER_DRIVERS_SELECT");
+    if (early.layers_off) _ = c.unsetenv("VK_LOADER_LAYERS_DISABLE");
+    early.filtered = false;
+    early.layers_off = false;
+    child_env.release();
+}
+fn earlyRun() void {
+    early.renderer.prepare(early.display) catch |err| {
+        log.debug(.render, "Vulkan early setup failed: {s}; the window will set up Vulkan itself\n", .{@errorName(err)});
+        early.failed = true;
+    };
+}
+fn takeEarly() ?Renderer {
+    const thread = early.thread orelse return null;
+    thread.join();
+    early.thread = null;
+    if (early.failed) return null;
+    defer early.renderer = .{};
+    return early.renderer;
+}
 
 /// A frame is deferred while the compositor's frame callback, the frame fence
 /// or a swapchain image is not ready: the usual cause is a hidden window. One

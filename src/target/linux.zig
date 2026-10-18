@@ -290,6 +290,8 @@ pub const Target = struct {
         if (argv.len == 0 or argv.len > 255) return error.TooManyArguments;
         var raw: [256]?[*:0]const u8 = @splat(null);
         for (argv, 0..) |arg, i| raw[i] = arg.ptr;
+        // The agent inherits the environment; not xodb's Vulkan loader variables.
+        @import("../child_env.zig").settle();
         try runtime.check(rt.xrt_target_remote_cancel(@ptrCast(&raw), &self.handle, cancel));
     }
     pub fn connectGdbRemote(self: *Target, endpoint: [:0]const u8) !void {
@@ -418,6 +420,8 @@ pub const Target = struct {
         var args: [256:null]?[*:0]const u8 = @splat(null);
         if (argv.len >= args.len) return error.TooManyArguments;
         for (argv, 0..) |arg, i| args[i] = arg.ptr;
+        // A target never inherits xodb's own Vulkan loader variables.
+        @import("../child_env.zig").settle();
         const status = rt.xrt_target_launch(try self.get(), @ptrCast(&args));
         if (status == rt.XRT_UNSUPPORTED_ARCHITECTURE) return error.UnsupportedTargetArchitecture;
         try runtime.check(status);

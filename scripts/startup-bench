@@ -1,0 +1,431 @@
+#!/usr/bin/env python3
+"""Startup benchmark: exec to first frame, measured from outside.
+
+Every run is spawned by this script with os.posix_spawn. The parent reads
+CLOCK_MONOTONIC immediately before the spawn ("exec"); the program writes
+absolute CLOCK_MONOTONIC times to XODB_STARTUP_TRACE (src/startup_phases.zig,
+tools/startup-floor.c):
+  main       first statement of main()
+  configured the first xdg_surface.configure was handled (window phase end)
+  present    vkQueuePresentKHR accepted the first frame ("first window frame submitted")
+  shown      wp_presentation feedback for that frame: the compositor's presentation
+             time (headless sway: its output's frame timer, not a real scanout)
+Reported: exec->main, main->present and exec->present (the headlines),
+main->configured, exec->shown, and the program's own exclusive phases.
+
+Modes (shuffled together in each round; one untimed warm-up round first):
+  warm   the same command ran untimed immediately before (page cache, Mesa/NVIDIA
+         shader caches and xodb's own caches hot)
+  cold   as warm, then `sync; echo 3 > /proc/sys/vm/drop_caches` (sudo -n) right
+         before the timed run: every file is read from disk again
+  first  as warm for the page cache, but the timed run gets fresh XDG_CACHE_HOME,
+         XDG_STATE_HOME and XDG_CONFIG_HOME (no shader, pipeline or font caches)
+Drivers: default = the loader's own choice of every installed ICD; any other
+name pins VK_DRIVER_FILES to that ICD manifest (radv = radeon_icd.json; asahi,
+intel, lvp, nvidia, ... by file stem; or a path).
+
+Compositor: by default a private headless sway (its own XDG_RUNTIME_DIR;
+DISPLAY unset, Xwayland off). --compositor existing uses the caller's
+WAYLAND_DISPLAY and XDG_RUNTIME_DIR instead (Hyprland, or any compositor with
+xdg-shell); use it only on a display you were asked to use. Hyprland has no
+headless-only backend, so under Omarchy without sway this is the way to
+measure; it can also be tested privately by nesting Hyprland in the private
+sway (its Wayland backend) and pointing WAYLAND_DISPLAY at Hyprland's socket. Nothing here is
+architecture-specific: POSIX, Wayland and Vulkan only; perf is optional.
+Processes are killed only by the PIDs this script spawned.
+
+  scripts/startup-bench --out DIR [--runs 30] [--modes warm,cold,first]
+      [--drivers radv,default] [--program LABEL=PATH[,ARG...]]... [--floor]
+      [--probe N]
+
+--env LABEL:NAME=VALUE adds to one program's environment; --floor-label a,b
+runs the floor under two labels (e.g. to compare loader variables).
+--program may repeat; PATH is an xodb binary and ARGs follow it (default
+args: --frames 30 --no-ghidra-prestart; enough frames for the
+compositor's first presentation feedback to arrive before exit). --floor adds tools/startup-floor.c
+(built into DIR). --probe N skips timing and instead runs each program N
+times warm and N times cold under LD_DEBUG=statistics and `perf stat`.
+"""
+import argparse
+import json
+import os
+import random
+import re
+import shutil
+import signal
+import statistics
+import subprocess
+import sys
+import time
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+ICD_DIRS = ("/usr/share/vulkan/icd.d", "/etc/vulkan/icd.d", "/usr/local/share/vulkan/icd.d")
+
+
+def icd(driver):
+    """None for the loader's default; else the ICD manifest for a name
+    (radv is radeon; asahi, intel, lvp, nvidia, ... are file stems) or a path."""
+    if driver == "default":
+        return None
+    if "/" in driver:
+        return driver
+    stem = {"radv": "radeon"}.get(driver, driver)
+    for d in ICD_DIRS:
+        path = os.path.join(d, stem + "_icd.json")
+        if os.path.exists(path):
+            return path
+    raise SystemExit(f"startup-bench: no ICD manifest for {driver!r} in {', '.join(ICD_DIRS)}")
+PROTOCOLS = "/usr/share/wayland-protocols"
+
+
+def now():
+    return time.monotonic_ns()
+
+
+class Sway:
+    def __init__(self, work):
+        self.dir = os.path.join(work, "sway")
+        self.runtime = os.path.join(self.dir, "runtime")
+        os.makedirs(self.runtime, mode=0o700, exist_ok=True)
+        os.chmod(self.runtime, 0o700)
+        config = os.path.join(self.dir, "sway.conf")
+        with open(config, "w") as f:
+            f.write("xwayland disable\noutput HEADLESS-1 mode 1280x800\noutput * bg #0b0f16 solid_color\ndefault_border none\nfocus_follows_mouse no\n")
+        env = clean_env()
+        env.update(XDG_RUNTIME_DIR=self.runtime, WLR_BACKENDS="headless", WLR_HEADLESS_OUTPUTS="1", WLR_LIBINPUT_NO_DEVICES="1")
+        self.log = open(os.path.join(self.dir, "sway.log"), "wb")
+        self.proc = subprocess.Popen(["sway", "--unsupported-gpu", "--config", config], env=env, stdout=self.log, stderr=subprocess.STDOUT)
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            names = os.listdir(self.runtime)
+            sockets = [n for n in names if n.startswith("wayland-") and not n.endswith(".lock")]
+            if sockets and any(n.startswith("sway-ipc") for n in names):
+                self.socket = sockets[0]
+                return
+            if self.proc.poll() is not None:
+                raise RuntimeError("private sway exited")
+            time.sleep(0.05)
+        self.close()
+        raise TimeoutError("private sway did not start")
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+                self.proc.wait()
+
+
+class Existing:
+    """The caller's compositor, named by its WAYLAND_DISPLAY."""
+    def __init__(self):
+        self.runtime = os.environ.get("XDG_RUNTIME_DIR")
+        self.socket = os.environ.get("WAYLAND_DISPLAY")
+        if not self.runtime or not self.socket:
+            raise SystemExit("startup-bench: --compositor existing needs WAYLAND_DISPLAY and XDG_RUNTIME_DIR")
+
+    def close(self):
+        pass
+
+
+def clean_env():
+    env = dict(os.environ)
+    for key in list(env):
+        if key in ("DISPLAY", "WAYLAND_DISPLAY", "SWAYSOCK", "DBUS_SESSION_BUS_ADDRESS", "XAUTHORITY") or key.startswith(("VK_", "XODB_", "LD_", "MESA_", "__GL_")):
+            env.pop(key)
+    return env
+
+
+def build_floor(out):
+    d = os.path.join(out, "floor")
+    os.makedirs(d, exist_ok=True)
+    sources = []
+    for xml in ("stable/xdg-shell/xdg-shell.xml", "stable/presentation-time/presentation-time.xml"):
+        stem = os.path.basename(xml)[:-4]
+        subprocess.run(["wayland-scanner", "client-header", os.path.join(PROTOCOLS, xml), os.path.join(d, stem + "-client-protocol.h")], check=True)
+        subprocess.run(["wayland-scanner", "private-code", os.path.join(PROTOCOLS, xml), os.path.join(d, stem + "-protocol.c")], check=True)
+        sources.append(os.path.join(d, stem + "-protocol.c"))
+    binary = os.path.join(d, "startup-floor")
+    subprocess.run(["cc", "-O2", "-Wall", "-Wextra", "-Werror", "-I", d, os.path.join(ROOT, "tools/startup-floor.c"), *sources, "-lwayland-client", "-lvulkan", "-o", binary], check=True)
+    return binary
+
+
+def drop_caches():
+    subprocess.run(["sudo", "-n", "sh", "-c", "sync; echo 3 > /proc/sys/vm/drop_caches"], check=True)
+
+
+def loadavg():
+    with open("/proc/loadavg") as f:
+        return f.read().split()[0]
+
+
+class Bench:
+    def __init__(self, args):
+        self.args = args
+        self.out = os.path.abspath(args.out)
+        os.makedirs(self.out, exist_ok=True)
+        self.work = os.path.join(self.out, "work")
+        os.makedirs(self.work, exist_ok=True)
+        self.serial = 0
+        self.floor_device = args.floor_device
+        self.programs = []
+        for spec in args.program:
+            label, _, rest = spec.partition("=")
+            parts = rest.split(",")
+            argv = [os.path.abspath(parts[0])] + (parts[1:] or ["--frames", "30", "--no-ghidra-prestart"])
+            self.programs.append((label, argv, False))
+        if args.floor:
+            floor = build_floor(self.out)
+            for label in args.floor_label.split(","):
+                self.programs.append((label, [floor], True))
+        self.extra = {}
+        for spec in args.env:
+            label, _, assignment = spec.partition(":")
+            name, _, value = assignment.partition("=")
+            self.extra.setdefault(label, {})[name] = value
+        self.sway = Sway(self.work) if args.compositor == "sway" else Existing()
+        # Persistent dirs for warm and cold: one set per program and driver.
+        self.persistent = {}
+
+    def dirs(self, label, driver, fresh):
+        if fresh:
+            self.serial += 1
+            base = os.path.join(self.work, "fresh", f"{self.serial:05d}")
+        else:
+            base = os.path.join(self.work, "warm", f"{label}-{driver}")
+        for sub in ("cache", "state", "config", "tmp"):
+            os.makedirs(os.path.join(base, sub), exist_ok=True)
+        return base
+
+    def env(self, label, driver, base, floor, trace):
+        env = clean_env()
+        env.update(XDG_RUNTIME_DIR=self.sway.runtime, WAYLAND_DISPLAY=self.sway.socket,
+                   XDG_CACHE_HOME=os.path.join(base, "cache"), XDG_STATE_HOME=os.path.join(base, "state"),
+                   XDG_CONFIG_HOME=os.path.join(base, "config"), TMPDIR=os.path.join(base, "tmp"),
+                   XODB_GHIDRA_SIDECAR="off", XODB_STARTUP_TRACE=trace)
+        if icd(driver):
+            env["VK_DRIVER_FILES"] = icd(driver)
+        if floor and self.floor_device:
+            env["FLOOR_DEVICE"] = self.floor_device
+        env.update(self.extra.get(label, {}))
+        return env
+
+    def spawn(self, argv, env, log_path, timeout=30):
+        log = os.open(log_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        null = os.open("/dev/null", os.O_RDONLY)
+        actions = [(os.POSIX_SPAWN_DUP2, null, 0), (os.POSIX_SPAWN_DUP2, log, 1), (os.POSIX_SPAWN_DUP2, log, 2)]
+        started = now()
+        pid = os.posix_spawn(argv[0], argv, env, file_actions=actions)
+        os.close(log)
+        os.close(null)
+        deadline = time.monotonic() + timeout
+        while True:
+            done, status = os.waitpid(pid, os.WNOHANG)
+            if done:
+                return started, os.waitstatus_to_exitcode(status)
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                return started, "timeout"
+            time.sleep(0.002)
+
+    def run(self, label, argv, floor, driver, mode, timed=True):
+        base = self.dirs(label, driver, fresh=(mode == "first" and timed))
+        self.serial += 1
+        trace = os.path.join(self.work, "trace", f"{self.serial:05d}.txt")
+        os.makedirs(os.path.dirname(trace), exist_ok=True)
+        log_path = os.path.join(self.work, "logs", f"{self.serial:05d}-{label}-{driver}-{mode}{'' if timed else '-prime'}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        env = self.env(label, driver, base, floor, trace)
+        if mode == "cold" and timed:
+            drop_caches()
+        started, rc = self.spawn(argv, env, log_path)
+        row = {"label": label, "driver": driver, "mode": mode, "rc": rc, "exec": started, "log": os.path.relpath(log_path, self.out)}
+        if os.path.exists(trace):
+            with open(trace) as f:
+                for line in f:
+                    kind, *fields = line.split()
+                    values = dict(field.split("=", 1) for field in fields)
+                    if kind == "present" and "main" not in row:
+                        row.update({k: int(v) for k, v in values.items()})
+                    if kind == "onscreen" and "shown" not in row:
+                        row.update(shown=int(values["shown"]), clock=int(values["clock"]), refresh=int(values["refresh"]), received=int(values["received"]), shown_frame=int(values.get("frame", 0)))
+        if not floor and self.floor_device is None:
+            with open(log_path, errors="replace") as f:
+                m = re.search(r"Vulkan device: (.+)", f.read())
+            if m and driver == "default":
+                self.floor_device = m.group(1).strip()
+        return row
+
+    def timing(self):
+        modes = self.args.modes.split(",")
+        drivers = self.args.drivers.split(",")
+        configs = [(p, d, m) for p in self.programs for d in drivers for m in modes]
+        raw = open(os.path.join(self.out, "raw.jsonl"), "a")
+        meta = {"start": time.strftime("%Y-%m-%dT%H:%M:%S"), "programs": [(l, a) for l, a, _ in self.programs], "modes": modes, "drivers": drivers, "runs": self.args.runs, "kernel": os.uname().release, "nproc": os.cpu_count()}
+        raw.write(json.dumps({"meta": meta}) + "\n")
+        # Warm-up: every xodb config once (it names the display device for the floor).
+        for (label, argv, floor), driver, _ in sorted(configs, key=lambda c: c[0][2]):
+            self.run(label, argv, floor, driver, "warm", timed=False)
+        for round_index in range(self.args.runs):
+            order = configs[:]
+            random.shuffle(order)
+            load = loadavg()
+            for (label, argv, floor), driver, mode in order:
+                self.run(label, argv, floor, driver, mode, timed=False)
+                row = self.run(label, argv, floor, driver, mode)
+                row.update(round=round_index, load1=load)
+                raw.write(json.dumps(row) + "\n")
+                raw.flush()
+            print(f"round {round_index + 1}/{self.args.runs} load {load}", file=sys.stderr, flush=True)
+        raw.close()
+
+    def probe(self):
+        """LD_DEBUG=statistics and perf stat page faults, warm and cold."""
+        drivers = self.args.drivers.split(",")
+        path = os.path.join(self.out, "probe.txt")
+        with open(path, "a") as out:
+            for label, argv, floor in self.programs:
+                for driver in drivers:
+                    for mode in ("warm", "cold"):
+                        for k in range(self.args.probe):
+                            base = self.dirs(label, driver, False)
+                            env = self.env(label, driver, base, floor, os.path.join(self.work, "probe-trace.txt"))
+                            self.spawn(argv, env, "/dev/null")
+                            if mode == "cold":
+                                drop_caches()
+                            env["LD_DEBUG"] = "statistics"
+                            log = os.path.join(self.work, f"probe-{label}-{driver}-{mode}-{k}-ld.log")
+                            self.spawn(argv, env, log)
+                            env.pop("LD_DEBUG")
+                            if mode == "cold":
+                                drop_caches()
+                            stat = os.path.join(self.work, f"probe-{label}-{driver}-{mode}-{k}-perf.csv")
+                            if not shutil.which("perf"):
+                                continue
+                            self.spawn([shutil.which("perf"), "stat", "-x,", "-o", stat, "-e", "page-faults,minor-faults,major-faults,task-clock,context-switches", "--", *argv], env, "/dev/null")
+                            with open(log, errors="replace") as f:
+                                ld = f.read()
+                            reloc = re.findall(r"time needed for relocation: (\d+) cycles", ld)
+                            total = re.findall(r"total startup time in dynamic loader: (\d+) cycles", ld)
+                            nrel = re.findall(r"number of relocations: (\d+)", ld)
+                            objs = re.findall(r"number of objects loaded: (\d+)|final number of relocations: (\d+)", ld)
+                            perf = {}
+                            if os.path.exists(stat):
+                                with open(stat) as f:
+                                    perf = {line.split(",")[2]: line.split(",")[0] for line in f if line.count(",") >= 3 and not line.startswith("#")}
+                            out.write(json.dumps({"label": label, "driver": driver, "mode": mode, "ld_total_cycles": total[:1], "ld_reloc_cycles": reloc[:1], "relocations": nrel, "perf": perf}) + "\n")
+                            out.flush()
+
+    def close(self):
+        self.sway.close()
+
+
+def pct(values, q):
+    values = sorted(values)
+    if not values:
+        return float("nan")
+    k = (len(values) - 1) * q
+    lo, hi = int(k), min(int(k) + 1, len(values) - 1)
+    return values[lo] + (values[hi] - values[lo]) * (k - lo)
+
+
+def summarize(out):
+    rows = []
+    with open(os.path.join(out, "raw.jsonl")) as f:
+        for line in f:
+            row = json.loads(line)
+            if "meta" not in row:
+                rows.append(row)
+    groups = {}
+    for row in rows:
+        groups.setdefault((row["label"], row["driver"], row["mode"]), []).append(row)
+    lines = ["median [p10-p90] ms; n = runs with a trace; headlines: main>present and exec>present",
+             f"{'program':<16} {'driver':<8} {'mode':<6} {'n':>3} {'main>present':>22} {'exec>present':>22} {'exec>main':>22} {'main>configured':>22} {'exec>shown':>22}  phases (median ms) connect window instance device swapchain draw  load1"]
+
+    def cell(values):
+        if not values:
+            return f"{'-':>22}"
+        return f"{statistics.median(values):7.2f} [{pct(values, .1):6.2f}-{pct(values, .9):6.2f}]"
+    for key in sorted(groups):
+        good = [r for r in groups[key] if "present" in r and r["rc"] == 0]
+        ms = lambda a, b: [(r[b] - r[a]) / 1e6 for r in good if r.get(a) and r.get(b)]
+        shown = [(r["shown"] - r["exec"]) / 1e6 for r in good if r.get("shown") and r.get("clock") == 1]
+        phases = " ".join(f"{statistics.median([r[p] for r in good]) / 1000:.2f}" if good else "-" for p in ("connect", "window", "instance", "device", "swapchain", "draw"))
+        loads = sorted(float(r["load1"]) for r in groups[key])
+        lines.append(f"{key[0]:<16} {key[1]:<8} {key[2]:<6} {len(good):>3} {cell(ms('main', 'present'))} {cell(ms('exec', 'present'))} {cell(ms('exec', 'main'))} {cell(ms('main', 'configured'))} {cell(shown)}  {phases}  {loads[0]:.1f}-{loads[-1]:.1f}")
+        bad = len(groups[key]) - len(good)
+        if bad:
+            lines.append(f"  ({bad} runs without a trace or with nonzero exit)")
+    # Where main>present goes: named phases and the gaps between them.
+    spans = [("pre-window", None, "connect"), ("connect", "connect", None), ("window", "window", None),
+             ("window>instance", "window", "instance"), ("instance", "instance", None), ("instance>device", "instance", "device"),
+             ("device", "device", None), ("device>swapchain", "device", "swapchain"), ("swapchain", "swapchain", None),
+             ("swapchain>draw", "swapchain", "draw"), ("draw", "draw", None)]
+    lines.append("")
+    lines.append("main>present split (median ms): gaps are work between named phases; phases that overlap or never ran show '-'")
+    lines.append(f"{'program':<16} {'driver':<8} {'mode':<6} " + " ".join(f"{name:>16}" for name, _, _ in spans) + f" {'shown frame':>11}")
+    for key in sorted(groups):
+        good = [r for r in groups[key] if "present" in r and r["rc"] == 0 and "connect_at" in r]
+        if not good:
+            continue
+        cols = []
+        for name, a, b in spans:
+            vals = []
+            for r in good:
+                end = lambda p: r[p + "_at"] + r[p] * 1000
+                if a is None:
+                    vals.append((r[b + "_at"] - r["main"]) / 1e6 if r[b + "_at"] else None)
+                elif b is None:
+                    vals.append(r[a] / 1000)
+                else:
+                    vals.append((r[b + "_at"] - end(a)) / 1e6 if r[a + "_at"] and r[b + "_at"] else None)
+            vals = [v for v in vals if v is not None]
+            cols.append(f"{statistics.median(vals):16.2f}" if vals else f"{'-':>16}")
+        frames = [r["shown_frame"] for r in good if r.get("shown_frame")]
+        lines.append(f"{key[0]:<16} {key[1]:<8} {key[2]:<6} " + " ".join(cols) + f" {statistics.median(frames) if frames else '-':>11}")
+    text = "\n".join(lines) + "\n"
+    with open(os.path.join(out, "table.txt"), "w") as f:
+        f.write(text)
+    return text
+
+
+def main():
+    os.umask(0o022)
+    p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--out", required=True)
+    p.add_argument("--runs", type=int, default=30)
+    p.add_argument("--modes", default="warm,cold,first")
+    p.add_argument("--drivers", default="radv,default")
+    p.add_argument("--program", action="append", default=[])
+    p.add_argument("--floor", action="store_true")
+    p.add_argument("--env", action="append", default=[], metavar="LABEL:NAME=VALUE", help="extra environment for one program (LABEL as in --program, or floor)")
+    p.add_argument("--floor-label", default="floor", help="label for the floor program (to run it twice with different --env)")
+    p.add_argument("--floor-device", help="FLOOR_DEVICE for the floor; default: the device xodb chose")
+    p.add_argument("--probe", type=int, default=0)
+    p.add_argument("--compositor", choices=("sway", "existing"), default="sway")
+    p.add_argument("--summarize", action="store_true", help="only rewrite table.txt from raw.jsonl")
+    args = p.parse_args()
+    if args.summarize:
+        sys.stdout.write(summarize(os.path.abspath(args.out)))
+        return
+    if not args.program and not args.floor:
+        p.error("nothing to run: give --program and/or --floor")
+    if "cold" in args.modes.split(",") or args.probe:
+        if subprocess.run(["sudo", "-n", "true"], capture_output=True).returncode != 0:
+            p.error("cold mode and --probe drop the page cache with `sudo -n`, which needs a password here; run with --modes warm,first")
+    bench = Bench(args)
+    try:
+        if args.probe:
+            bench.probe()
+        else:
+            bench.timing()
+            sys.stdout.write(summarize(bench.out))
+    finally:
+        bench.close()
+
+
+if __name__ == "__main__":
+    main()

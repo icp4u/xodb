@@ -48,6 +48,7 @@ pub const usage =
     \\  --radio-demo SCENE  Radio panel on SYNTHETIC spectrum and traffic (kitchen, microwave60, microwave50, inverter,
     \\                  wifi, bluetooth, empty)
     \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
+    \\  --no-vk-layers Vulkan implicit layers (overlays, capture hooks) off for this window
     \\  -q, -qq, -v, -vv, --log=LEVEL|TOPIC=LEVEL[,...] and --log-file FILE choose what is logged (xodb --help).
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
     \\      B treemap, N xodbfetch (B there runs benchmarks), W radio, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
@@ -134,6 +135,7 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.mcp = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--no-vk-layers")) continue; // main.zig applies it
         if (std.mem.eql(u8, arg, "--pause")) {
             o.paused = true;
             continue;

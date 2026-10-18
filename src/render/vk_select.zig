@@ -18,6 +18,23 @@ pub const Node = struct {
         return a.major == b.major and a.minor == b.minor;
     }
 };
+/// The Vulkan loader's VK_LOADER_DRIVERS_SELECT pattern (manifest file
+/// names) for the ICD that serves a DRM device bound to kernel `driver`, or
+/// null when it is not known. Mesa manifests are radeon_icd*, intel_icd* and
+/// intel_hasvk_icd*, nouveau_icd*, asahi_icd*, freedreno_icd*, panfrost_icd*,
+/// broadcom_icd*, virtio_icd*, powervr_mesa_icd*; NVIDIA's is nvidia_icd*.
+pub fn loaderPattern(driver: []const u8) ?[:0]const u8 {
+    const table = [_]struct { []const u8, [:0]const u8 }{
+        .{ "amdgpu", "*radeon*" },     .{ "i915", "*intel*" },        .{ "xe", "*intel*" },
+        .{ "nouveau", "*nouveau*" },   .{ "nvidia", "*nvidia*" },     .{ "asahi", "*asahi*" },
+        .{ "msm", "*freedreno*" },     .{ "panfrost", "*panfrost*" }, .{ "panthor", "*panfrost*" },
+        .{ "v3d", "*broadcom*" },      .{ "virtio_gpu", "*virtio*" }, .{ "virtio-gpu", "*virtio*" },
+        .{ "powervr", "*powervr*" },
+    };
+    for (table) |entry| if (std.mem.eql(u8, driver, entry[0])) return entry[1];
+    return null;
+}
+
 pub const Kind = enum { discrete, integrated, virtual, cpu, other };
 pub const Device = struct {
     name: []const u8,
@@ -222,4 +239,12 @@ test "device listing preserves names nodes selection and presentation status" {
     const headless = listing(&buf, stub[2..3], null, null, false);
     try std.testing.expect(std.mem.indexOf(u8, headless, "unknown") != null);
     try std.testing.expect(std.mem.indexOf(u8, headless, "unchecked") != null);
+}
+
+test "display drivers map to their loader manifest pattern, unknown ones to none" {
+    try std.testing.expectEqualStrings("*radeon*", loaderPattern("amdgpu").?);
+    try std.testing.expectEqualStrings("*intel*", loaderPattern("xe").?);
+    try std.testing.expectEqualStrings("*asahi*", loaderPattern("asahi").?);
+    try std.testing.expect(loaderPattern("apple-drm") == null);
+    try std.testing.expect(loaderPattern("") == null);
 }

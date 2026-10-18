@@ -2608,6 +2608,11 @@ pub const Session = struct {
     pub fn init() Session {
         return .{ .id = linux.now() };
     }
+    /// Init in place: `ptr.* = init()` puts a 1.4 MB temporary in the
+    /// caller's stack frame, which main's prologue then faults in.
+    pub fn initIn(self: *Session) void {
+        self.* = .{ .id = linux.now() };
+    }
     fn exitSummary(self: *const Session) ?ExitSummary {
         if (self.target.snapshot().state != .exited) return null;
         const events = self.target.eventSlice();

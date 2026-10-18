@@ -54,6 +54,23 @@ fn refusePlatform() error{PlatformUnavailable} {
 pub fn requestedPlatform() ?Runtime {
     return runtime_request;
 }
+/// Null when the window will not be Wayland; else the compositor's DRM node
+/// (itself null when unknown), from a short private connection made before
+/// any window exists, for Vulkan setup on another thread.
+pub fn earlyDisplayGpu() ?@typeInfo(@TypeOf(backend.Window.displayGpu)).@"fn".return_type.? {
+    const build = @import("build_options").platform;
+    if (comptime build != .wayland and build != .linux) return null;
+    if (requestedPlatform()) |choice| {
+        if (choice != .wayland) return null;
+    } else if (build == .linux) {
+        const name = std.c.getenv("WAYLAND_DISPLAY") orelse return null;
+        if (name[0] == 0) return null;
+    }
+    const wl = @import("wayland.zig").c;
+    const connection = wl.wl_display_connect(null) orelse return null;
+    defer wl.wl_display_disconnect(connection);
+    return @import("display_gpu.zig").query(connection);
+}
 pub const Window = backend.Window;
 pub const Keyboard = backend.Keyboard;
 

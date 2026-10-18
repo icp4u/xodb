@@ -91,16 +91,19 @@ def run(name, rule, retry=False):
 try:
     d = h.Display('d', width=1280, height=720)
     text, baseline = run('baseline', '')
-    framebuffers = int(re.search(r'scene3d base framebuffers=(\d+)', text).group(1))
+    base = re.search(r'scene3d base framebuffers=(\d+) pipelines=(\d+) maps=(\d+)', text)
+    framebuffers, pipelines, maps = int(base.group(1)), int(base.group(2)), int(base.group(3))
+    # The 2D renderer makes `pipelines` before the scene, two shader modules each;
+    # the scene's own follow (its first, seventh and eighth pipeline below).
     cases = [('vkCreateRenderPass', 2), ('vkCreateRenderPass', 3),
              ('vkCreatePipelineLayout', 2), ('vkCreatePipelineLayout', 3),
              ('vkCreateDescriptorSetLayout', 2), ('vkCreateDescriptorPool', 2), ('vkAllocateDescriptorSets', 2),
-             ('vkCreateSampler', 2), ('vkCreateShaderModule', 9),
-             ('vkCreateGraphicsPipelines', 5), ('vkCreateGraphicsPipelines', 11), ('vkCreateGraphicsPipelines', 12),
+             ('vkCreateSampler', 2), ('vkCreateShaderModule', 2 * pipelines + 1),
+             ('vkCreateGraphicsPipelines', pipelines + 1), ('vkCreateGraphicsPipelines', pipelines + 7), ('vkCreateGraphicsPipelines', pipelines + 8),
              ('vkCreateImage', 2), ('vkCreateImage', 3), ('vkCreateImage', 4), ('vkCreateImage', 5),
              ('vkAllocateMemory', 3), ('vkBindImageMemory', 2), ('vkCreateImageView', framebuffers + 2),
              ('vkCreateFramebuffer', framebuffers + 1), ('vkCreateFramebuffer', framebuffers + 2),
-             ('vkCreateBuffer', 2), ('vkAllocateMemory', 7), ('vkBindBufferMemory', 2), ('vkMapMemory', 2)]
+             ('vkCreateBuffer', 2), ('vkAllocateMemory', 7), ('vkBindBufferMemory', 2), ('vkMapMemory', maps + 1)]
     if baseline['created'].get('query_pool', 0):
         cases.append(('vkCreateQueryPool', 1))
     for function, call in cases:
