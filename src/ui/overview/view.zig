@@ -20,9 +20,9 @@ pub const Rect = draw.Rect;
 pub const Color = draw.Color;
 const fade = draw.fade;
 
-pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch };
+pub const Panel = enum { summary, performance, processes, memory, disk, disk_space, network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch, radio };
 pub const panel_count = @typeInfo(Panel).@"enum".fields.len;
-pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch" };
+pub const titles = [panel_count][]const u8{ "Summary", "Performance", "Processes", "Memory", "Disk", "Disk Space", "Network", "Connections", "Power & Thermals", "System Info", "Users", "Services", "Installed Apps", "Files & IO", "Memory Map", "FD Graph", "FD Galaxy", "Parent/Child FDs", "FD Treemap", "xodbfetch", "Radio" };
 pub fn shortTitle(panel: Panel) []const u8 {
     return switch (panel) {
         .power => "Power / Temp",
@@ -31,7 +31,7 @@ pub fn shortTitle(panel: Panel) []const u8 {
         else => titles[@intFromEnum(panel)],
     };
 }
-const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N" };
+const keys = [panel_count][]const u8{ "1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "", "", "", "L", "M", "G", "Y", "I", "B", "N", "W" };
 
 pub const Sort = enum { cpu, memory, disk, net, fds, threads, pid, name };
 pub const sort_names = [_][]const u8{ "CPU", "Memory", "Disk", "Net", "FDs", "Threads", "PID", "Name" };
@@ -93,6 +93,7 @@ pub const View = struct {
     graph: graph_model.State = .{},
     treemap: @import("treemap_model.zig").State = .{},
     fetch: @import("fetch_panel.zig").State = .{},
+    radio: @import("radio_panel.zig").State = .{},
     /// Start to first presented frame, for the fetch panel.
     startup_ns: u64 = 0,
     /// The Memory map looks draw period-styled tooltips.
@@ -164,7 +165,7 @@ pub const View = struct {
     quit: bool = false,
 
     pub const Hit = struct { rect: Rect, action: Action };
-    pub const Action = union(enum) { classic: win95.Action, classic_page: i32, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_cluster: u64, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder };
+    pub const Action = union(enum) { classic: win95.Action, classic_page: i32, classic_scroll: win95.Scroll, panel: Panel, sort: Sort, row: usize, attach, files, profile, confirm, cancel, tree, theme, pause, search, files_mode: files_model.Mode, files_row: usize, files_all, file_holders, events, stop_events, memmap: memmap.Click, graph_star: u32, graph_resource: u32, graph_cluster: u64, graph_all, graph_files, inheritance_files: Identity, treemap_node: u32, treemap_up, treemap_holder, radio: @import("radio_panel.zig").Click };
 
     pub fn init(gpa: std.mem.Allocator) !View {
         const hist = try gpa.create(History);
@@ -177,6 +178,7 @@ pub const View = struct {
         self.graph.deinit();
         self.treemap.deinit();
         self.fetch.deinit(self.gpa);
+        self.radio.deinit();
         self.dropSamples();
         self.rows.deinit(self.gpa);
         self.collapsed.deinit(self.gpa);
@@ -379,7 +381,7 @@ pub const View = struct {
     pub fn animating(self: *const View, now: u64) bool {
         if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().table.open) return false;
         if (self.panel == .galaxy and @import("galaxy_descriptors.zig").navigation().motion.navigation.active) return true;
-        return self.ease(now) < 1 or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now)) or (self.panel == .fetch and self.fetch.busy());
+        return self.ease(now) < 1 or (self.panel == .radio and self.radio.animating(now)) or (self.panel == .files and !self.paused and self.files.flowing(now)) or (self.panel == .memory_map and self.memmap.animating(now)) or ((self.panel == .graph or self.panel == .galaxy) and !self.paused and self.graph.flowing(now)) or (self.panel == .fetch and self.fetch.busy());
     }
 
     pub fn setStatus(self: *View, comptime fmt: []const u8, args: anytype, now: u64) void {
@@ -418,6 +420,7 @@ pub const View = struct {
             if (draw.inside(self.memmap.city.field, w.pointer_x, w.pointer_y)) self.cameraInteraction(now);
             w.dirty = true;
             if (self.classic_scroll != null) win95.drag(self) else if (self.deepMap()) memmap.deepmap.motion(self) else if (self.gibsonMap()) memmap.gibson.motion(self);
+            if (self.panel == .radio) self.radio.motion(w.pointer_x);
         }
         if (w.scroll != 0) {
             if (self.classic_menu != null) win95.scrollMenu(self, w.scroll) else if (!self.classic_about and self.pending_action == null) self.wheel(w.scroll);
@@ -455,7 +458,7 @@ pub const View = struct {
                     // The deep map's field and minimap take presses (drag, select, jump).
                     if (event.code == 272) {
                         const unobscured = self.pending_action == null and self.classic_menu == null and !self.classic_about;
-                        const taken = unobscured and ((self.galaxyMap() and !self.galaxyResource(event.x, event.y) and camera.press(&galaxy_state.scene, .{ event.x, event.y }, now)) or (self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)));
+                        const taken = unobscured and ((self.galaxyMap() and !self.galaxyResource(event.x, event.y) and camera.press(&galaxy_state.scene, .{ event.x, event.y }, now)) or (self.deepMap() and memmap.deepmap.press(self, event.x, event.y)) or (self.gibsonMap() and memmap.gibson.press(self, event.x, event.y)) or (self.panel == .radio and self.radio.press(event.x, event.y, event.time_ms, now)));
                         if (!taken) self.click(event.x, event.y, now);
                         self.cameraInteraction(now);
                     }
@@ -474,6 +477,7 @@ pub const View = struct {
                         w.dirty = true;
                         memmap.deepmap.release(self, event.x, event.y);
                     }
+                    if (self.panel == .radio and self.radio.release(event.x, now)) w.dirty = true;
                 },
             }
             if (self.quit) {
@@ -561,6 +565,7 @@ pub const View = struct {
         if (self.panel == .inheritance and (sym == 0xff0d or sym == 0xff8d)) return;
         if (self.panel == .treemap and @import("treemap_panel.zig").key(self, event)) return;
         if (self.panel == .fetch) if (self.fetch.key(self.gpa, event)) |status| return self.setStatus("{s}", .{status}, now);
+        if (self.panel == .radio and !self.searching and event.kind == .press and event.plain() and self.radio.key(sym, event.shortcut, now)) return;
         if (self.panel == .files and self.filesKey(event, now)) return;
         if ((self.panel == .graph or self.panel == .galaxy) and @import("graph_panel.zig").key(self, event)) return;
         if (self.panel == .memory_map and !self.searching and memmap.key(self, event, now)) return;
@@ -648,6 +653,7 @@ pub const View = struct {
             'i' => self.show(.inheritance),
             'b' => self.show(.treemap),
             'n' => self.show(.fetch),
+            'w' => self.show(.radio),
             'm' => if (self.panel == .processes) memmap.openSelected(self, now) else self.show(.memory_map),
             'v' => {
                 self.tree = !self.tree;
@@ -955,6 +961,7 @@ pub const View = struct {
             .theme => self.palette = (self.palette + 1) % themes.all.len,
             .pause => self.paused = !self.paused,
             .search => self.searching = true,
+            .radio => |c| self.radio.click(c, now),
             .files_mode => |mode| if (mode == .events) self.requestAction(.events, now) else self.files.show(mode),
             .files_row => |row| self.files.select(row),
             .files_all => self.files.all(),
@@ -1421,6 +1428,7 @@ pub const View = struct {
                 .apps => .{ .text = if (snapshot.apps_count.get()) |n| std.fmt.bufPrint(&vb, "{d} packages", .{n}) catch "" else snapshot.apps_count.reason },
                 .files => .{ .text = if (self.files.snapshot) |fds| std.fmt.bufPrint(&vb, "{d} descriptors", .{fds.fd_count}) catch "" else "sampled when shown" },
                 .treemap => .{ .text = if (self.treemap.tree) |tree| std.fmt.bufPrint(&vb, "{d} handles", .{tree.fd_count}) catch "" else "sampled when shown" },
+                .radio => .{ .text = if (self.radio.report) |r| r.kind else "listens when shown" },
                 .fetch => .{ .text = if (snapshot.uptime_s.get()) |u| std.fmt.bufPrint(&vb, "up {s}", .{@import("fetch.zig").uptime(&ub, u, false)}) catch "" else "this machine" },
                 .inheritance => .{ .text = if (self.graph.inheritance) |rows| std.fmt.bufPrint(&vb, "{d} sampled matches", .{rows.matched}) catch "" else "sampled when shown" },
                 .graph, .galaxy => .{ .text = if (self.graph.graph) |g| std.fmt.bufPrint(&vb, "{d} processes · {d} fds", .{ g.processes, g.member_count }) catch "" else "sampled when shown" },
@@ -2036,7 +2044,7 @@ test "short classic menus expose every full-height item by keyboard and paging" 
         win95.scrollMenu(&v, 1000);
         try std.testing.expectEqual(panel_count - 1, v.classic_cursor);
         v.key(.{ .kind = .press, .sym = 0xff0d }, 1);
-        try std.testing.expectEqual(Panel.fetch, v.panel);
+        try std.testing.expectEqual(Panel.radio, v.panel);
         try std.testing.expect(v.classic_menu == null);
     }
 }

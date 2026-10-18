@@ -50,7 +50,15 @@ try:
  for stage in range(2):
   session=c.session();tid=next(t['tid'] for t in session['threads'] if t['reason']=='breakpoint')
   # First source step passes the prologue while keeping arguments live.
-  c.action('step_over',tid=tid);c.stopped(seconds=30)
+  # Preemption can resume the goroutine on another thread; read that stop.
+  c.action('step_over',tid=tid);stepped=c.stopped(seconds=30)
+  hits=[]
+  for t in stepped['threads']:
+   if t['reason'] not in ('breakpoint','single_step'): continue
+   frame=c.inspect('get_stack',tid=t['tid'])['frames'][0]
+   if frame.get('symbol')=='main.marker' and (frame.get('source') or {}).get('line',0)>38: hits.append(t['tid'])
+  assert len(hits)==1,[(t['tid'],t['reason']) for t in stepped['threads']]
+  tid=hits[0]
   truth=json.loads(truth_file.read_text());assert truth['stage']==stage,truth
   gen=c.session()['generation']
   if stage:

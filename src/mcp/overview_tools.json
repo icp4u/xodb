@@ -389,5 +389,23 @@
       "readOnlyHint": true,
       "xodbSessionAccess": "observer"
     }
+  },
+  {
+    "name": "list_radios",
+    "description": "Wi-Fi cards for burrito mode (is it the microwave?): driver, bus, role (in_use, spare, blocked) and why, spectral and monitor capability, rfkill, what each card can contribute, and what is missing. In-use means associated (or up with a link), up with a default route, another interface on the card up, or managed by NetworkManager/iwd/ConnMan/wpa_supplicant/hostapd (read-only checks); such cards are only read passively. Read-only: never changes a card.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
+  },
+  {
+    "name": "radio_channels",
+    "description": "Burrito mode per Wi-Fi channel 1-14 over the last window: which channels the interferer hits and how badly, so an agent can answer 'which channel should my AP use when the microwave is on?'. Per channel (its 22 MHz mask at its true centre): the window that measured it and how fresh (age_ms, watched_s), power, floor, power over the floor, occupied share, the interferer's MHz in the mask, its power over the floor and share of time, impact (blasted >= 20 dB over the floor, grazed >= 6 dB, clean, unseen = not watched), mains_hz; and traffic from a receive-only monitor card if one was chosen (frames/s, airtime estimate, retry share, bad-FCS frames/s, distinct networks and stations: counts only, addresses hashed in memory with a per-session key, never stored or returned). Also the verdict in words, the blast band, per-window detector regions, the least-affected of channels 1/6/11, the sensors' sweep plan and the TX counters of taken cards. Observer-only: never takes or retunes a card.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {"window_ms": {"type": "integer", "minimum": 1000, "maximum": 600000}, "redact": {"type": "boolean"}}, "additionalProperties": false}
+  },
+  {
+    "name": "radio_interference",
+    "description": "Burrito mode verdict over the last window: 2.4 GHz spectral samples (if a spare card was chosen with --radio, root) analysed for mains-rate (50/60 Hz) pulsing, duty cycle, occupied band and Wi-Fi channels hit, with confidence from the measurement; continuous energy without pulsing is 'pulsing not seen' (inverter microwaves look like that). Joined on CLOCK_MONOTONIC with the in-use link's signal, bitrate, retries, channel busy and gateway ping loss (50 Hz). Starts the passive collector if none runs (no card is ever taken by this tool). Receive-only.",
+    "annotations": {"readOnlyHint": true, "xodbSessionAccess": "observer"},
+    "inputSchema": {"type": "object", "properties": {"window_ms": {"type": "integer", "minimum": 1000, "maximum": 600000}, "redact": {"type": "boolean"}}, "additionalProperties": false}
   }
 ]

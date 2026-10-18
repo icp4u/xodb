@@ -26,6 +26,7 @@ pub const Session = struct {
     options: Options,
     revision: u64 = 1,
     initial_break: bool = false,
+    detached: bool = false,
     source_text: ?[]const u8 = null,
 
     pub fn open(self: *Session) !void {
@@ -37,13 +38,13 @@ pub const Session = struct {
         for (self.options.argv, 0..) |arg, i| args[i] = arg.ptr;
         args[self.options.argv.len] = null;
         try rt.check(c.xrt_debugserver_start(&.{
-            .directory = "/tmp",
             .executable = null,
             .cancel = null,
             .argv = if (self.options.argv.len != 0) args.ptr else null,
             .attach_pid = self.options.attach,
         }, &self.helper));
-        try rt.check(c.xrt_gdb_open(&self.helper.endpoint, self.target, &self.gdb, null));
+        log.info(.runtime, "xodb: native helper started pid={d}; private inherited transport\n", .{self.helper.pid});
+        try rt.check(c.xrt_gdb_open_fd(c.xrt_debugserver_take_transport(&self.helper), self.target, &self.gdb, null));
         self.metadata.executable = self.options.executable orelse if (self.options.argv.len != 0) self.options.argv[0] else null;
         if (self.options.source) |path| {
             const file = @import("../c.zig").api;
@@ -59,14 +60,21 @@ pub const Session = struct {
         }
     }
     pub fn close(self: *Session) void {
+        const helper_pid = self.helper.pid;
+        var detach_confirmed = false;
         if (self.gdb != null) {
             self.call(.{ .op = c.XRT_RPC_DETACH }) catch |err|
                 log.warn(.runtime, "xodb: native detach unconfirmed: {s}\n", .{@errorName(err)});
+            detach_confirmed = c.xrt_gdb_detach_confirmed(self.gdb);
             c.xrt_gdb_free(self.gdb);
             self.gdb = null;
         }
-        const result = c.xrt_debugserver_close(&self.helper);
-        if (result != c.XRT_OK) log.warn(.runtime, "xodb: native helper cleanup unconfirmed (status {d})\n", .{result});
+        const result = if (detach_confirmed) c.xrt_debugserver_close_detached(&self.helper) else c.xrt_debugserver_close(&self.helper);
+        if (result != c.XRT_OK) {
+            log.warn(.runtime, "xodb: native helper cleanup unconfirmed (status {d}); kept helper pid={d}\n", .{ result, self.helper.pid });
+        } else if (helper_pid != 0) {
+            log.info(.runtime, "xodb: native helper reaped pid={d}\n", .{helper_pid});
+        }
         if (self.target) |target| std.c.free(target);
         self.target = null;
         self.metadata.deinit();
@@ -83,10 +91,15 @@ pub const Session = struct {
         c.xrt_target_view(self.target, &view);
         return view;
     }
+    /// The private stream failed: no further packet can reach debugserver.
+    pub fn linkLost(self: *const Session) bool {
+        return self.gdb == null or c.xrt_gdb_health(self.gdb) != c.XRT_OK;
+    }
     pub fn ready(self: *const Session) bool {
         return self.options.breakpoint == null or self.initial_break;
     }
     pub fn poll(self: *Session) !void {
+        if (self.detached) return;
         const before = self.state().generation;
         try self.call(.{ .op = c.XRT_RPC_SYNC });
         const view = self.state();
@@ -102,6 +115,10 @@ pub const Session = struct {
         if (!self.initial_break) if (self.options.breakpoint) |name| {
             const address = self.findSymbol(name) catch |err| {
                 if (err == error.MachOSymbolsPending) return;
+                // A missing startup symbol is a diagnostic, not a reason to
+                // release the target. Expose its initial stop for user control.
+                self.initial_break = true;
+                self.revision +%= 1;
                 return err;
             };
             try self.execute(.{ .breakpoint = .{ .address = address } });
@@ -146,7 +163,10 @@ pub const Session = struct {
                 .interrupt, .cancel_continue => try self.call(.{ .op = c.XRT_RPC_INTERRUPT }),
                 .continue_execution => try self.call(.{ .op = c.XRT_RPC_CONTINUE }),
                 .step_instruction => |tid| try self.call(.{ .op = c.XRT_RPC_STEP, .args = .{ @intCast(tid), 0, 0 } }),
-                .detach => try self.call(.{ .op = c.XRT_RPC_DETACH }),
+                .detach => {
+                    try self.call(.{ .op = c.XRT_RPC_DETACH });
+                    self.detached = true;
+                },
                 // Refuse before decoding/executing; do not mislabel a single
                 // instruction as source stepping or a step over a call.
                 else => return error.NativeControlNotAvailable,
@@ -175,7 +195,7 @@ pub const Session = struct {
         try self.call(.{ .op = c.XRT_RPC_READ, .args = .{ address, bytes.len, 0 }, .out = bytes.ptr, .capacity = bytes.len, .length = &size });
         return size;
     }
-    pub fn snapshot(self: *Session, mem: std.mem.Allocator, selected_tid: i32, selected_frame: usize) !wire.View {
+    pub fn summary(self: *Session, mem: std.mem.Allocator, selected_tid: i32) !wire.View {
         const view = self.state();
         var info: c.struct_xrt_gdb_info = undefined;
         c.xrt_gdb_info(self.gdb, &info);
@@ -183,7 +203,7 @@ pub const Session = struct {
             c.XRT_STOPPED => "stopped",
             c.XRT_RUNNING => "running",
             c.XRT_EXITED => "exited",
-            else => "idle",
+            else => if (self.detached) "detached" else "idle",
         }, .scope = "control", .owned = self.options.argv.len != 0, .diagnostics = &.{.{ .component = "metadata", .message = "Native DWARF unavailable: source lines and locals are not decoded" }} };
         const threads = try mem.alloc(wire.Thread, view.thread_count);
         for (view.threads[0..view.thread_count], threads) |thread, *row| row.* = .{ .id = thread.id, .tid = thread.tid, .state = if (thread.state == c.XRT_STOPPED) "stopped" else "running", .reason = "debugserver" };
@@ -197,7 +217,13 @@ pub const Session = struct {
         for (view.breakpoints[0..view.breakpoint_count], breakpoints) |bp, *row| row.* = .{ .id = bp.id, .address = bp.address };
         out.breakpoints = breakpoints;
         if (self.source_text) |text| out.source = .{ .path = self.options.source.?, .text = text, .truncated = text.len == 48 * 1024 };
-        if (view.state != c.XRT_STOPPED or out.tid == 0) return out;
+        return out;
+    }
+    pub fn snapshot(self: *Session, mem: std.mem.Allocator, selected_tid: i32, selected_frame: usize) !wire.View {
+        var out = try self.summary(mem, selected_tid);
+        if (!std.mem.eql(u8, out.state, "stopped") or out.tid == 0) return out;
+        var info: c.struct_xrt_gdb_info = undefined;
+        c.xrt_gdb_info(self.gdb, &info);
         const regs = try self.registers(out.tid);
         const descriptions = regs.descriptions();
         const rows = try mem.alloc(wire.Register, descriptions.len);

@@ -27,7 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # A file that matches nothing selects the full gui tier.
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
-    (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'tests/macos-bootstrap.c'),
+    (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'src/runtime/gdb_link.c',
+      'src/runtime/gdb_link.h', 'tests/runtime-debugserver.c', 'tests/macos-bootstrap.c'),
      ('build-tests', 'macos-bootstrap', 'release-runner')),
     (('src/model/macos_session.zig', 'src/remote/native_owner.zig', 'src/c_macos.zig', 'tests/macos-local.py', 'tests/fixtures/macos-local.*'),
      ('macos-local', 'release-runner')),
@@ -83,6 +84,8 @@ COVERS = (
     (('src/preferences.zig', 'config/preferences.example.json'), ('language-off*', 'm2-preferences*')),
     (('src/language/watch.*', 'src/model/language_*', 'src/mcp/language_*', 'src/mcp/locals_list.zig', 'src/ui/language_*'),
      ('lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'go-language*', 'go-gui', 'elisp-*', 'gdscript-*', *LANGUAGE_PANES)),
+    (('src/model/session.zig', 'tests/run-control.py', 'tests/run-control-gui.py'),
+     ('go-language*', 'go-gui', 'go-native*', 'lua-*', 'python-*', 'perl-*', 'ruby-*', 'javascript-*', 'elisp-*', 'gdscript-*', 'run-control', 'gui-run-control', *LANGUAGE_PANES)),
     (('src/model/remote_*', 'src/model/workspace_view.zig', 'src/ui/remote_workspace.zig'), ('remote-owner-*', 'remote-queued-drop', 'gui-remote-retry', 'gui-remote-owner', 'gui-remote-close', 'gui-remote-publication', 'gui-owner-*')),
     (('src/model/remote_worker.zig', 'src/model/remote_dispatch.zig', 'tests/fixtures/hold-ptrace.c'), ('gui-local-owner*',)),
     (('src/model/runtime_*', 'src/model/value_view.zig', 'src/mcp/runtime_type*', 'src/ui/runtime_types.zig'),
@@ -94,6 +97,7 @@ COVERS = (
     (('src/mcp/fd*', 'src/runtime/fd*', 'src/runtime/xrt_fd*', 'src/runtime/files.c', 'src/runtime/file_view.c',
       'src/runtime/xrt_files.h', 'src/lsoftop/*'), ('fdactivity', 'lsof-top', 'gui-fd*', 'gui-files*')),
     (('src/ui/overview/fetch*', 'src/ui/overview/png.zig', 'tests/fetch*.py'), ('fetch', 'gui-fetch')),
+    (('src/radio/*', 'src/mcp/radio.zig', 'src/ui/overview/radio_panel.zig', 'tests/radio-gui.py'), ('radio-detector', 'sysstat-headless', 'gui-radio')),
     (('src/mcp/overview*', 'src/ui/overview/*', 'src/runtime/sysstat*', 'src/runtime/xrt_sysstat.h', 'src/model/system*.zig'),
      ('sysstat-*', 'gui-overview*', 'gui-win95', 'gui-decoration', 'gui-files*', 'gui-fd*', 'gui-memdefrag*', 'gui-gibson*', 'gui-deepmap*', 'gui-safe-keys*', 'gui-themes')),
     (('tests/runtime-sysstat.c',), ('sysstat-*', 'build-tests')),
@@ -312,6 +316,8 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
     steps.append(('command-decode', [sys.executable, '-B', 'tests/command-decode.py'], 5))
     steps.append(('command-compare-selftest', [sys.executable, '-B', 'tests/command-compare-selftest.py'], 5))
     steps.append(('scene3d-math', ['zig', 'test', 'src/render/scene3d/math.zig', '-OReleaseSafe'], 30))
+    # Burrito mode: ath9k parser, detector on synthetic spectra, nl80211 codec, card policy (no hardware).
+    steps.append(('radio-detector', ['zig', 'test', 'src/radio/radio.zig', '-OReleaseSafe'], 120))
     steps.append(('go-type-index', [sys.executable, '-B', 'tests/go-type-index.py', '--work', '.work/go-type-index'], 60))
     steps.append(('go-maps-component', [sys.executable, '-B', 'tests/go-maps-component.py', '--work', '.work/go-maps-component'], 60))
     steps.append(('go-values-component', [sys.executable, '-B', 'tests/go-values-component.py', '--work', '.work/go-values-component'], 60))
@@ -783,6 +789,7 @@ def plan(tier, headless=False, optimize='ReleaseSafe', uprobes=False, perl=None,
         steps.append(('gui-overview-live', [sys.executable, '-B', 'tests/overview-live.py'], 180))
         steps.append(('gui-system-capture', [sys.executable, '-B', 'tests/system-capture-gui.py'], 60))
         steps.append(('gui-fetch', [sys.executable, '-B', 'tests/fetch-gui.py'], 120))
+        steps.append(('gui-radio', [sys.executable, '-B', 'tests/radio-gui.py'], 180))
         steps.append(('gui-log-levels', [sys.executable, '-B', 'tests/log-levels-gui.py'], 180))
         steps.append(('gui-x11', [sys.executable, '-B', 'tests/x11-gui.py'], 180))
         for suffix, extra in (('', []), ('-agent', ['--agent', 'zig-out/bin/xodb-agent'])):

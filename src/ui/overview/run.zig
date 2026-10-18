@@ -125,6 +125,8 @@ const Source = struct {
         if (view.panel == .memory_map) {
             if (view.memmap.refresh(self.gpa, self.collector, current, view.paused, view.redact)) window.dirty = true;
         }
+        // The Radio panel draws when samples or traffic landed (at most 10 per second).
+        if (view.panel == .radio and !view.paused and view.radio.due(current)) window.dirty = true;
         _ = self.collector.tick(current, if (view.paused) 0 else view.groups(true), view.panel == .processes) catch |err| blk: {
             view.setStatus("Sampling failed: {s}", .{@errorName(err)}, current);
             break :blk false;
@@ -159,6 +161,11 @@ const Source = struct {
 fn live(o: *const Options, startup_started: u64) !void {
     if (o.redact) @import("../../redact.zig").enable();
     const gpa = std.heap.c_allocator;
+    const radio = @import("../../radio/radio.zig");
+    radio.defaults = .{ .radio = o.radio, .traffic = o.radio_traffic, .channel = o.radio_channel, .focus = o.radio_focus, .ping_gateway = o.radio_ping, .demo = o.radio_demo, .hop = o.radio_hop, .state_dir = @import("../../radio/burrito.zig").stateDir(gpa) };
+    // A chosen card is taken at once; otherwise the passive collector starts with the Radio panel or MCP.
+    if (o.radio != null or o.radio_traffic != null or o.radio_demo != null) _ = radio.ensure(gpa);
+    defer radio.shutdown();
     var collector: Collector = .{ .redact = o.redact, .fd_scope = o.graph_pids[0..o.graph_count] };
     collector.capture.mode = .gui;
     defer collector.deinit();
@@ -194,6 +201,9 @@ fn live(o: *const Options, startup_started: u64) !void {
     view.action_hook = launchAction;
     view.action_context = &launcher;
     var source = Source{ .o = o, .gpa = gpa, .collector = &collector, .session = session, .shared = if (shared) |*endpoint| endpoint else null, .server = server, .launcher = &launcher, .sysstat = .{ .collector = &collector }, .capture = &capture };
+    // A taken card goes back first, before any other teardown can stall
+    // (the panel's jobs still read the halted collector's rings until shutdown).
+    defer if (radio.global) |held| held.halt();
     try loop.run(o, gpa, &view, &source, startup_started);
 }
 

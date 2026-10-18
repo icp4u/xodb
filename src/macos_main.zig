@@ -3,7 +3,7 @@ const std = @import("std");
 const log = @import("log.zig");
 const transport = @import("remote/transport.zig");
 var quitting: transport.c.sig_atomic_t = 0;
-extern fn xodb_macos_ignore_sigpipe() void;
+extern fn xodb_macos_process_signals() void;
 fn onSignal(signal: c_int) callconv(.c) void {
     quitting = signal;
 }
@@ -55,13 +55,14 @@ pub fn main(init: std.process.Init) !void {
     if (!is_local and (local.executable != null or local.source != null or local.breakpoint != null)) return error.LocalTargetRequired;
     _ = transport.c.signal(transport.c.SIGINT, onSignal);
     _ = transport.c.signal(transport.c.SIGTERM, onSignal);
-    xodb_macos_ignore_sigpipe();
+    xodb_macos_process_signals();
     @import("appearance.zig").init(theme);
     var owner: @import("remote/native_owner.zig").Owner = .{ .options = local };
     try @import("ui/remote.zig").run(if (is_local) owner.endpoint() else if (endpoint) |address| .{ .tcp = address } else .none, if (is_local) "local / Apple debugserver" else if (endpoint != null) "remote" else "macOS presentation preview", font, scale, frames, &quitting, started);
 }
 
 test {
+    _ = @import("remote/native_owner.zig");
     _ = @import("platform/window.zig");
     _ = @import("ui/remote.zig");
 }

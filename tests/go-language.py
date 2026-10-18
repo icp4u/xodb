@@ -108,9 +108,24 @@ try:
     # Step one source line so stack-passed arguments are past the prologue.
     client.action('step_over', tid=tid)
     stepped = client.stopped(seconds=30)
-    frame0 = client.inspect('get_stack', tid=tid)['frames'][0]
-    check(frame0['symbol'] == 'main.marker' and frame0['source']['line'] > 37, frame0)
+    # Preemption can resume this goroutine on another thread. The stop is the
+    # thread still in main.marker, past the prologue (line 38 is the function
+    # line; its locals are still PartialValue), not the tid that entered.
+    landed = []
+    for thread in stepped['threads']:
+        if thread['reason'] not in ('breakpoint', 'single_step'):
+            continue
+        frame = client.inspect('get_stack', tid=thread['tid'])['frames'][0]
+        source = frame.get('source') or {}
+        if frame.get('symbol') == 'main.marker' and source.get('line', 0) > 38:
+            landed.append((thread['tid'], frame))
+    check(len(landed) == 1, [(t['tid'], t['reason'], (t.get('breakpoint_address'))) for t in stepped['threads']])
+    tid, frame0 = landed[0]
+    check(frame0['symbol'] == 'main.marker' and frame0['source']['line'] > 38, frame0)
     rows = {l['name']: l for l in client.inspect('list_locals', tid=tid, frame=0)['locals']}
+    for name in ('stage', 'label', 'items', 'ratio', 'ok', 'first', 'counts', 'err', 'results'):
+        value = rows[name]['value']
+        check(value.get('diagnostic') != 'PartialValue' and not value.get('partial') and value.get('availability') != 'unavailable', (name, value))
     shown = {name: rows[name]['value']['display'] for name in ('stage', 'label', 'items', 'ratio', 'ok', 'first', 'counts', 'err', 'results')}
     # Which worker receives each job changes total; compare against the fixture's
     # actual arguments instead of assuming every job went to worker 3.

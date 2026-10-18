@@ -192,6 +192,9 @@ enum xrt_status xrt_target_extended(const struct xrt_target *target, int32_t tid
 enum xrt_status xrt_target_signal_info(const struct xrt_target *, int32_t tid,
                                        struct xrt_signal_info *out);
 enum xrt_status xrt_target_signal_suppress(struct xrt_target *target, int32_t tid);
+/* Drop a breakpoint reason left behind after a temporary probe was removed.
+ * Only a breakpoint stop at `address` changes, and only to interrupt. */
+enum xrt_status xrt_target_clear_stop(struct xrt_target *target, int32_t tid, uint64_t address);
 /* Host-decoded core files supply an immutable thread snapshot. Execution APIs
  * reject it, and closing it never signals or waits for a live PID. */
 enum xrt_status xrt_target_core(struct xrt_target *target, int32_t pid,

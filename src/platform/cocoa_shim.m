@@ -136,6 +136,21 @@ static void note_size(void) {
 @end
 static XCDelegate *delegate;
 
+static void install_menu(void) {
+    delegate = [XCDelegate new];
+    NSApp.delegate = delegate;
+    NSMenu *menu = [NSMenu new], *application = [NSMenu new];
+    NSMenuItem *application_item = [NSMenuItem new];
+    application_item.submenu = application; [menu addItem:application_item];
+    for (NSString *key in @[@"q", @"w"]) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:[key isEqualToString:@"q"] ? @"Quit xodb" : @"Close Window"
+            action:@selector(requestClose:) keyEquivalent:key];
+        item.target = delegate; item.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+        [application addItem:item];
+    }
+    NSApp.mainMenu = menu;
+}
+
 // macOS virtual key (ANSI position) -> evdev code.
 static uint16_t evdev_of(uint16_t vk) {
     static const struct { uint16_t vk, ev; } t[] = {
@@ -250,6 +265,12 @@ int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
         cur_w = width; cur_h = height; pixel_scale = cur_scale = 1;
         offscreen = getenv("XODB_MAC_OFFSCREEN") != NULL;
         if (offscreen) {
+            // Scripted shortcuts exercise the real menu action, without creating
+            // a window, activating the app, or finishing its launch on screen.
+            if (getenv("XODB_TEST_SCRIPT")) {
+                [NSApplication sharedApplication];
+                install_menu();
+            }
             layer = [CAMetalLayer layer];
             layer.frame = CGRectMake(0, 0, width, height);
             layer.drawableSize = CGSizeMake(width, height);
@@ -269,8 +290,8 @@ int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
         win = [[NSWindow alloc] initWithContentRect:rect styleMask:style backing:NSBackingStoreBuffered defer:NO];
         if (!win) return 0;
         startup_trace_begin();
-        delegate = [XCDelegate new];
-        win.delegate = delegate; NSApp.delegate = delegate;
+        install_menu();
+        win.delegate = delegate;
         win.releasedWhenClosed = NO; win.acceptsMouseMovedEvents = YES;
         if (title) win.title = [NSString stringWithUTF8String:title] ?: @"xodb";
         view = [[XCView alloc] initWithFrame:NSMakeRect(0, 0, rect.size.width, rect.size.height)];
@@ -280,16 +301,6 @@ int xcocoa_open(uint32_t width, uint32_t height, const char *title) {
         layer.contentsGravity = kCAGravityTopLeft;
         cur_scale = pixel_scale = (float)win.backingScaleFactor;
         cur_w = 0; note_size();
-        NSMenu *menu = [NSMenu new], *application = [NSMenu new];
-        NSMenuItem *application_item = [NSMenuItem new];
-        application_item.submenu = application; [menu addItem:application_item];
-        for (NSString *key in @[@"q", @"w"]) {
-            NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:[key isEqualToString:@"q"] ? @"Quit xodb" : @"Close Window"
-                action:@selector(requestClose:) keyEquivalent:key];
-            item.target = delegate; item.keyEquivalentModifierMask = NSEventModifierFlagCommand;
-            [application addItem:item];
-        }
-        NSApp.mainMenu = menu;
         [NSApp finishLaunching];
         [win makeKeyAndOrderFront:nil];
         [NSApp activateIgnoringOtherApps:YES];

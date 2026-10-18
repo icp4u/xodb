@@ -43,6 +43,8 @@ src/import/**             import
 # external evidence: capture files, decoders, clock domains, socket joins
 src/evidence/**           evidence
 src/capture/**            capture
+# burrito mode: Wi-Fi cards, ath9k spectral samples, nl80211, the interference detector
+src/radio/**              radio
 
 # C runtime: also builds alone (src/runtime/Makefile, xodb-agent)
 src/runtime/**            runtime

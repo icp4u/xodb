@@ -86,7 +86,7 @@ pub const Investigation = struct {
     }
 };
 const RunTo = struct { tid: i32, thread_id: u64, address: u64, probe: u64, owns_probe: bool, image_epoch: u64, expected_sp: ?u64 = null, cancelled: bool = false, ignored_stops: usize = 0 };
-const SourceStep = struct { tid: i32, line: u32, path: [4096]u8, path_len: usize, over: bool, instructions: usize = 0, return_address: ?u64 = null, signal_return: ?u64 = null, signal_sp: ?u64 = null, signal_probe: ?u64 = null, deferred_ignored: u8 = 0 };
+const SourceStep = struct { tid: i32, line: u32, path: [4096]u8, path_len: usize, over: bool, instructions: usize = 0, return_address: ?u64 = null, return_g: ?u64 = null, return_depth: ?u64 = null, return_sp: ?u64 = null, signal_return: ?u64 = null, signal_sp: ?u64 = null, signal_probe: ?u64 = null, deferred_ignored: u8 = 0, stepoff_tid: ?i32 = null };
 fn isGoSigtramp(name: []const u8) bool {
     return std.mem.eql(u8, name, "runtime.sigtramp") or std.mem.eql(u8, name, "runtime.sigtramp.abi0");
 }
@@ -1386,13 +1386,118 @@ pub const Session = struct {
         errdefer self.source_step = null;
         try self.advanceSourceStep();
     }
+    fn clearReturnProbe(self: *Session) void {
+        if (self.source_step) |*step| {
+            step.return_address = null;
+            step.return_g = null;
+            step.return_depth = null;
+            step.return_sp = null;
+        }
+    }
+    /// Go keeps g in r14. A stack copy moves the stack, so a step-over return
+    /// names that goroutine by g, not by the stack pointer. Other code has no
+    /// g; the stack pointer distinguishes this frame from a recursive one.
+    /// Go code is a dotted symbol on a .go line; C symbols such as foo.isra.0
+    /// and cgo preamble functions are not. A recursive Go call keeps g; its
+    /// depth below g.stack.hi differs, and a stack copy keeps that depth.
+    fn noteReturnProbe(self: *Session, tid: i32, address: u64) !void {
+        const regs = try self.target.registers(tid);
+        const sp = linux.stackPointer(regs) catch null;
+        var g: ?u64 = null;
+        const go_line = if (self.source_step) |*step| std.mem.endsWith(u8, step.path[0..step.path_len], ".go") else false;
+        if (go_line) {
+            if (linux.programCounter(regs)) |pc| {
+                if (self.modules.symbolAt(pc)) |symbol| {
+                    if (std.mem.indexOfScalar(u8, symbol.name, '.') != null) {
+                        if (regs.named("r14")) |value| if (value != 0) {
+                            g = value;
+                        };
+                    }
+                } else |_| {}
+            } else |_| {}
+        }
+        const depth = if (g != null and sp != null) self.goStackDepth(g.?, sp.?) else null;
+        if (self.source_step) |*step| {
+            step.return_address = address;
+            step.return_g = g;
+            step.return_depth = depth;
+            step.return_sp = sp;
+        }
+    }
+    /// Bytes from the stack pointer up to g.stack.hi (runtime.g starts with
+    /// stack{lo, hi}).
+    fn goStackDepth(self: *Session, g: u64, sp: u64) ?u64 {
+        var bytes: [8]u8 = undefined;
+        const n = self.target.readMemory(g +% 8, &bytes) catch return null;
+        if (n != bytes.len) return null;
+        const hi = std.mem.readInt(u64, &bytes, .little);
+        return if (hi >= sp) hi - sp else null;
+    }
+    fn returnProbeMatches(self: *Session, step: *const SourceStep, regs: linux.Registers) bool {
+        const sp = linux.stackPointer(regs) catch null;
+        if (step.return_g) |saved| {
+            const g = regs.named("r14") orelse return false;
+            if (g != saved) return false;
+            const depth = step.return_depth orelse return true;
+            return sp != null and self.goStackDepth(g, sp.?) == depth;
+        }
+        // A block-end probe is planted with one live thread, in this frame,
+        // and the block may push or pop; it records no stack pointer.
+        const saved = step.return_sp orelse return true;
+        return sp != null and sp.? == saved;
+    }
+    /// A temporary probe is removed before this stop is published, but the
+    /// breakpoint reason stays. Peers that hit it are not the stepped goroutine.
+    fn clearStaleProbeStops(self: *Session, keep: ?i32) void {
+        const step = self.source_step orelse return;
+        for (self.target.threadSlice()) |thread| {
+            if (keep != null and thread.tid == keep.?) continue;
+            if (thread.reason != .breakpoint) continue;
+            const owned_return = step.return_address != null and thread.breakpoint_address == step.return_address.?;
+            const owned_signal = step.signal_probe != null and step.signal_return != null and thread.breakpoint_address == step.signal_return.?;
+            if (!owned_return and !owned_signal) continue;
+            self.target.clearStop(thread.tid, thread.breakpoint_address) catch |err| {
+                log.debug(.session, "xodb: stale stop reason stayed: {s}\n", .{@errorName(err)});
+            };
+        }
+    }
+    fn threadOnOwnedProbe(self: *Session) ?i32 {
+        const step = self.source_step orelse return null;
+        for (self.target.threadSlice()) |thread| {
+            if (thread.state != .stopped or thread.breakpoint_address == 0) continue;
+            const on_return = step.return_address != null and thread.breakpoint_address == step.return_address.?;
+            const on_signal = step.signal_probe != null and step.signal_return != null and thread.breakpoint_address == step.signal_return.?;
+            if (!on_return and !on_signal) continue;
+            const regs = self.target.registers(thread.tid) catch continue;
+            const pc = linux.programCounter(regs) catch continue;
+            if (pc == thread.breakpoint_address) return thread.tid;
+        }
+        return null;
+    }
+    fn replantStepProbes(self: *Session) !void {
+        const step = self.source_step orelse return;
+        if (step.signal_return) |address| {
+            if (step.signal_sp) |sp| try self.armSignalReturn(address, sp);
+        }
+        const ret = (self.source_step orelse return).return_address orelse return;
+        for (self.target.breakpointSlice()) |probe| if (!probe.pending and probe.address == ret) return;
+        _ = try self.target.setBreakpoint(ret, true);
+    }
+    fn armStepoff(self: *Session) void {
+        const hop = self.threadOnOwnedProbe();
+        if (self.source_step) |*live| live.stepoff_tid = hop;
+    }
+    fn stopSourceStep(self: *Session, keep: ?i32) void {
+        self.clearStaleProbeStops(keep);
+        self.endSourceStep();
+    }
     fn advanceSourceStep(self: *Session) !void {
         if (self.source_step == null) return;
         if (!self.resumeAllowed()) return error.AgentScopeRevoked;
         const step = &self.source_step.?;
         self.source_step.?.instructions += 1;
         self.source_step_resumes += 1;
-        self.source_step.?.return_address = null;
+        self.clearReturnProbe();
         if (try self.advanceSourceBlock()) return;
         if (step.over) {
             const regs = try self.target.registers(step.tid);
@@ -1407,7 +1512,7 @@ pub const Session = struct {
                 for (self.target.breakpointSlice()) |probe| {
                     if (probe.address == address and !probe.temporary) user_breakpoint = true;
                 }
-                if (!user_breakpoint) self.source_step.?.return_address = address;
+                if (!user_breakpoint) try self.noteReturnProbe(step.tid, address);
             }
             try self.stepOverInstruction(step.tid);
         } else try self.target.singleStep(step.tid);
@@ -1586,47 +1691,125 @@ pub const Session = struct {
                 return;
             }
             if (self.target.snapshot().state != .stopped) return;
+            // Continuing off a probe steps one thread past it. That stop is
+            // not the source step; plant the probe again and run everyone.
+            if (step.stepoff_tid) |hop| {
+                var hopped = false;
+                for (self.target.threadSlice()) |thread| {
+                    if (thread.tid == hop and thread.reason == .single_step) {
+                        hopped = true;
+                    }
+                }
+                if (self.source_step) |*live| live.stepoff_tid = null;
+                if (hopped) {
+                    if (step.instructions >= 10000) {
+                        self.step_diagnostic = "SourceStepResumeLimit";
+                        self.stopSourceStep(null);
+                        return;
+                    }
+                    if (self.source_step) |*live| live.instructions += 1;
+                    self.replantStepProbes() catch |err| {
+                        self.step_diagnostic = @errorName(err);
+                        self.stopSourceStep(null);
+                        return;
+                    };
+                    self.armStepoff();
+                    self.target.continueExecution() catch |err| {
+                        self.step_diagnostic = @errorName(err);
+                        self.stopSourceStep(null);
+                        try @import("../target/runtime.zig").propagateUnknownOutcome(err);
+                    };
+                    return;
+                }
+            }
             var expected_stop = false;
             var foreign_stop = false;
             var other_frame = false;
+            var stepped_real = false;
+            var step_ignored = false;
+            // The signal probe follows the saved sigcontext stack pointer.
+            // The step-over return probe follows g when the caller is Go,
+            // because a stack copy moves the stack. A different g, or a
+            // different stack pointer when there is no g, is another frame.
+            var landed: ?i32 = null;
             for (self.target.threadSlice()) |thread| {
                 const ignored_stop = thread.reason == .signal and ignoredMask(thread.signal) != 0;
+                var signal_back = false;
+                const signal_hit = thread.reason == .breakpoint and step.signal_return != null and step.signal_return.? == thread.breakpoint_address;
+                if (signal_hit) {
+                    const regs = try self.target.registers(thread.tid);
+                    const sp = linux.stackPointer(regs) catch null;
+                    signal_back = sp != null and step.signal_sp != null and sp.? == step.signal_sp.?;
+                    if (signal_back) {
+                        if (landed == null) landed = thread.tid;
+                    } else if (step.signal_probe != null) other_frame = true;
+                }
+                var return_back = false;
+                const return_hit = thread.reason == .breakpoint and step.return_address != null and step.return_address.? == thread.breakpoint_address;
+                if (return_hit) {
+                    const regs = try self.target.registers(thread.tid);
+                    return_back = self.returnProbeMatches(&step, regs);
+                    if (return_back) {
+                        if (landed == null) landed = thread.tid;
+                    } else other_frame = true;
+                }
                 if (thread.tid == step.tid) {
-                    // The interrupted instruction is reached again with the
-                    // same stack pointer. Another goroutine scheduled on this
-                    // thread, or a recursive frame, has a different one.
-                    var signal_back = false;
-                    if (thread.reason == .breakpoint and step.signal_return != null and step.signal_return.? == thread.breakpoint_address) {
-                        const regs = try self.target.registers(thread.tid);
-                        const sp = linux.stackPointer(regs) catch null;
-                        signal_back = sp != null and step.signal_sp != null and sp.? == step.signal_sp.?;
-                        other_frame = !signal_back and step.signal_probe != null;
-                    }
-                    const at_return = thread.reason == .breakpoint and ((step.return_address != null and step.return_address.? == thread.breakpoint_address) or signal_back);
+                    const at_return = signal_back or return_back;
                     // SIGURG (and the other default-ignored signals) reported
                     // on this thread is still the step. A real fault is not.
                     expected_stop = thread.reason == .single_step or at_return or ignored_stop;
-                } else if (thread.reason != .interrupt and thread.reason != .none and !ignored_stop) {
-                    foreign_stop = true;
+                    step_ignored = ignored_stop;
+                    // A mismatched hit on a probe this step owns is not a
+                    // user stop. A fault or a user breakpoint on this thread is.
+                    const owned_mismatch = (signal_hit and !signal_back and step.signal_probe != null) or (return_hit and !return_back);
+                    if (!expected_stop and thread.reason != .interrupt and thread.reason != .none and thread.reason != .clone and !ignored_stop and !owned_mismatch) stepped_real = true;
+                } else if (signal_back or return_back) {
+                    // The stepped goroutine resumed on this thread.
+                } else if (thread.reason != .interrupt and thread.reason != .none and thread.reason != .clone and !ignored_stop) {
+                    // An owned probe hit by another frame is not a user stop.
+                    // A clone reason sticks until a full continue, so it is
+                    // not a foreign stop either.
+                    if (!(signal_hit and step.signal_probe != null) and !return_hit) foreign_stop = true;
                 }
             }
+            var follow = step.tid;
+            if (landed) |tid| {
+                // The thread the goroutine left now runs another goroutine.
+                // A breakpoint or fault reported there is a foreign stop; a
+                // later continue of the step would otherwise consume it.
+                if (tid != step.tid and stepped_real) foreign_stop = true;
+                follow = tid;
+                if (self.source_step) |*live| live.tid = tid;
+                expected_stop = true;
+            }
+            // While the probe waits for the preempted goroutine, the thread it
+            // left runs other goroutines. A default-ignored signal queued there
+            // at a stop is not the step: continue, which delivers it.
+            if (landed == null and step.signal_return != null and step_ignored) {
+                expected_stop = false;
+                other_frame = true;
+            }
             if (foreign_stop) {
-                self.endSourceStep();
+                self.stopSourceStep(follow);
                 return;
             }
-            // Our own probe, hit by a different frame on the stepped thread.
-            // The runtime drops temporary probes at a stop, so plant it again
-            // for the interrupted frame and continue.
-            if (other_frame and step.instructions < 10000) {
+            // Our own probe, hit by a different frame, and the stepped
+            // goroutine has not landed. The runtime drops temporary probes
+            // at a stop, so plant them again and continue once. A thread
+            // still sitting on the probe is stepped off it; that single
+            // step is not the source step.
+            if (other_frame and landed == null and !expected_stop and !stepped_real and step.instructions < 10000) {
                 if (self.source_step) |*s| s.instructions += 1;
-                self.armSignalReturn(step.signal_return.?, step.signal_sp.?) catch |err| {
+                self.clearStaleProbeStops(null);
+                self.replantStepProbes() catch |err| {
                     self.step_diagnostic = @errorName(err);
-                    self.endSourceStep();
+                    self.stopSourceStep(null);
                     return;
                 };
+                self.armStepoff();
                 self.target.continueExecution() catch |err| {
                     self.step_diagnostic = @errorName(err);
-                    self.endSourceStep();
+                    self.stopSourceStep(null);
                     try @import("../target/runtime.zig").propagateUnknownOutcome(err);
                 };
                 return;
@@ -1634,41 +1817,43 @@ pub const Session = struct {
             // SIGURG delivered during a hardware step stops at runtime.sigtramp's
             // entry, often with SIGTRAP, while peers are stopped on SIGURG.
             // That PC is still this step; its source line is not.
-            if (!expected_stop and !self.inGoSigtramp(step.tid)) {
-                self.endSourceStep();
+            if (!expected_stop and !self.inGoSigtramp(follow)) {
+                self.stopSourceStep(follow);
                 return;
             }
             if (step.instructions >= 10000) {
                 self.step_diagnostic = "SourceStepResumeLimit";
-                self.endSourceStep();
+                self.stopSourceStep(follow);
                 return;
             }
+            self.clearStaleProbeStops(follow);
             if (self.resumePastGoSignal()) |resumed| {
                 if (resumed) return;
                 // A trampoline entry the step did not cause, or a real
                 // signal's handler: the stop is visible.
                 if (!expected_stop) {
-                    self.endSourceStep();
+                    self.stopSourceStep(follow);
                     return;
                 }
             } else |err| {
                 self.step_diagnostic = @errorName(err);
-                self.endSourceStep();
+                self.stopSourceStep(follow);
                 return;
             }
             var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
             defer arena.deinit();
-            const regs = try self.target.registers(step.tid);
+            const regs = try self.target.registers(follow);
             if (self.sourceAt(arena.allocator(), try linux.programCounter(regs))) |site| {
                 if (site.line != step.line or !std.mem.eql(u8, site.path, step.path[0..step.path_len])) {
-                    self.endSourceStep();
+                    self.stopSourceStep(follow);
                     return;
                 }
             } else |_| {}
             self.holdIgnoredSignal();
+            self.clearStaleProbeStops(follow);
             self.advanceSourceStep() catch |err| {
                 self.step_diagnostic = @errorName(err);
-                self.endSourceStep();
+                self.stopSourceStep(follow);
                 try @import("../target/runtime.zig").propagateUnknownOutcome(err);
             };
         }

@@ -27,7 +27,7 @@ fn named(names: []const []const u8, arg: []const u8) bool {
 /// Every parser xodb dispatches to after log.init: the debugger, the overview
 /// and the scene3d probe ("--instances"; its "--frames" is in the other two).
 fn takesValue(arg: []const u8) bool {
-    return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or named(&@import("ui/overview/fetch.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
+    return named(&value_options, arg) or named(&@import("ui/overview/options.zig").takes, arg) or named(&@import("ui/overview/fetch.zig").takes, arg) or named(&@import("radio/burrito.zig").takes, arg) or std.mem.eql(u8, arg, "--instances");
 }
 fn parseUiScale(value: []const u8) !f32 {
     const scale = std.fmt.parseFloat(f32, value) catch return error.InvalidUiScale;
@@ -81,6 +81,7 @@ pub fn main(init: std.process.Init) !void {
     for (args[1..]) |arg| {
         if (std.mem.eql(u8, arg, "--")) break;
         if (std.mem.eql(u8, arg, "--fetch")) return @import("ui/overview/fetch.zig").main(args);
+        if (std.mem.eql(u8, arg, "--burrito")) return @import("radio/burrito.zig").main(args);
     }
     // The overview is its own window and session with no debug target;
     // headless, it is the collector and MCP alone (no window code runs).
@@ -244,6 +245,7 @@ pub fn main(init: std.process.Init) !void {
                 \\--lsof-top runs the terminal open-file and fd activity view (--lsof-top --help; docs/LSOF_TOP.md).
                 \\--overview opens the system overview (no target); xodb --overview --help lists its options.
                 \\--fetch prints a fastfetch-style card of this machine and exits (--fetch --help; docs/FETCH.md).
+                \\--burrito listens to 2.4 GHz and the Wi-Fi link, receive-only: is it the microwave? (--burrito --help; docs/RADIO.md).
                 \\Graph/galaxy default: LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
                 \\--memdefrag runs the terminal memory map and THP "defrag" view (--memdefrag --help).
                 \\--static-analysis DIR enables pseudo-C (D), static slices (S), and decompile_function over MCP with the
@@ -1181,6 +1183,10 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     };
     const o = try options.parse(args);
     if (o.redact) @import("redact.zig").enable();
+    const radio = @import("radio/radio.zig");
+    radio.defaults = .{ .radio = o.radio, .traffic = o.radio_traffic, .channel = o.radio_channel, .focus = o.radio_focus, .ping_gateway = o.radio_ping, .demo = o.radio_demo, .hop = o.radio_hop, .state_dir = @import("radio/burrito.zig").stateDir(std.heap.c_allocator) };
+    if (o.radio != null or o.radio_traffic != null or o.radio_demo != null) _ = radio.ensure(std.heap.c_allocator);
+    defer radio.shutdown();
     _ = c.signal(c.SIGINT, onSignal);
     _ = c.signal(c.SIGTERM, onSignal);
     _ = c.signal(c.SIGHUP, onSignal);
@@ -1216,6 +1222,8 @@ fn overviewHeadless(args: []const [:0]const u8) !void {
     defer capture.deinit(linux.now());
     if (shared) |*endpoint| endpoint.overview_capture = &capture.cpu;
     if (server) |p| p.overview_capture = &capture.cpu;
+    // A taken card goes back first, before any other teardown can stall.
+    defer if (radio.global) |held| held.halt();
     var samples: u64 = 0;
     while (quitting == 0) {
         // The owner clock: history groups at their periods, plus requested groups.
@@ -1435,6 +1443,8 @@ test {
         _ = @import("ui/overview/fetch_panel.zig");
     }
     _ = @import("ui/overview/fetch.zig");
+    _ = @import("radio/radio.zig");
+    _ = @import("radio/burrito.zig");
     _ = @import("ui/overview/fetch_bench.zig");
     _ = @import("ui/overview/png.zig");
     _ = @import("memdefrag/model.zig");

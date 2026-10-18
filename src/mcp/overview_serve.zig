@@ -17,6 +17,14 @@ pub const usage =
     \\  --interval-ms N        owner sampling interval, 250..10000 (default 500); processes at 1 Hz
     \\  --redact               every reply redacted
     \\  --graph-pid N          restrict descriptor collection to these PIDs (repeatable)
+    \\  --radio IFACE          burrito mode: take this spare card (or up to four, comma-separated) for spectrum
+    \\                         (root, receive-only); the cards sweep the band
+    \\  --radio-traffic IFACE  count frames per channel on this spare card (root, receive-only, counts only)
+    \\  --radio-channel N      one fixed window on channel N, 1..14, instead of the sweep
+    \\  --radio-focus LO-HI    sweep only LO-HI MHz
+    \\  --radio-hop            sweep the band (the default)
+    \\  --radio-ping           ping the in-use link's gateway at 50 Hz (the one thing xodb sends; off by default)
+    \\  --radio-demo SCENE     SYNTHETIC spectrum and traffic for demos and tests (kitchen, microwave60, inverter, ...)
     \\
 ;
 
@@ -28,6 +36,13 @@ pub const Options = struct {
     agent_scope: @import("../model/command.zig").AgentScope = .observe,
     graph_pids: [c.XRT_FD_INTEREST_MAX]i32 = @splat(0),
     graph_count: usize = 0,
+    radio: ?[:0]const u8 = null,
+    radio_traffic: ?[:0]const u8 = null,
+    radio_channel: ?u8 = null,
+    radio_focus: ?@import("../radio/sweep.zig").Request = null,
+    radio_hop: bool = false,
+    radio_ping: bool = false,
+    radio_demo: ?@import("../radio/detect.zig").Synth.Scene = null,
 };
 
 pub fn parse(args: []const [:0]const u8) !Options {
@@ -40,11 +55,19 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.mcp = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--radio-hop")) {
+            o.radio_hop = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--radio-ping")) {
+            o.radio_ping = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--redact")) {
             o.redact = true;
             continue;
         }
-        const takes = std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--interval-ms") or std.mem.eql(u8, arg, "--graph-pid") or std.mem.eql(u8, arg, "--agent-scope");
+        const takes = std.mem.eql(u8, arg, "--session-socket") or std.mem.eql(u8, arg, "--interval-ms") or std.mem.eql(u8, arg, "--graph-pid") or std.mem.eql(u8, arg, "--agent-scope") or std.mem.eql(u8, arg, "--radio") or std.mem.eql(u8, arg, "--radio-channel") or std.mem.eql(u8, arg, "--radio-demo") or std.mem.eql(u8, arg, "--radio-traffic") or std.mem.eql(u8, arg, "--radio-focus");
         if (!takes) {
             log.err(.overview, "xodb: --overview --headless does not accept {s}\n{s}", .{ arg, usage });
             return error.OverviewOptionConflict;
@@ -54,6 +77,15 @@ pub fn parse(args: []const [:0]const u8) !Options {
         const value = args[i];
         if (std.mem.eql(u8, arg, "--agent-scope")) o.agent_scope = std.meta.stringToEnum(@import("../model/command.zig").AgentScope, value) orelse return error.InvalidAgentScope;
         if (std.mem.eql(u8, arg, "--session-socket")) o.session_socket = value;
+        if (std.mem.eql(u8, arg, "--radio")) o.radio = value;
+        if (std.mem.eql(u8, arg, "--radio-traffic")) o.radio_traffic = value;
+        if (std.mem.eql(u8, arg, "--radio-focus")) o.radio_focus = @import("../radio/burrito.zig").parseFocus(value) orelse return error.InvalidRadioFocus;
+        if (std.mem.eql(u8, arg, "--radio-demo")) o.radio_demo = std.meta.stringToEnum(@import("../radio/detect.zig").Synth.Scene, value) orelse return error.InvalidRadioDemo;
+        if (std.mem.eql(u8, arg, "--radio-channel")) {
+            const ch = std.fmt.parseInt(u8, value, 10) catch return error.InvalidRadioChannel;
+            if (ch < 1 or ch > 14) return error.InvalidRadioChannel;
+            o.radio_channel = ch;
+        }
         if (std.mem.eql(u8, arg, "--interval-ms")) {
             o.interval_ms = std.fmt.parseInt(u64, value, 10) catch return error.InvalidOverviewInterval;
             if (o.interval_ms < 250 or o.interval_ms > 10_000) return error.InvalidOverviewInterval;

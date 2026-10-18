@@ -27,11 +27,12 @@ samples the whole system with the bounded, unprivileged collector
 | FD Treemap | Literal sampled paths; area counts open handles, colour shows sampled IO, capped/unknown paths remain explicit |
 | FD Graph | Processes and cgroups linked through shared files, pipes and proved UNIX socket peers |
 | Parent/Child FDs | Sampled matching descriptors and close-on-exec flags; origin stays unproved |
+| Radio | Burrito mode: is it the microwave? The 2.4 GHz waterfall from a spare spectral-capable card chosen with `--radio NAME` (root, receive-only), the verdict in words, and band power, gateway ping and link signal lanes on the same clock; the cards with their roles and what each can contribute ([details](RADIO.md)) |
 | FD Galaxy | Processes as stars in nebulae (one per cgroup or application), shared descriptors as threads between them, measured bytes as impulses along the threads; deleted-but-open holders in pink |
 
 Keys: `1`–`9`, `0`, Tab/Shift+Tab switch panels; arrows, Page Up/Down, Home/End
 move; Left/Right fold the tree; `/` search; `s` next sort, `r` reverse; `v`
-tree/flat; `t` next theme; `p` or Space pause; `x` turns redaction on (it cannot
+tree/flat; `w` Radio; `t` next theme; `p` or Space pause; `x` turns redaction on (it cannot
 be turned off without a restart); `q` quits. Mouse clicks and the wheel work too.
 
 ## Honesty rules

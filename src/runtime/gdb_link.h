@@ -23,6 +23,9 @@ struct xrt_gdb_link {
 /* One owning thread serializes all link operations. Payload views are copied
  * into caller storage; the link retains only an outstanding command frame. */
 enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *, const char *endpoint, struct xrt_cancel *);
+/* Takes ownership of an already-connected private stream descriptor, including
+ * on failure. It has the same framing, deadlines and cancellation as TCP. */
+enum xrt_status xrt_gdb_adopt(struct xrt_gdb_link *, int fd, struct xrt_cancel *);
 void xrt_gdb_disconnect(struct xrt_gdb_link *);
 enum xrt_status xrt_gdb_send(struct xrt_gdb_link *, const void *, size_t);
 enum xrt_status xrt_gdb_receive(struct xrt_gdb_link *, void *, size_t, size_t *,

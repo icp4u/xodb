@@ -10,6 +10,7 @@
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <unistd.h>
 
 struct remote_thread { uint64_t pid, tid; int32_t local; };
 struct xrt_gdb {
@@ -24,7 +25,7 @@ struct xrt_gdb {
     int32_t selected, signal_tid;
     unsigned pending_signal;
     bool vcont_signal_continue, vcont_signal_step, single_write_unavailable, unmapped_signal;
-    bool multiprocess, vcont_continue, vcont_step, interrupt, step_after_rearm;
+    bool multiprocess, vcont_continue, vcont_step, interrupt, step_after_rearm, detach_confirmed;
     uint8_t reply[XRT_GDB_PAYLOAD_MAX + 1];
     size_t length, last_stop_size;
     uint8_t *last_stop;
@@ -983,6 +984,7 @@ static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
     ++t->generation;
     status = ok(g, command, "GDB detach unconfirmed");
     if (status != XRT_OK) { t->detach_pending = true; return XRT_DETACH_INCOMPLETE; }
+    g->detach_confirmed = true;
     event(t, XRT_EVENT_DETACH, t->pid, 0);
     t->pid = 0; t->thread_count = t->breakpoint_count = 0; t->state = XRT_IDLE;
     t->detach_pending = t->owned = false; g->thread_count = 0; g->process = 0; g->selected = 0;
@@ -992,6 +994,10 @@ static enum xrt_status detach(struct xrt_gdb *g, struct xrt_target *t)
 enum xrt_status xrt_gdb_health(const struct xrt_gdb *g)
 {
     return g->link.failed ? XRT_TRANSPORT_FAILED : XRT_OK;
+}
+bool xrt_gdb_detach_confirmed(const struct xrt_gdb *g)
+{
+    return g && g->detach_confirmed;
 }
 void xrt_gdb_info(const struct xrt_gdb *g, struct xrt_gdb_info *out)
 {
@@ -1020,18 +1026,27 @@ void xrt_gdb_free(struct xrt_gdb *g)
     xrt_gdb_disconnect(&g->link); free(g->last_stop); free(g->bank); free(g);
 }
 uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *g) { return g->link.mutation_written; }
-enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
+static enum xrt_status open_connection(const char *endpoint, int fd, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
 {
+    if (out) *out = NULL;
+    if (!out || !t || (!endpoint && fd < 0)) {
+        if (fd >= 0) close(fd);
+        return XRT_INVALID_ARGUMENT;
+    }
     const uint64_t deadline = xrt_now() + XRT_GDB_OPEN_NS;
-    *out = NULL;
     struct xrt_gdb *g = calloc(1, sizeof(*g));
-    if (!g) return XRT_OUT_OF_MEMORY;
+    if (!g) { if (fd >= 0) close(fd); return XRT_OUT_OF_MEMORY; }
     uint8_t *initial_stop = NULL; size_t initial_size = 0;
     g->info.attached = -1;
     g->info.unsupported = XRT_GDB_CAP_WATCH | XRT_GDB_CAP_LIBRARIES | XRT_GDB_CAP_BINARY_WRITE;
-    enum xrt_status status = xrt_gdb_connect(&g->link, endpoint, cancel);
+    enum xrt_status status = endpoint ? xrt_gdb_connect(&g->link, endpoint, cancel) : xrt_gdb_adopt(&g->link, fd, cancel);
     g->link.operation_deadline_ns = deadline;
     if (status != XRT_OK) goto fail;
+    if (!endpoint) {
+        /* Native debugserver only; do not change other GDB stubs' handshake. */
+        status = ok(g, "QSetDetachOnError:1", "Debugserver detach-on-error negotiation failed");
+        if (status != XRT_OK) goto fail;
+    }
     status = query(g, "qSupported:multiprocess+;qXfer:features:read+;xmlRegisters=i386;swbreak+");
     if (status != XRT_OK) goto fail;
     g->multiprocess = feature((char *)g->reply, "multiprocess+");
@@ -1145,6 +1160,14 @@ fail:
     free(initial_stop);
     xrt_log(XRT_LOG_ERROR, XRT_LOG_RUNTIME, "xodb: GDB connection failed: %s (status %d)\n", g->info.reason, status);
     xrt_gdb_free(g); return status;
+}
+enum xrt_status xrt_gdb_open(const char *endpoint, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
+{
+    return open_connection(endpoint, -1, t, out, cancel);
+}
+enum xrt_status xrt_gdb_open_fd(int fd, struct xrt_target *t, struct xrt_gdb **out, struct xrt_cancel *cancel)
+{
+    return open_connection(NULL, fd, t, out, cancel);
 }
 enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const struct xrt_call *call)
 {
@@ -1273,6 +1296,16 @@ enum xrt_status xrt_gdb_call(struct xrt_gdb *g, struct xrt_target *t, const stru
         t->threads[i].signal = 0;
         if (g->signal_tid == (int32_t)call->args[0]) { g->pending_signal = 0; g->unmapped_signal = false; }
         ++t->generation; return XRT_OK;
+    }
+    case XRT_RPC_CLEAR_STOP: {
+        int i = xrt_thread_index(t, (int32_t)call->args[0]);
+        if (i < 0) return XRT_UNKNOWN_THREAD;
+        if (t->state != XRT_STOPPED) return XRT_NOT_STOPPED;
+        if (t->threads[i].reason == XRT_STOP_BREAKPOINT && t->threads[i].breakpoint_address == call->args[1]) {
+            t->threads[i].reason = XRT_STOP_INTERRUPT;
+            ++t->generation;
+        }
+        return XRT_OK;
     }
     case XRT_RPC_FOLLOW:
         return call->args[0] ? XRT_UNSUPPORTED_PROCESS_FOLLOWING : XRT_OK;

@@ -38,12 +38,18 @@ and `tests/macos-local.py`. From Linux use `--ssh HOST --local`; the opt-in
 `macos-local` release-check step runs this lane. The tests compile only an
 owned, lifetime-bounded fixture and check launch, symbolic breakpoint, attach,
 rendered registers/assembly, instruction-step PC changes, and heartbeat
-progress after window close. A deliberately unchanged PC must fail the oracle.
+progress after window close, Cmd-Q, SIGTERM and setup errors. Missing startup
+symbols retain a controllable stopped session; explicit Detach publishes the
+detached state once, then stops the owner. A deliberately unchanged PC and a
+summary incorrectly marked detached must fail their respective oracles.
 The enclosing timeout is a hang bound, not a speed assertion.
 
 The Cocoa test script adds `FRAME stopped`: wait for a stopped publication to
-have been presented with no pending request. It uses the same NSEvent input
+have been presented with no pending request. `FRAME detached` waits for the
+detached publication and completed owner cleanup. It uses the same NSEvent input
 path as other script commands. It does not inject a synthetic target state.
 The existing `state` diagnostic adds a debugger row with generation, PC and
 register/instruction/breakpoint counts. Native testing remains offscreen;
 actual display/input acceptance is a separate console-session check.
+Scripted offscreen runs install the real Cmd-Q/W menu without creating a
+window or activating the app, so menu-close cleanup can be checked there too.

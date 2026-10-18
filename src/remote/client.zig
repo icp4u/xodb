@@ -84,7 +84,10 @@ pub const Client = struct {
         self.work() catch |err| {
             if (err != error.Cancelled) {
                 self.message(@errorName(err));
-                log.warn(.runtime, "xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
+                if (self.endpoint == .local) {
+                    // The injected owner reports its own detach/reap outcome.
+                    log.warn(.runtime, "xodb: native owner ended: {s}\n", .{@errorName(err)});
+                } else log.warn(.runtime, "xodb: remote connection ended: {s}; target cleanup is unconfirmed\n", .{@errorName(err)});
             }
         };
         self.lock();

@@ -34,6 +34,7 @@ pub fn render(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !v
         .graph, .galaxy => try @import("graph_panel.zig").render(v, ctx, rect, now),
         .memory_map => try @import("memmap.zig").render(v, ctx, rect, now),
         .fetch => try fetchCard(v, ctx, rect, s, now),
+        .radio => try radioPanel(v, ctx, rect, now),
     }
 }
 
@@ -1890,4 +1891,520 @@ fn fetchCard(v: *View, ctx: Ctx, rect: Rect, s: *const m.Snapshot, now: u64) !vo
     const ansi = [16]u24{ 0x000000, 0xcd3131, 0x0dbc79, 0xe5e510, 0x2472c8, 0xbc3fbc, 0x11a8cd, 0xe5e5e5, 0x666666, 0xf14c4c, 0x23d18b, 0xf5f543, 0x3b8eea, 0xd670d6, 0x29b8db, 0xffffff };
     const bw = @min(28, w / 16);
     for (ansi, 0..) |col, i| try ctx.r.rect(.{ .x = x0 + @as(f32, @floatFromInt(i)) * bw, .y = right.y + right.h - 32, .w = bw, .h = 18 }, @import("../../appearance.zig").rgb(col));
+}
+
+// --- Radio (burrito mode) -------------------------------------------------------
+
+const rp = @import("radio_panel.zig");
+/// Power to colour: the floor dark, strong signals hot.
+fn radioHeat(p: *const @import("theme.zig").Palette, dbm: i8) [4]u8 {
+    const t = std.math.clamp((@as(f32, @floatFromInt(dbm)) + 115) / 60, 0, 1);
+    // A measured noise floor is visibly not "no sample" (the panel colour).
+    const stops = [_]Color{ draw.mix(p.panel, p.accent, 0.18), p.accent, p.warn, p.crit };
+    const x = t * 3;
+    const i: usize = @min(2, @as(usize, @intFromFloat(x)));
+    const c = draw.mix(stops[i], stops[i + 1], x - @as(f32, @floatFromInt(i)));
+    return .{ @intFromFloat(c[0] * 255), @intFromFloat(c[1] * 255), @intFromFloat(c[2] * 255), 255 };
+}
+
+fn radioPanel(v: *View, ctx: Ctx, rect: Rect, now: u64) !void {
+    const st = &v.radio;
+    _ = try st.prepare(v.gpa, v.redact, now);
+    const p = ctx.p;
+    const t = @import("../../radio/radio.zig").fsx.monotonicNs();
+    const right_w = std.math.clamp(rect.w * 0.27, 210, 360);
+    const main = Rect{ .x = rect.x, .y = rect.y, .w = rect.w - right_w - 10, .h = rect.h };
+    const side = Rect{ .x = main.x + main.w + 10, .y = rect.y, .w = right_w, .h = rect.h };
+    const r = st.report;
+    const ch = st.chan;
+
+    // Verdict: the detector's words, then the channel verdict.
+    const head = Rect{ .x = main.x, .y = main.y, .w = main.w, .h = 96 };
+    try ctx.panel(head);
+    var fb: [96]u8 = undefined;
+    const focus_text = if (st.focus) |f| (std.fmt.bufPrint(&fb, "{s} {d:.0}-{d:.0} MHz · double-click: sweep", .{ if (st.fixed) "FIXED" else "FOCUS", f[0], f[1] }) catch "") else "SWEEP · drag to focus";
+    try ctx.textFit(head.x + 12, head.y + 7, head.w * 0.45, "Is it the microwave?", p.dim);
+    try ctx.textRightFit(head.x + head.w - 12, head.y + 7, head.w * 0.5, focus_text, if (st.focus != null) p.accent else p.dim);
+    const words = if (r) |x| x.words else st.status;
+    const hot = if (r) |x| std.mem.eql(u8, x.kind, "microwave_pulsed") or std.mem.eql(u8, x.kind, "continuous_wideband") else false;
+    try ctx.wrap(.{ .x = head.x + 12, .y = head.y + 28, .w = head.w - 24, .h = 40 }, words, if (hot) p.warn else p.text);
+    v.hover(.{ .x = head.x, .y = head.y, .w = head.w, .h = 68 }, "{s}", .{words});
+    if (ch) |c| {
+        try ctx.textFit(head.x + 12, head.y + 70, head.w - 24, c.words, if (c.blast != null) p.crit else p.dim);
+        v.hover(.{ .x = head.x, .y = head.y + 68, .w = head.w, .h = 28 }, "{s}", .{c.words});
+    }
+
+    const link = r != null and r.?.link.iface != null;
+    const lane_h: f32 = 46;
+    const lanes_h: f32 = if (link) 2 * (lane_h + 6) else 0;
+    const traffic_h: f32 = 62;
+    const rest = main.h - head.h - 8 - traffic_h - 6 - lanes_h;
+    const spec_h = @max(130, rest * 0.46);
+    const spec = Rect{ .x = main.x, .y = head.y + head.h + 8, .w = main.w, .h = spec_h };
+    const strip = Rect{ .x = main.x, .y = spec.y + spec.h + 8, .w = main.w, .h = @max(80, rest - spec_h - 8) };
+    const traffic = Rect{ .x = main.x, .y = strip.y + strip.h + 6, .w = main.w, .h = traffic_h };
+    const plot_x = main.x + 66;
+    const plot_w = main.w - 78;
+
+    try radioSpectrum(v, ctx, spec, plot_x, plot_w, t);
+    if (st.mode == .channels) try radioStrip(v, ctx, strip, plot_x, plot_w, t) else try radioWaterfall(v, ctx, strip);
+    try radioTraffic(v, ctx, traffic, plot_x, plot_w);
+    if (link) {
+        var y = traffic.y + traffic.h + 6;
+        const lane_x = plot_x;
+        const link_why = r.?.link.ping_why;
+        try radioLane(v, ctx, .{ .x = main.x, .y = y, .w = main.w, .h = lane_h }, lane_x, plot_w, "ping (sent)", &st.rtt, &st.lost, 0, null, if (r.?.ping.sent == 0) (if (link_why.len > 0) link_why else "no pings") else "", p.accent2);
+        y += lane_h + 6;
+        try radioLane(v, ctx, .{ .x = main.x, .y = y, .w = main.w, .h = lane_h }, lane_x, plot_w, "signal", &st.signal, null, -95, -20, if (r.?.link.samples == 0) (if (r.?.link.why.len > 0) r.?.link.why else "no link") else "", p.accent3);
+    }
+    try radioSide(v, ctx, side);
+}
+
+/// Colours of what the detector says each MHz is.
+fn radioClass(p: *const @import("theme.zig").Palette, c: rp.radio.channels.Class) Color {
+    return switch (c) {
+        .mains_pulsed => p.crit,
+        .continuous => p.warn,
+        .wifi_like => p.accent,
+        .hopping => p.accent2,
+        .other => p.accent3,
+        .quiet, .unseen => draw.mix(p.panel, p.dim, 0.55),
+    };
+}
+fn rgba(c: Color, alpha: f32) [4]u8 {
+    return .{ @intFromFloat(std.math.clamp(c[0], 0, 1) * 255), @intFromFloat(std.math.clamp(c[1], 0, 1) * 255), @intFromFloat(std.math.clamp(c[2], 0, 1) * 255), @intFromFloat(std.math.clamp(c[3] * alpha, 0, 1) * 255) };
+}
+
+/// The total-energy spectrum: x = frequency (the view's span), y = dBm per FFT bin.
+fn radioSpectrum(v: *View, ctx: Ctx, box: Rect, plot_x: f32, plot_w: f32, t: u64) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    try ctx.panel(box);
+    const plot = Rect{ .x = plot_x, .y = box.y + 30, .w = plot_w, .h = box.h - 30 - 24 };
+    st.spec_plot = plot;
+    // Title, legend and the live pulse.
+    const fresh = t -| st.live_ns < 600_000_000 and st.live_ns != 0;
+    var tb: [96]u8 = undefined;
+    const rate = if (st.report) |x| x.spectral.rate_hz else 0;
+    const title = std.fmt.bufPrint(&tb, "energy · {d:.1}k/s", .{rate / 1000}) catch "";
+    const title_w = @min(ctx.measure(title), box.w * 0.30);
+    try ctx.textFit(box.x + 12, box.y + 6, title_w, title, p.dim);
+    const legend = [_]struct { c: rp.radio.channels.Class, name: []const u8 }{ .{ .c = .mains_pulsed, .name = "mains-pulsed" }, .{ .c = .continuous, .name = "continuous" }, .{ .c = .wifi_like, .name = "Wi-Fi-like" }, .{ .c = .hopping, .name = "hopping" }, .{ .c = .other, .name = "other" }, .{ .c = .quiet, .name = "quiet" } };
+    var lx = box.x + box.w - 70;
+    var li: usize = legend.len;
+    while (li > 0) {
+        li -= 1;
+        const w = ctx.measure(legend[li].name) + 22;
+        if (lx - w < box.x + 12 + title_w + 16) break;
+        lx -= w;
+        try ctx.r.rect(.{ .x = lx, .y = box.y + 11, .w = 9, .h = 9 }, radioClass(p, legend[li].c));
+        try ctx.text(lx + 12, box.y + 6, legend[li].name, p.dim);
+    }
+    // The live pulse: a ring that expands while samples land.
+    const cx = box.x + box.w - 52;
+    const cy = box.y + 15;
+    if (fresh) {
+        const phase = @as(f32, @floatFromInt(t % 900_000_000)) / 900_000_000;
+        try ctx.arc(cx, cy, 3 + 7 * phase, 1.5, 0, std.math.pi * 2, draw.fade(p.ok, 1 - phase));
+        try ctx.arc(cx, cy, 2, 2, 0, std.math.pi * 2, p.ok);
+    } else try ctx.arc(cx, cy, 2, 2, 0, std.math.pi * 2, p.dim);
+    try ctx.text(cx + 10, box.y + 6, if (fresh) "live" else "idle", if (fresh) p.ok else p.dim);
+
+    const saved = ctx.r.clip;
+    ctx.r.clip = draw.intersect(saved, plot);
+    defer ctx.r.clip = saved;
+    // dB grid.
+    const yAt = struct {
+        fn f(pl: Rect, dbm: f32) f32 {
+            return pl.y + pl.h * (1 - std.math.clamp((dbm - rp.spec_floor_dbm) / (rp.spec_top_dbm - rp.spec_floor_dbm), 0, 1));
+        }
+    }.f;
+    for ([_]f32{ -100, -80, -60 }) |d| try ctx.r.rect(.{ .x = plot.x, .y = yAt(plot, d), .w = plot.w, .h = 1 }, draw.fade(p.grid, 0.5));
+    // The 14 channel masks beneath: 22 MHz at their true centres, overlapping; 1, 6 and 11 brighter.
+    for (1..15) |c| {
+        const fc: f32 = @floatFromInt(rp.sweep.channelMhz(@intCast(c)));
+        if (fc + 11 < st.view[0] or fc - 11 > st.view[1]) continue;
+        const main_ch = c == 1 or c == 6 or c == 11;
+        const top = plot.y + plot.h * (if (main_ch) @as(f32, 0.30) else 0.42);
+        const col = if (main_ch) draw.fade(p.dim, 0.55) else draw.fade(p.border, 0.7);
+        const pts = [_]?[2]f32{ .{ st.xAt(plot, fc - 11), plot.y + plot.h }, .{ st.xAt(plot, fc - 9), top }, .{ st.xAt(plot, fc + 9), top }, .{ st.xAt(plot, fc + 11), plot.y + plot.h } };
+        try ctx.polyline(&pts, 1, col, false);
+    }
+    // The blast band: where the interferer's own energy is.
+    if (st.chan) |c| if (c.blast) |b| {
+        const x0 = st.xAt(plot, @floatFromInt(b.lo_mhz));
+        const x1 = st.xAt(plot, @floatFromInt(b.hi_mhz));
+        try ctx.r.rect(.{ .x = x0, .y = plot.y, .w = x1 - x0, .h = plot.h }, draw.fade(p.crit, 0.07));
+        try ctx.r.rect(.{ .x = x0, .y = plot.y, .w = x1 - x0, .h = 3 }, p.crit);
+    };
+    // Bars (springing after a focus), peak-hold ticks, coloured by class, faded by age.
+    const revisit_ns: u64 = if (st.plan) |pl| @as(u64, pl.plan.revisitMs()) * 1_000_000 else 0;
+    var n: usize = 0;
+    for (st.live) |x| n += 2 * @as(usize, @intFromBool(x != null));
+    const cells = try ctx.r.cells(n);
+    var k: usize = 0;
+    var ghost: [rp.max_rows]?[2]f32 = @splat(null);
+    for (0..rp.max_rows) |row| {
+        if (st.live[row] == null) continue;
+        const f0 = rp.grid_lo_mhz + @as(f32, @floatFromInt(row)) * @import("../../radio/ath9k.zig").bin_mhz;
+        const f1 = f0 + @import("../../radio/ath9k.zig").bin_mhz;
+        const x0 = st.xAt(plot, f0);
+        const x1 = st.xAt(plot, f1);
+        const bucket: usize = @intFromFloat(std.math.clamp(f0 + 0.17 - 2400, 0, 99));
+        const age = t -| st.last_ns[row];
+        const alpha: f32 = if (age <= revisit_ns + 1_200_000_000) 1 else std.math.clamp(1 - @as(f32, @floatFromInt(age - revisit_ns - 1_200_000_000)) / 12e9, 0.28, 1);
+        const col = radioClass(p, st.buckets[bucket].class);
+        const yv = yAt(plot, st.disp[row]);
+        cells[k] = .{ .rect = .{ x0, yv, @max(1, x1 - x0 - 0.4), plot.y + plot.h - yv }, .fill = rgba(col, 0.85 * alpha), .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+        const yp = yAt(plot, st.peak[row] orelse st.disp[row]);
+        cells[k + 1] = .{ .rect = .{ x0, yp - 1, @max(1, x1 - x0 - 0.4), 2 }, .fill = rgba(draw.mix(col, p.text, 0.5), alpha), .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+        k += 2;
+        if (st.ghost[row]) |g| ghost[row] = .{ (x0 + x1) / 2, yAt(plot, g) };
+    }
+    try ctx.polyline(&ghost, 1, draw.fade(p.text, 0.3), false);
+    // Each swept window's age, above it (a label that would touch the last one is left out).
+    var age_right: f32 = -1e9;
+    if (st.plan) |pl| if (pl.plan.revisitMs() > 0) for (pl.plan.windows.list()) |w| {
+        const row: usize = @intFromFloat((@as(f32, @floatFromInt(w)) - rp.grid_lo_mhz) / @import("../../radio/ath9k.zig").bin_mhz);
+        if (row >= rp.max_rows or st.last_ns[row] == 0) continue;
+        const x = st.xAt(plot, @floatFromInt(w));
+        if (x < plot.x + 14 or x > plot.x + plot.w - 14) continue;
+        var ab: [16]u8 = undefined;
+        const s = std.fmt.bufPrint(&ab, "{d:.1}s", .{@as(f32, @floatFromInt(t -| st.last_ns[row])) / 1e9}) catch "";
+        const ax = x - ctx.measure(s) / 2;
+        if (ax < age_right + 16 or plot.w * 15 / (st.view[1] - st.view[0]) < 60) continue;
+        age_right = ax + ctx.measure(s);
+        try ctx.text(ax, plot.y + 4, s, p.dim);
+    };
+    // The focus and the drag.
+    if (st.focus) |f| for ([_]f32{ f[0], f[1] }) |edge| try ctx.r.rect(.{ .x = st.xAt(plot, edge), .y = plot.y, .w = 1.5, .h = plot.h }, p.accent);
+    if (st.drag) |d| try ctx.r.rect(.{ .x = @min(d.x0, d.x1), .y = plot.y, .w = @abs(d.x1 - d.x0), .h = plot.h }, draw.fade(p.accent, 0.22));
+    if (n == 0) {
+        try ctx.hatchLight(plot);
+        try ctx.wrap(.{ .x = plot.x + 10, .y = plot.y + 10, .w = plot.w - 20, .h = plot.h - 20 }, st.status, p.dim);
+    } else if (st.stall.len > 0) {
+        // The stream stopped: say so over the (stale) bars, never just freeze.
+        try ctx.r.rect(.{ .x = plot.x + 6, .y = plot.y + 20, .w = plot.w - 12, .h = 24 }, draw.fade(p.panel, 0.85));
+        try ctx.textFit(plot.x + 12, plot.y + 23, plot.w - 24, st.stall, p.crit);
+    }
+    ctx.r.clip = saved;
+    // Axes: dBm left, channel numbers under the masks, the span's ends.
+    var b: [16]u8 = undefined;
+    for ([_]f32{ -60, -100 }) |d| try ctx.textRight(plot.x - 6, yAt(plot, d) - 9, std.fmt.bufPrint(&b, "{d:.0}", .{d}) catch "", p.dim);
+    try ctx.textFit(box.x + 6, plot.y + plot.h / 2 - 9, 40, "dBm", p.dim);
+    const spacing = plot.w * 5 / (st.view[1] - st.view[0]);
+    for (1..15) |c| {
+        const fc: f32 = @floatFromInt(rp.sweep.channelMhz(@intCast(c)));
+        const x = st.xAt(plot, fc);
+        if (x < plot.x + 4 or x > plot.x + plot.w - 4) continue;
+        if (spacing < 16 and c != 1 and c != 6 and c != 11 and c != 14) continue;
+        const s = std.fmt.bufPrint(&b, "{d}", .{c}) catch "";
+        try ctx.text(x - ctx.measure(s) / 2, plot.y + plot.h + 3, s, if (c == 1 or c == 6 or c == 11) p.text else p.dim);
+    }
+    if (draw.inside(plot, v.pointer[0], v.pointer[1])) {
+        const f = st.freqAt(v.pointer[0]);
+        const row: usize = @intFromFloat(std.math.clamp((f - rp.grid_lo_mhz) / @import("../../radio/ath9k.zig").bin_mhz, 0, rp.max_rows - 1));
+        const bucket = st.buckets[@intFromFloat(std.math.clamp(f - 2400, 0, 99))];
+        v.hover(plot, "{d:.1} MHz: {s}, {d:.0} dBm now, peak {d:.0}, seen {d:.1} s ago. Drag to focus the sensors on a span; double-click for the full sweep.", .{ f, @tagName(bucket.class), st.live[row] orelse rp.spec_floor_dbm, st.peak[row] orelse rp.spec_floor_dbm, @as(f32, @floatFromInt(t -| st.last_ns[row])) / 1e9 });
+    }
+}
+
+/// The 14-channel strip: one lane per channel at its true centre (5 MHz
+/// apart; the masks above show the overlap), newest row on top. Cells that
+/// measured nothing carry the last value, faded.
+fn radioStrip(v: *View, ctx: Ctx, box: Rect, plot_x: f32, plot_w: f32, t: u64) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    try ctx.panel(box);
+    try radioChips(v, ctx, box);
+    const plot = Rect{ .x = plot_x, .y = box.y + 70, .w = plot_w, .h = box.h - 70 - 8 };
+    st.strip_plot = plot;
+    // Channel numbers, data age and the blast bracket.
+    const lane = @max(2, plot.w * 5 / (st.view[1] - st.view[0]) - 2);
+    var b: [24]u8 = undefined;
+    if (st.chan) |c| {
+        var lo: ?f32 = null;
+        var hi: f32 = 0;
+        for (c.channels) |cc| if (cc.impact == .blasted or cc.impact == .grazed) {
+            const x = st.xAt(plot, @floatFromInt(cc.centre_mhz));
+            if (lo == null) lo = x - lane / 2;
+            hi = x + lane / 2;
+            try ctx.r.rect(.{ .x = x - lane / 2, .y = plot.y - 6, .w = lane, .h = 4 }, if (cc.impact == .blasted) p.crit else draw.fade(p.warn, 0.7));
+        };
+        if (lo) |l| if (c.blast) |bl| {
+            // "blast" only for mains-pulsed energy; anything else is just continuous.
+            const label = if (bl.kind != .microwave_pulsed) "continuous, not pulsed" else if (bl.mains_hz) |hz| (std.fmt.bufPrint(&b, "{d} Hz blast", .{hz}) catch "") else "blast";
+            const lx = std.math.clamp((l + hi) / 2 - ctx.measure(label) / 2, plot.x, @max(plot.x, plot.x + plot.w - ctx.measure(label)));
+            try ctx.text(lx, plot.y - 44, label, p.crit);
+        };
+    }
+    for (1..15) |c| {
+        const fc: f32 = @floatFromInt(rp.sweep.channelMhz(@intCast(c)));
+        const x = st.xAt(plot, fc);
+        if (x < plot.x - 2 or x > plot.x + plot.w + 2) continue;
+        if (lane < 13 and c != 1 and c != 6 and c != 11 and c != 14) continue;
+        const s = std.fmt.bufPrint(&b, "{d}", .{c}) catch "";
+        try ctx.text(x - ctx.measure(s) / 2, plot.y - 24, s, if (c == 1 or c == 6 or c == 11) p.text else p.dim);
+    }
+    // Cells, oldest to newest so empty cells can carry the last value.
+    const rows: usize = @min(rp.strip_rows, @max(10, @as(usize, @intFromFloat(plot.h / 3))));
+    const row_h = plot.h / @as(f32, @floatFromInt(rows));
+    const newest = t / rp.strip_row_ns;
+    var last: [14]?f32 = @splat(null);
+    var last_id: [14]u64 = @splat(0);
+    const saved_clip = ctx.r.clip;
+    ctx.r.clip = draw.intersect(saved_clip, plot);
+    const cells = try ctx.r.cells(rows * 14);
+    ctx.r.clip = saved_clip;
+    var k: usize = 0;
+    var hover_text: ?struct { c: usize, ago: f32, v: ?f32, carried: bool } = null;
+    var r_i: usize = rows;
+    while (r_i > 0) {
+        r_i -= 1;
+        const id = newest -| r_i;
+        const y = plot.y + @as(f32, @floatFromInt(r_i)) * row_h;
+        const row = st.stripRow(id);
+        for (0..14) |c| {
+            const fc: f32 = @floatFromInt(rp.sweep.channelMhz(@intCast(c + 1)));
+            const x = st.xAt(plot, fc) - lane / 2;
+            var val: ?f32 = if (row) |cs| st.cellValue(&cs[c]) else null;
+            const carried = val == null and last[c] != null;
+            if (val) |x_| {
+                last[c] = x_;
+                last_id[c] = id;
+            } else val = last[c];
+            if (draw.inside(.{ .x = x, .y = y, .w = lane, .h = row_h }, v.pointer[0], v.pointer[1])) hover_text = .{ .c = c + 1, .ago = @as(f32, @floatFromInt(r_i)) * 0.5, .v = val, .carried = carried };
+            const vv = val orelse continue;
+            if (x + lane < plot.x or x > plot.x + plot.w) continue;
+            cells[k] = .{ .rect = .{ x, y, lane, row_h + 0.4 }, .fill = rgba(heatColor(p, st.metricT(vv)), if (carried) 0.32 else 1), .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+            k += 1;
+        }
+    }
+    // Unused cells are invisible.
+    for (cells[k..]) |*cl| cl.* = .{ .rect = .{ 0, 0, 0, 0 }, .fill = @splat(0), .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+    if (st.drag) |d| try ctx.r.rect(.{ .x = @min(d.x0, d.x1), .y = plot.y, .w = @abs(d.x1 - d.x0), .h = plot.h }, draw.fade(p.accent, 0.22));
+    try ctx.textRight(plot.x - 6, plot.y - 2, "now", p.dim);
+    var tb: [16]u8 = undefined;
+    try ctx.textRight(plot.x - 6, plot.y + plot.h - 16, std.fmt.bufPrint(&tb, "-{d:.0}s", .{@as(f32, @floatFromInt(rows)) * 0.5}) catch "", p.dim);
+    if (hover_text) |hv| {
+        const unit: []const u8 = switch (st.metric) {
+            .power, .floor => " dBm",
+            .over_floor => " dB",
+            .busy, .retry => "",
+            .frames => " frames/s",
+        };
+        const pct = st.metric == .busy or st.metric == .retry;
+        v.hover(plot, "channel {d} ({d} MHz) {d:.1} s ago: {s} {d:.1}{s}{s}{s}", .{ hv.c, rp.sweep.channelMhz(@intCast(hv.c)), hv.ago, rp.metric_names[@intFromEnum(st.metric)], if (hv.v) |x| (if (pct) x * 100 else x) else 0, if (pct) "%" else unit, if (hv.carried) " (last measured value: the sweep was elsewhere)" else "", if (hv.v == null) " (not measured)" else "" });
+    } else v.hover(plot, "Channels 1-14 at their true centres; each lane is the channel's 22 MHz mask measured by the window centred nearest it. Faded cells carry the last value while the sweep is elsewhere.", .{});
+}
+
+fn heatColor(p: *const @import("theme.zig").Palette, x: f32) Color {
+    const stops = [_]Color{ draw.mix(p.panel, p.accent, 0.25), p.accent, p.warn, p.crit };
+    const s = std.math.clamp(x, 0, 1) * 3;
+    const i: usize = @min(2, @as(usize, @intFromFloat(s)));
+    return draw.mix(stops[i], stops[i + 1], s - @as(f32, @floatFromInt(i)));
+}
+
+/// Metric chips and the view toggle above the strip.
+fn radioChips(v: *View, ctx: Ctx, box: Rect) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    var x = box.x + 12;
+    const y = box.y + 6;
+    try ctx.text(x, y, if (st.mode == .channels) "channels:" else "waterfall:", p.dim);
+    x += ctx.measure("waterfall:") + 8;
+    if (st.mode == .channels) for (rp.metric_names, 0..) |name, i| {
+        const w = ctx.measure(name) + 12;
+        if (x + w > box.x + box.w - 110) break;
+        const r = Rect{ .x = x, .y = y - 1, .w = w, .h = 20 };
+        const on = @intFromEnum(st.metric) == i;
+        try ctx.r.rect(r, if (on) draw.fade(p.accent, 0.3) else draw.fade(p.grid, 0.4));
+        try ctx.text(x + 6, y, name, if (on) p.text else p.dim);
+        v.hit(r, .{ .radio = .{ .metric = @enumFromInt(i) } });
+        x += w + 4;
+    };
+    const label = if (st.mode == .channels) "waterfall" else "channels";
+    const w = ctx.measure(label) + 12;
+    const r = Rect{ .x = box.x + box.w - w - 12, .y = y - 1, .w = w, .h = 20 };
+    try ctx.r.rect(r, draw.fade(p.grid, 0.4));
+    try ctx.text(r.x + 6, y, label, p.dim);
+    v.hit(r, .{ .radio = .{ .mode = if (st.mode == .channels) .waterfall else .channels } });
+}
+
+/// Per-channel traffic from the monitor card: frames/s (height), retries (colour).
+fn radioTraffic(v: *View, ctx: Ctx, box: Rect, plot_x: f32, plot_w: f32) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    try ctx.panel(box);
+    try ctx.textFit(box.x + 6, box.y + box.h / 2 - 9, plot_x - box.x - 8, "traffic", p.dim);
+    const area = Rect{ .x = plot_x, .y = box.y + 5, .w = plot_w, .h = box.h - 10 };
+    const c = st.chan orelse return;
+    if (!c.traffic.on) {
+        try ctx.hatchLight(area);
+        try ctx.textFit(area.x + 8, area.y + area.h / 2 - 9, area.w - 16, "no traffic card: --radio-traffic NAME (a spare monitor-capable card, root; counts only)", p.dim);
+        return;
+    }
+    var top: f32 = 1;
+    for (c.channels) |cc| if (cc.traffic) |tr| {
+        top = @max(top, tr.frames_ps);
+    };
+    const lane = @max(2, plot_w * 5 / (st.view[1] - st.view[0]) - 2);
+    var b: [16]u8 = undefined;
+    for (c.channels) |cc| {
+        const x = st.xAt(area, @floatFromInt(cc.centre_mhz)) - lane / 2;
+        if (x + lane < area.x or x > area.x + area.w) continue;
+        const tr = cc.traffic orelse {
+            try ctx.r.rect(.{ .x = x, .y = area.y + area.h - 2, .w = lane, .h = 2 }, draw.fade(p.dim, 0.4));
+            continue;
+        };
+        const bar = (area.h - 16) * @log10(1 + tr.frames_ps) / @log10(1 + top);
+        const retry = tr.retry orelse 0;
+        const col = if (retry >= 0.25 or tr.bad_fcs_ps >= 5) p.crit else if (retry >= 0.12) p.warn else p.ok;
+        try ctx.r.rect(.{ .x = x, .y = area.y + area.h - bar, .w = lane, .h = bar }, draw.fade(col, 0.8));
+        if (lane >= 26) {
+            const s = std.fmt.bufPrint(&b, "{d:.0}", .{tr.frames_ps}) catch "";
+            const tx = x + lane / 2 - ctx.measure(s) / 2;
+            if (tx >= area.x and tx + ctx.measure(s) <= area.x + area.w) try ctx.text(tx, area.y - 1, s, p.dim);
+        }
+        if (draw.inside(.{ .x = x, .y = area.y, .w = lane, .h = area.h }, v.pointer[0], v.pointer[1]))
+            v.hover(area, "channel {d}: {d:.0} frames/s, ~{d:.0}% airtime, {d:.0}% retries, {d:.1} bad-FCS frames/s, {d}{s} networks and {d} stations seen over {d:.1} s of listening (counts only; addresses hashed in memory)", .{ cc.channel, tr.frames_ps, tr.airtime * 100, retry * 100, tr.bad_fcs_ps, tr.networks, if (tr.at_least) "+" else "", tr.stations, tr.watched_s });
+    }
+}
+
+/// R2's waterfall (time across, frequency up), the other view of the strip area.
+fn radioWaterfall(v: *View, ctx: Ctx, wf: Rect) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    try ctx.panel(wf);
+    try radioChips(v, ctx, wf);
+    const plot = Rect{ .x = wf.x + 92, .y = wf.y + 30, .w = wf.w - 104, .h = wf.h - 52 };
+    st.strip_plot = plot;
+    if (st.rows > 0) {
+        var n: usize = 0;
+        const shown = st.cells[0 .. rp.columns * st.rows];
+        for (shown) |cl| n += @intFromBool(cl != null);
+        const out = try ctx.r.cells(n);
+        const cw = plot.w / rp.columns;
+        const rh = plot.h / @as(f32, @floatFromInt(st.rows));
+        var k: usize = 0;
+        for (shown, 0..) |cl, i| if (cl) |dbm| {
+            const col: f32 = @floatFromInt(i / st.rows);
+            const row: f32 = @floatFromInt(i % st.rows);
+            out[k] = .{ .rect = .{ plot.x + col * cw, plot.y + plot.h - (row + 1) * rh, cw + 0.5, rh + 0.5 }, .fill = radioHeat(p, dbm), .accent = @splat(0), .overlay = @splat(0), .kind = 0 };
+            k += 1;
+        };
+        var b: [32]u8 = undefined;
+        try ctx.textFit(wf.x + 10, plot.y - 2, 76, std.fmt.bufPrint(&b, "{d:.0}", .{st.hi_mhz}) catch "", p.dim);
+        try ctx.textFit(wf.x + 10, plot.y + plot.h - 16, 76, std.fmt.bufPrint(&b, "{d:.0}", .{st.lo_mhz}) catch "", p.dim);
+        try ctx.textFit(wf.x + 10, plot.y + plot.h / 2 - 8, 76, "MHz", p.dim);
+        v.hover(plot, "Mean power per cell, dBm: dark = noise floor, hot = strong. {d} samples in the window", .{if (st.report) |x| x.spectral.window_samples else 0});
+    } else {
+        try ctx.hatchLight(plot);
+        try ctx.wrap(.{ .x = plot.x + 10, .y = plot.y + 10, .w = plot.w - 20, .h = plot.h - 20 }, st.status, p.dim);
+    }
+    try ctx.textFit(plot.x, wf.y + wf.h - 20, 80, "-30 s", p.dim);
+    try ctx.textRight(plot.x + plot.w, wf.y + wf.h - 20, "now", p.dim);
+}
+
+/// The sensors' plan, the pulse strip, the numbers, traffic, advice and the cards.
+fn radioSide(v: *View, ctx: Ctx, side: Rect) !void {
+    const st = &v.radio;
+    const p = ctx.p;
+    const r = st.report;
+    try ctx.panel(side);
+    var sy = side.y + 8;
+    const sx = side.x + 12;
+    const sw = side.w - 24;
+    const bottom = side.y + side.h - 6;
+    if (r) |x| if (x.plan.len > 0) {
+        try ctx.wrap(.{ .x = sx, .y = sy, .w = sw, .h = 60 }, x.plan, p.text);
+        v.hover(.{ .x = sx, .y = sy, .w = sw, .h = 60 }, "Where the spectral sensors listen. {s}", .{x.plan});
+        sy += 64;
+    };
+    try ctx.textFit(sx, sy, sw, "drag: focus · dbl-click/Esc: sweep · f: fixed · [ ]: metric", p.dim);
+    sy += 24;
+    try ctx.textFit(sx, sy, sw, "last 100 ms (mains pulses repeat every 16.7 or 20 ms)", p.dim);
+    sy += 22;
+    const strip = Rect{ .x = sx, .y = sy, .w = sw, .h = 36 };
+    try ctx.r.rect(strip, draw.fade(p.grid, 0.4));
+    var any = false;
+    for (st.pulse, 0..) |pp, i| if (pp) |dbm| {
+        any = true;
+        const tt = std.math.clamp((dbm + 100) / 60, 0, 1);
+        const bw = strip.w / 200;
+        try ctx.r.rect(.{ .x = strip.x + @as(f32, @floatFromInt(i)) * bw, .y = strip.y + strip.h * (1 - tt), .w = bw + 0.3, .h = strip.h * tt }, p.warn);
+    };
+    if (!any) try ctx.hatchLight(strip);
+    sy += 44;
+    var b: [160]u8 = undefined;
+    if (r) |x| {
+        const vv = x.verdict;
+        try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(b[0..80], "{s} · confidence {d:.2}", .{ x.kind, x.confidence }) catch "", p.text);
+        sy += 20;
+        try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(b[80..160], "{d} samples/s · {d} in window", .{ @as(u32, @intFromFloat(x.spectral.rate_hz)), x.spectral.window_samples }) catch "", p.text);
+        sy += 20;
+        var c1: [96]u8 = undefined;
+        try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(&c1, "60 Hz r={d:.2} · 50 Hz r={d:.2} · active {d:.0}%", .{ vv.r60, vv.r50, vv.active * 100 }) catch "", p.dim);
+        sy += 20;
+        for (x.tx_cards) |tc| {
+            try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(&c1, "{s} TX {d} -> {?d} packets: {s}", .{ tc.iface, tc.packets_before, tc.packets_now, if (tc.flat) "flat" else "MOVED" }) catch "", if (tc.flat) p.ok else p.crit);
+            sy += 20;
+        }
+        if (x.ping.loss) |l| {
+            try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(&c1, "ping loss {d:.1}% · median {d:.1} ms", .{ l * 100, x.ping.rtt_median_ms orelse 0 }) catch "", p.text);
+            sy += 20;
+        }
+    }
+    if (st.chan) |c| {
+        for ([_][]const u8{ c.advice, c.traffic_words }) |line| if (line.len > 0 and sy + 44 <= bottom) {
+            try ctx.wrap(.{ .x = sx, .y = sy, .w = sw, .h = 40 }, line, p.dim);
+            v.hover(.{ .x = sx, .y = sy, .w = sw, .h = 40 }, "{s}", .{line});
+            sy += 44;
+        };
+    }
+    sy += 4;
+    try ctx.r.rect(.{ .x = sx, .y = sy, .w = sw, .h = 1 }, p.border);
+    sy += 8;
+    if (sy + 22 > bottom) return;
+    try ctx.textFit(sx, sy, sw, "Cards", p.dim);
+    sy += 22;
+    if (st.cards) |cs| {
+        for (cs.cards) |rc| {
+            if (sy + 64 > bottom) break;
+            var c2: [96]u8 = undefined;
+            const col = if (std.mem.eql(u8, rc.role, "in_use")) p.accent2 else if (std.mem.eql(u8, rc.role, "spare")) p.ok else p.dim;
+            try ctx.textFit(sx, sy, sw, std.fmt.bufPrint(&c2, "{s} · {s} · {s}", .{ rc.interface, rc.driver, rc.role }) catch "", col);
+            sy += 20;
+            try ctx.wrap(.{ .x = sx + 8, .y = sy, .w = sw - 8, .h = 40 }, rc.contributes, p.dim);
+            v.hover(.{ .x = sx, .y = sy - 20, .w = sw, .h = 60 }, "{s}: {s}", .{ rc.interface, rc.refusal orelse rc.why });
+            sy += 44;
+        }
+        if (sy + 40 <= bottom) try ctx.wrap(.{ .x = sx, .y = sy, .w = sw, .h = bottom - sy }, cs.needs, p.dim);
+    }
+}
+
+fn radioLane(v: *View, ctx: Ctx, outer: Rect, x0: f32, w: f32, label: []const u8, values: *const [rp.columns]?f32, lost: ?*const [rp.columns]u16, lo: f32, hi_fixed: ?f32, why: []const u8, color: Color) !void {
+    try ctx.panel(outer);
+    try ctx.textFit(outer.x + 6, outer.y + outer.h / 2 - 9, x0 - outer.x - 8, label, ctx.p.dim);
+    const area = Rect{ .x = x0, .y = outer.y + 5, .w = w, .h = outer.h - 10 };
+    if (why.len > 0) {
+        try ctx.hatchLight(area);
+        try ctx.textFit(area.x + 8, area.y + area.h / 2 - 9, area.w - 16, why, ctx.p.dim);
+        v.hover(area, "Unavailable: {s}", .{why});
+        return;
+    }
+    var hi: f32 = hi_fixed orelse 1;
+    if (hi_fixed == null) for (values) |x| if (x) |y| {
+        hi = @max(hi, y * 1.2);
+    };
+    var pts: [rp.columns]?[2]f32 = undefined;
+    const cw = area.w / rp.columns;
+    for (values, &pts, 0..) |x, *pt, i| pt.* = if (x) |y| .{ area.x + (@as(f32, @floatFromInt(i)) + 0.5) * cw, area.y + area.h * (1 - std.math.clamp((y - lo) / (hi - lo), 0, 1)) } else null;
+    try ctx.polyline(&pts, 1.5, color, false);
+    if (lost) |l| for (l, 0..) |n, i| if (n > 0) {
+        try ctx.r.rect(.{ .x = area.x + @as(f32, @floatFromInt(i)) * cw, .y = area.y, .w = @max(1, cw), .h = 6 }, ctx.p.crit);
+    };
+    var b: [32]u8 = undefined;
+    try ctx.textRight(area.x + area.w, area.y - 2, std.fmt.bufPrint(&b, "{d:.0}", .{hi}) catch "", ctx.p.dim);
+    v.hover(area, "{s} over the last 30 s (band: max channel power, dBm; ping: gateway round trip, ms; signal: link dBm){s}", .{ label, if (lost != null) "; red ticks: lost pings" else "" });
 }

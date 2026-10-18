@@ -127,7 +127,7 @@ try:
     names = {x['name'] for x in definitions}
     expected = {'get_overview','get_process','list_processes','get_connections','get_sensors','get_memory_map','get_thp_state','get_fragmentation',
                 'get_fd_activity','who_has_open','get_fd_leaks','get_deleted_open','get_fd_inheritance','get_fd_treemap',
-                'get_history','get_process_groups','get_graph','get_layout'}
+                'get_history','get_process_groups','get_graph','get_layout','list_radios','radio_interference','radio_channels'}
     requests = {'request_system_capture', 'cancel_system_capture'}
     expected |= requests | {'get_system_capture', 'get_system_capture_result'}
     check('overview exposes observers and capture requests, not general control', names == expected and all(x['annotations']['readOnlyHint'] == (x['name'] not in requests) for x in definitions))

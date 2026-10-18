@@ -497,6 +497,9 @@ pub const Target = struct {
     pub fn suppressSignal(self: *Target, tid: i32) !void {
         try runtime.check(rt.xrt_target_signal_suppress(try self.get(), tid));
     }
+    pub fn clearStop(self: *Target, tid: i32, address: u64) !void {
+        try runtime.check(rt.xrt_target_clear_stop(try self.get(), tid, address));
+    }
     pub fn resolveBreakpoint(self: *Target, id: u64, address: u64) !void {
         try runtime.check(rt.xrt_target_breakpoint_resolve(try self.get(), id, address));
     }

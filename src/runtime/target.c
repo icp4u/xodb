@@ -464,6 +464,26 @@ enum xrt_status xrt_target_control_write(struct xrt_target *t, int32_t tid,
     finish_mutation(t, tid, status, result);
     return status;
 }
+enum xrt_status xrt_target_clear_stop(struct xrt_target *t, int32_t tid, uint64_t address)
+{
+    if (!t)
+        return XRT_INVALID_ARGUMENT;
+    if (t->connection)
+        return xrt_remote_call(
+            t, &(struct xrt_call){.op = XRT_RPC_CLEAR_STOP, .args = {(uint32_t)tid, address}});
+    const int i = xrt_thread_index(t, tid);
+    if (i < 0)
+        return XRT_UNKNOWN_THREAD;
+    if (t->core)
+        return XRT_READ_ONLY_CORE;
+    if (t->threads[i].state != XRT_STOPPED)
+        return XRT_NOT_STOPPED;
+    if (t->threads[i].reason == XRT_STOP_BREAKPOINT && t->threads[i].breakpoint_address == address) {
+        t->threads[i].reason = XRT_STOP_INTERRUPT;
+        ++t->generation;
+    }
+    return XRT_OK;
+}
 enum xrt_status xrt_target_signal_suppress(struct xrt_target *t, int32_t tid)
 {
     if (t && t->connection)

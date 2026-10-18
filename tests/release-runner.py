@@ -535,14 +535,15 @@ class RunnerTests(unittest.TestCase):
                 ('src/profile/flame.zig', ('m2-profile', 'm2-archive', 'gui-profile', 'gui-flame-status'), 'lua-named-gui-0'),
                 ('tests/perl-gui.py', ('perl-gui-fixtures', 'perl-gui'), 'perl-named-gui'),
                 ('tests/memory-search-speed.py', ('memory-search-speed', 'memory-search-speed-agent'), 'mcp'),
-                ('docs/GUIDE.md', ('package-source',), 'mcp')):
+                ('docs/GUIDE.md', ('package-source',), 'mcp'),
+                ('src/model/session.zig', ('go-language', 'go-language-agent', 'run-control', 'gui-run-control'), 'mcp')):
             names, lines = chosen(changed)
             self.assertTrue(set(required) <= set(names), (changed, sorted(set(required) - set(names))))
             self.assertNotIn(absent, names, changed)
             self.assertNotIn('not mapped', lines[0])
             self.assertEqual(names, [step.name for step in steps if step.name in names])  # plan order
         # No step covers these: the whole gui tier runs, beside what is mapped.
-        for unmapped in ('src/model/session.zig', 'src/ui/workspace.zig', 'build.zig', 'brand-new-file'):
+        for unmapped in ('src/ui/workspace.zig', 'build.zig', 'brand-new-file'):
             names, lines = chosen(unmapped, 'src/mcp/memory.zig')
             self.assertIn('not mapped, so the full gui tier', lines[0])
             self.assertTrue(set(fallback) <= set(names), unmapped)

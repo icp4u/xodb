@@ -433,6 +433,11 @@ pub fn build(b: *std.Build) void {
     for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/log.c", "tests/runtime-gdb-link.c" }) |source|
         gdb_link_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
     b.installArtifact(gdb_link_tests);
+    const debugserver_tests = b.addExecutable(.{ .name = "xodb-debugserver-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
+    debugserver_tests.root_module.addIncludePath(b.path("src/runtime"));
+    for ([_][]const u8{ "src/runtime/cancel.c", "src/runtime/gdb_packet.c", "src/runtime/gdb_link.c", "src/runtime/macos_debugserver.c", "src/runtime/log.c", "tests/runtime-debugserver.c" }) |source|
+        debugserver_tests.root_module.addCSourceFile(.{ .file = b.path(source), .flags = &.{ "-std=c11", "-UNDEBUG", "-Wall", "-Wextra", "-Werror", "-Wswitch-enum" } });
+    b.installArtifact(debugserver_tests);
     const gdb_description_tests = b.addExecutable(.{ .name = "xodb-gdb-description-test", .root_module = b.createModule(.{ .target = target, .optimize = optimize, .link_libc = true }) });
     gdb_description_tests.root_module.addIncludePath(b.path("src/runtime"));
     for ([_][]const u8{ "src/runtime/arch.c", "src/runtime/gdb_description.c", "tests/runtime-gdb-description.c" }) |source|
@@ -531,6 +536,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&fdgraph_owner_run.step);
     test_step.dependOn(&b.addRunArtifact(gdb_packet_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_link_tests).step);
+    test_step.dependOn(&b.addRunArtifact(debugserver_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_description_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_model_tests).step);
     test_step.dependOn(&b.addRunArtifact(gdb_lldb_tests).step);
@@ -709,7 +715,7 @@ pub fn build(b: *std.Build) void {
         const libdir = b.option([]const u8, "android-lib-dir", "NDK library directory for the selected Android API") orelse
             @panic("Android requires -Dandroid-lib-dir pointing to the NDK API library directory");
         // Android requires PIE; permit both 4 KiB and 16 KiB page kernels.
-        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
+        for ([_]*std.Build.Step.Compile{ exe, fixture, m1, m2, observations, profile, lifecycle, process, fd_fixture, fdscan_tests, fdevent_tests, fdcount_tests, fdactivity_tests, cancel_tests, resolve_tests, gdb_packet_tests, gdb_link_tests, debugserver_tests, gdb_description_tests, gdb_model_tests, fdactivity_live, fdactivity_scope, fd_events, tests, remote_lifecycle_tests, runtime_tests, register_tests, process_tests, target_tests, perf_tests, wire_tests, agent, snapshot_tests, sysstat_tests, sys_services_tests, memstat_system_tests, memstat_process_tests, memstat_cells_tests, memobserver_tests, perl_tests, python_tests, lua_tests, ruby_tests, elisp_tests, go_tests, javascript_tests, javascript_layout_tests }) |artifact| {
             artifact.root_module.addLibraryPath(.{ .cwd_relative = libdir });
             artifact.pie = true;
             artifact.link_z_max_page_size = 16384;

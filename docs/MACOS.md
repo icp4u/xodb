@@ -81,26 +81,50 @@ receives a synthetic TCP publication and tests normal SIGTERM cleanup. It does
 **not** yet test local debugserver, real input, on-screen resize or scanout.
 The retained directory is recorded in `.work/macos-native-remote-dir.txt`.
 
-The next native engine component is `xrt_debugserver_start` (not yet wired into
-the GUI/Session). It discovers debugserver in the selected Xcode, starts launch
-or attach with an OS-assigned loopback port, and returns that endpoint to the
-existing GDB client. Its private Unix handshake uses debugserver's documented
-implementation of [`--unix-socket`](https://github.com/llvm/llvm-project/blob/main/lldb/tools/debugserver/source/debugserver.cpp),
-not a reserve-and-close TCP-port race. The helper has its own process group and
-inherits no session descriptors. The owner must detach/close the GDB connection
-before reaping the helper; this component never signals a target pid. A cleanup
-timeout retains the helper pid rather than claiming success or force-killing it.
+The native local owner uses `xrt_debugserver_start`. It discovers debugserver
+in the selected Xcode and starts
+launch or attach with one end of a private `AF_UNIX` socketpair inherited through
+debugserver's documented [`--fd`](https://github.com/llvm/llvm-project/blob/main/lldb/tools/debugserver/source/debugserver.cpp)
+option. No TCP port is reserved or opened. The caller transfers the other end
+directly into the existing GDB client. The helper has its own process group,
+starts with an empty signal mask and default `SIGTERM`, `SIGINT` and `SIGPIPE`
+dispositions, and inherits no unrelated session descriptors. The owner must
+receive the GDB detach reply before closing the transport and reaping the helper.
+The first packet after adopting the socket is `QSetDetachOnError:1`, requiring
+an OK reply before the ordinary GDB handshake. Upstream debugserver initializes
+`g_detach_on_error` to true and detaches on read-thread exit (see
+[debugserver.cpp](https://github.com/llvm/llvm-project/blob/main/lldb/tools/debugserver/source/debugserver.cpp));
+the packet makes the policy explicit after adoption. The pre-packet owner-death
+window still depends on the installed debugserver's default, tested separately
+by the native bootstrap oracle. A launched target, like an attached one, is
+left running if xodb dies; the launched target then becomes an orphan.
+Unconfirmed detach never races EOF cleanup with a signal. After an actual
+`D/OK` exchange, a helper still alive past the grace period is terminated by
+its exact pid and reaped. An idle/exited no-op detach does not count as that
+protocol confirmation. Any cleanup timeout retains the helper pid rather
+than claiming success.
 The bootstrap currently discards child stdio; target console forwarding is not
 implemented by this component.
 
+All native child spawns, including the SSH shim, use
+`POSIX_SPAWN_CLOEXEC_DEFAULT`. The debugserver executable override is confined
+to component tests; neither MCP nor the session wire supplies it. Window
+close, Cmd-Q and SIGTERM close the window first, then the owning worker sends
+detach and waits for OK before disconnect/reap. Cleanup can take roughly
+20 seconds in the timeout case; it performs no target work on the Cocoa
+thread, and reports any retained helper pid. A GUI Detach publishes `detached`
+and ends polling. Missing symbols/registers are diagnostic observations, not
+automatic detach requests. See [native local scope](MACOS_LOCAL.md) for limits.
+
 `zig build test-debugserver -Doptimize=ReleaseSafe` is an explicit, native-only
-component test. It launches and attaches owned fixtures, checks the helper's
-actual listener is loopback-only, steps using the existing GDB packet/link
-implementation, detaches, checks helper reaping and preserves an attached
-fixture after transport loss. `tests/macos-native.py --ssh mac --bootstrap` and
+component test. It launches and attaches owned fixtures, checks that the helper
+has no TCP listener, steps using the existing GDB packet/link implementation,
+waits for detach before close, checks helper reaping and preserves an attached
+fixture after transport loss. Add `--bootstrap-load` for 40 attach cycles under
+six owned CPU loops. `tests/macos-native.py --ssh mac --bootstrap` and
 the opt-in `macos-bootstrap` release-check step run this lane; Linux's
 `macos-seam` also compiles the component. These are **not** acceptance of a
-native GUI owner, source/locals/MCP or the local `-- ./program` CLI yet.
+native source/locals/MCP implementation. The separate `--local` lane exercises the native GUI.
 
 Startup logs distinguish main-to-first-submitted-frame from on-screen appearance.
 `XODB_STARTUP_TRACE=1` additionally logs when the window's occlusion

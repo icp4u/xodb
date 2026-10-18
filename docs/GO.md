@@ -20,8 +20,19 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
   `runtime.sigtramp` for SIGURG, SIGCHLD or SIGWINCH does not finish there.
   It resumes at the interrupted instruction (same stack pointer, so not
   another goroutine or frame) and keeps stepping until the source line
-  changes. A step into the handler for a fault such as SIGSEGV still stops
-  in the trampoline, since Go never returns to the faulting instruction. A peer
+  changes. After that preemption the goroutine may resume on another
+  thread. The step follows it when the stack pointer matches the one saved
+  from the sigcontext, and reports the stop on the thread where it lands.
+  A step over a call uses a return probe. On amd64 Go that probe follows the
+  goroutine by g (R14) and by the frame's depth below `g.stack.hi`, which a
+  stack copy keeps, so the step follows it onto another thread after
+  `morestack` preempts or grows the stack. A different g, or the same g in a
+  deeper recursive frame, is not that return: the probe is planted again and
+  the step continues. A non-Go frame is the same return only when the stack
+  pointer matches, so a recursive call is not taken as the outer frame. A
+  fault such as SIGSEGV stops the step. The step does not resume past it,
+  including when that stop is already in the trampoline, since Go never
+  returns to the faulting instruction. A peer
   stopped on SIGCHLD, SIGWINCH, or SIGURG does not cancel that step. A
   preemption signal observed while the step is still on the same line is
   delivered when the step finishes. A stack sampled in that trampoline keeps the trampoline as
@@ -85,7 +96,9 @@ Nothing runs in the target: the reader only reads stopped memory.
 - `tests/go-language.py --go PATH`: builds `examples/go-demo.go`, stops at
   `main.marker` and compares goroutine ids, states, top three visible frames
   and creation sites with the program's own `runtime.Stack(buf, true)`; checks
-  value previews; `--strace` audits that only reads happen.
+  value previews; `--strace` audits that only reads happen. The step check
+  reads the thread that stopped in `main.marker`, which can differ from the
+  thread that entered the step when preemption moved the goroutine.
 - `tests/go-gui.py --go PATH`: private headless compositor screenshot of the
   goroutine list and a parked stack.
 - `scripts/release-check host|gui|all --go /opt/debug/bin/go` runs them.

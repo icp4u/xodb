@@ -1,19 +1,35 @@
 /* Apple's debugserver remains the debugger. This component owns only its
- * process and initial endpoint discovery, not a second run-control path. */
+ * process and private inherited transport, not a second run-control path. */
+#define _GNU_SOURCE 1
 #include "xrt_debugserver.h"
 #include "host_compat.h"
+#ifdef __APPLE__
 #include <crt_externs.h>
+#endif
 #include <poll.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/un.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <signal.h>
 
+#define DEBUGSERVER_FD 3
+
+#ifndef POSIX_SPAWN_CLOEXEC_DEFAULT
+#define POSIX_SPAWN_CLOEXEC_DEFAULT 0
+#endif
+
+static char **environment(void)
+{
+#ifdef __APPLE__
+    return *_NSGetEnviron();
+#else
+    extern char **environ;
+    return environ;
+#endif
+}
 static uint64_t milliseconds(void)
 {
     struct timespec now;
@@ -36,22 +52,37 @@ static enum xrt_status wait_read(int fd, uint64_t until, struct xrt_cancel *canc
         return XRT_TRANSPORT_FAILED;
     }
 }
-static int spawn(const char *path, char *const *argv, int output, pid_t *pid)
+static int spawn_child(const char *path, char *const *argv, int output, int inherited, pid_t *pid)
 {
     posix_spawn_file_actions_t actions;
     int status = posix_spawn_file_actions_init(&actions);
     if (status) return status;
-    status = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
-    if (!status) status = output >= 0 ? posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO) :
-        posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    /* Duplicate first: with the owner's stdio closed, output or inherited may
+     * be 0..2, and the /dev/null opens below would replace them. */
+    if (!status && inherited >= 0)
+        status = posix_spawn_file_actions_adddup2(&actions, inherited, DEBUGSERVER_FD);
+    if (!status && output >= 0) status = posix_spawn_file_actions_adddup2(&actions, output, STDOUT_FILENO);
+    if (!status) status = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null", O_RDONLY, 0);
+    if (!status && output < 0)
+        status = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
     if (!status) status = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
-    // Helpers must not inherit the session's IPC sockets or other open files.
+
     posix_spawnattr_t attr;
     int attr_status = posix_spawnattr_init(&attr);
     if (!status) status = attr_status;
+    sigset_t empty, defaults;
+    sigemptyset(&empty);
+    sigemptyset(&defaults);
+    sigaddset(&defaults, SIGTERM);
+    sigaddset(&defaults, SIGINT);
+    sigaddset(&defaults, SIGPIPE);
     if (!status) status = posix_spawnattr_setpgroup(&attr, 0);
-    if (!status) status = posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETPGROUP);
-    if (!status) status = posix_spawn(pid, path, &actions, &attr, argv, *_NSGetEnviron());
+    if (!status) status = posix_spawnattr_setsigmask(&attr, &empty);
+    if (!status) status = posix_spawnattr_setsigdefault(&attr, &defaults);
+    short flags = POSIX_SPAWN_SETPGROUP | POSIX_SPAWN_SETSIGMASK | POSIX_SPAWN_SETSIGDEF |
+        POSIX_SPAWN_CLOEXEC_DEFAULT;
+    if (!status) status = posix_spawnattr_setflags(&attr, flags);
+    if (!status) status = posix_spawn(pid, path, &actions, &attr, argv, environment());
     if (!attr_status) posix_spawnattr_destroy(&attr);
     posix_spawn_file_actions_destroy(&actions);
     return status;
@@ -62,7 +93,8 @@ static enum xrt_status reap(struct xrt_debugserver *child, uint64_t until)
         int status;
         pid_t result = waitpid(child->pid, &status, WNOHANG);
         if (result == child->pid || (result < 0 && errno == ECHILD)) {
-            child->pid = 0; child->endpoint[0] = 0; return XRT_OK;
+            child->pid = 0;
+            return XRT_OK;
         }
         if (result < 0 && errno != EINTR) return XRT_WAIT_FAILED;
         if (milliseconds() >= until) return XRT_STOP_TIMEOUT;
@@ -71,18 +103,67 @@ static enum xrt_status reap(struct xrt_debugserver *child, uint64_t until)
     }
     return XRT_OK;
 }
-enum xrt_status xrt_debugserver_close(struct xrt_debugserver *child)
+/* Catch exec/argument/attach failures promptly without inventing a readiness
+ * byte that Apple's --fd protocol does not provide. A live child may still be
+ * loading or attaching when this short observation ends; the first GDB request
+ * then reports any later failure directly through the private stream. */
+static enum xrt_status early_exit(struct xrt_debugserver *child, struct xrt_cancel *cancel)
+{
+    uint64_t until = milliseconds() + 100;
+    while (milliseconds() < until) {
+        if (xrt_cancel_requested(cancel)) return XRT_REMOTE_CANCELLED;
+        int status;
+        pid_t result = waitpid(child->pid, &status, WNOHANG);
+        if (result == child->pid || (result < 0 && errno == ECHILD)) {
+            child->pid = 0;
+            return XRT_EXEC_FAILED;
+        }
+        if (result < 0 && errno != EINTR) return XRT_WAIT_FAILED;
+        struct pollfd fds[2] = {{child->transport, POLLIN, 0}, {xrt_cancel_fd(cancel), POLLIN, 0}};
+        int polled = poll(fds, cancel ? 2 : 1, 10);
+        if (polled < 0 && errno == EINTR) continue;
+        if (polled < 0) return XRT_TRANSPORT_FAILED;
+        if (xrt_cancel_requested(cancel)) return XRT_REMOTE_CANCELLED;
+        if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            (void)reap(child, milliseconds() + 100);
+            return XRT_EXEC_FAILED;
+        }
+        if (fds[0].revents & POLLIN) return XRT_OK;
+    }
+    return XRT_OK;
+}
+int xrt_debugserver_take_transport(struct xrt_debugserver *child)
+{
+    if (!child || child->transport <= 0) return -1;
+    int fd = child->transport;
+    child->transport = 0;
+    return fd;
+}
+static enum xrt_status close_child(struct xrt_debugserver *child, int detach_confirmed)
 {
     if (!child) return XRT_INVALID_ARGUMENT;
+    if (child->transport > 0) {
+        close(child->transport);
+        child->transport = 0;
+    }
     if (child->pid <= 0) return XRT_OK;
-    enum xrt_status status = reap(child, milliseconds() + 100);
-    if (status != XRT_STOP_TIMEOUT) return status;
-    // The owner closes/detaches through GDB first. Signal only our helper,
-    // never a target pid or a process group.
+    /* Without D/OK, EOF is the only safe release: killing debugserver while
+     * it still owns an attached process can kill that process on Darwin. */
+    enum xrt_status status = reap(child, milliseconds() + (detach_confirmed ? 100 : 10000));
+    if (status != XRT_STOP_TIMEOUT || !detach_confirmed) return status;
+    /* D/OK is the protocol proof that the target is no longer owned. Some
+     * Apple debugserver builds remain alive after it; terminate only that
+     * exact, now targetless helper and retain its pid if reaping still fails. */
     if (kill(child->pid, SIGTERM) && errno != ESRCH) return XRT_SIGNAL_FAILED;
-    // Do not force-kill a debugger that may still own an attached process.
-    // Preserve the pid if cleanup cannot be confirmed by the deadline.
     return reap(child, milliseconds() + 2000);
+}
+enum xrt_status xrt_debugserver_close(struct xrt_debugserver *child)
+{
+    return close_child(child, 0);
+}
+enum xrt_status xrt_debugserver_close_detached(struct xrt_debugserver *child)
+{
+    return close_child(child, 1);
 }
 enum xrt_status xrt_debugserver_find(char *out, size_t capacity, struct xrt_cancel *cancel)
 {
@@ -93,7 +174,7 @@ enum xrt_status xrt_debugserver_find(char *out, size_t capacity, struct xrt_canc
     if (xrt_host_pipe(pipefd)) return XRT_PIPE_FAILED;
     char *args[] = {"/usr/bin/xcode-select", "-p", NULL};
     struct xrt_debugserver child = {0};
-    int status = spawn(args[0], args, pipefd[1], &child.pid);
+    int status = spawn_child(args[0], args, pipefd[1], -1, &child.pid);
     close(pipefd[1]);
     if (status) { close(pipefd[0]); return XRT_EXEC_FAILED; }
     char selected[4096]; size_t used = 0;
@@ -123,9 +204,8 @@ enum xrt_status xrt_debugserver_find(char *out, size_t capacity, struct xrt_canc
 }
 enum xrt_status xrt_debugserver_start(const struct xrt_debugserver_options *options, struct xrt_debugserver *out)
 {
-    if (!options || !out || out->pid || !options->directory || !*options->directory ||
+    if (!options || !out || out->pid || out->transport ||
         options->attach_pid < 0 || ((options->attach_pid > 0) == (options->argv != NULL))) return XRT_INVALID_ARGUMENT;
-    out->endpoint[0] = 0;
     if (xrt_cancel_requested(options->cancel)) return XRT_REMOTE_CANCELLED;
     size_t argc = 0;
     if (options->argv) {
@@ -140,60 +220,34 @@ enum xrt_status xrt_debugserver_start(const struct xrt_debugserver_options *opti
         if (found != XRT_OK) return found;
         executable = discovered;
     }
-    // The caller supplies its private work root. A fresh mode-0700 child owns
-    // the Unix handshake; there is no shared fixed filename or port reservation.
-    char directory[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    int length = snprintf(directory, sizeof(directory), "%s/xodb-ds.XXXXXX", options->directory);
-    if (length < 0 || (size_t)length + sizeof("/port") > sizeof(directory)) return XRT_BUFFER_TOO_SMALL;
-    if (!mkdtemp(directory)) return XRT_FILE_UNAVAILABLE;
-    char path[sizeof(directory)];
-    snprintf(path, sizeof(path), "%s/port", directory);
-    int listener = xrt_host_socket(AF_UNIX, SOCK_STREAM, 0, 1), peer = -1;
-    enum xrt_status result = XRT_TRANSPORT_FAILED;
-    struct sockaddr_un address = {.sun_family = AF_UNIX};
-    memcpy(address.sun_path, path, strlen(path) + 1);
-    address.sun_len = (uint8_t)SUN_LEN(&address);
-    if (listener < 0 || bind(listener, (struct sockaddr *)&address, address.sun_len) || listen(listener, 1)) goto done;
+    int transport[2];
+    if (xrt_host_socketpair(AF_UNIX, SOCK_STREAM, 0, transport)) return XRT_TRANSPORT_FAILED;
+    /* 0 means "no transport" in struct xrt_debugserver; keep our end off stdio. */
+    if (transport[0] <= STDERR_FILENO) {
+        int moved = fcntl(transport[0], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        close(transport[0]);
+        if (moved < 0) { close(transport[1]); return XRT_TRANSPORT_FAILED; }
+        transport[0] = moved;
+    }
     char attach[32];
     snprintf(attach, sizeof(attach), "--attach=%d", options->attach_pid);
+    char fd_option[32];
+    snprintf(fd_option, sizeof(fd_option), "--fd=%d", DEBUGSERVER_FD);
     char *args[264]; size_t n = 0;
     args[n++] = (char *)executable;
-    args[n++] = "--unix-socket"; args[n++] = path;
+    args[n++] = fd_option;
     args[n++] = "--no-stdio";
     if (options->attach_pid) args[n++] = attach;
-    args[n++] = "--";
-    args[n++] = "127.0.0.1:0";
-    for (size_t i = 0; i < argc; ++i) args[n++] = (char *)options->argv[i];
+    if (options->argv) {
+        args[n++] = "--";
+        for (size_t i = 0; i < argc; ++i) args[n++] = (char *)options->argv[i];
+    }
     args[n] = NULL;
-    if (spawn(executable, args, -1, &out->pid)) { result = XRT_EXEC_FAILED; goto done; }
-    uint64_t deadline = milliseconds() + 10000;
-    result = wait_read(listener, deadline, options->cancel);
-    if (result != XRT_OK) goto done;
-    peer = xrt_host_flags(accept(listener, NULL, NULL), 1);
-    if (peer < 0) { result = XRT_TRANSPORT_FAILED; goto done; }
-    char port[6]; size_t used = 0;
-    for (;;) {
-        result = wait_read(peer, deadline, options->cancel);
-        if (result != XRT_OK) goto done;
-        ssize_t got = read(peer, port + used, sizeof(port) - used);
-        if (got < 0 && (errno == EINTR || errno == EAGAIN)) continue;
-        if (got < 0) { result = XRT_TRANSPORT_FAILED; goto done; }
-        if (!got) break;
-        used += (size_t)got;
-        if (used == sizeof(port)) { result = XRT_PROTOCOL_ERROR; goto done; }
-    }
-    unsigned number = 0;
-    for (size_t i = 0; i < used; ++i) {
-        if (port[i] < '0' || port[i] > '9') { result = XRT_PROTOCOL_ERROR; goto done; }
-        number = number * 10 + (unsigned)(port[i] - '0');
-    }
-    if (!number || number > 65535) { result = XRT_PROTOCOL_ERROR; goto done; }
-    snprintf(out->endpoint, sizeof(out->endpoint), "127.0.0.1:%u", number);
-    result = XRT_OK;
-done:
-    if (peer >= 0) close(peer);
-    if (listener >= 0) close(listener);
-    unlink(path); rmdir(directory); // Only this call's fresh handshake files.
+    int spawned = spawn_child(executable, args, -1, transport[1], &out->pid);
+    close(transport[1]);
+    if (spawned) { close(transport[0]); return XRT_EXEC_FAILED; }
+    out->transport = transport[0];
+    enum xrt_status result = early_exit(out, options->cancel);
     if (result != XRT_OK) {
         enum xrt_status cleanup = xrt_debugserver_close(out);
         if (cleanup != XRT_OK) return cleanup;

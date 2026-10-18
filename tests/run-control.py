@@ -62,4 +62,21 @@ for mode, symbol in [('sleep','wait_seven'), ('fib','fib')]:
         else:
             assert c.inspect('evaluate_expression',tid=tid,expression='n')['value']['display']=='13'
     finally:c.close()
-print('Finish through recursive return sites and a seven-second function, run-to and shared probe ownership passed:',run)
+# Step over a recursive call, then over blocks that push and pop.
+lines=source.read_text().splitlines()
+at={k:next(i for i,s in enumerate(lines,1) if k in s) for k in ('NEST_CALL','NEST_PUSH','NEST_POP','NEST_DONE')}
+c=Client('control',str(binary),args=['step'])
+try:
+    ids=c.action('set_breakpoint',file=str(source),line=at['NEST_CALL'])['ids']
+    c.action('continue');tid=c.stopped('breakpoint')['threads'][0]['tid']
+    for b in ids: c.action('remove_breakpoint',id=b)
+    assert c.inspect('evaluate_expression',tid=tid,expression='depth')['value']['display']=='3'
+    want=[at['NEST_PUSH'],at['NEST_POP'],at['NEST_DONE']] if os.uname().machine=='x86_64' else [at['NEST_DONE']]
+    for line in want:
+        c.action('step_over',tid=tid);snap=c.stopped(seconds=30)
+        assert not snap['source_stepping'] and snap['step_diagnostic'] is None,snap
+        rip=c.inspect('get_stack',tid=tid)['frames'][0]
+        assert rip['source']['line']==line,(line,rip)
+        assert c.inspect('evaluate_expression',tid=tid,expression='depth')['value']['display']=='3',line
+finally:c.close()
+print('Finish through recursive return sites and a seven-second function, run-to, shared probe ownership and step over recursion and stack-moving blocks passed:',run)

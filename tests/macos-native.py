@@ -175,7 +175,7 @@ def native(stress=False):
     print(json.dumps(report))
 
 
-def bootstrap_native():
+def bootstrap_native(load=False):
     check(sys.platform == 'darwin', 'bootstrap lane requires Darwin')
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
     zig = os.environ.get('XODB_MAC_ZIG', 'zig')
@@ -184,10 +184,33 @@ def bootstrap_native():
     wrong = subprocess.run(['zig-out/bin/xodb-macos-bootstrap', 'planted-wrong-argc'],
                            capture_output=True, timeout=10)
     check(wrong.returncode != 0 and b'CHECK failed: argc == 1' in wrong.stderr, 'bootstrap oracle did not reject planted input')
-    print(json.dumps(dict(native_debugserver_bootstrap='pass', negative_oracle='pass', native_owner_gui='not_tested')))
+    report = dict(native_debugserver_bootstrap='pass', negative_oracle='pass',
+                  private_transport='pass', detach_before_close='pass', native_owner_gui='not_tested')
+    if load:
+        busy = [subprocess.Popen(['/usr/bin/yes'], stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL) for _ in range(6)]
+        started = time.monotonic()
+        try:
+            loaded = run(['zig-out/bin/xodb-macos-bootstrap'],
+                         env=dict(env, XODB_BOOTSTRAP_ATTACH_RUNS='40'),
+                         capture_output=True, text=True, timeout=900)
+            check('40 attach cycle(s)' in loaded.stdout,
+                  'load run did not complete all 40 known attach cycles')
+        finally:
+            for process in busy:
+                process.terminate()
+            for process in busy:
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+        report['load'] = dict(busy_loops=6, attach_cycles=40,
+                              failures=0, elapsed_s=round(time.monotonic() - started, 3))
+    print(json.dumps(report))
 
 
-def remote(host, stress=False, bootstrap=False, local=False):
+def remote(host, stress=False, bootstrap=False, local=False, bootstrap_load=False):
     ssh = ['ssh', '-o', 'BatchMode=yes', '-o', 'LogLevel=ERROR', '-o', 'ConnectTimeout=10', host]
     directory = run(ssh + [GUARD + 'umask 022; mkdir -p "$HOME/xodb-mac" && mktemp -d "$HOME/xodb-mac/native-check.XXXXXX"'],
                     capture_output=True, text=True, timeout=20).stdout.strip()
@@ -213,7 +236,8 @@ def remote(host, stress=False, bootstrap=False, local=False):
         if name in os.environ:
             settings.append(name + '=' + shlex.quote(os.environ[name]))
     run(ssh + [prefix + ' '.join(settings) + ' /usr/bin/python3 -B tests/macos-native.py --native' +
-               (' --stress' if stress else '') + (' --bootstrap' if bootstrap else '') + (' --local' if local else '')], timeout=960 if stress else 360)
+               (' --stress' if stress else '') + (' --bootstrap' if bootstrap else '') + (' --local' if local else '') +
+               (' --bootstrap-load' if bootstrap and bootstrap_load else '')], timeout=960 if stress or bootstrap_load else 360)
     print('Native artifacts retained in the fresh ~/xodb-mac/native-check.* directory; no on-screen launch.')
 
 
@@ -225,16 +249,19 @@ if __name__ == '__main__':
     parser.add_argument('--stress', action='store_true', help='periodic: 20k offscreen frames with CPU/RSS evidence')
     parser.add_argument('--bootstrap', action='store_true', help='native debugserver lifecycle component, not the GUI owner')
     parser.add_argument('--local', action='store_true', help='native local debugger GUI, owned launch/attach and instruction step')
+    parser.add_argument('--bootstrap-load', action='store_true', help='with --bootstrap: 40 attach cycles under six owned CPU loops')
     args = parser.parse_args()
     if sum((args.bootstrap, args.stress, args.local)) > 1:
         parser.error('--bootstrap, --local and --stress are separate lanes')
+    if args.bootstrap_load and not args.bootstrap:
+        parser.error('--bootstrap-load requires --bootstrap')
     os.chdir(ROOT)
     if args.native:
         if args.bootstrap:
-            bootstrap_native()
+            bootstrap_native(args.bootstrap_load)
         else:
             native(args.stress)
             if args.local:
                 run([sys.executable, '-B', 'tests/macos-local.py'], timeout=150)
     else:
-        remote(args.ssh, args.stress, args.bootstrap, args.local)
+        remote(args.ssh, args.stress, args.bootstrap, args.local, args.bootstrap_load)

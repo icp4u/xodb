@@ -148,3 +148,56 @@ The two processes appear as stars; a pipe or socket between them is a thread,
 and impulses follow their traffic. Without `--graph-pid` the galaxy covers the
 host: press **C** to unfold cgroups into process stars. See
 [Overview](OVERVIEW.md#reading-the-galaxy) for how to read it and its caps.
+
+## Is it the microwave? (burrito mode)
+
+```sh
+xodb --burrito --demo microwave60 --phases 10,15
+xodb --overview --radio-demo microwave60 --panel radio
+```
+
+Both run on SYNTHETIC spectrum and read no radio. The spectrum is 10 s quiet,
+then 15 s of 60 Hz magnetron pulsing on channel 10, repeating. The terminal
+run prints one verdict per phase: "quiet", then "microwave-like interference:
+60 Hz pulsing, ~48% duty, 2448-2466 MHz (Wi-Fi channels 7-13)". The panel
+(**W**) shows the waterfall turning hot, the verdict changing and the pulse
+strip with its 16.7 ms rhythm. `inverter`, `wifi`, `bluetooth` and `empty`
+show the other verdicts.
+
+For the real thing, with a spare USB AR9271 as `wlan1`, while someone runs
+the microwave from 30 s to 90 s:
+
+```sh
+sudo xodb --burrito --radio wlan1 --phases 30,60,30
+```
+
+The card goes back to how it was on exit, and the run ends by printing its
+TX counters before and after (they stay flat). See [RADIO.md](RADIO.md).
+
+### The blast radius: 14 channels, live (R2b)
+
+```sh
+xodb --burrito --demo kitchen --phases 9,15 --no-wait
+xodb --overview --radio-demo kitchen --panel radio
+```
+
+SYNTHETIC again: access points on channels 1, 6 and 11, a Bluetooth device,
+and a 60 Hz microwave 15 s of every 25. The synthetic sensor sweeps six
+windows (ch 1/4/7/10/13/14, 600 ms each). The terminal run's second phase
+ends with a per-channel table and "CHANNEL VERDICT: microwave-like 60 Hz
+pulsing at 2445-2475 MHz: channels 6-13 blasted (...), 1-5 and 14 clean",
+and the synthetic traffic retries on the hit channels ("33% retries" against
+"7%"). In the panel, the spectrum's bars turn red over the blast band while
+the access points stay blue; the channel strip lights up 6-13. Drag across
+the spectrum from about 2449 to 2466 MHz: the plan turns into one fixed
+window on channel 10, the view zooms with a pop and the bars spring back up.
+Double-click returns to the sweep. `--demo-sensors 2` splits the windows
+between two synthetic sensors.
+
+With the hardware (AR9271 as `wlan1`, a second spare card as `wlan0`):
+
+```sh
+sudo xodb --burrito --radio wlan1 --traffic wlan0 --phases 30,60,30
+sudo xodb --overview --radio wlan1 --radio-traffic wlan0 --panel radio
+```
+

@@ -14,6 +14,7 @@ pub fn handles(name: []const u8) bool {
     if (std.mem.eql(u8, name, "get_layout")) return true;
     if (std.mem.eql(u8, name, "get_graph")) return true;
     if (fd.handles(name)) return true;
+    if (@import("radio.zig").handles(name)) return true;
     for ([_][]const u8{ "get_overview", "list_processes", "get_process", "get_connections", "get_sensors", "get_history", "get_process_groups" }) |candidate|
         if (std.mem.eql(u8, name, candidate)) return true;
     return memstat.handles(name);
@@ -34,6 +35,7 @@ fn group(id: c_uint) u32 {
 
 pub fn call(a: std.mem.Allocator, state: *State, name: []const u8, args: Value) !Value {
     if (std.mem.eql(u8, name, "get_graph")) return @import("graph.zig").descriptors(a, state, args);
+    if (@import("radio.zig").handles(name)) return @import("radio.zig").call(a, name, args, state.redact);
     if (fd.handles(name)) return fd.call(a, state, name, args);
     if (memstat.handles(name)) return memstat.call(a, state, name, args);
     if (std.mem.eql(u8, name, "get_history")) return historyCall(a, state, args);
@@ -486,7 +488,7 @@ fn ownerHints(a: std.mem.Allocator, result: *Value, snap: *const c.struct_xrt_sy
 test "overview reads and explicit fd capture controls are advertised" {
     const parsed = try std.json.parseFromSlice(Value, std.testing.allocator, definitions, .{});
     defer parsed.deinit();
-    try std.testing.expectEqual(24, parsed.value.array.items.len);
+    try std.testing.expectEqual(27, parsed.value.array.items.len);
     for (parsed.value.array.items) |definition| {
         try std.testing.expect(handles(definition.object.get("name").?.string));
         const name = definition.object.get("name").?.string;

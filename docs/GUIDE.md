@@ -30,6 +30,7 @@ detailed docs. If you just want to try something, jump to
 | Check whether a change made a function faster | **Repeated experiment** (`tools/experiments/run.py`) | Baseline vs changed vs unchanged control, several runs each, with honest spread ([details](OBSERVATION_EXPERIMENTS.md)) |
 | Let an AI agent help | **MCP** (`--mcp` or `--session-socket`) | The same tools for an agent; you keep **F8** to take back control |
 | See which files are being read, written, leaked or held after deletion, right now | **lsof-top** (`xodb --lsof-top`, a terminal view) | Top files by bytes/s, processes by fd churn and growth, leak watch, deleted-but-open files and live per-process fd tables, from unprivileged `/proc` polling ([details](LSOF_TOP.md)) |
+| Find out whether the microwave is killing your Wi-Fi | **Burrito mode** (`xodb --burrito`; `sudo xodb --burrito --radio wlan1 --phases 30,60,30`; **W** Radio panel in `--overview`) | The whole 2.4 GHz band from a spare spectral-capable card (a USB AR9271), the verdict in words ("microwave-like interference: 60 Hz pulsing, ~48% duty"), the blast radius per channel ("channels 6-13 blasted, 1-5 clean"), traffic per channel from a second spare card, and (with `--ping`) your link's ping loss while it ran. Receive-only; an in-use card is only read ([Is it the microwave?](#is-it-the-microwave), [details](RADIO.md)) |
 | Show this machine off, fetch-style | **xodbfetch** (`xodb --fetch` in a terminal; **N** in `--overview`) | A fastfetch-format card (logo, `user@host`, `Key: value` lines, colour blocks) that prints and exits, or lives in the overview with the real distro logo, sparklines and ticking values; `--redact` hides names, **B** runs on-demand benchmarks ([details](FETCH.md)) |
 | Explore open files visually | **Files & IO** (`xodb --overview --panel files`) | Churn heatmap, seekable progress, fd-growth sparklines and deleted holders. **L** drills in from Processes; exact events require explicit host-cost confirmation ([details](OVERVIEW.md#files-and-exact-events)) |
 | Find paths holding open handles and sampled IO | **FD Treemap** (`xodb --overview --panel treemap`) | **B** opens; click zooms, **Backspace** goes up, **L** opens a sampled holder. **E** stops default live tracing (~11% host cost). Area is handle count ([details](FD_TREEMAP.md)). |
@@ -545,6 +546,35 @@ space permits; otherwise the footer remains the fallback.
 Its `get_layout` publication includes the content rectangle, actual text
 rectangles (including shape-drawn numeric readouts), overlap/unmarked-clip
 counts and explicit bounded-copy flags.
+
+## Is it the microwave?
+
+Your Wi-Fi stutters when someone uses the microwave, and you want proof.
+Burrito mode listens to 2.4 GHz and to your own link at the same time.
+
+| You have | You get | Run |
+| --- | --- | --- |
+| Only the laptop's built-in Wi-Fi (your internet link) | Link evidence: signal, bitrate, retries, channel busy (add `--ping` for gateway ping loss at 50 Hz, the one thing xodb sends). It can say "the link degraded" but not what caused it. | `xodb --burrito` |
+| A USB AR9271 adapter plugged in as well (the usual case) | The sweep of the whole band and the verdict: mains-rate pulsing (50/60 Hz), duty, band, and per channel 1-14 how hard it is hit ("channels 6-13 blasted, 1-5 clean"). The built-in card is only read, never changed. | `sudo xodb --burrito --radio wlan1 --phases 30,60,30` |
+| A second spare card as well | Per-channel traffic too: frames/s, airtime, retries, bad-FCS frames, how many networks and stations (counts only) | `sudo xodb --burrito --radio wlan1 --traffic wlan0 --phases 30,60,30` |
+| The same, in the window | The Radio panel (**W**): the total-energy spectrum, the 14-channel strip, traffic, the verdicts, the cards. Drag across the spectrum to focus the sensor on a span; double-click for the full sweep | `sudo xodb --overview --radio wlan1 --radio-traffic wlan0 --panel radio` |
+| No hardware, just a look | The panel on synthetic spectrum and traffic (access points, Bluetooth and a microwave), labelled SYNTHETIC | `xodb --overview --radio-demo kitchen --panel radio` |
+| An agent asking "which channel should my AP use?" | MCP `radio_channels`: per channel power, occupancy, traffic and microwave impact, and the least-affected of 1/6/11 | `xodb --overview --headless --mcp --radio wlan1` |
+
+With `--phases 30,60,30` xodb prompts you to switch the microwave on, and
+later off, and prints one verdict per phase. The off, on and off phases then
+sit side by side. A transformer microwave shows "60 Hz pulsing" (50 Hz in
+Europe). An inverter microwave can show "continuous wideband energy; mains
+pulsing not seen". That means the pulsing was not seen; it does not mean
+there is no microwave.
+
+Rules it keeps: it never transmits from a card it holds (no scans, probes or
+association; every held card's TX counters are checked every second and
+printed at the end), it sends nothing at all unless you ask for `--ping`,
+and it never touches a card that is in use. A card it takes goes back to how
+it was on exit, or at the next start after a crash. `xodb --burrito` lists
+your cards with what each can contribute and what is missing.
+[Details](RADIO.md).
 
 ## Where to go next
 

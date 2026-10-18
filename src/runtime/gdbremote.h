@@ -6,8 +6,13 @@ struct xrt_gdb;
 struct xrt_cancel;
 uint64_t xrt_gdb_mutation_bytes(const struct xrt_gdb *);
 enum xrt_status xrt_gdb_open(const char *, struct xrt_target *, struct xrt_gdb **, struct xrt_cancel *);
+/* Native debugserver: consumes fd on success AND failure; first negotiates
+ * detach-on-error, then uses the same handshake as the TCP GDB runtime. */
+enum xrt_status xrt_gdb_open_fd(int, struct xrt_target *, struct xrt_gdb **, struct xrt_cancel *);
 enum xrt_status xrt_gdb_call(struct xrt_gdb *, struct xrt_target *, const struct xrt_call *);
 enum xrt_status xrt_gdb_health(const struct xrt_gdb *);
+/* True only after an actual D/OK exchange, not an idle/exited no-op detach. */
+bool xrt_gdb_detach_confirmed(const struct xrt_gdb *);
 void xrt_gdb_info(const struct xrt_gdb *, struct xrt_gdb_info *);
 enum xrt_status xrt_gdb_thread_info(const struct xrt_gdb *, int32_t, struct xrt_gdb_thread_info *);
 enum xrt_status xrt_gdb_regions(struct xrt_gdb *, struct xrt_target *, struct xrt_gdb_region *,

@@ -186,9 +186,10 @@ static void architecture_agent(struct xrt_target *t, int32_t pid)
     assert(xrt_rpc_classify(XRT_RPC_FUNCTION_START) == XRT_RPC_CLASS_PERF);
     assert(xrt_rpc_classify(XRT_RPC_CONTROL_WRITE) == XRT_RPC_CLASS_MUTATION);
     assert(xrt_rpc_classify(XRT_RPC_SOURCE_OPEN) == XRT_RPC_CLASS_FILE);
-    assert(xrt_rpc_classify(56) == XRT_RPC_CLASS_PROTOCOL);
+    assert(xrt_rpc_classify(XRT_RPC_CLEAR_STOP) == XRT_RPC_CLASS_MUTATION);
+    assert(xrt_rpc_classify(57) == XRT_RPC_CLASS_PROTOCOL);
     uint64_t packed = 1;
-    assert(xrt_remote_call(t, &(struct xrt_call){.op = 56, .value = &packed}) == XRT_PROTOCOL_ERROR);
+    assert(xrt_remote_call(t, &(struct xrt_call){.op = 57, .value = &packed}) == XRT_PROTOCOL_ERROR);
     struct xrt_registers regs;
     OK(xrt_target_registers(t, pid, &regs));
     uint64_t pc = 0;

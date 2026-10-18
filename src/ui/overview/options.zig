@@ -19,7 +19,7 @@ pub const usage =
     \\  --platform wayland|x11  window system; otherwise WAYLAND_DISPLAY, then DISPLAY
     \\  --config FILE  load UI scale and galaxy look from provisional JSON preferences
     \\  --panel NAME    start on summary, performance, processes, memory, disk, disk_space,
-    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap or fetch
+    \\                  network, connections, power, system, users, services, apps, files, memory_map, graph, galaxy, inheritance, treemap, fetch or radio
     \\  Graph/galaxy/treemap starts LIVE SYSCALL TRACING · ~11% host syscall overhead · E to stop
     \\  --graph-pid N   restrict descriptor collection and captured threads to these PIDs (repeatable)
     \\  --files-pid N   start Files & IO scoped to one process; its first observed start is pinned
@@ -36,10 +36,21 @@ pub const usage =
     \\  --galaxy-demo N[:idle]  FD Galaxy with N synthetic processes (1-1024); reads and traces nothing
     \\  --galaxy-tour   start the galaxy's explicit camera tour (O stops; any control takes over)
     \\  --pause         start paused (replay: show the last frame with full history)
+    \\  --radio IFACE   Radio panel (W): take this spare spectral-capable card (or up to four, comma-separated)
+    \\                  for the 2.4 GHz spectrum (root; receive-only monitor mode, restored on exit); it sweeps
+    \\                  the band; drag across the spectrum or channel strip to focus, double-click for the sweep.
+    \\                  In-use cards are only read
+    \\  --radio-traffic IFACE  count frames per channel on this spare card (root; receive-only monitor, counts only)
+    \\  --radio-channel N  one fixed window on channel N, 1..14, instead of the sweep
+    \\  --radio-focus LO-HI  start focused on LO-HI MHz
+    \\  --radio-hop     sweep the band (the default; kept for older command lines)
+    \\  --radio-ping    ping the in-use link's gateway at 50 Hz (the one thing xodb sends; off by default)
+    \\  --radio-demo SCENE  Radio panel on SYNTHETIC spectrum and traffic (kitchen, microwave60, microwave50, inverter,
+    \\                  wifi, bluetooth, empty)
     \\  --vk-device X   Vulkan device by its `xodb --vk-list` index or part of its name (also XODB_VK_DEVICE)
     \\  -q, -qq, -v, -vv, --log=LEVEL|TOPIC=LEVEL[,...] and --log-file FILE choose what is logged (xodb --help).
     \\Keys: 1-9 0 Tab panels, arrows, / search, s sort, r reverse, v tree, L files, M memory map, F profile, Enter debugger (all confirmed),
-    \\      B treemap, N xodbfetch (B there runs benchmarks), t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
+    \\      B treemap, N xodbfetch (B there runs benchmarks), W radio, t theme, p pause, x redact (cannot be turned off), q quit. Mouse: click and wheel.
     \\
 ;
 
@@ -69,10 +80,18 @@ pub const Options = struct {
     paused: bool = false,
     frames: u64 = 0,
     font: [:0]const u8 = @import("build_options").font_path ++ "",
+    /// Burrito mode: the spare card to take for spectrum (root), and its channel.
+    radio: ?[:0]const u8 = null,
+    radio_traffic: ?[:0]const u8 = null,
+    radio_channel: ?u8 = null,
+    radio_focus: ?@import("../../radio/sweep.zig").Request = null,
+    radio_hop: bool = false,
+    radio_ping: bool = false,
+    radio_demo: ?@import("../../radio/detect.zig").Synth.Scene = null,
 };
 
 /// The overview options that are followed by a value.
-pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--platform", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config" };
+pub const takes = [_][]const u8{ "--replay", "--theme", "--panel", "--interval-ms", "--frames", "--font", "--ui-scale", "--platform", "--session-socket", "--files-pid", "--files-start-ticks", "--look", "--memmap-pid", "--memmap-start-ticks", "--graph-pid", "--galaxy-demo", "--vk-device", "--config", "--radio", "--radio-channel", "--radio-demo", "--radio-traffic", "--radio-focus" };
 
 /// Parses overview arguments (args[0] is the program). Debugger options are
 /// rejected: the overview has no target.
@@ -97,6 +116,14 @@ pub fn parse(args: []const [:0]const u8) !Options {
         }
         if (std.mem.eql(u8, arg, "--attach-exe")) {
             o.attach_exe = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--radio-hop")) {
+            o.radio_hop = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--radio-ping")) {
+            o.radio_ping = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--redact")) {
@@ -126,6 +153,15 @@ pub fn parse(args: []const [:0]const u8) !Options {
             o.ui_scale = try @import("../../platform/window.zig").validateScale(scale);
         }
         if (std.mem.eql(u8, arg, "--replay")) o.replay = value;
+        if (std.mem.eql(u8, arg, "--radio")) o.radio = value;
+        if (std.mem.eql(u8, arg, "--radio-traffic")) o.radio_traffic = value;
+        if (std.mem.eql(u8, arg, "--radio-focus")) o.radio_focus = @import("../../radio/burrito.zig").parseFocus(value) orelse return error.InvalidRadioFocus;
+        if (std.mem.eql(u8, arg, "--radio-demo")) o.radio_demo = std.meta.stringToEnum(@import("../../radio/detect.zig").Synth.Scene, value) orelse return error.InvalidRadioDemo;
+        if (std.mem.eql(u8, arg, "--radio-channel")) {
+            const ch = std.fmt.parseInt(u8, value, 10) catch return error.InvalidRadioChannel;
+            if (ch < 1 or ch > 14) return error.InvalidRadioChannel;
+            o.radio_channel = ch;
+        }
         if (std.mem.eql(u8, arg, "--session-socket")) o.session_socket = value;
         if (std.mem.eql(u8, arg, "--theme")) {
             _ = themes.find(value) orelse return error.UnknownOverviewTheme;

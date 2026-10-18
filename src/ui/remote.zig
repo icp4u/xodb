@@ -382,7 +382,8 @@ const Workspace = struct {
         r.clip = all;
         try r.rect(.{ .x = 0, .y = height - 32, .w = width, .h = 32 }, theme.header);
         const message = std.mem.sliceTo(&facts.status, 0);
-        const state_text = if (facts.state == .disconnected) "DISCONNECTED / last snapshot; target state unknown" else if (facts.busy) "Pending remote request" else if (message.len != 0) message else if (!std.mem.eql(u8, self.status, "Ready") and !std.mem.eql(u8, self.status, "Connecting")) self.status else if (historical) "Showing last stop; values are stale" else if (live_view) |v| (if (v.diagnostics.len > 0) v.diagnostics[0].message else self.status) else "Connecting";
+        const detached = if (live_view) |v| std.mem.eql(u8, v.state, "detached") else false;
+        const state_text = if (detached) "Detached; target released" else if (facts.state == .disconnected) "DISCONNECTED / last snapshot; target state unknown" else if (facts.busy) "Pending remote request" else if (message.len != 0) message else if (!std.mem.eql(u8, self.status, "Ready") and !std.mem.eql(u8, self.status, "Connecting")) self.status else if (historical) "Showing last stop; values are stale" else if (live_view) |v| (if (v.diagnostics.len > 0) v.diagnostics[0].message else self.status) else "Connecting";
         if (view) |v| if (!historical and !facts.busy and facts.state == .ready and message.len == 0 and v.watch_hits.len > 0 and std.mem.eql(u8, self.status, "Ready")) {
             const hit = v.watch_hits[0];
             try formatted(r, font, 14, height - 25, width - 28, theme.warm, "{s} #{d}: {any} -> {any}  |  access {s}  |  0x{x}  |  V watches / W toggles selected local", .{ if (std.mem.eql(u8, hit.attribution, "candidate")) "Possible watch" else "Watch", hit.id, hit.before, hit.after, if (std.mem.eql(u8, hit.phase, "interrupted")) "interrupted" else "completed", hit.address });
@@ -470,7 +471,7 @@ pub fn run(endpoint: remote.Endpoint, label: []const u8, font_path: [:0]const u8
         workspace.input(&window, client);
         if (@hasDecl(Window, "testStep")) {
             var steps: usize = 0;
-            while (!window.closing and steps < 64 and try window.testStep(frames.rendered, frames.stoppedPresented(client))) : (steps += 1) {
+            while (!window.closing and steps < 64 and try window.testStep(frames.rendered, frames.presentedState(client))) : (steps += 1) {
                 workspace.input(&window, client);
                 if (window.takeTestState()) {
                     log.info(.window, "xodb: state panel={s} selected={} search=\"\" searching=false search_supported=false source_scroll={d} pointer={d:.0},{d:.0} size={d}x{d} frames={d} rss_bytes={d}\n", .{
@@ -529,10 +530,13 @@ const Frames = struct {
     drawing: bool = false,
     live_frames: u64 = 0,
     gaps: Pacing = .{},
-    fn stoppedPresented(self: *const Frames, client: *remote.Client) bool {
+    fn presentedState(self: *const Frames, client: *remote.Client) u8 {
         const facts = client.facts();
-        const snapshot = self.workspace.snapshot orelse return false;
-        return facts.state == .ready and !facts.busy and self.presented_generation == snapshot.value.generation and std.mem.eql(u8, snapshot.value.state, "stopped");
+        const snapshot = self.workspace.snapshot orelse return 0;
+        if (facts.busy or self.presented_generation != snapshot.value.generation) return 0;
+        if (facts.state == .ready and std.mem.eql(u8, snapshot.value.state, "stopped")) return 1;
+        if (facts.state == .disconnected and std.mem.eql(u8, snapshot.value.state, "detached")) return 2;
+        return 0;
     }
     fn liveResize(context: ?*anyopaque) callconv(.c) void {
         const self: *Frames = @ptrCast(@alignCast(context orelse return));

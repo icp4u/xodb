@@ -73,7 +73,8 @@ enum xrt_rpc_op {
     XRT_RPC_ALLOCATIONS_START,
     XRT_RPC_FUNCTION_START,
     XRT_RPC_CONTROL_WRITE,
-    XRT_RPC_SOURCE_OPEN
+    XRT_RPC_SOURCE_OPEN,
+    XRT_RPC_CLEAR_STOP
 };
 
 enum xrt_rpc_class {
@@ -147,6 +148,7 @@ static inline enum xrt_rpc_class xrt_rpc_classify(uint16_t op)
     case XRT_RPC_INVALIDATE:
     case XRT_RPC_EVENT:
     case XRT_RPC_CONTROL_WRITE:
+    case XRT_RPC_CLEAR_STOP:
         return XRT_RPC_CLASS_MUTATION;
     default:
         return XRT_RPC_CLASS_PROTOCOL;
@@ -159,4 +161,5 @@ _Static_assert(XRT_RPC_ALLOCATIONS_START == 52, "allocation start stays 52");
 _Static_assert(XRT_RPC_FUNCTION_START == 53, "function start stays 53");
 _Static_assert(XRT_RPC_CONTROL_WRITE == 54, "control write is opcode 54");
 _Static_assert(XRT_RPC_SOURCE_OPEN == 55, "source open is opcode 55");
+_Static_assert(XRT_RPC_CLEAR_STOP == 56, "clear stop is opcode 56");
 #endif

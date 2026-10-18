@@ -307,6 +307,9 @@ static enum xrt_status dispatch(struct agent *a, struct xrt_wire_frame *frame, u
     case XRT_RPC_SIGNAL_SUPPRESS:
         return args[0] > INT32_MAX ? XRT_INVALID_PID
                                    : xrt_target_signal_suppress(t, (int32_t)args[0]);
+    case XRT_RPC_CLEAR_STOP:
+        return args[0] > INT32_MAX ? XRT_INVALID_PID
+                                   : xrt_target_clear_stop(t, (int32_t)args[0], args[1]);
     case XRT_RPC_INVALIDATE:
         xrt_target_invalidate(t);
         return XRT_OK;

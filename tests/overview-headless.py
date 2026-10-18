@@ -157,6 +157,15 @@ try:
     denied = mcp.raw('attach', pid=group)
     check('headless overview cannot attach', bool(denied.get('error')) or denied['result']['isError'])
 
+    # Burrito mode, passive: cards are listed with roles and reasons; the verdict never takes a card.
+    radios = mcp.tool('list_radios')
+    check('list_radios names every card with a role and a reason', isinstance(radios.get('cards'), list) and bool(radios.get('needs')) and all(c['role'] in ('in_use', 'spare', 'blocked', 'absent') and c['why'] for c in radios['cards']))
+    verdict = mcp.tool('radio_interference', window_ms=1000, redact=True)
+    check('radio_interference is passive and honest without a chosen card', verdict['kind'] == 'no_spectrum' and verdict['spectral']['on'] is False and verdict['tx'] is None and 'no spectrum' in verdict['words'])
+    chans = mcp.tool('radio_channels', window_ms=1000)
+    check('radio_channels lists 14 channels, unwatched and honest without a card', len(chans['channels']) == 14 and all(c['impact'] == 'unseen' and c['traffic'] is None for c in chans['channels']) and chans['blast'] is None and chans['traffic']['on'] is False and 'no spectrum' in chans['words'] and chans['tx'] == [])
+    check('radio_interference rejects a bad window', bool(mcp.raw('radio_interference', window_ms=5).get('error')) or mcp.raw('radio_interference', window_ms=5)['result']['isError'])
+
     # Sort, filter and paging on the canonical process table.
     def mine(**extra):
         return mcp.tool('list_processes', filter={'match': 'overview-tree'}, **extra)

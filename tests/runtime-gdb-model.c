@@ -2,6 +2,8 @@
 #include "xrt_gdbremote.h"
 #include "gdb_packet.h"
 #include "gdb_link.h"
+#include "gdbremote.h"
+#include "check.h"
 #include "remote_internal.h"
 #include <pthread.h>
 #include <stdatomic.h>
@@ -88,9 +90,14 @@ static void hold_reply(int fd, uint64_t value)
     assert(recv(fd, &byte, 1, 0) <= 0);
     close(fd); _exit(0);
 }
-static void serve(int listener, int mode)
+static void serve_connection(int fd, int mode, bool adopted)
 {
-    int fd = accept(listener, NULL, NULL); assert(fd >= 0); close(listener);
+    if (adopted) {
+        char first[128];
+        CHECK(command(fd, first, sizeof first));
+        CHECK(!strcmp(first, "QSetDetachOnError:1"));
+        reply(fd, "OK");
+    }
     uint64_t reg = 7, memory = 17, selected = 1; unsigned detach_count = 0;
     char request[4096], response[4096];
     unsigned commands = 0, round = 0, listed = 0, delayed = 0;
@@ -167,6 +174,11 @@ static void serve(int listener, int mode)
         reply(fd, response);
     }
     close(fd); _exit(0);
+}
+static void serve(int listener, int mode)
+{
+    int fd = accept(listener, NULL, NULL); assert(fd >= 0); close(listener);
+    serve_connection(fd, mode, false);
 }
 struct fixture { pid_t child; char endpoint[64]; };
 static struct fixture start(int mode)
@@ -382,9 +394,34 @@ static void owner_guard(void)
     assert(xrt_target_gdb_remote(NULL, NULL) == XRT_INVALID_ARGUMENT);
     puts("remote owner guard: GDB, agent, dispatch and lock entrypoints assert before I/O; worker-local state and native path preserved");
 }
+static void private_open(void)
+{
+    int pair[2]; CHECK(!socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair));
+    pid_t child = fork(); CHECK(child >= 0);
+    if (!child) { close(pair[0]); serve_connection(pair[1], 1, true); }
+    close(pair[1]);
+    struct xrt_target *target = xrt_target_create(); CHECK(target);
+    struct xrt_gdb *gdb = NULL;
+    CHECK(xrt_gdb_open_fd(pair[0], target, &gdb, NULL) == XRT_OK);
+    CHECK(!xrt_gdb_detach_confirmed(gdb));
+    struct xrt_target *idle = xrt_target_create(); CHECK(idle);
+    CHECK(xrt_gdb_call(gdb, idle, &(struct xrt_call){.op=XRT_RPC_DETACH}) == XRT_OK);
+    CHECK(!xrt_gdb_detach_confirmed(gdb)); // No packet was sent for an idle target.
+    free(idle);
+    struct xrt_target_view view; xrt_target_view(target, &view);
+    CHECK(view.state == XRT_STOPPED && view.thread_count == 1);
+    CHECK(xrt_gdb_call(gdb, target, &(struct xrt_call){.op=XRT_RPC_DETACH}) == XRT_DETACH_INCOMPLETE);
+    CHECK(!xrt_gdb_detach_confirmed(gdb));
+    CHECK(xrt_gdb_call(gdb, target, &(struct xrt_call){.op=XRT_RPC_DETACH}) == XRT_OK);
+    CHECK(xrt_gdb_detach_confirmed(gdb));
+    xrt_gdb_free(gdb); free(target); // Internal owner, no native pid relationship.
+    CHECK(fcntl(pair[0], F_GETFD) == -1);
+    finish((struct fixture){.child=child});
+}
 int main(int argc, char **argv)
 {
     alarm(90);
+    private_open();
     release_guard();
     owner_guard();
     cancellation_checks();

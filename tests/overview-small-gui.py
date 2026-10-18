@@ -45,7 +45,7 @@ if args.tracing_failure:
         frame['tracing_failure'] = 'perf_event_open: Permission denied · recorded access failure; no live tracing in replay'
     replay.write_text(''.join(json.dumps(frame) + '\n' for frame in frames))
 os.environ['XODB_OVERVIEW_LAYOUT'] = '1'
-panels = 'summary performance processes memory disk disk_space network connections power system users services apps files memory_map graph galaxy inheritance treemap fetch'.split()
+panels = 'summary performance processes memory disk disk_space network connections power system users services apps files memory_map graph galaxy inheritance treemap fetch radio'.split()
 themes = 'dark light green amber blue mono win95'.split() if args.matrix else ['dark']
 bad = []
 seen = []

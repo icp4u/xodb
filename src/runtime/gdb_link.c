@@ -190,6 +190,15 @@ void xrt_gdb_disconnect(struct xrt_gdb_link *l)
     if (l && l->fd >= 0) close(l->fd);
     if (l) { l->fd = -1; l->failed = true; }
 }
+enum xrt_status xrt_gdb_adopt(struct xrt_gdb_link *l, int fd, struct xrt_cancel *cancel)
+{
+    if (!l || fd < 0) { if (fd >= 0) close(fd); return XRT_INVALID_ARGUMENT; }
+    *l = (struct xrt_gdb_link){.fd = xrt_host_flags(fd, 1), .packet_size = 1024,
+        .cancel = cancel, .operation_deadline_ns = now() + XRT_GDB_OPEN_NS};
+    if (l->fd < 0) return fail(l, XRT_TRANSPORT_FAILED, "GDB private transport setup failed");
+    if (xrt_cancel_requested(cancel)) return cancelled(l);
+    return XRT_OK;
+}
 enum xrt_status xrt_gdb_connect(struct xrt_gdb_link *l, const char *endpoint, struct xrt_cancel *cancel)
 {
     if (!l || !endpoint) return XRT_INVALID_ARGUMENT;
