@@ -1396,12 +1396,14 @@ pub const Session = struct {
     }
     /// Go's current-goroutine register. amd64 uses r14. aarch64 uses x28.
     /// riscv64 Go uses X27; the register row names that column s11.
-    /// LoongArch has an r14 column too; that register is not g.
+    /// loong64 Go uses R22; the register row names that column r22.
+    /// LoongArch also has an r14 column; that register is not g.
     fn goGRegister(self: *Session) ?[]const u8 {
         return switch (self.target.arch()) {
             .x86_64 => "r14",
             .aarch64 => "x28",
             .riscv64 => "s11",
+            .loongarch64 => "r22",
             else => null,
         };
     }

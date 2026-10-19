@@ -25,7 +25,8 @@ xodb. Agents ask `get_language_stack` with `language` `go`.
   from the sigcontext, and reports the stop on the thread where it lands.
   A step over a call uses a return probe. On amd64 Go, g is R14. On aarch64
   Go, g is X28. On riscv64 Go, g is X27, and the register row names that
-  column s11. That probe follows the goroutine by g and by the frame's
+  column s11. On loong64 Go, g is R22, and the register row names that
+  column r22. That probe follows the goroutine by g and by the frame's
   depth below `g.stack.hi`, which a stack copy keeps, so the step follows it
   onto another thread after `morestack` preempts or grows the stack. A
   different g, or the same g in a deeper recursive frame, is not that return:

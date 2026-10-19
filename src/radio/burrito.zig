@@ -217,23 +217,23 @@ pub fn main(args: []const [:0]const u8) !void {
         while (fsx.monotonicNs() < end and !stop_flag.load(.acquire)) {
             sleepMs(100);
             if (fsx.monotonicNs() >= next_line and !as_json) {
+                const line_to = @min(next_line, end);
                 next_line += 5_000_000_000;
                 var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
                 defer scratch.deinit();
-                const r = radio.report(scratch.allocator(), m, 5_000_000_000, redact) catch continue;
-                say(a, "  [{d:>4.0} s] {d} samples ({d:.0}/s, lag {d:.0} ms; clock: {d} TSF steps, {d} held back; watchdog: {d} re-triggers, {d} re-arms; {d} malformed) pings {d}/{d} lost: {s}\n", .{ @as(f32, @floatFromInt(fsx.monotonicNs() - from)) / 1e9, r.spectral.window_samples, r.spectral.rate_hz, r.spectral.lag_ms, r.spectral.tsf_steps, r.spectral.rejected, r.spectral.retriggers, r.spectral.rearms, r.spectral.malformed, r.ping.lost, r.ping.sent, r.words });
-                // The channels over the last full sweeps (two revisits, at least 8 s).
-                const t = fsx.monotonicNs();
-                const span = @max(8_000_000_000, 2 * @as(u64, m.planInfo().plan.revisitMs()) * 1_000_000);
-                if (r.spectral.window_samples > 0) if (radio.channelsBetween(scratch.allocator(), m, @max(from, t -| span), t, null)) |cr| {
+                const line_from = @max(from, line_to -| 5_000_000_000);
+                const r = radio.reportBetween(scratch.allocator(), m, line_from, line_to, redact) catch continue;
+                say(a, "  [{d:>4.0} s] {d} samples ({d:.0}/s, lag {d:.0} ms; clock: {d} TSF steps, {d} held back; watchdog: {d} re-triggers, {d} re-arms; {d} malformed) pings {d}/{d} lost: {s}\n", .{ @as(f32, @floatFromInt(line_to - from)) / 1e9, r.spectral.window_samples, r.spectral.rate_hz, r.spectral.lag_ms, r.spectral.tsf_steps, r.spectral.rejected, r.spectral.retriggers, r.spectral.rearms, r.spectral.malformed, r.ping.lost, r.ping.sent, r.words });
+                // The channel line describes the exact same five-second interval.
+                if (r.spectral.window_samples > 0) if (radio.channelsBetween(scratch.allocator(), m, line_from, line_to, null)) |cr| {
                     say(a, "         channels: {s}\n", .{cr.words});
                 } else |_| {};
             }
         }
         const to = @min(fsx.monotonicNs(), end);
-        const r = try radio.reportBetween(a, m, from, to, redact);
+        const r = try radio.reportPhaseBetween(a, m, from, to, redact);
         try reports.append(a, r);
-        const cr = try radio.channelsBetween(a, m, from, to, null);
+        const cr = try radio.channelsPhaseBetween(a, m, from, to, null);
         try channel_reports.append(a, cr);
         if (!as_json) {
             out(a, "phase {d}: {s}\n  kind={s} confidence={d:.2} samples={d} rate={d:.0}/s r60={d:.2} r50={d:.2} half={d:.2} active={d:.2} floor={d:.0}dBm width={d:.1}MHz hop={d:.1}MHz coverage={d:.2} pings sent={d} lost={d}\n", .{ k + 1, r.words, r.kind, r.confidence, r.spectral.window_samples, r.spectral.rate_hz, r.verdict.r60, r.verdict.r50, if (r.verdict.r60 >= r.verdict.r50) r.verdict.r60half else r.verdict.r50half, r.verdict.active, r.verdict.floor_dbm, r.verdict.width_mhz, r.verdict.hop_mhz, r.verdict.coverage, r.ping.sent, r.ping.lost });
@@ -271,7 +271,7 @@ fn printChannels(a: std.mem.Allocator, phase: usize, cr: *const radio.ChannelsOu
     out(a, "  channels (phase {d}): {s}\n", .{ phase, cr.words });
     if (cr.plan.len > 0) out(a, "  sensors: {s}\n", .{cr.plan});
     if (cr.samples == 0 and !cr.traffic.on) return;
-    out(a, "    ch   MHz  power  floor  busy  interferer         impact   | frames/s  air  retry  badFCS/s nets stas\n", .{});
+    out(a, "    ch   MHz  power  floor  busy  when present/time  impact   | frames/s  air  retry  badFCS/s nets stas\n", .{});
     for (cr.channels) |ch| {
         var p: [8]u8 = undefined;
         var f: [8]u8 = undefined;
@@ -279,7 +279,8 @@ fn printChannels(a: std.mem.Allocator, phase: usize, cr: *const radio.ChannelsOu
         var it: [24]u8 = undefined;
         var bz: [8]u8 = undefined;
         var tr: [64]u8 = undefined;
-        const inter = if (ch.interferer_over_floor_db) |d| std.fmt.bufPrint(&it, "+{d:.0} dB {d:.0}%", .{ d, (ch.interferer_time orelse 0) * 100 }) catch "" else "-";
+        var tb: [16]u8 = undefined;
+        const inter = if (ch.interferer_over_floor_db) |d| std.fmt.bufPrint(&it, "+{d:.0} dB {s}", .{ d, radio.channels.timeShareText(&tb, ch.interferer_time orelse 0) }) catch "" else "-";
         const traffic = if (ch.traffic) |t| std.fmt.bufPrint(&tr, "{d:>8.0} {d:>3.0}% {s:>5} {d:>8.1} {d:>4}{s} {d:>3}", .{ t.frames_ps, t.airtime * 100, if (t.retry) |x| (std.fmt.bufPrint(&o, "{d:.0}%", .{x * 100}) catch "") else "-", t.bad_fcs_ps, t.networks, if (t.at_least) "+" else " ", t.stations }) catch "" else "      (not watched)";
         out(a, "    {d:>2}  {d}  {s:>5}  {s:>5}  {s:>4}  {s:<17}  {s:<7}  |{s}\n", .{
             ch.channel,

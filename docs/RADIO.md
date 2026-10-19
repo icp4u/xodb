@@ -93,7 +93,13 @@ spectra. It works in these steps:
    (r ≥ 0.35), clearly stronger than at the other period, with its second
    multiple present, at least 20 periods seen, and a duty cycle between 10%
    and 90%. A sample rate too slow to resolve 50/60 Hz is reported as too
-   slow, never as "no pulsing".
+   slow, never as "no pulsing". The terminal's `half=` is the ACF at half a
+   mains period minus the mean ACF at quarter and three-quarter periods: a
+   transformer oven should be negative, while a 100/120 Hz frame source stays
+   positive. Subtracting those flanks removes the broad positive correlation
+   from Wi-Fi or Bluetooth activity in the same window. The gate takes the
+   same baseline off the full-period ACF too (`half` must be under half of
+   it), so a weak frame source on a busy band is still rejected.
 3. **Shape.** Each active sample's occupied width counts the bins within
    10 dB of its peak, and the spread of peak frequencies across samples shows
    hopping. Bins hot in at least 10% of active samples give the occupied
@@ -152,12 +158,21 @@ Each channel (its 22 MHz mask at its true centre, 5 MHz apart, overlapping)
 is measured by the window centred nearest it: power, floor (the quieter tenth,
 capped by the card's own noise figure), power over the floor, and the share of
 samples 8 dB or more over the floor. The interferer's own power inside the
-mask, over the floor, says how badly the channel is hit: **blasted** at 20 dB
-or more (a typical link has 25-45 dB of SNR), **grazed** at 6 dB or more,
-otherwise **clean**; **unseen** when no window covered it. With it comes the
-share of time the interferer held the channel. The verdict groups them
+mask while it is present says how badly the channel is hit: **blasted** at
+20 dB or more (a typical link has 25-45 dB of SNR), **grazed** at 6 dB or
+more, otherwise **clean**; **unseen** when no window covered it. This is
+instantaneous severity, while the adjacent percentage is the share of watched
+time (`<1%` is printed instead of rounding a real hit to `0%`). The verdict groups them
 ("channels 6-13 blasted (up to 49 dB over the floor, 53% of the time), 1-5 and
 14 clean") and names the least affected of channels 1, 6 and 11.
+
+The terminal's five-second headline and channel line analyse the same exact
+interval. If pulsing is clear but no MHz bucket passes the synchronous-energy
+test, both report that the location is unresolved instead of naming the whole
+observed band. A phase summary unions the locations independently supported by
+its five-second windows, reports how many pulsing windows were localized, and
+marks a channel hit if any such window hit it. A carrier that moves during the
+phase therefore appears as its swept span rather than one long-window peak.
 
 The blast is the mains-pulsed energy and the continuous energy touching it
 (the oven's skirt). Continuous energy apart from it is another source: it is
@@ -239,8 +254,9 @@ counters. `radio_channels` takes the same arguments and returns, per channel
 1-14, the window that measured it and how fresh, power, floor, occupancy, the
 interferer's power over the floor and share of time, the impact, and the
 traffic counts; plus the verdict in words, the blast band, the per-window
-regions, the least-affected of channels 1/6/11, the sweep plan and the TX
-counters of every taken card. An agent can answer "which channel should my AP
+regions, five-second pulsing/location counts for a phase, the least-affected
+of channels 1/6/11, the sweep plan and the TX counters of every taken card. An
+agent can answer "which channel should my AP
 use when the microwave is on?" from it. All three tools are observer-only. A
 card is only ever taken by the operator's `--radio` or `--traffic`; the tools
 start the passive collector if none is running (no ping) and say when the

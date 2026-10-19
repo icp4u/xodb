@@ -155,6 +155,13 @@ pub fn report(a: std.mem.Allocator, m: *Monitor, span_ns: u64, redact: bool) !Re
 }
 /// Analyses [from_ns, to_ns) of `m` (CLOCK_MONOTONIC).
 pub fn reportBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, redact: bool) !Report {
+    return reportBetweenMode(a, m, from_ns, to_ns, redact, false);
+}
+/// A phase report whose location is the union of its five-second views.
+pub fn reportPhaseBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, redact: bool) !Report {
+    return reportBetweenMode(a, m, from_ns, to_ns, redact, true);
+}
+fn reportBetweenMode(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, redact: bool, windowed_location: bool) !Report {
     const span_ns = to_ns - from_ns;
     const w = try m.between(a, from_ns, to_ns);
     const samples = try detectorSamples(a, w.samples);
@@ -203,14 +210,27 @@ pub fn reportBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64
     var centres: u32 = 0;
     for (w.samples, 0..) |x, i| centres += @intFromBool(i == 0 or x.s.freq_mhz != w.samples[i - 1].s.freq_mhz);
     if (interfering(verdict.kind) and centres > 1) {
-        const cr = try channels.analyse(a, w.samples, &.{}, from_ns, to_ns, to_ns);
-        if (cr.blast) |b| {
+        const cr = if (windowed_location)
+            try channels.analyseWindowed(a, w.samples, &.{}, from_ns, to_ns, to_ns, &verdict)
+        else
+            try channels.analyseKnown(a, w.samples, &.{}, from_ns, to_ns, to_ns, &verdict);
+        verdict.location_windows_total = cr.location_windows_total;
+        verdict.location_windows_pulsing = cr.location_windows_pulsing;
+        verdict.location_windows_located = cr.location_windows_located;
+        const located_same_source = if (cr.blast) |b| b.kind == verdict.kind else false;
+        if (located_same_source) {
+            const b = cr.blast.?;
             verdict.band_lo_mhz = @floatFromInt(b.lo_mhz);
             verdict.band_hi_mhz = @floatFromInt(b.hi_mhz);
             verdict.channels = 0;
             for (cr.channels) |ch| if (ch.impact == .blasted or ch.impact == .grazed) {
                 verdict.channels |= @as(u16, 1) << @intCast(ch.channel);
             };
+        } else if (verdict.kind == .microwave_pulsed) {
+            verdict.location_resolved = false;
+            verdict.band_lo_mhz = null;
+            verdict.band_hi_mhz = null;
+            verdict.channels = 0;
         }
     }
 
@@ -355,6 +375,9 @@ pub const ChannelsOut = struct {
     plan: []const u8,
     sweep: ?SweepInfo,
     samples: u32,
+    location_windows_total: u16,
+    location_windows_pulsing: u16,
+    location_windows_located: u16,
     status: []const u8,
     traffic: TrafficInfo,
     tx: []const Tx,
@@ -364,9 +387,19 @@ pub const ChannelsOut = struct {
 /// Per-channel power, occupancy, traffic and interferer impact over [from_ns, to_ns).
 /// `full` keeps the per-bucket spectrum (the panel); MCP leaves it out.
 pub fn channelsBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report) !ChannelsOut {
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, false);
+}
+/// A phase channel report whose location is the union of five-second views.
+pub fn channelsPhaseBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report) !ChannelsOut {
+    return channelsBetweenMode(a, m, from_ns, to_ns, report_out, true);
+}
+fn channelsBetweenMode(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u64, report_out: ?*channels.Report, windowed_location: bool) !ChannelsOut {
     const w = try m.between(a, from_ns, to_ns);
     const dwells = try m.dwellsBetween(a, from_ns, to_ns);
-    const r = try channels.analyse(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs());
+    const r = if (windowed_location)
+        try channels.analyseWindowed(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs(), null)
+    else
+        try channels.analyse(a, w.samples, dwells, from_ns, to_ns, fsx.monotonicNs());
     if (report_out) |o| o.* = r;
     const info = m.planInfo();
     var pb: [240]u8 = undefined;
@@ -391,6 +424,9 @@ pub fn channelsBetween(a: std.mem.Allocator, m: *Monitor, from_ns: u64, to_ns: u
         .plan = if (info.sensors > 0) try a.dupe(u8, info.plan.describe(&pb)) else "",
         .sweep = if (info.sensors > 0) .{ .mode = @tagName(info.plan.mode), .windows_mhz = try a.dupe(u16, info.plan.windows.list()), .dwell_ms = info.plan.dwell_ms, .revisit_ms = info.plan.revisitMs(), .sensors = info.sensors, .watch_share = info.plan.watchShare() } else null,
         .samples = r.samples,
+        .location_windows_total = r.location_windows_total,
+        .location_windows_pulsing = r.location_windows_pulsing,
+        .location_windows_located = r.location_windows_located,
         .status = status,
         .traffic = .{ .on = t_on, .iface = t_iface, .why = if (t_on) "" else "no traffic card chosen (--traffic NAME)", .dwell_ms = monitor.traffic_dwell_ms, .packets = packets },
         .tx = try txList(a, m),
@@ -520,6 +556,34 @@ test "report on a monitor fed with synthetic microwave samples" {
     try std.testing.expect(std.mem.indexOf(u8, r.words, "60 Hz pulsing") != null);
     try std.testing.expect(std.mem.indexOf(u8, r.words, "seen ") != null);
     _ = try std.json.Stringify.valueAlloc(arena.allocator(), r, .{});
+}
+
+test "a five-second headline and channel report use one localized interval" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const aa = arena.allocator();
+    const m = try Monitor.start(a, .{ .roots = .{ .sys = "/nonexistent", .proc = "/nonexistent" } });
+    defer m.deinit();
+    m.samples = try monitor.Ring(monitor.Stamped).init(a, 1 << 16);
+    const p = sweep.plan(.{}, 1);
+    const xs = try channels.synthSweep(aa, p.windows.list(), 0.7, 1, true, 91);
+    m.mutex.lock();
+    for (xs) |x| m.samples.push(x);
+    m.mutex.unlock();
+    const from = xs[0].mono_ns;
+    const to = xs[xs.len - 1].mono_ns + 1;
+    const headline = try reportBetween(aa, m, from, to, true);
+    const channel = try channelsBetween(aa, m, from, to, null);
+    try std.testing.expectEqualStrings("microwave_pulsed", headline.kind);
+    try std.testing.expect(headline.verdict.location_resolved);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(channel.blast.?.lo_mhz)), headline.verdict.band_lo_mhz.?);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(channel.blast.?.hi_mhz)), headline.verdict.band_hi_mhz.?);
+    var mask: u16 = 0;
+    for (channel.channels) |ch| {
+        if (ch.impact == .blasted or ch.impact == .grazed) mask |= @as(u16, 1) << @intCast(ch.channel);
+    }
+    try std.testing.expectEqual(mask, headline.verdict.channels);
 }
 
 test "an in-use card is never taken, even when chosen" {

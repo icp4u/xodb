@@ -48,8 +48,9 @@ pub const Verdict = struct {
     r50: f32 = 0,
     r60x2: f32 = 0,
     r50x2: f32 = 0,
-    /// ... and at half of them: a half-wave magnetron is off there (negative),
-    /// a 100/120 Hz frame source is on again (positive).
+    /// ... and the baseline-corrected half-cycle contrast: ACF(P/2) minus
+    /// the mean at P/4 and 3P/4. A half-wave magnetron is negative there;
+    /// slow background bursts cancel, while a 100/120 Hz source stays positive.
     r60half: f32 = 0,
     r50half: f32 = 0,
     mains_hz: ?u8 = null,
@@ -58,6 +59,13 @@ pub const Verdict = struct {
     observed_hi_mhz: f32 = 0,
     band_lo_mhz: ?f32 = null,
     band_hi_mhz: ?f32 = null,
+    /// A swept view saw mains pulsing but could not assign it to frequency
+    /// buckets in this window. A fixed window remains located by its span.
+    location_resolved: bool = true,
+    /// Temporal location evidence for a phase, in fixed five-second windows.
+    location_windows_pulsing: u16 = 0,
+    location_windows_located: u16 = 0,
+    location_windows_total: u16 = 0,
     /// Median occupied width of one active sample, MHz.
     width_mhz: f32 = 0,
     /// Spread (standard deviation) of the active samples' peak frequency, MHz.
@@ -84,7 +92,16 @@ pub const Verdict = struct {
         switch (self.kind) {
             .not_enough_data => try w.print("not enough spectrum yet ({d} samples over {d:.1} s)", .{ self.samples, self.duration_s }),
             .quiet => try w.print("quiet: nothing above the noise floor ({d:.0} dBm)", .{self.floor_dbm}),
-            .microwave_pulsed => try w.print("microwave-like interference: {d} Hz pulsing, ~{d:.0}% duty, {d:.0}-{d:.0} MHz{s}", .{ self.mains_hz.?, self.duty.? * 100, lo, hi, ch }),
+            .microwave_pulsed => {
+                try w.print("microwave-like interference: {d} Hz pulsing, ~{d:.0}% duty", .{ self.mains_hz.?, self.duty.? * 100 });
+                if (!self.location_resolved) {
+                    try w.print("; location unresolved this window", .{});
+                } else {
+                    try w.print(", {s}{d:.0}-{d:.0} MHz{s}", .{ if (self.location_windows_total > 1) "swept span " else "", lo, hi, ch });
+                    if (self.location_windows_total > 1)
+                        try w.print("; pulsing in {d}/{d} five-second windows, location resolved in {d}/{d}", .{ self.location_windows_pulsing, self.location_windows_total, self.location_windows_located, self.location_windows_pulsing });
+                }
+            },
             .continuous_wideband => try w.print("continuous wideband energy {d:.0}-{d:.0} MHz{s}; mains pulsing not seen (an inverter microwave, video sender or other continuous source)", .{ lo, hi, ch }),
             .bluetooth_like => try w.print("narrowband hopping {d:.0}-{d:.0} MHz (Bluetooth-like); no mains pulsing", .{ lo, hi }),
             .wifi_like => try w.print("Wi-Fi-like bursts {d:.0}-{d:.0} MHz{s}; no mains pulsing", .{ lo, hi, ch }),
@@ -325,6 +342,9 @@ pub fn analyseBuckets(scratch: std.mem.Allocator, samples: []const Sample, o: Op
     const other = @min(v.r60, v.r50);
     const harmonic = if (best60) v.r60x2 else v.r50x2;
     const half = if (best60) v.r60half else v.r50half;
+    // The same background baseline comes off both sides: a 100/120 Hz frame
+    // source is as high at P/2 as at P, a half-wave magnetron is not.
+    const base = if (best60) pick.r60base else pick.r50base;
     const period_s: f32 = if (best60) 1.0 / 60.0 else 1.0 / 50.0;
     const periods = v.duration_s / period_s;
     const occupied = if (v.band_lo_mhz) |lo| v.band_hi_mhz.? - lo else 0;
@@ -333,7 +353,7 @@ pub fn analyseBuckets(scratch: std.mem.Allocator, samples: []const Sample, o: Op
     if (v.active < 0.02 or n_on < 10) {
         v.kind = .quiet;
         v.confidence = @min(1, v.duration_s / 5) * quality;
-    } else if (v.resolvable and best >= 0.35 and best - other >= 0.15 and harmonic >= 0.2 and half < 0.5 * best and periods >= 20 and duty >= 0.1 and duty <= 0.9) {
+    } else if (v.resolvable and best >= 0.35 and best - other >= 0.15 and harmonic >= 0.2 and half < 0.5 * (best - base) and periods >= 20 and duty >= 0.1 and duty <= 0.9) {
         v.kind = .microwave_pulsed;
         v.mains_hz = if (best60) 60 else 50;
         v.duty = duty;
@@ -370,7 +390,7 @@ fn sortByTsf(xs: []Sample) void {
     }.lt);
 }
 
-const Periodicity = struct { r60: f32 = 0, r50: f32 = 0, r60x2: f32 = 0, r50x2: f32 = 0, r60half: f32 = 0, r50half: f32 = 0, duty: f32 = 0 };
+const Periodicity = struct { r60: f32 = 0, r50: f32 = 0, r60x2: f32 = 0, r50x2: f32 = 0, r60half: f32 = 0, r50half: f32 = 0, r60base: f32 = 0, r50base: f32 = 0, duty: f32 = 0 };
 fn periodicity(x: []const f32, slot_us: u32, resolvable: bool) Periodicity {
     // Duty within the active stretches: 100 ms blocks that hold any energy,
     // so quiet time (or hopping to other channels) does not dilute it.
@@ -395,9 +415,18 @@ fn periodicity(x: []const f32, slot_us: u32, resolvable: bool) Periodicity {
     p.r50 = acfAt(x, 1e6 / 50.0, slot_us);
     p.r60x2 = acfAt(x, 2e6 / 60.0, slot_us);
     p.r50x2 = acfAt(x, 2e6 / 50.0, slot_us);
-    p.r60half = acfAt(x, 0.5e6 / 60.0, slot_us);
-    p.r50half = acfAt(x, 0.5e6 / 50.0, slot_us);
+    p.r60base = quarterBaseline(x, 1e6 / 60.0, slot_us);
+    p.r50base = quarterBaseline(x, 1e6 / 50.0, slot_us);
+    p.r60half = acfAt(x, 0.5e6 / 60.0, slot_us) - p.r60base;
+    p.r50half = acfAt(x, 0.5e6 / 50.0, slot_us) - p.r50base;
     return p;
+}
+
+/// A slowly varying background (for example a Wi-Fi burst) raises the ACF at
+/// every nearby lag. The mean at a quarter and three quarters of the period
+/// estimates it; the half-cycle gate compares excesses over it at P/2 and P.
+fn quarterBaseline(x: []const f32, period_us: f64, slot_us: u32) f32 {
+    return (acfAt(x, 0.25 * period_us, slot_us) + acfAt(x, 0.75 * period_us, slot_us)) / 2;
 }
 
 /// Normalised autocorrelation of `x` (NaN = no sample) at a lag of
@@ -458,6 +487,11 @@ pub const Synth = struct {
     seed: u64 = 1,
     /// kitchen: the microwave runs.
     mains_on: bool = true,
+    /// Shift the synthetic magnetron's swept carrier (tests only).
+    microwave_offset_mhz: f32 = 0,
+    /// Add a deterministic long Wi-Fi-like background burst with this duty.
+    /// This models the real oven run's broad correlated occupancy.
+    wifi_occupancy: f32 = 0,
 
     pub fn generate(self: Synth, a: std.mem.Allocator) ![]Sample {
         var prng = std.Random.DefaultPrng.init(self.seed);
@@ -491,9 +525,9 @@ pub const Synth = struct {
                     const phase = @mod(t, period) / period;
                     if (phase < 0.48) {
                         // The carrier sweeps upward through the half cycle, with a pedestal.
-                        const fc = 2450 + 14 * phase / 0.48;
+                        const fc = 2450 + self.microwave_offset_mhz + 14 * phase / 0.48;
                         add(&mw, &s0, fc, 1.5, -48);
-                        add(&mw, &s0, 2457, 8, -72);
+                        add(&mw, &s0, 2457 + self.microwave_offset_mhz, 8, -72);
                         energy = true;
                     }
                 },
@@ -536,8 +570,8 @@ pub const Synth = struct {
                     }
                     if (self.mains_on and @mod(t, 1e6 / 60.0) / (1e6 / 60.0) < 0.48) {
                         const phase = @mod(t, 1e6 / 60.0) / (1e6 / 60.0);
-                        add(&mw, &s0, 2450 + 14 * phase / 0.48, 1.5, -46);
-                        add(&mw, &s0, 2457, 8, -70);
+                        add(&mw, &s0, 2450 + self.microwave_offset_mhz + 14 * phase / 0.48, 1.5, -46);
+                        add(&mw, &s0, 2457 + self.microwave_offset_mhz, 8, -70);
                         energy = true;
                     }
                 },
@@ -553,6 +587,10 @@ pub const Synth = struct {
                         energy = true;
                     }
                 },
+            }
+            if (self.wifi_occupancy > 0 and @mod(t, 1_000_000) < 1_000_000 * self.wifi_occupancy) {
+                flat(&mw, &s0, @floatFromInt(self.freq_mhz), 8.3, -58);
+                energy = true;
             }
             if (self.sparse and !energy and r.float(f32) > 0.02) continue;
             var rec: [3 + ath9k.ht20_len]u8 = undefined;
@@ -682,4 +720,30 @@ test "hopping across five channels still finds 60 Hz pulsing and the band" {
     try std.testing.expect(v.observed_lo_mhz <= 2402 and v.observed_hi_mhz >= 2482);
     try std.testing.expect(v.band_lo_mhz.? >= 2430 and v.band_hi_mhz.? <= 2470);
     try std.testing.expect(@abs(v.duty.? - 0.48) < 0.08);
+}
+
+test "real-oven mixture: localized carrier survives correlated Wi-Fi background" {
+    const a = std.testing.allocator;
+    var all: std.ArrayList(Sample) = .empty;
+    defer all.deinit(a);
+    const centres = [_]u16{ 2412, 2427, 2442, 2457, 2472, 2484 };
+    var tsf: u64 = 0;
+    for (centres, 0..) |f, k| {
+        // The oven is visible in two of six sweep windows. Every window also
+        // carries a 30%-occupied, long Wi-Fi burst which raises raw ACFs at
+        // all short lags, as in the real kitchen run.
+        const scene: Synth.Scene = if (k == 2 or k == 3) .microwave60 else .empty;
+        const seg = try (Synth{ .scene = scene, .freq_mhz = f, .seconds = 1, .wifi_occupancy = 0.30, .seed = 40 + k }).generate(a);
+        defer a.free(seg);
+        for (seg) |s0| {
+            var s = s0;
+            s.tsf_us += tsf;
+            try all.append(a, s);
+        }
+        tsf += 1_000_000;
+    }
+    const v = try analyse(a, all.items, .{});
+    try std.testing.expectEqual(Kind.microwave_pulsed, v.kind);
+    try std.testing.expectEqual(@as(?u8, 60), v.mains_hz);
+    try std.testing.expect(v.r60half < -0.10);
 }

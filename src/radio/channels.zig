@@ -77,6 +77,11 @@ pub const Channel = struct {
     interferer_over_floor_db: ?f32 = null,
     /// Share of samples in which the interferer's part of the mask was 8 dB or more over the floor.
     interferer_time: ?f32 = null,
+    /// Five-second windows which observed this channel, and those in which
+    /// the localized interferer grazed or blasted it. Non-zero for a phase
+    /// aggregate; a single-window report uses 0/1 or 1/1.
+    observed_windows: u16 = 0,
+    hit_windows: u16 = 0,
     impact: Impact = .unseen,
     mains_hz: ?u8 = null,
     traffic: ?Traffic = null,
@@ -125,6 +130,13 @@ pub const Report = struct {
     /// The least affected of channels 1, 6 and 11, the usual AP choices.
     best_channel: ?u8,
     advice: []const u8,
+    /// Whole-window pulsing and how often a five-second temporal view could
+    /// localize it. These keep a phase honest when its carrier sweeps.
+    pulsing: bool = false,
+    pulse_mains_hz: ?u8 = null,
+    location_windows_total: u16 = 0,
+    location_windows_pulsing: u16 = 0,
+    location_windows_located: u16 = 0,
 };
 
 pub const Span = struct { lo: usize, hi: usize, pulsed: bool };
@@ -190,11 +202,32 @@ const Group = struct { centre: u16, idx: std.ArrayList(u32) = .empty };
 /// Analyses spectral samples and traffic dwells in [from_ns, to_ns) at `now_ns`
 /// (CLOCK_MONOTONIC). Strings and slices live in `a`.
 pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []const radiotap.Dwell, from_ns: u64, to_ns: u64, now_ns: u64) !Report {
+    return analyseKnown(a, samples, dwells, from_ns, to_ns, now_ns, null);
+}
+
+/// `analyse`, reusing a whole-window verdict when its caller already computed
+/// one. The channel path still performs its per-frequency-region analyses.
+pub fn analyseKnown(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []const radiotap.Dwell, from_ns: u64, to_ns: u64, now_ns: u64, known: ?*const detect.Verdict) !Report {
     var r = Report{ .window_s = @as(f32, @floatFromInt(to_ns -| from_ns)) / 1e9, .samples = @intCast(samples.len), .channels = undefined, .regions = &.{}, .buckets = @splat(.{}), .blast = null, .words = "", .traffic_words = "", .best_channel = null, .advice = "" };
     for (&r.channels, 1..) |*ch, c| {
         const m = maskOf(@intCast(c));
         ch.* = .{ .channel = @intCast(c), .centre_mhz = sweep.channelMhz(@intCast(c)), .lo_mhz = m[0], .hi_mhz = m[1] };
     }
+
+    var computed = detect.Verdict{};
+    const whole = if (known) |v| v else blk: {
+        const xs = try a.alloc(ath9k.Sample, samples.len);
+        for (xs, samples) |*out, x| {
+            out.* = x.s;
+            out.tsf_us = x.mono_ns / 1000;
+        }
+        computed = try detect.analyse(a, xs, .{});
+        break :blk &computed;
+    };
+    r.pulsing = whole.kind == .microwave_pulsed;
+    r.pulse_mains_hz = if (r.pulsing) whole.mains_hz else null;
+    r.location_windows_total = @intFromBool(samples.len > 0);
+    r.location_windows_pulsing = @intFromBool(r.pulsing);
 
     // Regions: samples by tuned centre.
     var groups: std.ArrayList(Group) = .empty;
@@ -295,6 +328,12 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
             if (best == null or reg.confidence > best.?.confidence) best = reg;
         };
         r.blast = .{ .kind = if (any_pulsed) .microwave_pulsed else .continuous_wideband, .mains_hz = if (best) |b| b.mains_hz else null, .lo_mhz = lo, .hi_mhz = blast_hi, .confidence = if (best) |b| b.confidence else 0 };
+        if (any_pulsed) {
+            r.pulsing = true;
+            if (r.pulse_mains_hz == null) r.pulse_mains_hz = r.blast.?.mains_hz;
+            r.location_windows_pulsing = 1;
+            r.location_windows_located = 1;
+        }
     }
 
     // Channels: the window centred nearest each channel measures it.
@@ -368,6 +407,7 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
         ch.peak_dbm = powers.items[@min(n - 1, n * 95 / 100)];
         ch.occupied = @as(f32, @floatFromInt(on)) / @as(f32, @floatFromInt(n));
         ch.impact = .clean;
+        ch.observed_windows = 1;
         if (ch.interferer_mhz > 0 and inter_mw > 0) {
             ch.interferer_dbm = @floatCast(10 * std.math.log10(inter_mw));
             const over = ch.interferer_dbm.? - floor;
@@ -379,13 +419,23 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
                 for (blast_mws.items) |x| hits += @intFromBool(x >= at);
                 ch.interferer_time = @as(f32, @floatFromInt(hits)) / @as(f32, @floatFromInt(blast_mws.items.len));
             }
-            ch.impact = if (over >= blasted_db) .blasted else if (over >= grazed_db) .grazed else .clean;
-            if (r.blast != null) ch.mains_hz = r.blast.?.mains_hz;
+            // A severity label requires at least one sample that met the same
+            // time-share threshold printed beside it. Rare non-zero hits are
+            // kept and printed as <1%; zero cannot read as "blasted 0%".
+            const present = (ch.interferer_time orelse 0) > 0;
+            ch.impact = if (!present) .clean else if (over >= blasted_db) .blasted else if (over >= grazed_db) .grazed else .clean;
+            if (!present) {
+                ch.interferer_mhz = 0;
+                ch.interferer_dbm = null;
+                ch.interferer_over_floor_db = null;
+                ch.interferer_time = null;
+            }
+            ch.hit_windows = @intFromBool(ch.impact == .blasted or ch.impact == .grazed);
+            if (r.blast != null and ch.hit_windows > 0) ch.mains_hz = r.blast.?.mains_hz;
         }
     }
 
     // Traffic per channel.
-    var any_traffic = false;
     var sets_n: std.ArrayList([]const u32) = .empty;
     var sets_s: std.ArrayList([]const u32) = .empty;
     for (&r.channels) |*ch| {
@@ -414,7 +464,6 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
             try sets_s.append(a, d.stas[0..d.n_stas]);
         }
         if (t.dwells == 0) continue;
-        any_traffic = true;
         t.watched_s = @as(f32, @floatFromInt(watched)) / 1e9;
         if (t.watched_s > 0) {
             t.frames_ps = @as(f32, @floatFromInt(t.frames)) / t.watched_s;
@@ -428,14 +477,150 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
         ch.traffic = t;
     }
 
-    // Words.
+    try writeWords(a, &r, samples.len > 0);
+
+    try writeTrafficWords(a, &r, dwells, from_ns, to_ns);
+    try writeAdvice(a, &r);
+    return r;
+}
+
+pub const location_window_ns: u64 = 5_000_000_000;
+
+/// A phase location is the union of the locations independently supported by
+/// its five-second views. This preserves a swept carrier instead of letting a
+/// long-window average collapse it to one peak bucket.
+pub fn analyseWindowed(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []const radiotap.Dwell, from_ns: u64, to_ns: u64, now_ns: u64, known: ?*const detect.Verdict) !Report {
+    var r = try analyseKnown(a, samples, dwells, from_ns, to_ns, now_ns, known);
+    if (to_ns -| from_ns <= location_window_ns or samples.len == 0) return r;
+
+    var total: u16 = 0;
+    var pulsing: u16 = 0;
+    var located: u16 = 0;
+    var lo_mhz: u16 = std.math.maxInt(u16);
+    var hi_mhz: u16 = 0;
+    var best_confidence: f32 = -1;
+    var best_hz: ?u8 = r.pulse_mains_hz;
+    var observed: [n_channels]u16 = @splat(0);
+    var hit: [n_channels]u16 = @splat(0);
+    var worst: [n_channels]Impact = @splat(.unseen);
+    var max_over: [n_channels]f32 = @splat(-std.math.inf(f32));
+    var max_dbm: [n_channels]f32 = @splat(-std.math.inf(f32));
+    var max_mhz: [n_channels]u16 = @splat(0);
+    var time_sum: [n_channels]f32 = @splat(0);
+
+    var si: usize = 0;
+    var start = from_ns;
+    while (start < to_ns) : (start += location_window_ns) {
+        const stop = @min(to_ns, start +| location_window_ns);
+        while (si < samples.len and samples[si].mono_ns < start) si += 1;
+        var end = si;
+        while (end < samples.len and samples[end].mono_ns < stop) end += 1;
+        total +|= 1;
+        {
+            // A phase can contain hundreds of windows. Only their scalar
+            // location evidence survives this block; release each window's
+            // detector arrays before analysing the next one.
+            var scratch = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer scratch.deinit();
+            const part = try analyseKnown(scratch.allocator(), samples[si..end], &.{}, start, stop, now_ns, null);
+            const part_pulsed = part.pulsing or (part.blast != null and part.blast.?.kind == .microwave_pulsed);
+            if (part_pulsed) pulsing +|= 1;
+            const part_located = part.blast != null and part.blast.?.kind == .microwave_pulsed;
+            if (part_located) {
+                located +|= 1;
+                const b = part.blast.?;
+                lo_mhz = @min(lo_mhz, b.lo_mhz);
+                hi_mhz = @max(hi_mhz, b.hi_mhz);
+                if (b.confidence > best_confidence) {
+                    best_confidence = b.confidence;
+                    best_hz = b.mains_hz orelse part.pulse_mains_hz;
+                }
+                for (part.buckets, &r.buckets) |src, *dst| if (src.class == .mains_pulsed) {
+                    dst.class = .mains_pulsed;
+                    dst.interferer_mw = @max(dst.interferer_mw, src.interferer_mw);
+                };
+            }
+            for (part.channels, 0..) |ch, k| {
+                if (ch.impact == .unseen) continue;
+                observed[k] +|= 1;
+                if (!part_located or (ch.impact != .blasted and ch.impact != .grazed)) continue;
+                hit[k] +|= 1;
+                time_sum[k] += ch.interferer_time orelse 0;
+                if (@intFromEnum(ch.impact) > @intFromEnum(worst[k])) worst[k] = ch.impact;
+                if (ch.interferer_over_floor_db) |x| max_over[k] = @max(max_over[k], x);
+                if (ch.interferer_dbm) |x| max_dbm[k] = @max(max_dbm[k], x);
+                max_mhz[k] = @max(max_mhz[k], ch.interferer_mhz);
+            }
+        }
+        si = end;
+    }
+
+    r.location_windows_total = total;
+    r.location_windows_pulsing = pulsing;
+    r.location_windows_located = located;
+    r.pulsing = r.pulsing or pulsing > 0;
+    if (best_hz != null) r.pulse_mains_hz = best_hz;
+    if (!r.pulsing) return r;
+
+    if (located > 0) {
+        r.blast = .{ .kind = .microwave_pulsed, .mains_hz = best_hz, .lo_mhz = lo_mhz, .hi_mhz = hi_mhz, .confidence = @max(0, best_confidence) };
+    } else {
+        r.blast = null;
+    }
+    for (&r.channels, 0..) |*ch, k| {
+        ch.observed_windows = observed[k];
+        ch.hit_windows = hit[k];
+        if (observed[k] == 0) {
+            ch.impact = .unseen;
+        } else if (hit[k] == 0) {
+            ch.impact = .clean;
+            ch.interferer_mhz = 0;
+            ch.interferer_dbm = null;
+            ch.interferer_over_floor_db = null;
+            ch.interferer_time = null;
+            ch.mains_hz = null;
+        } else {
+            ch.impact = worst[k];
+            ch.interferer_mhz = max_mhz[k];
+            ch.interferer_dbm = max_dbm[k];
+            ch.interferer_over_floor_db = max_over[k];
+            ch.interferer_time = time_sum[k] / @as(f32, @floatFromInt(observed[k]));
+            ch.mains_hz = best_hz;
+        }
+    }
+    try writeWords(a, &r, true);
+    try writeTrafficWords(a, &r, dwells, from_ns, to_ns);
+    try writeAdvice(a, &r);
+    return r;
+}
+
+/// Formats a non-zero time share without turning a real, short hit into 0%.
+pub fn timeShareText(buf: []u8, share: f32) []const u8 {
+    if (share > 0 and share < 0.005) return "<1%";
+    return std.fmt.bufPrint(buf, "{d:.0}%", .{share * 100}) catch "";
+}
+
+test "a short real hit never prints as zero percent" {
+    var b: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("<1%", timeShareText(&b, 0.004));
+    try std.testing.expectEqualStrings("0%", timeShareText(&b, 0));
+}
+
+fn writeWords(a: std.mem.Allocator, r: *Report, have_samples: bool) !void {
     var out: std.Io.Writer.Allocating = .init(a);
     const w = &out.writer;
-    if (r.blast) |b| {
-        if (b.kind == .microwave_pulsed)
-            try w.print("microwave-like {d} Hz pulsing at {d}-{d} MHz: ", .{ b.mains_hz orelse 0, b.lo_mhz, b.hi_mhz })
-        else
+    const resolved = r.blast != null and r.blast.?.kind == .microwave_pulsed;
+    if (r.pulsing and !resolved) {
+        try w.print("microwave-like {d} Hz pulsing seen; location unresolved this window", .{r.pulse_mains_hz orelse 0});
+    } else if (r.blast) |b| {
+        if (b.kind == .microwave_pulsed) {
+            try w.print("microwave-like {d} Hz pulsing {s}{d}-{d} MHz", .{ b.mains_hz orelse 0, if (r.location_windows_total > 1) "swept across " else "at ", b.lo_mhz, b.hi_mhz });
+            if (r.location_windows_total > 1)
+                try w.print(" (location resolved in {d}/{d} pulsing five-second windows; pulsing in {d}/{d})", .{ r.location_windows_located, r.location_windows_pulsing, r.location_windows_pulsing, r.location_windows_total });
+            try w.print(": ", .{});
+        } else {
             try w.print("continuous wideband energy at {d}-{d} MHz (mains pulsing not seen): ", .{ b.lo_mhz, b.hi_mhz });
+        }
         var first = true;
         for ([_]Impact{ .blasted, .grazed, .clean }) |imp| {
             var list: [64]u8 = undefined;
@@ -455,11 +640,18 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
                     }
                 };
                 try w.print(" ({s}{d:.0} dB over the floor", .{ if (imp == .blasted) "up to " else "", over });
-                if (k > 0) try w.print(", {d:.0}% of the time", .{occ / k * 100});
+                if (k > 0) {
+                    var pb: [16]u8 = undefined;
+                    try w.print(", {s} of the time", .{timeShareText(&pb, occ / k)});
+                }
                 try w.print(")", .{});
             }
         }
-        // Continuous energy apart from the pulsed blast is another source, not the oven's.
+        // Continuous energy apart from the pulsed blast is another source.
+        var in_blast: [detect.n_buckets]bool = @splat(false);
+        if (blastRange(&r.buckets)) |span| for (span.lo..span.hi) |k| {
+            in_blast[k] = r.buckets[k].class == .mains_pulsed or r.buckets[k].class == .continuous;
+        };
         var o_lo: ?usize = null;
         var o_hi: usize = 0;
         for (r.buckets, 0..) |bk, k| if (bk.class == .continuous and !in_blast[k]) {
@@ -467,7 +659,7 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
             o_hi = k + 1;
         };
         if (o_lo) |ol| try w.print("; other continuous energy at {d}-{d} MHz (not mains-pulsed, not counted in the blast)", .{ 2400 + ol, 2400 + o_hi });
-    } else if (samples.len > 0) {
+    } else if (have_samples) {
         var busiest: ?*const Channel = null;
         for (&r.channels) |*ch| if (ch.occupied) |o| {
             if (busiest == null or o > busiest.?.occupied.?) busiest = ch;
@@ -475,36 +667,41 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
         try w.print("no microwave-like interference in the band", .{});
         if (busiest) |bc| try w.print("; busiest channel {d} ({d:.0}% occupied, {d:.0} dB over the floor)", .{ bc.channel, bc.occupied.? * 100, bc.over_floor_db.? });
     }
-    {
-        var list: [64]u8 = undefined;
-        const ranges = rangeText(&list, &r.channels, .unseen);
-        if (samples.len > 0 and ranges.len > 0) try w.print("; channel{s} {s} not watched in this window", .{ if (std.mem.indexOfAny(u8, ranges, "-a") != null) "s" else "", ranges });
-    }
+    var list: [64]u8 = undefined;
+    const ranges = rangeText(&list, &r.channels, .unseen);
+    if (have_samples and ranges.len > 0) try w.print("; channel{s} {s} not watched in this window", .{ if (std.mem.indexOfAny(u8, ranges, "-a") != null) "s" else "", ranges });
     r.words = out.written();
+}
 
-    if (any_traffic) {
-        var tw: std.Io.Writer.Allocating = .init(a);
-        const hit = sumTraffic(&r.channels, .blasted, .grazed);
-        const clean = sumTraffic(&r.channels, .clean, .clean);
-        if (r.blast != null and hit.watched > 0) {
-            try tw.writer.print("traffic on hit channels: {d:.0} frames/s, {d:.0}% retries, {d:.1} bad-FCS frames/s", .{ hit.frames / hit.watched, pct(hit.retries, hit.eligible), hit.bad / hit.watched });
-            if (clean.watched > 0) try tw.writer.print("; on clean channels: {d:.0} frames/s, {d:.0}% retries, {d:.1} bad-FCS frames/s", .{ clean.frames / clean.watched, pct(clean.retries, clean.eligible), clean.bad / clean.watched });
-        } else {
-            // An access point is heard on its neighbours' channels too: count it once.
-            sets_n.clearRetainingCapacity();
-            for (dwells) |*d| if (d.to_ns > from_ns and d.from_ns < to_ns) try sets_n.append(a, d.nets[0..d.n_nets]);
-            const nets = try radiotap.distinct(a, sets_n.items);
-            var busiest: ?*const Channel = null;
-            for (&r.channels) |*ch| if (ch.traffic) |t| {
-                if (busiest == null or t.airtime > busiest.?.traffic.?.airtime) busiest = ch;
-            };
-            try tw.writer.print("traffic: {d} network{s} seen", .{ nets, if (nets == 1) "" else "s" });
-            if (busiest) |bc| try tw.writer.print("; busiest channel {d} ({d:.0} frames/s, ~{d:.0}% airtime)", .{ bc.channel, bc.traffic.?.frames_ps, bc.traffic.?.airtime * 100 });
-        }
-        r.traffic_words = tw.written();
+fn writeTrafficWords(a: std.mem.Allocator, r: *Report, dwells: []const radiotap.Dwell, from_ns: u64, to_ns: u64) !void {
+    r.traffic_words = "";
+    var any = false;
+    for (r.channels) |ch| any = any or ch.traffic != null;
+    if (!any) return;
+    var tw: std.Io.Writer.Allocating = .init(a);
+    const hit = sumTraffic(&r.channels, .blasted, .grazed);
+    const clean = sumTraffic(&r.channels, .clean, .clean);
+    if (r.blast != null and hit.watched > 0) {
+        try tw.writer.print("traffic on hit channels: {d:.0} frames/s, {d:.0}% retries, {d:.1} bad-FCS frames/s", .{ hit.frames / hit.watched, pct(hit.retries, hit.eligible), hit.bad / hit.watched });
+        if (clean.watched > 0) try tw.writer.print("; on clean channels: {d:.0} frames/s, {d:.0}% retries, {d:.1} bad-FCS frames/s", .{ clean.frames / clean.watched, pct(clean.retries, clean.eligible), clean.bad / clean.watched });
+    } else {
+        // An access point is heard on its neighbours' channels too: count it once.
+        var sets: std.ArrayList([]const u32) = .empty;
+        for (dwells) |*d| if (d.to_ns > from_ns and d.from_ns < to_ns) try sets.append(a, d.nets[0..d.n_nets]);
+        const nets = try radiotap.distinct(a, sets.items);
+        var busiest: ?*const Channel = null;
+        for (&r.channels) |*ch| if (ch.traffic) |t| {
+            if (busiest == null or t.airtime > busiest.?.traffic.?.airtime) busiest = ch;
+        };
+        try tw.writer.print("traffic: {d} network{s} seen", .{ nets, if (nets == 1) "" else "s" });
+        if (busiest) |bc| try tw.writer.print("; busiest channel {d} ({d:.0} frames/s, ~{d:.0}% airtime)", .{ bc.channel, bc.traffic.?.frames_ps, bc.traffic.?.airtime * 100 });
     }
+    r.traffic_words = tw.written();
+}
 
-    // Advice: the least affected of 1, 6 and 11.
+fn writeAdvice(a: std.mem.Allocator, r: *Report) !void {
+    r.best_channel = null;
+    r.advice = "";
     var best: ?*const Channel = null;
     for ([_]u8{ 1, 6, 11 }) |c| {
         const ch = &r.channels[c - 1];
@@ -515,7 +712,6 @@ pub fn analyse(a: std.mem.Allocator, samples: []const ath9k.Stamped, dwells: []c
         r.best_channel = b.channel;
         r.advice = try std.fmt.allocPrint(a, "least affected of channels 1/6/11{s}: {d} ({s}, {d:.0}% occupied{s})", .{ if (r.blast != null) " while it runs" else "", b.channel, @tagName(b.impact), b.occupied.? * 100, if (b.traffic) |t| try std.fmt.allocPrint(a, ", ~{d:.0}% airtime", .{t.airtime * 100}) else "" });
     }
-    return r;
 }
 
 fn kindClass(k: detect.Kind, occ: f32) Class {
@@ -739,6 +935,7 @@ test "kitchen sweep: the microwave blasts channels 6-13, grazes 14, spares 1-5" 
         };
         if (ch.impact != want) std.debug.print("channel {d}: {s} (interferer {d} MHz, {?d:.1} dB over the floor, {?d:.2} of the time) want {s}\n{s}\n", .{ ch.channel, @tagName(ch.impact), ch.interferer_mhz, ch.interferer_over_floor_db, ch.interferer_time, @tagName(want), r.words });
         try std.testing.expectEqual(want, ch.impact);
+        if (ch.impact == .blasted or ch.impact == .grazed) try std.testing.expect(ch.interferer_time.? > 0);
     }
     try std.testing.expect(std.mem.startsWith(u8, r.words, "microwave-like 60 Hz pulsing at 24"));
     try std.testing.expect(std.mem.indexOf(u8, r.words, "channels 6-13 blasted (up to ") != null);
@@ -766,6 +963,52 @@ test "kitchen sweep without the microwave: no blast, every channel clean" {
     try std.testing.expectEqual(@as(?Blast, null), r.blast);
     for (r.channels) |ch| try std.testing.expectEqual(Impact.clean, ch.impact);
     try std.testing.expect(std.mem.startsWith(u8, r.words, "no microwave-like interference in the band; busiest channel "));
+}
+
+test "phase location is the five-second union of a swept carrier" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = sweep.plan(.{}, 1);
+    const from: u64 = 1_000_000_000;
+    var xs: std.ArrayList(ath9k.Stamped) = .empty;
+    const offsets = [_]f32{ -12, 0, 10 };
+    for (offsets, 0..) |offset, window| {
+        const window_start = from + window * location_window_ns;
+        for (p.windows.list(), 0..) |f, dwell| {
+            const seg = try (detect.Synth{ .scene = .kitchen, .freq_mhz = f, .rate_hz = 1200, .seconds = 0.7, .mains_on = true, .microwave_offset_mhz = offset, .seed = 200 + window * 17 + dwell }).generate(a);
+            for (seg) |s| try xs.append(a, .{ .s = s, .mono_ns = window_start + dwell * 750_000_000 + s.tsf_us * 1000 });
+        }
+    }
+    const to = from + offsets.len * location_window_ns;
+    const r = try analyseWindowed(a, xs.items, &.{}, from, to, to, null);
+    try std.testing.expectEqual(@as(u16, 3), r.location_windows_total);
+    try std.testing.expectEqual(@as(u16, 3), r.location_windows_pulsing);
+    // One deliberately marginal shifted window stays unresolved; the phase
+    // reports that instead of inventing a location for it.
+    try std.testing.expectEqual(@as(u16, 2), r.location_windows_located);
+    try std.testing.expect(r.blast.?.lo_mhz <= 2440);
+    try std.testing.expect(r.blast.?.hi_mhz >= 2472);
+    try std.testing.expect(r.channels[5].impact != .clean); // lower sweep reaches channel 6
+    try std.testing.expect(r.channels[12].impact != .clean); // upper sweep reaches channel 13
+    try std.testing.expect(std.mem.indexOf(u8, r.words, "swept across") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.words, "2/3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.words, "pulsing in 3/3") != null);
+}
+
+test "whole-window pulse with no bucket proof reports unresolved location" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const p = sweep.plan(.{}, 1);
+    const xs = try synthSweep(a, p.windows.list(), 0.2, 1, true, 71);
+    const end = xs[xs.len - 1].mono_ns + 1;
+    const known = detect.Verdict{ .kind = .microwave_pulsed, .mains_hz = 60, .duty = 0.45 };
+    const r = try analyseKnown(a, xs, &.{}, xs[0].mono_ns, end, end, &known);
+    try std.testing.expect(r.pulsing);
+    try std.testing.expectEqual(@as(?Blast, null), r.blast);
+    try std.testing.expect(std.mem.indexOf(u8, r.words, "location unresolved this window") != null);
+    try std.testing.expect(std.mem.indexOf(u8, r.words, "no microwave-like") == null);
 }
 
 test "a fixed window leaves far channels unwatched, and says so" {

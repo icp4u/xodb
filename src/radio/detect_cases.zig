@@ -135,6 +135,27 @@ test "100/120 Hz frame sources are not mains-pulsed ovens" {
     const b = try verdictOf("tdd120", 4, tdd120);
     try std.testing.expect(a.kind != .microwave_pulsed);
     try std.testing.expect(b.kind != .microwave_pulsed);
+    try std.testing.expect(a.r50half > 0.25);
+    try std.testing.expect(b.r60half > 0.25);
+}
+fn busyBand(t: f32, e: *std.ArrayList(Emit)) void {
+    // Slow Wi-Fi activity: 400 ms of every second, raising the ACF at every short lag.
+    if (@mod(t, 1e6) < 4e5) e.appendAssumeCapacity(.{ .fc = 2457, .sigma = 6, .dbm = -60 });
+}
+fn dect100Busy(t: f32, _: std.Random, e: *std.ArrayList(Emit)) void {
+    // A cordless-phone-like 100 Hz frame source at ~12% duty in a busy band.
+    if (@mod(t, 10_000) < 1200) e.appendAssumeCapacity(.{ .fc = 2456, .sigma = 1.0, .dbm = -58 });
+    busyBand(t, e);
+}
+fn tdd120Busy(t: f32, _: std.Random, e: *std.ArrayList(Emit)) void {
+    if (@mod(t, 1e6 / 120.0) < 1000) e.appendAssumeCapacity(.{ .fc = 2456, .sigma = 1.0, .dbm = -58 });
+    busyBand(t, e);
+}
+test "low-duty 100/120 Hz frames in a busy band are not ovens" {
+    const a = try verdictOf("dect100-busy", 4, dect100Busy);
+    const b = try verdictOf("tdd120-busy", 4, tdd120Busy);
+    try std.testing.expect(a.kind != .microwave_pulsed);
+    try std.testing.expect(b.kind != .microwave_pulsed);
 }
 test "Bluetooth headset bursts" {
     const v = try verdictOf("bt-headset", 4, btHeadset);
