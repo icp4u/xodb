@@ -570,6 +570,39 @@ class RunnerTests(unittest.TestCase):
         picked, lines = gate.affected(bare, ['src/mcp/observation.zig'], fallback)
         self.assertIn('inspections', [step.name for step in picked])
 
+    def test_affected_follows_the_import_graph(self):
+        # A synthetic graph over real paths: leaf.zig <- mid.zig <- covered.zig;
+        # orphan.zig <- uncovered root; hubbed.zig <- the session hub.
+        Step = gate.Step
+        steps = [Step('release-runner', ['x'], 1), Step('deps', ['x'], 1, paths=['src/*']),
+                 Step('cov', ['x'], 1, paths=['src/covered.zig']), Step('leafstep', ['x'], 1, paths=['src/leaf.zig']),
+                 Step('hubstep', ['x'], 1, paths=['src/model/session.zig']), Step('gui-a', ['x'], 1), Step('gui-b', ['x'], 1)]
+        fallback = ['gui-a', 'gui-b']
+        graph = {'src/leaf.zig': {'src/mid.zig'}, 'src/mid.zig': {'src/covered.zig'}, 'src/covered.zig': {'src/main.zig'},
+                 'src/orphan.zig': {'src/root.zig'}, 'src/hubbed.zig': {'src/model/session.zig'},
+                 'src/model/session.zig': {'src/main.zig'}, 'src/both.zig': {'src/covered.zig', 'src/root.zig'},
+                 'src/cyc.zig': {'src/cyc_a.zig'}, 'src/cyc_a.zig': {'src/cyc_b.zig', 'src/covered.zig'}, 'src/cyc_b.zig': {'src/cyc_a.zig'}}
+        pick = lambda path: [step.name for step in gate.affected(steps, [path], fallback, (), graph)[0]]
+        # A mapped file also runs the steps of its nearest covered importer.
+        self.assertEqual(set(pick('src/leaf.zig')), {'release-runner', 'deps', 'leafstep', 'cov'})
+        # An unmapped file whose every import path reaches covered files runs those steps only.
+        # It keeps the ALWAYS steps (deps) that COVERS gave it.
+        self.assertEqual(set(pick('src/mid.zig')), {'release-runner', 'deps', 'cov'})
+        # An import cycle whose only way in is a covered file is walked once and narrows.
+        self.assertEqual(set(pick('src/cyc.zig')), {'release-runner', 'deps', 'cov'})
+        # An import path that ends at an uncovered root keeps the full fallback.
+        self.assertTrue(set(fallback) <= set(pick('src/orphan.zig')))
+        self.assertTrue(set(fallback) <= set(pick('src/both.zig')))
+        # The walk stops at a hub: the hub's steps are not enough to stand for every use.
+        self.assertTrue(set(fallback) <= set(pick('src/hubbed.zig')))
+        # Without a graph, behaviour is exactly the COVERS mapping.
+        self.assertEqual(set(step.name for step in gate.affected(steps, ['src/leaf.zig'], fallback)[0]), {'release-runner', 'deps', 'leafstep'})
+        # The real graph is available and knows the session hub's importers.
+        real = gate.importers_from_deps()
+        self.assertIsNotNone(real)
+        self.assertGreater(len(real.get('src/model/session.zig', ())), 50)
+        self.assertIn('src/model/session.zig', gate.hubs())
+
     def test_native_mac_paths_have_focused_coverage(self):
         steps = gate.plan('all', macos='fixture-mac')
         for path in ('build_macos.zig', 'src/macos_main.zig', 'scripts/macos-bundle.py', 'tests/cocoa-native.m'):

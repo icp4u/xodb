@@ -55,9 +55,14 @@ Small, stdlib-only, no build integration needed to start.
   lowering a budget is a one-line change in the same diff that earns it.
 - **Cycles.** Report strongly connected components at file level; new cycles fail.
 - **Uses beyond the gate.**
-  - The file graph replaces the hand-kept `COVERS` table in `scripts/release-check`
-    for `affected` selection (a changed file selects the steps of every file that
-    depends on it). This makes the gate both faster and harder to fool.
+  - `affected` follows the file graph (2026-10-20). A changed source file also
+    selects the steps of its nearest covered importers: walk up the imports, stop at
+    each file `COVERS` maps and at each hub in `tools/deps/budgets`. An unmapped file
+    runs only those steps when every upward path reaches a covered file; a path that
+    ends at an uncovered root or a hub keeps the full gui tier. Measured over all 617
+    source files: 28 to 49 steps per changed file on average, 2 files narrowed, the
+    rest the same or wider. It is harder to fool, not faster. C runtime files are linked,
+    not imported, so they stay outside this graph; their coverage is still `COVERS`.
   - The JSON is a graph-model source: xodb's own architecture in the galaxy and the
     table view (`--graph-file`), which is also a good demo of those views.
 - **Not now:** Zig build modules per layer. They enforce the same rules at

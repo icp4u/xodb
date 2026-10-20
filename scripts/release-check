@@ -24,7 +24,8 @@ ROOT = Path(__file__).resolve().parents[1]
 # Coarse map from sources to the steps that cover them: (source globs, step
 # name globs). `release-check affected` runs the steps of every row that a
 # changed file matches. A step also covers the test scripts in its own argv.
-# A file that matches nothing selects the full gui tier.
+# A file that matches nothing selects the full gui tier. For a source file,
+# `affected` also follows scripts/deps' import graph: see affected().
 LANGUAGE_PANES = ('language-*', 'gui-language-tabs', 'gui-language-thread-tabs', 'gui-live-display')
 COVERS = (
     (('src/runtime/macos_debugserver.c', 'src/runtime/xrt_debugserver.h', 'src/runtime/gdb_link.c',
@@ -1201,17 +1202,92 @@ def select(steps, only=None, start=None):
     return [step for step in steps if step.name in wanted]
 
 
-def affected(steps, changed, fallback, registered=()):
+def hubs():
+    """The files with a fan-in budget in tools/deps/budgets: importer walks stop at them."""
+    names = set()
+    for line in (ROOT / 'tools/deps/budgets').read_text().splitlines():
+        line = line.split('#', 1)[0].split()
+        if line:
+            names.add(line[0])
+    return names
+
+
+def importers_from_deps():
+    """{file: files that import it directly} from scripts/deps; None when it cannot say."""
+    out = subprocess.run([sys.executable, '-I', str(ROOT / 'scripts/deps'), 'graph', '--json'], cwd=ROOT, capture_output=True, text=True)
+    if out.returncode:
+        return None
+    rev = {}
+    for edge in json.loads(out.stdout)['edges']:
+        rev.setdefault(edge['target'], set()).add(edge['source'])
+    return rev
+
+
+def covering_importers(path, importers, covered, stop):
+    """The nearest covered files that import path, walking up the import graph
+    and stopping at each covered file and at each hub (tools/deps/budgets).
+    escaped says some upward path ended at an uncovered file nothing imports,
+    or at a hub: then the covered importers do not stand for every use of path."""
+    nearest, seen, todo, escaped = set(), {path}, [path], False
+    while todo:
+        sources = importers.get(todo.pop(), ())
+        for source in sources:
+            if source in seen:
+                continue
+            seen.add(source)
+            if source in stop:
+                escaped = True
+                if covered(source):
+                    nearest.add(source)
+            elif covered(source):
+                nearest.add(source)
+            elif not importers.get(source):
+                escaped = True
+            else:
+                todo.append(source)
+    return nearest, escaped
+
+
+def affected(steps, changed, fallback, registered=(), importers=None):
     """The steps that cover the changed files, and a line per decision.
 
     A file that no planned step covers selects every step named in fallback.
     An uncovered file under tests/ or scripts/ selects every planned step
     outside PERIODIC: a helper may be loaded by any step of either lane. registered names the
     steps whose registration changed, for scripts/release-check itself.
+    importers (from importers_from_deps) adds, for a source file, the steps
+    that cover the files importing it; an uncovered source file whose importers
+    are covered selects those steps instead of the fallback, unless the walk
+    reached a hub file (tools/deps/budgets), where it keeps the fallback.
     """
     wanted, lines = {'release-runner'}, []
+    hub_files = hubs() if importers else set()
+    cover = {}
+
+    def covering(source):
+        if source not in cover:
+            cover[source] = [step.name for step in steps if step.name not in ALWAYS and any(fnmatch.fnmatchcase(source, glob) for glob in step.paths)]
+        return cover[source]
     for path in changed:
         names = [step.name for step in steps if any(fnmatch.fnmatchcase(path, glob) for glob in step.paths)]
+        direct = any(name not in ALWAYS for name in names)
+        if importers and path.startswith('src/') and path not in hub_files:
+            nearest, escaped = covering_importers(path, importers, covering, hub_files)
+            via = {}
+            for source in sorted(nearest):
+                for name in covering(source):
+                    via.setdefault(name, source)
+            extra = [name for name in via if name not in names]
+            if direct and extra:
+                names = names + extra
+                lines.append(f'affected: {path}: {len(names)} steps ({len(extra)} via nearest covered importers): ' + ' '.join(names))
+                wanted.update(names)
+                continue
+            if not direct and via and not escaped:
+                lines.append(f'affected: {path}: not mapped; every importer path reaches covered files, so their {len(extra)} steps: '
+                             + ' '.join(f'{name} ({via[name]})' for name in extra))
+                wanted.update(names + extra)  # keep the ALWAYS steps (deps) that map every source
+                continue
         if path == 'scripts/release-check' and registered:
             names = [step.name for step in steps if step.name in registered or step.name in names]
             lines.append(f'affected: {path}: {len(names)} steps, those whose registration changed: ' + ' '.join(names))
@@ -1383,7 +1459,10 @@ def main(argv=None):
         registered = registered_since(base, runtimes, args.redot) if 'scripts/release-check' in changed else ()
         steps += plan('all', *runtimes, moved=True, redot=args.redot)  # selected only by their own test scripts
         everything = steps
-        steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes, redot=args.redot)], registered)
+        importers = importers_from_deps()
+        steps, decisions = affected(steps, changed, [step.name for step in plan('gui', *runtimes, redot=args.redot)], registered, importers)
+        if importers is None:
+            decisions.append('affected: WARNING: scripts/deps graph failed; mapping by COVERS only')
         # A runtime that was not passed has no steps to select. Say what the change lost.
         chosen = {step.name for step in steps}
         for flag, more in (('perl', dict(perl='PERL')), ('padwalker', dict(perl=args.perl or 'PERL', padwalker='PADWALKER')), ('python', dict(python='PYTHON')),
@@ -1392,7 +1471,7 @@ def main(argv=None):
             if getattr(args, flag):
                 continue
             named = dict(zip(('headless', 'optimize', 'uprobes', 'perl', 'node', 'node_include', 'lua', 'python', 'padwalker', 'ruby', 'node_refusal', 'go', 'wine', 'emacs'), runtimes), **dict(dict(redot=args.redot), **more))
-            lost = [step.name for step in affected(plan('all', **named), changed, [step.name for step in plan('gui', **named)], registered)[0] if step.name not in chosen]
+            lost = [step.name for step in affected(plan('all', **named), changed, [step.name for step in plan('gui', **named)], registered, importers)[0] if step.name not in chosen]
             if lost:
                 missing.append('--' + flag)
                 decisions.append(f'affected: WARNING: without --{flag}, {len(lost)} steps that cover this change cannot run: ' + ' '.join(lost))
